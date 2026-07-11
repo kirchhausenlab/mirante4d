@@ -47,6 +47,17 @@ const TARGET_CRATES: [&str; 17] = [
     "mirante4d-ui-egui",
 ];
 
+// Keep the WP-08A JSON immutable while checking the small set of dependency
+// edges activated by its accepted WP-08B successor.
+fn wp08b_normal_dependency_additions(crate_name: &str) -> &'static [&'static str] {
+    match crate_name {
+        "mirante4d-app" => &["mirante4d-dataset-runtime"],
+        "mirante4d-data" | "mirante4d-renderer" => &["mirante4d-dataset"],
+        "xtask" => &["mirante4d-dataset", "mirante4d-dataset-runtime"],
+        _ => &[],
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SubsystemContract {
@@ -364,8 +375,15 @@ fn validate_dependency_matrix(
             ("build", &entry.dependencies.build),
         ];
         for (kind, expected) in expected_by_kind {
-            let expected =
+            let mut expected =
                 unique_string_set(expected, &format!("WP-08A {name} {kind} dependency list"))?;
+            if kind == "normal" {
+                expected.extend(
+                    wp08b_normal_dependency_additions(&name)
+                        .iter()
+                        .map(|dependency| (*dependency).to_owned()),
+                );
+            }
             let actual = actual.get(kind).cloned().unwrap_or_default();
             if actual != expected {
                 bail!(
@@ -469,13 +487,18 @@ fn validate_normal_edge_closure(
                 .is_some_and(|dependencies| dependencies.contains(dependency));
             let explicitly_transitional =
                 transitional.contains(&(source.as_str(), dependency.as_str()));
-            match (target_permitted, explicitly_transitional) {
-                (true, false) | (false, true) => {}
-                (true, true) => bail!(
-                    "WP-08A normal edge {source} -> {dependency} is both target-permitted and transitional"
+            let wp08b_cutover_edge = !target_permitted
+                && wp08b_normal_dependency_additions(source).contains(&dependency.as_str());
+            let owners = usize::from(target_permitted)
+                + usize::from(explicitly_transitional)
+                + usize::from(wp08b_cutover_edge);
+            match owners {
+                1 => {}
+                0 => bail!(
+                    "live normal edge {source} -> {dependency} is not target-permitted, transitional, or part of the WP-08B cutover"
                 ),
-                (false, false) => bail!(
-                    "WP-08A normal edge {source} -> {dependency} is neither target-permitted nor transitional"
+                _ => bail!(
+                    "live normal edge {source} -> {dependency} has overlapping architecture classifications"
                 ),
             }
         }
@@ -531,6 +554,14 @@ fn validate_side_effect_capabilities(
         for exception in &capability.current_exceptions {
             require_nonempty("side-effect exception reason", &exception.reason)?;
             validate_expiry_gate(&exception.expiry_gate)?;
+            let expired_at_wp08b = capability.capability == "dataset-demand-and-open-workers"
+                && exception.crate_name == "mirante4d-data"
+                && exception.expiry_gate == "WP-08B";
+            let disabled_at_wp08b = capability.capability == "analysis-background-workers"
+                && exception.crate_name == "mirante4d-app";
+            if expired_at_wp08b || disabled_at_wp08b {
+                continue;
+            }
             if !current_crates.insert(&exception.crate_name) {
                 bail!(
                     "WP-08A side-effect capability {} repeats current crate {}",
@@ -547,7 +578,18 @@ fn validate_side_effect_capabilities(
                 exception.evidence_source.as_deref(),
             )?;
         }
-        if current_crates.is_empty() {
+        if capability.capability == "dataset-demand-and-open-workers" {
+            current_crates.insert(&capability.target_owner);
+            validate_side_effect_evidence(
+                repo_root,
+                metadata,
+                crate_paths,
+                &capability.target_owner,
+                None,
+                Some("thread::Builder::new"),
+            )?;
+        }
+        if current_crates.is_empty() && capability.capability != "analysis-background-workers" {
             bail!(
                 "WP-08A side-effect capability {} has no evidenced current owner or exception",
                 capability.capability
@@ -566,7 +608,7 @@ fn validate_thread_creation_owners(
     contract: &SubsystemContract,
     crate_paths: &BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
-    let declared = contract
+    let mut declared = contract
         .side_effect_capabilities
         .iter()
         .filter(|capability| capability.capability.contains("worker"))
@@ -583,6 +625,7 @@ fn validate_thread_creation_owners(
                 )
         })
         .collect::<BTreeSet<_>>();
+    declared.insert("mirante4d-dataset-runtime");
 
     let mut observed = BTreeSet::new();
     for (crate_name, crate_path) in crate_paths {
@@ -590,7 +633,9 @@ fn validate_thread_creation_owners(
             if path
                 .components()
                 .any(|component| component.as_os_str() == "tests")
-                || path.file_stem().is_some_and(|stem| stem == "tests")
+                || path.file_stem().is_some_and(|stem| {
+                    stem == "tests" || stem.to_string_lossy().ends_with("_tests")
+                })
             {
                 continue;
             }
@@ -1359,7 +1404,9 @@ fn validate_restricted_trait_implementations(
             if path
                 .components()
                 .any(|component| component.as_os_str() == "tests")
-                || path.file_stem().is_some_and(|stem| stem == "tests")
+                || path.file_stem().is_some_and(|stem| {
+                    stem == "tests" || stem.to_string_lossy().ends_with("_tests")
+                })
             {
                 continue;
             }
@@ -1822,7 +1869,7 @@ mod tests {
             validate_normal_edge_closure(&contract, &metadata, &BTreeMap::new())
                 .unwrap_err()
                 .to_string()
-                .contains("neither target-permitted nor transitional")
+                .contains("not target-permitted, transitional, or part of the WP-08B cutover")
         );
     }
 

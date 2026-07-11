@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use mirante4d_domain::Shape3D;
+use mirante4d_dataset::CpuByteLedger;
 use mirante4d_render_api::CameraFrame;
 use wgpu::util::DeviceExt;
 
@@ -30,9 +30,9 @@ use super::{
     },
 };
 use crate::{
-    BrickFrameDiagnosticsF32, CameraRenderModeF32, CameraRenderQuality, DvrRgbaFrame,
-    FrameDiagnosticsF32, IsoSurfaceFrameF32, MipImageF32, PixelCoverage, RenderError,
-    RenderViewport, ResidentBrickSetF32, frame_diagnostics_f32,
+    BrickFrameDiagnosticsF32, CameraRenderModeF32, CameraRenderQuality, CurrentLeaseVolume,
+    DvrRgbaFrame, FrameDiagnosticsF32, IsoSurfaceFrameF32, MipImageF32, PixelCoverage, RenderError,
+    RenderViewport, frame_diagnostics_f32,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,27 +49,28 @@ struct GpuBrickedRawOutputF32 {
 
 impl GpuRenderer {
     #[allow(clippy::too_many_arguments)]
-    fn render_camera_f32_from_bricks_raw_pairs(
+    fn render_camera_f32_from_leases_raw_pairs(
         &self,
-        resident: &ResidentBrickSetF32,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
         camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderModeF32,
         quality: CameraRenderQuality,
     ) -> Result<GpuBrickedRawOutputF32, GpuRenderError> {
-        if resident.bricks().is_empty() {
-            return Err(RenderError::InvalidBrickAtlas("resident brick set is empty").into());
+        if volume.resident().is_empty() {
+            return Err(
+                RenderError::InvalidBrickAtlas("lease-backed float32 volume is empty").into(),
+            );
         }
 
         let viewport_width = checked_u32("viewport_width", viewport.width)?;
         let viewport_height = checked_u32("viewport_height", viewport.height)?;
-        let shape_x = checked_u32("x", resident.volume_shape.x())?;
-        let shape_y = checked_u32("y", resident.volume_shape.y())?;
-        let shape_z = checked_u32("z", resident.volume_shape.z())?;
+        let shape_x = checked_u32("x", volume.volume_shape().x())?;
+        let shape_y = checked_u32("y", volume.volume_shape().y())?;
+        let shape_z = checked_u32("z", volume.volume_shape().z())?;
         let upload_started = Instant::now();
-        let atlas = self.cached_brick_atlas_f32(resident, brick_shape, brick_grid_shape)?;
+        let atlas = self.cached_brick_atlas_f32(volume, cpu_ledger)?;
         let mut timings = GpuRenderTimings {
             upload_ns: duration_ns_u64(upload_started.elapsed()),
             ..Default::default()
@@ -83,8 +84,8 @@ impl GpuRenderer {
         let brick_voxel_count = checked_u32("brick_voxel_count", atlas.brick_voxel_count)?;
 
         let mut camera_params =
-            camera_grid_params_f32_for_transform(resident.grid_to_world, camera, viewport)?;
-        let mode_params = gpu_mode_params_f32_for_transform(resident.grid_to_world, mode)?;
+            camera_grid_params_f32_for_transform(volume.grid_to_world(), camera, viewport)?;
+        let mode_params = gpu_mode_params_f32_for_transform(volume.grid_to_world(), mode)?;
         camera_params[15] = mode_params.density_scale;
         camera_params[GPU_PARAM_ISO_LEVEL_INDEX] = mode_params.iso_display_level;
         camera_params[GPU_PARAM_ISO_DISPLAY_LOW_INDEX] = mode_params.iso_transfer.window.low();
@@ -252,8 +253,8 @@ impl GpuRenderer {
             &output_words,
             mode_uses_dvr_f32(mode),
         )?;
-        let input_voxels = resident
-            .volume_shape
+        let input_voxels = volume
+            .volume_shape()
             .element_count()
             .map_err(RenderError::from)?;
         let frame = frame_diagnostics_f32(input_voxels, &pixels);
@@ -274,19 +275,17 @@ impl GpuRenderer {
         })
     }
 
-    pub fn render_camera_f32_from_bricks(
+    pub fn render_camera_f32_from_leases(
         &self,
-        resident: &ResidentBrickSetF32,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
         camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderModeF32,
     ) -> Result<GpuMipOutputF32, GpuRenderError> {
-        self.render_camera_f32_from_bricks_with_quality(
-            resident,
-            brick_shape,
-            brick_grid_shape,
+        self.render_camera_f32_from_leases_with_quality(
+            volume,
+            cpu_ledger,
             camera,
             viewport,
             mode,
@@ -295,28 +294,29 @@ impl GpuRenderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn render_camera_f32_from_bricks_output_buffer(
+    pub(super) fn render_camera_f32_from_lease_output_buffer(
         &self,
-        resident: &ResidentBrickSetF32,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
         camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderModeF32,
         quality: CameraRenderQuality,
         output_slot: usize,
     ) -> Result<GpuF32CameraOutputBuffer, GpuRenderError> {
-        if resident.bricks().is_empty() {
-            return Err(RenderError::InvalidBrickAtlas("resident brick set is empty").into());
+        if volume.resident().is_empty() {
+            return Err(
+                RenderError::InvalidBrickAtlas("lease-backed float32 volume is empty").into(),
+            );
         }
 
         let viewport_width = checked_u32("viewport_width", viewport.width)?;
         let viewport_height = checked_u32("viewport_height", viewport.height)?;
-        let shape_x = checked_u32("x", resident.volume_shape.x())?;
-        let shape_y = checked_u32("y", resident.volume_shape.y())?;
-        let shape_z = checked_u32("z", resident.volume_shape.z())?;
+        let shape_x = checked_u32("x", volume.volume_shape().x())?;
+        let shape_y = checked_u32("y", volume.volume_shape().y())?;
+        let shape_z = checked_u32("z", volume.volume_shape().z())?;
         let upload_started = Instant::now();
-        let atlas = self.cached_brick_atlas_f32(resident, brick_shape, brick_grid_shape)?;
+        let atlas = self.cached_brick_atlas_f32(volume, cpu_ledger)?;
         let mut timings = GpuRenderTimings {
             upload_ns: duration_ns_u64(upload_started.elapsed()),
             ..Default::default()
@@ -330,8 +330,8 @@ impl GpuRenderer {
         let brick_voxel_count = checked_u32("brick_voxel_count", atlas.brick_voxel_count)?;
 
         let mut camera_params =
-            camera_grid_params_f32_for_transform(resident.grid_to_world, camera, viewport)?;
-        let mode_params = gpu_mode_params_f32_for_transform(resident.grid_to_world, mode)?;
+            camera_grid_params_f32_for_transform(volume.grid_to_world(), camera, viewport)?;
+        let mode_params = gpu_mode_params_f32_for_transform(volume.grid_to_world(), mode)?;
         camera_params[15] = mode_params.density_scale;
         camera_params[GPU_PARAM_ISO_LEVEL_INDEX] = mode_params.iso_display_level;
         camera_params[GPU_PARAM_ISO_DISPLAY_LOW_INDEX] = mode_params.iso_transfer.window.low();
@@ -444,24 +444,17 @@ impl GpuRenderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn render_camera_f32_from_bricks_with_quality(
+    pub fn render_camera_f32_from_leases_with_quality(
         &self,
-        resident: &ResidentBrickSetF32,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
         camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderModeF32,
         quality: CameraRenderQuality,
     ) -> Result<GpuMipOutputF32, GpuRenderError> {
-        let output = self.render_camera_f32_from_bricks_raw_pairs(
-            resident,
-            brick_shape,
-            brick_grid_shape,
-            camera,
-            viewport,
-            mode,
-            quality,
+        let output = self.render_camera_f32_from_leases_raw_pairs(
+            volume, cpu_ledger, camera, viewport, mode, quality,
         )?;
         Ok(GpuMipOutputF32 {
             image: MipImageF32::try_new_with_mode_frames(

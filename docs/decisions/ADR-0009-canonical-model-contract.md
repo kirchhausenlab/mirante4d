@@ -55,9 +55,9 @@ predecessor-field disposition before any product authority moves.
 The machine-checked root API, dependency, side-effect, state-class, and semantic
 invariant allowlists are frozen in
 [`architecture/model-contract.json`](../../architecture/model-contract.json).
-The immutable exit revision is the exact Rust signature and variant authority.
-Every field in the predecessor `AppState` and `MiranteWorkbenchApp` appears
-exactly once in
+The immutable WP-07A/WP-07B exit revisions remain the exact historical Rust
+signature, variant, and predecessor-field disposition authority. The current
+owner and deletion state is recorded without brittle field counts in
 [`architecture/current-state-field-ledger.json`](../../architecture/current-state-field-ledger.json).
 
 ## Consequences

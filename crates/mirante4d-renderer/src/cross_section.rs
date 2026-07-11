@@ -1,10 +1,15 @@
 use glam::{DQuat, DVec2, DVec3};
 use mirante4d_data::SpatialBrickIndex;
+use mirante4d_dataset::ResourceRegion;
 use mirante4d_domain::{GridToWorld, Shape3D};
 use mirante4d_format::CurrentGridToWorldExt;
 use mirante4d_render_api::PresentationViewport;
 
-use crate::BrickGridSpec;
+use crate::{
+    BrickGridSpec, RenderError, ResourcePlanCapacityKind, ResourcePlanLimits,
+    SemanticRegionGridSpec,
+    brick_plan::{planning_capacity_error, semantic_region},
+};
 
 const EPSILON: f64 = 1.0e-9;
 const BRICK_INDEX_EPSILON: f64 = 1.0e-9;
@@ -291,33 +296,78 @@ pub fn plan_cross_section_bricks(
     plan_cross_section_bricks_with_diagnostics(slab, spec).selected_bricks
 }
 
+/// Plans storage-independent semantic regions intersecting one visible panel
+/// slab. The current storage brick index remains an internal implementation
+/// detail until the predecessor renderer is replaced.
+pub fn plan_cross_section_resource_regions(
+    slab: CrossSectionSlab,
+    spec: SemanticRegionGridSpec,
+    limits: ResourcePlanLimits,
+) -> Result<Vec<ResourceRegion>, RenderError> {
+    plan_cross_section_bricks_bounded(
+        slab,
+        BrickGridSpec {
+            volume_shape: spec.volume_shape,
+            brick_shape: spec.resource_shape,
+            grid_to_world: spec.grid_to_world,
+        },
+        limits,
+    )?
+    .selected_bricks
+    .into_iter()
+    .map(|index| semantic_region(spec, index))
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(RenderError::from)
+}
+
 pub fn plan_cross_section_bricks_with_diagnostics(
     slab: CrossSectionSlab,
     spec: BrickGridSpec,
 ) -> CrossSectionBrickPlan {
+    plan_cross_section_bricks_bounded(slab, spec, ResourcePlanLimits::new(usize::MAX, usize::MAX))
+        .expect("an unbounded cross-section plan cannot exceed usize capacity")
+}
+
+fn plan_cross_section_bricks_bounded(
+    slab: CrossSectionSlab,
+    spec: BrickGridSpec,
+    limits: ResourcePlanLimits,
+) -> Result<CrossSectionBrickPlan, RenderError> {
     let grid_shape = brick_grid_shape(spec.volume_shape, spec.brick_shape);
     let Some(bounds) = cross_section_candidate_brick_bounds(slab, spec, grid_shape) else {
-        return CrossSectionBrickPlan {
+        return Ok(CrossSectionBrickPlan {
             selected_bricks: Vec::new(),
             candidate_bricks: 0,
-        };
+        });
     };
     let candidate_bricks = bounds.candidate_count();
-    let mut bricks = Vec::new();
+    if candidate_bricks > limits.max_candidates {
+        return Err(planning_capacity_error(
+            ResourcePlanCapacityKind::Candidates,
+            limits.max_candidates,
+        ));
+    }
+    let mut bricks = Vec::with_capacity(candidate_bricks.min(limits.max_resources));
     for z in bounds.z_min..=bounds.z_max {
         for y in bounds.y_min..=bounds.y_max {
             for x in bounds.x_min..=bounds.x_max {
                 let brick = SpatialBrickIndex::new(z, y, x);
                 if slab.intersects_brick(spec, brick) {
+                    if bricks.len() == limits.max_resources {
+                        return Err(planning_capacity_error(
+                            ResourcePlanCapacityKind::Resources,
+                            limits.max_resources,
+                        ));
+                    }
                     bricks.push(brick);
                 }
             }
         }
     }
-    CrossSectionBrickPlan {
+    Ok(CrossSectionBrickPlan {
         selected_bricks: bricks,
         candidate_bricks,
-    }
+    })
 }
 
 pub fn cross_section_chunk_plane_polygon(
@@ -643,7 +693,7 @@ mod tests {
     use mirante4d_domain::{GridToWorld, Shape3D};
     use mirante4d_render_api::PresentationViewport;
 
-    use crate::{BrickGridSpec, cross_section::*};
+    use crate::{BrickGridSpec, SemanticRegionGridSpec, cross_section::*};
 
     fn assert_vec3_abs_diff_eq(actual: DVec3, expected: DVec3) {
         assert_abs_diff_eq!(actual.x, expected.x, epsilon = 1e-12);
@@ -811,6 +861,60 @@ mod tests {
                 SpatialBrickIndex::new(1, 1, 0),
                 SpatialBrickIndex::new(1, 1, 1),
             ]
+        );
+    }
+
+    #[test]
+    fn semantic_cross_section_plan_returns_clipped_storage_independent_regions() {
+        let view = CrossSectionView::new(
+            DVec3::new(3.5, 3.5, 6.5),
+            CrossSectionPanel::Xy,
+            DQuat::IDENTITY,
+            1.0,
+            1.0,
+        );
+        let regions = plan_cross_section_resource_regions(
+            view.slab(PresentationViewport::new(8.0, 8.0).unwrap()),
+            SemanticRegionGridSpec {
+                volume_shape: Shape3D::new(7, 8, 8).unwrap(),
+                resource_shape: Shape3D::new(4, 4, 4).unwrap(),
+                grid_to_world: GridToWorld::identity(),
+            },
+            ResourcePlanLimits::new(64, 64),
+        )
+        .unwrap();
+
+        assert_eq!(regions.len(), 4);
+        assert!(regions.iter().all(|region| region.origin()[0] == 4));
+        assert!(regions.iter().all(|region| region.shape().z() == 3));
+    }
+
+    #[test]
+    fn semantic_cross_section_plan_rejects_candidate_window_before_scanning_it() {
+        let view = CrossSectionView::new(
+            DVec3::splat(500_000.0),
+            CrossSectionPanel::Xy,
+            DQuat::IDENTITY,
+            1.0,
+            1_000_000.0,
+        );
+        let error = plan_cross_section_resource_regions(
+            view.slab(PresentationViewport::new(1_000_000.0, 1_000_000.0).unwrap()),
+            SemanticRegionGridSpec {
+                volume_shape: Shape3D::new(1_000_000, 1_000_000, 1_000_000).unwrap(),
+                resource_shape: Shape3D::new(64, 64, 64).unwrap(),
+                grid_to_world: GridToWorld::identity(),
+            },
+            ResourcePlanLimits::new(16, 16),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            RenderError::ResourcePlanCapacityExceeded {
+                kind: ResourcePlanCapacityKind::Candidates,
+                maximum: 16,
+            }
         );
     }
 

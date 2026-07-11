@@ -1,34 +1,41 @@
 use eframe::egui;
 use mirante4d_application::{ApplicationCommand, ApplicationSnapshot, OperationKind};
+use mirante4d_domain::ViewerLayout;
 use mirante4d_project_model::ViewState;
 
 use crate::{
     BACKGROUND_WORK_REPAINT_INTERVAL,
-    brick_streaming::{brick_runtime_work_active, playback_timepoint_finished_loading},
-    cross_section_scheduler::cross_section_refinement_work_pending,
-    cross_section_streaming::cross_section_runtime_work_active,
     current_runtime::{
-        analysis::CurrentAnalysisRuntime, dataset::CurrentDatasetRuntime,
-        import::CurrentImportRuntime, render::CurrentRenderRuntime,
+        analysis::CurrentAnalysisRuntime, import::CurrentImportRuntime,
+        render::CurrentRenderRuntime,
     },
+    dataset_requests::{DatasetDemandState, SCOPE_CURRENT_3D},
     playback::{PLAYBACK_FRAME_INTERVAL, playback_tick_for_ui_time},
+    viewer_layout::CrossSectionPanelScheduleStatus,
 };
 
 pub(crate) fn background_work_active(
     snapshot: &ApplicationSnapshot,
     import: &CurrentImportRuntime,
-    analysis: &CurrentAnalysisRuntime,
-    dataset: &CurrentDatasetRuntime,
+    _analysis: &CurrentAnalysisRuntime,
+    dataset: &DatasetDemandState,
     render: &CurrentRenderRuntime,
 ) -> bool {
     application_service_work_active(snapshot)
         || import.tiff_import_setup_task.is_some()
         || import.import_task.is_some()
-        || analysis.analysis_task.is_some()
         || snapshot.transient().playback_active()
-        || brick_runtime_work_active(dataset)
-        || cross_section_runtime_work_active(&render.cross_section_runtime)
-        || cross_section_refinement_work_pending(dataset, render)
+        || dataset.dispatcher().has_pending_work()
+        || (crate::application_view(snapshot).layout() == ViewerLayout::FourPanel
+            && render.cross_section_runtime.panels().any(|panel| {
+                panel.cross_section_schedule.is_some_and(|schedule| {
+                    matches!(
+                        schedule.status,
+                        CrossSectionPanelScheduleStatus::Loading
+                            | CrossSectionPanelScheduleStatus::Coarse
+                    )
+                })
+            }))
 }
 
 fn application_service_work_active(snapshot: &ApplicationSnapshot) -> bool {
@@ -58,8 +65,8 @@ fn pending_application_service_work(
 
 pub(crate) fn enqueue_playback_command_if_due(
     snapshot: &ApplicationSnapshot,
-    view: &ViewState,
-    dataset: &CurrentDatasetRuntime,
+    _view: &ViewState,
+    dataset: &DatasetDemandState,
     render: &mut CurrentRenderRuntime,
     commands: &mut Vec<ApplicationCommand>,
     ctx: &egui::Context,
@@ -76,7 +83,7 @@ pub(crate) fn enqueue_playback_command_if_due(
     }
 
     if snapshot.transient().last_playback_tick().is_some()
-        && !playback_timepoint_finished_loading(snapshot, dataset, render, view.timepoint())
+        && !dataset.scope_complete(SCOPE_CURRENT_3D, &render.lease_bridge)
     {
         ctx.request_repaint_after(BACKGROUND_WORK_REPAINT_INTERVAL);
         return;

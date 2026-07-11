@@ -12,6 +12,7 @@ use mirante4d_format::{
 };
 use zarrs::array::ArrayShardedReadableExtCache;
 
+mod current_source_bridge;
 mod error;
 mod payloads;
 mod regions;
@@ -19,39 +20,27 @@ mod runtime_config;
 mod runtime_support;
 mod sharded_bricks;
 mod types;
-mod worker;
+pub use current_source_bridge::{CurrentDatasetSource, CurrentDatasetSourceOpenError};
 pub use error::DataError;
 use payloads::*;
 pub use regions::translated_region_grid_to_world;
-use regions::{
-    brick_record, brick_record_and_region, brick_region, validate_region_within_brick,
-    validate_spatial_brick_index, validate_timepoint,
-};
+use regions::{brick_record, brick_region, validate_spatial_brick_index, validate_timepoint};
 use runtime_config::DEFAULT_BRICK_CACHE_BYTES;
 pub use runtime_config::{DataEngineDiagnostics, DataEngineStats, DataRuntimeConfig};
 #[cfg(test)]
 use runtime_config::{GIB, MIB};
 use runtime_support::*;
-use sharded_bricks::{
-    ShardSplitContext, brick_cache_key, split_f32_shard_brick, split_u8_shard_brick,
-    split_u16_shard_brick, storage_shard_brick_indices, storage_shard_region,
-};
+use sharded_bricks::storage_shard_region;
 pub use types::{
     BrickMetadata, DenseVolumeF32, DenseVolumeU8, DenseVolumeU16, SpatialBrickIndex,
     VolumeBrickF32, VolumeBrickU8, VolumeBrickU16, VolumeRegion,
-};
-pub use worker::{
-    BrickHistogramSample, BrickReadMetrics, BrickReadOutcome, BrickReadPayload, BrickReadPool,
-    BrickReadQueueDiagnostics, BrickReadSpec, BrickReadStatus, BrickReadTicket,
-    BrickRequestPriority, CancellationToken, CrossSectionChunkReadPool, CrossSectionChunkReadSpec,
-    DataGenerationId, DataRequestId,
 };
 
 #[derive(Debug, Clone)]
 pub struct DatasetHandle {
     root: PathBuf,
     dataset_id: DatasetId,
-    manifest: NativeManifest,
+    manifest: Arc<NativeManifest>,
     runtime: Arc<DataRuntime>,
 }
 
@@ -121,7 +110,7 @@ impl DatasetHandle {
         Ok(Self {
             root,
             dataset_id,
-            manifest,
+            manifest: Arc::new(manifest),
             runtime: Arc::new(DataRuntime {
                 config,
                 manifest_index,
@@ -389,31 +378,6 @@ impl DatasetHandle {
             .map_err(DataError::InvalidShape)
     }
 
-    fn storage_shard_bricks_for_request(
-        &self,
-        layer_id: &LayerId,
-        scale_level: u32,
-        anchor_brick_index: SpatialBrickIndex,
-        requested_bricks: &[SpatialBrickIndex],
-    ) -> Result<(SpatialBrickIndex, Vec<SpatialBrickIndex>), DataError> {
-        let scale = self.scale(layer_id, scale_level)?;
-        let shard_index =
-            self.storage_shard_index_for_brick(layer_id, scale_level, anchor_brick_index)?;
-        for brick in requested_bricks {
-            let candidate = self.storage_shard_index_for_brick(layer_id, scale_level, *brick)?;
-            if candidate != shard_index {
-                return Err(DataError::ReadFailed {
-                    layer_id: layer_id.to_string(),
-                    message: "coalesced brick request spans multiple storage shards".to_owned(),
-                });
-            }
-        }
-        Ok((
-            shard_index,
-            storage_shard_brick_indices(scale, shard_index)?,
-        ))
-    }
-
     pub fn scale_shape(&self, layer_id: &LayerId, scale_level: u32) -> Result<Shape3D, DataError> {
         let scale = self.scale(layer_id, scale_level)?;
         Ok(scale.shape.spatial())
@@ -676,35 +640,6 @@ impl DatasetHandle {
         Ok(Some(brick))
     }
 
-    pub(crate) fn read_u8_brick_region_at_scale_cancellable(
-        &self,
-        layer_id: &LayerId,
-        scale_level: u32,
-        timepoint: TimeIndex,
-        brick_index: SpatialBrickIndex,
-        region: VolumeRegion,
-        is_cancelled: impl Fn() -> bool,
-    ) -> Result<Option<VolumeBrickU8>, DataError> {
-        if is_cancelled() {
-            return Ok(None);
-        }
-        let read = self.read_u8_brick_region_uncached(
-            layer_id,
-            scale_level,
-            timepoint,
-            brick_index,
-            region,
-        )?;
-        let brick = read.brick;
-        if is_cancelled() {
-            return Ok(None);
-        }
-        let decoded = brick.volume.values.len() as u64;
-        self.record_subset_read(decoded, std::mem::size_of::<u8>() as u64, read.diagnostics)?;
-        self.record_brick_read(decoded, std::mem::size_of::<u8>() as u64)?;
-        Ok(Some(brick))
-    }
-
     pub fn read_u16_brick_at_scale(
         &self,
         layer_id: &LayerId,
@@ -759,35 +694,6 @@ impl DatasetHandle {
         self.record_brick_read(decoded, std::mem::size_of::<u16>() as u64)?;
         let cache_update = self.brick_cache_insert_u16(key, brick.clone())?;
         self.record_brick_cache_update(cache_update)?;
-        Ok(Some(brick))
-    }
-
-    pub(crate) fn read_u16_brick_region_at_scale_cancellable(
-        &self,
-        layer_id: &LayerId,
-        scale_level: u32,
-        timepoint: TimeIndex,
-        brick_index: SpatialBrickIndex,
-        region: VolumeRegion,
-        is_cancelled: impl Fn() -> bool,
-    ) -> Result<Option<VolumeBrickU16>, DataError> {
-        if is_cancelled() {
-            return Ok(None);
-        }
-        let read = self.read_u16_brick_region_uncached(
-            layer_id,
-            scale_level,
-            timepoint,
-            brick_index,
-            region,
-        )?;
-        let brick = read.brick;
-        if is_cancelled() {
-            return Ok(None);
-        }
-        let decoded = brick.volume.values.len() as u64;
-        self.record_subset_read(decoded, std::mem::size_of::<u16>() as u64, read.diagnostics)?;
-        self.record_brick_read(decoded, std::mem::size_of::<u16>() as u64)?;
         Ok(Some(brick))
     }
 
@@ -855,224 +761,6 @@ impl DatasetHandle {
         let cache_update = self.brick_cache_insert_f32(key, brick.clone())?;
         self.record_brick_cache_update(cache_update)?;
         Ok(Some(brick))
-    }
-
-    pub(crate) fn read_f32_brick_region_at_scale_cancellable(
-        &self,
-        layer_id: &LayerId,
-        scale_level: u32,
-        timepoint: TimeIndex,
-        brick_index: SpatialBrickIndex,
-        region: VolumeRegion,
-        is_cancelled: impl Fn() -> bool,
-    ) -> Result<Option<VolumeBrickF32>, DataError> {
-        if is_cancelled() {
-            return Ok(None);
-        }
-        let read = self.read_f32_brick_region_uncached(
-            layer_id,
-            scale_level,
-            timepoint,
-            brick_index,
-            region,
-        )?;
-        let brick = read.brick;
-        if is_cancelled() {
-            return Ok(None);
-        }
-        let decoded = brick.volume.values.len() as u64;
-        self.record_subset_read(decoded, std::mem::size_of::<f32>() as u64, read.diagnostics)?;
-        self.record_brick_read(decoded, std::mem::size_of::<f32>() as u64)?;
-        Ok(Some(brick))
-    }
-
-    pub(crate) fn read_u8_brick_group_at_scale_cancellable(
-        &self,
-        layer_id: &LayerId,
-        scale_level: u32,
-        timepoint: TimeIndex,
-        anchor_brick_index: SpatialBrickIndex,
-        requested_bricks: &[SpatialBrickIndex],
-        is_cancelled: impl Fn() -> bool,
-    ) -> Result<Option<Vec<VolumeBrickU8>>, DataError> {
-        let (shard_index, shard_bricks) = self.storage_shard_bricks_for_request(
-            layer_id,
-            scale_level,
-            anchor_brick_index,
-            requested_bricks,
-        )?;
-        let mut cached = Vec::with_capacity(shard_bricks.len());
-        let mut missing = 0usize;
-        for brick in &shard_bricks {
-            let key = brick_cache_key(layer_id, scale_level, timepoint, *brick);
-            if let Some(payload) = self.brick_cache_get_u8(&key)? {
-                self.record_brick_cache_hit()?;
-                cached.push(payload);
-            } else {
-                self.record_brick_cache_miss()?;
-                missing += 1;
-            }
-        }
-        if is_cancelled() {
-            return Ok(None);
-        }
-        if missing == 0 {
-            return Ok(Some(cached));
-        }
-
-        let scale = self.scale(layer_id, scale_level)?;
-        let shard_region = storage_shard_region(scale, shard_index)?;
-        let read =
-            self.read_u8_region_at_scale_uncached(layer_id, scale_level, timepoint, shard_region)?;
-        if is_cancelled() {
-            return Ok(None);
-        }
-        let decoded = read.volume.values.len() as u64;
-        self.record_subset_read(decoded, std::mem::size_of::<u8>() as u64, read.diagnostics)?;
-        self.record_brick_read(decoded, std::mem::size_of::<u8>() as u64)?;
-        let mut bricks = Vec::with_capacity(shard_bricks.len());
-        let split_context = ShardSplitContext {
-            dataset_id: &self.dataset_id,
-            layer_id,
-            scale,
-            scale_level,
-            timepoint,
-            shard_region,
-        };
-        for brick_index in shard_bricks {
-            let brick = split_u8_shard_brick(split_context, &read.volume, brick_index)?;
-            let key = brick_cache_key(layer_id, scale_level, timepoint, brick_index);
-            let cache_update = self.brick_cache_insert_u8(key, brick.clone())?;
-            self.record_brick_cache_update(cache_update)?;
-            bricks.push(brick);
-        }
-        Ok(Some(bricks))
-    }
-
-    pub(crate) fn read_u16_brick_group_at_scale_cancellable(
-        &self,
-        layer_id: &LayerId,
-        scale_level: u32,
-        timepoint: TimeIndex,
-        anchor_brick_index: SpatialBrickIndex,
-        requested_bricks: &[SpatialBrickIndex],
-        is_cancelled: impl Fn() -> bool,
-    ) -> Result<Option<Vec<VolumeBrickU16>>, DataError> {
-        let (shard_index, shard_bricks) = self.storage_shard_bricks_for_request(
-            layer_id,
-            scale_level,
-            anchor_brick_index,
-            requested_bricks,
-        )?;
-        let mut cached = Vec::with_capacity(shard_bricks.len());
-        let mut missing = 0usize;
-        for brick in &shard_bricks {
-            let key = brick_cache_key(layer_id, scale_level, timepoint, *brick);
-            if let Some(payload) = self.brick_cache_get_u16(&key)? {
-                self.record_brick_cache_hit()?;
-                cached.push(payload);
-            } else {
-                self.record_brick_cache_miss()?;
-                missing += 1;
-            }
-        }
-        if is_cancelled() {
-            return Ok(None);
-        }
-        if missing == 0 {
-            return Ok(Some(cached));
-        }
-
-        let scale = self.scale(layer_id, scale_level)?;
-        let shard_region = storage_shard_region(scale, shard_index)?;
-        let read =
-            self.read_u16_region_at_scale_uncached(layer_id, scale_level, timepoint, shard_region)?;
-        if is_cancelled() {
-            return Ok(None);
-        }
-        let decoded = read.volume.values.len() as u64;
-        self.record_subset_read(decoded, std::mem::size_of::<u16>() as u64, read.diagnostics)?;
-        self.record_brick_read(decoded, std::mem::size_of::<u16>() as u64)?;
-        let mut bricks = Vec::with_capacity(shard_bricks.len());
-        let split_context = ShardSplitContext {
-            dataset_id: &self.dataset_id,
-            layer_id,
-            scale,
-            scale_level,
-            timepoint,
-            shard_region,
-        };
-        for brick_index in shard_bricks {
-            let brick = split_u16_shard_brick(split_context, &read.volume, brick_index)?;
-            let key = brick_cache_key(layer_id, scale_level, timepoint, brick_index);
-            let cache_update = self.brick_cache_insert_u16(key, brick.clone())?;
-            self.record_brick_cache_update(cache_update)?;
-            bricks.push(brick);
-        }
-        Ok(Some(bricks))
-    }
-
-    pub(crate) fn read_f32_brick_group_at_scale_cancellable(
-        &self,
-        layer_id: &LayerId,
-        scale_level: u32,
-        timepoint: TimeIndex,
-        anchor_brick_index: SpatialBrickIndex,
-        requested_bricks: &[SpatialBrickIndex],
-        is_cancelled: impl Fn() -> bool,
-    ) -> Result<Option<Vec<VolumeBrickF32>>, DataError> {
-        let (shard_index, shard_bricks) = self.storage_shard_bricks_for_request(
-            layer_id,
-            scale_level,
-            anchor_brick_index,
-            requested_bricks,
-        )?;
-        let mut cached = Vec::with_capacity(shard_bricks.len());
-        let mut missing = 0usize;
-        for brick in &shard_bricks {
-            let key = brick_cache_key(layer_id, scale_level, timepoint, *brick);
-            if let Some(payload) = self.brick_cache_get_f32(&key)? {
-                self.record_brick_cache_hit()?;
-                cached.push(payload);
-            } else {
-                self.record_brick_cache_miss()?;
-                missing += 1;
-            }
-        }
-        if is_cancelled() {
-            return Ok(None);
-        }
-        if missing == 0 {
-            return Ok(Some(cached));
-        }
-
-        let scale = self.scale(layer_id, scale_level)?;
-        let shard_region = storage_shard_region(scale, shard_index)?;
-        let read =
-            self.read_f32_region_at_scale_uncached(layer_id, scale_level, timepoint, shard_region)?;
-        if is_cancelled() {
-            return Ok(None);
-        }
-        let decoded = read.volume.values.len() as u64;
-        self.record_subset_read(decoded, std::mem::size_of::<f32>() as u64, read.diagnostics)?;
-        self.record_brick_read(decoded, std::mem::size_of::<f32>() as u64)?;
-        let mut bricks = Vec::with_capacity(shard_bricks.len());
-        let split_context = ShardSplitContext {
-            dataset_id: &self.dataset_id,
-            layer_id,
-            scale,
-            scale_level,
-            timepoint,
-            shard_region,
-        };
-        for brick_index in shard_bricks {
-            let brick = split_f32_shard_brick(split_context, &read.volume, brick_index)?;
-            let key = brick_cache_key(layer_id, scale_level, timepoint, brick_index);
-            let cache_update = self.brick_cache_insert_f32(key, brick.clone())?;
-            self.record_brick_cache_update(cache_update)?;
-            bricks.push(brick);
-        }
-        Ok(Some(bricks))
     }
 
     fn read_u8_region_at_scale_uncached(
@@ -1220,117 +908,6 @@ impl DatasetHandle {
                 values_read.cache,
                 render_valid_read.cache,
             )?,
-        })
-    }
-
-    fn read_u8_brick_region_uncached(
-        &self,
-        layer_id: &LayerId,
-        scale_level: u32,
-        timepoint: TimeIndex,
-        brick_index: SpatialBrickIndex,
-        region: VolumeRegion,
-    ) -> Result<UncachedU8BrickRead, DataError> {
-        let layer = self
-            .layer(layer_id)
-            .ok_or_else(|| DataError::LayerNotFound(layer_id.to_string()))?;
-        validate_u8_dense_layer(layer_id, layer)?;
-        validate_timepoint(layer_id, layer, timepoint)?;
-
-        let scale = self.scale(layer_id, scale_level)?;
-        let (chunk_index, record, full_region) =
-            brick_record_and_region(layer_id, scale, timepoint, brick_index)?;
-        validate_region_within_brick(region, full_region)?;
-        let read =
-            self.read_u8_region_at_scale_uncached(layer_id, scale_level, timepoint, region)?;
-
-        Ok(UncachedU8BrickRead {
-            brick: VolumeBrickU8 {
-                scale_level,
-                brick_index,
-                chunk_index,
-                region,
-                occupied: record.occupied,
-                valid_voxel_count: record.valid_voxel_count,
-                min: record.min,
-                max: record.max,
-                volume: read.volume,
-            },
-            diagnostics: read.diagnostics,
-        })
-    }
-
-    fn read_u16_brick_region_uncached(
-        &self,
-        layer_id: &LayerId,
-        scale_level: u32,
-        timepoint: TimeIndex,
-        brick_index: SpatialBrickIndex,
-        region: VolumeRegion,
-    ) -> Result<UncachedU16BrickRead, DataError> {
-        let layer = self
-            .layer(layer_id)
-            .ok_or_else(|| DataError::LayerNotFound(layer_id.to_string()))?;
-        validate_u16_dense_layer(layer_id, layer)?;
-        validate_timepoint(layer_id, layer, timepoint)?;
-
-        let scale = self.scale(layer_id, scale_level)?;
-        let (chunk_index, record, full_region) =
-            brick_record_and_region(layer_id, scale, timepoint, brick_index)?;
-        validate_region_within_brick(region, full_region)?;
-        let read =
-            self.read_u16_region_at_scale_uncached(layer_id, scale_level, timepoint, region)?;
-
-        Ok(UncachedU16BrickRead {
-            brick: VolumeBrickU16 {
-                scale_level,
-                brick_index,
-                chunk_index,
-                region,
-                occupied: record.occupied,
-                valid_voxel_count: record.valid_voxel_count,
-                min: record.min,
-                max: record.max,
-                volume: read.volume,
-            },
-            diagnostics: read.diagnostics,
-        })
-    }
-
-    fn read_f32_brick_region_uncached(
-        &self,
-        layer_id: &LayerId,
-        scale_level: u32,
-        timepoint: TimeIndex,
-        brick_index: SpatialBrickIndex,
-        region: VolumeRegion,
-    ) -> Result<UncachedF32BrickRead, DataError> {
-        let layer = self
-            .layer(layer_id)
-            .ok_or_else(|| DataError::LayerNotFound(layer_id.to_string()))?;
-        validate_f32_dense_layer(layer_id, layer)?;
-        validate_timepoint(layer_id, layer, timepoint)?;
-
-        let scale = self.scale(layer_id, scale_level)?;
-        let (chunk_index, record, full_region) =
-            brick_record_and_region(layer_id, scale, timepoint, brick_index)?;
-        validate_region_within_brick(region, full_region)?;
-        let read =
-            self.read_f32_region_at_scale_uncached(layer_id, scale_level, timepoint, region)?;
-
-        Ok(UncachedF32BrickRead {
-            brick: VolumeBrickF32 {
-                scale_level,
-                brick_index,
-                chunk_index,
-                region,
-                occupied: record.occupied,
-                valid_voxel_count: record.valid_voxel_count,
-                min: record.min,
-                max: record.max,
-                volume: read.volume,
-            },
-            diagnostics: read.diagnostics,
         })
     }
 
@@ -1959,42 +1536,6 @@ impl DatasetHandle {
             stats.brick_reads += 1;
             stats.decoded_brick_values += decoded_values;
             stats.decoded_brick_bytes += decoded_values * decoded_value_bytes;
-        })
-    }
-
-    pub(crate) fn record_brick_request_queued(&self) -> Result<(), DataError> {
-        self.update_stats(|stats| {
-            stats.brick_requests_queued += 1;
-        })
-    }
-
-    pub(crate) fn record_brick_request_completed(&self) -> Result<(), DataError> {
-        self.update_stats(|stats| {
-            stats.brick_requests_completed += 1;
-        })
-    }
-
-    pub(crate) fn record_brick_request_cancelled(&self) -> Result<(), DataError> {
-        self.update_stats(|stats| {
-            stats.brick_requests_cancelled += 1;
-        })
-    }
-
-    pub(crate) fn record_brick_request_stale(&self) -> Result<(), DataError> {
-        self.update_stats(|stats| {
-            stats.brick_requests_stale += 1;
-        })
-    }
-
-    pub(crate) fn record_brick_request_failed(&self) -> Result<(), DataError> {
-        self.update_stats(|stats| {
-            stats.brick_requests_failed += 1;
-        })
-    }
-
-    pub(crate) fn record_brick_queue_full(&self) -> Result<(), DataError> {
-        self.update_stats(|stats| {
-            stats.brick_queue_full += 1;
         })
     }
 

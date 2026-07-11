@@ -1,27 +1,96 @@
-use crate::smoke::render_playback_steps_for_smoke;
 use crate::viewer_layout::PanelId;
+use mirante4d_dataset::{
+    DatasetResourceIdentity, DatasetResourceKey, DatasetSourceId, ResourceLease,
+    ResourcePayloadDescriptor, ResourcePayloadView, ResourceRegion, ResourceValidity,
+};
+use mirante4d_domain::{LogicalLayerKey, ScaleLevel};
+use mirante4d_renderer::CurrentLeaseBridge;
 
-fn active_layer_histogram_for_test(
-    application: &ApplicationState,
-    analysis: &mut current_runtime::analysis::CurrentAnalysisRuntime,
-    dataset: &current_runtime::dataset::CurrentDatasetRuntime,
+struct HistogramTestLease {
+    key: DatasetResourceKey,
+    descriptor: ResourcePayloadDescriptor,
+    bytes: Vec<u8>,
+}
+
+impl ResourceLease for HistogramTestLease {
+    fn key(&self) -> DatasetResourceKey {
+        self.key
+    }
+
+    fn payload(&self) -> ResourcePayloadView<'_> {
+        let value_len = usize::try_from(self.descriptor.value_byte_len()).unwrap();
+        let (values, validity) = self.bytes.split_at(value_len);
+        self.descriptor
+            .view(
+                values,
+                (self.descriptor.validity_byte_len() != 0).then_some(validity),
+            )
+            .unwrap()
+    }
+}
+
+fn histogram_key(
+    layer: u32,
+    timepoint: u64,
+    scale: u32,
+    origin_x: u64,
+    samples: u64,
+) -> DatasetResourceKey {
+    DatasetResourceKey::new(
+        DatasetResourceIdentity::Unverified(DatasetSourceId::new(77)),
+        LogicalLayerKey::new(layer),
+        TimeIndex::new(timepoint),
+        ScaleLevel::new(scale),
+        ResourceRegion::new([0, 0, origin_x], Shape3D::new(1, 1, samples).unwrap()).unwrap(),
+    )
+}
+
+fn u16_histogram_lease(
+    key: DatasetResourceKey,
+    values: &[u16],
+    validity: Option<u8>,
+) -> Arc<dyn ResourceLease> {
+    let descriptor = ResourcePayloadDescriptor::new(
+        IntensityDType::Uint16,
+        key.region().shape(),
+        if validity.is_some() {
+            ResourceValidity::BitMask
+        } else {
+            ResourceValidity::AllValid
+        },
+    )
+    .unwrap();
+    let mut bytes = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    if let Some(validity) = validity {
+        bytes.push(validity);
+    }
+    Arc::new(HistogramTestLease {
+        key,
+        descriptor,
+        bytes,
+    })
+}
+
+fn histogram_for_test(
+    bridge: &CurrentLeaseBridge,
+    layer: u32,
+    timepoint: u64,
+    scale: u32,
 ) -> LayerHistogramSummary {
-    let snapshot = application.snapshot();
-    let view = application_view(&snapshot);
-    let layer = snapshot
-        .catalog()
-        .layer(view.active_layer())
-        .expect("the canonical view must close over the test catalog");
-    let layer_id = current_physical_layer_id(dataset, view.active_layer())
-        .expect("the test catalog must map to the current physical dataset");
+    let requirements = bridge.required_keys().collect::<Vec<_>>();
     active_layer_histogram_summary(
-        analysis,
-        dataset,
+        bridge,
         histogram::ActiveLayerHistogramInput {
-            layer_id: &layer_id,
-            layer_name: layer.label(),
-            dtype: layer.dtype(),
-            timepoint: view.timepoint(),
+            requirements: &requirements,
+            identity: DatasetResourceIdentity::Unverified(DatasetSourceId::new(77)),
+            layer: LogicalLayerKey::new(layer),
+            layer_name: "intensity",
+            dtype: IntensityDType::Uint16,
+            timepoint: TimeIndex::new(timepoint),
+            scale: ScaleLevel::new(scale),
         },
     )
 }
@@ -51,355 +120,105 @@ fn workbench_shell_exposes_channel_display_controls() {
 }
 
 #[test]
-fn active_layer_histogram_is_exact_for_loaded_dense_volume() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut opened = open_dataset_and_render_first_frame(root).unwrap();
-    let application = test_application_for_opened_source(&opened);
-    let dense_max = opened.analysis_runtime.active_intensity_summary.max as f32;
+fn active_layer_histogram_reads_only_valid_lease_samples_and_keeps_valid_zero() {
+    let key = histogram_key(0, 0, 0, 0, 4);
+    let mut bridge = CurrentLeaseBridge::new();
+    bridge.replace_current_requirements([key]).unwrap();
+    bridge
+        .install(u16_histogram_lease(key, &[0, 4, 10, 20], Some(0b0000_1101)))
+        .unwrap();
 
-    let histogram = active_layer_histogram_for_test(
-        &application,
-        &mut opened.analysis_runtime,
-        &opened.dataset_runtime,
-    );
+    let histogram = histogram_for_test(&bridge, 0, 0, 0);
     let window = auto_dense_window_from_histogram(&histogram).unwrap();
-
-    assert_eq!(histogram.status, HistogramStatus::Exact);
-    assert_eq!(histogram.bin_count, 32);
-    assert_eq!(histogram.sample_count, 16 * 16 * 16);
+    assert!(matches!(histogram.status, HistogramStatus::Sampled { .. }));
+    assert_eq!(histogram.sample_count, 3);
     assert_eq!(histogram.min_value, 0.0);
-    assert_eq!(histogram.max_value, dense_max);
-    assert_eq!(histogram.bins.iter().sum::<u64>(), histogram.sample_count);
-    assert!(window.low() >= histogram.min_value);
-    assert!(window.high() <= histogram.max_value);
-    assert!(window.high() > window.low());
+    assert_eq!(histogram.max_value, 20.0);
+    assert_eq!(histogram.bins.iter().sum::<u64>(), 3);
+    assert!(window.low() >= 0.0);
+    assert!(window.high() <= 20.0);
 }
 
 #[test]
-fn active_layer_histogram_uses_data_engine_sample_when_no_dense_or_resident_data() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut opened = open_dataset_and_render_first_frame(root).unwrap();
-    let application = test_application_for_opened_source(&opened);
-    let dense_max = opened.analysis_runtime.active_intensity_summary.max as f32;
-    opened.dataset_runtime.active_volume_u8 = None;
-    opened.dataset_runtime.active_volume = None;
-    opened.dataset_runtime.active_volume_f32 = None;
-    opened.dataset_runtime.resident_bricks_u8.clear();
-    opened.dataset_runtime.resident_bricks_u8_by_layer.clear();
-    opened.dataset_runtime.resident_bricks.clear();
-    opened.dataset_runtime.resident_bricks_by_layer.clear();
-    opened.dataset_runtime.resident_bricks_f32.clear();
-    opened.dataset_runtime.resident_bricks_f32_by_layer.clear();
+fn active_layer_histogram_is_pending_when_its_own_cohort_lease_is_missing() {
+    let retained = histogram_key(0, 0, 0, 0, 2);
+    let missing = histogram_key(0, 0, 0, 2, 2);
+    let mut bridge = CurrentLeaseBridge::new();
+    bridge
+        .replace_current_requirements([retained, missing])
+        .unwrap();
+    bridge
+        .install(u16_histogram_lease(retained, &[1, 2], None))
+        .unwrap();
 
-    let histogram = active_layer_histogram_for_test(
-        &application,
-        &mut opened.analysis_runtime,
-        &opened.dataset_runtime,
-    );
-    let window = auto_dense_window_from_histogram(&histogram).unwrap();
-
-    match &histogram.status {
-        HistogramStatus::Sampled { source } => {
-            assert!(source.contains("data engine s0"));
-            assert!(source.contains("1/1br"));
-        }
-        other => panic!("expected data-engine sampled histogram, got {other:?}"),
-    }
-    assert_eq!(histogram.bin_count, 32);
-    assert_eq!(histogram.sample_count, 16 * 16 * 16);
-    assert_eq!(histogram.min_value, 0.0);
-    assert_eq!(histogram.max_value, dense_max);
-    assert_eq!(histogram.bins.iter().sum::<u64>(), histogram.sample_count);
-    assert!(window.low() >= histogram.min_value);
-    assert!(window.high() <= histogram.max_value);
-    assert!(window.high() > window.low());
-}
-
-#[test]
-fn active_layer_histogram_caches_data_engine_sample() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut opened = open_dataset_and_render_first_frame(root).unwrap();
-    let application = test_application_for_opened_source(&opened);
-    opened.dataset_runtime.active_volume_u8 = None;
-    opened.dataset_runtime.active_volume = None;
-    opened.dataset_runtime.active_volume_f32 = None;
-    opened.dataset_runtime.resident_bricks_u8.clear();
-    opened.dataset_runtime.resident_bricks_u8_by_layer.clear();
-    opened.dataset_runtime.resident_bricks.clear();
-    opened.dataset_runtime.resident_bricks_by_layer.clear();
-    opened.dataset_runtime.resident_bricks_f32.clear();
-    opened.dataset_runtime.resident_bricks_f32_by_layer.clear();
-
-    let first = active_layer_histogram_for_test(
-        &application,
-        &mut opened.analysis_runtime,
-        &opened.dataset_runtime,
-    );
-    let stats_after_first = opened.dataset_runtime.dataset.stats().unwrap();
-    let second = active_layer_histogram_for_test(
-        &application,
-        &mut opened.analysis_runtime,
-        &opened.dataset_runtime,
-    );
-    let stats_after_second = opened.dataset_runtime.dataset.stats().unwrap();
-
-    assert!(matches!(first.status, HistogramStatus::Sampled { .. }));
-    assert_eq!(first, second);
-    assert!(stats_after_first.brick_reads > 0);
-    assert_eq!(
-        stats_after_second.brick_reads,
-        stats_after_first.brick_reads
+    let histogram = histogram_for_test(&bridge, 0, 0, 0);
+    assert!(matches!(histogram.status, HistogramStatus::Pending { .. }));
+    assert_eq!(histogram.sample_count, 2);
+    assert!(!histogram_can_auto_window(&histogram));
+    assert!(
+        auto_dense_window_from_histogram(&histogram)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot auto-window")
     );
 }
 
 #[test]
-fn active_layer_histogram_uses_data_engine_sample_for_float32_layer() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::BasicF32_8Cube, tempdir.path()).unwrap();
-    let mut opened = open_dataset_and_render_first_frame(root).unwrap();
-    let application = test_application_for_opened_source(&opened);
-    opened.dataset_runtime.active_volume_u8 = None;
-    opened.dataset_runtime.active_volume = None;
-    opened.dataset_runtime.active_volume_f32 = None;
-    opened.dataset_runtime.resident_bricks_u8.clear();
-    opened.dataset_runtime.resident_bricks_u8_by_layer.clear();
-    opened.dataset_runtime.resident_bricks.clear();
-    opened.dataset_runtime.resident_bricks_by_layer.clear();
-    opened.dataset_runtime.resident_bricks_f32.clear();
-    opened.dataset_runtime.resident_bricks_f32_by_layer.clear();
+fn unrelated_missing_lease_does_not_keep_active_histogram_pending() {
+    let active = histogram_key(0, 0, 0, 0, 2);
+    let unrelated = histogram_key(1, 0, 0, 0, 2);
+    let mut bridge = CurrentLeaseBridge::new();
+    bridge
+        .replace_current_requirements([active, unrelated])
+        .unwrap();
+    bridge
+        .install(u16_histogram_lease(active, &[3, 9], None))
+        .unwrap();
 
-    let histogram = active_layer_histogram_for_test(
-        &application,
-        &mut opened.analysis_runtime,
-        &opened.dataset_runtime,
-    );
-    let window = auto_dense_window_from_histogram(&histogram).unwrap();
-
-    match &histogram.status {
-        HistogramStatus::Sampled { source } => {
-            assert!(source.contains("data engine s0"));
-            assert!(source.contains("br"));
-        }
-        other => panic!("expected data-engine sampled histogram, got {other:?}"),
-    }
-    assert_eq!(histogram.bin_count, 32);
-    assert!(histogram.sample_count > 0);
-    assert!(histogram.max_value > histogram.min_value);
-    assert_eq!(histogram.bins.iter().sum::<u64>(), histogram.sample_count);
-    assert!(window.low() >= histogram.min_value);
-    assert!(window.high() <= histogram.max_value);
-    assert!(window.high() > window.low());
+    let histogram = histogram_for_test(&bridge, 0, 0, 0);
+    assert!(matches!(histogram.status, HistogramStatus::Sampled { .. }));
+    assert_eq!(histogram.sample_count, 2);
+    assert_eq!(histogram.min_value, 3.0);
+    assert_eq!(histogram.max_value, 9.0);
 }
 
 #[test]
-fn active_layer_histogram_reports_unavailable_for_data_engine_failure() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut opened = open_dataset_and_render_first_frame(root).unwrap();
-    opened.dataset_runtime.active_volume_u8 = None;
-    opened.dataset_runtime.active_volume = None;
-    opened.dataset_runtime.active_volume_f32 = None;
-    opened.dataset_runtime.resident_bricks_u8.clear();
-    opened.dataset_runtime.resident_bricks_u8_by_layer.clear();
-    opened.dataset_runtime.resident_bricks.clear();
-    opened.dataset_runtime.resident_bricks_by_layer.clear();
-    opened.dataset_runtime.resident_bricks_f32.clear();
-    opened.dataset_runtime.resident_bricks_f32_by_layer.clear();
-    let missing_layer = LayerId::new("missing-layer").unwrap();
+fn linked_view_missing_lease_in_same_cohort_does_not_block_histogram() {
+    let active = histogram_key(0, 0, 0, 0, 2);
+    let linked = histogram_key(0, 0, 0, 2, 2);
+    let mut bridge = CurrentLeaseBridge::new();
+    bridge.replace_current_requirements([active, linked]).unwrap();
+    bridge
+        .install(u16_histogram_lease(active, &[3, 9], None))
+        .unwrap();
+    let requirements = [active];
 
     let histogram = active_layer_histogram_summary(
-        &mut opened.analysis_runtime,
-        &opened.dataset_runtime,
+        &bridge,
         histogram::ActiveLayerHistogramInput {
-            layer_id: &missing_layer,
-            layer_name: "missing-layer",
+            requirements: &requirements,
+            identity: active.identity(),
+            layer: active.layer(),
+            layer_name: "intensity",
             dtype: IntensityDType::Uint16,
-            timepoint: TimeIndex::new(0),
+            timepoint: active.timepoint(),
+            scale: active.scale(),
         },
     );
-    let err = auto_dense_window_from_histogram(&histogram).unwrap_err();
 
-    match &histogram.status {
-        HistogramStatus::Unavailable { reason } => {
-            assert!(reason.contains("sampled histogram read failed"));
-            assert!(reason.contains("missing-layer"));
-        }
-        other => panic!("expected unavailable histogram, got {other:?}"),
-    }
-    assert_eq!(histogram.sample_count, 0);
-    assert!(err.to_string().contains("cannot auto-window"));
+    assert!(matches!(histogram.status, HistogramStatus::Sampled { .. }));
+    assert_eq!(histogram.sample_count, 2);
 }
 
 #[test]
-fn active_layer_histogram_is_sampled_for_resident_u16_bricks() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let opened = open_dataset_and_render_first_frame(root).unwrap();
-    let mut app = test_workbench_app_without_background_runtime(opened);
-    let dense_max = app.analysis_runtime.active_intensity_summary.max as f32;
-    let pool = BrickReadPool::new(app.dataset_runtime.dataset.clone(), 1, 4).unwrap();
-    let snapshot = app.application.snapshot();
-
-    let submission = submit_visible_bricks_to_pool(
-        &snapshot,
-        &mut app.dataset_runtime,
-        &mut app.analysis_runtime,
-        &app.render_runtime,
-        &pool,
-    );
-    assert!(submission.queued_current);
-    for _ in 0..submission.current_tickets.len() {
-        let outcome = pool.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(apply_brick_read_outcome(
-            &snapshot,
-            &mut app.dataset_runtime,
-            &mut app.analysis_runtime,
-            &app.render_runtime,
-            outcome,
-        ));
-    }
-    assert!(app.dataset_runtime.brick_stream_complete);
-    app.dataset_runtime.active_volume_u8 = None;
-    app.dataset_runtime.active_volume = None;
-    app.dataset_runtime.active_volume_f32 = None;
-    assert!(!app.analysis_runtime.resident_histogram_samples.is_empty());
-
-    let histogram = active_layer_histogram_for_test(
-        &app.application,
-        &mut app.analysis_runtime,
-        &app.dataset_runtime,
-    );
-    let window = auto_dense_window_from_histogram(&histogram).unwrap();
-
-    match &histogram.status {
-        HistogramStatus::Sampled { source } => {
-            assert!(source.contains("resident s0"));
-            assert!(source.contains("1br"));
-        }
-        other => panic!("expected sampled histogram, got {other:?}"),
-    }
-    assert_eq!(histogram.bin_count, 32);
-    assert_eq!(histogram.sample_count, 16 * 16 * 16);
-    assert_eq!(histogram.min_value, 0.0);
-    assert_eq!(histogram.max_value, dense_max);
-    assert_eq!(histogram.bins.iter().sum::<u64>(), histogram.sample_count);
-    assert!(window.low() >= histogram.min_value);
-    assert!(window.high() <= histogram.max_value);
-    assert!(window.high() > window.low());
-}
-
-#[test]
-fn resident_histogram_without_worker_samples_is_pending_not_scanned_from_ui() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let opened = open_dataset_and_render_first_frame(root).unwrap();
-    let mut app = test_workbench_app_without_background_runtime(opened);
-    let pool = BrickReadPool::new(app.dataset_runtime.dataset.clone(), 1, 4).unwrap();
-    let snapshot = app.application.snapshot();
-
-    let submission = submit_visible_bricks_to_pool(
-        &snapshot,
-        &mut app.dataset_runtime,
-        &mut app.analysis_runtime,
-        &app.render_runtime,
-        &pool,
-    );
-    assert!(submission.queued_current);
-    for _ in 0..submission.current_tickets.len() {
-        let outcome = pool.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(apply_brick_read_outcome(
-            &snapshot,
-            &mut app.dataset_runtime,
-            &mut app.analysis_runtime,
-            &app.render_runtime,
-            outcome,
-        ));
-    }
-    assert!(app.dataset_runtime.brick_stream_complete);
-    assert!(!app.dataset_runtime.resident_bricks.is_empty());
-    app.dataset_runtime.active_volume_u8 = None;
-    app.dataset_runtime.active_volume = None;
-    app.dataset_runtime.active_volume_f32 = None;
-    app.analysis_runtime.resident_histogram_samples.clear();
-    app.analysis_runtime.resident_histogram_generation = app
-        .analysis_runtime
-        .resident_histogram_generation
-        .saturating_add(1);
-    app.analysis_runtime.active_histogram_cache = None;
-
-    let histogram = active_layer_histogram_for_test(
-        &app.application,
-        &mut app.analysis_runtime,
-        &app.dataset_runtime,
-    );
-
-    match &histogram.status {
-        HistogramStatus::Pending { reason } => {
-            assert!(reason.contains("resident histogram samples pending"));
-        }
-        other => panic!("expected pending resident histogram, got {other:?}"),
+fn histogram_without_a_requested_lease_reports_loading_without_io() {
+    let histogram = histogram_for_test(&CurrentLeaseBridge::new(), 0, 0, 0);
+    match histogram.status {
+        HistogramStatus::Pending { reason } => assert!(reason.contains("leases loading")),
+        other => panic!("expected pending lease histogram, got {other:?}"),
     }
     assert_eq!(histogram.sample_count, 0);
     assert!(histogram.bins.is_empty());
-    assert!(!histogram_can_auto_window(&histogram));
-}
-
-#[test]
-fn active_layer_histogram_is_sampled_for_resident_f32_bricks() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::BasicF32_8Cube, tempdir.path()).unwrap();
-    let opened = open_dataset_and_render_first_frame(root).unwrap();
-    let mut app = test_workbench_app_without_background_runtime(opened);
-    let pool = BrickReadPool::new(app.dataset_runtime.dataset.clone(), 1, 32).unwrap();
-    let snapshot = app.application.snapshot();
-
-    let submission = submit_visible_bricks_to_pool(
-        &snapshot,
-        &mut app.dataset_runtime,
-        &mut app.analysis_runtime,
-        &app.render_runtime,
-        &pool,
-    );
-    assert!(submission.queued_current);
-    for _ in 0..submission.current_tickets.len() {
-        let outcome = pool.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(apply_brick_read_outcome(
-            &snapshot,
-            &mut app.dataset_runtime,
-            &mut app.analysis_runtime,
-            &app.render_runtime,
-            outcome,
-        ));
-    }
-    assert!(app.dataset_runtime.brick_stream_complete);
-    app.dataset_runtime.active_volume_u8 = None;
-    app.dataset_runtime.active_volume = None;
-    app.dataset_runtime.active_volume_f32 = None;
-
-    let histogram = active_layer_histogram_for_test(
-        &app.application,
-        &mut app.analysis_runtime,
-        &app.dataset_runtime,
-    );
-    let window = auto_dense_window_from_histogram(&histogram).unwrap();
-
-    match &histogram.status {
-        HistogramStatus::Sampled { source } => {
-            assert!(source.contains("resident s0"));
-            assert!(source.contains("br"));
-        }
-        other => panic!("expected sampled histogram, got {other:?}"),
-    }
-    assert_eq!(histogram.bin_count, 32);
-    assert!(histogram.sample_count > 0);
-    assert!(histogram.max_value > histogram.min_value);
-    assert_eq!(histogram.bins.iter().sum::<u64>(), histogram.sample_count);
-    assert!(window.low() >= histogram.min_value);
-    assert!(window.high() <= histogram.max_value);
-    assert!(window.high() > window.low());
 }
 
 #[test]
@@ -524,9 +343,9 @@ fn application_playback_commands_reconcile_transient_state_and_timepoint() {
 }
 
 #[test]
-fn streaming_timepoint_command_dirties_cross_section_panels_without_dirtying_3d_panel() {
+fn timepoint_command_dirties_cross_section_panels_without_dirtying_3d_panel() {
     let tempdir = tempfile::tempdir().unwrap();
-    let root = write_time_spatially_chunked_app_dataset(tempdir.path());
+    let root = write_fixture(FixtureKind::TimeMultiChannelU16_8Cube3T2C, tempdir.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(root).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
     let ctx = egui::Context::default();
@@ -587,67 +406,13 @@ fn streaming_timepoint_command_dirties_cross_section_panels_without_dirtying_3d_
         assert!(panel.generation > generation_before);
         assert!(
             !panel.display_current(),
-            "{} should be dirty after a streaming timepoint change",
+            "{} should be dirty after a timepoint change",
             panel_id.label()
         );
     }
     let three_d = runtime.panel(PanelId::ThreeD).unwrap();
     assert_eq!(three_d.generation, generations_before[2]);
     assert!(three_d.display_current());
-}
-
-#[test]
-fn streaming_timepoint_switch_preserves_last_nonblank_frame_while_loading() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let root = write_time_spatially_chunked_app_dataset(tempdir.path());
-    let opened = open_dataset_and_render_first_frame(root).unwrap();
-    let mut app = test_workbench_app_without_background_runtime(opened);
-    let ctx = egui::Context::default();
-    let previous_pixels = app.render_runtime.frame.pixels().to_vec();
-
-    assert!(previous_pixels.iter().any(|value| *value > 0));
-
-    app.apply_application_command(ApplicationCommand::SetTimepoint(TimeIndex::new(1)), &ctx)
-        .unwrap();
-
-    assert_eq!(
-        application_view(&app.application.snapshot()).timepoint(),
-        TimeIndex::new(1)
-    );
-    assert_eq!(
-        app.render_runtime.frame.pixels(),
-        previous_pixels.as_slice()
-    );
-    assert_eq!(
-        app.render_runtime.frame_fidelity.completeness,
-        FrameCompleteness::Loading
-    );
-}
-
-#[test]
-fn playback_smoke_helper_renders_multiple_nonblank_timepoints() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let root = write_time_spatially_chunked_app_dataset(tempdir.path());
-    let mut opened = open_dataset_and_render_first_frame(root).unwrap();
-    let mut application = test_application_for_opened_source(&opened);
-    let ui_runtime = current_runtime::ui::CurrentUiRuntime::new(ResourcePolicy::default(), None);
-
-    let frames = render_playback_steps_for_smoke(
-        &mut application,
-        &mut opened.dataset_runtime,
-        &mut opened.render_runtime,
-        &mut opened.analysis_runtime,
-        &ui_runtime,
-        None,
-        2,
-        Duration::from_secs(2),
-    )
-    .unwrap();
-
-    assert_eq!(frames.len(), 2);
-    assert_eq!(frames[0].timepoint, 1);
-    assert_eq!(frames[1].timepoint, 2);
-    assert!(frames.iter().all(|frame| frame.nonzero_pixels > 0));
 }
 
 #[test]

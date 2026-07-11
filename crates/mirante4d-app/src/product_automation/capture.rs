@@ -7,12 +7,7 @@ use eframe::egui;
 use serde_json::{Value, json};
 
 use crate::image_compositing::color_image_for_snapshot;
-use crate::resident_rendering::render_state_from_resident_bricks_with_backend;
-use crate::viewport::resident_brick_render_supported;
-use crate::{
-    MiranteWorkbenchApp, application_view, brick_streaming::current_resident_frame_ready,
-    current_egui_shell_bridge,
-};
+use crate::{MiranteWorkbenchApp, current_egui_shell_bridge};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProductAutomationArtifact {
@@ -144,47 +139,9 @@ pub(crate) fn capture_color_image(
             color_image_from_rgba(width, height, &rgba)?,
         ));
     }
-    let view = application_view(&snapshot);
-    let active_mode = view
-        .layer(view.active_layer())
-        .expect("application view has an active layer")
-        .render_state()
-        .mode();
-    if current_resident_frame_ready(&snapshot, &app.dataset_runtime, &app.render_runtime)
-        && resident_brick_render_supported(active_mode)
-    {
-        app.clear_gpu_display_frame();
-        let gpu_renderer = app.render_runtime.gpu_renderer.clone();
-        render_state_from_resident_bricks_with_backend(
-            &snapshot,
-            &app.dataset_runtime,
-            &mut app.render_runtime,
-            &app.analysis_runtime,
-            &app.ui_runtime,
-            gpu_renderer.as_deref(),
-        )
-        .map_err(|err| format!("failed to render resident frame for viewport capture: {err}"))?;
-        app.render_runtime.texture = None;
-        return Ok((
-            "resident_brick_cpu_snapshot",
-            color_image_for_snapshot(
-                &snapshot,
-                &app.dataset_runtime,
-                &app.analysis_runtime,
-                &app.ui_runtime,
-                &app.render_runtime,
-            ),
-        ));
-    }
     Ok((
-        "state_color_image",
-        color_image_for_snapshot(
-            &snapshot,
-            &app.dataset_runtime,
-            &app.analysis_runtime,
-            &app.ui_runtime,
-            &app.render_runtime,
-        ),
+        "loading_reference_color_image",
+        color_image_for_snapshot(&snapshot, &app.render_runtime),
     ))
 }
 
@@ -220,12 +177,9 @@ pub(crate) fn current_display_image_stats(
         ));
     }
     Ok((
-        "state_color_image",
+        "loading_reference_color_image",
         ProductAutomationImageStats::from_color_image(&color_image_for_snapshot(
             &snapshot,
-            &app.dataset_runtime,
-            &app.analysis_runtime,
-            &app.ui_runtime,
             &app.render_runtime,
         )),
     ))

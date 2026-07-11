@@ -4,13 +4,15 @@ use std::{
     sync::Arc,
 };
 
-use mirante4d_data::{SpatialBrickIndex, VolumeRegion};
-use mirante4d_domain::Shape3D;
+use mirante4d_dataset::{
+    CpuByteLease, CpuByteLedger, CpuLedgerCategory, ResourcePayloadView, ResourceRegion,
+};
+use mirante4d_domain::{IntensityDType, Shape3D};
 use wgpu::util::DeviceExt;
 
 use super::{GpuBrickAtlasResidencySnapshot, GpuRenderError, GpuRenderer, GpuRendererStats};
 use crate::{
-    RenderError, ResidentBrickSetF32, ResidentBrickSetU8, ResidentBrickSetU16,
+    CurrentLeaseResource, CurrentLeaseVolume, RenderError,
     resources::{BrickAtlasResourceKey, ResourceRepresentation},
 };
 
@@ -21,18 +23,10 @@ use super::buffers::{
 };
 
 mod f32_packing;
-#[cfg(test)]
-mod test_builders;
 mod upload_ready;
 
-use f32_packing::pack_brick_f32_compact;
-#[cfg(test)]
-pub(super) use f32_packing::pack_brick_f32_for_slot;
-#[cfg(test)]
-pub(super) use test_builders::{build_gpu_brick_atlas, build_gpu_brick_atlas_u8};
+use f32_packing::F32UploadBytes;
 use upload_ready::{PackedIntegerBrick, UploadReadyIntegerBrickCache, upload_ready_cache_budget};
-#[cfg(test)]
-use upload_ready::{pack_u8_brick_for_slot, pack_u16_brick_for_slot};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum IntegerAtlasDType {
@@ -57,6 +51,13 @@ const BRICK_METADATA_HAS_VALID_FLAG: u32 = 0x2;
 const BRICK_METADATA_MIN_MAX_VALID_FLAG: u32 = 0x4;
 
 impl IntegerAtlasDType {
+    fn intensity_dtype(self) -> IntensityDType {
+        match self {
+            Self::U8 => IntensityDType::Uint8,
+            Self::U16 => IntensityDType::Uint16,
+        }
+    }
+
     fn values_per_word(self) -> u32 {
         match self {
             Self::U8 => 4,
@@ -143,12 +144,13 @@ pub(super) struct GpuBrickAtlasResource {
     pub(super) slot_count: usize,
     page_table: Vec<u32>,
     metadata: Vec<u32>,
-    page_slots: HashMap<SpatialBrickIndex, usize>,
-    page_regions: HashMap<SpatialBrickIndex, VolumeRegion>,
-    page_priorities: HashMap<SpatialBrickIndex, GpuBrickAtlasPagePriority>,
-    active_pages: HashSet<SpatialBrickIndex>,
-    slot_pages: Vec<Option<SpatialBrickIndex>>,
-    page_lru: VecDeque<SpatialBrickIndex>,
+    page_slots: HashMap<AtlasPageIndex, usize>,
+    page_regions: HashMap<AtlasPageIndex, ResourceRegion>,
+    page_priorities: HashMap<AtlasPageIndex, GpuBrickAtlasPagePriority>,
+    active_pages: HashSet<AtlasPageIndex>,
+    slot_pages: Vec<Option<AtlasPageIndex>>,
+    page_lru: VecDeque<AtlasPageIndex>,
+    _cpu_mapping_charge: Arc<dyn CpuByteLease>,
 }
 
 #[derive(Clone)]
@@ -164,10 +166,26 @@ pub(super) struct GpuBrickAtlasF32Resource {
     pub(super) values_word_capacity: u64,
     pub(super) page_table_word_count: u64,
     page_table: Vec<u32>,
-    page_allocations: HashMap<SpatialBrickIndex, GpuF32BrickAllocation>,
-    page_priorities: HashMap<SpatialBrickIndex, GpuBrickAtlasPagePriority>,
-    active_pages: HashSet<SpatialBrickIndex>,
-    page_lru: VecDeque<SpatialBrickIndex>,
+    page_allocations: HashMap<AtlasPageIndex, GpuF32BrickAllocation>,
+    page_priorities: HashMap<AtlasPageIndex, GpuBrickAtlasPagePriority>,
+    active_pages: HashSet<AtlasPageIndex>,
+    page_lru: VecDeque<AtlasPageIndex>,
+    _cpu_mapping_charge: Arc<dyn CpuByteLease>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct AtlasPageIndex {
+    z: u64,
+    y: u64,
+    x: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LeaseAtlasPage<'a> {
+    brick_index: AtlasPageIndex,
+    region: ResourceRegion,
+    payload: ResourcePayloadView<'a>,
+    resource: CurrentLeaseResource<'a>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,33 +254,29 @@ pub(super) struct GpuBrickAtlasF32Cache {
 impl GpuRenderer {
     pub(super) fn cached_brick_atlas_u8(
         &self,
-        resident: &ResidentBrickSetU8,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
     ) -> Result<GpuBrickAtlasResource, GpuRenderError> {
-        let key = BrickAtlasResourceKey::from_resident_u8(resident, brick_shape, brick_grid_shape)?;
+        let key = BrickAtlasResourceKey::from_lease_volume(
+            volume,
+            ResourceRepresentation::BrickedU8Atlas,
+        )?;
         self.brick_atlas_cache
             .lock()
             .map_err(|_| GpuRenderError::CachePoisoned)?
-            .get_or_update_u8(
-                &self.device,
-                &self.queue,
-                key,
-                resident,
-                brick_shape,
-                brick_grid_shape,
-                None,
-            )
+            .get_or_update_u8(&self.device, &self.queue, key, volume, cpu_ledger, None)
     }
 
     pub(super) fn cached_brick_atlas_u8_with_page_priorities(
         &self,
-        resident: &ResidentBrickSetU8,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
-        page_priorities: &HashMap<SpatialBrickIndex, GpuBrickAtlasPagePriority>,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
+        page_priorities: &HashMap<ResourceRegion, GpuBrickAtlasPagePriority>,
     ) -> Result<GpuBrickAtlasResource, GpuRenderError> {
-        let key = BrickAtlasResourceKey::from_resident_u8(resident, brick_shape, brick_grid_shape)?;
+        let key = BrickAtlasResourceKey::from_lease_volume(
+            volume,
+            ResourceRepresentation::BrickedU8Atlas,
+        )?;
         self.brick_atlas_cache
             .lock()
             .map_err(|_| GpuRenderError::CachePoisoned)?
@@ -270,42 +284,37 @@ impl GpuRenderer {
                 &self.device,
                 &self.queue,
                 key,
-                resident,
-                brick_shape,
-                brick_grid_shape,
-                Some(page_priorities),
+                volume,
+                cpu_ledger,
+                Some(&page_priorities_by_index(volume, page_priorities)?),
             )
     }
 
     pub(super) fn cached_brick_atlas(
         &self,
-        resident: &ResidentBrickSetU16,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
     ) -> Result<GpuBrickAtlasResource, GpuRenderError> {
-        let key = BrickAtlasResourceKey::from_resident(resident, brick_shape, brick_grid_shape)?;
+        let key = BrickAtlasResourceKey::from_lease_volume(
+            volume,
+            ResourceRepresentation::BrickedU16Atlas,
+        )?;
         self.brick_atlas_cache
             .lock()
             .map_err(|_| GpuRenderError::CachePoisoned)?
-            .get_or_update(
-                &self.device,
-                &self.queue,
-                key,
-                resident,
-                brick_shape,
-                brick_grid_shape,
-                None,
-            )
+            .get_or_update(&self.device, &self.queue, key, volume, cpu_ledger, None)
     }
 
     pub(super) fn cached_brick_atlas_with_page_priorities(
         &self,
-        resident: &ResidentBrickSetU16,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
-        page_priorities: &HashMap<SpatialBrickIndex, GpuBrickAtlasPagePriority>,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
+        page_priorities: &HashMap<ResourceRegion, GpuBrickAtlasPagePriority>,
     ) -> Result<GpuBrickAtlasResource, GpuRenderError> {
-        let key = BrickAtlasResourceKey::from_resident(resident, brick_shape, brick_grid_shape)?;
+        let key = BrickAtlasResourceKey::from_lease_volume(
+            volume,
+            ResourceRepresentation::BrickedU16Atlas,
+        )?;
         self.brick_atlas_cache
             .lock()
             .map_err(|_| GpuRenderError::CachePoisoned)?
@@ -313,44 +322,37 @@ impl GpuRenderer {
                 &self.device,
                 &self.queue,
                 key,
-                resident,
-                brick_shape,
-                brick_grid_shape,
-                Some(page_priorities),
+                volume,
+                cpu_ledger,
+                Some(&page_priorities_by_index(volume, page_priorities)?),
             )
     }
 
     pub(super) fn cached_brick_atlas_f32(
         &self,
-        resident: &ResidentBrickSetF32,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
     ) -> Result<GpuBrickAtlasF32Resource, GpuRenderError> {
-        let key =
-            BrickAtlasResourceKey::from_resident_f32(resident, brick_shape, brick_grid_shape)?;
+        let key = BrickAtlasResourceKey::from_lease_volume(
+            volume,
+            ResourceRepresentation::BrickedF32Atlas,
+        )?;
         self.brick_atlas_f32_cache
             .lock()
             .map_err(|_| GpuRenderError::CachePoisoned)?
-            .get_or_update(
-                &self.device,
-                &self.queue,
-                key,
-                resident,
-                brick_shape,
-                brick_grid_shape,
-                None,
-            )
+            .get_or_update(&self.device, &self.queue, key, volume, cpu_ledger, None)
     }
 
     pub(super) fn cached_brick_atlas_f32_with_page_priorities(
         &self,
-        resident: &ResidentBrickSetF32,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
-        page_priorities: &HashMap<SpatialBrickIndex, GpuBrickAtlasPagePriority>,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
+        page_priorities: &HashMap<ResourceRegion, GpuBrickAtlasPagePriority>,
     ) -> Result<GpuBrickAtlasF32Resource, GpuRenderError> {
-        let key =
-            BrickAtlasResourceKey::from_resident_f32(resident, brick_shape, brick_grid_shape)?;
+        let key = BrickAtlasResourceKey::from_lease_volume(
+            volume,
+            ResourceRepresentation::BrickedF32Atlas,
+        )?;
         self.brick_atlas_f32_cache
             .lock()
             .map_err(|_| GpuRenderError::CachePoisoned)?
@@ -358,10 +360,9 @@ impl GpuRenderer {
                 &self.device,
                 &self.queue,
                 key,
-                resident,
-                brick_shape,
-                brick_grid_shape,
-                Some(page_priorities),
+                volume,
+                cpu_ledger,
+                Some(&page_priorities_by_index(volume, page_priorities)?),
             )
     }
 
@@ -398,6 +399,7 @@ impl GpuRenderer {
 impl GpuBrickAtlasResource {
     fn new(
         device: &wgpu::Device,
+        cpu_ledger: &dyn CpuByteLedger,
         generation: u64,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
@@ -431,10 +433,9 @@ impl GpuBrickAtlasResource {
             validity_len,
             std::mem::size_of::<u32>() as u64,
         )?;
-        let page_table = vec![0u32; page_count];
         let page_table_bytes = checked_buffer_byte_count(
             "brick atlas page table",
-            page_table.len(),
+            page_count,
             std::mem::size_of::<u32>(),
         )?;
         let metadata_len = (page_count as u64)
@@ -442,12 +443,20 @@ impl GpuBrickAtlasResource {
             .ok_or(RenderError::InvalidBrickAtlas(
                 "brick atlas metadata count overflow",
             ))? as usize;
-        let metadata = vec![0u32; metadata_len];
         let metadata_bytes = checked_buffer_byte_count(
             "brick atlas integer metadata",
-            metadata.len(),
+            metadata_len,
             std::mem::size_of::<u32>(),
         )?;
+        let cpu_mapping_bytes = page_table_bytes.checked_add(metadata_bytes).ok_or(
+            GpuRenderError::BufferSizeOverflow {
+                resource: "brick atlas CPU mapping mirrors",
+            },
+        )?;
+        let cpu_mapping_charge: Arc<dyn CpuByteLease> =
+            Arc::from(cpu_ledger.try_acquire(CpuLedgerCategory::UploadStaging, cpu_mapping_bytes)?);
+        let page_table = vec![0u32; page_count];
+        let metadata = vec![0u32; metadata_len];
         let limits = device.limits();
         validate_storage_buffer_bytes(&limits, dtype.value_resource(), packed_values_bytes)?;
         validate_storage_buffer_bytes(
@@ -516,175 +525,75 @@ impl GpuBrickAtlasResource {
             active_pages: HashSet::new(),
             slot_pages: vec![None; slot_count],
             page_lru: VecDeque::new(),
+            _cpu_mapping_charge: cpu_mapping_charge,
         })
     }
 
     fn update_resident_pages_u8(
         &mut self,
         queue: &wgpu::Queue,
-        resident: &ResidentBrickSetU8,
+        volume: CurrentLeaseVolume<'_>,
         upload_ready_cache: &mut UploadReadyIntegerBrickCache,
-        page_priorities: Option<&HashMap<SpatialBrickIndex, GpuBrickAtlasPagePriority>>,
+        cpu_ledger: &dyn CpuByteLedger,
+        page_priorities: Option<&HashMap<AtlasPageIndex, GpuBrickAtlasPagePriority>>,
     ) -> Result<GpuBrickAtlasUpdate, GpuRenderError> {
         debug_assert_eq!(self.dtype, IntegerAtlasDType::U8);
-        let current_pages = validate_resident_pages_u8(
-            resident,
-            self.brick_shape,
-            self.brick_grid_shape,
-            self.slot_count,
-        )?;
-        let missing_pages = resident
-            .bricks()
-            .iter()
-            .filter(|brick| !self.page_slots.contains_key(&brick.brick_index))
-            .count();
-        let changed_pages = resident
-            .bricks()
-            .iter()
-            .filter(|brick| !self.page_region_matches(brick.brick_index, brick.region))
-            .count();
-        if missing_pages == 0
-            && changed_pages == 0
-            && current_pages_match_active_pages(&current_pages, &self.active_pages)
-        {
-            return Ok(GpuBrickAtlasUpdate {
-                uploaded_pages: 0,
-                uploaded_bytes: 0,
-                evicted_pages: 0,
-                page_table_rebuilds: 0,
-                page_table_bytes_written: 0,
-            });
-        }
-        let mut page_table_updates = Vec::new();
-        let mut metadata_updates = Vec::new();
-        self.deactivate_pages_not_in(
-            &current_pages,
-            &mut page_table_updates,
-            &mut metadata_updates,
-        );
-        let evicted_pages = self.evict_pages_for_missing(missing_pages, &current_pages);
-
-        let mut uploaded_pages = 0u64;
-        let values_uploaded_bytes_per_page = checked_u64_buffer_byte_count(
-            "brick atlas uploaded uint8 value page",
-            self.packed_u32_per_brick,
-            std::mem::size_of::<u32>() as u64,
-        )?;
-        let validity_uploaded_bytes_per_page = checked_u64_buffer_byte_count(
-            "brick atlas uploaded uint8 validity page",
-            self.valid_u32_per_brick,
-            std::mem::size_of::<u32>() as u64,
-        )?;
-        let uploaded_bytes_per_page = values_uploaded_bytes_per_page
-            .checked_add(validity_uploaded_bytes_per_page)
-            .ok_or(GpuRenderError::BufferSizeOverflow {
-                resource: "brick atlas uploaded uint8 bytes",
-            })?;
-        let mut pending_uploads = Vec::new();
-        for brick in resident.bricks() {
-            if let Some(slot) = self.page_slots.get(&brick.brick_index).copied() {
-                let region_changed = !self.page_region_matches(brick.brick_index, brick.region);
-                if region_changed {
-                    pending_uploads.push((
-                        slot,
-                        self.pack_brick_u8_for_upload(brick, upload_ready_cache)?,
-                    ));
-                    self.page_regions.insert(brick.brick_index, brick.region);
-                    uploaded_pages += 1;
-                }
-                let became_active = self.active_pages.insert(brick.brick_index);
-                self.set_page_priority(brick.brick_index, page_priorities);
-                let page_index = brick_page_index(brick.brick_index, self.brick_grid_shape);
-                if became_active || region_changed {
-                    self.page_table[page_index] = u32::try_from(slot + 1).map_err(|_| {
-                        RenderError::InvalidBrickAtlas("brick atlas slot exceeds u32")
-                    })?;
-                    write_u8_brick_metadata(&mut self.metadata, page_index, brick);
-                    page_table_updates.push(page_index);
-                    metadata_updates.push(page_index);
-                }
-                self.touch_page(brick.brick_index);
-                continue;
-            }
-            let slot = self.free_slot().ok_or(RenderError::InvalidBrickAtlas(
-                "brick atlas has no free slot for required resident page",
-            ))?;
-            pending_uploads.push((
-                slot,
-                self.pack_brick_u8_for_upload(brick, upload_ready_cache)?,
-            ));
-            self.page_slots.insert(brick.brick_index, slot);
-            self.page_regions.insert(brick.brick_index, brick.region);
-            self.set_page_priority(brick.brick_index, page_priorities);
-            self.active_pages.insert(brick.brick_index);
-            self.slot_pages[slot] = Some(brick.brick_index);
-            let page_index = brick_page_index(brick.brick_index, self.brick_grid_shape);
-            self.page_table[page_index] = u32::try_from(slot + 1)
-                .map_err(|_| RenderError::InvalidBrickAtlas("brick atlas slot exceeds u32"))?;
-            write_u8_brick_metadata(&mut self.metadata, page_index, brick);
-            page_table_updates.push(page_index);
-            metadata_updates.push(page_index);
-            self.touch_page(brick.brick_index);
-            uploaded_pages += 1;
-        }
-        let uploaded_bytes = uploaded_pages.checked_mul(uploaded_bytes_per_page).ok_or(
-            GpuRenderError::BufferSizeOverflow {
-                resource: "brick atlas uploaded uint8 bytes",
-            },
-        )?;
-        self.upload_packed_brick_runs(queue, &pending_uploads);
-        self.upload_integer_page_table_entries(queue, &page_table_updates);
-        self.upload_integer_metadata_entries(queue, &metadata_updates);
-        let page_table_bytes_written =
-            integer_mapping_update_bytes(page_table_updates.len(), metadata_updates.len())?;
-
-        Ok(GpuBrickAtlasUpdate {
-            uploaded_pages,
-            uploaded_bytes,
-            evicted_pages: evicted_pages.len() as u64,
-            page_table_rebuilds: (!page_table_updates.is_empty()
-                || !metadata_updates.is_empty()
-                || !pending_uploads.is_empty()) as u64,
-            page_table_bytes_written,
-        })
+        self.update_resident_integer_pages(
+            queue,
+            volume,
+            upload_ready_cache,
+            cpu_ledger,
+            page_priorities,
+        )
     }
 
     fn update_resident_pages_u16(
         &mut self,
         queue: &wgpu::Queue,
-        resident: &ResidentBrickSetU16,
+        volume: CurrentLeaseVolume<'_>,
         upload_ready_cache: &mut UploadReadyIntegerBrickCache,
-        page_priorities: Option<&HashMap<SpatialBrickIndex, GpuBrickAtlasPagePriority>>,
+        cpu_ledger: &dyn CpuByteLedger,
+        page_priorities: Option<&HashMap<AtlasPageIndex, GpuBrickAtlasPagePriority>>,
     ) -> Result<GpuBrickAtlasUpdate, GpuRenderError> {
         debug_assert_eq!(self.dtype, IntegerAtlasDType::U16);
-        let current_pages = validate_resident_pages_u16(
-            resident,
-            self.brick_shape,
-            self.brick_grid_shape,
-            self.slot_count,
-        )?;
-        let missing_pages = resident
-            .bricks()
+        self.update_resident_integer_pages(
+            queue,
+            volume,
+            upload_ready_cache,
+            cpu_ledger,
+            page_priorities,
+        )
+    }
+
+    fn update_resident_integer_pages(
+        &mut self,
+        queue: &wgpu::Queue,
+        volume: CurrentLeaseVolume<'_>,
+        upload_ready_cache: &mut UploadReadyIntegerBrickCache,
+        cpu_ledger: &dyn CpuByteLedger,
+        page_priorities: Option<&HashMap<AtlasPageIndex, GpuBrickAtlasPagePriority>>,
+    ) -> Result<GpuBrickAtlasUpdate, GpuRenderError> {
+        let pages =
+            validate_lease_pages(volume, self.dtype.intensity_dtype(), Some(self.slot_count))?;
+        let current_pages = pages
             .iter()
-            .filter(|brick| !self.page_slots.contains_key(&brick.brick_index))
+            .map(|page| page.brick_index)
+            .collect::<HashSet<_>>();
+        let missing_pages = pages
+            .iter()
+            .filter(|page| !self.page_slots.contains_key(&page.brick_index))
             .count();
-        let changed_pages = resident
-            .bricks()
+        let changed_pages = pages
             .iter()
-            .filter(|brick| !self.page_region_matches(brick.brick_index, brick.region))
+            .filter(|page| !self.page_region_matches(page.brick_index, page.region))
             .count();
         if missing_pages == 0
             && changed_pages == 0
             && current_pages_match_active_pages(&current_pages, &self.active_pages)
         {
-            return Ok(GpuBrickAtlasUpdate {
-                uploaded_pages: 0,
-                uploaded_bytes: 0,
-                evicted_pages: 0,
-                page_table_rebuilds: 0,
-                page_table_bytes_written: 0,
-            });
+            return Ok(GpuBrickAtlasUpdate::default());
         }
+
         let mut page_table_updates = Vec::new();
         let mut metadata_updates = Vec::new();
         self.deactivate_pages_not_in(
@@ -693,81 +602,98 @@ impl GpuBrickAtlasResource {
             &mut metadata_updates,
         );
         let evicted_pages = self.evict_pages_for_missing(missing_pages, &current_pages);
-
-        let mut uploaded_pages = 0u64;
-        let values_uploaded_bytes_per_page = checked_u64_buffer_byte_count(
-            "brick atlas uploaded uint16 value page",
+        let uploaded_bytes_per_page = checked_u64_buffer_byte_count(
+            "brick atlas uploaded integer value page",
             self.packed_u32_per_brick,
             std::mem::size_of::<u32>() as u64,
-        )?;
-        let validity_uploaded_bytes_per_page = checked_u64_buffer_byte_count(
-            "brick atlas uploaded uint16 validity page",
+        )?
+        .checked_add(checked_u64_buffer_byte_count(
+            "brick atlas uploaded integer validity page",
             self.valid_u32_per_brick,
             std::mem::size_of::<u32>() as u64,
-        )?;
-        let uploaded_bytes_per_page = values_uploaded_bytes_per_page
-            .checked_add(validity_uploaded_bytes_per_page)
-            .ok_or(GpuRenderError::BufferSizeOverflow {
-                resource: "brick atlas uploaded uint16 bytes",
-            })?;
+        )?)
+        .ok_or(GpuRenderError::BufferSizeOverflow {
+            resource: "brick atlas uploaded integer bytes",
+        })?;
         let mut pending_uploads = Vec::new();
-        for brick in resident.bricks() {
-            if let Some(slot) = self.page_slots.get(&brick.brick_index).copied() {
-                let region_changed = !self.page_region_matches(brick.brick_index, brick.region);
+        let mut uploaded_pages = 0_u64;
+
+        for page in &pages {
+            if let Some(slot) = self.page_slots.get(&page.brick_index).copied() {
+                let region_changed = !self.page_region_matches(page.brick_index, page.region);
                 if region_changed {
-                    pending_uploads.push((
-                        slot,
-                        self.pack_brick_u16_for_upload(brick, upload_ready_cache)?,
-                    ));
-                    self.page_regions.insert(brick.brick_index, brick.region);
+                    let packed = upload_ready_cache.get_or_pack(
+                        *page,
+                        self.brick_shape,
+                        self.packed_u32_per_brick,
+                        self.valid_u32_per_brick,
+                        self.dtype,
+                        cpu_ledger,
+                    )?;
+                    write_integer_page_metadata(
+                        &mut self.metadata,
+                        brick_page_index(page.brick_index, self.brick_grid_shape),
+                        &packed,
+                    );
+                    pending_uploads.push((slot, packed));
+                    self.page_regions.insert(page.brick_index, page.region);
                     uploaded_pages += 1;
+                    metadata_updates
+                        .push(brick_page_index(page.brick_index, self.brick_grid_shape));
                 }
-                let became_active = self.active_pages.insert(brick.brick_index);
-                self.set_page_priority(brick.brick_index, page_priorities);
-                let page_index = brick_page_index(brick.brick_index, self.brick_grid_shape);
+                let became_active = self.active_pages.insert(page.brick_index);
+                self.set_page_priority(page.brick_index, page_priorities);
+                let page_index = brick_page_index(page.brick_index, self.brick_grid_shape);
                 if became_active || region_changed {
                     self.page_table[page_index] = u32::try_from(slot + 1).map_err(|_| {
                         RenderError::InvalidBrickAtlas("brick atlas slot exceeds u32")
                     })?;
-                    write_u16_brick_metadata(&mut self.metadata, page_index, brick);
                     page_table_updates.push(page_index);
-                    metadata_updates.push(page_index);
+                    if became_active && !region_changed {
+                        metadata_updates.push(page_index);
+                    }
                 }
-                self.touch_page(brick.brick_index);
+                self.touch_page(page.brick_index);
                 continue;
             }
+
             let slot = self.free_slot().ok_or(RenderError::InvalidBrickAtlas(
-                "brick atlas has no free slot for required resident page",
+                "brick atlas has no free slot for required lease-backed page",
             ))?;
-            pending_uploads.push((
-                slot,
-                self.pack_brick_u16_for_upload(brick, upload_ready_cache)?,
-            ));
-            self.page_slots.insert(brick.brick_index, slot);
-            self.page_regions.insert(brick.brick_index, brick.region);
-            self.set_page_priority(brick.brick_index, page_priorities);
-            self.active_pages.insert(brick.brick_index);
-            self.slot_pages[slot] = Some(brick.brick_index);
-            let page_index = brick_page_index(brick.brick_index, self.brick_grid_shape);
+            let packed = upload_ready_cache.get_or_pack(
+                *page,
+                self.brick_shape,
+                self.packed_u32_per_brick,
+                self.valid_u32_per_brick,
+                self.dtype,
+                cpu_ledger,
+            )?;
+            let page_index = brick_page_index(page.brick_index, self.brick_grid_shape);
+            write_integer_page_metadata(&mut self.metadata, page_index, &packed);
+            pending_uploads.push((slot, packed));
+            self.page_slots.insert(page.brick_index, slot);
+            self.page_regions.insert(page.brick_index, page.region);
+            self.set_page_priority(page.brick_index, page_priorities);
+            self.active_pages.insert(page.brick_index);
+            self.slot_pages[slot] = Some(page.brick_index);
             self.page_table[page_index] = u32::try_from(slot + 1)
                 .map_err(|_| RenderError::InvalidBrickAtlas("brick atlas slot exceeds u32"))?;
-            write_u16_brick_metadata(&mut self.metadata, page_index, brick);
             page_table_updates.push(page_index);
             metadata_updates.push(page_index);
-            self.touch_page(brick.brick_index);
+            self.touch_page(page.brick_index);
             uploaded_pages += 1;
         }
+
         let uploaded_bytes = uploaded_pages.checked_mul(uploaded_bytes_per_page).ok_or(
             GpuRenderError::BufferSizeOverflow {
-                resource: "brick atlas uploaded uint16 bytes",
+                resource: "brick atlas uploaded integer bytes",
             },
         )?;
-        self.upload_packed_brick_runs(queue, &pending_uploads);
+        self.upload_packed_bricks(queue, &pending_uploads);
         self.upload_integer_page_table_entries(queue, &page_table_updates);
         self.upload_integer_metadata_entries(queue, &metadata_updates);
         let page_table_bytes_written =
             integer_mapping_update_bytes(page_table_updates.len(), metadata_updates.len())?;
-
         Ok(GpuBrickAtlasUpdate {
             uploaded_pages,
             uploaded_bytes,
@@ -781,9 +707,9 @@ impl GpuBrickAtlasResource {
 
     fn deactivate_pages_not_in(
         &mut self,
-        current_pages: &HashSet<SpatialBrickIndex>,
+        current_pages: &HashSet<AtlasPageIndex>,
         page_table_updates: &mut Vec<usize>,
-        metadata_updates: &mut Vec<usize>,
+        _metadata_updates: &mut Vec<usize>,
     ) {
         let inactive = self
             .active_pages
@@ -795,17 +721,15 @@ impl GpuBrickAtlasResource {
             self.active_pages.remove(&page);
             let page_index = brick_page_index(page, self.brick_grid_shape);
             self.page_table[page_index] = 0;
-            clear_integer_brick_metadata(&mut self.metadata, page_index);
             page_table_updates.push(page_index);
-            metadata_updates.push(page_index);
         }
     }
 
     fn evict_pages_for_missing(
         &mut self,
         missing_pages: usize,
-        current_pages: &HashSet<SpatialBrickIndex>,
-    ) -> Vec<SpatialBrickIndex> {
+        current_pages: &HashSet<AtlasPageIndex>,
+    ) -> Vec<AtlasPageIndex> {
         let mut evicted = Vec::new();
         for candidate in
             prioritized_eviction_candidates(&self.page_lru, current_pages, &self.page_priorities)
@@ -819,7 +743,7 @@ impl GpuBrickAtlasResource {
         evicted
     }
 
-    fn remove_page(&mut self, page: SpatialBrickIndex) {
+    fn remove_page(&mut self, page: AtlasPageIndex) {
         if let Some(slot) = self.page_slots.remove(&page) {
             self.page_regions.remove(&page);
             self.page_priorities.remove(&page);
@@ -827,7 +751,6 @@ impl GpuBrickAtlasResource {
             self.slot_pages[slot] = None;
             let page_index = brick_page_index(page, self.brick_grid_shape);
             self.page_table[page_index] = 0;
-            clear_integer_brick_metadata(&mut self.metadata, page_index);
             self.page_lru.retain(|candidate| *candidate != page);
         }
     }
@@ -840,96 +763,49 @@ impl GpuBrickAtlasResource {
         self.slot_pages.iter().filter(|slot| slot.is_none()).count()
     }
 
-    fn touch_page(&mut self, page: SpatialBrickIndex) {
+    fn touch_page(&mut self, page: AtlasPageIndex) {
         self.page_lru.retain(|candidate| *candidate != page);
         self.page_lru.push_back(page);
     }
 
     fn set_page_priority(
         &mut self,
-        page: SpatialBrickIndex,
-        page_priorities: Option<&HashMap<SpatialBrickIndex, GpuBrickAtlasPagePriority>>,
+        page: AtlasPageIndex,
+        page_priorities: Option<&HashMap<AtlasPageIndex, GpuBrickAtlasPagePriority>>,
     ) {
         if let Some(priority) = page_priorities.and_then(|priorities| priorities.get(&page)) {
             self.page_priorities.insert(page, *priority);
         }
     }
 
-    fn page_region_matches(&self, page: SpatialBrickIndex, region: VolumeRegion) -> bool {
+    fn page_region_matches(&self, page: AtlasPageIndex, region: ResourceRegion) -> bool {
         self.page_regions
             .get(&page)
             .is_some_and(|stored| *stored == region)
     }
 
-    fn pack_brick_u8_for_upload(
-        &self,
-        brick: &mirante4d_data::VolumeBrickU8,
-        upload_ready_cache: &mut UploadReadyIntegerBrickCache,
-    ) -> Result<Arc<PackedIntegerBrick>, RenderError> {
-        upload_ready_cache.get_or_pack_u8(
-            brick,
-            self.brick_shape,
-            self.packed_u32_per_brick,
-            self.valid_u32_per_brick,
-        )
-    }
-
-    fn pack_brick_u16_for_upload(
-        &self,
-        brick: &mirante4d_data::VolumeBrickU16,
-        upload_ready_cache: &mut UploadReadyIntegerBrickCache,
-    ) -> Result<Arc<PackedIntegerBrick>, RenderError> {
-        upload_ready_cache.get_or_pack_u16(
-            brick,
-            self.brick_shape,
-            self.packed_u32_per_brick,
-            self.valid_u32_per_brick,
-        )
-    }
-
-    fn upload_packed_brick_runs(
+    fn upload_packed_bricks(
         &self,
         queue: &wgpu::Queue,
         uploads: &[(usize, Arc<PackedIntegerBrick>)],
     ) {
-        if uploads.is_empty() {
-            return;
-        }
-        let mut ordered = uploads.to_vec();
-        ordered.sort_by_key(|(slot, _)| *slot);
-        let mut run_start = 0usize;
-        while run_start < ordered.len() {
-            let mut run_end = run_start + 1;
-            while run_end < ordered.len() && ordered[run_end].0 == ordered[run_end - 1].0 + 1 {
-                run_end += 1;
-            }
-            let first_slot = ordered[run_start].0;
-            let run = &ordered[run_start..run_end];
-            let value_len = run[0].1.values.len();
-            let validity_len = run[0].1.validity_bits.len();
-            let mut values = Vec::with_capacity(value_len * run.len());
-            let mut validity_bits = Vec::with_capacity(validity_len * run.len());
-            for (_, packed) in run {
-                values.extend_from_slice(&packed.values);
-                validity_bits.extend_from_slice(&packed.validity_bits);
-            }
+        for (slot, packed) in uploads {
             let value_offset =
-                (first_slot as u64 * self.packed_u32_per_brick * std::mem::size_of::<u32>() as u64)
+                (*slot as u64 * self.packed_u32_per_brick * std::mem::size_of::<u32>() as u64)
                     as wgpu::BufferAddress;
             queue.write_buffer(
                 self.packed_values_buffer.as_ref(),
                 value_offset,
-                bytemuck::cast_slice(&values),
+                bytemuck::cast_slice(&packed.values),
             );
             let validity_offset =
-                (first_slot as u64 * self.valid_u32_per_brick * std::mem::size_of::<u32>() as u64)
+                (*slot as u64 * self.valid_u32_per_brick * std::mem::size_of::<u32>() as u64)
                     as wgpu::BufferAddress;
             queue.write_buffer(
                 self.validity_buffer.as_ref(),
                 validity_offset,
-                bytemuck::cast_slice(&validity_bits),
+                bytemuck::cast_slice(&packed.validity_bits),
             );
-            run_start = run_end;
         }
     }
 
@@ -969,6 +845,7 @@ impl GpuBrickAtlasResource {
 impl GpuBrickAtlasF32Resource {
     fn new(
         device: &wgpu::Device,
+        cpu_ledger: &dyn CpuByteLedger,
         generation: u64,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
@@ -985,19 +862,19 @@ impl GpuBrickAtlasF32Resource {
             std::mem::size_of::<f32>() as u64,
         )?;
         let page_table_word_count = f32_page_table_word_count(brick_grid_shape)?;
-        let page_table = vec![
-            0u32;
-            usize::try_from(page_table_word_count).map_err(|_| {
-                GpuRenderError::BufferSizeOverflow {
-                    resource: "brick atlas float32 page table",
-                }
-            })?
-        ];
+        let page_table_len = usize::try_from(page_table_word_count).map_err(|_| {
+            GpuRenderError::BufferSizeOverflow {
+                resource: "brick atlas float32 page table",
+            }
+        })?;
         let page_table_bytes = checked_buffer_byte_count(
             "brick atlas float32 page table",
-            page_table.len(),
+            page_table_len,
             std::mem::size_of::<u32>(),
         )?;
+        let cpu_mapping_charge: Arc<dyn CpuByteLease> =
+            Arc::from(cpu_ledger.try_acquire(CpuLedgerCategory::UploadStaging, page_table_bytes)?);
+        let page_table = vec![0u32; page_table_len];
         let limits = device.limits();
         validate_storage_buffer_bytes(&limits, "brick atlas float32 values", values_bytes)?;
         validate_storage_buffer_bytes(&limits, "brick atlas float32 page table", page_table_bytes)?;
@@ -1034,44 +911,50 @@ impl GpuBrickAtlasF32Resource {
             page_priorities: HashMap::new(),
             active_pages: HashSet::new(),
             page_lru: VecDeque::new(),
+            _cpu_mapping_charge: cpu_mapping_charge,
         })
     }
 
     fn update_resident_pages(
         &mut self,
         queue: &wgpu::Queue,
-        resident: &ResidentBrickSetF32,
-        page_priorities: Option<&HashMap<SpatialBrickIndex, GpuBrickAtlasPagePriority>>,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
+        page_priorities: Option<&HashMap<AtlasPageIndex, GpuBrickAtlasPagePriority>>,
     ) -> Result<GpuBrickAtlasUpdate, GpuRenderError> {
-        let current_pages =
-            validate_resident_pages_f32(resident, self.brick_shape, self.brick_grid_shape)?;
+        let pages = validate_lease_pages(volume, IntensityDType::Float32, None)?;
+        let current_pages = pages
+            .iter()
+            .map(|page| page.brick_index)
+            .collect::<HashSet<_>>();
         let mut page_table_updates = Vec::new();
         self.deactivate_pages_not_in(&current_pages, &mut page_table_updates);
         let mut uploaded_pages = 0u64;
         let mut uploaded_bytes = 0u64;
         let mut stale_allocations = 0u64;
 
-        for brick in resident.bricks() {
-            let page_index = brick_page_index(brick.brick_index, self.brick_grid_shape);
-            if let Some(allocation) = self.page_allocations.get(&brick.brick_index).copied() {
-                if allocation.matches_brick_region(brick.region) {
-                    let became_active = self.active_pages.insert(brick.brick_index);
-                    self.set_page_priority(brick.brick_index, page_priorities);
+        for page in &pages {
+            let page_index = brick_page_index(page.brick_index, self.brick_grid_shape);
+            if let Some(allocation) = self.page_allocations.get(&page.brick_index).copied() {
+                if allocation.matches_resource_region(page.region) {
+                    let became_active = self.active_pages.insert(page.brick_index);
+                    self.set_page_priority(page.brick_index, page_priorities);
                     if became_active {
                         write_f32_brick_page_table(&mut self.page_table, page_index, allocation);
                         page_table_updates.push(page_index);
                     }
-                    self.touch_page(brick.brick_index);
+                    self.touch_page(page.brick_index);
                     continue;
                 }
-                self.page_allocations.remove(&brick.brick_index);
-                self.page_priorities.remove(&brick.brick_index);
+                self.page_allocations.remove(&page.brick_index);
+                self.page_priorities.remove(&page.brick_index);
                 self.page_lru
-                    .retain(|candidate| *candidate != brick.brick_index);
+                    .retain(|candidate| *candidate != page.brick_index);
                 stale_allocations = stale_allocations.saturating_add(1);
             }
 
-            let allocation = self.upload_compact_brick(queue, self.value_words_used, brick)?;
+            let allocation =
+                self.upload_compact_page(queue, self.value_words_used, *page, cpu_ledger)?;
             self.value_words_used = self
                 .value_words_used
                 .checked_add(allocation.value_words)
@@ -1083,11 +966,11 @@ impl GpuBrickAtlasF32Resource {
                 .ok_or(GpuRenderError::BufferSizeOverflow {
                     resource: "brick atlas uploaded float32 bytes",
                 })?;
-            self.page_allocations.insert(brick.brick_index, allocation);
-            self.set_page_priority(brick.brick_index, page_priorities);
-            self.active_pages.insert(brick.brick_index);
+            self.page_allocations.insert(page.brick_index, allocation);
+            self.set_page_priority(page.brick_index, page_priorities);
+            self.active_pages.insert(page.brick_index);
             write_f32_brick_page_table(&mut self.page_table, page_index, allocation);
-            self.touch_page(brick.brick_index);
+            self.touch_page(page.brick_index);
             page_table_updates.push(page_index);
             uploaded_pages += 1;
         }
@@ -1105,7 +988,7 @@ impl GpuBrickAtlasF32Resource {
 
     fn deactivate_pages_not_in(
         &mut self,
-        current_pages: &HashSet<SpatialBrickIndex>,
+        current_pages: &HashSet<AtlasPageIndex>,
         page_table_updates: &mut Vec<usize>,
     ) {
         let inactive = self
@@ -1122,29 +1005,30 @@ impl GpuBrickAtlasF32Resource {
         }
     }
 
-    fn touch_page(&mut self, page: SpatialBrickIndex) {
+    fn touch_page(&mut self, page: AtlasPageIndex) {
         self.page_lru.retain(|candidate| *candidate != page);
         self.page_lru.push_back(page);
     }
 
     fn set_page_priority(
         &mut self,
-        page: SpatialBrickIndex,
-        page_priorities: Option<&HashMap<SpatialBrickIndex, GpuBrickAtlasPagePriority>>,
+        page: AtlasPageIndex,
+        page_priorities: Option<&HashMap<AtlasPageIndex, GpuBrickAtlasPagePriority>>,
     ) {
         if let Some(priority) = page_priorities.and_then(|priorities| priorities.get(&page)) {
             self.page_priorities.insert(page, *priority);
         }
     }
 
-    fn upload_compact_brick(
+    fn upload_compact_page(
         &self,
         queue: &wgpu::Queue,
         value_offset_words: u64,
-        brick: &mirante4d_data::VolumeBrickF32,
+        page: LeaseAtlasPage<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
     ) -> Result<GpuF32BrickAllocation, GpuRenderError> {
-        let values = pack_brick_f32_compact(brick)?;
-        let value_words = values.len() as u64;
+        let values = F32UploadBytes::new(page.payload, cpu_ledger)?;
+        let value_words = page.payload.sample_count();
         let end_words = value_offset_words.checked_add(value_words).ok_or(
             GpuRenderError::BufferSizeOverflow {
                 resource: "brick atlas float32 compact upload",
@@ -1162,11 +1046,7 @@ impl GpuBrickAtlasF32Resource {
             .ok_or(GpuRenderError::BufferSizeOverflow {
                 resource: "brick atlas float32 compact upload offset",
             })? as wgpu::BufferAddress;
-        queue.write_buffer(
-            self.values_buffer.as_ref(),
-            offset,
-            bytemuck::cast_slice(&values),
-        );
+        queue.write_buffer(self.values_buffer.as_ref(), offset, values.bytes());
         if value_offset_words >= u64::from(u32::MAX) {
             return Err(GpuRenderError::BufferSizeOverflow {
                 resource: "brick atlas float32 compact value offset",
@@ -1179,12 +1059,12 @@ impl GpuBrickAtlasF32Resource {
                 }
             })?,
             value_words,
-            x_size: checked_u32("f32_brick_x_size", brick.volume.shape.x())?,
-            y_size: checked_u32("f32_brick_y_size", brick.volume.shape.y())?,
-            z_size: checked_u32("f32_brick_z_size", brick.volume.shape.z())?,
-            x_start: checked_u32("f32_brick_x_start", brick.region.x_start)?,
-            y_start: checked_u32("f32_brick_y_start", brick.region.y_start)?,
-            z_start: checked_u32("f32_brick_z_start", brick.region.z_start)?,
+            x_size: checked_u32("f32_resource_x_size", page.payload.shape().x())?,
+            y_size: checked_u32("f32_resource_y_size", page.payload.shape().y())?,
+            z_size: checked_u32("f32_resource_z_size", page.payload.shape().z())?,
+            x_start: checked_u32("f32_resource_x_start", page.region.origin()[2])?,
+            y_start: checked_u32("f32_resource_y_start", page.region.origin()[1])?,
+            z_start: checked_u32("f32_resource_z_start", page.region.origin()[0])?,
         })
     }
 
@@ -1207,13 +1087,32 @@ impl GpuBrickAtlasF32Resource {
 }
 
 impl GpuF32BrickAllocation {
-    fn matches_brick_region(self, region: VolumeRegion) -> bool {
-        self.x_start as u64 == region.x_start
-            && self.y_start as u64 == region.y_start
-            && self.z_start as u64 == region.z_start
-            && self.x_size as u64 == region.x_size
-            && self.y_size as u64 == region.y_size
-            && self.z_size as u64 == region.z_size
+    fn matches_resource_region(self, region: ResourceRegion) -> bool {
+        let origin = region.origin();
+        let shape = region.shape();
+        self.x_start as u64 == origin[2]
+            && self.y_start as u64 == origin[1]
+            && self.z_start as u64 == origin[0]
+            && self.x_size as u64 == shape.x()
+            && self.y_size as u64 == shape.y()
+            && self.z_size as u64 == shape.z()
+    }
+
+    fn resource_region(self) -> ResourceRegion {
+        ResourceRegion::new(
+            [
+                u64::from(self.z_start),
+                u64::from(self.y_start),
+                u64::from(self.x_start),
+            ],
+            Shape3D::new(
+                u64::from(self.z_size),
+                u64::from(self.y_size),
+                u64::from(self.x_size),
+            )
+            .expect("a live float32 allocation has nonzero dimensions"),
+        )
+        .expect("a live float32 allocation preserves checked region ends")
     }
 }
 
@@ -1251,6 +1150,7 @@ impl GpuBrickAtlasCache {
     fn new_integer_resource(
         &mut self,
         device: &wgpu::Device,
+        cpu_ledger: &dyn CpuByteLedger,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
         required_slot_count: usize,
@@ -1258,6 +1158,7 @@ impl GpuBrickAtlasCache {
     ) -> Result<GpuBrickAtlasResource, GpuRenderError> {
         GpuBrickAtlasResource::new(
             device,
+            cpu_ledger,
             self.next_resource_generation()?,
             brick_shape,
             brick_grid_shape,
@@ -1368,12 +1269,14 @@ impl GpuBrickAtlasCache {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         key: BrickAtlasResourceKey,
-        resident: &ResidentBrickSetU8,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
-        page_priorities: Option<&HashMap<SpatialBrickIndex, GpuBrickAtlasPagePriority>>,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
+        page_priorities: Option<&HashMap<AtlasPageIndex, GpuBrickAtlasPagePriority>>,
     ) -> Result<GpuBrickAtlasResource, GpuRenderError> {
-        let visible_slot_count = resident.bricks().len().max(1);
+        let brick_shape = volume.resource_shape();
+        let brick_grid_shape = volume.resource_grid_shape();
+        let pages = validate_lease_pages(volume, IntensityDType::Uint8, None)?;
+        let visible_slot_count = pages.len().max(1);
         let limits = device.limits();
         let mut resource = if let Some(atlas) = self.atlases.remove(&key) {
             self.stats.brick_atlas_cache_hits += 1;
@@ -1390,6 +1293,7 @@ impl GpuBrickAtlasCache {
             )?;
             self.new_integer_resource(
                 device,
+                cpu_ledger,
                 brick_shape,
                 brick_grid_shape,
                 required_slot_count,
@@ -1398,10 +1302,9 @@ impl GpuBrickAtlasCache {
         };
         self.order.retain(|existing| existing != &key);
 
-        let missing_pages = resident
-            .bricks()
+        let missing_pages = pages
             .iter()
-            .filter(|brick| !resource.page_slots.contains_key(&brick.brick_index))
+            .filter(|page| !resource.page_slots.contains_key(&page.brick_index))
             .count();
         let required_slot_count = resource
             .page_slots
@@ -1422,6 +1325,7 @@ impl GpuBrickAtlasCache {
         )? {
             resource = self.new_integer_resource(
                 device,
+                cpu_ledger,
                 brick_shape,
                 brick_grid_shape,
                 required_slot_count,
@@ -1431,8 +1335,9 @@ impl GpuBrickAtlasCache {
 
         let update = resource.update_resident_pages_u8(
             queue,
-            resident,
+            volume,
             &mut self.upload_ready_cache,
+            cpu_ledger,
             page_priorities,
         )?;
         self.record_update(resource.dtype, update);
@@ -1446,12 +1351,14 @@ impl GpuBrickAtlasCache {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         key: BrickAtlasResourceKey,
-        resident: &ResidentBrickSetU16,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
-        page_priorities: Option<&HashMap<SpatialBrickIndex, GpuBrickAtlasPagePriority>>,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
+        page_priorities: Option<&HashMap<AtlasPageIndex, GpuBrickAtlasPagePriority>>,
     ) -> Result<GpuBrickAtlasResource, GpuRenderError> {
-        let visible_slot_count = resident.bricks().len().max(1);
+        let brick_shape = volume.resource_shape();
+        let brick_grid_shape = volume.resource_grid_shape();
+        let pages = validate_lease_pages(volume, IntensityDType::Uint16, None)?;
+        let visible_slot_count = pages.len().max(1);
         let limits = device.limits();
         let mut resource = if let Some(atlas) = self.atlases.remove(&key) {
             self.stats.brick_atlas_cache_hits += 1;
@@ -1468,6 +1375,7 @@ impl GpuBrickAtlasCache {
             )?;
             self.new_integer_resource(
                 device,
+                cpu_ledger,
                 brick_shape,
                 brick_grid_shape,
                 required_slot_count,
@@ -1476,10 +1384,9 @@ impl GpuBrickAtlasCache {
         };
         self.order.retain(|existing| existing != &key);
 
-        let missing_pages = resident
-            .bricks()
+        let missing_pages = pages
             .iter()
-            .filter(|brick| !resource.page_slots.contains_key(&brick.brick_index))
+            .filter(|page| !resource.page_slots.contains_key(&page.brick_index))
             .count();
         let required_slot_count = resource
             .page_slots
@@ -1500,6 +1407,7 @@ impl GpuBrickAtlasCache {
         )? {
             resource = self.new_integer_resource(
                 device,
+                cpu_ledger,
                 brick_shape,
                 brick_grid_shape,
                 required_slot_count,
@@ -1509,8 +1417,9 @@ impl GpuBrickAtlasCache {
 
         let update = resource.update_resident_pages_u16(
             queue,
-            resident,
+            volume,
             &mut self.upload_ready_cache,
+            cpu_ledger,
             page_priorities,
         )?;
         self.record_update(resource.dtype, update);
@@ -1628,8 +1537,12 @@ impl GpuBrickAtlasCache {
         Ok(GpuBrickAtlasResidencySnapshot {
             retained: true,
             generation: Some(atlas.generation),
-            resident_pages: atlas.page_slots.keys().copied().collect(),
-            active_pages: atlas.active_pages.clone(),
+            resident_pages: atlas.page_regions.values().copied().collect(),
+            active_pages: atlas
+                .active_pages
+                .iter()
+                .filter_map(|page| atlas.page_regions.get(page).copied())
+                .collect(),
             bytes: atlas.bytes,
             slot_count: atlas.slot_count,
         })
@@ -1662,12 +1575,14 @@ impl GpuBrickAtlasF32Cache {
     fn new_f32_resource(
         &mut self,
         device: &wgpu::Device,
+        cpu_ledger: &dyn CpuByteLedger,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
         value_word_capacity: u64,
     ) -> Result<GpuBrickAtlasF32Resource, GpuRenderError> {
         GpuBrickAtlasF32Resource::new(
             device,
+            cpu_ledger,
             self.next_resource_generation()?,
             brick_shape,
             brick_grid_shape,
@@ -1748,12 +1663,23 @@ impl GpuBrickAtlasF32Cache {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         key: BrickAtlasResourceKey,
-        resident: &ResidentBrickSetF32,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
-        page_priorities: Option<&HashMap<SpatialBrickIndex, GpuBrickAtlasPagePriority>>,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
+        page_priorities: Option<&HashMap<AtlasPageIndex, GpuBrickAtlasPagePriority>>,
     ) -> Result<GpuBrickAtlasF32Resource, GpuRenderError> {
-        let required_value_words = compact_f32_value_words(resident)?.max(1);
+        let brick_shape = volume.resource_shape();
+        let brick_grid_shape = volume.resource_grid_shape();
+        let pages = validate_lease_pages(volume, IntensityDType::Float32, None)?;
+        let required_value_words = pages
+            .iter()
+            .try_fold(0_u64, |total, page| {
+                total.checked_add(page.payload.sample_count()).ok_or(
+                    GpuRenderError::BufferSizeOverflow {
+                        resource: "lease-backed float32 atlas values",
+                    },
+                )
+            })?
+            .max(1);
         let page_table_word_count = f32_page_table_word_count(brick_grid_shape)?;
         let limits = device.limits();
         validate_f32_brick_atlas_budget(
@@ -1773,11 +1699,17 @@ impl GpuBrickAtlasF32Cache {
                 required_value_words,
                 page_table_word_count,
             )?;
-            self.new_f32_resource(device, brick_shape, brick_grid_shape, value_word_capacity)?
+            self.new_f32_resource(
+                device,
+                cpu_ledger,
+                brick_shape,
+                brick_grid_shape,
+                value_word_capacity,
+            )?
         };
         self.order.retain(|existing| existing != &key);
 
-        let missing_value_words = missing_f32_value_words_for_resource(&resource, resident)?;
+        let missing_value_words = missing_f32_value_words_for_resource(&resource, &pages)?;
         let required_resource_value_words = resource
             .value_words_used
             .checked_add(missing_value_words)
@@ -1792,11 +1724,16 @@ impl GpuBrickAtlasF32Cache {
                 required_value_words,
                 page_table_word_count,
             )?;
-            resource =
-                self.new_f32_resource(device, brick_shape, brick_grid_shape, value_word_capacity)?;
+            resource = self.new_f32_resource(
+                device,
+                cpu_ledger,
+                brick_shape,
+                brick_grid_shape,
+                value_word_capacity,
+            )?;
         }
 
-        let update = resource.update_resident_pages(queue, resident, page_priorities)?;
+        let update = resource.update_resident_pages(queue, volume, cpu_ledger, page_priorities)?;
         self.stats.brick_atlas_uploads += update.uploaded_pages;
         self.stats.brick_atlas_uploaded_bytes += update.uploaded_bytes;
         self.stats.brick_atlas_f32_uploaded_bytes += update.uploaded_bytes;
@@ -1854,66 +1791,129 @@ impl GpuBrickAtlasF32Cache {
         Ok(GpuBrickAtlasResidencySnapshot {
             retained: true,
             generation: Some(atlas.generation),
-            resident_pages: atlas.page_allocations.keys().copied().collect(),
-            active_pages: atlas.active_pages.clone(),
+            resident_pages: atlas
+                .page_allocations
+                .values()
+                .map(|allocation| allocation.resource_region())
+                .collect(),
+            active_pages: atlas
+                .active_pages
+                .iter()
+                .filter_map(|page| atlas.page_allocations.get(page))
+                .map(|allocation| allocation.resource_region())
+                .collect(),
             bytes: atlas.bytes,
             slot_count: atlas.page_allocations.len(),
         })
     }
 }
 
-fn validate_resident_pages_u8(
-    resident: &ResidentBrickSetU8,
-    brick_shape: Shape3D,
-    brick_grid_shape: Shape3D,
-    slot_count: usize,
-) -> Result<HashSet<SpatialBrickIndex>, RenderError> {
-    if resident.bricks().len() > slot_count {
+fn validate_lease_pages(
+    volume: CurrentLeaseVolume<'_>,
+    dtype: IntensityDType,
+    slot_count: Option<usize>,
+) -> Result<Vec<LeaseAtlasPage<'_>>, RenderError> {
+    let resources = volume.resident().resources().collect::<Vec<_>>();
+    if resources.is_empty() {
         return Err(RenderError::InvalidBrickAtlas(
-            "resident brick count exceeds atlas slot count",
+            "lease-backed atlas input is empty",
         ));
     }
-    let mut pages = HashSet::with_capacity(resident.bricks().len());
-    for brick in resident.bricks() {
-        if brick.brick_index.z >= brick_grid_shape.z()
-            || brick.brick_index.y >= brick_grid_shape.y()
-            || brick.brick_index.x >= brick_grid_shape.x()
-        {
+    if slot_count.is_some_and(|limit| resources.len() > limit) {
+        return Err(RenderError::InvalidBrickAtlas(
+            "lease-backed resource count exceeds atlas slot count",
+        ));
+    }
+    let mut indices = HashSet::with_capacity(resources.len());
+    let mut pages = Vec::with_capacity(resources.len());
+    for resource in resources {
+        let payload = resource.payload();
+        if payload.dtype() != dtype {
             return Err(RenderError::InvalidBrickAtlas(
-                "resident brick index exceeds brick grid",
+                "lease-backed atlas cohort contains an unexpected dtype",
             ));
         }
-        if brick.volume.shape.z() > brick_shape.z()
-            || brick.volume.shape.y() > brick_shape.y()
-            || brick.volume.shape.x() > brick_shape.x()
-        {
+        let region = resource.key().region();
+        if payload.shape() != region.shape() {
             return Err(RenderError::InvalidBrickAtlas(
-                "resident brick shape exceeds declared brick shape",
+                "lease payload shape does not match its semantic region",
             ));
         }
-        if !pages.insert(brick.brick_index) {
+        let brick_index = atlas_page_for_region(volume, region)?;
+        if !indices.insert(brick_index) {
             return Err(RenderError::InvalidBrickAtlas(
-                "duplicate resident brick page",
+                "two lease resources map to one semantic atlas page",
             ));
         }
+        pages.push(LeaseAtlasPage {
+            brick_index,
+            region,
+            payload,
+            resource,
+        });
     }
     Ok(pages)
 }
 
-#[cfg(test)]
-fn current_pages_match_atlas_pages(
-    current_pages: &HashSet<SpatialBrickIndex>,
-    page_slots: &HashMap<SpatialBrickIndex, usize>,
-) -> bool {
-    current_pages.len() == page_slots.len()
-        && current_pages
-            .iter()
-            .all(|page| page_slots.contains_key(page))
+fn atlas_page_for_region(
+    volume: CurrentLeaseVolume<'_>,
+    region: ResourceRegion,
+) -> Result<AtlasPageIndex, RenderError> {
+    if !region.fits_within(volume.volume_shape()) {
+        return Err(RenderError::InvalidBrickAtlas(
+            "lease resource region exceeds the semantic volume",
+        ));
+    }
+    let origin = region.origin();
+    let resource_shape = volume.resource_shape().dimensions();
+    if origin
+        .into_iter()
+        .zip(resource_shape)
+        .any(|(start, length)| start % length != 0)
+    {
+        return Err(RenderError::InvalidBrickAtlas(
+            "lease resource origin is not aligned to the semantic resource grid",
+        ));
+    }
+    let index = AtlasPageIndex {
+        z: origin[0] / resource_shape[0],
+        y: origin[1] / resource_shape[1],
+        x: origin[2] / resource_shape[2],
+    };
+    let grid = volume.resource_grid_shape();
+    if index.z >= grid.z() || index.y >= grid.y() || index.x >= grid.x() {
+        return Err(RenderError::InvalidBrickAtlas(
+            "lease resource index exceeds the semantic resource grid",
+        ));
+    }
+    let volume_shape = volume.volume_shape().dimensions();
+    let expected_shape = Shape3D::new(
+        resource_shape[0].min(volume_shape[0] - origin[0]),
+        resource_shape[1].min(volume_shape[1] - origin[1]),
+        resource_shape[2].min(volume_shape[2] - origin[2]),
+    )
+    .expect("an in-grid semantic resource is nonempty");
+    if region.shape() != expected_shape {
+        return Err(RenderError::InvalidBrickAtlas(
+            "lease resource is not the exact full or clipped semantic tile",
+        ));
+    }
+    Ok(index)
+}
+
+fn page_priorities_by_index(
+    volume: CurrentLeaseVolume<'_>,
+    priorities: &HashMap<ResourceRegion, GpuBrickAtlasPagePriority>,
+) -> Result<HashMap<AtlasPageIndex, GpuBrickAtlasPagePriority>, RenderError> {
+    priorities
+        .iter()
+        .map(|(region, priority)| Ok((atlas_page_for_region(volume, *region)?, *priority)))
+        .collect()
 }
 
 fn current_pages_match_active_pages(
-    current_pages: &HashSet<SpatialBrickIndex>,
-    active_pages: &HashSet<SpatialBrickIndex>,
+    current_pages: &HashSet<AtlasPageIndex>,
+    active_pages: &HashSet<AtlasPageIndex>,
 ) -> bool {
     current_pages == active_pages
 }
@@ -1957,81 +1957,11 @@ fn f32_mapping_update_bytes(page_table_entries: usize) -> Result<u64, GpuRenderE
     )
 }
 
-fn validate_resident_pages_u16(
-    resident: &ResidentBrickSetU16,
-    brick_shape: Shape3D,
-    brick_grid_shape: Shape3D,
-    slot_count: usize,
-) -> Result<HashSet<SpatialBrickIndex>, RenderError> {
-    if resident.bricks().len() > slot_count {
-        return Err(RenderError::InvalidBrickAtlas(
-            "resident brick count exceeds atlas slot count",
-        ));
-    }
-    let mut pages = HashSet::with_capacity(resident.bricks().len());
-    for brick in resident.bricks() {
-        if brick.brick_index.z >= brick_grid_shape.z()
-            || brick.brick_index.y >= brick_grid_shape.y()
-            || brick.brick_index.x >= brick_grid_shape.x()
-        {
-            return Err(RenderError::InvalidBrickAtlas(
-                "resident brick index exceeds brick grid",
-            ));
-        }
-        if brick.volume.shape.z() > brick_shape.z()
-            || brick.volume.shape.y() > brick_shape.y()
-            || brick.volume.shape.x() > brick_shape.x()
-        {
-            return Err(RenderError::InvalidBrickAtlas(
-                "resident brick shape exceeds declared brick shape",
-            ));
-        }
-        if !pages.insert(brick.brick_index) {
-            return Err(RenderError::InvalidBrickAtlas(
-                "duplicate resident brick page",
-            ));
-        }
-    }
-    Ok(pages)
-}
-
-fn validate_resident_pages_f32(
-    resident: &ResidentBrickSetF32,
-    brick_shape: Shape3D,
-    brick_grid_shape: Shape3D,
-) -> Result<HashSet<SpatialBrickIndex>, RenderError> {
-    let mut pages = HashSet::with_capacity(resident.bricks().len());
-    for brick in resident.bricks() {
-        if brick.brick_index.z >= brick_grid_shape.z()
-            || brick.brick_index.y >= brick_grid_shape.y()
-            || brick.brick_index.x >= brick_grid_shape.x()
-        {
-            return Err(RenderError::InvalidBrickAtlas(
-                "resident brick index exceeds brick grid",
-            ));
-        }
-        if brick.volume.shape.z() > brick_shape.z()
-            || brick.volume.shape.y() > brick_shape.y()
-            || brick.volume.shape.x() > brick_shape.x()
-        {
-            return Err(RenderError::InvalidBrickAtlas(
-                "resident brick shape exceeds declared brick shape",
-            ));
-        }
-        if !pages.insert(brick.brick_index) {
-            return Err(RenderError::InvalidBrickAtlas(
-                "duplicate resident brick page",
-            ));
-        }
-    }
-    Ok(pages)
-}
-
 fn prioritized_eviction_candidates(
-    page_lru: &VecDeque<SpatialBrickIndex>,
-    current_pages: &HashSet<SpatialBrickIndex>,
-    page_priorities: &HashMap<SpatialBrickIndex, GpuBrickAtlasPagePriority>,
-) -> Vec<SpatialBrickIndex> {
+    page_lru: &VecDeque<AtlasPageIndex>,
+    current_pages: &HashSet<AtlasPageIndex>,
+    page_priorities: &HashMap<AtlasPageIndex, GpuBrickAtlasPagePriority>,
+) -> Vec<AtlasPageIndex> {
     let mut candidates = page_lru
         .iter()
         .copied()
@@ -2062,7 +1992,7 @@ fn page_eviction_order(
         .then_with(|| left.score.total_cmp(&right.score))
 }
 
-fn brick_page_index(index: SpatialBrickIndex, brick_grid_shape: Shape3D) -> usize {
+fn brick_page_index(index: AtlasPageIndex, brick_grid_shape: Shape3D) -> usize {
     ((index.z * brick_grid_shape.y() + index.y) * brick_grid_shape.x() + index.x) as usize
 }
 
@@ -2076,44 +2006,24 @@ fn f32_page_table_word_count(brick_grid_shape: Shape3D) -> Result<u64, GpuRender
         })
 }
 
-fn compact_f32_value_words(resident: &ResidentBrickSetF32) -> Result<u64, GpuRenderError> {
-    resident.bricks().iter().try_fold(0u64, |total, brick| {
-        let words = f32_brick_value_words(brick)?;
-        total
-            .checked_add(words)
-            .ok_or(GpuRenderError::BufferSizeOverflow {
-                resource: "brick atlas float32 compact values",
-            })
-    })
-}
-
 fn missing_f32_value_words_for_resource(
     resource: &GpuBrickAtlasF32Resource,
-    resident: &ResidentBrickSetF32,
+    pages: &[LeaseAtlasPage<'_>],
 ) -> Result<u64, GpuRenderError> {
-    resident.bricks().iter().try_fold(0u64, |total, brick| {
+    pages.iter().try_fold(0u64, |total, page| {
         if resource
             .page_allocations
-            .get(&brick.brick_index)
-            .is_some_and(|allocation| allocation.matches_brick_region(brick.region))
+            .get(&page.brick_index)
+            .is_some_and(|allocation| allocation.matches_resource_region(page.region))
         {
             return Ok(total);
         }
         total
-            .checked_add(f32_brick_value_words(brick)?)
+            .checked_add(page.payload.sample_count())
             .ok_or(GpuRenderError::BufferSizeOverflow {
                 resource: "brick atlas missing float32 compact values",
             })
     })
-}
-
-fn f32_brick_value_words(brick: &mirante4d_data::VolumeBrickF32) -> Result<u64, GpuRenderError> {
-    brick
-        .volume
-        .shape
-        .element_count()
-        .map_err(RenderError::from)
-        .map_err(Into::into)
 }
 
 fn write_f32_brick_page_table(
@@ -2142,33 +2052,18 @@ fn clear_f32_brick_page_table(page_table: &mut [u32], page_index: usize) {
     page_table[base..base + F32_BRICK_PAGE_TABLE_WORDS as usize].fill(0);
 }
 
-fn write_u8_brick_metadata(
+fn write_integer_page_metadata(
     metadata: &mut [u32],
     page_index: usize,
-    brick: &mirante4d_data::VolumeBrickU8,
+    packed: &PackedIntegerBrick,
 ) {
     write_integer_brick_metadata(
         metadata,
         page_index,
-        brick.occupied,
-        brick.valid_voxel_count,
-        brick.min,
-        brick.max,
-    );
-}
-
-fn write_u16_brick_metadata(
-    metadata: &mut [u32],
-    page_index: usize,
-    brick: &mirante4d_data::VolumeBrickU16,
-) {
-    write_integer_brick_metadata(
-        metadata,
-        page_index,
-        brick.occupied,
-        brick.valid_voxel_count,
-        brick.min,
-        brick.max,
+        packed.valid_voxel_count != 0,
+        packed.valid_voxel_count,
+        f64::from(packed.min_value),
+        f64::from(packed.max_value),
     );
 }
 
@@ -2199,13 +2094,5 @@ fn write_integer_brick_metadata(
     metadata[base + 3] = 0;
 }
 
-fn clear_integer_brick_metadata(metadata: &mut [u32], page_index: usize) {
-    let base = page_index * INTEGER_BRICK_METADATA_WORDS as usize;
-    if base + INTEGER_BRICK_METADATA_WORDS as usize > metadata.len() {
-        return;
-    }
-    metadata[base..base + INTEGER_BRICK_METADATA_WORDS as usize].fill(0);
-}
-
 #[cfg(test)]
-mod tests;
+mod lease_tests;

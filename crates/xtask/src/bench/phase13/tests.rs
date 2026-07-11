@@ -195,12 +195,12 @@ fn phase13_capacity_probe_error_json_records_policy_and_error_kind() {
     assert_eq!(report["order_dependent"], true);
     assert_eq!(report["ok"], false);
     assert_eq!(report["error_kind"], "budget_exceeded");
-    assert_eq!(report["batched_fallback_attempted"], false);
+    assert_eq!(report["alternate_render_path_attempted"], false);
     assert!(
         report["expected_policy"]
             .as_str()
             .unwrap()
-            .contains("must downgrade or fail visibly")
+            .contains("must fail visibly")
     );
 }
 
@@ -209,10 +209,10 @@ fn phase13_failure_policy_probe_records_backend_limits_and_downgrade_policy() {
     let report = phase13_failure_policy_probe_report();
 
     assert_eq!(report["ok"], true);
-    assert_eq!(report["summary"]["cases"], 8);
-    assert_eq!(report["summary"]["user_visible_cases"], 8);
+    assert_eq!(report["summary"]["cases"], 9);
+    assert_eq!(report["summary"]["user_visible_cases"], 9);
     assert_eq!(report["summary"]["backend_limit_cases"], 3);
-    assert_eq!(report["summary"]["valid_lod_downgrade_cases"], 5);
+    assert_eq!(report["summary"]["valid_lod_downgrade_cases"], 6);
 
     let cases = report["cases"].as_array().unwrap();
     let backend_limit = cases
@@ -222,6 +222,14 @@ fn phase13_failure_policy_probe_records_backend_limits_and_downgrade_policy() {
     assert_eq!(backend_limit["error_kind"], "backend_limit");
     assert_eq!(backend_limit["valid_lod_downgrade"], true);
     assert_eq!(backend_limit["hidden_dense_fallback_allowed"], false);
+
+    let resource_plan = cases
+        .iter()
+        .find(|case| case["label"] == "budget_exceeded_resource_plan")
+        .unwrap();
+    assert_eq!(resource_plan["error_kind"], "budget_exceeded");
+    assert_eq!(resource_plan["valid_lod_downgrade"], true);
+    assert_eq!(resource_plan["hidden_dense_fallback_allowed"], false);
 
     let invalid_transform = cases
         .iter()

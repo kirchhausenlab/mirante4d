@@ -1,679 +1,116 @@
 {
   "schema": "mirante4d-current-state-field-ledger",
-  "schema_version": 1,
-  "status": "wp07b-live-cutover-enforced",
-  "source_revision": "9f398f6d19b9ce918395cb4191ccbd9d134e2344",
-  "sources": [
+  "schema_version": 2,
+  "status": "wp08b-unified-runtime-cutover",
+  "predecessor": {
+    "tag": "foundation-wp-08a-exit-2",
+    "revision": "f2e520da891134d1b3f65d8fcac7afb4140579a2"
+  },
+  "dataset_authority": {
+    "runtime_owner": "mirante4d-dataset-runtime",
+    "composition_state": "DatasetDemandState",
+    "sole_poll_owner": "DatasetRequestDispatcher",
+    "source_bridge": {
+      "type": "CurrentDatasetSource",
+      "path": "crates/mirante4d-data/src/current_source_bridge.rs",
+      "expires": "WP-10C"
+    },
+    "renderer_bridge": {
+      "type": "CurrentLeaseBridge",
+      "path": "crates/mirante4d-renderer/src/current_lease_bridge.rs",
+      "expires": "WP-09B"
+    }
+  },
+  "temporary_owners": [
     {
-      "path": "crates/mirante4d-app/src/lib.rs",
-      "struct": "AppState",
-      "expected_fields": 120
+      "module": "render",
+      "path": "crates/mirante4d-app/src/current_runtime/render.rs",
+      "type": "CurrentRenderRuntime",
+      "composition_field": "render_runtime",
+      "expires": "WP-09B"
     },
     {
-      "path": "crates/mirante4d-app/src/lib.rs",
-      "struct": "MiranteWorkbenchApp",
-      "expected_fields": 32
+      "module": "ui",
+      "path": "crates/mirante4d-app/src/current_runtime/ui.rs",
+      "type": "CurrentUiRuntime",
+      "composition_field": "ui_runtime",
+      "expires": "WP-09C"
+    },
+    {
+      "module": "project",
+      "path": "crates/mirante4d-app/src/current_runtime/project.rs",
+      "type": "CurrentProjectRuntime",
+      "composition_field": "project_runtime",
+      "expires": "WP-10B"
+    },
+    {
+      "module": "import",
+      "path": "crates/mirante4d-app/src/current_runtime/import.rs",
+      "type": "CurrentImportRuntime",
+      "composition_field": "import_runtime",
+      "expires": "WP-10C"
+    },
+    {
+      "module": "analysis",
+      "path": "crates/mirante4d-app/src/current_runtime/analysis.rs",
+      "type": "CurrentAnalysisRuntime",
+      "composition_field": "analysis_runtime",
+      "expires": "WP-12",
+      "mode": "passive-results-only"
+    },
+    {
+      "module": "validation",
+      "path": "crates/mirante4d-app/src/current_runtime/validation.rs",
+      "type": "CurrentValidationRuntime",
+      "composition_field": "validation_runtime",
+      "expires": "WP-14"
     }
   ],
-  "enforcement": {
-    "historical_inventory_fields": 152,
-    "finalized_or_deleted_at_wp07b": 44,
-    "temporary_non_durable_fields": 108,
-    "predecessor_appstate_deleted": true,
-    "predecessor_project_v14_authority_deleted": true,
-    "temporary_owners": [
-      { "owner": "CurrentDatasetRuntime", "fields": 53, "expires": "WP-08B" },
-      { "owner": "CurrentRenderRuntime", "fields": 24, "expires": "WP-09B" },
-      { "owner": "CurrentUiRuntime", "fields": 14, "expires": "WP-09C" },
-      { "owner": "CurrentProjectRuntime", "fields": 1, "expires": "WP-10B" },
-      { "owner": "CurrentImportRuntime", "fields": 4, "expires": "WP-10C" },
-      { "owner": "CurrentAnalysisRuntime", "fields": 10, "expires": "WP-12" },
-      { "owner": "CurrentValidationRuntime", "fields": 2, "expires": "WP-14" }
+  "deleted_predecessors": {
+    "paths": [
+      "crates/mirante4d-app/src/current_runtime/dataset.rs",
+      "crates/mirante4d-app/src/brick_streaming.rs",
+      "crates/mirante4d-app/src/brick_streaming_plan.rs",
+      "crates/mirante4d-app/src/cross_section_read_queue.rs",
+      "crates/mirante4d-app/src/cross_section_streaming.rs",
+      "crates/mirante4d-app/src/analysis_jobs.rs",
+      "crates/mirante4d-app/src/dataset_opening.rs",
+      "crates/mirante4d-data/src/worker.rs",
+      "crates/mirante4d-data/src/worker/tests.rs"
+    ],
+    "types": [
+      "CurrentDatasetRuntime",
+      "DataRequestId",
+      "DataGenerationId",
+      "CancellationToken",
+      "BrickReadPool",
+      "CrossSectionChunkReadPool",
+      "BrickReadTicket",
+      "BrickReadOutcome",
+      "BrickRequestPriority",
+      "BrickHistogramSample",
+      "BrickReadMetrics",
+      "BrickReadQueueDiagnostics",
+      "BrickReadSpec",
+      "CrossSectionChunkReadSpec",
+      "BrickReadStatus",
+      "BrickReadPayload"
+    ],
+    "app_owned_payload_types": [
+      "DenseVolumeU8",
+      "DenseVolumeU16",
+      "DenseVolumeF32",
+      "VolumeBrickU8",
+      "VolumeBrickU16",
+      "VolumeBrickF32"
     ]
   },
-  "invariants": {
-    "every_source_field_exactly_once": true,
-    "one_target_owner_or_deletion": true,
-    "product_cutover_gate": "WP-07B",
-    "no_live_target_model_in_wp07a": true,
-    "appstate_predecessor_field_removal_gate": "WP-07B",
-    "finalization_gate_meaning": "Latest gate for reaching the named final owner or deletion. At the live WP-07B cutover, every later-gated fact is held by exactly one bounded temporary non-durable owner listed above."
-  },
-  "dispositions": [
-    {
-      "id": "appstate-process-diagnostics",
-      "source_struct": "AppState",
-      "fields": ["startup_diagnostics"],
-      "action": "move",
-      "target_owner": "mirante4d-app",
-      "state_class": "diagnostic",
-      "finalization_gate": "WP-07B",
-      "reason": "Process and capability diagnostics are composition facts, never project state."
-    },
-    {
-      "id": "appstate-delete-capability-mirror",
-      "source_struct": "AppState",
-      "fields": ["adapter_summary"],
-      "action": "delete",
-      "target_owner": "mirante4d-app",
-      "state_class": "diagnostic",
-      "finalization_gate": "WP-07B",
-      "reason": "Derive the user-facing adapter summary from the composition-owned capability snapshot."
-    },
-    {
-      "id": "appstate-delete-catalog-mirrors",
-      "source_struct": "AppState",
-      "fields": [
-        "dataset_name",
-        "layer_count",
-        "active_layer_name",
-        "active_layer_shape",
-        "active_layer_dtype",
-        "active_source_shape",
-        "active_source_grid_to_world",
-        "timepoint_count"
-      ],
-      "action": "delete",
-      "target_owner": "mirante4d-dataset",
-      "state_class": "immutable_catalog",
-      "finalization_gate": "WP-07B",
-      "reason": "Resolve immutable catalog facts from the dataset authority by LogicalLayerKey instead of mirroring them."
-    },
-    {
-      "id": "appstate-delete-active-index",
-      "source_struct": "AppState",
-      "fields": ["active_layer_index"],
-      "action": "delete",
-      "target_owner": "mirante4d-project-model",
-      "state_class": "durable",
-      "finalization_gate": "WP-07B",
-      "reason": "Active selection is the typed logical layer key; indices are derived presentation positions."
-    },
-    {
-      "id": "appstate-durable-view",
-      "source_struct": "AppState",
-      "fields": ["active_layer_id", "active_timepoint", "iso_light_state", "camera"],
-      "action": "move",
-      "target_owner": "mirante4d-project-model",
-      "state_class": "durable",
-      "finalization_gate": "WP-07B",
-      "reason": "These become the single validated durable ViewState keyed by typed IDs."
-    },
-    {
-      "id": "appstate-dataset-locator",
-      "source_struct": "AppState",
-      "fields": ["dataset_path"],
-      "action": "delete",
-      "target_owner": "mirante4d-project-model",
-      "state_class": "durable_nonidentity_hint",
-      "finalization_gate": "WP-07B",
-      "reason": "Replace PathBuf authority with an optional bounded locator hint that never establishes dataset identity."
-    },
-    {
-      "id": "appstate-delete-active-layer-mirrors",
-      "source_struct": "AppState",
-      "fields": [
-        "active_layer_display",
-        "active_layer_color",
-        "active_layer_transfer",
-        "active_dvr_opacity_transfer",
-        "active_render_mode",
-        "render_sampling_policy",
-        "render_iso_shading_policy",
-        "iso_display_level",
-        "dvr_density_scale"
-      ],
-      "action": "delete",
-      "target_owner": "mirante4d-project-model",
-      "state_class": "durable",
-      "finalization_gate": "WP-07B",
-      "reason": "One LayerViewState keyed by LogicalLayerKey owns transfer and render intent, including one DVR opacity value."
-    },
-    {
-      "id": "appstate-delete-projection-mirror",
-      "source_struct": "AppState",
-      "fields": ["active_projection"],
-      "action": "delete",
-      "target_owner": "mirante4d-project-model",
-      "state_class": "durable",
-      "finalization_gate": "WP-07B",
-      "reason": "CameraView.projection is authoritative."
-    },
-    {
-      "id": "appstate-split-layer-aggregate",
-      "source_struct": "AppState",
-      "fields": ["layers"],
-      "action": "split",
-      "target_owner": "mirante4d-dataset+mirante4d-project-model",
-      "state_class": "immutable_and_durable",
-      "finalization_gate": "WP-07B",
-      "reason": "Catalog identity/name/shape/dtype move to dataset; display/render choices move to project-model. The aggregate is deleted."
-    },
-    {
-      "id": "appstate-channel-presets",
-      "source_struct": "AppState",
-      "fields": ["channel_presets"],
-      "action": "move",
-      "target_owner": "mirante4d-project-model",
-      "state_class": "durable",
-      "finalization_gate": "WP-07B",
-      "reason": "Project-scoped presets are durable and reference logical layer keys only."
-    },
-    {
-      "id": "appstate-split-layout",
-      "source_struct": "AppState",
-      "fields": ["viewer_layout"],
-      "action": "split",
-      "target_owner": "mirante4d-project-model+mirante4d-application+mirante4d-render-api",
-      "state_class": "durable_transient_runtime",
-      "finalization_gate": "WP-07B",
-      "reason": "Durable layout/cross-section view moves to project-model; active panel is transient application state; panel schedules/generations are runtime snapshots."
-    },
-    {
-      "id": "appstate-render-snapshot",
-      "source_struct": "AppState",
-      "fields": [
-        "presentation_viewport",
-        "render_viewport",
-        "render_backend",
-        "frame_fidelity",
-        "channel_fidelity",
-        "lod_schedule",
-        "lod_replan_pending",
-        "playback_lod_downshift_active",
-        "visible_brick_count",
-        "visible_brick_plan_stride",
-        "visible_brick_plan_error",
-        "diagnostics",
-        "diagnostics_f32"
-      ],
-      "action": "move",
-      "target_owner": "mirante4d-render-api",
-      "state_class": "runtime_snapshot_or_diagnostic",
-      "finalization_gate": "WP-09B",
-      "reason": "Expose immutable render intent/status snapshots; none is durable project state."
-    },
-    {
-      "id": "appstate-delete-physical-visible-brick-plan",
-      "source_struct": "AppState",
-      "fields": ["visible_bricks"],
-      "action": "delete",
-      "target_owner": "mirante4d-dataset-runtime+mirante4d-render-api",
-      "state_class": "runtime",
-      "finalization_gate": "WP-09B",
-      "reason": "Physical SpatialBrickIndex vectors cannot cross render-api; replace them with semantic requirements, leases, and coverage."
-    },
-    {
-      "id": "appstate-resource-policy",
-      "source_struct": "AppState",
-      "fields": ["renderer_gpu_brick_budget_bytes"],
-      "action": "move",
-      "target_owner": "mirante4d-settings",
-      "state_class": "settings",
-      "finalization_gate": "WP-07B",
-      "reason": "Validated settings own resource policy; runtime consumes reconfiguration intent."
-    },
-    {
-      "id": "appstate-dataset-runtime",
-      "source_struct": "AppState",
-      "fields": [
-        "brick_stream_scale_level",
-        "brick_stream_scale_shape",
-        "brick_stream_generation",
-        "brick_stream_requested",
-        "brick_stream_completed",
-        "brick_stream_cancelled",
-        "brick_stream_stale",
-        "brick_stream_failed",
-        "brick_stream_last_error",
-        "brick_stream_complete",
-        "brick_result_drain_limit",
-        "brick_result_drain_time_budget_ms",
-        "brick_result_drain_last_count",
-        "brick_result_drain_last_budget_limited",
-        "brick_result_drain_last_repaint_reason",
-        "brick_result_drain_budget_hit_count",
-        "brick_result_drain_total_drained",
-        "brick_prefetch_timepoints",
-        "brick_prefetch_requested",
-        "brick_prefetch_completed",
-        "brick_prefetch_cancelled",
-        "brick_prefetch_stale",
-        "brick_prefetch_failed",
-        "brick_prefetch_skipped",
-        "brick_prefetch_last_error",
-        "brick_warm_brick_count",
-        "brick_warm_requested",
-        "brick_warm_completed",
-        "brick_warm_cancelled",
-        "brick_warm_stale",
-        "brick_warm_failed",
-        "brick_warm_skipped",
-        "brick_warm_last_error",
-        "brick_stream_request_key",
-        "brick_prefetch_request_key",
-        "brick_warm_request_key"
-      ],
-      "action": "move",
-      "target_owner": "mirante4d-dataset-runtime",
-      "state_class": "runtime",
-      "finalization_gate": "WP-08B",
-      "reason": "One runtime owns scheduling, currentness, cancellation, bounded queues, and typed status snapshots."
-    },
-    {
-      "id": "appstate-delete-owned-dataset-payload-mirrors",
-      "source_struct": "AppState",
-      "fields": [
-        "resident_bricks_u8",
-        "resident_bricks_u8_by_layer",
-        "resident_bricks",
-        "resident_bricks_by_layer",
-        "resident_bricks_f32",
-        "resident_bricks_f32_by_layer",
-        "prefetched_brick_payloads",
-        "active_volume_u8",
-        "active_volume",
-        "active_volume_f32"
-      ],
-      "action": "delete",
-      "target_owner": "mirante4d-dataset-runtime",
-      "state_class": "runtime",
-      "finalization_gate": "WP-08B",
-      "reason": "Replace owning resident/prefetch mirrors with runtime-accounted immutable leases; dense active-volume product paths are forbidden."
-    },
-    {
-      "id": "appstate-delete-concrete-dataset-handle",
-      "source_struct": "AppState",
-      "fields": ["dataset"],
-      "action": "delete",
-      "target_owner": "mirante4d-dataset+mirante4d-dataset-runtime",
-      "state_class": "runtime",
-      "finalization_gate": "WP-08B",
-      "reason": "Replace the concrete DatasetHandle with the accepted catalog/source contract and a bounded current-source bridge."
-    },
-    {
-      "id": "appstate-split-cross-section-runtime",
-      "source_struct": "AppState",
-      "fields": ["cross_section_runtime"],
-      "action": "split",
-      "target_owner": "mirante4d-dataset-runtime+mirante4d-render-wgpu",
-      "state_class": "runtime",
-      "finalization_gate": "WP-09B",
-      "reason": "Dataset runtime owns demand/cache/leases and render-wgpu owns GPU residency; the mixed predecessor is deleted."
-    },
-    {
-      "id": "appstate-delete-interaction-clock",
-      "source_struct": "AppState",
-      "fields": ["cross_section_last_interaction_at"],
-      "action": "delete",
-      "target_owner": "mirante4d-application",
-      "state_class": "transient",
-      "finalization_gate": "WP-08B",
-      "reason": "Replace an absolute Instant with application-issued demand/currentness generations."
-    },
-    {
-      "id": "appstate-analysis-runtime",
-      "source_struct": "AppState",
-      "fields": [
-        "resident_histogram_generation",
-        "resident_histogram_samples",
-        "active_histogram_cache",
-        "active_intensity_summary"
-      ],
-      "action": "move",
-      "target_owner": "mirante4d-analysis-runtime",
-      "state_class": "runtime_or_derived_diagnostic",
-      "finalization_gate": "WP-12",
-      "reason": "Derived caches and summaries are runtime evidence, never durable project state."
-    },
-    {
-      "id": "appstate-delete-owned-frames",
-      "source_struct": "AppState",
-      "fields": ["frame", "frame_f32", "rendered_channels"],
-      "action": "delete",
-      "target_owner": "mirante4d-render-wgpu",
-      "state_class": "runtime",
-      "finalization_gate": "WP-09B",
-      "reason": "Render-wgpu retains presentation resources; application snapshots carry only opaque render-api tokens."
-    },
-    {
-      "id": "appstate-delete-inline-analysis-results",
-      "source_struct": "AppState",
-      "fields": ["analysis_tables", "analysis_plots"],
-      "action": "delete",
-      "target_owner": "mirante4d-analysis-core+mirante4d-project-model",
-      "state_class": "durable_reference_and_payload",
-      "finalization_gate": "WP-12",
-      "reason": "Analysis-core owns immutable payloads; ProjectState owns typed artifact references only."
-    },
-    {
-      "id": "appstate-delete-operation-aggregate",
-      "source_struct": "AppState",
-      "fields": ["analysis_operations"],
-      "action": "delete",
-      "target_owner": "mirante4d-application+mirante4d-analysis-core",
-      "state_class": "transient_operation_and_provenance",
-      "finalization_gate": "WP-12",
-      "reason": "Application owns live operations/tasks; immutable recipe and derivation provenance is attached to admitted artifacts."
-    },
-    {
-      "id": "appstate-split-scene-artifacts",
-      "source_struct": "AppState",
-      "fields": ["scene_artifacts"],
-      "action": "split",
-      "target_owner": "mirante4d-project-model+mirante4d-analysis-core+mirante4d-application",
-      "state_class": "durable_payload_and_history",
-      "finalization_gate": "WP-12",
-      "reason": "ProjectState owns immutable artifact references, analysis-core owns payloads, and application owns revision/history movement."
-    },
-    {
-      "id": "appstate-transient-selections",
-      "source_struct": "AppState",
-      "fields": [
-        "selected_channel_preset_index",
-        "selected_analysis_table_index",
-        "selected_analysis_plot_index",
-        "selected_analysis_plot_point"
-      ],
-      "action": "move",
-      "target_owner": "mirante4d-application",
-      "state_class": "transient",
-      "finalization_gate": "WP-07B",
-      "reason": "Selections become typed IDs and never positional indices."
-    },
-    {
-      "id": "appstate-delete-string-faults",
-      "source_struct": "AppState",
-      "fields": ["channel_preset_warnings", "last_render_error", "last_workflow_message"],
-      "action": "delete",
-      "target_owner": "mirante4d-application",
-      "state_class": "event_or_fault",
-      "finalization_gate": "WP-07B",
-      "reason": "Typed application events and fault envelopes replace mutable warning/error strings."
-    },
-    {
-      "id": "appstate-delete-export-payload",
-      "source_struct": "AppState",
-      "fields": ["last_analysis_export_csv"],
-      "action": "delete",
-      "target_owner": "mirante4d-analysis-runtime",
-      "state_class": "operation_outcome",
-      "finalization_gate": "WP-12",
-      "reason": "Export is an operation/artifact outcome, not application state."
-    },
-    {
-      "id": "appstate-ui-transient",
-      "source_struct": "AppState",
-      "fields": ["viewport_orbit_drag", "analysis_plot_view", "analysis_filter", "analysis_sort"],
-      "action": "move",
-      "target_owner": "mirante4d-ui-egui",
-      "state_class": "transient_ui",
-      "finalization_gate": "WP-09C",
-      "reason": "Widget interaction state is never durable or application authority."
-    },
-    {
-      "id": "appstate-split-viewer-tools",
-      "source_struct": "AppState",
-      "fields": ["viewer_tools"],
-      "action": "split",
-      "target_owner": "mirante4d-application+mirante4d-ui-egui",
-      "state_class": "transient",
-      "finalization_gate": "WP-09C",
-      "reason": "Application owns semantic tool/selection IDs; UI owns hover/drag/anchor interaction state."
-    },
-    {
-      "id": "appstate-transient-pick-readout",
-      "source_struct": "AppState",
-      "fields": ["hovered_pixel", "hovered_source_readout"],
-      "action": "move",
-      "target_owner": "mirante4d-application",
-      "state_class": "transient_snapshot",
-      "finalization_gate": "WP-09C",
-      "reason": "Typed pick/readout facts are transient application snapshot data."
-    },
-    {
-      "id": "appstate-delete-test-seam",
-      "source_struct": "AppState",
-      "fields": ["fixed_frame_time_ms_for_snapshots"],
-      "action": "delete",
-      "target_owner": "test-harness",
-      "state_class": "test_only",
-      "finalization_gate": "WP-07B",
-      "reason": "Deterministic timing belongs to a test/reference harness, not production state."
-    },
-    {
-      "id": "shell-delete-god-state",
-      "source_struct": "MiranteWorkbenchApp",
-      "fields": ["state"],
-      "action": "delete",
-      "target_owner": "mirante4d-application",
-      "state_class": "all_state_classes",
-      "finalization_gate": "WP-07B",
-      "reason": "The application reducer/snapshot boundary replaces the embedded AppState authority."
-    },
-    {
-      "id": "shell-project-location",
-      "source_struct": "MiranteWorkbenchApp",
-      "fields": ["current_project_path"],
-      "action": "delete",
-      "target_owner": "mirante4d-project-store+mirante4d-application",
-      "state_class": "runtime_location",
-      "finalization_gate": "WP-10B",
-      "reason": "The temporary private persistence bridge may retain the current location until project-store owns it."
-    },
-    {
-      "id": "shell-delete-clean-project-mirror",
-      "source_struct": "MiranteWorkbenchApp",
-      "fields": ["clean_project_snapshot"],
-      "action": "delete",
-      "target_owner": "mirante4d-application",
-      "state_class": "durable_mirror",
-      "finalization_gate": "WP-07B",
-      "reason": "Dirty state derives from application current and saved revision IDs; a cloned comparison snapshot is forbidden."
-    },
-    {
-      "id": "shell-ui-state",
-      "source_struct": "MiranteWorkbenchApp",
-      "fields": [
-        "close_prompt_open",
-        "allow_close_without_prompt",
-        "settings_runtime_draft",
-        "analysis_workspace_open"
-      ],
-      "action": "move",
-      "target_owner": "mirante4d-ui-egui",
-      "state_class": "transient_ui",
-      "finalization_gate": "WP-09C",
-      "reason": "Dialog and draft state is local widget state."
-    },
-    {
-      "id": "shell-settings",
-      "source_struct": "MiranteWorkbenchApp",
-      "fields": ["preferences", "preferences_path"],
-      "action": "move",
-      "target_owner": "mirante4d-settings",
-      "state_class": "settings",
-      "finalization_gate": "WP-07B",
-      "reason": "Settings owns validated preferences and its separate background persistence lifecycle."
-    },
-    {
-      "id": "shell-delete-settings-message",
-      "source_struct": "MiranteWorkbenchApp",
-      "fields": ["settings_message"],
-      "action": "delete",
-      "target_owner": "mirante4d-application",
-      "state_class": "event_or_fault",
-      "finalization_gate": "WP-07B",
-      "reason": "A typed application event replaces mutable text."
-    },
-    {
-      "id": "shell-delete-legacy-ui-texture",
-      "source_struct": "MiranteWorkbenchApp",
-      "fields": ["texture"],
-      "action": "delete",
-      "target_owner": "mirante4d-ui-egui",
-      "state_class": "transient_ui",
-      "finalization_gate": "WP-09B",
-      "reason": "Delete the legacy CPU texture/fallback route with every predecessor rendering path; the replacement UI presents only composition-registered opaque presentation tokens."
-    },
-    {
-      "id": "shell-render-backend-resources",
-      "source_struct": "MiranteWorkbenchApp",
-      "fields": ["gpu_display_frame", "gpu_renderer"],
-      "action": "move",
-      "target_owner": "mirante4d-render-wgpu",
-      "state_class": "runtime",
-      "finalization_gate": "WP-09B",
-      "reason": "Render-wgpu owns backend frames and GPU resources; application state receives opaque tokens only."
-    },
-    {
-      "id": "shell-render-status-snapshot",
-      "source_struct": "MiranteWorkbenchApp",
-      "fields": ["gpu_display_frame_identity", "last_display_refresh_timing"],
-      "action": "delete",
-      "target_owner": "mirante4d-render-api+mirante4d-application",
-      "state_class": "runtime_snapshot_or_diagnostic",
-      "finalization_gate": "WP-09B",
-      "reason": "Replace concrete renderer status mirrors with typed frame identity and timing snapshots."
-    },
-    {
-      "id": "shell-egui-presentation-bridge",
-      "source_struct": "MiranteWorkbenchApp",
-      "fields": [
-        "gpu_display_texture_id",
-        "retired_gpu_display_texture_ids",
-        "wgpu_texture_renderer"
-      ],
-      "action": "delete",
-      "target_owner": "mirante4d-app+mirante4d-ui-egui",
-      "state_class": "runtime_bridge",
-      "finalization_gate": "WP-09C",
-      "reason": "Egui and egui-wgpu types stay in the composition/UI bridge and are replaced by an opaque token registry; render-wgpu never imports them."
-    },
-    {
-      "id": "shell-split-cross-section-presentation-bridge",
-      "source_struct": "MiranteWorkbenchApp",
-      "fields": ["cross_section_gpu_display_frames"],
-      "action": "split",
-      "target_owner": "mirante4d-render-wgpu+mirante4d-app+mirante4d-ui-egui",
-      "state_class": "runtime_bridge",
-      "finalization_gate": "WP-09B",
-      "reason": "Delete the mixed aggregate with the predecessor renderer: render-wgpu takes backend resources and composition introduces a newly typed opaque bridge. Only that replacement bridge may remain until WP-09C, when UI texture IDs are isolated behind the token registry."
-    },
-    {
-      "id": "shell-dataset-runtime",
-      "source_struct": "MiranteWorkbenchApp",
-      "fields": [
-        "brick_read_pool",
-        "cross_section_read_pool",
-        "current_brick_tickets",
-        "prefetch_brick_tickets",
-        "warm_brick_tickets"
-      ],
-      "action": "move",
-      "target_owner": "mirante4d-dataset-runtime",
-      "state_class": "runtime",
-      "finalization_gate": "WP-08B",
-      "reason": "Dataset runtime owns workers, tickets, queues, cancellation, and leases."
-    },
-    {
-      "id": "shell-import-operations",
-      "source_struct": "MiranteWorkbenchApp",
-      "fields": [
-        "tiff_import_setup_task",
-        "tiff_import_setup_error",
-        "pending_tiff_import",
-        "import_task"
-      ],
-      "action": "move",
-      "target_owner": "mirante4d-import-pipeline+mirante4d-application",
-      "state_class": "runtime_operation",
-      "finalization_gate": "WP-10C",
-      "reason": "Import-pipeline executes typed work behind application-owned task/operation IDs."
-    },
-    {
-      "id": "shell-analysis-operation",
-      "source_struct": "MiranteWorkbenchApp",
-      "fields": ["analysis_task"],
-      "action": "move",
-      "target_owner": "mirante4d-analysis-runtime+mirante4d-application",
-      "state_class": "runtime_operation",
-      "finalization_gate": "WP-12",
-      "reason": "Analysis-runtime executes typed work behind the application operation registry."
-    },
-    {
-      "id": "shell-playback",
-      "source_struct": "MiranteWorkbenchApp",
-      "fields": ["playback"],
-      "action": "move",
-      "target_owner": "mirante4d-application",
-      "state_class": "transient",
-      "finalization_gate": "WP-07B",
-      "reason": "Playback-running state is transient application state and is not serialized."
-    },
-    {
-      "id": "shell-validation-harness",
-      "source_struct": "MiranteWorkbenchApp",
-      "fields": ["product_automation", "test_render_viewport_max_side"],
-      "action": "move",
-      "target_owner": "validation-harness",
-      "state_class": "test_or_validation_only",
-      "finalization_gate": "WP-14",
-      "reason": "Product automation and deterministic test limits are validation harness state, not product authority."
-    }
-  ],
-  "nested_aggregate_deletions": [
-    {
-      "type": "AppLayerSummary",
-      "split": {
-        "mirante4d-dataset": ["id", "name", "shape", "dtype"],
-        "mirante4d-project-model": ["display", "color", "curve", "invert", "render_state"]
-      },
-      "delete_duplicates": ["dvr_opacity_transfer", "preset"]
-    },
-    {
-      "type": "ViewerLayoutState",
-      "split": {
-        "mirante4d-project-model": ["layout", "cross_section"],
-        "mirante4d-application": ["active_cross_section_panel"],
-        "mirante4d-render-api": ["panel_viewports", "schedules", "generations"]
-      }
-    },
-    {
-      "type": "ViewerToolState",
-      "split": {
-        "mirante4d-application": ["active_tool", "selection", "crosshair"],
-        "mirante4d-ui-egui": ["hover", "pending_anchors", "active_drag"]
-      }
-    },
-    {
-      "type": "SceneArtifactStore",
-      "split": {
-        "mirante4d-project-model": ["immutable_artifact_references"],
-        "mirante4d-analysis-core": ["artifact_payloads"],
-        "mirante4d-application": ["revision_history"]
-      },
-      "delete_duplicates": ["revision", "undo_stack", "redo_stack"]
-    }
-  ],
-  "project_v14_source": {
-    "path": "crates/mirante4d-app/src/project_session.rs",
-    "struct": "AppSession",
-    "expected_fields": 13
-  },
-  "project_v14_dto_dispositions": [
-    {"field": "format", "action": "delete", "target_owner": "mirante4d-project-store", "reason": "Encoding discriminator is a store DTO fact."},
-    {"field": "dataset", "action": "replace", "target_owner": "mirante4d-project-model", "reason": "Use a verified typed DatasetReference; path is only a locator hint."},
-    {"field": "active_layer_id", "action": "move", "target_owner": "mirante4d-project-model", "reason": "Use LogicalLayerKey."},
-    {"field": "layer_display_states", "action": "replace", "target_owner": "mirante4d-project-model", "reason": "Use one LayerViewState collection keyed by LogicalLayerKey."},
-    {"field": "channel_presets", "action": "move", "target_owner": "mirante4d-project-model", "reason": "Remove layer-name mirrors and duplicate DVR opacity."},
-    {"field": "active_timepoint", "action": "move", "target_owner": "mirante4d-project-model", "reason": "Durable ViewState."},
-    {"field": "iso_light_state", "action": "move", "target_owner": "mirante4d-project-model", "reason": "Durable ViewState."},
-    {"field": "camera", "action": "move", "target_owner": "mirante4d-project-model", "reason": "Durable ViewState."},
-    {"field": "viewer_layout", "action": "replace", "target_owner": "mirante4d-project-model", "reason": "Validated framework-neutral layout and cross-section values only."},
-    {"field": "scene_artifacts", "action": "replace", "target_owner": "mirante4d-project-model", "reason": "Immutable artifact references only; payload/history authorities are separate."},
-    {"field": "analysis_tables", "action": "replace", "target_owner": "mirante4d-project-model", "reason": "Immutable artifact references only."},
-    {"field": "analysis_plots", "action": "replace", "target_owner": "mirante4d-project-model", "reason": "Immutable artifact references only."},
-    {"field": "analysis_operations", "action": "delete", "target_owner": "mirante4d-application+mirante4d-analysis-core", "reason": "Live task state is transient; admitted artifact references carry recipe/derivation provenance."}
+  "invariants": [
+    "No exact field count is an architecture contract.",
+    "The application owns bounded payload-free request correlation, not decoded pixels.",
+    "Only DatasetRequestDispatcher polls DatasetRuntime in product application code.",
+    "CurrentDatasetSource is the sole current-storage source bridge.",
+    "CurrentLeaseBridge is the sole current-renderer lease bridge.",
+    "Analysis execution remains unavailable until WP-12."
   ]
 }

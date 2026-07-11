@@ -6,10 +6,9 @@ use std::{
 
 use eframe::egui;
 use mirante4d_application::{ApplicationSnapshot, OperationToken, WorkspaceSnapshot};
-use mirante4d_domain::IntensityDType;
-use mirante4d_format::{
-    ExistingPackagePolicy, NoDataPolicy, NoDataPolicyKind, NoDataVisibilityPolicy,
-};
+use mirante4d_dataset::ResourceValidity;
+use mirante4d_domain::{IntensityDType, ScaleLevel};
+use mirante4d_format::ExistingPackagePolicy;
 use mirante4d_import::{
     ImportCancellationToken, ImportError, ImportProgressEvent, TiffDirectoryImportReport,
     TiffDirectoryInspection, TiffImportSource, TiffImportStorageEstimate, TiffNoDataPolicyReview,
@@ -20,10 +19,7 @@ use mirante4d_import::{
     inspect_tiff_source_with_grouping,
 };
 
-use crate::{
-    current_runtime::dataset::CurrentDatasetRuntime,
-    ui_kit::{self, StatusTone},
-};
+use crate::ui_kit::{self, StatusTone};
 
 pub(crate) struct TiffImportSetupTask {
     pub(crate) source: TiffImportSource,
@@ -321,45 +317,18 @@ pub(crate) fn show_tiff_no_data_controls(ui: &mut egui::Ui, pending: &mut Pendin
     }
 }
 
-pub(crate) fn active_layer_no_data_policy_label(
-    snapshot: &ApplicationSnapshot,
-    dataset: &CurrentDatasetRuntime,
-) -> Option<String> {
+pub(crate) fn active_layer_no_data_policy_label(snapshot: &ApplicationSnapshot) -> Option<String> {
     let active_layer = match snapshot.workspace() {
         WorkspaceSnapshot::Unbound { workspace } => workspace.view().active_layer(),
         WorkspaceSnapshot::Bound { project, .. } => project.view().active_layer(),
     };
-    dataset
-        .dataset
-        .manifest()
-        .layers
-        .get(active_layer.ordinal() as usize)
-        .and_then(|layer| layer.no_data_policy.as_ref())
-        .map(no_data_policy_label)
-}
-
-pub(crate) fn no_data_policy_label(policy: &NoDataPolicy) -> String {
-    let value = if policy.source_value.fract() == 0.0 {
-        format!("{:.0}", policy.source_value)
-    } else {
-        policy.source_value.to_string()
-    };
-    match (policy.kind, policy.visibility_policy) {
-        (
-            NoDataPolicyKind::SentinelValue,
-            NoDataVisibilityPolicy::InvisibleWith1VoxelInvalidDilation,
-        ) => format!(
-            "value {value} ({}), dilated 1 voxel",
-            no_data_dtype_label(policy.source_dtype)
-        ),
-    }
-}
-
-fn no_data_dtype_label(dtype: IntensityDType) -> &'static str {
-    match dtype {
-        IntensityDType::Uint8 => "uint8",
-        IntensityDType::Uint16 => "uint16",
-        IntensityDType::Float32 => "float32",
+    match snapshot
+        .catalog()
+        .layer(active_layer)
+        .and_then(|layer| layer.validity(ScaleLevel::BASE))
+    {
+        Some(ResourceValidity::BitMask) => Some("explicit per-sample validity mask".to_owned()),
+        Some(ResourceValidity::AllValid) | None => None,
     }
 }
 

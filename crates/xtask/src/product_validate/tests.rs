@@ -1,6 +1,34 @@
 use super::*;
 use mirante4d_format::{FixtureKind, write_fixture};
 
+fn assert_dataset_runtime_limits(script: &Value, total_bytes: u64, resident_resources: u64) {
+    assert_eq!(script["schema_version"], PRODUCT_AUTOMATION_SCHEMA_VERSION);
+    assert_eq!(script["limits"]["max_cpu_total_bytes"], total_bytes);
+    assert_eq!(
+        script["limits"]["max_cpu_decoded_residency_bytes"],
+        total_bytes / 2
+    );
+    assert_eq!(script["limits"]["max_runtime_queued_requests"], 1_024);
+    assert_eq!(script["limits"]["max_runtime_in_flight_decodes"], 8);
+    assert_eq!(script["limits"]["max_runtime_pending_completions"], 1_024);
+    assert_eq!(
+        script["limits"]["max_runtime_resident_resources"],
+        resident_resources
+    );
+}
+
+fn active_lease_cohort_assertions(commands: &[Value]) -> usize {
+    commands
+        .iter()
+        .filter(|command| {
+            command["condition"]["active_lease_cohort"]["min_required"] == 1
+                && command["condition"]["active_lease_cohort"]["min_retained"] == 1
+                && command["condition"]["active_lease_cohort"]["max_missing"] == 0
+                && command["condition"]["active_lease_cohort"]["complete"] == true
+        })
+        .count()
+}
+
 #[test]
 fn generated_fixture_product_automation_script_uses_semantic_commands() {
     let script = generated_fixture_camera_smoke_script(Path::new("/tmp/demo.m4d"));
@@ -8,12 +36,7 @@ fn generated_fixture_product_automation_script_uses_semantic_commands() {
 
     assert_eq!(script["schema"], PRODUCT_AUTOMATION_SCRIPT_SCHEMA);
     assert_eq!(script["scenario"], GENERATED_FIXTURE_SCENARIO);
-    assert_eq!(script["limits"]["max_decoded_bytes"], 8 * MIB);
-    assert_eq!(
-        script["limits"]["max_gpu_brick_atlas_uploaded_bytes"],
-        64 * MIB
-    );
-    assert_eq!(script["limits"]["max_gpu_brick_atlas_resident_bytes"], GIB);
+    assert_dataset_runtime_limits(&script, 128 * MIB, 128);
     assert!(
         commands
             .iter()
@@ -48,12 +71,7 @@ fn generated_fixture_render_modes_script_switches_supported_modes() {
 
     assert_eq!(script["schema"], PRODUCT_AUTOMATION_SCRIPT_SCHEMA);
     assert_eq!(script["scenario"], GENERATED_RENDER_MODES_SCENARIO);
-    assert_eq!(script["limits"]["max_decoded_bytes"], 12 * MIB);
-    assert_eq!(
-        script["limits"]["max_gpu_brick_atlas_uploaded_bytes"],
-        96 * MIB
-    );
-    assert_eq!(script["limits"]["max_gpu_brick_atlas_resident_bytes"], GIB);
+    assert_dataset_runtime_limits(&script, 128 * MIB, 192);
     assert_eq!(
         script_requested_window_inner_size_points_json(&script)["width"],
         GENERATED_VIEWPORT_WIDTH
@@ -162,8 +180,7 @@ fn t5_qual_001_interaction_mip_script_records_bounded_mip_camera_sequence() {
         .collect();
 
     assert_eq!(script["scenario"], T5_QUAL_001_INTERACTION_MIP_SCENARIO);
-    assert_eq!(script["limits"]["max_decoded_bytes"], GIB);
-    assert_eq!(script["limits"]["max_gpu_brick_atlas_uploaded_bytes"], GIB);
+    assert_dataset_runtime_limits(&script, 4 * GIB, 4_096);
     assert_eq!(
         script_requested_window_inner_size_points_json(&script)["width"],
         T5_QUAL_001_VIEWPORT_WIDTH
@@ -216,11 +233,7 @@ fn t5_qual_001_interaction_render_modes_script_records_bounded_mode_sequence() {
         script["scenario"],
         T5_QUAL_001_INTERACTION_RENDER_MODES_SCENARIO
     );
-    assert_eq!(script["limits"]["max_decoded_bytes"], 2 * GIB);
-    assert_eq!(
-        script["limits"]["max_gpu_brick_atlas_uploaded_bytes"],
-        2 * GIB
-    );
+    assert_dataset_runtime_limits(&script, 6 * GIB, 8_192);
     assert_eq!(
         script_requested_window_inner_size_points_json(&script)["width"],
         T5_QUAL_001_VIEWPORT_WIDTH
@@ -297,11 +310,7 @@ fn t5_qual_001_four_panel_cross_section_script_records_layout_and_2d_interaction
         script["scenario"],
         T5_QUAL_001_FOUR_PANEL_CROSS_SECTION_SCENARIO
     );
-    assert_eq!(script["limits"]["max_decoded_bytes"], 2 * GIB);
-    assert_eq!(
-        script["limits"]["max_gpu_brick_atlas_uploaded_bytes"],
-        2 * GIB
-    );
+    assert_dataset_runtime_limits(&script, 6 * GIB, 8_192);
     assert_eq!(
         script_requested_window_inner_size_points_json(&script)["width"],
         T5_QUAL_001_VIEWPORT_WIDTH
@@ -329,45 +338,22 @@ fn t5_qual_001_four_panel_cross_section_script_records_layout_and_2d_interaction
     ] {
         assert!(command_names.contains(&expected), "missing {expected}");
     }
-    let xz_stream_assert = commands
-        .iter()
-        .find(|command| command["condition"]["cross_section_stream"]["panel"] == "xz")
-        .expect("missing xz stream assertion");
-    assert_eq!(
-        xz_stream_assert["condition"]["cross_section_stream"]["priority"],
-        "current_frame"
-    );
-    assert_eq!(
-        xz_stream_assert["condition"]["cross_section_stream"]["min_requested"],
-        1
-    );
-    assert_eq!(
-        xz_stream_assert["condition"]["cross_section_stream"]["min_completed"],
-        1
-    );
-    assert_eq!(
-        xz_stream_assert["condition"]["cross_section_stream"]["min_visible_chunks"],
-        1
-    );
-    assert!(xz_stream_assert["condition"]["cross_section_stream"]["min_selected_bricks"].is_null());
-    assert!(
-        xz_stream_assert["condition"]["cross_section_stream"]["min_queued_current_frame"].is_null()
-    );
-    for panel in ["xy", "yz"] {
-        let stream_assert = commands
+    for panel in ["xy", "xz", "yz"] {
+        let schedule_assert = commands
             .iter()
-            .find(|command| command["condition"]["cross_section_stream"]["panel"] == panel)
-            .unwrap_or_else(|| panic!("missing {panel} stream assertion"));
-        assert!(stream_assert["condition"]["cross_section_stream"]["priority"].is_null());
+            .find(|command| {
+                command["condition"]["cross_section_panel_schedule"]["panel"] == panel
+                    && command["condition"]["cross_section_panel_schedule"]
+                        ["min_selected_resources"]
+                        == 1
+            })
+            .unwrap_or_else(|| panic!("missing {panel} panel schedule assertion"));
         assert_eq!(
-            stream_assert["condition"]["cross_section_stream"]["active_panel_at_submission"],
-            "xz"
-        );
-        assert_eq!(
-            stream_assert["condition"]["cross_section_stream"]["min_completed"],
+            schedule_assert["condition"]["cross_section_panel_schedule"]["min_selected_resources"],
             1
         );
     }
+    assert_eq!(active_lease_cohort_assertions(commands), 1);
     let panel_distinct_assert_count = commands
         .iter()
         .filter(|command| {
@@ -416,7 +402,7 @@ fn t5_qual_001_four_panel_fine_scale_script_records_zoomed_s0_gate() {
         script["scenario"],
         T5_QUAL_001_FOUR_PANEL_FINE_SCALE_SCENARIO
     );
-    assert_eq!(script["limits"]["max_decoded_bytes"], 2 * GIB);
+    assert_dataset_runtime_limits(&script, 6 * GIB, 8_192);
     assert_eq!(
         script_requested_window_inner_size_points_json(&script)["width"],
         T5_QUAL_001_VIEWPORT_WIDTH
@@ -455,19 +441,8 @@ fn t5_qual_001_four_panel_fine_scale_script_records_zoomed_s0_gate() {
             schedule_assert["condition"]["cross_section_panel_schedule"]["display_current"],
             true
         );
-        let stream_assert = commands
-            .iter()
-            .find(|command| {
-                command["condition"]["cross_section_stream"]["panel"] == panel
-                    && command["condition"]["cross_section_stream"]["min_visible_chunks"] == 1
-                    && command["condition"]["cross_section_stream"]["max_failed"] == 0
-            })
-            .unwrap_or_else(|| panic!("missing fine-scale stream assertion for {panel}"));
-        assert_eq!(
-            stream_assert["condition"]["cross_section_stream"]["timepoint"],
-            0
-        );
     }
+    assert_eq!(active_lease_cohort_assertions(commands), 1);
     assert!(
         commands
             .iter()
@@ -496,11 +471,7 @@ fn t5_qual_001_four_panel_continuous_cross_section_script_records_nonblank_stres
         script["scenario"],
         T5_QUAL_001_FOUR_PANEL_CONTINUOUS_CROSS_SECTION_SCENARIO
     );
-    assert_eq!(script["limits"]["max_decoded_bytes"], 2 * GIB);
-    assert_eq!(
-        script["limits"]["max_gpu_brick_atlas_uploaded_bytes"],
-        2 * GIB
-    );
+    assert_dataset_runtime_limits(&script, 6 * GIB, 8_192);
     assert_eq!(
         script_requested_window_inner_size_points_json(&script)["width"],
         T5_QUAL_001_VIEWPORT_WIDTH
@@ -558,7 +529,7 @@ fn t5_qual_001_four_panel_continuous_cross_section_script_records_nonblank_stres
             .find(|command| {
                 command["condition"]["cross_section_panel_schedule"]["panel"] == panel
                     && command["condition"]["cross_section_panel_schedule"]
-                        ["max_missing_occupied_bricks"]
+                        ["max_missing_occupied_resources"]
                         == 0
                     && command["condition"]["cross_section_panel_schedule"]["display_current"]
                         == true
@@ -569,12 +540,8 @@ fn t5_qual_001_four_panel_continuous_cross_section_script_records_nonblank_stres
                 .as_u64()
                 .is_some_and(|value| value >= 4)
         );
-        assert!(commands.iter().any(|command| {
-            command["condition"]["cross_section_stream"]["panel"] == panel
-                && command["condition"]["cross_section_stream"]["min_visible_chunks"] == 1
-                && command["condition"]["cross_section_stream"]["max_failed"] == 0
-        }));
     }
+    assert!(active_lease_cohort_assertions(commands) >= 1);
     assert!(
         commands
             .iter()
@@ -602,11 +569,7 @@ fn t5_qual_002_four_panel_timepoint_script_records_2d_timepoint_updates() {
         script["scenario"],
         T5_QUAL_002_FOUR_PANEL_TIMEPOINT_SCENARIO
     );
-    assert_eq!(script["limits"]["max_decoded_bytes"], 2 * GIB);
-    assert_eq!(
-        script["limits"]["max_gpu_brick_atlas_uploaded_bytes"],
-        2 * GIB
-    );
+    assert_dataset_runtime_limits(&script, 6 * GIB, 8_192);
     assert_eq!(
         script_requested_window_inner_size_points_json(&script)["width"],
         T5_QUAL_002_VIEWPORT_WIDTH
@@ -646,19 +609,8 @@ fn t5_qual_002_four_panel_timepoint_script_records_2d_timepoint_updates() {
             }),
             "missing active timepoint assertion for {timepoint}"
         );
-        let stream_assert_count = commands
-            .iter()
-            .filter(|command| {
-                command["condition"]["cross_section_stream"]["timepoint"].as_u64()
-                    == Some(timepoint)
-                    && command["condition"]["cross_section_stream"]["min_visible_chunks"].as_u64()
-                        == Some(1)
-                    && command["condition"]["cross_section_stream"]["max_failed"].as_u64()
-                        == Some(0)
-            })
-            .count();
-        assert_eq!(stream_assert_count, 3);
     }
+    assert_eq!(active_lease_cohort_assertions(commands), 3);
     assert_eq!(
         commands
             .iter()
@@ -666,7 +618,7 @@ fn t5_qual_002_four_panel_timepoint_script_records_2d_timepoint_updates() {
                 command["condition"]["cross_section_panel_schedule"]["display_current"].as_bool()
                     == Some(true)
                     && command["condition"]["cross_section_panel_schedule"]
-                        ["max_missing_occupied_bricks"]
+                        ["max_missing_occupied_resources"]
                         .as_u64()
                         == Some(0)
             })
@@ -697,11 +649,7 @@ fn t5_qual_002_four_panel_autoplay_script_records_2d_playback_updates() {
         .collect();
 
     assert_eq!(script["scenario"], T5_QUAL_002_FOUR_PANEL_AUTOPLAY_SCENARIO);
-    assert_eq!(script["limits"]["max_decoded_bytes"], 2 * GIB);
-    assert_eq!(
-        script["limits"]["max_gpu_brick_atlas_uploaded_bytes"],
-        2 * GIB
-    );
+    assert_dataset_runtime_limits(&script, 6 * GIB, 8_192);
     assert_eq!(
         script_requested_window_inner_size_points_json(&script)["width"],
         T5_QUAL_002_VIEWPORT_WIDTH
@@ -754,18 +702,7 @@ fn t5_qual_002_four_panel_autoplay_script_records_2d_playback_updates() {
     assert!(commands.iter().any(|command| {
         command["condition"]["observed_timepoints"]["min_distinct"].as_u64() == Some(2)
     }));
-    assert!(commands.iter().any(|command| {
-        command["condition"]["cross_section_streams_match_active_timepoint"]["min_completed"]
-            .as_u64()
-            == Some(1)
-            && command["condition"]["cross_section_streams_match_active_timepoint"]
-                ["min_visible_chunks"]
-                .as_u64()
-                == Some(1)
-            && command["condition"]["cross_section_streams_match_active_timepoint"]["max_failed"]
-                .as_u64()
-                == Some(0)
-    }));
+    assert!(active_lease_cohort_assertions(commands) >= 2);
     for panel in ["xy", "xz", "yz"] {
         assert!(commands.iter().any(|command| {
             command["condition"]["cross_section_panel_nonblank"]["panel"] == panel
@@ -801,11 +738,7 @@ fn t5_qual_001_interaction_continuous_script_records_paced_mode_sequences() {
         script["scenario"],
         T5_QUAL_001_INTERACTION_CONTINUOUS_SCENARIO
     );
-    assert_eq!(script["limits"]["max_decoded_bytes"], 2 * GIB);
-    assert_eq!(
-        script["limits"]["max_gpu_brick_atlas_uploaded_bytes"],
-        2 * GIB
-    );
+    assert_dataset_runtime_limits(&script, 6 * GIB, 8_192);
     assert_eq!(
         script_requested_window_inner_size_points_json(&script)["width"],
         T5_QUAL_001_VIEWPORT_WIDTH
@@ -1038,6 +971,22 @@ fn custom_product_automation_script_validation_rejects_wrong_schema() {
         .to_string();
 
     assert!(err.contains(PRODUCT_AUTOMATION_SCRIPT_SCHEMA));
+
+    let old_version = json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": 1,
+        "scenario": "unit",
+        "commands": [
+            { "command": "open_dataset", "path": "/tmp/demo.m4d" },
+            { "command": "quit" }
+        ]
+    });
+    assert!(
+        validate_product_automation_script(&old_version)
+            .unwrap_err()
+            .to_string()
+            .contains("schema_version must be 2")
+    );
 }
 
 #[test]
@@ -1092,7 +1041,7 @@ fn custom_product_automation_script_validation_rejects_bad_limits() {
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": "unit",
         "limits": {
-            "max_decoded_bytes": "lots"
+            "max_cpu_total_bytes": "lots"
         },
         "commands": [
             { "command": "open_dataset", "path": "/tmp/demo.m4d" },
@@ -1230,7 +1179,7 @@ fn completed_product_validation_fails_without_viewport_capture() {
         failure_reason
             .as_deref()
             .unwrap()
-            .contains("missing a nonblank viewport_capture artifact")
+            .contains("missing a nonblank GPU viewport_capture artifact")
     );
 }
 
@@ -1240,6 +1189,7 @@ fn completed_product_validation_fails_with_blank_viewport_capture() {
         "status": "passed",
         "artifacts": [{
             "kind": "viewport_capture",
+            "capture_source": "gpu_display_frame_readback",
             "path": "blank.ppm",
             "width": 2,
             "height": 2,
@@ -1264,6 +1214,7 @@ fn completed_product_validation_passes_with_nonblank_viewport_capture() {
         "status": "passed",
         "artifacts": [{
             "kind": "viewport_capture",
+            "capture_source": "gpu_display_frame_readback",
             "path": "nonblank.ppm",
             "width": 2,
             "height": 2,
@@ -1280,6 +1231,31 @@ fn completed_product_validation_passes_with_nonblank_viewport_capture() {
 
     assert_eq!(status, ProductValidationStatus::Passed);
     assert_eq!(failure_reason, None);
+}
+
+#[test]
+fn completed_product_validation_rejects_nonblank_loading_reference_capture() {
+    let automation_report = json!({
+        "status": "passed",
+        "artifacts": [{
+            "kind": "viewport_capture",
+            "capture_source": "loading_reference_color_image",
+            "path": "loading.ppm",
+            "width": 2,
+            "height": 2,
+            "pixel_stats": {
+                "pixel_count": 4,
+                "nonzero_rgb_pixels": 1,
+                "max_rgb": 255
+            }
+        }]
+    });
+
+    let (status, failure_reason) =
+        completed_product_validation_outcome(true, Some("passed"), None, Some(&automation_report));
+
+    assert_eq!(status, ProductValidationStatus::Failed);
+    assert!(failure_reason.unwrap().contains("GPU viewport_capture"));
 }
 
 #[test]
@@ -1311,7 +1287,7 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
                 "path": "target/mirante4d/product-validation/artifacts/post-camera-sequence.ppm",
                 "width": 16,
                 "height": 16,
-                "capture_source": "resident_brick_cpu_snapshot",
+                "capture_source": "gpu_display_frame_readback",
                 "pixel_stats": {
                     "pixel_count": 256,
                     "nonzero_rgb_pixels": 32,
@@ -1388,21 +1364,48 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
                 "status": "unsupported_by_current_eframe_wgpu_integration"
             }
         },
+        "diagnostics": [
+            {
+                "dataset_runtime": {
+                    "capacity": {
+                        "total_cpu_bytes": 134217728,
+                        "worker_limit": 8,
+                        "request_queue_limit": 1024,
+                        "completion_queue_limit": 1024
+                    },
+                    "used": { "total_cpu_bytes": 4096 },
+                    "work": {
+                        "queued_requests": 0,
+                        "in_flight_decodes": 0,
+                        "pending_completions": 0,
+                        "resident_resources": 3
+                    }
+                },
+                "lease_bridge": {
+                    "required": 3,
+                    "retained": 3,
+                    "missing": 0,
+                    "complete": true
+                }
+            }
+        ],
         "events": [
             {
                 "command": "assert",
                 "details": {
                     "condition": "cross_section_panel_schedule",
                     "cross_section_snapshot": {
-                        "schema": "mirante4d-cross-section-runtime-diagnostics",
+                        "schema": "mirante4d-cross-section-panel-diagnostics",
                         "schema_version": 1,
                         "layout": "FourPanel",
-                        "old_path_fallback_used": false,
-                        "runtime": {
-                            "visible_work": true,
-                            "state_counts": {"cpu_resident": 3},
-                            "cpu_resident_bytes": 4096
-                        }
+                        "demand_scopes": {"xy": 1, "xz": 1, "yz": 1},
+                        "active_lease_cohort": {
+                            "required": 3,
+                            "retained": 3,
+                            "missing": 0,
+                            "complete": true
+                        },
+                        "panels": []
                     }
                 }
             },
@@ -1411,30 +1414,55 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
                 "details": {
                     "condition": "cross_section_retired",
                     "cross_section_snapshot": {
-                        "schema": "mirante4d-cross-section-runtime-diagnostics",
+                        "schema": "mirante4d-cross-section-panel-diagnostics",
                         "schema_version": 1,
                         "layout": "Single3d",
-                        "old_path_fallback_used": false,
-                        "runtime": {
-                            "visible_work": false,
-                            "state_counts": {"cpu_resident": 3},
-                            "cpu_resident_bytes": 4096
-                        }
+                        "demand_scopes": {"xy": 0, "xz": 0, "yz": 0},
+                        "active_lease_cohort": {
+                            "required": 3,
+                            "retained": 3,
+                            "missing": 0,
+                            "complete": true
+                        },
+                        "panels": []
                     }
                 }
             }
         ],
         "final_diagnostics": {
+            "dataset_runtime": {
+                "capacity": {
+                    "total_cpu_bytes": 134217728,
+                    "worker_limit": 8,
+                    "request_queue_limit": 1024,
+                    "completion_queue_limit": 1024
+                },
+                "used": { "total_cpu_bytes": 4096 },
+                "work": {
+                    "queued_requests": 0,
+                    "in_flight_decodes": 0,
+                    "pending_completions": 0,
+                    "resident_resources": 3
+                }
+            },
+            "lease_bridge": {
+                "required": 3,
+                "retained": 3,
+                "missing": 0,
+                "complete": true
+            },
             "cross_section": {
-                "schema": "mirante4d-cross-section-runtime-diagnostics",
+                "schema": "mirante4d-cross-section-panel-diagnostics",
                 "schema_version": 1,
                 "layout": "Single3d",
-                "old_path_fallback_used": false,
-                "runtime": {
-                    "visible_work": false,
-                    "state_counts": {"cpu_resident": 3},
-                    "cpu_resident_bytes": 4096
-                }
+                "demand_scopes": {"xy": 0, "xz": 0, "yz": 0},
+                "active_lease_cohort": {
+                    "required": 3,
+                    "retained": 3,
+                    "missing": 0,
+                    "complete": true
+                },
+                "panels": []
             },
             "gpu_adapter": {
                 "name": "unit adapter",
@@ -1561,32 +1589,34 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
         "missing_samples"
     );
     assert_eq!(
-        report["metrics"]["cross_section_runtime"]["kind"],
-        "cross_section_runtime_metrics"
+        report["metrics"]["dataset_runtime"]["kind"],
+        "dataset_runtime_metrics"
+    );
+    assert_eq!(report["metrics"]["dataset_runtime"]["snapshot_count"], 1);
+    assert_eq!(
+        report["metrics"]["dataset_runtime"]["final"]["capacity"]["worker_limit"],
+        8
     );
     assert_eq!(
-        report["metrics"]["cross_section_runtime"]["snapshot_count"],
+        report["metrics"]["lease_bridge"]["kind"],
+        "lease_bridge_metrics"
+    );
+    assert_eq!(report["metrics"]["lease_bridge"]["final"]["missing"], 0);
+    assert_eq!(
+        report["metrics"]["cross_section_panels"]["kind"],
+        "cross_section_panel_metrics"
+    );
+    assert_eq!(
+        report["metrics"]["cross_section_panels"]["snapshot_count"],
         2
     );
     assert_eq!(
-        report["metrics"]["cross_section_runtime"]["final"]["layout"],
+        report["metrics"]["cross_section_panels"]["final"]["layout"],
         "Single3d"
     );
     assert_eq!(
-        report["metrics"]["cross_section_runtime"]["latest_assertion"]["layout"],
+        report["metrics"]["cross_section_panels"]["latest_assertion"]["layout"],
         "Single3d"
-    );
-    assert_eq!(
-        report["metrics"]["cross_section_runtime"]["latest_visible_work_assertion"]["layout"],
-        "FourPanel"
-    );
-    assert_eq!(
-        report["metrics"]["cross_section_runtime"]["latest_visible_work_assertion"]["old_path_fallback_used"],
-        false
-    );
-    assert_eq!(
-        report["metrics"]["cross_section_runtime"]["latest_visible_work_assertion"]["runtime"]["cpu_resident_bytes"],
-        4096
     );
     assert_eq!(report["gpu_adapter"]["name"], "unit adapter");
     assert_eq!(report["gpu_timestamp_timing"]["status"], "enabled");
@@ -1643,20 +1673,19 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
     );
     assert_eq!(report["scenario"]["render_modes"], json!(["mip"]));
     assert_eq!(report["limits"]["heavy_local_evidence"], false);
-    assert_eq!(report["limits"]["decoded_byte_limit_enforced"], true);
-    assert_eq!(report["limits"]["gpu_upload_byte_limit_enforced"], true);
-    assert_eq!(report["limits"]["gpu_resident_byte_limit_enforced"], true);
+    assert_eq!(report["limits"]["cpu_byte_limit_enforced"], true);
+    assert_eq!(report["limits"]["runtime_work_limit_enforced"], true);
     assert_eq!(
-        report["limits"]["decoded_byte_limit_bytes"],
-        script["limits"]["max_decoded_bytes"]
+        report["limits"]["cpu_total_byte_limit_bytes"],
+        script["limits"]["max_cpu_total_bytes"]
     );
     assert_eq!(
-        report["limits"]["gpu_upload_byte_limit_bytes"],
-        script["limits"]["max_gpu_brick_atlas_uploaded_bytes"]
+        report["limits"]["cpu_category_byte_limits"]["decoded_residency"],
+        script["limits"]["max_cpu_decoded_residency_bytes"]
     );
     assert_eq!(
-        report["limits"]["gpu_resident_byte_limit_bytes"],
-        script["limits"]["max_gpu_brick_atlas_resident_bytes"]
+        report["limits"]["runtime_work_limits"]["queued_requests"],
+        script["limits"]["max_runtime_queued_requests"]
     );
 
     let custom_script_report = wrapper_report_json(WrapperReport {

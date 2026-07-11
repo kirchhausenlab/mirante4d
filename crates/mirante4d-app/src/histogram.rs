@@ -1,698 +1,234 @@
-use anyhow::Context;
-use mirante4d_data::{SpatialBrickIndex, VolumeBrickF32, VolumeBrickU8, VolumeBrickU16};
-use mirante4d_domain::{DisplayWindow, DvrOpacityTransfer, IntensityDType, Shape3D, TransferCurve};
-use mirante4d_format::LayerId;
-
-use crate::{
-    HistogramStatus, LayerHistogramSummary,
-    current_runtime::{analysis::CurrentAnalysisRuntime, dataset::CurrentDatasetRuntime},
-    state::{LayerHistogramCache, LayerHistogramCacheKey, ResidentHistogramSampleKey},
+use mirante4d_dataset::{DatasetResourceIdentity, DatasetResourceKey, ResourcePayloadView};
+use mirante4d_domain::{
+    DisplayWindow, DvrOpacityTransfer, IntensityDType, LogicalLayerKey, ScaleLevel, TimeIndex,
+    TransferCurve,
 };
+use mirante4d_renderer::CurrentLeaseBridge;
+
+use crate::{HistogramStatus, LayerHistogramSummary};
 
 const HISTOGRAM_BIN_COUNT: usize = 32;
-const RESIDENT_HISTOGRAM_SAMPLE_LIMIT: usize = 1_000_000;
-const DATA_ENGINE_HISTOGRAM_BRICK_READ_LIMIT: usize = 16;
-const DATA_ENGINE_HISTOGRAM_MAX_DECODE_BYTES: u64 = 16 * 1024 * 1024;
+const LEASE_HISTOGRAM_SAMPLE_LIMIT: u64 = 65_536;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ActiveLayerHistogramInput<'a> {
-    pub(crate) layer_id: &'a LayerId,
+    pub(crate) requirements: &'a [DatasetResourceKey],
+    pub(crate) identity: DatasetResourceIdentity,
+    pub(crate) layer: LogicalLayerKey,
     pub(crate) layer_name: &'a str,
     pub(crate) dtype: IntensityDType,
-    pub(crate) timepoint: mirante4d_domain::TimeIndex,
+    pub(crate) timepoint: TimeIndex,
+    pub(crate) scale: ScaleLevel,
+}
+
+#[derive(Clone, Copy)]
+struct LeaseHistogramResource<'a> {
+    payload: ResourcePayloadView<'a>,
+    start: u64,
+    end: u64,
 }
 
 pub(crate) fn active_layer_histogram_summary(
-    analysis: &mut CurrentAnalysisRuntime,
-    dataset: &CurrentDatasetRuntime,
+    leases: &CurrentLeaseBridge,
     input: ActiveLayerHistogramInput<'_>,
 ) -> LayerHistogramSummary {
-    match (
-        &dataset.active_volume_u8,
-        &dataset.active_volume,
-        &dataset.active_volume_f32,
-    ) {
-        (Some(volume), _, _) => histogram_from_u8_values(volume.values(), HISTOGRAM_BIN_COUNT),
-        (None, Some(volume), _) => histogram_from_u16_values(volume.values(), HISTOGRAM_BIN_COUNT),
-        (None, None, Some(volume)) => {
-            histogram_from_f32_values(volume.values(), HISTOGRAM_BIN_COUNT)
-        }
-        (None, None, None) => {
-            cached_resident_histogram_summary_for_active_layer(analysis, dataset, input)
-                .unwrap_or_else(|| {
-                    cached_data_engine_histogram_summary_for_active_layer(analysis, dataset, input)
-                })
-        }
-    }
-}
-
-fn histogram_from_u8_values(values: &[u8], bin_count: usize) -> LayerHistogramSummary {
-    histogram_from_finite_values_with_status(
-        values.iter().map(|value| f32::from(*value)),
-        bin_count,
-        HistogramStatus::Exact,
-    )
-}
-
-fn histogram_from_u16_values(values: &[u16], bin_count: usize) -> LayerHistogramSummary {
-    histogram_from_finite_values_with_status(
-        values.iter().map(|value| f32::from(*value)),
-        bin_count,
-        HistogramStatus::Exact,
-    )
-}
-
-fn histogram_from_f32_values(values: &[f32], bin_count: usize) -> LayerHistogramSummary {
-    histogram_from_finite_values_with_status(
-        values.iter().copied(),
-        bin_count,
-        HistogramStatus::Exact,
-    )
-}
-
-fn cached_resident_histogram_summary_for_active_layer(
-    analysis: &mut CurrentAnalysisRuntime,
-    dataset: &CurrentDatasetRuntime,
-    input: ActiveLayerHistogramInput<'_>,
-) -> Option<LayerHistogramSummary> {
-    let resident_generation = analysis.resident_histogram_generation;
-    let key = LayerHistogramCacheKey {
-        layer_id: input.layer_id.as_str().to_owned(),
-        dtype: input.dtype,
-        timepoint: input.timepoint,
-        scale_level: dataset.brick_stream_scale_level,
-        resident_generation: Some(resident_generation),
-    };
-    if let Some(cache) = &analysis.active_histogram_cache
-        && cache.key == key
-    {
-        return Some(cache.summary.clone());
-    }
-
-    let entries = analysis
-        .resident_histogram_samples
-        .iter()
-        .filter(|(sample_key, _)| {
-            sample_key.layer_id == key.layer_id
-                && sample_key.dtype == key.dtype
-                && sample_key.timepoint == key.timepoint
-                && sample_key.scale_level == key.scale_level
-        })
-        .map(|(_, sample)| sample)
-        .collect::<Vec<_>>();
-    if entries.is_empty() {
-        if active_layer_resident_brick_count(dataset, input) == 0 {
-            return None;
-        }
-        return Some(LayerHistogramSummary {
-            status: HistogramStatus::Pending {
-                reason: format!(
-                    "resident histogram samples pending for {} at s{}",
-                    input.layer_name, dataset.brick_stream_scale_level
-                ),
-            },
-            bin_count: HISTOGRAM_BIN_COUNT,
-            sample_count: 0,
-            min_value: 0.0,
-            max_value: 0.0,
-            bins: Vec::new(),
-        });
-    }
-
-    let summary = histogram_from_cached_resident_samples(
-        entries.as_slice(),
-        HISTOGRAM_BIN_COUNT,
-        dataset.brick_stream_scale_level,
+    let cohort = leases.resident_subset(
+        input.requirements,
+        input.identity,
+        input.layer,
+        input.timepoint,
+        input.scale,
     );
-    analysis.active_histogram_cache = Some(LayerHistogramCache {
-        key,
-        summary: summary.clone(),
-    });
-    Some(summary)
-}
-
-fn cached_data_engine_histogram_summary_for_active_layer(
-    analysis: &mut CurrentAnalysisRuntime,
-    dataset: &CurrentDatasetRuntime,
-    input: ActiveLayerHistogramInput<'_>,
-) -> LayerHistogramSummary {
-    let key = LayerHistogramCacheKey {
-        layer_id: input.layer_id.as_str().to_owned(),
-        dtype: input.dtype,
-        timepoint: input.timepoint,
-        scale_level: dataset.brick_stream_scale_level,
-        resident_generation: None,
-    };
-    if let Some(cache) = &analysis.active_histogram_cache
-        && cache.key == key
-    {
-        return cache.summary.clone();
-    }
-
-    let summary = match data_engine_histogram_summary_for_active_layer(dataset, &key) {
-        Ok(summary) => summary,
-        Err(err) => LayerHistogramSummary {
-            status: HistogramStatus::Unavailable {
-                reason: format!(
-                    "sampled histogram read failed for {} at s{}: {err}",
-                    input.layer_name, dataset.brick_stream_scale_level
-                ),
-            },
-            bin_count: HISTOGRAM_BIN_COUNT,
-            sample_count: 0,
-            min_value: 0.0,
-            max_value: 0.0,
-            bins: Vec::new(),
-        },
-    };
-    analysis.active_histogram_cache = Some(LayerHistogramCache {
-        key,
-        summary: summary.clone(),
-    });
-    summary
-}
-
-fn data_engine_histogram_summary_for_active_layer(
-    dataset: &CurrentDatasetRuntime,
-    key: &LayerHistogramCacheKey,
-) -> anyhow::Result<LayerHistogramSummary> {
-    let layer_id = LayerId::new(key.layer_id.clone())?;
-    let brick_grid = dataset
-        .dataset
-        .brick_grid_shape_at_scale(&layer_id, key.scale_level)
-        .with_context(|| {
-            format!(
-                "failed to read brick grid for layer {} at s{}",
-                key.layer_id, key.scale_level
-            )
-        })?;
-    let brick_shape = dataset
-        .dataset
-        .brick_shape_at_scale(&layer_id, key.scale_level)
-        .with_context(|| {
-            format!(
-                "failed to read brick shape for layer {} at s{}",
-                key.layer_id, key.scale_level
-            )
-        })?;
-    let total_bricks = brick_grid.element_count()?;
-    let brick_read_limit = data_engine_histogram_brick_read_limit(key.dtype, brick_shape)?;
-    let sample_bricks = sampled_spatial_brick_indices(brick_grid, brick_read_limit)?;
-    if sample_bricks.is_empty() {
-        anyhow::bail!("no brick candidates are available for histogram sampling");
-    }
-
-    match key.dtype {
-        IntensityDType::Float32 => {
-            let mut bricks = Vec::with_capacity(sample_bricks.len());
-            for brick_index in &sample_bricks {
-                bricks.push(dataset.dataset.read_f32_brick_at_scale(
-                    &layer_id,
-                    key.scale_level,
-                    key.timepoint,
-                    *brick_index,
-                )?);
-            }
-            Ok(histogram_from_data_engine_f32_bricks(
-                &bricks,
-                HISTOGRAM_BIN_COUNT,
-                key.scale_level,
-                total_bricks,
-            ))
+    let cohort_status = cohort.status();
+    let mut resources = Vec::new();
+    let mut total_samples = 0_u64;
+    for resource in cohort.resources() {
+        let payload = resource.payload();
+        if payload.dtype() != input.dtype {
+            return unavailable(format!(
+                "histogram lease dtype mismatch for {} at s{}",
+                input.layer_name,
+                input.scale.get()
+            ));
         }
-        IntensityDType::Uint8 => {
-            let mut bricks = Vec::with_capacity(sample_bricks.len());
-            for brick_index in &sample_bricks {
-                bricks.push(dataset.dataset.read_u8_brick_at_scale(
-                    &layer_id,
-                    key.scale_level,
-                    key.timepoint,
-                    *brick_index,
-                )?);
-            }
-            Ok(histogram_from_data_engine_u8_bricks(
-                &bricks,
-                HISTOGRAM_BIN_COUNT,
-                key.scale_level,
-                total_bricks,
-            ))
-        }
-        IntensityDType::Uint16 => {
-            let mut bricks = Vec::with_capacity(sample_bricks.len());
-            for brick_index in &sample_bricks {
-                bricks.push(dataset.dataset.read_u16_brick_at_scale(
-                    &layer_id,
-                    key.scale_level,
-                    key.timepoint,
-                    *brick_index,
-                )?);
-            }
-            Ok(histogram_from_data_engine_u16_bricks(
-                &bricks,
-                HISTOGRAM_BIN_COUNT,
-                key.scale_level,
-                total_bricks,
-            ))
-        }
-    }
-}
-
-fn data_engine_histogram_brick_read_limit(
-    dtype: IntensityDType,
-    brick_shape: Shape3D,
-) -> anyhow::Result<usize> {
-    let bytes_per_value = match dtype {
-        IntensityDType::Uint8 => 1_u64,
-        IntensityDType::Uint16 => 2_u64,
-        IntensityDType::Float32 => 4_u64,
-    };
-    let values_per_brick = brick_shape.element_count()?;
-    let bytes_per_brick = values_per_brick
-        .saturating_mul(bytes_per_value)
-        .max(bytes_per_value);
-    let budget_limited = (DATA_ENGINE_HISTOGRAM_MAX_DECODE_BYTES / bytes_per_brick).max(1);
-    Ok(DATA_ENGINE_HISTOGRAM_BRICK_READ_LIMIT.min(budget_limited as usize))
-}
-
-fn sampled_spatial_brick_indices(
-    brick_grid: Shape3D,
-    limit: usize,
-) -> anyhow::Result<Vec<SpatialBrickIndex>> {
-    let total = brick_grid.element_count()?;
-    if total == 0 || limit == 0 {
-        return Ok(Vec::new());
-    }
-    let sample_count = (limit as u64).min(total);
-    let stride = total.div_ceil(sample_count);
-    let mut indices = Vec::with_capacity(sample_count as usize);
-    for sample_index in 0..sample_count {
-        let linear = sample_index.saturating_mul(stride).min(total - 1);
-        indices.push(spatial_brick_index_from_linear(brick_grid, linear));
-    }
-    Ok(indices)
-}
-
-fn spatial_brick_index_from_linear(brick_grid: Shape3D, linear: u64) -> SpatialBrickIndex {
-    let x = linear % brick_grid.x();
-    let yz = linear / brick_grid.x();
-    let y = yz % brick_grid.y();
-    let z = yz / brick_grid.y();
-    SpatialBrickIndex::new(z, y, x)
-}
-
-fn active_layer_resident_brick_count(
-    dataset: &CurrentDatasetRuntime,
-    input: ActiveLayerHistogramInput<'_>,
-) -> usize {
-    match input.dtype {
-        IntensityDType::Uint8 => active_layer_resident_u8_bricks(dataset, input.layer_id).len(),
-        IntensityDType::Uint16 => active_layer_resident_u16_bricks(dataset, input.layer_id).len(),
-        IntensityDType::Float32 => active_layer_resident_f32_bricks(dataset, input.layer_id).len(),
-    }
-}
-
-pub(crate) fn resident_histogram_sample_key_for_u8_brick(
-    layer_id: String,
-    brick: &VolumeBrickU8,
-) -> ResidentHistogramSampleKey {
-    ResidentHistogramSampleKey {
-        layer_id,
-        dtype: IntensityDType::Uint8,
-        timepoint: brick.volume.timepoint,
-        scale_level: brick.scale_level,
-        brick_index: brick.brick_index,
-    }
-}
-
-pub(crate) fn resident_histogram_sample_key_for_u16_brick(
-    layer_id: String,
-    brick: &VolumeBrickU16,
-) -> ResidentHistogramSampleKey {
-    ResidentHistogramSampleKey {
-        layer_id,
-        dtype: IntensityDType::Uint16,
-        timepoint: brick.volume.timepoint,
-        scale_level: brick.scale_level,
-        brick_index: brick.brick_index,
-    }
-}
-
-pub(crate) fn resident_histogram_sample_key_for_f32_brick(
-    layer_id: String,
-    brick: &VolumeBrickF32,
-) -> ResidentHistogramSampleKey {
-    ResidentHistogramSampleKey {
-        layer_id,
-        dtype: IntensityDType::Float32,
-        timepoint: brick.volume.timepoint,
-        scale_level: brick.scale_level,
-        brick_index: brick.brick_index,
-    }
-}
-
-fn active_layer_resident_u8_bricks<'a>(
-    dataset: &'a CurrentDatasetRuntime,
-    layer_id: &LayerId,
-) -> &'a [VolumeBrickU8] {
-    dataset
-        .resident_bricks_u8_by_layer
-        .get(layer_id)
-        .filter(|bricks| !bricks.is_empty())
-        .map(Vec::as_slice)
-        .unwrap_or_else(|| dataset.resident_bricks_u8.as_slice())
-}
-
-fn active_layer_resident_u16_bricks<'a>(
-    dataset: &'a CurrentDatasetRuntime,
-    layer_id: &LayerId,
-) -> &'a [VolumeBrickU16] {
-    dataset
-        .resident_bricks_by_layer
-        .get(layer_id)
-        .filter(|bricks| !bricks.is_empty())
-        .map(Vec::as_slice)
-        .unwrap_or_else(|| dataset.resident_bricks.as_slice())
-}
-
-fn active_layer_resident_f32_bricks<'a>(
-    dataset: &'a CurrentDatasetRuntime,
-    layer_id: &LayerId,
-) -> &'a [VolumeBrickF32] {
-    dataset
-        .resident_bricks_f32_by_layer
-        .get(layer_id)
-        .filter(|bricks| !bricks.is_empty())
-        .map(Vec::as_slice)
-        .unwrap_or_else(|| dataset.resident_bricks_f32.as_slice())
-}
-
-fn histogram_from_cached_resident_samples(
-    samples: &[&mirante4d_data::BrickHistogramSample],
-    bin_count: usize,
-    scale_level: u32,
-) -> LayerHistogramSummary {
-    let total_values = samples
-        .iter()
-        .map(|sample| sample.total_values)
-        .sum::<u64>();
-    let finite_values = samples
-        .iter()
-        .map(|sample| sample.finite_values)
-        .sum::<u64>();
-    let min_value = samples
-        .iter()
-        .map(|sample| sample.min_value)
-        .fold(f32::INFINITY, f32::min);
-    let max_value = samples
-        .iter()
-        .map(|sample| sample.max_value)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let values = downsample_finite_values(
-        samples
-            .iter()
-            .flat_map(|sample| sample.samples.iter().copied()),
-        RESIDENT_HISTOGRAM_SAMPLE_LIMIT,
-    );
-    let source = format!(
-        "resident s{scale_level} {}/{finite_values} sampled finite values {total_values} total {}br",
-        values.len(),
-        samples.len()
-    );
-    histogram_from_finite_values_with_known_range(
-        values,
-        bin_count,
-        HistogramStatus::Sampled { source },
-        min_value,
-        max_value,
-    )
-}
-
-fn histogram_from_data_engine_u8_bricks(
-    bricks: &[VolumeBrickU8],
-    bin_count: usize,
-    scale_level: u32,
-    total_bricks: u64,
-) -> LayerHistogramSummary {
-    let total_values = bricks
-        .iter()
-        .map(|brick| brick.values().len())
-        .sum::<usize>();
-    let values = sampled_resident_u8_values(bricks, RESIDENT_HISTOGRAM_SAMPLE_LIMIT);
-    histogram_from_data_engine_sampled_values(
-        values,
-        bin_count,
-        scale_level,
-        bricks.len(),
-        total_bricks,
-        total_values,
-    )
-}
-
-fn histogram_from_data_engine_u16_bricks(
-    bricks: &[VolumeBrickU16],
-    bin_count: usize,
-    scale_level: u32,
-    total_bricks: u64,
-) -> LayerHistogramSummary {
-    let total_values = bricks
-        .iter()
-        .map(|brick| brick.values().len())
-        .sum::<usize>();
-    let values = sampled_resident_u16_values(bricks, RESIDENT_HISTOGRAM_SAMPLE_LIMIT);
-    histogram_from_data_engine_sampled_values(
-        values,
-        bin_count,
-        scale_level,
-        bricks.len(),
-        total_bricks,
-        total_values,
-    )
-}
-
-fn histogram_from_data_engine_f32_bricks(
-    bricks: &[VolumeBrickF32],
-    bin_count: usize,
-    scale_level: u32,
-    total_bricks: u64,
-) -> LayerHistogramSummary {
-    let total_values = bricks
-        .iter()
-        .flat_map(|brick| brick.values())
-        .filter(|value| value.is_finite())
-        .count();
-    let values = sampled_resident_f32_values(bricks, RESIDENT_HISTOGRAM_SAMPLE_LIMIT);
-    histogram_from_data_engine_sampled_values(
-        values,
-        bin_count,
-        scale_level,
-        bricks.len(),
-        total_bricks,
-        total_values,
-    )
-}
-
-fn histogram_from_data_engine_sampled_values(
-    values: Vec<f32>,
-    bin_count: usize,
-    scale_level: u32,
-    brick_count: usize,
-    total_bricks: u64,
-    total_values: usize,
-) -> LayerHistogramSummary {
-    let sample_count = values.len();
-    let source = format!(
-        "data engine s{scale_level} {sample_count}/{total_values} read values {brick_count}/{total_bricks}br"
-    );
-    histogram_from_finite_values_with_status(values, bin_count, HistogramStatus::Sampled { source })
-}
-
-fn downsample_finite_values(
-    values: impl IntoIterator<Item = f32>,
-    sample_limit: usize,
-) -> Vec<f32> {
-    let finite = values
-        .into_iter()
-        .filter(|value| value.is_finite())
-        .collect::<Vec<_>>();
-    if finite.len() <= sample_limit {
-        return finite;
-    }
-    let stride = histogram_sample_stride(finite.len(), sample_limit);
-    finite
-        .into_iter()
-        .step_by(stride)
-        .take(sample_limit)
-        .collect()
-}
-
-fn sampled_resident_u8_values(bricks: &[VolumeBrickU8], sample_limit: usize) -> Vec<f32> {
-    let total_values = bricks
-        .iter()
-        .map(|brick| brick.values().len())
-        .sum::<usize>();
-    if total_values == 0 || sample_limit == 0 {
-        return Vec::new();
-    }
-    let stride = histogram_sample_stride(total_values, sample_limit);
-    let mut sampled = Vec::with_capacity(total_values.div_ceil(stride).min(sample_limit));
-    let mut value_index = 0_usize;
-    for brick in bricks {
-        for value in brick.values() {
-            if value_index.is_multiple_of(stride) && sampled.len() < sample_limit {
-                sampled.push(f32::from(*value));
-            }
-            value_index += 1;
-        }
-    }
-    sampled
-}
-
-fn sampled_resident_u16_values(bricks: &[VolumeBrickU16], sample_limit: usize) -> Vec<f32> {
-    let total_values = bricks
-        .iter()
-        .map(|brick| brick.values().len())
-        .sum::<usize>();
-    if total_values == 0 || sample_limit == 0 {
-        return Vec::new();
-    }
-    let stride = histogram_sample_stride(total_values, sample_limit);
-    let mut sampled = Vec::with_capacity(total_values.div_ceil(stride).min(sample_limit));
-    let mut value_index = 0_usize;
-    for brick in bricks {
-        for value in brick.values() {
-            if value_index.is_multiple_of(stride) && sampled.len() < sample_limit {
-                sampled.push(f32::from(*value));
-            }
-            value_index += 1;
-        }
-    }
-    sampled
-}
-
-fn sampled_resident_f32_values(bricks: &[VolumeBrickF32], sample_limit: usize) -> Vec<f32> {
-    let total_finite = bricks
-        .iter()
-        .flat_map(|brick| brick.values())
-        .filter(|value| value.is_finite())
-        .count();
-    if total_finite == 0 || sample_limit == 0 {
-        return Vec::new();
-    }
-    let stride = histogram_sample_stride(total_finite, sample_limit);
-    let mut sampled = Vec::with_capacity(total_finite.div_ceil(stride).min(sample_limit));
-    let mut finite_index = 0_usize;
-    for brick in bricks {
-        for value in brick
-            .values()
-            .iter()
-            .copied()
-            .filter(|value| value.is_finite())
-        {
-            if finite_index.is_multiple_of(stride) && sampled.len() < sample_limit {
-                sampled.push(value);
-            }
-            finite_index += 1;
-        }
-    }
-    sampled
-}
-
-fn histogram_sample_stride(total_values: usize, sample_limit: usize) -> usize {
-    if sample_limit == 0 {
-        return usize::MAX;
-    }
-    total_values.div_ceil(sample_limit).max(1)
-}
-
-fn histogram_from_finite_values_with_status(
-    values: impl IntoIterator<Item = f32>,
-    bin_count: usize,
-    status: HistogramStatus,
-) -> LayerHistogramSummary {
-    let finite = values
-        .into_iter()
-        .filter(|value| value.is_finite())
-        .collect::<Vec<_>>();
-    if finite.is_empty() || bin_count == 0 {
-        return LayerHistogramSummary {
-            status: HistogramStatus::Unavailable {
-                reason: "no finite intensity values are available".to_owned(),
-            },
-            bin_count,
-            sample_count: 0,
-            min_value: 0.0,
-            max_value: 0.0,
-            bins: Vec::new(),
+        let Some(end) = total_samples.checked_add(payload.sample_count()) else {
+            return unavailable(format!(
+                "histogram lease sample count overflows for {} at s{}",
+                input.layer_name,
+                input.scale.get()
+            ));
         };
+        resources.push(LeaseHistogramResource {
+            payload,
+            start: total_samples,
+            end,
+        });
+        total_samples = end;
     }
+
+    if resources.is_empty() {
+        return pending(format!(
+            "histogram leases loading for {} at s{}",
+            input.layer_name,
+            input.scale.get()
+        ));
+    }
+
+    let selected_samples = total_samples.min(LEASE_HISTOGRAM_SAMPLE_LIMIT);
     let mut min_value = f32::INFINITY;
     let mut max_value = f32::NEG_INFINITY;
-    for value in &finite {
-        min_value = min_value.min(*value);
-        max_value = max_value.max(*value);
-    }
-    let mut bins = vec![0_u64; bin_count];
-    if max_value <= min_value {
-        bins[0] = finite.len() as u64;
-    } else {
-        let width = max_value - min_value;
-        for value in &finite {
-            let normalized = ((*value - min_value) / width).clamp(0.0, 1.0);
-            let index = ((normalized * bin_count as f32).floor() as usize).min(bin_count - 1);
-            bins[index] += 1;
+    let valid_samples =
+        match visit_selected_valid_values(&resources, total_samples, selected_samples, |value| {
+            min_value = min_value.min(value);
+            max_value = max_value.max(value);
+        }) {
+            Ok(count) => count,
+            Err(reason) => return unavailable(reason.to_owned()),
+        };
+
+    if valid_samples == 0 {
+        if cohort_status.missing > 0 {
+            return pending(format!(
+                "histogram leases loading for {} at s{} ({} missing)",
+                input.layer_name,
+                input.scale.get(),
+                cohort_status.missing
+            ));
         }
+        return unavailable(format!(
+            "no valid intensity samples are available for {} at s{}",
+            input.layer_name,
+            input.scale.get()
+        ));
     }
+
+    let mut bins = vec![0_u64; HISTOGRAM_BIN_COUNT];
+    let fill_result =
+        visit_selected_valid_values(&resources, total_samples, selected_samples, |value| {
+            let index = histogram_bin_index(value, min_value, max_value, HISTOGRAM_BIN_COUNT);
+            bins[index] = bins[index].saturating_add(1);
+        });
+    if let Err(reason) = fill_result {
+        return unavailable(reason.to_owned());
+    }
+
+    let status = if cohort_status.missing > 0 {
+        HistogramStatus::Pending {
+            reason: format!(
+                "histogram leases loading for {} at s{} ({} missing)",
+                input.layer_name,
+                input.scale.get(),
+                cohort_status.missing
+            ),
+        }
+    } else {
+        HistogramStatus::Sampled {
+            source: format!(
+                "lease s{} {valid_samples}/{total_samples} valid samples from {} resources",
+                input.scale.get(),
+                resources.len()
+            ),
+        }
+    };
     LayerHistogramSummary {
         status,
-        bin_count,
-        sample_count: finite.len() as u64,
+        bin_count: HISTOGRAM_BIN_COUNT,
+        sample_count: valid_samples,
         min_value,
         max_value,
         bins,
     }
 }
 
-fn histogram_from_finite_values_with_known_range(
-    values: impl IntoIterator<Item = f32>,
-    bin_count: usize,
-    status: HistogramStatus,
-    min_value: f32,
-    max_value: f32,
-) -> LayerHistogramSummary {
-    let finite = values
-        .into_iter()
-        .filter(|value| value.is_finite())
-        .collect::<Vec<_>>();
-    if finite.is_empty() || bin_count == 0 || !min_value.is_finite() || !max_value.is_finite() {
-        return LayerHistogramSummary {
-            status: HistogramStatus::Unavailable {
-                reason: "no finite intensity values are available".to_owned(),
-            },
-            bin_count,
-            sample_count: 0,
-            min_value: 0.0,
-            max_value: 0.0,
-            bins: Vec::new(),
-        };
+fn visit_selected_valid_values(
+    resources: &[LeaseHistogramResource<'_>],
+    total_samples: u64,
+    selected_samples: u64,
+    mut visit: impl FnMut(f32),
+) -> Result<u64, &'static str> {
+    if total_samples == 0 || selected_samples == 0 {
+        return Ok(0);
     }
-    let mut bins = vec![0_u64; bin_count];
-    if max_value <= min_value {
-        bins[0] = finite.len() as u64;
-    } else {
-        let width = max_value - min_value;
-        for value in &finite {
-            let normalized = ((*value - min_value) / width).clamp(0.0, 1.0);
-            let index = ((normalized * bin_count as f32).floor() as usize).min(bin_count - 1);
-            bins[index] += 1;
+    let mut resource_index = 0_usize;
+    let mut valid_samples = 0_u64;
+    for ordinal in 0..selected_samples {
+        let global_index = u64::try_from(
+            (u128::from(ordinal) * u128::from(total_samples)) / u128::from(selected_samples),
+        )
+        .expect("an evenly selected index is smaller than its u64 sample total");
+        while global_index >= resources[resource_index].end {
+            resource_index += 1;
+        }
+        let resource = resources[resource_index];
+        let local_index = global_index - resource.start;
+        if let Some(value) = valid_payload_sample(resource.payload, local_index)? {
+            visit(value);
+            valid_samples += 1;
         }
     }
+    Ok(valid_samples)
+}
+
+fn valid_payload_sample(
+    payload: ResourcePayloadView<'_>,
+    sample_index: u64,
+) -> Result<Option<f32>, &'static str> {
+    if !payload
+        .sample_is_valid(sample_index)
+        .map_err(|_| "histogram lease validity indexing failed")?
+    {
+        return Ok(None);
+    }
+    let byte_offset = usize::try_from(
+        sample_index
+            .checked_mul(u64::from(payload.dtype().bytes_per_sample()))
+            .ok_or("histogram lease byte offset overflowed")?,
+    )
+    .map_err(|_| "histogram lease byte offset is not addressable")?;
+    let bytes = payload.value_bytes();
+    let value = match payload.dtype() {
+        IntensityDType::Uint8 => f32::from(bytes[byte_offset]),
+        IntensityDType::Uint16 => f32::from(u16::from_le_bytes(
+            bytes[byte_offset..byte_offset + 2]
+                .try_into()
+                .expect("a validated uint16 payload contains a complete sample"),
+        )),
+        IntensityDType::Float32 => f32::from_le_bytes(
+            bytes[byte_offset..byte_offset + 4]
+                .try_into()
+                .expect("a validated float32 payload contains a complete sample"),
+        ),
+    };
+    if !value.is_finite() {
+        return Err("histogram lease contains a non-finite intensity sample");
+    }
+    Ok(Some(value))
+}
+
+fn histogram_bin_index(value: f32, min_value: f32, max_value: f32, bin_count: usize) -> usize {
+    if max_value <= min_value {
+        return 0;
+    }
+    let normalized = ((value - min_value) / (max_value - min_value)).clamp(0.0, 1.0);
+    ((normalized * bin_count as f32).floor() as usize).min(bin_count - 1)
+}
+
+fn pending(reason: String) -> LayerHistogramSummary {
+    empty_histogram(HistogramStatus::Pending { reason })
+}
+
+fn unavailable(reason: String) -> LayerHistogramSummary {
+    empty_histogram(HistogramStatus::Unavailable { reason })
+}
+
+fn empty_histogram(status: HistogramStatus) -> LayerHistogramSummary {
     LayerHistogramSummary {
         status,
-        bin_count,
-        sample_count: finite.len() as u64,
-        min_value,
-        max_value,
-        bins,
+        bin_count: HISTOGRAM_BIN_COUNT,
+        sample_count: 0,
+        min_value: 0.0,
+        max_value: 0.0,
+        bins: Vec::new(),
     }
 }
 

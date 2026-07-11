@@ -4,16 +4,33 @@ pub mod camera_mip;
 pub mod cpu;
 pub mod cross_section;
 mod current_camera;
+mod current_lease_bridge;
 pub mod gpu;
 pub mod resources;
 pub mod scene;
 pub mod scene_render;
 pub mod transfer;
 
+use mirante4d_dataset::ResourceContractError;
 use mirante4d_domain::ShapeError;
 use mirante4d_format::CurrentTransformError;
 use mirante4d_render_api::RenderApiError;
 use thiserror::Error;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourcePlanCapacityKind {
+    Candidates,
+    Resources,
+}
+
+impl std::fmt::Display for ResourcePlanCapacityKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Candidates => "candidate",
+            Self::Resources => "resource",
+        })
+    }
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RenderError {
@@ -30,6 +47,11 @@ pub enum RenderError {
     },
     #[error("brick planner pixel stride must be positive")]
     InvalidBrickPixelStride,
+    #[error("semantic planning exceeded the {kind} limit of {maximum}")]
+    ResourcePlanCapacityExceeded {
+        kind: ResourcePlanCapacityKind,
+        maximum: usize,
+    },
     #[error("{axis} dimension {value} exceeds GPU u32 limits")]
     DimensionTooLarge { axis: &'static str, value: u64 },
     #[error("invalid brick atlas metadata: {0}")]
@@ -117,6 +139,8 @@ pub enum RenderError {
     InvalidResourceId { kind: &'static str, value: String },
     #[error(transparent)]
     Shape(#[from] ShapeError),
+    #[error(transparent)]
+    ResourceContract(#[from] ResourceContractError),
     #[error(transparent)]
     Space(#[from] CurrentTransformError),
     #[error(transparent)]
@@ -830,7 +854,10 @@ pub fn frame_diagnostics_f32(input_voxels: u64, pixels: &[f32]) -> FrameDiagnost
     }
 }
 
-pub use brick_plan::{BrickGridSpec, BrickPlanOptions, plan_visible_bricks};
+pub use brick_plan::{
+    BrickGridSpec, BrickPlanOptions, ResourcePlanLimits, SemanticRegionGridSpec,
+    plan_visible_bricks, plan_visible_resource_regions,
+};
 pub use brick_render::{
     BrickFrameDiagnostics, BrickFrameDiagnosticsF32, BrickSkipDiagnostics, DvrResidentChannel,
     ResidentBrickSetF32, ResidentBrickSetU8, ResidentBrickSetU16, render_camera_f32_from_bricks,
@@ -852,6 +879,11 @@ pub use cross_section::{
     CrossSectionChunkPlaneVertex, CrossSectionPanel, CrossSectionPanelBounds, CrossSectionSlab,
     CrossSectionView, CrossSectionViewState, cross_section_chunk_plane_polygon,
     plan_cross_section_bricks, plan_cross_section_bricks_with_diagnostics,
+    plan_cross_section_resource_regions,
+};
+pub use current_lease_bridge::{
+    CurrentLeaseBridge, CurrentLeaseBridgeError, CurrentLeaseCohortStatus, CurrentLeaseResidentSet,
+    CurrentLeaseResource, CurrentLeaseSample, CurrentLeaseVolume, MAX_CURRENT_LEASE_REQUIREMENTS,
 };
 pub use resources::{
     BrickAtlasResourceKey, DenseVolumeResourceKey, RenderResourceKey, RenderResourceKind,

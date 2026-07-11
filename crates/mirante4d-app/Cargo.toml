@@ -14,6 +14,7 @@ mirante4d-analysis.workspace = true
 mirante4d-application.workspace = true
 mirante4d-data.workspace = true
 mirante4d-dataset.workspace = true
+mirante4d-dataset-runtime.workspace = true
 mirante4d-domain.workspace = true
 mirante4d-format.workspace = true
 mirante4d-identity.workspace = true

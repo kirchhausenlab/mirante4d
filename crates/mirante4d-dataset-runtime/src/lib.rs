@@ -1,8 +1,8 @@
 //! Dataset scheduling and byte-accounted lease contracts.
 //!
-//! WP-08A freezes this boundary; WP-08B supplies the production scheduler,
-//! cache, queues, and workers. This crate performs no I/O and starts no
-//! threads.
+//! WP-08A froze this boundary; WP-08B supplies the production scheduler,
+//! cache, queues, byte ledger, and decode workers. Sources perform storage I/O
+//! only on runtime-owned worker threads.
 
 #![forbid(unsafe_code)]
 
@@ -13,6 +13,9 @@ use mirante4d_dataset::{
     ResourcePayloadDescriptor, ResourcePayloadView,
 };
 use thiserror::Error;
+
+mod ledger;
+mod production;
 
 /// One nonzero request identity assigned by the dataset runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -575,19 +578,45 @@ impl Drop for TestUsageCharge {
 
 #[derive(Debug)]
 struct AccountedCpuCharge {
-    bytes: u64,
-    category: CpuLedgerCategory,
+    charge: RuntimeCharge,
+}
+
+#[derive(Debug)]
+enum RuntimeCharge {
+    Production(ledger::LedgerCharge),
     #[cfg(test)]
-    _usage_charge: Option<TestUsageCharge>,
+    Test {
+        bytes: u64,
+        category: CpuLedgerCategory,
+        _usage_charge: Option<TestUsageCharge>,
+    },
+}
+
+impl RuntimeCharge {
+    fn bytes(&self) -> u64 {
+        match self {
+            Self::Production(charge) => charge.bytes(),
+            #[cfg(test)]
+            Self::Test { bytes, .. } => *bytes,
+        }
+    }
+
+    fn category(&self) -> CpuLedgerCategory {
+        match self {
+            Self::Production(charge) => charge.category(),
+            #[cfg(test)]
+            Self::Test { category, .. } => *category,
+        }
+    }
 }
 
 impl AccountedCpuLease {
     pub fn accounted_bytes(&self) -> u64 {
-        self.inner.bytes
+        self.inner.charge.bytes()
     }
 
     pub fn ledger_category(&self) -> CpuLedgerCategory {
-        self.inner.category
+        self.inner.charge.category()
     }
 
     pub fn shares_charge_with(&self, other: &Self) -> bool {
@@ -599,19 +628,17 @@ impl AccountedCpuLease {
 struct AccountedPayload {
     key: DatasetResourceKey,
     descriptor: ResourcePayloadDescriptor,
-    value_bytes: Box<[u8]>,
-    validity_bits: Option<Box<[u8]>>,
-    accounted_bytes: u64,
-    category: CpuLedgerCategory,
+    bytes: Box<[u8]>,
+    charge: RuntimeCharge,
 }
 
 impl AccountedResourceLease {
     pub fn accounted_bytes(&self) -> u64 {
-        self.inner.accounted_bytes
+        self.inner.charge.bytes()
     }
 
     pub fn ledger_category(&self) -> CpuLedgerCategory {
-        self.inner.category
+        self.inner.charge.category()
     }
 
     pub fn shares_allocation_with(&self, other: &Self) -> bool {
@@ -625,30 +652,37 @@ impl ResourceLease for AccountedResourceLease {
     }
 
     fn payload(&self) -> ResourcePayloadView<'_> {
+        let value_len = usize::try_from(self.inner.descriptor.value_byte_len())
+            .expect("runtime-issued payload lengths fit the process address space");
+        let (value_bytes, validity_bytes) = self.inner.bytes.split_at(value_len);
+        let validity_bits = match self.inner.descriptor.validity() {
+            mirante4d_dataset::ResourceValidity::AllValid => None,
+            mirante4d_dataset::ResourceValidity::BitMask => Some(validity_bytes),
+        };
         self.inner
             .descriptor
-            .view(&self.inner.value_bytes, self.inner.validity_bits.as_deref())
+            .view(value_bytes, validity_bits)
             .expect("runtime-issued lease preserves its validated descriptor")
     }
 }
 
 impl CpuByteLease for AccountedResourceLease {
     fn category(&self) -> CpuLedgerCategory {
-        self.inner.category
+        self.inner.charge.category()
     }
 
     fn reserved_bytes(&self) -> u64 {
-        self.inner.accounted_bytes
+        self.inner.charge.bytes()
     }
 }
 
 impl CpuByteLease for AccountedCpuLease {
     fn category(&self) -> CpuLedgerCategory {
-        self.inner.category
+        self.inner.charge.category()
     }
 
     fn reserved_bytes(&self) -> u64 {
-        self.inner.bytes
+        self.inner.charge.bytes()
     }
 }
 
@@ -896,10 +930,12 @@ mod tests {
             inner: Arc::new(AccountedPayload {
                 key: resource,
                 descriptor,
-                value_bytes: vec![1, 0, 2, 0].into_boxed_slice(),
-                validity_bits: None,
-                accounted_bytes: descriptor.byte_len(),
-                category: CpuLedgerCategory::DecodedResidency,
+                bytes: vec![1, 0, 2, 0].into_boxed_slice(),
+                charge: RuntimeCharge::Test {
+                    bytes: descriptor.byte_len(),
+                    category: CpuLedgerCategory::DecodedResidency,
+                    _usage_charge: None,
+                },
             }),
         }
     }
@@ -1325,9 +1361,11 @@ mod tests {
                 .map_err(RuntimeFault::new)?;
             Ok(AccountedCpuLease {
                 inner: Arc::new(AccountedCpuCharge {
-                    bytes,
-                    category: CpuLedgerCategory::QueuesAndResults,
-                    _usage_charge: Some(charge),
+                    charge: RuntimeCharge::Test {
+                        bytes,
+                        category: CpuLedgerCategory::QueuesAndResults,
+                        _usage_charge: Some(charge),
+                    },
                 }),
             })
         }
@@ -1660,10 +1698,12 @@ mod tests {
             inner: Arc::new(AccountedPayload {
                 key: key(1),
                 descriptor: masked_descriptor,
-                value_bytes: vec![0, 17].into_boxed_slice(),
-                validity_bits: Some(vec![0b0000_0001].into_boxed_slice()),
-                accounted_bytes: masked_descriptor.byte_len(),
-                category: CpuLedgerCategory::DecodedResidency,
+                bytes: vec![0, 17, 0b0000_0001].into_boxed_slice(),
+                charge: RuntimeCharge::Test {
+                    bytes: masked_descriptor.byte_len(),
+                    category: CpuLedgerCategory::DecodedResidency,
+                    _usage_charge: None,
+                },
             }),
         };
         assert_eq!(masked.accounted_bytes(), 3);

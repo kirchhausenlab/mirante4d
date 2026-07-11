@@ -26,7 +26,6 @@ use mirante4d_renderer::{
 };
 use serde_json::{Value, json};
 
-use super::phase11::Phase11GpuMipFrame;
 use super::{
     Phase11InteractionBenchmarkOptions, Phase11LodPlan, Phase11LodPlanningInput,
     Phase11ResidentBrickSet, Phase11ResidentReadInput, phase11_interaction_report,
@@ -42,9 +41,9 @@ use crate::package;
 use crate::reports::{phase13_gpu_timings_json, timing_summary_json};
 use crate::{
     BENCHMARK_PRESENTATION_POINTS, PHASE11_DEFAULT_MAX_RESPONSIVE_VISIBLE_BRICKS,
-    PHASE11_GPU_MIP_BRICKS_PER_BATCH, benchmark_camera_for_shape, benchmark_camera_frame,
-    benchmark_camera_orbit, benchmark_camera_pan, benchmark_camera_world_per_screen_point,
-    benchmark_camera_zoom, phase11_benchmark_viewport_for_shape, phase11_brick_pixel_stride,
+    benchmark_camera_for_shape, benchmark_camera_frame, benchmark_camera_orbit,
+    benchmark_camera_pan, benchmark_camera_world_per_screen_point, benchmark_camera_zoom,
+    phase11_benchmark_viewport_for_shape, phase11_brick_pixel_stride,
     phase11_gpu_brick_cache_budget_bytes, phase11_gpu_volume_cache_budget_bytes,
     phase11_max_decoded_bytes, phase11_max_visible_bricks, stable_id_from_name,
 };
@@ -115,6 +114,7 @@ fn phase13_viewport_matrix_report(package: &Path) -> anyhow::Result<Value> {
     Ok(json!({
         "benchmark": "bench-phase13-viewport-matrix",
         "benchmark_schema_version": 1,
+        "authority": "diagnostic_only_not_an_authoritative_baseline_or_product_validation",
         "baseline_class": benchmark_baseline_class(),
         "hardware_class": benchmark_hardware_class(),
         "dataset_class": dataset_class,
@@ -245,8 +245,6 @@ pub(crate) fn phase13_renderer_report(
     for mode_case in &mode_cases {
         let report = phase13_render_mode_report(
             &resident,
-            plan.brick_shape,
-            plan.brick_grid_shape,
             camera,
             viewport,
             mode_case,
@@ -272,14 +270,7 @@ pub(crate) fn phase13_renderer_report(
         }
         mode_reports.push(report.json);
     }
-    let capacity_probe = phase13_capacity_probe_report(
-        &resident,
-        plan.brick_shape,
-        plan.brick_grid_shape,
-        camera,
-        viewport,
-        &mode_cases,
-    )?;
+    let capacity_probe = phase13_capacity_probe_report(&resident, camera, viewport, &mode_cases)?;
     let failure_policy_probe = phase13_failure_policy_probe_report();
     let refinement_budget_probe = phase13_refinement_budget_probe_report(
         &dataset,
@@ -335,6 +326,7 @@ pub(crate) fn phase13_renderer_report(
     let report_json = json!({
         "benchmark": "bench-phase13-renderer",
         "benchmark_schema_version": 1,
+        "authority": "diagnostic_only_not_an_authoritative_baseline_or_product_validation",
         "baseline_class": benchmark_baseline_class(),
         "hardware_class": benchmark_hardware_class(),
         "dataset_class": dataset_class,
@@ -392,7 +384,7 @@ pub(crate) fn phase13_renderer_report(
             "max_decoded_bytes": max_decoded_bytes,
             "gpu_volume_cache_budget_bytes": phase11_gpu_volume_cache_budget_bytes()?,
             "gpu_brick_cache_budget_bytes": phase11_gpu_brick_cache_budget_bytes()?,
-            "gpu_mip_bricks_per_batch": PHASE11_GPU_MIP_BRICKS_PER_BATCH,
+            "gpu_input": "runtime_issued_semantic_leases",
         },
         "render_mode_defaults": {
             "iso_threshold": iso_threshold_policy.threshold,
@@ -679,8 +671,6 @@ fn phase13_iso_threshold_from_value(value: f64, resident_max: f64) -> u16 {
 
 fn phase13_render_mode_report(
     resident: &Phase11ResidentBrickSet,
-    brick_shape: Shape3D,
-    brick_grid_shape: Shape3D,
     camera: CameraFrame,
     viewport: RenderViewport,
     mode_case: &Phase13RenderModeCase,
@@ -719,15 +709,7 @@ fn phase13_render_mode_report(
         ),
     };
 
-    let gpu = phase13_gpu_render_mode_report(
-        resident,
-        brick_shape,
-        brick_grid_shape,
-        camera,
-        viewport,
-        mode_case,
-        gpu_renderer,
-    );
+    let gpu = phase13_gpu_render_mode_report(resident, camera, viewport, mode_case, gpu_renderer);
 
     Phase13RenderModeReport {
         json: json!({
@@ -759,30 +741,30 @@ fn phase13_render_cpu_mode(
     viewport: RenderViewport,
     mode_case: &Phase13RenderModeCase,
 ) -> Result<Phase13CpuModeFrame, mirante4d_renderer::RenderError> {
-    match resident {
-        Phase11ResidentBrickSet::U8(_) | Phase11ResidentBrickSet::U16(_) => {
-            let (_image, diagnostics) =
-                resident.render_cpu(camera, viewport, mode_case.integer_mode)?;
-            Ok(Phase13CpuModeFrame {
-                json: brick_frame_json(diagnostics),
-                complete: diagnostics.complete,
-                nonzero_pixels: diagnostics.frame.nonzero_pixels,
-            })
-        }
-        Phase11ResidentBrickSet::F32(resident) => {
-            let (_image, diagnostics) = render_camera_f32_from_bricks_with_quality(
-                resident,
-                camera,
-                viewport,
-                mode_case.f32_mode,
-                CameraRenderQuality::voxel_exact(),
-            )?;
-            Ok(Phase13CpuModeFrame {
-                json: brick_frame_f32_json(diagnostics),
-                complete: diagnostics.complete,
-                nonzero_pixels: diagnostics.frame.nonzero_pixels,
-            })
-        }
+    if resident.is_integer() {
+        let (_image, diagnostics) =
+            resident.render_cpu(camera, viewport, mode_case.integer_mode)?;
+        Ok(Phase13CpuModeFrame {
+            json: brick_frame_json(diagnostics),
+            complete: diagnostics.complete,
+            nonzero_pixels: diagnostics.frame.nonzero_pixels,
+        })
+    } else {
+        let f32_resident = resident
+            .f32_resident()
+            .expect("a non-integer Phase 11 resident set is Float32");
+        let (_image, diagnostics) = render_camera_f32_from_bricks_with_quality(
+            f32_resident,
+            camera,
+            viewport,
+            mode_case.f32_mode,
+            CameraRenderQuality::voxel_exact(),
+        )?;
+        Ok(Phase13CpuModeFrame {
+            json: brick_frame_f32_json(diagnostics),
+            complete: diagnostics.complete,
+            nonzero_pixels: diagnostics.frame.nonzero_pixels,
+        })
     }
 }
 
@@ -828,68 +810,67 @@ fn phase13_package_iso_relighting_case(
     viewport: RenderViewport,
     iso_mode: &Phase13RenderModeCase,
 ) -> anyhow::Result<Value> {
-    match resident {
-        Phase11ResidentBrickSet::U8(_) | Phase11ResidentBrickSet::U16(_) => {
-            let render_started = Instant::now();
-            let (image, diagnostics) =
-                resident.render_cpu(camera, viewport, iso_mode.integer_mode)?;
-            let initial_iso_render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
-            let surface = image
-                .iso_surface()
-                .context("Phase 13 ISO render did not return a cached integer surface frame")?;
-            let relight = phase13_relight_cached_surfaces(
-                "package_cached_surface",
-                viewport,
-                camera_view,
-                &[surface],
-                Some(initial_iso_render_ms),
-            )?;
+    if resident.is_integer() {
+        let render_started = Instant::now();
+        let (image, diagnostics) = resident.render_cpu(camera, viewport, iso_mode.integer_mode)?;
+        let initial_iso_render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
+        let surface = image
+            .iso_surface()
+            .context("Phase 13 ISO render did not return a cached integer surface frame")?;
+        let relight = phase13_relight_cached_surfaces(
+            "package_cached_surface",
+            viewport,
+            camera_view,
+            &[surface],
+            Some(initial_iso_render_ms),
+        )?;
 
-            Ok(json!({
-                "source": "package_cpu_iso_surface_frame",
-                "stored_dtype": resident.stored_dtype_label(),
-                "initial_iso_render": {
-                    "timings_ms": {
-                        "render": initial_iso_render_ms,
-                    },
-                    "frame": brick_frame_json(diagnostics),
+        Ok(json!({
+            "source": "package_cpu_iso_surface_frame",
+            "stored_dtype": resident.stored_dtype_label(),
+            "initial_iso_render": {
+                "timings_ms": {
+                    "render": initial_iso_render_ms,
                 },
-                "relight": relight,
-            }))
-        }
-        Phase11ResidentBrickSet::F32(resident) => {
-            let render_started = Instant::now();
-            let (image, diagnostics) = render_camera_f32_from_bricks_with_quality(
-                resident,
-                camera,
-                viewport,
-                iso_mode.f32_mode,
-                CameraRenderQuality::voxel_exact(),
-            )?;
-            let initial_iso_render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
-            let surface = image
-                .iso_surface()
-                .context("Phase 13 ISO render did not return a cached Float32 surface frame")?;
-            let relight = phase13_relight_cached_f32_surfaces(
-                "package_cached_surface",
-                viewport,
-                camera_view,
-                &[surface],
-                Some(initial_iso_render_ms),
-            )?;
+                "frame": brick_frame_json(diagnostics),
+            },
+            "relight": relight,
+        }))
+    } else {
+        let f32_resident = resident
+            .f32_resident()
+            .expect("a non-integer Phase 11 resident set is Float32");
+        let render_started = Instant::now();
+        let (image, diagnostics) = render_camera_f32_from_bricks_with_quality(
+            f32_resident,
+            camera,
+            viewport,
+            iso_mode.f32_mode,
+            CameraRenderQuality::voxel_exact(),
+        )?;
+        let initial_iso_render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
+        let surface = image
+            .iso_surface()
+            .context("Phase 13 ISO render did not return a cached Float32 surface frame")?;
+        let relight = phase13_relight_cached_f32_surfaces(
+            "package_cached_surface",
+            viewport,
+            camera_view,
+            &[surface],
+            Some(initial_iso_render_ms),
+        )?;
 
-            Ok(json!({
-                "source": "package_cpu_iso_surface_frame",
-                "stored_dtype": "Float32",
-                "initial_iso_render": {
-                    "timings_ms": {
-                        "render": initial_iso_render_ms,
-                    },
-                    "frame": brick_frame_f32_json(diagnostics),
+        Ok(json!({
+            "source": "package_cpu_iso_surface_frame",
+            "stored_dtype": "Float32",
+            "initial_iso_render": {
+                "timings_ms": {
+                    "render": initial_iso_render_ms,
                 },
-                "relight": relight,
-            }))
-        }
+                "frame": brick_frame_f32_json(diagnostics),
+            },
+            "relight": relight,
+        }))
     }
 }
 
@@ -1082,8 +1063,6 @@ struct Phase13GpuModeReport {
 
 fn phase13_gpu_render_mode_report(
     resident: &Phase11ResidentBrickSet,
-    brick_shape: Shape3D,
-    brick_grid_shape: Shape3D,
     camera: CameraFrame,
     viewport: RenderViewport,
     mode_case: &Phase13RenderModeCase,
@@ -1105,30 +1084,13 @@ fn phase13_gpu_render_mode_report(
 
     let stats_before = renderer.stats().ok();
     let started = Instant::now();
-    let (output, mip_batched, monolithic_error) =
-        if matches!(mode_case.integer_mode, CameraRenderMode::Mip) {
-            resident.render_gpu_mip_with_u16_batched_fallback(
-                renderer,
-                brick_shape,
-                brick_grid_shape,
-                camera,
-                viewport,
-            )
-        } else {
-            (
-                phase13_render_gpu_direct(
-                    resident,
-                    renderer,
-                    brick_shape,
-                    brick_grid_shape,
-                    camera,
-                    viewport,
-                    mode_case,
-                ),
-                false,
-                None,
-            )
-        };
+    let output = resident.render_gpu(
+        renderer,
+        camera,
+        viewport,
+        mode_case.integer_mode,
+        mode_case.f32_mode,
+    );
     let render_ms = started.elapsed().as_secs_f64() * 1000.0;
     let stats_after = renderer.stats().ok();
     let resource_delta = gpu_stats_delta_json(stats_before, stats_after);
@@ -1143,8 +1105,7 @@ fn phase13_gpu_render_mode_report(
                     "available": true,
                     "ok": true,
                     "stored_dtype": resident.stored_dtype_label(),
-                    "mip_batched": mip_batched,
-                    "monolithic_error": monolithic_error,
+                    "gpu_input": "runtime_issued_semantic_leases",
                     "timings_ms": phase13_gpu_timings_json(render_ms, upload_ms),
                     "upload_timing_source": "renderer_atlas_update_wall_time",
                     "resource_delta": resource_delta,
@@ -1177,43 +1138,8 @@ fn phase13_gpu_render_mode_report(
     }
 }
 
-fn phase13_render_gpu_direct(
-    resident: &Phase11ResidentBrickSet,
-    renderer: &GpuRenderer,
-    brick_shape: Shape3D,
-    brick_grid_shape: Shape3D,
-    camera: CameraFrame,
-    viewport: RenderViewport,
-    mode_case: &Phase13RenderModeCase,
-) -> Result<Phase11GpuMipFrame, GpuRenderError> {
-    match resident {
-        Phase11ResidentBrickSet::U8(_) | Phase11ResidentBrickSet::U16(_) => resident
-            .render_gpu_direct(
-                renderer,
-                brick_shape,
-                brick_grid_shape,
-                camera,
-                viewport,
-                mode_case.integer_mode,
-            )
-            .map(Phase11GpuMipFrame::Integer),
-        Phase11ResidentBrickSet::F32(resident) => renderer
-            .render_camera_f32_from_bricks(
-                resident,
-                brick_shape,
-                brick_grid_shape,
-                camera,
-                viewport,
-                mode_case.f32_mode,
-            )
-            .map(Phase11GpuMipFrame::F32),
-    }
-}
-
 fn phase13_capacity_probe_report(
     resident: &Phase11ResidentBrickSet,
-    brick_shape: Shape3D,
-    brick_grid_shape: Shape3D,
     camera: CameraFrame,
     viewport: RenderViewport,
     mode_cases: &[Phase13RenderModeCase],
@@ -1248,14 +1174,12 @@ fn phase13_capacity_probe_report(
             order_dependent_modes += 1;
         }
         let started = Instant::now();
-        let result = phase13_render_gpu_direct(
-            resident,
+        let result = resident.render_gpu(
             &renderer,
-            brick_shape,
-            brick_grid_shape,
             camera,
             viewport,
-            mode_case,
+            mode_case.integer_mode,
+            mode_case.f32_mode,
         );
         let render_ms = started.elapsed().as_secs_f64() * 1000.0;
         match result {
@@ -1288,7 +1212,7 @@ fn phase13_capacity_probe_report(
         "purpose": "intentional_tiny_gpu_brick_budget_capacity_probe",
         "stored_dtype": resident.stored_dtype_label(),
         "direct_render_only": true,
-        "batched_fallback_attempted": false,
+        "alternate_render_path_attempted": false,
         "probe_brick_cache_budget_bytes": PHASE13_CAPACITY_PROBE_BRICK_BUDGET_BYTES,
         "init_ms": init_ms,
         "summary": {
@@ -1335,8 +1259,6 @@ fn phase13_transition_cache_probe_report(
         resident_identity: "initial render populates the controlled probe atlas",
         renderer: &renderer,
         resident: &base_resident,
-        brick_shape: plan.brick_shape,
-        brick_grid_shape: plan.brick_grid_shape,
         camera: base_camera,
         viewport,
         mode_case: mip_mode,
@@ -1352,8 +1274,6 @@ fn phase13_transition_cache_probe_report(
             resident_identity: "dataset/layer/timepoint/scale/brick set unchanged",
             renderer: &renderer,
             resident: &base_resident,
-            brick_shape: plan.brick_shape,
-            brick_grid_shape: plan.brick_grid_shape,
             camera: benchmark_camera_frame(orbit_camera),
             viewport,
             mode_case: mip_mode,
@@ -1371,8 +1291,6 @@ fn phase13_transition_cache_probe_report(
             resident_identity: "dataset/layer/timepoint/scale/brick set unchanged",
             renderer: &renderer,
             resident: &base_resident,
-            brick_shape: plan.brick_shape,
-            brick_grid_shape: plan.brick_grid_shape,
             camera: benchmark_camera_frame(pan_camera),
             viewport,
             mode_case: mip_mode,
@@ -1388,8 +1306,6 @@ fn phase13_transition_cache_probe_report(
             resident_identity: "dataset/layer/timepoint/scale/brick set unchanged",
             renderer: &renderer,
             resident: &base_resident,
-            brick_shape: plan.brick_shape,
-            brick_grid_shape: plan.brick_grid_shape,
             camera: benchmark_camera_frame(zoom_camera),
             viewport,
             mode_case: mip_mode,
@@ -1405,8 +1321,6 @@ fn phase13_transition_cache_probe_report(
                 resident_identity: "dataset/layer/timepoint/scale/brick set unchanged",
                 renderer: &renderer,
                 resident: &base_resident,
-                brick_shape: plan.brick_shape,
-                brick_grid_shape: plan.brick_grid_shape,
                 camera: base_camera,
                 viewport,
                 mode_case: *mode_case,
@@ -1428,8 +1342,6 @@ fn phase13_transition_cache_probe_report(
                     resident_identity: &identity,
                     renderer: &renderer,
                     resident: &transition.resident,
-                    brick_shape: transition.brick_shape,
-                    brick_grid_shape: transition.brick_grid_shape,
                     camera: base_camera,
                     viewport,
                     mode_case: mip_mode,
@@ -1454,8 +1366,6 @@ fn phase13_transition_cache_probe_report(
                 resident_identity: "timepoint changed; atlas key must not be reused as the same scientific frame",
                 renderer: &renderer,
                 resident: &resident,
-                brick_shape: plan.brick_shape,
-                brick_grid_shape: plan.brick_grid_shape,
                 camera: base_camera,
                 viewport,
                 mode_case: mip_mode,
@@ -1481,8 +1391,6 @@ fn phase13_transition_cache_probe_report(
                 resident_identity: &identity,
                 renderer: &renderer,
                 resident: &resident,
-                brick_shape: plan.brick_shape,
-                brick_grid_shape: plan.brick_grid_shape,
                 camera: base_camera,
                 viewport,
                 mode_case: mip_mode,
@@ -1667,8 +1575,6 @@ fn phase13_channel_transition_resident(
 struct Phase13ScaleTransitionResident {
     scale_level: u32,
     resident: Phase11ResidentBrickSet,
-    brick_shape: Shape3D,
-    brick_grid_shape: Shape3D,
 }
 
 fn phase13_scale_transition_resident(
@@ -1720,8 +1626,6 @@ fn phase13_scale_transition_resident(
         return Ok(Some(Phase13ScaleTransitionResident {
             scale_level,
             resident,
-            brick_shape: scale_plan.brick_shape,
-            brick_grid_shape: scale_plan.brick_grid_shape,
         }));
     }
     Ok(None)
@@ -1733,8 +1637,6 @@ struct Phase13TransitionProbeRender<'a> {
     resident_identity: &'a str,
     renderer: &'a GpuRenderer,
     resident: &'a Phase11ResidentBrickSet,
-    brick_shape: Shape3D,
-    brick_grid_shape: Shape3D,
     camera: CameraFrame,
     viewport: RenderViewport,
     mode_case: Phase13RenderModeCase,
@@ -1744,14 +1646,12 @@ struct Phase13TransitionProbeRender<'a> {
 fn phase13_transition_render_probe_item(input: Phase13TransitionProbeRender<'_>) -> Value {
     let stats_before = input.renderer.stats().ok();
     let started = Instant::now();
-    let output = phase13_render_gpu_direct(
-        input.resident,
+    let output = input.resident.render_gpu(
         input.renderer,
-        input.brick_shape,
-        input.brick_grid_shape,
         input.camera,
         input.viewport,
-        &input.mode_case,
+        input.mode_case.integer_mode,
+        input.mode_case.f32_mode,
     );
     let render_ms = started.elapsed().as_secs_f64() * 1000.0;
     let stats_after = input.renderer.stats().ok();
@@ -1887,11 +1787,11 @@ fn phase13_capacity_probe_error_json(
             "render": render_ms,
         },
         "expected_policy": if mode_case.order_dependent {
-            "order-dependent modes must downgrade or fail visibly; capacity probe does not attempt batch fallback"
+            "order-dependent modes must fail visibly; the capacity probe does not downgrade the mode or choose an alternate renderer path"
         } else {
             "capacity failure must remain typed and visible"
         },
-        "batched_fallback_attempted": false,
+        "alternate_render_path_attempted": false,
     })
 }
 

@@ -2,12 +2,12 @@
 
 Status: ACTIVE PUBLIC-EPOCH PROGRAM
 Last reviewed: 2026-07-11
-Current technical sequence: WP-08A through WP-15
+Current technical sequence: WP-08B through WP-15
 Public-data publication: deferred to a separate future handoff
 WP-08A predecessor: `foundation-wp-07b-exit-1`
-Completed through: WP-08A exit 1 at `foundation-wp-08a-exit-1`
-Current checkpoint: narrow WP-08A contract correction and exit 2
-Next checkpoint: WP-08B unified dataset runtime
+Completed through: WP-08A exit 2 at `foundation-wp-08a-exit-2`
+Current checkpoint: WP-08B unified dataset runtime
+Next protected-branch checkpoint: WP-10A dataset schema and storage
 
 ## Purpose
 
@@ -172,12 +172,9 @@ tag was accepted. WP-07A is complete at
 and exact-revision exit acceptance at
 `61cd39263d5f663d9af3fc75fa63ef054c3f4540`
 (`foundation-wp-07b-exit-1`).
-WP-08A exit 1 was accepted at
-`f1692d985730779e03b1d8cdd9806eec637e585e`
-(`foundation-wp-08a-exit-1`). Before WP-08B, the contract was reopened for one
-corrective exit covering effective validity, scoped cancellation, runtime-owned
-request IDs, bounded configuration/diagnostics/progress, and future worker
-ownership. Exit 1 remains immutable.
+WP-08A exit 1 remains immutable. Its narrow corrective contract exit was
+accepted at `f2e520da891134d1b3f65d8fcac7afb4140579a2`
+(`foundation-wp-08a-exit-2`) before WP-08B implementation began.
 
 ## Dataset And Fixture Boundary
 

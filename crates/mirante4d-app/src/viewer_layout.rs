@@ -12,17 +12,10 @@ pub(crate) enum PanelId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PanelKind {
-    CrossSectionXy,
-    CrossSectionXz,
-    ThreeD,
-    CrossSectionYz,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CrossSectionPanelScheduleStatus {
     MissingViewport,
     Loading,
+    Empty,
     Ready,
     Current,
     Coarse,
@@ -39,9 +32,10 @@ pub(crate) enum CrossSectionPanelScheduleReason {
     TargetScaleReady,
     ResidentScaleCoarserThanTarget,
     MissingSelectedBricks,
-    DecodedBudgetExceeded,
+    NoSelectedData,
+    PlanningBudgetExceeded,
+    PlanningFailed,
     Rendered,
-    StaleGeneration,
     RenderFailed,
 }
 
@@ -109,6 +103,7 @@ impl CrossSectionPanelScheduleState {
         match self.status {
             CrossSectionPanelScheduleStatus::MissingViewport => "waiting for panel size",
             CrossSectionPanelScheduleStatus::Loading => "loading",
+            CrossSectionPanelScheduleStatus::Empty => "outside selected data",
             CrossSectionPanelScheduleStatus::Ready => "ready",
             CrossSectionPanelScheduleStatus::Current => "current",
             CrossSectionPanelScheduleStatus::Coarse => "coarse",
@@ -125,15 +120,6 @@ impl PanelId {
             CrossSectionPanelId::Xy => Self::Xy,
             CrossSectionPanelId::Xz => Self::Xz,
             CrossSectionPanelId::Yz => Self::Yz,
-        }
-    }
-
-    pub(crate) fn kind(self) -> PanelKind {
-        match self {
-            Self::Xy => PanelKind::CrossSectionXy,
-            Self::Xz => PanelKind::CrossSectionXz,
-            Self::ThreeD => PanelKind::ThreeD,
-            Self::Yz => PanelKind::CrossSectionYz,
         }
     }
 

@@ -104,11 +104,13 @@ WP-06 is complete: its exact protected-main revision passed the real Vulkan
 viewer exercise at 1280x720 and 1920x1080 before
 `foundation-wp-06-exit-1` was created. WP-07A is accepted at
 `foundation-wp-07a-exit-1` (`5383cbb93c13c59e6f035bfa551356c75fb426dc`).
-WP-07B is accepted at `foundation-wp-07b-exit-1`. WP-08A exit 1 is accepted at
-`foundation-wp-08a-exit-1`; its contract was subsequently reopened for one
-narrow correction. Exit 2 requires focused contract and architecture checks,
-the normal public verification, and exact-main trusted-GPU plus real-display T2
-no-regression evidence before `foundation-wp-08a-exit-2` is created.
+WP-07B is accepted at `foundation-wp-07b-exit-1`. WP-08A's corrected contract
+is accepted at `foundation-wp-08a-exit-2`
+(`f2e520da891134d1b3f65d8fcac7afb4140579a2`). WP-08B is active. Its exit
+requires the normal public verification plus exact-main trusted-GPU and real-
+display 1280x720 T2 exercises of 3D, linked panels, playback, histogram, and
+readout through the unified runtime. Internal smoke and schema-v2 product
+automation remain supporting evidence, not product-open proof.
 
 The checked independent report supports only the WP-03 source-TIFF archive.
 Current schema-1 packages remain non-authoritative T2 support fixtures;

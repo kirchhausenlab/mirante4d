@@ -90,13 +90,14 @@ fn phase11_u8_resident_wrapper_renders_without_u16_read_path() {
         max: 255.0,
         volume,
     };
-    let resident = Phase11ResidentBrickSet::U8(ResidentBrickSetU8::new(
-        layer_id,
-        TimeIndex::new(0),
-        shape,
-        grid_to_world,
-        vec![brick],
-    ));
+    let resident =
+        Phase11ResidentBrickSet::cpu_only(Phase11CpuResidentBrickSet::U8(ResidentBrickSetU8::new(
+            layer_id,
+            TimeIndex::new(0),
+            shape,
+            grid_to_world,
+            vec![brick],
+        )));
     let camera = benchmark_camera_frame(benchmark_camera_for_shape(shape, grid_to_world));
     let viewport = RenderViewport::new(8, 8).unwrap();
 
@@ -140,12 +141,14 @@ fn phase11_f32_resident_wrapper_renders_without_integer_conversion() {
         max: 1.0,
         volume,
     };
-    let resident = Phase11ResidentBrickSet::F32(ResidentBrickSetF32::new(
-        layer_id,
-        TimeIndex::new(0),
-        shape,
-        grid_to_world,
-        vec![brick],
+    let resident = Phase11ResidentBrickSet::cpu_only(Phase11CpuResidentBrickSet::F32(
+        ResidentBrickSetF32::new(
+            layer_id,
+            TimeIndex::new(0),
+            shape,
+            grid_to_world,
+            vec![brick],
+        ),
     ));
     let camera = benchmark_camera_frame(benchmark_camera_for_shape(shape, grid_to_world));
     let viewport = RenderViewport::new(8, 8).unwrap();
@@ -188,8 +191,14 @@ fn phase11_f32_fixture_read_dispatch_uses_f32_bricks() {
     let viewport = RenderViewport::new(8, 8).unwrap();
     let summary = resident.render_cpu_mip_summary(camera, viewport).unwrap();
     let stats = dataset.stats().unwrap();
+    let leases = resident
+        .leases
+        .as_deref()
+        .expect("package benchmark reads must retain runtime-issued semantic leases");
 
-    assert!(matches!(&resident, Phase11ResidentBrickSet::F32(_)));
+    assert!(matches!(&resident.cpu, Phase11CpuResidentBrickSet::F32(_)));
+    assert!(leases.bridge.is_complete());
+    assert_eq!(leases.bridge.retained_len(), 1);
     assert_eq!(resident.stored_dtype_label(), "Float32");
     assert!(summary.nonzero_pixels > 0);
     assert_eq!(summary.max_value, json!(1.0));

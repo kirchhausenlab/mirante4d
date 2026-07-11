@@ -34,9 +34,11 @@ publication and external dataset contribution are separate future decisions.
 ## Current Scope
 
 The prototype includes import/preprocessing, streaming native data,
-MIP/DVR/ISO intensity rendering, multichannel display, project state, analysis
-tools, and Linux packaging. [Current state](CURRENT_STATE.md) is the sole
-authority for exact implemented behavior and limitations.
+MIP/DVR/ISO intensity rendering, multichannel display, project state, a
+passive analysis-results workspace, and Linux packaging. Analysis execution is
+temporarily absent while its foundation is rebuilt in WP-12.
+[Current state](CURRENT_STATE.md) is the sole authority for exact implemented
+behavior and limitations.
 
 Segmentation is not part of the current product or foundation program. Any
 future return requires a separately approved post-foundation design.

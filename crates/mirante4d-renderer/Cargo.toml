@@ -10,6 +10,7 @@ repository.workspace = true
 bytemuck.workspace = true
 glam.workspace = true
 mirante4d-data.workspace = true
+mirante4d-dataset.workspace = true
 mirante4d-domain.workspace = true
 mirante4d-format.workspace = true
 mirante4d-render-api.workspace = true

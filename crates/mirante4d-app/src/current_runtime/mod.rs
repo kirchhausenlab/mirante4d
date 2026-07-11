@@ -5,7 +5,6 @@
 //! wrapped in another mutable runtime aggregate.
 
 pub(crate) mod analysis;
-pub(crate) mod dataset;
 pub(crate) mod import;
 pub(crate) mod project;
 pub(crate) mod render;

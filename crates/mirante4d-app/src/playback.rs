@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use mirante4d_domain::TimeIndex;
 
+#[cfg(test)]
 use crate::LodDecisionReason;
 
 pub(crate) const PLAYBACK_FRAME_INTERVAL: Duration = Duration::from_millis(42);
@@ -24,6 +25,7 @@ pub(crate) fn stepped_timepoint(current: TimeIndex, count: u64, delta: i64) -> T
     TimeIndex::new(wrapped as u64)
 }
 
+#[cfg(test)]
 pub(crate) fn playback_effective_lod_target(
     normal_target_scale_level: u32,
     scale_count: usize,
