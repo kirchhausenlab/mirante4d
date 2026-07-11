@@ -82,99 +82,6 @@ pub(crate) fn is_product_validation_scenario_name(name: &str) -> bool {
     ProductValidationScenario::is_named_scenario(name)
 }
 
-pub(crate) fn t5_qual_001_product_validation_completion_plan_json(
-    scenario_name: &str,
-    current_report: Option<&Value>,
-) -> Value {
-    let scenario = ProductValidationScenario::resolve(Some(scenario_name), None, None)
-        .ok()
-        .filter(ProductValidationScenario::is_t5_qual_001_scenario);
-    let package = current_report
-        .and_then(|report| report.pointer("/dataset/package_path"))
-        .and_then(Value::as_str)
-        .unwrap_or("<t5-qual-001-package.m4d>");
-    let scenario_label = scenario
-        .as_ref()
-        .map(ProductValidationScenario::name)
-        .unwrap_or(scenario_name);
-    let timeout_secs = scenario
-        .as_ref()
-        .map(ProductValidationScenario::default_timeout_secs)
-        .unwrap_or(0);
-    let default_process_rss_limit_bytes = scenario
-        .as_ref()
-        .and_then(ProductValidationScenario::default_process_rss_limit_bytes);
-    let output_dir = scenario
-        .as_ref()
-        .map(product_validation_output_dir)
-        .unwrap_or_else(|| Path::new(OUTPUT_DIR).join(scenario_label));
-    let current_evidence = current_report.map(|report| {
-        json!({
-            "status": report.get("status").and_then(Value::as_str),
-            "failure_reason": report.get("failure_reason").and_then(Value::as_str),
-            "preflight_only": report.pointer("/environment/product_validate_preflight_only").and_then(Value::as_bool),
-            "display_class": report.pointer("/environment/display_class").and_then(Value::as_str),
-            "dataset_id": report.pointer("/dataset/id").and_then(Value::as_str),
-            "dataset_name": report.pointer("/dataset/name").and_then(Value::as_str),
-            "package_path": report.pointer("/dataset/package_path").and_then(Value::as_str),
-            "stored_dtype": report.pointer("/dataset/active_layer/dtype/stored").and_then(Value::as_str),
-            "shape": report.pointer("/dataset/active_layer/shape"),
-            "command_count": report.pointer("/scenario/command_count").and_then(Value::as_u64),
-            "render_modes": report.pointer("/scenario/render_modes"),
-            "viewport": report.pointer("/scenario/viewport"),
-            "automation_limits": report.pointer("/scenario/automation_limits"),
-            "process_rss_limit_bytes": report.pointer("/process/rss_limit_bytes").and_then(Value::as_u64),
-            "stdout_log": report.pointer("/logs/stdout").and_then(Value::as_str),
-            "stderr_log": report.pointer("/logs/stderr").and_then(Value::as_str),
-        })
-    });
-    json!({
-        "schema": "mirante4d-t5-qual-001-product-validation-completion-plan",
-        "schema_version": PRODUCT_VALIDATION_SCHEMA_VERSION,
-        "scenario": scenario_label,
-        "status": "pending_real_native_window_product_validation",
-        "requires_product_open_validation": true,
-        "requires_explicit_heavy_opt_in": true,
-        "requires_real_display": true,
-        "default_timeout_secs": timeout_secs,
-        "default_process_rss_limit_bytes": default_process_rss_limit_bytes,
-        "output_dir": output_dir,
-        "required_report": output_dir.join("product-validation-report.json"),
-        "required_script": output_dir.join("product-automation-script.json"),
-        "current_evidence": current_evidence,
-        "preflight_command": product_validation_shell_command(
-            package,
-            scenario_label,
-            true,
-            false,
-            default_process_rss_limit_bytes,
-        ),
-        "product_open_command": product_validation_shell_command(
-            package,
-            scenario_label,
-            false,
-            false,
-            default_process_rss_limit_bytes,
-        ),
-        "timestamp_product_open_command": product_validation_shell_command(
-            package,
-            scenario_label,
-            false,
-            true,
-            default_process_rss_limit_bytes,
-        ),
-        "acceptance": {
-            "required_status": "passed",
-            "must_launch_native_app": true,
-            "must_not_be_preflight": true,
-            "must_record_exit_success": true,
-            "must_record_automation_status_passed": true,
-            "must_record_process_rss_limit": true,
-            "must_inspect_stdout_stderr_logs": true,
-        },
-    })
-}
-
 pub(crate) fn product_validate_report_with_scenario(
     package: Option<&Path>,
     scenario: Option<&str>,
@@ -193,68 +100,6 @@ pub(crate) fn product_validate_report_with_scenario(
     } else {
         product_validate_report_inner(package, &scenario)
     }
-}
-
-fn product_validation_shell_command(
-    package: &str,
-    scenario: &str,
-    preflight_only: bool,
-    gpu_timestamps: bool,
-    process_rss_limit_bytes: Option<u64>,
-) -> Value {
-    let mut env = vec![("MIRANTE4D_XTASK_ALLOW_HEAVY_BENCHMARK", "1".to_owned())];
-    if preflight_only {
-        env.push((PREFLIGHT_ONLY_ENV, "1".to_owned()));
-    }
-    if gpu_timestamps {
-        env.push((PRODUCT_VALIDATE_GPU_TIMESTAMPS_ENV, "1".to_owned()));
-    }
-    if let Some(limit) = process_rss_limit_bytes {
-        env.push((PRODUCT_VALIDATE_MAX_RSS_BYTES_ENV, limit.to_string()));
-    }
-    let argv = vec![
-        "cargo".to_owned(),
-        "xtask".to_owned(),
-        "product-validate".to_owned(),
-        package.to_owned(),
-        scenario.to_owned(),
-    ];
-    let shell_command = env
-        .iter()
-        .map(|(name, value)| format!("{name}={}", shell_quote(value)))
-        .chain(argv.iter().map(|arg| shell_quote(arg)))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let env_json = env
-        .into_iter()
-        .map(|(name, value)| (name.to_owned(), Value::String(value)))
-        .collect::<serde_json::Map<_, _>>();
-    json!({
-        "env": env_json,
-        "argv": argv,
-        "shell_command": shell_command,
-    })
-}
-
-fn shell_quote(value: &str) -> String {
-    if value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':' | '='))
-    {
-        value.to_owned()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
-}
-
-pub(crate) fn product_validate_report_with_custom_script(
-    package: Option<&Path>,
-    script_path: &Path,
-) -> anyhow::Result<ProductValidationOutcome> {
-    product_validate_report_inner(
-        package,
-        &ProductValidationScenario::CustomScript(script_path.to_path_buf()),
-    )
 }
 
 fn product_validate_report_inner(
@@ -278,6 +123,14 @@ fn product_validate_report_inner(
     let wrapper_report_path = output_dir.join("product-validation-report.json");
     let stdout_path = output_dir.join("mirante4d-app.stdout.log");
     let stderr_path = output_dir.join("mirante4d-app.stderr.log");
+    if automation_report_path.exists() {
+        fs::remove_file(&automation_report_path).with_context(|| {
+            format!(
+                "failed to remove stale {} before product validation",
+                automation_report_path.display()
+            )
+        })?;
+    }
     write_json_file(&script_path, &script)?;
     let timeout_seconds = timeout_secs(scenario);
     let process_rss_limit_bytes = process_rss_limit_bytes(scenario);
@@ -500,26 +353,17 @@ fn product_validate_report_inner(
         .and_then(Value::as_str)
         .map(str::to_owned);
     let app_exited_successfully = status.exit_success.unwrap_or(false);
-    let passed = app_exited_successfully && automation_status.as_deref() == Some("passed");
-    let validation_status = if passed {
-        ProductValidationStatus::Passed
-    } else {
-        ProductValidationStatus::Failed
-    };
+    let (validation_status, failure_reason) = completed_product_validation_outcome(
+        app_exited_successfully,
+        automation_status.as_deref(),
+        automation_failure.as_deref(),
+        automation_report.as_ref(),
+    );
     write_wrapper_report(WrapperReport {
         path: &wrapper_report_path,
         scenario_name: scenario.name(),
         status: validation_status,
-        failure_reason: if passed {
-            None
-        } else {
-            Some(automation_failure.unwrap_or_else(|| {
-                format!(
-                    "native app exit success={app_exited_successfully}, automation status={:?}",
-                    automation_status
-                )
-            }))
-        },
+        failure_reason,
         started_at_epoch_ms,
         duration_ms: duration_ms(started_at.elapsed()),
         timeout_secs: timeout_seconds,
@@ -786,6 +630,80 @@ impl ProductValidationStatus {
     pub(crate) fn is_failure(self) -> bool {
         matches!(self, Self::Failed | Self::TimedOut)
     }
+}
+
+fn completed_product_validation_outcome(
+    app_exited_successfully: bool,
+    automation_status: Option<&str>,
+    automation_failure: Option<&str>,
+    automation_report: Option<&Value>,
+) -> (ProductValidationStatus, Option<String>) {
+    if !app_exited_successfully || automation_status != Some("passed") {
+        return (
+            ProductValidationStatus::Failed,
+            Some(automation_failure.map_or_else(
+                || {
+                    format!(
+                        "native app exit success={app_exited_successfully}, automation status={automation_status:?}"
+                    )
+                },
+                str::to_owned,
+            )),
+        );
+    }
+
+    match qualifying_nonblank_viewport_capture(automation_report) {
+        Ok(_) => (ProductValidationStatus::Passed, None),
+        Err(reason) => (ProductValidationStatus::Failed, Some(reason)),
+    }
+}
+
+fn qualifying_nonblank_viewport_capture(
+    automation_report: Option<&Value>,
+) -> Result<&Value, String> {
+    let artifacts = automation_report
+        .and_then(|report| report.get("artifacts"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "same-run automation report is missing a nonblank viewport_capture artifact".to_owned()
+        })?;
+
+    artifacts
+        .iter()
+        .find(|artifact| {
+            if artifact.get("kind").and_then(Value::as_str) != Some("viewport_capture") {
+                return false;
+            }
+            let Some(width) = artifact.get("width").and_then(Value::as_u64) else {
+                return false;
+            };
+            let Some(height) = artifact.get("height").and_then(Value::as_u64) else {
+                return false;
+            };
+            let Some(path) = artifact.get("path").and_then(Value::as_str) else {
+                return false;
+            };
+            let pixel_stats = artifact.get("pixel_stats");
+            let pixel_count = pixel_stats
+                .and_then(|stats| stats.get("pixel_count"))
+                .and_then(Value::as_u64);
+            let nonzero_rgb_pixels = pixel_stats
+                .and_then(|stats| stats.get("nonzero_rgb_pixels"))
+                .and_then(Value::as_u64);
+            let max_rgb = pixel_stats
+                .and_then(|stats| stats.get("max_rgb"))
+                .and_then(Value::as_u64);
+
+            width > 0
+                && height > 0
+                && !path.trim().is_empty()
+                && width.checked_mul(height) == pixel_count
+                && nonzero_rgb_pixels.is_some_and(|count| count > 0 && Some(count) <= pixel_count)
+                && max_rgb.is_some_and(|value| value > 0)
+        })
+        .ok_or_else(|| {
+            "same-run automation report is missing a nonblank viewport_capture artifact".to_owned()
+        })
 }
 
 fn product_validation_package_and_script(
@@ -2126,7 +2044,23 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
         .get("commands")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
-    let viewport = script_viewport_json(report.script_value);
+    let requested_window_inner_size_points =
+        script_requested_window_inner_size_points_json(report.script_value);
+    let pixels_per_point = report
+        .automation_report_value
+        .and_then(|value| value.pointer("/viewport_evidence/pixels_per_point"))
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(Value::from)
+        .unwrap_or(Value::Null);
+    let render_target_pixels = qualifying_nonblank_viewport_capture(report.automation_report_value)
+        .map(|artifact| {
+            json!({
+                "width": artifact.get("width").and_then(Value::as_u64),
+                "height": artifact.get("height").and_then(Value::as_u64),
+            })
+        })
+        .unwrap_or(Value::Null);
     let render_modes = script_render_modes_json(report.script_value);
     let frame_wait_count = script_frame_wait_count(report.script_value);
     let millis_wait_count = script_millis_wait_count(report.script_value);
@@ -2157,7 +2091,13 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
         "schema": PRODUCT_VALIDATION_SCHEMA,
         "schema_version": PRODUCT_VALIDATION_SCHEMA_VERSION,
         "command": "product-validate",
-        "evidence_type": "native_window_product_automation",
+        "evidence_level": "E1",
+        "claim_boundary": {
+            "evidence_type": "internal_native_window_product_automation",
+            "source": "instrumented_application_commands_internal_state_and_readback",
+            "closure_authority": "integration_support_only_not_black_box_product_open",
+            "e4_product_open_satisfied": false,
+        },
         "status": report.status.name(),
         "failure_reason": report.failure_reason,
         "started_at_epoch_ms": report.started_at_epoch_ms,
@@ -2180,7 +2120,10 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
             "automation_script": report.script,
             "automation_status": report.automation_status,
             "command_count": command_count,
-            "viewport": viewport.clone(),
+            "requested_window_inner_size_points": requested_window_inner_size_points,
+            "pixels_per_point": pixels_per_point,
+            "observed_client_area_pixels": Value::Null,
+            "render_target_pixels": render_target_pixels,
             "render_modes": render_modes.clone(),
             "frame_wait_count": frame_wait_count,
             "millis_wait_count": millis_wait_count,
@@ -2189,7 +2132,6 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
         },
         "limits": {
             "timeout_secs": report.timeout_secs,
-            "viewport": viewport,
             "render_modes": render_modes,
             "heavy_local_evidence": heavy_local_evidence,
             "command_count": command_count,
@@ -2412,7 +2354,7 @@ fn script_limit_u64(script: &Value, name: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
-fn script_viewport_json(script: &Value) -> Value {
+fn script_requested_window_inner_size_points_json(script: &Value) -> Value {
     script_commands(script)
         .and_then(|commands| {
             commands.iter().find_map(|command| {

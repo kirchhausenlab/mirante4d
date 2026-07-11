@@ -1,0 +1,432 @@
+{
+  "schema": "mirante4d-verification-registry",
+  "schema_version": 1,
+  "bootstrap_bridge": {
+    "enabled": true,
+    "deletion_gate": "WP06-C-authority-flip"
+  },
+  "tools": [
+    { "id": "actions-checkout", "version": "7.0.0", "action_commit": "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0" },
+    { "id": "cargo-nextest", "version": "0.9.138", "artifact_sha256": "3793bf0c27607b196f502c39b2108f571de89fcda7586ae6beefa11ee177b216" },
+    { "id": "rumdl", "version": "0.2.30", "artifact_sha256": "eb51e28ef9dff2b2d29b4527bc40123e840bb997dc8bae39d99496b898ee9f72" },
+    { "id": "cargo-deny", "version": "0.20.2", "artifact_sha256": "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f" },
+    { "id": "sourcemeta-jsonschema", "version": "16.1.0", "artifact_sha256": "96b214be67bf25c6184f1d009a94e082d1eaa83787a8f1878607aebf3185668e", "binary_sha256": "4aa8ba3f4bc0b1ef4f8d82b109676b186fa66603d1953be25fde22b2854190d5" }
+  ],
+  "property_groups": [
+    { "id": "camera", "owner": "mirante4d-core", "seed": "0x4d3443414d455241", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
+    { "id": "space", "owner": "mirante4d-core", "seed": "0x4d34535041434531", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
+    { "id": "shape", "owner": "mirante4d-core", "seed": "0x4d34534841504531", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" }
+  ],
+  "lint_exceptions": [
+    {
+      "code": "clippy::too_many_arguments",
+      "path": "crates/mirante4d-core/src/camera.rs",
+      "primary_line": 255,
+      "reason": "The inherited camera gesture API remains until the canonical model cutover.",
+      "deletion_gate": "WP-07A"
+    },
+    {
+      "code": "clippy::too_many_arguments",
+      "path": "crates/mirante4d-renderer/src/gpu/atlas.rs",
+      "primary_line": 1365,
+      "reason": "The inherited u8 atlas update API remains until the product-render cutover.",
+      "deletion_gate": "WP-09B"
+    },
+    {
+      "code": "clippy::too_many_arguments",
+      "path": "crates/mirante4d-renderer/src/gpu/atlas.rs",
+      "primary_line": 1442,
+      "reason": "The inherited u16 atlas update API remains until the product-render cutover.",
+      "deletion_gate": "WP-09B"
+    },
+    {
+      "code": "clippy::too_many_arguments",
+      "path": "crates/mirante4d-renderer/src/gpu/atlas.rs",
+      "primary_line": 1743,
+      "reason": "The inherited f32 atlas update API remains until the product-render cutover.",
+      "deletion_gate": "WP-09B"
+    },
+    {
+      "code": "clippy::op_ref",
+      "path": "crates/mirante4d-app/src/cross_section_readout.rs",
+      "primary_line": 376,
+      "reason": "The inherited cross-section readout path remains until the UI composition-root cutover.",
+      "deletion_gate": "WP-09C"
+    },
+    {
+      "code": "clippy::too_many_arguments",
+      "path": "crates/mirante4d-app/src/cross_section_readout.rs",
+      "primary_line": 602,
+      "reason": "The inherited mapped-value readout API remains until the UI composition-root cutover.",
+      "deletion_gate": "WP-09C"
+    },
+    {
+      "code": "clippy::too_many_arguments",
+      "path": "crates/mirante4d-app/src/cross_section_readout.rs",
+      "primary_line": 643,
+      "reason": "The inherited mapped-status readout API remains until the UI composition-root cutover.",
+      "deletion_gate": "WP-09C"
+    },
+    {
+      "code": "clippy::field_reassign_with_default",
+      "path": "crates/mirante4d-app/src/cross_section_runtime.rs",
+      "primary_line": 1847,
+      "reason": "The inherited cross-section runtime test setup remains until the UI composition-root cutover.",
+      "deletion_gate": "WP-09C"
+    },
+    {
+      "code": "clippy::field_reassign_with_default",
+      "path": "crates/mirante4d-app/src/cross_section_runtime.rs",
+      "primary_line": 1901,
+      "reason": "The inherited cross-section runtime test setup remains until the UI composition-root cutover.",
+      "deletion_gate": "WP-09C"
+    },
+    {
+      "code": "clippy::collapsible_if",
+      "path": "crates/mirante4d-app/src/cross_section_streaming.rs",
+      "primary_line": 325,
+      "reason": "The inherited cross-section scheduling branch remains until the UI composition-root cutover.",
+      "deletion_gate": "WP-09C"
+    },
+    {
+      "code": "clippy::too_many_arguments",
+      "path": "crates/mirante4d-app/src/product_automation.rs",
+      "primary_line": 1021,
+      "reason": "The inherited product-evidence probe API remains until verification and release hardening.",
+      "deletion_gate": "WP-14"
+    },
+    {
+      "code": "clippy::question_mark",
+      "path": "crates/mirante4d-app/src/workbench_ui.rs",
+      "primary_line": 169,
+      "reason": "The inherited workbench viewport path remains until the UI composition-root cutover.",
+      "deletion_gate": "WP-09C"
+    },
+    {
+      "code": "clippy::question_mark",
+      "path": "crates/mirante4d-app/src/workbench_ui.rs",
+      "primary_line": 176,
+      "reason": "The inherited workbench viewport path remains until the UI composition-root cutover.",
+      "deletion_gate": "WP-09C"
+    },
+    {
+      "code": "clippy::too_many_arguments",
+      "path": "crates/xtask/src/audits/phase20.rs",
+      "primary_line": 303,
+      "reason": "The inherited phase-20 evidence API remains until verification and release hardening.",
+      "deletion_gate": "WP-14"
+    }
+  ],
+  "lanes": [
+    {
+      "id": "policy",
+      "kind": "policy",
+      "owner": "repository-policy",
+      "requirements": ["D-022-policy"],
+      "fixture_tier": "none",
+      "capability": "hosted-cpu",
+      "hosted_required": true,
+      "packages": [],
+      "selector": null,
+      "warn_ms": 240000,
+      "terminate_ms": 360000,
+      "aggregate_timeout_secs": 360
+    },
+    {
+      "id": "lint",
+      "kind": "lint",
+      "owner": "rust-workspace",
+      "requirements": ["D-022-lint"],
+      "fixture_tier": "none",
+      "capability": "hosted-cpu",
+      "hosted_required": true,
+      "packages": [],
+      "selector": null,
+      "warn_ms": 360000,
+      "terminate_ms": 480000,
+      "aggregate_timeout_secs": 480
+    },
+    {
+      "id": "unit",
+      "kind": "nextest",
+      "owner": "crate-unit-owners",
+      "requirements": ["D-022-unit"],
+      "fixture_tier": "none-or-T2",
+      "capability": "hosted-cpu",
+      "hosted_required": true,
+      "packages": [
+        "mirante4d-analysis",
+        "mirante4d-core",
+        "mirante4d-data",
+        "mirante4d-renderer",
+        "xtask"
+      ],
+      "selector": "package(mirante4d-analysis) | package(mirante4d-core) | package(mirante4d-data) | package(mirante4d-renderer) | package(xtask)",
+      "warn_ms": 500,
+      "terminate_ms": 2000,
+      "aggregate_timeout_secs": 720
+    },
+    {
+      "id": "contract",
+      "kind": "nextest",
+      "owner": "format-import-contract-owners",
+      "requirements": ["D-022-contract"],
+      "fixture_tier": "T1-source-or-T2",
+      "capability": "hosted-cpu",
+      "hosted_required": true,
+      "packages": ["mirante4d-format", "mirante4d-import"],
+      "selector": "package(mirante4d-format) | package(mirante4d-import)",
+      "warn_ms": 5000,
+      "terminate_ms": 20000,
+      "aggregate_timeout_secs": 720
+    },
+    {
+      "id": "ui",
+      "kind": "nextest",
+      "owner": "application-ui",
+      "requirements": ["D-022-ui"],
+      "fixture_tier": "none-or-T2",
+      "capability": "hosted-headless-cpu",
+      "hosted_required": true,
+      "packages": ["mirante4d-app"],
+      "selector": "package(mirante4d-app)",
+      "warn_ms": 2000,
+      "terminate_ms": 10000,
+      "aggregate_timeout_secs": 720
+    },
+    {
+      "id": "doctest",
+      "kind": "doctest",
+      "owner": "rust-workspace",
+      "requirements": ["D-022-doctest"],
+      "fixture_tier": "none",
+      "capability": "hosted-cpu",
+      "hosted_required": true,
+      "packages": [],
+      "selector": null,
+      "warn_ms": 60000,
+      "terminate_ms": 120000,
+      "aggregate_timeout_secs": 240
+    }
+  ],
+  "non_pr_lanes": [
+    {
+      "id": "main-package-capability",
+      "owner": "linux-package",
+      "capability": "standard-public-linux",
+      "requirements": ["D-022-package-capability"],
+      "fixture_tier": "T2",
+      "timeout_secs": 1200,
+      "evidence_level": "E2",
+      "trigger": "protected-main after an honest unsupported-GPU diagnostic command exists",
+      "command": "pending: no honest package-capability command before WP-14",
+      "hosted_required": false,
+      "activation_state": "pending-WP-14-capability-command"
+    },
+    {
+      "id": "deep-coverage",
+      "owner": "requirement-owners",
+      "capability": "standard-public-linux",
+      "requirements": ["D-022-code-gap-discovery"],
+      "fixture_tier": "none-or-T2",
+      "timeout_secs": 1200,
+      "evidence_level": "support-only",
+      "trigger": "manual until WP-14 bounded rotation",
+      "command": "cargo xtask verify-coverage",
+      "hosted_required": false,
+      "activation_state": "planned"
+    },
+    {
+      "id": "deep-fuzz",
+      "owner": "parser-and-state-owners",
+      "capability": "standard-public-linux-shard",
+      "requirements": ["D-022-seeded-crash-discovery"],
+      "fixture_tier": "T1-source-or-T2",
+      "timeout_secs": 480,
+      "evidence_level": "support-only",
+      "trigger": "manual or approved bounded rotation",
+      "command": "cargo fuzz run <registered-target>",
+      "hosted_required": false,
+      "activation_state": "planned"
+    },
+    {
+      "id": "deep-mutation",
+      "owner": "requirement-owners",
+      "capability": "standard-public-linux-shard",
+      "requirements": ["D-022-test-strength"],
+      "fixture_tier": "none-or-T2",
+      "timeout_secs": 1500,
+      "evidence_level": "support-only",
+      "trigger": "manual or approved bounded rotation",
+      "command": "cargo mutants --test-tool=nextest --package <registered-owner>",
+      "hosted_required": false,
+      "activation_state": "planned"
+    },
+    {
+      "id": "format-lifecycle",
+      "owner": "format-and-converter",
+      "capability": "standard-public-cpu",
+      "requirements": ["D-023-format-lifecycle"],
+      "fixture_tier": "T1-source-or-T2",
+      "timeout_secs": 900,
+      "evidence_level": "E2",
+      "trigger": "target-format change or release candidate",
+      "command": "pending: WP-10 format-lifecycle command",
+      "hosted_required": false,
+      "activation_state": "planned-WP-10"
+    },
+    {
+      "id": "trusted-gpu",
+      "owner": "renderer-and-application-gpu",
+      "capability": "trusted-hw2-vulkan",
+      "requirements": ["D-022-trusted-gpu-separation"],
+      "fixture_tier": "T2-or-T5",
+      "timeout_secs": 900,
+      "evidence_level": "E2-E3",
+      "trigger": "manual clean-worktree trusted HW-2",
+      "command": "cargo xtask verify-local trusted-gpu",
+      "hosted_required": false,
+      "activation_state": "active-temporary-WP-06-until-WP-09B"
+    },
+    {
+      "id": "product-e1",
+      "owner": "product-evidence",
+      "capability": "trusted-local-cpu",
+      "requirements": ["D-023-product-E1"],
+      "fixture_tier": "T1-source-or-T2",
+      "timeout_secs": 900,
+      "evidence_level": "E1",
+      "trigger": "manual applicable work package or milestone",
+      "command": "cargo xtask product-validate <package.m4d> <registered-e1-scenario>",
+      "hosted_required": false,
+      "activation_state": "planned-WP-14"
+    },
+    {
+      "id": "product-e2",
+      "owner": "product-evidence",
+      "capability": "trusted-hw2-vulkan",
+      "requirements": ["D-023-product-E2"],
+      "fixture_tier": "T1-source-or-T2",
+      "timeout_secs": 900,
+      "evidence_level": "E2",
+      "trigger": "manual applicable work package or milestone",
+      "command": "cargo xtask product-validate <package.m4d> <registered-e2-scenario>",
+      "hosted_required": false,
+      "activation_state": "planned-WP-14"
+    },
+    {
+      "id": "product-e3",
+      "owner": "product-evidence",
+      "capability": "trusted-hw2-vulkan",
+      "requirements": ["D-023-product-E3"],
+      "fixture_tier": "T1-source-or-T2-or-T5",
+      "timeout_secs": 900,
+      "evidence_level": "E3",
+      "trigger": "manual applicable work package or milestone",
+      "command": "cargo xtask product-validate <package.m4d> <registered-e3-scenario>",
+      "hosted_required": false,
+      "activation_state": "planned-WP-14"
+    },
+    {
+      "id": "product-e4",
+      "owner": "product-evidence",
+      "capability": "trusted-hw2-vulkan-real-display",
+      "requirements": ["D-023-product-E4"],
+      "fixture_tier": "T1-source-or-T5",
+      "timeout_secs": 2700,
+      "evidence_level": "E4",
+      "trigger": "manual applicable work package or milestone",
+      "command": "cargo xtask product-validate <package.m4d> <registered-e4-scenario>",
+      "hosted_required": false,
+      "activation_state": "planned-WP-14"
+    },
+    {
+      "id": "performance",
+      "owner": "fixed-hardware-performance",
+      "capability": "trusted-hw2-vulkan",
+      "requirements": ["D-023-performance"],
+      "fixture_tier": "T2-or-T5",
+      "timeout_secs": 2700,
+      "evidence_level": "E4",
+      "trigger": "manual applicable performance claim",
+      "command": "cargo xtask bench-native-package <package.m4d>",
+      "hosted_required": false,
+      "activation_state": "planned-WP-14"
+    },
+    {
+      "id": "stress",
+      "owner": "resource-and-cancellation",
+      "capability": "trusted-hw2-vulkan",
+      "requirements": ["D-023-resource-stress"],
+      "fixture_tier": "T2-or-T5",
+      "timeout_secs": 1800,
+      "evidence_level": "E2-E4",
+      "trigger": "manual applicable pressure or stress claim",
+      "command": "cargo xtask bench-runtime-stress",
+      "hosted_required": false,
+      "activation_state": "planned-WP-14"
+    },
+    {
+      "id": "scientific-acceptance",
+      "owner": "scientific-requirement-owners",
+      "capability": "trusted-hw2-vulkan",
+      "requirements": ["D-023-independent-scientific-facts"],
+      "fixture_tier": "T1-source-or-T5",
+      "timeout_secs": 2700,
+      "evidence_level": "E1-E4",
+      "trigger": "manual applicable milestone or release candidate",
+      "command": "cargo xtask product-validate <package.m4d> <registered-scientific-scenario>",
+      "hosted_required": false,
+      "activation_state": "planned-WP-14"
+    },
+    {
+      "id": "release",
+      "owner": "release-maintainers",
+      "capability": "standard-public-linux-or-trusted-hw2",
+      "requirements": ["D-023-release-integrity"],
+      "fixture_tier": "T1-source-or-T2-or-T5",
+      "timeout_secs": 1800,
+      "evidence_level": "E3-E4",
+      "trigger": "accepted protected tag",
+      "command": "cargo xtask package-linux-release",
+      "hosted_required": false,
+      "activation_state": "planned-WP-14"
+    },
+    {
+      "id": "developer-local",
+      "owner": "contributors",
+      "capability": "local-cpu",
+      "requirements": ["D-022-local-feedback"],
+      "fixture_tier": "none-or-T2",
+      "timeout_secs": 600,
+      "evidence_level": "support-only",
+      "trigger": "manual pre-push feedback",
+      "command": "cargo xtask verify-pr",
+      "hosted_required": false,
+      "activation_state": "planned"
+    }
+  ],
+  "selector_adapters": [
+    {
+      "id": "WP06-ADAPTER-TRUSTED-SPECIAL-SELECTOR",
+      "lane": "trusted-gpu",
+      "owner": "renderer-and-application-gpu",
+      "requirements": ["D-022-trusted-gpu-separation"],
+      "fixture_tier": "T2",
+      "capability": "trusted-gpu",
+      "matches": [
+        {
+          "package": "mirante4d-renderer",
+          "test_prefix": "gpu::"
+        },
+        {
+          "package": "mirante4d-app",
+          "test_prefix": "tests::app_backend_uses_gpu"
+        }
+      ],
+      "expected_ignored_cases": 40,
+      "expiry": "WP-09B",
+      "deletion_gate": "WP-09B-product-render-hard-cutover"
+    }
+  ]
+}

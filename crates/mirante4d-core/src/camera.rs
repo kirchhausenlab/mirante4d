@@ -433,6 +433,7 @@ mod tests {
     use super::*;
     use approx::assert_abs_diff_eq;
     use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
 
     fn presentation(width_points: f64, height_points: f64) -> PresentationViewport {
         PresentationViewport::new(width_points, height_points).unwrap()
@@ -713,6 +714,9 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 64,
+            max_shrink_iters: 1_024,
+            failure_persistence: None,
+            rng_seed: RngSeed::Fixed(0x4d34_4341_4d45_5241),
             .. ProptestConfig::default()
         })]
 

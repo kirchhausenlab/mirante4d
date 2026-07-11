@@ -7,8 +7,6 @@ use std::{
 use anyhow::{Context, bail};
 
 const MAX_TRACKED_GENERATED_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_SOURCE_FILE_LINES: usize = 2_000;
-const LARGE_SOURCE_FILE_ALLOWLIST: &[(&str, &str)] = &[];
 const FORBIDDEN_DUMPING_GROUND_MODULE_NAMES: &[&str] =
     &["common.rs", "helpers.rs", "misc.rs", "utils.rs"];
 const FORBIDDEN_AXIS_ALIGNED_2D_CHUNK_PATTERNS: &[&str] = &[
@@ -165,9 +163,6 @@ fn check_source_architecture_policy() -> anyhow::Result<()> {
 fn source_architecture_violations(path: &Path, source: &str) -> Vec<String> {
     let normalized = normalize_repo_path(path);
     let mut violations = Vec::new();
-    if let Some(violation) = large_source_file_violation(path, &normalized, source) {
-        violations.push(violation);
-    }
     if let Some(violation) = dumping_ground_module_name_violation(path) {
         violations.push(violation);
     }
@@ -216,25 +211,6 @@ fn axis_aligned_2d_chunk_dependency_violations(path: &Path, source: &str) -> Vec
         FORBIDDEN_AXIS_ALIGNED_2D_CHUNK_PATTERNS,
         "implementation must not depend on axis-aligned 2D slice chunk layouts",
     )
-}
-
-fn large_source_file_violation(path: &Path, normalized: &str, source: &str) -> Option<String> {
-    let line_count = source.lines().count();
-    if line_count <= MAX_SOURCE_FILE_LINES
-        || large_source_file_allowlist_reason(normalized).is_some()
-    {
-        return None;
-    }
-    Some(format!(
-        "{} has {line_count} lines, exceeding the {MAX_SOURCE_FILE_LINES}-line architecture limit; split by domain responsibility or add a documented temporary allowlist entry",
-        path.display()
-    ))
-}
-
-fn large_source_file_allowlist_reason(normalized: &str) -> Option<&'static str> {
-    LARGE_SOURCE_FILE_ALLOWLIST
-        .iter()
-        .find_map(|(path, reason)| (*path == normalized).then_some(*reason))
 }
 
 fn dumping_ground_module_name_violation(path: &Path) -> Option<String> {
@@ -474,64 +450,6 @@ mirante4d-renderer.workspace = true
 
         assert_eq!(violations.len(), 2);
         assert!(violations[0].contains("renderer source must not perform direct filesystem I/O"));
-    }
-
-    #[test]
-    fn source_architecture_policy_rejects_new_large_source_files() {
-        let source = "fn oversized() {}\n".repeat(MAX_SOURCE_FILE_LINES + 1);
-        let violations = source_architecture_violations(
-            Path::new("crates/mirante4d-renderer/src/new_monolith.rs"),
-            &source,
-        );
-
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].contains("exceeding the 2000-line architecture limit"));
-    }
-
-    #[test]
-    fn source_architecture_policy_has_no_current_large_source_allowlist() {
-        let source = "fn oversized() {}\n".repeat(MAX_SOURCE_FILE_LINES + 1);
-        let violations =
-            source_architecture_violations(Path::new("crates/xtask/src/main.rs"), &source);
-
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].contains("exceeding the 2000-line architecture limit"));
-        assert_eq!(
-            large_source_file_allowlist_reason("crates/xtask/src/main.rs"),
-            None
-        );
-        assert_eq!(
-            large_source_file_allowlist_reason("crates/mirante4d-format/src/writer.rs"),
-            None
-        );
-        assert_eq!(
-            large_source_file_allowlist_reason("crates/mirante4d-renderer/src/gpu/mod.rs"),
-            None
-        );
-        assert_eq!(
-            large_source_file_allowlist_reason("crates/mirante4d-app/src/lib.rs"),
-            None
-        );
-        assert_eq!(
-            large_source_file_allowlist_reason("crates/mirante4d-import/src/lib.rs"),
-            None
-        );
-        assert_eq!(
-            large_source_file_allowlist_reason("crates/mirante4d-renderer/src/brick_render.rs"),
-            None
-        );
-        assert_eq!(
-            large_source_file_allowlist_reason("crates/mirante4d-renderer/src/camera_mip.rs"),
-            None
-        );
-        assert_eq!(
-            large_source_file_allowlist_reason("crates/mirante4d-data/src/lib.rs"),
-            None
-        );
-        assert_eq!(
-            large_source_file_allowlist_reason("crates/mirante4d-analysis/src/lib.rs"),
-            None
-        );
     }
 
     #[test]

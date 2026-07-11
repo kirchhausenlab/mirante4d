@@ -1,0 +1,6 @@
+{
+  "schema": "mirante4d-verification-doctest-inventory",
+  "schema_version": 1,
+  "source": "tracked crates/**/*.rs doc comments",
+  "cases": []
+}

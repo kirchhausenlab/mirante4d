@@ -486,6 +486,8 @@ pub struct MiranteWorkbenchApp {
     analysis_workspace_open: bool,
     product_automation: Option<ProductAutomationController>,
     playback: PlaybackState,
+    #[cfg(test)]
+    test_render_viewport_max_side: Option<usize>,
 }
 
 struct CrossSectionPanelGpuDisplayFrame {
@@ -579,6 +581,8 @@ impl MiranteWorkbenchApp {
             analysis_workspace_open: false,
             product_automation: ProductAutomationController::from_env(),
             playback: PlaybackState::default(),
+            #[cfg(test)]
+            test_render_viewport_max_side: None,
         };
         app.request_opened_state_visible_work(Some(&cc.egui_ctx));
         app

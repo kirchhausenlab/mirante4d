@@ -16,12 +16,9 @@ use crate::bench::{
     bench_phase13_renderer, bench_phase13_viewport_matrix, bench_runtime_stress, bench_smoke,
 };
 use crate::command_audit::command_audit;
-use crate::completion_waiver::completion_waiver;
-use crate::external_ci_evidence::external_ci_evidence;
 use crate::fixtures::generate_fixture;
 use crate::neuroglancer_compare::neuroglancer_compare;
 use crate::product_validate::{is_product_validation_scenario_name, product_validate};
-use crate::report_audit::report_audit;
 use crate::smoke::app_smoke;
 use crate::workflow_audit::workflow_audit;
 use anyhow::{Context, bail};
@@ -31,20 +28,15 @@ const PRODUCT_VALIDATE_USAGE: &str = "usage: cargo xtask product-validate [nativ
       t5_qual_001_interaction_mip|t5_qual_001_interaction_render_modes|t5_qual_001_interaction_continuous|\
       t5_qual_001_four_panel_cross_section|t5_qual_001_four_panel_fine_scale|\
       t5_qual_001_four_panel_continuous_cross_section|t5_qual_002_four_panel_timepoint|t5_qual_002_four_panel_autoplay|custom_script]";
-const EXTERNAL_CI_EVIDENCE_USAGE: &str = "usage: cargo xtask external-ci-evidence";
-const COMPLETION_WAIVER_USAGE: &str = "usage: cargo xtask completion-waiver";
-
 mod arch;
 mod audits;
 mod baseline_audit;
 mod baseline_promote;
 mod bench;
 mod command_audit;
-mod completion_waiver;
 mod deps;
 mod dev;
 mod documentation;
-mod external_ci_evidence;
 mod fixtures;
 mod host;
 mod ids;
@@ -52,9 +44,9 @@ mod neuroglancer_compare;
 mod package;
 mod process;
 mod product_validate;
-mod report_audit;
 mod reports;
 mod smoke;
+mod verification;
 mod verify;
 mod workflow_audit;
 
@@ -72,14 +64,40 @@ fn main() -> anyhow::Result<()> {
     let command = args.next().unwrap_or_else(|| "help".to_owned());
     match command.as_str() {
         "verify-bootstrap" => verify::verify_bootstrap(),
-        "verify-fast" => verify::verify_fast(),
-        "verify-full" => verify::verify_full(),
+        "verify-leaf" => {
+            let leaf = args
+                .next()
+                .context("usage: cargo xtask verify-leaf policy|lint|unit|contract|ui|doctest")?;
+            if args.next().is_some() {
+                bail!("verify-leaf accepts exactly one leaf");
+            }
+            verification::verify_leaf(verification::Leaf::parse(&leaf)?)
+        }
+        "verify-pr" => {
+            let group = args.next();
+            if args.next().is_some() {
+                bail!("usage: cargo xtask verify-pr [policy|rust]");
+            }
+            verification::verify_pr(group.as_deref())
+        }
+        "verify-local" => {
+            let lane = args
+                .next()
+                .context("usage: cargo xtask verify-local trusted-gpu")?;
+            if args.next().is_some() {
+                bail!("usage: cargo xtask verify-local trusted-gpu");
+            }
+            verification::verify_local(&lane)
+        }
+        "verification-sync" => {
+            let option = args.next();
+            if args.next().is_some() || option.as_deref().is_some_and(|value| value != "--check") {
+                bail!("usage: cargo xtask verification-sync [--check]");
+            }
+            verification::verification_sync(option.as_deref() == Some("--check"))
+        }
         "verify-deps" => verify::verify_deps(),
-        "verify-render" => verify::verify_render(),
-        "verify-ui" => verify::verify_ui(),
-        "verify-e2e" => verify::verify_e2e(),
         "verify-coverage" => verify::verify_coverage(),
-        "verify-nightly" => verify::verify_nightly(),
         "generate-fixture" => {
             let name = args
                 .next()
@@ -298,30 +316,7 @@ fn main() -> anyhow::Result<()> {
             println!("{}", path.display());
         }),
         "docs-check" => documentation::docs_check(),
-        "external-ci-evidence" => {
-            if no_arg_command_requests_help(args.collect::<Vec<_>>(), EXTERNAL_CI_EVIDENCE_USAGE)? {
-                print_external_ci_evidence_help();
-                Ok(())
-            } else {
-                external_ci_evidence().map(|path| {
-                    println!("{}", path.display());
-                })
-            }
-        }
-        "completion-waiver" => {
-            if no_arg_command_requests_help(args.collect::<Vec<_>>(), COMPLETION_WAIVER_USAGE)? {
-                print_completion_waiver_help();
-                Ok(())
-            } else {
-                completion_waiver().map(|path| {
-                    println!("{}", path.display());
-                })
-            }
-        }
         "command-audit" => command_audit().map(|path| {
-            println!("{}", path.display());
-        }),
-        "report-audit" => report_audit().map(|path| {
             println!("{}", path.display());
         }),
         "run-dev" => dev::run_dev(),
@@ -365,16 +360,6 @@ fn product_validate_args(args: Vec<String>) -> anyhow::Result<ProductValidateArg
     Ok(ProductValidateArgs::Run { package, scenario })
 }
 
-fn no_arg_command_requests_help(args: Vec<String>, usage: &str) -> anyhow::Result<bool> {
-    if args.iter().any(|arg| is_help_arg(arg)) {
-        return Ok(true);
-    }
-    if !args.is_empty() {
-        bail!("{usage}");
-    }
-    Ok(false)
-}
-
 fn is_help_arg(arg: &str) -> bool {
     matches!(arg, "help" | "--help" | "-h")
 }
@@ -415,59 +400,6 @@ Controls:
     );
 }
 
-fn print_external_ci_evidence_help() {
-    println!(
-        "\
-{EXTERNAL_CI_EVIDENCE_USAGE}
-
-Records externally inspected or CI-captured hosted CPU and self-hosted GPU run
-evidence. This is completion-readiness evidence, not static workflow policy.
-
-Modes:
-  manual  writes the final report from explicit operator-supplied run metadata
-  surface writes one hosted_cpu_ci or self_hosted_gpu_ci surface report
-  merge   combines hosted and GPU surface reports into the final evidence report
-
-Controls:
-  MIRANTE4D_EXTERNAL_CI_MODE=manual|surface|merge
-  MIRANTE4D_EXTERNAL_CI_GIT_SHA=<sha> or GITHUB_SHA
-  MIRANTE4D_EXTERNAL_CI_HOSTED_CPU_STATUS=passed
-  MIRANTE4D_EXTERNAL_CI_HOSTED_CPU_RUN_URL=<url>
-  MIRANTE4D_EXTERNAL_CI_HOSTED_CPU_RUN_ID=<id>
-  MIRANTE4D_EXTERNAL_CI_SELF_HOSTED_GPU_STATUS=passed
-  MIRANTE4D_EXTERNAL_CI_SELF_HOSTED_GPU_RUN_URL=<url>
-  MIRANTE4D_EXTERNAL_CI_SELF_HOSTED_GPU_RUN_ID=<id>
-  MIRANTE4D_EXTERNAL_CI_SURFACE=hosted_cpu_ci|self_hosted_gpu_ci
-  MIRANTE4D_EXTERNAL_CI_SURFACE_STATUS=passed
-  MIRANTE4D_EXTERNAL_CI_SURFACE_REPORTS=<hosted-surface.json,gpu-surface.json>"
-    );
-}
-
-fn print_completion_waiver_help() {
-    println!(
-        "\
-{COMPLETION_WAIVER_USAGE}
-
-Records explicit user-approved exceptions for completion-readiness blockers.
-This is not product-open, benchmark, or CI evidence.
-
-Controls:
-  MIRANTE4D_COMPLETION_WAIVER_USER_APPROVED=1
-  MIRANTE4D_COMPLETION_WAIVER_APPROVED_BY=<name>
-  MIRANTE4D_COMPLETION_WAIVER_REASON=<reason>
-  MIRANTE4D_COMPLETION_WAIVER_MILESTONE=<milestone>
-  MIRANTE4D_COMPLETION_WAIVER_ITEMS=<code[,code[:scenario]...]>
-
-Known current blocker item shapes:
-  baseline_refresh_pending
-  external_ci_run_evidence_pending
-  external_ci_run_evidence_missing
-  t5_qual_001_product_open_validation_not_current:t5_qual_001_interaction_mip
-  t5_qual_001_product_open_validation_not_current:t5_qual_001_interaction_render_modes
-  t5_qual_001_product_open_validation_not_current:t5_qual_001_interaction_continuous"
-    );
-}
-
 fn print_help() {
     println!(
         "\
@@ -477,18 +409,17 @@ Commands:
   cargo xtask verify-bootstrap
       temporary WP-01 local feedback: format, compile, targeted correctness, and active docs
       explicitly excludes complete-suite, GPU, E2E, performance, and product-open claims
-  cargo xtask verify-fast
-  cargo xtask verify-full
+  cargo xtask verify-leaf policy|lint|unit|contract|ui|doctest
+      runs one non-recursive verification leaf with its declared timeout and selector
+  cargo xtask verify-pr [policy|rust]
+      runs the pull-request policy and/or Rust group without recursively invoking xtask
+  cargo xtask verify-local trusted-gpu
+      runs the registry-owned ignored GPU union on an explicitly trusted local machine
+      env: MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 acknowledges trusted-machine execution
+  cargo xtask verification-sync [--check]
+      generates or verifies the registry-derived Nextest configuration and selectors
   cargo xtask verify-deps
-  cargo xtask verify-render
-      GPU render gate; requires a usable non-CPU adapter, runs explicit renderer/app GPU tests,
-      and writes target/mirante4d/verify-render/verify-render-report.json
-  cargo xtask verify-ui
-  cargo xtask verify-e2e
-      workflow gate with library tests, virtual-window automation, real-window product validation,
-      and target/mirante4d/verify-e2e/verify-e2e-report.json
   cargo xtask verify-coverage
-  cargo xtask verify-nightly
   cargo xtask generate-fixture basic-u16-16cube
   cargo xtask generate-fixture anisotropic-u16-16cube
   cargo xtask generate-fixture time-u16-8cube-3t
@@ -662,41 +593,8 @@ Commands:
       audits GitHub Actions workflow files for evidence-role naming, xtask gates, artifact uploads, and private-data exclusions
   cargo xtask docs-check
       checks the exact documentation inventory, authority graph, read order, local links, and anchors
-  cargo xtask external-ci-evidence
-      records externally inspected or CI-captured hosted CPU and self-hosted GPU run evidence
-      help: cargo xtask external-ci-evidence --help
-      env: MIRANTE4D_EXTERNAL_CI_MODE=manual|surface|merge (default manual)
-      manual mode:
-      env: MIRANTE4D_EXTERNAL_CI_GIT_SHA=<sha> or GITHUB_SHA
-      env: MIRANTE4D_EXTERNAL_CI_HOSTED_CPU_STATUS=passed
-      env: MIRANTE4D_EXTERNAL_CI_HOSTED_CPU_RUN_URL=<url>
-      env: MIRANTE4D_EXTERNAL_CI_HOSTED_CPU_RUN_ID=<id>
-      env: MIRANTE4D_EXTERNAL_CI_SELF_HOSTED_GPU_STATUS=passed
-      env: MIRANTE4D_EXTERNAL_CI_SELF_HOSTED_GPU_RUN_URL=<url>
-      env: MIRANTE4D_EXTERNAL_CI_SELF_HOSTED_GPU_RUN_ID=<id>
-      surface mode:
-      env: MIRANTE4D_EXTERNAL_CI_SURFACE=hosted_cpu_ci|self_hosted_gpu_ci
-      env: MIRANTE4D_EXTERNAL_CI_SURFACE_STATUS=passed
-      env: GITHUB_RUN_ID/GITHUB_SHA/GITHUB_SERVER_URL/GITHUB_REPOSITORY or explicit surface run env
-      merge mode:
-      env: MIRANTE4D_EXTERNAL_CI_SURFACE_REPORTS=<hosted-surface.json,gpu-surface.json>
-  cargo xtask completion-waiver
-      records explicit user-approved completion-readiness waivers
-      help: cargo xtask completion-waiver --help
-      env: MIRANTE4D_COMPLETION_WAIVER_USER_APPROVED=1 required
-      env: MIRANTE4D_COMPLETION_WAIVER_APPROVED_BY=<name>
-      env: MIRANTE4D_COMPLETION_WAIVER_REASON=<reason>
-      env: MIRANTE4D_COMPLETION_WAIVER_MILESTONE=<milestone>
-      env: MIRANTE4D_COMPLETION_WAIVER_ITEMS=<code[,code[:scenario]...]>
   cargo xtask command-audit
       writes machine-readable xtask command classification and quarantine reports
-  cargo xtask report-audit
-      audits target/mirante4d report artifacts, schema-checks current evidence paths,
-      and fails on known legacy root product-validation artifacts
-  cargo xtask verify-nightly
-      env: MIRANTE4D_NIGHTLY_FUZZ_SECONDS=<seconds> (default 30)
-      env: MIRANTE4D_MUTANTS_PACKAGES=<comma-separated crates> (default mirante4d-core,mirante4d-format)
-      env: MIRANTE4D_NIGHTLY_SAMPLE_EXPERIMENT=<sample folder name> (optional)
   cargo xtask run-dev"
     );
 }
@@ -759,21 +657,5 @@ mod tests {
         .to_string();
 
         assert!(err.contains("usage: cargo xtask product-validate"));
-    }
-
-    #[test]
-    fn no_arg_command_args_treat_help_as_inert() {
-        for help_arg in ["--help", "-h", "help"] {
-            assert!(no_arg_command_requests_help(args(&[help_arg]), "usage: cmd").unwrap());
-        }
-    }
-
-    #[test]
-    fn no_arg_command_args_reject_unexpected_args() {
-        let err = no_arg_command_requests_help(args(&["extra"]), "usage: cmd")
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("usage: cmd"));
     }
 }

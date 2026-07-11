@@ -52,6 +52,17 @@ pub(crate) struct OpenedScalarLayer {
     pub(crate) active_intensity_summary: IntensitySummary,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct InitialScalarLayerOverrides {
+    render_viewport: Option<RenderViewport>,
+    dense_startup_voxel_limit: Option<u64>,
+}
+
+#[cfg(test)]
+pub(crate) const TEST_INITIAL_RENDER_VIEWPORT_SIDE: u64 = 32;
+#[cfg(test)]
+pub(crate) const TEST_DENSE_STARTUP_VOXEL_LIMIT: u64 = 16 * 16 * 16;
+
 fn placeholder_open_frame(
     source_shape: Shape3D,
     render_viewport: RenderViewport,
@@ -81,17 +92,44 @@ pub(crate) fn open_initial_scalar_layer(
     stored_dtype: IntensityDType,
     options: ScalarLayerOpenOptions,
 ) -> anyhow::Result<OpenedScalarLayer> {
+    open_initial_scalar_layer_with_overrides(
+        dataset,
+        layer_id,
+        stored_dtype,
+        options,
+        InitialScalarLayerOverrides::default(),
+    )
+}
+
+fn open_initial_scalar_layer_with_overrides(
+    dataset: &DatasetHandle,
+    layer_id: &LayerId,
+    stored_dtype: IntensityDType,
+    options: ScalarLayerOpenOptions,
+    overrides: InitialScalarLayerOverrides,
+) -> anyhow::Result<OpenedScalarLayer> {
     let source_shape = dataset.scale_shape(layer_id, 0)?;
     let source_grid_to_world = dataset.scale_grid_to_world(layer_id, 0)?;
     let camera = default_camera_for_shape(source_shape, source_grid_to_world);
     let presentation_viewport = options.presentation_viewport;
-    let render_viewport = default_render_viewport_for_shape(source_shape)?;
+    let render_viewport = overrides
+        .render_viewport
+        .map(Ok)
+        .unwrap_or_else(|| default_render_viewport_for_shape(source_shape))?;
     let quality = mirante4d_renderer::CameraRenderQuality {
         intensity_sampling: IntensitySamplingPolicy::SmoothLinear,
         iso_shading: IsoShadingMode::GradientLighting,
     };
     let active_intensity_summary = metadata_intensity_summary(source_shape)?;
-    if !dense_startup_allowed(source_shape) {
+    let dense_startup_is_allowed = overrides
+        .dense_startup_voxel_limit
+        .map(|limit| {
+            source_shape
+                .element_count()
+                .is_ok_and(|voxels| voxels <= limit)
+        })
+        .unwrap_or_else(|| dense_startup_allowed(source_shape));
+    if !dense_startup_is_allowed {
         let (frame, diagnostics) =
             placeholder_open_frame(source_shape, render_viewport, options.mode)?;
         return Ok(OpenedScalarLayer {
@@ -233,6 +271,50 @@ pub fn open_dataset_with_preferences_and_render_first_frame(
     path: impl AsRef<Path>,
     preferences: &AppPreferences,
 ) -> anyhow::Result<AppState> {
+    #[cfg(test)]
+    {
+        open_test_dataset_with_preferences_and_render_first_frame(
+            path,
+            preferences,
+            RenderViewport::new(
+                TEST_INITIAL_RENDER_VIEWPORT_SIDE,
+                TEST_INITIAL_RENDER_VIEWPORT_SIDE,
+            )
+            .expect("the fixed test viewport is valid"),
+            TEST_DENSE_STARTUP_VOXEL_LIMIT,
+        )
+    }
+
+    #[cfg(not(test))]
+    open_dataset_with_preferences_and_overrides(
+        path,
+        preferences,
+        InitialScalarLayerOverrides::default(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn open_test_dataset_with_preferences_and_render_first_frame(
+    path: impl AsRef<Path>,
+    preferences: &AppPreferences,
+    render_viewport: RenderViewport,
+    dense_startup_voxel_limit: u64,
+) -> anyhow::Result<AppState> {
+    open_dataset_with_preferences_and_overrides(
+        path,
+        preferences,
+        InitialScalarLayerOverrides {
+            render_viewport: Some(render_viewport),
+            dense_startup_voxel_limit: Some(dense_startup_voxel_limit),
+        },
+    )
+}
+
+fn open_dataset_with_preferences_and_overrides(
+    path: impl AsRef<Path>,
+    preferences: &AppPreferences,
+    overrides: InitialScalarLayerOverrides,
+) -> anyhow::Result<AppState> {
     preferences.validate()?;
     let dataset = DatasetHandle::open_with_runtime_config(&path, preferences.runtime_config())?;
     let layer_id = dataset.first_layer_id()?;
@@ -270,7 +352,7 @@ pub fn open_dataset_with_preferences_and_render_first_frame(
     let active_color = ChannelColor::new(layer.channel.color_rgba)
         .expect("dataset validation rejects invalid channel colors");
     let active_transfer = ChannelTransferFunction::linear(layer.display, active_color);
-    let opened = open_initial_scalar_layer(
+    let opened = open_initial_scalar_layer_with_overrides(
         &dataset,
         &layer_id,
         layer.dtype.stored,
@@ -284,6 +366,7 @@ pub fn open_dataset_with_preferences_and_render_first_frame(
             iso_display_level,
             dvr_density_scale,
         },
+        overrides,
     )?;
     let OpenedScalarLayer {
         source_shape,

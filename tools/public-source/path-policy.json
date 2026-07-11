@@ -8,9 +8,6 @@
   ],
   "allowed_executable_paths": [],
   "allowed_binary_paths": [
-    "crates/mirante4d-app/tests/snapshots/workbench_shell_basic.png",
-    "crates/mirante4d-app/tests/snapshots/workbench_shell_dvr_hidpi.png",
-    "crates/mirante4d-app/tests/snapshots/workbench_shell_iso_hidpi.png",
     "fixtures/source/mirante4d-source-tiff-fixtures-v1.tar"
   ],
   "allowed_archive_paths": [

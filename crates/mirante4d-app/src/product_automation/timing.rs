@@ -657,9 +657,9 @@ fn latency_gate_status(p95: Option<f64>, threshold_ms: f64) -> &'static str {
 }
 
 fn aggregate_gate_status(statuses: &[&'static str]) -> &'static str {
-    if statuses.iter().any(|status| *status == "failed") {
+    if statuses.contains(&"failed") {
         "failed"
-    } else if statuses.iter().any(|status| *status == "passed") {
+    } else if statuses.contains(&"passed") {
         "passed"
     } else {
         "insufficient_samples"

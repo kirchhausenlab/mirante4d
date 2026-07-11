@@ -16,4 +16,5 @@ tiff.workspace = true
 
 [dev-dependencies]
 mirante4d-data.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true

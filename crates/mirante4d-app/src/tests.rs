@@ -21,7 +21,35 @@ use mirante4d_format::{
 use tiff::encoder::{TiffEncoder, colortype};
 use tiff::tags::Tag;
 
+use crate::dataset_opening::{TEST_DENSE_STARTUP_VOXEL_LIMIT, TEST_INITIAL_RENDER_VIEWPORT_SIDE};
+
 use super::*;
+
+fn test_initial_render_viewport() -> RenderViewport {
+    RenderViewport::new(
+        TEST_INITIAL_RENDER_VIEWPORT_SIDE,
+        TEST_INITIAL_RENDER_VIEWPORT_SIDE,
+    )
+    .expect("the fixed test viewport is valid")
+}
+
+fn open_dataset_and_render_first_frame(
+    path: impl AsRef<std::path::Path>,
+) -> anyhow::Result<AppState> {
+    open_dataset_with_preferences_and_render_first_frame(path, &AppPreferences::default())
+}
+
+fn open_dataset_with_preferences_and_render_first_frame(
+    path: impl AsRef<std::path::Path>,
+    preferences: &AppPreferences,
+) -> anyhow::Result<AppState> {
+    crate::dataset_opening::open_test_dataset_with_preferences_and_render_first_frame(
+        path,
+        preferences,
+        test_initial_render_viewport(),
+        TEST_DENSE_STARTUP_VOXEL_LIMIT,
+    )
+}
 
 fn test_workbench_app_without_background_runtime(state: AppState) -> MiranteWorkbenchApp {
     let clean_project_snapshot = ProjectDirtySnapshot::from_state(&state);
@@ -57,7 +85,18 @@ fn test_workbench_app_without_background_runtime(state: AppState) -> MiranteWork
         analysis_workspace_open: false,
         product_automation: None,
         playback: PlaybackState::default(),
+        test_render_viewport_max_side: None,
     }
+}
+
+fn test_workbench_app_for_ui_harness(
+    cc: &eframe::CreationContext<'_>,
+    state: AppState,
+) -> MiranteWorkbenchApp {
+    ui_kit::configure_visuals(&cc.egui_ctx);
+    let mut app = test_workbench_app_without_background_runtime(state);
+    app.test_render_viewport_max_side = Some(TEST_INITIAL_RENDER_VIEWPORT_SIDE as usize);
+    app
 }
 
 fn world_tool_hit(world: DVec3, screen_x: f32, screen_y: f32) -> PickHit {

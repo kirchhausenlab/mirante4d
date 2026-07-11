@@ -2407,6 +2407,7 @@ dependencies = [
  "mirante4d-data",
  "mirante4d-format",
  "quick-xml",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tiff",

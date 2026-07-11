@@ -1,0 +1,230 @@
+{
+  "schema": "mirante4d-verification-fixture-registry",
+  "schema_version": 1,
+  "record_count": 6,
+  "rules": {
+    "maximum_records": 64,
+    "candidate_output_root": "target/mirante4d/fixture-candidates",
+    "candidate_cannot_promote_itself": true,
+    "one_promoted_authority_per_claim_scope": true,
+    "target_format_t1_available": false
+  },
+  "promotions": [
+    {
+      "fixture_id": "source-tiff-v1",
+      "authority": "fixtures/source/manifest.json#/approvals",
+      "approved_on": "2026-07-10",
+      "changed_bytes_or_facts_require_new_version": true
+    },
+    {
+      "fixture_id": "ui-token-text-v1",
+      "authority": "reviewed-source-change",
+      "changed_bytes_or_facts_require_new_version": true
+    }
+  ],
+  "records": [
+    {
+      "id": "source-tiff-v1",
+      "tier": "T1-source",
+      "claim_scope": "source-tiff-layout-and-independent-value-facts",
+      "authority_state": "promoted-source-only",
+      "owner": "WP-03 source publication",
+      "capability": "public-cpu",
+      "publication": "public-safe-synthetic",
+      "license": "MIT",
+      "path": "fixtures/source/mirante4d-source-tiff-fixtures-v1.tar",
+      "sha256": "f0f082b8bf54abd0bd3f7487ba73ac7a963cec0b3ad73b196eb61b736a7ac051",
+      "manifest": {
+        "path": "fixtures/source/manifest.json",
+        "sha256": "230337c8ef9fbf68a7251b002887be501b062675457e70dd4ac423ba79c37220"
+      },
+      "archive": {
+        "path": "fixtures/source/mirante4d-source-tiff-fixtures-v1.tar",
+        "sha256": "f0f082b8bf54abd0bd3f7487ba73ac7a963cec0b3ad73b196eb61b736a7ac051",
+        "bytes": 51200,
+        "compression": "none",
+        "max_files": 32,
+        "max_directories": 8,
+        "max_unpacked_bytes": 2097152,
+        "max_file_bytes": 2097152,
+        "max_depth": 4,
+        "max_fan_out": 32,
+        "max_path_bytes": 160,
+        "max_compression_ratio": 1
+      },
+      "lineages": [
+        {
+          "role": "byte-producer",
+          "id": "SRC-PRODUCER-001",
+          "path": "tools/source-fixtures/producer/produce.py",
+          "sha256": "7f861940a2d6db97f8879f8bead5f9df460c782d7f05e7e836a2f2ba2ea2213e"
+        },
+        {
+          "role": "expected-fact-oracle",
+          "id": "SRC-FACT-001",
+          "path": "tools/source-fixtures/fact-oracle/src/main.rs",
+          "sha256": "4b660e2c98b7c9ec17c11a894d22a79b574b6aea94fa73f0383904060acf57ac"
+        },
+        {
+          "role": "independent-reader",
+          "id": "SRC-READER-001",
+          "path": "tools/source-fixtures/reader/reader.py",
+          "sha256": "0d06868c137efd4d17846d9f137784f465e815f797749fb4d395fd7f8d64c16f"
+        }
+      ],
+      "expected_facts_sha256": "186d2e4c062440cee57b4203c7763f707ed9d1f7bfe7431f32eabee9e2dc6f04",
+      "independent_reader_report": {
+        "path": "fixtures/source/independent-reader-report.json",
+        "sha256": "c90ae8b62e5cf8e912b852cb460731491b9bb9f999b7be14c5bb2b84cb669b45"
+      },
+      "promotion": {
+        "authority": "fixtures/source/manifest.json#/approvals",
+        "approved_on": "2026-07-10",
+        "changed_authority_requires_new_version": true
+      },
+      "limits": {
+        "max_files": 32,
+        "max_directories": 8,
+        "max_unpacked_bytes": 2097152,
+        "max_file_bytes": 2097152,
+        "max_depth": 4,
+        "max_fan_out": 32,
+        "max_path_bytes": 160,
+        "max_compression_ratio": 1
+      },
+      "validation_command": "python3 tools/source-fixtures/validate.py --self-test --reader-report fixtures/source/independent-reader-report.json",
+      "expiry": null,
+      "deletion_gate": null,
+      "target_format_conformance": false
+    },
+    {
+      "id": "bootstrap-m4d-schema1",
+      "tier": "T2",
+      "claim_scope": "current-schema1-generated-test-support",
+      "authority_state": "non-authoritative-generated",
+      "owner": "WP-06 verification bootstrap",
+      "capability": "public-cpu",
+      "publication": "generated-synthetic",
+      "license": "MIT",
+      "path": "crates/xtask/src/fixtures.rs",
+      "sha256": "fd6c96fe0880cab9c09488c24eaff238efad8f291fb0442652835115da9338b6",
+      "generator": {
+        "command": "cargo xtask generate-fixture <fixture-name>",
+        "source": "crates/xtask/src/fixtures.rs",
+        "sha256": "fd6c96fe0880cab9c09488c24eaff238efad8f291fb0442652835115da9338b6",
+        "production_writer_used": true
+      },
+      "fixture_names": [
+        "basic-u16-16cube",
+        "anisotropic-u16-16cube",
+        "time-u16-8cube-3t",
+        "time-multichannel-u16-8cube-3t-2c",
+        "multichannel-u16-8cube-4c",
+        "basic-f32-8cube"
+      ],
+      "lineages": [
+        {
+          "role": "production-writer-support-only",
+          "id": "WP06-ADAPTER-SCHEMA1-T2",
+          "path": "crates/xtask/src/fixtures.rs",
+          "sha256": "fd6c96fe0880cab9c09488c24eaff238efad8f291fb0442652835115da9338b6"
+        }
+      ],
+      "limits": {
+        "output_root": "target/mirante4d/fixtures",
+        "archive": false,
+        "authority": false
+      },
+      "validation_command": "cargo xtask generate-fixture basic-u16-16cube",
+      "promotion": null,
+      "expiry": "WP-10C entry",
+      "deletion_gate": "WP-10C storage/runtime product hard cutover",
+      "target_format_conformance": false
+    },
+    {
+      "id": "ui-token-text-v1",
+      "tier": "T2",
+      "claim_scope": "deterministic-ui-token-text",
+      "authority_state": "reviewed-snapshot",
+      "owner": "mirante4d-app UI tests",
+      "capability": "public-cpu-headless",
+      "publication": "public-safe-generated-text",
+      "license": "MIT",
+      "path": "crates/mirante4d-app/src/snapshots/mirante4d_app__ui_kit__tests__mirante4d_ui_tokens.snap",
+      "sha256": "8e4ea8502f37bbf01f8e7100942fc24e2e3d189c0dd47d13f5a1b102e12d40b0",
+      "lineages": [],
+      "limits": {
+        "max_bytes": 65536,
+        "requires_gpu": false
+      },
+      "validation_command": "cargo test -p mirante4d-app ui_kit::tests::design_tokens_have_stable_snapshot --frozen",
+      "promotion": {
+        "authority": "reviewed-source-change",
+        "changed_authority_requires_new_version": true
+      },
+      "expiry": "WP-09C review",
+      "deletion_gate": null,
+      "target_format_conformance": false
+    },
+    {
+      "id": "T5-QUAL-001",
+      "tier": "T5",
+      "claim_scope": "spatial-extreme-open-navigation-render-resource",
+      "authority_state": "private-resolver-only",
+      "owner": "trusted local qualification",
+      "capability": "trusted-hw2-vulkan",
+      "publication": "internal_lab_data",
+      "validation_command": "private resolver only; never runnable by public policy",
+      "lineages": [],
+      "limits": {
+        "public_paths": 0,
+        "public_digests": 0
+      },
+      "opaque_id": "T5-QUAL-001",
+      "public_identity": "opaque-id-only",
+      "public_path_or_digest": null,
+      "expiry": null,
+      "deletion_gate": null
+    },
+    {
+      "id": "T5-QUAL-002",
+      "tier": "T5",
+      "claim_scope": "temporal-extreme-playback-cancellation-resource",
+      "authority_state": "private-resolver-only",
+      "owner": "trusted local qualification",
+      "capability": "trusted-hw2-vulkan",
+      "publication": "internal_lab_data",
+      "validation_command": "private resolver only; never runnable by public policy",
+      "lineages": [],
+      "limits": {
+        "public_paths": 0,
+        "public_digests": 0
+      },
+      "opaque_id": "T5-QUAL-002",
+      "public_identity": "opaque-id-only",
+      "public_path_or_digest": null,
+      "expiry": null,
+      "deletion_gate": null
+    },
+    {
+      "id": "T5-QUAL-003",
+      "tier": "T5",
+      "claim_scope": "ordinary-multichannel-science-and-hw2-calibration",
+      "authority_state": "private-resolver-only",
+      "owner": "trusted local qualification",
+      "capability": "trusted-hw2-vulkan",
+      "publication": "internal_lab_data",
+      "validation_command": "private resolver only; never runnable by public policy",
+      "lineages": [],
+      "limits": {
+        "public_paths": 0,
+        "public_digests": 0
+      },
+      "opaque_id": "T5-QUAL-003",
+      "public_identity": "opaque-id-only",
+      "public_path_or_digest": null,
+      "expiry": null,
+      "deletion_gate": null
+    }
+  ]
+}

@@ -1,0 +1,1043 @@
+{
+  "schema": "mirante4d-verification-predecessor-disposition",
+  "schema_version": 1,
+  "source": {
+    "path": "docs/plans/active/foundation-refactor/manifests/pre-foundation-verification-disposition.json",
+    "sha256": "3f6b647c8e06b91c521d076fab3b7cd29f633dc0fef6bcb59c71a21f1453b1a7",
+    "record_count": 1055
+  },
+  "invariants": {
+    "exactly_one_rule": true,
+    "current_case_exactly_one_lane": true
+  },
+  "rules": [
+    {
+      "id": "source-deleted-by-wp02",
+      "match": {
+        "source_dispositions": ["deleted"]
+      },
+      "disposition": "deleted",
+      "reason": "WP-02 already removed segmentation-only verification and its command surface; WP-06 records that completed deletion without reviving it.",
+      "lane": null,
+      "requirement_ids": ["D-020-segmentation-absence"],
+      "replacement_command": null,
+      "deletion_gate": "WP-02-segmentation-hard-removal"
+    },
+    {
+      "id": "source-moved-ui-case",
+      "match": {
+        "source_dispositions": ["moved"]
+      },
+      "disposition": "moved",
+      "reason": "The non-segmentation application case survived WP-02 at its recorded replacement identity and now belongs to the UI leaf.",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui"],
+      "replacement_command": "cargo xtask verify-leaf ui",
+      "deletion_gate": null
+    },
+    {
+      "id": "source-rewritten-ui-cases",
+      "match": {
+        "source_dispositions": ["rewritten"]
+      },
+      "disposition": "rewritten",
+      "reason": "WP-02 removed label coupling from these application assertions; their recorded replacement identities belong to the UI leaf.",
+      "lane": "ui",
+      "requirement_ids": ["D-020-segmentation-absence", "D-022-ui"],
+      "replacement_command": "cargo xtask verify-leaf ui",
+      "deletion_gate": null
+    },
+    {
+      "id": "delete-wgpu-png-snapshot-tests",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["libtest"],
+        "ids": [
+          "libtest:mirante4d-app:tests::workbench_shell_image_snapshot_dvr_hidpi_matches_baseline",
+          "libtest:mirante4d-app:tests::workbench_shell_image_snapshot_iso_hidpi_matches_baseline",
+          "libtest:mirante4d-app:tests::workbench_shell_image_snapshot_matches_baseline"
+        ]
+      },
+      "disposition": "deleted",
+      "reason": "The PNG cases initialize WGPU and were ignored rather than portable deterministic UI evidence; semantic UI remains in the public UI leaf and GPU behavior has its trusted lane.",
+      "lane": null,
+      "requirement_ids": ["D-022-ui", "D-022-trusted-gpu-separation"],
+      "replacement_command": "cargo xtask verify-leaf ui",
+      "deletion_gate": "WP06-A-shadow-machinery"
+    },
+    {
+      "id": "move-application-gpu-cases",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["libtest"],
+        "owners": ["mirante4d-app"],
+        "ignored": true,
+        "id_prefixes": ["libtest:mirante4d-app:tests::app_backend_uses_gpu"]
+      },
+      "disposition": "moved",
+      "reason": "Application cases requiring an actual GPU are explicit trusted-local evidence and cannot satisfy a hosted PR result.",
+      "lane": "trusted-gpu",
+      "requirement_ids": ["D-022-trusted-gpu-separation"],
+      "replacement_command": "cargo xtask verify-local trusted-gpu",
+      "deletion_gate": null
+    },
+    {
+      "id": "move-renderer-gpu-cases",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["libtest"],
+        "owners": ["mirante4d-renderer"],
+        "ignored": true,
+        "id_prefixes": ["libtest:mirante4d-renderer:gpu::"]
+      },
+      "disposition": "moved",
+      "reason": "Renderer cases requiring an actual GPU are explicit trusted-local evidence and cannot satisfy a hosted PR result.",
+      "lane": "trusted-gpu",
+      "requirement_ids": ["D-022-trusted-gpu-separation"],
+      "replacement_command": "cargo xtask verify-local trusted-gpu",
+      "deletion_gate": null
+    },
+    {
+      "id": "delete-stale-evidence-scanner-tests",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["libtest"],
+        "owners": ["xtask"],
+        "source_path_prefixes": [
+          "crates/xtask/src/completion_waiver.rs",
+          "crates/xtask/src/external_ci_evidence.rs",
+          "crates/xtask/src/report_audit/"
+        ]
+      },
+      "disposition": "deleted",
+      "reason": "Persistent target-directory report scanning, completion-waiver blessing, and source-unbound external-CI evidence are superseded by exact-invocation evidence and native process results.",
+      "lane": null,
+      "requirement_ids": ["VER-BLOCK-001", "VER-BLOCK-003", "D-022-exact-revision-evidence"],
+      "replacement_command": null,
+      "deletion_gate": "WP06-A-shadow-machinery"
+    },
+    {
+      "id": "delete-criterion-libtest-duplicates",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["libtest"],
+        "owners": ["mirante4d-core"],
+        "source_path_prefixes": ["crates/mirante4d-core/benches/"]
+      },
+      "disposition": "deleted",
+      "reason": "These are duplicate libtest discovery records for Criterion benchmark functions; correctness discovery no longer uses --all-targets and the Criterion records remain in performance.",
+      "lane": null,
+      "requirement_ids": ["D-022-unit", "D-023-performance", "VER-BLOCK-004"],
+      "replacement_command": "cargo bench --frozen -p mirante4d-core --bench core_primitives",
+      "deletion_gate": "WP06-A-shadow-machinery"
+    },
+    {
+      "id": "delete-legacy-deep-target-list-test",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["libtest"],
+        "ids": ["libtest:xtask::bin/xtask:verify::tests::deep_verification_targets_are_stable"]
+      },
+      "disposition": "deleted",
+      "reason": "The assertion froze the recursive verify-nightly target array that WP-06 replaces with independent registry-owned lanes.",
+      "lane": null,
+      "requirement_ids": ["D-022-nonrecursive-leaves", "VER-BLOCK-004"],
+      "replacement_command": "cargo xtask verification-sync --check",
+      "deletion_gate": "WP06-A-shadow-machinery"
+    },
+    {
+      "id": "delete-orphaned-legacy-policy-tests",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["libtest"],
+        "owners": ["xtask"],
+        "ids": [
+          "libtest:xtask::bin/xtask:arch::tests::source_architecture_policy_has_no_current_large_source_allowlist",
+          "libtest:xtask::bin/xtask:arch::tests::source_architecture_policy_rejects_new_large_source_files",
+          "libtest:xtask::bin/xtask:command_audit::tests::command_audit_tracks_completion_waiver_as_explicit_exception",
+          "libtest:xtask::bin/xtask:command_audit::tests::command_audit_tracks_external_ci_evidence_as_run_evidence",
+          "libtest:xtask::bin/xtask:command_audit::tests::command_audit_tracks_report_audit_as_evidence_hygiene",
+          "libtest:xtask::bin/xtask:product_validate::tests::t5_qual_001_completion_plan_records_heavy_product_open_commands",
+          "libtest:xtask::bin/xtask:tests::no_arg_command_args_reject_unexpected_args",
+          "libtest:xtask::bin/xtask:tests::no_arg_command_args_treat_help_as_inert",
+          "libtest:xtask::bin/xtask:workflow_audit::tests::fragment_presence_distinguishes_required_and_forbidden_text",
+          "libtest:xtask::bin/xtask:workflow_audit::tests::workflow_policy_checks_ignore_commented_out_commands",
+          "libtest:xtask::bin/xtask:workflow_audit::tests::workflow_policy_checks_require_structured_artifact_paths"
+        ]
+      },
+      "disposition": "deleted",
+      "reason": "These assertions owned the superseded source-line limit, deleted evidence commands, stale completion plans, or predecessor workflow-text heuristics; the registry and exact workflow inventory replace them.",
+      "lane": null,
+      "requirement_ids": ["VER-BLOCK-002", "VER-BLOCK-003", "D-022-policy", "D-022-registry"],
+      "replacement_command": "cargo xtask verify-leaf policy",
+      "deletion_gate": "WP06-A-shadow-machinery"
+    },
+    {
+      "id": "keep-analysis-unit-tests",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["libtest"],
+        "owners": ["mirante4d-analysis"],
+        "ignored": false
+      },
+      "disposition": "kept",
+      "reason": "Analysis model and pure scientific-operation cases remain ordinary hosted CPU unit evidence.",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit"],
+      "replacement_command": "cargo xtask verify-leaf unit",
+      "deletion_gate": null
+    },
+    {
+      "id": "keep-application-ui-tests",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["libtest"],
+        "owners": ["mirante4d-app"],
+        "ignored": false
+      },
+      "disposition": "kept",
+      "reason": "Normal application tests are headless semantic, state, and interaction evidence owned by the UI leaf.",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui"],
+      "replacement_command": "cargo xtask verify-leaf ui",
+      "deletion_gate": null
+    },
+    {
+      "id": "keep-core-unit-tests",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["libtest"],
+        "owners": ["mirante4d-core"],
+        "ignored": false,
+        "source_path_prefixes": ["crates/mirante4d-core/src/"]
+      },
+      "disposition": "kept",
+      "reason": "Core geometry, identity, and state cases remain ordinary hosted CPU unit evidence.",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit"],
+      "replacement_command": "cargo xtask verify-leaf unit",
+      "deletion_gate": null
+    },
+    {
+      "id": "keep-data-unit-tests",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["libtest"],
+        "owners": ["mirante4d-data"],
+        "ignored": false
+      },
+      "disposition": "kept",
+      "reason": "Data scheduling, cancellation, cache, and access cases remain ordinary hosted CPU unit evidence.",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit"],
+      "replacement_command": "cargo xtask verify-leaf unit",
+      "deletion_gate": null
+    },
+    {
+      "id": "keep-format-contract-tests",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["libtest"],
+        "owners": ["mirante4d-format"],
+        "ignored": false
+      },
+      "disposition": "kept",
+      "reason": "Current experimental format acceptance and rejection cases belong to the hosted contract leaf without claiming target-format T1 authority.",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "D-023-no-target-t1-before-wp10a"],
+      "replacement_command": "cargo xtask verify-leaf contract",
+      "deletion_gate": null
+    },
+    {
+      "id": "keep-import-contract-tests",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["libtest"],
+        "owners": ["mirante4d-import"],
+        "ignored": false
+      },
+      "disposition": "kept",
+      "reason": "Import parser, safety, and source-fixture cases belong to the hosted contract leaf.",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "D-023-source-fixture-independence"],
+      "replacement_command": "cargo xtask verify-leaf contract",
+      "deletion_gate": null
+    },
+    {
+      "id": "keep-renderer-unit-tests",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["libtest"],
+        "owners": ["mirante4d-renderer"],
+        "ignored": false
+      },
+      "disposition": "kept",
+      "reason": "Pure CPU renderer math, contracts, and resource-policy cases remain ordinary hosted unit evidence; actual-GPU cases are separate.",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-022-trusted-gpu-separation"],
+      "replacement_command": "cargo xtask verify-leaf unit",
+      "deletion_gate": null
+    },
+    {
+      "id": "keep-xtask-unit-tests",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["libtest"],
+        "owners": ["xtask"],
+        "ignored": false,
+        "source_path_prefixes": [
+          "crates/xtask/src/arch.rs",
+          "crates/xtask/src/audits/phase12.rs",
+          "crates/xtask/src/audits/phase14.rs",
+          "crates/xtask/src/audits/phase19.rs",
+          "crates/xtask/src/baseline_audit.rs",
+          "crates/xtask/src/baseline_promote.rs",
+          "crates/xtask/src/bench/",
+          "crates/xtask/src/command_audit.rs",
+          "crates/xtask/src/deps.rs",
+          "crates/xtask/src/fixtures.rs",
+          "crates/xtask/src/host.rs",
+          "crates/xtask/src/ids.rs",
+          "crates/xtask/src/main.rs",
+          "crates/xtask/src/neuroglancer_compare.rs",
+          "crates/xtask/src/package.rs",
+          "crates/xtask/src/process.rs",
+          "crates/xtask/src/product_validate/",
+          "crates/xtask/src/reports.rs",
+          "crates/xtask/src/workflow_audit.rs"
+        ],
+        "exclude_ids": [
+          "libtest:xtask::bin/xtask:arch::tests::source_architecture_policy_has_no_current_large_source_allowlist",
+          "libtest:xtask::bin/xtask:arch::tests::source_architecture_policy_rejects_new_large_source_files",
+          "libtest:xtask::bin/xtask:command_audit::tests::command_audit_tracks_completion_waiver_as_explicit_exception",
+          "libtest:xtask::bin/xtask:command_audit::tests::command_audit_tracks_external_ci_evidence_as_run_evidence",
+          "libtest:xtask::bin/xtask:command_audit::tests::command_audit_tracks_report_audit_as_evidence_hygiene",
+          "libtest:xtask::bin/xtask:product_validate::tests::t5_qual_001_completion_plan_records_heavy_product_open_commands",
+          "libtest:xtask::bin/xtask:tests::no_arg_command_args_reject_unexpected_args",
+          "libtest:xtask::bin/xtask:tests::no_arg_command_args_treat_help_as_inert",
+          "libtest:xtask::bin/xtask:workflow_audit::tests::fragment_presence_distinguishes_required_and_forbidden_text",
+          "libtest:xtask::bin/xtask:workflow_audit::tests::workflow_policy_checks_ignore_commented_out_commands",
+          "libtest:xtask::bin/xtask:workflow_audit::tests::workflow_policy_checks_require_structured_artifact_paths"
+        ]
+      },
+      "disposition": "kept",
+      "reason": "Developer-automation implementation cases remain ordinary hosted CPU unit evidence after stale evidence scanners are excluded.",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit"],
+      "replacement_command": "cargo xtask verify-leaf unit",
+      "deletion_gate": null
+    },
+    {
+      "id": "delete-legacy-verify-helper-tests",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["libtest"],
+        "owners": ["xtask"],
+        "ignored": false,
+        "source_path_prefixes": ["crates/xtask/src/verify.rs"],
+        "ids": [
+          "libtest:xtask::bin/xtask:verify::tests::adapter_diagnostics_json_preserves_limits_and_device_identity",
+          "libtest:xtask::bin/xtask:verify::tests::gpu_timestamp_timing_json_distinguishes_request_support_and_enablement",
+          "libtest:xtask::bin/xtask:verify::tests::verify_e2e_real_product_scenarios_cover_camera_and_render_modes",
+          "libtest:xtask::bin/xtask:verify::tests::verify_e2e_real_product_summary_classifies_unsupported_and_failures",
+          "libtest:xtask::bin/xtask:verify::tests::verify_e2e_report_json_sections_product_scenarios",
+          "libtest:xtask::bin/xtask:verify::tests::verify_e2e_virtual_product_tests_cover_camera_and_render_modes",
+          "libtest:xtask::bin/xtask:verify::tests::verify_render_report_json_names_requirements_and_test_counts",
+          "libtest:xtask::bin/xtask:verify::tests::verify_render_targets_are_product_relevant_and_explicit",
+          "libtest:xtask::bin/xtask:verify::tests::verify_ui_report_json_names_requirements_and_test_counts",
+          "libtest:xtask::bin/xtask:verify::tests::verify_ui_targets_cover_semantic_layout_and_snapshots",
+          "libtest:xtask::bin/xtask:verify::tests::verify_ui_timeout_parsing_uses_positive_overrides_only"
+        ]
+      },
+      "disposition": "deleted",
+      "reason": "These tests froze legacy per-test arrays and mixed report aggregates for verify-render, verify-ui, and verify-e2e; registry-owned lanes replace that topology.",
+      "lane": null,
+      "requirement_ids": ["D-022-nonrecursive-leaves", "D-022-registry", "VER-BLOCK-004"],
+      "replacement_command": "cargo xtask verification-sync --check",
+      "deletion_gate": "WP06-A-shadow-machinery"
+    },
+    {
+      "id": "keep-criterion-benchmarks",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["criterion_benchmark"]
+      },
+      "disposition": "kept",
+      "reason": "Criterion is the single representation of these measurements and runs only in the non-PR performance lane.",
+      "lane": "performance",
+      "requirement_ids": ["D-023-performance"],
+      "replacement_command": "cargo bench --frozen -p mirante4d-core --bench core_primitives",
+      "deletion_gate": null
+    },
+    {
+      "id": "move-fuzz-targets",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["fuzz_target"]
+      },
+      "disposition": "moved",
+      "reason": "Seeded fuzzing is explicit bounded deep evidence and is never part of either required PR check.",
+      "lane": "deep-fuzz",
+      "requirement_ids": ["D-022-seeded-crash-discovery"],
+      "replacement_command": null,
+      "deletion_gate": null
+    },
+    {
+      "id": "move-package-smoke-records",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["package_smoke"]
+      },
+      "disposition": "moved",
+      "reason": "Install, layout, and headless smoke assertions are package-capability E2 evidence on protected main, not PR correctness tests.",
+      "lane": "main-package-capability",
+      "requirement_ids": ["D-022-package-capability", "D-023-product-E2"],
+      "replacement_command": "cargo xtask package-linux-release",
+      "deletion_gate": null
+    },
+    {
+      "id": "move-internal-product-scenarios",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["product_scenario"]
+      },
+      "disposition": "moved",
+      "reason": "Candidate-controlled product automation is E1 integration support only and cannot satisfy packaged E3 or real-display E4.",
+      "lane": "product-e1",
+      "requirement_ids": ["D-023-product-E1", "D-023-no-E4-self-certification"],
+      "replacement_command": "cargo xtask product-validate",
+      "deletion_gate": null
+    },
+    {
+      "id": "keep-stable-semantic-ui-snapshot",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["ui_snapshot"],
+        "ids": ["ui_snapshot:crates/mirante4d-app/src/snapshots/mirante4d_app__ui_kit__tests__mirante4d_ui_tokens.snap"]
+      },
+      "disposition": "kept",
+      "reason": "The text snapshot is stable headless semantic UI evidence and requires neither WGPU nor a compositor.",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui"],
+      "replacement_command": "cargo xtask verify-leaf ui",
+      "deletion_gate": null
+    },
+    {
+      "id": "delete-wgpu-png-snapshot-assets",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["ui_snapshot"],
+        "source_path_prefixes": ["crates/mirante4d-app/tests/snapshots/"]
+      },
+      "disposition": "deleted",
+      "reason": "The PNG baselines depend on the removed WGPU snapshot cases and are neither portable PR snapshots nor independent product evidence.",
+      "lane": null,
+      "requirement_ids": ["D-022-ui", "D-022-trusted-gpu-separation"],
+      "replacement_command": "cargo xtask verify-leaf ui",
+      "deletion_gate": "WP06-A-shadow-machinery"
+    },
+    {
+      "id": "delete-obsolete-evidence-and-recursive-commands",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["xtask_command"],
+        "ids": [
+          "xtask_command:completion-waiver",
+          "xtask_command:external-ci-evidence",
+          "xtask_command:report-audit",
+          "xtask_command:verify-fast",
+          "xtask_command:verify-full",
+          "xtask_command:verify-nightly"
+        ]
+      },
+      "disposition": "deleted",
+      "reason": "WP-06 removes recursive aggregate gates and stale report/waiver/external-evidence authorities rather than renaming or hiding them.",
+      "lane": null,
+      "requirement_ids": ["VER-BLOCK-001", "VER-BLOCK-002", "VER-BLOCK-003", "VER-BLOCK-004", "D-022-nonrecursive-leaves"],
+      "replacement_command": null,
+      "deletion_gate": "WP06-A-shadow-machinery"
+    },
+    {
+      "id": "move-performance-commands",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["xtask_command"],
+        "ids": [
+          "xtask_command:baseline-audit",
+          "xtask_command:baseline-promote",
+          "xtask_command:baseline-promote-manifest",
+          "xtask_command:baseline-refresh-plan",
+          "xtask_command:bench-check",
+          "xtask_command:bench-import-sample",
+          "xtask_command:bench-native-package",
+          "xtask_command:bench-phase11-interaction",
+          "xtask_command:bench-phase11-large-view",
+          "xtask_command:bench-phase11-synthetic-matrix",
+          "xtask_command:bench-phase11-viewport-matrix",
+          "xtask_command:bench-phase13-renderer",
+          "xtask_command:bench-phase13-viewport-matrix",
+          "xtask_command:bench-phase14-multichannel",
+          "xtask_command:bench-phase15-analysis",
+          "xtask_command:bench-smoke"
+        ]
+      },
+      "disposition": "kept",
+      "reason": "These existing timing and baseline commands are now explicitly registered as trusted fixed-hardware performance evidence and never PR correctness checks.",
+      "lane": "performance",
+      "requirement_ids": ["D-023-performance"],
+      "replacement_command": null,
+      "deletion_gate": null
+    },
+    {
+      "id": "rewrite-policy-commands",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["xtask_command"],
+        "ids": [
+          "xtask_command:command-audit",
+          "xtask_command:verify-deps",
+          "xtask_command:workflow-audit"
+        ]
+      },
+      "disposition": "rewritten",
+      "reason": "These checks become nonrecursive implementation phases of the registry-owned policy leaf instead of independent completion authorities.",
+      "lane": "policy",
+      "requirement_ids": ["D-022-policy"],
+      "replacement_command": "cargo xtask verify-leaf policy",
+      "deletion_gate": null
+    },
+    {
+      "id": "keep-package-dev-command",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["xtask_command"],
+        "ids": ["xtask_command:package-dev"]
+      },
+      "disposition": "kept",
+      "reason": "The development package builder remains a local contributor helper; it does not satisfy the pending main package-capability lane.",
+      "lane": "developer-local",
+      "requirement_ids": ["D-022-local-feedback"],
+      "replacement_command": null,
+      "deletion_gate": null
+    },
+    {
+      "id": "keep-release-package-command",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["xtask_command"],
+        "ids": ["xtask_command:package-linux-release"]
+      },
+      "disposition": "kept",
+      "reason": "The Linux release-package builder remains the registry-owned release assembly command; it is not a package-capability or product-open result by itself.",
+      "lane": "release",
+      "requirement_ids": ["D-023-release-integrity"],
+      "replacement_command": "cargo xtask package-linux-release",
+      "deletion_gate": null
+    },
+    {
+      "id": "rewrite-app-smoke-command",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["xtask_command"],
+        "ids": ["xtask_command:app-smoke"]
+      },
+      "disposition": "rewritten",
+      "reason": "The ad hoc smoke command is replaced by the registry-owned E1 scenario command and cannot imply E2, E3, or E4.",
+      "lane": "product-e1",
+      "requirement_ids": ["D-023-product-E1", "D-023-no-E4-self-certification"],
+      "replacement_command": "cargo xtask product-validate <package.m4d> <registered-e1-scenario>",
+      "deletion_gate": null
+    },
+    {
+      "id": "keep-product-e1-command",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["xtask_command"],
+        "ids": ["xtask_command:product-validate"]
+      },
+      "disposition": "kept",
+      "reason": "Product validation remains candidate-controlled E1 support under the registry-owned scenario contract; it cannot imply E2, E3, or E4.",
+      "lane": "product-e1",
+      "requirement_ids": ["D-023-product-E1", "D-023-no-E4-self-certification"],
+      "replacement_command": "cargo xtask product-validate <package.m4d> <registered-e1-scenario>",
+      "deletion_gate": null
+    },
+    {
+      "id": "rewrite-mixed-e2e-command",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["xtask_command"],
+        "ids": ["xtask_command:verify-e2e"]
+      },
+      "disposition": "deleted",
+      "reason": "The mixed recursive E2E aggregate had no honest single evidence level; it is deleted while separately registered E1, E2, E3, and E4 lanes remain distinct.",
+      "lane": null,
+      "requirement_ids": ["D-022-nonrecursive-leaves", "D-023-product-E1", "D-023-product-E2", "D-023-product-E3", "D-023-product-E4"],
+      "replacement_command": null,
+      "deletion_gate": "WP06-A-shadow-machinery"
+    },
+    {
+      "id": "move-gpu-command",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["xtask_command"],
+        "ids": ["xtask_command:verify-render"]
+      },
+      "disposition": "rewritten",
+      "reason": "The per-test-array GPU aggregate is replaced by the registry-owned complete trusted-GPU selector and local lane command.",
+      "lane": "trusted-gpu",
+      "requirement_ids": ["D-022-trusted-gpu-separation"],
+      "replacement_command": "cargo xtask verify-local trusted-gpu",
+      "deletion_gate": null
+    },
+    {
+      "id": "rewrite-ui-command",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["xtask_command"],
+        "ids": ["xtask_command:verify-ui"]
+      },
+      "disposition": "rewritten",
+      "reason": "The old mixed semantic/WGPU visual gate is replaced by the portable semantic UI leaf after the ignored PNG snapshot cases are deleted.",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui"],
+      "replacement_command": "cargo xtask verify-leaf ui",
+      "deletion_gate": null
+    },
+    {
+      "id": "move-coverage-command",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["xtask_command"],
+        "ids": ["xtask_command:verify-coverage"]
+      },
+      "disposition": "kept",
+      "reason": "The existing code-coverage command is registered as bounded deep diagnostic evidence, distinct from both PR correctness and requirement coverage.",
+      "lane": "deep-coverage",
+      "requirement_ids": ["D-022-code-gap-discovery"],
+      "replacement_command": "cargo xtask verify-coverage",
+      "deletion_gate": null
+    },
+    {
+      "id": "move-scientific-acceptance-commands",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["xtask_command"],
+        "ids": [
+          "xtask_command:neuroglancer-compare",
+          "xtask_command:phase10-audit",
+          "xtask_command:phase12-audit",
+          "xtask_command:phase14-audit",
+          "xtask_command:phase15-audit",
+          "xtask_command:phase17-audit",
+          "xtask_command:phase19-audit"
+        ]
+      },
+      "disposition": "kept",
+      "reason": "These existing phase comparisons and audits are registered as trusted scientific-acceptance inputs, not required PR checks or self-blessing reports.",
+      "lane": "scientific-acceptance",
+      "requirement_ids": ["D-023-independent-scientific-facts", "D-023-independent-oracles"],
+      "replacement_command": null,
+      "deletion_gate": null
+    },
+    {
+      "id": "move-stress-commands",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["xtask_command"],
+        "ids": [
+          "xtask_command:bench-runtime-stress",
+          "xtask_command:phase20-extreme-audit",
+          "xtask_command:phase20-extreme-sample",
+          "xtask_command:phase20-smoke-audit"
+        ]
+      },
+      "disposition": "kept",
+      "reason": "These existing pressure and extreme-volume commands are registered in the bounded trusted stress lane, not ordinary hosted correctness feedback.",
+      "lane": "stress",
+      "requirement_ids": ["D-023-resource-stress"],
+      "replacement_command": null,
+      "deletion_gate": null
+    },
+    {
+      "id": "keep-developer-local-commands",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["xtask_command"],
+        "ids": [
+          "xtask_command:generate-fixture",
+          "xtask_command:help",
+          "xtask_command:run-dev"
+        ]
+      },
+      "disposition": "kept",
+      "reason": "These are discoverability, local run, and non-authoritative T2 support commands rather than completion evidence.",
+      "lane": "developer-local",
+      "requirement_ids": ["D-022-local-feedback", "D-023-T2"],
+      "replacement_command": null,
+      "deletion_gate": null
+    }
+  ],
+  "current_additions": [
+    {
+      "id": "libtest:mirante4d-app:product_automation::tests::automation_script_rejects_removed_label_probe_fields",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-020-segmentation-absence", "D-022-ui"],
+      "reason": "WP-02 regression coverage added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:mirante4d-app:tests::project_v13_and_autosave_rejection_leave_m4dseg_sentinels_untouched",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-020-segmentation-absence", "D-022-ui"],
+      "reason": "WP-02 regression coverage added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:mirante4d-app:tests::project_v14_rejects_removed_active_segmentation_field",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-020-segmentation-absence", "D-022-ui"],
+      "reason": "WP-02 regression coverage added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:mirante4d-app:tests::project_v14_save_autosave_and_recovery_leave_m4dseg_sentinels_untouched",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-020-segmentation-absence", "D-022-ui"],
+      "reason": "WP-02 regression coverage added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:mirante4d-import:tests::ome_xml_rejects_documents_over_depth_budget",
+      "kind": "libtest",
+      "owner": "mirante4d-import",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "D-023-bounded-source-validation"],
+      "reason": "WP-03 public-source hardening added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:mirante4d-import:tests::ome_xml_rejects_documents_over_event_budget",
+      "kind": "libtest",
+      "owner": "mirante4d-import",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "D-023-bounded-source-validation"],
+      "reason": "WP-03 public-source hardening added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:mirante4d-import:tests::ome_xml_rejects_documents_over_total_attribute_byte_budget",
+      "kind": "libtest",
+      "owner": "mirante4d-import",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "D-023-bounded-source-validation"],
+      "reason": "WP-03 public-source hardening added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:mirante4d-import:tests::ome_xml_rejects_duplicate_metadata_attributes",
+      "kind": "libtest",
+      "owner": "mirante4d-import",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "D-023-bounded-source-validation"],
+      "reason": "WP-03 public-source hardening added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:mirante4d-import:tests::ome_xml_rejects_elements_over_attribute_count_budget",
+      "kind": "libtest",
+      "owner": "mirante4d-import",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "D-023-bounded-source-validation"],
+      "reason": "WP-03 public-source hardening added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:mirante4d-import:tests::ome_xml_rejects_input_over_byte_budget",
+      "kind": "libtest",
+      "owner": "mirante4d-import",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "D-023-bounded-source-validation"],
+      "reason": "WP-03 public-source hardening added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:mirante4d-import:tests::ome_xml_rejects_metadata_values_over_decode_allocation_budget",
+      "kind": "libtest",
+      "owner": "mirante4d-import",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "D-023-bounded-source-validation"],
+      "reason": "WP-03 public-source hardening added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:mirante4d-import:tests::ome_xml_rejects_namespace_declarations_over_element_byte_budget",
+      "kind": "libtest",
+      "owner": "mirante4d-import",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "D-023-bounded-source-validation"],
+      "reason": "WP-03 public-source hardening added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:mirante4d-import:tests::source_tiff_archive_matches_independent_reader_observations",
+      "kind": "libtest",
+      "owner": "mirante4d-import",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "D-023-source-fixture-independence"],
+      "reason": "WP-03 added independent source-fixture readback after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:documentation::tests::documentation_index_accepts_exact_inventory_and_rooted_listing_graph",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-022-policy"],
+      "reason": "WP-05 documentation-policy coverage added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:documentation::tests::documentation_index_rejects_a_declared_listing_without_a_real_link",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-022-policy"],
+      "reason": "WP-05 documentation-policy coverage added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:documentation::tests::documentation_index_rejects_broken_agent_entry_links",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-022-policy"],
+      "reason": "WP-05 documentation-policy coverage added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:documentation::tests::documentation_index_rejects_duplicate_authority_and_listing_cycle",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-022-policy"],
+      "reason": "WP-05 documentation-policy coverage added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:documentation::tests::documentation_index_rejects_duplicate_or_misordered_read_order_links",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-022-policy"],
+      "reason": "WP-05 documentation-policy coverage added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:documentation::tests::documentation_index_rejects_required_authority_truth_scope_drift",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-022-policy"],
+      "reason": "WP-05 documentation-policy coverage added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:documentation::tests::documentation_index_rejects_unregistered_markdown",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-022-policy"],
+      "reason": "WP-05 documentation-policy coverage added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:documentation::tests::documentation_index_rejects_unsafe_paths_and_unknown_fields",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-022-policy"],
+      "reason": "WP-05 documentation-policy coverage added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:package::tests::release_manifest_names_license_and_provenance_notices",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-022-package-separation"],
+      "reason": "WP-03 public-package policy coverage added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:product_validate::tests::completed_product_validation_fails_with_blank_viewport_capture",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "VER-BLOCK-001"],
+      "reason": "WP-06 corrects the viewport-capture evidence contract with direct report-construction tests."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:product_validate::tests::completed_product_validation_fails_without_viewport_capture",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "VER-BLOCK-001"],
+      "reason": "WP-06 corrects the viewport-capture evidence contract with direct report-construction tests."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:product_validate::tests::completed_product_validation_passes_with_nonblank_viewport_capture",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "VER-BLOCK-001"],
+      "reason": "WP-06 corrects the viewport-capture evidence contract with direct report-construction tests."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:verification::registry::tests::adapter_selectors_are_anchored",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-022-registry"],
+      "reason": "WP-06 registry machinery added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:verification::registry::tests::generated_files_are_current",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-022-registry"],
+      "reason": "WP-06 registry machinery added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:verification::registry::tests::registry_has_exact_required_leaf_set",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-022-registry"],
+      "reason": "WP-06 registry machinery added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:verification::runner::tests::leaf_parser_accepts_exact_surface",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-022-nonrecursive-leaves"],
+      "reason": "WP-06 leaf-runner machinery added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:verification::runner::tests::phase_collector_retains_failures_before_returning",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-022-zero-retry-evidence"],
+      "reason": "WP-06 leaf-runner machinery added after the frozen predecessor inventory."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:verify::tests::bootstrap_scope_is_explicit_and_bounded",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-022-bootstrap-bridge"],
+      "reason": "The temporary WP-04 bridge remains explicit only until WP06-C deletes it after the required-context flip."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:workflow_audit::tests::workflow_inventory_is_exact",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-022-policy", "D-022-registry"],
+      "reason": "WP-06 replaces predecessor text-fragment heuristics with exact workflow inventory coverage."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:verification::fixtures::tests::checked_registry_is_structurally_valid",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-023-fixture-registry"],
+      "reason": "WP-06 adds fail-closed fixture-registry structure and lineage enforcement."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:verification::fixtures::tests::rejects_wrong_rule_archive_and_lifecycle_types",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-023-fixture-registry"],
+      "reason": "WP-06 adds negative fixture rule, archive, and lifecycle type coverage."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:verification::fixtures::tests::rejects_nonopaque_t5_and_malformed_promotions",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-023-fixture-registry", "D-023-private-T5-boundary"],
+      "reason": "WP-06 adds negative promotion and opaque-only T5 coverage."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:verification::runner::tests::clippy_json_parser_normalizes_and_deduplicates_warnings",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-022-lint"],
+      "reason": "WP-06 adds deterministic Clippy diagnostic normalization."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:verification::runner::tests::lint_warning_comparison_requires_an_exact_registered_set",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-022-lint"],
+      "reason": "WP-06 makes both unknown and stale inherited lint exceptions fail closed."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:verification::runner::tests::nextest_commands_disable_user_configuration",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-022-deterministic-selection"],
+      "reason": "WP-06 prevents ambient Nextest user configuration from changing verification selection."
+    },
+    {
+      "id": "xtask_command:docs-check",
+      "kind": "xtask_command",
+      "owner": "xtask",
+      "lane": "policy",
+      "requirement_ids": ["D-022-policy", "WP-05-documentation-authority"],
+      "reason": "WP-05 added the bounded documentation-authority gate after the frozen predecessor inventory."
+    },
+    {
+      "id": "xtask_command:verify-bootstrap",
+      "kind": "xtask_command",
+      "owner": "xtask",
+      "lane": "policy",
+      "requirement_ids": ["D-022-bootstrap-bridge"],
+      "reason": "WP-01 added the temporary bootstrap bridge after the frozen predecessor command inventory; WP06-C deletes it."
+    },
+    {
+      "id": "xtask_command:verify-leaf",
+      "kind": "xtask_command",
+      "owner": "xtask",
+      "lane": "developer-local",
+      "requirement_ids": ["D-022-nonrecursive-leaves"],
+      "reason": "WP-06 adds the single nonrecursive leaf command surface."
+    },
+    {
+      "id": "xtask_command:verify-pr",
+      "kind": "xtask_command",
+      "owner": "xtask",
+      "lane": "developer-local",
+      "requirement_ids": ["D-022-public-pr-groups"],
+      "reason": "WP-06 adds the repository-owned two-group public verification command."
+    },
+    {
+      "id": "xtask_command:verify-local",
+      "kind": "xtask_command",
+      "owner": "xtask",
+      "lane": "trusted-gpu",
+      "requirement_ids": ["D-022-trusted-gpu-separation"],
+      "reason": "WP-06 adds the explicitly trusted-local GPU command after the frozen predecessor inventory."
+    },
+    {
+      "id": "xtask_command:verification-sync",
+      "kind": "xtask_command",
+      "owner": "xtask",
+      "lane": "policy",
+      "requirement_ids": ["D-022-registry"],
+      "reason": "WP-06 adds registry-owned selector and Nextest configuration generation."
+    }
+  ],
+  "expected_summary": {
+    "source_records": 1055,
+    "kept": 836,
+    "moved": 57,
+    "rewritten": 8,
+    "deleted": 154,
+    "current_additions": 44
+  }
+}
