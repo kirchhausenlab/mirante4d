@@ -778,7 +778,7 @@ fn workbench_shell_exposes_primary_regions_at_high_dpi() {
     let harness = Harness::builder()
         .with_size(egui::vec2(1440.0, 900.0))
         .with_pixels_per_point(2.0)
-        .build_eframe(|cc| MiranteWorkbenchApp::new(cc, state));
+        .build_eframe(|cc| test_workbench_app_for_ui_harness(cc, state));
 
     harness.get_by_label("Mirante4D");
     harness.get_by_label("Dataset");
@@ -805,7 +805,7 @@ fn workbench_shell_exposes_four_panel_layout_shell() {
     let harness = Harness::builder()
         .with_size(egui::vec2(1440.0, 900.0))
         .with_pixels_per_point(1.0)
-        .build_eframe(|cc| MiranteWorkbenchApp::new(cc, state));
+        .build_eframe(|cc| test_workbench_app_for_ui_harness(cc, state));
 
     harness.get_by_label("Layout");
     harness.get_by_label("4 Panel");
@@ -834,7 +834,7 @@ fn workbench_shell_handles_long_dataset_name_in_narrow_layout() {
     let harness = Harness::builder()
         .with_size(egui::vec2(520.0, 360.0))
         .with_pixels_per_point(1.5)
-        .build_eframe(|cc| MiranteWorkbenchApp::new(cc, state));
+        .build_eframe(|cc| test_workbench_app_for_ui_harness(cc, state));
 
     harness.get_by_label("Mirante4D");
     harness.get_by_label("Dataset");
@@ -1113,7 +1113,7 @@ fn analysis_workspace_window_exposes_selected_results() {
         .with_size(egui::vec2(1440.0, 900.0))
         .with_pixels_per_point(1.0)
         .build_eframe(|cc| {
-            let mut app = MiranteWorkbenchApp::new(cc, state);
+            let mut app = test_workbench_app_for_ui_harness(cc, state);
             app.analysis_workspace_open = true;
             app
         });

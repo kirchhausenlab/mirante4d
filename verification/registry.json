@@ -98,14 +98,14 @@
     {
       "code": "clippy::question_mark",
       "path": "crates/mirante4d-app/src/workbench_ui.rs",
-      "primary_line": 160,
+      "primary_line": 169,
       "reason": "The inherited workbench viewport path remains until the UI composition-root cutover.",
       "deletion_gate": "WP-09C"
     },
     {
       "code": "clippy::question_mark",
       "path": "crates/mirante4d-app/src/workbench_ui.rs",
-      "primary_line": 165,
+      "primary_line": 176,
       "reason": "The inherited workbench viewport path remains until the UI composition-root cutover.",
       "deletion_gate": "WP-09C"
     },

@@ -9,7 +9,7 @@ fn workbench_shell_exposes_channel_display_controls() {
     let harness = Harness::builder()
         .with_size(egui::vec2(1280.0, 720.0))
         .with_pixels_per_point(1.0)
-        .build_eframe(|cc| MiranteWorkbenchApp::new(cc, state));
+        .build_eframe(|cc| test_workbench_app_for_ui_harness(cc, state));
 
     harness.get_by_label("Layers");
     harness.get_by_label("channel visible");
@@ -280,7 +280,7 @@ fn workbench_shell_exposes_histogram_and_auto_window_controls() {
     let harness = Harness::builder()
         .with_size(egui::vec2(1280.0, 720.0))
         .with_pixels_per_point(1.0)
-        .build_eframe(|cc| MiranteWorkbenchApp::new(cc, state));
+        .build_eframe(|cc| test_workbench_app_for_ui_harness(cc, state));
 
     harness.get_by_label("histogram");
     harness.get_by_label("histogram bins");
@@ -477,7 +477,7 @@ fn workbench_shell_exposes_playback_controls_for_time_series() {
     let harness = Harness::builder()
         .with_size(egui::vec2(1280.0, 720.0))
         .with_pixels_per_point(1.0)
-        .build_eframe(|cc| MiranteWorkbenchApp::new(cc, state));
+        .build_eframe(|cc| test_workbench_app_for_ui_harness(cc, state));
 
     harness.get_by_label("First");
     harness.get_by_label("Prev");

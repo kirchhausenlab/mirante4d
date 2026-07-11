@@ -85,7 +85,18 @@ fn test_workbench_app_without_background_runtime(state: AppState) -> MiranteWork
         analysis_workspace_open: false,
         product_automation: None,
         playback: PlaybackState::default(),
+        test_render_viewport_max_side: None,
     }
+}
+
+fn test_workbench_app_for_ui_harness(
+    cc: &eframe::CreationContext<'_>,
+    state: AppState,
+) -> MiranteWorkbenchApp {
+    ui_kit::configure_visuals(&cc.egui_ctx);
+    let mut app = test_workbench_app_without_background_runtime(state);
+    app.test_render_viewport_max_side = Some(TEST_INITIAL_RENDER_VIEWPORT_SIDE as usize);
+    app
 }
 
 fn world_tool_hit(world: DVec3, screen_x: f32, screen_y: f32) -> PickHit {

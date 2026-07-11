@@ -104,6 +104,14 @@ const CROSS_SECTION_SCROLL_POINTS_PER_NOTCH: f32 = 120.0;
 const CROSS_SECTION_SCROLL_ZOOM_FACTOR_SCALE: f32 = 0.001;
 
 impl MiranteWorkbenchApp {
+    fn render_viewport_max_side(&self, context_max: usize) -> usize {
+        #[cfg(test)]
+        if let Some(test_max) = self.test_render_viewport_max_side {
+            return context_max.min(test_max);
+        }
+        context_max
+    }
+
     fn show_viewer_layout(
         &mut self,
         ui: &mut egui::Ui,
@@ -132,7 +140,8 @@ impl MiranteWorkbenchApp {
         ctx: &egui::Context,
         display_size_points: egui::Vec2,
     ) {
-        let max_texture_side = ctx.input(|input| input.max_texture_side);
+        let max_texture_side =
+            self.render_viewport_max_side(ctx.input(|input| input.max_texture_side));
         let mut viewport_changed = false;
         if let Some(presentation_viewport) =
             presentation_viewport_for_display_size(display_size_points)
@@ -162,10 +171,12 @@ impl MiranteWorkbenchApp {
         else {
             return None;
         };
+        let max_texture_side =
+            self.render_viewport_max_side(ctx.input(|input| input.max_texture_side));
         let Some(render_viewport) = render_viewport_for_display_size(
             display_size_points,
             ctx.pixels_per_point(),
-            ctx.input(|input| input.max_texture_side),
+            max_texture_side,
         ) else {
             return None;
         };
