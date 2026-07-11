@@ -2724,12 +2724,52 @@
       "reason": "WP-08A freezes the semantic dataset contract."
     },
     {
-      "id": "libtest:mirante4d-dataset:tests::regions_and_payload_views_validate_bounds_without_scanning_payloads",
+      "id": "libtest:mirante4d-dataset:tests::resource_regions_reject_overflowing_exclusive_ends",
       "kind": "libtest",
       "owner": "mirante4d-dataset",
       "lane": "unit",
-      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
-      "reason": "WP-08A freezes the semantic dataset contract."
+      "requirement_ids": ["D-022-unit", "WP-08A-C1-runtime-contract"],
+      "reason": "The WP-08A correction retains checked semantic region bounds."
+    },
+    {
+      "id": "libtest:mirante4d-dataset:tests::payload_descriptor_bounds_value_validity_and_total_bytes_exactly",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-C1-runtime-contract"],
+      "reason": "The WP-08A correction proves overflow-safe value and validity reservations."
+    },
+    {
+      "id": "libtest:mirante4d-dataset:tests::all_valid_payload_keeps_valid_zero_and_rejects_any_mask",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-C1-runtime-contract"],
+      "reason": "The WP-08A correction distinguishes valid zero from no-data."
+    },
+    {
+      "id": "libtest:mirante4d-dataset:tests::bitmask_payload_supports_mixed_and_all_invalid_samples_lsb_first",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-C1-runtime-contract"],
+      "reason": "The WP-08A correction freezes LSB-first mixed and all-invalid masks."
+    },
+    {
+      "id": "libtest:mirante4d-dataset:tests::payload_view_rejects_noncanonical_masks_and_inexact_lengths",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-C1-runtime-contract"],
+      "reason": "The WP-08A correction rejects ambiguous or noncanonical validity payloads."
+    },
+    {
+      "id": "libtest:mirante4d-dataset:tests::source_checks_cancellation_before_reading_or_writing",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-C1-runtime-contract"],
+      "reason": "The WP-08A correction makes proactive source cancellation observable."
     },
     {
       "id": "libtest:mirante4d-dataset:tests::multiscale_catalog_bounds_and_validates_semantic_requests",
@@ -2788,12 +2828,36 @@
       "reason": "WP-08A freezes the unified runtime contract."
     },
     {
-      "id": "libtest:mirante4d-dataset-runtime:tests::deduplication_uses_semantic_resource_not_request_identity",
+      "id": "libtest:mirante4d-dataset-runtime:tests::submit_assigns_unique_ids_while_deduping_by_semantic_resource",
       "kind": "libtest",
       "owner": "mirante4d-dataset-runtime",
       "lane": "unit",
-      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
-      "reason": "WP-08A freezes the unified runtime contract."
+      "requirement_ids": ["D-022-unit", "WP-08A-C1-runtime-contract"],
+      "reason": "The WP-08A correction makes request identities runtime-owned without weakening deduplication."
+    },
+    {
+      "id": "libtest:mirante4d-dataset-runtime:tests::cancellation_scopes_are_isolated_on_one_deduplicated_decode",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset-runtime",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-C1-runtime-contract"],
+      "reason": "The WP-08A correction prevents unrelated scopes from cancelling shared work."
+    },
+    {
+      "id": "libtest:mirante4d-dataset-runtime:tests::runtime_config_uses_exact_hard_category_fractions",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset-runtime",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-C1-runtime-contract"],
+      "reason": "The WP-08A correction freezes non-overcommitting CPU category caps."
+    },
+    {
+      "id": "libtest:mirante4d-dataset-runtime:tests::diagnostics_and_progress_reject_impossible_states",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset-runtime",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-C1-runtime-contract"],
+      "reason": "The WP-08A correction exposes bounded diagnostics and reservation progress."
     },
     {
       "id": "libtest:mirante4d-dataset-runtime:tests::lease_clones_share_one_accounted_immutable_allocation",
@@ -2906,6 +2970,38 @@
       "lane": "unit",
       "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
       "reason": "WP-08A adds mutation coverage for its architecture gate."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp08a::tests::corrective_entry_hash_is_required_and_exact",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-C1-runtime-contract"],
+      "reason": "The WP-08A correction binds enforcement to its sealed entry."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp08a::tests::frozen_public_api_rejects_root_name_drift",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-C1-runtime-contract"],
+      "reason": "The WP-08A correction protects the amended frozen public roots."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp08a::tests::production_thread_creation_requires_a_worker_capability_owner",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-C1-runtime-contract"],
+      "reason": "The WP-08A correction rejects production thread creation outside a declared worker capability."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp08a::tests::thread_creation_detection_closes_import_alias_and_scope_bypasses",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-C1-runtime-contract"],
+      "reason": "The WP-08A correction closes aliased and scoped thread-owner bypasses."
     }
   ],
   "expected_summary": {
@@ -2914,6 +3010,6 @@
     "moved": 49,
     "rewritten": 7,
     "deleted": 305,
-    "current_additions": 224
+    "current_additions": 236
   }
 }

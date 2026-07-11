@@ -1,9 +1,10 @@
 {
   "schema": "mirante4d-wp08a-subsystem-contract",
-  "schema_version": 1,
+  "schema_version": 2,
   "status": "frozen",
   "entry_sha256": "5d4a0b73c9e0689fad6295c61f25ada7a1095ea65436e846450ed72b41b9b477",
   "entry_clarification_sha256": "3ce060eb0f4ec259b6581419b4785df461b6d9d3c9594cb145d043d2a5c953d1",
+  "corrective_entry_sha256": "413d16ebe0094f3d9a2160e2fdcfc459c61d8d1c809e741e7d478af6fe144ddf",
   "target_dependency_matrix": [
     {"name": "mirante4d-domain", "normal": []},
     {"name": "mirante4d-identity", "normal": ["mirante4d-domain"]},
@@ -325,12 +326,12 @@
     {
       "crate": "mirante4d-dataset",
       "path": "crates/mirante4d-dataset/src/lib.rs",
-      "items": ["CpuByteLease", "CpuByteLedger", "CpuLedgerCategory", "CpuLedgerError", "DatasetCatalog", "DatasetCatalogError", "DatasetLayer", "DatasetResourceIdentity", "DatasetResourceKey", "DatasetScale", "DatasetSource", "DatasetSourceFault", "DatasetSourceId", "DecodeSinkError", "MAX_DATASET_LABEL_BYTES", "MAX_DATASET_LAYERS", "MAX_LAYER_LABEL_BYTES", "MAX_SCALES_PER_LAYER", "ReservedDecodeSink", "ResourceContractError", "ResourceLease", "ResourcePayloadDescriptor", "ResourcePayloadView", "ResourceRegion", "ScientificIdentityStatus"]
+      "items": ["CpuByteLease", "CpuByteLedger", "CpuLedgerCategory", "CpuLedgerError", "DatasetCatalog", "DatasetCatalogError", "DatasetLayer", "DatasetResourceIdentity", "DatasetResourceKey", "DatasetScale", "DatasetSource", "DatasetSourceFault", "DatasetSourceId", "DecodeSinkError", "MAX_DATASET_LABEL_BYTES", "MAX_DATASET_LAYERS", "MAX_LAYER_LABEL_BYTES", "MAX_SCALES_PER_LAYER", "ReservedDecodeSink", "ResourceContractError", "ResourceLease", "ResourcePayloadDescriptor", "ResourcePayloadView", "ResourceRegion", "ResourceValidity", "ScientificIdentityStatus"]
     },
     {
       "crate": "mirante4d-dataset-runtime",
       "path": "crates/mirante4d-dataset-runtime/src/lib.rs",
-      "items": ["AccountedCpuLease", "AccountedResourceLease", "CancellationGeneration", "DatasetRuntime", "RequestDedupeKey", "RequestPriority", "RequestTicket", "ResourceRequest", "RuntimeCompletion", "RuntimeFault", "RuntimeFaultCode", "RuntimeOutcome", "RuntimeRequestId", "ShutdownState"]
+      "items": ["AccountedCpuLease", "AccountedResourceLease", "CancellationGeneration", "DatasetRuntime", "DatasetRuntimeConfig", "DatasetRuntimeDiagnostics", "RequestDedupeKey", "RequestPriority", "RequestTicket", "ResourceRequest", "RuntimeCompletion", "RuntimeFault", "RuntimeFaultCode", "RuntimeOutcome", "RuntimeRequestId", "RuntimeRequestProgress", "ShutdownState"]
     },
     {
       "crate": "mirante4d-render-api",
@@ -370,7 +371,7 @@
     },
     {
       "path": "crates/mirante4d-dataset-runtime/src",
-      "forbidden_imports": ["eframe", "egui", "mirante4d-data", "mirante4d-format", "mirante4d-renderer", "std::fs", "std::path", "std::thread", "wgpu", "zarrs"]
+      "forbidden_imports": ["eframe", "egui", "mirante4d-data", "mirante4d-format", "mirante4d-renderer", "std::fs", "std::path", "wgpu", "zarrs"]
     },
     {
       "path": "crates/mirante4d-render-api/src",

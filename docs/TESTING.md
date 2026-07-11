@@ -104,10 +104,11 @@ WP-06 is complete: its exact protected-main revision passed the real Vulkan
 viewer exercise at 1280x720 and 1920x1080 before
 `foundation-wp-06-exit-1` was created. WP-07A is accepted at
 `foundation-wp-07a-exit-1` (`5383cbb93c13c59e6f035bfa551356c75fb426dc`).
-The WP-07B live cutover changes application state, persistence boundaries,
-loading, rendering, and interaction. It therefore requires its entry-stamped
-automated, trusted-GPU, and real product-open evidence on the exact accepted
-revision before `foundation-wp-07b-exit-1` can be created.
+WP-07B is accepted at `foundation-wp-07b-exit-1`. WP-08A exit 1 is accepted at
+`foundation-wp-08a-exit-1`; its contract was subsequently reopened for one
+narrow correction. Exit 2 requires focused contract and architecture checks,
+the normal public verification, and exact-main trusted-GPU plus real-display T2
+no-regression evidence before `foundation-wp-08a-exit-2` is created.
 
 The checked independent report supports only the WP-03 source-TIFF archive.
 Current schema-1 packages remain non-authoritative T2 support fixtures;

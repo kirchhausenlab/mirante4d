@@ -15,11 +15,13 @@ use super::{
 
 const CONTRACT_PATH: &str = "architecture/wp08a-subsystem-contract.json";
 const CONTRACT_SCHEMA: &str = "mirante4d-wp08a-subsystem-contract";
-const CONTRACT_SCHEMA_VERSION: u64 = 1;
+const CONTRACT_SCHEMA_VERSION: u64 = 2;
 const CONTRACT_STATUS: &str = "frozen";
 const ENTRY_SHA256: &str = "5d4a0b73c9e0689fad6295c61f25ada7a1095ea65436e846450ed72b41b9b477";
 const ENTRY_CLARIFICATION_SHA256: &str =
     "3ce060eb0f4ec259b6581419b4785df461b6d9d3c9594cb145d043d2a5c953d1";
+const CORRECTIVE_ENTRY_SHA256: &str =
+    "413d16ebe0094f3d9a2160e2fdcfc459c61d8d1c809e741e7d478af6fe144ddf";
 const CPU_LEDGER_OWNER: &str = "mirante4d-dataset-runtime";
 const CPU_LEDGER_CONTRACT_CRATE: &str = "mirante4d-dataset";
 const GPU_LEDGER_OWNER: &str = "mirante4d-render-wgpu";
@@ -53,6 +55,7 @@ struct SubsystemContract {
     status: String,
     entry_sha256: String,
     entry_clarification_sha256: String,
+    corrective_entry_sha256: String,
     workspace_dependency_matrix: Vec<DependencyContract>,
     target_dependency_matrix: Vec<TargetDependencyContract>,
     transitional_edges: Vec<TransitionalEdge>,
@@ -289,9 +292,10 @@ fn validate_header(contract: &SubsystemContract) -> anyhow::Result<()> {
         || contract.status != CONTRACT_STATUS
         || contract.entry_sha256 != ENTRY_SHA256
         || contract.entry_clarification_sha256 != ENTRY_CLARIFICATION_SHA256
+        || contract.corrective_entry_sha256 != CORRECTIVE_ENTRY_SHA256
     {
         bail!(
-            "{CONTRACT_PATH} must bind schema {CONTRACT_SCHEMA} v{CONTRACT_SCHEMA_VERSION}, status {CONTRACT_STATUS}, WP-08A entry {ENTRY_SHA256}, and clarification {ENTRY_CLARIFICATION_SHA256}"
+            "{CONTRACT_PATH} must bind schema {CONTRACT_SCHEMA} v{CONTRACT_SCHEMA_VERSION}, status {CONTRACT_STATUS}, WP-08A entry {ENTRY_SHA256}, clarification {ENTRY_CLARIFICATION_SHA256}, and corrective entry {CORRECTIVE_ENTRY_SHA256}"
         );
     }
     Ok(())
@@ -592,11 +596,7 @@ fn validate_thread_creation_owners(
             }
             let source = fs::read_to_string(&path)
                 .with_context(|| format!("failed to read {}", path.display()))?;
-            let file = syn::parse_file(&source)
-                .with_context(|| format!("failed to parse {}", path.display()))?;
-            let mut visitor = ThreadCreationVisitor { found: false };
-            visitor.visit_file(&file);
-            if visitor.found {
+            if source_creates_thread(&path, &source)? {
                 observed.insert(crate_name.as_str());
             }
         }
@@ -609,20 +609,117 @@ fn validate_thread_creation_owners(
     Ok(())
 }
 
+fn source_creates_thread(path: &Path, source: &str) -> anyhow::Result<bool> {
+    let file =
+        syn::parse_file(source).with_context(|| format!("failed to parse {}", path.display()))?;
+    let mut import_visitor = ThreadImportVisitor::default();
+    import_visitor.visit_file(&file);
+    let mut creation_visitor = ThreadCreationVisitor {
+        found: false,
+        imports: import_visitor.imports,
+    };
+    creation_visitor.visit_file(&file);
+    Ok(creation_visitor.found)
+}
+
+#[derive(Default)]
+struct ThreadImports {
+    modules: BTreeSet<String>,
+    spawn_functions: BTreeSet<String>,
+    builder_types: BTreeSet<String>,
+    scope_functions: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct ThreadImportVisitor {
+    imports: ThreadImports,
+}
+
+impl<'ast> Visit<'ast> for ThreadImportVisitor {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if !is_test_only_module(item) {
+            syn::visit::visit_item_mod(self, item);
+        }
+    }
+
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        collect_thread_imports(&item.tree, &mut Vec::new(), &mut self.imports);
+    }
+}
+
+fn collect_thread_imports(
+    tree: &syn::UseTree,
+    prefix: &mut Vec<String>,
+    imports: &mut ThreadImports,
+) {
+    match tree {
+        syn::UseTree::Path(path) => {
+            prefix.push(path.ident.to_string());
+            collect_thread_imports(&path.tree, prefix, imports);
+            prefix.pop();
+        }
+        syn::UseTree::Name(name) => {
+            let source_name = name.ident.to_string();
+            let mut source = prefix.clone();
+            let local = if source_name == "self" {
+                prefix.last().cloned().unwrap_or(source_name)
+            } else {
+                source.push(source_name.clone());
+                source_name
+            };
+            register_thread_import(&source, local, imports);
+        }
+        syn::UseTree::Rename(rename) => {
+            let source_name = rename.ident.to_string();
+            let mut source = prefix.clone();
+            if source_name != "self" {
+                source.push(source_name);
+            }
+            register_thread_import(&source, rename.rename.to_string(), imports);
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                collect_thread_imports(item, prefix, imports);
+            }
+        }
+        syn::UseTree::Glob(_)
+            if prefix.len() == 2 && prefix[0] == "std" && prefix[1] == "thread" =>
+        {
+            imports.spawn_functions.insert("spawn".to_owned());
+            imports.builder_types.insert("Builder".to_owned());
+            imports.scope_functions.insert("scope".to_owned());
+        }
+        syn::UseTree::Glob(_) => {}
+    }
+}
+
+fn register_thread_import(source: &[String], local: String, imports: &mut ThreadImports) {
+    let source = source.iter().map(String::as_str).collect::<Vec<_>>();
+    match source.as_slice() {
+        ["std", "thread"] => {
+            imports.modules.insert(local);
+        }
+        ["std", "thread", "spawn"] => {
+            imports.spawn_functions.insert(local);
+        }
+        ["std", "thread", "Builder"] => {
+            imports.builder_types.insert(local);
+        }
+        ["std", "thread", "scope"] => {
+            imports.scope_functions.insert(local);
+        }
+        _ => {}
+    }
+}
+
 struct ThreadCreationVisitor {
     found: bool,
+    imports: ThreadImports,
 }
 
 impl<'ast> Visit<'ast> for ThreadCreationVisitor {
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
-        let test_only = item.attrs.iter().any(|attribute| {
-            attribute.path().is_ident("cfg")
-                && attribute
-                    .meta
-                    .require_list()
-                    .is_ok_and(|list| list.tokens.to_string() == "test")
-        });
-        if !test_only {
+        if !is_test_only_module(item) {
             syn::visit::visit_item_mod(self, item);
         }
     }
@@ -635,15 +732,67 @@ impl<'ast> Visit<'ast> for ThreadCreationVisitor {
                 .iter()
                 .map(|segment| segment.ident.to_string())
                 .collect::<Vec<_>>();
-            self.found |= segments.ends_with(&["thread".to_owned(), "spawn".to_owned()])
-                || segments.ends_with(&[
-                    "thread".to_owned(),
-                    "Builder".to_owned(),
-                    "new".to_owned(),
-                ]);
+            self.found |= self.is_thread_spawn(&segments)
+                || self.is_thread_builder_constructor(&segments)
+                || self.is_thread_scope(&segments);
         }
         syn::visit::visit_expr_call(self, item);
     }
+}
+
+impl ThreadCreationVisitor {
+    fn is_thread_spawn(&self, segments: &[String]) -> bool {
+        matches_path(segments, &["std", "thread", "spawn"])
+            || matches_module_item(segments, &self.imports.modules, "spawn")
+            || matches_imported_item(segments, &self.imports.spawn_functions)
+    }
+
+    fn is_thread_builder_constructor(&self, segments: &[String]) -> bool {
+        let direct = segments.len() == 4
+            && segments[0] == "std"
+            && segments[1] == "thread"
+            && segments[2] == "Builder"
+            && matches!(segments[3].as_str(), "new" | "default");
+        let through_module = segments.len() == 3
+            && self.imports.modules.contains(&segments[0])
+            && segments[1] == "Builder"
+            && matches!(segments[2].as_str(), "new" | "default");
+        let imported = segments.len() == 2
+            && self.imports.builder_types.contains(&segments[0])
+            && matches!(segments[1].as_str(), "new" | "default");
+        direct || through_module || imported
+    }
+
+    fn is_thread_scope(&self, segments: &[String]) -> bool {
+        matches_path(segments, &["std", "thread", "scope"])
+            || matches_module_item(segments, &self.imports.modules, "scope")
+            || matches_imported_item(segments, &self.imports.scope_functions)
+    }
+}
+
+fn matches_path(actual: &[String], expected: &[&str]) -> bool {
+    actual
+        .iter()
+        .map(String::as_str)
+        .eq(expected.iter().copied())
+}
+
+fn matches_module_item(segments: &[String], module_aliases: &BTreeSet<String>, item: &str) -> bool {
+    segments.len() == 2 && module_aliases.contains(&segments[0]) && segments[1] == item
+}
+
+fn matches_imported_item(segments: &[String], aliases: &BTreeSet<String>) -> bool {
+    segments.len() == 1 && aliases.contains(&segments[0])
+}
+
+fn is_test_only_module(item: &syn::ItemMod) -> bool {
+    item.attrs.iter().any(|attribute| {
+        attribute.path().is_ident("cfg")
+            && attribute
+                .meta
+                .require_list()
+                .is_ok_and(|list| list.tokens.to_string() == "test")
+    })
 }
 
 fn validate_side_effect_evidence(
@@ -1494,6 +1643,7 @@ mod tests {
             status: CONTRACT_STATUS.to_owned(),
             entry_sha256: ENTRY_SHA256.to_owned(),
             entry_clarification_sha256: ENTRY_CLARIFICATION_SHA256.to_owned(),
+            corrective_entry_sha256: CORRECTIVE_ENTRY_SHA256.to_owned(),
             workspace_dependency_matrix: Vec::new(),
             target_dependency_matrix: target_entries(),
             transitional_edges: Vec::new(),
@@ -1538,6 +1688,33 @@ mod tests {
                 },
             })
             .collect()
+    }
+
+    #[test]
+    fn corrective_entry_hash_is_required_and_exact() {
+        let mut missing: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../architecture/wp08a-subsystem-contract.json"
+        ))
+        .unwrap();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("corrective_entry_sha256");
+        assert!(
+            serde_json::from_value::<SubsystemContract>(missing)
+                .unwrap_err()
+                .to_string()
+                .contains("corrective_entry_sha256")
+        );
+
+        let mut wrong = contract();
+        wrong.corrective_entry_sha256 = "0".repeat(64);
+        assert!(
+            validate_header(&wrong)
+                .unwrap_err()
+                .to_string()
+                .contains("corrective entry")
+        );
     }
 
     #[test]
@@ -1691,6 +1868,28 @@ fn private(_: NativeManifest) -> Vec<u8> { unreachable!() }
     }
 
     #[test]
+    fn frozen_public_api_rejects_root_name_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_root = temp.path().join("crates/example/src");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("lib.rs"), "pub struct Unexpected;").unwrap();
+
+        let mut contract = contract();
+        contract.frozen_public_roots = vec![FrozenPublicRoot {
+            crate_name: "example".to_owned(),
+            path: "crates/example/src/lib.rs".to_owned(),
+            items: vec!["Expected".to_owned()],
+        }];
+        let crate_paths = BTreeMap::from([("example".to_owned(), "crates/example".to_owned())]);
+        assert!(
+            validate_frozen_public_api(temp.path(), &contract, &crate_paths)
+                .unwrap_err()
+                .to_string()
+                .contains("public root drifted")
+        );
+    }
+
+    #[test]
     fn duplicate_transitional_edge_and_resource_class_are_rejected() {
         let mut contract = contract();
         contract.transitional_edges = vec![
@@ -1760,6 +1959,85 @@ fn private(_: NativeManifest) -> Vec<u8> { unreachable!() }
             .unwrap_err()
             .to_string()
             .contains("expiry gate")
+        );
+    }
+
+    #[test]
+    fn production_thread_creation_requires_a_worker_capability_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_root = temp.path().join("crates/rogue/src");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(
+            source_root.join("lib.rs"),
+            "pub fn start() { let _ = std::thread::spawn(|| {}); }",
+        )
+        .unwrap();
+
+        let contract = contract();
+        let crate_paths = BTreeMap::from([("rogue".to_owned(), "crates/rogue".to_owned())]);
+        assert!(
+            validate_thread_creation_owners(temp.path(), &contract, &crate_paths)
+                .unwrap_err()
+                .to_string()
+                .contains("no worker-capability owner")
+        );
+    }
+
+    #[test]
+    fn thread_creation_detection_closes_import_alias_and_scope_bypasses() {
+        let creating_threads = [
+            (
+                "direct spawn",
+                "fn start() { let _ = std::thread::spawn(|| {}); }",
+            ),
+            (
+                "imported spawn",
+                "use std::thread::spawn; fn start() { let _ = spawn(|| {}); }",
+            ),
+            (
+                "renamed spawn",
+                "use std::thread::spawn as launch; fn start() { let _ = launch(|| {}); }",
+            ),
+            (
+                "aliased thread module",
+                "use std::thread as workers; fn start() { let _ = workers::spawn(|| {}); }",
+            ),
+            (
+                "direct builder",
+                "fn start() { let _ = std::thread::Builder::new().spawn(|| {}); }",
+            ),
+            (
+                "imported builder",
+                "use std::thread::Builder; fn start() { let _ = Builder::new().spawn(|| {}); }",
+            ),
+            (
+                "renamed builder",
+                "use std::thread::Builder as ThreadBuilder; fn start() { let _ = ThreadBuilder::default().spawn(|| {}); }",
+            ),
+            (
+                "direct scoped worker",
+                "fn start() { std::thread::scope(|scope| { scope.spawn(|| {}); }); }",
+            ),
+            (
+                "renamed scoped worker",
+                "use std::thread::scope as with_threads; fn start() { with_threads(|scope| { scope.spawn(|| {}); }); }",
+            ),
+        ];
+        for (case, source) in creating_threads {
+            assert!(
+                source_creates_thread(Path::new("src/lib.rs"), source).unwrap(),
+                "{case} bypassed worker ownership detection"
+            );
+        }
+
+        let arbitrary_spawn = r#"
+struct Executor;
+impl Executor { fn spawn(&self, _: impl FnOnce()) {} }
+fn run(executor: &Executor) { executor.spawn(|| {}); }
+"#;
+        assert!(
+            !source_creates_thread(Path::new("src/lib.rs"), arbitrary_spawn).unwrap(),
+            "an arbitrary .spawn method must not imply OS thread creation"
         );
     }
 }
