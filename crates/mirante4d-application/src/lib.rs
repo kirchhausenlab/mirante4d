@@ -22,6 +22,7 @@ use mirante4d_project_model::{
     ProjectGenerationProjection, ProjectId, ProjectRevisionHighWater, ProjectRevisionId,
     ProjectState, ViewState,
 };
+use mirante4d_render_api::PresentedFrame;
 use mirante4d_settings::{RejectedFileDisposition, ResourcePolicy};
 
 /// Maximum number of project revisions retained for undo/redo.
@@ -945,7 +946,7 @@ impl ApplicationState {
         workspace: UnboundWorkspace,
         resource_policy: ResourcePolicy,
     ) -> Result<Self, ApplicationFaultCode> {
-        require_unverified_catalog(&catalog)?;
+        require_unverified_catalog(&catalog, source_generation)?;
         validate_view_against_catalog(&catalog, workspace.view())?;
         Ok(Self {
             source_generation,
@@ -1002,7 +1003,7 @@ impl ApplicationState {
             return Ok(CommandEffect::NoChange);
         }
         match self.catalog.scientific_identity() {
-            ScientificIdentityStatus::Unverified => {
+            ScientificIdentityStatus::Unverified(_) => {
                 self.catalog = Arc::new(
                     DatasetCatalog::new(
                         self.catalog.label(),
@@ -1085,6 +1086,7 @@ impl ApplicationState {
             pending_settings_change: self.pending_settings_change,
             pending_event_count: self.events.len(),
             latest_problem: self.latest_problem.clone(),
+            presentation: None,
         }
     }
 
@@ -1193,7 +1195,7 @@ impl ApplicationState {
         if source_generation.get() <= self.source_generation.get() {
             return Err(ApplicationFaultCode::SourceGenerationNotAdvanced);
         }
-        require_unverified_catalog(&catalog)?;
+        require_unverified_catalog(&catalog, source_generation)?;
         validate_view_against_catalog(&catalog, workspace.view())?;
         let provisional_project_id = workspace.provisional_project_id();
         self.source_generation = source_generation;
@@ -2161,6 +2163,7 @@ pub struct ApplicationSnapshot {
     pending_settings_change: Option<SettingsChangeToken>,
     pending_event_count: usize,
     latest_problem: Option<ApplicationEvent>,
+    presentation: Option<PresentedFrame>,
 }
 
 impl ApplicationSnapshot {
@@ -2213,6 +2216,20 @@ impl ApplicationSnapshot {
     /// has been drained by composition services. A new retry clears it.
     pub fn latest_problem(&self) -> Option<&ApplicationEvent> {
         self.latest_problem.as_ref()
+    }
+
+    /// Returns the renderer-owned frame projection carried only by its opaque
+    /// presentation token and backend-neutral frame facts.
+    pub const fn presentation(&self) -> Option<&PresentedFrame> {
+        self.presentation.as_ref()
+    }
+
+    /// Composition attaches the current presentation projection after taking
+    /// an immutable application snapshot. This does not mutate application or
+    /// durable project state.
+    pub fn with_presentation(mut self, presentation: Option<PresentedFrame>) -> Self {
+        self.presentation = presentation;
+        self
     }
 
     pub const fn is_bound(&self) -> bool {
@@ -2320,14 +2337,19 @@ fn validate_view_against_catalog(
     Ok(())
 }
 
-fn require_unverified_catalog(catalog: &DatasetCatalog) -> Result<(), ApplicationFaultCode> {
-    if matches!(
-        catalog.scientific_identity(),
-        ScientificIdentityStatus::Unverified
-    ) {
-        Ok(())
-    } else {
-        Err(ApplicationFaultCode::DatasetIdentityMismatch)
+fn require_unverified_catalog(
+    catalog: &DatasetCatalog,
+    source_generation: SourceSessionGeneration,
+) -> Result<(), ApplicationFaultCode> {
+    match catalog.scientific_identity() {
+        ScientificIdentityStatus::Unverified(source_id)
+            if source_id.get() == source_generation.get() =>
+        {
+            Ok(())
+        }
+        ScientificIdentityStatus::Unverified(_) | ScientificIdentityStatus::Verified(_) => {
+            Err(ApplicationFaultCode::DatasetIdentityMismatch)
+        }
     }
 }
 

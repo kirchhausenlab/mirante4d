@@ -31,6 +31,7 @@ fn streaming_test_source_with_policy(
         dataset_opening::open_test_dataset_with_resource_policy_and_render_first_frame(
             path,
             resource_policy,
+            DatasetSourceId::new(1),
             test_initial_render_viewport(),
             dataset_opening::TEST_DENSE_STARTUP_VOXEL_LIMIT,
         )?;

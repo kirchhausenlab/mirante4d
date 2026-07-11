@@ -1866,7 +1866,9 @@ mod tests {
         ApplicationCommand, ApplicationEvent, ApplicationState, MAX_PENDING_EVENTS, OperationKind,
         OperationToken, SourceSessionGeneration, UnboundWorkspace,
     };
-    use mirante4d_dataset::{DatasetCatalog, DatasetLayer, ScientificIdentityStatus};
+    use mirante4d_dataset::{
+        DatasetCatalog, DatasetLayer, DatasetSourceId, ScientificIdentityStatus,
+    };
     use mirante4d_domain::{GridToWorld, IntensityDType, IsoShadingPolicy, Shape4D};
     use mirante4d_settings::ResourcePolicy;
     use serde_json::{Value, json};
@@ -2120,7 +2122,7 @@ mod tests {
         .unwrap();
         let catalog = DatasetCatalog::new(
             "bridge-test",
-            ScientificIdentityStatus::Unverified,
+            ScientificIdentityStatus::Unverified(DatasetSourceId::new(1)),
             vec![
                 DatasetLayer::new(
                     LogicalLayerKey::new(7),

@@ -156,6 +156,7 @@ use mirante4d_application::{
 use mirante4d_data::{BrickReadOutcome, BrickReadStatus, BrickRequestPriority, CancellationToken};
 #[cfg(test)]
 use mirante4d_data::{BrickReadPool, BrickReadTicket, SpatialBrickIndex};
+use mirante4d_dataset::DatasetSourceId;
 use mirante4d_domain::{
     CameraView, CrossSectionView, DisplayWindow, DvrOpacityTransfer as CanonicalDvrOpacityTransfer,
     IsoLightState, IsoShadingPolicy, LayerTransfer, LogicalLayerKey,
@@ -376,8 +377,11 @@ impl MiranteWorkbenchApp {
     ) -> anyhow::Result<Self> {
         let (settings_connection, resource_policy) =
             current_settings_connection::CurrentSettingsConnection::start();
-        let opened =
-            open_dataset_with_resource_policy_and_render_first_frame(path, resource_policy)?;
+        let opened = open_dataset_with_resource_policy_and_render_first_frame(
+            path,
+            resource_policy,
+            DatasetSourceId::new(1),
+        )?;
         Self::new_with_settings(cc, opened, settings_connection, resource_policy)
     }
 

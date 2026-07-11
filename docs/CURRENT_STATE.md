@@ -22,7 +22,7 @@ public release or public full microscopy dataset yet.
 - Linux release-directory, tarball, and AppImage build paths.
 - No segmentation or derived-label subsystem.
 
-The workspace has fourteen crates. `mirante4d-core`, the application
+The workspace has fifteen crates. `mirante4d-core`, the application
 `AppState` god-state, `WorkbenchCommand`, project-v14 authority, and
 preferences-v1 authority have been deleted. There is one live canonical
 application reducer and one canonical project model.
@@ -36,16 +36,15 @@ WP-01 through WP-06 are complete. The public root is
 `9f398f6d19b9ce918395cb4191ccbd9d134e2344`.
 
 WP-07A accepted the canonical domain, identity, and project model at
-`5383cbb93c13c59e6f035bfa551356c75fb426dc`. WP-07B-A accepted the initially
-unreachable boundary crates at `dfe49398fbacc933140cfd9a7992c7f86b3a9548`.
+`5383cbb93c13c59e6f035bfa551356c75fb426dc`. WP-07B completed its live cutover
+at `61cd39263d5f663d9af3fc75fa63ef054c3f4540`, tagged
+`foundation-wp-07b-exit-1`.
 
-The current revision implements WP-07B-B's live hard cutover. Canonical
-application commands/snapshots now drive the viewer; settings use the closed
-`mirante4d-settings-v1` background owner; project persistence is a private
-experimental v15 bridge; and later work is isolated in seven exact temporary
-runtime owners. WP-07B is not complete until automated checks, trusted GPU
-verification, real product-open validation, protected-main checks, and the
-exit tag all pass on the accepted revision.
+The current WP-08A candidate freezes semantic dataset/source/lease, unified
+runtime, progressive render, opaque presentation, dependency, side-effect,
+and resource-ledger contracts. These contracts are preparatory: the existing
+`CurrentDatasetRuntime`, reader, renderer, and egui-wgpu bridge remain the sole
+live product route until their later hard-cutover packages.
 
 ## Current Verification Boundary
 

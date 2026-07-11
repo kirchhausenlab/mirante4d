@@ -5,7 +5,7 @@ use mirante4d_application::UnboundWorkspace;
 use mirante4d_data::{
     DataRuntimeConfig, DatasetHandle, DenseVolumeF32, DenseVolumeU8, DenseVolumeU16,
 };
-use mirante4d_dataset::{DatasetCatalog, DatasetLayer, ScientificIdentityStatus};
+use mirante4d_dataset::{DatasetCatalog, DatasetLayer, DatasetSourceId, ScientificIdentityStatus};
 use mirante4d_domain::{
     CameraView, CrossSectionView, GridToWorld, IntensityDType, IsoLightState, LayerTransfer,
     LogicalLayerKey, RenderMode as CanonicalRenderMode, RenderState, RgbColor, SamplingPolicy,
@@ -257,12 +257,14 @@ pub(crate) struct OpenedCurrentSource {
 pub(crate) fn open_dataset_with_resource_policy_and_render_first_frame(
     path: impl AsRef<Path>,
     resource_policy: ResourcePolicy,
+    source_id: DatasetSourceId,
 ) -> anyhow::Result<OpenedCurrentSource> {
     #[cfg(test)]
     {
         open_test_dataset_with_resource_policy_and_render_first_frame(
             path,
             resource_policy,
+            source_id,
             RenderViewport::new(
                 TEST_INITIAL_RENDER_VIEWPORT_SIDE,
                 TEST_INITIAL_RENDER_VIEWPORT_SIDE,
@@ -276,6 +278,7 @@ pub(crate) fn open_dataset_with_resource_policy_and_render_first_frame(
     open_dataset_with_resource_policy_and_overrides(
         path,
         resource_policy,
+        source_id,
         // The interactive product always enters through the progressive brick
         // path. Dense whole-volume startup is retained only by the explicit
         // test/reference override below.
@@ -290,12 +293,14 @@ pub(crate) fn open_dataset_with_resource_policy_and_render_first_frame(
 pub(crate) fn open_test_dataset_with_resource_policy_and_render_first_frame(
     path: impl AsRef<Path>,
     resource_policy: ResourcePolicy,
+    source_id: DatasetSourceId,
     render_viewport: RenderViewport,
     dense_startup_voxel_limit: u64,
 ) -> anyhow::Result<OpenedCurrentSource> {
     open_dataset_with_resource_policy_and_overrides(
         path,
         resource_policy,
+        source_id,
         InitialScalarLayerOverrides {
             render_viewport: Some(render_viewport),
             dense_startup_voxel_limit: Some(dense_startup_voxel_limit),
@@ -306,6 +311,7 @@ pub(crate) fn open_test_dataset_with_resource_policy_and_render_first_frame(
 fn open_dataset_with_resource_policy_and_overrides(
     path: impl AsRef<Path>,
     resource_policy: ResourcePolicy,
+    source_id: DatasetSourceId,
     overrides: InitialScalarLayerOverrides,
 ) -> anyhow::Result<OpenedCurrentSource> {
     let adapter = resource_policy.current_runtime_adapter();
@@ -351,7 +357,7 @@ fn open_dataset_with_resource_policy_and_overrides(
     }
     let catalog = Arc::new(DatasetCatalog::new(
         dataset.dataset_name(),
-        ScientificIdentityStatus::Unverified,
+        ScientificIdentityStatus::Unverified(source_id),
         catalog_layers,
     )?);
     let active_key = LogicalLayerKey::new(0);

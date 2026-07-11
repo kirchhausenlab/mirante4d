@@ -8,7 +8,7 @@ import/preprocessing workflows.
 
 ## Workspace Boundaries
 
-The workspace has fourteen crates:
+The workspace has fifteen crates:
 
 - `mirante4d-domain`: validated framework-neutral geometry, view, transfer,
   render-intent, and tool values.
@@ -19,9 +19,14 @@ The workspace has fourteen crates:
 - `mirante4d-application`: the sole command reducer, revision/history owner,
   transient semantic state, operations, events, snapshots, and typed faults.
 - `mirante4d-settings`: closed settings document and bounded background I/O.
-- `mirante4d-dataset`: immutable logical-layer catalog and explicit
-  verified/unverified identity status.
-- `mirante4d-render-api`: framework-neutral presentation and camera math.
+- `mirante4d-dataset`: immutable multiscale catalog, semantic resource keys,
+  source/decode-sink boundary, payload views, lease contract, and the
+  dependency-inverted CPU byte-ledger admission interface.
+- `mirante4d-dataset-runtime`: preparatory unified request, cancellation,
+  deduplication, CPU-ledger, completion, fault, and accounted-lease contract;
+  the production scheduler arrives in WP-08B.
+- `mirante4d-render-api`: backend-neutral intent, requirements, progressive
+  frame status, opaque presentation lifecycle, and camera math.
 - `mirante4d-data`, `mirante4d-format`, `mirante4d-import`,
   `mirante4d-analysis`, and `mirante4d-renderer`: current storage/runtime,
   format, import, analysis, and rendering implementations.
@@ -54,6 +59,13 @@ The private egui bridge translates UI input to `ApplicationCommand` and reads
 snapshots/events. The private project-v15 bridge is the sole temporary project
 I/O route and has no compatibility reader. Both are mandatory-deletion
 bridges, not permanent public APIs.
+
+WP-08A contracts do not create a second product implementation. The current
+runtime and renderer remain authoritative until WP-08B and WP-09B delete them.
+Unverified bootstrap reads use an opaque per-open source ID, never a fabricated
+scientific-content ID. Storage and import acquire CPU capacity through the
+dataset interface; only the dataset runtime may implement and issue those
+production leases.
 
 ## Runtime Flow
 
@@ -94,7 +106,9 @@ files are neither read nor changed.
 - Rendering/loading/UI/GPU changes require real product validation under
   [testing](TESTING.md).
 
-The exact enforced cutover contract is
-[`architecture/wp07b-boundary-contract.json`](../architecture/wp07b-boundary-contract.json).
+The exact current dependency, side-effect, public-API, and allocation contract
+is [`architecture/wp08a-subsystem-contract.json`](../architecture/wp08a-subsystem-contract.json).
+The prior live-cutover contract remains enforced where WP-08A did not
+explicitly supersede it.
 Later target ownership is defined by the
 [workspace architecture brief](plans/active/foundation-refactor/WORKSPACE_ARCHITECTURE_BRIEF.md).

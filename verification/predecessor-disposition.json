@@ -518,6 +518,24 @@
       "deletion_gate": null
     },
     {
+      "id": "delete-wp08a-loose-dependency-parser-tests",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["libtest"],
+        "owners": ["xtask"],
+        "ids": [
+          "libtest:xtask::bin/xtask:arch::tests::normal_workspace_dependencies_ignores_comments_and_other_sections",
+          "libtest:xtask::bin/xtask:arch::tests::normal_workspace_dependencies_reads_only_normal_dependency_section"
+        ]
+      },
+      "disposition": "deleted",
+      "reason": "WP-08A replaced the loose hand-parsed normal-dependency policy with the exact cargo-metadata contract.",
+      "lane": null,
+      "requirement_ids": ["D-022-policy", "WP-08A-subsystem-contract"],
+      "replacement_command": "cargo xtask verify-leaf policy",
+      "deletion_gate": "WP-08A-subsystem-contract"
+    },
+    {
       "id": "keep-xtask-unit-tests",
       "match": {
         "source_dispositions": ["retained"],
@@ -546,6 +564,8 @@
           "crates/xtask/src/workflow_audit.rs"
         ],
         "exclude_ids": [
+          "libtest:xtask::bin/xtask:arch::tests::normal_workspace_dependencies_ignores_comments_and_other_sections",
+          "libtest:xtask::bin/xtask:arch::tests::normal_workspace_dependencies_reads_only_normal_dependency_section",
           "libtest:xtask::bin/xtask:arch::tests::source_architecture_policy_has_no_current_large_source_allowlist",
           "libtest:xtask::bin/xtask:arch::tests::source_architecture_policy_rejects_new_large_source_files",
           "libtest:xtask::bin/xtask:command_audit::tests::command_audit_tracks_completion_waiver_as_explicit_exception",
@@ -2686,14 +2706,214 @@
       "lane": "ui",
       "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
       "reason": "WP-07B-B makes cross-section GPU failures visible and prevents repaint-driven retry loops until meaningful residency changes."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::snapshot_carries_only_an_optional_backend_neutral_presentation_projection",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A proves opaque presentation facts cross the application snapshot without backend or UI types."
+    },
+    {
+      "id": "libtest:mirante4d-dataset:tests::semantic_resource_keys_are_stable_hashable_and_storage_independent",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A freezes the semantic dataset contract."
+    },
+    {
+      "id": "libtest:mirante4d-dataset:tests::regions_and_payload_views_validate_bounds_without_scanning_payloads",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A freezes the semantic dataset contract."
+    },
+    {
+      "id": "libtest:mirante4d-dataset:tests::multiscale_catalog_bounds_and_validates_semantic_requests",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A freezes the semantic dataset contract."
+    },
+    {
+      "id": "libtest:mirante4d-dataset:tests::multiscale_layer_validation_is_bounded_before_collection",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A freezes the semantic dataset contract."
+    },
+    {
+      "id": "libtest:mirante4d-dataset:tests::unverified_source_identity_supports_bootstrap_decode_without_a_fake_scientific_id",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A proves bootstrap decode uses an exact per-open source identity rather than a fabricated scientific identity."
+    },
+    {
+      "id": "libtest:mirante4d-dataset:tests::source_contract_is_substitutable_across_two_in_memory_implementations",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A proves the source boundary with independent in-memory implementations."
+    },
+    {
+      "id": "libtest:mirante4d-dataset:tests::source_and_sink_failures_are_typed_and_reservation_bound",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A proves reservation-bound decode and typed source failures."
+    },
+    {
+      "id": "libtest:mirante4d-dataset-runtime:tests::priorities_are_explicit_and_total",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset-runtime",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A freezes the unified runtime contract."
+    },
+    {
+      "id": "libtest:mirante4d-dataset-runtime:tests::generation_currentness_is_exact_and_overflow_is_typed",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset-runtime",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A freezes the unified runtime contract."
+    },
+    {
+      "id": "libtest:mirante4d-dataset-runtime:tests::deduplication_uses_semantic_resource_not_request_identity",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset-runtime",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A freezes the unified runtime contract."
+    },
+    {
+      "id": "libtest:mirante4d-dataset-runtime:tests::lease_clones_share_one_accounted_immutable_allocation",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset-runtime",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A proves one Arc-backed accounted lease allocation."
+    },
+    {
+      "id": "libtest:mirante4d-dataset-runtime:tests::tickets_and_faults_keep_typed_currentness_context",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset-runtime",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A freezes typed runtime completion and fault context."
+    },
+    {
+      "id": "libtest:mirante4d-dataset-runtime:tests::polling_is_runtime_bounded_and_shutdown_drains_before_stopping",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset-runtime",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A proves bounded completion polling and nonblocking shutdown state transitions."
+    },
+    {
+      "id": "libtest:mirante4d-render-api:tests::render_extent_and_intent_are_validated_and_bounded",
+      "kind": "libtest",
+      "owner": "mirante4d-render-api",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A freezes the backend-neutral render contract."
+    },
+    {
+      "id": "libtest:mirante4d-render-api:tests::requirements_use_semantic_keys_and_reject_duplicate_or_unbounded_work",
+      "kind": "libtest",
+      "owner": "mirante4d-render-api",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A freezes the backend-neutral render contract."
+    },
+    {
+      "id": "libtest:mirante4d-render-api:tests::progressive_frame_status_cannot_claim_uncovered_work_is_exact",
+      "kind": "libtest",
+      "owner": "mirante4d-render-api",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A freezes truthful progressive frame status."
+    },
+    {
+      "id": "libtest:mirante4d-render-api:tests::presentation_lifecycle_carries_only_opaque_identity_and_frame_facts",
+      "kind": "libtest",
+      "owner": "mirante4d-render-api",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A freezes the opaque presentation lifecycle."
+    },
+    {
+      "id": "libtest:mirante4d-render-api:tests::render_faults_are_typed_and_backend_neutral",
+      "kind": "libtest",
+      "owner": "mirante4d-render-api",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A freezes typed backend-neutral render faults."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp08a::tests::dependency_matrix_rejects_missing_extra_and_wrong_kind",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A adds mutation coverage for its architecture gate."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp08a::tests::target_dependency_matrix_rejects_missing_unknown_and_cycles",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A adds mutation coverage for its architecture gate."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp08a::tests::normal_workspace_edge_requires_target_or_transitional_authority",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A adds mutation coverage for its architecture gate."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp08a::tests::public_api_rejects_forbidden_types_and_owning_pixel_vectors",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A adds mutation coverage for its architecture gate."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp08a::tests::duplicate_transitional_edge_and_resource_class_are_rejected",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A adds mutation coverage for its architecture gate."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp08a::tests::side_effect_exception_requires_a_valid_expiry",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-08A-subsystem-contract"],
+      "reason": "WP-08A adds mutation coverage for its architecture gate."
     }
   ],
   "expected_summary": {
     "source_records": 1055,
-    "kept": 696,
+    "kept": 694,
     "moved": 49,
     "rewritten": 7,
-    "deleted": 303,
-    "current_additions": 199
+    "deleted": 305,
+    "current_additions": 224
   }
 }

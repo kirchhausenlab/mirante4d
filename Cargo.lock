@@ -2249,6 +2249,7 @@ dependencies = [
  "mirante4d-domain",
  "mirante4d-identity",
  "mirante4d-project-model",
+ "mirante4d-render-api",
  "mirante4d-settings",
 ]
 
@@ -2269,6 +2270,16 @@ dependencies = [
 name = "mirante4d-dataset"
 version = "0.1.0"
 dependencies = [
+ "mirante4d-domain",
+ "mirante4d-identity",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "mirante4d-dataset-runtime"
+version = "0.1.0"
+dependencies = [
+ "mirante4d-dataset",
  "mirante4d-domain",
  "mirante4d-identity",
  "thiserror 2.0.18",
@@ -2333,6 +2344,7 @@ dependencies = [
 name = "mirante4d-render-api"
 version = "0.1.0"
 dependencies = [
+ "mirante4d-dataset",
  "mirante4d-domain",
  "thiserror 2.0.18",
 ]
