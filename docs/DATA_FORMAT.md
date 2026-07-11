@@ -50,11 +50,12 @@ is forbidden.
 
 ## Approved Replacement
 
-WP-10A will hard-cut the current dataset package to a strict Mirante4D profile
-over released OME-NGFF 0.5 and Zarr v3. The target adds storage-independent
-scientific identity, distinct package/recipe/derivation/artifact identities,
-explicit lifecycle states, mandatory object-count and amplification proof, and
-an independent conformance corpus.
+WP-10A builds and freezes an off-product strict Mirante4D profile over released
+OME-NGFF 0.5 and Zarr v3. The target adds storage-independent scientific
+identity, distinct package/recipe/derivation/artifact identities, explicit
+lifecycle states, mandatory object-count and amplification proof, and an
+independent conformance corpus. WP-10C later activates it in the product and
+deletes the current reader and writer.
 
 WP-10B separately installs immutable content-addressed project objects,
 complete generations, atomic head/recovery refs, leases, autosave/recovery,
