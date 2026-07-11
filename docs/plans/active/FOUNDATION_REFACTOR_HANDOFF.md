@@ -2,12 +2,12 @@
 
 Status: ACTIVE PUBLIC-EPOCH PROGRAM
 Last reviewed: 2026-07-11
-Current technical sequence: WP-06 through WP-15
+Current technical sequence: WP-07A through WP-15
 Public-data publication: deferred to a separate future handoff
-WP-06 predecessor: `foundation-wp-05-exit-1`
-Completed through: WP-05 documentation and governance reset
-Current checkpoint: WP-06C Bootstrap deletion implemented; WP-06 exit pending
-Next checkpoint: exact protected-main product validation and WP-06 exit tag
+WP-07A predecessor: `foundation-wp-06-exit-1`
+Completed through: WP-06 verification bootstrap
+Current checkpoint: WP-07A canonical-model candidate implemented; promotion pending
+Next checkpoint: protected-main acceptance and `foundation-wp-07a-exit-1`, then WP-07B
 
 ## Purpose
 
@@ -163,8 +163,12 @@ fixture/dataset identity, toolchain, hardware/display facts, commands, and
 results. Zero retry is the default. A failure remains part of the evidence set;
 quarantine is remediation-only, time-bounded, and never a silent pass.
 
-WP-06 remains incomplete until the exact protected-main merge revision passes
-product-open validation and the create-once exit tag is accepted.
+WP-06 is complete at `foundation-wp-06-exit-1`. Its exact protected-main
+revision passed the required real product-open exercise before the create-once
+tag was accepted. The WP-07A candidate adds pure model contracts only, so its
+exit does not require another product-open run; it still requires exact-main
+checks and the create-once tag. WP-07B changes live viewer behavior and does
+require the package-stamped real product scenario.
 
 ## Dataset And Fixture Boundary
 

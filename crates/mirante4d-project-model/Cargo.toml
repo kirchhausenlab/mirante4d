@@ -1,0 +1,15 @@
+[package]
+name = "mirante4d-project-model"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mirante4d-domain.workspace = true
+mirante4d-identity.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

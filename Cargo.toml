@@ -4,8 +4,11 @@ members = [
     "crates/mirante4d-app",
     "crates/mirante4d-core",
     "crates/mirante4d-data",
+    "crates/mirante4d-domain",
     "crates/mirante4d-format",
+    "crates/mirante4d-identity",
     "crates/mirante4d-import",
+    "crates/mirante4d-project-model",
     "crates/mirante4d-renderer",
     "crates/xtask",
 ]
@@ -35,9 +38,11 @@ quick-xml = "0.41.0"
 rfd = "0.15.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+syn = { version = "2.0.117", features = ["full", "visit"] }
 tempfile = "3.23.0"
 thiserror = "2.0.17"
 tiff = "0.11.3"
+toml = { version = "1.1.2", default-features = false, features = ["std", "serde", "parse"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 wgpu = "29.0.3"
@@ -49,8 +54,11 @@ mirante4d-app = { path = "crates/mirante4d-app" }
 mirante4d-analysis = { path = "crates/mirante4d-analysis" }
 mirante4d-core = { path = "crates/mirante4d-core" }
 mirante4d-data = { path = "crates/mirante4d-data" }
+mirante4d-domain = { path = "crates/mirante4d-domain" }
 mirante4d-format = { path = "crates/mirante4d-format" }
+mirante4d-identity = { path = "crates/mirante4d-identity" }
 mirante4d-import = { path = "crates/mirante4d-import" }
+mirante4d-project-model = { path = "crates/mirante4d-project-model" }
 mirante4d-renderer = { path = "crates/mirante4d-renderer" }
 
 [patch.crates-io]

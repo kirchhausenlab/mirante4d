@@ -38,8 +38,9 @@ experiment.m4dproj/
 
 `project.json` identifies the experimental store profile and one stable random
 project UUID; mutable viewer state never lives there. A generation contains
-the project ID, kind, sequence, parent, captured project revision, D-009
-scientific identity, optional package/release pin and locator hints, one bounded
+the project ID, kind, sequence, parent, captured project revision, the persisted
+project-bound revision high-water, D-009 scientific identity, optional
+package/release pin and locator hints, one bounded
 persistence-owned state DTO, and typed object descriptors with digest, byte
 length, schema/media type, logical role/handle, provenance, completeness, and
 recoverability class.
@@ -62,7 +63,9 @@ UI commands submit immutable domain snapshots; no save, autosave, hash, flush,
 or directory operation runs on the interaction thread.
 
 Each durable domain command creates a `ProjectRevisionId`; undo/redo moves the
-current revision pointer. A save captures an exact `(revision, snapshot)` pair.
+current revision pointer but never rolls the project-bound revision high-water
+back. A save captures an exact `(revision, revision_high_water, snapshot)`
+tuple.
 `saved_revision` changes only after that exact revision commits durably. If the
 user edits revision 12 while revision 11 is saving, completion of 11 leaves the
 project dirty.

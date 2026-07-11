@@ -1014,6 +1014,611 @@
       "lane": "policy",
       "requirement_ids": ["D-022-registry"],
       "reason": "WP-06 adds registry-owned selector and Nextest configuration generation."
+    },
+    {
+      "id": "libtest:mirante4d-domain:display::tests::every_ordered_finite_window_round_trips",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:display::tests::layer_transfer_has_one_validated_value_for_each_control",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:display::tests::color_is_rgb_and_cannot_duplicate_opacity",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:display::tests::rejects_non_finite_or_reversed_windows",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:display::tests::transfer_gamma_is_bounded",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:display::tests::validates_colors_and_opacity",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:geometry::tests::finite_nonzero_quaternions_are_normalized",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:geometry::tests::normalizes_and_sign_canonicalizes_quaternions",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:geometry::tests::preserves_finite_affine_transforms_without_invertibility_policy",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:geometry::tests::rejects_non_finite_world_points",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:geometry::tests::transforms_voxel_centers_with_row_major_affine_values",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:indices::tests::index_wrappers_preserve_their_full_unsigned_ranges",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:indices::tests::intensity_dtype_reports_exact_sample_width",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:render::tests::dvr_has_one_canonical_opacity_transfer_and_positive_density",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:render::tests::each_mode_exposes_only_its_own_parameters",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:render::tests::iso_rejects_out_of_range_display_levels",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:render::tests::valid_dvr_density_round_trips",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:shape::tests::rejects_overflowing_element_counts_at_construction",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:shape::tests::rejects_zero_dimensions",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:shape::tests::spatial_projection_preserves_zyx",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:shape::tests::valid_small_shapes_have_exact_element_counts",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:tool::tests::navigation_is_the_neutral_default_tool",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:view::tests::camera_view_preserves_validated_framing_values",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:view::tests::camera_view_rejects_nonpositive_scales",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:view::tests::cross_section_view_rejects_invalid_depth",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:view::tests::detached_light_rejects_values_outside_the_unit_disc",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-domain:view::tests::valid_cross_section_scales_round_trip",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure validated domain-model contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-identity:digest::tests::sha256_and_all_typed_forms_roundtrip",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds strict typed-identity and descriptor contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-identity:digest::tests::strict_digest_rejects_uppercase_wrong_length_and_non_hexadecimal_bytes",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds strict typed-identity and descriptor contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-identity:digest::tests::typed_identifiers_with_the_same_digest_remain_distinct",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds strict typed-identity and descriptor contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-identity:digest::tests::typed_identities_parse_and_display_their_exact_prefixes",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds strict typed-identity and descriptor contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-identity:digest::tests::typed_parsers_reject_wrong_or_bare_prefixes",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds strict typed-identity and descriptor contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-identity:object::tests::descriptors_keep_raw_object_facts_separate_from_package_path",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds strict typed-identity and descriptor contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-identity:object::tests::media_type_and_role_enforce_strict_ascii_grammars",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds strict typed-identity and descriptor contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-identity:object::tests::normalized_object_paths_roundtrip",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds strict typed-identity and descriptor contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-identity:object::tests::object_path_accepts_only_normalized_relative_lowercase_ascii",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds strict typed-identity and descriptor contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-project-model:tests::arbitrary_reorder_keeps_active_selection_by_identity",
+      "kind": "libtest",
+      "owner": "mirante4d-project-model",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure durable project-model invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-project-model:tests::artifact_schemas_enforce_exact_versioned_media_types_and_object_roles",
+      "kind": "libtest",
+      "owner": "mirante4d-project-model",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure durable project-model invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-project-model:tests::canonical_uuid_round_trips_for_project_and_artifact_handles",
+      "kind": "libtest",
+      "owner": "mirante4d-project-model",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure durable project-model invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-project-model:tests::high_water_allocation_is_exact_and_project_bound",
+      "kind": "libtest",
+      "owner": "mirante4d-project-model",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure durable project-model invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-project-model:tests::collection_limits_reject_oversized_inputs_before_duplicate_checks",
+      "kind": "libtest",
+      "owner": "mirante4d-project-model",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure durable project-model invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-project-model:tests::dataset_locator_is_explicitly_not_scientific_identity",
+      "kind": "libtest",
+      "owner": "mirante4d-project-model",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure durable project-model invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-project-model:tests::generation_projection_rejects_a_revision_from_another_project",
+      "kind": "libtest",
+      "owner": "mirante4d-project-model",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure durable project-model invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-project-model:tests::generation_projection_rejects_foreign_or_insufficient_high_water",
+      "kind": "libtest",
+      "owner": "mirante4d-project-model",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure durable project-model invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-project-model:tests::generation_projection_round_trips_the_exact_revision_and_state",
+      "kind": "libtest",
+      "owner": "mirante4d-project-model",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure durable project-model invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-project-model:tests::locator_is_bounded_and_rejects_controls",
+      "kind": "libtest",
+      "owner": "mirante4d-project-model",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure durable project-model invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-project-model:tests::preset_entries_and_artifact_source_layers_are_keyed_and_canonical",
+      "kind": "libtest",
+      "owner": "mirante4d-project-model",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure durable project-model invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-project-model:tests::project_construction_rejects_artifact_references_outside_the_view",
+      "kind": "libtest",
+      "owner": "mirante4d-project-model",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure durable project-model invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-project-model:tests::project_construction_rejects_invalid_preset_closure_without_a_partial_value",
+      "kind": "libtest",
+      "owner": "mirante4d-project-model",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure durable project-model invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-project-model:tests::revision_high_water_never_reuses_after_undo_and_overflow_is_typed",
+      "kind": "libtest",
+      "owner": "mirante4d-project-model",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure durable project-model invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-project-model:tests::uuid_format_parse_is_a_bijection",
+      "kind": "libtest",
+      "owner": "mirante4d-project-model",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure durable project-model invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-project-model:tests::uuid_parser_rejects_noncanonical_forms",
+      "kind": "libtest",
+      "owner": "mirante4d-project-model",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure durable project-model invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-project-model:tests::view_reorder_keeps_active_selection_by_logical_layer_key",
+      "kind": "libtest",
+      "owner": "mirante4d-project-model",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds pure durable project-model invariant evidence."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::tests::rust_struct_field_extraction_handles_visibility_attributes_and_split_types",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds machine-enforced canonical-model and current-state ledger evidence."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::tests::wp07a_model_and_current_state_contracts_match_the_repository",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-07A-canonical-model"
+      ],
+      "reason": "WP-07A adds machine-enforced canonical-model and current-state ledger evidence."
     }
   ],
   "expected_summary": {
@@ -1022,6 +1627,6 @@
     "moved": 57,
     "rewritten": 8,
     "deleted": 154,
-    "current_additions": 42
+    "current_additions": 97
   }
 }

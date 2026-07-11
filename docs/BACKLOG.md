@@ -5,9 +5,9 @@ contains unresolved work only.
 
 ## Foundation Program
 
-- WP-06: merge the Bootstrap deletion, validate the exact protected-main
-  revision on the real viewer, and create the exit tag.
-- WP-07A through WP-15: perform the model, state, runtime, storage, renderer,
+- WP-07A: promote the canonical-model candidate through protected-main checks
+  and create `foundation-wp-07a-exit-1`.
+- WP-07B through WP-15: perform the live state, runtime, storage, renderer,
   import, analysis, UI, release, and final-deletion cutovers in the
   [foundation handoff](plans/active/FOUNDATION_REFACTOR_HANDOFF.md).
 - Expose packaged unsaved-autosave recovery in its owning application package.

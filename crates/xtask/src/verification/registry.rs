@@ -704,7 +704,7 @@ fn validate_registry(registry: &Registry) -> anyhow::Result<()> {
 }
 
 fn validate_lint_exceptions(exceptions: &[LintException]) -> anyhow::Result<()> {
-    let allowed_deletion_gates = BTreeSet::from(["WP-07A", "WP-09B", "WP-09C", "WP-14"]);
+    let allowed_deletion_gates = BTreeSet::from(["WP-07B", "WP-09B", "WP-09C", "WP-14"]);
     let mut keys = BTreeSet::new();
     for exception in exceptions {
         let key = exception.key();
@@ -812,19 +812,54 @@ fn validate_tool_pins(tools: &[ToolPin]) -> anyhow::Result<()> {
 
 fn validate_property_groups(groups: &[PropertyGroup]) -> anyhow::Result<()> {
     let expected = BTreeMap::from([
-        ("camera", "0x4d3443414d455241"),
-        ("shape", "0x4d34534841504531"),
-        ("space", "0x4d34535041434531"),
+        ("camera", ("mirante4d-core", "0x4d3443414d455241", 64)),
+        (
+            "domain-display",
+            ("mirante4d-domain", "0x4d34444f4d444953", 64),
+        ),
+        (
+            "domain-geometry",
+            ("mirante4d-domain", "0x4d34444f4d47454f", 64),
+        ),
+        (
+            "domain-render",
+            ("mirante4d-domain", "0x4d34444f4d52454e", 64),
+        ),
+        (
+            "domain-shape",
+            ("mirante4d-domain", "0x4d34444f4d534850", 64),
+        ),
+        (
+            "domain-view",
+            ("mirante4d-domain", "0x4d34444f4d564945", 64),
+        ),
+        (
+            "identity-digest",
+            ("mirante4d-identity", "0x4d34494444494731", 128),
+        ),
+        (
+            "identity-object",
+            ("mirante4d-identity", "0x4d344f424a454354", 128),
+        ),
+        (
+            "project-model",
+            ("mirante4d-project-model", "0x4d3450524f4a4d4f", 128),
+        ),
+        ("shape", ("mirante4d-core", "0x4d34534841504531", 64)),
+        ("space", ("mirante4d-core", "0x4d34535041434531", 64)),
     ]);
     if groups.len() != expected.len() {
         bail!("verification property group set drifted");
     }
     let mut ids = BTreeSet::new();
     for group in groups {
+        let Some((owner, seed, cases)) = expected.get(group.id.as_str()) else {
+            bail!("unknown verification property group {:?}", group.id);
+        };
         if !ids.insert(group.id.as_str())
-            || expected.get(group.id.as_str()) != Some(&group.seed.as_str())
-            || group.owner != "mirante4d-core"
-            || group.cases != 64
+            || group.owner != *owner
+            || group.seed != *seed
+            || group.cases != *cases
             || group.max_shrink_iters != 1024
             || group.persistence
             || group.replay != "fixed-seed"
