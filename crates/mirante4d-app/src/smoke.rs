@@ -8,6 +8,7 @@ use mirante4d_application::{
     ApplicationCommand, ApplicationSnapshot, ApplicationState, SourceSessionGeneration,
 };
 use mirante4d_data::BrickReadPool;
+use mirante4d_dataset::DatasetSourceId;
 use mirante4d_domain::TimeIndex;
 use mirante4d_renderer::gpu::GpuRenderer;
 use mirante4d_settings::recommended_for_current_system;
@@ -80,7 +81,11 @@ pub fn run_headless_smoke(
         mut dataset_runtime,
         mut render_runtime,
         mut analysis_runtime,
-    } = open_dataset_with_resource_policy_and_render_first_frame(path, resource_policy)?;
+    } = open_dataset_with_resource_policy_and_render_first_frame(
+        path,
+        resource_policy,
+        DatasetSourceId::new(1),
+    )?;
     let mut application = ApplicationState::new_unbound(
         SourceSessionGeneration::new(1),
         catalog.as_ref().clone(),

@@ -8,6 +8,8 @@ use std::{
 use anyhow::{Context, bail};
 use syn::visit::Visit;
 
+mod wp08a;
+
 const MAX_TRACKED_GENERATED_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024;
 const FORBIDDEN_DUMPING_GROUND_MODULE_NAMES: &[&str] =
     &["common.rs", "helpers.rs", "misc.rs", "utils.rs"];
@@ -62,141 +64,12 @@ pub(crate) fn architecture_self_check() -> anyhow::Result<()> {
             bail!("first milestone must not create empty future crate: {forbidden}");
         }
     }
-    check_crate_dependency_policy()?;
+    wp08a::check_wp08a_subsystem_contract(Path::new("."))?;
     check_source_architecture_policy()?;
     check_wp07a_contracts(Path::new("."))?;
     check_wp07b_boundary_contract(Path::new("."))?;
     check_tracked_artifact_policy()?;
     Ok(())
-}
-
-fn check_crate_dependency_policy() -> anyhow::Result<()> {
-    let policies = [
-        ("mirante4d-domain", &[][..]),
-        ("mirante4d-identity", &[][..]),
-        (
-            "mirante4d-project-model",
-            &["mirante4d-domain", "mirante4d-identity"][..],
-        ),
-        (
-            "mirante4d-dataset",
-            &["mirante4d-domain", "mirante4d-identity"][..],
-        ),
-        (
-            "mirante4d-render-api",
-            &["mirante4d-dataset", "mirante4d-domain"][..],
-        ),
-        ("mirante4d-settings", &["mirante4d-domain"][..]),
-        (
-            "mirante4d-application",
-            &[
-                "mirante4d-dataset",
-                "mirante4d-domain",
-                "mirante4d-identity",
-                "mirante4d-project-model",
-                "mirante4d-render-api",
-                "mirante4d-settings",
-            ][..],
-        ),
-        ("mirante4d-format", &["mirante4d-domain"][..]),
-        (
-            "mirante4d-data",
-            &["mirante4d-domain", "mirante4d-format"][..],
-        ),
-        (
-            "mirante4d-renderer",
-            &[
-                "mirante4d-data",
-                "mirante4d-domain",
-                "mirante4d-format",
-                "mirante4d-render-api",
-            ][..],
-        ),
-        (
-            "mirante4d-import",
-            &["mirante4d-domain", "mirante4d-format"][..],
-        ),
-        (
-            "mirante4d-analysis",
-            &["mirante4d-data", "mirante4d-domain", "mirante4d-format"][..],
-        ),
-        (
-            "mirante4d-app",
-            &[
-                "mirante4d-analysis",
-                "mirante4d-application",
-                "mirante4d-data",
-                "mirante4d-dataset",
-                "mirante4d-domain",
-                "mirante4d-format",
-                "mirante4d-identity",
-                "mirante4d-import",
-                "mirante4d-project-model",
-                "mirante4d-render-api",
-                "mirante4d-renderer",
-                "mirante4d-settings",
-            ][..],
-        ),
-        (
-            "xtask",
-            &[
-                "mirante4d-analysis",
-                "mirante4d-data",
-                "mirante4d-domain",
-                "mirante4d-format",
-                "mirante4d-import",
-                "mirante4d-render-api",
-                "mirante4d-renderer",
-            ][..],
-        ),
-    ];
-
-    for (crate_name, allowed) in policies {
-        let manifest_path = Path::new("crates").join(crate_name).join("Cargo.toml");
-        let manifest = fs::read_to_string(&manifest_path)
-            .with_context(|| format!("failed to read {}", manifest_path.display()))?;
-        let dependencies = normal_workspace_dependencies(&manifest);
-        for dependency in dependencies {
-            if !allowed.contains(&dependency.as_str()) {
-                bail!(
-                    "crate {crate_name} has forbidden normal dependency {dependency}; allowed Mirante4D dependencies are: {}",
-                    if allowed.is_empty() {
-                        "<none>".to_owned()
-                    } else {
-                        allowed.join(", ")
-                    }
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn normal_workspace_dependencies(manifest: &str) -> Vec<String> {
-    let mut in_dependencies = false;
-    let mut dependencies = Vec::new();
-    for line in manifest.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_dependencies = trimmed == "[dependencies]";
-            continue;
-        }
-        if !in_dependencies || trimmed.starts_with('#') {
-            continue;
-        }
-        let Some((name, _rest)) = trimmed.split_once('=') else {
-            continue;
-        };
-        let name = name
-            .trim()
-            .split_once('.')
-            .map(|(crate_name, _field)| crate_name)
-            .unwrap_or_else(|| name.trim());
-        if name.starts_with("mirante4d-") {
-            dependencies.push(name.to_owned());
-        }
-    }
-    dependencies
 }
 
 fn check_source_architecture_policy() -> anyhow::Result<()> {
@@ -806,7 +679,18 @@ fn check_wp07b_boundary_contract(repo_root: &Path) -> anyhow::Result<()> {
             .chain(&external_dependencies)
             .cloned()
             .collect::<BTreeSet<_>>();
-        if actual_kinds.get("normal").cloned().unwrap_or_default() != expected_normal
+        // WP-07B remains historical evidence. WP-08A's exact matrix, checked
+        // first, owns these narrowly superseding dependency/API additions.
+        let wp08a_normal_additions = match name {
+            "mirante4d-application" => BTreeSet::from(["mirante4d-render-api".to_owned()]),
+            "mirante4d-render-api" => BTreeSet::from(["mirante4d-dataset".to_owned()]),
+            _ => BTreeSet::new(),
+        };
+        let wp08a_normal = expected_normal
+            .union(&wp08a_normal_additions)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if actual_kinds.get("normal").cloned().unwrap_or_default() != wp08a_normal
             || actual_kinds.get("dev").cloned().unwrap_or_default() != dev_dependencies
             || actual_kinds
                 .get("build")
@@ -822,7 +706,11 @@ fn check_wp07b_boundary_contract(repo_root: &Path) -> anyhow::Result<()> {
         }
         let actual_public_api =
             public_root_api_names(&repo_root.join(crate_path).join("src/lib.rs"))?;
-        if actual_public_api != public_api {
+        let wp08a_supersedes_public_root =
+            matches!(name, "mirante4d-dataset" | "mirante4d-render-api");
+        if (!wp08a_supersedes_public_root && actual_public_api != public_api)
+            || (wp08a_supersedes_public_root && !public_api.is_subset(&actual_public_api))
+        {
             let missing = public_api
                 .difference(&actual_public_api)
                 .collect::<Vec<_>>();
@@ -926,9 +814,18 @@ fn check_wp07b_live_cutover(
             })
         })
         .collect::<BTreeSet<_>>();
-    if actual_edges != expected_edges {
+    let wp08a_edges = BTreeSet::from([
+        ("mirante4d-application", "mirante4d-render-api"),
+        ("mirante4d-dataset-runtime", "mirante4d-dataset"),
+        ("mirante4d-render-api", "mirante4d-dataset"),
+    ]);
+    let wp08a_expected_edges = expected_edges
+        .union(&wp08a_edges)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if actual_edges != wp08a_expected_edges {
         bail!(
-            "WP-07B live boundary dependency edges drifted: expected={expected_edges:?}, actual={actual_edges:?}"
+            "WP-07B/WP-08A live boundary dependency edges drifted: expected={wp08a_expected_edges:?}, actual={actual_edges:?}"
         );
     }
 
@@ -2390,40 +2287,6 @@ fn normalize_repo_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn normal_workspace_dependencies_reads_only_normal_dependency_section() {
-        let manifest = r#"
-[package]
-name = "example"
-
-[dependencies]
-mirante4d-domain.workspace = true
-serde.workspace = true
-mirante4d-data = { workspace = true }
-
-[dev-dependencies]
-mirante4d-format.workspace = true
-"#;
-
-        assert_eq!(
-            normal_workspace_dependencies(manifest),
-            vec!["mirante4d-domain".to_owned(), "mirante4d-data".to_owned()]
-        );
-    }
-
-    #[test]
-    fn normal_workspace_dependencies_ignores_comments_and_other_sections() {
-        let manifest = r#"
-[dependencies]
-# mirante4d-app.workspace = true
-
-[build-dependencies]
-mirante4d-renderer.workspace = true
-"#;
-
-        assert!(normal_workspace_dependencies(manifest).is_empty());
-    }
 
     #[test]
     fn source_architecture_policy_rejects_ui_imports_outside_app_crate() {

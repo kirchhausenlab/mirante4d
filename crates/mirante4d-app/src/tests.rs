@@ -38,6 +38,7 @@ fn open_dataset_and_render_first_frame(
     crate::dataset_opening::open_test_dataset_with_resource_policy_and_render_first_frame(
         path,
         ResourcePolicy::default(),
+        DatasetSourceId::new(1),
         test_initial_render_viewport(),
         TEST_DENSE_STARTUP_VOXEL_LIMIT,
     )

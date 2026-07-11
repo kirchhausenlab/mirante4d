@@ -61,6 +61,7 @@
         "mirante4d-application",
         "mirante4d-data",
         "mirante4d-dataset",
+        "mirante4d-dataset-runtime",
         "mirante4d-domain",
         "mirante4d-identity",
         "mirante4d-project-model",
@@ -69,7 +70,7 @@
         "mirante4d-settings",
         "xtask"
       ],
-      "selector": "package(mirante4d-analysis) | package(mirante4d-application) | package(mirante4d-data) | package(mirante4d-dataset) | package(mirante4d-domain) | package(mirante4d-identity) | package(mirante4d-project-model) | package(mirante4d-render-api) | package(mirante4d-renderer) | package(mirante4d-settings) | package(xtask)",
+      "selector": "package(mirante4d-analysis) | package(mirante4d-application) | package(mirante4d-data) | package(mirante4d-dataset) | package(mirante4d-dataset-runtime) | package(mirante4d-domain) | package(mirante4d-identity) | package(mirante4d-project-model) | package(mirante4d-render-api) | package(mirante4d-renderer) | package(mirante4d-settings) | package(xtask)",
       "warn_ms": 500,
       "terminate_ms": 2000,
       "aggregate_timeout_secs": 720

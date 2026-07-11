@@ -366,7 +366,9 @@ mod tests {
     use mirante4d_application::{
         ApplicationState, MAX_PENDING_EVENTS, SourceSessionGeneration, UnboundWorkspace,
     };
-    use mirante4d_dataset::{DatasetCatalog, DatasetLayer, ScientificIdentityStatus};
+    use mirante4d_dataset::{
+        DatasetCatalog, DatasetLayer, DatasetSourceId, ScientificIdentityStatus,
+    };
     use mirante4d_domain::{
         CameraView, CrossSectionView, DisplayWindow, GridToWorld, IntensityDType, IsoLightState,
         LayerTransfer, LogicalLayerKey, Opacity, Projection, RenderState, RgbColor, SamplingPolicy,
@@ -415,7 +417,7 @@ mod tests {
     fn application() -> ApplicationState {
         let catalog = DatasetCatalog::new(
             "settings-connection-test",
-            ScientificIdentityStatus::Unverified,
+            ScientificIdentityStatus::Unverified(DatasetSourceId::new(1)),
             vec![
                 DatasetLayer::new(
                     LogicalLayerKey::new(0),

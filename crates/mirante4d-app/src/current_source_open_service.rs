@@ -19,7 +19,7 @@ use mirante4d_application::{
     SourceSessionGeneration, UnboundWorkspace,
 };
 use mirante4d_data::DataError;
-use mirante4d_dataset::DatasetCatalog;
+use mirante4d_dataset::{DatasetCatalog, DatasetSourceId};
 use mirante4d_domain::ShapeError;
 use mirante4d_format::FormatError;
 use mirante4d_renderer::RenderError;
@@ -290,13 +290,16 @@ fn run_open(
         return CurrentSourceOpenOutcome::Cancelled;
     }
 
-    let opened =
-        match open_dataset_with_resource_policy_and_render_first_frame(&path, resource_policy) {
-            Ok(opened) => opened,
-            Err(error) => {
-                return CurrentSourceOpenOutcome::Failed(map_open_failure(&error, &path));
-            }
-        };
+    let opened = match open_dataset_with_resource_policy_and_render_first_frame(
+        &path,
+        resource_policy,
+        DatasetSourceId::new(next_generation.get()),
+    ) {
+        Ok(opened) => opened,
+        Err(error) => {
+            return CurrentSourceOpenOutcome::Failed(map_open_failure(&error, &path));
+        }
+    };
     if is_cancelled(cancellation) {
         return CurrentSourceOpenOutcome::Cancelled;
     }

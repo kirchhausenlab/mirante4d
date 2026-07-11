@@ -125,7 +125,11 @@ generic `common`, `utils`, `prelude`, or test-support crate is approved.
 - Dataset runtime owns all CPU demand, priorities, cancellation, deduplication,
   queues, decoded-buffer admission, lease issuance/lifetime, and byte ledgers
   for 3D, cross-section, playback, analysis, and prefetch. The `dataset` crate
-  defines opaque lease/view contracts but cannot issue or account them.
+  defines opaque lease/view contracts and the dependency-inverted CPU ledger
+  admission interface but cannot issue or account them. Storage and import
+  receive that interface by injection; analysis obtains an opaque accounted
+  byte lease through dataset runtime. Only dataset runtime may implement the
+  ledger in production.
 - `render-wgpu` alone may create pipelines/resources, mutate VRAM residency,
   upload, submit GPU work, or own presentation targets. It consumes semantic
   leases rather than storage-shaped volumes.

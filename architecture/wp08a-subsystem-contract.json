@@ -1,0 +1,415 @@
+{
+  "schema": "mirante4d-wp08a-subsystem-contract",
+  "schema_version": 1,
+  "status": "frozen",
+  "entry_sha256": "5d4a0b73c9e0689fad6295c61f25ada7a1095ea65436e846450ed72b41b9b477",
+  "entry_clarification_sha256": "3ce060eb0f4ec259b6581419b4785df461b6d9d3c9594cb145d043d2a5c953d1",
+  "target_dependency_matrix": [
+    {"name": "mirante4d-domain", "normal": []},
+    {"name": "mirante4d-identity", "normal": ["mirante4d-domain"]},
+    {"name": "mirante4d-dataset", "normal": ["mirante4d-domain", "mirante4d-identity"]},
+    {"name": "mirante4d-project-model", "normal": ["mirante4d-domain", "mirante4d-identity"]},
+    {"name": "mirante4d-settings", "normal": ["mirante4d-domain"]},
+    {"name": "mirante4d-storage", "normal": ["mirante4d-dataset", "mirante4d-domain", "mirante4d-identity"]},
+    {"name": "mirante4d-project-store", "normal": ["mirante4d-identity", "mirante4d-project-model"]},
+    {"name": "mirante4d-dataset-runtime", "normal": ["mirante4d-dataset"]},
+    {"name": "mirante4d-render-api", "normal": ["mirante4d-dataset", "mirante4d-domain"]},
+    {"name": "mirante4d-render-wgpu", "normal": ["mirante4d-dataset", "mirante4d-render-api"]},
+    {"name": "mirante4d-analysis-core", "normal": ["mirante4d-dataset", "mirante4d-domain", "mirante4d-identity"]},
+    {"name": "mirante4d-analysis-runtime", "normal": ["mirante4d-analysis-core", "mirante4d-dataset-runtime", "mirante4d-project-model"]},
+    {"name": "mirante4d-import-pipeline", "normal": ["mirante4d-dataset", "mirante4d-domain", "mirante4d-identity", "mirante4d-storage"]},
+    {"name": "mirante4d-application", "normal": ["mirante4d-analysis-core", "mirante4d-analysis-runtime", "mirante4d-dataset", "mirante4d-dataset-runtime", "mirante4d-domain", "mirante4d-identity", "mirante4d-import-pipeline", "mirante4d-project-model", "mirante4d-project-store", "mirante4d-render-api", "mirante4d-settings"]},
+    {"name": "mirante4d-ui-egui", "normal": ["mirante4d-application"]},
+    {"name": "mirante4d-app", "normal": ["mirante4d-analysis-runtime", "mirante4d-application", "mirante4d-dataset-runtime", "mirante4d-import-pipeline", "mirante4d-project-store", "mirante4d-render-api", "mirante4d-render-wgpu", "mirante4d-settings", "mirante4d-storage", "mirante4d-ui-egui"]},
+    {"name": "mirante4d-render-reference", "normal": ["mirante4d-dataset", "mirante4d-domain", "mirante4d-render-api"]}
+  ],
+  "workspace_dependency_matrix": [
+    {
+      "name": "mirante4d-analysis",
+      "path": "crates/mirante4d-analysis",
+      "dependencies": {
+        "normal": ["glam", "mirante4d-data", "mirante4d-domain", "mirante4d-format", "serde", "serde_json", "thiserror"],
+        "dev": ["approx", "tempfile"],
+        "build": []
+      }
+    },
+    {
+      "name": "mirante4d-app",
+      "path": "crates/mirante4d-app",
+      "dependencies": {
+        "normal": ["anyhow", "eframe", "glam", "mirante4d-analysis", "mirante4d-application", "mirante4d-data", "mirante4d-dataset", "mirante4d-domain", "mirante4d-format", "mirante4d-identity", "mirante4d-import", "mirante4d-project-model", "mirante4d-render-api", "mirante4d-renderer", "mirante4d-settings", "rfd", "serde", "serde_json", "tracing", "tracing-subscriber", "uuid", "winit"],
+        "dev": ["egui_kittest", "insta", "tempfile", "tiff"],
+        "build": []
+      }
+    },
+    {
+      "name": "mirante4d-application",
+      "path": "crates/mirante4d-application",
+      "dependencies": {
+        "normal": ["mirante4d-dataset", "mirante4d-domain", "mirante4d-identity", "mirante4d-project-model", "mirante4d-render-api", "mirante4d-settings"],
+        "dev": [],
+        "build": []
+      }
+    },
+    {
+      "name": "mirante4d-data",
+      "path": "crates/mirante4d-data",
+      "dependencies": {
+        "normal": ["glam", "mirante4d-domain", "mirante4d-format", "thiserror", "tracing", "zarrs"],
+        "dev": ["tempfile"],
+        "build": []
+      }
+    },
+    {
+      "name": "mirante4d-dataset",
+      "path": "crates/mirante4d-dataset",
+      "dependencies": {
+        "normal": ["mirante4d-domain", "mirante4d-identity", "thiserror"],
+        "dev": [],
+        "build": []
+      }
+    },
+    {
+      "name": "mirante4d-dataset-runtime",
+      "path": "crates/mirante4d-dataset-runtime",
+      "dependencies": {
+        "normal": ["mirante4d-dataset", "thiserror"],
+        "dev": ["mirante4d-domain", "mirante4d-identity"],
+        "build": []
+      }
+    },
+    {
+      "name": "mirante4d-domain",
+      "path": "crates/mirante4d-domain",
+      "dependencies": {
+        "normal": ["thiserror"],
+        "dev": ["proptest"],
+        "build": []
+      }
+    },
+    {
+      "name": "mirante4d-format",
+      "path": "crates/mirante4d-format",
+      "dependencies": {
+        "normal": ["blake3", "glam", "mirante4d-domain", "serde", "serde_json", "thiserror", "zarrs"],
+        "dev": ["tempfile"],
+        "build": []
+      }
+    },
+    {
+      "name": "mirante4d-identity",
+      "path": "crates/mirante4d-identity",
+      "dependencies": {
+        "normal": ["thiserror"],
+        "dev": ["proptest"],
+        "build": []
+      }
+    },
+    {
+      "name": "mirante4d-import",
+      "path": "crates/mirante4d-import",
+      "dependencies": {
+        "normal": ["blake3", "mirante4d-domain", "mirante4d-format", "quick-xml", "thiserror", "tiff"],
+        "dev": ["mirante4d-data", "serde_json", "tempfile"],
+        "build": []
+      }
+    },
+    {
+      "name": "mirante4d-project-model",
+      "path": "crates/mirante4d-project-model",
+      "dependencies": {
+        "normal": ["mirante4d-domain", "mirante4d-identity", "thiserror"],
+        "dev": ["proptest"],
+        "build": []
+      }
+    },
+    {
+      "name": "mirante4d-render-api",
+      "path": "crates/mirante4d-render-api",
+      "dependencies": {
+        "normal": ["mirante4d-dataset", "mirante4d-domain", "thiserror"],
+        "dev": [],
+        "build": []
+      }
+    },
+    {
+      "name": "mirante4d-renderer",
+      "path": "crates/mirante4d-renderer",
+      "dependencies": {
+        "normal": ["bytemuck", "glam", "mirante4d-data", "mirante4d-domain", "mirante4d-format", "mirante4d-render-api", "pollster", "thiserror", "wgpu"],
+        "dev": ["approx", "tempfile"],
+        "build": []
+      }
+    },
+    {
+      "name": "mirante4d-settings",
+      "path": "crates/mirante4d-settings",
+      "dependencies": {
+        "normal": ["serde", "serde_json", "thiserror"],
+        "dev": ["tempfile"],
+        "build": []
+      }
+    },
+    {
+      "name": "xtask",
+      "path": "crates/xtask",
+      "dependencies": {
+        "normal": ["anyhow", "glam", "mirante4d-analysis", "mirante4d-data", "mirante4d-domain", "mirante4d-format", "mirante4d-import", "mirante4d-render-api", "mirante4d-renderer", "serde", "serde_json", "syn", "tiff", "toml", "yaml-rust2"],
+        "dev": ["tempfile"],
+        "build": []
+      }
+    }
+  ],
+  "transitional_edges": [
+    {"from": "mirante4d-analysis", "to": "mirante4d-data", "kind": "normal", "reason": "Current analysis still reads predecessor dataset payloads until the unified source bridge is removed.", "expiry_gate": "WP-10C"},
+    {"from": "mirante4d-analysis", "to": "mirante4d-domain", "kind": "normal", "reason": "Current analysis remains a predecessor of analysis-core.", "expiry_gate": "WP-12"},
+    {"from": "mirante4d-analysis", "to": "mirante4d-format", "kind": "normal", "reason": "Current analysis still names predecessor dataset identifiers.", "expiry_gate": "WP-10C"},
+    {"from": "mirante4d-app", "to": "mirante4d-analysis", "kind": "normal", "reason": "Composition still reaches the current analysis implementation.", "expiry_gate": "WP-12"},
+    {"from": "mirante4d-app", "to": "mirante4d-data", "kind": "normal", "reason": "Composition still constructs the current-source bridge.", "expiry_gate": "WP-10C"},
+    {"from": "mirante4d-app", "to": "mirante4d-dataset", "kind": "normal", "reason": "The predecessor shell still translates catalog facts directly.", "expiry_gate": "WP-09C"},
+    {"from": "mirante4d-app", "to": "mirante4d-domain", "kind": "normal", "reason": "The predecessor shell still translates framework input to domain values.", "expiry_gate": "WP-09C"},
+    {"from": "mirante4d-app", "to": "mirante4d-format", "kind": "normal", "reason": "The current-source and import routes still use predecessor format facts.", "expiry_gate": "WP-10C"},
+    {"from": "mirante4d-app", "to": "mirante4d-identity", "kind": "normal", "reason": "The predecessor composition shell still builds typed identity context directly.", "expiry_gate": "WP-09C"},
+    {"from": "mirante4d-app", "to": "mirante4d-import", "kind": "normal", "reason": "The current importer remains the sole reachable producer until target activation.", "expiry_gate": "WP-10C"},
+    {"from": "mirante4d-app", "to": "mirante4d-project-model", "kind": "normal", "reason": "The temporary project-v15 bridge still maps canonical projections.", "expiry_gate": "WP-10B"},
+    {"from": "mirante4d-app", "to": "mirante4d-renderer", "kind": "normal", "reason": "The predecessor renderer remains the sole product renderer.", "expiry_gate": "WP-09B"},
+    {"from": "mirante4d-data", "to": "mirante4d-domain", "kind": "normal", "reason": "Current data types predate the semantic dataset source boundary.", "expiry_gate": "WP-10C"},
+    {"from": "mirante4d-data", "to": "mirante4d-format", "kind": "normal", "reason": "The current reader remains physically coupled to the predecessor format.", "expiry_gate": "WP-10C"},
+    {"from": "mirante4d-format", "to": "mirante4d-domain", "kind": "normal", "reason": "The predecessor format still carries domain-shaped DTO facts.", "expiry_gate": "WP-10C"},
+    {"from": "mirante4d-import", "to": "mirante4d-domain", "kind": "normal", "reason": "The current importer remains active until the target pipeline cutover.", "expiry_gate": "WP-10C"},
+    {"from": "mirante4d-import", "to": "mirante4d-format", "kind": "normal", "reason": "The current importer writes only the predecessor format.", "expiry_gate": "WP-10C"},
+    {"from": "mirante4d-import", "to": "mirante4d-data", "kind": "dev", "reason": "Current importer integration tests reopen predecessor packages.", "expiry_gate": "WP-10C"},
+    {"from": "mirante4d-renderer", "to": "mirante4d-data", "kind": "normal", "reason": "The predecessor renderer still consumes owning current payload values.", "expiry_gate": "WP-09B"},
+    {"from": "mirante4d-renderer", "to": "mirante4d-domain", "kind": "normal", "reason": "The predecessor renderer directly interprets domain values.", "expiry_gate": "WP-09B"},
+    {"from": "mirante4d-renderer", "to": "mirante4d-format", "kind": "normal", "reason": "The predecessor renderer still names current dataset identifiers.", "expiry_gate": "WP-09B"},
+    {"from": "mirante4d-renderer", "to": "mirante4d-render-api", "kind": "normal", "reason": "The predecessor renderer temporarily implements part of the new render boundary.", "expiry_gate": "WP-09B"},
+    {"from": "xtask", "to": "mirante4d-analysis", "kind": "normal", "reason": "Legacy analysis audit logic has not yet moved to its owner.", "expiry_gate": "WP-14"},
+    {"from": "xtask", "to": "mirante4d-data", "kind": "normal", "reason": "Legacy benchmark and fixture commands still open current datasets.", "expiry_gate": "WP-14"},
+    {"from": "xtask", "to": "mirante4d-domain", "kind": "normal", "reason": "Legacy benchmark orchestration still imports product-domain values.", "expiry_gate": "WP-14"},
+    {"from": "xtask", "to": "mirante4d-format", "kind": "normal", "reason": "Legacy fixture and package commands still import predecessor format code.", "expiry_gate": "WP-14"},
+    {"from": "xtask", "to": "mirante4d-import", "kind": "normal", "reason": "Legacy import audits still invoke the predecessor importer directly.", "expiry_gate": "WP-14"},
+    {"from": "xtask", "to": "mirante4d-render-api", "kind": "normal", "reason": "Legacy benchmark orchestration imports render values instead of invoking owner targets.", "expiry_gate": "WP-14"},
+    {"from": "xtask", "to": "mirante4d-renderer", "kind": "normal", "reason": "Legacy GPU and benchmark commands still import the predecessor renderer.", "expiry_gate": "WP-14"}
+  ],
+  "side_effect_capabilities": [
+    {
+      "capability": "analysis-export-filesystem",
+      "target_owner": "mirante4d-analysis-runtime",
+      "owners": [],
+      "current_exceptions": [
+        {"crate": "mirante4d-analysis", "reason": "The predecessor analysis implementation still writes explicit user exports.", "expiry_gate": "WP-12", "evidence_source": "fs::write"}
+      ]
+    },
+    {
+      "capability": "dataset-package-filesystem-and-codecs",
+      "target_owner": "mirante4d-storage",
+      "owners": [],
+      "current_exceptions": [
+        {"crate": "mirante4d-data", "reason": "The current reader remains active until the source hard cutover.", "expiry_gate": "WP-10C", "evidence_dependency": "zarrs"},
+        {"crate": "mirante4d-format", "reason": "The predecessor package reader/writer remains active until target storage activation.", "expiry_gate": "WP-10C", "evidence_dependency": "zarrs"},
+        {"crate": "mirante4d-app", "reason": "The current source-open failure classifier still probes the selected dataset path.", "expiry_gate": "WP-10C", "evidence_source": "std::fs::metadata"}
+      ]
+    },
+    {
+      "capability": "dataset-demand-and-open-workers",
+      "target_owner": "mirante4d-dataset-runtime",
+      "owners": [],
+      "current_exceptions": [
+        {"crate": "mirante4d-data", "reason": "The predecessor brick and cross-section worker pools remain active until the unified runtime cutover.", "expiry_gate": "WP-08B", "evidence_source": "mirante4d-data-brick"},
+        {"crate": "mirante4d-app", "reason": "The current source-open actor remains in composition until storage/runtime activation.", "expiry_gate": "WP-10C", "evidence_source": "CurrentSourceOpenService"}
+      ]
+    },
+    {
+      "capability": "gpu-resource-and-submission",
+      "target_owner": "mirante4d-render-wgpu",
+      "owners": [],
+      "current_exceptions": [
+        {"crate": "mirante4d-renderer", "reason": "The predecessor renderer remains the sole live GPU owner.", "expiry_gate": "WP-09B", "evidence_dependency": "wgpu"}
+      ]
+    },
+    {
+      "capability": "native-process-window-and-logging",
+      "target_owner": "mirante4d-app",
+      "owners": [
+        {"crate": "mirante4d-app", "evidence_dependency": "eframe"}
+      ],
+      "current_exceptions": []
+    },
+    {
+      "capability": "process-runtime-disposal-worker",
+      "target_owner": "mirante4d-app",
+      "owners": [
+        {"crate": "mirante4d-app", "evidence_source": "std::thread::spawn(move ||"}
+      ],
+      "current_exceptions": []
+    },
+    {
+      "capability": "product-validation-script-and-artifact-filesystem",
+      "target_owner": "mirante4d-app",
+      "owners": [
+        {"crate": "mirante4d-app", "evidence_source": "fs::read_to_string(&script_path)"}
+      ],
+      "current_exceptions": []
+    },
+    {
+      "capability": "project-package-filesystem",
+      "target_owner": "mirante4d-project-store",
+      "owners": [],
+      "current_exceptions": [
+        {"crate": "mirante4d-app", "reason": "The private project-v15 bridge is the sole temporary project I/O route.", "expiry_gate": "WP-10B", "evidence_source": "current_project_persistence_bridge"}
+      ]
+    },
+    {
+      "capability": "project-store-background-worker",
+      "target_owner": "mirante4d-project-store",
+      "owners": [],
+      "current_exceptions": [
+        {"crate": "mirante4d-app", "reason": "The private project-v15 bridge owns the current persistence actor until project-store activation.", "expiry_gate": "WP-10B", "evidence_source": "mirante4d-project-v15"}
+      ]
+    },
+    {
+      "capability": "repository-tool-filesystem-and-processes",
+      "target_owner": "xtask",
+      "owners": [
+        {"crate": "xtask", "evidence_source": "fs::"}
+      ],
+      "current_exceptions": []
+    },
+    {
+      "capability": "source-import-and-staging-filesystem",
+      "target_owner": "mirante4d-import-pipeline",
+      "owners": [],
+      "current_exceptions": [
+        {"crate": "mirante4d-import", "reason": "The predecessor importer remains the sole reachable source reader and writer.", "expiry_gate": "WP-10C", "evidence_dependency": "tiff"}
+      ]
+    },
+    {
+      "capability": "source-import-background-workers",
+      "target_owner": "mirante4d-import-pipeline",
+      "owners": [],
+      "current_exceptions": [
+        {"crate": "mirante4d-app", "reason": "The predecessor TIFF setup and import tasks remain active until the import hard cutover.", "expiry_gate": "WP-10C", "evidence_source": "start_import_task"}
+      ]
+    },
+    {
+      "capability": "analysis-background-workers",
+      "target_owner": "mirante4d-analysis-runtime",
+      "owners": [],
+      "current_exceptions": [
+        {"crate": "mirante4d-app", "reason": "The predecessor analysis task remains active until analysis-runtime activation.", "expiry_gate": "WP-12", "evidence_source": "spawn_analysis_task"}
+      ]
+    },
+    {
+      "capability": "ui-framework-and-file-dialogs",
+      "target_owner": "mirante4d-ui-egui",
+      "owners": [],
+      "current_exceptions": [
+        {"crate": "mirante4d-app", "reason": "The predecessor egui shell and dialogs remain until the shell cutover.", "expiry_gate": "WP-09C", "evidence_dependency": "rfd"}
+      ]
+    },
+    {
+      "capability": "user-settings-filesystem-environment-and-worker",
+      "target_owner": "mirante4d-settings",
+      "owners": [
+        {"crate": "mirante4d-settings", "evidence_source": "fs::{self, File, OpenOptions}"}
+      ],
+      "current_exceptions": []
+    }
+  ],
+  "frozen_public_roots": [
+    {
+      "crate": "mirante4d-application",
+      "path": "crates/mirante4d-application/src/lib.rs",
+      "items": ["AnalysisDescriptorError", "AnalysisPlotDescriptor", "AnalysisPlotId", "AnalysisPlotPointSelection", "AnalysisTableDescriptor", "AnalysisTableId", "ApplicationCommand", "ApplicationCommandKind", "ApplicationEvent", "ApplicationFault", "ApplicationFaultCode", "ApplicationSnapshot", "ApplicationState", "CommandEffect", "CrossSectionPanelId", "CurrentnessGeneration", "MAX_ACTIVE_OPERATIONS", "MAX_ANALYSIS_PLOTS", "MAX_ANALYSIS_PLOT_POINTS", "MAX_ANALYSIS_PLOT_SERIES", "MAX_ANALYSIS_TABLES", "MAX_HISTORY_ENTRIES", "MAX_PENDING_EVENTS", "OperationCompletion", "OperationFailureCode", "OperationId", "OperationKind", "OperationOutcome", "OperationToken", "ResourcePolicyPersistenceOutcome", "ResourcePolicyRejection", "SettingsChangeId", "SettingsChangeToken", "SourceSessionGeneration", "SourceVerificationSnapshot", "TaskId", "TransientApplicationState", "UnboundWorkspace", "WorkspaceSnapshot"]
+    },
+    {
+      "crate": "mirante4d-dataset",
+      "path": "crates/mirante4d-dataset/src/lib.rs",
+      "items": ["CpuByteLease", "CpuByteLedger", "CpuLedgerCategory", "CpuLedgerError", "DatasetCatalog", "DatasetCatalogError", "DatasetLayer", "DatasetResourceIdentity", "DatasetResourceKey", "DatasetScale", "DatasetSource", "DatasetSourceFault", "DatasetSourceId", "DecodeSinkError", "MAX_DATASET_LABEL_BYTES", "MAX_DATASET_LAYERS", "MAX_LAYER_LABEL_BYTES", "MAX_SCALES_PER_LAYER", "ReservedDecodeSink", "ResourceContractError", "ResourceLease", "ResourcePayloadDescriptor", "ResourcePayloadView", "ResourceRegion", "ScientificIdentityStatus"]
+    },
+    {
+      "crate": "mirante4d-dataset-runtime",
+      "path": "crates/mirante4d-dataset-runtime/src/lib.rs",
+      "items": ["AccountedCpuLease", "AccountedResourceLease", "CancellationGeneration", "DatasetRuntime", "RequestDedupeKey", "RequestPriority", "RequestTicket", "ResourceRequest", "RuntimeCompletion", "RuntimeFault", "RuntimeFaultCode", "RuntimeOutcome", "RuntimeRequestId", "ShutdownState"]
+    },
+    {
+      "crate": "mirante4d-render-api",
+      "path": "crates/mirante4d-render-api/src/lib.rs",
+      "items": ["CameraAxes", "CameraFrame", "DEFAULT_PRESENTATION_VIEWPORT", "FrameCompleteness", "FrameCoverage", "FrameIdentity", "FrameLimitation", "FrameProgress", "GpuLedgerCategory", "LayerRenderIntent", "MAX_PRESENTATION_TARGETS", "MAX_RENDER_LAYERS", "MAX_RENDER_REQUIREMENTS", "PresentationPaintRequest", "PresentationRegistration", "PresentationRegistry", "PresentationRetirement", "PresentationToken", "PresentationUpdate", "PresentationViewport", "PresentedFrame", "RenderApiError", "RenderExtent", "RenderFault", "RenderIntent", "RenderRequirement", "RenderRequirementRole", "RenderRequirements", "RenderViewIntent", "ViewRay"]
+    }
+  ],
+  "public_api_forbidden_identifiers": [
+    "BrickReadPool",
+    "BrickReadTicket",
+    "CrossSectionChunkReadPool",
+    "DataRuntimeConfig",
+    "DenseVolume*",
+    "File",
+    "GpuDisplayFrame",
+    "JoinHandle",
+    "NativeManifest",
+    "Path",
+    "PathBuf",
+    "RendererResourceHandle",
+    "TextureId",
+    "VolumeBrick*",
+    "Zarr*",
+    "eframe",
+    "egui",
+    "wgpu",
+    "zarrs"
+  ],
+  "frozen_source_rules": [
+    {
+      "path": "crates/mirante4d-application/src",
+      "forbidden_imports": ["eframe", "egui", "mirante4d-data", "mirante4d-format", "mirante4d-renderer", "std::fs", "std::path", "std::thread", "wgpu", "zarrs"]
+    },
+    {
+      "path": "crates/mirante4d-dataset/src",
+      "forbidden_imports": ["eframe", "egui", "mirante4d-data", "mirante4d-format", "mirante4d-renderer", "std::fs", "std::path", "std::thread", "wgpu", "zarrs"]
+    },
+    {
+      "path": "crates/mirante4d-dataset-runtime/src",
+      "forbidden_imports": ["eframe", "egui", "mirante4d-data", "mirante4d-format", "mirante4d-renderer", "std::fs", "std::path", "std::thread", "wgpu", "zarrs"]
+    },
+    {
+      "path": "crates/mirante4d-render-api/src",
+      "forbidden_imports": ["eframe", "egui", "mirante4d-data", "mirante4d-format", "mirante4d-renderer", "std::fs", "std::path", "std::thread", "wgpu", "zarrs"]
+    }
+  ],
+  "resource_allocations": [
+    {"class": "decoded-resource-payload", "owner": "mirante4d-dataset-runtime", "ledger_category": "cpu.decoded-residency"},
+    {"class": "decode-reservation-buffer", "owner": "mirante4d-dataset-runtime", "ledger_category": "cpu.in-flight-decode"},
+    {"class": "cpu-upload-lease", "owner": "mirante4d-dataset-runtime", "ledger_category": "cpu.upload-staging"},
+    {"class": "storage-bootstrap-and-catalog-metadata", "owner": "mirante4d-storage", "ledger_category": "cpu.metadata-and-indexes"},
+    {"class": "storage-lazy-index-page", "owner": "mirante4d-storage", "ledger_category": "cpu.metadata-and-indexes"},
+    {"class": "storage-encoded-io-and-codec-buffer", "owner": "mirante4d-storage", "ledger_category": "cpu.in-flight-decode"},
+    {"class": "runtime-queue-and-completion", "owner": "mirante4d-dataset-runtime", "ledger_category": "cpu.queues-and-results"},
+    {"class": "analysis-pending-result", "owner": "mirante4d-analysis-runtime", "ledger_category": "cpu.queues-and-results"},
+    {"class": "import-working-buffer", "owner": "mirante4d-import-pipeline", "ledger_category": "cpu.import-working-set"},
+    {"class": "presentation-requirement-and-coverage-metadata", "owner": "mirante4d-render-wgpu", "ledger_category": "cpu.queues-and-results"},
+    {"class": "prefetch-residency", "owner": "mirante4d-dataset-runtime", "ledger_category": "cpu.prefetch"},
+    {"class": "gpu-payload-or-atlas", "owner": "mirante4d-render-wgpu", "ledger_category": "gpu.payload-residency"},
+    {"class": "gpu-transfer-staging", "owner": "mirante4d-render-wgpu", "ledger_category": "gpu.transfer-staging"},
+    {"class": "gpu-display-target", "owner": "mirante4d-render-wgpu", "ledger_category": "gpu.display-target"},
+    {"class": "gpu-page-table", "owner": "mirante4d-render-wgpu", "ledger_category": "gpu.page-table"},
+    {"class": "gpu-render-scratch", "owner": "mirante4d-render-wgpu", "ledger_category": "gpu.scratch"}
+  ],
+  "ledger_authorities": {
+    "cpu": {
+      "owner": "mirante4d-dataset-runtime",
+      "contract_crate": "mirante4d-dataset",
+      "categories": ["cpu.decoded-residency", "cpu.upload-staging", "cpu.in-flight-decode", "cpu.metadata-and-indexes", "cpu.queues-and-results", "cpu.prefetch", "cpu.import-working-set"]
+    },
+    "gpu": {
+      "owner": "mirante4d-render-wgpu",
+      "contract_crate": "mirante4d-render-api",
+      "categories": ["gpu.payload-residency", "gpu.transfer-staging", "gpu.display-target", "gpu.page-table", "gpu.scratch"]
+    }
+  },
+  "restricted_trait_implementations": [
+    {"trait_name": "ResourceLease", "owner": "mirante4d-dataset-runtime", "required": true},
+    {"trait_name": "CpuByteLedger", "owner": "mirante4d-dataset-runtime", "required": false},
+    {"trait_name": "CpuByteLease", "owner": "mirante4d-dataset-runtime", "required": true}
+  ]
+}

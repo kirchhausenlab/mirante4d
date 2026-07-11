@@ -5,8 +5,9 @@ contains unresolved work only.
 
 ## Foundation Program
 
-- WP-07B-B through WP-15: perform the live state, runtime, storage, renderer,
-  import, analysis, UI, release, and final-deletion cutovers in the
+- WP-08A through WP-15: complete the remaining subsystem-contract, runtime,
+  storage, renderer, project, import, analysis, UI, release, and final-deletion
+  packages in the
   [foundation handoff](plans/active/FOUNDATION_REFACTOR_HANDOFF.md).
 - Expose packaged unsaved-autosave recovery in its owning application package.
 - Repair the inherited clean-state X11/Winit shutdown panic in its owning

@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
-use mirante4d_dataset::{DatasetCatalog, DatasetLayer, ScientificIdentityStatus};
+use mirante4d_dataset::{
+    DatasetCatalog, DatasetLayer, DatasetResourceIdentity, DatasetResourceKey, DatasetSourceId,
+    ResourceRegion, ScientificIdentityStatus,
+};
 use mirante4d_domain::{
     CameraView, CrossSectionView, DisplayWindow, GridToWorld, IntensityDType, IsoLightState,
-    LayerTransfer, Opacity, Projection, RenderState, RgbColor, SamplingPolicy, Shape4D, TimeIndex,
-    ToolKind, TransferCurve, UnitQuaternion, ViewerLayout, WorldPoint3,
+    LayerTransfer, Opacity, Projection, RenderState, RgbColor, SamplingPolicy, ScaleLevel, Shape3D,
+    Shape4D, TimeIndex, ToolKind, TransferCurve, UnitQuaternion, ViewerLayout, WorldPoint3,
 };
 use mirante4d_identity::{
     ArtifactContentId, ExactBytesDigest, MediaType, ObjectRole, RawObjectDescriptor,
@@ -13,9 +16,71 @@ use mirante4d_project_model::{
     ArtifactCompleteness, ArtifactRecoverability, ArtifactSchema, ChannelPresetEntry,
     DatasetLocatorHint,
 };
+use mirante4d_render_api::{
+    FrameCompleteness, FrameCoverage, FrameIdentity, FrameProgress, LayerRenderIntent,
+    PresentationToken, PresentationViewport, PresentedFrame, RenderExtent, RenderIntent,
+    RenderRequirement, RenderRequirementRole, RenderRequirements, RenderViewIntent,
+};
 use mirante4d_settings::{GIB, RejectedFileDisposition};
 
 use super::*;
+
+#[test]
+fn snapshot_carries_only_an_optional_backend_neutral_presentation_projection() {
+    let snapshot = application().snapshot();
+    assert_eq!(snapshot.presentation(), None);
+
+    let resource_identity = DatasetResourceIdentity::Verified(
+        ScientificContentId::parse(&format!(
+            "{}{}",
+            ScientificContentId::PREFIX,
+            "0".repeat(64)
+        ))
+        .unwrap(),
+    );
+    let key = DatasetResourceKey::new(
+        resource_identity,
+        LogicalLayerKey::new(0),
+        TimeIndex::new(0),
+        ScaleLevel::BASE,
+        ResourceRegion::new([0, 0, 0], Shape3D::new(1, 1, 1).unwrap()).unwrap(),
+    );
+    let extent = RenderExtent::new(32, 24).unwrap();
+    let render_intent = RenderIntent::new(
+        FrameIdentity::new(7),
+        resource_identity,
+        TimeIndex::new(0),
+        RenderViewIntent::volume(camera(), IsoLightState::attached_camera()),
+        PresentationViewport::new(32.0, 24.0).unwrap(),
+        extent,
+        vec![LayerRenderIntent::new(
+            LogicalLayerKey::new(0),
+            transfer(),
+            RenderState::mip(SamplingPolicy::SmoothLinear),
+        )],
+    )
+    .unwrap();
+    let requirements = RenderRequirements::new(
+        &render_intent,
+        vec![RenderRequirement::new(
+            key,
+            RenderRequirementRole::FirstUsefulFrame,
+        )],
+    )
+    .unwrap();
+    let presented = PresentedFrame::new(
+        PresentationToken::new(1).unwrap(),
+        extent,
+        FrameProgress::new(
+            FrameCoverage::from_available(&requirements, &[key]).unwrap(),
+            FrameCompleteness::Exact,
+            None,
+        )
+        .unwrap(),
+    );
+    let projected = snapshot.with_presentation(Some(presented.clone()));
+    assert_eq!(projected.presentation(), Some(&presented));
+}
 
 #[test]
 fn unbound_view_changes_are_transient_and_invalid_or_noop_commands_are_atomic() {
@@ -59,7 +124,7 @@ fn catalog_is_owned_by_snapshot_and_closes_every_view_transition() {
 
     let missing_layer_catalog = DatasetCatalog::new(
         "incomplete",
-        ScientificIdentityStatus::Unverified,
+        ScientificIdentityStatus::Unverified(DatasetSourceId::new(1)),
         vec![dataset_layer(0, 4)],
     )
     .unwrap();
@@ -1203,7 +1268,7 @@ fn source_replacement_is_central_generation_guarded_and_resets_bound_transients(
         .dispatch(ApplicationCommand::CompleteOperation {
             token,
             completion: OperationCompletion::DatasetOpened {
-                catalog: Arc::new(catalog(4)),
+                catalog: Arc::new(catalog_for_source(4, 2)),
                 workspace: Box::new(unbound_workspace(project_id(9))),
                 source_generation: SourceSessionGeneration::new(2),
             },
@@ -1330,7 +1395,7 @@ fn dataset_open_completion_rejects_verified_or_view_incompatible_catalogs_atomic
     let before = incompatible.fork_for_dispatch();
     let incomplete = DatasetCatalog::new(
         "incomplete",
-        ScientificIdentityStatus::Unverified,
+        ScientificIdentityStatus::Unverified(DatasetSourceId::new(2)),
         vec![dataset_layer(0, 4)],
     )
     .unwrap();
@@ -1542,7 +1607,11 @@ fn view() -> ViewState {
 }
 
 fn catalog(label_digit: u8) -> DatasetCatalog {
-    catalog_named_with_timepoints(format!("catalog-{label_digit}"), 10_000)
+    catalog_for_source(label_digit, 1)
+}
+
+fn catalog_for_source(label_digit: u8, source_id: u64) -> DatasetCatalog {
+    catalog_named_with_timepoints_and_source(format!("catalog-{label_digit}"), 10_000, source_id)
 }
 
 fn catalog_with_timepoints(timepoints: u64) -> DatasetCatalog {
@@ -1550,9 +1619,17 @@ fn catalog_with_timepoints(timepoints: u64) -> DatasetCatalog {
 }
 
 fn catalog_named_with_timepoints(label: String, timepoints: u64) -> DatasetCatalog {
+    catalog_named_with_timepoints_and_source(label, timepoints, 1)
+}
+
+fn catalog_named_with_timepoints_and_source(
+    label: String,
+    timepoints: u64,
+    source_id: u64,
+) -> DatasetCatalog {
     DatasetCatalog::new(
         label,
-        ScientificIdentityStatus::Unverified,
+        ScientificIdentityStatus::Unverified(DatasetSourceId::new(source_id)),
         [0, 1]
             .into_iter()
             .map(|ordinal| dataset_layer(ordinal, timepoints))
