@@ -1,0 +1,56 @@
+{
+  "schema": "mirante4d-source-fixture-mutation-recipes",
+  "schema_version": 1,
+  "recipes": [
+    {
+      "id": "invalid-byte-order",
+      "operation": "replace_bytes",
+      "base_path": "spec-004/u16-all-zero.tif",
+      "semantic_target": "TIFF byte-order marker",
+      "replacement_hex": "5a5a"
+    },
+    {
+      "id": "truncated-header",
+      "operation": "truncate_header",
+      "base_path": "spec-004/u16-all-zero.tif",
+      "semantic_target": "classic TIFF header"
+    },
+    {
+      "id": "truncated-ifd",
+      "operation": "truncate_ifd",
+      "base_path": "spec-004/u16-all-zero.tif",
+      "semantic_target": "first IFD entry-count field"
+    },
+    {
+      "id": "truncated-data",
+      "operation": "truncate_strip_data",
+      "base_path": "spec-004/f32-finite.tif",
+      "semantic_target": "last byte of first strip"
+    },
+    {
+      "id": "ome-sizez-ifd-contradiction",
+      "operation": "replace_ome_sizez",
+      "base_path": "spec-001/ome-u16-anisotropic.ome.tif",
+      "semantic_target": "OME Pixels SizeZ"
+    },
+    {
+      "id": "missing-timepoint",
+      "operation": "remove_group_member",
+      "base_path": "spec-002/stack-t001.tif",
+      "semantic_target": "time-series membership"
+    },
+    {
+      "id": "duplicate-timepoint",
+      "operation": "duplicate_group_member",
+      "base_path": "spec-002/stack-t001.tif",
+      "semantic_target": "time-series membership"
+    },
+    {
+      "id": "multipage-plane-series-member",
+      "operation": "replace_with_multipage_file",
+      "base_path": "spec-003/channel-00/z001.tif",
+      "replacement_path": "spec-002/stack-t000.tif",
+      "semantic_target": "single-plane channel-folder member"
+    }
+  ]
+}

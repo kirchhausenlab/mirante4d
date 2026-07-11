@@ -1,0 +1,33 @@
+[global]
+enable = [
+  "MD001",
+  "MD009",
+  "MD010",
+  "MD011",
+  "MD018",
+  "MD019",
+  "MD023",
+  "MD024",
+  "MD025",
+  "MD040",
+  "MD041",
+  "MD042",
+  "MD047",
+  "MD051",
+  "MD052",
+  "MD053",
+  "MD055",
+  "MD056",
+  "MD057",
+  "MD062",
+  "MD070",
+  "MD075",
+  "MD080",
+]
+exclude = [
+  "docs/archive/**",
+  "target/**",
+  "vendor/**",
+]
+respect-gitignore = true
+flavor = "standard"

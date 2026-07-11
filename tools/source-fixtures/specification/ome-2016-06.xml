@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
+  <Image ID="Image:0" Name="Mirante4D anisotropic source fixture">
+    <Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="uint16" SizeX="3" SizeY="2" SizeZ="2" SizeC="1" SizeT="1" PhysicalSizeX="0.25" PhysicalSizeXUnit="&#181;m" PhysicalSizeY="0.5" PhysicalSizeYUnit="&#181;m" PhysicalSizeZ="0.75" PhysicalSizeZUnit="&#181;m">
+      <Channel ID="Channel:0:0" SamplesPerPixel="1"/>
+      <TiffData IFD="0" PlaneCount="2"/>
+    </Pixels>
+  </Image>
+</OME>

@@ -1,0 +1,598 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:mirante4d:foundation:source-fixture-manifest:v1",
+  "title": "Mirante4D bounded public source-fixture manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema",
+    "schema_version",
+    "specification_ids",
+    "specification_version",
+    "status",
+    "publication_class",
+    "license",
+    "producer",
+    "expected_fact_authority",
+    "independent_reader",
+    "independence_audit_sha256",
+    "archive",
+    "files",
+    "expected_facts",
+    "reproduction",
+    "approvals"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "../../docs/plans/active/foundation-refactor/schemas/foundation-source-fixture-manifest-v1.schema.json"
+    },
+    "schema": {
+      "const": "mirante4d-foundation-source-fixture-manifest"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "specification_ids": {
+      "const": [
+        "SRC-TIFF-SPEC-001",
+        "SRC-TIFF-SPEC-002",
+        "SRC-TIFF-SPEC-003",
+        "SRC-TIFF-SPEC-004"
+      ]
+    },
+    "specification_version": {
+      "const": 1
+    },
+    "status": {
+      "enum": [
+        "generated_candidate",
+        "independently_validated"
+      ]
+    },
+    "publication_class": {
+      "const": "public_safe"
+    },
+    "license": {
+      "const": "MIT"
+    },
+    "producer": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/lineage"
+        },
+        {
+          "properties": {
+            "lineage_id": {
+              "const": "SRC-PRODUCER-001"
+            },
+            "lineage_class": {
+              "const": "byte_producer"
+            },
+            "implementation_source": {
+              "pattern": "^tools/source-fixtures/producer/"
+            },
+            "runtime": {
+              "properties": {
+                "name": {
+                  "const": "CPython"
+                }
+              }
+            },
+            "dependencies": {
+              "minItems": 2,
+              "maxItems": 2,
+              "allOf": [
+                {
+                  "contains": {
+                    "properties": {
+                      "name": {
+                        "const": "tifffile"
+                      }
+                    }
+                  },
+                  "minContains": 1,
+                  "maxContains": 1
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "name": {
+                        "const": "numpy"
+                      }
+                    }
+                  },
+                  "minContains": 1,
+                  "maxContains": 1
+                }
+              ]
+            },
+            "reproduction_command_id": {
+              "const": "SRC-CMD-001"
+            }
+          }
+        }
+      ]
+    },
+    "expected_fact_authority": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/lineage"
+        },
+        {
+          "properties": {
+            "lineage_id": {
+              "const": "SRC-FACT-001"
+            },
+            "lineage_class": {
+              "const": "fact_oracle"
+            },
+            "implementation_source": {
+              "pattern": "^tools/source-fixtures/fact-oracle/"
+            },
+            "runtime": {
+              "properties": {
+                "name": {
+                  "const": "Rust"
+                }
+              }
+            },
+            "dependencies": {
+              "maxItems": 8,
+              "not": {
+                "contains": {
+                  "properties": {
+                    "name": {
+                      "enum": [
+                        "tiff",
+                        "tifffile",
+                        "numpy",
+                        "Pillow",
+                        "lxml",
+                        "mirante4d"
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            "reproduction_command_id": {
+              "const": "SRC-CMD-002"
+            }
+          }
+        }
+      ]
+    },
+    "independent_reader": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/lineage"
+        },
+        {
+          "properties": {
+            "lineage_id": {
+              "const": "SRC-READER-001"
+            },
+            "lineage_class": {
+              "const": "independent_reader"
+            },
+            "implementation_source": {
+              "pattern": "^tools/source-fixtures/reader/"
+            },
+            "runtime": {
+              "properties": {
+                "name": {
+                  "const": "CPython"
+                }
+              }
+            },
+            "dependencies": {
+              "minItems": 3,
+              "maxItems": 3,
+              "allOf": [
+                {
+                  "contains": {
+                    "properties": {
+                      "name": {
+                        "const": "Pillow"
+                      }
+                    }
+                  },
+                  "minContains": 1,
+                  "maxContains": 1
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "name": {
+                        "const": "lxml"
+                      }
+                    }
+                  },
+                  "minContains": 1,
+                  "maxContains": 1
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "name": {
+                        "const": "OME-XML-XSD"
+                      }
+                    }
+                  },
+                  "minContains": 1,
+                  "maxContains": 1
+                },
+                {
+                  "not": {
+                    "contains": {
+                      "properties": {
+                        "name": {
+                          "enum": [
+                            "tifffile",
+                            "numpy"
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            "reproduction_command_id": {
+              "const": "SRC-CMD-003"
+            }
+          }
+        }
+      ]
+    },
+    "independence_audit_sha256": {
+      "$ref": "urn:mirante4d:foundation:common:v1#/$defs/sha256"
+    },
+    "archive": {
+      "$ref": "#/$defs/archive"
+    },
+    "files": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 32,
+      "propertyNames": {
+        "$ref": "urn:mirante4d:foundation:common:v1#/$defs/repo_path"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/file"
+      }
+    },
+    "expected_facts": {
+      "$ref": "#/$defs/expected_facts"
+    },
+    "reproduction": {
+      "$ref": "#/$defs/reproduction"
+    },
+    "approvals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "project_original_and_license",
+        "scientific_and_layout_facts"
+      ],
+      "properties": {
+        "project_original_and_license": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/approval"
+        },
+        "scientific_and_layout_facts": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/approval"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "independently_validated"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "approvals": {
+            "properties": {
+              "project_original_and_license": {
+                "properties": {
+                  "state": {
+                    "const": "approved"
+                  }
+                }
+              },
+              "scientific_and_layout_facts": {
+                "properties": {
+                  "state": {
+                    "const": "approved"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lineage_id",
+        "lineage_class",
+        "implementation_source",
+        "implementation_sha256",
+        "runtime",
+        "dependencies",
+        "lock_manifest_path",
+        "lock_manifest_sha256",
+        "reproduction_command_id",
+        "independence_statement"
+      ],
+      "properties": {
+        "lineage_id": {
+          "type": "string",
+          "pattern": "^SRC-(PRODUCER|FACT|READER)-[0-9]{3}$"
+        },
+        "lineage_class": {
+          "enum": [
+            "byte_producer",
+            "fact_oracle",
+            "independent_reader"
+          ]
+        },
+        "implementation_source": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/repo_path"
+        },
+        "implementation_sha256": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/sha256"
+        },
+        "runtime": {
+          "$ref": "#/$defs/tool_artifact"
+        },
+        "dependencies": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/tool_artifact"
+          }
+        },
+        "lock_manifest_path": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/repo_path"
+        },
+        "lock_manifest_sha256": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/sha256"
+        },
+        "reproduction_command_id": {
+          "type": "string",
+          "pattern": "^SRC-CMD-[0-9]{3}$"
+        },
+        "independence_statement": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/nonempty_string"
+        }
+      }
+    },
+    "tool_artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "source_revision",
+        "source_url",
+        "release_artifact_sha256",
+        "installed_artifact_sha256",
+        "license"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/nonempty_string"
+        },
+        "version": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/nonempty_string"
+        },
+        "source_revision": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/nonempty_string"
+        },
+        "source_url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://"
+        },
+        "release_artifact_sha256": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/sha256"
+        },
+        "installed_artifact_sha256": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/sha256"
+        },
+        "license": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/nonempty_string"
+        }
+      }
+    },
+    "archive": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "format",
+        "compression",
+        "sha256",
+        "archive_bytes",
+        "regular_file_bytes",
+        "logical_voxel_bytes",
+        "directories",
+        "max_depth",
+        "max_fan_out",
+        "max_path_bytes",
+        "max_file_bytes",
+        "compression_ratio"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/repo_path"
+        },
+        "format": {
+          "const": "ustar"
+        },
+        "compression": {
+          "const": "none"
+        },
+        "sha256": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/sha256"
+        },
+        "archive_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2097152
+        },
+        "regular_file_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4194304
+        },
+        "logical_voxel_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576
+        },
+        "directories": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "urn:mirante4d:foundation:common:v1#/$defs/repo_path"
+          }
+        },
+        "max_depth": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4
+        },
+        "max_fan_out": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        },
+        "max_path_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120
+        },
+        "max_file_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576
+        },
+        "compression_ratio": {
+          "const": 1
+        }
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "media_type",
+        "bytes",
+        "sha256",
+        "role"
+      ],
+      "properties": {
+        "media_type": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/nonempty_string"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576
+        },
+        "sha256": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/sha256"
+        },
+        "role": {
+          "enum": [
+            "source_tiff",
+            "source_grouping",
+            "mutation_manifest",
+            "provenance_license",
+            "expected_facts"
+          ]
+        }
+      }
+    },
+    "expected_facts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "schema_id",
+        "schema_version",
+        "sha256",
+        "logical_value_digest_algorithm",
+        "logical_value_sha256",
+        "independent_reader_report_sha256"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/repo_path"
+        },
+        "schema_id": {
+          "const": "mirante4d-source-fixture-expected-facts"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "sha256": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/sha256"
+        },
+        "logical_value_digest_algorithm": {
+          "const": "sha256"
+        },
+        "logical_value_sha256": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/sha256"
+        },
+        "independent_reader_report_sha256": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/sha256"
+        }
+      }
+    },
+    "reproduction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command_id",
+        "run_evidence_sha256",
+        "generated_tree_sha256"
+      ],
+      "properties": {
+        "command_id": {
+          "const": "SRC-CMD-004"
+        },
+        "run_evidence_sha256": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "urn:mirante4d:foundation:common:v1#/$defs/sha256"
+          }
+        },
+        "generated_tree_sha256": {
+          "$ref": "urn:mirante4d:foundation:common:v1#/$defs/sha256"
+        }
+      }
+    }
+  }
+}

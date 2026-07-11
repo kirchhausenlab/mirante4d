@@ -1,0 +1,31 @@
+name: Feature request
+description: Propose a focused user or research outcome.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Large architectural changes should begin with a discussion. Dataset
+        uploads and external dataset contributions are not accepted through
+        this repository.
+  - type: textarea
+    id: outcome
+    attributes:
+      label: User outcome
+      description: Which user or research workflow should improve?
+    validations:
+      required: true
+  - type: textarea
+    id: current-limit
+    attributes:
+      label: Current limitation
+      description: What prevents that outcome today?
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Suggested scope
+      description: Describe useful boundaries or non-goals, without attaching data.

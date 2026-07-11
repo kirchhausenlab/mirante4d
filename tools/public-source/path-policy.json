@@ -1,0 +1,19 @@
+{
+  "schema": "mirante4d-public-path-policy",
+  "schema_version": 1,
+  "excluded_paths": [
+    "docs/plans/active/foundation-refactor/PUBLIC_SOURCE_CUTOVER_BRIEF.md",
+    "docs/plans/active/foundation-refactor/TOOLCHAIN_MANIFEST.md",
+    "docs/plans/active/foundation-refactor/WP03_ENTRY.md"
+  ],
+  "allowed_executable_paths": [],
+  "allowed_binary_paths": [
+    "crates/mirante4d-app/tests/snapshots/workbench_shell_basic.png",
+    "crates/mirante4d-app/tests/snapshots/workbench_shell_dvr_hidpi.png",
+    "crates/mirante4d-app/tests/snapshots/workbench_shell_iso_hidpi.png",
+    "fixtures/source/mirante4d-source-tiff-fixtures-v1.tar"
+  ],
+  "allowed_archive_paths": [
+    "fixtures/source/mirante4d-source-tiff-fixtures-v1.tar"
+  ]
+}

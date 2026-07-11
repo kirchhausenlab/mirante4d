@@ -1,0 +1,36 @@
+{
+  "schema": "mirante4d-source-fixture-python-wheel-lock",
+  "schema_version": 1,
+  "python": {
+    "version": "3.12.3",
+    "ubuntu_revision": "3.12.3-1ubuntu0.15",
+    "binary": "/usr/bin/python3.12",
+    "binary_sha256": "1643dacd9feaedc58f3cc581e4d22577dfe25c09b10282936186ccf0f2e61118"
+  },
+  "wheels": [
+    {
+      "name": "Pillow",
+      "version": "12.3.0",
+      "filename": "pillow-12.3.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "url": "https://files.pythonhosted.org/packages/84/21/a35af28dcc61f37ed850a2d64c65c701321dfbf25085e469d5559360cbbf/pillow-12.3.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "78cb2c6865a35ab8ff8b75fd122f6033b92a62c82801110e48ddd6c936a45d91",
+      "license": "MIT-CMU"
+    },
+    {
+      "name": "lxml",
+      "version": "6.1.1",
+      "filename": "lxml-6.1.1-cp312-cp312-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl",
+      "url": "https://files.pythonhosted.org/packages/08/f6/af32e23e563971ffb0fb86be52bc5be5c2c118858ffc119bf6a9039b173d/lxml-6.1.1-cp312-cp312-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "ebe6af670449830d6d9b752c256a983291c766a1365ba5d5460048f9e33a7818",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "OME-XML-XSD",
+      "version": "2016-06",
+      "filename": "ome.xsd",
+      "url": "https://www.openmicroscopy.org/Schemas/OME/2016-06/ome.xsd",
+      "sha256": "64b439ff488c87d81ca112b73b7123596952ff8a8543e3b02d94ea8db5ed51ee",
+      "license": "CC-BY-4.0"
+    }
+  ]
+}

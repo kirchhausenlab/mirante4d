@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.kirchhausenlab.Mirante4D</id>
+  <name>Mirante4D</name>
+  <summary>Native 4D microscopy viewer</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <launchable type="desktop-id">org.kirchhausenlab.Mirante4D.desktop</launchable>
+  <url type="homepage">https://github.com/kirchhausenlab/mirante4d</url>
+  <description>
+    <p>
+      Mirante4D is a native desktop application for viewing and analyzing large
+      4D microscopy datasets stored in the strict Mirante4D native format.
+    </p>
+  </description>
+  <categories>
+    <category>Science</category>
+    <category>DataVisualization</category>
+  </categories>
+  <provides>
+    <binary>mirante4d-app</binary>
+  </provides>
+</component>

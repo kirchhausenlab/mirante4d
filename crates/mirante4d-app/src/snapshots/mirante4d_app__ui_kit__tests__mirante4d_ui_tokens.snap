@@ -1,0 +1,9 @@
+---
+source: crates/mirante4d-app/src/ui_kit.rs
+assertion_line: 342
+expression: "format!(\"panel={:?}\\nviewport={:?}\\naccent={:?}\\nleft={} right={} top={} bottom={}\",\nUiTokens::default().colors.panel_background,\nUiTokens::default().colors.viewport_background,\nUiTokens::default().colors.accent,\nWorkbenchLayoutSpec::default().left_panel_width,\nWorkbenchLayoutSpec::default().right_panel_width,\nWorkbenchLayoutSpec::default().top_bar_height,\nWorkbenchLayoutSpec::default().bottom_strip_height,)"
+---
+panel=#18_1A_1D_FF
+viewport=#08_0A_0D_FF
+accent=#5C_B1_BC_FF
+left=260 right=340 top=34 bottom=0

@@ -1,0 +1,46 @@
+name: Bug report
+description: Report a reproducible non-sensitive Mirante4D problem.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Mirante4D is pre-alpha research software. Do not attach microscopy
+        data, credentials, private URLs, unpublished results, or unredacted
+        machine paths. Report security issues through the private security
+        route instead.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the smallest steps that reproduce the problem.
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Revision
+      description: Commit, package version, or other exact source identity.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, display system, GPU/backend, and other relevant details.
+  - type: checkboxes
+    id: disclosure
+    attributes:
+      label: Disclosure check
+      options:
+        - label: I removed private data, credentials, access URLs, and identifying paths.
+          required: true

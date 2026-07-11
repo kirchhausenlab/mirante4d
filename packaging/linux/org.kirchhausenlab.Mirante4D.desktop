@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Mirante4D
+Comment=Native 4D microscopy viewer
+Exec=mirante4d-app %F
+Icon=mirante4d
+Terminal=false
+Categories=Science;DataVisualization;
+Keywords=microscopy;volume;4D;visualization;bioimaging;
+StartupWMClass=Mirante4D

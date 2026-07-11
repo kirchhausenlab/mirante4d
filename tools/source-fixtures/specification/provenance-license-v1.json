@@ -1,0 +1,32 @@
+{
+  "schema": "mirante4d-source-fixture-provenance-license",
+  "schema_version": 1,
+  "publication_class": "public_safe",
+  "fixture_license": "MIT",
+  "project_original": true,
+  "project_original_scope": "fixture specifications, deterministic scalar formulas, grouping rules, mutation recipes, and generated TIFF bytes",
+  "approval": {
+    "reference": "OA-001",
+    "approved_on": "2026-07-10",
+    "classification": "project-original MIT source-fixture material and plain scientific/layout facts"
+  },
+  "data_statement": "The archive contains deterministic synthetic source data only; it contains no microscopy experiment, person, specimen, or private dataset bytes.",
+  "lineages": {
+    "producer": "SRC-PRODUCER-001",
+    "expected_fact_authority": "SRC-FACT-001",
+    "independent_reader": "SRC-READER-001"
+  },
+  "third_party_tools": [
+    {"name": "tifffile", "version": "2026.6.1", "license": "BSD-3-Clause"},
+    {"name": "NumPy", "version": "2.5.1", "license": "BSD-3-Clause"},
+    {"name": "Pillow", "version": "12.3.0", "license": "MIT-CMU"},
+    {"name": "lxml", "version": "6.1.1", "license": "BSD-3-Clause"}
+  ],
+  "ome_xsd": {
+    "name": "OME-XML 2016-06 ome.xsd",
+    "url": "https://www.openmicroscopy.org/Schemas/OME/2016-06/ome.xsd",
+    "sha256": "64b439ff488c87d81ca112b73b7123596952ff8a8543e3b02d94ea8db5ed51ee",
+    "license": "CC-BY-4.0",
+    "attribution": "OME Data Model and XML Schema, Open Microscopy Environment; https://www.openmicroscopy.org/licensing/"
+  }
+}

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Mirante4D icon">
+  <rect width="128" height="128" rx="24" fill="#111827"/>
+  <path d="M26 82 64 26l38 56-38 20z" fill="#38bdf8" opacity=".92"/>
+  <path d="M26 82 64 102V26z" fill="#22c55e" opacity=".78"/>
+  <path d="M64 26v76l38-20z" fill="#f97316" opacity=".82"/>
+  <path d="M37 78 64 39l27 39-27 14z" fill="#f8fafc" opacity=".9"/>
+  <circle cx="64" cy="64" r="10" fill="#111827"/>
+</svg>

@@ -1,0 +1,59 @@
+{
+  "schema": "mirante4d-source-fixture-grouping",
+  "schema_version": 1,
+  "groups": [
+    {
+      "specification_id": "SRC-TIFF-SPEC-001",
+      "grouping_id": "single_ome_tiff",
+      "paths": ["spec-001/ome-u16-anisotropic.ome.tif"],
+      "binding": "OME DimensionOrder XYZCT and IFD order bind z",
+      "reject": ["OME SizeZ contradicts IFD count", "additional file"]
+    },
+    {
+      "specification_id": "SRC-TIFF-SPEC-002",
+      "grouping_id": "time_token_multipage",
+      "paths": [
+        "spec-002/stack-t000.tif",
+        "spec-002/stack-t001.tif",
+        "spec-002/stack-t002.tif"
+      ],
+      "binding": "three-digit t token binds time and IFD order binds z",
+      "reject": ["missing timepoint", "duplicate timepoint", "extra timepoint"]
+    },
+    {
+      "specification_id": "SRC-TIFF-SPEC-003",
+      "grouping_id": "channel_folder_plane",
+      "paths": [
+        "spec-003/channel-00/z000.tif",
+        "spec-003/channel-00/z001.tif",
+        "spec-003/channel-00/z002.tif",
+        "spec-003/channel-01/z000.tif",
+        "spec-003/channel-01/z001.tif",
+        "spec-003/channel-01/z002.tif"
+      ],
+      "binding": "lexicographic channel directories bind c and three-digit z tokens bind z",
+      "reject": [
+        "mixed files",
+        "recursive extra level",
+        "multipage plane",
+        "missing plane",
+        "duplicate plane",
+        "ambiguous token order"
+      ]
+    },
+    {
+      "specification_id": "SRC-TIFF-SPEC-004",
+      "grouping_id": "bounded_dtype_layout_family",
+      "paths": [
+        "spec-004/f32-finite.tif",
+        "spec-004/nonfinite-f32.tif",
+        "spec-004/u16-all-zero.tif",
+        "spec-004/u16-striped.tif",
+        "spec-004/u8-no-data-corner.tif",
+        "spec-004/unsupported-u32.tif"
+      ],
+      "binding": "each named file is an independent bounded source case",
+      "reject": ["unsupported uint32", "nonfinite float32", "corrupt TIFF structure"]
+    }
+  ]
+}

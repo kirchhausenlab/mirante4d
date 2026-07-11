@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use Mirante4D in research, please cite this software and the associated research context."
+type: software
+title: Mirante4D
+abstract: "A native desktop viewer for large four-dimensional microscopy datasets."
+authors:
+  - family-names: Costa-Filho
+    given-names: Jose Inacio
+  - family-names: Kirchhausen
+    given-names: Tom
+repository-code: "https://github.com/kirchhausenlab/mirante4d"
+url: "https://github.com/kirchhausenlab/mirante4d"
+license: MIT
+keywords:
+  - microscopy
+  - bioimaging
+  - scientific visualization
+  - 4D imaging
+references:
+  - type: generic
+    title: SpatialDINO
+    doi: 10.64898/2025.12.31.697247
+  - type: software
+    title: llsm_viewer
+    repository-code: "https://github.com/kirchhausenlab/llsm_viewer"

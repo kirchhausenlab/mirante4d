@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:mirante4d:foundation:common:v1",
+  "title": "Mirante4D public foundation common definitions",
+  "$defs": {
+    "nonempty_string": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "repo_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*//)(?!.*[*?\\[\\]])[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "role", "approved_by", "approved_on", "reference"],
+      "properties": {
+        "state": { "enum": ["approved", "pending"] },
+        "role": { "$ref": "#/$defs/nonempty_string" },
+        "approved_by": { "type": ["string", "null"] },
+        "approved_on": { "type": ["string", "null"], "format": "date" },
+        "reference": { "type": ["string", "null"] }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "state": { "const": "approved" } },
+            "required": ["state"]
+          },
+          "then": {
+            "properties": {
+              "approved_by": { "$ref": "#/$defs/nonempty_string" },
+              "approved_on": { "type": "string", "format": "date" },
+              "reference": { "$ref": "#/$defs/nonempty_string" }
+            }
+          },
+          "else": {
+            "properties": {
+              "approved_by": { "type": "null" },
+              "approved_on": { "type": "null" },
+              "reference": { "type": "null" }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

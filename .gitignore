@@ -1,0 +1,39 @@
+/target/
+/.nextest/
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/target/
+/fuzz/Cargo.lock
+**/*.rs.bk
+**/tests/snapshots/**/*.diff.png
+**/tests/snapshots/**/*.new.png
+
+# Local environments and credentials. Scanning remains mandatory; ignore rules
+# are only a first line of defense.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+secrets.*
+
+# Research data and local Mirante4D outputs. Approved public source fixtures
+# live only under fixtures/source/ and are reviewed before being tracked.
+/datasets/
+/local-data/
+/sample_data/
+*.m4d
+*.m4dproj/
+*.ome.tif
+*.ome.tiff
+*.tif
+*.tiff
+*.zarr/
+
+# Local diagnostics outside the normal target tree.
+*.log
+*.profraw
+*.trace
