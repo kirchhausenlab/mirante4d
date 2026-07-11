@@ -1,12 +1,8 @@
 {
   "schema": "mirante4d-verification-registry",
   "schema_version": 1,
-  "bootstrap_bridge": {
-    "enabled": true,
-    "deletion_gate": "WP06-C-authority-flip"
-  },
   "tools": [
-    { "id": "actions-checkout", "version": "7.0.0", "action_commit": "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0" },
+    { "id": "actions-checkout", "version": "4.2.2", "action_commit": "11bd71901bbe5b1630ceea73d27597364c9af683" },
     { "id": "cargo-nextest", "version": "0.9.138", "artifact_sha256": "3793bf0c27607b196f502c39b2108f571de89fcda7586ae6beefa11ee177b216" },
     { "id": "rumdl", "version": "0.2.30", "artifact_sha256": "eb51e28ef9dff2b2d29b4527bc40123e840bb997dc8bae39d99496b898ee9f72" },
     { "id": "cargo-deny", "version": "0.20.2", "artifact_sha256": "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f" },

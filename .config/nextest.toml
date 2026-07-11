@@ -54,9 +54,3 @@ global-timeout = "15m"
 [[profile.trusted-gpu.overrides]]
 filter = '(package(mirante4d-renderer) & test(/^gpu::/)) | (package(mirante4d-app) & test(/^tests::app_backend_uses_gpu/))'
 slow-timeout = { period = "20s", terminate-after = 3 }
-
-[profile.bootstrap]
-inherits = "default"
-retries = 0
-fail-fast = false
-slow-timeout = { period = "20s", terminate-after = 1 }

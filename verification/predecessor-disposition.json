@@ -920,14 +920,6 @@
       "reason": "WP-06 leaf-runner machinery added after the frozen predecessor inventory."
     },
     {
-      "id": "libtest:xtask::bin/xtask:verify::tests::bootstrap_scope_is_explicit_and_bounded",
-      "kind": "libtest",
-      "owner": "xtask",
-      "lane": "unit",
-      "requirement_ids": ["D-022-unit", "D-022-bootstrap-bridge"],
-      "reason": "The temporary WP-04 bridge remains explicit only until WP06-C deletes it after the required-context flip."
-    },
-    {
       "id": "libtest:xtask::bin/xtask:workflow_audit::tests::workflow_inventory_is_exact",
       "kind": "libtest",
       "owner": "xtask",
@@ -992,14 +984,6 @@
       "reason": "WP-05 added the bounded documentation-authority gate after the frozen predecessor inventory."
     },
     {
-      "id": "xtask_command:verify-bootstrap",
-      "kind": "xtask_command",
-      "owner": "xtask",
-      "lane": "policy",
-      "requirement_ids": ["D-022-bootstrap-bridge"],
-      "reason": "WP-01 added the temporary bootstrap bridge after the frozen predecessor command inventory; WP06-C deletes it."
-    },
-    {
       "id": "xtask_command:verify-leaf",
       "kind": "xtask_command",
       "owner": "xtask",
@@ -1038,6 +1022,6 @@
     "moved": 57,
     "rewritten": 8,
     "deleted": 154,
-    "current_additions": 44
+    "current_additions": 42
   }
 }

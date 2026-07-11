@@ -63,7 +63,6 @@ fn main() -> anyhow::Result<()> {
     let mut args = env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "help".to_owned());
     match command.as_str() {
-        "verify-bootstrap" => verify::verify_bootstrap(),
         "verify-leaf" => {
             let leaf = args
                 .next()
@@ -406,9 +405,6 @@ fn print_help() {
 Mirante4D developer tasks
 
 Commands:
-  cargo xtask verify-bootstrap
-      temporary WP-01 local feedback: format, compile, targeted correctness, and active docs
-      explicitly excludes complete-suite, GPU, E2E, performance, and product-open claims
   cargo xtask verify-leaf policy|lint|unit|contract|ui|doctest
       runs one non-recursive verification leaf with its declared timeout and selector
   cargo xtask verify-pr [policy|rust]

@@ -11,8 +11,7 @@ may change through explicit hard cutovers.
 - Read [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 - Keep changes narrow and delete replaced paths instead of adding compatibility
   layers.
-- Run `cargo xtask verify-bootstrap` and any additional checks relevant to the
-  change.
+- Run `cargo xtask verify-pr` and any additional checks relevant to the change.
 - Explain what was verified and what remains unverified.
 - Never include credentials, private paths, unpublished results, or microscopy
   data in an issue, pull request, log, screenshot, or test fixture.

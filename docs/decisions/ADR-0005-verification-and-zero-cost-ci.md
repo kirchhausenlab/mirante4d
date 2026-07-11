@@ -4,23 +4,23 @@ Status: ACCEPTED TARGET DECISION
 Date accepted: 2026-07-10
 Decision IDs: D-022, D-023
 Implementation authorization: NONE INDEPENDENT; ACTIVE HANDOFF AND PACKAGE ENTRY ONLY
-Current-state effect: WP-04 BRIDGE ACTIVE; WP-06 TARGET NOT IMPLEMENTED
+Current-state effect: WP-06 TOPOLOGY ACTIVE; EXACT-REVISION EXIT PENDING
 
 This ADR did not independently authorize a test rewrite, fixture generation,
 hosted run, runner registration, workflow change, branch rule, cache, artifact
-upload, or production implementation. WP-04 separately installed the
-transitional public `Bootstrap / required` workflow and branch-protection gate.
-The six-leaf verification target and two-check topology remain WP-06 work. The
-[Current State](../CURRENT_STATE.md) remains the authority for current commands,
-tests, workflows, reports, and evidence.
+upload, or production implementation. WP-04 separately installed the former
+transitional `Bootstrap / required` gate. WP-06 implemented the six-leaf
+topology, calibrated and installed the two required checks, then removed that
+bridge. [Current State](../CURRENT_STATE.md) remains the authority for current
+commands, tests, workflows, reports, and evidence.
 
 ## Context
 
-The current recursive verification stack duplicates work, mixes proof classes,
-depends on ignored/name-based selection, and can let stale reports or incomplete
-execution look authoritative. It is too slow for useful pull-request feedback
-yet still cannot establish independent format, scientific, GPU, packaged-product,
-or performance claims.
+The predecessor recursive verification stack duplicated work, mixed proof
+classes, depended on ignored/name-based selection, and could let stale reports
+or incomplete execution look authoritative. It was too slow for useful pull-
+request feedback yet still could not establish independent format, scientific,
+GPU, packaged-product, or performance claims.
 
 The replacement must keep public CI genuinely free and safe for untrusted
 contributions while moving machine-specific evidence to the trusted local
@@ -105,8 +105,8 @@ unstable proof green.
   not silently converted into a pass.
 - Flakes and missing assertions remain visible and can block closure; quarantine
   is a repair deadline, not a green status mechanism.
-- Accepted target policy does not validate or replace any current test or
-  report before its owning work package executes.
+- Accepted target policy did not validate or replace any predecessor test or
+  report before its owning work package executed.
 
 ## Enforcement
 
@@ -118,10 +118,10 @@ unstable proof green.
 - Required jobs are unconditional and uniquely named: no path filter,
   job-level skip route, `continue-on-error`, duplicate identity, retry, private
   data, GPU discovery, mutable service, or performance timing is permitted.
-- The implementation handoff owns the D-022 bootstrap, twenty-attempt shadow window,
-  transactional required-check replacement/readback, separate bridge-deletion
-  PR, and continuing main-check rollout. The two target names do not become
-  required until that sequence proves them.
+- The implementation handoff owned the D-022 bootstrap, twenty-attempt shadow
+  window, transactional required-check replacement/readback, and separate
+  bridge deletion. The sequence installed the two target names before removing
+  the bridge; exact-revision product validation and the WP-06 exit tag remain.
 - Workflow and repository-policy audits enforce standard public runners,
   read-only tokens, no PR secrets, full-SHA actions, no external reusable
   workflows initially, bounded retention, no initial cache/artifact upload,

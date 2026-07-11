@@ -48,50 +48,7 @@ const COMMON_FORBIDDEN: &[&str] = &[
     "    environment:",
 ];
 
-const BOOTSTRAP_FORBIDDEN: &[&str] = &[
-    "pull_request_target",
-    "workflow_run:",
-    "  push:",
-    "schedule:",
-    "secrets.",
-    "github.token",
-    "GH_TOKEN",
-    "actions/cache@",
-    "actions/upload-artifact@",
-    "actions/download-artifact@",
-    "self-hosted",
-    ": write",
-    "continue-on-error:",
-    "  paths:",
-    "  paths-ignore:",
-    "    needs:",
-    "    strategy:",
-    "    services:",
-    "    container:",
-    "    environment:",
-];
-
 const SPECS: &[Spec] = &[
-    Spec {
-        path: ".github/workflows/bootstrap.yml",
-        name: "Bootstrap",
-        jobs: &[(
-            "bootstrap",
-            "Bootstrap / required",
-            15,
-            "cargo xtask verify-bootstrap",
-            6,
-        )],
-        required: &[
-            "  pull_request:",
-            "  workflow_dispatch:",
-            "cancel-in-progress: true",
-            "Guard the public-root bootstrap dispatch",
-            "3793bf0c27607b196f502c39b2108f571de89fcda7586ae6beefa11ee177b216",
-            "eb51e28ef9dff2b2d29b4527bc40123e840bb997dc8bae39d99496b898ee9f72",
-        ],
-        forbidden: BOOTSTRAP_FORBIDDEN,
-    },
     Spec {
         path: ".github/workflows/pr.yml",
         name: "PR",
@@ -272,10 +229,9 @@ fn audit_one(spec: &Spec) -> Value {
     if content.lines().any(|line| line.starts_with("    if:")) {
         failures.push("contains a job-level condition".to_owned());
     }
-    if spec.name != "Bootstrap"
-        && content
-            .lines()
-            .any(|line| line.trim_start().starts_with("if:"))
+    if content
+        .lines()
+        .any(|line| line.trim_start().starts_with("if:"))
     {
         failures.push("contains a conditional step".to_owned());
     }

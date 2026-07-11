@@ -33,17 +33,17 @@ WP-03 closed the `PUB-004` assignments `DEP-BLOCK-001` through
 advisory result. The accepted audit also names `VER-BLOCK-001` (the
 viewport-capture report mismatch), `VER-BLOCK-002` (the broken primary fast
 gate), `VER-BLOCK-003` (stale external evidence identity), and
-`VER-BLOCK-004` (the unsuitable verification topology) as open WP-06 work.
-The completed WP-03 report does not close those verification blockers, and a
-green schema or report wrapper cannot override a native process result.
+`VER-BLOCK-004` (the unsuitable verification topology) as WP-06 work. WP-06A
+closed all four by correction or deletion; a green schema or report wrapper
+still cannot override a native process result.
 
-Provisional target pull-request p95 critical-path wall time is under ten minutes
-with a fifteen-minute ceiling. The handoff must define runner image, cold/warm
-cache state, observation window, sample count, and enforcement semantics before
-this becomes a gate. Fast profiles cannot generate large volumes or open a
-product window. Per-test budgets are semantic/profile classifications measured
-on the named reference environment, not a universal two-second cutoff applied
-to noisy shared runners.
+The installed public pull-request target is p95 below ten minutes with a
+fifteen-minute ceiling. Its accepted twenty-attempt cache-free Main window met
+those bounds; [current state](../../../CURRENT_STATE.md) owns the measured
+result. Fast profiles cannot generate large volumes or open a product window.
+Per-test budgets are semantic/profile classifications measured on the named
+reference environment, not a universal two-second cutoff applied to noisy
+shared runners.
 
 ### CI Cost And Trust Topology
 
@@ -212,13 +212,11 @@ suppress unrelated tests, while an actual compilation failure may block only
 targets that could not be built.
 
 The WP-04 cutover installed one explicitly transitional
-`Bootstrap / required` check that runs the honest WP-01 bridge on a standard
-public Linux runner and is the current branch-protection gate. It makes no
-full-suite claim and has a fifteen-minute hard ceiling. WP-06 does not remove
-it until both target checks have produced their twenty-run shadow evidence, the
-required-check list has been replaced and read back successfully, and a later
-separate PR removes the bridge; thus public `main` is never ungated merely
-because target check names do not exist yet.
+`Bootstrap / required` check that ran the honest WP-01 bridge on a standard
+public Linux runner. WP-06 retained it until both target checks completed their
+twenty-run shadow window and the required-check replacement was read back.
+Repository rules now require `PR / policy` and `PR / rust`, and the separate
+WP-06C checkpoint removes the bridge without leaving public `main` ungated.
 
 Semantic per-case limits are:
 
@@ -306,10 +304,9 @@ non-infrastructure attempts on clean revisions and reports cold and warm/cache
 state separately. Functional failures and timeout-censored attempts remain in
 the duration window; excluding them would create survivor bias. Hard ceilings
 apply from the first implementation, and a censored ceiling event is a
-violation. Percentile enforcement begins when the fixed window is complete. If
-cache-free shadow attempts prove the ceiling unattainable because of setup or
-dependency retrieval, D-022 is failed but the separately reviewed bounded cache
-exception may still be evaluated while `Bootstrap / required` protects `main`.
+violation. Percentile enforcement begins when the fixed window is complete.
+The WP-06 window completed with twenty valid first-attempt successes, no
+infrastructure invalidations, caches, artifacts, or censored timeouts.
 
 No cron is enabled until the corresponding lane has a measured duration,
 output size, owner, and approved cadence. Main evidence runs are not cancelled
@@ -634,7 +631,7 @@ Criterion, GPU, E3/E4, or T5 cases in a CPU number.
 | Alternative | Rejection reason |
 | --- | --- |
 | Repair the existing `verify-fast/full/nightly` stack | Preserves recursive reruns, mixed semantics, ignored/name allowlists, report authority, and the wrong ownership graph |
-| Put every test in one universal fast lane | Makes pure feedback hostage to I/O/UI/GPU/large-data behavior and recreates the current eighty-minute gate |
+| Put every test in one universal fast lane | Makes pure feedback hostage to I/O/UI/GPU/large-data behavior and recreates the predecessor eighty-minute gate |
 | Make every lane a required hosted check | Trusted GPU/T5/product/performance work cannot safely or credibly run for arbitrary public PR heads |
 | Attach the workstation as a public self-hosted runner | Public fork code can compromise persistent local data, credentials, and network access |
 | Let retries/quarantine keep required checks green | Converts nondeterminism and missing proof into false confidence |

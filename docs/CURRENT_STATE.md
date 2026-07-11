@@ -42,30 +42,32 @@ possible without changing product behavior.
 WP-05 is complete at `97ba103463a419d696b445c414515b17a5df215f`
 (`foundation-wp-05-exit-1`).
 
-This revision implements the WP-06A shadow verification machinery. It adds six
-nonrecursive leaves (`policy`, `lint`, `unit`, `contract`, `ui`, and
-`doctest`), explicit trusted-local separation, fixture and test-inventory
-enforcement, and shadow PR/Main workflows. It also removes the superseded
-`verify-fast` and `report-audit` authorities. WP-06 is not yet accepted.
+WP-06A merged at `c7cc4636a6fd8555fb58100311f1db35e40db28b`. Its
+twenty-attempt cache-free Main calibration passed, with policy p95/max at 92/95
+seconds and Rust critical-path p95/max at 403/408 seconds. Repository rules now
+require exactly `PR / policy` and `PR / rust`.
+
+This revision removes the transitional Bootstrap workflow, command, profile,
+and audit rules. WP-06 is not yet accepted because its exact protected-main
+merge revision still needs product-open validation and the exit tag.
 
 ## Current Verification Boundary
 
-The WP-06A checkpoint discovers 879 live tests: 839 normal tests assigned once
+The WP-06 checkpoint discovers 878 live tests: 838 normal tests assigned once
 across the public CPU leaves and 40 ignored tests assigned to the trusted GPU
 lane. The six leaves are available through `cargo xtask verify-leaf`, while
 `cargo xtask verify-pr` runs the two public groups without recursive aggregate
 commands.
 
-On the protected repository, `Bootstrap / required` remains the sole required
-status context. Candidate `PR / policy`, `PR / rust`, `Main / policy`, and
-`Main / rust` checks are shadow, non-required results until calibration and the
-explicit branch-rule flip.
+On the protected repository, `PR / policy` and `PR / rust` are the only
+required pull-request contexts. Matching `Main / policy` and `Main / rust`
+checks verify protected-main revisions. Hosted jobs use standard public runners
+without caches or artifacts.
 
 ## Known Limitations
 
-- WP-06 still needs protected integration and acceptance of this checkpoint,
-  twenty-run cache-free calibration, the required-context flip, separate
-  bootstrap cleanup, product-open validation, and its exit tag.
+- WP-06 still needs exact protected-main product-open validation and its
+  create-once exit tag.
 - The package-capability lane remains pending because there is not yet an
   honest unsupported-GPU package command.
 - The committed T1 source archive checks source TIFF facts only. Target-format

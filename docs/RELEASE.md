@@ -33,6 +33,6 @@ Application logs default to
 
 The final release and contributor gates belong to WP-14. Their approved target
 is in the [foundation handoff](plans/active/FOUNDATION_REFACTOR_HANDOFF.md).
-The WP-06A checkpoint does not change release support or qualify the package-
-capability lane; that lane remains pending until it has an honest
+The WP-06 verification cutover does not change release support or qualify the
+package-capability lane; that lane remains pending until it has an honest
 unsupported-GPU diagnostic command.
