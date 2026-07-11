@@ -40,17 +40,6 @@ pub(crate) const COMMAND_AUDIT_ENTRIES: &[CommandAuditEntry] = &[
         notes: "Prints xtask help text only. Help aliases must not be interpreted as product-validation dataset paths.",
     },
     CommandAuditEntry {
-        command: "verify-bootstrap",
-        family: "verify",
-        evidence_class: "partial_bootstrap_gate",
-        default_safety: "routine_local",
-        requires_heavy_opt_in: false,
-        product_evidence_role: "partial_automated_feedback_only",
-        stale_or_unsafe_status: "temporary_wp01_bridge",
-        report_paths: &[],
-        notes: "Temporary WP-01 format, compile, targeted-correctness, and active-documentation bridge; explicitly incomplete and replaced by WP-06.",
-    },
-    CommandAuditEntry {
         command: "verify-leaf",
         family: "verify",
         evidence_class: "nonrecursive_verification_leaf",
@@ -604,7 +593,6 @@ mod tests {
 
     const HANDLED_COMMANDS: &[&str] = &[
         "help",
-        "verify-bootstrap",
         "verify-leaf",
         "verify-pr",
         "verify-local",

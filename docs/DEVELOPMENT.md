@@ -60,8 +60,8 @@ cargo xtask --help
 ```
 
 `verify-pr policy` and `verify-pr rust` run one public group. The protected
-repository still uses `verify-bootstrap` as its sole required transitional
-check while the new jobs run in shadow. It is not the development profile.
+repository requires the matching `PR / policy` and `PR / rust` checks; the
+transitional Bootstrap command and workflow have been removed.
 
 Trusted GPU verification is separate and requires the designated Vulkan
 workstation:

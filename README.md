@@ -39,11 +39,11 @@ outside the repository.
 For a bounded local check before submitting a change, run:
 
 ```bash
-cargo xtask verify-bootstrap
+cargo xtask verify-pr
 ```
 
-This is a temporary foundation check, not a claim that the full verification
-suite or platform matrix is complete. Its current scope is documented in
+This runs the public policy and Rust checks. GPU, packaged-product,
+performance, and real-data evidence remain separate trusted-local work; see
 [docs/TESTING.md](docs/TESTING.md).
 
 ## Documentation

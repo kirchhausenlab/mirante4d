@@ -15,7 +15,7 @@ Do not collapse these claims. Unit tests, smoke tests, virtual/no-display
 automation, snapshots, benchmarks, preflight runs, and render readbacks are
 supporting evidence, not product validation.
 
-## WP-06A Checks
+## WP-06 Checks
 
 This revision exposes six independently selectable leaves:
 
@@ -45,7 +45,7 @@ The generated selectors and Nextest configuration must match their registry:
 cargo xtask verification-sync --check
 ```
 
-The checkpoint inventory has 879 live tests: 839 normal public-CPU tests and 40
+The checkpoint inventory has 878 live tests: 838 normal public-CPU tests and 40
 ignored trusted-GPU tests. The old recursive aggregates, `verify-fast`, and
 target-directory `report-audit` are no longer live authorities in the
 checkpoint.
@@ -62,11 +62,11 @@ navigation, local links, and heading anchors. Command discovery is owned by
 
 ## Hosted And Trusted-Local Boundary
 
-The protected repository still has one required pull-request context,
-`Bootstrap / required`. Candidate `PR / policy` and `PR / rust` jobs, plus
-matching non-required `Main / ...` jobs, run in shadow on standard public
-runners. They do not become required until the twenty-run cache-free window is
-accepted and the branch rule is replaced and read back.
+The protected repository requires exactly `PR / policy` and `PR / rust`.
+Matching non-required `Main / policy` and `Main / rust` jobs run on protected
+main. The twenty-attempt cache-free calibration passed before the required-
+context list was replaced and read back; the transitional Bootstrap bridge is
+no longer part of the repository.
 
 Hosted verification has a hard `$0` budget, no public self-hosted workstation,
 no private data, no automatic retry, and no cache or artifact storage.
@@ -100,10 +100,9 @@ logs and evidence. Packaging or release changes use the packaged application.
 
 ## WP-06 Remaining Gates
 
-The machinery alone is not a completed cutover. WP-06 still requires protected
-integration and acceptance, twenty consecutive qualifying cache-free Main
-attempts, required-context replacement, separate bootstrap cleanup,
-exact-revision product-open validation, and its create-once exit tag.
+WP-06 still requires product-open validation of the exact protected-main merge
+revision and its create-once exit tag. The viewer validation must use the real
+Vulkan workstation and the required 1280x720 and 1920x1080 scenarios.
 
 The checked independent report supports only the WP-03 source-TIFF archive.
 Current schema-1 packages remain non-authoritative T2 support fixtures;

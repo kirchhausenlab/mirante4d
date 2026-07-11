@@ -19,19 +19,12 @@ const PREDECESSOR_DISPOSITION_PATH: &str = "verification/predecessor-disposition
 pub(super) struct Registry {
     schema: String,
     schema_version: u32,
-    bootstrap_bridge: BootstrapBridge,
     tools: Vec<ToolPin>,
     property_groups: Vec<PropertyGroup>,
     pub(super) lint_exceptions: Vec<LintException>,
     pub(super) lanes: Vec<Lane>,
     non_pr_lanes: Vec<NonPrLane>,
     pub(super) selector_adapters: Vec<SelectorAdapter>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BootstrapBridge {
-    enabled: bool,
-    deletion_gate: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -584,11 +577,6 @@ fn validate_registry(registry: &Registry) -> anyhow::Result<()> {
     if registry.schema != "mirante4d-verification-registry" || registry.schema_version != 1 {
         bail!("verification registry has unsupported schema identity");
     }
-    if registry.bootstrap_bridge.enabled
-        && registry.bootstrap_bridge.deletion_gate.trim().is_empty()
-    {
-        bail!("enabled bootstrap bridge must name its deletion gate");
-    }
     validate_tool_pins(&registry.tools)?;
     validate_property_groups(&registry.property_groups)?;
     validate_lint_exceptions(&registry.lint_exceptions)?;
@@ -759,10 +747,10 @@ fn validate_tool_pins(tools: &[ToolPin]) -> anyhow::Result<()> {
         (
             "actions-checkout",
             (
-                "7.0.0",
+                "4.2.2",
                 None,
                 None,
-                Some("9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"),
+                Some("11bd71901bbe5b1630ceea73d27597364c9af683"),
             ),
         ),
         (
@@ -947,15 +935,6 @@ fn generated_nextest(registry: &Registry) -> anyhow::Result<String> {
          filter = '{trusted_selector}'\n\
          slow-timeout = {{ period = \"20s\", terminate-after = 3 }}\n"
     ));
-    if registry.bootstrap_bridge.enabled {
-        text.push_str(
-            "\n[profile.bootstrap]\n\
-             inherits = \"default\"\n\
-             retries = 0\n\
-             fail-fast = false\n\
-             slow-timeout = { period = \"20s\", terminate-after = 1 }\n",
-        );
-    }
     Ok(text)
 }
 

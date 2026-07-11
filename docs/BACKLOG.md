@@ -5,7 +5,8 @@ contains unresolved work only.
 
 ## Foundation Program
 
-- WP-06: replace the verification architecture and provisional hosted job.
+- WP-06: merge the Bootstrap deletion, validate the exact protected-main
+  revision on the real viewer, and create the exit tag.
 - WP-07A through WP-15: perform the model, state, runtime, storage, renderer,
   import, analysis, UI, release, and final-deletion cutovers in the
   [foundation handoff](plans/active/FOUNDATION_REFACTOR_HANDOFF.md).
