@@ -43,6 +43,7 @@ mod command_audit;
 mod completion_waiver;
 mod deps;
 mod dev;
+mod documentation;
 mod external_ci_evidence;
 mod fixtures;
 mod host;
@@ -296,6 +297,7 @@ fn main() -> anyhow::Result<()> {
         "workflow-audit" => workflow_audit().map(|path| {
             println!("{}", path.display());
         }),
+        "docs-check" => documentation::docs_check(),
         "external-ci-evidence" => {
             if no_arg_command_requests_help(args.collect::<Vec<_>>(), EXTERNAL_CI_EVIDENCE_USAGE)? {
                 print_external_ci_evidence_help();
@@ -658,6 +660,8 @@ Commands:
       writes target/mirante4d/baseline-refresh/baseline-promotion-manifest.json only when every stale baseline has one unique promotable source
   cargo xtask workflow-audit
       audits GitHub Actions workflow files for evidence-role naming, xtask gates, artifact uploads, and private-data exclusions
+  cargo xtask docs-check
+      checks the exact documentation inventory, authority graph, read order, local links, and anchors
   cargo xtask external-ci-evidence
       records externally inspected or CI-captured hosted CPU and self-hosted GPU run evidence
       help: cargo xtask external-ci-evidence --help

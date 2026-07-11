@@ -3,12 +3,14 @@
 Status: ACCEPTED TARGET DECISION
 Date accepted: 2026-07-10
 Decision IDs: D-022, D-023
-Implementation authorization: NO
-Current-state effect: NONE — current facts remain unchanged
+Implementation authorization: NONE INDEPENDENT; ACTIVE HANDOFF AND PACKAGE ENTRY ONLY
+Current-state effect: WP-04 BRIDGE ACTIVE; WP-06 TARGET NOT IMPLEMENTED
 
-This ADR records an accepted target decision only. It authorizes no test rewrite,
-fixture generation, hosted run, runner registration, workflow change, branch
-rule, cache, artifact upload, or production implementation. The
+This ADR did not independently authorize a test rewrite, fixture generation,
+hosted run, runner registration, workflow change, branch rule, cache, artifact
+upload, or production implementation. WP-04 separately installed the
+transitional public `Bootstrap / required` workflow and branch-protection gate.
+The six-leaf verification target and two-check topology remain WP-06 work. The
 [Current State](../CURRENT_STATE.md) remains the authority for current commands,
 tests, workflows, reports, and evidence.
 

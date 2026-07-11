@@ -2,7 +2,7 @@
 
 Status: HANDOFF_READY SUBORDINATE
 Program version: 0.21
-Last updated: 2026-07-10
+Last updated: 2026-07-11
 Implementation authorization: INHERITED ONLY THROUGH THE ACTIVATED HANDOFF AND PACKAGE ENTRY GATES
 Parent authority: `docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md`
 Authority scope: D-017 workspace graph, ownership, bridges, migration/deletion, enforcement, and operation classification
@@ -50,9 +50,9 @@ fact until the approved work packages execute.
 
 Status: OWNER-APPROVED TARGET POLICY under OD-021. D-002, D-017, and D-018 are
 resolved. This section fixes the target architecture, publication timing, work-
-package sequencing, and deletion ownership, but it does not create a branch,
-change repository visibility, modify production source, or authorize
-implementation.
+package sequencing, and deletion ownership. It did not independently create a
+branch, change repository visibility, modify production source, or authorize
+implementation. WP-04 later completed the approved public-root cutover.
 
 ### D-017 Architecture Alternatives
 
@@ -299,6 +299,10 @@ The owner approved D-017 and D-018 together on 2026-07-09 through OD-021:
    corrected serial integration order, annotated exit tags, atomic
    product-cutover revisions, and revision/deployment rollback without a
    product fallback.
+
+WP-03 completed the public-source readiness work, and WP-04 completed the clean
+public-root transition. The protected public repository is now canonical, and
+the remaining technical sequence begins with WP-06.
 
 This approval fixes the architecture and execution topology, not every internal
 module name or checkpoint size. WP-07A/WP-08A execution briefs still must freeze

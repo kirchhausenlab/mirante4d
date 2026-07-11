@@ -2,57 +2,57 @@
 
 Mirante4D is a native desktop application for exploring and analysing large 4D
 microscopy datasets: three-dimensional volumes over time, often with multiple
-channels and derived scientific results.
+intensity channels and derived scientific results.
 
-## Users
+## Users And Outcomes
 
 The primary users are microscopy researchers and biologists. Routine viewing
 should not require knowledge of GPU APIs, storage layouts, or command-line
 tools.
 
-## Intended Outcomes
+Mirante4D aims to:
 
-- Open local microscopy datasets reliably.
-- Navigate space, time, and channels interactively.
-- Render intensity data with scientifically explicit controls.
-- Work with datasets larger than system memory through streaming and
-  multiscale storage.
-- Record analysis inputs, outputs, and provenance clearly.
-- Preserve user data and report incomplete or unsupported states honestly.
+- open local microscopy data reliably;
+- navigate space, time, and channels interactively;
+- render intensity data with scientifically explicit controls;
+- work beyond RAM and VRAM through bounded streaming and multiscale storage;
+- record analysis inputs, outputs, and provenance; and
+- preserve source data and report incomplete or unsupported states honestly.
 
 ## Product Principles
 
-- Native desktop application, not a browser service.
+- Native local desktop software, not a browser or server service.
+- One bounded product path for small and large datasets.
 - Strict validated inputs rather than permissive guessing.
-- One runtime path for small and large datasets.
-- Explicit CPU, memory, storage, and GPU budgets.
+- Explicit CPU, memory, storage, GPU, and I/O budgets.
 - Reproducible scientific operations and typed persisted state.
 - Hard cutovers while the project remains pre-alpha.
 
+The source is public, MIT-licensed academic software. Full microscopy-data
+publication and external dataset contribution are separate future decisions.
+
 ## Current Scope
 
-The current application includes import/preprocessing, streaming native data,
-MIP/DVR/ISO rendering, multichannel display, project state, analysis tools, and
-Linux packaging. See [CURRENT_STATE.md](CURRENT_STATE.md) for exact current
-facts.
+The prototype includes import/preprocessing, streaming native data,
+MIP/DVR/ISO intensity rendering, multichannel display, project state, analysis
+tools, and Linux packaging. [Current state](CURRENT_STATE.md) is the sole
+authority for exact implemented behavior and limitations.
 
-A previously attempted derived-label capability has been removed. Any future
-return requires a new, separately approved design after the foundation work;
-the lessons are preserved in a deferred capability record.
+Segmentation is not part of the current product or foundation program. Any
+future return requires a separately approved post-foundation design.
 
 ## Non-Goals
 
-- Browser or server deployment.
-- Compatibility with `llsm_viewer` data or architecture.
-- A generic viewer for arbitrary OME-Zarr datasets.
+- Browser, cloud, or server deployment.
+- Compatibility with `llsm_viewer` architecture or formats.
+- A generic reader for arbitrary OME-Zarr datasets.
 - Silent repair of malformed or underspecified inputs.
 - Stable persisted-format compatibility during pre-alpha development.
 - Paid hosted CI or a public self-hosted runner.
-- Platform support claims beyond verified Linux x86_64 builds.
-
-## Project Lineage
+- Platform claims beyond qualified Linux x86_64/Vulkan work.
+- 4K foundation qualification.
 
 Mirante4D carries forward useful product ideas from
 [llsm_viewer](https://github.com/kirchhausenlab/llsm_viewer) while replacing
-the browser architecture with a native implementation. Related research code
-is available in [SpatialDINO](https://github.com/kirchhausenlab/spatialdino).
+its browser architecture. Related research code is available in
+[SpatialDINO](https://github.com/kirchhausenlab/spatialdino).

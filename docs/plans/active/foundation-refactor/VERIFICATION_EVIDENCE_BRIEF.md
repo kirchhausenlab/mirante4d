@@ -2,7 +2,7 @@
 
 Status: HANDOFF_READY SUBORDINATE
 Program version: 0.21
-Last updated: 2026-07-10
+Last updated: 2026-07-11
 Implementation authorization: INHERITED ONLY THROUGH THE ACTIVATED HANDOFF AND PACKAGE ENTRY GATES
 Parent authority: `docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md`
 Authority scope: D-022/D-023 verification mechanics, fixtures/oracles, E0-E4, performance, and failure semantics
@@ -28,17 +28,14 @@ The canonical trusted-local, public-runner, branch-protection, and zero-cost rol
 | Scientific acceptance | Independent goldens and representative public/private real data | Trusted hardware plus human review where required | Milestone/release |
 | Public-data reproducibility | Download, verify, derive, open, and reproduce expected facts | Clean environment and separately approved trusted execution | Dataset release/release candidate |
 
-The static policy lane carries `PUB-004` assignments `DEP-BLOCK-001` through
-`DEP-BLOCK-005` as open WP-03 inputs. The bound full-source audit configuration
-additionally names
-`VER-BLOCK-001` (the viewport-capture report mismatch),
-`VER-BLOCK-002` (the broken primary fast gate), `VER-BLOCK-003` (stale external
-evidence identity), and `VER-BLOCK-004` (the unsuitable verification topology)
-for WP-06. PH-00 evidence may report any of them only through the strict
-detached audit schema with exact config/report/manifest equality. WP-03 still
-requires a refreshed exact-candidate advisory run with zero unapproved
-findings; a green schema or report wrapper cannot override the native process
-result.
+WP-03 closed the `PUB-004` assignments `DEP-BLOCK-001` through
+`DEP-BLOCK-005` through its bound full-source audit and exact-candidate
+advisory result. The accepted audit also names `VER-BLOCK-001` (the
+viewport-capture report mismatch), `VER-BLOCK-002` (the broken primary fast
+gate), `VER-BLOCK-003` (stale external evidence identity), and
+`VER-BLOCK-004` (the unsuitable verification topology) as open WP-06 work.
+The completed WP-03 report does not close those verification blockers, and a
+green schema or report wrapper cannot override a native process result.
 
 Provisional target pull-request p95 critical-path wall time is under ten minutes
 with a fifteen-minute ceiling. The handoff must define runner image, cold/warm
@@ -50,16 +47,16 @@ to noisy shared runners.
 
 ### CI Cost And Trust Topology
 
-Before repository publication:
+WP-04 completed the repository-publication requirements:
 
 - hard-stop paid GitHub Actions spending;
 - run the temporary fast gate locally;
 - use trusted local execution outside GitHub Actions where useful;
-- keep every current hosted workflow and repository Actions disabled; do not
-  manually trigger the duplicated old workflows;
+- keep every predecessor hosted workflow and repository Actions surface out of
+  the public root;
 - keep heavy real-data evidence local.
 
-After repository publication:
+In the now-public repository:
 
 - use free standard GitHub-hosted runners for untrusted PR CPU/platform work;
 - keep persistent GPU, performance, and real-data machines out of the public
@@ -214,14 +211,14 @@ before returning the aggregate result: a lint or individual-test failure cannot
 suppress unrelated tests, while an actual compilation failure may block only
 targets that could not be built.
 
-From WP-04 visibility until WP-06 promotion, one explicitly transitional
-`Bootstrap / required` check runs the honest WP-01 bridge on a standard public
-Linux runner and is the branch-protection gate. It makes no full-suite claim and
-has a fifteen-minute hard ceiling. WP-06 does not remove it until both target
-checks have produced their twenty-run shadow evidence, the required-check list
-has been replaced and read back successfully, and a later separate PR removes
-the bridge; thus public `main` is never ungated merely because target check
-names do not exist yet.
+The WP-04 cutover installed one explicitly transitional
+`Bootstrap / required` check that runs the honest WP-01 bridge on a standard
+public Linux runner and is the current branch-protection gate. It makes no
+full-suite claim and has a fifteen-minute hard ceiling. WP-06 does not remove
+it until both target checks have produced their twenty-run shadow evidence, the
+required-check list has been replaced and read back successfully, and a later
+separate PR removes the bridge; thus public `main` is never ungated merely
+because target check names do not exist yet.
 
 Semantic per-case limits are:
 
@@ -361,8 +358,8 @@ The registry has three non-overlapping states:
 3. WP-10A target-profile vectors become the sole candidate-format authority
    only after the schema and external-reader claim are frozen.
 
-Early WP-04 public visibility therefore does not claim target-format
-conformance.
+The completed WP-04 public cutover therefore makes no target-format conformance
+claim.
 
 The minimum positive DS-0 matrix is:
 
@@ -510,15 +507,15 @@ public reproducibility rather than relabeling T5 evidence.
 The external OS-automation harness, image/landmark assertions, and expected
 state facts are frozen by digest before the candidate run and use the same
 separate promotion/approval rule as T1 oracles. Candidate-controlled harness
-changes cannot certify that candidate. Before the final E4 harness or target-
-profile T1 authority exists, WP-02 uses a manually executed packaged E4-
-equivalent deletion-regression checklist on the real display with a rights-
-cleared small current/generated input or opaque T5 input. This transitional
-evidence closes only WP-02's product-open regression obligation; it does not
-satisfy the final T1-backed E4 requirement. Current internal product automation
-remains E1 and cannot close either obligation by itself. WP-14 must close final
-product evidence with the frozen harness and at least one authoritative T1-
-backed E4 workflow.
+changes cannot certify that candidate. WP-02 used a manually executed packaged
+E4-equivalent deletion-regression checklist on the real display with a
+rights-cleared small current/generated input before the final E4 harness and
+target-profile T1 authority existed. That transitional evidence closed only
+WP-02's product-open regression obligation; it does not satisfy the final
+T1-backed E4 requirement. Current internal product automation remains E1 and
+cannot close the final obligation by itself. WP-14 must close final product
+evidence with the frozen harness and at least one authoritative T1-backed E4
+workflow.
 
 #### Performance And Resource Statistics
 

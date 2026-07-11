@@ -2,62 +2,70 @@
 
 Last reviewed: 2026-07-11
 
-Mirante4D is pre-alpha research software. This tree is the clean source
-snapshot prepared for public development; it contains no pre-public Git object
-history or private operational evidence.
+Mirante4D is public, pre-alpha research software. Persisted formats and APIs
+can change through explicit hard cutovers; there is no supported public release
+or public full microscopy dataset yet.
 
 ## Implemented Product
 
-- Native Rust desktop application for Linux x86_64.
-- Experimental `mirante4d-v1` dataset packages and
-  `mirante4d-project-v14` project/session state.
+- Native Rust desktop application for Linux x86_64 using `wgpu`, `winit`, and
+  `egui`.
+- Strict experimental `mirante4d-v1` schema-1 dataset packages using sharded
+  Zarr v3 storage.
+- `mirante4d-project-v14` project/session state and
+  `mirante4d-preferences-v1` preferences.
 - MIP, DVR, and ISO intensity rendering with per-channel controls.
-- Streaming data and renderer caches for datasets larger than memory.
-- TIFF import/preprocessing, intensity analysis, ROI/annotation/track/
-  measurement tools, and deterministic exports.
-- Linux release directory, tarball, and AppImage packaging.
+- Bounded streaming, cache, and renderer paths for data beyond memory.
+- TIFF/OME-TIFF import and preprocessing, typed intensity analysis,
+  ROI/annotation/track/measurement tools, and deterministic exports.
+- Linux release-directory, tarball, and AppImage build paths.
 - No segmentation or derived-label subsystem.
 
-Domain specifications describe details where they still match the
-implementation. This file is the sole authority for overall implementation
-status.
+The workspace currently has the application, analysis, core, data, format,
+import, renderer, and developer-automation crates described in
+[architecture](ARCHITECTURE.md).
 
-## Foundation Refactor
+## Foundation Status
 
-The approved foundation program is active:
+WP-01 installed a bounded temporary verification bridge. WP-02 removed
+segmentation and cut project state to v14. WP-03 sanitized the source and built
+the public root. WP-04 made `kirchhausenlab/mirante4d` public and installed its
+zero-cost repository controls.
 
-1. WP-01 installed the bounded temporary local verification bridge.
-2. WP-02 removed segmentation and hard-cut project state to v14.
-3. WP-03 sanitized the source, cleared dependency advisories, installed public
-   governance, added independently checked TIFF fixtures, and constructed the
-   deterministic public root.
+The preserved parentless root is
+`d0594436c0739e19000ce5bdb9ff9fc65e8a9028`
+(`foundation-public-root-v1`). Its sole corrective child and WP-04 exit is
+`5872e7cdf27040dd65fe324d6daf6b0e4e7bd32e`
+(`foundation-wp-04-exit-1`). The correction made a cold hosted bootstrap
+possible without changing product behavior.
 
-The repository-publication operation in WP-04 leaves that root unchanged. The
-next source packages are WP-05 documentation/governance ownership and WP-06
-verification replacement, followed by the technical cutovers through WP-15.
+WP-05 is complete at the revision containing this documentation reset. It
+replaces the fragmented specification tree with 32 registered documents and a
+bounded `cargo xtask docs-check`. WP-06 is the next package; later technical
+cutovers remain targets, not current implementation.
 
-The temporary normal local check is `cargo xtask verify-bootstrap`. It pins its
-tool versions, enforces a 169-test CPU subset, and states its exclusions. The
-sanitized pre-foundation disposition preserves all 1,055 predecessor
-verification records for WP-06 without private revision or machine bindings.
+## Current Verification Boundary
 
-The complete order and contracts live in the
-[foundation handoff](plans/active/FOUNDATION_REFACTOR_HANDOFF.md). Current work
-is summarized in [planning/NOW.md](planning/NOW.md).
+`cargo xtask verify-bootstrap` is temporary partial feedback: formatting,
+workspace compilation, 169 selected CPU tests, and documentation checks. The
+single `Bootstrap / required` pull-request job runs that bridge on a standard
+public runner. WP-06 replaces both the bridge and the inefficient legacy test
+topology.
 
 ## Known Limitations
 
-- `cargo xtask verify-fast` stops on the superseded source-size rule.
-- `cargo xtask report-audit` reports a blocking legacy evidence mismatch.
-- Raw workspace Clippy reports inherited warnings outside the temporary bridge.
-- Packaged runtime does not yet expose unsaved autosave recovery.
+- `verify-fast` stops on a superseded source-size rule, and `report-audit`
+  reports an inherited evidence mismatch.
+- Raw workspace Clippy still reports inherited warnings outside the bridge.
+- Packaged runtime does not expose unsaved-autosave recovery.
 - Direct X11 close of a clean project can hit an inherited Winit shutdown
   panic; the dirty-project save/discard/cancel route exits cleanly.
-- The sole hosted bootstrap workflow is provisional; WP-06 replaces it.
-- There is no public full microscopy dataset release.
-- Windows and macOS are not release-supported.
-- Current persisted formats are experimental and carry no compatibility
+- GPU, packaged E2E, performance, scientific, and real-data evidence remain
+  trusted-local work rather than ordinary pull-request checks.
+- Windows, macOS, and 4K are not qualified product targets.
+- Current persisted formats are experimental and have no compatibility
   promise.
 
-These limitations are owned by the remaining foundation work packages; they
-are not claims that the current product is production-ready.
+The [foundation handoff](plans/active/FOUNDATION_REFACTOR_HANDOFF.md) owns the
+remaining target sequence. [Current work](planning/NOW.md) identifies the next
+checkpoint.

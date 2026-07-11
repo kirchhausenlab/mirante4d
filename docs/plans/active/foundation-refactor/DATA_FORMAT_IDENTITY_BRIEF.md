@@ -2,7 +2,7 @@
 
 Status: HANDOFF_READY SUBORDINATE
 Program version: 0.21
-Last updated: 2026-07-10
+Last updated: 2026-07-11
 Implementation authorization: INHERITED ONLY THROUGH THE ACTIVATED HANDOFF AND PACKAGE ENTRY GATES
 Parent authority: `docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md`
 Authority scope: D-007/D-008/D-009 format, lifecycle, sharding, interoperability, and identity families
@@ -172,14 +172,15 @@ tag, DOI, or generated fixture never grants stability by implication.
 | `STABLE` | Granted only by a separate explicit owner-approved release gate after normative schemas, identity rules, independent fixtures, compatibility matrix, regeneration/conversion rehearsal, and product evidence pass. The promise is irreversible for the named version. |
 | `DEPRECATED` / `SUPERSEDED` | An immutable successor exists, scientific/package/release identity relationships are recorded, and a verified regeneration path or separately approved side-by-side converter exists before the current app drops the old stable profile. |
 
-At plan start, current `mirante4d-v1`, `mirante4d-project-v13`, analysis
-artifacts, and preferences are explicitly
-`EXPERIMENTAL / NO COMPATIBILITY PROMISE`. Their owning packages perform
-separate hard cuts without implicit converters: WP-02 cuts project v13 to
-transitional v14, WP-07B owns preferences/durable-state cutover, WP-10A/C owns
-the dataset format, and WP-12 owns analysis artifacts. This brief owns only the
-dataset lifecycle. Public source and small experimental public fixtures do not
-change any contract's status.
+The current dataset remains `mirante4d-v1`. WP-02 completed the project hard
+cut from v13 to the current transitional `mirante4d-project-v14`. Those
+contracts, analysis artifacts, and preferences are explicitly
+`EXPERIMENTAL / NO COMPATIBILITY PROMISE`. The remaining owning packages
+perform separate hard cuts without implicit converters: WP-07B owns
+preferences/durable-state cutover, WP-10A/C owns the dataset format, and WP-12
+owns analysis artifacts. This brief owns only the dataset lifecycle. Public
+source and small experimental public fixtures do not change any contract's
+status.
 
 The dataset format should remain experimental through the technical foundation
 and public-source release. The first stable obligation begins only when a

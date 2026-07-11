@@ -1,71 +1,90 @@
 # Agent Guide
 
-Mirante4D is an early-stage native desktop viewer for large 4D microscopy
-datasets. It is a hard-cutover successor to the browser-based `llsm_viewer`,
-not a compatibility-preserving port.
+Mirante4D is a pre-alpha academic open-source desktop viewer for large 4D
+microscopy data.
 
-## Required Read Order
+## Before Changing The Repository
 
-Before changing the repository, read:
+Follow the sole read order in the [documentation index](README.md), then read
+the domain document that owns the change.
 
-1. `docs/CURRENT_STATE.md`
-2. `docs/planning/NOW.md`
-3. The domain document relevant to the task
+For foundation work, also read the
+[foundation handoff](plans/active/FOUNDATION_REFACTOR_HANDOFF.md), the current
+work-package contract, its accepted predecessor-bound entry brief, and only the
+technical briefs named by that package.
 
-For foundation work, also read
-`docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md` and the owning work-package
-brief.
+Authority resolves as follows:
 
-## Non-Negotiable Rules
+- [Product](PRODUCT.md) owns product scope.
+- [Current state](CURRENT_STATE.md) owns implemented-versus-planned status.
+- [Current work](planning/NOW.md) owns the active checkpoint.
+- The relevant domain document owns technical detail.
 
-- Backward compatibility is forbidden unless the user explicitly requests it.
-  Do not add legacy readers, compatibility shims, fallback paths, dual-format
-  branches, or commented-out predecessor code.
-- Keep current facts separate from approved targets. A plan is not an
-  implementation.
-- Prefer clear domain ownership and typed models over generic modules or loose
-  maps.
-- Preserve source data. Writes must be explicit, validated, and recoverable or
-  atomic where practical.
-- Make performance claims only from named measurements.
-- Keep the project appropriate for a small academic open-source team. Add
-  process only when it protects scientific correctness, user data, or release
-  integrity.
+Plans and ADRs record accepted targets and rationale. Tests and reports are
+evidence. None overrides current-state facts by itself. Treat conflicting
+active authorities as a documentation defect; do not silently choose one.
 
-## High-Risk Changes
+## Project Invariants
 
-Architecture, rendering, GPU, preprocessing, persistence, data-format,
-large-dataset, and corrective refactors require an approved plan before code
-changes. The plan must state:
+- Use hard cutovers. Do not add compatibility readers, migration shims,
+  fallback branches, dual-format paths, commented-out predecessors, or other
+  legacy machinery unless the user explicitly requests it.
+- Keep one live authority for each model, field, resource, operation, and
+  persisted identity. Delete the predecessor in the accepted cutover.
+- Never mutate source microscopy data. Validate output before publication and
+  never expose an incomplete result as complete.
+- Bound large work in memory, VRAM, queues, open objects, I/O, and physical
+  filesystem objects. It must be cancellable and suppress stale results.
+- Dataset storage must be sharded with a bounded physical-object count.
+  File-per-brick layouts and comparable sidecar explosions are forbidden.
+- Capacity and capability failures must be typed and visible. They must not
+  silently select dense, CPU, legacy, or alternate product paths.
+- Scientific conformance needs independent expected facts or an independent
+  reader. Writer/reader self-agreement is insufficient.
+- Segmentation remains absent throughout the foundation program. Restoring it
+  requires a separately approved post-foundation capability plan.
+- Do not commit secrets, private paths, or unpublished dataset metadata.
+- Hosted verification must cost `$0`: standard public runners only, no paid
+  runners, and no public self-hosted workstation.
+- Keep process proportionate to a small academic project. Add it only when it
+  protects scientific correctness, user data, security, or release integrity.
 
-- user-visible outcome;
-- boundary or invariant being changed;
-- paths being replaced or deleted;
-- important requirement-to-evidence mappings;
-- non-goals and risks;
-- automated and product-open validation.
+## High-Risk Work
 
-Do not narrow an architectural request into a local patch without saying so.
+Architecture, domain APIs, ownership/concurrency, persistence, data formats or
+identity, import/preprocessing, rendering/viewport/GPU, data loading,
+large-data performance, scientific analysis, verification/release
+architecture, and broad corrective refactors require an approved plan before
+implementation.
+
+Before editing:
+
+1. Bind the work to the accepted predecessor and owning package.
+2. Write a short entry brief with outcome, invariants, allowed scope,
+   authority flip and deletions, non-goals, risks, stop conditions, exact
+   evidence, and rollback unit.
+3. Obtain user approval before changing accepted scope, order, architecture,
+   proof class, or replacing the requested outcome with a narrower patch.
+4. Define how the predecessor is deleted and the new authority is proved.
+
+Foundation packages also follow the entry, exit, evidence, commit, and attempt-
+tag contract in the foundation handoff. A cutover is incomplete while its
+predecessor or a hidden alternate path remains.
 
 ## Verification Language
 
 - **Implemented:** the change exists.
-- **Automated-verified:** the relevant automated checks passed.
-- **Product-validated:** the real desktop application was opened and the
-  affected workflow was exercised on the relevant dataset.
+- **Automated-verified:** the relevant automated checks passed for the stated
+  revision.
+- **Product-validated:** the normal native application was opened on a real
+  display and the affected workflow was exercised on the relevant dataset and
+  hardware.
 
 Rendering, viewport, GPU, data-loading, interaction, and large-dataset work is
-not complete without product-open validation unless the user explicitly waives
-it. Report exact commands, datasets, failures, skipped checks, and residual
-risk.
+not complete without product validation unless the user explicitly waives it.
+Unit tests, smoke tests, virtual/no-display automation, benchmarks, snapshots,
+and internal readbacks are supporting evidence, not substitutes.
 
-## Expected Stack
-
-- Rust
-- `wgpu`
-- `winit`
-- `egui` / `egui-wgpu`
-- strict native packages with explicit CPU, memory, GPU, and I/O budgets
-
-CUDA is not a baseline dependency. Add it only if a future benchmark justifies
-an explicit optional NVIDIA path.
+Performance claims must name the workload, hardware, metric, sampling method,
+and threshold. Completion reports must name the revision, commands, fixtures
+or datasets, results, failures, skipped checks, waivers, and remaining risk.

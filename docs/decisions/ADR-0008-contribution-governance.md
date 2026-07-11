@@ -3,13 +3,14 @@
 Status: ACCEPTED TARGET DECISION
 Accepted: 2026-07-10
 Last reviewed: 2026-07-11
-Public contribution intake: ACTIVE WHEN THIS REPOSITORY IS PUBLIC
+Implementation authorization: NONE INDEPENDENT; ACTIVE HANDOFF AND PACKAGE ENTRY ONLY
+Public contribution intake: OPERATIONAL
 Decision ID: D-003
-Current-state effect: SOURCE POLICY INSTALLED; REMOTE CONTROLS VERIFIED AT PUBLICATION
+Current-state effect: PUBLIC SOURCE POLICY AND REMOTE CONTROLS OPERATIONAL
 
 This decision resolves source governance. The public-facing policy is installed
-in this snapshot. Repository roles, rules, and workflow controls remain remote
-settings and are verified as part of publication.
+in this snapshot. WP-04 made the repository public and verified its roles,
+rules, and workflow controls.
 
 ## Context
 
@@ -52,16 +53,17 @@ system. If ownership, institutional, patent, or relicensing needs later become
 concrete, governance can change prospectively through a new owner-approved ADR;
 that future possibility does not retroactively alter accepted contributions.
 
-Source contribution intake is operational only in the public repository after
-the approved roles, rules, and workflow controls are applied. D-020 remains the
-separate fail-closed authority for dataset contributions.
+Source contribution intake is operational in the public repository with the
+approved roles, rules, and workflow controls applied and read back during
+WP-04. D-020 remains the separate fail-closed authority for dataset
+contributions.
 
 ## Enforcement
 
 - Contributor, conduct, security, support, template, license,
   maintainer-authority, and pre-alpha disclosures remain concise and verified.
-- Publication applies and reads back the accepted maintainer, review, fork,
-  token, workflow, and branch controls.
+- WP-04 applied and read back the accepted maintainer, review, fork, token,
+  workflow, and branch controls; later changes must preserve the policy.
 - No source-governance file or setting may imply that external datasets are
   accepted.
 - A future CLA, DCO, approval-count, maintainer-role, or inbound-license change
@@ -71,5 +73,5 @@ separate fail-closed authority for dataset contributions.
 ## Owning Documents
 
 - `docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md`
-- `docs/PUBLIC_SOURCE.md`
+- `docs/DEVELOPMENT.md`
 - `docs/plans/active/foundation-refactor/FOUNDATION_ENTRY_WORK_PACKAGES.md`

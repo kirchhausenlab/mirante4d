@@ -48,7 +48,6 @@ const VERIFY_BOOTSTRAP_TARGET_DIR: &str = "target/mirante4d/verify-bootstrap";
 const VERIFY_BOOTSTRAP_FORMAT_TIMEOUT: Duration = Duration::from_secs(60);
 const VERIFY_BOOTSTRAP_CHECK_TIMEOUT: Duration = Duration::from_secs(480);
 const VERIFY_BOOTSTRAP_TEST_TIMEOUT: Duration = Duration::from_secs(240);
-const VERIFY_BOOTSTRAP_DOCS_TIMEOUT: Duration = Duration::from_secs(90);
 const VERIFY_BOOTSTRAP_EXPECTED_TESTS: u64 = 169;
 const VERIFY_BOOTSTRAP_RUSTC_VERSION: &str = "rustc 1.96.1 (31fca3adb 2026-06-26)";
 const VERIFY_BOOTSTRAP_CARGO_VERSION: &str = "cargo 1.96.1 (356927216 2026-06-26)";
@@ -361,9 +360,7 @@ pub(crate) fn verify_bootstrap() -> anyhow::Result<()> {
     )?;
     run_bootstrap_tests()?;
 
-    let mut rumdl = rumdl_command();
-    rumdl.args(["check", "--no-cache", "--config", ".rumdl.toml", "."]);
-    run_bootstrap_command_with_timeout(&mut rumdl, VERIFY_BOOTSTRAP_DOCS_TIMEOUT)?;
+    crate::documentation::docs_check()?;
 
     println!(
         "verify-bootstrap passed its declared partial scope; deeper verification remains required"
@@ -1488,7 +1485,7 @@ mod tests {
         let total_ceiling = VERIFY_BOOTSTRAP_FORMAT_TIMEOUT
             + VERIFY_BOOTSTRAP_CHECK_TIMEOUT
             + VERIFY_BOOTSTRAP_TEST_TIMEOUT
-            + VERIFY_BOOTSTRAP_DOCS_TIMEOUT;
+            + crate::documentation::DOCS_CHECK_TIMEOUT;
         assert_eq!(total_ceiling, Duration::from_secs(14 * 60 + 30));
     }
 

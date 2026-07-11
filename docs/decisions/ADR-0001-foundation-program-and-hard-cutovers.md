@@ -2,8 +2,8 @@
 
 Status: ACCEPTED TARGET DECISION
 Accepted: 2026-07-09
-Last reviewed: 2026-07-10
-Implementation authorization: NO
+Last reviewed: 2026-07-11
+Implementation authorization: NONE INDEPENDENT; ACTIVE HANDOFF AND PACKAGE ENTRY ONLY
 Decision source: OD-001 through OD-008 and PRG-001/002/003/008/015
 
 ## Context
@@ -26,8 +26,8 @@ debris, and requires planning before implementation.
 - Keep preparation code unreachable until its named activation/deletion gate;
   never expose old/new product routes, compatibility shims, legacy readers,
   fallback branches, re-export facades, or dormant feature flags.
-- Remove the current segmentation prototype in WP-02 before rebuilding the
-  general foundations. Segmentation may return only through a separately
+- WP-02 removed the segmentation prototype before the general foundation
+  rebuild. Segmentation remains absent and may return only through a separately
   approved post-foundation capability plan.
 - Separate planning approval from implementation authorization through PH-00,
   a promoted revision-stamped handoff, entry-stamped package briefs, and

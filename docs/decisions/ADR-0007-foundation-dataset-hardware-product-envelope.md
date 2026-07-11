@@ -2,14 +2,15 @@
 
 Status: ACCEPTED TARGET DECISION
 Accepted: 2026-07-09
-Last reviewed: 2026-07-10
+Last reviewed: 2026-07-11
 Decision IDs: D-004, D-005, D-006, D-015, D-016
-Implementation authorization: NO
+Implementation authorization: NONE INDEPENDENT; ACTIVE HANDOFF AND PACKAGE ENTRY ONLY
 
 This ADR fixes target policy only. Current product behavior and support evidence
-remain factual until approved work packages change and validate them. The
-current segmentation prototype, current CPU fallback behavior, current formats,
-and existing diagnostics are not changed or qualified by this ADR.
+remain factual until approved work packages change and validate them. WP-02
+removed the segmentation prototype, and segmentation is absent. Current CPU
+fallback behavior, current formats, and existing diagnostics are not changed or
+qualified by this ADR.
 
 ## Context
 
@@ -17,8 +18,8 @@ The foundation needs a truthful, measurable workload and hardware boundary.
 Combining every observed maximum would imply an untested dataset, storing a
 nominal 1 TiB test would be wasteful, broad platform and 4K claims would exceed
 available evidence, and a silent CPU product fallback would hide unsupported
-interactive hardware. The existing segmentation prototype also sits above
-foundations that are about to be replaced.
+interactive hardware. The former segmentation prototype also sat above
+foundations that are now being replaced.
 
 ## Options Considered
 
@@ -50,8 +51,8 @@ foundations that are about to be replaced.
   remain portability work until separately approved and validated.
 - Qualify product viewports at 1280x720 and through a 1920x1080 exercise. Do not
   spend foundation work on 4K/3840-wide benchmarks, optimization, or claims.
-- Delete the current segmentation prototype as a vertical hard cut in WP-02.
-  Keep segmentation absent for the rest of the foundation program; any return
+- WP-02 deleted the segmentation prototype as a vertical hard cut. Keep
+  segmentation absent for the rest of the foundation program; any return
   requires a separate post-foundation capability decision.
 - Use the approved CPU and GPU byte-ledger formulas as measured seed policy.
   Calibration may tune implementation details but may not silently broaden the
@@ -72,8 +73,8 @@ foundations that are about to be replaced.
 
 ## Enforcement
 
-- WP-02 must delete segmentation source, commands, persistence, UI, tests,
-  benchmarks, reports, and documentation together and pass product-open
+- WP-02 deleted segmentation source, commands, persistence, UI, tests,
+  benchmarks, reports, and documentation together and passed its product-open
   regression proof without leaving a hidden route or compatibility shim.
 - Dataset, scheduler, renderer, import, package, and performance evidence must
   name the exact `DS-*` profile, support level, hardware manifest, viewport,
