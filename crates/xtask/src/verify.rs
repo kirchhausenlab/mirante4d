@@ -20,7 +20,7 @@ const VERIFY_BOOTSTRAP_TARGET_DIR: &str = "target/mirante4d/verify-bootstrap";
 const VERIFY_BOOTSTRAP_FORMAT_TIMEOUT: Duration = Duration::from_secs(60);
 const VERIFY_BOOTSTRAP_CHECK_TIMEOUT: Duration = Duration::from_secs(480);
 const VERIFY_BOOTSTRAP_TEST_TIMEOUT: Duration = Duration::from_secs(240);
-const VERIFY_BOOTSTRAP_EXPECTED_TESTS: u64 = 169;
+const VERIFY_BOOTSTRAP_EXPECTED_TESTS: u64 = 170;
 const VERIFY_BOOTSTRAP_RUSTC_VERSION: &str = "rustc 1.96.1 (31fca3adb 2026-06-26)";
 const VERIFY_BOOTSTRAP_CARGO_VERSION: &str = "cargo 1.96.1 (356927216 2026-06-26)";
 const VERIFY_BOOTSTRAP_NEXTEST_VERSION: &str = "cargo-nextest 0.9.138 (fc97e97bb 2026-06-21)";
@@ -299,7 +299,7 @@ mod tests {
             assert!(VERIFY_BOOTSTRAP_FILTER.contains(package));
         }
         assert!(!VERIFY_BOOTSTRAP_FILTER.contains("all()"));
-        assert_eq!(VERIFY_BOOTSTRAP_EXPECTED_TESTS, 169);
+        assert_eq!(VERIFY_BOOTSTRAP_EXPECTED_TESTS, 170);
 
         let total_ceiling = VERIFY_BOOTSTRAP_FORMAT_TIMEOUT
             + VERIFY_BOOTSTRAP_CHECK_TIMEOUT
