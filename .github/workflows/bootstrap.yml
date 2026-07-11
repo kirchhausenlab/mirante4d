@@ -32,7 +32,10 @@ jobs:
         run: |
           set -euo pipefail
           test "${GITHUB_REF}" = "refs/heads/main"
-          tag_commit="$(git rev-parse 'refs/tags/foundation-public-root-v1^{commit}')"
+          root_commit="$(git rev-parse 'refs/tags/foundation-public-root-v1^{commit}')"
+          tag_commit="$(git rev-parse 'refs/tags/foundation-wp-04-bootstrap-candidate-v1^{commit}')"
+          test "$(git rev-list --parents -n 1 "${tag_commit}" | wc -w)" = "2"
+          test "$(git rev-parse "${tag_commit}^")" = "${root_commit}"
           test "${GITHUB_SHA}" = "${tag_commit}"
 
       - name: Verify the pinned Rust manifest and compiler commits
@@ -80,4 +83,6 @@ jobs:
 
       - name: Run the temporary local foundation check
         shell: bash
-        run: cargo xtask verify-bootstrap
+        run: |
+          timeout 120s cargo fetch --locked --target x86_64-unknown-linux-gnu
+          cargo xtask verify-bootstrap
