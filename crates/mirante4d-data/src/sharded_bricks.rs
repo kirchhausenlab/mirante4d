@@ -1,5 +1,5 @@
-use mirante4d_core::{DatasetId, LayerId, Shape3D, TimeIndex};
-use mirante4d_format::ScaleManifest;
+use mirante4d_domain::{Shape3D, TimeIndex};
+use mirante4d_format::{DatasetId, LayerId, ScaleManifest};
 
 use crate::regions::{brick_record_and_region, translated_region_grid_to_world};
 use crate::{
@@ -16,7 +16,7 @@ pub(super) fn brick_cache_key(
     BrickCacheKey {
         layer_id: layer_id.to_string(),
         scale_level,
-        timepoint: timepoint.0,
+        timepoint: timepoint.get(),
         z: brick_index.z,
         y: brick_index.y,
         x: brick_index.x,
@@ -29,20 +29,20 @@ pub(super) fn storage_shard_brick_indices(
 ) -> Result<Vec<SpatialBrickIndex>, DataError> {
     let chunks_per_shard = scale.storage.chunks_per_shard;
     let grid = scale.bricks.grid_shape.spatial();
-    let z_start = shard_index.z.saturating_mul(chunks_per_shard.z);
-    let y_start = shard_index.y.saturating_mul(chunks_per_shard.y);
-    let x_start = shard_index.x.saturating_mul(chunks_per_shard.x);
-    let z_end = z_start.saturating_add(chunks_per_shard.z).min(grid.z);
-    let y_end = y_start.saturating_add(chunks_per_shard.y).min(grid.y);
-    let x_end = x_start.saturating_add(chunks_per_shard.x).min(grid.x);
+    let z_start = shard_index.z.saturating_mul(chunks_per_shard.z());
+    let y_start = shard_index.y.saturating_mul(chunks_per_shard.y());
+    let x_start = shard_index.x.saturating_mul(chunks_per_shard.x());
+    let z_end = z_start.saturating_add(chunks_per_shard.z()).min(grid.z());
+    let y_end = y_start.saturating_add(chunks_per_shard.y()).min(grid.y());
+    let x_end = x_start.saturating_add(chunks_per_shard.x()).min(grid.x());
     if z_start >= z_end || y_start >= y_end || x_start >= x_end {
         return Err(DataError::BrickIndexOutOfBounds {
             z: z_start,
             y: y_start,
             x: x_start,
-            grid_z: grid.z,
-            grid_y: grid.y,
-            grid_x: grid.x,
+            grid_z: grid.z(),
+            grid_y: grid.y(),
+            grid_x: grid.x(),
         });
     }
     let mut bricks = Vec::new();
@@ -65,17 +65,17 @@ pub(super) fn storage_shard_region(
     let spatial = scale.shape.spatial();
     let z_start = shard_index
         .z
-        .saturating_mul(chunks_per_shard.z)
-        .saturating_mul(brick_shape.z);
+        .saturating_mul(chunks_per_shard.z())
+        .saturating_mul(brick_shape.z());
     let y_start = shard_index
         .y
-        .saturating_mul(chunks_per_shard.y)
-        .saturating_mul(brick_shape.y);
+        .saturating_mul(chunks_per_shard.y())
+        .saturating_mul(brick_shape.y());
     let x_start = shard_index
         .x
-        .saturating_mul(chunks_per_shard.x)
-        .saturating_mul(brick_shape.x);
-    if z_start >= spatial.z || y_start >= spatial.y || x_start >= spatial.x {
+        .saturating_mul(chunks_per_shard.x())
+        .saturating_mul(brick_shape.x());
+    if z_start >= spatial.z() || y_start >= spatial.y() || x_start >= spatial.x() {
         return Err(DataError::RegionOutOfBounds {
             z_start,
             z_end: z_start,
@@ -83,9 +83,9 @@ pub(super) fn storage_shard_region(
             y_end: y_start,
             x_start,
             x_end: x_start,
-            shape_z: spatial.z,
-            shape_y: spatial.y,
-            shape_x: spatial.x,
+            shape_z: spatial.z(),
+            shape_y: spatial.y(),
+            shape_x: spatial.x(),
         });
     }
     VolumeRegion::new(
@@ -93,17 +93,17 @@ pub(super) fn storage_shard_region(
         y_start,
         x_start,
         chunks_per_shard
-            .z
-            .saturating_mul(brick_shape.z)
-            .min(spatial.z - z_start),
+            .z()
+            .saturating_mul(brick_shape.z())
+            .min(spatial.z() - z_start),
         chunks_per_shard
-            .y
-            .saturating_mul(brick_shape.y)
-            .min(spatial.y - y_start),
+            .y()
+            .saturating_mul(brick_shape.y())
+            .min(spatial.y() - y_start),
         chunks_per_shard
-            .x
-            .saturating_mul(brick_shape.x)
-            .min(spatial.x - x_start),
+            .x()
+            .saturating_mul(brick_shape.x())
+            .min(spatial.x() - x_start),
     )
 }
 
@@ -290,11 +290,11 @@ fn extract_shard_values<T: Copy>(
     let x_offset = target_region.x_start - shard_region.x_start;
     let mut extracted =
         Vec::with_capacity(shape.element_count().map_err(DataError::InvalidShape)? as usize);
-    for z in 0..shape.z {
-        for y in 0..shape.y {
-            let start = (((z_offset + z) * shard_shape.y + (y_offset + y)) * shard_shape.x
+    for z in 0..shape.z() {
+        for y in 0..shape.y() {
+            let start = (((z_offset + z) * shard_shape.y() + (y_offset + y)) * shard_shape.x()
                 + x_offset) as usize;
-            let end = start + shape.x as usize;
+            let end = start + shape.x() as usize;
             extracted.extend_from_slice(values.get(start..end).ok_or_else(|| {
                 DataError::ReadFailed {
                     layer_id: "<shard>".to_owned(),

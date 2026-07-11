@@ -172,13 +172,13 @@ tag, DOI, or generated fixture never grants stability by implication.
 | `STABLE` | Granted only by a separate explicit owner-approved release gate after normative schemas, identity rules, independent fixtures, compatibility matrix, regeneration/conversion rehearsal, and product evidence pass. The promise is irreversible for the named version. |
 | `DEPRECATED` / `SUPERSEDED` | An immutable successor exists, scientific/package/release identity relationships are recorded, and a verified regeneration path or separately approved side-by-side converter exists before the current app drops the old stable profile. |
 
-The current dataset remains `mirante4d-v1`. WP-02 completed the project hard
-cut from v13 to the current transitional `mirante4d-project-v14`. Those
-contracts, analysis artifacts, and preferences are explicitly
-`EXPERIMENTAL / NO COMPATIBILITY PROMISE`. The remaining owning packages
-perform separate hard cuts without implicit converters: WP-07B owns
-preferences/durable-state cutover, WP-10A/C owns the dataset format, and WP-12
-owns analysis artifacts. This brief owns only the dataset lifecycle. Public
+The current dataset remains `mirante4d-v1`. WP-07B deleted project-v14 and
+preferences-v1 authority, installed the private experimental project-v15
+bridge, and made `mirante4d-settings-v1` authoritative. These contracts and
+analysis artifacts are explicitly `EXPERIMENTAL / NO COMPATIBILITY PROMISE`.
+The remaining owning packages perform separate hard cuts without implicit
+converters: WP-10A/C owns the dataset format, WP-10B owns the project store,
+and WP-12 owns analysis artifacts. This brief owns only the dataset lifecycle. Public
 source and small experimental public fixtures do not change any contract's
 status.
 

@@ -1,15 +1,363 @@
+fn begin_test_analysis_operation(application: &mut ApplicationState) -> OperationToken {
+    application
+        .dispatch(ApplicationCommand::BeginOperation(OperationKind::Analysis))
+        .expect("the canonical application must admit the test analysis operation");
+    application
+        .drain_events(usize::MAX)
+        .into_iter()
+        .rev()
+        .find_map(|event| match event {
+            ApplicationEvent::OperationStarted { token }
+                if token.kind() == OperationKind::Analysis =>
+            {
+                Some(token)
+            }
+            _ => None,
+        })
+        .expect("beginning analysis must emit its operation token")
+}
+
+fn complete_test_analysis_operation(
+    application: &mut ApplicationState,
+    analysis: &current_runtime::analysis::CurrentAnalysisRuntime,
+    token: OperationToken,
+    table_start: usize,
+    plot_start: usize,
+) {
+    let tables = analysis.analysis_tables[table_start..]
+        .iter()
+        .enumerate()
+        .map(|(slot, table)| {
+            let slot = u16::try_from(slot).expect("test analysis table slots fit in u16");
+            AnalysisTableDescriptor::new(
+                AnalysisTableId::from_operation(token.operation_id(), slot),
+                u64::try_from(table.rows.len()).expect("test table row counts fit in u64"),
+            )
+        })
+        .collect();
+    let plots = analysis.analysis_plots[plot_start..]
+        .iter()
+        .enumerate()
+        .map(|(slot, plot)| {
+            let slot = u16::try_from(slot).expect("test analysis plot slots fit in u16");
+            AnalysisPlotDescriptor::new(
+                AnalysisPlotId::from_operation(token.operation_id(), slot),
+                plot.series
+                    .iter()
+                    .map(|series| {
+                        u64::try_from(series.points.len())
+                            .expect("test plot point counts fit in u64")
+                    })
+                    .collect(),
+            )
+            .expect("test analysis plots must satisfy descriptor bounds")
+        })
+        .collect();
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::AnalysisReady { tables, plots },
+        })
+        .expect("the canonical application must admit matching analysis descriptors");
+}
+
+fn compute_full_time_series_analysis_for_test(
+    application: &mut ApplicationState,
+    dataset: &current_runtime::dataset::CurrentDatasetRuntime,
+    analysis: &mut current_runtime::analysis::CurrentAnalysisRuntime,
+) -> anyhow::Result<()> {
+    let token = begin_test_analysis_operation(application);
+    let table_start = analysis.analysis_tables.len();
+    let plot_start = analysis.analysis_plots.len();
+    let snapshot = application.snapshot();
+    let view = application_view(&snapshot);
+    let layer = snapshot
+        .catalog()
+        .layer(view.active_layer())
+        .expect("the canonical test view must close over its catalog");
+    let layer_id = current_physical_layer_id(dataset, view.active_layer())?;
+    compute_full_time_series_analysis(
+        dataset,
+        analysis,
+        AnalysisJobInput {
+            dataset_name: snapshot.catalog().label(),
+            active_layer_id: layer_id.as_str(),
+            active_layer_dtype: layer.dtype(),
+            active_timepoint: view.timepoint(),
+            timepoint_count: layer.shape().t(),
+        },
+    )?;
+    complete_test_analysis_operation(application, analysis, token, table_start, plot_start);
+    Ok(())
+}
+
+fn compute_active_roi_analysis_for_test(
+    application: &mut ApplicationState,
+    dataset: &current_runtime::dataset::CurrentDatasetRuntime,
+    analysis: &mut current_runtime::analysis::CurrentAnalysisRuntime,
+) -> anyhow::Result<()> {
+    let token = begin_test_analysis_operation(application);
+    let table_start = analysis.analysis_tables.len();
+    let plot_start = analysis.analysis_plots.len();
+    let snapshot = application.snapshot();
+    let view = application_view(&snapshot);
+    let layer = snapshot
+        .catalog()
+        .layer(view.active_layer())
+        .expect("the canonical test view must close over its catalog");
+    let layer_id = current_physical_layer_id(dataset, view.active_layer())?;
+    compute_active_roi_analysis(
+        dataset,
+        analysis,
+        AnalysisJobInput {
+            dataset_name: snapshot.catalog().label(),
+            active_layer_id: layer_id.as_str(),
+            active_layer_dtype: layer.dtype(),
+            active_timepoint: view.timepoint(),
+            timepoint_count: layer.shape().t(),
+        },
+    )?;
+    complete_test_analysis_operation(application, analysis, token, table_start, plot_start);
+    Ok(())
+}
+
+fn analysis_job_context_for_test(
+    application: &ApplicationState,
+    dataset: &current_runtime::dataset::CurrentDatasetRuntime,
+    analysis: &current_runtime::analysis::CurrentAnalysisRuntime,
+) -> AnalysisJobContext {
+    let snapshot = application.snapshot();
+    let view = application_view(&snapshot);
+    let layer = snapshot
+        .catalog()
+        .layer(view.active_layer())
+        .expect("the canonical test view must close over its catalog");
+    let layer_id = current_physical_layer_id(dataset, view.active_layer()).unwrap();
+    AnalysisJobContext::from_runtime(
+        dataset,
+        analysis,
+        AnalysisJobInput {
+            dataset_name: snapshot.catalog().label(),
+            active_layer_id: layer_id.as_str(),
+            active_layer_dtype: layer.dtype(),
+            active_timepoint: view.timepoint(),
+            timepoint_count: layer.shape().t(),
+        },
+    )
+}
+
+fn test_analysis_table(rows: Vec<(&str, u64, f64)>) -> AnalysisTable {
+    test_analysis_table_named("test-table", "test table", rows)
+}
+
+fn test_analysis_table_named(id: &str, name: &str, rows: Vec<(&str, u64, f64)>) -> AnalysisTable {
+    AnalysisTable {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        state: AnalysisResultState::Complete,
+        provenance: test_analysis_provenance(),
+        columns: vec![
+            AnalysisColumn::new("name", "name", None),
+            AnalysisColumn::new("count", "count", None),
+            AnalysisColumn::new("mean", "mean", None),
+        ],
+        rows: rows
+            .into_iter()
+            .map(|(name, count, mean)| {
+                AnalysisTableRow::new([
+                    ("name", AnalysisCell::Text(name.to_owned())),
+                    ("count", AnalysisCell::Integer(count)),
+                    ("mean", AnalysisCell::Float(mean)),
+                ])
+            })
+            .collect(),
+    }
+}
+
+fn test_analysis_provenance() -> AnalysisProvenance {
+    AnalysisProvenance {
+        source_dataset_id: "test-dataset".to_owned(),
+        source_dataset: "test-dataset".to_owned(),
+        native_format: "mirante4d-v1".to_owned(),
+        native_schema_version: 1,
+        app_version: "0.1.0-test".to_owned(),
+        created_at_utc: "test-clock".to_owned(),
+        source_layer_id: "ch0".to_owned(),
+        timepoint_start: 0,
+        timepoint_end_exclusive: 1,
+        scale_level: 0,
+        operation: "test".to_owned(),
+        operation_version: 1,
+        parameters: BTreeMap::new(),
+        scope: "test".to_owned(),
+        execution_class: AnalysisExecutionClass::RoiLocalExact,
+        result_state: AnalysisResultState::Complete,
+        data_source: "test".to_owned(),
+        compute_precision: "f64".to_owned(),
+    }
+}
+
+fn analysis_scene_ui_runtime() -> current_runtime::ui::CurrentUiRuntime {
+    current_runtime::ui::CurrentUiRuntime::new(ResourcePolicy::default(), None)
+}
+
+fn analysis_test_scene_artifacts() -> SceneArtifactStore {
+    let mut store = SceneArtifactStore::default();
+    let track = TrackArtifact::new(
+        SceneArtifactId::new("track", "track-a").unwrap(),
+        "track a",
+        Some(LayerId::new("ch0").unwrap()),
+        vec![
+            TrackPoint::new(TimeIndex::new(0), DVec3::ZERO).unwrap(),
+            TrackPoint::new(TimeIndex::new(1), DVec3::new(1.0, 0.0, 0.0)).unwrap(),
+            TrackPoint::new(TimeIndex::new(3), DVec3::new(3.0, 0.0, 0.0)).unwrap(),
+        ],
+    )
+    .unwrap();
+    let roi = RoiArtifact::new(
+        SceneArtifactId::new("roi", "roi-a").unwrap(),
+        "roi a",
+        AnalysisWorldGeometry::Box3D {
+            min: DVec3::new(-1.0, -1.0, -1.0),
+            max: DVec3::new(1.0, 1.0, 1.0),
+        },
+        SceneArtifactTime::interval(TimeIndex::new(0), TimeIndex::new(4)).unwrap(),
+    )
+    .unwrap();
+    let annotation = AnnotationArtifact::new(
+        SceneArtifactId::new("annotation", "note-a").unwrap(),
+        "note a",
+        AnalysisWorldGeometry::Point {
+            position: DVec3::new(0.0, 2.0, 0.0),
+            radius_px: 4.0,
+        },
+        Some("interesting".to_owned()),
+        SceneArtifactTime::Static,
+    )
+    .unwrap();
+    let measurement = MeasurementArtifact::distance(
+        SceneArtifactId::new("measurement", "distance-a").unwrap(),
+        "distance a",
+        DVec3::ZERO,
+        DVec3::new(0.0, 3.0, 4.0),
+        MeasurementProvenance {
+            source: "manual".to_owned(),
+            scope: "world".to_owned(),
+        },
+        SceneArtifactTime::Static,
+    )
+    .unwrap();
+    store
+        .apply(SceneEditCommand::PutTrack { artifact: track })
+        .unwrap();
+    store
+        .apply(SceneEditCommand::PutRoi { artifact: roi })
+        .unwrap();
+    store
+        .apply(SceneEditCommand::PutAnnotation {
+            artifact: annotation,
+        })
+        .unwrap();
+    store
+        .apply(SceneEditCommand::PutMeasurement {
+            artifact: measurement,
+        })
+        .unwrap();
+    store
+}
+
+fn analysis_test_scene_handle_pick_value(
+    artifact_kind: EditableSceneArtifactKind,
+    handle: SceneEditHandle,
+) -> PickValue {
+    PickValue::ObjectMetadata(
+        SceneEditHandleId {
+            artifact_kind,
+            artifact_id: "test".to_owned(),
+            handle,
+        }
+        .metadata_value(),
+    )
+}
+
+fn scene_draw_list_for_test(
+    application: &ApplicationState,
+    dataset: &current_runtime::dataset::CurrentDatasetRuntime,
+    analysis: &current_runtime::analysis::CurrentAnalysisRuntime,
+    ui_runtime: &current_runtime::ui::CurrentUiRuntime,
+) -> anyhow::Result<mirante4d_renderer::SceneDrawList> {
+    let snapshot = application.snapshot();
+    let view = application_view(&snapshot);
+    let active_layer_id = current_physical_layer_id(dataset, view.active_layer())?;
+    scene_draw_list(
+        analysis,
+        ui_runtime,
+        scene_extraction::SceneViewInput {
+            active_layer_id: &active_layer_id,
+            active_timepoint: view.timepoint(),
+            active_source_grid_to_world: snapshot
+                .catalog()
+                .layer(view.active_layer())
+                .expect("the canonical test view must close over its catalog")
+                .grid_to_world(),
+            camera: *view.camera(),
+        },
+    )
+}
+
+fn selected_scene_handle_targets_for_test(
+    application: &ApplicationState,
+    dataset: &current_runtime::dataset::CurrentDatasetRuntime,
+    analysis: &current_runtime::analysis::CurrentAnalysisRuntime,
+    ui_runtime: &current_runtime::ui::CurrentUiRuntime,
+    render: &current_runtime::render::CurrentRenderRuntime,
+) -> anyhow::Result<Vec<mirante4d_renderer::ScenePickTarget>> {
+    let snapshot = application.snapshot();
+    let view = application_view(&snapshot);
+    let active_layer_id = current_physical_layer_id(dataset, view.active_layer())?;
+    selected_scene_handle_pick_targets(
+        analysis,
+        ui_runtime,
+        render,
+        scene_extraction::SceneViewInput {
+            active_layer_id: &active_layer_id,
+            active_timepoint: view.timepoint(),
+            active_source_grid_to_world: snapshot
+                .catalog()
+                .layer(view.active_layer())
+                .expect("the canonical test view must close over its catalog")
+                .grid_to_world(),
+            camera: *view.camera(),
+        },
+    )
+}
+
 #[test]
 fn app_full_time_series_analysis_uses_data_engine_and_exports_csv() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_fixture(FixtureKind::TimeMultiChannelU16_8Cube3T2C, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(&root).unwrap();
-    let before_stats = state.dataset.stats().unwrap();
+    let mut opened = open_dataset_and_render_first_frame(&root).unwrap();
+    let mut application = test_application_for_opened_source(&opened);
+    let before_stats = opened.dataset_runtime.dataset.stats().unwrap();
 
-    compute_full_time_series_analysis(&mut state).unwrap();
-    export_selected_analysis_table(&mut state).unwrap();
+    compute_full_time_series_analysis_for_test(
+        &mut application,
+        &opened.dataset_runtime,
+        &mut opened.analysis_runtime,
+    )
+    .unwrap();
+    let snapshot = application.snapshot();
+    export_selected_analysis_table(
+        &mut opened.analysis_runtime,
+        AnalysisTableExportInput {
+            table_descriptors: snapshot.transient().analysis_tables(),
+            selected_table: snapshot.transient().selected_analysis_table(),
+        },
+    )
+    .unwrap();
 
-    let after_stats = state.dataset.stats().unwrap();
-    let table = state.analysis_tables.last().unwrap();
+    let after_stats = opened.dataset_runtime.dataset.stats().unwrap();
+    let table = opened.analysis_runtime.analysis_tables.last().unwrap();
     assert!(after_stats.subset_reads > before_stats.subset_reads);
     assert_eq!(table.rows.len(), 3);
     assert_eq!(table.state, AnalysisResultState::Complete);
@@ -21,145 +369,107 @@ fn app_full_time_series_analysis_uses_data_engine_and_exports_csv() {
     assert_eq!(table.provenance.timepoint_end_exclusive, 3);
     assert_eq!(table.provenance.data_source, "data_engine_volume_reads");
     assert_eq!(
-        state.analysis_plots.last().unwrap().series[0].points.len(),
+        opened
+            .analysis_runtime
+            .analysis_plots
+            .last()
+            .unwrap()
+            .series[0]
+            .points
+            .len(),
         3
     );
-    let csv = state.last_analysis_export_csv.as_ref().unwrap();
+    let csv = opened
+        .analysis_runtime
+        .last_analysis_export_csv
+        .as_ref()
+        .unwrap();
     assert!(csv.contains("# analysis_state,complete"));
     assert!(csv.contains("timepoint,voxel_count,geometric_voxel_count,nonzero_count,min,max,mean"));
-}
-
-#[test]
-fn analysis_selection_defaults_to_latest_and_clamps_out_of_range() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(root).unwrap();
-
-    normalize_analysis_selection(&mut state);
-    assert_eq!(state.selected_analysis_table_index, None);
-    assert_eq!(state.selected_analysis_plot_index, None);
-
-    state.analysis_tables.push(test_analysis_table_named(
-        "first-table",
-        "first table",
-        vec![("first", 1, 1.0)],
-    ));
-    state.analysis_tables.push(test_analysis_table_named(
-        "second-table",
-        "second table",
-        vec![("second", 2, 2.0)],
-    ));
-    state
-        .analysis_plots
-        .push(test_analysis_plot("first-plot", "first plot", 2));
-
-    normalize_analysis_selection(&mut state);
-    assert_eq!(state.selected_analysis_table_index, Some(1));
-    assert_eq!(state.selected_analysis_plot_index, Some(0));
-
-    state.selected_analysis_table_index = Some(99);
-    state.selected_analysis_plot_index = Some(99);
-    normalize_analysis_selection(&mut state);
-    assert_eq!(state.selected_analysis_table_index, Some(1));
-    assert_eq!(state.selected_analysis_plot_index, Some(0));
-
-    state.analysis_tables.clear();
-    state.analysis_plots.clear();
-    normalize_analysis_selection(&mut state);
-    assert_eq!(state.selected_analysis_table_index, None);
-    assert_eq!(state.selected_analysis_plot_index, None);
-}
-
-#[test]
-fn analysis_plot_point_selection_is_cleared_when_out_of_scope() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(root).unwrap();
-    state
-        .analysis_plots
-        .push(test_analysis_plot("first-plot", "first plot", 2));
-    state
-        .analysis_plots
-        .push(test_analysis_plot("second-plot", "second plot", 1));
-    state.selected_analysis_plot_index = Some(0);
-    state.selected_analysis_plot_point = Some(AnalysisPlotPointSelection {
-        plot_index: 0,
-        series_index: 0,
-        point_index: 1,
-    });
-
-    normalize_analysis_selection(&mut state);
-    assert_eq!(
-        state.selected_analysis_plot_point,
-        Some(AnalysisPlotPointSelection {
-            plot_index: 0,
-            series_index: 0,
-            point_index: 1,
-        })
-    );
-
-    state.selected_analysis_plot_index = Some(1);
-    normalize_analysis_selection(&mut state);
-    assert_eq!(state.selected_analysis_plot_point, None);
-
-    state.selected_analysis_plot_point = Some(AnalysisPlotPointSelection {
-        plot_index: 1,
-        series_index: 0,
-        point_index: 10,
-    });
-    normalize_analysis_selection(&mut state);
-    assert_eq!(state.selected_analysis_plot_point, None);
 }
 
 #[test]
 fn export_uses_selected_analysis_table_not_latest_table() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(root).unwrap();
-    state.analysis_tables.push(test_analysis_table_named(
-        "alpha-table",
-        "alpha table",
-        vec![("alpha-row", 1, 1.0)],
-    ));
-    state.analysis_tables.push(test_analysis_table_named(
-        "beta-table",
-        "beta table",
-        vec![("beta-row", 2, 2.0)],
-    ));
+    let mut opened = open_dataset_and_render_first_frame(root).unwrap();
+    let mut application = test_application_for_opened_source(&opened);
+    opened
+        .analysis_runtime
+        .analysis_tables
+        .push(test_analysis_table_named(
+            "alpha-table",
+            "alpha table",
+            vec![("alpha-row", 1, 1.0)],
+        ));
+    opened
+        .analysis_runtime
+        .analysis_tables
+        .push(test_analysis_table_named(
+            "beta-table",
+            "beta table",
+            vec![("beta-row", 2, 2.0)],
+        ));
 
-    state.selected_analysis_table_index = Some(0);
-    export_selected_analysis_table(&mut state).unwrap();
-    let alpha_csv = state.last_analysis_export_csv.as_ref().unwrap();
+    let token = begin_test_analysis_operation(&mut application);
+    complete_test_analysis_operation(&mut application, &opened.analysis_runtime, token, 0, 0);
+    let descriptors = application
+        .snapshot()
+        .transient()
+        .analysis_tables()
+        .to_vec();
+
+    application
+        .dispatch(ApplicationCommand::SelectAnalysisTable(Some(
+            descriptors[0].id(),
+        )))
+        .unwrap();
+    let snapshot = application.snapshot();
+    export_selected_analysis_table(
+        &mut opened.analysis_runtime,
+        AnalysisTableExportInput {
+            table_descriptors: snapshot.transient().analysis_tables(),
+            selected_table: snapshot.transient().selected_analysis_table(),
+        },
+    )
+    .unwrap();
+    let alpha_csv = opened
+        .analysis_runtime
+        .last_analysis_export_csv
+        .as_ref()
+        .unwrap();
     assert!(alpha_csv.contains("alpha-row"));
     assert!(!alpha_csv.contains("beta-row"));
 
-    state.selected_analysis_table_index = Some(1);
-    export_selected_analysis_table(&mut state).unwrap();
-    let beta_csv = state.last_analysis_export_csv.as_ref().unwrap();
+    application
+        .dispatch(ApplicationCommand::SelectAnalysisTable(Some(
+            descriptors[1].id(),
+        )))
+        .unwrap();
+    let snapshot = application.snapshot();
+    export_selected_analysis_table(
+        &mut opened.analysis_runtime,
+        AnalysisTableExportInput {
+            table_descriptors: snapshot.transient().analysis_tables(),
+            selected_table: snapshot.transient().selected_analysis_table(),
+        },
+    )
+    .unwrap();
+    let beta_csv = opened
+        .analysis_runtime
+        .last_analysis_export_csv
+        .as_ref()
+        .unwrap();
     assert!(beta_csv.contains("beta-row"));
     assert!(!beta_csv.contains("alpha-row"));
-}
-
-#[test]
-fn computed_analysis_outputs_select_new_table_and_plot() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::TimeMultiChannelU16_8Cube3T2C, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(root).unwrap();
-
-    compute_full_time_series_analysis(&mut state).unwrap();
-    assert_eq!(state.selected_analysis_table_index, Some(0));
-    assert_eq!(state.selected_analysis_plot_index, Some(0));
-
-    compute_active_roi_analysis(&mut state).unwrap();
-    assert_eq!(state.selected_analysis_table_index, Some(1));
-    assert_eq!(state.selected_analysis_plot_index, Some(0));
 }
 
 #[test]
 fn roi_analysis_records_exact_cpu_compute_path_without_gpu_renderer() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(root).unwrap();
+    let mut opened = open_dataset_and_render_first_frame(root).unwrap();
+    let mut application = test_application_for_opened_source(&opened);
     let roi = RoiArtifact::new(
         SceneArtifactId::new("roi", "roi-a").unwrap(),
         "roi-a",
@@ -170,14 +480,20 @@ fn roi_analysis_records_exact_cpu_compute_path_without_gpu_renderer() {
         SceneArtifactTime::Static,
     )
     .unwrap();
-    state
+    opened
+        .analysis_runtime
         .scene_artifacts
         .apply(SceneEditCommand::PutRoi { artifact: roi })
         .unwrap();
 
-    compute_active_roi_analysis(&mut state).unwrap();
+    compute_active_roi_analysis_for_test(
+        &mut application,
+        &opened.dataset_runtime,
+        &mut opened.analysis_runtime,
+    )
+    .unwrap();
 
-    let table = state.analysis_tables.last().unwrap();
+    let table = opened.analysis_runtime.analysis_tables.last().unwrap();
     assert_eq!(
         table.provenance.parameters.get("compute_path"),
         Some(&"cpu_exact_u16_region_streaming_reference".to_owned())
@@ -192,8 +508,13 @@ fn roi_analysis_records_exact_cpu_compute_path_without_gpu_renderer() {
 fn full_time_series_analysis_job_reports_progress_and_cancels() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_fixture(FixtureKind::TimeMultiChannelU16_8Cube3T2C, tempdir.path()).unwrap();
-    let state = open_dataset_and_render_first_frame(&root).unwrap();
-    let context = AnalysisJobContext::from_state(&state, None);
+    let opened = open_dataset_and_render_first_frame(&root).unwrap();
+    let application = test_application_for_opened_source(&opened);
+    let context = analysis_job_context_for_test(
+        &application,
+        &opened.dataset_runtime,
+        &opened.analysis_runtime,
+    );
     let cancellation = CancellationToken::new();
     let mut progress_events = Vec::new();
 
@@ -491,7 +812,8 @@ fn analysis_plot_view_normalization_clears_invalid_or_foreign_ranges() {
 fn app_roi_analysis_uses_roi_artifacts_and_data_engine_volume_reads() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(&root).unwrap();
+    let mut opened = open_dataset_and_render_first_frame(&root).unwrap();
+    let mut application = test_application_for_opened_source(&opened);
     let roi = RoiArtifact::new(
         SceneArtifactId::new("roi", "roi-a").unwrap(),
         "roi-a",
@@ -499,19 +821,25 @@ fn app_roi_analysis_uses_roi_artifacts_and_data_engine_volume_reads() {
             min: DVec3::new(0.0, 0.0, 0.0),
             max: DVec3::new(0.4, 0.4, 0.4),
         },
-        SceneArtifactTime::Timepoint(TimeIndex(0)),
+        SceneArtifactTime::Timepoint(TimeIndex::new(0)),
     )
     .unwrap();
-    state
+    opened
+        .analysis_runtime
         .scene_artifacts
         .apply(SceneEditCommand::PutRoi { artifact: roi })
         .unwrap();
-    let before_stats = state.dataset.stats().unwrap();
+    let before_stats = opened.dataset_runtime.dataset.stats().unwrap();
 
-    compute_active_roi_analysis(&mut state).unwrap();
+    compute_active_roi_analysis_for_test(
+        &mut application,
+        &opened.dataset_runtime,
+        &mut opened.analysis_runtime,
+    )
+    .unwrap();
 
-    let after_stats = state.dataset.stats().unwrap();
-    let table = state.analysis_tables.last().unwrap();
+    let after_stats = opened.dataset_runtime.dataset.stats().unwrap();
+    let table = opened.analysis_runtime.analysis_tables.last().unwrap();
     let row = &table.rows[0];
     assert!(after_stats.subset_reads > before_stats.subset_reads);
     assert_eq!(after_stats.decoded_values - before_stats.decoded_values, 8);
@@ -534,37 +862,24 @@ fn app_roi_analysis_uses_roi_artifacts_and_data_engine_volume_reads() {
 }
 
 #[test]
-fn project_package_roundtrip_does_not_persist_viewer_tool_state() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(&root).unwrap();
-    state.viewer_tools.set_active_tool(ViewerTool::RoiBox);
-    state.viewer_tools.crosshair = Some(world_tool_hit(DVec3::ZERO, 1.0, 1.0));
-    state.viewer_tools.selection = Some(ToolSelection::SceneObject {
-        kind: PickHitKind::Roi,
-        object_id: "roi-a".to_owned(),
-    });
-    let session_path = tempdir.path().join("tool-state-session.m4dproj");
-
-    let session = session_from_state(&state);
-    write_session_file(&session_path, &session).unwrap();
-    let restored =
-        open_state_from_session(&read_session_file(&session_path).unwrap(), None).unwrap();
-
-    assert_eq!(restored.viewer_tools.active_tool, ViewerTool::Navigate);
-    assert!(restored.viewer_tools.crosshair.is_none());
-    assert!(restored.viewer_tools.selection.is_none());
-}
-
-#[test]
 fn app_extracts_time_aware_scene_layers_from_persistent_artifacts() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_fixture(FixtureKind::TimeMultiChannelU16_8Cube3T2C, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(&root).unwrap();
-    state.scene_artifacts = sample_scene_artifacts();
-    state.active_timepoint = TimeIndex(2);
+    let mut opened = open_dataset_and_render_first_frame(&root).unwrap();
+    let mut application = test_application_for_opened_source(&opened);
+    let ui_runtime = analysis_scene_ui_runtime();
+    opened.analysis_runtime.scene_artifacts = analysis_test_scene_artifacts();
+    application
+        .dispatch(ApplicationCommand::SetTimepoint(TimeIndex::new(2)))
+        .unwrap();
 
-    let draw_list = scene_draw_list_for_state(&state).unwrap();
+    let draw_list = scene_draw_list_for_test(
+        &application,
+        &opened.dataset_runtime,
+        &opened.analysis_runtime,
+        &ui_runtime,
+    )
+    .unwrap();
 
     assert_eq!(draw_list.len(), 4);
     assert!(draw_list.items().iter().any(|item| {
@@ -588,13 +903,28 @@ fn app_extracts_time_aware_scene_layers_from_persistent_artifacts() {
 fn app_extracts_selected_scene_artifact_viewport_handles() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(&root).unwrap();
-    state.scene_artifacts = sample_scene_artifacts();
+    let mut opened = open_dataset_and_render_first_frame(&root).unwrap();
+    let application = test_application_for_opened_source(&opened);
+    let mut ui_runtime = analysis_scene_ui_runtime();
+    opened.analysis_runtime.scene_artifacts = analysis_test_scene_artifacts();
     let roi_id = SceneArtifactId::new("roi", "roi-a").unwrap();
-    select_scene_artifact(&mut state, EditableSceneArtifactKind::Roi, &roi_id);
+    select_scene_artifact(&mut ui_runtime, EditableSceneArtifactKind::Roi, &roi_id);
 
-    let draw_list = scene_draw_list_for_state(&state).unwrap();
-    let handles = selected_scene_handle_pick_targets(&state).unwrap();
+    let draw_list = scene_draw_list_for_test(
+        &application,
+        &opened.dataset_runtime,
+        &opened.analysis_runtime,
+        &ui_runtime,
+    )
+    .unwrap();
+    let handles = selected_scene_handle_targets_for_test(
+        &application,
+        &opened.dataset_runtime,
+        &opened.analysis_runtime,
+        &ui_runtime,
+        &opened.render_runtime,
+    )
+    .unwrap();
 
     assert_eq!(handles.len(), 2);
     assert_eq!(
@@ -607,14 +937,14 @@ fn app_extracts_selected_scene_artifact_viewport_handles() {
     );
     assert!(handles.iter().any(|target| {
         target.hit.value
-            == Some(scene_handle_pick_value(
+            == Some(analysis_test_scene_handle_pick_value(
                 EditableSceneArtifactKind::Roi,
                 SceneEditHandle::WorldBoxMin,
             ))
     }));
     assert!(handles.iter().any(|target| {
         target.hit.value
-            == Some(scene_handle_pick_value(
+            == Some(analysis_test_scene_handle_pick_value(
                 EditableSceneArtifactKind::Roi,
                 SceneEditHandle::WorldBoxMax,
             ))
@@ -625,29 +955,42 @@ fn app_extracts_selected_scene_artifact_viewport_handles() {
 fn app_picks_selected_scene_artifact_viewport_handle_before_volume() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(&root).unwrap();
-    state.scene_artifacts = sample_scene_artifacts();
+    let mut opened = open_dataset_and_render_first_frame(&root).unwrap();
+    let application = test_application_for_opened_source(&opened);
+    let mut ui_runtime = analysis_scene_ui_runtime();
+    opened.analysis_runtime.scene_artifacts = analysis_test_scene_artifacts();
     let measurement_id = SceneArtifactId::new("measurement", "distance-a").unwrap();
     select_scene_artifact(
-        &mut state,
+        &mut ui_runtime,
         EditableSceneArtifactKind::Measurement,
         &measurement_id,
     );
-    let target = selected_scene_handle_pick_targets(&state)
-        .unwrap()
-        .into_iter()
-        .find(|target| {
-            target.hit.value
-                == Some(scene_handle_pick_value(
-                    EditableSceneArtifactKind::Measurement,
-                    SceneEditHandle::MeasurementStart,
-                ))
-        })
-        .unwrap();
+    let target = selected_scene_handle_targets_for_test(
+        &application,
+        &opened.dataset_runtime,
+        &opened.analysis_runtime,
+        &ui_runtime,
+        &opened.render_runtime,
+    )
+    .unwrap()
+    .into_iter()
+    .find(|target| {
+        target.hit.value
+            == Some(analysis_test_scene_handle_pick_value(
+                EditableSceneArtifactKind::Measurement,
+                SceneEditHandle::MeasurementStart,
+            ))
+    })
+    .unwrap();
     let screen = target.hit.screen_position.unwrap();
 
+    let snapshot = application.snapshot();
     let hit = pick_hit_from_viewport_hover(
-        &state,
+        &snapshot,
+        &opened.dataset_runtime,
+        &opened.analysis_runtime,
+        &ui_runtime,
+        &opened.render_runtime,
         ViewportHover {
             x: screen.x.round() as u64,
             y: screen.y.round() as u64,
@@ -659,7 +1002,7 @@ fn app_picks_selected_scene_artifact_viewport_handle_before_volume() {
     assert_eq!(hit.kind, PickHitKind::AnnotationHandle);
     assert_eq!(
         hit.value,
-        Some(scene_handle_pick_value(
+        Some(analysis_test_scene_handle_pick_value(
             EditableSceneArtifactKind::Measurement,
             SceneEditHandle::MeasurementStart,
         ))
@@ -674,40 +1017,58 @@ fn app_picks_selected_scene_artifact_viewport_handle_before_volume() {
 fn app_viewport_handle_commit_updates_scene_artifact_through_command_store() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(&root).unwrap();
-    state.scene_artifacts = sample_scene_artifacts();
+    let mut opened = open_dataset_and_render_first_frame(&root).unwrap();
+    let application = test_application_for_opened_source(&opened);
+    let mut ui_runtime = analysis_scene_ui_runtime();
+    opened.analysis_runtime.scene_artifacts = analysis_test_scene_artifacts();
     let measurement_id = SceneArtifactId::new("measurement", "distance-a").unwrap();
     select_scene_artifact(
-        &mut state,
+        &mut ui_runtime,
         EditableSceneArtifactKind::Measurement,
         &measurement_id,
     );
-    let handle = selected_scene_handle_pick_targets(&state)
-        .unwrap()
-        .into_iter()
-        .find(|target| {
-            target.hit.value
-                == Some(scene_handle_pick_value(
-                    EditableSceneArtifactKind::Measurement,
-                    SceneEditHandle::MeasurementEnd,
-                ))
-        })
-        .unwrap()
-        .hit;
+    let handle = selected_scene_handle_targets_for_test(
+        &application,
+        &opened.dataset_runtime,
+        &opened.analysis_runtime,
+        &ui_runtime,
+        &opened.render_runtime,
+    )
+    .unwrap()
+    .into_iter()
+    .find(|target| {
+        target.hit.value
+            == Some(analysis_test_scene_handle_pick_value(
+                EditableSceneArtifactKind::Measurement,
+                SceneEditHandle::MeasurementEnd,
+            ))
+    })
+    .unwrap()
+    .hit;
     let current = world_tool_hit(DVec3::new(0.0, 0.0, 12.0), 10.0, 10.0);
 
     let outcome = apply_viewer_tool_commands(
-        &mut state,
+        &application.snapshot(),
+        &mut opened.analysis_runtime,
+        &mut ui_runtime,
         vec![ViewerToolCommand::CommitSceneHandleDrag { handle, current }],
     )
     .unwrap();
 
     assert!(outcome.rerender_requested);
-    let measurement = state.scene_artifacts.measurement(&measurement_id).unwrap();
+    let measurement = opened
+        .analysis_runtime
+        .scene_artifacts
+        .measurement(&measurement_id)
+        .unwrap();
     assert_eq!(measurement.result.as_ref().unwrap().value, 12.0);
-    assert!(state.scene_artifacts.can_undo());
-    state.scene_artifacts.undo().unwrap();
-    let restored = state.scene_artifacts.measurement(&measurement_id).unwrap();
+    assert!(opened.analysis_runtime.scene_artifacts.can_undo());
+    opened.analysis_runtime.scene_artifacts.undo().unwrap();
+    let restored = opened
+        .analysis_runtime
+        .scene_artifacts
+        .measurement(&measurement_id)
+        .unwrap();
     assert_eq!(restored.result.as_ref().unwrap().value, 5.0);
 }
 
@@ -870,71 +1231,101 @@ fn world_geometry_viewport_handle_updates_cover_all_geometry_variants() {
 fn app_viewport_handle_commit_updates_track_point_artifact() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(&root).unwrap();
-    state.scene_artifacts = sample_scene_artifacts();
+    let mut opened = open_dataset_and_render_first_frame(&root).unwrap();
+    let application = test_application_for_opened_source(&opened);
+    let mut ui_runtime = analysis_scene_ui_runtime();
+    opened.analysis_runtime.scene_artifacts = analysis_test_scene_artifacts();
     let track_id = SceneArtifactId::new("track", "track-a").unwrap();
-    select_scene_artifact(&mut state, EditableSceneArtifactKind::Track, &track_id);
-    let handle = selected_scene_handle_pick_targets(&state)
-        .unwrap()
-        .into_iter()
-        .find(|target| {
-            target.hit.value
-                == Some(scene_handle_pick_value(
-                    EditableSceneArtifactKind::Track,
-                    SceneEditHandle::TrackPoint { index: 1 },
-                ))
-        })
-        .unwrap()
-        .hit;
+    select_scene_artifact(&mut ui_runtime, EditableSceneArtifactKind::Track, &track_id);
+    let handle = selected_scene_handle_targets_for_test(
+        &application,
+        &opened.dataset_runtime,
+        &opened.analysis_runtime,
+        &ui_runtime,
+        &opened.render_runtime,
+    )
+    .unwrap()
+    .into_iter()
+    .find(|target| {
+        target.hit.value
+            == Some(analysis_test_scene_handle_pick_value(
+                EditableSceneArtifactKind::Track,
+                SceneEditHandle::TrackPoint { index: 1 },
+            ))
+    })
+    .unwrap()
+    .hit;
     let current = world_tool_hit(DVec3::new(5.0, 6.0, 7.0), 10.0, 10.0);
 
     let outcome = apply_viewer_tool_commands(
-        &mut state,
+        &application.snapshot(),
+        &mut opened.analysis_runtime,
+        &mut ui_runtime,
         vec![ViewerToolCommand::CommitSceneHandleDrag { handle, current }],
     )
     .unwrap();
 
     assert!(outcome.rerender_requested);
     assert_eq!(
-        state.scene_artifacts.track(&track_id).unwrap().points[1].position_world,
+        opened
+            .analysis_runtime
+            .scene_artifacts
+            .track(&track_id)
+            .unwrap()
+            .points[1]
+            .position_world,
         DVec3::new(5.0, 6.0, 7.0)
     );
-    assert!(state.scene_artifacts.can_undo());
+    assert!(opened.analysis_runtime.scene_artifacts.can_undo());
 }
 
 #[test]
 fn app_viewport_handle_commit_updates_annotation_geometry_artifact() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(&root).unwrap();
-    state.scene_artifacts = sample_scene_artifacts();
+    let mut opened = open_dataset_and_render_first_frame(&root).unwrap();
+    let application = test_application_for_opened_source(&opened);
+    let mut ui_runtime = analysis_scene_ui_runtime();
+    opened.analysis_runtime.scene_artifacts = analysis_test_scene_artifacts();
     let annotation_id = SceneArtifactId::new("annotation", "note-a").unwrap();
     select_scene_artifact(
-        &mut state,
+        &mut ui_runtime,
         EditableSceneArtifactKind::Annotation,
         &annotation_id,
     );
-    let handle = selected_scene_handle_pick_targets(&state)
-        .unwrap()
-        .into_iter()
-        .find(|target| {
-            target.hit.value
-                == Some(scene_handle_pick_value(
-                    EditableSceneArtifactKind::Annotation,
-                    SceneEditHandle::WorldPointPosition,
-                ))
-        })
-        .unwrap()
-        .hit;
+    let handle = selected_scene_handle_targets_for_test(
+        &application,
+        &opened.dataset_runtime,
+        &opened.analysis_runtime,
+        &ui_runtime,
+        &opened.render_runtime,
+    )
+    .unwrap()
+    .into_iter()
+    .find(|target| {
+        target.hit.value
+            == Some(analysis_test_scene_handle_pick_value(
+                EditableSceneArtifactKind::Annotation,
+                SceneEditHandle::WorldPointPosition,
+            ))
+    })
+    .unwrap()
+    .hit;
     let current = world_tool_hit(DVec3::new(3.0, 4.0, 5.0), 10.0, 10.0);
 
     apply_viewer_tool_commands(
-        &mut state,
+        &application.snapshot(),
+        &mut opened.analysis_runtime,
+        &mut ui_runtime,
         vec![ViewerToolCommand::CommitSceneHandleDrag { handle, current }],
     )
     .unwrap();
 
-    let annotation = state.scene_artifacts.annotation(&annotation_id).unwrap();
+    let annotation = opened
+        .analysis_runtime
+        .scene_artifacts
+        .annotation(&annotation_id)
+        .unwrap();
     assert_eq!(
         annotation.geometry,
         AnalysisWorldGeometry::Point {

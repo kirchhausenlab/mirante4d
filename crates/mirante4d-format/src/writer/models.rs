@@ -1,6 +1,7 @@
-use mirante4d_core::{GridToWorld, IntensityDType, LayerDisplay, Shape4D, WorldSpace};
+use mirante4d_domain::{GridToWorld, IntensityDType, Shape4D};
 
 use crate::manifest::{ChannelMetadata, NoDataPolicy, ScaleReduction};
+use crate::{LayerDisplay, WorldSpace};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExistingPackagePolicy {

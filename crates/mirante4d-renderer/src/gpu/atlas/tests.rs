@@ -1,8 +1,8 @@
-use mirante4d_core::{DatasetId, GridToWorld, LayerId, Shape3D, TimeIndex};
 use mirante4d_data::{
     DenseVolumeF32, DenseVolumeU16, SpatialBrickIndex, VolumeBrickF32, VolumeBrickU16, VolumeRegion,
 };
-use mirante4d_format::BrickIndex;
+use mirante4d_domain::{GridToWorld, Shape3D, TimeIndex};
+use mirante4d_format::{BrickIndex, DatasetId, LayerId};
 
 use super::*;
 
@@ -95,7 +95,7 @@ fn compact_f32_atlas_counts_actual_region_voxels_and_page_metadata() {
     let layer_id = LayerId::new("ch0").unwrap();
     let resident = ResidentBrickSetF32::new(
         layer_id.clone(),
-        TimeIndex(0),
+        TimeIndex::new(0),
         Shape3D::new(3, 5, 5).unwrap(),
         GridToWorld::identity(),
         vec![
@@ -342,9 +342,9 @@ fn test_u16_brick(shape: Shape3D) -> VolumeBrickU16 {
         z_start: 0,
         y_start: 0,
         x_start: 0,
-        z_size: shape.z,
-        y_size: shape.y,
-        x_size: shape.x,
+        z_size: shape.z(),
+        y_size: shape.y(),
+        x_size: shape.x(),
     };
     test_u16_brick_region(SpatialBrickIndex::new(0, 0, 0), region, 0)
 }
@@ -364,7 +364,7 @@ fn test_u16_brick_region(
         dataset_id,
         layer_id,
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         GridToWorld::identity(),
         values,
@@ -389,7 +389,7 @@ fn test_u16_brick_region(
 }
 
 fn local_index(shape: Shape3D, z: u64, y: u64, x: u64) -> usize {
-    ((z * shape.y + y) * shape.x + x) as usize
+    ((z * shape.y() + y) * shape.x() + x) as usize
 }
 
 fn packed_u16_value(packed: &PackedIntegerBrick, index: usize) -> u16 {
@@ -416,7 +416,7 @@ fn f32_brick(
         DatasetId::new("compact-f32-atlas-test").unwrap(),
         layer_id,
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         GridToWorld::identity(),
         values,

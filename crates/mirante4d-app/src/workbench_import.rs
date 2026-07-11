@@ -2,9 +2,10 @@ use super::*;
 
 impl MiranteWorkbenchApp {
     pub(super) fn import_tiff_directory_from_dialog(&mut self, ctx: &egui::Context) {
-        if self.import_task.is_some() || self.tiff_import_setup_task.is_some() {
-            self.state.last_workflow_message =
-                Some("TIFF import workflow already running".to_owned());
+        if self.import_runtime.import_task.is_some()
+            || self.import_runtime.tiff_import_setup_task.is_some()
+        {
+            tracing::info!("TIFF import workflow is already running");
             return;
         }
         let Some(input_dir) = rfd::FileDialog::new()
@@ -27,9 +28,10 @@ impl MiranteWorkbenchApp {
     }
 
     pub(super) fn import_tiff_file_from_dialog(&mut self, ctx: &egui::Context) {
-        if self.import_task.is_some() || self.tiff_import_setup_task.is_some() {
-            self.state.last_workflow_message =
-                Some("TIFF import workflow already running".to_owned());
+        if self.import_runtime.import_task.is_some()
+            || self.import_runtime.tiff_import_setup_task.is_some()
+        {
+            tracing::info!("TIFF import workflow is already running");
             return;
         }
         let Some(input_file) = rfd::FileDialog::new()
@@ -85,54 +87,48 @@ impl MiranteWorkbenchApp {
         output_parent: PathBuf,
         receiver: Receiver<TiffImportSetupTaskMessage>,
     ) {
-        self.pending_tiff_import = None;
-        self.tiff_import_setup_error = None;
-        self.tiff_import_setup_task = Some(TiffImportSetupTask {
+        self.import_runtime.pending_tiff_import = None;
+        self.import_runtime.tiff_import_setup_error = None;
+        self.import_runtime.tiff_import_setup_task = Some(TiffImportSetupTask {
             source,
             output_parent,
             receiver,
         });
-        self.state.last_render_error = None;
-        self.state.last_workflow_message =
-            Some("Inspecting TIFF input before package creation".to_owned());
     }
 
     pub(super) fn drain_tiff_import_setup_results(&mut self, ctx: &egui::Context) {
-        let Some(message) =
-            self.tiff_import_setup_task
-                .as_ref()
-                .and_then(|task| match task.receiver.try_recv() {
-                    Ok(message) => Some(message),
-                    Err(mpsc::TryRecvError::Empty) => None,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        Some(TiffImportSetupTaskMessage::Finished(Err(
-                            "TIFF import setup worker stopped unexpectedly".to_owned(),
-                        )))
-                    }
-                })
+        let Some(message) = self
+            .import_runtime
+            .tiff_import_setup_task
+            .as_ref()
+            .and_then(|task| match task.receiver.try_recv() {
+                Ok(message) => Some(message),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(TiffImportSetupTaskMessage::Finished(Err(
+                        "TIFF import setup worker stopped unexpectedly".to_owned(),
+                    )))
+                }
+            })
         else {
             return;
         };
 
-        self.tiff_import_setup_task = None;
+        self.import_runtime.tiff_import_setup_task = None;
         match message {
             TiffImportSetupTaskMessage::Finished(Ok((options, inspection))) => {
                 let grouping_confirmed = matches!(options.source, TiffImportSource::SingleFile(_));
-                self.pending_tiff_import = Some(PendingTiffImport {
+                self.import_runtime.pending_tiff_import = Some(PendingTiffImport {
                     grouping_confirmed,
                     options,
                     inspection,
                     voxel_spacing_confirmed: false,
                 });
-                self.tiff_import_setup_error = None;
-                self.state.last_render_error = None;
-                self.state.last_workflow_message = Some("Review TIFF import settings".to_owned());
+                self.import_runtime.tiff_import_setup_error = None;
             }
             TiffImportSetupTaskMessage::Finished(Err(error)) => {
-                self.pending_tiff_import = None;
-                self.tiff_import_setup_error = Some(error.clone());
-                self.state.last_render_error = Some(error.clone());
-                self.state.last_workflow_message = Some("TIFF import setup failed".to_owned());
+                self.import_runtime.pending_tiff_import = None;
+                self.import_runtime.tiff_import_setup_error = Some(error.clone());
                 tracing::error!(error = %error, "failed to configure TIFF import");
             }
         }
@@ -140,38 +136,36 @@ impl MiranteWorkbenchApp {
     }
 
     pub(super) fn start_pending_tiff_import(&mut self) {
-        let Some(pending) = self.pending_tiff_import.take() else {
+        let Some(pending) = self.import_runtime.pending_tiff_import.take() else {
             return;
         };
         match validate_pending_tiff_import(&pending) {
             Ok(()) => {
-                self.tiff_import_setup_error = None;
+                self.import_runtime.tiff_import_setup_error = None;
                 let reviewed_plan = accepted_reviewed_plan_for_pending_tiff_import(&pending);
                 let mut options = pending.options;
                 options.reviewed_plan = reviewed_plan;
                 self.start_import_task(options);
             }
             Err(err) => {
-                self.pending_tiff_import = Some(pending);
+                self.import_runtime.pending_tiff_import = Some(pending);
                 let error = err.to_string();
-                self.tiff_import_setup_error = Some(error.clone());
-                self.state.last_render_error = Some(error);
+                self.import_runtime.tiff_import_setup_error = Some(error);
             }
         }
     }
 
     pub(super) fn cancel_pending_tiff_import(&mut self) {
-        if self.tiff_import_setup_task.take().is_some() {
-            self.state.last_workflow_message = Some("Cancelled TIFF import setup".to_owned());
-        }
-        if self.pending_tiff_import.take().is_some() {
-            self.state.last_workflow_message = Some("Cancelled TIFF import setup".to_owned());
-        }
+        self.import_runtime.tiff_import_setup_task = None;
+        self.import_runtime.pending_tiff_import = None;
     }
 
     pub(super) fn start_import_task(&mut self, options: TiffSourceImportOptions) {
         let source_path = options.source.path().to_path_buf();
         let output_package = options.output_package.clone();
+        let Some(token) = self.begin_background_operation(OperationKind::Import) else {
+            return;
+        };
         let cancellation = ImportCancellationToken::new();
         let worker_cancellation = cancellation.clone();
         let (sender, receiver) = mpsc::channel();
@@ -185,34 +179,34 @@ impl MiranteWorkbenchApp {
             });
             let _ = sender.send(ImportTaskMessage::Finished(result));
         });
-        self.import_task = Some(ImportTask {
+        self.import_runtime.import_task = Some(ImportTask {
+            token,
             cancellation,
             receiver,
             latest_event: None,
         });
-        self.state.last_render_error = None;
-        self.state.last_workflow_message = Some(format!(
-            "Importing {} to {}",
-            source_path.display(),
-            output_package.display()
-        ));
+        tracing::info!(
+            source = %source_path.display(),
+            output = %output_package.display(),
+            "started TIFF import"
+        );
     }
 
     pub(super) fn cancel_import_task(&mut self) {
-        if let Some(task) = &self.import_task {
+        if let Some(task) = self.import_runtime.import_task.as_ref() {
+            let token = task.token.clone();
             task.cancellation.cancel();
-            self.state.last_workflow_message = Some("Cancelling import".to_owned());
+            self.cancel_background_operation(&token);
         }
     }
 
     pub(super) fn drain_import_results(&mut self, ctx: &egui::Context) {
         let mut completion = None;
         let mut saw_progress = false;
-        if let Some(task) = self.import_task.as_mut() {
+        if let Some(task) = self.import_runtime.import_task.as_mut() {
             while let Ok(message) = task.receiver.try_recv() {
                 match message {
                     ImportTaskMessage::Progress(event) => {
-                        self.state.last_workflow_message = Some(import_progress_message(&event));
                         task.latest_event = Some(event);
                         saw_progress = true;
                     }
@@ -224,15 +218,26 @@ impl MiranteWorkbenchApp {
         }
 
         if let Some(result) = completion {
-            self.import_task = None;
+            let task = self
+                .import_runtime
+                .import_task
+                .take()
+                .expect("an import completion has an active task");
+            let token = task.token.clone();
             match result {
-                Ok(report) => self.finish_successful_import(report, ctx),
+                Ok(report) => {
+                    if self.complete_background_operation(token, OperationCompletion::Succeeded) {
+                        self.finish_successful_import(report, ctx);
+                    }
+                }
                 Err(ImportError::Cancelled) => {
-                    self.state.last_workflow_message = Some("Import cancelled".to_owned());
-                    self.state.last_render_error = None;
+                    self.complete_background_operation(token, OperationCompletion::Cancelled);
                 }
                 Err(err) => {
-                    self.state.last_render_error = Some(err.to_string());
+                    self.complete_background_operation(
+                        token,
+                        OperationCompletion::Failed(import_failure_code(&err)),
+                    );
                     tracing::error!(error = %err, "failed to import TIFF directory");
                 }
             }
@@ -251,17 +256,16 @@ impl MiranteWorkbenchApp {
     ) {
         let output = report.output_package.clone();
         if let Err(err) = self.replace_state_from_dataset_path(output.clone(), Some(ctx)) {
-            self.state.last_render_error = Some(err.to_string());
             tracing::error!(error = %err, "failed to open imported dataset");
             return;
         }
-        self.state.last_workflow_message = Some(format!(
-            "Imported {} channel(s), {} timepoint(s), {} z-plane(s) to {}",
-            report.channel_count,
-            report.timepoint_count,
-            report.z_planes,
-            output.display()
-        ));
+        tracing::info!(
+            channels = report.channel_count,
+            timepoints = report.timepoint_count,
+            z_planes = report.z_planes,
+            output = %output.display(),
+            "TIFF import completed"
+        );
     }
 
     pub(super) fn show_tiff_import_setup_window(
@@ -271,9 +275,9 @@ impl MiranteWorkbenchApp {
         cancel_pending_tiff_import: &mut bool,
         dismiss_setup_error: &mut bool,
     ) {
-        if self.tiff_import_setup_task.is_none()
-            && self.pending_tiff_import.is_none()
-            && self.tiff_import_setup_error.is_none()
+        if self.import_runtime.tiff_import_setup_task.is_none()
+            && self.import_runtime.pending_tiff_import.is_none()
+            && self.import_runtime.tiff_import_setup_error.is_none()
         {
             return;
         }
@@ -284,7 +288,7 @@ impl MiranteWorkbenchApp {
             .default_width(560.0)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
-                if let Some(task) = &self.tiff_import_setup_task {
+                if let Some(task) = &self.import_runtime.tiff_import_setup_task {
                     ui.horizontal(|ui| {
                         ui.add(egui::Spinner::new());
                     ui_kit::status_badge(ui, StatusTone::Warning, "inspecting input");
@@ -299,7 +303,7 @@ impl MiranteWorkbenchApp {
                     return;
                 }
 
-                if let Some(error) = self.tiff_import_setup_error.as_deref() {
+                if let Some(error) = self.import_runtime.tiff_import_setup_error.as_deref() {
                     ui_kit::status_badge(ui, StatusTone::Error, "setup failed");
                     ui.add_space(6.0);
                     ui.label(error);
@@ -314,7 +318,7 @@ impl MiranteWorkbenchApp {
                     return;
                 }
 
-                if let Some(pending_import) = &mut self.pending_tiff_import {
+                if let Some(pending_import) = &mut self.import_runtime.pending_tiff_import {
                     ui_kit::status_badge(ui, StatusTone::Warning, "review settings");
                     ui.add_space(6.0);
                     ui_kit::property_row(
@@ -431,5 +435,35 @@ impl MiranteWorkbenchApp {
                     });
                 }
             });
+    }
+}
+
+fn import_failure_code(error: &ImportError) -> OperationFailureCode {
+    match error {
+        ImportError::StorageEstimateOverflow => OperationFailureCode::ImportCapacityExceeded,
+        ImportError::MissingInputDirectory(_)
+        | ImportError::MissingInputFile(_)
+        | ImportError::EmptyInputDirectory(_)
+        | ImportError::UnsupportedTiffPath(_)
+        | ImportError::AmbiguousTiffSourceLayout { .. }
+        | ImportError::InvalidPlaneSeriesLayout { .. }
+        | ImportError::PlaneSeriesFileHasMultipleImages { .. }
+        | ImportError::EmptyFileGrouping
+        | ImportError::DuplicateFileGroupingPath(_)
+        | ImportError::GroupedFileOutsideInputDirectory { .. }
+        | ImportError::UnsupportedPixelType { .. }
+        | ImportError::SourceDTypeMismatch { .. }
+        | ImportError::UnreviewedImportPlan
+        | ImportError::UnsupportedReviewedSourceFormat(_)
+        | ImportError::ReviewedSourceProfileMismatch { .. }
+        | ImportError::InvalidReviewedNativeAxes
+        | ImportError::InvalidReviewedChannelPolicy
+        | ImportError::ReviewedValueRangeMismatch { .. }
+        | ImportError::MissingChannel(_)
+        | ImportError::MissingStackIndex(_)
+        | ImportError::TimepointCountMismatch { .. }
+        | ImportError::StackShapeMismatch { .. } => OperationFailureCode::ImportInvalidInput,
+        ImportError::Cancelled => unreachable!("cancellation is handled separately"),
+        _ => OperationFailureCode::ImportExecutionFailed,
     }
 }

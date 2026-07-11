@@ -9,7 +9,10 @@ pub fn estimate_tiff_import_storage(
         inspection.shape.y,
         inspection.shape.x,
     )?;
-    let scale_specs = build_mean_multiscale_specs(shape4d, GridToWorld::scale_um(1.0, 1.0, 1.0))?;
+    let scale_specs = build_mean_multiscale_specs(
+        shape4d,
+        mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
+    )?;
     let bytes_per_voxel = import_stored_bytes_per_voxel(inspection.source_dtype);
     let channel_count = u64::try_from(inspection.channel_count)
         .map_err(|_| ImportError::StorageEstimateOverflow)?;
@@ -156,7 +159,7 @@ where
         expected_shape.y,
         expected_shape.x,
     )?;
-    let grid_to_world = GridToWorld::scale_um(
+    let grid_to_world = mirante4d_format::grid_to_world_scale_um(
         voxel_spacing_um[0],
         voxel_spacing_um[1],
         voxel_spacing_um[2],

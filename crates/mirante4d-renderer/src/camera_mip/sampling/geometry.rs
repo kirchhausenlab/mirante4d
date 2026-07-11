@@ -290,9 +290,9 @@ pub(super) fn pick_along_grid_ray(
         return empty_pick(policy);
     };
     let entry = ray.origin + ray.direction * hit.enter;
-    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, volume.shape.x);
-    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, volume.shape.y);
-    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, volume.shape.z);
+    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, volume.shape.x());
+    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, volume.shape.y());
+    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, volume.shape.z());
 
     let mut selected: Option<PickSample> = None;
     loop {
@@ -371,9 +371,9 @@ pub(super) fn pick_along_grid_ray_u8(
         return empty_pick_u8(policy);
     };
     let entry = ray.origin + ray.direction * hit.enter;
-    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, volume.shape.x);
-    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, volume.shape.y);
-    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, volume.shape.z);
+    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, volume.shape.x());
+    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, volume.shape.y());
+    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, volume.shape.z());
 
     let mut selected: Option<PickSampleU8> = None;
     loop {
@@ -452,9 +452,9 @@ pub(super) fn pick_along_grid_ray_f32(
         return empty_pick_f32(policy);
     };
     let entry = ray.origin + ray.direction * hit.enter;
-    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, volume.shape.x);
-    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, volume.shape.y);
-    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, volume.shape.z);
+    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, volume.shape.x());
+    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, volume.shape.y());
+    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, volume.shape.z());
 
     let mut selected: Option<PickSampleF32> = None;
     loop {
@@ -525,7 +525,7 @@ pub(super) fn pick_from_sample(
         y: sample.y as f64,
         x: sample.x as f64,
     };
-    let world_position = volume.grid_to_world.transform_point(DVec3::new(
+    let world_position = volume.grid_to_world.transform_point_vec(DVec3::new(
         sample.x as f64 + 0.5,
         sample.y as f64 + 0.5,
         sample.z as f64 + 0.5,
@@ -549,7 +549,7 @@ pub(super) fn pick_from_sample_u8(
         y: sample.y as f64,
         x: sample.x as f64,
     };
-    let world_position = volume.grid_to_world.transform_point(DVec3::new(
+    let world_position = volume.grid_to_world.transform_point_vec(DVec3::new(
         sample.x as f64 + 0.5,
         sample.y as f64 + 0.5,
         sample.z as f64 + 0.5,
@@ -573,7 +573,7 @@ pub(super) fn pick_from_sample_f32(
         y: sample.y as f64,
         x: sample.x as f64,
     };
-    let world_position = volume.grid_to_world.transform_point(DVec3::new(
+    let world_position = volume.grid_to_world.transform_point_vec(DVec3::new(
         sample.x as f64 + 0.5,
         sample.y as f64 + 0.5,
         sample.z as f64 + 0.5,
@@ -618,9 +618,9 @@ pub(super) fn empty_pick_f32(policy: PickPolicy) -> CameraVolumePickF32 {
 }
 
 pub(super) fn sample_trilinear_u8(volume: &DenseVolumeU8, point: DVec3) -> Option<f64> {
-    let x = interpolation_axis(point.x, volume.shape.x)?;
-    let y = interpolation_axis(point.y, volume.shape.y)?;
-    let z = interpolation_axis(point.z, volume.shape.z)?;
+    let x = interpolation_axis(point.x, volume.shape.x())?;
+    let y = interpolation_axis(point.y, volume.shape.y())?;
+    let z = interpolation_axis(point.z, volume.shape.z())?;
     let c000 = f64::from(volume.render_voxel(z.lower, y.lower, x.lower)?);
     let c100 = f64::from(volume.render_voxel(z.lower, y.lower, x.upper)?);
     let c010 = f64::from(volume.render_voxel(z.lower, y.upper, x.lower)?);
@@ -635,9 +635,9 @@ pub(super) fn sample_trilinear_u8(volume: &DenseVolumeU8, point: DVec3) -> Optio
 }
 
 pub(super) fn sample_trilinear_u16(volume: &DenseVolumeU16, point: DVec3) -> Option<f64> {
-    let x = interpolation_axis(point.x, volume.shape.x)?;
-    let y = interpolation_axis(point.y, volume.shape.y)?;
-    let z = interpolation_axis(point.z, volume.shape.z)?;
+    let x = interpolation_axis(point.x, volume.shape.x())?;
+    let y = interpolation_axis(point.y, volume.shape.y())?;
+    let z = interpolation_axis(point.z, volume.shape.z())?;
     let c000 = f64::from(volume.render_voxel(z.lower, y.lower, x.lower)?);
     let c100 = f64::from(volume.render_voxel(z.lower, y.lower, x.upper)?);
     let c010 = f64::from(volume.render_voxel(z.lower, y.upper, x.lower)?);
@@ -652,9 +652,9 @@ pub(super) fn sample_trilinear_u16(volume: &DenseVolumeU16, point: DVec3) -> Opt
 }
 
 pub(super) fn sample_trilinear_f32(volume: &DenseVolumeF32, point: DVec3) -> Option<f32> {
-    let x = interpolation_axis(point.x, volume.shape.x)?;
-    let y = interpolation_axis(point.y, volume.shape.y)?;
-    let z = interpolation_axis(point.z, volume.shape.z)?;
+    let x = interpolation_axis(point.x, volume.shape.x())?;
+    let y = interpolation_axis(point.y, volume.shape.y())?;
+    let z = interpolation_axis(point.z, volume.shape.z())?;
     let c000 = f64::from(volume.render_voxel(z.lower, y.lower, x.lower)?);
     let c100 = f64::from(volume.render_voxel(z.lower, y.lower, x.upper)?);
     let c010 = f64::from(volume.render_voxel(z.lower, y.upper, x.lower)?);
@@ -994,7 +994,7 @@ pub(super) fn intersect_grid_box(ray: GridRay, shape: Shape3D) -> Option<RayBoxH
         ray.origin.x,
         ray.direction.x,
         -0.5,
-        shape.x as f64 - 0.5,
+        shape.x() as f64 - 0.5,
         &mut enter,
         &mut exit,
     )?;
@@ -1002,7 +1002,7 @@ pub(super) fn intersect_grid_box(ray: GridRay, shape: Shape3D) -> Option<RayBoxH
         ray.origin.y,
         ray.direction.y,
         -0.5,
-        shape.y as f64 - 0.5,
+        shape.y() as f64 - 0.5,
         &mut enter,
         &mut exit,
     )?;
@@ -1010,7 +1010,7 @@ pub(super) fn intersect_grid_box(ray: GridRay, shape: Shape3D) -> Option<RayBoxH
         ray.origin.z,
         ray.direction.z,
         -0.5,
-        shape.z as f64 - 0.5,
+        shape.z() as f64 - 0.5,
         &mut enter,
         &mut exit,
     )?;
@@ -1058,12 +1058,13 @@ mod tests {
 
     #[test]
     fn world_space_gradient_uses_inverse_transpose_transform() {
-        let grid_to_world = GridToWorld::from_dmat4(DMat4::from_cols_array(&[
+        let grid_to_world = mirante4d_format::grid_to_world_from_dmat4(DMat4::from_cols_array(&[
             2.0, 0.0, 0.0, 0.0, //
             0.25, 3.0, 0.0, 0.0, //
             0.0, 0.5, 4.0, 0.0, //
             7.0, 11.0, 13.0, 1.0,
-        ]));
+        ]))
+        .unwrap();
         let grid_gradient = DVec3::new(1.0, 2.0, 3.0);
 
         let actual = world_space_gradient(grid_gradient, grid_to_world).normalize();

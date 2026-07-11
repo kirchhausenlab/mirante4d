@@ -31,7 +31,7 @@ impl F32StreamingStatisticsAccumulator {
         shape: Shape4D,
         values: &[f32],
     ) -> Result<(), FormatError> {
-        let timepoint_voxels = Shape4D::new(1, shape.z, shape.y, shape.x)?.element_count()?;
+        let timepoint_voxels = Shape4D::new(1, shape.z(), shape.y(), shape.x())?.element_count()?;
         let timepoint_offset =
             timepoint
                 .checked_mul(timepoint_voxels)
@@ -66,11 +66,11 @@ impl F32StreamingStatisticsAccumulator {
         shape: Shape4D,
         values: &[f32],
     ) -> Result<(), FormatError> {
-        let timepoint_voxels = Shape4D::new(1, shape.z, shape.y, shape.x)?.element_count()?;
+        let timepoint_voxels = Shape4D::new(1, shape.z(), shape.y(), shape.x())?.element_count()?;
         let plane_voxels =
             shape
-                .y
-                .checked_mul(shape.x)
+                .y()
+                .checked_mul(shape.x())
                 .ok_or_else(|| FormatError::ZarrStorage {
                     layer_id: layer_id.to_owned(),
                     message: "float32 statistics plane voxel count overflow".to_owned(),
@@ -130,16 +130,16 @@ impl F32StreamingStatisticsAccumulator {
         let max = f64::from(self.max);
         let mut histogram_bins = vec![0u64; 4096];
         let chunk_grid = shape.chunk_grid(chunk_shape)?;
-        for t in 0..chunk_grid.t {
-            for z in 0..chunk_grid.z {
-                let z0 = z * chunk_shape.z;
-                let z1 = (z0 + chunk_shape.z).min(shape.z);
-                for y in 0..chunk_grid.y {
-                    let y0 = y * chunk_shape.y;
-                    let y1 = (y0 + chunk_shape.y).min(shape.y);
-                    for x in 0..chunk_grid.x {
-                        let x0 = x * chunk_shape.x;
-                        let x1 = (x0 + chunk_shape.x).min(shape.x);
+        for t in 0..chunk_grid.t() {
+            for z in 0..chunk_grid.z() {
+                let z0 = z * chunk_shape.z();
+                let z1 = (z0 + chunk_shape.z()).min(shape.z());
+                for y in 0..chunk_grid.y() {
+                    let y0 = y * chunk_shape.y();
+                    let y1 = (y0 + chunk_shape.y()).min(shape.y());
+                    for x in 0..chunk_grid.x() {
+                        let x0 = x * chunk_shape.x();
+                        let x1 = (x0 + chunk_shape.x()).min(shape.x());
                         let values: Vec<f32> = array
                             .retrieve_array_subset(&[t..t + 1, z0..z1, y0..y1, x0..x1])
                             .map_err(zarr_storage_error)?;
@@ -526,3 +526,4 @@ pub(super) fn percentile_from_f32_histogram(
     }
     max
 }
+use crate::CurrentShape4DExt;

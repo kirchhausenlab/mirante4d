@@ -6,8 +6,8 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use mirante4d_core::TimeIndex;
 use mirante4d_data::DatasetHandle;
+use mirante4d_domain::TimeIndex;
 use mirante4d_format::validate::load_manifest;
 use mirante4d_format::{ExistingPackagePolicy, NativeDatasetProvenanceKind};
 use mirante4d_import::{
@@ -70,7 +70,7 @@ pub(crate) fn phase17_audit() -> anyhow::Result<PathBuf> {
 
     let dataset = DatasetHandle::open(&import_report.output_package)?;
     let layer_id = dataset.first_layer_id()?;
-    let volume = dataset.read_u16_volume(&layer_id, TimeIndex(0))?;
+    let volume = dataset.read_u16_volume(&layer_id, TimeIndex::new(0))?;
     let manifest = load_manifest(&import_report.output_package)?;
     let provenance = &manifest.provenance;
     if provenance.kind != NativeDatasetProvenanceKind::Imported {
@@ -143,9 +143,9 @@ pub(crate) fn phase17_audit() -> anyhow::Result<PathBuf> {
             "strict_native_opened": true,
             "first_layer_id": layer_id.as_str(),
             "first_volume_shape": {
-                "z": volume.shape.z,
-                "y": volume.shape.y,
-                "x": volume.shape.x,
+                "z": volume.shape.z(),
+                "y": volume.shape.y(),
+                "x": volume.shape.x(),
             },
             "first_volume_probe_1_1_2": volume.voxel(1, 1, 2),
         },

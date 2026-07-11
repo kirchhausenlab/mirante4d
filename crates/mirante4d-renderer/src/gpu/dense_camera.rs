@@ -1,5 +1,5 @@
-use mirante4d_core::CameraState;
 use mirante4d_data::DenseVolumeU16;
+use mirante4d_render_api::CameraFrame;
 use wgpu::util::DeviceExt;
 
 use super::{
@@ -31,7 +31,7 @@ impl GpuRenderer {
     pub fn render_camera_mip(
         &self,
         volume: &DenseVolumeU16,
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
     ) -> Result<GpuMipOutput, GpuRenderError> {
         self.render_camera(volume, camera, viewport, CameraRenderMode::Mip)
@@ -40,7 +40,7 @@ impl GpuRenderer {
     pub fn render_camera(
         &self,
         volume: &DenseVolumeU16,
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
     ) -> Result<GpuMipOutput, GpuRenderError> {
@@ -56,7 +56,7 @@ impl GpuRenderer {
     pub fn render_camera_with_quality(
         &self,
         volume: &DenseVolumeU16,
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
         quality: CameraRenderQuality,
@@ -67,24 +67,24 @@ impl GpuRenderer {
 
         let viewport_width = checked_u32("viewport_width", viewport.width)?;
         let viewport_height = checked_u32("viewport_height", viewport.height)?;
-        let shape_x = checked_u32("x", volume.shape.x)?;
-        let shape_y = checked_u32("y", volume.shape.y)?;
-        let shape_z = checked_u32("z", volume.shape.z)?;
+        let shape_x = checked_u32("x", volume.shape.x())?;
+        let shape_y = checked_u32("y", volume.shape.y())?;
+        let shape_z = checked_u32("z", volume.shape.z())?;
         let mut camera_params = camera_grid_params(volume, camera, viewport)?;
         let mode_params = gpu_mode_params(volume, mode)?;
         camera_params[15] = mode_params.density_scale;
         camera_params[GPU_PARAM_ISO_LEVEL_INDEX] = mode_params.iso_display_level;
-        camera_params[GPU_PARAM_ISO_DISPLAY_LOW_INDEX] = mode_params.iso_transfer.window.low;
-        camera_params[GPU_PARAM_ISO_DISPLAY_HIGH_INDEX] = mode_params.iso_transfer.window.high;
+        camera_params[GPU_PARAM_ISO_DISPLAY_LOW_INDEX] = mode_params.iso_transfer.window.low();
+        camera_params[GPU_PARAM_ISO_DISPLAY_HIGH_INDEX] = mode_params.iso_transfer.window.high();
         camera_params[GPU_PARAM_ISO_GAMMA_INDEX] = mode_params.iso_transfer.curve.gamma_value();
         camera_params[GPU_PARAM_DVR_COLOR_R_INDEX] = mode_params.dvr_color_rgb[0];
         camera_params[GPU_PARAM_DVR_COLOR_G_INDEX] = mode_params.dvr_color_rgb[1];
         camera_params[GPU_PARAM_DVR_COLOR_B_INDEX] = mode_params.dvr_color_rgb[2];
         camera_params[GPU_PARAM_DVR_ALPHA_MULTIPLIER_INDEX] = mode_params.dvr_alpha_multiplier;
         camera_params[GPU_PARAM_DVR_OPACITY_LOW_INDEX] =
-            mode_params.dvr_opacity_transfer.window.low;
+            mode_params.dvr_opacity_transfer.window.low();
         camera_params[GPU_PARAM_DVR_OPACITY_HIGH_INDEX] =
-            mode_params.dvr_opacity_transfer.window.high;
+            mode_params.dvr_opacity_transfer.window.high();
         camera_params[GPU_PARAM_DVR_OPACITY_GAMMA_INDEX] =
             mode_params.dvr_opacity_transfer.curve.gamma_value();
         apply_gpu_quality_params(&mut camera_params, quality);
@@ -119,7 +119,7 @@ impl GpuRenderer {
             shape_x,
             shape_y,
             shape_z,
-            projection_code(camera.projection),
+            projection_code(crate::current_camera::projection(camera)),
             mode_params.mode_code,
             mode_params.iso_invert,
         ];

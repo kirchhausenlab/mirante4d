@@ -1,5 +1,6 @@
-use mirante4d_core::{DatasetId, GridToWorld, LayerId, ScaleLevel, Shape3D, TimeIndex};
 use mirante4d_data::{DenseVolumeF32, DenseVolumeU16};
+use mirante4d_domain::{GridToWorld, ScaleLevel, Shape3D, TimeIndex};
+use mirante4d_format::{DatasetId, LayerId};
 
 use crate::{
     RenderError,
@@ -97,12 +98,7 @@ pub struct RendererResourceHandle<K> {
 impl TransformKey {
     pub fn from_grid_to_world(grid_to_world: GridToWorld) -> Self {
         let mut matrix4x4_row_major_bits = [0u64; 16];
-        for (index, value) in grid_to_world
-            .matrix4x4_row_major
-            .iter()
-            .copied()
-            .enumerate()
-        {
+        for (index, value) in grid_to_world.row_major().iter().copied().enumerate() {
             matrix4x4_row_major_bits[index] = canonical_f64_bits(value);
         }
         Self {
@@ -124,7 +120,7 @@ impl DenseVolumeResourceKey {
         Ok(Self {
             dataset_id: volume.dataset_id.clone(),
             layer_id: volume.layer_id.clone(),
-            scale_level: ScaleLevel(volume.scale_level),
+            scale_level: ScaleLevel::new(volume.scale_level),
             timepoint: volume.timepoint,
             shape: volume.shape,
             value_count,
@@ -145,7 +141,7 @@ impl DenseVolumeResourceKey {
         Ok(Self {
             dataset_id: volume.dataset_id.clone(),
             layer_id: volume.layer_id.clone(),
-            scale_level: ScaleLevel(volume.scale_level),
+            scale_level: ScaleLevel::new(volume.scale_level),
             timepoint: volume.timepoint,
             shape: volume.shape,
             value_count,
@@ -227,7 +223,7 @@ impl BrickAtlasResourceKey {
         Ok(Self {
             dataset_id,
             layer_id: resident.layer_id.clone(),
-            scale_level: ScaleLevel(scale_level),
+            scale_level: ScaleLevel::new(scale_level),
             timepoint: resident.timepoint,
             volume_shape: resident.volume_shape,
             brick_shape,
@@ -283,7 +279,7 @@ impl BrickAtlasResourceKey {
         Ok(Self {
             dataset_id,
             layer_id: resident.layer_id.clone(),
-            scale_level: ScaleLevel(scale_level),
+            scale_level: ScaleLevel::new(scale_level),
             timepoint: resident.timepoint,
             volume_shape: resident.volume_shape,
             brick_shape,
@@ -339,7 +335,7 @@ impl BrickAtlasResourceKey {
         Ok(Self {
             dataset_id,
             layer_id: resident.layer_id.clone(),
-            scale_level: ScaleLevel(scale_level),
+            scale_level: ScaleLevel::new(scale_level),
             timepoint: resident.timepoint,
             volume_shape: resident.volume_shape,
             brick_shape,
@@ -403,16 +399,15 @@ fn validate_resource_id(kind: &'static str, value: &str) -> Result<(), RenderErr
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use mirante4d_core::{
-        DatasetId, GridToWorld, LayerId, Shape3D, Shape4D, TimeIndex, WorldSpace, WorldUnit,
-    };
     use mirante4d_data::{
         DatasetHandle, DenseVolumeU8, SpatialBrickIndex, VolumeBrickU8, VolumeRegion,
     };
+    use mirante4d_domain::{GridToWorld, Shape3D, Shape4D, TimeIndex};
     use mirante4d_format::{
-        ChannelMetadata, DenseF32Layer, DenseU16Layer, ExistingPackagePolicy, FixtureKind,
-        NativeF32Dataset, NativeU16Dataset, default_f32_display, default_u16_display,
-        write_fixture, write_native_f32_dataset, write_native_u16_dataset,
+        ChannelMetadata, DatasetId, DenseF32Layer, DenseU16Layer, ExistingPackagePolicy,
+        FixtureKind, LayerId, NativeF32Dataset, NativeU16Dataset, WorldSpace, WorldUnit,
+        default_f32_display, default_u16_display, write_fixture, write_native_f32_dataset,
+        write_native_u16_dataset,
     };
 
     use super::*;
@@ -423,7 +418,9 @@ mod tests {
         let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
         let dataset = DatasetHandle::open(&root).unwrap();
         let layer_id = dataset.first_layer_id().unwrap();
-        let volume = dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
+        let volume = dataset
+            .read_u16_volume(&layer_id, TimeIndex::new(0))
+            .unwrap();
 
         let mut other_dataset_volume = volume.clone();
         other_dataset_volume.dataset_id = DatasetId::new("other-dataset").unwrap();
@@ -440,10 +437,12 @@ mod tests {
         let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
         let dataset = DatasetHandle::open(&root).unwrap();
         let layer_id = dataset.first_layer_id().unwrap();
-        let volume = dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
+        let volume = dataset
+            .read_u16_volume(&layer_id, TimeIndex::new(0))
+            .unwrap();
 
         let mut shifted_volume = volume.clone();
-        shifted_volume.grid_to_world = GridToWorld::scale_um(0.5, 0.5, 1.5);
+        shifted_volume.grid_to_world = mirante4d_format::grid_to_world_scale_um(0.5, 0.5, 1.5);
 
         assert_ne!(
             DenseVolumeResourceKey::from_volume(&volume).unwrap(),
@@ -457,7 +456,9 @@ mod tests {
         let root = write_two_brick_f32_fixture(tempdir.path());
         let dataset = DatasetHandle::open(&root).unwrap();
         let layer_id = dataset.first_layer_id().unwrap();
-        let volume = dataset.read_f32_volume(&layer_id, TimeIndex(0)).unwrap();
+        let volume = dataset
+            .read_f32_volume(&layer_id, TimeIndex::new(0))
+            .unwrap();
 
         let key = DenseVolumeResourceKey::from_f32_volume(&volume).unwrap();
 
@@ -476,22 +477,30 @@ mod tests {
         let volume_shape = dataset.scale_shape(&layer_id, 0).unwrap();
         let grid_to_world = dataset.scale_grid_to_world(&layer_id, 0).unwrap();
         let left = dataset
-            .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+            .read_u16_brick(
+                &layer_id,
+                TimeIndex::new(0),
+                SpatialBrickIndex::new(0, 0, 0),
+            )
             .unwrap();
         let right = dataset
-            .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 1))
+            .read_u16_brick(
+                &layer_id,
+                TimeIndex::new(0),
+                SpatialBrickIndex::new(0, 0, 1),
+            )
             .unwrap();
 
         let left_only = ResidentBrickSetU16::new(
             layer_id.clone(),
-            TimeIndex(0),
+            TimeIndex::new(0),
             volume_shape,
             grid_to_world,
             vec![left.clone()],
         );
         let right_only = ResidentBrickSetU16::new(
             layer_id,
-            TimeIndex(0),
+            TimeIndex::new(0),
             volume_shape,
             grid_to_world,
             vec![right],
@@ -516,22 +525,30 @@ mod tests {
         let volume_shape = dataset.scale_shape(&layer_id, 0).unwrap();
         let grid_to_world = dataset.scale_grid_to_world(&layer_id, 0).unwrap();
         let left = dataset
-            .read_f32_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+            .read_f32_brick(
+                &layer_id,
+                TimeIndex::new(0),
+                SpatialBrickIndex::new(0, 0, 0),
+            )
             .unwrap();
         let right = dataset
-            .read_f32_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 1))
+            .read_f32_brick(
+                &layer_id,
+                TimeIndex::new(0),
+                SpatialBrickIndex::new(0, 0, 1),
+            )
             .unwrap();
 
         let left_only = ResidentBrickSetF32::new(
             layer_id.clone(),
-            TimeIndex(0),
+            TimeIndex::new(0),
             volume_shape,
             grid_to_world,
             vec![left],
         );
         let right_only = ResidentBrickSetF32::new(
             layer_id,
-            TimeIndex(0),
+            TimeIndex::new(0),
             volume_shape,
             grid_to_world,
             vec![right],
@@ -558,7 +575,7 @@ mod tests {
             DatasetId::new("u8-resource").unwrap(),
             layer_id.clone(),
             0,
-            TimeIndex(0),
+            TimeIndex::new(0),
             Shape3D::new(1, 1, 2).unwrap(),
             GridToWorld::identity(),
             vec![1, 2],
@@ -582,7 +599,7 @@ mod tests {
         };
         let resident = ResidentBrickSetU8::new(
             layer_id,
-            TimeIndex(0),
+            TimeIndex::new(0),
             Shape3D::new(1, 1, 2).unwrap(),
             GridToWorld::identity(),
             vec![brick],
@@ -609,15 +626,23 @@ mod tests {
         let volume_shape = dataset.scale_shape(&layer_id, 0).unwrap();
         let grid_to_world = dataset.scale_grid_to_world(&layer_id, 0).unwrap();
         let first = dataset
-            .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+            .read_u16_brick(
+                &layer_id,
+                TimeIndex::new(0),
+                SpatialBrickIndex::new(0, 0, 0),
+            )
             .unwrap();
         let mut second = dataset
-            .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 1))
+            .read_u16_brick(
+                &layer_id,
+                TimeIndex::new(0),
+                SpatialBrickIndex::new(0, 0, 1),
+            )
             .unwrap();
         second.volume.dataset_id = DatasetId::new("other-dataset").unwrap();
         let mixed = ResidentBrickSetU16::new(
             layer_id,
-            TimeIndex(0),
+            TimeIndex::new(0),
             volume_shape,
             grid_to_world,
             vec![first, second],
@@ -646,8 +671,8 @@ mod tests {
             dataset_id: DatasetId::new("dataset").unwrap(),
             track_layer_id: TrackLayerResourceId::new("tracks").unwrap(),
             time_range: Some(TimeRangeKey {
-                start: TimeIndex(2),
-                end_exclusive: TimeIndex(7),
+                start: TimeIndex::new(2),
+                end_exclusive: TimeIndex::new(7),
             }),
             representation: ResourceRepresentation::TrackPolyline,
         };
@@ -683,7 +708,7 @@ mod tests {
                     },
                     shape: Shape4D::new(1, 2, 2, 4).unwrap(),
                     brick_shape: Shape4D::new(1, 2, 2, 2).unwrap(),
-                    grid_to_world: GridToWorld::scale_um(1.0, 1.0, 1.0),
+                    grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
                     display: default_u16_display(),
                     values_tzyx: (0..16).collect(),
                 }],
@@ -714,7 +739,7 @@ mod tests {
                     },
                     shape: Shape4D::new(1, 2, 2, 4).unwrap(),
                     brick_shape: Shape4D::new(1, 2, 2, 2).unwrap(),
-                    grid_to_world: GridToWorld::scale_um(1.0, 1.0, 1.0),
+                    grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
                     display: default_f32_display(),
                     values_tzyx: (0..16).map(|value| value as f32 - 7.5).collect(),
                 }],

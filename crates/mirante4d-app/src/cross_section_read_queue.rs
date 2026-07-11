@@ -1,16 +1,17 @@
-use mirante4d_core::{LayerId, TimeIndex};
 #[cfg(test)]
 use mirante4d_data::{BrickReadPool, BrickReadSpec};
 use mirante4d_data::{
     BrickReadTicket, BrickRequestPriority, CancellationToken, CrossSectionChunkReadPool,
     CrossSectionChunkReadSpec, DataError, DataGenerationId, SpatialBrickIndex,
 };
+use mirante4d_domain::TimeIndex;
+use mirante4d_format::LayerId;
 
 use crate::{
-    AppState,
     cross_section_runtime::{
         CrossSectionChunkKey, CrossSectionChunkQueueEntry, CrossSectionRuntime,
     },
+    current_runtime::dataset::CurrentDatasetRuntime,
     viewer_layout::PanelId,
 };
 
@@ -114,10 +115,10 @@ impl CrossSectionChunkReadSubmission {
 }
 
 pub(crate) fn create_cross_section_read_pool(
-    state: &AppState,
+    dataset: &CurrentDatasetRuntime,
 ) -> Option<CrossSectionChunkReadPool> {
     match CrossSectionChunkReadPool::new(
-        state.dataset.clone(),
+        dataset.dataset.clone(),
         default_cross_section_worker_count(),
         default_cross_section_queue_capacity(),
     ) {
@@ -170,8 +171,9 @@ fn cross_section_worker_queue_priority_for_admission(index: usize, len: usize) -
 #[cfg(test)]
 mod tests {
     use glam::DVec2;
-    use mirante4d_core::{DatasetId, LayerId, TimeIndex};
     use mirante4d_data::SpatialBrickIndex;
+    use mirante4d_domain::TimeIndex;
+    use mirante4d_format::{DatasetId, LayerId};
     use mirante4d_renderer::CrossSectionPanelBounds;
 
     use super::*;
@@ -184,7 +186,7 @@ mod tests {
         CrossSectionChunkKey {
             dataset_id: DatasetId::new("dataset").unwrap(),
             layer_id: LayerId::new("layer").unwrap(),
-            timepoint: TimeIndex(0),
+            timepoint: TimeIndex::new(0),
             scale_level: 0,
             brick_index: SpatialBrickIndex::new(z, y, x),
         }
@@ -229,14 +231,15 @@ mod tests {
         let first = key(0, 0, 1);
         let second = key(0, 0, 2);
         let outside_budget = key(0, 0, 3);
-        runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.mark_cross_section_panels_dirty());
+        assert!(runtime.apply_visible_chunk_plan(plan(
             PanelId::Xy,
             vec![
                 geometry(outside_budget.clone(), -3.0),
                 geometry(first.clone(), -1.0),
                 geometry(second.clone(), -2.0),
             ],
-        ));
+        )));
 
         let admissions = cross_section_read_admissions_for_refresh(&runtime, [PanelId::Xy], 2);
 

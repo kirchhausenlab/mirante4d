@@ -37,7 +37,7 @@ pub use scene_artifacts::{
 #[derive(Debug, Error, PartialEq)]
 pub enum AnalysisError {
     #[error(transparent)]
-    Space(#[from] mirante4d_core::SpaceError),
+    Space(#[from] mirante4d_format::CurrentTransformError),
     #[error("no scene edit is available to undo")]
     UndoUnavailable,
     #[error("no scene edit is available to redo")]

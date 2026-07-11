@@ -2,8 +2,8 @@ use std::{borrow::Cow, sync::Mutex, time::Duration};
 
 use std::collections::HashSet;
 
-use mirante4d_core::Shape3D;
 use mirante4d_data::SpatialBrickIndex;
+use mirante4d_domain::Shape3D;
 use thiserror::Error;
 
 use crate::{

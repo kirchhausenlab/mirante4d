@@ -11,8 +11,9 @@ runtime expectations are explicit before a dataset opens.
 - Dense array axes: explicit time and spatial axes; channels are separate
   layers
 - Storage: Zarr v3 indexed sharding with bounded groups of bricks per shard
-- Project/session identity: `mirante4d-project-v14`
-- Preferences identity: `mirante4d-preferences-v1`
+- Temporary private project bridge: `mirante4d-project-v15` schema version 1;
+  normal project I/O is identity-gated
+- Settings identity: `mirante4d-settings-v1`
 
 Metadata records axes, units, geometry, multiscale reductions, intensity
 ranges, checksums, and provenance. Unsupported identities, malformed metadata,

@@ -1,5 +1,5 @@
-use mirante4d_core::{IdError, IntensityDType, ShapeError};
-use mirante4d_format::{BrickIndex, FormatError, LayerKind};
+use mirante4d_domain::{IntensityDType, ShapeError};
+use mirante4d_format::{BrickIndex, CurrentFormatIdError, FormatError, LayerKind};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -7,7 +7,7 @@ pub enum DataError {
     #[error(transparent)]
     Format(#[from] FormatError),
     #[error(transparent)]
-    InvalidId(#[from] IdError),
+    InvalidId(#[from] CurrentFormatIdError),
     #[error("invalid runtime shape: {0}")]
     InvalidShape(#[from] ShapeError),
     #[error("layer {0:?} was not found")]

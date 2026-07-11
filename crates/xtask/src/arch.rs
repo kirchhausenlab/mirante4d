@@ -6,7 +6,6 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use serde::Deserialize;
 use syn::visit::Visit;
 
 const MAX_TRACKED_GENERATED_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024;
@@ -29,7 +28,7 @@ const FORBIDDEN_AXIS_ALIGNED_2D_CHUNK_PATTERNS: &[&str] = &[
 ];
 const ALLOWED_LOCAL_CARGO_OVERRIDES: &[(&str, &str)] =
     &[("wayland-scanner", "vendor/wayland-scanner")];
-const WP07B_BOUNDARY_CANDIDATE_CRATES: &[&str] = &[
+const WP07B_BOUNDARY_CRATES: &[&str] = &[
     "mirante4d-application",
     "mirante4d-dataset",
     "mirante4d-render-api",
@@ -39,7 +38,6 @@ const WP07B_BOUNDARY_CANDIDATE_CRATES: &[&str] = &[
 pub(crate) fn architecture_self_check() -> anyhow::Result<()> {
     let required = [
         "crates/mirante4d-analysis",
-        "crates/mirante4d-core",
         "crates/mirante4d-format",
         "crates/mirante4d-import",
         "crates/mirante4d-data",
@@ -59,7 +57,7 @@ pub(crate) fn architecture_self_check() -> anyhow::Result<()> {
             bail!("required crate directory is missing: {path}");
         }
     }
-    for forbidden in ["crates/mirante4d-preprocess"] {
+    for forbidden in ["crates/mirante4d-core", "crates/mirante4d-preprocess"] {
         if Path::new(forbidden).exists() {
             bail!("first milestone must not create empty future crate: {forbidden}");
         }
@@ -100,43 +98,54 @@ fn check_crate_dependency_policy() -> anyhow::Result<()> {
                 "mirante4d-settings",
             ][..],
         ),
-        ("mirante4d-core", &[][..]),
-        ("mirante4d-format", &["mirante4d-core"][..]),
+        ("mirante4d-format", &["mirante4d-domain"][..]),
         (
             "mirante4d-data",
-            &["mirante4d-core", "mirante4d-format"][..],
+            &["mirante4d-domain", "mirante4d-format"][..],
         ),
         (
             "mirante4d-renderer",
-            &["mirante4d-core", "mirante4d-data"][..],
+            &[
+                "mirante4d-data",
+                "mirante4d-domain",
+                "mirante4d-format",
+                "mirante4d-render-api",
+            ][..],
         ),
         (
             "mirante4d-import",
-            &["mirante4d-core", "mirante4d-format"][..],
+            &["mirante4d-domain", "mirante4d-format"][..],
         ),
         (
             "mirante4d-analysis",
-            &["mirante4d-core", "mirante4d-data"][..],
+            &["mirante4d-data", "mirante4d-domain", "mirante4d-format"][..],
         ),
         (
             "mirante4d-app",
             &[
                 "mirante4d-analysis",
-                "mirante4d-core",
+                "mirante4d-application",
                 "mirante4d-data",
+                "mirante4d-dataset",
+                "mirante4d-domain",
                 "mirante4d-format",
+                "mirante4d-identity",
                 "mirante4d-import",
+                "mirante4d-project-model",
+                "mirante4d-render-api",
                 "mirante4d-renderer",
+                "mirante4d-settings",
             ][..],
         ),
         (
             "xtask",
             &[
                 "mirante4d-analysis",
-                "mirante4d-core",
                 "mirante4d-data",
+                "mirante4d-domain",
                 "mirante4d-format",
                 "mirante4d-import",
+                "mirante4d-render-api",
                 "mirante4d-renderer",
             ][..],
         ),
@@ -279,7 +288,6 @@ fn source_architecture_violations(path: &Path, source: &str) -> Vec<String> {
                 "serde::",
                 "mirante4d_analysis",
                 "mirante4d_app",
-                "mirante4d_core",
                 "mirante4d_data",
                 "mirante4d_format",
                 "mirante4d_import",
@@ -446,16 +454,15 @@ fn check_wp07b_boundary_source_ownership(repo_root: &Path) -> anyhow::Result<()>
         "wgpu::",
         "winit::",
         "zarrs::",
-        "mirante4d_analysis",
-        "mirante4d_app",
-        "mirante4d_core",
-        "mirante4d_data",
-        "mirante4d_format",
-        "mirante4d_import",
-        "mirante4d_renderer",
+        "mirante4d_analysis::",
+        "mirante4d_app::",
+        "mirante4d_data::",
+        "mirante4d_format::",
+        "mirante4d_import::",
+        "mirante4d_renderer::",
     ];
     let mut violations = Vec::new();
-    for crate_name in WP07B_BOUNDARY_CANDIDATE_CRATES {
+    for crate_name in WP07B_BOUNDARY_CRATES {
         let source_root = repo_root.join("crates").join(crate_name).join("src");
         for path in collect_rust_source_files(&source_root)? {
             let source = fs::read_to_string(&path)
@@ -464,7 +471,7 @@ fn check_wp07b_boundary_source_ownership(repo_root: &Path) -> anyhow::Result<()>
                 &path,
                 &source,
                 &forbidden_frameworks,
-                "WP-07B boundary crate imports a forbidden predecessor/runtime/UI authority",
+                "WP-07B boundary crate imports a forbidden runtime/UI authority",
             ));
             let (forbidden_std, policy) = if *crate_name == "mirante4d-settings" {
                 (&settings_forbidden_std, "WP-07B settings crate")
@@ -489,60 +496,8 @@ fn check_wp07b_boundary_source_ownership(repo_root: &Path) -> anyhow::Result<()>
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct StateFieldLedger {
-    schema: String,
-    schema_version: u64,
-    source_revision: String,
-    sources: Vec<StateFieldSource>,
-    invariants: StateLedgerInvariants,
-    dispositions: Vec<StateFieldDisposition>,
-    nested_aggregate_deletions: Vec<serde_json::Value>,
-    project_v14_source: StateFieldSource,
-    project_v14_dto_dispositions: Vec<ProjectDtoDisposition>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StateLedgerInvariants {
-    every_source_field_exactly_once: bool,
-    one_target_owner_or_deletion: bool,
-    product_cutover_gate: String,
-    no_live_target_model_in_wp07a: bool,
-    appstate_predecessor_field_removal_gate: String,
-    finalization_gate_meaning: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct StateFieldSource {
-    path: String,
-    #[serde(rename = "struct")]
-    struct_name: String,
-    expected_fields: usize,
-}
-
-#[derive(Debug, Deserialize)]
-struct StateFieldDisposition {
-    id: String,
-    source_struct: String,
-    fields: Vec<String>,
-    action: String,
-    target_owner: String,
-    state_class: String,
-    finalization_gate: String,
-    reason: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProjectDtoDisposition {
-    field: String,
-    action: String,
-    target_owner: String,
-    reason: String,
-}
-
 fn check_wp07a_contracts(repo_root: &Path) -> anyhow::Result<()> {
-    let (predecessor, state_class_mapping) = check_wp07a_model_contract(repo_root)?;
-    check_current_state_field_ledger(repo_root, &predecessor, &state_class_mapping)
+    check_wp07a_model_contract(repo_root).map(|_| ())
 }
 
 fn check_wp07b_boundary_contract(repo_root: &Path) -> anyhow::Result<()> {
@@ -555,67 +510,146 @@ fn check_wp07b_boundary_contract(repo_root: &Path) -> anyhow::Result<()> {
         || contract
             .get("schema_version")
             .and_then(serde_json::Value::as_u64)
-            != Some(1)
-        || contract.get("status").and_then(serde_json::Value::as_str)
-            != Some("candidate-unreachable")
-        || contract
-            .pointer("/scope/existing_product_reachable")
-            .and_then(serde_json::Value::as_bool)
-            != Some(false)
-        || contract
-            .pointer("/scope/product_behavior_changed")
-            .and_then(serde_json::Value::as_bool)
-            != Some(false)
+            != Some(2)
+        || contract.get("status").and_then(serde_json::Value::as_str) != Some("live-cutover")
     {
-        bail!("{} has an unsupported WP-07B-A boundary", path.display());
+        bail!("{} has an unsupported WP-07B live boundary", path.display());
     }
-    if contract
-        .get("predecessor_tag")
-        .and_then(serde_json::Value::as_str)
-        != Some("foundation-wp-07a-exit-1")
-        || contract
-            .get("predecessor_revision")
-            .and_then(serde_json::Value::as_str)
-            != Some("5383cbb93c13c59e6f035bfa551356c75fb426dc")
-    {
-        bail!("WP-07B-A boundary is not bound to the accepted WP-07A exit");
-    }
-    if contract
-        .get("entry_sha256")
-        .and_then(serde_json::Value::as_str)
-        != Some("ee14dae5433626e19fa28d0bcc13cabfdbc259604845ee967c0404d978a27d15")
-        || contract
-            .get("entry_correction_sha256")
-            .and_then(serde_json::Value::as_str)
-            != Some("d4309d2cdd342c84d536f34de4bfa05013f46b6e009f7e37516c93f814067ac6")
-    {
-        bail!("WP-07B-A boundary entry hashes drifted from the accepted private records");
+    let expected_entry_binding = [
+        ("predecessor_tag", "foundation-wp-07a-exit-1"),
+        (
+            "predecessor_revision",
+            "5383cbb93c13c59e6f035bfa551356c75fb426dc",
+        ),
+        (
+            "entry_sha256",
+            "ee14dae5433626e19fa28d0bcc13cabfdbc259604845ee967c0404d978a27d15",
+        ),
+        (
+            "entry_correction_sha256",
+            "d4309d2cdd342c84d536f34de4bfa05013f46b6e009f7e37516c93f814067ac6",
+        ),
+    ];
+    for (field, expected) in expected_entry_binding {
+        if contract.get(field).and_then(serde_json::Value::as_str) != Some(expected) {
+            bail!("WP-07B entry binding {field} drifted");
+        }
     }
     let expected_scope = serde_json::json!({
-        "checkpoint": "WP07B-A-boundary-candidates",
-        "existing_product_reachable": false,
-        "product_behavior_changed": false,
-        "project_serialization_changed": false,
-        "settings_product_path_changed": false,
-        "core_deleted": false,
-        "live_cutover_gate": "WP07B-B-atomic-product-cutover"
+        "checkpoint": "WP07B-B-live-cutover",
+        "product_reachable": true,
+        "canonical_application_authoritative": true,
+        "canonical_project_model_authoritative": true,
+        "settings_product_path_live": true,
+        "project_v15_private_bridge_live": true,
+        "core_deleted": true,
+        "predecessors_deleted": true
     });
     if contract.get("scope") != Some(&expected_scope) {
-        bail!("WP-07B-A boundary scope drifted from its frozen checkpoint");
+        bail!("WP-07B live-cutover scope drifted");
+    }
+    let expected_product_open_validation = serde_json::json!({
+        "scenario_id": "wp07b-t2-state-settings-identity-gate-v1",
+        "fixture": {
+            "name": "time-multichannel-u16-8cube-3t-2c",
+            "dataset_id": "fixture-time-multichannel-u16-8cube-3t-2c",
+            "tier": "T2"
+        },
+        "runtime": {
+            "binary": "release",
+            "display": "real-vulkan",
+            "input": "os",
+            "xdg_profile": "isolated",
+            "automation": false,
+            "smoke": false
+        },
+        "launch_1": {
+            "physical_client_area_px": [1280, 720],
+            "gpu_frame": "nonblank",
+            "same_source_open": {
+                "old_frame": "visible-until-completion"
+            },
+            "project_io_gate": {
+                "open": "disabled",
+                "save": "disabled",
+                "text": "verification-required",
+                "before": "dialog-or-io"
+            },
+            "next": "t2/3",
+            "play": {
+                "minimum_current_nonblank_timepoints": 2,
+                "then": "Pause"
+            },
+            "layouts": ["3D", "4Panel", "3D"],
+            "render_modes": ["MIP", "DVR", "MIP"],
+            "settings_save_mib": {
+                "cpu": 3072,
+                "gpu": 1280
+            },
+            "physical_close_exit_code": 0
+        },
+        "launch_2": {
+            "physical_client_area_px": [1920, 1080],
+            "profile": "same-isolated-xdg",
+            "settings_status": "Loaded",
+            "settings_mib": {
+                "cpu": 3072,
+                "gpu": 1280
+            },
+            "gpu_frame": "nonblank",
+            "project_io_gate": {
+                "open": "disabled",
+                "save": "disabled",
+                "text": "verification-required",
+                "before": "dialog-or-io"
+            },
+            "physical_close_exit_code": 0
+        },
+        "postconditions": {
+            "launch_2_settings_bytes": "identical-to-post-launch-1",
+            "source_tree": "unchanged"
+        },
+        "reject_log_signatures": [
+            "panic",
+            "validation error",
+            "wgpu error",
+            "fallback",
+            "retry loop",
+            "corruption"
+        ],
+        "exclusions": [
+            "segmentation",
+            "4K",
+            "private-data",
+            "synthetic-large-dataset",
+            "unsupported-project-roundtrip"
+        ],
+        "qualification": {
+            "preflight": "nonqualifying",
+            "final_run": {
+                "qualifying": true,
+                "workspace": "clean",
+                "revision": "protected-main",
+                "order": "after-checks"
+            }
+        }
+    });
+    if contract.get("product_open_validation") != Some(&expected_product_open_validation) {
+        bail!("WP-07B product-open validation scenario drifted");
     }
     let expected_activation_invariants = serde_json::json!([
-        "No existing product, test, benchmark, build, or tool target depends on any WP-07B boundary crate in checkpoint A.",
-        "The frozen WP-07A model APIs remain unchanged.",
+        "The canonical application, dataset, render-api, and settings boundaries are live dependencies of mirante4d-app.",
+        "ApplicationState and the canonical project model are the sole live semantic and durable-state authorities.",
+        "AppState, WorkbenchCommand, project-v14, app-local preferences, and mirante4d-core authority are absent.",
+        "Exactly seven temporary runtime owners remain with their frozen field counts and expiry gates.",
+        "Exactly two crate-private bridges remain: the egui shell bridge through WP-09C and project-v15 persistence bridge through WP-10B.",
         "The application reducer owns no filesystem, thread, UI, renderer, runtime payload, or serialization authority.",
-        "The dataset and render-api candidates own no storage, scheduling, cache, lease, backend, or UI behavior.",
-        "Settings is the only checkpoint-A boundary allowed external side effects, and it remains unreachable from the product.",
-        "ScientificIdentityStatus is representational only at checkpoint A; application verification remains unavailable until the verifier-owned WP-08 admission route exists.",
-        "Product activation and predecessor deletion occur together only in WP07B-B."
+        "Scientific identity remains explicit and project open/save stays gated on a verified source."
     ]);
     if contract.get("activation_invariants") != Some(&expected_activation_invariants)
         || contract.get("unresolved_decisions") != Some(&serde_json::json!([]))
     {
-        bail!("WP-07B-A activation invariants or decision closure drifted");
+        bail!("WP-07B live-cutover invariants or decision closure drifted");
     }
 
     let expected_mirante4d_dependencies = BTreeMap::from([
@@ -623,6 +657,7 @@ fn check_wp07b_boundary_contract(repo_root: &Path) -> anyhow::Result<()> {
             "mirante4d-application",
             BTreeSet::from(
                 [
+                    "mirante4d-dataset",
                     "mirante4d-domain",
                     "mirante4d-identity",
                     "mirante4d-project-model",
@@ -679,19 +714,19 @@ fn check_wp07b_boundary_contract(repo_root: &Path) -> anyhow::Result<()> {
     let expected_authorities = BTreeMap::from([
         (
             "mirante4d-application",
-            "Pure bounded application commands, reducer, events, snapshots, project revision/history movement, transient semantic selection, operation currentness, and typed faults",
+            "Sole live bounded application command, reducer, event, snapshot, project revision/history, transient semantic selection, operation-currentness, and typed-fault authority",
         ),
         (
             "mirante4d-dataset",
-            "Bounded immutable logical-layer catalog and explicit verified/unverified scientific identity status",
+            "Sole live bounded immutable logical-layer catalog and verified/unverified scientific-identity status authority",
         ),
         (
             "mirante4d-render-api",
-            "Narrow framework-neutral presentation viewport and canonical-camera projection math; broader render contracts remain WP-08A work",
+            "Sole live framework-neutral presentation viewport and canonical-camera projection-math authority at the WP-07B boundary",
         ),
         (
             "mirante4d-settings",
-            "Closed validated two-ledger settings document, Linux path, bounded background load/write actor, and typed persistence outcomes",
+            "Sole live validated two-ledger settings document, Linux path, bounded background persistence actor, and typed persistence-outcome authority",
         ),
     ]);
     let crate_contracts = contract
@@ -800,7 +835,7 @@ fn check_wp07b_boundary_contract(repo_root: &Path) -> anyhow::Result<()> {
         }
     }
     if observed
-        != WP07B_BOUNDARY_CANDIDATE_CRATES
+        != WP07B_BOUNDARY_CRATES
             .iter()
             .copied()
             .collect::<BTreeSet<_>>()
@@ -808,33 +843,526 @@ fn check_wp07b_boundary_contract(repo_root: &Path) -> anyhow::Result<()> {
         bail!("WP-07B boundary contract must cover exactly the four approved crates");
     }
 
-    let boundary_candidates = WP07B_BOUNDARY_CANDIDATE_CRATES
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    for (package, kinds) in &workspace_metadata.declared_dependency_kinds_by_name {
-        if boundary_candidates.contains(package.as_str()) {
-            continue;
-        }
-        let forbidden = kinds
-            .values()
-            .flatten()
-            .filter(|dependency| boundary_candidates.contains(dependency.as_str()))
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        if !forbidden.is_empty() {
-            bail!(
-                "existing workspace package {package} reaches unreachable WP-07B-A boundary crates: {forbidden:?}"
-            );
-        }
-    }
-    check_non_workspace_manifest_reachability(repo_root, &boundary_candidates)?;
+    check_wp07b_live_cutover(repo_root, &contract, &workspace_metadata)?;
     check_wp07b_boundary_source_ownership(repo_root)
 }
 
-fn check_non_workspace_manifest_reachability(
+fn check_wp07b_live_cutover(
     repo_root: &Path,
-    boundary_candidates: &BTreeSet<&str>,
+    contract: &serde_json::Value,
+    workspace_metadata: &WorkspaceDependencyMetadata,
+) -> anyhow::Result<()> {
+    let expected_product_activation = serde_json::json!({
+        "package": "mirante4d-app",
+        "required_normal_dependencies": [
+            "mirante4d-application",
+            "mirante4d-dataset",
+            "mirante4d-render-api",
+            "mirante4d-settings"
+        ]
+    });
+    if contract.get("product_activation") != Some(&expected_product_activation) {
+        bail!("WP-07B live product activation contract drifted");
+    }
+    let required_product_dependencies = WP07B_BOUNDARY_CRATES
+        .iter()
+        .map(|dependency| (*dependency).to_owned())
+        .collect::<BTreeSet<_>>();
+    let actual_product_dependencies = workspace_metadata
+        .declared_dependency_kinds_by_name
+        .get("mirante4d-app")
+        .and_then(|kinds| kinds.get("normal"))
+        .context("cargo metadata is missing mirante4d-app normal dependencies")?;
+    if !required_product_dependencies.is_subset(actual_product_dependencies) {
+        bail!(
+            "mirante4d-app is missing live WP-07B boundary dependencies: {:?}",
+            required_product_dependencies
+                .difference(actual_product_dependencies)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    let expected_edges = BTreeSet::from([
+        ("mirante4d-app", "mirante4d-application"),
+        ("mirante4d-app", "mirante4d-dataset"),
+        ("mirante4d-app", "mirante4d-render-api"),
+        ("mirante4d-app", "mirante4d-settings"),
+        ("mirante4d-application", "mirante4d-dataset"),
+        ("mirante4d-application", "mirante4d-settings"),
+        ("mirante4d-renderer", "mirante4d-render-api"),
+        ("xtask", "mirante4d-render-api"),
+    ]);
+    let contract_edges = contract
+        .get("live_boundary_dependency_edges")
+        .and_then(serde_json::Value::as_array)
+        .context("WP-07B live boundary dependency edges must be an array")?
+        .iter()
+        .map(|edge| {
+            Ok((
+                edge.get("from")
+                    .and_then(serde_json::Value::as_str)
+                    .context("WP-07B live dependency edge must name from")?,
+                edge.get("to")
+                    .and_then(serde_json::Value::as_str)
+                    .context("WP-07B live dependency edge must name to")?,
+            ))
+        })
+        .collect::<anyhow::Result<BTreeSet<_>>>()?;
+    if contract_edges != expected_edges {
+        bail!("WP-07B live boundary dependency-edge contract drifted");
+    }
+    let boundary_crates = WP07B_BOUNDARY_CRATES
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let actual_edges = workspace_metadata
+        .declared_dependency_kinds_by_name
+        .iter()
+        .flat_map(|(package, kinds)| {
+            kinds.values().flatten().filter_map(|dependency| {
+                boundary_crates
+                    .contains(dependency.as_str())
+                    .then_some((package.as_str(), dependency.as_str()))
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    if actual_edges != expected_edges {
+        bail!(
+            "WP-07B live boundary dependency edges drifted: expected={expected_edges:?}, actual={actual_edges:?}"
+        );
+    }
+
+    check_wp07b_temporary_runtime_owners(repo_root, contract)?;
+    check_wp07b_private_bridges(repo_root, contract)?;
+    check_wp07b_predecessor_absence(repo_root, contract, workspace_metadata)
+}
+
+fn check_wp07b_temporary_runtime_owners(
+    repo_root: &Path,
+    contract: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let expected_contract = serde_json::json!([
+        {
+            "module": "dataset",
+            "path": "crates/mirante4d-app/src/current_runtime/dataset.rs",
+            "struct": "CurrentDatasetRuntime",
+            "composition_field": "dataset_runtime",
+            "expected_fields": 53,
+            "expiry_gate": "WP-08B"
+        },
+        {
+            "module": "render",
+            "path": "crates/mirante4d-app/src/current_runtime/render.rs",
+            "struct": "CurrentRenderRuntime",
+            "composition_field": "render_runtime",
+            "expected_fields": 24,
+            "expiry_gate": "WP-09B"
+        },
+        {
+            "module": "ui",
+            "path": "crates/mirante4d-app/src/current_runtime/ui.rs",
+            "struct": "CurrentUiRuntime",
+            "composition_field": "ui_runtime",
+            "expected_fields": 14,
+            "expiry_gate": "WP-09C"
+        },
+        {
+            "module": "project",
+            "path": "crates/mirante4d-app/src/current_runtime/project.rs",
+            "struct": "CurrentProjectRuntime",
+            "composition_field": "project_runtime",
+            "expected_fields": 1,
+            "expiry_gate": "WP-10B"
+        },
+        {
+            "module": "import",
+            "path": "crates/mirante4d-app/src/current_runtime/import.rs",
+            "struct": "CurrentImportRuntime",
+            "composition_field": "import_runtime",
+            "expected_fields": 4,
+            "expiry_gate": "WP-10C"
+        },
+        {
+            "module": "analysis",
+            "path": "crates/mirante4d-app/src/current_runtime/analysis.rs",
+            "struct": "CurrentAnalysisRuntime",
+            "composition_field": "analysis_runtime",
+            "expected_fields": 10,
+            "expiry_gate": "WP-12"
+        },
+        {
+            "module": "validation",
+            "path": "crates/mirante4d-app/src/current_runtime/validation.rs",
+            "struct": "CurrentValidationRuntime",
+            "composition_field": "validation_runtime",
+            "expected_fields": 2,
+            "expiry_gate": "WP-14"
+        }
+    ]);
+    if contract.get("temporary_runtime_owners") != Some(&expected_contract) {
+        bail!("WP-07B temporary-runtime-owner contract drifted");
+    }
+    let expected = [
+        (
+            "dataset",
+            "crates/mirante4d-app/src/current_runtime/dataset.rs",
+            "CurrentDatasetRuntime",
+            "dataset_runtime",
+            53_usize,
+            "WP-08B",
+        ),
+        (
+            "render",
+            "crates/mirante4d-app/src/current_runtime/render.rs",
+            "CurrentRenderRuntime",
+            "render_runtime",
+            24,
+            "WP-09B",
+        ),
+        (
+            "ui",
+            "crates/mirante4d-app/src/current_runtime/ui.rs",
+            "CurrentUiRuntime",
+            "ui_runtime",
+            14,
+            "WP-09C",
+        ),
+        (
+            "project",
+            "crates/mirante4d-app/src/current_runtime/project.rs",
+            "CurrentProjectRuntime",
+            "project_runtime",
+            1,
+            "WP-10B",
+        ),
+        (
+            "import",
+            "crates/mirante4d-app/src/current_runtime/import.rs",
+            "CurrentImportRuntime",
+            "import_runtime",
+            4,
+            "WP-10C",
+        ),
+        (
+            "analysis",
+            "crates/mirante4d-app/src/current_runtime/analysis.rs",
+            "CurrentAnalysisRuntime",
+            "analysis_runtime",
+            10,
+            "WP-12",
+        ),
+        (
+            "validation",
+            "crates/mirante4d-app/src/current_runtime/validation.rs",
+            "CurrentValidationRuntime",
+            "validation_runtime",
+            2,
+            "WP-14",
+        ),
+    ];
+    let runtime_root = repo_root.join("crates/mirante4d-app/src/current_runtime");
+    let actual_files = fs::read_dir(&runtime_root)?
+        .map(|entry| {
+            let entry = entry?;
+            Ok(entry
+                .file_type()?
+                .is_file()
+                .then(|| entry.file_name().to_string_lossy().into_owned()))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>();
+    let expected_files = expected
+        .iter()
+        .map(|(module, ..)| format!("{module}.rs"))
+        .chain(std::iter::once("mod.rs".to_owned()))
+        .collect::<BTreeSet<_>>();
+    if actual_files != expected_files {
+        bail!(
+            "WP-07B temporary runtime modules drifted: expected={expected_files:?}, actual={actual_files:?}"
+        );
+    }
+    let runtime_mod_source = fs::read_to_string(runtime_root.join("mod.rs"))?;
+    let actual_modules = crate_private_root_module_names(&runtime_mod_source)?;
+    let expected_modules = expected
+        .iter()
+        .map(|(module, ..)| (*module).to_owned())
+        .collect::<BTreeSet<_>>();
+    if actual_modules != expected_modules {
+        bail!("current_runtime must declare exactly the seven private WP-07B owner modules");
+    }
+
+    let app_source = fs::read_to_string(repo_root.join("crates/mirante4d-app/src/lib.rs"))?;
+    let app_fields = rust_struct_field_terminal_type_names(&app_source, "MiranteWorkbenchApp")?;
+    let owner_type_names = expected
+        .iter()
+        .map(|(_, _, struct_name, ..)| *struct_name)
+        .collect::<BTreeSet<_>>();
+    let expected_composition = expected
+        .iter()
+        .map(|(_, _, struct_name, field, ..)| ((*field).to_owned(), (*struct_name).to_owned()))
+        .collect::<BTreeMap<_, _>>();
+    let actual_composition = app_fields
+        .into_iter()
+        .filter(|(_, type_name)| owner_type_names.contains(type_name.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    if actual_composition != expected_composition {
+        bail!(
+            "MiranteWorkbenchApp temporary-owner composition drifted: expected={expected_composition:?}, actual={actual_composition:?}"
+        );
+    }
+
+    for (_, relative_path, struct_name, _, expected_fields, expiry_gate) in expected {
+        let source = fs::read_to_string(repo_root.join(relative_path))?;
+        let actual_fields = rust_struct_field_names(&source, struct_name)?.len();
+        if actual_fields != expected_fields {
+            bail!(
+                "{struct_name} has {actual_fields} fields; WP-07B freezes {expected_fields} until {expiry_gate}"
+            );
+        }
+        if !source.contains(&format!("until {expiry_gate}.")) {
+            bail!("{relative_path} does not declare its frozen expiry gate {expiry_gate}");
+        }
+    }
+    Ok(())
+}
+
+fn check_wp07b_private_bridges(
+    repo_root: &Path,
+    contract: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let expected_contract = serde_json::json!([
+        {
+            "module": "current_egui_shell_bridge",
+            "path": "crates/mirante4d-app/src/current_egui_shell_bridge.rs",
+            "route": "current-egui-shell-to-application",
+            "expiry_gate": "WP-09C",
+            "required_root_items": ["dispatch", "drain_events", "snapshot"]
+        },
+        {
+            "module": "current_project_persistence_bridge",
+            "path": "crates/mirante4d-app/src/current_project_persistence_bridge.rs",
+            "route": "canonical-project-model-to-private-project-v15-persistence",
+            "expiry_gate": "WP-10B",
+            "required_root_items": [
+                "CurrentProjectPersistenceBridge",
+                "PROJECT_V15_SCHEMA",
+                "PROJECT_V15_SCHEMA_VERSION",
+                "ProjectPersistenceError",
+                "ProjectPersistenceEvent"
+            ]
+        }
+    ]);
+    if contract.get("private_bridges") != Some(&expected_contract) {
+        bail!("WP-07B private-bridge contract drifted");
+    }
+    let app_source_root = repo_root.join("crates/mirante4d-app/src");
+    let bridge_paths = collect_rust_source_files(&app_source_root)?
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("_bridge.rs"))
+        })
+        .map(|path| {
+            path.strip_prefix(repo_root)
+                .map(normalize_repo_path)
+                .map_err(Into::into)
+        })
+        .collect::<anyhow::Result<BTreeSet<_>>>()?;
+    let expected_bridge_paths = BTreeSet::from([
+        "crates/mirante4d-app/src/current_egui_shell_bridge.rs".to_owned(),
+        "crates/mirante4d-app/src/current_project_persistence_bridge.rs".to_owned(),
+    ]);
+    if bridge_paths != expected_bridge_paths {
+        bail!(
+            "WP-07B must retain exactly its two private bridges: expected={expected_bridge_paths:?}, actual={bridge_paths:?}"
+        );
+    }
+
+    let app_source = fs::read_to_string(app_source_root.join("lib.rs"))?;
+    let private_modules = private_root_module_names(&app_source)?;
+    for module in [
+        "current_egui_shell_bridge",
+        "current_project_persistence_bridge",
+    ] {
+        if !private_modules.contains(module) {
+            bail!("WP-07B bridge module {module} must remain private");
+        }
+    }
+    let app_fields = rust_struct_field_terminal_type_names(&app_source, "MiranteWorkbenchApp")?;
+    if app_fields.get("application").map(String::as_str) != Some("ApplicationState")
+        || app_fields.get("project_persistence").map(String::as_str)
+            != Some("CurrentProjectPersistenceBridge")
+    {
+        bail!("MiranteWorkbenchApp canonical application or project-bridge route drifted");
+    }
+
+    let egui_path = app_source_root.join("current_egui_shell_bridge.rs");
+    let egui_source = fs::read_to_string(&egui_path)?;
+    if !egui_source.contains("until\n//! WP-09C.") && !egui_source.contains("WP-09C") {
+        bail!("current egui shell bridge must retain its WP-09C expiry");
+    }
+    let egui_items = rust_root_defined_item_names(&egui_source)?;
+    let expected_egui_items = BTreeSet::from([
+        "dispatch".to_owned(),
+        "drain_events".to_owned(),
+        "snapshot".to_owned(),
+    ]);
+    if egui_items != expected_egui_items || !public_root_api_names(&egui_path)?.is_empty() {
+        bail!("current egui shell bridge API or privacy drifted");
+    }
+    if !egui_source.contains("application.dispatch(command)")
+        || !app_source.contains("current_egui_shell_bridge::dispatch")
+        || !app_source.contains("fn apply_application_command")
+    {
+        bail!("current egui shell mutation route no longer closes through the application bridge");
+    }
+
+    let project_path = app_source_root.join("current_project_persistence_bridge.rs");
+    let project_source = fs::read_to_string(&project_path)?;
+    if !project_source.contains("WP-10B") {
+        bail!("current project persistence bridge must retain its WP-10B expiry");
+    }
+    let project_items = rust_root_defined_item_names(&project_source)?;
+    let required_project_items = BTreeSet::from([
+        "CurrentProjectPersistenceBridge".to_owned(),
+        "PROJECT_V15_SCHEMA".to_owned(),
+        "PROJECT_V15_SCHEMA_VERSION".to_owned(),
+        "ProjectPersistenceError".to_owned(),
+        "ProjectPersistenceEvent".to_owned(),
+    ]);
+    if !required_project_items.is_subset(&project_items)
+        || !public_root_api_names(&project_path)?.is_empty()
+    {
+        bail!("current project persistence bridge API or privacy drifted");
+    }
+    let project_route_source = format!(
+        "{app_source}\n{}",
+        fs::read_to_string(app_source_root.join("workbench_ui.rs"))?
+    );
+    for marker in [
+        "bridge.request_open",
+        "bridge.request_save",
+        "bridge.cancel",
+        "bridge.try_recv",
+        "project_persistence.shutdown",
+    ] {
+        if !project_route_source.contains(marker) {
+            bail!("project persistence sole route is missing {marker:?}");
+        }
+    }
+    for path in collect_rust_source_files(&app_source_root)? {
+        if path == project_path || path == app_source_root.join("lib.rs") {
+            continue;
+        }
+        let source = fs::read_to_string(&path)?;
+        for identifier in [
+            "CurrentProjectPersistenceBridge",
+            "PROJECT_V15_SCHEMA",
+            "ProjectDocumentDto",
+        ] {
+            if source_contains_identifier(&source, identifier) {
+                bail!(
+                    "{} bypasses the sole private project persistence route with {identifier}",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_wp07b_predecessor_absence(
+    repo_root: &Path,
+    contract: &serde_json::Value,
+    workspace_metadata: &WorkspaceDependencyMetadata,
+) -> anyhow::Result<()> {
+    let expected_contract = serde_json::json!({
+        "paths": [
+            "crates/mirante4d-core",
+            "crates/mirante4d-app/src/commands.rs",
+            "crates/mirante4d-app/src/preferences.rs",
+            "crates/mirante4d-app/src/project_session.rs",
+            "crates/mirante4d-app/src/project_store.rs",
+            "crates/mirante4d-app/src/session_state.rs",
+            "crates/mirante4d-app/src/workbench_project.rs"
+        ],
+        "rust_identifiers": [
+            "AppPreferences",
+            "AppRecoverySession",
+            "AppRuntimePreferences",
+            "AppSession",
+            "AppSessionManifest",
+            "AppState",
+            "PREFERENCES_FORMAT",
+            "ProjectDirtySnapshot",
+            "SESSION_FORMAT",
+            "WorkbenchCommand",
+            "WorkbenchCommandOutcome",
+            "default_app_preferences_for_system",
+            "load_app_preferences",
+            "mirante4d_core",
+            "open_dataset_with_preferences_and_render_first_frame",
+            "save_app_preferences"
+        ],
+        "dependency_packages": ["mirante4d-core"]
+    });
+    if contract.get("forbidden_predecessors") != Some(&expected_contract) {
+        bail!("WP-07B predecessor-deletion contract drifted");
+    }
+    for relative_path in expected_contract["paths"]
+        .as_array()
+        .expect("frozen predecessor paths are an array")
+    {
+        let relative_path = relative_path
+            .as_str()
+            .expect("frozen predecessor path is a string");
+        if repo_root.join(relative_path).exists() {
+            bail!("WP-07B predecessor path still exists: {relative_path}");
+        }
+    }
+    let identifiers = expected_contract["rust_identifiers"]
+        .as_array()
+        .expect("frozen predecessor identifiers are an array")
+        .iter()
+        .map(|value| value.as_str().expect("predecessor identifier is a string"))
+        .collect::<Vec<_>>();
+    for path in collect_rust_source_files(&repo_root.join("crates"))? {
+        if normalize_repo_path(&path).contains("/crates/xtask/")
+            || path.starts_with(repo_root.join("crates/xtask"))
+        {
+            continue;
+        }
+        let source = fs::read_to_string(&path)?;
+        for identifier in &identifiers {
+            if source_contains_identifier(&source, identifier) {
+                bail!(
+                    "WP-07B predecessor identifier {identifier} remains in {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    for (package, kinds) in &workspace_metadata.declared_dependency_kinds_by_name {
+        if kinds
+            .values()
+            .flatten()
+            .any(|dependency| dependency == "mirante4d-core")
+        {
+            bail!("workspace package {package} still depends on deleted mirante4d-core");
+        }
+    }
+    check_non_workspace_manifest_forbidden_dependencies(
+        repo_root,
+        &BTreeSet::from(["mirante4d-core"]),
+    )
+}
+
+fn check_non_workspace_manifest_forbidden_dependencies(
+    repo_root: &Path,
+    forbidden_packages: &BTreeSet<&str>,
 ) -> anyhow::Result<()> {
     let mut manifests = Vec::new();
     collect_non_workspace_cargo_manifests(repo_root, repo_root, &mut manifests)?;
@@ -848,11 +1376,11 @@ fn check_non_workspace_manifest_reachability(
         let dependencies = manifest_dependency_package_names(&manifest)?;
         let forbidden = dependencies
             .iter()
-            .filter(|dependency| boundary_candidates.contains(dependency.as_str()))
+            .filter(|dependency| forbidden_packages.contains(dependency.as_str()))
             .collect::<Vec<_>>();
         if !forbidden.is_empty() {
             bail!(
-                "non-workspace target {} reaches unreachable WP-07B-A boundary crates: {forbidden:?}",
+                "non-workspace target {} reaches deleted WP-07B predecessor packages: {forbidden:?}",
                 manifest_path.display(),
             );
         }
@@ -1114,30 +1642,6 @@ fn check_wp07a_model_contract(
     if observed != expected {
         bail!("WP-07A crate dependency contracts do not match the frozen three-crate boundary");
     }
-    let preparatory_crates = expected.keys().copied().collect::<BTreeSet<_>>();
-    let boundary_candidates = WP07B_BOUNDARY_CANDIDATE_CRATES
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    for (package, kinds) in &workspace_metadata.declared_dependency_kinds_by_name {
-        if preparatory_crates.contains(package.as_str())
-            || boundary_candidates.contains(package.as_str())
-        {
-            continue;
-        }
-        let forbidden = kinds
-            .values()
-            .flatten()
-            .filter(|dependency| preparatory_crates.contains(dependency.as_str()))
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        if !forbidden.is_empty() {
-            bail!(
-                "existing workspace package {package} reaches WP-07A preparatory crates through some declared dependency kind or target: {forbidden:?}"
-            );
-        }
-    }
-
     let canonical_classes = contract
         .get("state_classes")
         .and_then(serde_json::Value::as_array)
@@ -1571,150 +2075,9 @@ fn add_public_use_tree_names(
     Ok(())
 }
 
-fn check_current_state_field_ledger(
-    repo_root: &Path,
-    expected_revision: &str,
-    state_class_mapping: &BTreeMap<String, BTreeSet<String>>,
-) -> anyhow::Result<()> {
-    let path = repo_root.join("architecture/current-state-field-ledger.json");
-    let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let ledger: StateFieldLedger = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
-    if ledger.schema != "mirante4d-current-state-field-ledger" || ledger.schema_version != 1 {
-        bail!("{} has an unsupported schema", path.display());
-    }
-    if ledger.source_revision != expected_revision {
-        bail!("state-field ledger and model contract must name the same predecessor revision");
-    }
-    if !ledger.invariants.every_source_field_exactly_once
-        || !ledger.invariants.one_target_owner_or_deletion
-        || ledger.invariants.product_cutover_gate != "WP-07B"
-        || !ledger.invariants.no_live_target_model_in_wp07a
-        || ledger.invariants.appstate_predecessor_field_removal_gate != "WP-07B"
-        || ledger
-            .invariants
-            .finalization_gate_meaning
-            .trim()
-            .is_empty()
-    {
-        bail!("state-field ledger invariants drifted");
-    }
-
-    let expected_sources = BTreeMap::from([
-        ("AppState", ("crates/mirante4d-app/src/lib.rs", 120_usize)),
-        (
-            "MiranteWorkbenchApp",
-            ("crates/mirante4d-app/src/lib.rs", 32_usize),
-        ),
-    ]);
-    if ledger.sources.len() != expected_sources.len() {
-        bail!("state-field ledger must name exactly the two frozen application structs");
-    }
-    let mut source_fields = BTreeMap::<String, BTreeSet<String>>::new();
-    for source_contract in &ledger.sources {
-        let expected = expected_sources
-            .get(source_contract.struct_name.as_str())
-            .with_context(|| {
-                format!(
-                    "unknown state-field source struct {}",
-                    source_contract.struct_name
-                )
-            })?;
-        if source_contract.path != expected.0 || source_contract.expected_fields != expected.1 {
-            bail!(
-                "state-field source contract drifted for {}",
-                source_contract.struct_name
-            );
-        }
-        let source_path = repo_root.join(&source_contract.path);
-        let source = fs::read_to_string(&source_path)
-            .with_context(|| format!("failed to read {}", source_path.display()))?;
-        let fields = rust_struct_field_names(&source, &source_contract.struct_name)?;
-        if fields.len() != source_contract.expected_fields {
-            bail!(
-                "{} has {} fields, but the ledger expects {}",
-                source_contract.struct_name,
-                fields.len(),
-                source_contract.expected_fields
-            );
-        }
-        let field_set = fields.into_iter().collect::<BTreeSet<_>>();
-        if source_fields
-            .insert(source_contract.struct_name.clone(), field_set)
-            .is_some()
-        {
-            bail!(
-                "duplicate state-field source {}",
-                source_contract.struct_name
-            );
-        }
-    }
-    if source_fields.values().map(BTreeSet::len).sum::<usize>() != 152 {
-        bail!("state-field ledger source inventory must contain exactly 152 fields");
-    }
-
-    let mut dispositions = BTreeMap::<String, BTreeSet<String>>::new();
-    let mut disposition_ids = BTreeSet::new();
-    let allowed_gates = BTreeSet::from([
-        "WP-07B", "WP-08B", "WP-09B", "WP-09C", "WP-10B", "WP-10C", "WP-12", "WP-14",
-    ]);
-    let allowed_owners = BTreeSet::from([
-        "mirante4d-analysis-core",
-        "mirante4d-analysis-runtime",
-        "mirante4d-app",
-        "mirante4d-application",
-        "mirante4d-dataset",
-        "mirante4d-dataset-runtime",
-        "mirante4d-import-pipeline",
-        "mirante4d-project-model",
-        "mirante4d-project-store",
-        "mirante4d-render-api",
-        "mirante4d-render-wgpu",
-        "mirante4d-settings",
-        "mirante4d-ui-egui",
-        "test-harness",
-        "validation-harness",
-    ]);
-    for disposition in &ledger.dispositions {
-        if !disposition_ids.insert(&disposition.id) {
-            bail!("duplicate state-field disposition ID {}", disposition.id);
-        }
-        if !matches!(disposition.action.as_str(), "move" | "delete" | "split")
-            || disposition.target_owner.trim().is_empty()
-            || !disposition
-                .target_owner
-                .split('+')
-                .all(|owner| allowed_owners.contains(owner))
-            || !allowed_gates.contains(disposition.finalization_gate.as_str())
-            || !state_class_mapping.contains_key(&disposition.state_class)
-            || disposition.reason.trim().is_empty()
-            || disposition.fields.is_empty()
-        {
-            bail!("incomplete state-field disposition {}", disposition.id);
-        }
-        let target = dispositions
-            .entry(disposition.source_struct.clone())
-            .or_default();
-        for field in &disposition.fields {
-            if !target.insert(field.clone()) {
-                bail!(
-                    "{}.{} has more than one disposition",
-                    disposition.source_struct,
-                    field
-                );
-            }
-        }
-    }
-    if dispositions != source_fields {
-        bail!("state-field ledger does not cover every current source field exactly once");
-    }
-    validate_nested_aggregate_dispositions(&ledger.nested_aggregate_deletions)?;
-    validate_project_v14_dispositions(repo_root, &ledger)?;
-    Ok(())
-}
-
 fn rust_struct_field_names(source: &str, struct_name: &str) -> anyhow::Result<Vec<String>> {
-    let file = syn::parse_file(source).context("failed to parse Rust source for field ledger")?;
+    let file =
+        syn::parse_file(source).context("failed to parse Rust source for field inventory")?;
     let matches = file
         .items
         .iter()
@@ -1727,7 +2090,7 @@ fn rust_struct_field_names(source: &str, struct_name: &str) -> anyhow::Result<Ve
         bail!("expected exactly one top-level struct {struct_name}");
     }
     let syn::Fields::Named(fields) = &matches[0].fields else {
-        bail!("state-ledger struct {struct_name} must have named fields");
+        bail!("inventory struct {struct_name} must have named fields");
     };
     fields
         .named
@@ -1742,95 +2105,128 @@ fn rust_struct_field_names(source: &str, struct_name: &str) -> anyhow::Result<Ve
         .collect()
 }
 
-fn validate_nested_aggregate_dispositions(items: &[serde_json::Value]) -> anyhow::Result<()> {
-    let expected = BTreeSet::from([
-        "AppLayerSummary",
-        "SceneArtifactStore",
-        "ViewerLayoutState",
-        "ViewerToolState",
-    ]);
-    let mut observed = BTreeSet::new();
-    for item in items {
-        let aggregate = item
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .context("nested aggregate disposition must name its type")?;
-        if !observed.insert(aggregate) {
-            bail!("duplicate nested aggregate disposition {aggregate}");
-        }
-        let split = item
-            .get("split")
-            .and_then(serde_json::Value::as_object)
-            .context("nested aggregate disposition must have a split object")?;
-        let mut concepts = BTreeSet::new();
-        for fields in split.values() {
-            let fields = fields
-                .as_array()
-                .context("nested aggregate split fields must be an array")?;
-            if fields.is_empty() {
-                bail!("nested aggregate {aggregate} has an empty split");
-            }
-            for field in fields {
-                let field = field
-                    .as_str()
-                    .context("nested aggregate split field must be a string")?;
-                if !concepts.insert(field) {
-                    bail!("nested aggregate {aggregate} assigns {field:?} more than once");
-                }
-            }
-        }
-        if let Some(deletions) = item.get("delete_duplicates") {
-            for field in deletions
-                .as_array()
-                .context("nested aggregate delete_duplicates must be an array")?
-            {
-                let field = field
-                    .as_str()
-                    .context("nested aggregate deletion must be a string")?;
-                if !concepts.insert(field) {
-                    bail!("nested aggregate {aggregate} both moves and deletes {field:?}");
-                }
-            }
-        }
-    }
-    if observed != expected {
-        bail!("nested aggregate disposition set drifted");
-    }
-    Ok(())
+fn rust_struct_field_terminal_type_names(
+    source: &str,
+    struct_name: &str,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let file = syn::parse_file(source).context("failed to parse Rust source for type inventory")?;
+    let item = file
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Struct(item) if item.ident == struct_name => Some(item),
+            _ => None,
+        })
+        .with_context(|| format!("expected one top-level struct {struct_name}"))?;
+    let syn::Fields::Named(fields) = &item.fields else {
+        bail!("inventory struct {struct_name} must have named fields");
+    };
+    fields
+        .named
+        .iter()
+        .map(|field| {
+            let name = field
+                .ident
+                .as_ref()
+                .map(ToString::to_string)
+                .context("named field has no identifier")?;
+            let type_name = terminal_type_name(&field.ty)
+                .with_context(|| format!("{struct_name}.{name} has an unsupported field type"))?;
+            Ok((name, type_name))
+        })
+        .collect()
 }
 
-fn validate_project_v14_dispositions(
-    repo_root: &Path,
-    ledger: &StateFieldLedger,
-) -> anyhow::Result<()> {
-    let source = &ledger.project_v14_source;
-    if source.path != "crates/mirante4d-app/src/project_session.rs"
-        || source.struct_name != "AppSession"
-        || source.expected_fields != 13
-    {
-        bail!("project-v14 source contract drifted");
-    }
-    let source_text = fs::read_to_string(repo_root.join(&source.path))?;
-    let actual = rust_struct_field_names(&source_text, &source.struct_name)?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    if actual.len() != source.expected_fields {
-        bail!("project-v14 source field count drifted");
-    }
-    let mut disposed = BTreeSet::new();
-    for disposition in &ledger.project_v14_dto_dispositions {
-        if !disposed.insert(disposition.field.clone())
-            || !matches!(disposition.action.as_str(), "move" | "delete" | "replace")
-            || disposition.target_owner.trim().is_empty()
-            || disposition.reason.trim().is_empty()
-        {
-            bail!("project-v14 DTO disposition is incomplete or duplicate");
+fn terminal_type_name(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Group(group) => terminal_type_name(&group.elem),
+        syn::Type::Paren(paren) => terminal_type_name(&paren.elem),
+        syn::Type::Reference(reference) => terminal_type_name(&reference.elem),
+        syn::Type::Path(path) => {
+            let segment = path.path.segments.last()?;
+            if let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments
+                && let Some(inner) = arguments.args.iter().find_map(|argument| match argument {
+                    syn::GenericArgument::Type(ty) => Some(ty),
+                    _ => None,
+                })
+            {
+                terminal_type_name(inner)
+            } else {
+                Some(segment.ident.to_string())
+            }
         }
+        _ => None,
     }
-    if actual != disposed {
-        bail!("project-v14 DTO dispositions do not cover every AppSession field exactly once");
-    }
-    Ok(())
+}
+
+fn private_root_module_names(source: &str) -> anyhow::Result<BTreeSet<String>> {
+    let file =
+        syn::parse_file(source).context("failed to parse Rust source for module inventory")?;
+    file.items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Mod(item) => Some(item),
+            _ => None,
+        })
+        .map(|module| {
+            if !matches!(module.vis, syn::Visibility::Inherited) {
+                bail!("module {} must remain private", module.ident);
+            }
+            if module.content.is_some() {
+                bail!("module {} must remain file-backed", module.ident);
+            }
+            Ok(module.ident.to_string())
+        })
+        .collect()
+}
+
+fn crate_private_root_module_names(source: &str) -> anyhow::Result<BTreeSet<String>> {
+    let file =
+        syn::parse_file(source).context("failed to parse Rust source for module inventory")?;
+    file.items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Mod(item) => Some(item),
+            _ => None,
+        })
+        .map(|module| {
+            if matches!(module.vis, syn::Visibility::Public(_)) {
+                bail!("module {} must not be public", module.ident);
+            }
+            if module.content.is_some() {
+                bail!("module {} must remain file-backed", module.ident);
+            }
+            Ok(module.ident.to_string())
+        })
+        .collect()
+}
+
+fn rust_root_defined_item_names(source: &str) -> anyhow::Result<BTreeSet<String>> {
+    let file =
+        syn::parse_file(source).context("failed to parse Rust source for root API inventory")?;
+    Ok(file
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+            syn::Item::Const(item) => Some(item.ident.to_string()),
+            syn::Item::Enum(item) => Some(item.ident.to_string()),
+            syn::Item::Fn(item) => Some(item.sig.ident.to_string()),
+            syn::Item::Mod(item) => Some(item.ident.to_string()),
+            syn::Item::Static(item) => Some(item.ident.to_string()),
+            syn::Item::Struct(item) => Some(item.ident.to_string()),
+            syn::Item::Trait(item) => Some(item.ident.to_string()),
+            syn::Item::TraitAlias(item) => Some(item.ident.to_string()),
+            syn::Item::Type(item) => Some(item.ident.to_string()),
+            syn::Item::Union(item) => Some(item.ident.to_string()),
+            _ => None,
+        })
+        .collect())
+}
+
+fn source_contains_identifier(source: &str, identifier: &str) -> bool {
+    source
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .any(|token| token == identifier)
 }
 
 fn axis_aligned_2d_chunk_dependency_violations(path: &Path, source: &str) -> Vec<String> {
@@ -2002,7 +2398,7 @@ mod tests {
 name = "example"
 
 [dependencies]
-mirante4d-core.workspace = true
+mirante4d-domain.workspace = true
 serde.workspace = true
 mirante4d-data = { workspace = true }
 
@@ -2012,7 +2408,7 @@ mirante4d-format.workspace = true
 
         assert_eq!(
             normal_workspace_dependencies(manifest),
-            vec!["mirante4d-core".to_owned(), "mirante4d-data".to_owned()]
+            vec!["mirante4d-domain".to_owned(), "mirante4d-data".to_owned()]
         );
     }
 
@@ -2145,7 +2541,7 @@ pub struct Example {
     }
 
     #[test]
-    fn wp07a_model_and_current_state_contracts_match_the_repository() {
+    fn wp07a_model_contract_matches_the_repository() {
         let nested_use_violations = forbidden_canonical_model_std_use_violations(
             Path::new("crates/mirante4d-domain/src/nested.rs"),
             r#"
@@ -2250,7 +2646,7 @@ directory = "vendor"
     }
 
     #[test]
-    fn wp07b_boundary_candidates_match_the_frozen_unreachable_contract() {
+    fn wp07b_live_cutover_matches_the_repository() {
         let forbidden = BTreeSet::from(["fs"]);
         let violations = forbidden_std_authority_violations(
             Path::new("crates/example/src/lib.rs"),

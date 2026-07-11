@@ -154,8 +154,9 @@ pub(crate) fn phase13_render_error_kind(err: &RenderError) -> &'static str {
         | RenderError::ResourceIdentityMismatch(_)
         | RenderError::InvalidResourceId { .. } => "invalid_mode_parameter",
         RenderError::DimensionTooLarge { .. } => "backend_limit",
-        RenderError::EmptyVolume | RenderError::Shape(_) | RenderError::Space(_) => {
-            "invalid_transform"
-        }
+        RenderError::EmptyVolume
+        | RenderError::Shape(_)
+        | RenderError::Space(_)
+        | RenderError::Camera(_) => "invalid_transform",
     }
 }

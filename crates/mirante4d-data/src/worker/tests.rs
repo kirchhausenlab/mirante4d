@@ -1,4 +1,5 @@
-use mirante4d_core::{LayerId, TimeIndex};
+use mirante4d_domain::TimeIndex;
+use mirante4d_format::LayerId;
 
 use super::*;
 
@@ -215,7 +216,7 @@ fn request_with_queue_priority(
         generation_id: DataGenerationId(0),
         layer_id: LayerId::new("ch0").unwrap(),
         scale_level: 0,
-        timepoint: TimeIndex(0),
+        timepoint: TimeIndex::new(0),
         brick_index: SpatialBrickIndex::new(0, 0, 0),
         sample_region: None,
         coalesced_brick_indices: Vec::new(),

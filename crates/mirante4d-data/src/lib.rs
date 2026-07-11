@@ -5,9 +5,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use mirante4d_core::{DatasetId, GridToWorld, LayerId, Shape3D, TimeIndex};
+use mirante4d_domain::{GridToWorld, Shape3D, TimeIndex};
 use mirante4d_format::{
-    BrickIndex, LayerManifest, NativeManifest, ScaleManifest, ValidatedDataset,
+    BrickIndex, DatasetId, LayerId, LayerManifest, NativeManifest, ScaleManifest, ValidatedDataset,
     load_and_validate_dataset_quick,
 };
 use zarrs::array::ArrayShardedReadableExtCache;
@@ -213,7 +213,7 @@ impl DatasetHandle {
         let key = VolumeCacheKey {
             layer_id: layer_id.to_string(),
             scale_level,
-            timepoint: timepoint.0,
+            timepoint: timepoint.get(),
         };
         if let Some(volume) = self.cache_get_u8(&key)? {
             self.record_cache_hit()?;
@@ -241,7 +241,7 @@ impl DatasetHandle {
         let key = VolumeCacheKey {
             layer_id: layer_id.to_string(),
             scale_level,
-            timepoint: timepoint.0,
+            timepoint: timepoint.get(),
         };
         if let Some(volume) = self.cache_get_u16(&key)? {
             self.record_cache_hit()?;
@@ -363,16 +363,16 @@ impl DatasetHandle {
         let scale = self.scale(layer_id, scale_level)?;
         validate_spatial_brick_index(scale, brick_index)?;
         let chunks_per_shard = scale.storage.chunks_per_shard;
-        if chunks_per_shard.z == 0 || chunks_per_shard.y == 0 || chunks_per_shard.x == 0 {
+        if chunks_per_shard.z() == 0 || chunks_per_shard.y() == 0 || chunks_per_shard.x() == 0 {
             return Err(DataError::ReadFailed {
                 layer_id: layer_id.to_string(),
                 message: "storage chunks_per_shard must be positive".to_owned(),
             });
         }
         Ok(SpatialBrickIndex {
-            z: brick_index.z / chunks_per_shard.z,
-            y: brick_index.y / chunks_per_shard.y,
-            x: brick_index.x / chunks_per_shard.x,
+            z: brick_index.z / chunks_per_shard.z(),
+            y: brick_index.y / chunks_per_shard.y(),
+            x: brick_index.x / chunks_per_shard.x(),
         })
     }
 
@@ -495,10 +495,13 @@ impl DatasetHandle {
     ) -> Result<u64, DataError> {
         let lookup = self.scale_lookup(layer_id, scale_level)?;
         let ends = region.ends()?;
-        let t_chunks = chunk_index_range(timepoint.0..timepoint.0 + 1, scale.storage.shard_shape.t);
-        let z_chunks = chunk_index_range(region.z_start..ends.z, scale.storage.shard_shape.z);
-        let y_chunks = chunk_index_range(region.y_start..ends.y, scale.storage.shard_shape.y);
-        let x_chunks = chunk_index_range(region.x_start..ends.x, scale.storage.shard_shape.x);
+        let t_chunks = chunk_index_range(
+            timepoint.get()..timepoint.get() + 1,
+            scale.storage.shard_shape.t(),
+        );
+        let z_chunks = chunk_index_range(region.z_start..ends.z, scale.storage.shard_shape.z());
+        let y_chunks = chunk_index_range(region.y_start..ends.y, scale.storage.shard_shape.y());
+        let x_chunks = chunk_index_range(region.x_start..ends.x, scale.storage.shard_shape.x());
 
         let mut payload_bytes = 0u64;
         let mut seen = HashSet::new();
@@ -571,7 +574,7 @@ impl DatasetHandle {
         let scale = self.scale(layer_id, scale_level)?;
         validate_spatial_brick_index(scale, brick_index)?;
         let chunk_index = BrickIndex {
-            t: timepoint.0 / scale.storage.brick_shape.t,
+            t: timepoint.get() / scale.storage.brick_shape.t(),
             z: brick_index.z,
             y: brick_index.y,
             x: brick_index.x,
@@ -644,7 +647,7 @@ impl DatasetHandle {
         let key = BrickCacheKey {
             layer_id: layer_id.to_string(),
             scale_level,
-            timepoint: timepoint.0,
+            timepoint: timepoint.get(),
             z: brick_index.z,
             y: brick_index.y,
             x: brick_index.x,
@@ -730,7 +733,7 @@ impl DatasetHandle {
         let key = BrickCacheKey {
             layer_id: layer_id.to_string(),
             scale_level,
-            timepoint: timepoint.0,
+            timepoint: timepoint.get(),
             z: brick_index.z,
             y: brick_index.y,
             x: brick_index.x,
@@ -825,7 +828,7 @@ impl DatasetHandle {
         let key = BrickCacheKey {
             layer_id: layer_id.to_string(),
             scale_level,
-            timepoint: timepoint.0,
+            timepoint: timepoint.get(),
             z: brick_index.z,
             y: brick_index.y,
             x: brick_index.x,
@@ -1097,7 +1100,7 @@ impl DatasetHandle {
             },
         )?;
         let subset = [
-            timepoint.0..timepoint.0 + 1,
+            timepoint.get()..timepoint.get() + 1,
             region.z_start..ends.z,
             region.y_start..ends.y,
             region.x_start..ends.x,
@@ -1171,7 +1174,7 @@ impl DatasetHandle {
             },
         )?;
         let subset = [
-            timepoint.0..timepoint.0 + 1,
+            timepoint.get()..timepoint.get() + 1,
             region.z_start..ends.z,
             region.y_start..ends.y,
             region.x_start..ends.x,
@@ -1347,7 +1350,7 @@ impl DatasetHandle {
         let scale = self.scale(layer_id, scale_level)?;
         validate_spatial_brick_index(scale, brick_index)?;
         let chunk_index = BrickIndex {
-            t: timepoint.0 / scale.storage.brick_shape.t,
+            t: timepoint.get() / scale.storage.brick_shape.t(),
             z: brick_index.z,
             y: brick_index.y,
             x: brick_index.x,
@@ -1389,7 +1392,7 @@ impl DatasetHandle {
         let scale = self.scale(layer_id, scale_level)?;
         validate_spatial_brick_index(scale, brick_index)?;
         let chunk_index = BrickIndex {
-            t: timepoint.0 / scale.storage.brick_shape.t,
+            t: timepoint.get() / scale.storage.brick_shape.t(),
             z: brick_index.z,
             y: brick_index.y,
             x: brick_index.x,
@@ -1431,7 +1434,7 @@ impl DatasetHandle {
         let scale = self.scale(layer_id, scale_level)?;
         validate_spatial_brick_index(scale, brick_index)?;
         let chunk_index = BrickIndex {
-            t: timepoint.0 / scale.storage.brick_shape.t,
+            t: timepoint.get() / scale.storage.brick_shape.t(),
             z: brick_index.z,
             y: brick_index.y,
             x: brick_index.x,
@@ -1477,14 +1480,14 @@ impl DatasetHandle {
             },
         )?;
         let spatial = scale.shape.spatial();
-        let region = VolumeRegion::new(0, 0, 0, spatial.z, spatial.y, spatial.x)?;
+        let region = VolumeRegion::new(0, 0, 0, spatial.z(), spatial.y(), spatial.x())?;
         let encoded =
             encoded_payload_diagnostics_for_timepoint_region(layer_id, scale, timepoint, &region)?;
         let subset = [
-            timepoint.0..timepoint.0 + 1,
-            0..spatial.z,
-            0..spatial.y,
-            0..spatial.x,
+            timepoint.get()..timepoint.get() + 1,
+            0..spatial.z(),
+            0..spatial.y(),
+            0..spatial.x(),
         ];
         let intensity_cache = self.shard_index_cache(&scale.array_path, &array)?;
         let values_read = retrieve_sharded_subset::<Vec<u8>>(
@@ -1550,14 +1553,14 @@ impl DatasetHandle {
             },
         )?;
         let spatial = scale.shape.spatial();
-        let region = VolumeRegion::new(0, 0, 0, spatial.z, spatial.y, spatial.x)?;
+        let region = VolumeRegion::new(0, 0, 0, spatial.z(), spatial.y(), spatial.x())?;
         let encoded =
             encoded_payload_diagnostics_for_timepoint_region(layer_id, scale, timepoint, &region)?;
         let subset = [
-            timepoint.0..timepoint.0 + 1,
-            0..spatial.z,
-            0..spatial.y,
-            0..spatial.x,
+            timepoint.get()..timepoint.get() + 1,
+            0..spatial.z(),
+            0..spatial.y(),
+            0..spatial.x(),
         ];
         let intensity_cache = self.shard_index_cache(&scale.array_path, &array)?;
         let values_read = retrieve_sharded_subset::<Vec<u16>>(
@@ -1628,7 +1631,7 @@ impl DatasetHandle {
             },
         )?;
         let subset = [
-            timepoint.0..timepoint.0 + 1,
+            timepoint.get()..timepoint.get() + 1,
             region.z_start..ends.z,
             region.y_start..ends.y,
             region.x_start..ends.x,
@@ -1697,14 +1700,14 @@ impl DatasetHandle {
             },
         )?;
         let spatial = scale.shape.spatial();
-        let region = VolumeRegion::new(0, 0, 0, spatial.z, spatial.y, spatial.x)?;
+        let region = VolumeRegion::new(0, 0, 0, spatial.z(), spatial.y(), spatial.x())?;
         let encoded =
             encoded_payload_diagnostics_for_timepoint_region(layer_id, scale, timepoint, &region)?;
         let subset = [
-            timepoint.0..timepoint.0 + 1,
-            0..spatial.z,
-            0..spatial.y,
-            0..spatial.x,
+            timepoint.get()..timepoint.get() + 1,
+            0..spatial.z(),
+            0..spatial.y(),
+            0..spatial.x(),
         ];
         let intensity_cache = self.shard_index_cache(&scale.array_path, &array)?;
         let values_read = retrieve_sharded_subset::<Vec<f32>>(

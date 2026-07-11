@@ -24,7 +24,7 @@ fn brick_atlas_cache_key_is_independent_of_resident_pages() {
                 },
                 shape: Shape4D::new(1, 2, 2, 4).unwrap(),
                 brick_shape: Shape4D::new(1, 2, 2, 2).unwrap(),
-                grid_to_world: GridToWorld::scale_um(1.0, 1.0, 1.0),
+                grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
                 display: default_u16_display(),
                 values_tzyx: (0..16).collect(),
             }],
@@ -38,35 +38,43 @@ fn brick_atlas_cache_key_is_independent_of_resident_pages() {
     let brick_grid_shape = dataset.brick_grid_shape(&layer_id).unwrap();
     let grid_to_world = dataset.scale_grid_to_world(&layer_id, 0).unwrap();
     let left = dataset
-        .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+        .read_u16_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 0),
+        )
         .unwrap();
     let right = dataset
-        .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 1))
+        .read_u16_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 1),
+        )
         .unwrap();
     let left_first = ResidentBrickSetU16::new(
         layer_id.clone(),
-        TimeIndex(0),
+        TimeIndex::new(0),
         Shape3D::new(2, 2, 4).unwrap(),
         grid_to_world,
         vec![left.clone(), right.clone()],
     );
     let right_first = ResidentBrickSetU16::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         Shape3D::new(2, 2, 4).unwrap(),
         grid_to_world,
         vec![right, left],
     );
     let left_only = ResidentBrickSetU16::new(
         left_first.layer_id.clone(),
-        TimeIndex(0),
+        TimeIndex::new(0),
         Shape3D::new(2, 2, 4).unwrap(),
         left_first.grid_to_world,
         vec![left_first.bricks()[0].clone()],
     );
     let right_only = ResidentBrickSetU16::new(
         left_first.layer_id.clone(),
-        TimeIndex(0),
+        TimeIndex::new(0),
         Shape3D::new(2, 2, 4).unwrap(),
         left_first.grid_to_world,
         vec![right_first.bricks()[0].clone()],

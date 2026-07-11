@@ -1,31 +1,35 @@
 use std::time::Instant;
 
 use anyhow::Context;
-#[cfg(test)]
-use mirante4d_core::LayerId;
-use mirante4d_core::{
-    CameraView, ChannelTransferFunction, IntensityDType, LayerDisplay, PresentationViewport,
-    Shape3D,
-};
+use mirante4d_application::ApplicationSnapshot;
 use mirante4d_data::{DenseVolumeF32, DenseVolumeU8, DenseVolumeU16};
+use mirante4d_domain::{
+    CameraView, DisplayWindow, DvrOpacityTransfer, IntensityDType, RenderMode, RenderState, Shape3D,
+};
+use mirante4d_format::LayerId;
+use mirante4d_render_api::{CameraFrame, PresentationViewport};
 use mirante4d_renderer::{
     CameraRenderMode, CameraRenderModeF32, CameraRenderQuality, DvrRenderParameters,
-    FrameDiagnostics, FrameDiagnosticsF32, IsoSurfaceFrameF32, IsoSurfaceFrameU16,
-    IsoSurfaceNormal, IsoSurfaceParameters, MipImageF32, MipImageU16, PixelCoverage, RenderError,
-    RenderViewport, ScalarDisplayTransfer,
+    FrameDiagnostics, FrameDiagnosticsF32, IntensityTransfer, IsoSurfaceFrameF32,
+    IsoSurfaceFrameU16, IsoSurfaceNormal, IsoSurfaceParameters, MipImageF32, MipImageU16,
+    PixelCoverage, RenderError, RenderViewport, ScalarDisplayTransfer,
     gpu::{GpuRenderError, GpuRenderer},
     render_camera_f32_with_quality, render_camera_u8_with_quality, render_camera_with_quality,
 };
 
 use crate::{
-    AppLayerSummary, AppState, ChannelFidelityStatus, ChannelFidelityWarning, ChannelRenderState,
-    DvrOpacityTransfer, FrameCompleteness, FrameFailureKind, IntensitySummary, LodDecisionReason,
-    RenderBackend, RenderMode, RenderedIntensityChannel, SMALL_DENSE_VIEWER_VOXEL_LIMIT,
-    brick_streaming::current_resident_frame_ready,
+    ChannelFidelityStatus, ChannelFidelityWarning, FrameCompleteness, FrameFailureKind,
+    IntensitySummary, LodDecisionReason, RenderBackend, RenderedIntensityChannel,
+    SMALL_DENSE_VIEWER_VOXEL_LIMIT,
+    brick_streaming::{current_resident_frame_ready, physical_layer_id_for_key, view_for_snapshot},
+    current_runtime::{
+        analysis::CurrentAnalysisRuntime, dataset::CurrentDatasetRuntime,
+        render::CurrentRenderRuntime, ui::CurrentUiRuntime,
+    },
     fidelity::visible_channel_fidelity_is_mixed,
     lod_scheduler::update_visible_brick_plan,
     resident_rendering::render_state_from_resident_bricks_with_backend,
-    viewport::{camera_render_quality, resident_brick_render_supported},
+    viewport::{camera_render_quality_for_render_state, resident_brick_render_supported},
 };
 
 pub(crate) fn dense_startup_allowed(shape: Shape3D) -> bool {
@@ -97,24 +101,27 @@ pub(crate) fn metadata_intensity_summary(shape: Shape3D) -> anyhow::Result<Inten
     })
 }
 
-pub(crate) fn set_render_viewport(state: &mut AppState, viewport: RenderViewport) -> bool {
-    if state.render_viewport == viewport {
+pub(crate) fn set_render_viewport(
+    render: &mut CurrentRenderRuntime,
+    viewport: RenderViewport,
+) -> bool {
+    if render.render_viewport == viewport {
         return false;
     }
-    state.render_viewport = viewport;
-    state.frame_fidelity.viewport = viewport;
+    render.render_viewport = viewport;
+    render.frame_fidelity.viewport = viewport;
     true
 }
 
 pub(crate) fn set_presentation_viewport(
-    state: &mut AppState,
+    render: &mut CurrentRenderRuntime,
     viewport: PresentationViewport,
 ) -> bool {
-    if state.presentation_viewport == viewport {
+    if render.presentation_viewport == viewport {
         return false;
     }
-    state.presentation_viewport = viewport;
-    state.frame_fidelity.presentation_viewport = viewport;
+    render.presentation_viewport = viewport;
+    render.frame_fidelity.presentation_viewport = viewport;
     true
 }
 
@@ -124,24 +131,15 @@ pub(crate) fn render_app_frame(
     camera: CameraView,
     presentation_viewport: PresentationViewport,
     viewport: RenderViewport,
-    mode: RenderMode,
-    transfer: &ChannelTransferFunction,
-    dvr_opacity_transfer: DvrOpacityTransfer,
-    iso_display_level: f32,
-    dvr_density_scale: f64,
+    render_state: RenderState,
+    transfer: &IntensityTransfer,
     quality: CameraRenderQuality,
 ) -> anyhow::Result<(MipImageU16, FrameDiagnostics)> {
     Ok(render_camera_with_quality(
         volume,
-        camera.to_camera_state(presentation_viewport),
+        CameraFrame::new(camera, presentation_viewport)?,
         viewport,
-        renderer_mode(
-            mode,
-            transfer,
-            dvr_opacity_transfer,
-            iso_display_level,
-            dvr_density_scale,
-        )?,
+        renderer_mode(render_state, transfer)?,
         quality,
     )?)
 }
@@ -152,24 +150,15 @@ pub(crate) fn render_u8_app_frame(
     camera: CameraView,
     presentation_viewport: PresentationViewport,
     viewport: RenderViewport,
-    mode: RenderMode,
-    transfer: &ChannelTransferFunction,
-    dvr_opacity_transfer: DvrOpacityTransfer,
-    iso_display_level: f32,
-    dvr_density_scale: f64,
+    render_state: RenderState,
+    transfer: &IntensityTransfer,
     quality: CameraRenderQuality,
 ) -> anyhow::Result<(MipImageU16, FrameDiagnostics)> {
     Ok(render_camera_u8_with_quality(
         volume,
-        camera.to_camera_state(presentation_viewport),
+        CameraFrame::new(camera, presentation_viewport)?,
         viewport,
-        renderer_mode(
-            mode,
-            transfer,
-            dvr_opacity_transfer,
-            iso_display_level,
-            dvr_density_scale,
-        )?,
+        renderer_mode(render_state, transfer)?,
         quality,
     )?)
 }
@@ -180,178 +169,186 @@ pub(crate) fn render_f32_app_frame(
     camera: CameraView,
     presentation_viewport: PresentationViewport,
     viewport: RenderViewport,
-    mode: RenderMode,
-    transfer: &ChannelTransferFunction,
-    display: LayerDisplay,
-    dvr_opacity_transfer: DvrOpacityTransfer,
-    iso_display_level: f32,
-    dvr_density_scale: f64,
+    render_state: RenderState,
+    transfer: &IntensityTransfer,
     quality: CameraRenderQuality,
 ) -> anyhow::Result<(MipImageF32, FrameDiagnosticsF32)> {
     Ok(render_camera_f32_with_quality(
         volume,
-        camera.to_camera_state(presentation_viewport),
+        CameraFrame::new(camera, presentation_viewport)?,
         viewport,
-        renderer_mode_f32(
-            mode,
-            transfer,
-            display,
-            dvr_opacity_transfer,
-            iso_display_level,
-            dvr_density_scale,
-        )?,
+        renderer_mode_f32(render_state, transfer)?,
         quality,
     )?)
 }
 
 pub(crate) fn rerender_state_with_backend(
-    state: &mut AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &mut CurrentDatasetRuntime,
+    analysis: &CurrentAnalysisRuntime,
+    ui_runtime: &CurrentUiRuntime,
+    render: &mut CurrentRenderRuntime,
     gpu_renderer: Option<&GpuRenderer>,
 ) -> anyhow::Result<()> {
     let render_start = Instant::now();
-    update_visible_brick_plan(state);
+    update_visible_brick_plan(snapshot, dataset, render);
+    let view = view_for_snapshot(snapshot);
+    let active_layer = view
+        .layer(view.active_layer())
+        .ok_or_else(|| anyhow::anyhow!("active logical layer is absent from the canonical view"))?;
+    let render_state = *active_layer.render_state();
+    let transfer = IntensityTransfer::new(active_layer.visible(), active_layer.transfer().clone());
+    let camera = *view.camera();
+    let quality = camera_render_quality_for_render_state(render_state);
 
-    if current_resident_frame_ready(state)
-        && resident_brick_render_supported(state.active_render_mode)
+    if current_resident_frame_ready(snapshot, dataset, render)
+        && resident_brick_render_supported(render_state.mode())
     {
-        render_state_from_resident_bricks_with_backend(state, gpu_renderer)?;
-        record_completed_frame_time(state, render_start);
-        refresh_fidelity_resource_stats(state, gpu_renderer);
+        render_state_from_resident_bricks_with_backend(
+            snapshot,
+            dataset,
+            render,
+            analysis,
+            ui_runtime,
+            gpu_renderer,
+        )?;
+        record_completed_frame_time(render, render_start);
+        refresh_fidelity_resource_stats(snapshot, dataset, render, gpu_renderer);
         return Ok(());
     }
 
-    if let Some(volume_f32) = &state.active_volume_f32 {
+    if let Some(volume_f32) = &dataset.active_volume_f32 {
+        if gpu_renderer.is_some() {
+            anyhow::bail!(
+                "dense float32 rendering is reference-only; the interactive viewer must stream bricks"
+            );
+        }
         let (frame_f32, diagnostics_f32) = render_f32_app_frame(
             volume_f32,
-            state.camera,
-            state.presentation_viewport,
-            state.render_viewport,
-            state.active_render_mode,
-            &state.active_layer_transfer,
-            state.active_layer_display,
-            state.active_dvr_opacity_transfer,
-            state.iso_display_level,
-            state.dvr_density_scale,
-            camera_render_quality(state),
+            camera,
+            render.presentation_viewport,
+            render.render_viewport,
+            render_state,
+            &transfer,
+            quality,
         )?;
-        state.frame = f32_frame_to_display_u16_for_mode(
+        render.frame = f32_frame_to_display_u16_for_mode(
             &frame_f32,
-            state.active_render_mode,
-            state.active_layer_display,
+            render_state.mode(),
+            active_layer.transfer().window(),
         )?;
-        state.diagnostics = mirante4d_renderer::frame_diagnostics(
+        render.diagnostics = mirante4d_renderer::frame_diagnostics(
             volume_f32.shape.element_count()?,
-            state.frame.pixels(),
+            render.frame.pixels(),
         );
-        state.frame_f32 = Some(frame_f32);
-        state.diagnostics_f32 = Some(diagnostics_f32);
-        state.render_backend = RenderBackend::CpuReference;
-        state.frame_fidelity.displayed_scale_level = Some(volume_f32.scale_level);
-        state.lod_schedule.displayed_scale_level = Some(volume_f32.scale_level);
-        state.lod_schedule.pending_scale_level = None;
-        state.frame_fidelity.target_scale_level = state.lod_schedule.target_scale_level;
-        state.frame_fidelity.completeness = FrameCompleteness::Exact;
-        state.frame_fidelity.reason = if volume_f32.scale_level == 0 {
+        render.frame_f32 = Some(frame_f32);
+        render.diagnostics_f32 = Some(diagnostics_f32);
+        render.render_backend = RenderBackend::CpuReference;
+        render.frame_fidelity.displayed_scale_level = Some(volume_f32.scale_level);
+        render.lod_schedule.displayed_scale_level = Some(volume_f32.scale_level);
+        render.lod_schedule.pending_scale_level = None;
+        render.frame_fidelity.target_scale_level = render.lod_schedule.target_scale_level;
+        render.frame_fidelity.completeness = FrameCompleteness::Exact;
+        render.frame_fidelity.reason = if volume_f32.scale_level == 0 {
             LodDecisionReason::ExactS0
         } else {
             LodDecisionReason::ScreenEquivalentCoarserScale
         };
-        state.frame_fidelity.backend = state.render_backend;
-        record_completed_frame_time(state, render_start);
-        set_single_rendered_channel(state);
-        update_visible_brick_plan(state);
-        refresh_fidelity_resource_stats(state, gpu_renderer);
+        render.frame_fidelity.backend = render.render_backend;
+        record_completed_frame_time(render, render_start);
+        set_single_rendered_channel(snapshot, dataset, render)?;
+        update_visible_brick_plan(snapshot, dataset, render);
+        refresh_fidelity_resource_stats(snapshot, dataset, render, gpu_renderer);
         return Ok(());
     }
 
-    if let Some(volume_u8) = &state.active_volume_u8 {
+    if let Some(volume_u8) = &dataset.active_volume_u8 {
+        if gpu_renderer.is_some() {
+            anyhow::bail!(
+                "dense uint8 rendering is reference-only; the interactive viewer must stream bricks"
+            );
+        }
         let (frame, diagnostics) = render_u8_app_frame(
             volume_u8,
-            state.camera,
-            state.presentation_viewport,
-            state.render_viewport,
-            state.active_render_mode,
-            &state.active_layer_transfer,
-            state.active_dvr_opacity_transfer,
-            state.iso_display_level,
-            state.dvr_density_scale,
-            camera_render_quality(state),
+            camera,
+            render.presentation_viewport,
+            render.render_viewport,
+            render_state,
+            &transfer,
+            quality,
         )?;
-        state.frame = frame;
-        state.diagnostics = diagnostics;
-        state.frame_f32 = None;
-        state.diagnostics_f32 = None;
-        state.render_backend = RenderBackend::CpuReference;
-        state.frame_fidelity.displayed_scale_level = Some(volume_u8.scale_level);
-        state.lod_schedule.displayed_scale_level = Some(volume_u8.scale_level);
-        state.lod_schedule.pending_scale_level = None;
-        state.frame_fidelity.target_scale_level = state.lod_schedule.target_scale_level;
-        state.frame_fidelity.completeness = frame_completeness_for_rendered_scale(
+        render.frame = frame;
+        render.diagnostics = diagnostics;
+        render.frame_f32 = None;
+        render.diagnostics_f32 = None;
+        render.render_backend = RenderBackend::CpuReference;
+        render.frame_fidelity.displayed_scale_level = Some(volume_u8.scale_level);
+        render.lod_schedule.displayed_scale_level = Some(volume_u8.scale_level);
+        render.lod_schedule.pending_scale_level = None;
+        render.frame_fidelity.target_scale_level = render.lod_schedule.target_scale_level;
+        render.frame_fidelity.completeness = frame_completeness_for_rendered_scale(
             volume_u8.scale_level,
-            state.frame_fidelity.target_scale_level,
-            state.frame_fidelity.reason,
+            render.frame_fidelity.target_scale_level,
+            render.frame_fidelity.reason,
         );
-        state.frame_fidelity.reason = if volume_u8.scale_level == 0 {
+        render.frame_fidelity.reason = if volume_u8.scale_level == 0 {
             LodDecisionReason::ExactS0
         } else {
             LodDecisionReason::ScreenEquivalentCoarserScale
         };
-        state.frame_fidelity.backend = state.render_backend;
-        record_completed_frame_time(state, render_start);
-        set_single_rendered_channel(state);
-        refresh_fidelity_resource_stats(state, gpu_renderer);
+        render.frame_fidelity.backend = render.render_backend;
+        record_completed_frame_time(render, render_start);
+        set_single_rendered_channel(snapshot, dataset, render)?;
+        refresh_fidelity_resource_stats(snapshot, dataset, render, gpu_renderer);
         return Ok(());
     }
 
-    let Some(active_volume) = state.active_volume.as_ref() else {
-        set_loading_frame_for_current_viewport(state);
-        set_single_rendered_channel(state);
-        state.render_backend = RenderBackend::CpuResidentBricks;
-        state.frame_fidelity.backend = state.render_backend;
-        state.frame_fidelity.displayed_scale_level = state.lod_schedule.displayed_scale_level;
-        if state.frame_fidelity.completeness != FrameCompleteness::BudgetLimited {
-            state.frame_fidelity.completeness = FrameCompleteness::Loading;
-            state.frame_fidelity.reason = LodDecisionReason::LoadingTargetScale;
+    let Some(active_volume) = dataset.active_volume.as_ref() else {
+        set_loading_frame_for_current_viewport(snapshot, render);
+        set_single_rendered_channel(snapshot, dataset, render)?;
+        render.render_backend = RenderBackend::CpuResidentBricks;
+        render.frame_fidelity.backend = render.render_backend;
+        render.frame_fidelity.displayed_scale_level = render.lod_schedule.displayed_scale_level;
+        if render.frame_fidelity.completeness != FrameCompleteness::BudgetLimited {
+            render.frame_fidelity.completeness = FrameCompleteness::Loading;
+            render.frame_fidelity.reason = LodDecisionReason::LoadingTargetScale;
         }
-        state.frame_fidelity.frame_time_ms = None;
-        refresh_fidelity_resource_stats(state, gpu_renderer);
+        render.frame_fidelity.frame_time_ms = None;
+        refresh_fidelity_resource_stats(snapshot, dataset, render, gpu_renderer);
         return Ok(());
     };
 
     let (frame, diagnostics, backend) = render_app_frame_with_backend(
         active_volume,
-        state.camera,
-        state.presentation_viewport,
-        state.render_viewport,
-        state.active_render_mode,
-        &state.active_layer_transfer,
-        state.active_dvr_opacity_transfer,
-        state.iso_display_level,
-        state.dvr_density_scale,
-        camera_render_quality(state),
+        camera,
+        render.presentation_viewport,
+        render.render_viewport,
+        render_state,
+        &transfer,
+        quality,
         gpu_renderer,
     )?;
-    state.frame = frame;
-    state.diagnostics = diagnostics;
-    state.render_backend = backend;
-    state.frame_fidelity.displayed_scale_level = Some(active_volume.scale_level);
-    state.lod_schedule.displayed_scale_level = Some(active_volume.scale_level);
-    state.lod_schedule.pending_scale_level = None;
-    state.frame_fidelity.target_scale_level = state.lod_schedule.target_scale_level;
-    state.frame_fidelity.completeness = frame_completeness_for_rendered_scale(
+    render.frame = frame;
+    render.diagnostics = diagnostics;
+    render.render_backend = backend;
+    render.frame_fidelity.displayed_scale_level = Some(active_volume.scale_level);
+    render.lod_schedule.displayed_scale_level = Some(active_volume.scale_level);
+    render.lod_schedule.pending_scale_level = None;
+    render.frame_fidelity.target_scale_level = render.lod_schedule.target_scale_level;
+    render.frame_fidelity.completeness = frame_completeness_for_rendered_scale(
         active_volume.scale_level,
-        state.frame_fidelity.target_scale_level,
-        state.frame_fidelity.reason,
+        render.frame_fidelity.target_scale_level,
+        render.frame_fidelity.reason,
     );
-    state.frame_fidelity.reason = if active_volume.scale_level == 0 {
+    render.frame_fidelity.reason = if active_volume.scale_level == 0 {
         LodDecisionReason::ExactS0
     } else {
         LodDecisionReason::ScreenEquivalentCoarserScale
     };
-    state.frame_fidelity.backend = backend;
-    record_completed_frame_time(state, render_start);
-    set_single_rendered_channel(state);
-    refresh_fidelity_resource_stats(state, gpu_renderer);
+    render.frame_fidelity.backend = backend;
+    record_completed_frame_time(render, render_start);
+    set_single_rendered_channel(snapshot, dataset, render)?;
+    refresh_fidelity_resource_stats(snapshot, dataset, render, gpu_renderer);
     Ok(())
 }
 
@@ -361,23 +358,14 @@ pub(crate) fn render_app_frame_with_backend(
     camera: CameraView,
     presentation_viewport: PresentationViewport,
     viewport: RenderViewport,
-    mode: RenderMode,
-    transfer: &ChannelTransferFunction,
-    dvr_opacity_transfer: DvrOpacityTransfer,
-    iso_display_level: f32,
-    dvr_density_scale: f64,
+    render_state: RenderState,
+    transfer: &IntensityTransfer,
     quality: CameraRenderQuality,
     gpu_renderer: Option<&GpuRenderer>,
 ) -> anyhow::Result<(MipImageU16, FrameDiagnostics, RenderBackend)> {
     if let Some(gpu_renderer) = gpu_renderer {
-        let camera_mode = renderer_mode(
-            mode,
-            transfer,
-            dvr_opacity_transfer,
-            iso_display_level,
-            dvr_density_scale,
-        )?;
-        let backend = match mode {
+        let camera_mode = renderer_mode(render_state, transfer)?;
+        let backend = match render_state.mode() {
             RenderMode::Mip => Some(RenderBackend::GpuCameraMip),
             RenderMode::Isosurface => Some(RenderBackend::GpuCameraIso),
             RenderMode::Dvr => Some(RenderBackend::GpuCameraDvr),
@@ -385,19 +373,13 @@ pub(crate) fn render_app_frame_with_backend(
         if let Some(backend) = backend {
             match gpu_renderer.render_camera_with_quality(
                 volume,
-                camera.to_camera_state(presentation_viewport),
+                CameraFrame::new(camera, presentation_viewport)?,
                 viewport,
                 camera_mode,
                 quality,
             ) {
                 Ok(output) => return Ok((output.image, output.frame, backend)),
-                Err(err) => {
-                    if !dense_startup_allowed(volume.shape) {
-                        return Err(err).context(
-                            "dense GPU rendering failed and dense CPU fallback is disabled for large interactive volumes",
-                        );
-                    }
-                }
+                Err(err) => return Err(err).context("dense GPU rendering failed"),
             }
         }
     }
@@ -410,132 +392,163 @@ pub(crate) fn render_app_frame_with_backend(
         camera,
         presentation_viewport,
         viewport,
-        mode,
+        render_state,
         transfer,
-        dvr_opacity_transfer,
-        iso_display_level,
-        dvr_density_scale,
         quality,
     )?;
     Ok((frame, diagnostics, RenderBackend::CpuReference))
 }
 
-pub(crate) fn set_single_rendered_channel(state: &mut AppState) {
-    state.rendered_channels = vec![RenderedIntensityChannel {
-        layer_id: state.active_layer_id.clone(),
-        render_state: ChannelRenderState::for_mode(
-            state.active_render_mode,
-            state.render_sampling_policy,
-            state.render_iso_shading_policy,
-            state.iso_display_level,
-            state.active_dvr_opacity_transfer,
-            state.dvr_density_scale,
-        ),
-        transfer: state.active_layer_transfer.clone(),
-        frame: state.frame.clone(),
-        frame_f32: state.frame_f32.clone(),
+pub(crate) fn set_single_rendered_channel(
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &mut CurrentRenderRuntime,
+) -> anyhow::Result<()> {
+    let view = view_for_snapshot(snapshot);
+    let layer = view
+        .layer(view.active_layer())
+        .ok_or_else(|| anyhow::anyhow!("active logical layer is absent from the canonical view"))?;
+    render.rendered_channels = vec![RenderedIntensityChannel {
+        layer_id: physical_layer_id_for_key(dataset, view.active_layer())?,
+        render_state: *layer.render_state(),
+        transfer: IntensityTransfer::new(layer.visible(), layer.transfer().clone()),
+        frame: render.frame.clone(),
+        frame_f32: render.frame_f32.clone(),
     }];
-    update_channel_fidelity_status(state);
+    update_channel_fidelity_status(snapshot, dataset, render);
+    Ok(())
 }
 
-pub(crate) fn set_loading_frame_for_current_viewport(state: &mut AppState) {
-    if state.frame.width != state.render_viewport.width
-        || state.frame.height != state.render_viewport.height
-        || (state.active_render_mode == RenderMode::Isosurface
-            && state.frame.iso_surface().is_none())
+pub(crate) fn set_loading_frame_for_current_viewport(
+    snapshot: &ApplicationSnapshot,
+    render: &mut CurrentRenderRuntime,
+) {
+    let view = view_for_snapshot(snapshot);
+    let render_mode = view
+        .layer(view.active_layer())
+        .map(|layer| layer.render_state().mode())
+        .unwrap_or(RenderMode::Mip);
+    if render.frame.width != render.render_viewport.width
+        || render.frame.height != render.render_viewport.height
+        || (render_mode == RenderMode::Isosurface && render.frame.iso_surface().is_none())
     {
-        state.frame = placeholder_frame_for_mode(state.render_viewport, state.active_render_mode);
+        render.frame = placeholder_frame_for_mode(render.render_viewport, render_mode);
     }
-    state.frame_f32 = None;
-    state.diagnostics = mirante4d_renderer::frame_diagnostics(
-        state.active_source_shape.element_count().unwrap_or(0),
-        state.frame.pixels(),
+    render.frame_f32 = None;
+    let active_shape = snapshot
+        .catalog()
+        .layer(view.active_layer())
+        .map(|layer| layer.shape().spatial());
+    render.diagnostics = mirante4d_renderer::frame_diagnostics(
+        active_shape
+            .and_then(|shape| shape.element_count().ok())
+            .unwrap_or(0),
+        render.frame.pixels(),
     );
-    state.diagnostics_f32 = None;
+    render.diagnostics_f32 = None;
 }
 
 pub(crate) fn refresh_fidelity_resource_stats(
-    state: &mut AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &mut CurrentRenderRuntime,
     gpu_renderer: Option<&GpuRenderer>,
 ) {
-    state.frame_fidelity.viewport = state.render_viewport;
-    state.frame_fidelity.visible_bricks = state.visible_brick_count;
-    state.frame_fidelity.resident_bricks = state.resident_bricks_u8.len()
-        + state.resident_bricks.len()
-        + state.resident_bricks_f32.len();
-    state.frame_fidelity.missing_occupied_bricks = state
+    render.frame_fidelity.viewport = render.render_viewport;
+    render.frame_fidelity.visible_bricks = render.visible_brick_count;
+    render.frame_fidelity.resident_bricks = dataset
+        .resident_bricks_u8_by_layer
+        .values()
+        .map(Vec::len)
+        .sum::<usize>()
+        + dataset
+            .resident_bricks_by_layer
+            .values()
+            .map(Vec::len)
+            .sum::<usize>()
+        + dataset
+            .resident_bricks_f32_by_layer
+            .values()
+            .map(Vec::len)
+            .sum::<usize>();
+    render.frame_fidelity.missing_occupied_bricks = dataset
         .brick_stream_requested
-        .saturating_sub(state.brick_stream_completed);
-    if let Ok(diagnostics) = state.dataset.diagnostics() {
-        state.frame_fidelity.cpu_cache_bytes = diagnostics.stats.brick_cache_bytes;
+        .saturating_sub(dataset.brick_stream_completed);
+    if let Ok(diagnostics) = dataset.dataset.diagnostics() {
+        render.frame_fidelity.cpu_cache_bytes = diagnostics.stats.brick_cache_bytes;
     }
     if let Some(renderer) = gpu_renderer
         && let Ok(stats) = renderer.stats()
     {
-        state.frame_fidelity.gpu_resident_bytes = stats.brick_atlas_resident_bytes;
+        render.frame_fidelity.gpu_resident_bytes = stats.brick_atlas_resident_bytes;
     }
-    update_channel_fidelity_status(state);
+    update_channel_fidelity_status(snapshot, dataset, render);
 }
 
-pub(crate) fn update_channel_fidelity_status(state: &mut AppState) {
-    let visible_status = state.frame_fidelity.clone();
-    state.channel_fidelity = state
-        .layers
-        .iter()
-        .map(|layer| {
-            let visible = layer.display.visible;
-            let resident_bricks = if visible {
-                resident_brick_count_for_layer(state, layer)
+pub(crate) fn update_channel_fidelity_status(
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &mut CurrentRenderRuntime,
+) {
+    let visible_status = render.frame_fidelity.clone();
+    let view = view_for_snapshot(snapshot);
+    let mut channel_fidelity = Vec::with_capacity(view.layers().len());
+    for layer_view in view.layers() {
+        let Some(layer) = snapshot.catalog().layer(layer_view.layer_key()) else {
+            continue;
+        };
+        let Ok(layer_id) = physical_layer_id_for_key(dataset, layer_view.layer_key()) else {
+            continue;
+        };
+        let visible = layer_view.visible();
+        let resident_bricks = if visible {
+            resident_brick_count_for_layer(dataset, &layer_id, layer.dtype())
+        } else {
+            0
+        };
+        let visible_bricks = if visible {
+            render.visible_brick_count
+        } else {
+            0
+        };
+        let missing = if visible {
+            dataset
+                .brick_stream_requested
+                .saturating_sub(dataset.brick_stream_completed)
+        } else {
+            0
+        };
+        let warning = if !visible {
+            Some(ChannelFidelityWarning::Hidden)
+        } else if visible_status.completeness == FrameCompleteness::Incomplete {
+            Some(ChannelFidelityWarning::Incomplete)
+        } else {
+            None
+        };
+        channel_fidelity.push(ChannelFidelityStatus {
+            layer_id: layer_id.to_string(),
+            layer_name: layer.label().to_owned(),
+            visible,
+            render_mode: layer_view.render_state().mode(),
+            displayed_scale_level: visible_status.displayed_scale_level,
+            target_scale_level: visible_status.target_scale_level,
+            completeness: if visible {
+                visible_status.completeness
             } else {
-                0
-            };
-            let visible_bricks = if visible {
-                state.visible_brick_count
-            } else {
-                0
-            };
-            let missing = if visible {
-                state
-                    .brick_stream_requested
-                    .saturating_sub(state.brick_stream_completed)
-            } else {
-                0
-            };
-            let warning = if !visible {
-                Some(ChannelFidelityWarning::Hidden)
-            } else if visible_status.completeness == FrameCompleteness::Incomplete {
-                Some(ChannelFidelityWarning::Incomplete)
-            } else {
-                None
-            };
-            ChannelFidelityStatus {
-                layer_id: layer.id.clone(),
-                layer_name: layer.name.clone(),
-                visible,
-                render_mode: if layer.id == state.active_layer_id {
-                    state.active_render_mode
-                } else {
-                    layer.render_state.mode()
-                },
-                displayed_scale_level: visible_status.displayed_scale_level,
-                target_scale_level: visible_status.target_scale_level,
-                completeness: if visible {
-                    visible_status.completeness
-                } else {
-                    FrameCompleteness::Complete
-                },
-                reason: visible_status.reason,
-                backend: visible_status.backend,
-                resident_bricks,
-                visible_bricks,
-                missing_occupied_bricks: missing,
-                warning,
-            }
-        })
-        .collect();
+                FrameCompleteness::Complete
+            },
+            reason: visible_status.reason,
+            backend: visible_status.backend,
+            resident_bricks,
+            visible_bricks,
+            missing_occupied_bricks: missing,
+            warning,
+        });
+    }
+    render.channel_fidelity = channel_fidelity;
 
-    if visible_channel_fidelity_is_mixed(&state.channel_fidelity) {
-        for channel in &mut state.channel_fidelity {
+    if visible_channel_fidelity_is_mixed(&render.channel_fidelity) {
+        for channel in &mut render.channel_fidelity {
             if channel.visible {
                 channel.warning = Some(ChannelFidelityWarning::MixedFidelity);
             }
@@ -543,41 +556,27 @@ pub(crate) fn update_channel_fidelity_status(state: &mut AppState) {
     }
 }
 
-fn resident_brick_count_for_layer(state: &AppState, layer: &AppLayerSummary) -> usize {
-    match layer.dtype {
-        IntensityDType::Float32 => state
+fn resident_brick_count_for_layer(
+    dataset: &CurrentDatasetRuntime,
+    layer_id: &LayerId,
+    dtype: IntensityDType,
+) -> usize {
+    match dtype {
+        IntensityDType::Float32 => dataset
             .resident_bricks_f32_by_layer
-            .get(&layer.id)
+            .get(layer_id)
             .map(Vec::len)
-            .unwrap_or_else(|| {
-                if layer.id == state.active_layer_id {
-                    state.resident_bricks_f32.len()
-                } else {
-                    0
-                }
-            }),
-        IntensityDType::Uint8 => state
+            .unwrap_or(0),
+        IntensityDType::Uint8 => dataset
             .resident_bricks_u8_by_layer
-            .get(&layer.id)
+            .get(layer_id)
             .map(Vec::len)
-            .unwrap_or_else(|| {
-                if layer.id == state.active_layer_id {
-                    state.resident_bricks_u8.len()
-                } else {
-                    0
-                }
-            }),
-        IntensityDType::Uint16 => state
+            .unwrap_or(0),
+        IntensityDType::Uint16 => dataset
             .resident_bricks_by_layer
-            .get(&layer.id)
+            .get(layer_id)
             .map(Vec::len)
-            .unwrap_or_else(|| {
-                if layer.id == state.active_layer_id {
-                    state.resident_bricks.len()
-                } else {
-                    0
-                }
-            }),
+            .unwrap_or(0),
     }
 }
 
@@ -606,14 +605,12 @@ pub(crate) fn frame_completeness_for_rendered_scale(
     }
 }
 
-pub(crate) fn record_completed_frame_time(state: &mut AppState, render_start: Instant) {
-    #[cfg(test)]
-    let frame_time_ms = state
-        .fixed_frame_time_ms_for_snapshots
-        .unwrap_or_else(|| render_start.elapsed().as_secs_f64() * 1000.0);
-    #[cfg(not(test))]
+pub(crate) fn record_completed_frame_time(
+    render: &mut CurrentRenderRuntime,
+    render_start: Instant,
+) {
     let frame_time_ms = render_start.elapsed().as_secs_f64() * 1000.0;
-    state.frame_fidelity.frame_time_ms = Some(frame_time_ms);
+    render.frame_fidelity.frame_time_ms = Some(frame_time_ms);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -704,13 +701,13 @@ pub(crate) fn frame_failure_kind_for_render_error(err: &RenderError) -> FrameFai
         | RenderError::ResourceIdentityMismatch(_)
         | RenderError::InvalidResourceId { .. } => FrameFailureKind::InvalidModeParameter,
         RenderError::DimensionTooLarge { .. } => FrameFailureKind::BackendLimit,
-        RenderError::EmptyVolume | RenderError::Shape(_) | RenderError::Space(_) => {
-            FrameFailureKind::InvalidTransform
-        }
+        RenderError::EmptyVolume
+        | RenderError::Shape(_)
+        | RenderError::Space(_)
+        | RenderError::Camera(_) => FrameFailureKind::InvalidTransform,
     }
 }
 
-#[cfg(test)]
 pub(crate) fn fidelity_state_for_resident_render_failure(
     kind: FrameFailureKind,
 ) -> (FrameCompleteness, LodDecisionReason) {
@@ -746,7 +743,6 @@ pub(crate) fn fidelity_state_for_resident_render_failure(
     }
 }
 
-#[cfg(test)]
 fn resident_render_failure_can_trigger_lod_downgrade(kind: FrameFailureKind) -> bool {
     matches!(
         kind,
@@ -756,121 +752,201 @@ fn resident_render_failure_can_trigger_lod_downgrade(kind: FrameFailureKind) -> 
     )
 }
 
-#[cfg(test)]
 pub(crate) fn request_lod_downgrade_after_resident_capacity_failure(
-    state: &mut AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &mut CurrentDatasetRuntime,
+    render: &mut CurrentRenderRuntime,
     failure: ResidentRenderFailureStatus,
 ) -> bool {
-    state.frame_fidelity.last_capacity_error = Some(failure.message.clone());
-    state.frame_fidelity.last_failure_kind = Some(failure.kind);
+    render.frame_fidelity.last_capacity_error = Some(failure.message.clone());
+    render.frame_fidelity.last_failure_kind = Some(failure.kind);
     let (completeness, reason) = fidelity_state_for_resident_render_failure(failure.kind);
-    state.frame_fidelity.completeness = completeness;
-    state.frame_fidelity.reason = reason;
-    state.brick_stream_last_error = Some(failure.message);
+    render.frame_fidelity.completeness = completeness;
+    render.frame_fidelity.reason = reason;
+    dataset.brick_stream_last_error = Some(failure.message);
 
     if !resident_render_failure_can_trigger_lod_downgrade(failure.kind) {
         return false;
     }
 
-    let Ok(layer_id) = LayerId::new(state.active_layer_id.clone()) else {
+    let Ok(active_layer_id) =
+        physical_layer_id_for_key(dataset, view_for_snapshot(snapshot).active_layer())
+    else {
         return false;
     };
-    let Ok(scale_count) = state.dataset.scale_count(&layer_id) else {
+    let Ok(scale_count) = dataset.dataset.scale_count(&active_layer_id) else {
         return false;
     };
-    if state.brick_stream_scale_level as usize + 1 >= scale_count {
+    if dataset.brick_stream_scale_level as usize + 1 >= scale_count {
         return false;
     }
 
-    state.lod_schedule.hard_failed_scale_level = Some(state.brick_stream_scale_level);
-    state.lod_schedule.hard_failure_reason = Some(reason);
-    state.lod_replan_pending = true;
+    render.lod_schedule.hard_failed_scale_level = Some(dataset.brick_stream_scale_level);
+    render.lod_schedule.hard_failure_reason = Some(reason);
+    render.lod_replan_pending = true;
     true
 }
 
-pub(crate) fn take_lod_replan_pending(state: &mut AppState) -> bool {
-    let pending = state.lod_replan_pending;
-    state.lod_replan_pending = false;
+/// Records a render failure in the existing fidelity fault channel and, for a
+/// typed resident-capacity failure, schedules one coarser LOD attempt.
+///
+/// Resident rendering wraps its failures in `ResidentRenderFailure`; dense or
+/// composition failures remain visible but must not mutate the brick LOD plan.
+pub(crate) fn record_render_failure(
+    snapshot: &ApplicationSnapshot,
+    dataset: &mut CurrentDatasetRuntime,
+    render: &mut CurrentRenderRuntime,
+    error: &anyhow::Error,
+) -> bool {
+    if let Some(failure) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ResidentRenderFailure>())
+        .map(|failure| failure.status.clone())
+    {
+        return request_lod_downgrade_after_resident_capacity_failure(
+            snapshot, dataset, render, failure,
+        );
+    }
+
+    let failure = render_failure_status(error);
+    let (completeness, reason) = fidelity_state_for_resident_render_failure(failure.kind);
+    render.frame_fidelity.last_failure_kind = Some(failure.kind);
+    render.frame_fidelity.last_capacity_error = Some(failure.message.clone());
+    render.frame_fidelity.completeness = completeness;
+    render.frame_fidelity.reason = reason;
+    dataset.brick_stream_last_error = Some(failure.message);
+    false
+}
+
+pub(crate) fn render_failure_status(error: &anyhow::Error) -> ResidentRenderFailureStatus {
+    if let Some(failure) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ResidentRenderFailure>())
+    {
+        return failure.status.clone();
+    }
+    let kind = error
+        .chain()
+        .find_map(|cause| {
+            cause
+                .downcast_ref::<GpuRenderError>()
+                .map(frame_failure_kind_for_gpu_error)
+                .or_else(|| {
+                    cause
+                        .downcast_ref::<RenderError>()
+                        .map(frame_failure_kind_for_render_error)
+                })
+        })
+        .unwrap_or(FrameFailureKind::InvalidModeParameter);
+    ResidentRenderFailureStatus::new(kind, format!("{error:#}"))
+}
+
+pub(crate) fn take_lod_replan_pending(render: &mut CurrentRenderRuntime) -> bool {
+    let pending = render.lod_replan_pending;
+    render.lod_replan_pending = false;
     pending
 }
 
 pub(crate) fn renderer_mode(
-    mode: RenderMode,
-    transfer: &ChannelTransferFunction,
-    dvr_opacity_transfer: DvrOpacityTransfer,
-    iso_display_level: f32,
-    dvr_density_scale: f64,
+    render_state: RenderState,
+    transfer: &IntensityTransfer,
 ) -> anyhow::Result<CameraRenderMode> {
-    Ok(match mode {
+    Ok(match render_state.mode() {
         RenderMode::Mip => CameraRenderMode::Mip,
         RenderMode::Isosurface => CameraRenderMode::Isosurface {
-            parameters: iso_surface_parameters(transfer, iso_display_level),
+            parameters: iso_surface_parameters(
+                transfer,
+                render_state
+                    .iso_parameters()
+                    .expect("ISO mode has ISO parameters")
+                    .display_level(),
+            ),
         },
         RenderMode::Dvr => CameraRenderMode::Dvr {
-            parameters: dvr_render_parameters(transfer, dvr_opacity_transfer, dvr_density_scale),
+            parameters: {
+                let parameters = render_state
+                    .dvr_parameters()
+                    .expect("DVR mode has DVR parameters");
+                dvr_render_parameters(
+                    transfer,
+                    parameters.opacity_transfer(),
+                    parameters.density_scale(),
+                )
+            },
         },
     })
 }
 
 pub(crate) fn renderer_mode_f32(
-    mode: RenderMode,
-    transfer: &ChannelTransferFunction,
-    _display: LayerDisplay,
-    dvr_opacity_transfer: DvrOpacityTransfer,
-    iso_display_level: f32,
-    dvr_density_scale: f64,
+    render_state: RenderState,
+    transfer: &IntensityTransfer,
 ) -> anyhow::Result<CameraRenderModeF32> {
-    Ok(match mode {
+    Ok(match render_state.mode() {
         RenderMode::Mip => CameraRenderModeF32::Mip,
         RenderMode::Isosurface => CameraRenderModeF32::Isosurface {
-            parameters: iso_surface_parameters(transfer, iso_display_level),
+            parameters: iso_surface_parameters(
+                transfer,
+                render_state
+                    .iso_parameters()
+                    .expect("ISO mode has ISO parameters")
+                    .display_level(),
+            ),
         },
         RenderMode::Dvr => CameraRenderModeF32::Dvr {
-            parameters: dvr_render_parameters(transfer, dvr_opacity_transfer, dvr_density_scale),
+            parameters: {
+                let parameters = render_state
+                    .dvr_parameters()
+                    .expect("DVR mode has DVR parameters");
+                dvr_render_parameters(
+                    transfer,
+                    parameters.opacity_transfer(),
+                    parameters.density_scale(),
+                )
+            },
         },
     })
 }
 
 pub(crate) fn iso_surface_parameters(
-    transfer: &ChannelTransferFunction,
+    transfer: &IntensityTransfer,
     iso_display_level: f32,
 ) -> IsoSurfaceParameters {
     IsoSurfaceParameters::new(
         iso_display_level,
-        ScalarDisplayTransfer::from_transfer_function(transfer),
+        ScalarDisplayTransfer::from_intensity_transfer(*transfer),
     )
 }
 
 pub(crate) fn dvr_render_parameters(
-    transfer: &ChannelTransferFunction,
+    transfer: &IntensityTransfer,
     dvr_opacity_transfer: DvrOpacityTransfer,
     dvr_density_scale: f64,
 ) -> DvrRenderParameters {
     DvrRenderParameters::new(
-        ScalarDisplayTransfer::from_transfer_function(transfer),
+        ScalarDisplayTransfer::from_intensity_transfer(*transfer),
         ScalarDisplayTransfer::new(
-            dvr_opacity_transfer.window,
-            dvr_opacity_transfer.curve,
+            dvr_opacity_transfer.window(),
+            dvr_opacity_transfer.curve(),
             false,
         ),
-        transfer.color.color_rgba,
-        transfer.display.opacity,
+        transfer.color_rgba(),
+        transfer.opacity().get(),
         dvr_density_scale,
     )
 }
 
-pub(crate) fn f32_values_to_display_u16(values: &[f32], display: LayerDisplay) -> Vec<u16> {
+pub(crate) fn f32_values_to_display_u16(values: &[f32], window: DisplayWindow) -> Vec<u16> {
     values
         .iter()
-        .map(|value| f32_value_to_display_u16(*value, display))
+        .map(|value| f32_value_to_display_u16(*value, window))
         .collect()
 }
 
-pub(crate) fn f32_frame_to_display_u16(image: &MipImageF32, display: LayerDisplay) -> MipImageU16 {
+pub(crate) fn f32_frame_to_display_u16(image: &MipImageF32, window: DisplayWindow) -> MipImageU16 {
     MipImageU16::try_new_with_mode_frames(
         image.width,
         image.height,
-        f32_values_to_display_u16(image.pixels(), display),
+        f32_values_to_display_u16(image.pixels(), window),
         image.coverage().clone(),
         None,
         image.dvr_rgba().cloned(),
@@ -896,11 +972,11 @@ pub(crate) fn f32_dvr_frame_to_display_u16(image: &MipImageF32) -> MipImageU16 {
 
 pub(crate) fn f32_iso_frame_to_display_u16(
     image: &MipImageF32,
-    display: LayerDisplay,
+    window: DisplayWindow,
 ) -> MipImageU16 {
     let iso_surface = image
         .iso_surface()
-        .map(|surface| f32_iso_surface_to_display_u16_surface(surface, display));
+        .map(|surface| f32_iso_surface_to_display_u16_surface(surface, window));
     MipImageU16::try_new_with_mode_frames(
         image.width,
         image.height,
@@ -918,12 +994,12 @@ pub(crate) fn f32_iso_frame_to_display_u16(
 
 fn f32_iso_surface_to_display_u16_surface(
     surface: &IsoSurfaceFrameF32,
-    display: LayerDisplay,
+    window: DisplayWindow,
 ) -> IsoSurfaceFrameU16 {
     IsoSurfaceFrameU16::try_new(
         surface.width,
         surface.height,
-        f32_values_to_display_u16(surface.source_values(), display),
+        f32_values_to_display_u16(surface.source_values(), window),
         surface
             .display_scalars()
             .iter()
@@ -946,21 +1022,21 @@ fn f32_iso_surface_to_display_u16_surface(
 pub(crate) fn f32_frame_to_display_u16_for_mode(
     image: &MipImageF32,
     mode: RenderMode,
-    display: LayerDisplay,
+    window: DisplayWindow,
 ) -> anyhow::Result<MipImageU16> {
     Ok(match mode {
-        RenderMode::Isosurface => f32_iso_frame_to_display_u16(image, display),
+        RenderMode::Isosurface => f32_iso_frame_to_display_u16(image, window),
         RenderMode::Dvr => f32_dvr_frame_to_display_u16(image),
-        RenderMode::Mip => f32_frame_to_display_u16(image, display),
+        RenderMode::Mip => f32_frame_to_display_u16(image, window),
     })
 }
 
-fn f32_value_to_display_u16(value: f32, display: LayerDisplay) -> u16 {
+fn f32_value_to_display_u16(value: f32, window: DisplayWindow) -> u16 {
     if !value.is_finite() {
         return 0;
     }
-    let low = display.window.low;
-    let high = display.window.high;
+    let low = window.low();
+    let high = window.high();
     let normalized = if high > low {
         ((value - low) / (high - low)).clamp(0.0, 1.0)
     } else {

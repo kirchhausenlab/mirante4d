@@ -1,5 +1,5 @@
-use mirante4d_core::TimeIndex;
 use mirante4d_data::{DatasetHandle, VolumeRegion};
+use mirante4d_domain::TimeIndex;
 
 use super::test_support::{
     cpu_f32_region_summary, cpu_region_summary, write_three_brick_f32_gpu_fixture,
@@ -27,7 +27,9 @@ fn gpu_intensity_summary_matches_cpu_volume_summary() {
     let root = write_three_brick_gpu_fixture(tempdir.path());
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let renderer = GpuRenderer::new_blocking().unwrap();
 
     let summary = renderer.summarize_u16_volume(&volume).unwrap();
@@ -60,7 +62,9 @@ fn gpu_roi_intensity_summary_matches_cpu_region_summary() {
     let root = write_three_brick_gpu_fixture(tempdir.path());
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let region = VolumeRegion::new(0, 0, 1, 2, 2, 4).unwrap();
     let renderer = GpuRenderer::new_blocking().unwrap();
 
@@ -79,13 +83,23 @@ fn gpu_float32_intensity_summary_matches_cpu_volume_summary() {
     let root = write_three_brick_f32_gpu_fixture(tempdir.path());
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_f32_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_f32_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let renderer = GpuRenderer::new_blocking().unwrap();
 
     let summary = renderer.summarize_f32_volume(&volume).unwrap();
     let expected = cpu_f32_region_summary(
         &volume,
-        VolumeRegion::new(0, 0, 0, volume.shape.z, volume.shape.y, volume.shape.x).unwrap(),
+        VolumeRegion::new(
+            0,
+            0,
+            0,
+            volume.shape.z(),
+            volume.shape.y(),
+            volume.shape.x(),
+        )
+        .unwrap(),
     );
 
     assert_eq!(summary.voxel_count, expected.voxel_count);
@@ -104,7 +118,9 @@ fn gpu_float32_roi_intensity_summary_matches_cpu_region_summary() {
     let root = write_three_brick_f32_gpu_fixture(tempdir.path());
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_f32_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_f32_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let region = VolumeRegion::new(0, 0, 1, 2, 2, 4).unwrap();
     let renderer = GpuRenderer::new_blocking().unwrap();
 

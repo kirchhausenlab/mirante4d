@@ -1,26 +1,157 @@
 {
   "schema": "mirante4d-wp07b-boundary-contract",
-  "schema_version": 1,
-  "status": "candidate-unreachable",
+  "schema_version": 2,
+  "status": "live-cutover",
   "predecessor_tag": "foundation-wp-07a-exit-1",
   "predecessor_revision": "5383cbb93c13c59e6f035bfa551356c75fb426dc",
   "entry_sha256": "ee14dae5433626e19fa28d0bcc13cabfdbc259604845ee967c0404d978a27d15",
   "entry_correction_sha256": "d4309d2cdd342c84d536f34de4bfa05013f46b6e009f7e37516c93f814067ac6",
   "scope": {
-    "checkpoint": "WP07B-A-boundary-candidates",
-    "existing_product_reachable": false,
-    "product_behavior_changed": false,
-    "project_serialization_changed": false,
-    "settings_product_path_changed": false,
-    "core_deleted": false,
-    "live_cutover_gate": "WP07B-B-atomic-product-cutover"
+    "checkpoint": "WP07B-B-live-cutover",
+    "product_reachable": true,
+    "canonical_application_authoritative": true,
+    "canonical_project_model_authoritative": true,
+    "settings_product_path_live": true,
+    "project_v15_private_bridge_live": true,
+    "core_deleted": true,
+    "predecessors_deleted": true
   },
+  "product_activation": {
+    "package": "mirante4d-app",
+    "required_normal_dependencies": [
+      "mirante4d-application",
+      "mirante4d-dataset",
+      "mirante4d-render-api",
+      "mirante4d-settings"
+    ]
+  },
+  "product_open_validation": {
+    "scenario_id": "wp07b-t2-state-settings-identity-gate-v1",
+    "fixture": {
+      "name": "time-multichannel-u16-8cube-3t-2c",
+      "dataset_id": "fixture-time-multichannel-u16-8cube-3t-2c",
+      "tier": "T2"
+    },
+    "runtime": {
+      "binary": "release",
+      "display": "real-vulkan",
+      "input": "os",
+      "xdg_profile": "isolated",
+      "automation": false,
+      "smoke": false
+    },
+    "launch_1": {
+      "physical_client_area_px": [1280, 720],
+      "gpu_frame": "nonblank",
+      "same_source_open": {
+        "old_frame": "visible-until-completion"
+      },
+      "project_io_gate": {
+        "open": "disabled",
+        "save": "disabled",
+        "text": "verification-required",
+        "before": "dialog-or-io"
+      },
+      "next": "t2/3",
+      "play": {
+        "minimum_current_nonblank_timepoints": 2,
+        "then": "Pause"
+      },
+      "layouts": ["3D", "4Panel", "3D"],
+      "render_modes": ["MIP", "DVR", "MIP"],
+      "settings_save_mib": {
+        "cpu": 3072,
+        "gpu": 1280
+      },
+      "physical_close_exit_code": 0
+    },
+    "launch_2": {
+      "physical_client_area_px": [1920, 1080],
+      "profile": "same-isolated-xdg",
+      "settings_status": "Loaded",
+      "settings_mib": {
+        "cpu": 3072,
+        "gpu": 1280
+      },
+      "gpu_frame": "nonblank",
+      "project_io_gate": {
+        "open": "disabled",
+        "save": "disabled",
+        "text": "verification-required",
+        "before": "dialog-or-io"
+      },
+      "physical_close_exit_code": 0
+    },
+    "postconditions": {
+      "launch_2_settings_bytes": "identical-to-post-launch-1",
+      "source_tree": "unchanged"
+    },
+    "reject_log_signatures": [
+      "panic",
+      "validation error",
+      "wgpu error",
+      "fallback",
+      "retry loop",
+      "corruption"
+    ],
+    "exclusions": [
+      "segmentation",
+      "4K",
+      "private-data",
+      "synthetic-large-dataset",
+      "unsupported-project-roundtrip"
+    ],
+    "qualification": {
+      "preflight": "nonqualifying",
+      "final_run": {
+        "qualifying": true,
+        "workspace": "clean",
+        "revision": "protected-main",
+        "order": "after-checks"
+      }
+    }
+  },
+  "live_boundary_dependency_edges": [
+    {
+      "from": "mirante4d-app",
+      "to": "mirante4d-application"
+    },
+    {
+      "from": "mirante4d-app",
+      "to": "mirante4d-dataset"
+    },
+    {
+      "from": "mirante4d-app",
+      "to": "mirante4d-render-api"
+    },
+    {
+      "from": "mirante4d-app",
+      "to": "mirante4d-settings"
+    },
+    {
+      "from": "mirante4d-application",
+      "to": "mirante4d-dataset"
+    },
+    {
+      "from": "mirante4d-application",
+      "to": "mirante4d-settings"
+    },
+    {
+      "from": "mirante4d-renderer",
+      "to": "mirante4d-render-api"
+    },
+    {
+      "from": "xtask",
+      "to": "mirante4d-render-api"
+    }
+  ],
   "crate_contracts": [
     {
       "name": "mirante4d-application",
       "path": "crates/mirante4d-application",
-      "authority": "Pure bounded application commands, reducer, events, snapshots, project revision/history movement, transient semantic selection, operation currentness, and typed faults",
+      "authority": "Sole live bounded application command, reducer, event, snapshot, project revision/history, transient semantic selection, operation-currentness, and typed-fault authority",
       "permitted_normal_mirante4d_dependencies": [
+        "mirante4d-dataset",
         "mirante4d-domain",
         "mirante4d-identity",
         "mirante4d-project-model",
@@ -30,6 +161,12 @@
       "permitted_dev_dependencies": [],
       "permitted_external_side_effects": [],
       "public_api": [
+        "AnalysisDescriptorError",
+        "AnalysisPlotDescriptor",
+        "AnalysisPlotId",
+        "AnalysisPlotPointSelection",
+        "AnalysisTableDescriptor",
+        "AnalysisTableId",
         "ApplicationCommand",
         "ApplicationCommandKind",
         "ApplicationEvent",
@@ -41,9 +178,14 @@
         "CrossSectionPanelId",
         "CurrentnessGeneration",
         "MAX_ACTIVE_OPERATIONS",
+        "MAX_ANALYSIS_PLOTS",
+        "MAX_ANALYSIS_PLOT_POINTS",
+        "MAX_ANALYSIS_PLOT_SERIES",
+        "MAX_ANALYSIS_TABLES",
         "MAX_HISTORY_ENTRIES",
         "MAX_PENDING_EVENTS",
         "OperationCompletion",
+        "OperationFailureCode",
         "OperationId",
         "OperationKind",
         "OperationOutcome",
@@ -63,7 +205,7 @@
     {
       "name": "mirante4d-dataset",
       "path": "crates/mirante4d-dataset",
-      "authority": "Bounded immutable logical-layer catalog and explicit verified/unverified scientific identity status",
+      "authority": "Sole live bounded immutable logical-layer catalog and verified/unverified scientific-identity status authority",
       "permitted_normal_mirante4d_dependencies": [
         "mirante4d-domain",
         "mirante4d-identity"
@@ -86,7 +228,7 @@
     {
       "name": "mirante4d-render-api",
       "path": "crates/mirante4d-render-api",
-      "authority": "Narrow framework-neutral presentation viewport and canonical-camera projection math; broader render contracts remain WP-08A work",
+      "authority": "Sole live framework-neutral presentation viewport and canonical-camera projection-math authority at the WP-07B boundary",
       "permitted_normal_mirante4d_dependencies": [
         "mirante4d-domain"
       ],
@@ -107,7 +249,7 @@
     {
       "name": "mirante4d-settings",
       "path": "crates/mirante4d-settings",
-      "authority": "Closed validated two-ledger settings document, Linux path, bounded background load/write actor, and typed persistence outcomes",
+      "authority": "Sole live validated two-ledger settings document, Linux path, bounded background persistence actor, and typed persistence-outcome authority",
       "permitted_normal_mirante4d_dependencies": [],
       "permitted_normal_external_dependencies": [
         "serde",
@@ -146,18 +288,135 @@
         "SettingsLoadOutcome",
         "SettingsRequestId",
         "default_linux_settings_path",
-        "linux_settings_path"
+        "linux_settings_path",
+        "recommended_for_current_system"
       ]
     }
   ],
+  "temporary_runtime_owners": [
+    {
+      "module": "dataset",
+      "path": "crates/mirante4d-app/src/current_runtime/dataset.rs",
+      "struct": "CurrentDatasetRuntime",
+      "composition_field": "dataset_runtime",
+      "expected_fields": 53,
+      "expiry_gate": "WP-08B"
+    },
+    {
+      "module": "render",
+      "path": "crates/mirante4d-app/src/current_runtime/render.rs",
+      "struct": "CurrentRenderRuntime",
+      "composition_field": "render_runtime",
+      "expected_fields": 24,
+      "expiry_gate": "WP-09B"
+    },
+    {
+      "module": "ui",
+      "path": "crates/mirante4d-app/src/current_runtime/ui.rs",
+      "struct": "CurrentUiRuntime",
+      "composition_field": "ui_runtime",
+      "expected_fields": 14,
+      "expiry_gate": "WP-09C"
+    },
+    {
+      "module": "project",
+      "path": "crates/mirante4d-app/src/current_runtime/project.rs",
+      "struct": "CurrentProjectRuntime",
+      "composition_field": "project_runtime",
+      "expected_fields": 1,
+      "expiry_gate": "WP-10B"
+    },
+    {
+      "module": "import",
+      "path": "crates/mirante4d-app/src/current_runtime/import.rs",
+      "struct": "CurrentImportRuntime",
+      "composition_field": "import_runtime",
+      "expected_fields": 4,
+      "expiry_gate": "WP-10C"
+    },
+    {
+      "module": "analysis",
+      "path": "crates/mirante4d-app/src/current_runtime/analysis.rs",
+      "struct": "CurrentAnalysisRuntime",
+      "composition_field": "analysis_runtime",
+      "expected_fields": 10,
+      "expiry_gate": "WP-12"
+    },
+    {
+      "module": "validation",
+      "path": "crates/mirante4d-app/src/current_runtime/validation.rs",
+      "struct": "CurrentValidationRuntime",
+      "composition_field": "validation_runtime",
+      "expected_fields": 2,
+      "expiry_gate": "WP-14"
+    }
+  ],
+  "private_bridges": [
+    {
+      "module": "current_egui_shell_bridge",
+      "path": "crates/mirante4d-app/src/current_egui_shell_bridge.rs",
+      "route": "current-egui-shell-to-application",
+      "expiry_gate": "WP-09C",
+      "required_root_items": [
+        "dispatch",
+        "drain_events",
+        "snapshot"
+      ]
+    },
+    {
+      "module": "current_project_persistence_bridge",
+      "path": "crates/mirante4d-app/src/current_project_persistence_bridge.rs",
+      "route": "canonical-project-model-to-private-project-v15-persistence",
+      "expiry_gate": "WP-10B",
+      "required_root_items": [
+        "CurrentProjectPersistenceBridge",
+        "PROJECT_V15_SCHEMA",
+        "PROJECT_V15_SCHEMA_VERSION",
+        "ProjectPersistenceError",
+        "ProjectPersistenceEvent"
+      ]
+    }
+  ],
+  "forbidden_predecessors": {
+    "paths": [
+      "crates/mirante4d-core",
+      "crates/mirante4d-app/src/commands.rs",
+      "crates/mirante4d-app/src/preferences.rs",
+      "crates/mirante4d-app/src/project_session.rs",
+      "crates/mirante4d-app/src/project_store.rs",
+      "crates/mirante4d-app/src/session_state.rs",
+      "crates/mirante4d-app/src/workbench_project.rs"
+    ],
+    "rust_identifiers": [
+      "AppPreferences",
+      "AppRecoverySession",
+      "AppRuntimePreferences",
+      "AppSession",
+      "AppSessionManifest",
+      "AppState",
+      "PREFERENCES_FORMAT",
+      "ProjectDirtySnapshot",
+      "SESSION_FORMAT",
+      "WorkbenchCommand",
+      "WorkbenchCommandOutcome",
+      "default_app_preferences_for_system",
+      "load_app_preferences",
+      "mirante4d_core",
+      "open_dataset_with_preferences_and_render_first_frame",
+      "save_app_preferences"
+    ],
+    "dependency_packages": [
+      "mirante4d-core"
+    ]
+  },
   "activation_invariants": [
-    "No existing product, test, benchmark, build, or tool target depends on any WP-07B boundary crate in checkpoint A.",
-    "The frozen WP-07A model APIs remain unchanged.",
+    "The canonical application, dataset, render-api, and settings boundaries are live dependencies of mirante4d-app.",
+    "ApplicationState and the canonical project model are the sole live semantic and durable-state authorities.",
+    "AppState, WorkbenchCommand, project-v14, app-local preferences, and mirante4d-core authority are absent.",
+    "Exactly seven temporary runtime owners remain with their frozen field counts and expiry gates.",
+    "Exactly two crate-private bridges remain: the egui shell bridge through WP-09C and project-v15 persistence bridge through WP-10B.",
     "The application reducer owns no filesystem, thread, UI, renderer, runtime payload, or serialization authority.",
-    "The dataset and render-api candidates own no storage, scheduling, cache, lease, backend, or UI behavior.",
-    "Settings is the only checkpoint-A boundary allowed external side effects, and it remains unreachable from the product.",
-    "ScientificIdentityStatus is representational only at checkpoint A; application verification remains unavailable until the verifier-owned WP-08 admission route exists.",
-    "Product activation and predecessor deletion occur together only in WP07B-B."
+    "Scientific identity remains explicit and project open/save stays gated on a verified source."
   ],
   "unresolved_decisions": []
 }

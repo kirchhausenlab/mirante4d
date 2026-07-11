@@ -1,32 +1,34 @@
 use eframe::egui;
 
 use crate::{
-    MiranteWorkbenchApp,
+    MiranteWorkbenchApp, application_view,
     cross_section_runtime::{
-        CrossSectionChunkState, CrossSectionPanelChunkRuntime, CrossSectionRuntime,
+        CrossSectionChunkState, CrossSectionPanelRuntime, CrossSectionRuntime,
     },
-    cross_section_scheduler::cross_section_interaction_recent,
     cross_section_streaming::CROSS_SECTION_CHUNK_READ_SUBMISSIONS_PER_REFRESH,
+    current_egui_shell_bridge, current_physical_layer_id,
     fidelity::show_frame_fidelity_property_rows,
-    scene_extraction::scene_draw_list_for_state,
+    scene_extraction::{SceneViewInput, scene_draw_list},
     ui_kit::{self, StatusTone},
+    viewer_layout::PanelId,
 };
 
 pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut egui::Ui) {
+    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let view = application_view(&snapshot);
     if ui_kit::toolbar_button(ui, "Copy Diagnostics", true).clicked() {
         ui.ctx().copy_text(app.diagnostics_summary_text());
     }
     ui_kit::property_row(
         ui,
         "logs",
-        app.state
-            .startup_diagnostics
+        app.startup_diagnostics
             .logs_path
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "stderr/stdout".to_owned()),
     );
-    if let Ok(diagnostics) = app.state.dataset.diagnostics() {
+    if let Ok(diagnostics) = app.dataset_runtime.dataset.diagnostics() {
         let config = diagnostics.config;
         let stats = diagnostics.stats;
         ui_kit::property_row(
@@ -89,7 +91,7 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
             ),
         );
     }
-    if let Some(pool) = &app.brick_read_pool {
+    if let Some(pool) = &app.dataset_runtime.brick_read_pool {
         ui_kit::property_row(ui, "brick workers", pool.worker_count().to_string());
         ui_kit::property_row(
             ui,
@@ -117,10 +119,10 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
         "visible bricks",
         format!(
             "{} @ stride {}, scale s{} {:?}",
-            app.state.visible_brick_count,
-            app.state.visible_brick_plan_stride,
-            app.state.brick_stream_scale_level,
-            app.state.brick_stream_scale_shape
+            app.render_runtime.visible_brick_count,
+            app.render_runtime.visible_brick_plan_stride,
+            app.dataset_runtime.brick_stream_scale_level,
+            app.dataset_runtime.brick_stream_scale_shape
         ),
     );
     ui_kit::property_row(
@@ -128,11 +130,11 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
         "LOD schedule",
         format!(
             "shown {:?}, target s{}, fallback {:?}, pending {:?}, replan {}",
-            app.state.lod_schedule.displayed_scale_level,
-            app.state.lod_schedule.target_scale_level,
-            app.state.lod_schedule.fallback_scale_level,
-            app.state.lod_schedule.pending_scale_level,
-            app.state.lod_replan_pending
+            app.render_runtime.lod_schedule.displayed_scale_level,
+            app.render_runtime.lod_schedule.target_scale_level,
+            app.render_runtime.lod_schedule.fallback_scale_level,
+            app.render_runtime.lod_schedule.pending_scale_level,
+            app.render_runtime.lod_replan_pending
         ),
     );
     ui_kit::property_row(
@@ -140,20 +142,21 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
         "stream",
         format!(
             "gen {}: {}/{} done, {} stale, {} fail, complete {}",
-            app.state.brick_stream_generation,
-            app.state.brick_stream_completed,
-            app.state.brick_stream_requested,
-            app.state.brick_stream_stale,
-            app.state.brick_stream_failed,
-            app.state.brick_stream_complete
+            app.dataset_runtime.brick_stream_generation,
+            app.dataset_runtime.brick_stream_completed,
+            app.dataset_runtime.brick_stream_requested,
+            app.dataset_runtime.brick_stream_stale,
+            app.dataset_runtime.brick_stream_failed,
+            app.dataset_runtime.brick_stream_complete
         ),
     );
     ui_kit::property_row(
         ui,
         "active 2D panel",
-        app.state
-            .viewer_layout
+        snapshot
+            .transient()
             .active_cross_section_panel()
+            .map(PanelId::from_application_panel)
             .map(|panel_id| panel_id.label().to_owned())
             .unwrap_or_else(|| "none".to_owned()),
     );
@@ -162,8 +165,12 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
         "2D interaction",
         format!(
             "recent {}, last age {} ms",
-            cross_section_interaction_recent(&app.state),
-            app.state
+            app.dataset_runtime
+                .cross_section_last_interaction_at
+                .is_some_and(|instant| {
+                    instant.elapsed() < crate::CROSS_SECTION_INTERACTION_SETTLE_DURATION
+                }),
+            app.dataset_runtime
                 .cross_section_last_interaction_at
                 .map(|instant| instant.elapsed().as_millis().to_string())
                 .unwrap_or_else(|| "none".to_owned())
@@ -177,23 +184,22 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
             CROSS_SECTION_CHUNK_READ_SUBMISSIONS_PER_REFRESH
         ),
     );
-    if let Some(runtime) = app.state.viewer_layout.four_panel_runtime() {
-        for panel in runtime.panels() {
-            if panel.panel_id.cross_section_panel().is_some() {
-                ui_kit::property_row(
-                    ui,
-                    format!("2D panel {}", panel.panel_id.label()),
-                    cross_section_panel_lod_summary(panel),
-                );
-            }
+    for panel in app.render_runtime.cross_section_runtime.panels() {
+        if panel.panel_id.cross_section_panel().is_some() {
+            ui_kit::property_row(
+                ui,
+                format!("2D panel {}", panel.panel_id.label()),
+                cross_section_panel_lod_summary(panel),
+            );
         }
     }
     ui_kit::property_row(
         ui,
         "2D global runtime",
-        cross_section_global_runtime_summary(&app.state.cross_section_runtime),
+        cross_section_global_runtime_summary(&app.render_runtime.cross_section_runtime),
     );
-    let state_counts = cross_section_runtime_state_counts(&app.state.cross_section_runtime);
+    let state_counts =
+        cross_section_runtime_state_counts(&app.render_runtime.cross_section_runtime);
     ui_kit::property_row(
         ui,
         "2D chunk states",
@@ -209,14 +215,14 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
             state_counts.evicted
         ),
     );
-    for (panel_id, panel) in &app.state.cross_section_runtime.panels {
+    for (panel_id, panel) in &app.render_runtime.cross_section_runtime.panels {
         ui_kit::property_row(
             ui,
             format!("2D global {}", panel_id.label()),
             cross_section_global_panel_summary(panel),
         );
     }
-    for (panel_id, stream) in &app.state.cross_section_runtime.panel_streams {
+    for (panel_id, stream) in &app.render_runtime.cross_section_runtime.panel_streams {
         ui_kit::property_row(
             ui,
             format!("2D stream {}", panel_id.label()),
@@ -240,7 +246,7 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
             ),
         );
     }
-    for (panel_id, displayed) in &app.cross_section_gpu_display_frames {
+    for (panel_id, displayed) in &app.render_runtime.cross_section_gpu_display_frames {
         let diagnostics = displayed.frame.diagnostics;
         ui_kit::property_row(
             ui,
@@ -259,13 +265,13 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
         "prefetch",
         format!(
             "{:?}: {}/{} done, {} cancel, {} stale, {} fail, {} skip",
-            app.state.brick_prefetch_timepoints,
-            app.state.brick_prefetch_completed,
-            app.state.brick_prefetch_requested,
-            app.state.brick_prefetch_cancelled,
-            app.state.brick_prefetch_stale,
-            app.state.brick_prefetch_failed,
-            app.state.brick_prefetch_skipped
+            app.dataset_runtime.brick_prefetch_timepoints,
+            app.dataset_runtime.brick_prefetch_completed,
+            app.dataset_runtime.brick_prefetch_requested,
+            app.dataset_runtime.brick_prefetch_cancelled,
+            app.dataset_runtime.brick_prefetch_stale,
+            app.dataset_runtime.brick_prefetch_failed,
+            app.dataset_runtime.brick_prefetch_skipped
         ),
     );
     ui_kit::property_row(
@@ -273,16 +279,16 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
         "warm",
         format!(
             "{} candidates: {}/{} done, {} cancel, {} stale, {} fail, {} skip",
-            app.state.brick_warm_brick_count,
-            app.state.brick_warm_completed,
-            app.state.brick_warm_requested,
-            app.state.brick_warm_cancelled,
-            app.state.brick_warm_stale,
-            app.state.brick_warm_failed,
-            app.state.brick_warm_skipped
+            app.dataset_runtime.brick_warm_brick_count,
+            app.dataset_runtime.brick_warm_completed,
+            app.dataset_runtime.brick_warm_requested,
+            app.dataset_runtime.brick_warm_cancelled,
+            app.dataset_runtime.brick_warm_stale,
+            app.dataset_runtime.brick_warm_failed,
+            app.dataset_runtime.brick_warm_skipped
         ),
     );
-    if let Some(renderer) = app.gpu_renderer.as_ref()
+    if let Some(renderer) = app.render_runtime.gpu_renderer.as_ref()
         && let Ok(stats) = renderer.stats()
     {
         ui_kit::property_row(
@@ -311,7 +317,7 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
             ),
         );
     }
-    if let Some(timing) = app.last_display_refresh_timing {
+    if let Some(timing) = app.render_runtime.last_display_refresh_timing {
         ui_kit::property_row(
             ui,
             "display timing",
@@ -341,8 +347,29 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
             },
         );
     }
-    show_frame_fidelity_property_rows(ui, &app.state.frame_fidelity);
-    match scene_draw_list_for_state(&app.state) {
+    show_frame_fidelity_property_rows(ui, &app.render_runtime.frame_fidelity);
+    let active_layer_id = match current_physical_layer_id(&app.dataset_runtime, view.active_layer())
+    {
+        Ok(layer_id) => layer_id,
+        Err(err) => {
+            ui_kit::status_badge(ui, StatusTone::Warning, format!("scene extraction: {err}"));
+            return;
+        }
+    };
+    match scene_draw_list(
+        &app.analysis_runtime,
+        &app.ui_runtime,
+        SceneViewInput {
+            active_layer_id: &active_layer_id,
+            active_timepoint: view.timepoint(),
+            active_source_grid_to_world: snapshot
+                .catalog()
+                .layer(view.active_layer())
+                .expect("application view closes over the dataset catalog")
+                .grid_to_world(),
+            camera: *view.camera(),
+        },
+    ) {
         Ok(draw_list) => {
             ui_kit::property_row(ui, "scene draw items", draw_list.len().to_string());
         }
@@ -359,9 +386,10 @@ fn display_gpu_upload_ms(value: Option<f64>) -> String {
 }
 
 pub(crate) fn diagnostics_summary_text(app: &MiranteWorkbenchApp) -> String {
-    let mut text = app.state.startup_diagnostics.summary_text(
-        Some(&app.state.dataset_path),
-        app.state.adapter_summary.as_deref(),
+    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let mut text = app.startup_diagnostics.summary_text(
+        Some(app.dataset_runtime.dataset.root()),
+        app.startup_diagnostics.gpu_adapter.as_deref(),
     );
     text.push_str(&format!(
         "visible_bricks: {}\n\
@@ -387,35 +415,36 @@ pub(crate) fn diagnostics_summary_text(app: &MiranteWorkbenchApp) -> String {
          brick_warm_stale: {}\n\
          brick_warm_failed: {}\n\
          brick_warm_skipped: {}\n",
-        app.state.visible_brick_count,
-        app.state.visible_brick_plan_stride,
-        app.state.brick_stream_scale_level,
-        app.state.brick_stream_generation,
-        app.state.brick_stream_requested,
-        app.state.brick_stream_completed,
-        app.state.brick_stream_cancelled,
-        app.state.brick_stream_stale,
-        app.state.brick_stream_failed,
-        app.state.brick_stream_complete,
-        app.state.brick_prefetch_requested,
-        app.state.brick_prefetch_completed,
-        app.state.brick_prefetch_cancelled,
-        app.state.brick_prefetch_stale,
-        app.state.brick_prefetch_failed,
-        app.state.brick_prefetch_skipped,
-        app.state.brick_warm_brick_count,
-        app.state.brick_warm_requested,
-        app.state.brick_warm_completed,
-        app.state.brick_warm_cancelled,
-        app.state.brick_warm_stale,
-        app.state.brick_warm_failed,
-        app.state.brick_warm_skipped
+        app.render_runtime.visible_brick_count,
+        app.render_runtime.visible_brick_plan_stride,
+        app.dataset_runtime.brick_stream_scale_level,
+        app.dataset_runtime.brick_stream_generation,
+        app.dataset_runtime.brick_stream_requested,
+        app.dataset_runtime.brick_stream_completed,
+        app.dataset_runtime.brick_stream_cancelled,
+        app.dataset_runtime.brick_stream_stale,
+        app.dataset_runtime.brick_stream_failed,
+        app.dataset_runtime.brick_stream_complete,
+        app.dataset_runtime.brick_prefetch_requested,
+        app.dataset_runtime.brick_prefetch_completed,
+        app.dataset_runtime.brick_prefetch_cancelled,
+        app.dataset_runtime.brick_prefetch_stale,
+        app.dataset_runtime.brick_prefetch_failed,
+        app.dataset_runtime.brick_prefetch_skipped,
+        app.dataset_runtime.brick_warm_brick_count,
+        app.dataset_runtime.brick_warm_requested,
+        app.dataset_runtime.brick_warm_completed,
+        app.dataset_runtime.brick_warm_cancelled,
+        app.dataset_runtime.brick_warm_stale,
+        app.dataset_runtime.brick_warm_failed,
+        app.dataset_runtime.brick_warm_skipped
     ));
     text.push_str(&format!(
         "cross_section_active_panel: {}\n",
-        app.state
-            .viewer_layout
+        snapshot
+            .transient()
             .active_cross_section_panel()
+            .map(PanelId::from_application_panel)
             .map(|panel_id| panel_id.label().to_owned())
             .unwrap_or_else(|| "none".to_owned())
     ));
@@ -426,21 +455,26 @@ pub(crate) fn diagnostics_summary_text(app: &MiranteWorkbenchApp) -> String {
     text.push_str(&format!(
         "cross_section_interaction_recent: {}\n\
          cross_section_last_interaction_age_ms: {}\n",
-        cross_section_interaction_recent(&app.state),
-        app.state
+        app.dataset_runtime
+            .cross_section_last_interaction_at
+            .is_some_and(|instant| {
+                instant.elapsed() < crate::CROSS_SECTION_INTERACTION_SETTLE_DURATION
+            }),
+        app.dataset_runtime
             .cross_section_last_interaction_at
             .map(|instant| instant.elapsed().as_millis().to_string())
             .unwrap_or_else(|| "none".to_owned())
     ));
-    if let Some(runtime) = app.state.viewer_layout.four_panel_runtime() {
-        for panel in runtime.panels() {
-            if panel.panel_id.cross_section_panel().is_some() {
-                append_cross_section_panel_diagnostics(&mut text, panel);
-            }
+    for panel in app.render_runtime.cross_section_runtime.panels() {
+        if panel.panel_id.cross_section_panel().is_some() {
+            append_cross_section_panel_diagnostics(&mut text, panel);
         }
     }
-    append_cross_section_global_runtime_diagnostics(&mut text, &app.state.cross_section_runtime);
-    for (panel_id, stream) in &app.state.cross_section_runtime.panel_streams {
+    append_cross_section_global_runtime_diagnostics(
+        &mut text,
+        &app.render_runtime.cross_section_runtime,
+    );
+    for (panel_id, stream) in &app.render_runtime.cross_section_runtime.panel_streams {
         text.push_str(&format!(
             "cross_section_stream_{}_priority: {:?}\n\
              cross_section_stream_{}_requested: {}\n\
@@ -498,7 +532,7 @@ pub(crate) fn diagnostics_summary_text(app: &MiranteWorkbenchApp) -> String {
             stream.complete
         ));
     }
-    for (panel_id, displayed) in &app.cross_section_gpu_display_frames {
+    for (panel_id, displayed) in &app.render_runtime.cross_section_gpu_display_frames {
         let diagnostics = displayed.frame.diagnostics;
         text.push_str(&format!(
             "cross_section_frame_{}_channels: {}\n\
@@ -515,7 +549,7 @@ pub(crate) fn diagnostics_summary_text(app: &MiranteWorkbenchApp) -> String {
             diagnostics.vertex_count
         ));
     }
-    if let Some(pool) = &app.brick_read_pool
+    if let Some(pool) = &app.dataset_runtime.brick_read_pool
         && let Ok(queue) = pool.queue_diagnostics()
     {
         text.push_str(&format!(
@@ -563,7 +597,7 @@ fn cross_section_global_runtime_summary(runtime: &CrossSectionRuntime) -> String
     )
 }
 
-fn cross_section_global_panel_summary(panel: &CrossSectionPanelChunkRuntime) -> String {
+fn cross_section_global_panel_summary(panel: &CrossSectionPanelRuntime) -> String {
     format!(
         "gen {}, s{}, {:?}, {} visible, {} geometry, {} candidates",
         panel.generation,
@@ -669,7 +703,7 @@ fn append_cross_section_global_runtime_diagnostics(
     }
 }
 
-fn cross_section_panel_lod_summary(panel: &crate::viewer_layout::PanelRuntimeState) -> String {
+fn cross_section_panel_lod_summary(panel: &CrossSectionPanelRuntime) -> String {
     let Some(schedule) = panel.cross_section_schedule else {
         return format!(
             "target none, render none, fallback none, display {}, gen {}/{}",
@@ -693,10 +727,7 @@ fn cross_section_panel_lod_summary(panel: &crate::viewer_layout::PanelRuntimeSta
     )
 }
 
-fn append_cross_section_panel_diagnostics(
-    text: &mut String,
-    panel: &crate::viewer_layout::PanelRuntimeState,
-) {
+fn append_cross_section_panel_diagnostics(text: &mut String, panel: &CrossSectionPanelRuntime) {
     if let Some(schedule) = panel.cross_section_schedule {
         text.push_str(&format!(
             "cross_section_panel_{}_target_scale_level: {}\n\

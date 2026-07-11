@@ -1,9 +1,11 @@
 use anyhow::Context;
-use mirante4d_core::{DisplayWindow, IntensityDType, LayerId, Shape3D, TransferCurve};
 use mirante4d_data::{SpatialBrickIndex, VolumeBrickF32, VolumeBrickU8, VolumeBrickU16};
+use mirante4d_domain::{DisplayWindow, DvrOpacityTransfer, IntensityDType, Shape3D, TransferCurve};
+use mirante4d_format::LayerId;
 
 use crate::{
-    AppState, DvrOpacityTransfer, HistogramStatus, LayerHistogramSummary,
+    HistogramStatus, LayerHistogramSummary,
+    current_runtime::{analysis::CurrentAnalysisRuntime, dataset::CurrentDatasetRuntime},
     state::{LayerHistogramCache, LayerHistogramCacheKey, ResidentHistogramSampleKey},
 };
 
@@ -12,19 +14,35 @@ const RESIDENT_HISTOGRAM_SAMPLE_LIMIT: usize = 1_000_000;
 const DATA_ENGINE_HISTOGRAM_BRICK_READ_LIMIT: usize = 16;
 const DATA_ENGINE_HISTOGRAM_MAX_DECODE_BYTES: u64 = 16 * 1024 * 1024;
 
-pub(crate) fn active_layer_histogram_summary(state: &mut AppState) -> LayerHistogramSummary {
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ActiveLayerHistogramInput<'a> {
+    pub(crate) layer_id: &'a LayerId,
+    pub(crate) layer_name: &'a str,
+    pub(crate) dtype: IntensityDType,
+    pub(crate) timepoint: mirante4d_domain::TimeIndex,
+}
+
+pub(crate) fn active_layer_histogram_summary(
+    analysis: &mut CurrentAnalysisRuntime,
+    dataset: &CurrentDatasetRuntime,
+    input: ActiveLayerHistogramInput<'_>,
+) -> LayerHistogramSummary {
     match (
-        &state.active_volume_u8,
-        &state.active_volume,
-        &state.active_volume_f32,
+        &dataset.active_volume_u8,
+        &dataset.active_volume,
+        &dataset.active_volume_f32,
     ) {
         (Some(volume), _, _) => histogram_from_u8_values(volume.values(), HISTOGRAM_BIN_COUNT),
         (None, Some(volume), _) => histogram_from_u16_values(volume.values(), HISTOGRAM_BIN_COUNT),
         (None, None, Some(volume)) => {
             histogram_from_f32_values(volume.values(), HISTOGRAM_BIN_COUNT)
         }
-        (None, None, None) => cached_resident_histogram_summary_for_active_layer(state)
-            .unwrap_or_else(|| cached_data_engine_histogram_summary_for_active_layer(state)),
+        (None, None, None) => {
+            cached_resident_histogram_summary_for_active_layer(analysis, dataset, input)
+                .unwrap_or_else(|| {
+                    cached_data_engine_histogram_summary_for_active_layer(analysis, dataset, input)
+                })
+        }
     }
 }
 
@@ -53,23 +71,25 @@ fn histogram_from_f32_values(values: &[f32], bin_count: usize) -> LayerHistogram
 }
 
 fn cached_resident_histogram_summary_for_active_layer(
-    state: &mut AppState,
+    analysis: &mut CurrentAnalysisRuntime,
+    dataset: &CurrentDatasetRuntime,
+    input: ActiveLayerHistogramInput<'_>,
 ) -> Option<LayerHistogramSummary> {
-    let resident_generation = state.resident_histogram_generation;
+    let resident_generation = analysis.resident_histogram_generation;
     let key = LayerHistogramCacheKey {
-        layer_id: state.active_layer_id.clone(),
-        dtype: state.active_layer_dtype,
-        timepoint: state.active_timepoint,
-        scale_level: state.brick_stream_scale_level,
+        layer_id: input.layer_id.as_str().to_owned(),
+        dtype: input.dtype,
+        timepoint: input.timepoint,
+        scale_level: dataset.brick_stream_scale_level,
         resident_generation: Some(resident_generation),
     };
-    if let Some(cache) = &state.active_histogram_cache
+    if let Some(cache) = &analysis.active_histogram_cache
         && cache.key == key
     {
         return Some(cache.summary.clone());
     }
 
-    let entries = state
+    let entries = analysis
         .resident_histogram_samples
         .iter()
         .filter(|(sample_key, _)| {
@@ -81,14 +101,14 @@ fn cached_resident_histogram_summary_for_active_layer(
         .map(|(_, sample)| sample)
         .collect::<Vec<_>>();
     if entries.is_empty() {
-        if active_layer_resident_brick_count(state) == 0 {
+        if active_layer_resident_brick_count(dataset, input) == 0 {
             return None;
         }
         return Some(LayerHistogramSummary {
             status: HistogramStatus::Pending {
                 reason: format!(
                     "resident histogram samples pending for {} at s{}",
-                    state.active_layer_name, state.brick_stream_scale_level
+                    input.layer_name, dataset.brick_stream_scale_level
                 ),
             },
             bin_count: HISTOGRAM_BIN_COUNT,
@@ -102,9 +122,9 @@ fn cached_resident_histogram_summary_for_active_layer(
     let summary = histogram_from_cached_resident_samples(
         entries.as_slice(),
         HISTOGRAM_BIN_COUNT,
-        state.brick_stream_scale_level,
+        dataset.brick_stream_scale_level,
     );
-    state.active_histogram_cache = Some(LayerHistogramCache {
+    analysis.active_histogram_cache = Some(LayerHistogramCache {
         key,
         summary: summary.clone(),
     });
@@ -112,28 +132,30 @@ fn cached_resident_histogram_summary_for_active_layer(
 }
 
 fn cached_data_engine_histogram_summary_for_active_layer(
-    state: &mut AppState,
+    analysis: &mut CurrentAnalysisRuntime,
+    dataset: &CurrentDatasetRuntime,
+    input: ActiveLayerHistogramInput<'_>,
 ) -> LayerHistogramSummary {
     let key = LayerHistogramCacheKey {
-        layer_id: state.active_layer_id.clone(),
-        dtype: state.active_layer_dtype,
-        timepoint: state.active_timepoint,
-        scale_level: state.brick_stream_scale_level,
+        layer_id: input.layer_id.as_str().to_owned(),
+        dtype: input.dtype,
+        timepoint: input.timepoint,
+        scale_level: dataset.brick_stream_scale_level,
         resident_generation: None,
     };
-    if let Some(cache) = &state.active_histogram_cache
+    if let Some(cache) = &analysis.active_histogram_cache
         && cache.key == key
     {
         return cache.summary.clone();
     }
 
-    let summary = match data_engine_histogram_summary_for_active_layer(state, &key) {
+    let summary = match data_engine_histogram_summary_for_active_layer(dataset, &key) {
         Ok(summary) => summary,
         Err(err) => LayerHistogramSummary {
             status: HistogramStatus::Unavailable {
                 reason: format!(
                     "sampled histogram read failed for {} at s{}: {err}",
-                    state.active_layer_name, state.brick_stream_scale_level
+                    input.layer_name, dataset.brick_stream_scale_level
                 ),
             },
             bin_count: HISTOGRAM_BIN_COUNT,
@@ -143,7 +165,7 @@ fn cached_data_engine_histogram_summary_for_active_layer(
             bins: Vec::new(),
         },
     };
-    state.active_histogram_cache = Some(LayerHistogramCache {
+    analysis.active_histogram_cache = Some(LayerHistogramCache {
         key,
         summary: summary.clone(),
     });
@@ -151,11 +173,11 @@ fn cached_data_engine_histogram_summary_for_active_layer(
 }
 
 fn data_engine_histogram_summary_for_active_layer(
-    state: &AppState,
+    dataset: &CurrentDatasetRuntime,
     key: &LayerHistogramCacheKey,
 ) -> anyhow::Result<LayerHistogramSummary> {
     let layer_id = LayerId::new(key.layer_id.clone())?;
-    let brick_grid = state
+    let brick_grid = dataset
         .dataset
         .brick_grid_shape_at_scale(&layer_id, key.scale_level)
         .with_context(|| {
@@ -164,7 +186,7 @@ fn data_engine_histogram_summary_for_active_layer(
                 key.layer_id, key.scale_level
             )
         })?;
-    let brick_shape = state
+    let brick_shape = dataset
         .dataset
         .brick_shape_at_scale(&layer_id, key.scale_level)
         .with_context(|| {
@@ -184,7 +206,7 @@ fn data_engine_histogram_summary_for_active_layer(
         IntensityDType::Float32 => {
             let mut bricks = Vec::with_capacity(sample_bricks.len());
             for brick_index in &sample_bricks {
-                bricks.push(state.dataset.read_f32_brick_at_scale(
+                bricks.push(dataset.dataset.read_f32_brick_at_scale(
                     &layer_id,
                     key.scale_level,
                     key.timepoint,
@@ -201,7 +223,7 @@ fn data_engine_histogram_summary_for_active_layer(
         IntensityDType::Uint8 => {
             let mut bricks = Vec::with_capacity(sample_bricks.len());
             for brick_index in &sample_bricks {
-                bricks.push(state.dataset.read_u8_brick_at_scale(
+                bricks.push(dataset.dataset.read_u8_brick_at_scale(
                     &layer_id,
                     key.scale_level,
                     key.timepoint,
@@ -218,7 +240,7 @@ fn data_engine_histogram_summary_for_active_layer(
         IntensityDType::Uint16 => {
             let mut bricks = Vec::with_capacity(sample_bricks.len());
             for brick_index in &sample_bricks {
-                bricks.push(state.dataset.read_u16_brick_at_scale(
+                bricks.push(dataset.dataset.read_u16_brick_at_scale(
                     &layer_id,
                     key.scale_level,
                     key.timepoint,
@@ -271,18 +293,21 @@ fn sampled_spatial_brick_indices(
 }
 
 fn spatial_brick_index_from_linear(brick_grid: Shape3D, linear: u64) -> SpatialBrickIndex {
-    let x = linear % brick_grid.x;
-    let yz = linear / brick_grid.x;
-    let y = yz % brick_grid.y;
-    let z = yz / brick_grid.y;
+    let x = linear % brick_grid.x();
+    let yz = linear / brick_grid.x();
+    let y = yz % brick_grid.y();
+    let z = yz / brick_grid.y();
     SpatialBrickIndex::new(z, y, x)
 }
 
-fn active_layer_resident_brick_count(state: &AppState) -> usize {
-    match state.active_layer_dtype {
-        IntensityDType::Uint8 => active_layer_resident_u8_bricks(state).len(),
-        IntensityDType::Uint16 => active_layer_resident_u16_bricks(state).len(),
-        IntensityDType::Float32 => active_layer_resident_f32_bricks(state).len(),
+fn active_layer_resident_brick_count(
+    dataset: &CurrentDatasetRuntime,
+    input: ActiveLayerHistogramInput<'_>,
+) -> usize {
+    match input.dtype {
+        IntensityDType::Uint8 => active_layer_resident_u8_bricks(dataset, input.layer_id).len(),
+        IntensityDType::Uint16 => active_layer_resident_u16_bricks(dataset, input.layer_id).len(),
+        IntensityDType::Float32 => active_layer_resident_f32_bricks(dataset, input.layer_id).len(),
     }
 }
 
@@ -325,31 +350,40 @@ pub(crate) fn resident_histogram_sample_key_for_f32_brick(
     }
 }
 
-fn active_layer_resident_u8_bricks(state: &AppState) -> &[VolumeBrickU8] {
-    state
+fn active_layer_resident_u8_bricks<'a>(
+    dataset: &'a CurrentDatasetRuntime,
+    layer_id: &LayerId,
+) -> &'a [VolumeBrickU8] {
+    dataset
         .resident_bricks_u8_by_layer
-        .get(&state.active_layer_id)
+        .get(layer_id)
         .filter(|bricks| !bricks.is_empty())
         .map(Vec::as_slice)
-        .unwrap_or_else(|| state.resident_bricks_u8.as_slice())
+        .unwrap_or_else(|| dataset.resident_bricks_u8.as_slice())
 }
 
-fn active_layer_resident_u16_bricks(state: &AppState) -> &[VolumeBrickU16] {
-    state
+fn active_layer_resident_u16_bricks<'a>(
+    dataset: &'a CurrentDatasetRuntime,
+    layer_id: &LayerId,
+) -> &'a [VolumeBrickU16] {
+    dataset
         .resident_bricks_by_layer
-        .get(&state.active_layer_id)
+        .get(layer_id)
         .filter(|bricks| !bricks.is_empty())
         .map(Vec::as_slice)
-        .unwrap_or_else(|| state.resident_bricks.as_slice())
+        .unwrap_or_else(|| dataset.resident_bricks.as_slice())
 }
 
-fn active_layer_resident_f32_bricks(state: &AppState) -> &[VolumeBrickF32] {
-    state
+fn active_layer_resident_f32_bricks<'a>(
+    dataset: &'a CurrentDatasetRuntime,
+    layer_id: &LayerId,
+) -> &'a [VolumeBrickF32] {
+    dataset
         .resident_bricks_f32_by_layer
-        .get(&state.active_layer_id)
+        .get(layer_id)
         .filter(|bricks| !bricks.is_empty())
         .map(Vec::as_slice)
-        .unwrap_or_else(|| state.resident_bricks_f32.as_slice())
+        .unwrap_or_else(|| dataset.resident_bricks_f32.as_slice())
 }
 
 fn histogram_from_cached_resident_samples(
@@ -725,11 +759,11 @@ pub(crate) fn auto_dvr_opacity_transfer_from_histogram(
                 .unwrap_or(histogram.max_value);
             let window =
                 validated_auto_window(low, high, histogram.min_value, histogram.max_value)?;
-            DvrOpacityTransfer::new(
+            Ok(DvrOpacityTransfer::new(
                 window,
                 TransferCurve::gamma(crate::DEFAULT_DVR_OPACITY_GAMMA)
                     .expect("default DVR opacity gamma is valid"),
-            )
+            ))
         }
         HistogramStatus::Pending { reason } | HistogramStatus::Unavailable { reason } => {
             anyhow::bail!("cannot auto-window DVR opacity histogram: {reason}");

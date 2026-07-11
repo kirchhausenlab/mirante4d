@@ -3,7 +3,6 @@ members = [
     "crates/mirante4d-analysis",
     "crates/mirante4d-app",
     "crates/mirante4d-application",
-    "crates/mirante4d-core",
     "crates/mirante4d-data",
     "crates/mirante4d-dataset",
     "crates/mirante4d-domain",
@@ -30,7 +29,6 @@ anyhow = "1.0.103"
 approx = "0.5.1"
 blake3 = "1.8.2"
 bytemuck = "1.25.0"
-criterion = "0.8.2"
 eframe = { version = "0.34.3", default-features = false, features = ["accesskit", "default_fonts", "wayland", "web_screen_reader", "wgpu", "x11"] }
 egui_kittest = { version = "0.34.3", default-features = false }
 glam = { version = "0.30.9", features = ["serde"] }
@@ -49,6 +47,7 @@ tiff = "0.11.3"
 toml = { version = "1.1.2", default-features = false, features = ["std", "serde", "parse"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+uuid = { version = "1.23.3", features = ["v4"] }
 wgpu = "29.0.3"
 winit = { version = "0.30.13", default-features = false, features = ["wayland-csd-adwaita-notitle", "wayland-dlopen"] }
 yaml-rust2 = "0.11.0"
@@ -57,7 +56,6 @@ zarrs = { version = "0.23.13", default-features = false, features = ["crc32c", "
 mirante4d-app = { path = "crates/mirante4d-app" }
 mirante4d-analysis = { path = "crates/mirante4d-analysis" }
 mirante4d-application = { path = "crates/mirante4d-application" }
-mirante4d-core = { path = "crates/mirante4d-core" }
 mirante4d-data = { path = "crates/mirante4d-data" }
 mirante4d-dataset = { path = "crates/mirante4d-dataset" }
 mirante4d-domain = { path = "crates/mirante4d-domain" }

@@ -1,9 +1,9 @@
 use std::{collections::BTreeMap, env, fs, path::PathBuf, time::Instant};
 
 use anyhow::{Context, bail};
-use mirante4d_core::{IntensityDType, LayerId, Shape3D, TimeIndex};
 use mirante4d_data::{DatasetHandle, SpatialBrickIndex};
-use mirante4d_format::{ExistingPackagePolicy, NativeManifest, validate::load_manifest};
+use mirante4d_domain::{IntensityDType, Shape3D, TimeIndex};
+use mirante4d_format::{ExistingPackagePolicy, LayerId, NativeManifest, validate::load_manifest};
 use mirante4d_import::{
     ImportCancellationToken, ImportProgressEvent, TiffImportSource, TiffSourceImportOptions,
     TiffSourceProfile, accepted_tiff_reviewed_import_plan, import_tiff_source_with_progress,
@@ -196,9 +196,9 @@ pub(crate) fn bench_import_sample_with_limit(
         "first_volume": {
             "layer_id": layer_id.to_string(),
             "shape": {
-                "z": first_volume_shape.z,
-                "y": first_volume_shape.y,
-                "x": first_volume_shape.x,
+                "z": first_volume_shape.z(),
+                "y": first_volume_shape.y(),
+                "x": first_volume_shape.x(),
             },
             "first_brick_probe": first_brick_probe,
         },
@@ -231,7 +231,11 @@ fn first_layer_shape_from_manifest(
         .iter()
         .find(|layer| layer.id == layer_id.as_str())
         .with_context(|| format!("manifest missing first layer {}", layer_id.as_str()))?;
-    Ok(Shape3D::new(layer.shape.z, layer.shape.y, layer.shape.x)?)
+    Ok(Shape3D::new(
+        layer.shape.z(),
+        layer.shape.y(),
+        layer.shape.x(),
+    )?)
 }
 
 fn first_layer_dtype_from_manifest(
@@ -256,7 +260,7 @@ fn read_first_brick_probe(
             let brick = dataset.read_u8_brick_at_scale(
                 layer_id,
                 0,
-                TimeIndex(0),
+                TimeIndex::new(0),
                 SpatialBrickIndex::new(0, 0, 0),
             )?;
             Ok(json!({
@@ -283,7 +287,7 @@ fn read_first_brick_probe(
             let brick = dataset.read_u16_brick_at_scale(
                 layer_id,
                 0,
-                TimeIndex(0),
+                TimeIndex::new(0),
                 SpatialBrickIndex::new(0, 0, 0),
             )?;
             Ok(json!({
@@ -310,7 +314,7 @@ fn read_first_brick_probe(
             let brick = dataset.read_f32_brick_at_scale(
                 layer_id,
                 0,
-                TimeIndex(0),
+                TimeIndex::new(0),
                 SpatialBrickIndex::new(0, 0, 0),
             )?;
             Ok(json!({

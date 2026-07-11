@@ -37,7 +37,7 @@ pub(crate) fn pick_hit_json(hit: &PickHit) -> Value {
         "layer_id": hit.layer_id.as_ref().map(|id| id.as_str()),
         "object_id": hit.object_id.as_ref().map(|id| id.as_str()),
         "source_layer_id": hit.source_layer_id.as_ref().map(|id| id.as_str()),
-        "timepoint": hit.timepoint.0,
+        "timepoint": hit.timepoint.get(),
         "world_position": hit.world_position.map(world_position_json).unwrap_or(Value::Null),
         "grid_position": hit.grid_position.map(grid_position_json).unwrap_or(Value::Null),
         "screen_position": hit.screen_position.map(screen_position_json).unwrap_or(Value::Null),

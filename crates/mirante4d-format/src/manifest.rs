@@ -1,5 +1,7 @@
-use mirante4d_core::{GridToWorld, IntensityDType, LayerDisplay, Shape4D, WorldSpace};
+use mirante4d_domain::{GridToWorld, IntensityDType, Shape4D, ShapeError};
 use serde::{Deserialize, Serialize};
+
+use crate::{CurrentShape4DExt, LayerDisplay, WorldSpace};
 
 pub const FORMAT_ID: &str = "mirante4d-v1";
 pub const SCHEMA_VERSION: u32 = 1;
@@ -91,7 +93,9 @@ pub struct SourceMetadataProvenance {
     pub source_axes: Vec<String>,
     pub native_axes: Vec<String>,
     pub channels_as_layers: bool,
+    #[serde(with = "crate::manifest_wire::dtype")]
     pub source_dtype: IntensityDType,
+    #[serde(with = "crate::manifest_wire::shape4d")]
     pub shape_tzyx: Shape4D,
     pub voxel_spacing_um: [f64; 3],
     pub voxel_spacing_status: String,
@@ -158,10 +162,12 @@ pub struct LayerManifest {
     pub kind: LayerKind,
     pub name: String,
     pub channel: ChannelMetadata,
+    #[serde(with = "crate::manifest_wire::shape4d")]
     pub shape: Shape4D,
     pub dtype: DTypeMetadata,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_data_policy: Option<NoDataPolicy>,
+    #[serde(with = "crate::manifest_wire::grid_to_world")]
     pub grid_to_world: GridToWorld,
     pub display: LayerDisplay,
     pub scales: Vec<ScaleManifest>,
@@ -181,7 +187,9 @@ pub struct ChannelMetadata {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DTypeMetadata {
+    #[serde(with = "crate::manifest_wire::dtype")]
     pub source: IntensityDType,
+    #[serde(with = "crate::manifest_wire::dtype")]
     pub stored: IntensityDType,
     pub conversion: DTypeConversion,
 }
@@ -196,6 +204,7 @@ pub enum DTypeConversion {
 pub struct NoDataPolicy {
     pub kind: NoDataPolicyKind,
     pub source_value: f64,
+    #[serde(with = "crate::manifest_wire::dtype")]
     pub source_dtype: IntensityDType,
     pub visibility_policy: NoDataVisibilityPolicy,
 }
@@ -216,8 +225,10 @@ pub enum NoDataVisibilityPolicy {
 pub struct ScaleManifest {
     pub level: u32,
     pub array_path: String,
+    #[serde(with = "crate::manifest_wire::shape4d")]
     pub shape: Shape4D,
     pub storage: ScaleStorage,
+    #[serde(with = "crate::manifest_wire::grid_to_world")]
     pub grid_to_world: GridToWorld,
     pub source_scale: Option<u32>,
     pub reduction: ScaleReduction,
@@ -241,13 +252,20 @@ pub struct ScaleValidityMask {
 pub struct ScaleStorage {
     pub kind: String,
     pub array_path: String,
+    #[serde(with = "crate::manifest_wire::dtype")]
     pub dtype: IntensityDType,
     pub codec_chain: Vec<String>,
+    #[serde(with = "crate::manifest_wire::shape4d")]
     pub brick_shape: Shape4D,
+    #[serde(with = "crate::manifest_wire::shape4d")]
     pub brick_grid_shape: Shape4D,
+    #[serde(with = "crate::manifest_wire::shape4d")]
     pub subchunk_shape: Shape4D,
+    #[serde(with = "crate::manifest_wire::shape4d")]
     pub chunks_per_shard: Shape4D,
+    #[serde(with = "crate::manifest_wire::shape4d")]
     pub shard_shape: Shape4D,
+    #[serde(with = "crate::manifest_wire::shape4d")]
     pub shard_grid_shape: Shape4D,
     pub checksum_scope: String,
     pub shard_records: Vec<ShardRecord>,
@@ -261,7 +279,7 @@ impl ScaleStorage {
         brick_shape: Shape4D,
         shard_shape: Shape4D,
         shard_records: Vec<ShardRecord>,
-    ) -> Result<Self, mirante4d_core::ShapeError> {
+    ) -> Result<Self, ShapeError> {
         let brick_grid_shape = shape.chunk_grid(brick_shape)?;
         let shard_grid_shape = shape.chunk_grid(shard_shape)?;
         Ok(Self {
@@ -272,12 +290,12 @@ impl ScaleStorage {
             brick_shape,
             brick_grid_shape,
             subchunk_shape: brick_shape,
-            chunks_per_shard: Shape4D {
-                t: shard_shape.t / brick_shape.t,
-                z: shard_shape.z / brick_shape.z,
-                y: shard_shape.y / brick_shape.y,
-                x: shard_shape.x / brick_shape.x,
-            },
+            chunks_per_shard: Shape4D::new(
+                shard_shape.t() / brick_shape.t(),
+                shard_shape.z() / brick_shape.z(),
+                shard_shape.y() / brick_shape.y(),
+                shard_shape.x() / brick_shape.x(),
+            )?,
             shard_shape,
             shard_grid_shape,
             checksum_scope: SHARDED_CHECKSUM_SCOPE.to_owned(),
@@ -343,6 +361,7 @@ pub struct Percentiles {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrickTable {
+    #[serde(with = "crate::manifest_wire::shape4d")]
     pub grid_shape: Shape4D,
     pub records: Vec<BrickRecord>,
     pub range_hierarchy: BrickRangeHierarchy,
@@ -415,18 +434,19 @@ impl BrickRangeHierarchy {
         });
 
         let mut level = 1;
-        while current_shape.z > 1 || current_shape.y > 1 || current_shape.x > 1 {
-            let next_shape = Shape4D {
-                t: current_shape.t,
-                z: current_shape.z.div_ceil(2),
-                y: current_shape.y.div_ceil(2),
-                x: current_shape.x.div_ceil(2),
-            };
+        while current_shape.z() > 1 || current_shape.y() > 1 || current_shape.x() > 1 {
+            let next_shape = Shape4D::new(
+                current_shape.t(),
+                current_shape.z().div_ceil(2),
+                current_shape.y().div_ceil(2),
+                current_shape.x().div_ceil(2),
+            )
+            .expect("range hierarchy dimensions remain positive and bounded");
             let mut next_records = Vec::new();
-            for t in 0..next_shape.t {
-                for z in 0..next_shape.z {
-                    for y in 0..next_shape.y {
-                        for x in 0..next_shape.x {
+            for t in 0..next_shape.t() {
+                for z in 0..next_shape.z() {
+                    for y in 0..next_shape.y() {
+                        for x in 0..next_shape.x() {
                             next_records.push(BrickRangeRecord {
                                 index: BrickIndex { t, z, y, x },
                                 has_valid_voxels: false,
@@ -486,12 +506,13 @@ impl BrickRangeHierarchy {
 }
 
 fn brick_range_record_offset(shape: Shape4D, index: BrickIndex) -> usize {
-    (((index.t * shape.z + index.z) * shape.y + index.y) * shape.x + index.x) as usize
+    (((index.t * shape.z() + index.z) * shape.y() + index.y) * shape.x() + index.x) as usize
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrickRangeLevel {
     pub level: u32,
+    #[serde(with = "crate::manifest_wire::shape4d")]
     pub grid_shape: Shape4D,
     pub records: Vec<BrickRangeRecord>,
 }

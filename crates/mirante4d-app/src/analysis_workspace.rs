@@ -2,9 +2,13 @@ use std::cmp::Ordering;
 
 use eframe::egui;
 use mirante4d_analysis::{AnalysisCell, AnalysisPlot, AnalysisTable, export_table_csv};
+use mirante4d_application::{
+    AnalysisPlotDescriptor, AnalysisPlotId, AnalysisPlotPointSelection, AnalysisTableDescriptor,
+    AnalysisTableId, ApplicationCommand,
+};
 
 use crate::{
-    AppState,
+    current_runtime::{analysis::CurrentAnalysisRuntime, ui::CurrentUiRuntime},
     ui_kit::{self, StatusTone},
 };
 
@@ -17,13 +21,6 @@ pub(crate) struct AnalysisTableSort {
     pub(crate) ascending: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AnalysisPlotPointSelection {
-    pub(crate) plot_index: usize,
-    pub(crate) series_index: usize,
-    pub(crate) point_index: usize,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct AnalysisPlotViewRange {
     pub(crate) plot_index: usize,
@@ -33,77 +30,34 @@ pub(crate) struct AnalysisPlotViewRange {
     pub(crate) max_y: f64,
 }
 
-pub(crate) fn normalize_analysis_selection(state: &mut AppState) {
-    state.selected_analysis_table_index = normalize_selected_index(
-        state.selected_analysis_table_index,
-        state.analysis_tables.len(),
-    );
-    state.selected_analysis_plot_index = normalize_selected_index(
-        state.selected_analysis_plot_index,
-        state.analysis_plots.len(),
-    );
-    normalize_analysis_plot_point_selection(state);
-    normalize_analysis_plot_view(state);
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AnalysisWorkspaceViewInput<'a> {
+    pub(crate) table_descriptors: &'a [AnalysisTableDescriptor],
+    pub(crate) plot_descriptors: &'a [AnalysisPlotDescriptor],
+    pub(crate) selected_table: Option<AnalysisTableId>,
+    pub(crate) selected_plot: Option<AnalysisPlotId>,
+    pub(crate) selected_plot_point: Option<AnalysisPlotPointSelection>,
 }
 
-fn normalize_selected_index(selected: Option<usize>, len: usize) -> Option<usize> {
-    if len == 0 {
-        None
-    } else {
-        Some(selected.unwrap_or(len - 1).min(len - 1))
-    }
-}
-
-fn normalize_analysis_plot_point_selection(state: &mut AppState) {
-    let Some(selection) = state.selected_analysis_plot_point.as_ref() else {
-        return;
-    };
-    if state.selected_analysis_plot_index != Some(selection.plot_index) {
-        state.selected_analysis_plot_point = None;
-        return;
-    }
-    let Some(plot) = state.analysis_plots.get(selection.plot_index) else {
-        state.selected_analysis_plot_point = None;
-        return;
-    };
-    let Some(series) = plot.series.get(selection.series_index) else {
-        state.selected_analysis_plot_point = None;
-        return;
-    };
-    if selection.point_index >= series.points.len() {
-        state.selected_analysis_plot_point = None;
-    }
-}
-
-fn normalize_analysis_plot_view(state: &mut AppState) {
-    let Some(view) = state.analysis_plot_view else {
-        return;
-    };
-    if state.selected_analysis_plot_index != Some(view.plot_index) {
-        state.analysis_plot_view = None;
-        return;
-    }
-    if !view.min_x.is_finite()
-        || !view.max_x.is_finite()
-        || !view.min_y.is_finite()
-        || !view.max_y.is_finite()
-        || view.min_x >= view.max_x
-        || view.min_y >= view.max_y
-    {
-        state.analysis_plot_view = None;
-    }
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AnalysisTableExportInput<'a> {
+    pub(crate) table_descriptors: &'a [AnalysisTableDescriptor],
+    pub(crate) selected_table: Option<AnalysisTableId>,
 }
 
 pub(crate) fn show_analysis_workspace_window(
     ctx: &egui::Context,
-    open: &mut bool,
-    state: &mut AppState,
-) {
-    if !*open {
-        return;
+    analysis: &CurrentAnalysisRuntime,
+    ui_runtime: &mut CurrentUiRuntime,
+    input: AnalysisWorkspaceViewInput<'_>,
+) -> Vec<ApplicationCommand> {
+    if !ui_runtime.analysis_workspace_open {
+        return Vec::new();
     }
+    let mut open = ui_runtime.analysis_workspace_open;
+    let mut commands = Vec::new();
     egui::Window::new("Analysis Workspace")
-        .open(open)
+        .open(&mut open)
         .resizable(true)
         .default_size(egui::vec2(760.0, 560.0))
         .min_size(egui::vec2(420.0, 320.0))
@@ -112,23 +66,36 @@ pub(crate) fn show_analysis_workspace_window(
                 .id_salt("analysis-workspace-scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    show_analysis_workspace(ui, state);
+                    commands.extend(show_analysis_workspace(ui, analysis, ui_runtime, input));
                 });
         });
+    ui_runtime.analysis_workspace_open = open;
+    commands
 }
 
-pub(crate) fn show_analysis_workspace(ui: &mut egui::Ui, state: &mut AppState) {
-    normalize_analysis_selection(state);
-    ui_kit::property_row(ui, "tables", state.analysis_tables.len().to_string());
-    ui_kit::property_row(ui, "plots", state.analysis_plots.len().to_string());
+pub(crate) fn show_analysis_workspace(
+    ui: &mut egui::Ui,
+    analysis: &CurrentAnalysisRuntime,
+    ui_runtime: &mut CurrentUiRuntime,
+    input: AnalysisWorkspaceViewInput<'_>,
+) -> Vec<ApplicationCommand> {
+    let mut commands = Vec::new();
+    ui_kit::property_row(ui, "tables", analysis.analysis_tables.len().to_string());
+    ui_kit::property_row(ui, "plots", analysis.analysis_plots.len().to_string());
     ui_kit::property_row(
         ui,
         "operations",
-        state.analysis_operations.len().to_string(),
+        analysis.analysis_operations.len().to_string(),
     );
-    show_analysis_result_browser(ui, state);
-    if let Some(table_index) = state.selected_analysis_table_index {
-        let table = &state.analysis_tables[table_index];
+    show_analysis_result_browser(
+        ui,
+        analysis,
+        input,
+        &mut ui_runtime.analysis_plot_view,
+        &mut commands,
+    );
+    if let Some(table_index) = selected_analysis_table_index(analysis, input) {
+        let table = &analysis.analysis_tables[table_index];
         ui_kit::property_row(ui, "selected table", &table.name);
         ui_kit::property_row(ui, "state", format!("{:?}", table.state));
         ui_kit::property_row(ui, "rows", table.rows.len().to_string());
@@ -136,12 +103,13 @@ pub(crate) fn show_analysis_workspace(ui: &mut egui::Ui, state: &mut AppState) {
         show_analysis_table_preview(
             ui,
             table,
-            &mut state.analysis_filter,
-            &mut state.analysis_sort,
+            &mut ui_runtime.analysis_filter,
+            &mut ui_runtime.analysis_sort,
         );
     }
-    if let Some(plot_index) = state.selected_analysis_plot_index {
-        let plot = &state.analysis_plots[plot_index];
+    if let Some(plot_index) = selected_analysis_plot_index(analysis, input) {
+        let plot = &analysis.analysis_plots[plot_index];
+        let plot_id = input.plot_descriptors[plot_index].id();
         let point_count = plot
             .series
             .iter()
@@ -153,17 +121,26 @@ pub(crate) fn show_analysis_workspace(ui: &mut egui::Ui, state: &mut AppState) {
             ui,
             plot,
             plot_index,
-            &mut state.selected_analysis_plot_point,
-            &mut state.analysis_plot_view,
+            plot_id,
+            input.selected_plot_point,
+            &mut ui_runtime.analysis_plot_view,
+            &mut commands,
         );
     }
-    if let Some(csv) = &state.last_analysis_export_csv {
+    if let Some(csv) = &analysis.last_analysis_export_csv {
         ui_kit::property_row(ui, "csv", format!("{} byte(s)", csv.len()));
     }
+    commands
 }
 
-fn show_analysis_result_browser(ui: &mut egui::Ui, state: &mut AppState) {
-    if state.analysis_tables.is_empty() && state.analysis_plots.is_empty() {
+fn show_analysis_result_browser(
+    ui: &mut egui::Ui,
+    analysis: &CurrentAnalysisRuntime,
+    input: AnalysisWorkspaceViewInput<'_>,
+    plot_view: &mut Option<AnalysisPlotViewRange>,
+    commands: &mut Vec<ApplicationCommand>,
+) {
+    if analysis.analysis_tables.is_empty() && analysis.analysis_plots.is_empty() {
         ui_kit::status_badge(ui, StatusTone::Ready, "no analysis results");
         return;
     }
@@ -177,13 +154,20 @@ fn show_analysis_result_browser(ui: &mut egui::Ui, state: &mut AppState) {
                 .max_height(92.0)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    for (index, table) in state.analysis_tables.iter().enumerate() {
-                        let selected = state.selected_analysis_table_index == Some(index);
+                    for (index, (table, descriptor)) in analysis
+                        .analysis_tables
+                        .iter()
+                        .zip(input.table_descriptors)
+                        .enumerate()
+                    {
+                        let selected = input.selected_table == Some(descriptor.id());
                         if ui
                             .selectable_label(selected, analysis_table_browser_label(index, table))
                             .clicked()
                         {
-                            state.selected_analysis_table_index = Some(index);
+                            commands.push(ApplicationCommand::SelectAnalysisTable(Some(
+                                descriptor.id(),
+                            )));
                         }
                     }
                 });
@@ -195,20 +179,50 @@ fn show_analysis_result_browser(ui: &mut egui::Ui, state: &mut AppState) {
                 .max_height(92.0)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    for (index, plot) in state.analysis_plots.iter().enumerate() {
-                        let selected = state.selected_analysis_plot_index == Some(index);
+                    for (index, (plot, descriptor)) in analysis
+                        .analysis_plots
+                        .iter()
+                        .zip(input.plot_descriptors)
+                        .enumerate()
+                    {
+                        let selected = input.selected_plot == Some(descriptor.id());
                         if ui
                             .selectable_label(selected, analysis_plot_browser_label(index, plot))
                             .clicked()
                         {
-                            state.selected_analysis_plot_index = Some(index);
-                            state.selected_analysis_plot_point = None;
-                            state.analysis_plot_view = None;
+                            commands.push(ApplicationCommand::SelectAnalysisPlot(Some(
+                                descriptor.id(),
+                            )));
+                            *plot_view = None;
                         }
                     }
                 });
         });
     });
+}
+
+fn selected_analysis_table_index(
+    analysis: &CurrentAnalysisRuntime,
+    input: AnalysisWorkspaceViewInput<'_>,
+) -> Option<usize> {
+    let selected = input.selected_table?;
+    input
+        .table_descriptors
+        .iter()
+        .position(|descriptor| descriptor.id() == selected)
+        .filter(|index| *index < analysis.analysis_tables.len())
+}
+
+fn selected_analysis_plot_index(
+    analysis: &CurrentAnalysisRuntime,
+    input: AnalysisWorkspaceViewInput<'_>,
+) -> Option<usize> {
+    let selected = input.selected_plot?;
+    input
+        .plot_descriptors
+        .iter()
+        .position(|descriptor| descriptor.id() == selected)
+        .filter(|index| *index < analysis.analysis_plots.len())
 }
 
 fn analysis_table_browser_label(index: usize, table: &AnalysisTable) -> String {
@@ -312,8 +326,10 @@ fn show_analysis_plot_preview(
     ui: &mut egui::Ui,
     plot: &AnalysisPlot,
     plot_index: usize,
-    selected_point: &mut Option<AnalysisPlotPointSelection>,
+    plot_id: AnalysisPlotId,
+    selected_point: Option<AnalysisPlotPointSelection>,
     view_range: &mut Option<AnalysisPlotViewRange>,
+    commands: &mut Vec<ApplicationCommand>,
 ) {
     let Some(full_bounds) = analysis_plot_bounds(plot) else {
         ui_kit::status_badge(ui, StatusTone::Warning, "plot has no finite points");
@@ -391,12 +407,12 @@ fn show_analysis_plot_preview(
         .and_then(|pointer| nearest_analysis_plot_point(plot, bounds, plot_rect, pointer));
     if response.clicked()
         && let Some(nearest) = nearest_hover.as_ref()
+        && let Ok(series_index) = u16::try_from(nearest.series_index)
+        && let Ok(point_index) = u64::try_from(nearest.point_index)
     {
-        *selected_point = Some(AnalysisPlotPointSelection {
-            plot_index,
-            series_index: nearest.series_index,
-            point_index: nearest.point_index,
-        });
+        commands.push(ApplicationCommand::SelectAnalysisPlotPoint(Some(
+            AnalysisPlotPointSelection::new(plot_id, series_index, point_index),
+        )));
     }
     if let Some(nearest) = nearest_hover {
         ui_kit::property_row(
@@ -413,17 +429,18 @@ fn show_analysis_plot_preview(
             ),
         );
     }
-    if let Some(selection) = selected_point.as_ref()
-        && selection.plot_index == plot_index
-        && let Some(series) = plot.series.get(selection.series_index)
-        && let Some(point) = series.points.get(selection.point_index)
+    if let Some(selection) = selected_point
+        && selection.plot_id() == plot_id
+        && let Some(series) = plot.series.get(usize::from(selection.series_index()))
+        && let Ok(point_index) = usize::try_from(selection.point_index())
+        && let Some(point) = series.points.get(point_index)
     {
         ui_kit::property_row(
             ui,
             "selected",
             format!(
                 "{} #{}: {} {:.3}, {} {:.3}",
-                series.name, selection.point_index, plot.x_label, point.x, plot.y_label, point.y
+                series.name, point_index, plot.x_label, point.x, plot.y_label, point.y
             ),
         );
     }
@@ -853,18 +870,24 @@ fn degenerate_plot_padding(value: f64) -> f64 {
     (value.abs() * 0.05).max(1.0)
 }
 
-pub(crate) fn export_selected_analysis_table(state: &mut AppState) -> anyhow::Result<()> {
-    normalize_analysis_selection(state);
-    let table_index = state
-        .selected_analysis_table_index
+pub(crate) fn export_selected_analysis_table(
+    analysis: &mut CurrentAnalysisRuntime,
+    input: AnalysisTableExportInput<'_>,
+) -> anyhow::Result<usize> {
+    let selected = input
+        .selected_table
         .ok_or_else(|| anyhow::anyhow!("no analysis table is selected for export"))?;
-    let table = state
+    let table_index = input
+        .table_descriptors
+        .iter()
+        .position(|descriptor| descriptor.id() == selected)
+        .ok_or_else(|| anyhow::anyhow!("selected analysis table is not in the payload catalog"))?;
+    let table = analysis
         .analysis_tables
         .get(table_index)
-        .ok_or_else(|| anyhow::anyhow!("selected analysis table index is out of range"))?;
+        .ok_or_else(|| anyhow::anyhow!("selected analysis table payload is unavailable"))?;
     let csv = export_table_csv(table)?;
     let byte_count = csv.len();
-    state.last_analysis_export_csv = Some(csv);
-    state.last_workflow_message = Some(format!("Exported analysis CSV ({byte_count} bytes)"));
-    Ok(())
+    analysis.last_analysis_export_csv = Some(csv);
+    Ok(byte_count)
 }

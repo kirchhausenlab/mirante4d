@@ -1,12 +1,12 @@
 use std::{fs, path::PathBuf, time::Instant};
 
 use anyhow::Context;
-use mirante4d_core::{DEFAULT_PRESENTATION_VIEWPORT_POINTS, TimeIndex};
 use mirante4d_data::{DatasetHandle, SpatialBrickIndex};
+use mirante4d_domain::TimeIndex;
 use mirante4d_renderer::{CameraRenderMode, RenderViewport, render_camera};
 
-use crate::benchmark_camera_for_volume;
 use crate::fixtures::generate_fixture;
+use crate::{benchmark_camera_for_volume, benchmark_camera_frame};
 
 pub(crate) fn bench_smoke() -> anyhow::Result<PathBuf> {
     let started = Instant::now();
@@ -20,15 +20,18 @@ pub(crate) fn bench_smoke() -> anyhow::Result<PathBuf> {
 
     let layer_id = dataset.first_layer_id()?;
     let read_started = Instant::now();
-    let volume = dataset.read_u16_volume(&layer_id, TimeIndex(0))?;
+    let volume = dataset.read_u16_volume(&layer_id, TimeIndex::new(0))?;
     let read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
     let brick_read_started = Instant::now();
-    let brick = dataset.read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))?;
+    let brick = dataset.read_u16_brick(
+        &layer_id,
+        TimeIndex::new(0),
+        SpatialBrickIndex::new(0, 0, 0),
+    )?;
     let brick_read_ms = brick_read_started.elapsed().as_secs_f64() * 1000.0;
 
-    let camera =
-        benchmark_camera_for_volume(&volume).to_camera_state(DEFAULT_PRESENTATION_VIEWPORT_POINTS);
-    let viewport = RenderViewport::new(volume.shape.x, volume.shape.y)?;
+    let camera = benchmark_camera_frame(benchmark_camera_for_volume(&volume));
+    let viewport = RenderViewport::new(volume.shape.x(), volume.shape.y())?;
     let render_started = Instant::now();
     let (_frame, diagnostics) = render_camera(&volume, camera, viewport, CameraRenderMode::Mip)?;
     let render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
@@ -78,9 +81,9 @@ pub(crate) fn bench_smoke() -> anyhow::Result<PathBuf> {
                 "}}\n"
             ),
             dataset_path.display(),
-            volume.shape.z,
-            volume.shape.y,
-            volume.shape.x,
+            volume.shape.z(),
+            volume.shape.y(),
+            volume.shape.x(),
             fixture_ms,
             open_ms,
             read_ms,
@@ -95,9 +98,9 @@ pub(crate) fn bench_smoke() -> anyhow::Result<PathBuf> {
             stats.brick_cache_misses,
             stats.brick_reads,
             stats.decoded_brick_values,
-            brick.volume.shape.z,
-            brick.volume.shape.y,
-            brick.volume.shape.x,
+            brick.volume.shape.z(),
+            brick.volume.shape.y(),
+            brick.volume.shape.x(),
             brick.values().len(),
             brick.occupied,
             diagnostics.output_pixels,

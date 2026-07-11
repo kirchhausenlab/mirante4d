@@ -5,8 +5,9 @@ use std::{
 };
 
 use glam::DVec3;
-use mirante4d_core::{GridToWorld, Shape3D};
 use mirante4d_data::{DenseVolumeF32, DenseVolumeU8, DenseVolumeU16, VolumeRegion};
+use mirante4d_domain::{GridToWorld, Shape3D};
+use mirante4d_format::CurrentGridToWorldExt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -1164,9 +1165,9 @@ fn grid_ranges_for_world_box(
         grid_max = grid_max.max(grid);
     }
     Ok((
-        clamp_grid_range(grid_min.z, grid_max.z, shape.z),
-        clamp_grid_range(grid_min.y, grid_max.y, shape.y),
-        clamp_grid_range(grid_min.x, grid_max.x, shape.x),
+        clamp_grid_range(grid_min.z, grid_max.z, shape.z()),
+        clamp_grid_range(grid_min.y, grid_max.y, shape.y()),
+        clamp_grid_range(grid_min.x, grid_max.x, shape.x()),
     ))
 }
 
@@ -1268,13 +1269,12 @@ mod tests {
     use super::*;
     use crate::{SceneArtifactId, SceneArtifactTime};
     use approx::assert_abs_diff_eq;
-    use mirante4d_core::{
-        DatasetId, GridToWorld, LayerId, Shape3D, Shape4D, TimeIndex, WorldSpace, WorldUnit,
-    };
     use mirante4d_data::{DatasetHandle, DenseVolumeF32, DenseVolumeU8, DenseVolumeU16};
+    use mirante4d_domain::{GridToWorld, Shape3D, Shape4D, TimeIndex};
     use mirante4d_format::{
-        ChannelMetadata, DenseF32Layer, ExistingPackagePolicy, FixtureKind, NativeF32Dataset,
-        default_f32_display, write_fixture, write_native_f32_dataset,
+        ChannelMetadata, DatasetId, DenseF32Layer, ExistingPackagePolicy, FixtureKind, LayerId,
+        NativeF32Dataset, WorldSpace, WorldUnit, default_f32_display, write_fixture,
+        write_native_f32_dataset,
     };
 
     #[test]
@@ -1306,7 +1306,7 @@ mod tests {
             DatasetId::new("analysis-masked").unwrap(),
             LayerId::new("ch0").unwrap(),
             0,
-            TimeIndex(0),
+            TimeIndex::new(0),
             Shape3D::new(2, 1, 2).unwrap(),
             GridToWorld::identity(),
             vec![255, 1, 2, 0],
@@ -1349,7 +1349,7 @@ mod tests {
             DatasetId::new("analysis-u8-masked").unwrap(),
             LayerId::new("ch0").unwrap(),
             0,
-            TimeIndex(0),
+            TimeIndex::new(0),
             Shape3D::new(2, 1, 2).unwrap(),
             GridToWorld::identity(),
             vec![255, 1, 2, 0],
@@ -1708,7 +1708,9 @@ mod tests {
         let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
         let dataset = DatasetHandle::open(root).unwrap();
         let layer_id = dataset.first_layer_id().unwrap();
-        dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap()
+        dataset
+            .read_u16_volume(&layer_id, TimeIndex::new(0))
+            .unwrap()
     }
 
     fn f32_volume() -> DenseVolumeF32 {
@@ -1732,7 +1734,7 @@ mod tests {
                     },
                     shape: Shape4D::new(1, 2, 2, 3).unwrap(),
                     brick_shape: Shape4D::new(1, 1, 1, 3).unwrap(),
-                    grid_to_world: GridToWorld::scale_um(1.0, 1.0, 1.0),
+                    grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
                     display: default_f32_display(),
                     values_tzyx: vec![
                         -1.0, 0.0, 0.5, 2.0, 4.25, -3.5, 8.0, -0.25, 1.25, 3.0, 5.5, 9.75,
@@ -1744,7 +1746,9 @@ mod tests {
         .unwrap();
         let dataset = DatasetHandle::open(&root).unwrap();
         let layer_id = dataset.first_layer_id().unwrap();
-        dataset.read_f32_volume(&layer_id, TimeIndex(0)).unwrap()
+        dataset
+            .read_f32_volume(&layer_id, TimeIndex::new(0))
+            .unwrap()
     }
 
     fn final_provenance(operation: &str) -> AnalysisProvenance {
@@ -1775,7 +1779,7 @@ mod tests {
             SceneArtifactId::new("roi", id).unwrap(),
             id,
             WorldGeometry::Box3D { min, max },
-            SceneArtifactTime::Timepoint(TimeIndex(0)),
+            SceneArtifactTime::Timepoint(TimeIndex::new(0)),
         )
         .unwrap()
     }

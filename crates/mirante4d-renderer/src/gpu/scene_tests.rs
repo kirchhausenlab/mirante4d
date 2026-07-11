@@ -1,5 +1,5 @@
 use glam::DVec3;
-use mirante4d_core::TimeIndex;
+use mirante4d_domain::TimeIndex;
 
 use crate::scene_render::build_scene_render_commands;
 use crate::{
@@ -92,7 +92,7 @@ fn gpu_scene_renderer_draws_world_interaction_and_screen_primitives() {
             },
         )),
     ];
-    let draw_list = extract_scene_draw_list(&layers, SceneFrameContext::new(TimeIndex(0)));
+    let draw_list = extract_scene_draw_list(&layers, SceneFrameContext::new(TimeIndex::new(0)));
     let expected_render_commands = build_scene_render_commands(&draw_list, camera, viewport)
         .commands()
         .len() as u64;
@@ -150,7 +150,7 @@ fn gpu_scene_pick_returns_topmost_selectable_command_id() {
             radius_px: 6.0,
         },
     ));
-    let draw_list = extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex(0)));
+    let draw_list = extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex::new(0)));
 
     let pick = renderer
         .pick_scene_object_id_with_timings(
@@ -158,7 +158,7 @@ fn gpu_scene_pick_returns_topmost_selectable_command_id() {
             camera,
             viewport,
             PickQuery {
-                timepoint: TimeIndex(0),
+                timepoint: TimeIndex::new(0),
                 screen_position: crate::ScreenPosition::new(32.0, 32.0),
             },
         )
@@ -229,7 +229,7 @@ fn gpu_scene_renderer_respects_pass_order() {
             },
         )),
     ];
-    let draw_list = extract_scene_draw_list(&layers, SceneFrameContext::new(TimeIndex(0)));
+    let draw_list = extract_scene_draw_list(&layers, SceneFrameContext::new(TimeIndex::new(0)));
     let expected_commands_by_pass =
         build_scene_render_commands(&draw_list, camera, viewport).commands_by_pass;
 
@@ -252,7 +252,7 @@ fn gpu_scene_renderer_preserves_base_image_for_empty_draw_list() {
     let camera = scene_test_camera();
     let base_color = SceneColorRgba::new(11, 22, 33, 255);
     let base = SceneRgbaImage::solid(8, 8, base_color).unwrap();
-    let draw_list = extract_scene_draw_list(&[], SceneFrameContext::new(TimeIndex(0)));
+    let draw_list = extract_scene_draw_list(&[], SceneFrameContext::new(TimeIndex::new(0)));
 
     let output = renderer
         .render_scene_layers_rgba(&base, &draw_list, camera, viewport)

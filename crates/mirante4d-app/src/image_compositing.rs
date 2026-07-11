@@ -1,5 +1,8 @@
 use eframe::egui;
-use mirante4d_core::{ChannelColor, LayerDisplay};
+use mirante4d_application::ApplicationSnapshot;
+use mirante4d_domain::{RenderMode, RgbColor};
+use mirante4d_format::LayerDisplay;
+use mirante4d_render_api::CameraFrame;
 use mirante4d_renderer::scene_render::{SceneRgbaImage, render_scene_layers_rgba_cpu};
 use mirante4d_renderer::{
     DisplayRgbaImage, DvrRgbaChannelFrame, IntensityChannelFrame, IntensityChannelFrameF32,
@@ -10,8 +13,13 @@ use mirante4d_renderer::{
 };
 
 use crate::{
-    AppState, DisplayedFrameFreshness, FrameCompleteness, RenderMode, RenderedIntensityChannel,
-    scene_draw_list_for_state,
+    DisplayedFrameFreshness, FrameCompleteness, RenderedIntensityChannel, application_view,
+    current_physical_layer_id,
+    current_runtime::{
+        analysis::CurrentAnalysisRuntime, dataset::CurrentDatasetRuntime,
+        render::CurrentRenderRuntime, ui::CurrentUiRuntime,
+    },
+    scene_extraction::{SceneViewInput, scene_draw_list},
 };
 
 fn empty_display_rgba_image(viewport: RenderViewport) -> DisplayRgbaImage {
@@ -54,10 +62,10 @@ fn additive_rgba(dst: &mut [u8], src: &[u8]) {
     dst[3] = dst[3].max(src[3]);
 }
 
-pub(crate) fn missing_typed_payload_is_reportable_error(state: &AppState) -> bool {
-    state.frame_fidelity.display_freshness == DisplayedFrameFreshness::Current
+pub(crate) fn missing_typed_payload_is_reportable_error(render: &CurrentRenderRuntime) -> bool {
+    render.frame_fidelity.display_freshness == DisplayedFrameFreshness::Current
         && matches!(
-            state.frame_fidelity.completeness,
+            render.frame_fidelity.completeness,
             FrameCompleteness::Exact
                 | FrameCompleteness::Complete
                 | FrameCompleteness::BudgetLimited
@@ -87,16 +95,18 @@ fn blend_channel_rgba(
 }
 
 fn rendered_channel_to_rgba(
-    state: &AppState,
+    snapshot: &ApplicationSnapshot,
+    render: &CurrentRenderRuntime,
     channel: &RenderedIntensityChannel,
 ) -> DisplayRgbaImage {
+    let view = application_view(snapshot);
     match channel.render_state.mode() {
         RenderMode::Dvr => {
             if let Some(dvr_rgba) = channel.frame.dvr_rgba() {
                 composite_dvr_rgba_channels(&[DvrRgbaChannelFrame::new(dvr_rgba)])
                     .expect("DVR channel RGBA dimensions must match the active viewport")
             } else {
-                if missing_typed_payload_is_reportable_error(state) {
+                if missing_typed_payload_is_reportable_error(render) {
                     tracing::error!(
                         layer_id = %channel.layer_id,
                         "DVR channel missing typed RGBA frame; showing empty DVR channel instead of scalar fallback"
@@ -107,7 +117,7 @@ fn rendered_channel_to_rgba(
                         "DVR channel typed RGBA frame is pending; showing empty DVR channel instead of scalar fallback"
                     );
                 }
-                empty_display_rgba_image(state.render_viewport)
+                empty_display_rgba_image(render.render_viewport)
             }
         }
         RenderMode::Isosurface => {
@@ -117,26 +127,24 @@ fn rendered_channel_to_rgba(
                 .and_then(MipImageF32::iso_surface)
             {
                 composite_iso_surface_f32_channels(
-                    &[IsoSurfaceChannelFrameF32::new(
-                        surface,
-                        IntensityTransfer::from_transfer_function(channel.transfer.clone()),
-                    )],
-                    state.iso_light_state,
-                    state.camera.axes(),
+                    &[IsoSurfaceChannelFrameF32::new(surface, channel.transfer)],
+                    *view.iso_light(),
+                    CameraFrame::new(*view.camera(), render.presentation_viewport)
+                        .expect("validated camera and presentation viewport")
+                        .axes(),
                 )
                 .expect("f32 ISO channel dimensions must match the active viewport")
             } else if let Some(surface) = channel.frame.iso_surface() {
                 composite_iso_surface_channels(
-                    &[IsoSurfaceChannelFrame::new(
-                        surface,
-                        IntensityTransfer::from_transfer_function(channel.transfer.clone()),
-                    )],
-                    state.iso_light_state,
-                    state.camera.axes(),
+                    &[IsoSurfaceChannelFrame::new(surface, channel.transfer)],
+                    *view.iso_light(),
+                    CameraFrame::new(*view.camera(), render.presentation_viewport)
+                        .expect("validated camera and presentation viewport")
+                        .axes(),
                 )
                 .expect("ISO channel dimensions must match the active viewport")
             } else {
-                if missing_typed_payload_is_reportable_error(state) {
+                if missing_typed_payload_is_reportable_error(render) {
                     tracing::error!(
                         layer_id = %channel.layer_id,
                         "ISO channel missing typed surface frame; showing empty ISO channel instead of scalar fallback"
@@ -147,20 +155,20 @@ fn rendered_channel_to_rgba(
                         "ISO channel typed surface frame is pending; showing empty ISO channel instead of scalar fallback"
                     );
                 }
-                empty_display_rgba_image(state.render_viewport)
+                empty_display_rgba_image(render.render_viewport)
             }
         }
         RenderMode::Mip => {
             if let Some(frame_f32) = channel.frame_f32.as_ref() {
                 composite_f32_intensity_channels(&[IntensityChannelFrameF32::new(
                     frame_f32,
-                    IntensityTransfer::from_transfer_function(channel.transfer.clone()),
+                    channel.transfer,
                 )])
                 .expect("f32 intensity channel dimensions must match the active viewport")
             } else {
                 composite_intensity_channels(&[IntensityChannelFrame::new(
                     &channel.frame,
-                    IntensityTransfer::from_transfer_function(channel.transfer.clone()),
+                    channel.transfer,
                 )])
                 .expect("intensity channel dimensions must match the active viewport")
             }
@@ -168,57 +176,97 @@ fn rendered_channel_to_rgba(
     }
 }
 
-fn composite_rendered_channels_mixed(state: &AppState) -> DisplayRgbaImage {
-    let Some(first) = state.rendered_channels.first() else {
-        return empty_display_rgba_image(state.render_viewport);
+fn composite_rendered_channels_mixed(
+    snapshot: &ApplicationSnapshot,
+    render: &CurrentRenderRuntime,
+) -> DisplayRgbaImage {
+    let Some(first) = render.rendered_channels.first() else {
+        return empty_display_rgba_image(render.render_viewport);
     };
     let mut base = empty_display_rgba_image_for_size(first.frame.width, first.frame.height);
-    for channel in &state.rendered_channels {
-        let channel_rgba = rendered_channel_to_rgba(state, channel);
+    for channel in &render.rendered_channels {
+        let channel_rgba = rendered_channel_to_rgba(snapshot, render, channel);
         base = blend_channel_rgba(base, channel_rgba, channel.render_state.mode());
     }
     base
 }
 
-pub(crate) fn color_image_for_state(state: &AppState) -> egui::ColorImage {
-    let homogeneous_dvr = state.active_render_mode == RenderMode::Dvr
-        && state
+pub(crate) fn color_image_for_snapshot(
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    analysis: &CurrentAnalysisRuntime,
+    ui_runtime: &CurrentUiRuntime,
+    render: &CurrentRenderRuntime,
+) -> egui::ColorImage {
+    let view = application_view(snapshot);
+    let active_layer = view
+        .layer(view.active_layer())
+        .expect("application view has an active layer");
+    let homogeneous_dvr = active_layer.render_state().mode() == mirante4d_domain::RenderMode::Dvr
+        && render
             .rendered_channels
             .iter()
             .all(|channel| channel.render_state.mode() == RenderMode::Dvr);
     let base = if homogeneous_dvr {
-        let base = if let Some(dvr_rgba) = state.frame.dvr_rgba() {
+        let base = if let Some(dvr_rgba) = render.frame.dvr_rgba() {
             composite_dvr_rgba_channels(&[DvrRgbaChannelFrame::new(dvr_rgba)])
                 .expect("same-ray DVR RGBA dimensions must match the active viewport")
         } else {
-            if missing_typed_payload_is_reportable_error(state) {
+            if missing_typed_payload_is_reportable_error(render) {
                 tracing::error!(
-                    rendered_channel_count = state.rendered_channels.len(),
+                    rendered_channel_count = render.rendered_channels.len(),
                     "active DVR frame missing typed same-ray RGBA frame; showing an empty DVR frame instead of scalar fallback"
                 );
             } else {
                 tracing::debug!(
-                    rendered_channel_count = state.rendered_channels.len(),
+                    rendered_channel_count = render.rendered_channels.len(),
                     "active DVR same-ray RGBA frame is pending; showing an empty DVR frame instead of scalar fallback"
                 );
             }
-            empty_display_rgba_image(state.render_viewport)
+            empty_display_rgba_image(render.render_viewport)
         };
         display_rgba_to_color_image(base)
-    } else if !state.rendered_channels.is_empty() {
-        display_rgba_to_color_image(composite_rendered_channels_mixed(state))
+    } else if !render.rendered_channels.is_empty() {
+        display_rgba_to_color_image(composite_rendered_channels_mixed(snapshot, render))
     } else {
-        mip_to_color_image_with_color(
-            &state.frame,
-            state.active_layer_display,
-            state.active_layer_color,
+        let transfer =
+            IntensityTransfer::new(active_layer.visible(), active_layer.transfer().clone());
+        display_rgba_to_color_image(
+            composite_intensity_channels(&[IntensityChannelFrame::new(&render.frame, transfer)])
+                .expect("single channel frame dimensions are internally consistent"),
         )
     };
-    color_image_with_scene_layers(state, base)
+    color_image_with_scene_layers(snapshot, dataset, analysis, ui_runtime, render, base)
 }
 
-fn color_image_with_scene_layers(state: &AppState, base: egui::ColorImage) -> egui::ColorImage {
-    let Ok(draw_list) = scene_draw_list_for_state(state) else {
+fn color_image_with_scene_layers(
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    analysis: &CurrentAnalysisRuntime,
+    ui_runtime: &CurrentUiRuntime,
+    render: &CurrentRenderRuntime,
+    base: egui::ColorImage,
+) -> egui::ColorImage {
+    let view = application_view(snapshot);
+    let active_layer_id = match current_physical_layer_id(dataset, view.active_layer()) {
+        Ok(layer_id) => layer_id,
+        Err(_) => return base,
+    };
+    let active_grid_to_world = snapshot
+        .catalog()
+        .layer(view.active_layer())
+        .expect("application view closes over the dataset catalog")
+        .grid_to_world();
+    let Ok(draw_list) = scene_draw_list(
+        analysis,
+        ui_runtime,
+        SceneViewInput {
+            active_layer_id: &active_layer_id,
+            active_timepoint: view.timepoint(),
+            active_source_grid_to_world: active_grid_to_world,
+            camera: *view.camera(),
+        },
+    ) else {
         return base;
     };
     if draw_list.is_empty() {
@@ -239,8 +287,9 @@ fn color_image_with_scene_layers(state: &AppState, base: egui::ColorImage) -> eg
     let Ok(output) = render_scene_layers_rgba_cpu(
         &base_rgba,
         &draw_list,
-        state.camera.to_camera_state(state.presentation_viewport),
-        state.render_viewport,
+        CameraFrame::new(*view.camera(), render.presentation_viewport)
+            .expect("validated camera and presentation viewport"),
+        render.render_viewport,
     ) else {
         return base;
     };
@@ -265,9 +314,9 @@ pub fn mip_to_color_image(image: &MipImageU16, display: LayerDisplay) -> egui::C
 pub(crate) fn mip_to_color_image_with_color(
     image: &MipImageU16,
     display: LayerDisplay,
-    color: ChannelColor,
+    color: RgbColor,
 ) -> egui::ColorImage {
-    let transfer = IntensityTransfer::new(display, color);
+    let transfer = IntensityTransfer::new(display.visible(), display.layer_transfer(color));
     let base = composite_intensity_channels(&[IntensityChannelFrame::new(image, transfer)])
         .expect("single channel frame dimensions are internally consistent");
     display_rgba_to_color_image(base)
@@ -282,13 +331,14 @@ fn display_rgba_to_color_image(image: DisplayRgbaImage) -> egui::ColorImage {
     )
 }
 
-fn default_intensity_color() -> ChannelColor {
-    ChannelColor::new([1.0, 1.0, 1.0, 1.0]).expect("default channel color is valid")
+fn default_intensity_color() -> RgbColor {
+    RgbColor::new([1.0, 1.0, 1.0]).expect("default channel color is valid")
 }
 
 #[cfg(test)]
 mod tests {
-    use mirante4d_core::{DisplayWindow, LayerDisplay};
+    use mirante4d_domain::DisplayWindow;
+    use mirante4d_format::LayerDisplay;
 
     use super::*;
 

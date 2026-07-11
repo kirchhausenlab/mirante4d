@@ -126,18 +126,18 @@ impl DenseVolumeU8 {
     }
 
     pub fn voxel(&self, z: u64, y: u64, x: u64) -> Option<u8> {
-        if z >= self.shape.z || y >= self.shape.y || x >= self.shape.x {
+        if z >= self.shape.z() || y >= self.shape.y() || x >= self.shape.x() {
             return None;
         }
-        let index = ((z * self.shape.y + y) * self.shape.x + x) as usize;
+        let index = ((z * self.shape.y() + y) * self.shape.x() + x) as usize;
         self.values.get(index).copied()
     }
 
     pub fn is_render_valid(&self, z: u64, y: u64, x: u64) -> Option<bool> {
-        if z >= self.shape.z || y >= self.shape.y || x >= self.shape.x {
+        if z >= self.shape.z() || y >= self.shape.y() || x >= self.shape.x() {
             return None;
         }
-        let index = ((z * self.shape.y + y) * self.shape.x + x) as usize;
+        let index = ((z * self.shape.y() + y) * self.shape.x() + x) as usize;
         Some(
             self.render_valid
                 .as_ref()
@@ -226,18 +226,18 @@ impl DenseVolumeU16 {
     }
 
     pub fn voxel(&self, z: u64, y: u64, x: u64) -> Option<u16> {
-        if z >= self.shape.z || y >= self.shape.y || x >= self.shape.x {
+        if z >= self.shape.z() || y >= self.shape.y() || x >= self.shape.x() {
             return None;
         }
-        let index = ((z * self.shape.y + y) * self.shape.x + x) as usize;
+        let index = ((z * self.shape.y() + y) * self.shape.x() + x) as usize;
         self.values.get(index).copied()
     }
 
     pub fn is_render_valid(&self, z: u64, y: u64, x: u64) -> Option<bool> {
-        if z >= self.shape.z || y >= self.shape.y || x >= self.shape.x {
+        if z >= self.shape.z() || y >= self.shape.y() || x >= self.shape.x() {
             return None;
         }
-        let index = ((z * self.shape.y + y) * self.shape.x + x) as usize;
+        let index = ((z * self.shape.y() + y) * self.shape.x() + x) as usize;
         Some(
             self.render_valid
                 .as_ref()
@@ -326,18 +326,18 @@ impl DenseVolumeF32 {
     }
 
     pub fn voxel(&self, z: u64, y: u64, x: u64) -> Option<f32> {
-        if z >= self.shape.z || y >= self.shape.y || x >= self.shape.x {
+        if z >= self.shape.z() || y >= self.shape.y() || x >= self.shape.x() {
             return None;
         }
-        let index = ((z * self.shape.y + y) * self.shape.x + x) as usize;
+        let index = ((z * self.shape.y() + y) * self.shape.x() + x) as usize;
         self.values.get(index).copied()
     }
 
     pub fn is_render_valid(&self, z: u64, y: u64, x: u64) -> Option<bool> {
-        if z >= self.shape.z || y >= self.shape.y || x >= self.shape.x {
+        if z >= self.shape.z() || y >= self.shape.y() || x >= self.shape.x() {
             return None;
         }
-        let index = ((z * self.shape.y + y) * self.shape.x + x) as usize;
+        let index = ((z * self.shape.y() + y) * self.shape.x() + x) as usize;
         Some(
             self.render_valid
                 .as_ref()

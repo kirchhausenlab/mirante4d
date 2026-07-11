@@ -1,8 +1,10 @@
 use std::collections::HashSet;
 
 use glam::DVec3;
-use mirante4d_core::{CameraState, GridToWorld, Projection, Shape3D};
 use mirante4d_data::SpatialBrickIndex;
+use mirante4d_domain::{GridToWorld, Projection, Shape3D};
+use mirante4d_format::CurrentGridToWorldExt;
+use mirante4d_render_api::CameraFrame;
 
 use crate::{RenderError, RenderViewport};
 
@@ -58,7 +60,7 @@ impl Default for BrickPlanOptions {
 }
 
 pub fn plan_visible_bricks(
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     spec: BrickGridSpec,
     options: BrickPlanOptions,
@@ -67,8 +69,8 @@ pub fn plan_visible_bricks(
         return Err(RenderError::InvalidBrickPixelStride);
     }
 
-    if camera.projection == Projection::Orthographic {
-        return Ok(plan_orthographic_volume_bricks(camera, viewport, spec));
+    if crate::current_camera::projection(camera) == Projection::Orthographic {
+        return plan_orthographic_volume_bricks(camera, viewport, spec);
     }
 
     let world_to_grid = spec.grid_to_world.inverse()?;
@@ -76,12 +78,9 @@ pub fn plan_visible_bricks(
 
     for row in stepped_pixel_indices(viewport.height, options.pixel_stride) {
         for col in stepped_pixel_indices(viewport.width, options.pixel_stride) {
-            let world_ray = camera.ray_for_render_pixel(
-                col as f64,
-                row as f64,
-                viewport.width as f64,
-                viewport.height as f64,
-            );
+            let world_ray = crate::current_camera::ray_for_render_pixel(
+                camera, col as f64, row as f64, viewport,
+            )?;
             let grid_ray = GridRay {
                 origin: world_to_grid.transform_point(world_ray.origin),
                 direction: world_to_grid.transform_vector(world_ray.direction),
@@ -96,17 +95,17 @@ pub fn plan_visible_bricks(
 }
 
 fn plan_orthographic_volume_bricks(
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     spec: BrickGridSpec,
-) -> Vec<SpatialBrickIndex> {
+) -> Result<Vec<SpatialBrickIndex>, RenderError> {
     let Some((forward, right, up)) = camera_basis(camera) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let half_height = camera.orthographic_world_span_height() * 0.5;
-    let half_width = camera.orthographic_world_span_width() * 0.5;
+    let half_height = camera.orthographic_world_span_height()? * 0.5;
+    let half_width = camera.orthographic_world_span_width()? * 0.5;
     let view = OrthographicView {
-        eye: camera.eye,
+        eye: crate::current_camera::eye(camera),
         forward,
         right,
         up,
@@ -116,9 +115,9 @@ fn plan_orthographic_volume_bricks(
     let grid_shape = brick_grid_shape(spec.volume_shape, spec.brick_shape);
     let mut bricks = Vec::new();
 
-    for brick_z in 0..grid_shape.z {
-        for brick_y in 0..grid_shape.y {
-            for brick_x in 0..grid_shape.x {
+    for brick_z in 0..grid_shape.z() {
+        for brick_y in 0..grid_shape.y() {
+            for brick_x in 0..grid_shape.x() {
                 if orthographic_brick_overlaps_view(
                     view,
                     spec,
@@ -130,20 +129,20 @@ fn plan_orthographic_volume_bricks(
         }
     }
 
-    bricks
+    Ok(bricks)
 }
 
 fn sampled_center_half_extent(half_extent: f64, pixels: u64) -> f64 {
     half_extent * (1.0 - 1.0 / pixels as f64).max(0.0)
 }
 
-fn camera_basis(camera: CameraState) -> Option<(DVec3, DVec3, DVec3)> {
-    let forward = camera.target - camera.eye;
+fn camera_basis(camera: CameraFrame) -> Option<(DVec3, DVec3, DVec3)> {
+    let forward = crate::current_camera::target(camera) - crate::current_camera::eye(camera);
     if forward.length_squared() <= EPSILON {
         return None;
     }
     let forward = forward.normalize();
-    let right = forward.cross(camera.up);
+    let right = forward.cross(crate::current_camera::up(camera));
     if right.length_squared() <= EPSILON {
         return None;
     }
@@ -154,9 +153,9 @@ fn camera_basis(camera: CameraState) -> Option<(DVec3, DVec3, DVec3)> {
 
 fn brick_grid_shape(volume_shape: Shape3D, brick_shape: Shape3D) -> Shape3D {
     Shape3D::new(
-        volume_shape.z.div_ceil(brick_shape.z),
-        volume_shape.y.div_ceil(brick_shape.y),
-        volume_shape.x.div_ceil(brick_shape.x),
+        volume_shape.z().div_ceil(brick_shape.z()),
+        volume_shape.y().div_ceil(brick_shape.y()),
+        volume_shape.x().div_ceil(brick_shape.x()),
     )
     .expect("nonzero Shape3D dimensions produce a nonzero brick grid")
 }
@@ -166,12 +165,12 @@ fn orthographic_brick_overlaps_view(
     spec: BrickGridSpec,
     brick: SpatialBrickIndex,
 ) -> bool {
-    let min_x = brick.x * spec.brick_shape.x;
-    let min_y = brick.y * spec.brick_shape.y;
-    let min_z = brick.z * spec.brick_shape.z;
-    let max_x = (min_x + spec.brick_shape.x).min(spec.volume_shape.x);
-    let max_y = (min_y + spec.brick_shape.y).min(spec.volume_shape.y);
-    let max_z = (min_z + spec.brick_shape.z).min(spec.volume_shape.z);
+    let min_x = brick.x * spec.brick_shape.x();
+    let min_y = brick.y * spec.brick_shape.y();
+    let min_z = brick.z * spec.brick_shape.z();
+    let max_x = (min_x + spec.brick_shape.x()).min(spec.volume_shape.x());
+    let max_y = (min_y + spec.brick_shape.y()).min(spec.volume_shape.y());
+    let max_z = (min_z + spec.brick_shape.z()).min(spec.volume_shape.z());
     let min_x_bound = min_x as f64 - 0.5;
     let min_y_bound = min_y as f64 - 0.5;
     let min_z_bound = min_z as f64 - 0.5;
@@ -188,7 +187,7 @@ fn orthographic_brick_overlaps_view(
     for z in [min_z_bound, max_z_bound] {
         for y in [min_y_bound, max_y_bound] {
             for x in [min_x_bound, max_x_bound] {
-                let world = spec.grid_to_world.transform_point(DVec3::new(x, y, z));
+                let world = spec.grid_to_world.transform_point_vec(DVec3::new(x, y, z));
                 let relative = world - view.eye;
                 let view_x = relative.dot(view.right);
                 let view_y = relative.dot(view.up);
@@ -222,9 +221,9 @@ fn collect_ray_bricks(ray: GridRay, spec: BrickGridSpec, bricks: &mut HashSet<Sp
     };
 
     let entry = ray.origin + ray.direction * hit.enter;
-    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, spec.volume_shape.x);
-    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, spec.volume_shape.y);
-    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, spec.volume_shape.z);
+    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, spec.volume_shape.x());
+    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, spec.volume_shape.y());
+    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, spec.volume_shape.z());
 
     loop {
         if !x.is_inside() || !y.is_inside() || !z.is_inside() {
@@ -232,9 +231,9 @@ fn collect_ray_bricks(ray: GridRay, spec: BrickGridSpec, bricks: &mut HashSet<Sp
         }
 
         bricks.insert(SpatialBrickIndex::new(
-            z.index as u64 / spec.brick_shape.z,
-            y.index as u64 / spec.brick_shape.y,
-            x.index as u64 / spec.brick_shape.x,
+            z.index as u64 / spec.brick_shape.z(),
+            y.index as u64 / spec.brick_shape.y(),
+            x.index as u64 / spec.brick_shape.x(),
         ));
 
         let next_t = x.next_t.min(y.next_t.min(z.next_t));
@@ -317,7 +316,7 @@ fn intersect_grid_box(ray: GridRay, shape: Shape3D) -> Option<RayBoxHit> {
         ray.origin.x,
         ray.direction.x,
         -0.5,
-        shape.x as f64 - 0.5,
+        shape.x() as f64 - 0.5,
         &mut enter,
         &mut exit,
     )?;
@@ -325,7 +324,7 @@ fn intersect_grid_box(ray: GridRay, shape: Shape3D) -> Option<RayBoxHit> {
         ray.origin.y,
         ray.direction.y,
         -0.5,
-        shape.y as f64 - 0.5,
+        shape.y() as f64 - 0.5,
         &mut enter,
         &mut exit,
     )?;
@@ -333,7 +332,7 @@ fn intersect_grid_box(ray: GridRay, shape: Shape3D) -> Option<RayBoxHit> {
         ray.origin.z,
         ray.direction.z,
         -0.5,
-        shape.z as f64 - 0.5,
+        shape.z() as f64 - 0.5,
         &mut enter,
         &mut exit,
     )?;
@@ -375,7 +374,7 @@ fn slab(
 #[cfg(test)]
 mod tests {
     use glam::DVec3;
-    use mirante4d_core::{PresentationViewport, Projection};
+    use mirante4d_domain::Projection;
 
     use super::*;
 
@@ -503,11 +502,11 @@ mod tests {
         BrickGridSpec {
             volume_shape: Shape3D::new(4, 4, 4).unwrap(),
             brick_shape: Shape3D::new(2, 2, 2).unwrap(),
-            grid_to_world: GridToWorld::scale_um(1.0, 1.0, 1.0),
+            grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
         }
     }
 
-    fn front_camera(projection: Projection, height: f64, eye_distance_z: f64) -> CameraState {
+    fn front_camera(projection: Projection, height: f64, eye_distance_z: f64) -> CameraFrame {
         front_camera_at(
             projection,
             DVec3::new(2.0, 2.0, 2.0),
@@ -521,15 +520,15 @@ mod tests {
         target: DVec3,
         height: f64,
         eye_distance_z: f64,
-    ) -> CameraState {
-        CameraState::new(
+    ) -> CameraFrame {
+        crate::current_camera::frame_from_look_at(
             projection,
             DVec3::new(target.x, target.y, target.z - eye_distance_z),
             target,
             -DVec3::Y,
             1.0,
             height / (2.0 * (std::f64::consts::FRAC_PI_3 * 0.5).tan()),
-            PresentationViewport::new_unchecked(height, height),
+            crate::current_camera::presentation(height, height),
         )
     }
 }

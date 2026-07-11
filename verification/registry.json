@@ -9,7 +9,6 @@
     { "id": "sourcemeta-jsonschema", "version": "16.1.0", "artifact_sha256": "96b214be67bf25c6184f1d009a94e082d1eaa83787a8f1878607aebf3185668e", "binary_sha256": "4aa8ba3f4bc0b1ef4f8d82b109676b186fa66603d1953be25fde22b2854190d5" }
   ],
   "property_groups": [
-    { "id": "camera", "owner": "mirante4d-core", "seed": "0x4d3443414d455241", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
     { "id": "domain-display", "owner": "mirante4d-domain", "seed": "0x4d34444f4d444953", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
     { "id": "domain-geometry", "owner": "mirante4d-domain", "seed": "0x4d34444f4d47454f", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
     { "id": "domain-render", "owner": "mirante4d-domain", "seed": "0x4d34444f4d52454e", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
@@ -17,110 +16,9 @@
     { "id": "domain-view", "owner": "mirante4d-domain", "seed": "0x4d34444f4d564945", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
     { "id": "identity-digest", "owner": "mirante4d-identity", "seed": "0x4d34494444494731", "cases": 128, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
     { "id": "identity-object", "owner": "mirante4d-identity", "seed": "0x4d344f424a454354", "cases": 128, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
-    { "id": "project-model", "owner": "mirante4d-project-model", "seed": "0x4d3450524f4a4d4f", "cases": 128, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
-    { "id": "space", "owner": "mirante4d-core", "seed": "0x4d34535041434531", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
-    { "id": "shape", "owner": "mirante4d-core", "seed": "0x4d34534841504531", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" }
+    { "id": "project-model", "owner": "mirante4d-project-model", "seed": "0x4d3450524f4a4d4f", "cases": 128, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" }
   ],
-  "lint_exceptions": [
-    {
-      "code": "clippy::too_many_arguments",
-      "path": "crates/mirante4d-core/src/camera.rs",
-      "primary_line": 255,
-      "reason": "The inherited camera gesture API remains until the application and durable-state cutover.",
-      "deletion_gate": "WP-07B"
-    },
-    {
-      "code": "clippy::too_many_arguments",
-      "path": "crates/mirante4d-renderer/src/gpu/atlas.rs",
-      "primary_line": 1365,
-      "reason": "The inherited u8 atlas update API remains until the product-render cutover.",
-      "deletion_gate": "WP-09B"
-    },
-    {
-      "code": "clippy::too_many_arguments",
-      "path": "crates/mirante4d-renderer/src/gpu/atlas.rs",
-      "primary_line": 1442,
-      "reason": "The inherited u16 atlas update API remains until the product-render cutover.",
-      "deletion_gate": "WP-09B"
-    },
-    {
-      "code": "clippy::too_many_arguments",
-      "path": "crates/mirante4d-renderer/src/gpu/atlas.rs",
-      "primary_line": 1743,
-      "reason": "The inherited f32 atlas update API remains until the product-render cutover.",
-      "deletion_gate": "WP-09B"
-    },
-    {
-      "code": "clippy::op_ref",
-      "path": "crates/mirante4d-app/src/cross_section_readout.rs",
-      "primary_line": 376,
-      "reason": "The inherited cross-section readout path remains until the UI composition-root cutover.",
-      "deletion_gate": "WP-09C"
-    },
-    {
-      "code": "clippy::too_many_arguments",
-      "path": "crates/mirante4d-app/src/cross_section_readout.rs",
-      "primary_line": 602,
-      "reason": "The inherited mapped-value readout API remains until the UI composition-root cutover.",
-      "deletion_gate": "WP-09C"
-    },
-    {
-      "code": "clippy::too_many_arguments",
-      "path": "crates/mirante4d-app/src/cross_section_readout.rs",
-      "primary_line": 643,
-      "reason": "The inherited mapped-status readout API remains until the UI composition-root cutover.",
-      "deletion_gate": "WP-09C"
-    },
-    {
-      "code": "clippy::field_reassign_with_default",
-      "path": "crates/mirante4d-app/src/cross_section_runtime.rs",
-      "primary_line": 1847,
-      "reason": "The inherited cross-section runtime test setup remains until the UI composition-root cutover.",
-      "deletion_gate": "WP-09C"
-    },
-    {
-      "code": "clippy::field_reassign_with_default",
-      "path": "crates/mirante4d-app/src/cross_section_runtime.rs",
-      "primary_line": 1901,
-      "reason": "The inherited cross-section runtime test setup remains until the UI composition-root cutover.",
-      "deletion_gate": "WP-09C"
-    },
-    {
-      "code": "clippy::collapsible_if",
-      "path": "crates/mirante4d-app/src/cross_section_streaming.rs",
-      "primary_line": 325,
-      "reason": "The inherited cross-section scheduling branch remains until the UI composition-root cutover.",
-      "deletion_gate": "WP-09C"
-    },
-    {
-      "code": "clippy::too_many_arguments",
-      "path": "crates/mirante4d-app/src/product_automation.rs",
-      "primary_line": 1021,
-      "reason": "The inherited product-evidence probe API remains until verification and release hardening.",
-      "deletion_gate": "WP-14"
-    },
-    {
-      "code": "clippy::question_mark",
-      "path": "crates/mirante4d-app/src/workbench_ui.rs",
-      "primary_line": 169,
-      "reason": "The inherited workbench viewport path remains until the UI composition-root cutover.",
-      "deletion_gate": "WP-09C"
-    },
-    {
-      "code": "clippy::question_mark",
-      "path": "crates/mirante4d-app/src/workbench_ui.rs",
-      "primary_line": 176,
-      "reason": "The inherited workbench viewport path remains until the UI composition-root cutover.",
-      "deletion_gate": "WP-09C"
-    },
-    {
-      "code": "clippy::too_many_arguments",
-      "path": "crates/xtask/src/audits/phase20.rs",
-      "primary_line": 303,
-      "reason": "The inherited phase-20 evidence API remains until verification and release hardening.",
-      "deletion_gate": "WP-14"
-    }
-  ],
+  "lint_exceptions": [],
   "lanes": [
     {
       "id": "policy",
@@ -161,7 +59,6 @@
       "packages": [
         "mirante4d-analysis",
         "mirante4d-application",
-        "mirante4d-core",
         "mirante4d-data",
         "mirante4d-dataset",
         "mirante4d-domain",
@@ -172,7 +69,7 @@
         "mirante4d-settings",
         "xtask"
       ],
-      "selector": "package(mirante4d-analysis) | package(mirante4d-application) | package(mirante4d-core) | package(mirante4d-data) | package(mirante4d-dataset) | package(mirante4d-domain) | package(mirante4d-identity) | package(mirante4d-project-model) | package(mirante4d-render-api) | package(mirante4d-renderer) | package(mirante4d-settings) | package(xtask)",
+      "selector": "package(mirante4d-analysis) | package(mirante4d-application) | package(mirante4d-data) | package(mirante4d-dataset) | package(mirante4d-domain) | package(mirante4d-identity) | package(mirante4d-project-model) | package(mirante4d-render-api) | package(mirante4d-renderer) | package(mirante4d-settings) | package(xtask)",
       "warn_ms": 500,
       "terminate_ms": 2000,
       "aggregate_timeout_secs": 720
@@ -429,13 +326,9 @@
         {
           "package": "mirante4d-renderer",
           "test_prefix": "gpu::"
-        },
-        {
-          "package": "mirante4d-app",
-          "test_prefix": "tests::app_backend_uses_gpu"
         }
       ],
-      "expected_ignored_cases": 40,
+      "expected_ignored_cases": 34,
       "expiry": "WP-09B",
       "deletion_gate": "WP-09B-product-render-hard-cutover"
     }

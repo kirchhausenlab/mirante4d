@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
-use mirante4d_core::CameraState;
 use mirante4d_data::DenseVolumeU16;
+use mirante4d_render_api::CameraFrame;
 use wgpu::util::DeviceExt;
 
 use super::{
@@ -28,7 +28,7 @@ pub fn render_mip_z_wgpu_blocking(volume: &DenseVolumeU16) -> Result<GpuMipOutpu
 
 pub fn render_camera_mip_wgpu_blocking(
     volume: &DenseVolumeU16,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
 ) -> Result<GpuMipOutput, GpuRenderError> {
     let renderer = GpuRenderer::new_blocking()?;
@@ -37,7 +37,7 @@ pub fn render_camera_mip_wgpu_blocking(
 
 pub fn render_camera_wgpu_blocking(
     volume: &DenseVolumeU16,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     mode: CameraRenderMode,
 ) -> Result<GpuMipOutput, GpuRenderError> {
@@ -50,9 +50,9 @@ pub async fn render_mip_z_wgpu(volume: &DenseVolumeU16) -> Result<GpuMipOutput, 
         return Err(RenderError::EmptyVolume.into());
     }
 
-    let width = checked_u32("x", volume.shape.x)?;
-    let height = checked_u32("y", volume.shape.y)?;
-    let depth = checked_u32("z", volume.shape.z)?;
+    let width = checked_u32("x", volume.shape.x())?;
+    let height = checked_u32("y", volume.shape.y())?;
+    let depth = checked_u32("z", volume.shape.z())?;
     let input_values = render_upload_samples_u16(volume).into_owned();
 
     let (device, queue, adapter_diagnostics) =

@@ -1,17 +1,16 @@
 use glam::DVec3;
-use mirante4d_core::{
-    CameraState, DatasetId, DisplayWindow, GridToWorld, PresentationViewport, Projection, Shape4D,
-    TimeIndex, TransferCurve, WorldSpace, WorldUnit,
-};
 use mirante4d_data::{
     DatasetHandle, DenseVolumeF32, DenseVolumeU8, DenseVolumeU16, SpatialBrickIndex,
     VolumeBrickF32, VolumeBrickU8, VolumeBrickU16, VolumeRegion,
 };
+use mirante4d_domain::{DisplayWindow, GridToWorld, Projection, Shape4D, TimeIndex, TransferCurve};
 use mirante4d_format::{
-    BrickIndex, ChannelMetadata, DenseF32Layer, DenseU16Layer, ExistingPackagePolicy,
-    NativeF32Dataset, NativeU16Dataset, default_f32_display, default_u16_display,
-    expected_fixture_value, write_native_f32_dataset, write_native_u16_dataset,
+    BrickIndex, ChannelMetadata, CurrentGridToWorldExt, DatasetId, DenseF32Layer, DenseU16Layer,
+    ExistingPackagePolicy, NativeF32Dataset, NativeU16Dataset, WorldSpace, WorldUnit,
+    default_f32_display, default_u16_display, expected_fixture_value, write_native_f32_dataset,
+    write_native_u16_dataset,
 };
+use mirante4d_render_api::CameraFrame;
 
 use crate::{CameraRenderMode, CameraRenderModeF32, render_camera, render_camera_f32};
 
@@ -28,8 +27,8 @@ fn iso_f32_threshold(threshold: f32, low: f32, high: f32) -> crate::IsoSurfacePa
     crate::IsoSurfaceParameters::new(
         ((threshold - low) / (high - low)).clamp(0.0, 1.0),
         crate::ScalarDisplayTransfer::new(
-            DisplayWindow { low, high },
-            TransferCurve::Linear,
+            DisplayWindow::new(low, high).unwrap(),
+            TransferCurve::linear(),
             false,
         ),
     )
@@ -37,8 +36,8 @@ fn iso_f32_threshold(threshold: f32, low: f32, high: f32) -> crate::IsoSurfacePa
 
 fn dvr_parameters(low: f32, high: f32, density_scale: f64, invert: bool) -> DvrRenderParameters {
     let transfer = crate::ScalarDisplayTransfer::new(
-        DisplayWindow { low, high },
-        TransferCurve::Linear,
+        DisplayWindow::new(low, high).unwrap(),
+        TransferCurve::linear(),
         invert,
     );
     DvrRenderParameters::new(transfer, transfer, [1.0, 1.0, 1.0, 1.0], 1.0, density_scale)
@@ -50,7 +49,9 @@ fn complete_resident_bricks_match_dense_camera_mip() {
     let root = write_spatially_chunked_dataset(tempdir.path());
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let dense = dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
+    let dense = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let resident = resident_bricks(&dataset, &layer_id, true);
     let camera = front_camera();
     let viewport = RenderViewport::new(4, 4).unwrap();
@@ -96,7 +97,9 @@ fn complete_resident_bricks_match_dense_camera_iso_and_dvr() {
     let root = write_spatially_chunked_dataset(tempdir.path());
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let dense = dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
+    let dense = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let resident = resident_bricks(&dataset, &layer_id, true);
     let camera = front_camera();
     let viewport = RenderViewport::new(4, 4).unwrap();
@@ -270,11 +273,8 @@ fn same_ray_resident_dvr_channels_are_order_independent() {
     let red_resident = resident_from_fn(shape, |_z, _y, _x| 100);
     let green_resident = resident_from_fn(shape, |_z, _y, _x| 100);
     let transfer = crate::ScalarDisplayTransfer::new(
-        DisplayWindow {
-            low: 0.0,
-            high: 100.0,
-        },
-        TransferCurve::Linear,
+        DisplayWindow::new(0.0, 100.0).unwrap(),
+        TransferCurve::linear(),
         false,
     );
     let red = DvrRenderParameters::new(transfer, transfer, [1.0, 0.0, 0.0, 1.0], 1.0, 1.0);
@@ -493,18 +493,18 @@ fn dvr_opacity_uses_physical_step_length_for_anisotropic_spacing() {
     let shape = Shape3D::new(1, 1, 1).unwrap();
     let value_at = |_z, _y, _x| 100;
     let identity_resident = resident_from_fn(shape, value_at);
-    let anisotropic_grid = GridToWorld::scale_um(1.0, 1.0, 4.0);
+    let anisotropic_grid = mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 4.0);
     let anisotropic_resident = resident_from_fn_with_grid(shape, anisotropic_grid, value_at);
     let identity_camera = single_pixel_front_camera();
     let anisotropic_height = anisotropic_grid.transform_vector(DVec3::Y).length();
-    let anisotropic_camera = CameraState::new(
+    let anisotropic_camera = crate::current_camera::frame_from_look_at(
         Projection::Orthographic,
-        anisotropic_grid.transform_point(DVec3::new(0.0, 0.0, -3.0)),
-        anisotropic_grid.transform_point(DVec3::new(0.0, 0.0, 0.5)),
+        anisotropic_grid.transform_point_vec(DVec3::new(0.0, 0.0, -3.0)),
+        anisotropic_grid.transform_point_vec(DVec3::new(0.0, 0.0, 0.5)),
         anisotropic_grid.transform_vector(-DVec3::Y).normalize(),
         1.0,
         anisotropic_height / (2.0 * (std::f64::consts::FRAC_PI_3 * 0.5).tan()),
-        PresentationViewport::new_unchecked(anisotropic_height, anisotropic_height),
+        crate::current_camera::presentation(anisotropic_height, anisotropic_height),
     );
     let viewport = RenderViewport::new(1, 1).unwrap();
     let mode = CameraRenderMode::Dvr {
@@ -539,14 +539,14 @@ fn dvr_opacity_is_stable_for_equivalent_downsampled_physical_thickness() {
     let coarse_grid = fine_grid.downsampled_integer_centered(1, 1, 2).unwrap();
     let fine = resident_from_fn_with_grid(fine_shape, fine_grid, |_z, _y, _x| 100);
     let coarse = resident_from_fn_with_grid(coarse_shape, coarse_grid, |_z, _y, _x| 100);
-    let camera = CameraState::new(
+    let camera = crate::current_camera::frame_from_look_at(
         Projection::Orthographic,
         DVec3::new(0.0, 0.0, -3.0),
         DVec3::new(0.0, 0.0, 0.5),
         -DVec3::Y,
         1.0,
         1.0 / (2.0 * (std::f64::consts::FRAC_PI_3 * 0.5).tan()),
-        PresentationViewport::new_unchecked(1.0, 1.0),
+        crate::current_camera::presentation(1.0, 1.0),
     );
     let viewport = RenderViewport::new(1, 1).unwrap();
     let mode = CameraRenderMode::Dvr {
@@ -725,7 +725,7 @@ fn resident_u16_voxel_lookup_indexes_edge_bricks_without_dense_scan() {
     let layer_id = LayerId::new("ch0").unwrap();
     let resident = ResidentBrickSetU16::new(
         layer_id.clone(),
-        TimeIndex(0),
+        TimeIndex::new(0),
         Shape3D::new(5, 5, 5).unwrap(),
         GridToWorld::identity(),
         vec![u16_test_brick(
@@ -747,7 +747,7 @@ fn resident_u8_voxel_lookup_indexes_edge_bricks_without_dense_scan() {
     let layer_id = LayerId::new("ch0").unwrap();
     let resident = ResidentBrickSetU8::new(
         layer_id.clone(),
-        TimeIndex(0),
+        TimeIndex::new(0),
         Shape3D::new(5, 5, 5).unwrap(),
         GridToWorld::identity(),
         vec![u8_test_brick(
@@ -769,7 +769,7 @@ fn resident_f32_voxel_lookup_indexes_edge_bricks_without_dense_scan() {
     let layer_id = LayerId::new("ch0").unwrap();
     let resident = ResidentBrickSetF32::new(
         layer_id.clone(),
-        TimeIndex(0),
+        TimeIndex::new(0),
         Shape3D::new(5, 5, 5).unwrap(),
         GridToWorld::identity(),
         vec![f32_test_brick(
@@ -792,7 +792,9 @@ fn complete_float32_resident_bricks_match_dense_camera_modes() {
     let root = write_float32_spatially_chunked_dataset(tempdir.path());
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let dense = dataset.read_f32_volume(&layer_id, TimeIndex(0)).unwrap();
+    let dense = dataset
+        .read_f32_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let resident = resident_f32_bricks(&dataset, &layer_id, true);
     let camera = front_camera();
     let viewport = RenderViewport::new(4, 4).unwrap();
@@ -851,7 +853,11 @@ fn resident_bricks(
                 }
                 bricks.push(
                     dataset
-                        .read_u16_brick(layer_id, TimeIndex(0), SpatialBrickIndex::new(z, y, x))
+                        .read_u16_brick(
+                            layer_id,
+                            TimeIndex::new(0),
+                            SpatialBrickIndex::new(z, y, x),
+                        )
                         .unwrap(),
                 );
             }
@@ -860,7 +866,7 @@ fn resident_bricks(
     let layer = dataset.layer(layer_id).unwrap();
     ResidentBrickSetU16::new(
         layer_id.clone(),
-        TimeIndex(0),
+        TimeIndex::new(0),
         layer.shape.spatial(),
         layer.grid_to_world,
         bricks,
@@ -881,7 +887,11 @@ fn resident_f32_bricks(
                 }
                 bricks.push(
                     dataset
-                        .read_f32_brick(layer_id, TimeIndex(0), SpatialBrickIndex::new(z, y, x))
+                        .read_f32_brick(
+                            layer_id,
+                            TimeIndex::new(0),
+                            SpatialBrickIndex::new(z, y, x),
+                        )
                         .unwrap(),
                 );
             }
@@ -890,7 +900,7 @@ fn resident_f32_bricks(
     let layer = dataset.layer(layer_id).unwrap();
     ResidentBrickSetF32::new(
         layer_id.clone(),
-        TimeIndex(0),
+        TimeIndex::new(0),
         layer.shape.spatial(),
         layer.grid_to_world,
         bricks,
@@ -911,7 +921,7 @@ fn u16_test_brick(
         DatasetId::new("renderer-test").unwrap(),
         layer_id,
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         GridToWorld::identity(),
         values,
@@ -949,7 +959,7 @@ fn u8_test_brick(
         DatasetId::new("renderer-test").unwrap(),
         layer_id,
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         GridToWorld::identity(),
         values,
@@ -987,7 +997,7 @@ fn f32_test_brick(
         DatasetId::new("renderer-test").unwrap(),
         layer_id,
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         GridToWorld::identity(),
         values,
@@ -1029,9 +1039,9 @@ fn resident_from_u16_mask(
     let mut valid_count = 0u64;
     let mut valid_min = u16::MAX;
     let mut valid_max = 0u16;
-    for z in 0..shape.z {
-        for y in 0..shape.y {
-            for x in 0..shape.x {
+    for z in 0..shape.z() {
+        for y in 0..shape.y() {
+            for x in 0..shape.x() {
                 let value = value_at(z, y, x);
                 let valid = is_render_valid(z, y, x);
                 values.push(value);
@@ -1048,7 +1058,7 @@ fn resident_from_u16_mask(
         DatasetId::new("renderer-test").unwrap(),
         layer_id.clone(),
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         GridToWorld::identity(),
         values,
@@ -1056,10 +1066,10 @@ fn resident_from_u16_mask(
     .unwrap()
     .with_render_valid(render_valid)
     .unwrap();
-    let region = VolumeRegion::new(0, 0, 0, shape.z, shape.y, shape.x).unwrap();
+    let region = VolumeRegion::new(0, 0, 0, shape.z(), shape.y(), shape.x()).unwrap();
     ResidentBrickSetU16::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         GridToWorld::identity(),
         vec![VolumeBrickU16 {
@@ -1100,9 +1110,9 @@ fn resident_from_u8_mask(
     let mut valid_count = 0u64;
     let mut valid_min = u8::MAX;
     let mut valid_max = 0u8;
-    for z in 0..shape.z {
-        for y in 0..shape.y {
-            for x in 0..shape.x {
+    for z in 0..shape.z() {
+        for y in 0..shape.y() {
+            for x in 0..shape.x() {
                 let value = value_at(z, y, x);
                 let valid = is_render_valid(z, y, x);
                 values.push(value);
@@ -1119,7 +1129,7 @@ fn resident_from_u8_mask(
         DatasetId::new("renderer-test").unwrap(),
         layer_id.clone(),
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         GridToWorld::identity(),
         values,
@@ -1127,10 +1137,10 @@ fn resident_from_u8_mask(
     .unwrap()
     .with_render_valid(render_valid)
     .unwrap();
-    let region = VolumeRegion::new(0, 0, 0, shape.z, shape.y, shape.x).unwrap();
+    let region = VolumeRegion::new(0, 0, 0, shape.z(), shape.y(), shape.x()).unwrap();
     ResidentBrickSetU8::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         GridToWorld::identity(),
         vec![VolumeBrickU8 {
@@ -1173,24 +1183,24 @@ fn resident_from_fn_with_grid(
     value_at: impl Fn(u64, u64, u64) -> u16,
 ) -> ResidentBrickSetU16 {
     let layer_id = LayerId::new("ch0").unwrap();
-    let values = (0..shape.z)
-        .flat_map(|z| (0..shape.y).flat_map(move |y| (0..shape.x).map(move |x| (z, y, x))))
+    let values = (0..shape.z())
+        .flat_map(|z| (0..shape.y()).flat_map(move |y| (0..shape.x()).map(move |x| (z, y, x))))
         .map(|(z, y, x)| value_at(z, y, x))
         .collect::<Vec<_>>();
     let volume = DenseVolumeU16::new(
         DatasetId::new("renderer-test").unwrap(),
         layer_id.clone(),
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         grid_to_world,
         values,
     )
     .unwrap();
-    let region = VolumeRegion::new(0, 0, 0, shape.z, shape.y, shape.x).unwrap();
+    let region = VolumeRegion::new(0, 0, 0, shape.z(), shape.y(), shape.x()).unwrap();
     ResidentBrickSetU16::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         grid_to_world,
         vec![VolumeBrickU16 {
@@ -1217,21 +1227,21 @@ fn resident_f32_from_fn(
     value_at: impl Fn(u64, u64, u64) -> f32,
 ) -> ResidentBrickSetF32 {
     let layer_id = LayerId::new("ch0").unwrap();
-    let values = (0..shape.z)
-        .flat_map(|z| (0..shape.y).flat_map(move |y| (0..shape.x).map(move |x| (z, y, x))))
+    let values = (0..shape.z())
+        .flat_map(|z| (0..shape.y()).flat_map(move |y| (0..shape.x()).map(move |x| (z, y, x))))
         .map(|(z, y, x)| value_at(z, y, x))
         .collect::<Vec<_>>();
     let volume = DenseVolumeF32::new(
         DatasetId::new("renderer-test").unwrap(),
         layer_id.clone(),
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         GridToWorld::identity(),
         values,
     )
     .unwrap();
-    let region = VolumeRegion::new(0, 0, 0, shape.z, shape.y, shape.x).unwrap();
+    let region = VolumeRegion::new(0, 0, 0, shape.z(), shape.y(), shape.x()).unwrap();
     let (min, max) = volume
         .values()
         .iter()
@@ -1240,7 +1250,7 @@ fn resident_f32_from_fn(
         });
     ResidentBrickSetF32::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         GridToWorld::identity(),
         vec![VolumeBrickF32 {
@@ -1283,7 +1293,7 @@ fn write_spatially_chunked_dataset(output_root: &std::path::Path) -> std::path::
                 },
                 shape,
                 brick_shape: Shape4D::new(1, 2, 2, 2).unwrap(),
-                grid_to_world: GridToWorld::scale_um(1.0, 1.0, 1.0),
+                grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
                 display: default_u16_display(),
                 values_tzyx: fixture_values(shape),
             }],
@@ -1315,7 +1325,7 @@ fn write_float32_spatially_chunked_dataset(output_root: &std::path::Path) -> std
                 },
                 shape,
                 brick_shape: Shape4D::new(1, 2, 2, 2).unwrap(),
-                grid_to_world: GridToWorld::scale_um(1.0, 1.0, 1.0),
+                grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
                 display: default_f32_display(),
                 values_tzyx: fixture_f32_values(shape),
             }],
@@ -1328,10 +1338,10 @@ fn write_float32_spatially_chunked_dataset(output_root: &std::path::Path) -> std
 
 fn fixture_values(shape: Shape4D) -> Vec<u16> {
     let mut values = Vec::with_capacity(shape.element_count().unwrap() as usize);
-    for t in 0..shape.t {
-        for z in 0..shape.z {
-            for y in 0..shape.y {
-                for x in 0..shape.x {
+    for t in 0..shape.t() {
+        for z in 0..shape.z() {
+            for y in 0..shape.y() {
+                for x in 0..shape.x() {
                     values.push(expected_fixture_value(t, z, y, x));
                 }
             }
@@ -1342,10 +1352,10 @@ fn fixture_values(shape: Shape4D) -> Vec<u16> {
 
 fn fixture_f32_values(shape: Shape4D) -> Vec<f32> {
     let mut values = Vec::with_capacity(shape.element_count().unwrap() as usize);
-    for t in 0..shape.t {
-        for z in 0..shape.z {
-            for y in 0..shape.y {
-                for x in 0..shape.x {
+    for t in 0..shape.t() {
+        for z in 0..shape.z() {
+            for y in 0..shape.y() {
+                for x in 0..shape.x() {
                     let signed_z = z as f32 - 1.5;
                     let signed_y = y as f32 - 1.5;
                     let signed_x = x as f32 - 1.5;
@@ -1369,26 +1379,26 @@ fn assert_f32_pixels_eq(actual: &[f32], expected: &[f32]) {
     }
 }
 
-fn front_camera() -> CameraState {
-    CameraState::new(
+fn front_camera() -> CameraFrame {
+    crate::current_camera::frame_from_look_at(
         Projection::Orthographic,
         DVec3::new(1.5, 1.5, -7.0),
         DVec3::new(1.5, 1.5, 1.5),
         -DVec3::Y,
         1.0,
         4.0 / (2.0 * (std::f64::consts::FRAC_PI_3 * 0.5).tan()),
-        PresentationViewport::new_unchecked(4.0, 4.0),
+        crate::current_camera::presentation(4.0, 4.0),
     )
 }
 
-fn single_pixel_front_camera() -> CameraState {
-    CameraState::new(
+fn single_pixel_front_camera() -> CameraFrame {
+    crate::current_camera::frame_from_look_at(
         Projection::Orthographic,
         DVec3::new(0.0, 0.0, -3.0),
         DVec3::new(0.0, 0.0, 0.5),
         -DVec3::Y,
         1.0,
         1.0 / (2.0 * (std::f64::consts::FRAC_PI_3 * 0.5).tan()),
-        PresentationViewport::new_unchecked(1.0, 1.0),
+        crate::current_camera::presentation(1.0, 1.0),
     )
 }

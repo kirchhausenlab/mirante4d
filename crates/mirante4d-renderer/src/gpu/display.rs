@@ -1,8 +1,7 @@
 use std::time::Instant;
 
-use mirante4d_core::{
-    CameraAxes, CameraState, ChannelTransferFunction, GridToWorld, IsoLightState, Shape3D,
-};
+use mirante4d_domain::{GridToWorld, IsoLightState, Shape3D};
+use mirante4d_render_api::{CameraAxes, CameraFrame};
 use wgpu::util::DeviceExt;
 
 use super::{
@@ -23,8 +22,8 @@ use super::{
 };
 use crate::{
     CameraRenderMode, CameraRenderModeF32, CameraRenderQuality, DvrRenderParameters,
-    IntensitySamplingPolicy, RenderError, RenderViewport, ResidentBrickSetF32, ResidentBrickSetU8,
-    ResidentBrickSetU16,
+    IntensitySamplingPolicy, IntensityTransfer, RenderError, RenderViewport, ResidentBrickSetF32,
+    ResidentBrickSetU8, ResidentBrickSetU16,
 };
 
 const DVR_CHANNEL_U32_STRIDE: usize = 18;
@@ -97,27 +96,27 @@ pub enum GpuResidentDisplayChannel<'a> {
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
         mode: CameraRenderMode,
-        transfer: ChannelTransferFunction,
+        transfer: IntensityTransfer,
     },
     U16 {
         resident: &'a ResidentBrickSetU16,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
         mode: CameraRenderMode,
-        transfer: ChannelTransferFunction,
+        transfer: IntensityTransfer,
     },
     F32 {
         resident: &'a ResidentBrickSetF32,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
         mode: CameraRenderModeF32,
-        transfer: ChannelTransferFunction,
+        transfer: IntensityTransfer,
     },
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct GpuResidentDisplayRequest {
-    pub camera: CameraState,
+    pub camera: CameraFrame,
     pub viewport: RenderViewport,
     pub quality: CameraRenderQuality,
     pub iso_light_state: IsoLightState,
@@ -175,7 +174,7 @@ impl GpuResidentDisplayChannel<'_> {
         }
     }
 
-    fn transfer(&self) -> &ChannelTransferFunction {
+    fn transfer(&self) -> &IntensityTransfer {
         match self {
             Self::U8 { transfer, .. } | Self::U16 { transfer, .. } | Self::F32 { transfer, .. } => {
                 transfer
@@ -244,7 +243,7 @@ struct GpuIsoDisplayOutputChannel {
     timings: GpuRenderTimings,
     dtype: u32,
     record_stride_words: u32,
-    transfer: ChannelTransferFunction,
+    transfer: IntensityTransfer,
 }
 
 impl GpuRenderer {
@@ -473,7 +472,7 @@ impl GpuRenderer {
     fn render_iso_channels_to_display_texture(
         &self,
         channels: &[GpuResidentDisplayChannel<'_>],
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
         quality: CameraRenderQuality,
         iso_light_state: IsoLightState,
@@ -557,7 +556,7 @@ impl GpuRenderer {
                             "integer ISO output record stride",
                             GPU_SURFACE_OUTPUT_U16_FIELDS as u64,
                         )?,
-                        transfer: transfer.clone(),
+                        transfer: *transfer,
                     }
                 }
                 GpuResidentDisplayChannel::U16 {
@@ -597,7 +596,7 @@ impl GpuRenderer {
                             "integer ISO output record stride",
                             GPU_SURFACE_OUTPUT_U16_FIELDS as u64,
                         )?,
-                        transfer: transfer.clone(),
+                        transfer: *transfer,
                     }
                 }
                 GpuResidentDisplayChannel::F32 {
@@ -637,7 +636,7 @@ impl GpuRenderer {
                             "float32 ISO output record stride",
                             GPU_SURFACE_OUTPUT_F32_FIELDS as u64,
                         )?,
-                        transfer: transfer.clone(),
+                        transfer: *transfer,
                     }
                 }
             };
@@ -676,17 +675,17 @@ impl GpuRenderer {
             let transfer = &channel.transfer;
             channel_params_u32.extend_from_slice(&[
                 channel.dtype,
-                u32::from(transfer.display.visible),
+                u32::from(transfer.visible()),
                 0,
                 checked_u32("ISO output record offset", output_offset_words)?,
                 channel.record_stride_words,
             ]);
             channel_params_f32.extend_from_slice(&[
-                transfer.display.opacity,
-                transfer.color.color_rgba[0],
-                transfer.color.color_rgba[1],
-                transfer.color.color_rgba[2],
-                transfer.color.color_rgba[3],
+                transfer.opacity().get(),
+                transfer.color_rgba()[0],
+                transfer.color_rgba()[1],
+                transfer.color_rgba()[2],
+                transfer.color_rgba()[3],
             ]);
             output_offset_words = output_offset_words
                 .checked_add(channel.output_bytes / std::mem::size_of::<u32>() as u64)
@@ -717,29 +716,31 @@ impl GpuRenderer {
             channel_f32_bytes,
         )?;
 
-        let light_world = iso_light_state.light_direction_world(camera_axes);
+        let light_world = crate::current_camera::iso_light_direction(iso_light_state, camera_axes);
+        let (camera_forward, camera_right, camera_up) =
+            crate::current_camera::axes_vectors(camera_axes);
         let frame_params_u32 = [
             viewport_width,
             viewport_height,
             channel_count,
-            projection_code(camera.projection),
+            projection_code(crate::current_camera::projection(camera)),
         ];
         let frame_params_f32 = [
             light_world.x as f32,
             light_world.y as f32,
             light_world.z as f32,
-            camera_axes.forward.x as f32,
-            camera_axes.forward.y as f32,
-            camera_axes.forward.z as f32,
-            camera_axes.right.x as f32,
-            camera_axes.right.y as f32,
-            camera_axes.right.z as f32,
-            camera_axes.up.x as f32,
-            camera_axes.up.y as f32,
-            camera_axes.up.z as f32,
-            camera.perspective_focal_length_screen_points as f32,
-            camera.presentation_width_points as f32,
-            camera.presentation_height_points as f32,
+            camera_forward.x as f32,
+            camera_forward.y as f32,
+            camera_forward.z as f32,
+            camera_right.x as f32,
+            camera_right.y as f32,
+            camera_right.z as f32,
+            camera_up.x as f32,
+            camera_up.y as f32,
+            camera_up.z as f32,
+            crate::current_camera::perspective_focal_length_screen_points(camera) as f32,
+            crate::current_camera::presentation_width_points(camera) as f32,
+            crate::current_camera::presentation_height_points(camera) as f32,
         ];
         let frame_u32_bytes = checked_buffer_byte_count(
             "multi-channel ISO frame u32 parameters",
@@ -859,7 +860,7 @@ impl GpuRenderer {
                 "multi-channel GPU display DVR requires DVR channels",
             ));
         };
-        let display_visible = channel.transfer().display.visible;
+        let display_visible = channel.transfer().visible();
         let atlas = match channel {
             GpuResidentDisplayChannel::U8 {
                 resident,
@@ -925,7 +926,7 @@ impl GpuRenderer {
     fn render_dvr_channels_to_display_texture(
         &self,
         channels: &[GpuResidentDisplayChannel<'_>],
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
         quality: CameraRenderQuality,
     ) -> Result<GpuDisplayFrame, GpuRenderError> {
@@ -962,9 +963,9 @@ impl GpuRenderer {
 
         let viewport_width = checked_u32("viewport_width", viewport.width)?;
         let viewport_height = checked_u32("viewport_height", viewport.height)?;
-        let shape_x = checked_u32("x", volume_shape.x)?;
-        let shape_y = checked_u32("y", volume_shape.y)?;
-        let shape_z = checked_u32("z", volume_shape.z)?;
+        let shape_x = checked_u32("x", volume_shape.x())?;
+        let shape_y = checked_u32("y", volume_shape.y())?;
+        let shape_z = checked_u32("z", volume_shape.z())?;
         let channel_count = checked_u32("DVR channel count", channels.len() as u64)?;
         let pixel_count = (u64::from(viewport_width) * u64::from(viewport_height)) as usize;
         let accumulator_bytes =
@@ -1177,7 +1178,7 @@ impl GpuRenderer {
             shape_x,
             shape_y,
             shape_z,
-            projection_code(camera.projection),
+            projection_code(crate::current_camera::projection(camera)),
             channel_count,
             sampling_policy,
         ];
@@ -1380,7 +1381,9 @@ impl GpuRenderer {
             texture_bytes,
         )?;
 
-        let light_world = iso_light_state.light_direction_world(camera_axes);
+        let light_world = crate::current_camera::iso_light_direction(iso_light_state, camera_axes);
+        let (camera_forward, camera_right, camera_up) =
+            crate::current_camera::axes_vectors(camera_axes);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1519,34 +1522,34 @@ impl GpuRenderer {
                 viewport_width,
                 viewport_height,
                 mode_code,
-                u32::from(transfer.display.visible),
-                u32::from(transfer.invert),
-                projection_code(camera.projection),
+                u32::from(transfer.visible()),
+                u32::from(transfer.invert()),
+                projection_code(crate::current_camera::projection(camera)),
             ];
             let params_f32 = [
-                transfer.display.window.low,
-                transfer.display.window.high,
-                transfer.curve.gamma_value(),
-                transfer.display.opacity,
-                transfer.color.color_rgba[0],
-                transfer.color.color_rgba[1],
-                transfer.color.color_rgba[2],
-                transfer.color.color_rgba[3],
+                transfer.window().low(),
+                transfer.window().high(),
+                transfer.curve().gamma_value(),
+                transfer.opacity().get(),
+                transfer.color_rgba()[0],
+                transfer.color_rgba()[1],
+                transfer.color_rgba()[2],
+                transfer.color_rgba()[3],
                 light_world.x as f32,
                 light_world.y as f32,
                 light_world.z as f32,
-                camera_axes.forward.x as f32,
-                camera_axes.forward.y as f32,
-                camera_axes.forward.z as f32,
-                camera_axes.right.x as f32,
-                camera_axes.right.y as f32,
-                camera_axes.right.z as f32,
-                camera_axes.up.x as f32,
-                camera_axes.up.y as f32,
-                camera_axes.up.z as f32,
-                camera.perspective_focal_length_screen_points as f32,
-                camera.presentation_width_points as f32,
-                camera.presentation_height_points as f32,
+                camera_forward.x as f32,
+                camera_forward.y as f32,
+                camera_forward.z as f32,
+                camera_right.x as f32,
+                camera_right.y as f32,
+                camera_right.z as f32,
+                camera_up.x as f32,
+                camera_up.y as f32,
+                camera_up.z as f32,
+                crate::current_camera::perspective_focal_length_screen_points(camera) as f32,
+                crate::current_camera::presentation_width_points(camera) as f32,
+                crate::current_camera::presentation_height_points(camera) as f32,
             ];
             let params_u32_bytes = checked_buffer_byte_count(
                 "GPU display channel u32 parameters",

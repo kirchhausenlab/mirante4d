@@ -1,11 +1,12 @@
-use mirante4d_core::{DatasetId, GridToWorld, LayerId, Shape4D, TimeIndex, WorldSpace, WorldUnit};
 use mirante4d_data::{
     DatasetHandle, DenseVolumeF32, DenseVolumeU8, DenseVolumeU16, SpatialBrickIndex,
     VolumeBrickU16, VolumeRegion,
 };
+use mirante4d_domain::{GridToWorld, Shape4D, TimeIndex};
 use mirante4d_format::{
-    ChannelMetadata, DenseU16Layer, ExistingPackagePolicy, FixtureKind, NativeU16Dataset,
-    default_u16_display, write_fixture, write_native_u16_dataset,
+    ChannelMetadata, DatasetId, DenseU16Layer, ExistingPackagePolicy, FixtureKind, LayerId,
+    NativeU16Dataset, WorldSpace, WorldUnit, default_u16_display, write_fixture,
+    write_native_u16_dataset,
 };
 
 use crate::camera_mip::{
@@ -38,7 +39,7 @@ fn resident_u16_constant_brick(
         DatasetId::new("gpu-brick-skip-diagnostics").unwrap(),
         layer_id.clone(),
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         GridToWorld::identity(),
         values,
@@ -58,7 +59,7 @@ fn resident_u16_constant_brick(
             y: 0,
             x: 0,
         },
-        region: VolumeRegion::new(0, 0, 0, shape.z, shape.y, shape.x).unwrap(),
+        region: VolumeRegion::new(0, 0, 0, shape.z(), shape.y(), shape.x()).unwrap(),
         occupied,
         valid_voxel_count,
         min: f64::from(value),
@@ -69,7 +70,7 @@ fn resident_u16_constant_brick(
         volume,
         ResidentBrickSetU16::new(
             layer_id,
-            TimeIndex(0),
+            TimeIndex::new(0),
             shape,
             GridToWorld::identity(),
             vec![brick],
@@ -126,7 +127,7 @@ fn gpu_dense_upload_samples_mark_render_invalid_samples() {
         DatasetId::new("gpu-masked-upload").unwrap(),
         LayerId::new("ch0").unwrap(),
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         Shape3D::new(2, 1, 1).unwrap(),
         GridToWorld::identity(),
         vec![u16::MAX, 7],
@@ -138,7 +139,7 @@ fn gpu_dense_upload_samples_mark_render_invalid_samples() {
         DatasetId::new("gpu-masked-upload-f32").unwrap(),
         LayerId::new("ch0").unwrap(),
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         Shape3D::new(2, 1, 1).unwrap(),
         GridToWorld::identity(),
         vec![255.0, 1.5],
@@ -163,7 +164,7 @@ fn gpu_brick_atlas_uses_validity_bits_for_render_invalid_samples() {
         DatasetId::new("gpu-masked-atlas").unwrap(),
         layer_id.clone(),
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         Shape3D::new(1, 1, 2).unwrap(),
         GridToWorld::identity(),
         vec![u16::MAX, 4],
@@ -189,7 +190,7 @@ fn gpu_brick_atlas_uses_validity_bits_for_render_invalid_samples() {
     };
     let resident = ResidentBrickSetU16::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         Shape3D::new(1, 1, 2).unwrap(),
         GridToWorld::identity(),
         vec![brick],
@@ -213,7 +214,7 @@ fn gpu_brick_atlas_preserves_valid_u16_max_sample() {
         DatasetId::new("gpu-valid-max-atlas").unwrap(),
         layer_id.clone(),
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         Shape3D::new(1, 1, 2).unwrap(),
         GridToWorld::identity(),
         vec![u16::MAX, 4],
@@ -239,7 +240,7 @@ fn gpu_brick_atlas_preserves_valid_u16_max_sample() {
     };
     let resident = ResidentBrickSetU16::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         Shape3D::new(1, 1, 2).unwrap(),
         GridToWorld::identity(),
         vec![brick],
@@ -265,13 +266,13 @@ fn builds_brick_atlas_and_page_table_for_resident_bricks() {
     let brick = dataset
         .read_u16_brick(
             &layer_id,
-            TimeIndex(0),
+            TimeIndex::new(0),
             mirante4d_data::SpatialBrickIndex::new(0, 0, 0),
         )
         .unwrap();
     let resident = ResidentBrickSetU16::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         Shape3D::new(16, 16, 16).unwrap(),
         brick.volume.grid_to_world,
         vec![brick],
@@ -314,7 +315,7 @@ fn brick_atlas_pads_each_slot_for_odd_voxel_bricks() {
                 },
                 shape: Shape4D::new(1, 1, 1, 2).unwrap(),
                 brick_shape: Shape4D::new(1, 1, 1, 1).unwrap(),
-                grid_to_world: GridToWorld::scale_um(1.0, 1.0, 1.0),
+                grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
                 display: default_u16_display(),
                 values_tzyx: vec![7, 11],
             }],
@@ -325,14 +326,22 @@ fn brick_atlas_pads_each_slot_for_odd_voxel_bricks() {
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
     let left = dataset
-        .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+        .read_u16_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 0),
+        )
         .unwrap();
     let right = dataset
-        .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 1))
+        .read_u16_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 1),
+        )
         .unwrap();
     let resident = ResidentBrickSetU16::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         Shape3D::new(1, 1, 2).unwrap(),
         left.volume.grid_to_world,
         vec![left, right],
@@ -358,7 +367,7 @@ fn uint8_brick_atlas_packs_four_values_per_word_with_validity_bits() {
         DatasetId::new("gpu-u8-atlas").unwrap(),
         layer_id.clone(),
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         Shape3D::new(1, 1, 4).unwrap(),
         GridToWorld::identity(),
         vec![255, 2, 3, 4],
@@ -384,7 +393,7 @@ fn uint8_brick_atlas_packs_four_values_per_word_with_validity_bits() {
     };
     let resident = ResidentBrickSetU8::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         Shape3D::new(1, 1, 4).unwrap(),
         GridToWorld::identity(),
         vec![brick],
@@ -411,7 +420,11 @@ fn float32_brick_atlas_packs_source_values_without_quantization() {
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
     let brick = dataset
-        .read_f32_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 1))
+        .read_f32_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 1),
+        )
         .unwrap();
 
     let packed = pack_brick_f32_for_slot(&brick, Shape3D::new(2, 2, 2).unwrap(), 8).unwrap();
@@ -518,7 +531,9 @@ fn gpu_mip_matches_cpu_fixture() {
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let (cpu_image, cpu_frame) = render_mip_z(&volume).unwrap();
 
     let gpu_output = render_mip_z_wgpu_blocking(&volume).unwrap();
@@ -550,7 +565,9 @@ fn gpu_camera_volume_modes_match_cpu_camera_and_preserve_orthographic_invariants
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let viewport = RenderViewport::new(16, 16).unwrap();
     let renderer = GpuRenderer::new_blocking().unwrap();
 
@@ -683,7 +700,9 @@ fn gpu_camera_smooth_quality_matches_cpu_camera() {
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let viewport = RenderViewport::new(16, 16).unwrap();
     let camera = front_orthographic_camera(&volume, 16.0);
     let modes = [
@@ -743,19 +762,21 @@ fn gpu_bricked_camera_modes_match_cpu_resident_bricks() {
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let brick_shape = dataset.brick_shape(&layer_id).unwrap();
     let brick_grid_shape = dataset.brick_grid_shape(&layer_id).unwrap();
     let brick = dataset
         .read_u16_brick(
             &layer_id,
-            TimeIndex(0),
+            TimeIndex::new(0),
             mirante4d_data::SpatialBrickIndex::new(0, 0, 0),
         )
         .unwrap();
     let resident = ResidentBrickSetU16::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         volume.shape,
         volume.grid_to_world,
         vec![brick],
@@ -843,7 +864,7 @@ fn gpu_bricked_u8_camera_modes_match_cpu_resident_bricks() {
         DatasetId::new("gpu-u8-resident").unwrap(),
         layer_id.clone(),
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         grid_to_world,
         values,
@@ -865,13 +886,18 @@ fn gpu_bricked_u8_camera_modes_match_cpu_resident_bricks() {
         max: 63.0,
         volume,
     };
-    let resident =
-        ResidentBrickSetU8::new(layer_id, TimeIndex(0), shape, grid_to_world, vec![brick]);
+    let resident = ResidentBrickSetU8::new(
+        layer_id,
+        TimeIndex::new(0),
+        shape,
+        grid_to_world,
+        vec![brick],
+    );
     let camera_volume = DenseVolumeU16::new(
         DatasetId::new("gpu-u8-camera").unwrap(),
         LayerId::new("camera").unwrap(),
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         grid_to_world,
         vec![0; shape.element_count().unwrap() as usize],
@@ -1079,19 +1105,21 @@ fn gpu_bricked_smooth_quality_matches_cpu_resident_bricks() {
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let brick_shape = dataset.brick_shape(&layer_id).unwrap();
     let brick_grid_shape = dataset.brick_grid_shape(&layer_id).unwrap();
     let brick = dataset
         .read_u16_brick(
             &layer_id,
-            TimeIndex(0),
+            TimeIndex::new(0),
             mirante4d_data::SpatialBrickIndex::new(0, 0, 0),
         )
         .unwrap();
     let resident = ResidentBrickSetU16::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         volume.shape,
         volume.grid_to_world,
         vec![brick],
@@ -1156,19 +1184,25 @@ fn gpu_batched_bricked_mip_matches_monolithic_gpu_mip() {
     let root = write_three_brick_gpu_fixture(tempdir.path());
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let brick_shape = dataset.brick_shape(&layer_id).unwrap();
     let brick_grid_shape = dataset.brick_grid_shape(&layer_id).unwrap();
     let bricks = (0..3)
         .map(|x| {
             dataset
-                .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, x))
+                .read_u16_brick(
+                    &layer_id,
+                    TimeIndex::new(0),
+                    SpatialBrickIndex::new(0, 0, x),
+                )
                 .unwrap()
         })
         .collect::<Vec<_>>();
     let resident = ResidentBrickSetU16::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         volume.shape,
         volume.grid_to_world,
         bricks,
@@ -1210,15 +1244,21 @@ fn gpu_bricked_camera_modes_report_incomplete_residency() {
     let root = write_three_brick_gpu_fixture(tempdir.path());
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let brick_shape = dataset.brick_shape(&layer_id).unwrap();
     let brick_grid_shape = dataset.brick_grid_shape(&layer_id).unwrap();
     let brick_0 = dataset
-        .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+        .read_u16_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 0),
+        )
         .unwrap();
     let resident = ResidentBrickSetU16::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         volume.shape,
         volume.grid_to_world,
         vec![brick_0],
@@ -1284,28 +1324,42 @@ fn gpu_brick_atlas_reuses_overlapping_pages_between_resident_sets() {
     let root = write_three_brick_gpu_fixture(tempdir.path());
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let brick_shape = dataset.brick_shape(&layer_id).unwrap();
     let brick_grid_shape = dataset.brick_grid_shape(&layer_id).unwrap();
     let brick_0 = dataset
-        .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+        .read_u16_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 0),
+        )
         .unwrap();
     let brick_1 = dataset
-        .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 1))
+        .read_u16_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 1),
+        )
         .unwrap();
     let brick_2 = dataset
-        .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 2))
+        .read_u16_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 2),
+        )
         .unwrap();
     let first = ResidentBrickSetU16::new(
         layer_id.clone(),
-        TimeIndex(0),
+        TimeIndex::new(0),
         volume.shape,
         volume.grid_to_world,
         vec![brick_0, brick_1.clone()],
     );
     let second = ResidentBrickSetU16::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         volume.shape,
         volume.grid_to_world,
         vec![brick_1, brick_2],
@@ -1378,28 +1432,42 @@ fn gpu_f32_brick_atlas_reuses_overlapping_pages_between_resident_sets() {
     let root = write_three_brick_f32_gpu_fixture(tempdir.path());
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_f32_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_f32_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let brick_shape = dataset.brick_shape(&layer_id).unwrap();
     let brick_grid_shape = dataset.brick_grid_shape(&layer_id).unwrap();
     let brick_0 = dataset
-        .read_f32_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+        .read_f32_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 0),
+        )
         .unwrap();
     let brick_1 = dataset
-        .read_f32_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 1))
+        .read_f32_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 1),
+        )
         .unwrap();
     let brick_2 = dataset
-        .read_f32_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 2))
+        .read_f32_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 2),
+        )
         .unwrap();
     let first = ResidentBrickSetF32::new(
         layer_id.clone(),
-        TimeIndex(0),
+        TimeIndex::new(0),
         volume.shape,
         volume.grid_to_world,
         vec![brick_0, brick_1.clone()],
     );
     let second = ResidentBrickSetF32::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         volume.shape,
         volume.grid_to_world,
         vec![brick_1, brick_2],
@@ -1473,7 +1541,9 @@ fn gpu_float32_bricked_camera_modes_match_cpu_resident_bricks() {
     let root = write_three_brick_f32_gpu_fixture(tempdir.path());
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_f32_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_f32_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let brick_shape = dataset.brick_shape(&layer_id).unwrap();
     let brick_grid_shape = dataset.brick_grid_shape(&layer_id).unwrap();
     let bricks = [
@@ -1484,13 +1554,13 @@ fn gpu_float32_bricked_camera_modes_match_cpu_resident_bricks() {
     .into_iter()
     .map(|index| {
         dataset
-            .read_f32_brick(&layer_id, TimeIndex(0), index)
+            .read_f32_brick(&layer_id, TimeIndex::new(0), index)
             .unwrap()
     })
     .collect::<Vec<_>>();
     let resident = ResidentBrickSetF32::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         volume.shape,
         volume.grid_to_world,
         bricks,
@@ -1581,7 +1651,9 @@ fn gpu_float32_bricked_smooth_quality_matches_cpu_resident_bricks() {
     let root = write_three_brick_f32_gpu_fixture(tempdir.path());
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_f32_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_f32_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let brick_shape = dataset.brick_shape(&layer_id).unwrap();
     let brick_grid_shape = dataset.brick_grid_shape(&layer_id).unwrap();
     let bricks = [
@@ -1592,13 +1664,13 @@ fn gpu_float32_bricked_smooth_quality_matches_cpu_resident_bricks() {
     .into_iter()
     .map(|index| {
         dataset
-            .read_f32_brick(&layer_id, TimeIndex(0), index)
+            .read_f32_brick(&layer_id, TimeIndex::new(0), index)
             .unwrap()
     })
     .collect::<Vec<_>>();
     let resident = ResidentBrickSetF32::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         volume.shape,
         volume.grid_to_world,
         bricks,
@@ -1685,15 +1757,21 @@ fn gpu_float32_bricked_camera_modes_report_incomplete_residency() {
     let root = write_three_brick_f32_gpu_fixture(tempdir.path());
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_f32_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_f32_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let brick_shape = dataset.brick_shape(&layer_id).unwrap();
     let brick_grid_shape = dataset.brick_grid_shape(&layer_id).unwrap();
     let brick_0 = dataset
-        .read_f32_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+        .read_f32_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 0),
+        )
         .unwrap();
     let resident = ResidentBrickSetF32::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         volume.shape,
         volume.grid_to_world,
         vec![brick_0],

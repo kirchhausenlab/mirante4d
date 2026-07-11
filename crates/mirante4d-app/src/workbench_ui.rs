@@ -1,22 +1,36 @@
 use super::*;
+use mirante4d_application::CrossSectionPanelId;
+use mirante4d_domain::{Opacity, ToolKind};
+use mirante4d_render_api::CameraFrame;
+
+use crate::cross_section_scheduler::mark_cross_section_panel_render_failed;
+use crate::viewer_layout::PanelId;
+
 fn show_iso_light_controls(
     ui: &mut egui::Ui,
     light_state: IsoLightState,
-    workbench_commands: &mut Vec<WorkbenchCommand>,
+    application_commands: &mut Vec<ApplicationCommand>,
 ) {
-    let attached = light_state.mode == IsoLightMode::AttachedCamera;
+    let attached = light_state.is_attached_camera();
     ui.horizontal(|ui| {
         let mut attached_toggle = attached;
         if ui
             .checkbox(&mut attached_toggle, "Attached light")
             .changed()
         {
-            workbench_commands.push(WorkbenchCommand::SetIsoLightAttached {
-                attached: attached_toggle,
-            });
+            let next = if attached_toggle {
+                IsoLightState::attached_camera()
+            } else {
+                let [x, y] = light_state.detached_screen_position().unwrap_or([0.0, 0.0]);
+                IsoLightState::detached_screen(x, y)
+                    .expect("the retained detached ISO light position is valid")
+            };
+            application_commands.push(ApplicationCommand::SetIsoLight(next));
         }
         if ui.button("Reset").clicked() {
-            workbench_commands.push(WorkbenchCommand::ResetIsoLight);
+            application_commands.push(ApplicationCommand::SetIsoLight(
+                IsoLightState::attached_camera(),
+            ));
         }
     });
 
@@ -55,10 +69,10 @@ fn show_iso_light_controls(
         ],
         egui::Stroke::new(1.0, stroke.color.linear_multiply(0.4)),
     );
-    let position = light_state.detached_screen_position;
+    let position = light_state.detached_screen_position().unwrap_or([0.0, 0.0]);
     let marker = egui::pos2(
-        center.x + position.x * radius,
-        center.y - position.y * radius,
+        center.x + position[0] * radius,
+        center.y - position[1] * radius,
     );
     painter.circle_filled(
         marker,
@@ -74,29 +88,43 @@ fn show_iso_light_controls(
         && (response.dragged() || response.clicked())
         && let Some(pointer) = response.interact_pointer_pos()
     {
-        let x = ((pointer.x - center.x) / radius).clamp(-1.0, 1.0);
-        let y = (-(pointer.y - center.y) / radius).clamp(-1.0, 1.0);
-        workbench_commands.push(WorkbenchCommand::SetIsoLightDetachedPosition { x, y });
+        let mut x = ((pointer.x - center.x) / radius).clamp(-1.0, 1.0);
+        let mut y = (-(pointer.y - center.y) / radius).clamp(-1.0, 1.0);
+        let length = x.hypot(y);
+        if length > 1.0 {
+            x /= length;
+            y /= length;
+        }
+        if let Ok(next) = IsoLightState::detached_screen(x, y) {
+            application_commands.push(ApplicationCommand::SetIsoLight(next));
+        }
     }
 }
 
 fn layout_selector(
     ui: &mut egui::Ui,
-    current: ViewerLayout,
-    workbench_commands: &mut Vec<WorkbenchCommand>,
+    current: CanonicalViewerLayout,
+    cross_section: CrossSectionView,
+    application_commands: &mut Vec<ApplicationCommand>,
 ) {
     ui_kit::muted_label(ui, "Layout");
     if ui
-        .selectable_label(current == ViewerLayout::Single3d, "3D")
+        .selectable_label(current == CanonicalViewerLayout::Single3d, "3D")
         .clicked()
     {
-        workbench_commands.push(WorkbenchCommand::SetViewerLayout(ViewerLayout::Single3d));
+        application_commands.push(ApplicationCommand::SetLayout {
+            layout: CanonicalViewerLayout::Single3d,
+            cross_section,
+        });
     }
     if ui
-        .selectable_label(current == ViewerLayout::FourPanel, "4 Panel")
+        .selectable_label(current == CanonicalViewerLayout::FourPanel, "4 Panel")
         .clicked()
     {
-        workbench_commands.push(WorkbenchCommand::SetViewerLayout(ViewerLayout::FourPanel));
+        application_commands.push(ApplicationCommand::SetLayout {
+            layout: CanonicalViewerLayout::FourPanel,
+            cross_section,
+        });
     }
 }
 
@@ -105,8 +133,7 @@ const CROSS_SECTION_SCROLL_ZOOM_FACTOR_SCALE: f32 = 0.001;
 
 impl MiranteWorkbenchApp {
     fn render_viewport_max_side(&self, context_max: usize) -> usize {
-        #[cfg(test)]
-        if let Some(test_max) = self.test_render_viewport_max_side {
+        if let Some(test_max) = self.validation_runtime.test_render_viewport_max_side {
             return context_max.min(test_max);
         }
         context_max
@@ -115,20 +142,26 @@ impl MiranteWorkbenchApp {
     fn show_viewer_layout(
         &mut self,
         ui: &mut egui::Ui,
-        workbench_commands: &mut Vec<WorkbenchCommand>,
+        snapshot: &ApplicationSnapshot,
+        view: &ViewState,
+        application_commands: &mut Vec<ApplicationCommand>,
         rerender_requested: &mut bool,
         texture_refresh_requested: &mut bool,
     ) {
-        match self.state.viewer_layout.layout() {
-            ViewerLayout::Single3d => self.show_single_3d_viewport(
+        match view.layout() {
+            CanonicalViewerLayout::Single3d => self.show_single_3d_viewport(
                 ui,
-                workbench_commands,
+                snapshot,
+                view,
+                application_commands,
                 rerender_requested,
                 texture_refresh_requested,
             ),
-            ViewerLayout::FourPanel => self.show_four_panel_viewport(
+            CanonicalViewerLayout::FourPanel => self.show_four_panel_viewport(
                 ui,
-                workbench_commands,
+                snapshot,
+                view,
+                application_commands,
                 rerender_requested,
                 texture_refresh_requested,
             ),
@@ -146,14 +179,15 @@ impl MiranteWorkbenchApp {
         if let Some(presentation_viewport) =
             presentation_viewport_for_display_size(display_size_points)
         {
-            viewport_changed |= set_presentation_viewport(&mut self.state, presentation_viewport);
+            viewport_changed |=
+                set_presentation_viewport(&mut self.render_runtime, presentation_viewport);
         }
         if let Some(render_viewport) = render_viewport_for_display_size(
             display_size_points,
             ctx.pixels_per_point(),
             max_texture_side,
         ) {
-            viewport_changed |= set_render_viewport(&mut self.state, render_viewport);
+            viewport_changed |= set_render_viewport(&mut self.render_runtime, render_viewport);
         }
         if viewport_changed {
             self.refresh_frame(ctx);
@@ -166,32 +200,26 @@ impl MiranteWorkbenchApp {
         panel_id: PanelId,
         display_size_points: egui::Vec2,
     ) -> Option<PresentationViewport> {
-        let Some(presentation_viewport) =
-            presentation_viewport_for_display_size(display_size_points)
-        else {
-            return None;
-        };
+        let presentation_viewport = presentation_viewport_for_display_size(display_size_points)?;
         let max_texture_side =
             self.render_viewport_max_side(ctx.input(|input| input.max_texture_side));
-        let Some(render_viewport) = render_viewport_for_display_size(
+        let render_viewport = render_viewport_for_display_size(
             display_size_points,
             ctx.pixels_per_point(),
             max_texture_side,
-        ) else {
-            return None;
-        };
-        self.state.viewer_layout.record_panel_viewports(
-            panel_id,
-            presentation_viewport,
-            render_viewport,
-        );
+        )?;
+        self.render_runtime
+            .cross_section_runtime
+            .record_panel_viewports(panel_id, presentation_viewport, render_viewport);
         Some(presentation_viewport)
     }
 
     fn show_single_3d_viewport(
         &mut self,
         ui: &mut egui::Ui,
-        workbench_commands: &mut Vec<WorkbenchCommand>,
+        snapshot: &ApplicationSnapshot,
+        view: &ViewState,
+        application_commands: &mut Vec<ApplicationCommand>,
         rerender_requested: &mut bool,
         texture_refresh_requested: &mut bool,
     ) {
@@ -205,7 +233,9 @@ impl MiranteWorkbenchApp {
                 ui,
                 display_image,
                 image_size,
-                workbench_commands,
+                snapshot,
+                view,
+                application_commands,
                 rerender_requested,
                 texture_refresh_requested,
             );
@@ -215,7 +245,9 @@ impl MiranteWorkbenchApp {
     fn show_four_panel_viewport(
         &mut self,
         ui: &mut egui::Ui,
-        workbench_commands: &mut Vec<WorkbenchCommand>,
+        snapshot: &ApplicationSnapshot,
+        view: &ViewState,
+        application_commands: &mut Vec<ApplicationCommand>,
         rerender_requested: &mut bool,
         texture_refresh_requested: &mut bool,
     ) {
@@ -225,23 +257,10 @@ impl MiranteWorkbenchApp {
             ((available.x - gap) * 0.5).max(1.0),
             ((available.y - gap) * 0.5).max(1.0),
         );
-        let panels = self
-            .state
-            .viewer_layout
-            .four_panel_runtime()
-            .map(|runtime| {
-                let panels = runtime.panels();
-                [
-                    panels[0].panel_id,
-                    panels[1].panel_id,
-                    panels[2].panel_id,
-                    panels[3].panel_id,
-                ]
-            })
-            .unwrap_or([PanelId::Xy, PanelId::Xz, PanelId::ThreeD, PanelId::Yz]);
+        let panels = [PanelId::Xy, PanelId::Xz, PanelId::ThreeD, PanelId::Yz];
 
-        self.state.hovered_pixel = None;
-        self.state.hovered_source_readout = None;
+        self.ui_runtime.hovered_pixel = None;
+        self.ui_runtime.hovered_source_readout = None;
 
         ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
         ui.vertical(|ui| {
@@ -252,7 +271,9 @@ impl MiranteWorkbenchApp {
                             ui,
                             *panel_id,
                             cell_size,
-                            workbench_commands,
+                            snapshot,
+                            view,
+                            application_commands,
                             rerender_requested,
                             texture_refresh_requested,
                         );
@@ -262,12 +283,15 @@ impl MiranteWorkbenchApp {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn show_four_panel_cell(
         &mut self,
         ui: &mut egui::Ui,
         panel_id: PanelId,
         cell_size: egui::Vec2,
-        workbench_commands: &mut Vec<WorkbenchCommand>,
+        snapshot: &ApplicationSnapshot,
+        view: &ViewState,
+        application_commands: &mut Vec<ApplicationCommand>,
         rerender_requested: &mut bool,
         texture_refresh_requested: &mut bool,
     ) {
@@ -286,12 +310,20 @@ impl MiranteWorkbenchApp {
                     match panel_id {
                         PanelId::ThreeD => self.show_embedded_3d_panel(
                             ui,
-                            workbench_commands,
+                            snapshot,
+                            view,
+                            application_commands,
                             rerender_requested,
                             texture_refresh_requested,
                         ),
                         PanelId::Xy | PanelId::Xz | PanelId::Yz => {
-                            self.show_cross_section_panel(ui, panel_id, workbench_commands);
+                            self.show_cross_section_panel(
+                                ui,
+                                panel_id,
+                                snapshot,
+                                view,
+                                application_commands,
+                            );
                         }
                     }
                 });
@@ -301,7 +333,9 @@ impl MiranteWorkbenchApp {
     fn show_embedded_3d_panel(
         &mut self,
         ui: &mut egui::Ui,
-        workbench_commands: &mut Vec<WorkbenchCommand>,
+        snapshot: &ApplicationSnapshot,
+        view: &ViewState,
+        application_commands: &mut Vec<ApplicationCommand>,
         rerender_requested: &mut bool,
         texture_refresh_requested: &mut bool,
     ) {
@@ -316,19 +350,24 @@ impl MiranteWorkbenchApp {
                 ui,
                 display_image,
                 image_size,
-                workbench_commands,
+                snapshot,
+                view,
+                application_commands,
                 rerender_requested,
                 texture_refresh_requested,
             );
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn show_3d_viewport_image(
         &mut self,
         ui: &mut egui::Ui,
         display_image: ViewportDisplayImage,
         image_size: egui::Vec2,
-        workbench_commands: &mut Vec<WorkbenchCommand>,
+        snapshot: &ApplicationSnapshot,
+        view: &ViewState,
+        application_commands: &mut Vec<ApplicationCommand>,
         rerender_requested: &mut bool,
         texture_refresh_requested: &mut bool,
     ) {
@@ -346,26 +385,35 @@ impl MiranteWorkbenchApp {
                 .fit_to_exact_size(image_size)
                 .sense(egui::Sense::click_and_drag()),
         );
-        let hover = viewport_hover_from_response(&self.state, &response);
-        if response.hovered() || self.state.viewer_layout.layout() == ViewerLayout::Single3d {
-            self.state.hovered_pixel = hover;
-            self.state.hovered_source_readout = None;
+        let hover = viewport_hover_from_response(snapshot, view, &self.render_runtime, &response);
+        if response.hovered() || view.layout() == CanonicalViewerLayout::Single3d {
+            self.ui_runtime.hovered_pixel = hover;
+            self.ui_runtime.hovered_source_readout = None;
         }
-        match apply_viewport_tool_response(&mut self.state, &response, hover) {
+        match apply_viewport_tool_response(
+            snapshot,
+            &self.dataset_runtime,
+            &mut self.analysis_runtime,
+            &mut self.ui_runtime,
+            &self.render_runtime,
+            &response,
+            hover,
+        ) {
             Ok(outcome) => {
                 *texture_refresh_requested |= outcome.texture_refresh_requested;
                 *rerender_requested |= outcome.rerender_requested;
             }
             Err(err) => {
-                self.state.last_render_error = Some(err.to_string());
+                tracing::warn!(%err, "viewer tool interaction rejected");
             }
         }
         if matches!(
-            self.state.viewer_tools.active_tool,
+            self.ui_runtime.viewer_tools.active_tool,
             ViewerTool::Navigate | ViewerTool::Inspect
         ) {
-            workbench_commands.extend(viewport_interaction_commands(
-                &mut self.state,
+            application_commands.extend(viewport_interaction_commands(
+                &mut self.ui_runtime,
+                view,
                 &response,
                 image_size,
             ));
@@ -376,18 +424,33 @@ impl MiranteWorkbenchApp {
         &mut self,
         ui: &mut egui::Ui,
         panel_id: PanelId,
-        workbench_commands: &mut Vec<WorkbenchCommand>,
+        snapshot: &ApplicationSnapshot,
+        view: &ViewState,
+        application_commands: &mut Vec<ApplicationCommand>,
     ) {
         let available = ui.available_size();
         let ctx = ui.ctx().clone();
         let presentation_viewport = self.record_four_panel_viewport(&ctx, panel_id, available);
         if let Err(err) = self.render_cross_section_panel_for_display_if_needed(panel_id) {
-            self.state.last_render_error = Some(err.to_string());
             tracing::error!(
                 error = %err,
                 panel = panel_id.label(),
                 "cross-section panel render failed"
             );
+            if let Some(schedule) = self
+                .render_runtime
+                .cross_section_runtime
+                .panel(panel_id)
+                .and_then(|panel| panel.cross_section_schedule)
+            {
+                let failure = render_state::render_failure_status(&err);
+                mark_cross_section_panel_render_failed(
+                    &mut self.render_runtime,
+                    panel_id,
+                    schedule,
+                    failure,
+                );
+            }
         }
         let response =
             if let Some(display_image) = self.cross_section_panel_display_image(panel_id) {
@@ -412,28 +475,53 @@ impl MiranteWorkbenchApp {
             }
             .unwrap_or_else(|| self.show_cross_section_panel_placeholder(ui, panel_id, available));
 
-        if let Some(presentation_viewport) = presentation_viewport
-            && let Some(readout) = cross_section_hover_readout_for_response(
-                &self.state,
-                panel_id,
-                presentation_viewport,
-                &response,
-            )
-        {
-            self.state.hovered_pixel = None;
-            self.state.hovered_source_readout = Some(readout.text);
+        if let Some(presentation_viewport) = presentation_viewport {
+            let active_layer_id =
+                current_physical_layer_id(&self.dataset_runtime, view.active_layer());
+            let active_layer_dtype = snapshot
+                .catalog()
+                .layer(view.active_layer())
+                .map(|layer| layer.dtype());
+            if let (Ok(active_layer_id), Some(active_layer_dtype)) =
+                (active_layer_id, active_layer_dtype)
+                && let Some(readout) = cross_section_hover_readout_for_response(
+                    &self.dataset_runtime,
+                    &self.render_runtime,
+                    cross_section_readout::CrossSectionReadoutInput {
+                        view,
+                        active_layer_id: &active_layer_id,
+                        active_layer_dtype,
+                    },
+                    panel_id,
+                    presentation_viewport,
+                    &response,
+                )
+            {
+                self.ui_runtime.hovered_pixel = None;
+                self.ui_runtime.hovered_source_readout = Some(readout.text);
+            }
         }
 
         if matches!(
-            self.state.viewer_tools.active_tool,
+            self.ui_runtime.viewer_tools.active_tool,
             ViewerTool::Navigate | ViewerTool::Inspect
         ) && let Some(presentation_viewport) = presentation_viewport
         {
-            workbench_commands.extend(cross_section_interaction_commands(
+            match cross_section_interaction_commands(
+                snapshot,
+                view,
                 panel_id,
                 presentation_viewport,
                 &response,
-            ));
+            ) {
+                Ok(commands) if !commands.is_empty() => {
+                    application_commands.extend(commands);
+                    self.dataset_runtime.cross_section_last_interaction_at = Some(Instant::now());
+                    ctx.request_repaint_after(CROSS_SECTION_INTERACTION_SETTLE_DURATION);
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "cross-section interaction rejected"),
+            }
         }
     }
 
@@ -479,16 +567,17 @@ impl MiranteWorkbenchApp {
                 format!("{} cross-section panel", panel_id.label()),
             )
         });
-        let status = self
-            .state
-            .viewer_layout
-            .four_panel_runtime()
-            .and_then(|runtime| runtime.panel(panel_id))
+        let panel = self.render_runtime.cross_section_runtime.panel(panel_id);
+        let status = panel
             .and_then(|panel| panel.cross_section_schedule)
             .map(|schedule| schedule.status_label());
-        let text = status
-            .map(|status| format!("{}\n{}", panel_id.label(), status))
-            .unwrap_or_else(|| panel_id.label().to_owned());
+        let text = if panel.is_some_and(|panel| panel.render_failure.is_some()) {
+            format!("{}\nrender failed", panel_id.label())
+        } else {
+            status
+                .map(|status| format!("{}\n{}", panel_id.label(), status))
+                .unwrap_or_else(|| panel_id.label().to_owned())
+        };
         ui.painter().text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -501,11 +590,19 @@ impl MiranteWorkbenchApp {
 }
 
 fn cross_section_interaction_commands(
+    snapshot: &ApplicationSnapshot,
+    view: &ViewState,
     panel_id: PanelId,
     presentation_viewport: PresentationViewport,
     response: &egui::Response,
-) -> Vec<WorkbenchCommand> {
-    let mut commands = Vec::new();
+) -> Result<Vec<ApplicationCommand>, String> {
+    let panel = panel_id
+        .cross_section_panel()
+        .ok_or_else(|| "3D is not a cross-section interaction target".to_owned())?;
+    let application_panel = application_cross_section_panel_id(panel_id)
+        .ok_or_else(|| "3D is not a cross-section interaction target".to_owned())?;
+    let mut cross_section = viewer_layout::render_cross_section_view_state(*view.cross_section());
+    let mut edited = false;
     let modifiers = response.ctx.input(|input| input.modifiers);
     if response.dragged() {
         let primary_down = response.ctx.input(|input| input.pointer.primary_down());
@@ -516,16 +613,20 @@ fn cross_section_interaction_commands(
             && motion_points != egui::Vec2::ZERO
         {
             if modifiers.shift {
-                commands.push(WorkbenchCommand::CrossSectionRotateDrag {
-                    panel_id,
-                    motion_points,
-                });
+                cross_section.rotate_oblique_by_panel_drag(
+                    panel,
+                    f64::from(motion_points.x),
+                    f64::from(motion_points.y),
+                    CROSS_SECTION_ROTATE_RADIANS_PER_POINT,
+                );
             } else {
-                commands.push(WorkbenchCommand::CrossSectionPanDrag {
-                    panel_id,
-                    motion_points,
-                });
+                cross_section.pan_by_panel_points(
+                    panel,
+                    f64::from(motion_points.x),
+                    f64::from(motion_points.y),
+                );
             }
+            edited = true;
         }
     }
     if response.hovered() {
@@ -535,25 +636,71 @@ fn cross_section_interaction_commands(
                 && let Some(pointer) = response.hover_pos()
             {
                 let local = pointer - response.rect.min.to_vec2();
-                commands.push(WorkbenchCommand::CrossSectionZoom {
-                    panel_id,
+                let factor =
+                    (-f64::from(scroll_y) * CROSS_SECTION_SCROLL_ZOOM_FACTOR_SCALE as f64).exp();
+                cross_section.zoom_around_panel_point(
+                    panel,
                     presentation_viewport,
-                    pointer_position_points: local,
-                    scroll_y_points: scroll_y,
-                });
+                    f64::from(local.x),
+                    f64::from(local.y),
+                    factor,
+                );
+                edited = true;
             }
         } else {
             let scroll_y = response.ctx.input(|input| input.smooth_scroll_delta().y);
             if scroll_y.is_finite() && scroll_y != 0.0 {
-                commands.push(WorkbenchCommand::CrossSectionSliceStep {
-                    panel_id,
-                    notches: f64::from(scroll_y / CROSS_SECTION_SCROLL_POINTS_PER_NOTCH),
-                    fast: modifiers.shift,
-                });
+                let layer = snapshot
+                    .catalog()
+                    .layer(view.active_layer())
+                    .ok_or_else(|| "active layer is absent from the dataset catalog".to_owned())?;
+                let voxel_size =
+                    lod_scheduler::representative_voxel_world_size(layer.grid_to_world());
+                let multiplier = if modifiers.shift {
+                    CROSS_SECTION_FAST_SLICE_MULTIPLIER
+                } else {
+                    1.0
+                };
+                let notches = f64::from(scroll_y / CROSS_SECTION_SCROLL_POINTS_PER_NOTCH);
+                cross_section.slice_by_world_distance(panel, notches * voxel_size * multiplier);
+                edited = true;
             }
         }
     }
-    commands
+    if !edited {
+        return Ok(Vec::new());
+    }
+    let cross_section = canonical_cross_section_view(cross_section)?;
+    Ok(vec![
+        ApplicationCommand::SetActiveCrossSectionPanel(Some(application_panel)),
+        ApplicationCommand::SetLayout {
+            layout: view.layout(),
+            cross_section,
+        },
+    ])
+}
+
+fn application_cross_section_panel_id(panel_id: PanelId) -> Option<CrossSectionPanelId> {
+    match panel_id {
+        PanelId::Xy => Some(CrossSectionPanelId::Xy),
+        PanelId::Xz => Some(CrossSectionPanelId::Xz),
+        PanelId::Yz => Some(CrossSectionPanelId::Yz),
+        PanelId::ThreeD => None,
+    }
+}
+
+fn canonical_cross_section_view(
+    runtime: mirante4d_renderer::CrossSectionViewState,
+) -> Result<CrossSectionView, String> {
+    let [x, y, z] = runtime.center_world.to_array();
+    let [qx, qy, qz, qw] = runtime.orientation.to_array();
+    CrossSectionView::new(
+        WorldPoint3::new(x, y, z).map_err(|error| error.to_string())?,
+        UnitQuaternion::new_xyzw(qx, qy, qz, qw).map_err(|error| error.to_string())?,
+        runtime.scale_world_per_screen_point,
+        runtime.depth_world,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn scroll_y_points_from_zoom_delta(zoom_delta: f32) -> Option<f32> {
@@ -564,10 +711,154 @@ fn scroll_y_points_from_zoom_delta(zoom_delta: f32) -> Option<f32> {
     scroll_y.is_finite().then_some(scroll_y)
 }
 
+fn workspace_channel_presets(snapshot: &ApplicationSnapshot) -> &[ChannelPreset] {
+    match snapshot.workspace() {
+        WorkspaceSnapshot::Unbound { workspace } => workspace.channel_presets(),
+        WorkspaceSnapshot::Bound { project, .. } => project.channel_presets(),
+    }
+}
+
+fn layer_view_command(
+    layer: &LayerViewState,
+    visible: bool,
+    transfer: LayerTransfer,
+    render_state: CanonicalRenderState,
+) -> ApplicationCommand {
+    ApplicationCommand::SetLayerView(LayerViewState::new(
+        layer.layer_key(),
+        visible,
+        transfer,
+        render_state,
+    ))
+}
+
+fn layer_render_state_for_mode(
+    layer: &LayerViewState,
+    mode: mirante4d_domain::RenderMode,
+) -> Result<CanonicalRenderState, String> {
+    let current = *layer.render_state();
+    let sampling = current.sampling_policy();
+    match mode {
+        mirante4d_domain::RenderMode::Mip => Ok(CanonicalRenderState::mip(sampling)),
+        mirante4d_domain::RenderMode::Isosurface => {
+            let (shading, display_level) = current
+                .iso_parameters()
+                .map(|parameters| (parameters.shading_policy(), parameters.display_level()))
+                .unwrap_or((
+                    IsoShadingPolicy::GradientLighting,
+                    DEFAULT_ISO_DISPLAY_LEVEL,
+                ));
+            CanonicalRenderState::iso(sampling, shading, display_level)
+                .map_err(|error| error.to_string())
+        }
+        mirante4d_domain::RenderMode::Dvr => {
+            let (opacity_transfer, density_scale) = current
+                .dvr_parameters()
+                .map(|parameters| (parameters.opacity_transfer(), parameters.density_scale()))
+                .unwrap_or((
+                    CanonicalDvrOpacityTransfer::new(
+                        layer.transfer().window(),
+                        layer.transfer().curve(),
+                    ),
+                    DEFAULT_DVR_DENSITY_SCALE,
+                ));
+            CanonicalRenderState::dvr(sampling, opacity_transfer, density_scale)
+                .map_err(|error| error.to_string())
+        }
+    }
+}
+
+fn render_state_with_sampling(
+    current: CanonicalRenderState,
+    sampling: SamplingPolicy,
+) -> Result<CanonicalRenderState, String> {
+    match current.mode() {
+        mirante4d_domain::RenderMode::Mip => Ok(CanonicalRenderState::mip(sampling)),
+        mirante4d_domain::RenderMode::Isosurface => {
+            let parameters = current
+                .iso_parameters()
+                .expect("ISO mode has ISO parameters");
+            CanonicalRenderState::iso(
+                sampling,
+                parameters.shading_policy(),
+                parameters.display_level(),
+            )
+            .map_err(|error| error.to_string())
+        }
+        mirante4d_domain::RenderMode::Dvr => {
+            let parameters = current
+                .dvr_parameters()
+                .expect("DVR mode has DVR parameters");
+            CanonicalRenderState::dvr(
+                sampling,
+                parameters.opacity_transfer(),
+                parameters.density_scale(),
+            )
+            .map_err(|error| error.to_string())
+        }
+    }
+}
+
+fn viewer_tool_for_kind(tool: ToolKind) -> ViewerTool {
+    match tool {
+        ToolKind::Navigate => ViewerTool::Navigate,
+        ToolKind::Inspect => ViewerTool::Inspect,
+        ToolKind::Crosshair => ViewerTool::Crosshair,
+        ToolKind::RoiBox => ViewerTool::RoiBox,
+        ToolKind::MeasureDistance => ViewerTool::MeasureDistance,
+    }
+}
+
+fn reset_view_command(
+    snapshot: &ApplicationSnapshot,
+    view: &ViewState,
+    presentation_viewport: PresentationViewport,
+) -> Result<ApplicationCommand, String> {
+    let layer = snapshot
+        .catalog()
+        .layer(view.active_layer())
+        .ok_or_else(|| "active layer is absent from the dataset catalog".to_owned())?;
+    let default_camera = default_camera_for_shape(layer.shape().spatial(), layer.grid_to_world());
+    let camera = CameraView::new(
+        view.camera().projection(),
+        default_camera.target(),
+        default_camera.orientation(),
+        default_camera.orthographic_world_per_screen_point(),
+        default_camera.perspective_focal_length_screen_points(),
+        default_camera.perspective_view_distance_world(),
+    )
+    .map_err(|error| error.to_string())?;
+    let camera = fit_camera_to_shape_preserving_view(
+        camera,
+        layer.shape().spatial(),
+        layer.grid_to_world(),
+        presentation_viewport,
+    );
+    let cross_section = CrossSectionView::new(
+        camera.target(),
+        UnitQuaternion::identity(),
+        camera.orthographic_world_per_screen_point(),
+        lod_scheduler::representative_voxel_world_size(layer.grid_to_world()),
+    )
+    .map_err(|error| error.to_string())?;
+    let next = ViewState::new(
+        view.layers().to_vec(),
+        view.active_layer(),
+        view.timepoint(),
+        camera,
+        view.layout(),
+        cross_section,
+        *view.iso_light(),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(ApplicationCommand::ReplaceView(next))
+}
+
 impl eframe::App for MiranteWorkbenchApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let update_started = Instant::now();
         let setup_started = Instant::now();
+        self.pump_application_services();
         self.free_retired_gpu_display_textures();
         self.handle_close_request(ui.ctx());
         let setup_ms = duration_ms(setup_started.elapsed());
@@ -578,24 +869,52 @@ impl eframe::App for MiranteWorkbenchApp {
         self.drain_analysis_results(ui.ctx());
         let task_drain_ms = duration_ms(task_drain_started.elapsed());
 
+        let application_snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let view = application_view(&application_snapshot);
+        let canonical_tool = viewer_tool_for_kind(application_snapshot.transient().active_tool());
+        if self.ui_runtime.viewer_tools.active_tool != canonical_tool {
+            self.ui_runtime.viewer_tools.set_active_tool(canonical_tool);
+        }
+
         let mut rerender_requested = false;
         let mut texture_refresh_requested = false;
-        let mut workbench_commands = Vec::new();
-        let import_active = self.import_task.is_some();
-        let import_setup_active =
-            self.tiff_import_setup_task.is_some() || self.pending_tiff_import.is_some();
+        let mut application_commands = Vec::new();
+        let import_active = self.import_runtime.import_task.is_some();
+        let import_setup_active = self.import_runtime.tiff_import_setup_task.is_some()
+            || self.import_runtime.pending_tiff_import.is_some();
         let workflow_busy = import_active || import_setup_active;
         let mut start_pending_tiff_import = false;
         let mut cancel_pending_tiff_import = false;
         let mut dismiss_tiff_import_setup_error = false;
         let layout = WorkbenchLayoutSpec::default();
         let playback_started = Instant::now();
-        self.enqueue_playback_command_if_due(&mut workbench_commands, ui.ctx());
+        workbench_playback_runtime::enqueue_playback_command_if_due(
+            &application_snapshot,
+            view,
+            &self.dataset_runtime,
+            &mut self.render_runtime,
+            &mut application_commands,
+            ui.ctx(),
+        );
         let playback_ms = duration_ms(playback_started.elapsed());
 
         let ui_build_started = Instant::now();
         let mut histogram_ui_ms = 0.0;
         let mut active_layer_histogram_for_ui = None;
+        let project_actions_available = matches!(
+            application_snapshot.source(),
+            SourceVerificationSnapshot::Verified(_)
+        );
+        let active_layer = view
+            .layer(view.active_layer())
+            .expect("application view contains its active layer");
+        let active_catalog_layer = application_snapshot
+            .catalog()
+            .layer(view.active_layer())
+            .expect("application view closes over the dataset catalog");
+        let timepoint_count =
+            workbench_playback_runtime::catalog_timepoint_count(&application_snapshot);
+
         egui::Panel::top("top-toolbar").show_inside(ui, |ui| {
             ui.vertical(|ui| {
                 ui.horizontal_wrapped(|ui| {
@@ -604,10 +923,24 @@ impl eframe::App for MiranteWorkbenchApp {
                     if ui_kit::toolbar_button(ui, "Open", !workflow_busy).clicked() {
                         self.open_native_from_dialog(ui.ctx());
                     }
-                    if ui_kit::toolbar_button(ui, "Open Project", !workflow_busy).clicked() {
+                    if ui_kit::toolbar_button(
+                        ui,
+                        "Open Project",
+                        !workflow_busy && project_actions_available,
+                    )
+                    .on_hover_text("Requires a verified scientific dataset identity")
+                    .clicked()
+                    {
                         self.open_session_from_dialog(ui.ctx());
                     }
-                    if ui_kit::toolbar_button(ui, "Save Project", !workflow_busy).clicked() {
+                    if ui_kit::toolbar_button(
+                        ui,
+                        "Save Project",
+                        !workflow_busy && project_actions_available,
+                    )
+                    .on_hover_text("Requires a verified scientific dataset identity")
+                    .clicked()
+                    {
                         self.save_current_project();
                     }
                     if ui_kit::toolbar_button(ui, "Import Dir", !workflow_busy)
@@ -627,29 +960,44 @@ impl eframe::App for MiranteWorkbenchApp {
                         self.cancel_import_task();
                     }
                     ui.separator();
-                    ui_kit::elided_label(ui, &self.state.dataset_name, 42);
+                    ui_kit::elided_label(ui, application_snapshot.catalog().label(), 42);
                 });
                 ui.horizontal_wrapped(|ui| {
                     layout_selector(
                         ui,
-                        self.state.viewer_layout.layout(),
-                        &mut workbench_commands,
+                        view.layout(),
+                        *view.cross_section(),
+                        &mut application_commands,
                     );
                     ui.separator();
                     ui_kit::muted_label(ui, "Render");
-                    if let Some(command) = render_mode_selector(ui, self.state.active_render_mode) {
-                        workbench_commands.push(command);
+                    if let Some(command) = render_mode_selector(ui, view) {
+                        application_commands.push(command);
                     }
                     ui.separator();
                     ui_kit::muted_label(ui, "Camera");
-                    if let Some(command) = projection_selector(ui, self.state.camera.projection) {
-                        workbench_commands.push(command);
+                    if let Some(command) = projection_selector(ui, *view.camera()) {
+                        application_commands.push(command);
                     }
                     if ui.button("Fit Data").clicked() {
-                        workbench_commands.push(WorkbenchCommand::FitData);
+                        application_commands.push(ApplicationCommand::SetCamera(
+                            fit_camera_to_shape_preserving_view(
+                                *view.camera(),
+                                active_catalog_layer.shape().spatial(),
+                                active_catalog_layer.grid_to_world(),
+                                self.render_runtime.presentation_viewport,
+                            ),
+                        ));
                     }
                     if ui.button("Reset View").clicked() {
-                        workbench_commands.push(WorkbenchCommand::ResetView);
+                        match reset_view_command(
+                            &application_snapshot,
+                            view,
+                            self.render_runtime.presentation_viewport,
+                        ) {
+                            Ok(command) => application_commands.push(command),
+                            Err(error) => tracing::warn!(%error, "view reset rejected"),
+                        }
                     }
                 });
             });
@@ -662,24 +1010,38 @@ impl eframe::App for MiranteWorkbenchApp {
             .show_inside(ui, |ui| {
                 ui_kit::panel_scroll(ui, "layers-panel-scroll", |ui| {
                     ui_kit::section(ui, "Dataset", |ui| {
-                        ui_kit::property_row(ui, "name", &self.state.dataset_name);
-                        ui_kit::property_row(ui, "layers", self.state.layer_count.to_string());
+                        ui_kit::property_row(ui, "name", application_snapshot.catalog().label());
+                        ui_kit::property_row(
+                            ui,
+                            "layers",
+                            application_snapshot.catalog().len().to_string(),
+                        );
                         ui_kit::property_row(
                             ui,
                             "timepoints",
-                            self.state.timepoint_count.to_string(),
+                            timepoint_count.to_string(),
+                        );
+                        ui_kit::property_row(
+                            ui,
+                            "scientific identity",
+                            match application_snapshot.source() {
+                                SourceVerificationSnapshot::Required => {
+                                    "verification required; project open/save unavailable"
+                                }
+                                SourceVerificationSnapshot::Verified(_) => "verified",
+                            },
                         );
                     });
                     ui_kit::section(ui, "Status", |ui| {
-                        if let Some(task) = &self.import_task {
+                        if let Some(task) = &self.import_runtime.import_task {
                             ui_kit::status_badge(
                                 ui,
                                 StatusTone::Warning,
                                 import_task_status_text(task),
                             );
-                        } else if self.tiff_import_setup_task.is_some() {
+                        } else if self.import_runtime.tiff_import_setup_task.is_some() {
                             ui_kit::status_badge(ui, StatusTone::Warning, "inspecting TIFF input");
-                        } else if self.pending_tiff_import.is_some() {
+                        } else if self.import_runtime.pending_tiff_import.is_some() {
                             ui_kit::status_badge(
                                 ui,
                                 StatusTone::Warning,
@@ -688,154 +1050,194 @@ impl eframe::App for MiranteWorkbenchApp {
                         } else {
                             ui_kit::status_badge(ui, StatusTone::Ready, "ready");
                         }
-                        ui_kit::property_row(ui, "fidelity", composite_fidelity_label(&self.state));
-                        if let Some(hover) = self.state.hovered_pixel {
+                        ui_kit::property_row(
+                            ui,
+                            "fidelity",
+                            composite_fidelity_label(
+                                &application_snapshot,
+                                &self.dataset_runtime,
+                                &self.render_runtime,
+                            ),
+                        );
+                        if let Some(hover) = self.ui_runtime.hovered_pixel {
                             ui_kit::property_row(ui, "hover", viewport_hover_status_label(hover));
                         }
-                        if let Some(readout) = &self.state.hovered_source_readout {
+                        if let Some(readout) = &self.ui_runtime.hovered_source_readout {
                             ui_kit::property_row(ui, "readout", readout);
                         }
                         ui_kit::property_row(
                             ui,
                             "playback",
                             playback_status_label(
-                                self.playback,
-                                self.state.active_timepoint,
-                                self.state.timepoint_count,
+                                application_snapshot.transient().playback_active(),
+                                view.timepoint(),
+                                timepoint_count,
                             ),
                         );
                         ui_kit::property_row(
                             ui,
                             "path",
-                            dataset_path_status_label(&self.state.dataset_path),
+                            dataset_path_status_label(self.dataset_runtime.dataset.root()),
                         );
                         ui.horizontal_wrapped(|ui| {
                             show_playback_controls(
                                 ui,
-                                self.playback,
-                                self.state.active_timepoint,
-                                self.state.timepoint_count,
+                                &application_snapshot,
+                                view,
                                 workflow_busy,
-                                &mut workbench_commands,
+                                &mut application_commands,
                             );
                         });
                     });
                     ui_kit::section(ui, "Layers", |ui| {
-                        for (index, layer) in self.state.layers.iter().enumerate() {
-                            let selected = index == self.state.active_layer_index;
+                        for layer in view.layers() {
+                            let catalog_layer = application_snapshot
+                                .catalog()
+                                .layer(layer.layer_key())
+                                .expect("application view closes over the dataset catalog");
+                            let selected = layer.layer_key() == view.active_layer();
                             let detail = format!(
                                 "{} {:?} t{} z{} y{} x{}",
-                                layer.id,
-                                layer.dtype,
-                                layer.shape.t,
-                                layer.shape.z,
-                                layer.shape.y,
-                                layer.shape.x
+                                layer.layer_key().ordinal(),
+                                catalog_layer.dtype(),
+                                catalog_layer.shape().t(),
+                                catalog_layer.shape().z(),
+                                catalog_layer.shape().y(),
+                                catalog_layer.shape().x()
                             );
                             ui.horizontal(|ui| {
-                                let mut visible = layer.display.visible;
+                                let mut visible = layer.visible();
                                 if ui
                                     .checkbox(&mut visible, "")
-                                    .on_hover_text(format!("Show {}", layer.name))
+                                    .on_hover_text(format!("Show {}", catalog_layer.label()))
                                     .changed()
                                 {
-                                    workbench_commands.push(WorkbenchCommand::SetLayerVisibility {
-                                        layer_index: index,
+                                    application_commands.push(layer_view_command(
+                                        layer,
                                         visible,
-                                    });
+                                        layer.transfer().clone(),
+                                        *layer.render_state(),
+                                    ));
                                 }
                                 if ui_kit::layer_row(
                                     ui,
                                     selected,
-                                    layer.display.visible,
-                                    &layer.name,
+                                    layer.visible(),
+                                    catalog_layer.label(),
                                     &detail,
                                 )
                                 .clicked()
                                     && !selected
                                 {
-                                    workbench_commands.push(WorkbenchCommand::SelectLayer(index));
+                                    application_commands.push(ApplicationCommand::SetActiveLayer(
+                                        layer.layer_key(),
+                                    ));
                                 }
-                                let mut mode = if selected {
-                                    self.state.active_render_mode
-                                } else {
-                                    layer.render_state.mode()
-                                };
+                                let mut mode = layer.render_state().mode();
                                 egui::ComboBox::from_id_salt(format!(
                                     "layer-render-mode-{}",
-                                    layer.id
+                                    layer.layer_key().ordinal()
                                 ))
                                 .selected_text(render_mode_label(mode))
                                 .width(72.0)
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut mode, RenderMode::Mip, "MIP");
-                                    ui.selectable_value(&mut mode, RenderMode::Isosurface, "ISO");
-                                    ui.selectable_value(&mut mode, RenderMode::Dvr, "DVR");
+                                    ui.selectable_value(
+                                        &mut mode,
+                                        mirante4d_domain::RenderMode::Mip,
+                                        "MIP",
+                                    );
+                                    ui.selectable_value(
+                                        &mut mode,
+                                        mirante4d_domain::RenderMode::Isosurface,
+                                        "ISO",
+                                    );
+                                    ui.selectable_value(
+                                        &mut mode,
+                                        mirante4d_domain::RenderMode::Dvr,
+                                        "DVR",
+                                    );
                                 });
-                                let current_mode = if selected {
-                                    self.state.active_render_mode
-                                } else {
-                                    layer.render_state.mode()
-                                };
-                                if mode != current_mode {
-                                    workbench_commands.push(WorkbenchCommand::SetLayerRenderMode {
-                                        layer_index: index,
-                                        mode,
-                                    });
+                                if mode != layer.render_state().mode() {
+                                    match layer_render_state_for_mode(layer, mode) {
+                                        Ok(render_state) => application_commands.push(
+                                            layer_view_command(
+                                                layer,
+                                                layer.visible(),
+                                                layer.transfer().clone(),
+                                                render_state,
+                                            ),
+                                        ),
+                                        Err(error) => tracing::warn!(%error, "render mode change rejected"),
+                                    }
                                 }
                             });
                         }
-                        ui_kit::property_row(ui, "active ID", &self.state.active_layer_id);
+                        let active_id = current_physical_layer_id(
+                            &self.dataset_runtime,
+                            view.active_layer(),
+                        )
+                        .map(|id| id.as_str().to_owned())
+                        .unwrap_or_else(|_| view.active_layer().ordinal().to_string());
+                        ui_kit::property_row(ui, "active ID", active_id);
                     });
                     ui_kit::section(ui, "Channel Presets", |ui| {
-                        if self.state.channel_presets.is_empty() {
+                        let presets = workspace_channel_presets(&application_snapshot);
+                        if presets.is_empty() {
                             ui_kit::status_badge(ui, StatusTone::Warning, "no channel presets");
                         } else {
-                            let selected = self
-                                .state
-                                .selected_channel_preset_index
-                                .filter(|index| *index < self.state.channel_presets.len())
-                                .unwrap_or(0);
-                            let selected_name = self.state.channel_presets[selected].name.clone();
+                            let selected = application_snapshot
+                                .transient()
+                                .selected_channel_preset()
+                                .and_then(|id| presets.iter().find(|preset| preset.id() == id))
+                                .unwrap_or(&presets[0]);
                             egui::ComboBox::from_label("channel preset")
-                                .selected_text(selected_name)
+                                .selected_text(selected.label())
                                 .show_ui(ui, |ui| {
-                                    for (index, preset) in
-                                        self.state.channel_presets.iter().enumerate()
-                                    {
+                                    for preset in presets {
                                         if ui
-                                            .selectable_label(index == selected, &preset.name)
+                                            .selectable_label(
+                                                preset.id() == selected.id(),
+                                                preset.label(),
+                                            )
                                             .clicked()
                                         {
-                                            workbench_commands.push(
-                                                WorkbenchCommand::ApplyChannelPreset {
-                                                    preset_index: index,
-                                                },
+                                            application_commands.push(
+                                                ApplicationCommand::ApplyChannelPreset(
+                                                    preset.id().clone(),
+                                                ),
                                             );
                                         }
                                     }
                                 });
                             ui.horizontal_wrapped(|ui| {
                                 if ui_kit::toolbar_button(ui, "Apply", true).clicked() {
-                                    workbench_commands.push(WorkbenchCommand::ApplyChannelPreset {
-                                        preset_index: selected,
-                                    });
-                                }
-                                if ui_kit::toolbar_button(ui, "Save Current", true).clicked() {
-                                    workbench_commands
-                                        .push(WorkbenchCommand::SaveCurrentChannelPreset);
-                                }
-                                if ui_kit::toolbar_button(ui, "Update", true).clicked() {
-                                    workbench_commands.push(
-                                        WorkbenchCommand::UpdateChannelPreset {
-                                            preset_index: selected,
-                                        },
+                                    application_commands.push(
+                                        ApplicationCommand::ApplyChannelPreset(
+                                            selected.id().clone(),
+                                        ),
                                     );
                                 }
+                                if ui_kit::toolbar_button(ui, "Save Current", true).clicked() {
+                                    let id = next_user_channel_preset_id(presets);
+                                    let label = format!("Display {}", presets.len() + 1);
+                                    match channel_preset_from_current_view(view, id, label) {
+                                        Ok(preset) => application_commands
+                                            .push(ApplicationCommand::UpsertChannelPreset(preset)),
+                                        Err(error) => tracing::warn!(%error, "channel preset creation rejected"),
+                                    }
+                                }
+                                if ui_kit::toolbar_button(ui, "Update", true).clicked() {
+                                    match channel_preset_from_current_view(
+                                        view,
+                                        selected.id().clone(),
+                                        selected.label(),
+                                    ) {
+                                        Ok(preset) => application_commands
+                                            .push(ApplicationCommand::UpsertChannelPreset(preset)),
+                                        Err(error) => tracing::warn!(%error, "channel preset update rejected"),
+                                    }
+                                }
                             });
-                        }
-                        for warning in &self.state.channel_preset_warnings {
-                            ui_kit::status_badge(ui, StatusTone::Warning, warning);
                         }
                     });
                 });
@@ -851,34 +1253,49 @@ impl eframe::App for MiranteWorkbenchApp {
                         ui_kit::property_row(
                             ui,
                             "dtype",
-                            format!("{:?}", self.state.active_layer_dtype),
+                            format!("{:?}", active_catalog_layer.dtype()),
                         );
-                        if let Some(label) = active_layer_no_data_policy_label(&self.state) {
+                        if let Some(label) = active_layer_no_data_policy_label(
+                            &application_snapshot,
+                            &self.dataset_runtime,
+                        ) {
                             ui_kit::property_row(ui, "no-data", label);
                         }
-                        let layer_index = self.state.active_layer_index;
-                        let mut visible = self.state.active_layer_display.visible;
+                        let mut visible = active_layer.visible();
                         if ui.checkbox(&mut visible, "channel visible").changed() {
-                            workbench_commands.push(WorkbenchCommand::SetLayerVisibility {
-                                layer_index,
+                            application_commands.push(layer_view_command(
+                                active_layer,
                                 visible,
-                            });
+                                active_layer.transfer().clone(),
+                                *active_layer.render_state(),
+                            ));
                         }
-                        let mut opacity = self.state.active_layer_display.opacity;
+                        let mut opacity = active_layer.transfer().opacity().get();
                         ui.horizontal(|ui| {
                             ui.label("channel opacity");
                             if ui
                                 .add(egui::Slider::new(&mut opacity, 0.0..=1.0).show_value(true))
                                 .changed()
+                                && let Ok(opacity) = Opacity::new(opacity)
                             {
-                                workbench_commands.push(WorkbenchCommand::SetLayerOpacity {
-                                    layer_index,
+                                let current = active_layer.transfer();
+                                let transfer = LayerTransfer::new(
+                                    current.window(),
+                                    current.color(),
                                     opacity,
-                                });
+                                    current.curve(),
+                                    current.invert(),
+                                );
+                                application_commands.push(layer_view_command(
+                                    active_layer,
+                                    active_layer.visible(),
+                                    transfer,
+                                    *active_layer.render_state(),
+                                ));
                             }
                         });
-                        let mut window_low = self.state.active_layer_display.window.low;
-                        let mut window_high = self.state.active_layer_display.window.high;
+                        let mut window_low = active_layer.transfer().window().low();
+                        let mut window_high = active_layer.transfer().window().high();
                         ui.horizontal(|ui| {
                             ui.label("display window");
                             let low_changed = ui
@@ -895,28 +1312,52 @@ impl eframe::App for MiranteWorkbenchApp {
                                         .prefix("high "),
                                 )
                                 .changed();
-                            if low_changed || high_changed {
-                                workbench_commands.push(WorkbenchCommand::SetLayerWindow {
-                                    layer_index,
-                                    low: window_low,
-                                    high: window_high,
-                                });
+                            if (low_changed || high_changed)
+                                && let Ok(window) = DisplayWindow::new(window_low, window_high)
+                            {
+                                let current = active_layer.transfer();
+                                let transfer = LayerTransfer::new(
+                                    window,
+                                    current.color(),
+                                    current.opacity(),
+                                    current.curve(),
+                                    current.invert(),
+                                );
+                                application_commands.push(layer_view_command(
+                                    active_layer,
+                                    active_layer.visible(),
+                                    transfer,
+                                    *active_layer.render_state(),
+                                ));
                             }
                         });
-                        let mut color_rgba = self.state.active_layer_color.color_rgba;
+                        let [red, green, blue] = active_layer.transfer().color().rgb();
+                        let mut color_rgba = [red, green, blue, 1.0];
                         ui.horizontal(|ui| {
                             ui.label("channel color");
                             if ui
                                 .color_edit_button_rgba_unmultiplied(&mut color_rgba)
                                 .changed()
+                                && let Ok(color) =
+                                    RgbColor::new([color_rgba[0], color_rgba[1], color_rgba[2]])
                             {
-                                workbench_commands.push(WorkbenchCommand::SetLayerColor {
-                                    layer_index,
-                                    color_rgba,
-                                });
+                                let current = active_layer.transfer();
+                                let transfer = LayerTransfer::new(
+                                    current.window(),
+                                    color,
+                                    current.opacity(),
+                                    current.curve(),
+                                    current.invert(),
+                                );
+                                application_commands.push(layer_view_command(
+                                    active_layer,
+                                    active_layer.visible(),
+                                    transfer,
+                                    *active_layer.render_state(),
+                                ));
                             }
                         });
-                        let mut gamma = self.state.active_layer_transfer.curve.gamma_value();
+                        let mut gamma = active_layer.transfer().curve().gamma_value();
                         ui.horizontal(|ui| {
                             ui.label("transfer gamma");
                             if ui
@@ -928,38 +1369,72 @@ impl eframe::App for MiranteWorkbenchApp {
                                     .show_value(true),
                                 )
                                 .changed()
+                                && let Ok(curve) = TransferCurve::gamma(gamma)
                             {
-                                workbench_commands
-                                    .push(WorkbenchCommand::SetLayerGamma { layer_index, gamma });
+                                let current = active_layer.transfer();
+                                let transfer = LayerTransfer::new(
+                                    current.window(),
+                                    current.color(),
+                                    current.opacity(),
+                                    curve,
+                                    current.invert(),
+                                );
+                                application_commands.push(layer_view_command(
+                                    active_layer,
+                                    active_layer.visible(),
+                                    transfer,
+                                    *active_layer.render_state(),
+                                ));
                             }
                         });
-                        let mut invert = self.state.active_layer_transfer.invert;
+                        let mut invert = active_layer.transfer().invert();
                         if ui.checkbox(&mut invert, "invert LUT").changed() {
-                            workbench_commands.push(WorkbenchCommand::SetLayerInvert {
-                                layer_index,
+                            let current = active_layer.transfer();
+                            let transfer = LayerTransfer::new(
+                                current.window(),
+                                current.color(),
+                                current.opacity(),
+                                current.curve(),
                                 invert,
-                            });
+                            );
+                            application_commands.push(layer_view_command(
+                                active_layer,
+                                active_layer.visible(),
+                                transfer,
+                                *active_layer.render_state(),
+                            ));
                         }
+                        let active_curve = active_layer.transfer().curve();
+                        let active_preset_label = built_in_transfer_presets()
+                            .into_iter()
+                            .find(|preset| built_in_transfer_preset_curve(*preset) == active_curve)
+                            .map(built_in_transfer_preset_label)
+                            .unwrap_or("Custom");
                         egui::ComboBox::from_label("transfer preset")
-                            .selected_text(transfer_preset_label_for_id(
-                                &self.state.active_layer_transfer.preset,
-                            ))
+                            .selected_text(active_preset_label)
                             .show_ui(ui, |ui| {
                                 for preset in built_in_transfer_presets() {
                                     if ui
                                         .selectable_label(
-                                            self.state.active_layer_transfer.preset
-                                                == built_in_transfer_preset_id(preset),
+                                            active_curve == built_in_transfer_preset_curve(preset),
                                             built_in_transfer_preset_label(preset),
                                         )
                                         .clicked()
                                     {
-                                        workbench_commands.push(
-                                            WorkbenchCommand::SetLayerTransferPreset {
-                                                layer_index,
-                                                preset,
-                                            },
+                                        let current = active_layer.transfer();
+                                        let transfer = LayerTransfer::new(
+                                            current.window(),
+                                            current.color(),
+                                            current.opacity(),
+                                            built_in_transfer_preset_curve(preset),
+                                            current.invert(),
                                         );
+                                        application_commands.push(layer_view_command(
+                                            active_layer,
+                                            active_layer.visible(),
+                                            transfer,
+                                            *active_layer.render_state(),
+                                        ));
                                     }
                                 }
                             });
@@ -968,7 +1443,7 @@ impl eframe::App for MiranteWorkbenchApp {
                                 histogram
                             } else {
                                 let histogram_started = Instant::now();
-                                let histogram = active_layer_histogram_summary(&mut self.state);
+                                let histogram = self.active_histogram_summary();
                                 histogram_ui_ms += duration_ms(histogram_started.elapsed());
                                 active_layer_histogram_for_ui = Some(histogram.clone());
                                 histogram
@@ -989,14 +1464,23 @@ impl eframe::App for MiranteWorkbenchApp {
                             {
                                 match auto_dense_window_from_histogram(&histogram) {
                                     Ok(window) => {
-                                        workbench_commands.push(WorkbenchCommand::SetLayerWindow {
-                                            layer_index,
-                                            low: window.low,
-                                            high: window.high,
-                                        });
+                                        let current = active_layer.transfer();
+                                        let transfer = LayerTransfer::new(
+                                            window,
+                                            current.color(),
+                                            current.opacity(),
+                                            current.curve(),
+                                            current.invert(),
+                                        );
+                                        application_commands.push(layer_view_command(
+                                            active_layer,
+                                            active_layer.visible(),
+                                            transfer,
+                                            *active_layer.render_state(),
+                                        ));
                                     }
-                                    Err(err) => {
-                                        self.state.last_render_error = Some(err.to_string());
+                                    Err(error) => {
+                                        tracing::warn!(%error, "auto dense window rejected")
                                     }
                                 }
                             }
@@ -1009,14 +1493,23 @@ impl eframe::App for MiranteWorkbenchApp {
                             {
                                 match auto_signal_window_from_histogram(&histogram) {
                                     Ok(window) => {
-                                        workbench_commands.push(WorkbenchCommand::SetLayerWindow {
-                                            layer_index,
-                                            low: window.low,
-                                            high: window.high,
-                                        });
+                                        let current = active_layer.transfer();
+                                        let transfer = LayerTransfer::new(
+                                            window,
+                                            current.color(),
+                                            current.opacity(),
+                                            current.curve(),
+                                            current.invert(),
+                                        );
+                                        application_commands.push(layer_view_command(
+                                            active_layer,
+                                            active_layer.visible(),
+                                            transfer,
+                                            *active_layer.render_state(),
+                                        ));
                                     }
-                                    Err(err) => {
-                                        self.state.last_render_error = Some(err.to_string());
+                                    Err(error) => {
+                                        tracing::warn!(%error, "auto signal window rejected")
                                     }
                                 }
                             }
@@ -1026,23 +1519,19 @@ impl eframe::App for MiranteWorkbenchApp {
                             "shape",
                             format!(
                                 "t{} z{} y{} x{}",
-                                self.state.active_layer_shape.t,
-                                self.state.active_layer_shape.z,
-                                self.state.active_layer_shape.y,
-                                self.state.active_layer_shape.x
+                                active_catalog_layer.shape().t(),
+                                active_catalog_layer.shape().z(),
+                                active_catalog_layer.shape().y(),
+                                active_catalog_layer.shape().x()
                             ),
                         );
                         ui_kit::property_row(
                             ui,
                             "timepoint",
-                            format!(
-                                "{}/{}",
-                                self.state.active_timepoint.0 + 1,
-                                self.state.timepoint_count
-                            ),
+                            format!("{}/{}", view.timepoint().get() + 1, timepoint_count),
                         );
                     });
-                    if let Some(task) = &self.import_task {
+                    if let Some(task) = &self.import_runtime.import_task {
                         ui_kit::section(ui, "Import", |ui| {
                             ui_kit::status_badge(
                                 ui,
@@ -1055,14 +1544,14 @@ impl eframe::App for MiranteWorkbenchApp {
                                 ui.add(egui::ProgressBar::new(progress).show_percentage());
                             }
                         });
-                    } else if let Some(task) = &self.tiff_import_setup_task {
+                    } else if let Some(task) = &self.import_runtime.tiff_import_setup_task {
                         ui_kit::section(ui, "TIFF Import", |ui| {
                             ui_kit::status_badge(ui, StatusTone::Warning, "inspecting input");
                             ui_kit::property_row(ui, "source", task.source.path().display());
                             ui_kit::property_row(ui, "output", task.output_parent.display());
                         });
                     }
-                    if let Some(pending_import) = &mut self.pending_tiff_import {
+                    if let Some(pending_import) = &mut self.import_runtime.pending_tiff_import {
                         ui_kit::section(ui, "TIFF Import", |ui| {
                             ui_kit::property_row(
                                 ui,
@@ -1173,16 +1662,20 @@ impl eframe::App for MiranteWorkbenchApp {
                         });
                     }
                     ui_kit::section(ui, "Frame", |ui| {
-                        show_frame_fidelity_property_rows(ui, &self.state.frame_fidelity);
-                        if visible_channel_fidelity_is_mixed(&self.state.channel_fidelity) {
+                        show_frame_fidelity_property_rows(ui, &self.render_runtime.frame_fidelity);
+                        if visible_channel_fidelity_is_mixed(&self.render_runtime.channel_fidelity)
+                        {
                             ui_kit::status_badge(ui, StatusTone::Warning, "mixed channel fidelity");
                         }
                         ui_kit::property_row(
                             ui,
                             "pixels",
-                            self.state.diagnostics.output_pixels.to_string(),
+                            self.render_runtime.diagnostics.output_pixels.to_string(),
                         );
-                        if matches!(self.state.render_backend, RenderBackend::GpuResidentBricks) {
+                        if matches!(
+                            self.render_runtime.render_backend,
+                            RenderBackend::GpuResidentBricks
+                        ) {
                             ui_kit::property_row(ui, "nonzero", "unavailable");
                             ui_kit::property_row(ui, "max", "unavailable");
                             ui_kit::property_row(ui, "mean", "unavailable");
@@ -1190,20 +1683,23 @@ impl eframe::App for MiranteWorkbenchApp {
                             ui_kit::property_row(
                                 ui,
                                 "nonzero",
-                                self.state.diagnostics.nonzero_pixels.to_string(),
+                                self.render_runtime.diagnostics.nonzero_pixels.to_string(),
                             );
                             ui_kit::property_row(
                                 ui,
                                 "max",
-                                self.state.diagnostics.max_value.to_string(),
+                                self.render_runtime.diagnostics.max_value.to_string(),
                             );
                             ui_kit::property_row(
                                 ui,
                                 "mean",
-                                format!("{:.2}", self.state.active_intensity_summary.mean),
+                                format!(
+                                    "{:.2}",
+                                    self.analysis_runtime.active_intensity_summary.mean
+                                ),
                             );
                         }
-                        for channel in &self.state.channel_fidelity {
+                        for channel in &self.render_runtime.channel_fidelity {
                             ui_kit::property_row(
                                 ui,
                                 format!("{} fidelity", channel.layer_id),
@@ -1212,26 +1708,23 @@ impl eframe::App for MiranteWorkbenchApp {
                         }
                     });
                     ui_kit::section(ui, "Viewer Tools", |ui| {
-                        let mut active_tool = self.state.viewer_tools.active_tool;
+                        let mut active_tool = application_snapshot.transient().active_tool();
                         ui.horizontal_wrapped(|ui| {
-                            ui.selectable_value(&mut active_tool, ViewerTool::Navigate, "Navigate");
-                            ui.selectable_value(&mut active_tool, ViewerTool::Inspect, "Inspect");
+                            ui.selectable_value(&mut active_tool, ToolKind::Navigate, "Navigate");
+                            ui.selectable_value(&mut active_tool, ToolKind::Inspect, "Inspect");
+                            ui.selectable_value(&mut active_tool, ToolKind::Crosshair, "Crosshair");
+                            ui.selectable_value(&mut active_tool, ToolKind::RoiBox, "ROI");
                             ui.selectable_value(
                                 &mut active_tool,
-                                ViewerTool::Crosshair,
-                                "Crosshair",
-                            );
-                            ui.selectable_value(&mut active_tool, ViewerTool::RoiBox, "ROI");
-                            ui.selectable_value(
-                                &mut active_tool,
-                                ViewerTool::MeasureDistance,
+                                ToolKind::MeasureDistance,
                                 "Measure",
                             );
                         });
-                        if active_tool != self.state.viewer_tools.active_tool {
-                            self.state.viewer_tools.set_active_tool(active_tool);
+                        if active_tool != application_snapshot.transient().active_tool() {
+                            application_commands
+                                .push(ApplicationCommand::SetActiveTool(active_tool));
                         }
-                        if let Some(crosshair) = &self.state.viewer_tools.crosshair
+                        if let Some(crosshair) = &self.ui_runtime.viewer_tools.crosshair
                             && let Some(screen) = crosshair.screen_position
                         {
                             ui_kit::property_row(
@@ -1240,16 +1733,26 @@ impl eframe::App for MiranteWorkbenchApp {
                                 format!("x{:.0} y{:.0} {:?}", screen.x, screen.y, crosshair.kind),
                             );
                         }
-                        if let Some(selection) = &self.state.viewer_tools.selection {
+                        if let Some(selection) = &self.ui_runtime.viewer_tools.selection {
                             ui_kit::property_row(ui, "selection", format!("{selection:?}"));
                         }
                     });
-                    ui_kit::section(ui, "Scene Artifacts", |ui| {
-                        rerender_requested |= show_scene_artifacts_editor(ui, &mut self.state);
-                    });
+                    ui_kit::section(
+                        ui,
+                        "Scene Artifacts",
+                        |ui| match show_scene_artifacts_editor(
+                            ui,
+                            &mut self.analysis_runtime,
+                            &mut self.ui_runtime,
+                        ) {
+                            Ok(changed) => rerender_requested |= changed,
+                            Err(error) => tracing::warn!(%error, "scene edit rejected"),
+                        },
+                    );
                     ui_kit::section(ui, "Analysis", |ui| {
-                        let analysis_running = self.analysis_task.is_some();
-                        normalize_analysis_selection(&mut self.state);
+                        let analysis_running = self.analysis_runtime.analysis_task.is_some();
+                        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+                        let transient = snapshot.transient();
                         ui.horizontal_wrapped(|ui| {
                             if ui_kit::toolbar_button(ui, "Analyze Time", !analysis_running)
                                 .clicked()
@@ -1267,25 +1770,26 @@ impl eframe::App for MiranteWorkbenchApp {
                                 self.cancel_analysis_task();
                             }
                             if ui_kit::toolbar_button(ui, "Workspace", true).clicked() {
-                                self.analysis_workspace_open = true;
+                                self.ui_runtime.analysis_workspace_open = true;
                             }
                             if ui_kit::toolbar_button(
                                 ui,
                                 "Export CSV",
-                                !analysis_running
-                                    && self.state.selected_analysis_table_index.is_some(),
+                                !analysis_running && transient.selected_analysis_table().is_some(),
                             )
                             .clicked()
+                                && let Err(error) = export_selected_analysis_table(
+                                    &mut self.analysis_runtime,
+                                    AnalysisTableExportInput {
+                                        table_descriptors: transient.analysis_tables(),
+                                        selected_table: transient.selected_analysis_table(),
+                                    },
+                                )
                             {
-                                match export_selected_analysis_table(&mut self.state) {
-                                    Ok(()) => {}
-                                    Err(err) => {
-                                        self.state.last_render_error = Some(err.to_string())
-                                    }
-                                }
+                                tracing::warn!(%error, "analysis table export rejected");
                             }
                         });
-                        if let Some(task) = &self.analysis_task {
+                        if let Some(task) = &self.analysis_runtime.analysis_task {
                             ui_kit::status_badge(
                                 ui,
                                 StatusTone::Warning,
@@ -1297,41 +1801,59 @@ impl eframe::App for MiranteWorkbenchApp {
                                 ui.add(egui::ProgressBar::new(progress).show_percentage());
                             }
                         }
-                        show_analysis_workspace(ui, &mut self.state);
+                        let commands = show_analysis_workspace(
+                            ui,
+                            &self.analysis_runtime,
+                            &mut self.ui_runtime,
+                            AnalysisWorkspaceViewInput {
+                                table_descriptors: transient.analysis_tables(),
+                                plot_descriptors: transient.analysis_plots(),
+                                selected_table: transient.selected_analysis_table(),
+                                selected_plot: transient.selected_analysis_plot(),
+                                selected_plot_point: transient.selected_analysis_plot_point(),
+                            },
+                        );
+                        application_commands.extend(commands);
                     });
                     ui_kit::section(ui, "Settings", |ui| self.show_settings_body(ui));
                     egui::CollapsingHeader::new("Runtime Diagnostics")
                         .default_open(false)
                         .show(ui, |ui| self.show_runtime_diagnostics_body(ui));
                     ui_kit::section(ui, "Render Settings", |ui| {
-                        let mut sampling_policy = self.state.render_sampling_policy;
+                        let current_render = *active_layer.render_state();
+                        let mut sampling_policy = current_render.sampling_policy();
                         egui::ComboBox::from_label("sampling")
                             .selected_text(render_sampling_policy_label(sampling_policy))
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(
                                     &mut sampling_policy,
-                                    RenderSamplingPolicy::SmoothLinear,
-                                    render_sampling_policy_label(
-                                        RenderSamplingPolicy::SmoothLinear,
-                                    ),
+                                    SamplingPolicy::SmoothLinear,
+                                    render_sampling_policy_label(SamplingPolicy::SmoothLinear),
                                 );
                                 ui.selectable_value(
                                     &mut sampling_policy,
-                                    RenderSamplingPolicy::VoxelExact,
-                                    render_sampling_policy_label(RenderSamplingPolicy::VoxelExact),
+                                    SamplingPolicy::VoxelExact,
+                                    render_sampling_policy_label(SamplingPolicy::VoxelExact),
                                 );
                             });
-                        if sampling_policy != self.state.render_sampling_policy {
-                            workbench_commands
-                                .push(WorkbenchCommand::SetRenderSamplingPolicy(sampling_policy));
+                        if sampling_policy != current_render.sampling_policy() {
+                            match render_state_with_sampling(current_render, sampling_policy) {
+                                Ok(render_state) => application_commands.push(layer_view_command(
+                                    active_layer,
+                                    active_layer.visible(),
+                                    active_layer.transfer().clone(),
+                                    render_state,
+                                )),
+                                Err(error) => tracing::warn!(%error, "sampling change rejected"),
+                            }
                         }
                         ui_kit::property_row(
                             ui,
                             "sampling policy",
-                            render_sampling_policy_label(self.state.render_sampling_policy),
+                            render_sampling_policy_label(current_render.sampling_policy()),
                         );
-                        match self.state.active_render_mode {
-                            RenderMode::Mip => {
+                        match current_render.mode() {
+                            mirante4d_domain::RenderMode::Mip => {
                                 ui_kit::property_row(
                                     ui,
                                     "MIP projection",
@@ -1343,45 +1865,63 @@ impl eframe::App for MiranteWorkbenchApp {
                                     "active channel window and color",
                                 );
                             }
-                            RenderMode::Isosurface => {
-                                let mut display_level = self.state.iso_display_level;
+                            mirante4d_domain::RenderMode::Isosurface => {
+                                let parameters = current_render
+                                    .iso_parameters()
+                                    .expect("ISO mode has ISO parameters");
+                                let mut display_level = parameters.display_level();
                                 if ui
                                     .add(
                                         egui::Slider::new(&mut display_level, 0.0..=1.0)
                                             .text("ISO display level"),
                                     )
                                     .changed()
-                                {
-                                    workbench_commands.push(WorkbenchCommand::SetIsoDisplayLevel {
+                                    && let Ok(render_state) = CanonicalRenderState::iso(
+                                        current_render.sampling_policy(),
+                                        parameters.shading_policy(),
                                         display_level,
-                                    });
+                                    )
+                                {
+                                    application_commands.push(layer_view_command(
+                                        active_layer,
+                                        active_layer.visible(),
+                                        active_layer.transfer().clone(),
+                                        render_state,
+                                    ));
                                 }
-                                let mut iso_shading_policy = self.state.render_iso_shading_policy;
+                                let mut iso_shading_policy = parameters.shading_policy();
                                 egui::ComboBox::from_label("ISO shading")
                                     .selected_text(iso_shading_policy_label(iso_shading_policy))
                                     .show_ui(ui, |ui| {
                                         ui.selectable_value(
                                             &mut iso_shading_policy,
-                                            RenderIsoShadingPolicy::GradientLighting,
+                                            IsoShadingPolicy::GradientLighting,
                                             "Gradient lighting",
                                         );
                                         ui.selectable_value(
                                             &mut iso_shading_policy,
-                                            RenderIsoShadingPolicy::Flat,
+                                            IsoShadingPolicy::Flat,
                                             "Flat threshold hit",
                                         );
                                     });
-                                if iso_shading_policy != self.state.render_iso_shading_policy {
-                                    workbench_commands.push(
-                                        WorkbenchCommand::SetRenderIsoShadingPolicy(
-                                            iso_shading_policy,
-                                        ),
-                                    );
+                                if iso_shading_policy != parameters.shading_policy()
+                                    && let Ok(render_state) = CanonicalRenderState::iso(
+                                        current_render.sampling_policy(),
+                                        iso_shading_policy,
+                                        parameters.display_level(),
+                                    )
+                                {
+                                    application_commands.push(layer_view_command(
+                                        active_layer,
+                                        active_layer.visible(),
+                                        active_layer.transfer().clone(),
+                                        render_state,
+                                    ));
                                 }
                                 show_iso_light_controls(
                                     ui,
-                                    self.state.iso_light_state,
-                                    &mut workbench_commands,
+                                    *view.iso_light(),
+                                    &mut application_commands,
                                 );
                                 ui_kit::property_row(
                                     ui,
@@ -1390,8 +1930,11 @@ impl eframe::App for MiranteWorkbenchApp {
                                 );
                                 ui_kit::property_row(ui, "ISO pick policy", "display-level hit");
                             }
-                            RenderMode::Dvr => {
-                                let mut density_scale = self.state.dvr_density_scale;
+                            mirante4d_domain::RenderMode::Dvr => {
+                                let parameters = current_render
+                                    .dvr_parameters()
+                                    .expect("DVR mode has DVR parameters");
+                                let mut density_scale = parameters.density_scale();
                                 if ui
                                     .add(
                                         egui::Slider::new(
@@ -1401,42 +1944,55 @@ impl eframe::App for MiranteWorkbenchApp {
                                         .text("DVR density scale"),
                                     )
                                     .changed()
-                                {
-                                    workbench_commands.push(WorkbenchCommand::SetDvrDensityScale {
+                                    && let Ok(render_state) = CanonicalRenderState::dvr(
+                                        current_render.sampling_policy(),
+                                        parameters.opacity_transfer(),
                                         density_scale,
-                                    });
+                                    )
+                                {
+                                    application_commands.push(layer_view_command(
+                                        active_layer,
+                                        active_layer.visible(),
+                                        active_layer.transfer().clone(),
+                                        render_state,
+                                    ));
                                 }
-                                let layer_index = self.state.active_layer_index;
-                                let mut opacity_low =
-                                    self.state.active_dvr_opacity_transfer.window.low;
-                                let mut opacity_high =
-                                    self.state.active_dvr_opacity_transfer.window.high;
+                                let opacity = parameters.opacity_transfer();
+                                let mut opacity_low = opacity.window().low();
+                                let mut opacity_high = opacity.window().high();
+                                let mut opacity_window_changed = false;
                                 ui.horizontal(|ui| {
                                     ui.label("opacity low");
                                     if ui.add(egui::DragValue::new(&mut opacity_low)).changed() {
-                                        workbench_commands.push(
-                                            WorkbenchCommand::SetLayerDvrOpacityWindow {
-                                                layer_index,
-                                                low: opacity_low,
-                                                high: opacity_high,
-                                            },
-                                        );
+                                        opacity_window_changed = true;
                                     }
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("opacity high");
                                     if ui.add(egui::DragValue::new(&mut opacity_high)).changed() {
-                                        workbench_commands.push(
-                                            WorkbenchCommand::SetLayerDvrOpacityWindow {
-                                                layer_index,
-                                                low: opacity_low,
-                                                high: opacity_high,
-                                            },
-                                        );
+                                        opacity_window_changed = true;
                                     }
                                 });
-                                let mut opacity_gamma =
-                                    self.state.active_dvr_opacity_transfer.curve.gamma_value();
+                                if opacity_window_changed
+                                    && let Ok(window) =
+                                        DisplayWindow::new(opacity_low, opacity_high)
+                                {
+                                    let opacity_transfer =
+                                        CanonicalDvrOpacityTransfer::new(window, opacity.curve());
+                                    if let Ok(render_state) = CanonicalRenderState::dvr(
+                                        current_render.sampling_policy(),
+                                        opacity_transfer,
+                                        parameters.density_scale(),
+                                    ) {
+                                        application_commands.push(layer_view_command(
+                                            active_layer,
+                                            active_layer.visible(),
+                                            active_layer.transfer().clone(),
+                                            render_state,
+                                        ));
+                                    }
+                                }
+                                let mut opacity_gamma = opacity.curve().gamma_value();
                                 ui.horizontal(|ui| {
                                     ui.label("opacity gamma");
                                     if ui
@@ -1448,13 +2004,22 @@ impl eframe::App for MiranteWorkbenchApp {
                                             .show_value(true),
                                         )
                                         .changed()
+                                        && let Ok(curve) = TransferCurve::gamma(opacity_gamma)
+                                        && let Ok(render_state) = CanonicalRenderState::dvr(
+                                            current_render.sampling_policy(),
+                                            CanonicalDvrOpacityTransfer::new(
+                                                opacity.window(),
+                                                curve,
+                                            ),
+                                            parameters.density_scale(),
+                                        )
                                     {
-                                        workbench_commands.push(
-                                            WorkbenchCommand::SetLayerDvrOpacityGamma {
-                                                layer_index,
-                                                gamma: opacity_gamma,
-                                            },
-                                        );
+                                        application_commands.push(layer_view_command(
+                                            active_layer,
+                                            active_layer.visible(),
+                                            active_layer.transfer().clone(),
+                                            render_state,
+                                        ));
                                     }
                                 });
                                 let histogram = if let Some(histogram) =
@@ -1463,7 +2028,7 @@ impl eframe::App for MiranteWorkbenchApp {
                                     histogram
                                 } else {
                                     let histogram_started = Instant::now();
-                                    let histogram = active_layer_histogram_summary(&mut self.state);
+                                    let histogram = self.active_histogram_summary();
                                     histogram_ui_ms += duration_ms(histogram_started.elapsed());
                                     active_layer_histogram_for_ui = Some(histogram.clone());
                                     histogram
@@ -1476,14 +2041,49 @@ impl eframe::App for MiranteWorkbenchApp {
                                     )
                                     .clicked()
                                     {
-                                        workbench_commands.push(
-                                            WorkbenchCommand::AutoLayerDvrOpacity { layer_index },
-                                        );
+                                        match auto_dvr_opacity_transfer_from_histogram(&histogram) {
+                                            Ok(transfer) => {
+                                                let opacity_transfer =
+                                                    CanonicalDvrOpacityTransfer::new(
+                                                        transfer.window(),
+                                                        transfer.curve(),
+                                                    );
+                                                if let Ok(render_state) = CanonicalRenderState::dvr(
+                                                    current_render.sampling_policy(),
+                                                    opacity_transfer,
+                                                    parameters.density_scale(),
+                                                ) {
+                                                    application_commands.push(layer_view_command(
+                                                        active_layer,
+                                                        active_layer.visible(),
+                                                        active_layer.transfer().clone(),
+                                                        render_state,
+                                                    ));
+                                                }
+                                            }
+                                            Err(error) => {
+                                                tracing::warn!(%error, "auto DVR opacity rejected")
+                                            }
+                                        }
                                     }
                                     if ui_kit::toolbar_button(ui, "Reset Opacity", true).clicked() {
-                                        workbench_commands.push(
-                                            WorkbenchCommand::ResetLayerDvrOpacity { layer_index },
+                                        let opacity_transfer = CanonicalDvrOpacityTransfer::new(
+                                            active_layer.transfer().window(),
+                                            TransferCurve::gamma(DEFAULT_DVR_OPACITY_GAMMA)
+                                                .expect("default DVR opacity gamma is valid"),
                                         );
+                                        if let Ok(render_state) = CanonicalRenderState::dvr(
+                                            current_render.sampling_policy(),
+                                            opacity_transfer,
+                                            parameters.density_scale(),
+                                        ) {
+                                            application_commands.push(layer_view_command(
+                                                active_layer,
+                                                active_layer.visible(),
+                                                active_layer.transfer().clone(),
+                                                render_state,
+                                            ));
+                                        }
                                     }
                                 });
                                 ui_kit::property_row(
@@ -1503,34 +2103,61 @@ impl eframe::App for MiranteWorkbenchApp {
                         ui_kit::property_row(
                             ui,
                             "projection",
-                            format!("{:?}", self.state.camera.projection),
+                            format!("{:?}", view.camera().projection()),
                         );
-                        let camera_forward = self.state.camera.axes().forward;
-                        ui_kit::property_row(
-                            ui,
-                            "forward",
-                            format!(
-                                "{:.2}, {:.2}, {:.2}",
-                                camera_forward.x, camera_forward.y, camera_forward.z
-                            ),
-                        );
-                        ui_kit::property_row(
-                            ui,
-                            "scale",
-                            format!(
-                                "{:.4} world/pt",
-                                self.state.camera.world_per_screen_point_at_target()
-                            ),
-                        );
+                        if let Ok(camera_frame) = CameraFrame::new(
+                            *view.camera(),
+                            self.render_runtime.presentation_viewport,
+                        ) {
+                            let camera_forward = camera_frame.axes().forward();
+                            ui_kit::property_row(
+                                ui,
+                                "forward",
+                                format!(
+                                    "{:.2}, {:.2}, {:.2}",
+                                    camera_forward[0], camera_forward[1], camera_forward[2]
+                                ),
+                            );
+                            if let Ok(scale) = camera_frame.world_per_screen_point_at_target() {
+                                ui_kit::property_row(ui, "scale", format!("{scale:.4} world/pt"));
+                            }
+                        }
                     });
                     ui_kit::section(ui, "Messages", |ui| {
-                        if let Some(error) = &self.state.last_render_error {
+                        if let Some(message) =
+                            application_problem_message(application_snapshot.latest_problem())
+                        {
+                            ui_kit::status_badge(ui, StatusTone::Error, message);
+                        }
+                        if let Some(error) = &self.import_runtime.tiff_import_setup_error {
                             ui_kit::status_badge(ui, StatusTone::Error, error);
                         }
-                        if let Some(message) = &self.state.last_workflow_message {
-                            ui_kit::property_row(ui, "workflow", message);
+                        if let Some(error) = &self.dataset_runtime.brick_stream_last_error {
+                            ui_kit::status_badge(ui, StatusTone::Error, error);
                         }
-                        if let Some(hover) = self.state.hovered_pixel {
+                        if let Some(error) = &self.render_runtime.visible_brick_plan_error {
+                            ui_kit::status_badge(ui, StatusTone::Error, error);
+                        }
+                        if let Some(error) = &self.render_runtime.frame_fidelity.last_capacity_error
+                            && self.dataset_runtime.brick_stream_last_error.as_ref() != Some(error)
+                        {
+                            ui_kit::status_badge(ui, StatusTone::Error, error);
+                        }
+                        for panel in self.render_runtime.cross_section_runtime.panels() {
+                            if let Some(failure) = &panel.render_failure {
+                                ui_kit::status_badge(
+                                    ui,
+                                    StatusTone::Error,
+                                    format!(
+                                        "{} cross-section failed ({:?}): {}",
+                                        panel.panel_id.label(),
+                                        failure.kind,
+                                        failure.message
+                                    ),
+                                );
+                            }
+                        }
+                        if let Some(hover) = self.ui_runtime.hovered_pixel {
                             ui_kit::property_row(
                                 ui,
                                 "hover",
@@ -1544,17 +2171,29 @@ impl eframe::App for MiranteWorkbenchApp {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             self.show_viewer_layout(
                 ui,
-                &mut workbench_commands,
+                &application_snapshot,
+                view,
+                &mut application_commands,
                 &mut rerender_requested,
                 &mut texture_refresh_requested,
             );
         });
 
-        show_analysis_workspace_window(
+        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let transient = snapshot.transient();
+        let commands = show_analysis_workspace_window(
             ui.ctx(),
-            &mut self.analysis_workspace_open,
-            &mut self.state,
+            &self.analysis_runtime,
+            &mut self.ui_runtime,
+            AnalysisWorkspaceViewInput {
+                table_descriptors: transient.analysis_tables(),
+                plot_descriptors: transient.analysis_plots(),
+                selected_table: transient.selected_analysis_table(),
+                selected_plot: transient.selected_analysis_plot(),
+                selected_plot_point: transient.selected_analysis_plot_point(),
+            },
         );
+        application_commands.extend(commands);
 
         self.show_tiff_import_setup_window(
             ui.ctx(),
@@ -1566,15 +2205,20 @@ impl eframe::App for MiranteWorkbenchApp {
         let ui_build_ms = duration_ms(ui_build_started.elapsed());
 
         let command_apply_started = Instant::now();
-        for command in workbench_commands {
-            let outcome = self.apply_workbench_command(command, ui.ctx());
-            rerender_requested |= outcome.rerender_requested;
-            texture_refresh_requested |= outcome.texture_refresh_requested;
+        for command in application_commands {
+            if let Err(fault) = self.apply_application_command(command, ui.ctx()) {
+                tracing::warn!(?fault, "UI application command rejected");
+            }
+        }
+        let accepted_snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let accepted_tool = viewer_tool_for_kind(accepted_snapshot.transient().active_tool());
+        if self.ui_runtime.viewer_tools.active_tool != accepted_tool {
+            self.ui_runtime.viewer_tools.set_active_tool(accepted_tool);
         }
         let command_apply_ms = duration_ms(command_apply_started.elapsed());
 
         let display_refresh_trigger_started = Instant::now();
-        rerender_requested |= take_lod_replan_pending(&mut self.state);
+        rerender_requested |= take_lod_replan_pending(&mut self.render_runtime);
         if rerender_requested {
             self.refresh_frame(ui.ctx());
         } else if texture_refresh_requested {
@@ -1584,8 +2228,7 @@ impl eframe::App for MiranteWorkbenchApp {
 
         let import_action_started = Instant::now();
         if dismiss_tiff_import_setup_error {
-            self.tiff_import_setup_error = None;
-            self.state.last_render_error = None;
+            self.import_runtime.tiff_import_setup_error = None;
         }
         if cancel_pending_tiff_import {
             self.cancel_pending_tiff_import();
@@ -1600,7 +2243,14 @@ impl eframe::App for MiranteWorkbenchApp {
         let brick_result_drain_ms = duration_ms(brick_result_drain_started.elapsed());
 
         let background_repaint_started = Instant::now();
-        if self.background_work_active() {
+        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        if workbench_playback_runtime::background_work_active(
+            &snapshot,
+            &self.import_runtime,
+            &self.analysis_runtime,
+            &self.dataset_runtime,
+            &self.render_runtime,
+        ) {
             request_background_work_repaint_after(ui.ctx());
         }
         let background_repaint_request_ms = duration_ms(background_repaint_started.elapsed());
@@ -1622,6 +2272,38 @@ impl eframe::App for MiranteWorkbenchApp {
                 background_repaint_request_ms,
             },
         );
+    }
+
+    fn on_exit(&mut self) {
+        if let Some(source_open_service) = self.source_open_service.take()
+            && let Err(error) = source_open_service.shutdown()
+        {
+            tracing::warn!(%error, "dataset open service shutdown failed");
+        }
+        if let Err(error) = self.settings_connection.shutdown() {
+            tracing::warn!(%error, "settings actor shutdown failed");
+        }
+        if let Some(project_persistence) = self.project_persistence.take()
+            && let Err(error) = project_persistence.shutdown()
+        {
+            tracing::warn!(%error, "project persistence actor shutdown failed");
+        }
+    }
+}
+
+fn application_problem_message(event: Option<&ApplicationEvent>) -> Option<String> {
+    match event? {
+        ApplicationEvent::OperationCompleted {
+            token,
+            outcome: mirante4d_application::OperationOutcome::Failed(code),
+        } => Some(format!(
+            "{:?} failed ({code:?}); correct the input, permissions, or resource limit and retry",
+            token.kind()
+        )),
+        ApplicationEvent::ResourcePolicyRejected { reason, .. } => Some(format!(
+            "settings save failed ({reason:?}); correct the settings file or permissions and retry"
+        )),
+        _ => None,
     }
 }
 

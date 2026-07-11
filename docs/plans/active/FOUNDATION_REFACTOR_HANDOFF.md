@@ -5,9 +5,9 @@ Last reviewed: 2026-07-11
 Current technical sequence: WP-07B through WP-15
 Public-data publication: deferred to a separate future handoff
 WP-07B predecessor: `foundation-wp-07a-exit-1`
-Completed through: WP-07A canonical model contract
-Current checkpoint: unreachable WP-07B-A boundary candidate implemented; promotion pending
-Next checkpoint: WP-07B-A protected-main acceptance, then atomic WP-07B-B live cutover
+Completed through: WP-07B-A unreachable boundary acceptance
+Current checkpoint: WP-07B-B live cutover implemented; exit verification pending
+Next checkpoint: WP-07B exit acceptance, then WP-08A dataset/runtime contract
 
 ## Purpose
 
@@ -167,9 +167,11 @@ WP-06 is complete at `foundation-wp-06-exit-1`. Its exact protected-main
 revision passed the required real product-open exercise before the create-once
 tag was accepted. WP-07A is complete at
 `5383cbb93c13c59e6f035bfa551356c75fb426dc`
-(`foundation-wp-07a-exit-1`). The current WP-07B-A boundary candidate remains
-unreachable and makes no product claim. WP-07B-B changes live viewer behavior
-and requires the package-stamped real product scenario.
+(`foundation-wp-07a-exit-1`). WP-07B-A was accepted at
+`dfe49398fbacc933140cfd9a7992c7f86b3a9548`. The current WP-07B-B revision
+implements the live boundary and predecessor deletion; it remains incomplete
+until the package-stamped automated, trusted-GPU, hosted, and real product
+scenario all pass on the accepted revision.
 
 ## Dataset And Fixture Boundary
 

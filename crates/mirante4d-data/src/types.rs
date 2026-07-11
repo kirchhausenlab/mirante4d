@@ -1,5 +1,5 @@
-use mirante4d_core::{DatasetId, GridToWorld, LayerId, Shape3D, ShapeError, TimeIndex};
-use mirante4d_format::BrickIndex;
+use mirante4d_domain::{GridToWorld, Shape3D, ShapeError, TimeIndex};
+use mirante4d_format::{BrickIndex, DatasetId, LayerId};
 
 use super::DataError;
 
@@ -177,7 +177,7 @@ impl VolumeRegion {
 
     pub(super) fn validate_within(self, shape: Shape3D) -> Result<RegionEnds, DataError> {
         let ends = self.ends()?;
-        if ends.z > shape.z || ends.y > shape.y || ends.x > shape.x {
+        if ends.z > shape.z() || ends.y > shape.y() || ends.x > shape.x() {
             return Err(DataError::RegionOutOfBounds {
                 z_start: self.z_start,
                 z_end: ends.z,
@@ -185,9 +185,9 @@ impl VolumeRegion {
                 y_end: ends.y,
                 x_start: self.x_start,
                 x_end: ends.x,
-                shape_z: shape.z,
-                shape_y: shape.y,
-                shape_x: shape.x,
+                shape_z: shape.z(),
+                shape_y: shape.y(),
+                shape_x: shape.x(),
             });
         }
         Ok(ends)

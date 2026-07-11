@@ -1,7 +1,8 @@
 use std::{fmt::Write as _, fs::File, path::Path};
 
-use mirante4d_core::{LayerId, Shape3D, TimeIndex};
 use mirante4d_data::DatasetHandle;
+use mirante4d_domain::{Shape3D, TimeIndex};
+use mirante4d_format::LayerId;
 use mirante4d_format::NativeDatasetProvenanceKind;
 use mirante4d_format::validate::load_manifest;
 use tiff::encoder::{TiffEncoder, colortype};
@@ -111,9 +112,9 @@ fn source_tiff_archive_matches_independent_reader_observations() {
 
 fn assert_grid_to_world_close(actual: GridToWorld, expected: GridToWorld) {
     for (index, (actual, expected)) in actual
-        .matrix4x4_row_major
+        .row_major()
         .iter()
-        .zip(expected.matrix4x4_row_major.iter())
+        .zip(expected.row_major().iter())
         .enumerate()
     {
         assert!(
@@ -124,12 +125,7 @@ fn assert_grid_to_world_close(actual: GridToWorld, expected: GridToWorld) {
 }
 
 fn assert_grid_to_world_matrix(actual: GridToWorld, expected: [f64; 16]) {
-    for (index, (actual, expected)) in actual
-        .matrix4x4_row_major
-        .iter()
-        .zip(expected.iter())
-        .enumerate()
-    {
+    for (index, (actual, expected)) in actual.row_major().iter().zip(expected.iter()).enumerate() {
         assert!(
             (actual - expected).abs() <= 1.0e-9,
             "matrix element {index}: actual {actual}, expected {expected}"
@@ -239,8 +235,8 @@ fn imports_uint16_tiff_directory_to_native_dataset() {
         [0.25, 0.5, 0.75, 1.0]
     );
     assert_eq!(manifest.layers[1].shape, Shape4D::new(2, 2, 2, 3).unwrap());
-    assert_eq!(manifest.layers[1].display.window.low, 1000.0);
-    assert_eq!(manifest.layers[1].display.window.high, 1115.0);
+    assert_eq!(manifest.layers[1].display.window().low(), 1000.0);
+    assert_eq!(manifest.layers[1].display.window().high(), 1115.0);
     assert_eq!(manifest.layers[1].scales.len(), 1);
     assert_eq!(
         manifest.layers[1].scales[0].storage.brick_shape,
@@ -254,7 +250,7 @@ fn imports_uint16_tiff_directory_to_native_dataset() {
 
     let dataset = DatasetHandle::open(&report.output_package).unwrap();
     let volume = dataset
-        .read_u16_volume(&LayerId::new("ch1").unwrap(), TimeIndex(1))
+        .read_u16_volume(&LayerId::new("ch1").unwrap(), TimeIndex::new(1))
         .unwrap();
     assert_eq!(volume.voxel(1, 1, 2), Some(1115));
 }
@@ -352,7 +348,7 @@ fn import_rejects_review_plan_with_tampered_value_range() {
 
 #[test]
 fn import_multiscale_specs_follow_production_storage_policy() {
-    let grid_to_world = GridToWorld::scale_um(0.2, 0.3, 0.5);
+    let grid_to_world = mirante4d_format::grid_to_world_scale_um(0.2, 0.3, 0.5);
 
     let tiny_3d =
         build_mean_multiscale_specs(Shape4D::new(2, 2, 2, 3).unwrap(), grid_to_world).unwrap();
@@ -412,9 +408,9 @@ fn import_multiscale_specs_follow_production_storage_policy() {
 
 #[test]
 fn import_multiscale_specs_honor_explicit_storage_brick_shape() {
-    let grid_to_world = GridToWorld::scale_um(0.001, 0.001, 0.001);
+    let grid_to_world = mirante4d_format::grid_to_world_scale_um(0.001, 0.001, 0.001);
     let storage = TiffImportStorageOptions {
-        brick_shape_zyx: Some(mirante4d_core::Shape3D::new(16, 256, 256).unwrap()),
+        brick_shape_zyx: Some(Shape3D::new(16, 256, 256).unwrap()),
     };
 
     let scales = build_mean_multiscale_specs_with_storage(
@@ -470,7 +466,7 @@ fn imports_large_tiff_stack_with_bounded_native_chunks() {
         .read_u16_brick_at_scale(
             &LayerId::new("ch0").unwrap(),
             0,
-            TimeIndex(0),
+            TimeIndex::new(0),
             mirante4d_data::SpatialBrickIndex::new(1, 1, 1),
         )
         .unwrap();
@@ -542,7 +538,7 @@ fn imports_single_uint16_tiff_file_to_native_dataset() {
 
     let dataset = DatasetHandle::open(&report.output_package).unwrap();
     let volume = dataset
-        .read_u16_volume(&LayerId::new("ch0").unwrap(), TimeIndex(0))
+        .read_u16_volume(&LayerId::new("ch0").unwrap(), TimeIndex::new(0))
         .unwrap();
     assert_eq!(volume.voxel(1, 1, 2), Some(15));
 }
@@ -598,7 +594,7 @@ fn imports_single_uint8_tiff_file_to_native_uint8_dataset() {
 
     let dataset = DatasetHandle::open(&report.output_package).unwrap();
     let volume = dataset
-        .read_u8_volume(&LayerId::new("ch0").unwrap(), TimeIndex(0))
+        .read_u8_volume(&LayerId::new("ch0").unwrap(), TimeIndex::new(0))
         .unwrap();
     assert_eq!(volume.voxel(0, 0, 0), Some(0));
     assert_eq!(volume.voxel(1, 1, 2), Some(15));
@@ -687,7 +683,7 @@ fn imports_uint8_no_data_policy_with_render_valid_mask() {
 
     let dataset = DatasetHandle::open(&report.output_package).unwrap();
     let volume = dataset
-        .read_u8_volume(&LayerId::new("ch0").unwrap(), TimeIndex(0))
+        .read_u8_volume(&LayerId::new("ch0").unwrap(), TimeIndex::new(0))
         .unwrap();
     assert_eq!(volume.voxel(0, 0, 0), Some(255));
     assert_eq!(volume.render_voxel(0, 0, 0), None);
@@ -792,7 +788,7 @@ fn imports_uint8_plane_series_no_data_policy_streaming() {
 
     let dataset = DatasetHandle::open(&report.output_package).unwrap();
     let volume = dataset
-        .read_u8_volume(&LayerId::new("ch0").unwrap(), TimeIndex(0))
+        .read_u8_volume(&LayerId::new("ch0").unwrap(), TimeIndex::new(0))
         .unwrap();
     assert_eq!(volume.voxel(0, 0, 0), Some(255));
     assert_eq!(volume.render_voxel(0, 0, 0), None);
@@ -889,7 +885,7 @@ fn imports_single_float32_tiff_file_to_native_float32_dataset() {
 
     let dataset = DatasetHandle::open(&report.output_package).unwrap();
     let volume = dataset
-        .read_f32_volume(&LayerId::new("ch0").unwrap(), TimeIndex(0))
+        .read_f32_volume(&LayerId::new("ch0").unwrap(), TimeIndex::new(0))
         .unwrap();
     assert_eq!(volume.voxel(0, 0, 0), Some(-1.5));
     assert_eq!(volume.voxel(0, 0, 2), Some(0.25));
@@ -940,7 +936,7 @@ fn imports_zero_tiff_stack_as_valid_dense_data() {
         .read_u16_brick_at_scale(
             &LayerId::new("ch0").unwrap(),
             0,
-            TimeIndex(0),
+            TimeIndex::new(0),
             mirante4d_data::SpatialBrickIndex::new(0, 0, 0),
         )
         .unwrap();
@@ -1162,7 +1158,7 @@ fn imports_directory_with_explicit_grouping_without_filename_tokens() {
     assert_eq!(report.timepoint_count, 2);
     let dataset = DatasetHandle::open(&report.output_package).unwrap();
     let volume = dataset
-        .read_u16_volume(&LayerId::new("ch0").unwrap(), TimeIndex(1))
+        .read_u16_volume(&LayerId::new("ch0").unwrap(), TimeIndex::new(1))
         .unwrap();
     assert_eq!(volume.voxel(1, 1, 2), Some(115));
 }
@@ -1252,10 +1248,10 @@ fn imports_plane_series_folder_per_channel_in_lexicographic_order() {
 
     let dataset = DatasetHandle::open(&report.output_package).unwrap();
     let ch0 = dataset
-        .read_u8_volume(&LayerId::new("ch0").unwrap(), TimeIndex(0))
+        .read_u8_volume(&LayerId::new("ch0").unwrap(), TimeIndex::new(0))
         .unwrap();
     let ch1 = dataset
-        .read_u8_volume(&LayerId::new("ch1").unwrap(), TimeIndex(0))
+        .read_u8_volume(&LayerId::new("ch1").unwrap(), TimeIndex::new(0))
         .unwrap();
     assert_eq!(ch0.voxel(0, 0, 0), Some(10));
     assert_eq!(ch0.voxel(1, 0, 0), Some(20));

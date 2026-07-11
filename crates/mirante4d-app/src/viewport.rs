@@ -1,17 +1,21 @@
 use eframe::egui;
 use glam::{DQuat, DVec3};
-use mirante4d_core::{
-    CameraView, DEFAULT_PRESENTATION_VIEWPORT_POINTS, GridToWorld, IntensityDType,
-    PresentationViewport, Projection, Shape3D,
+use mirante4d_application::{ApplicationCommand, ApplicationSnapshot};
+use mirante4d_domain::{
+    CameraView, GridToWorld, IntensityDType, IsoShadingPolicy, Projection, RenderState,
+    SamplingPolicy, Shape3D, UnitQuaternion, WorldPoint3,
 };
+use mirante4d_format::CurrentGridToWorldExt;
+use mirante4d_project_model::ViewState;
+use mirante4d_render_api::{CameraFrame, DEFAULT_PRESENTATION_VIEWPORT, PresentationViewport};
 use mirante4d_renderer::{
     CameraRenderQuality, IntensitySamplingPolicy, IsoShadingMode, MipImageF32, MipImageU16,
     RenderViewport,
 };
 
 use crate::{
-    AppState, RenderIsoShadingPolicy, RenderMode, RenderSamplingPolicy, ViewportHover,
-    ViewportIntensity, commands::WorkbenchCommand,
+    ViewportHover, ViewportIntensity,
+    current_runtime::{render::CurrentRenderRuntime, ui::CurrentUiRuntime},
 };
 
 const DEFAULT_INITIAL_VIEWPORT_SIDE: u64 = 512;
@@ -30,7 +34,7 @@ pub(crate) fn default_camera_for_shape(shape: Shape3D, grid_to_world: GridToWorl
         target,
         DQuat::from_rotation_x(std::f64::consts::PI),
         &corners,
-        DEFAULT_PRESENTATION_VIEWPORT_POINTS,
+        DEFAULT_PRESENTATION_VIEWPORT,
     )
 }
 
@@ -43,9 +47,9 @@ pub(crate) fn fit_camera_to_shape_preserving_view(
     let target = shape_center_world(shape, grid_to_world);
     let corners = shape_bounds_corners_world(shape, grid_to_world);
     fit_camera_to_world_bounds(
-        camera.projection,
+        camera.projection(),
         target,
-        camera.orientation,
+        dquat(camera.orientation()),
         &corners,
         presentation_viewport,
     )
@@ -59,7 +63,7 @@ pub(crate) fn default_render_viewport_for_shape(shape: Shape3D) -> anyhow::Resul
 }
 
 pub(crate) fn default_presentation_viewport() -> PresentationViewport {
-    DEFAULT_PRESENTATION_VIEWPORT_POINTS
+    DEFAULT_PRESENTATION_VIEWPORT
 }
 
 pub(crate) fn presentation_viewport_for_display_size(
@@ -97,10 +101,10 @@ pub(crate) fn render_viewport_for_display_size(
 }
 
 fn shape_center_world(shape: Shape3D, grid_to_world: GridToWorld) -> DVec3 {
-    grid_to_world.transform_point(DVec3::new(
-        (shape.x.saturating_sub(1)) as f64 * 0.5,
-        (shape.y.saturating_sub(1)) as f64 * 0.5,
-        (shape.z.saturating_sub(1)) as f64 * 0.5,
+    grid_to_world.transform_point_vec(DVec3::new(
+        (shape.x().saturating_sub(1)) as f64 * 0.5,
+        (shape.y().saturating_sub(1)) as f64 * 0.5,
+        (shape.z().saturating_sub(1)) as f64 * 0.5,
     ))
 }
 
@@ -108,18 +112,18 @@ fn shape_bounds_corners_world(shape: Shape3D, grid_to_world: GridToWorld) -> [DV
     let min_x = -0.5;
     let min_y = -0.5;
     let min_z = -0.5;
-    let max_x = shape.x as f64 - 0.5;
-    let max_y = shape.y as f64 - 0.5;
-    let max_z = shape.z as f64 - 0.5;
+    let max_x = shape.x() as f64 - 0.5;
+    let max_y = shape.y() as f64 - 0.5;
+    let max_z = shape.z() as f64 - 0.5;
     [
-        grid_to_world.transform_point(DVec3::new(min_x, min_y, min_z)),
-        grid_to_world.transform_point(DVec3::new(max_x, min_y, min_z)),
-        grid_to_world.transform_point(DVec3::new(min_x, max_y, min_z)),
-        grid_to_world.transform_point(DVec3::new(max_x, max_y, min_z)),
-        grid_to_world.transform_point(DVec3::new(min_x, min_y, max_z)),
-        grid_to_world.transform_point(DVec3::new(max_x, min_y, max_z)),
-        grid_to_world.transform_point(DVec3::new(min_x, max_y, max_z)),
-        grid_to_world.transform_point(DVec3::new(max_x, max_y, max_z)),
+        grid_to_world.transform_point_vec(DVec3::new(min_x, min_y, min_z)),
+        grid_to_world.transform_point_vec(DVec3::new(max_x, min_y, min_z)),
+        grid_to_world.transform_point_vec(DVec3::new(min_x, max_y, min_z)),
+        grid_to_world.transform_point_vec(DVec3::new(max_x, max_y, min_z)),
+        grid_to_world.transform_point_vec(DVec3::new(min_x, min_y, max_z)),
+        grid_to_world.transform_point_vec(DVec3::new(max_x, min_y, max_z)),
+        grid_to_world.transform_point_vec(DVec3::new(min_x, max_y, max_z)),
+        grid_to_world.transform_point_vec(DVec3::new(max_x, max_y, max_z)),
     ]
 }
 
@@ -130,9 +134,23 @@ fn fit_camera_to_world_bounds(
     corners: &[DVec3; 8],
     presentation_viewport: PresentationViewport,
 ) -> CameraView {
-    let fit_width_points = (presentation_viewport.width_points / FIT_MARGIN).max(1.0);
-    let fit_height_points = (presentation_viewport.height_points / FIT_MARGIN).max(1.0);
-    let axes = CameraView::new(projection, target, orientation, 1.0, 1.0, 1.0).axes();
+    let fit_width_points = (presentation_viewport.width_points() / FIT_MARGIN).max(1.0);
+    let fit_height_points = (presentation_viewport.height_points() / FIT_MARGIN).max(1.0);
+    let provisional = CameraView::new(
+        projection,
+        world_point(target),
+        unit_quaternion(orientation),
+        1.0,
+        1.0,
+        1.0,
+    )
+    .expect("camera fit inputs are finite and positive");
+    let axes = CameraFrame::new(provisional, presentation_viewport)
+        .expect("camera fit inputs produce finite axes")
+        .axes();
+    let right = DVec3::from_array(axes.right());
+    let up = DVec3::from_array(axes.up());
+    let forward = DVec3::from_array(axes.forward());
 
     let mut max_abs_right = 0.0_f64;
     let mut max_abs_up = 0.0_f64;
@@ -141,9 +159,9 @@ fn fit_camera_to_world_bounds(
     let mut max_pair_distance = 0.0_f64;
     for corner in corners {
         let from_target = *corner - target;
-        max_abs_right = max_abs_right.max(from_target.dot(axes.right).abs());
-        max_abs_up = max_abs_up.max(from_target.dot(axes.up).abs());
-        let depth = from_target.dot(axes.forward);
+        max_abs_right = max_abs_right.max(from_target.dot(right).abs());
+        max_abs_up = max_abs_up.max(from_target.dot(up).abs());
+        let depth = from_target.dot(forward);
         min_depth = min_depth.min(depth);
         max_depth = max_depth.max(depth);
         for other in corners {
@@ -158,16 +176,16 @@ fn fit_camera_to_world_bounds(
     let perspective_view_distance_world = (bounds_depth_along_view * 2.0)
         .max(max_pair_distance * 1.25)
         .max(1.0);
-    let eye = target - axes.forward * perspective_view_distance_world;
+    let eye = target - forward * perspective_view_distance_world;
     let mut max_abs_projected_x_at_focal_1 = 0.0_f64;
     let mut max_abs_projected_y_at_focal_1 = 0.0_f64;
     for corner in corners {
         let from_eye = *corner - eye;
-        let depth = from_eye.dot(axes.forward).max(1.0e-9);
+        let depth = from_eye.dot(forward).max(1.0e-9);
         max_abs_projected_x_at_focal_1 =
-            max_abs_projected_x_at_focal_1.max((from_eye.dot(axes.right) / depth).abs());
+            max_abs_projected_x_at_focal_1.max((from_eye.dot(right) / depth).abs());
         max_abs_projected_y_at_focal_1 =
-            max_abs_projected_y_at_focal_1.max((from_eye.dot(axes.up) / depth).abs());
+            max_abs_projected_y_at_focal_1.max((from_eye.dot(up) / depth).abs());
     }
     let focal_limit_x = focal_limit_for_axis(fit_width_points, max_abs_projected_x_at_focal_1);
     let focal_limit_y = focal_limit_for_axis(fit_height_points, max_abs_projected_y_at_focal_1);
@@ -179,12 +197,13 @@ fn fit_camera_to_world_bounds(
 
     CameraView::new(
         projection,
-        target,
-        orientation,
+        world_point(target),
+        unit_quaternion(orientation),
         orthographic_world_per_screen_point,
         perspective_focal_length_screen_points,
         perspective_view_distance_world,
     )
+    .expect("camera fit derives finite positive framing")
 }
 
 fn focal_limit_for_axis(fit_points: f64, max_abs_projected_at_focal_1: f64) -> f64 {
@@ -196,14 +215,17 @@ fn focal_limit_for_axis(fit_points: f64, max_abs_projected_at_focal_1: f64) -> f
 }
 
 pub(crate) fn viewport_hover_from_response(
-    state: &AppState,
+    snapshot: &ApplicationSnapshot,
+    view: &ViewState,
+    render: &CurrentRenderRuntime,
     response: &egui::Response,
 ) -> Option<ViewportHover> {
     let position = response.hover_pos()?;
+    let active_layer_dtype = snapshot.catalog().layer(view.active_layer())?.dtype();
     viewport_hover_from_image_point(
-        &state.frame,
-        state.frame_f32.as_ref(),
-        state.active_layer_dtype,
+        &render.frame,
+        render.frame_f32.as_ref(),
+        active_layer_dtype,
         response.rect,
         position,
     )
@@ -272,24 +294,29 @@ pub(crate) fn viewport_hover_from_normalized_point(
 }
 
 pub(crate) fn viewport_interaction_commands(
-    state: &mut AppState,
+    ui_runtime: &mut CurrentUiRuntime,
+    view: &ViewState,
     response: &egui::Response,
     viewport_size: egui::Vec2,
-) -> Vec<WorkbenchCommand> {
+) -> Vec<ApplicationCommand> {
     let mut commands = Vec::new();
     if response.drag_stopped() {
-        state.viewport_orbit_drag = None;
+        ui_runtime.viewport_orbit_drag = None;
     }
     if response.dragged() {
         let camera_pan_requested = response.ctx.input(|input| {
             input.pointer.middle_down() || input.pointer.secondary_down() || input.modifiers.shift
         });
         if camera_pan_requested {
-            state.viewport_orbit_drag = None;
+            ui_runtime.viewport_orbit_drag = None;
         }
-        if let Some(command) =
-            viewport_drag_command(state, response, viewport_size, camera_pan_requested)
-        {
+        if let Some(command) = viewport_drag_command(
+            ui_runtime,
+            *view.camera(),
+            response,
+            viewport_size,
+            camera_pan_requested,
+        ) {
             commands.push(command);
         }
     }
@@ -297,7 +324,7 @@ pub(crate) fn viewport_interaction_commands(
     if response.hovered() {
         let scroll_y = response.ctx.input(|input| input.smooth_scroll_delta().y);
         if scroll_y != 0.0
-            && let Some(command) = viewport_scroll_command(scroll_y)
+            && let Some(command) = viewport_scroll_command(*view.camera(), scroll_y)
         {
             commands.push(command);
         }
@@ -306,11 +333,12 @@ pub(crate) fn viewport_interaction_commands(
 }
 
 pub(crate) fn viewport_drag_command(
-    state: &mut AppState,
+    ui_runtime: &mut CurrentUiRuntime,
+    camera: CameraView,
     response: &egui::Response,
     viewport_size_points: egui::Vec2,
     camera_pan_requested: bool,
-) -> Option<WorkbenchCommand> {
+) -> Option<ApplicationCommand> {
     if viewport_size_points.x <= 0.0
         || viewport_size_points.y <= 0.0
         || !viewport_size_points.x.is_finite()
@@ -323,7 +351,9 @@ pub(crate) fn viewport_drag_command(
         if !motion_points.x.is_finite() || !motion_points.y.is_finite() {
             return None;
         }
-        return Some(WorkbenchCommand::CameraPanDrag { motion_points });
+        let mut camera = camera;
+        apply_camera_pan(&mut camera, motion_points);
+        return Some(ApplicationCommand::SetCamera(camera));
     }
 
     let current_pointer = response.interact_pointer_pos()?;
@@ -335,34 +365,59 @@ pub(crate) fn viewport_drag_command(
     {
         return None;
     }
-    let drag_state = state
+    let drag_state = ui_runtime
         .viewport_orbit_drag
         .get_or_insert(ViewportOrbitDragState {
-            start_camera: state.camera,
+            start_camera: camera,
         });
     let current_position_points = current_pointer - response.rect.min.to_vec2();
     let start_position_points = current_position_points - total_drag_delta;
-    Some(WorkbenchCommand::CameraOrbitDrag {
-        start_camera: drag_state.start_camera,
+    let mut camera = drag_state.start_camera;
+    apply_camera_orbit(
+        &mut camera,
+        drag_state.start_camera,
         start_position_points,
         current_position_points,
         viewport_size_points,
-    })
+    );
+    Some(ApplicationCommand::SetCamera(camera))
 }
 
-pub(crate) fn viewport_scroll_command(scroll_y_points: f32) -> Option<WorkbenchCommand> {
+pub(crate) fn viewport_scroll_command(
+    camera: CameraView,
+    scroll_y_points: f32,
+) -> Option<ApplicationCommand> {
     if scroll_y_points == 0.0 || !scroll_y_points.is_finite() {
         return None;
     }
-    Some(WorkbenchCommand::CameraZoom { scroll_y_points })
+    let mut camera = camera;
+    apply_camera_zoom(&mut camera, scroll_y_points);
+    Some(ApplicationCommand::SetCamera(camera))
 }
 
 pub(crate) fn apply_camera_pan(camera: &mut CameraView, motion_points: egui::Vec2) {
-    let world_per_point = camera.world_per_screen_point_at_target();
-    camera.pan_by(
-        -f64::from(motion_points.x) * world_per_point,
-        f64::from(motion_points.y) * world_per_point,
-    );
+    let world_per_point = match camera.projection() {
+        Projection::Orthographic => camera.orthographic_world_per_screen_point(),
+        Projection::Perspective => {
+            camera.perspective_view_distance_world()
+                / camera.perspective_focal_length_screen_points()
+        }
+    };
+    let frame = CameraFrame::new(*camera, DEFAULT_PRESENTATION_VIEWPORT)
+        .expect("validated camera has finite axes");
+    let axes = frame.axes();
+    let target = dvec3(camera.target())
+        + DVec3::from_array(axes.right()) * (-f64::from(motion_points.x) * world_per_point)
+        + DVec3::from_array(axes.up()) * (f64::from(motion_points.y) * world_per_point);
+    *camera = CameraView::new(
+        camera.projection(),
+        world_point(target),
+        camera.orientation(),
+        camera.orthographic_world_per_screen_point(),
+        camera.perspective_focal_length_screen_points(),
+        camera.perspective_view_distance_world(),
+    )
+    .expect("pan preserves validated camera invariants");
 }
 
 pub(crate) fn apply_camera_orbit(
@@ -372,47 +427,151 @@ pub(crate) fn apply_camera_orbit(
     current_position_points: egui::Pos2,
     viewport_size_points: egui::Vec2,
 ) {
-    camera.orbit_arcball(
+    let Some(delta) = arcball_delta(
         f64::from(start_position_points.x),
         f64::from(start_position_points.y),
         f64::from(current_position_points.x),
         f64::from(current_position_points.y),
         f64::from(viewport_size_points.x),
         f64::from(viewport_size_points.y),
-        start_camera,
-    );
+    ) else {
+        return;
+    };
+    let orientation = dquat(start_camera.orientation()) * delta;
+    *camera = CameraView::new(
+        start_camera.projection(),
+        start_camera.target(),
+        unit_quaternion(orientation),
+        start_camera.orthographic_world_per_screen_point(),
+        start_camera.perspective_focal_length_screen_points(),
+        start_camera.perspective_view_distance_world(),
+    )
+    .expect("orbit preserves validated camera invariants");
 }
 
 pub(crate) fn apply_camera_zoom(camera: &mut CameraView, scroll_y_points: f32) {
     let factor = (-f64::from(scroll_y_points) * 0.001).exp();
-    camera.zoom_by(factor);
+    let (orthographic_scale, focal_length) = match camera.projection() {
+        Projection::Orthographic => (
+            (camera.orthographic_world_per_screen_point() * factor).max(1.0e-9),
+            camera.perspective_focal_length_screen_points(),
+        ),
+        Projection::Perspective => (
+            camera.orthographic_world_per_screen_point(),
+            (camera.perspective_focal_length_screen_points() / factor).max(1.0e-9),
+        ),
+    };
+    *camera = CameraView::new(
+        camera.projection(),
+        camera.target(),
+        camera.orientation(),
+        orthographic_scale,
+        focal_length,
+        camera.perspective_view_distance_world(),
+    )
+    .expect("zoom preserves validated camera invariants");
+}
+
+fn dvec3(point: WorldPoint3) -> DVec3 {
+    DVec3::from_array(point.components())
+}
+
+fn world_point(point: DVec3) -> WorldPoint3 {
+    WorldPoint3::new(point.x, point.y, point.z).expect("interaction math produced a finite point")
+}
+
+fn dquat(quaternion: UnitQuaternion) -> DQuat {
+    DQuat::from_array(quaternion.xyzw())
+}
+
+fn unit_quaternion(quaternion: DQuat) -> UnitQuaternion {
+    let [x, y, z, w] = quaternion.to_array();
+    UnitQuaternion::new_xyzw(x, y, z, w)
+        .expect("interaction math produced a finite nonzero quaternion")
+}
+
+fn arcball_delta(
+    start_x_points: f64,
+    start_y_points: f64,
+    current_x_points: f64,
+    current_y_points: f64,
+    viewport_width_points: f64,
+    viewport_height_points: f64,
+) -> Option<DQuat> {
+    let start = arcball_vector(
+        start_x_points,
+        start_y_points,
+        viewport_width_points,
+        viewport_height_points,
+    )?;
+    let current = arcball_vector(
+        current_x_points,
+        current_y_points,
+        viewport_width_points,
+        viewport_height_points,
+    )?;
+    if start.abs_diff_eq(current, 1.0e-12) {
+        None
+    } else {
+        Some(DQuat::from_rotation_arc(current, start).normalize())
+    }
+}
+
+fn arcball_vector(
+    x_points: f64,
+    y_points: f64,
+    width_points: f64,
+    height_points: f64,
+) -> Option<DVec3> {
+    if !x_points.is_finite()
+        || !y_points.is_finite()
+        || !width_points.is_finite()
+        || !height_points.is_finite()
+        || width_points <= 0.0
+        || height_points <= 0.0
+    {
+        return None;
+    }
+    let radius = width_points.min(height_points) * 0.5;
+    let mut x = (2.0 * x_points - width_points) / (2.0 * radius);
+    let mut y = (height_points - 2.0 * y_points) / (2.0 * radius);
+    let length_squared = x * x + y * y;
+    let z = if length_squared <= 1.0 {
+        (1.0 - length_squared).sqrt()
+    } else {
+        let inverse_length = length_squared.sqrt().recip();
+        x *= inverse_length;
+        y *= inverse_length;
+        0.0
+    };
+    Some(DVec3::new(x, y, z).normalize())
 }
 
 pub(crate) fn camera_render_quality_for_render_state(
-    render_state: crate::ChannelRenderState,
+    render_state: RenderState,
 ) -> CameraRenderQuality {
     CameraRenderQuality {
         intensity_sampling: match render_state.sampling_policy() {
-            RenderSamplingPolicy::VoxelExact => IntensitySamplingPolicy::VoxelExact,
-            RenderSamplingPolicy::SmoothLinear => IntensitySamplingPolicy::SmoothLinear,
+            SamplingPolicy::VoxelExact => IntensitySamplingPolicy::VoxelExact,
+            SamplingPolicy::SmoothLinear => IntensitySamplingPolicy::SmoothLinear,
         },
-        iso_shading: match render_state.iso_shading_policy() {
-            RenderIsoShadingPolicy::Flat => IsoShadingMode::Flat,
-            RenderIsoShadingPolicy::GradientLighting => IsoShadingMode::GradientLighting,
+        iso_shading: match render_state
+            .iso_parameters()
+            .map(|parameters| parameters.shading_policy())
+            .unwrap_or(IsoShadingPolicy::GradientLighting)
+        {
+            IsoShadingPolicy::Flat => IsoShadingMode::Flat,
+            IsoShadingPolicy::GradientLighting => IsoShadingMode::GradientLighting,
         },
     }
 }
 
-pub(crate) fn camera_render_quality(state: &AppState) -> CameraRenderQuality {
-    camera_render_quality_for_render_state(
-        crate::layer_state::active_layer_render_state_from_runtime(state),
-    )
-}
-
-pub(crate) fn resident_brick_render_supported(mode: RenderMode) -> bool {
+pub(crate) fn resident_brick_render_supported(mode: mirante4d_domain::RenderMode) -> bool {
     matches!(
         mode,
-        RenderMode::Mip | RenderMode::Isosurface | RenderMode::Dvr
+        mirante4d_domain::RenderMode::Mip
+            | mirante4d_domain::RenderMode::Isosurface
+            | mirante4d_domain::RenderMode::Dvr
     )
 }
 

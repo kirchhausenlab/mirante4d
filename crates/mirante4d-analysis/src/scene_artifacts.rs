@@ -1,10 +1,59 @@
 use std::collections::BTreeMap;
 
 use glam::DVec3;
-use mirante4d_core::{LayerId, TimeIndex};
+use mirante4d_domain::TimeIndex;
+use mirante4d_format::LayerId;
 use serde::{Deserialize, Serialize};
 
 use crate::AnalysisError;
+
+mod wire {
+    use mirante4d_domain::TimeIndex;
+    use mirante4d_format::LayerId;
+    use serde::{Deserialize, Serialize};
+
+    pub(super) mod time_index {
+        use super::*;
+
+        pub(crate) fn serialize<S>(value: &TimeIndex, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            value.get().serialize(serializer)
+        }
+
+        pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<TimeIndex, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            Ok(TimeIndex::new(u64::deserialize(deserializer)?))
+        }
+    }
+
+    pub(super) mod optional_layer_id {
+        use super::*;
+
+        pub(crate) fn serialize<S>(
+            value: &Option<LayerId>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            value.as_ref().map(LayerId::as_str).serialize(serializer)
+        }
+
+        pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Option<LayerId>, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            Option::<String>::deserialize(deserializer)?
+                .map(LayerId::new)
+                .transpose()
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -19,9 +68,11 @@ pub struct SceneStyleRgba {
 #[serde(rename_all = "snake_case")]
 pub enum SceneArtifactTime {
     Static,
-    Timepoint(TimeIndex),
+    Timepoint(#[serde(with = "wire::time_index")] TimeIndex),
     Interval {
+        #[serde(with = "wire::time_index")]
         start: TimeIndex,
+        #[serde(with = "wire::time_index")]
         end_exclusive: TimeIndex,
     },
 }
@@ -34,6 +85,7 @@ pub struct TrackTrailWindow {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrackPoint {
+    #[serde(with = "wire::time_index")]
     pub timepoint: TimeIndex,
     pub position_world: DVec3,
     #[serde(default)]
@@ -44,6 +96,7 @@ pub struct TrackPoint {
 pub struct TrackArtifact {
     pub id: SceneArtifactId,
     pub name: String,
+    #[serde(with = "wire::optional_layer_id")]
     pub source_layer_id: Option<LayerId>,
     pub points: Vec<TrackPoint>,
     pub style: SceneStyleRgba,
@@ -227,8 +280,8 @@ impl SceneArtifactTime {
     pub fn interval(start: TimeIndex, end_exclusive: TimeIndex) -> Result<Self, AnalysisError> {
         if start >= end_exclusive {
             return Err(AnalysisError::InvalidSceneTimeInterval {
-                start: start.0,
-                end_exclusive: end_exclusive.0,
+                start: start.get(),
+                end_exclusive: end_exclusive.get(),
             });
         }
         Ok(Self::Interval {
@@ -298,15 +351,15 @@ impl TrackArtifact {
         if !self.visible || self.points.len() < 2 {
             return Vec::new();
         }
-        let start_time = timepoint.0.saturating_sub(trail.before);
-        let end_time = timepoint.0.saturating_add(trail.after);
+        let start_time = timepoint.get().saturating_sub(trail.before);
+        let end_time = timepoint.get().saturating_add(trail.after);
         self.points
             .windows(2)
             .filter_map(|pair| {
                 let start = &pair[0];
                 let end = &pair[1];
-                let segment_start = start.timepoint.0;
-                let segment_end = end.timepoint.0;
+                let segment_start = start.timepoint.get();
+                let segment_end = end.timepoint.get();
                 let overlaps = segment_start <= end_time
                     && segment_end >= start_time
                     && segment_start < segment_end;
@@ -765,8 +818,8 @@ mod tests {
     fn track_artifact_requires_strictly_increasing_timepoints() {
         let id = SceneArtifactId::new("track", "track-a").unwrap();
         let points = vec![
-            TrackPoint::new(TimeIndex(0), DVec3::ZERO).unwrap(),
-            TrackPoint::new(TimeIndex(0), DVec3::X).unwrap(),
+            TrackPoint::new(TimeIndex::new(0), DVec3::ZERO).unwrap(),
+            TrackPoint::new(TimeIndex::new(0), DVec3::X).unwrap(),
         ];
 
         let err = TrackArtifact::new(id, "bad track", None, points).unwrap_err();
@@ -778,12 +831,12 @@ mod tests {
     fn track_segment_extraction_is_time_window_aware() {
         let track = sample_track();
 
-        let exact = track.visible_segments(TimeIndex(2), TrackTrailWindow::CURRENT_SEGMENT);
-        let windowed = track.visible_segments(TimeIndex(2), TrackTrailWindow::new(2, 2));
+        let exact = track.visible_segments(TimeIndex::new(2), TrackTrailWindow::CURRENT_SEGMENT);
+        let windowed = track.visible_segments(TimeIndex::new(2), TrackTrailWindow::new(2, 2));
 
         assert_eq!(exact.len(), 1);
-        assert_eq!(exact[0].start_timepoint, TimeIndex(1));
-        assert_eq!(exact[0].end_timepoint, TimeIndex(3));
+        assert_eq!(exact[0].start_timepoint, TimeIndex::new(1));
+        assert_eq!(exact[0].end_timepoint, TimeIndex::new(3));
         assert_eq!(windowed.len(), 2);
     }
 
@@ -899,9 +952,9 @@ mod tests {
             "track a",
             Some(LayerId::new("ch0").unwrap()),
             vec![
-                TrackPoint::new(TimeIndex(0), DVec3::ZERO).unwrap(),
-                TrackPoint::new(TimeIndex(1), DVec3::X).unwrap(),
-                TrackPoint::new(TimeIndex(3), DVec3::new(3.0, 0.0, 0.0)).unwrap(),
+                TrackPoint::new(TimeIndex::new(0), DVec3::ZERO).unwrap(),
+                TrackPoint::new(TimeIndex::new(1), DVec3::X).unwrap(),
+                TrackPoint::new(TimeIndex::new(3), DVec3::new(3.0, 0.0, 0.0)).unwrap(),
             ],
         )
         .unwrap()

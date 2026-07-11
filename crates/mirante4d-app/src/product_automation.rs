@@ -6,15 +6,22 @@ use std::{
 };
 
 use eframe::egui;
-use mirante4d_core::{LayerId, PresentationViewport, TimeIndex};
+use mirante4d_application::{ApplicationCommand, CrossSectionPanelId};
 use mirante4d_data::DataEngineStats;
+use mirante4d_domain::{
+    CrossSectionView as CanonicalCrossSectionView, DisplayWindow, DvrOpacityTransfer,
+    IsoShadingPolicy, LayerTransfer, Opacity, RenderMode, RenderState, TimeIndex, UnitQuaternion,
+    ViewerLayout, WorldPoint3,
+};
+use mirante4d_project_model::LayerViewState;
+use mirante4d_render_api::PresentationViewport;
 use mirante4d_renderer::gpu::{GpuDisplayFrame, GpuRenderer};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::cross_section_readout::{
     CrossSectionHoverGenerationStatus, CrossSectionHoverReadout, CrossSectionHoverStatus,
-    CrossSectionHoverValue, cross_section_hover_readout_for_panel_point,
+    CrossSectionHoverValue, CrossSectionReadoutInput, cross_section_hover_readout_for_panel_point,
 };
 use crate::cross_section_runtime::{CrossSectionChunkPayload, CrossSectionChunkState};
 use crate::display_refresh::DisplayRefreshTiming;
@@ -23,9 +30,10 @@ use crate::tools::ViewerToolEvent;
 use crate::viewport::viewport_hover_from_normalized_point;
 use crate::{
     DVR_DENSITY_SCALE_MAX, DVR_DENSITY_SCALE_MIN, DisplayedFrameFreshness, FrameCompleteness,
-    MiranteWorkbenchApp, RenderMode, WorkbenchCommand,
+    MiranteWorkbenchApp, application_view,
     cross_section_scheduler::cross_section_interaction_recent,
-    viewer_layout::{PanelId, ViewerLayout},
+    current_egui_shell_bridge, current_physical_layer_id,
+    viewer_layout::{PanelId, render_cross_section_view_state},
 };
 
 mod capture;
@@ -61,6 +69,129 @@ const AUTOMATION_REPORT_ENV: &str = "MIRANTE4D_AUTOMATION_REPORT";
 const AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 const AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
 const AUTOMATION_SCHEMA_VERSION: u32 = 1;
+
+fn dispatch_application_command(
+    app: &mut MiranteWorkbenchApp,
+    ctx: &egui::Context,
+    command: ApplicationCommand,
+) -> Result<(), String> {
+    app.apply_application_command(command, ctx)
+        .map(|_| ())
+        .map_err(|fault| format!("application command was rejected: {fault:?}"))
+}
+
+fn layer_command(
+    app: &MiranteWorkbenchApp,
+    layer_index: usize,
+    update: impl FnOnce(&LayerViewState) -> Result<LayerViewState, String>,
+) -> Result<ApplicationCommand, String> {
+    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let layer = application_view(&snapshot)
+        .layers()
+        .get(layer_index)
+        .ok_or_else(|| format!("layer index {layer_index} is out of range"))?;
+    Ok(ApplicationCommand::SetLayerView(update(layer)?))
+}
+
+fn active_layer_index(app: &MiranteWorkbenchApp) -> usize {
+    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let view = application_view(&snapshot);
+    view.layers()
+        .iter()
+        .position(|layer| layer.layer_key() == view.active_layer())
+        .expect("application view has an active layer")
+}
+
+fn render_state_for_mode(
+    current: RenderState,
+    transfer: &LayerTransfer,
+    mode: RenderMode,
+) -> Result<RenderState, String> {
+    let sampling = current.sampling_policy();
+    match mode {
+        RenderMode::Mip => Ok(RenderState::mip(sampling)),
+        RenderMode::Isosurface => {
+            let (shading, level) = current
+                .iso_parameters()
+                .map(|parameters| (parameters.shading_policy(), parameters.display_level()))
+                .unwrap_or((IsoShadingPolicy::GradientLighting, 0.5));
+            RenderState::iso(sampling, shading, level).map_err(|error| error.to_string())
+        }
+        RenderMode::Dvr => {
+            let (opacity_transfer, density) = current
+                .dvr_parameters()
+                .map(|parameters| (parameters.opacity_transfer(), parameters.density_scale()))
+                .unwrap_or((
+                    DvrOpacityTransfer::new(transfer.window(), transfer.curve()),
+                    12.0,
+                ));
+            RenderState::dvr(sampling, opacity_transfer, density).map_err(|error| error.to_string())
+        }
+    }
+}
+
+fn application_cross_section_panel_id(panel_id: PanelId) -> Option<CrossSectionPanelId> {
+    match panel_id {
+        PanelId::Xy => Some(CrossSectionPanelId::Xy),
+        PanelId::Xz => Some(CrossSectionPanelId::Xz),
+        PanelId::Yz => Some(CrossSectionPanelId::Yz),
+        PanelId::ThreeD => None,
+    }
+}
+
+fn canonical_cross_section_view(
+    runtime: mirante4d_renderer::CrossSectionViewState,
+) -> Result<CanonicalCrossSectionView, String> {
+    let [x, y, z] = runtime.center_world.to_array();
+    let [qx, qy, qz, qw] = runtime.orientation.to_array();
+    CanonicalCrossSectionView::new(
+        WorldPoint3::new(x, y, z).map_err(|error| error.to_string())?,
+        UnitQuaternion::new_xyzw(qx, qy, qz, qw).map_err(|error| error.to_string())?,
+        runtime.scale_world_per_screen_point,
+        runtime.depth_world,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn apply_cross_section_edit(
+    app: &mut MiranteWorkbenchApp,
+    ctx: &egui::Context,
+    panel_id: PanelId,
+    edit: impl FnOnce(
+        &mut mirante4d_renderer::CrossSectionViewState,
+        mirante4d_renderer::CrossSectionPanel,
+    ),
+) -> Result<(), String> {
+    let application_panel = application_cross_section_panel_id(panel_id)
+        .ok_or_else(|| "3D is not a cross-section panel".to_owned())?;
+    dispatch_application_command(
+        app,
+        ctx,
+        ApplicationCommand::SetActiveCrossSectionPanel(Some(application_panel)),
+    )?;
+    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let view = application_view(&snapshot);
+    let mut cross_section = render_cross_section_view_state(*view.cross_section());
+    edit(
+        &mut cross_section,
+        panel_id
+            .cross_section_panel()
+            .expect("validated cross-section panel"),
+    );
+    let layout = view.layout();
+    let cross_section = canonical_cross_section_view(cross_section)?;
+    app.dataset_runtime.cross_section_last_interaction_at = Some(Instant::now());
+    dispatch_application_command(
+        app,
+        ctx,
+        ApplicationCommand::SetLayout {
+            layout,
+            cross_section,
+        },
+    )?;
+    ctx.request_repaint_after(crate::CROSS_SECTION_INTERACTION_SETTLE_DURATION);
+    Ok(())
+}
 
 pub(crate) struct ProductAutomationController {
     script: ProductAutomationScript,
@@ -114,19 +245,22 @@ impl PendingCrossSectionLatencySample {
         &self,
         app: &MiranteWorkbenchApp,
     ) -> Option<ProductAutomationCrossSectionLatencySample> {
-        if app.state.active_timepoint.0 != self.active_timepoint {
+        let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+        if application_view(&snapshot).timepoint().get() != self.active_timepoint {
             return None;
         }
         let panel = app
-            .state
-            .viewer_layout
-            .four_panel_runtime()?
+            .render_runtime
+            .cross_section_runtime
             .panel(self.panel_id)?;
         let displayed_generation = panel.displayed_generation?;
         if displayed_generation < self.target_generation {
             return None;
         }
-        let displayed_frame = app.cross_section_gpu_display_frames.get(&self.panel_id)?;
+        let displayed_frame = app
+            .render_runtime
+            .cross_section_gpu_display_frames
+            .get(&self.panel_id)?;
         if displayed_frame.generation < self.target_generation {
             return None;
         }
@@ -180,7 +314,7 @@ impl ProductAutomationController {
         ctx: &egui::Context,
         update_timing: ProductAutomationAppUpdateTiming,
     ) {
-        let Some(mut automation) = app.product_automation.take() else {
+        let Some(mut automation) = app.validation_runtime.product_automation.take() else {
             return;
         };
         let automation_started = Instant::now();
@@ -218,7 +352,7 @@ impl ProductAutomationController {
                 automation.write_report_and_close(app, ctx, "failed", Some(reason));
             }
         }
-        app.product_automation = Some(automation);
+        app.validation_runtime.product_automation = Some(automation);
     }
 
     fn load_from_env() -> anyhow::Result<Self> {
@@ -296,7 +430,7 @@ impl ProductAutomationController {
         let command = self.script.commands[self.command_index].clone();
         let command_index = self.command_index;
         let command_started = Instant::now();
-        let previous_display_refresh_timing = app.last_display_refresh_timing;
+        let previous_display_refresh_timing = app.render_runtime.last_display_refresh_timing;
         let result = self.execute_command(app, ctx, &command, previous_display_refresh_timing);
         let command_execution_elapsed = command_started.elapsed();
         if let Err(reason) = self.observe_and_enforce_limits(app) {
@@ -376,17 +510,17 @@ impl ProductAutomationController {
         match command {
             ProductAutomationCommand::OpenDataset { path } => {
                 let expected = normalize_path(path);
-                let actual = normalize_path(&app.state.dataset_path);
+                let actual = normalize_path(app.dataset_runtime.dataset.root());
                 if actual != expected {
                     return Err(format!(
                         "automation dataset mismatch: product opened {}, script expected {}",
-                        app.state.dataset_path.display(),
+                        app.dataset_runtime.dataset.root().display(),
                         path.display()
                     ));
                 }
                 Ok(CommandProgress::Done(json!({
                     "mode": "opened_by_product_startup",
-                    "path": app.state.dataset_path.display().to_string(),
+                    "path": app.dataset_runtime.dataset.root().display().to_string(),
                 })))
             }
             ProductAutomationCommand::WaitFor {
@@ -425,13 +559,16 @@ impl ProductAutomationController {
             }
             ProductAutomationCommand::SetViewerLayout { layout } => {
                 let viewer_layout: ViewerLayout = (*layout).into();
-                let outcome = app
-                    .apply_workbench_command(WorkbenchCommand::SetViewerLayout(viewer_layout), ctx);
-                if outcome.rerender_requested {
-                    app.refresh_frame(ctx);
-                } else if outcome.texture_refresh_requested {
-                    app.refresh_texture_only(ctx);
-                }
+                let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+                let cross_section = *application_view(&snapshot).cross_section();
+                dispatch_application_command(
+                    app,
+                    ctx,
+                    ApplicationCommand::SetLayout {
+                        layout: viewer_layout,
+                        cross_section,
+                    },
+                )?;
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
                     previous_display_refresh_timing,
@@ -441,77 +578,97 @@ impl ProductAutomationController {
                 )))
             }
             ProductAutomationCommand::SetTimepoint { timepoint } => {
-                if *timepoint >= app.state.timepoint_count {
+                let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+                let view = application_view(&snapshot);
+                let timepoint_count = snapshot
+                    .catalog()
+                    .layer(view.active_layer())
+                    .expect("application view closes over the dataset catalog")
+                    .shape()
+                    .t();
+                if *timepoint >= timepoint_count {
                     return Err(format!(
                         "timepoint {timepoint} is out of range for {} timepoint(s)",
-                        app.state.timepoint_count
+                        timepoint_count
                     ));
                 }
-                let outcome = app.apply_workbench_command(
-                    WorkbenchCommand::SetTimepoint(TimeIndex(*timepoint)),
+                dispatch_application_command(
+                    app,
                     ctx,
-                );
-                if outcome.rerender_requested {
-                    app.refresh_frame(ctx);
-                } else if outcome.texture_refresh_requested {
-                    app.refresh_texture_only(ctx);
-                }
+                    ApplicationCommand::SetTimepoint(TimeIndex::new(*timepoint)),
+                )?;
+                let active_timepoint =
+                    application_view(&current_egui_shell_bridge::snapshot(&app.application))
+                        .timepoint()
+                        .get();
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
                     previous_display_refresh_timing,
                     json!({
                         "timepoint": timepoint,
-                        "active_timepoint": app.state.active_timepoint.0,
+                        "active_timepoint": active_timepoint,
                     }),
                 )))
             }
             ProductAutomationCommand::StepTimepoint { delta } => {
-                let outcome = app.apply_workbench_command(
-                    WorkbenchCommand::StepTimepoint { delta: *delta },
-                    ctx,
-                );
-                if outcome.rerender_requested {
-                    app.refresh_frame(ctx);
-                } else if outcome.texture_refresh_requested {
-                    app.refresh_texture_only(ctx);
-                }
+                let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+                let view = application_view(&snapshot);
+                let count = snapshot
+                    .catalog()
+                    .layer(view.active_layer())
+                    .expect("application view closes over the dataset catalog")
+                    .shape()
+                    .t();
+                let next = crate::playback::stepped_timepoint(view.timepoint(), count, *delta);
+                dispatch_application_command(app, ctx, ApplicationCommand::SetTimepoint(next))?;
+                let active_timepoint =
+                    application_view(&current_egui_shell_bridge::snapshot(&app.application))
+                        .timepoint()
+                        .get();
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
                     previous_display_refresh_timing,
                     json!({
                         "delta": delta,
-                        "active_timepoint": app.state.active_timepoint.0,
+                        "active_timepoint": active_timepoint,
                     }),
                 )))
             }
             ProductAutomationCommand::SetPlayback { playing } => {
-                let outcome = app.apply_workbench_command(
-                    WorkbenchCommand::SetPlayback { playing: *playing },
+                dispatch_application_command(
+                    app,
                     ctx,
-                );
-                if outcome.rerender_requested {
-                    app.refresh_frame(ctx);
-                } else if outcome.texture_refresh_requested {
-                    app.refresh_texture_only(ctx);
-                }
+                    ApplicationCommand::SetPlaybackActive(*playing),
+                )?;
+                let active_timepoint =
+                    application_view(&current_egui_shell_bridge::snapshot(&app.application))
+                        .timepoint()
+                        .get();
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
                     previous_display_refresh_timing,
                     json!({
                         "playing": playing,
-                        "active_timepoint": app.state.active_timepoint.0,
+                        "active_timepoint": active_timepoint,
                     }),
                 )))
             }
             ProductAutomationCommand::SetRenderMode { mode } => {
                 let render_mode: RenderMode = (*mode).into();
-                let outcome =
-                    app.apply_workbench_command(WorkbenchCommand::SetRenderMode(render_mode), ctx);
-                if outcome.rerender_requested {
-                    app.refresh_frame(ctx);
-                } else if outcome.texture_refresh_requested {
-                    app.refresh_texture_only(ctx);
-                }
+                let layer_index = active_layer_index(app);
+                let command = layer_command(app, layer_index, |layer| {
+                    Ok(LayerViewState::new(
+                        layer.layer_key(),
+                        layer.visible(),
+                        layer.transfer().clone(),
+                        render_state_for_mode(
+                            *layer.render_state(),
+                            layer.transfer(),
+                            render_mode,
+                        )?,
+                    ))
+                })?;
+                dispatch_application_command(app, ctx, command)?;
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
                     previous_display_refresh_timing,
@@ -522,18 +679,19 @@ impl ProductAutomationController {
             }
             ProductAutomationCommand::SetLayerRenderMode { layer_index, mode } => {
                 let render_mode: RenderMode = (*mode).into();
-                let outcome = app.apply_workbench_command(
-                    WorkbenchCommand::SetLayerRenderMode {
-                        layer_index: *layer_index,
-                        mode: render_mode,
-                    },
-                    ctx,
-                );
-                if outcome.rerender_requested {
-                    app.refresh_frame(ctx);
-                } else if outcome.texture_refresh_requested {
-                    app.refresh_texture_only(ctx);
-                }
+                let command = layer_command(app, *layer_index, |layer| {
+                    Ok(LayerViewState::new(
+                        layer.layer_key(),
+                        layer.visible(),
+                        layer.transfer().clone(),
+                        render_state_for_mode(
+                            *layer.render_state(),
+                            layer.transfer(),
+                            render_mode,
+                        )?,
+                    ))
+                })?;
+                dispatch_application_command(app, ctx, command)?;
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
                     previous_display_refresh_timing,
@@ -549,17 +707,23 @@ impl ProductAutomationController {
                         "ISO display level must be finite and between 0.0 and 1.0".to_owned()
                     );
                 }
-                let outcome = app.apply_workbench_command(
-                    WorkbenchCommand::SetIsoDisplayLevel {
-                        display_level: *display_level,
-                    },
-                    ctx,
-                );
-                if outcome.rerender_requested {
-                    app.refresh_frame(ctx);
-                } else if outcome.texture_refresh_requested {
-                    app.refresh_texture_only(ctx);
-                }
+                let command = layer_command(app, active_layer_index(app), |layer| {
+                    let current = *layer.render_state();
+                    let shading = current
+                        .iso_parameters()
+                        .map(|parameters| parameters.shading_policy())
+                        .unwrap_or(IsoShadingPolicy::GradientLighting);
+                    let render_state =
+                        RenderState::iso(current.sampling_policy(), shading, *display_level)
+                            .map_err(|error| error.to_string())?;
+                    Ok(LayerViewState::new(
+                        layer.layer_key(),
+                        layer.visible(),
+                        layer.transfer().clone(),
+                        render_state,
+                    ))
+                })?;
+                dispatch_application_command(app, ctx, command)?;
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
                     previous_display_refresh_timing,
@@ -576,17 +740,31 @@ impl ProductAutomationController {
                         "DVR density scale must be finite and between {DVR_DENSITY_SCALE_MIN:.1} and {DVR_DENSITY_SCALE_MAX:.1}"
                     ));
                 }
-                let outcome = app.apply_workbench_command(
-                    WorkbenchCommand::SetDvrDensityScale {
-                        density_scale: *density_scale,
-                    },
-                    ctx,
-                );
-                if outcome.rerender_requested {
-                    app.refresh_frame(ctx);
-                } else if outcome.texture_refresh_requested {
-                    app.refresh_texture_only(ctx);
-                }
+                let command = layer_command(app, active_layer_index(app), |layer| {
+                    let current = *layer.render_state();
+                    let opacity_transfer = current
+                        .dvr_parameters()
+                        .map(|parameters| parameters.opacity_transfer())
+                        .unwrap_or_else(|| {
+                            DvrOpacityTransfer::new(
+                                layer.transfer().window(),
+                                layer.transfer().curve(),
+                            )
+                        });
+                    let render_state = RenderState::dvr(
+                        current.sampling_policy(),
+                        opacity_transfer,
+                        *density_scale,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    Ok(LayerViewState::new(
+                        layer.layer_key(),
+                        layer.visible(),
+                        layer.transfer().clone(),
+                        render_state,
+                    ))
+                })?;
+                dispatch_application_command(app, ctx, command)?;
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
                     previous_display_refresh_timing,
@@ -599,18 +777,15 @@ impl ProductAutomationController {
                 layer_index,
                 visible,
             } => {
-                let outcome = app.apply_workbench_command(
-                    WorkbenchCommand::SetLayerVisibility {
-                        layer_index: *layer_index,
-                        visible: *visible,
-                    },
-                    ctx,
-                );
-                if outcome.rerender_requested {
-                    app.refresh_frame(ctx);
-                } else if outcome.texture_refresh_requested {
-                    app.refresh_texture_only(ctx);
-                }
+                let command = layer_command(app, *layer_index, |layer| {
+                    Ok(LayerViewState::new(
+                        layer.layer_key(),
+                        *visible,
+                        layer.transfer().clone(),
+                        *layer.render_state(),
+                    ))
+                })?;
+                dispatch_application_command(app, ctx, command)?;
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
                     previous_display_refresh_timing,
@@ -627,18 +802,23 @@ impl ProductAutomationController {
                 if !opacity.is_finite() || !(0.0..=1.0).contains(opacity) {
                     return Err("layer opacity must be finite and between 0.0 and 1.0".to_owned());
                 }
-                let outcome = app.apply_workbench_command(
-                    WorkbenchCommand::SetLayerOpacity {
-                        layer_index: *layer_index,
-                        opacity: *opacity,
-                    },
-                    ctx,
-                );
-                if outcome.rerender_requested {
-                    app.refresh_frame(ctx);
-                } else if outcome.texture_refresh_requested {
-                    app.refresh_texture_only(ctx);
-                }
+                let command = layer_command(app, *layer_index, |layer| {
+                    let current = layer.transfer();
+                    let transfer = LayerTransfer::new(
+                        current.window(),
+                        current.color(),
+                        Opacity::new(*opacity).map_err(|error| error.to_string())?,
+                        current.curve(),
+                        current.invert(),
+                    );
+                    Ok(LayerViewState::new(
+                        layer.layer_key(),
+                        layer.visible(),
+                        transfer,
+                        *layer.render_state(),
+                    ))
+                })?;
+                dispatch_application_command(app, ctx, command)?;
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
                     previous_display_refresh_timing,
@@ -658,19 +838,23 @@ impl ProductAutomationController {
                         "layer window bounds must be finite with low less than high".to_owned()
                     );
                 }
-                let outcome = app.apply_workbench_command(
-                    WorkbenchCommand::SetLayerWindow {
-                        layer_index: *layer_index,
-                        low: *low,
-                        high: *high,
-                    },
-                    ctx,
-                );
-                if outcome.rerender_requested {
-                    app.refresh_frame(ctx);
-                } else if outcome.texture_refresh_requested {
-                    app.refresh_texture_only(ctx);
-                }
+                let command = layer_command(app, *layer_index, |layer| {
+                    let current = layer.transfer();
+                    let transfer = LayerTransfer::new(
+                        DisplayWindow::new(*low, *high).map_err(|error| error.to_string())?,
+                        current.color(),
+                        current.opacity(),
+                        current.curve(),
+                        current.invert(),
+                    );
+                    Ok(LayerViewState::new(
+                        layer.layer_key(),
+                        layer.visible(),
+                        transfer,
+                        *layer.render_state(),
+                    ))
+                })?;
+                dispatch_application_command(app, ctx, command)?;
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
                     previous_display_refresh_timing,
@@ -682,10 +866,19 @@ impl ProductAutomationController {
                 )))
             }
             ProductAutomationCommand::CameraFitData => {
-                let outcome = app.apply_workbench_command(WorkbenchCommand::FitData, ctx);
-                if outcome.rerender_requested {
-                    app.refresh_frame(ctx);
-                }
+                let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+                let view = application_view(&snapshot);
+                let layer = snapshot
+                    .catalog()
+                    .layer(view.active_layer())
+                    .expect("application view closes over the dataset catalog");
+                let camera = crate::viewport::fit_camera_to_shape_preserving_view(
+                    *view.camera(),
+                    layer.shape().spatial(),
+                    layer.grid_to_world(),
+                    app.render_runtime.presentation_viewport,
+                );
+                dispatch_application_command(app, ctx, ApplicationCommand::SetCamera(camera))?;
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
                     previous_display_refresh_timing,
@@ -693,10 +886,17 @@ impl ProductAutomationController {
                 )))
             }
             ProductAutomationCommand::CameraReset => {
-                let outcome = app.apply_workbench_command(WorkbenchCommand::ResetView, ctx);
-                if outcome.rerender_requested {
-                    app.refresh_frame(ctx);
-                }
+                let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+                let view = application_view(&snapshot);
+                let layer = snapshot
+                    .catalog()
+                    .layer(view.active_layer())
+                    .expect("application view closes over the dataset catalog");
+                let camera = crate::viewport::default_camera_for_shape(
+                    layer.shape().spatial(),
+                    layer.grid_to_world(),
+                );
+                dispatch_application_command(app, ctx, ApplicationCommand::SetCamera(camera))?;
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
                     previous_display_refresh_timing,
@@ -711,18 +911,17 @@ impl ProductAutomationController {
                 let viewport_side = viewport_height_points.unwrap_or(800.0);
                 let start = egui::pos2(viewport_side * 0.5, viewport_side * 0.5);
                 let current = start + egui::vec2(*yaw_points, *pitch_points);
-                let outcome = app.apply_workbench_command(
-                    WorkbenchCommand::CameraOrbitDrag {
-                        start_camera: app.state().camera,
-                        start_position_points: start,
-                        current_position_points: current,
-                        viewport_size_points: egui::vec2(viewport_side, viewport_side),
-                    },
-                    ctx,
+                let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+                let start_camera = *application_view(&snapshot).camera();
+                let mut camera = start_camera;
+                crate::viewport::apply_camera_orbit(
+                    &mut camera,
+                    start_camera,
+                    start,
+                    current,
+                    egui::vec2(viewport_side, viewport_side),
                 );
-                if outcome.rerender_requested {
-                    app.refresh_frame(ctx);
-                }
+                dispatch_application_command(app, ctx, ApplicationCommand::SetCamera(camera))?;
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
                     previous_display_refresh_timing,
@@ -737,15 +936,10 @@ impl ProductAutomationController {
                 y_points,
                 viewport_height_points,
             } => {
-                let outcome = app.apply_workbench_command(
-                    WorkbenchCommand::CameraPanDrag {
-                        motion_points: egui::vec2(*x_points, *y_points),
-                    },
-                    ctx,
-                );
-                if outcome.rerender_requested {
-                    app.refresh_frame(ctx);
-                }
+                let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+                let mut camera = *application_view(&snapshot).camera();
+                crate::viewport::apply_camera_pan(&mut camera, egui::vec2(*x_points, *y_points));
+                dispatch_application_command(app, ctx, ApplicationCommand::SetCamera(camera))?;
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
                     previous_display_refresh_timing,
@@ -757,15 +951,10 @@ impl ProductAutomationController {
                 )))
             }
             ProductAutomationCommand::CameraZoom { scroll_y_points } => {
-                let outcome = app.apply_workbench_command(
-                    WorkbenchCommand::CameraZoom {
-                        scroll_y_points: *scroll_y_points,
-                    },
-                    ctx,
-                );
-                if outcome.rerender_requested {
-                    app.refresh_frame(ctx);
-                }
+                let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+                let mut camera = *application_view(&snapshot).camera();
+                crate::viewport::apply_camera_zoom(&mut camera, *scroll_y_points);
+                dispatch_application_command(app, ctx, ApplicationCommand::SetCamera(camera))?;
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
                     previous_display_refresh_timing,
@@ -782,13 +971,13 @@ impl ProductAutomationController {
             } => {
                 ensure_finite_pair("cross_section_pan motion", *x_points, *y_points)?;
                 let panel_id = automation_cross_section_panel_id(*panel)?;
-                app.apply_workbench_command(
-                    WorkbenchCommand::CrossSectionPanDrag {
-                        panel_id,
-                        motion_points: egui::vec2(*x_points, *y_points),
-                    },
-                    ctx,
-                );
+                apply_cross_section_edit(app, ctx, panel_id, |cross_section, panel| {
+                    cross_section.pan_by_panel_points(
+                        panel,
+                        f64::from(*x_points),
+                        f64::from(*y_points),
+                    );
+                })?;
                 let probe_after = if let Some(probe) = probe_after {
                     match self.probe_panel_hover(
                         app,
@@ -829,14 +1018,24 @@ impl ProductAutomationController {
                     return Err("cross_section_slice_step notches must be finite".to_owned());
                 }
                 let panel_id = automation_cross_section_panel_id(*panel)?;
-                app.apply_workbench_command(
-                    WorkbenchCommand::CrossSectionSliceStep {
-                        panel_id,
-                        notches: *notches,
-                        fast: *fast,
-                    },
-                    ctx,
+                let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+                let view = application_view(&snapshot);
+                let voxel_size = crate::lod_scheduler::representative_voxel_world_size(
+                    snapshot
+                        .catalog()
+                        .layer(view.active_layer())
+                        .expect("application view closes over the dataset catalog")
+                        .grid_to_world(),
                 );
+                let multiplier = if *fast {
+                    crate::CROSS_SECTION_FAST_SLICE_MULTIPLIER
+                } else {
+                    1.0
+                };
+                apply_cross_section_edit(app, ctx, panel_id, |cross_section, panel| {
+                    cross_section
+                        .slice_by_world_distance(panel, *notches * voxel_size * multiplier);
+                })?;
                 Ok(CommandProgress::Done(json!({
                     "panel": panel.name(),
                     "notches": notches,
@@ -858,25 +1057,26 @@ impl ProductAutomationController {
                 let presentation_viewport =
                     cross_section_panel_presentation_viewport(app, panel_id)?;
                 let pointer_position_points = egui::pos2(
-                    (presentation_viewport.width_points as f32) * *x_fraction,
-                    (presentation_viewport.height_points as f32) * *y_fraction,
+                    (presentation_viewport.width_points() as f32) * *x_fraction,
+                    (presentation_viewport.height_points() as f32) * *y_fraction,
                 );
-                app.apply_workbench_command(
-                    WorkbenchCommand::CrossSectionZoom {
-                        panel_id,
+                let factor = (-f64::from(*scroll_y_points) * 0.001).exp();
+                apply_cross_section_edit(app, ctx, panel_id, |cross_section, panel| {
+                    cross_section.zoom_around_panel_point(
+                        panel,
                         presentation_viewport,
-                        pointer_position_points,
-                        scroll_y_points: *scroll_y_points,
-                    },
-                    ctx,
-                );
+                        f64::from(pointer_position_points.x),
+                        f64::from(pointer_position_points.y),
+                        factor,
+                    );
+                })?;
                 Ok(CommandProgress::Done(json!({
                     "panel": panel.name(),
                     "x_fraction": x_fraction,
                     "y_fraction": y_fraction,
                     "scroll_y_points": scroll_y_points,
-                    "viewport_width_points": presentation_viewport.width_points,
-                    "viewport_height_points": presentation_viewport.height_points,
+                    "viewport_width_points": presentation_viewport.width_points(),
+                    "viewport_height_points": presentation_viewport.height_points(),
                 })))
             }
             ProductAutomationCommand::CrossSectionRotate {
@@ -886,13 +1086,14 @@ impl ProductAutomationController {
             } => {
                 ensure_finite_pair("cross_section_rotate motion", *x_points, *y_points)?;
                 let panel_id = automation_cross_section_panel_id(*panel)?;
-                app.apply_workbench_command(
-                    WorkbenchCommand::CrossSectionRotateDrag {
-                        panel_id,
-                        motion_points: egui::vec2(*x_points, *y_points),
-                    },
-                    ctx,
-                );
+                apply_cross_section_edit(app, ctx, panel_id, |cross_section, panel| {
+                    cross_section.rotate_oblique_by_panel_drag(
+                        panel,
+                        f64::from(*x_points),
+                        f64::from(*y_points),
+                        crate::CROSS_SECTION_ROTATE_RADIANS_PER_POINT,
+                    );
+                })?;
                 Ok(CommandProgress::Done(json!({
                     "panel": panel.name(),
                     "x_points": x_points,
@@ -1018,6 +1219,7 @@ impl ProductAutomationController {
             .unwrap_or_else(|| PathBuf::from("target/mirante4d/product-automation-artifacts"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn probe_panel_hover(
         &self,
         app: &mut MiranteWorkbenchApp,
@@ -1036,11 +1238,25 @@ impl ProductAutomationController {
         ensure_fraction("probe_panel_hover y_fraction", y_fraction)?;
         let panel_id = automation_cross_section_panel_id(panel)?;
         let presentation_viewport = cross_section_panel_presentation_viewport(app, panel_id)?;
-        let x_points = f64::from(x_fraction) * presentation_viewport.width_points;
-        let y_points = f64::from(y_fraction) * presentation_viewport.height_points;
+        let x_points = f64::from(x_fraction) * presentation_viewport.width_points();
+        let y_points = f64::from(y_fraction) * presentation_viewport.height_points();
         let before = panel_hover_readout_side_effect_snapshot(app);
+        let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+        let view = application_view(&snapshot);
+        let layer = snapshot
+            .catalog()
+            .layer(view.active_layer())
+            .expect("application view closes over the dataset catalog");
+        let active_layer_id = current_physical_layer_id(&app.dataset_runtime, view.active_layer())
+            .map_err(|error| error.to_string())?;
         let readout = cross_section_hover_readout_for_panel_point(
-            &app.state,
+            &app.dataset_runtime,
+            &app.render_runtime,
+            CrossSectionReadoutInput {
+                view,
+                active_layer_id: &active_layer_id,
+                active_layer_dtype: layer.dtype(),
+            },
             panel_id,
             x_points,
             y_points,
@@ -1130,16 +1346,16 @@ impl ProductAutomationController {
                 expected_schedule_generation
             ));
         }
-        app.state.hovered_pixel = None;
-        app.state.hovered_source_readout = Some(readout.text.clone());
+        app.ui_runtime.hovered_pixel = None;
+        app.ui_runtime.hovered_source_readout = Some(readout.text.clone());
         Ok(CommandProgress::Done(json!({
             "panel": panel.name(),
             "x_fraction": x_fraction,
             "y_fraction": y_fraction,
             "x_points": x_points,
             "y_points": y_points,
-            "viewport_width_points": presentation_viewport.width_points,
-            "viewport_height_points": presentation_viewport.height_points,
+            "viewport_width_points": presentation_viewport.width_points(),
+            "viewport_height_points": presentation_viewport.height_points(),
             "expected_status": expected_status.map(ProductAutomationCrossSectionHoverStatus::name),
             "expect_value": expect_value,
             "expected_generation_status": expected_generation_status.map(ProductAutomationCrossSectionGenerationStatus::name),
@@ -1168,23 +1384,43 @@ impl ProductAutomationController {
             return Err("probe_hover fractions must be finite and between 0.0 and 1.0".to_owned());
         }
 
+        let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+        let view = application_view(&snapshot);
+        let active_layer_dtype = snapshot
+            .catalog()
+            .layer(view.active_layer())
+            .expect("application view closes over the dataset catalog")
+            .dtype();
         let hover = viewport_hover_from_normalized_point(
-            &app.state.frame,
-            app.state.frame_f32.as_ref(),
-            app.state.active_layer_dtype,
+            &app.render_runtime.frame,
+            app.render_runtime.frame_f32.as_ref(),
+            active_layer_dtype,
             x_fraction,
             y_fraction,
         )
         .ok_or_else(|| "probe_hover could not map the requested viewport point".to_owned())?;
-        let hit = pick_hit_from_viewport_hover(&app.state, hover).map_err(|err| err.to_string())?;
+        let hit = pick_hit_from_viewport_hover(
+            &snapshot,
+            &app.dataset_runtime,
+            &app.analysis_runtime,
+            &app.ui_runtime,
+            &app.render_runtime,
+            hover,
+        )
+        .map_err(|err| err.to_string())?;
         let commands = app
-            .state
+            .ui_runtime
             .viewer_tools
             .handle_event(ViewerToolEvent::Hover(Some(hit.clone())));
-        let outcome =
-            apply_viewer_tool_commands(&mut app.state, commands).map_err(|err| err.to_string())?;
-        app.state.hovered_pixel = Some(hover);
-        app.state.hovered_source_readout = None;
+        let outcome = apply_viewer_tool_commands(
+            &snapshot,
+            &mut app.analysis_runtime,
+            &mut app.ui_runtime,
+            commands,
+        )
+        .map_err(|err| err.to_string())?;
+        app.ui_runtime.hovered_pixel = Some(hover);
+        app.ui_runtime.hovered_source_readout = None;
         Ok(CommandProgress::Done(json!({
             "x_fraction": x_fraction,
             "y_fraction": y_fraction,
@@ -1200,23 +1436,48 @@ impl ProductAutomationController {
         app: &MiranteWorkbenchApp,
         condition: ProductAutomationWaitCondition,
     ) -> bool {
+        let snapshot = current_egui_shell_bridge::snapshot(&app.application);
         match condition {
             ProductAutomationWaitCondition::WindowReady => true,
             ProductAutomationWaitCondition::FirstFrame => {
-                app.state.frame_fidelity.displayed_scale_level.is_some()
-                    || app.gpu_display_frame.is_some()
-                    || app.state.diagnostics.output_pixels > 0
+                app.render_runtime
+                    .frame_fidelity
+                    .displayed_scale_level
+                    .is_some()
+                    || app.render_runtime.gpu_display_frame.is_some()
+                    || app.render_runtime.diagnostics.output_pixels > 0
             }
-            ProductAutomationWaitCondition::RuntimeIdle => !app.background_work_active(),
+            ProductAutomationWaitCondition::RuntimeIdle => {
+                !crate::workbench_playback_runtime::background_work_active(
+                    &snapshot,
+                    &app.import_runtime,
+                    &app.analysis_runtime,
+                    &app.dataset_runtime,
+                    &app.render_runtime,
+                )
+            }
             ProductAutomationWaitCondition::FrameFreshnessCurrent => {
-                app.state.frame_fidelity.display_freshness == DisplayedFrameFreshness::Current
+                app.render_runtime.frame_fidelity.display_freshness
+                    == DisplayedFrameFreshness::Current
                     || matches!(
-                        app.state.frame_fidelity.completeness,
+                        app.render_runtime.frame_fidelity.completeness,
                         FrameCompleteness::Exact | FrameCompleteness::Complete
                     )
             }
-            ProductAutomationWaitCondition::NoRenderError => app.state.last_render_error.is_none(),
-            ProductAutomationWaitCondition::GpuFramePresented => app.gpu_display_frame.is_some(),
+            ProductAutomationWaitCondition::NoRenderError => {
+                app.render_runtime
+                    .frame_fidelity
+                    .last_failure_kind
+                    .is_none()
+                    && app
+                        .render_runtime
+                        .frame_fidelity
+                        .last_capacity_error
+                        .is_none()
+            }
+            ProductAutomationWaitCondition::GpuFramePresented => {
+                app.render_runtime.gpu_display_frame.is_some()
+            }
         }
     }
 
@@ -1225,6 +1486,8 @@ impl ProductAutomationController {
         app: &MiranteWorkbenchApp,
         condition: &ProductAutomationAssertCondition,
     ) -> Result<(), String> {
+        let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+        let view = application_view(&snapshot);
         match condition {
             ProductAutomationAssertCondition::NonblankFrame => {
                 let (source, stats) = current_display_image_stats(app)?;
@@ -1238,8 +1501,15 @@ impl ProductAutomationController {
                 }
             }
             ProductAutomationAssertCondition::NoRenderError => {
-                if let Some(err) = app.state.last_render_error.as_ref() {
-                    Err(format!("render error is set: {err}"))
+                if let Some(kind) = app.render_runtime.frame_fidelity.last_failure_kind {
+                    Err(format!("render failure is set: {kind:?}"))
+                } else if let Some(error) = app
+                    .render_runtime
+                    .frame_fidelity
+                    .last_capacity_error
+                    .as_ref()
+                {
+                    Err(format!("render capacity error is set: {error}"))
                 } else {
                     Ok(())
                 }
@@ -1252,12 +1522,18 @@ impl ProductAutomationController {
                 } else {
                     Err(format!(
                         "frame is not current: {:?}",
-                        app.state.frame_fidelity.display_freshness
+                        app.render_runtime.frame_fidelity.display_freshness
                     ))
                 }
             }
             ProductAutomationAssertCondition::RuntimeIdle => {
-                if app.background_work_active() {
+                if crate::workbench_playback_runtime::background_work_active(
+                    &snapshot,
+                    &app.import_runtime,
+                    &app.analysis_runtime,
+                    &app.dataset_runtime,
+                    &app.render_runtime,
+                ) {
                     Err("background work is still active".to_owned())
                 } else {
                     Ok(())
@@ -1265,40 +1541,46 @@ impl ProductAutomationController {
             }
             ProductAutomationAssertCondition::RenderMode { mode } => {
                 let expected: RenderMode = (*mode).into();
-                if app.state.active_render_mode == expected {
+                let actual = view
+                    .layer(view.active_layer())
+                    .expect("application view has an active layer")
+                    .render_state()
+                    .mode();
+                if actual == expected {
                     Ok(())
                 } else {
                     Err(format!(
                         "active render mode is {:?}, expected {:?}",
-                        app.state.active_render_mode, expected
+                        actual, expected
                     ))
                 }
             }
             ProductAutomationAssertCondition::ViewerLayout { layout } => {
                 let expected: ViewerLayout = (*layout).into();
-                if app.state.viewer_layout.layout() == expected {
+                if view.layout() == expected {
                     Ok(())
                 } else {
                     Err(format!(
                         "viewer layout is {:?}, expected {:?}",
-                        app.state.viewer_layout.layout(),
+                        view.layout(),
                         expected
                     ))
                 }
             }
             ProductAutomationAssertCondition::ActiveTimepoint { timepoint } => {
-                if app.state.active_timepoint.0 == *timepoint {
+                if view.timepoint().get() == *timepoint {
                     Ok(())
                 } else {
                     Err(format!(
                         "active timepoint is {}, expected {}",
-                        app.state.active_timepoint.0, timepoint
+                        view.timepoint().get(),
+                        timepoint
                     ))
                 }
             }
             ProductAutomationAssertCondition::ObservedTimepoints { min_distinct } => {
                 let mut observed = BTreeSet::new();
-                observed.insert(app.state.active_timepoint.0);
+                observed.insert(view.timepoint().get());
                 observed.extend(
                     self.app_update_samples
                         .iter()
@@ -1316,21 +1598,24 @@ impl ProductAutomationController {
                 }
             }
             ProductAutomationAssertCondition::Playback { playing } => {
-                if app.playback.playing == *playing {
+                let actual = snapshot.transient().playback_active();
+                if actual == *playing {
                     Ok(())
                 } else {
                     Err(format!(
                         "playback playing is {}, expected {}",
-                        app.playback.playing, playing
+                        actual, playing
                     ))
                 }
             }
             ProductAutomationAssertCondition::CrossSectionActivePanel { panel } => {
                 let expected = match panel {
-                    Some(panel) => Some(automation_cross_section_panel_id(*panel)?),
+                    Some(panel) => application_cross_section_panel_id(
+                        automation_cross_section_panel_id(*panel)?,
+                    ),
                     None => None,
                 };
-                let actual = app.state.viewer_layout.active_cross_section_panel();
+                let actual = snapshot.transient().active_cross_section_panel();
                 if actual == expected {
                     Ok(())
                 } else {
@@ -1351,12 +1636,12 @@ impl ProductAutomationController {
                 display_current,
             } => {
                 let panel_id = automation_cross_section_panel_id(*panel)?;
-                let runtime = app
-                    .state
-                    .viewer_layout
-                    .four_panel_runtime()
-                    .ok_or_else(|| "four-panel runtime is not active".to_owned())?;
-                let panel_state = runtime
+                if view.layout() != ViewerLayout::FourPanel {
+                    return Err("four-panel runtime is not active".to_owned());
+                }
+                let panel_state = app
+                    .render_runtime
+                    .cross_section_runtime
                     .panel(panel_id)
                     .ok_or_else(|| format!("panel {} is not active", panel_id.label()))?;
                 let schedule = panel_state.cross_section_schedule.ok_or_else(|| {
@@ -1451,7 +1736,7 @@ impl ProductAutomationController {
             } => {
                 let panel_id = automation_cross_section_panel_id(*panel)?;
                 let stream = app
-                    .state
+                    .render_runtime
                     .cross_section_runtime
                     .panel_streams
                     .get(&panel_id)
@@ -1459,12 +1744,12 @@ impl ProductAutomationController {
                         format!("panel {} has no cross-section stream", panel_id.label())
                     })?;
                 if let Some(timepoint) = timepoint
-                    && stream.request_key.timepoint.0 != *timepoint
+                    && stream.request_key.timepoint.get() != *timepoint
                 {
                     return Err(format!(
                         "panel {} stream timepoint is {}, expected {}",
                         panel_id.label(),
-                        stream.request_key.timepoint.0,
+                        stream.request_key.timepoint.get(),
                         timepoint
                     ));
                 }
@@ -1608,108 +1893,127 @@ impl ProductAutomationController {
     }
 
     fn diagnostics_json(&self, app: &MiranteWorkbenchApp) -> Value {
-        let active_layer = LayerId::new(app.state.active_layer_id.clone()).ok();
-        let active_scale_count = active_layer
-            .as_ref()
-            .and_then(|layer_id| app.state.dataset.scale_count(layer_id).ok());
+        let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+        let view = application_view(&snapshot);
+        let active_layer = snapshot
+            .catalog()
+            .layer(view.active_layer())
+            .expect("application view closes over the dataset catalog");
+        let active_layer_id = current_physical_layer_id(&app.dataset_runtime, view.active_layer())
+            .expect("application catalog closes over the current physical manifest");
+        let active_scale_count = app
+            .dataset_runtime
+            .dataset
+            .scale_count(&active_layer_id)
+            .ok();
+        let typed_render_error = app
+            .render_runtime
+            .frame_fidelity
+            .last_failure_kind
+            .map(|kind| format!("{kind:?}"))
+            .or_else(|| {
+                app.render_runtime
+                    .frame_fidelity
+                    .last_capacity_error
+                    .clone()
+            });
         json!({
             "dataset": {
-                "path": app.state.dataset_path.display().to_string(),
-                "name": app.state.dataset_name.clone(),
-                "layer_count": app.state.dataset.layer_count(),
-                "active_layer_id": app.state.active_layer_id.clone(),
-                "active_layer_dtype": format!("{:?}", app.state.active_layer_dtype),
+                "path": app.dataset_runtime.dataset.root().display().to_string(),
+                "name": snapshot.catalog().label(),
+                "layer_count": snapshot.catalog().len(),
+                "active_layer_id": active_layer_id.as_str(),
+                "active_layer_dtype": format!("{:?}", active_layer.dtype()),
                 "active_layer_shape": {
-                    "x": app.state.active_layer_shape.x,
-                    "y": app.state.active_layer_shape.y,
-                    "z": app.state.active_layer_shape.z,
-                    "t": app.state.active_layer_shape.t,
+                    "x": active_layer.shape().x(),
+                    "y": active_layer.shape().y(),
+                    "z": active_layer.shape().z(),
+                    "t": active_layer.shape().t(),
                 },
                 "active_scale_count": active_scale_count,
-                "timepoint_count": app.state.timepoint_count,
+                "timepoint_count": active_layer.shape().t(),
             },
             "render": {
-                "active_render_mode": format!("{:?}", app.state.active_render_mode),
-                "projection": format!("{:?}", app.state.active_projection),
-                "backend": format!("{:?}", app.state.render_backend),
-                "adapter": app.state.adapter_summary.clone(),
-                "last_error": app.state.last_render_error.clone(),
-                "gpu_display_frame_present": app.gpu_display_frame.is_some(),
-                "cpu_nonzero_pixels": app.state.diagnostics.nonzero_pixels,
-                "cpu_output_pixels": app.state.diagnostics.output_pixels,
+                "active_render_mode": format!("{:?}", view.layer(view.active_layer()).expect("active layer").render_state().mode()),
+                "projection": format!("{:?}", view.camera().projection()),
+                "backend": format!("{:?}", app.render_runtime.render_backend),
+                "adapter": app.startup_diagnostics.gpu_adapter.clone(),
+                "last_error": typed_render_error,
+                "gpu_display_frame_present": app.render_runtime.gpu_display_frame.is_some(),
+                "cpu_nonzero_pixels": app.render_runtime.diagnostics.nonzero_pixels,
+                "cpu_output_pixels": app.render_runtime.diagnostics.output_pixels,
                 "frame_fidelity": {
-                    "target_scale_level": app.state.frame_fidelity.target_scale_level,
-                    "displayed_scale_level": app.state.frame_fidelity.displayed_scale_level,
-                    "completeness": format!("{:?}", app.state.frame_fidelity.completeness),
-                    "reason": format!("{:?}", app.state.frame_fidelity.reason),
-                    "display_freshness": format!("{:?}", app.state.frame_fidelity.display_freshness),
-                    "frame_time_ms": app.state.frame_fidelity.frame_time_ms,
-                    "visible_bricks": app.state.frame_fidelity.visible_bricks,
-                    "resident_bricks": app.state.frame_fidelity.resident_bricks,
-                    "missing_occupied_bricks": app.state.frame_fidelity.missing_occupied_bricks,
-                    "cpu_cache_bytes": app.state.frame_fidelity.cpu_cache_bytes,
-                    "gpu_resident_bytes": app.state.frame_fidelity.gpu_resident_bytes,
-                    "upload_queue_depth": app.state.frame_fidelity.upload_queue_depth,
-                    "last_failure_kind": app.state.frame_fidelity.last_failure_kind.map(|kind| format!("{kind:?}")),
-                    "last_capacity_error": app.state.frame_fidelity.last_capacity_error.clone(),
+                    "target_scale_level": app.render_runtime.frame_fidelity.target_scale_level,
+                    "displayed_scale_level": app.render_runtime.frame_fidelity.displayed_scale_level,
+                    "completeness": format!("{:?}", app.render_runtime.frame_fidelity.completeness),
+                    "reason": format!("{:?}", app.render_runtime.frame_fidelity.reason),
+                    "display_freshness": format!("{:?}", app.render_runtime.frame_fidelity.display_freshness),
+                    "frame_time_ms": app.render_runtime.frame_fidelity.frame_time_ms,
+                    "visible_bricks": app.render_runtime.frame_fidelity.visible_bricks,
+                    "resident_bricks": app.render_runtime.frame_fidelity.resident_bricks,
+                    "missing_occupied_bricks": app.render_runtime.frame_fidelity.missing_occupied_bricks,
+                    "cpu_cache_bytes": app.render_runtime.frame_fidelity.cpu_cache_bytes,
+                    "gpu_resident_bytes": app.render_runtime.frame_fidelity.gpu_resident_bytes,
+                    "upload_queue_depth": app.render_runtime.frame_fidelity.upload_queue_depth,
+                    "last_failure_kind": app.render_runtime.frame_fidelity.last_failure_kind.map(|kind| format!("{kind:?}")),
+                    "last_capacity_error": app.render_runtime.frame_fidelity.last_capacity_error.clone(),
                 },
                 "display_refresh_timing": app
-                    .last_display_refresh_timing
+                    .render_runtime.last_display_refresh_timing
                     .map(display_refresh_timing_json),
             },
             "streaming": {
-                "visible_brick_count": app.state.visible_brick_count,
-                "visible_brick_plan_stride": app.state.visible_brick_plan_stride,
-                "visible_brick_plan_error": app.state.visible_brick_plan_error.clone(),
-                "brick_stream_scale_level": app.state.brick_stream_scale_level,
-                "brick_stream_requested": app.state.brick_stream_requested,
-                "brick_stream_completed": app.state.brick_stream_completed,
-                "brick_stream_cancelled": app.state.brick_stream_cancelled,
-                "brick_stream_stale": app.state.brick_stream_stale,
-                "brick_stream_failed": app.state.brick_stream_failed,
-                "brick_stream_complete": app.state.brick_stream_complete,
-                "brick_stream_last_error": app.state.brick_stream_last_error.clone(),
+                "visible_brick_count": app.render_runtime.visible_brick_count,
+                "visible_brick_plan_stride": app.render_runtime.visible_brick_plan_stride,
+                "visible_brick_plan_error": app.render_runtime.visible_brick_plan_error.clone(),
+                "brick_stream_scale_level": app.dataset_runtime.brick_stream_scale_level,
+                "brick_stream_requested": app.dataset_runtime.brick_stream_requested,
+                "brick_stream_completed": app.dataset_runtime.brick_stream_completed,
+                "brick_stream_cancelled": app.dataset_runtime.brick_stream_cancelled,
+                "brick_stream_stale": app.dataset_runtime.brick_stream_stale,
+                "brick_stream_failed": app.dataset_runtime.brick_stream_failed,
+                "brick_stream_complete": app.dataset_runtime.brick_stream_complete,
+                "brick_stream_last_error": app.dataset_runtime.brick_stream_last_error.clone(),
             },
             "cross_section": cross_section_diagnostics_json(app),
             "data_engine": app
-                .state
-                .dataset
+                .dataset_runtime.dataset
                 .diagnostics()
                 .ok()
                 .map(data_engine_diagnostics_json),
             "gpu_renderer": app
-                .gpu_renderer
+                .render_runtime.gpu_renderer
                 .as_ref()
                 .and_then(|renderer| renderer.stats().ok())
                 .map(gpu_renderer_stats_json),
             "gpu_adapter": app
-                .gpu_renderer
+                .render_runtime.gpu_renderer
                 .as_ref()
                 .map(|renderer| gpu_adapter_diagnostics_json(renderer.adapter_diagnostics())),
             "gpu_timestamp_timing": app
-                .gpu_renderer
+                .render_runtime.gpu_renderer
                 .as_ref()
                 .map(|renderer| gpu_timestamp_timing_json(renderer.adapter_diagnostics())),
             "presentation_timing": presentation_timing_json(),
             "brick_queue": app
-                .brick_read_pool
+                .dataset_runtime.brick_read_pool
                 .as_ref()
                 .and_then(|pool| pool.queue_diagnostics().ok())
                 .map(brick_queue_diagnostics_json),
             "brick_result_drain": {
-                "limit": app.state.brick_result_drain_limit,
-                "time_budget_ms": app.state.brick_result_drain_time_budget_ms,
-                "last_count": app.state.brick_result_drain_last_count,
-                "last_budget_limited": app.state.brick_result_drain_last_budget_limited,
-                "last_repaint_reason": app.state.brick_result_drain_last_repaint_reason.as_deref(),
-                "budget_hit_count": app.state.brick_result_drain_budget_hit_count,
-                "total_drained": app.state.brick_result_drain_total_drained,
+                "limit": app.dataset_runtime.brick_result_drain_limit,
+                "time_budget_ms": app.dataset_runtime.brick_result_drain_time_budget_ms,
+                "last_count": app.dataset_runtime.brick_result_drain_last_count,
+                "last_budget_limited": app.dataset_runtime.brick_result_drain_last_budget_limited,
+                "last_repaint_reason": app.dataset_runtime.brick_result_drain_last_repaint_reason.as_deref(),
+                "budget_hit_count": app.dataset_runtime.brick_result_drain_budget_hit_count,
+                "total_drained": app.dataset_runtime.brick_result_drain_total_drained,
             },
             "camera": {
-                "projection": format!("{:?}", app.state.camera.projection),
+                "projection": format!("{:?}", view.camera().projection()),
                 "viewport": {
-                    "width": app.state.render_viewport.width,
-                    "height": app.state.render_viewport.height,
+                    "width": app.render_runtime.render_viewport.width,
+                    "height": app.render_runtime.render_viewport.height,
                 },
             },
             "summary_text": app.diagnostics_summary_text(),
@@ -1758,6 +2062,7 @@ impl ProductAutomationController {
                 })
             })
             .unwrap_or(Value::Null);
+        let snapshot = current_egui_shell_bridge::snapshot(&app.application);
         let report = json!({
             "schema": AUTOMATION_REPORT_SCHEMA,
             "schema_version": AUTOMATION_SCHEMA_VERSION,
@@ -1790,8 +2095,8 @@ impl ProductAutomationController {
             "limits": self.script.limits,
             "limit_observations": self.limit_observations.json(),
             "dataset": {
-                "path": app.state.dataset_path.display().to_string(),
-                "name": app.state.dataset_name.clone(),
+                "path": app.dataset_runtime.dataset.root().display().to_string(),
+                "name": snapshot.catalog().label(),
             },
             "events": &self.events,
             "app_update_timing_samples": self
@@ -1841,7 +2146,7 @@ impl ProductAutomationController {
                 .collect::<Vec<_>>(),
             "final_diagnostics": self.diagnostics_json(app),
             "logs": {
-                "app_log": app.state.startup_diagnostics.logs_path.as_ref().map(|path| path.display().to_string()),
+                "app_log": app.startup_diagnostics.logs_path.as_ref().map(|path| path.display().to_string()),
             },
         });
         if let Some(parent) = self.report_path.parent()
@@ -1867,7 +2172,7 @@ impl ProductAutomationController {
                 tracing::error!(error = %err, "failed to serialize product automation report");
             }
         }
-        app.allow_close_without_prompt = true;
+        app.ui_runtime.allow_close_without_prompt = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
@@ -1881,6 +2186,13 @@ impl ProductAutomationController {
             return;
         }
         let total_update_ms = duration_ms(timing.update_started.elapsed());
+        let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+        let view = application_view(&snapshot);
+        let render_mode = view
+            .layer(view.active_layer())
+            .expect("application view has an active layer")
+            .render_state()
+            .mode();
         self.app_update_samples
             .push(ProductAutomationAppUpdateSample {
                 sample_index: self.app_update_samples.len(),
@@ -1900,14 +2212,20 @@ impl ProductAutomationController {
                     automation_step_ms,
                     total_update_ms,
                 },
-                background_work_active: app.background_work_active(),
-                active_timepoint: app.state.active_timepoint.0,
-                render_mode: app.state.active_render_mode,
-                display_freshness: app.state.frame_fidelity.display_freshness,
-                target_scale_level: app.state.frame_fidelity.target_scale_level,
-                displayed_scale_level: app.state.frame_fidelity.displayed_scale_level,
-                visible_bricks: app.state.frame_fidelity.visible_bricks,
-                resident_bricks: app.state.frame_fidelity.resident_bricks,
+                background_work_active: crate::workbench_playback_runtime::background_work_active(
+                    &snapshot,
+                    &app.import_runtime,
+                    &app.analysis_runtime,
+                    &app.dataset_runtime,
+                    &app.render_runtime,
+                ),
+                active_timepoint: view.timepoint().get(),
+                render_mode,
+                display_freshness: app.render_runtime.frame_fidelity.display_freshness,
+                target_scale_level: app.render_runtime.frame_fidelity.target_scale_level,
+                displayed_scale_level: app.render_runtime.frame_fidelity.displayed_scale_level,
+                visible_bricks: app.render_runtime.frame_fidelity.visible_bricks,
+                resident_bricks: app.render_runtime.frame_fidelity.resident_bricks,
             });
     }
 
@@ -2004,10 +2322,7 @@ impl ProductAutomationController {
         panel_id: PanelId,
         started_at: Instant,
     ) {
-        let Some(runtime) = app.state.viewer_layout.four_panel_runtime() else {
-            return;
-        };
-        let Some(panel) = runtime.panel(panel_id) else {
+        let Some(panel) = app.render_runtime.cross_section_runtime.panel(panel_id) else {
             return;
         };
         if panel_id.cross_section_panel().is_none() {
@@ -2021,7 +2336,11 @@ impl ProductAutomationController {
                 panel_id,
                 started_at,
                 target_generation: panel.generation,
-                active_timepoint: app.state.active_timepoint.0,
+                active_timepoint: application_view(&current_egui_shell_bridge::snapshot(
+                    &app.application,
+                ))
+                .timepoint()
+                .get(),
             });
     }
 
@@ -2044,7 +2363,7 @@ impl ProductAutomationController {
     fn observe_and_enforce_limits(&mut self, app: &MiranteWorkbenchApp) -> Result<(), String> {
         let limits = self.script.limits;
         let data_diagnostics = app
-            .state
+            .dataset_runtime
             .dataset
             .diagnostics()
             .map_err(|err| err.to_string());
@@ -2063,6 +2382,7 @@ impl ProductAutomationController {
         }
 
         let queue_diagnostics = app
+            .dataset_runtime
             .brick_read_pool
             .as_ref()
             .and_then(|pool| pool.queue_diagnostics().ok());
@@ -2081,6 +2401,7 @@ impl ProductAutomationController {
         }
 
         let gpu_stats = app
+            .render_runtime
             .gpu_renderer
             .as_ref()
             .map(|renderer| renderer.stats().map_err(|err| err.to_string()));
@@ -2143,10 +2464,9 @@ fn cross_section_panel_presentation_viewport(
     app: &MiranteWorkbenchApp,
     panel_id: PanelId,
 ) -> Result<PresentationViewport, String> {
-    app.state
-        .viewer_layout
-        .four_panel_runtime()
-        .and_then(|runtime| runtime.panel(panel_id))
+    app.render_runtime
+        .cross_section_runtime
+        .panel(panel_id)
         .and_then(|panel| panel.presentation_viewport)
         .ok_or_else(|| {
             format!(
@@ -2279,7 +2599,7 @@ fn vec3_json(value: glam::DVec3) -> Value {
 
 fn panel_hover_readout_side_effect_snapshot(app: &MiranteWorkbenchApp) -> Value {
     let cross_section_streams = app
-        .state
+        .render_runtime
         .cross_section_runtime
         .panel_streams
         .iter()
@@ -2288,7 +2608,7 @@ fn panel_hover_readout_side_effect_snapshot(app: &MiranteWorkbenchApp) -> Value 
                 "panel_id": panel_id.label(),
                 "panel_generation": stream.request_key.panel_generation,
                 "scale_level": stream.request_key.scale_level,
-                "timepoint": stream.request_key.timepoint.0,
+                "timepoint": stream.request_key.timepoint.get(),
                 "visible_chunks": stream.request_key.visible_chunk_count,
                 "visible_chunk_fingerprint": stream.request_key.visible_chunk_fingerprint,
                 "priority": format!("{:?}", stream.priority),
@@ -2322,21 +2642,21 @@ fn panel_hover_readout_side_effect_snapshot(app: &MiranteWorkbenchApp) -> Value 
         })
         .collect::<Vec<_>>();
     json!({
-        "data_engine_stats": app.state.dataset.stats().ok().map(data_engine_stats_json),
+        "data_engine_stats": app.dataset_runtime.dataset.stats().ok().map(data_engine_stats_json),
         "streaming_3d": {
-            "brick_stream_generation": app.state.brick_stream_generation,
-            "brick_stream_requested": app.state.brick_stream_requested,
-            "brick_stream_completed": app.state.brick_stream_completed,
-            "brick_stream_cancelled": app.state.brick_stream_cancelled,
-            "brick_stream_stale": app.state.brick_stream_stale,
-            "brick_stream_failed": app.state.brick_stream_failed,
-            "brick_stream_complete": app.state.brick_stream_complete,
-            "current_brick_ticket_count": app.current_brick_tickets.len(),
-            "prefetch_brick_ticket_count": app.prefetch_brick_tickets.len(),
-            "warm_brick_ticket_count": app.warm_brick_tickets.len(),
+            "brick_stream_generation": app.dataset_runtime.brick_stream_generation,
+            "brick_stream_requested": app.dataset_runtime.brick_stream_requested,
+            "brick_stream_completed": app.dataset_runtime.brick_stream_completed,
+            "brick_stream_cancelled": app.dataset_runtime.brick_stream_cancelled,
+            "brick_stream_stale": app.dataset_runtime.brick_stream_stale,
+            "brick_stream_failed": app.dataset_runtime.brick_stream_failed,
+            "brick_stream_complete": app.dataset_runtime.brick_stream_complete,
+            "current_brick_ticket_count": app.dataset_runtime.current_brick_tickets.len(),
+            "prefetch_brick_ticket_count": app.dataset_runtime.prefetch_brick_tickets.len(),
+            "warm_brick_ticket_count": app.dataset_runtime.warm_brick_tickets.len(),
         },
         "cross_section_brick_ticket_count": app
-            .state
+            .render_runtime
             .cross_section_runtime
             .pending_read_ticket_count(),
         "cross_section_streams": cross_section_streams,
@@ -2396,7 +2716,12 @@ fn cross_section_global_panel_chunk_counts(
     app: &MiranteWorkbenchApp,
     panel_id: PanelId,
 ) -> CrossSectionGlobalPanelChunkCounts {
-    let Some(panel) = app.state.cross_section_runtime.panels.get(&panel_id) else {
+    let Some(panel) = app
+        .render_runtime
+        .cross_section_runtime
+        .panels
+        .get(&panel_id)
+    else {
         return CrossSectionGlobalPanelChunkCounts::default();
     };
     let mut cpu_resident = 0usize;
@@ -2408,7 +2733,7 @@ fn cross_section_global_panel_chunk_counts(
     let mut gpu_resident = 0usize;
     let mut gpu_resident_bytes = 0u64;
     for key in &panel.visible_chunks {
-        let Some(entry) = app.state.cross_section_runtime.chunks.get(key) else {
+        let Some(entry) = app.render_runtime.cross_section_runtime.chunks.get(key) else {
             continue;
         };
         let Some(payload) = entry.payload.as_ref() else {
@@ -2457,12 +2782,14 @@ fn assert_cross_section_panel_images_distinct(
     min_different_pixels: usize,
 ) -> Result<(), String> {
     let renderer = app
+        .render_runtime
         .gpu_renderer
         .as_deref()
         .ok_or_else(|| "GPU renderer is unavailable for panel image readback".to_owned())?;
     let mut images = Vec::new();
     for panel_id in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
         let displayed = app
+            .render_runtime
             .cross_section_gpu_display_frames
             .get(&panel_id)
             .ok_or_else(|| {
@@ -2486,10 +2813,11 @@ fn assert_cross_section_streams_match_active_timepoint(
     min_visible_chunks: Option<usize>,
     max_failed: Option<usize>,
 ) -> Result<(), String> {
-    let active_timepoint = app.state.active_timepoint;
+    let active_timepoint =
+        application_view(&current_egui_shell_bridge::snapshot(&app.application)).timepoint();
     for panel_id in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
         let stream = app
-            .state
+            .render_runtime
             .cross_section_runtime
             .panel_streams
             .get(&panel_id)
@@ -2498,8 +2826,8 @@ fn assert_cross_section_streams_match_active_timepoint(
             return Err(format!(
                 "panel {} stream timepoint is {}, expected active timepoint {}",
                 panel_id.label(),
-                stream.request_key.timepoint.0,
-                active_timepoint.0
+                stream.request_key.timepoint.get(),
+                active_timepoint.get()
             ));
         }
         if let Some(min_completed) = min_completed
@@ -2542,10 +2870,12 @@ fn assert_cross_section_panel_nonblank(
     min_nonzero_rgb_pixels: usize,
 ) -> Result<(), String> {
     let renderer = app
+        .render_runtime
         .gpu_renderer
         .as_deref()
         .ok_or_else(|| "GPU renderer is unavailable for panel image readback".to_owned())?;
     let displayed = app
+        .render_runtime
         .cross_section_gpu_display_frames
         .get(&panel_id)
         .ok_or_else(|| {
@@ -2572,17 +2902,20 @@ fn assert_four_panel_images_distinct(
     min_different_pixels: usize,
 ) -> Result<(), String> {
     let renderer = app
+        .render_runtime
         .gpu_renderer
         .as_deref()
         .ok_or_else(|| "GPU renderer is unavailable for panel image readback".to_owned())?;
     let mut images = Vec::new();
     let frame = app
+        .render_runtime
         .gpu_display_frame
         .as_ref()
         .ok_or_else(|| "3D panel has no displayed GPU frame".to_owned())?;
     images.push(read_gpu_display_frame_image(renderer, "3D", frame)?);
     for panel_id in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
         let displayed = app
+            .render_runtime
             .cross_section_gpu_display_frames
             .get(&panel_id)
             .ok_or_else(|| {
@@ -2660,88 +2993,99 @@ fn assert_gpu_display_images_distinct(
 }
 
 fn assert_cross_section_retired(app: &MiranteWorkbenchApp) -> Result<(), String> {
-    if app.state.viewer_layout.layout() != ViewerLayout::Single3d {
+    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let view = application_view(&snapshot);
+    if view.layout() != ViewerLayout::Single3d {
         return Err(format!(
             "viewer layout is {:?}, expected Single3d for retired cross-section state",
-            app.state.viewer_layout.layout()
+            view.layout()
         ));
     }
-    if app.state.viewer_layout.four_panel_runtime().is_some() {
-        return Err("four-panel runtime is still allocated in Single3d".to_owned());
-    }
-    if !app.state.cross_section_runtime.panel_streams.is_empty() {
+    if !app
+        .render_runtime
+        .cross_section_runtime
+        .panel_streams
+        .is_empty()
+    {
         return Err(format!(
             "cross-section streams are still active: {}",
-            app.state.cross_section_runtime.panel_streams.len()
+            app.render_runtime.cross_section_runtime.panel_streams.len()
         ));
     }
-    if app.state.cross_section_runtime.pending_read_ticket_count() != 0 {
+    if app
+        .render_runtime
+        .cross_section_runtime
+        .pending_read_ticket_count()
+        != 0
+    {
         return Err(format!(
             "cross-section brick tickets are still active: {}",
-            app.state.cross_section_runtime.pending_read_ticket_count()
+            app.render_runtime
+                .cross_section_runtime
+                .pending_read_ticket_count()
         ));
     }
-    if app.state.cross_section_runtime.has_visible_work() {
+    if app.render_runtime.cross_section_runtime.has_visible_work() {
         return Err("cross-section global runtime still has visible work".to_owned());
     }
-    if !app.cross_section_gpu_display_frames.is_empty() {
+    if !app
+        .render_runtime
+        .cross_section_gpu_display_frames
+        .is_empty()
+    {
         return Err(format!(
             "cross-section display frames are still active: {}",
-            app.cross_section_gpu_display_frames.len()
+            app.render_runtime.cross_section_gpu_display_frames.len()
         ));
     }
     Ok(())
 }
 
 fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
+    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let view = application_view(&snapshot);
     let panels = app
-        .state
-        .viewer_layout
-        .four_panel_runtime()
-        .map(|runtime| {
-            runtime
-                .panels()
-                .iter()
-                .map(|panel| {
+        .render_runtime
+        .cross_section_runtime
+        .panels()
+        .map(|panel| {
+            json!({
+                "panel_id": panel.panel_id.label(),
+                "generation": panel.generation,
+                "displayed_generation": panel.displayed_generation,
+                "display_current": panel.display_current(),
+                "presentation_viewport": panel.presentation_viewport.map(|viewport| {
                     json!({
-                        "panel_id": panel.panel_id.label(),
-                        "generation": panel.generation,
-                        "displayed_generation": panel.displayed_generation,
-                        "display_current": panel.display_current(),
-                        "presentation_viewport": panel.presentation_viewport.map(|viewport| {
-                            json!({
-                                "width_points": viewport.width_points,
-                                "height_points": viewport.height_points,
-                            })
-                        }),
-                        "render_viewport": panel.render_viewport.map(|viewport| {
-                            json!({
-                                "width": viewport.width,
-                                "height": viewport.height,
-                            })
-                        }),
-                        "schedule": panel.cross_section_schedule.map(|schedule| {
-                            json!({
-                                "generation": schedule.generation,
-                                "target_scale_level": schedule.target_scale_level,
-                                "render_scale_level": schedule.render_scale_level,
-                                "fallback_scale_level": schedule.fallback_scale_level,
-                                "selected_bricks": schedule.selected_bricks,
-                                "occupied_selected_bricks": schedule.occupied_selected_bricks,
-                                "missing_occupied_bricks": schedule.missing_occupied_bricks,
-                                "estimated_decoded_bytes": schedule.estimated_decoded_bytes,
-                                "decoded_budget_bytes": schedule.decoded_budget_bytes,
-                                "status": format!("{:?}", schedule.status),
-                                "reason": format!("{:?}", schedule.reason),
-                            })
-                        }),
+                        "width_points": viewport.width_points(),
+                        "height_points": viewport.height_points(),
                     })
-                })
-                .collect::<Vec<_>>()
+                }),
+                "render_viewport": panel.render_viewport.map(|viewport| {
+                    json!({
+                        "width": viewport.width,
+                        "height": viewport.height,
+                    })
+                }),
+                "schedule": panel.cross_section_schedule.map(|schedule| {
+                    json!({
+                        "generation": schedule.generation,
+                        "target_scale_level": schedule.target_scale_level,
+                        "render_scale_level": schedule.render_scale_level,
+                        "fallback_scale_level": schedule.fallback_scale_level,
+                        "selected_bricks": schedule.selected_bricks,
+                        "occupied_selected_bricks": schedule.occupied_selected_bricks,
+                        "missing_occupied_bricks": schedule.missing_occupied_bricks,
+                        "estimated_decoded_bytes": schedule.estimated_decoded_bytes,
+                        "decoded_budget_bytes": schedule.decoded_budget_bytes,
+                        "status": format!("{:?}", schedule.status),
+                        "reason": format!("{:?}", schedule.reason),
+                    })
+                }),
+            })
         })
-        .unwrap_or_default();
+        .collect::<Vec<_>>();
     let streams = app
-        .state
+        .render_runtime
         .cross_section_runtime
         .panel_streams
         .iter()
@@ -2776,6 +3120,7 @@ fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
         .map(|panel_id| {
             let chunk_counts = cross_section_global_panel_chunk_counts(app, panel_id);
             let display_frame = app
+                .render_runtime
                 .cross_section_gpu_display_frames
                 .get(&panel_id)
                 .map(|displayed| {
@@ -2803,13 +3148,14 @@ fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
                 "gpu_resident_chunks": chunk_counts.gpu_resident,
                 "gpu_resident_bytes": chunk_counts.gpu_resident_bytes,
                 "missing_visible_chunks": chunk_counts.visible.saturating_sub(chunk_counts.cpu_resident),
-                "display_frame_present": app.cross_section_gpu_display_frames.contains_key(&panel_id),
+                "display_frame_present": app.render_runtime.cross_section_gpu_display_frames.contains_key(&panel_id),
                 "display_frame": display_frame,
             })
         })
         .collect::<Vec<_>>();
     let runtime_counts = cross_section_runtime_counts_json(app);
     let renderer_gpu = app
+        .render_runtime
         .gpu_renderer
         .as_ref()
         .and_then(|renderer| renderer.stats().ok())
@@ -2817,22 +3163,22 @@ fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
     json!({
         "schema": "mirante4d-cross-section-runtime-diagnostics",
         "schema_version": 1,
-        "layout": format!("{:?}", app.state.viewer_layout.layout()),
-        "active_panel": app
-            .state
-            .viewer_layout
+        "layout": format!("{:?}", view.layout()),
+        "active_panel": snapshot
+            .transient()
             .active_cross_section_panel()
+            .map(PanelId::from_application_panel)
             .map(|panel_id| panel_id.label().to_owned()),
-        "interaction_recent": cross_section_interaction_recent(&app.state),
+        "interaction_recent": cross_section_interaction_recent(&app.dataset_runtime),
         "last_interaction_age_ms": app
-            .state
+            .dataset_runtime
             .cross_section_last_interaction_at
             .map(|instant| instant.elapsed().as_millis()),
         "pending_ticket_count": app
-            .state
+            .render_runtime
             .cross_section_runtime
             .pending_read_ticket_count(),
-        "display_frame_count": app.cross_section_gpu_display_frames.len(),
+        "display_frame_count": app.render_runtime.cross_section_gpu_display_frames.len(),
         "read_submission_budget_per_refresh": crate::cross_section_streaming::CROSS_SECTION_CHUNK_READ_SUBMISSIONS_PER_REFRESH,
         "product_display_path": "global_runtime_chunked_renderer",
         "old_path_fallback_used": false,
@@ -2846,7 +3192,7 @@ fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
 }
 
 fn cross_section_runtime_counts_json(app: &MiranteWorkbenchApp) -> Value {
-    let runtime = &app.state.cross_section_runtime;
+    let runtime = &app.render_runtime.cross_section_runtime;
     let mut absent = 0usize;
     let mut queued = 0usize;
     let mut decoding = 0usize;

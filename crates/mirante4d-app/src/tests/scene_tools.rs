@@ -1,11 +1,52 @@
+fn scene_test_ui_runtime() -> current_runtime::ui::CurrentUiRuntime {
+    current_runtime::ui::CurrentUiRuntime::new(ResourcePolicy::default(), None)
+}
+
+fn set_scene_test_render_state(
+    app: &mut MiranteWorkbenchApp,
+    ctx: &egui::Context,
+    render_state: CanonicalRenderState,
+) {
+    let snapshot = app.application.snapshot();
+    let view = application_view(&snapshot);
+    let layer = view
+        .layer(view.active_layer())
+        .expect("the canonical test view must have an active layer");
+    app.apply_application_command(
+        ApplicationCommand::SetLayerView(LayerViewState::new(
+            layer.layer_key(),
+            layer.visible(),
+            layer.transfer().clone(),
+            render_state,
+        )),
+        ctx,
+    )
+    .expect("the test render state must satisfy the canonical application model");
+}
+
 #[test]
 fn app_color_image_composites_scene_layers_into_viewport_texture() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(&root).unwrap();
-    let base = color_image_for_state(&state);
-    state.scene_artifacts = sample_scene_artifacts();
-    let composited = color_image_for_state(&state);
+    let mut opened = open_dataset_and_render_first_frame(&root).unwrap();
+    let application = test_application_for_opened_source(&opened);
+    let ui_runtime = scene_test_ui_runtime();
+    let snapshot = application.snapshot();
+    let base = color_image_for_snapshot(
+        &snapshot,
+        &opened.dataset_runtime,
+        &opened.analysis_runtime,
+        &ui_runtime,
+        &opened.render_runtime,
+    );
+    opened.analysis_runtime.scene_artifacts = analysis_test_scene_artifacts();
+    let composited = color_image_for_snapshot(
+        &snapshot,
+        &opened.dataset_runtime,
+        &opened.analysis_runtime,
+        &ui_runtime,
+        &opened.render_runtime,
+    );
 
     assert_eq!(composited.size, base.size);
     assert_ne!(composited.pixels, base.pixels);
@@ -14,7 +55,7 @@ fn app_color_image_composites_scene_layers_into_viewport_texture() {
 fn app_scene_artifact_editor_updates_roi_through_command_store() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(&root).unwrap();
+    let mut opened = open_dataset_and_render_first_frame(&root).unwrap();
     let roi = RoiArtifact::new(
         SceneArtifactId::new("roi", "roi-a").unwrap(),
         "roi-a",
@@ -22,10 +63,11 @@ fn app_scene_artifact_editor_updates_roi_through_command_store() {
             min: DVec3::ZERO,
             max: DVec3::splat(1.0),
         },
-        SceneArtifactTime::Timepoint(TimeIndex(0)),
+        SceneArtifactTime::Timepoint(TimeIndex::new(0)),
     )
     .unwrap();
-    state
+    opened
+        .analysis_runtime
         .scene_artifacts
         .apply(SceneEditCommand::PutRoi {
             artifact: roi.clone(),
@@ -36,24 +78,36 @@ fn app_scene_artifact_editor_updates_roi_through_command_store() {
     updated.visible = false;
     updated.style = AnalysisSceneStyleRgba::new([0.25, 0.5, 0.75, 1.0]).unwrap();
 
-    assert!(update_scene_roi_artifact(&mut state, updated).unwrap());
+    assert!(update_scene_roi_artifact(&mut opened.analysis_runtime, updated).unwrap());
 
-    let stored = state.scene_artifacts.roi(&roi.id).unwrap();
+    let stored = opened
+        .analysis_runtime
+        .scene_artifacts
+        .roi(&roi.id)
+        .unwrap();
     assert_eq!(stored.name, "nucleus");
     assert!(!stored.visible);
     assert_eq!(stored.style.color_rgba, [0.25, 0.5, 0.75, 1.0]);
-    assert!(state.scene_artifacts.can_undo());
+    assert!(opened.analysis_runtime.scene_artifacts.can_undo());
 
-    state.scene_artifacts.undo().unwrap();
-    assert_eq!(state.scene_artifacts.roi(&roi.id).unwrap(), &roi);
-    assert!(state.scene_artifacts.can_redo());
+    opened.analysis_runtime.scene_artifacts.undo().unwrap();
+    assert_eq!(
+        opened
+            .analysis_runtime
+            .scene_artifacts
+            .roi(&roi.id)
+            .unwrap(),
+        &roi
+    );
+    assert!(opened.analysis_runtime.scene_artifacts.can_redo());
 }
 
 #[test]
 fn app_scene_artifact_editor_removes_roi_and_clears_selection() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(&root).unwrap();
+    let mut opened = open_dataset_and_render_first_frame(&root).unwrap();
+    let mut ui_runtime = scene_test_ui_runtime();
     let roi = RoiArtifact::new(
         SceneArtifactId::new("roi", "roi-a").unwrap(),
         "roi-a",
@@ -61,29 +115,50 @@ fn app_scene_artifact_editor_removes_roi_and_clears_selection() {
             min: DVec3::ZERO,
             max: DVec3::splat(1.0),
         },
-        SceneArtifactTime::Timepoint(TimeIndex(0)),
+        SceneArtifactTime::Timepoint(TimeIndex::new(0)),
     )
     .unwrap();
-    state
+    opened
+        .analysis_runtime
         .scene_artifacts
         .apply(SceneEditCommand::PutRoi {
             artifact: roi.clone(),
         })
         .unwrap();
-    select_scene_artifact(&mut state, EditableSceneArtifactKind::Roi, &roi.id);
+    select_scene_artifact(&mut ui_runtime, EditableSceneArtifactKind::Roi, &roi.id);
     assert!(selected_scene_artifact_matches(
-        &state,
+        &ui_runtime,
         EditableSceneArtifactKind::Roi,
         &roi.id
     ));
 
-    assert!(remove_scene_artifact(&mut state, EditableSceneArtifactKind::Roi, &roi.id).unwrap());
+    assert!(
+        remove_scene_artifact(
+            &mut opened.analysis_runtime,
+            &mut ui_runtime,
+            EditableSceneArtifactKind::Roi,
+            &roi.id,
+        )
+        .unwrap()
+    );
 
-    assert!(state.scene_artifacts.roi(&roi.id).is_none());
-    assert!(state.viewer_tools.selection.is_none());
-    assert!(state.scene_artifacts.can_undo());
-    state.scene_artifacts.undo().unwrap();
-    assert!(state.scene_artifacts.roi(&roi.id).is_some());
+    assert!(
+        opened
+            .analysis_runtime
+            .scene_artifacts
+            .roi(&roi.id)
+            .is_none()
+    );
+    assert!(ui_runtime.viewer_tools.selection.is_none());
+    assert!(opened.analysis_runtime.scene_artifacts.can_undo());
+    opened.analysis_runtime.scene_artifacts.undo().unwrap();
+    assert!(
+        opened
+            .analysis_runtime
+            .scene_artifacts
+            .roi(&roi.id)
+            .is_some()
+    );
 }
 
 #[test]
@@ -115,7 +190,7 @@ fn app_scene_artifact_editor_refreshes_measurement_result_after_geometry_edit() 
             source: "test".to_owned(),
             scope: "test".to_owned(),
         },
-        SceneArtifactTime::Timepoint(TimeIndex(0)),
+        SceneArtifactTime::Timepoint(TimeIndex::new(0)),
     )
     .unwrap();
     measurement.geometry =
@@ -133,24 +208,34 @@ fn app_scene_artifact_editor_refreshes_measurement_result_after_geometry_edit() 
 fn app_scene_artifact_editor_updates_track_and_annotation_artifacts() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(&root).unwrap();
-    state.scene_artifacts = sample_scene_artifacts();
+    let mut opened = open_dataset_and_render_first_frame(&root).unwrap();
+    opened.analysis_runtime.scene_artifacts = analysis_test_scene_artifacts();
 
     let track_id = SceneArtifactId::new("track", "track-a").unwrap();
-    let mut track = state.scene_artifacts.track(&track_id).unwrap().clone();
+    let mut track = opened
+        .analysis_runtime
+        .scene_artifacts
+        .track(&track_id)
+        .unwrap()
+        .clone();
     track.name = "edited track".to_owned();
     track.visible = false;
     track.style = AnalysisSceneStyleRgba::new([0.1, 0.2, 0.3, 1.0]).unwrap();
 
-    assert!(update_scene_track_artifact(&mut state, track).unwrap());
+    assert!(update_scene_track_artifact(&mut opened.analysis_runtime, track).unwrap());
 
-    let stored_track = state.scene_artifacts.track(&track_id).unwrap();
+    let stored_track = opened
+        .analysis_runtime
+        .scene_artifacts
+        .track(&track_id)
+        .unwrap();
     assert_eq!(stored_track.name, "edited track");
     assert!(!stored_track.visible);
     assert_eq!(stored_track.style.color_rgba, [0.1, 0.2, 0.3, 1.0]);
 
     let annotation_id = SceneArtifactId::new("annotation", "note-a").unwrap();
-    let mut annotation = state
+    let mut annotation = opened
+        .analysis_runtime
         .scene_artifacts
         .annotations()
         .find(|annotation| annotation.id == annotation_id)
@@ -160,9 +245,10 @@ fn app_scene_artifact_editor_updates_track_and_annotation_artifacts() {
     annotation.text = Some("reviewed".to_owned());
     annotation.visible = false;
 
-    assert!(update_scene_annotation_artifact(&mut state, annotation).unwrap());
+    assert!(update_scene_annotation_artifact(&mut opened.analysis_runtime, annotation).unwrap());
 
-    let stored_annotation = state
+    let stored_annotation = opened
+        .analysis_runtime
         .scene_artifacts
         .annotations()
         .find(|annotation| annotation.id == annotation_id)
@@ -176,24 +262,26 @@ fn app_scene_artifact_editor_updates_track_and_annotation_artifacts() {
 fn app_scene_artifact_editor_removes_annotation_and_clears_selection() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(&root).unwrap();
-    state.scene_artifacts = sample_scene_artifacts();
+    let mut opened = open_dataset_and_render_first_frame(&root).unwrap();
+    opened.analysis_runtime.scene_artifacts = analysis_test_scene_artifacts();
+    let mut ui_runtime = scene_test_ui_runtime();
     let annotation_id = SceneArtifactId::new("annotation", "note-a").unwrap();
 
     select_scene_artifact(
-        &mut state,
+        &mut ui_runtime,
         EditableSceneArtifactKind::Annotation,
         &annotation_id,
     );
     assert!(selected_scene_artifact_matches(
-        &state,
+        &ui_runtime,
         EditableSceneArtifactKind::Annotation,
         &annotation_id
     ));
 
     assert!(
         remove_scene_artifact(
-            &mut state,
+            &mut opened.analysis_runtime,
+            &mut ui_runtime,
             EditableSceneArtifactKind::Annotation,
             &annotation_id,
         )
@@ -201,15 +289,17 @@ fn app_scene_artifact_editor_removes_annotation_and_clears_selection() {
     );
 
     assert!(
-        state
+        opened
+            .analysis_runtime
             .scene_artifacts
             .annotations()
             .all(|annotation| annotation.id != annotation_id)
     );
-    assert!(state.viewer_tools.selection.is_none());
-    state.scene_artifacts.undo().unwrap();
+    assert!(ui_runtime.viewer_tools.selection.is_none());
+    opened.analysis_runtime.scene_artifacts.undo().unwrap();
     assert!(
-        state
+        opened
+            .analysis_runtime
             .scene_artifacts
             .annotations()
             .any(|annotation| annotation.id == annotation_id)
@@ -238,16 +328,27 @@ fn app_scene_artifact_editor_normalizes_annotation_geometry() {
 fn app_scene_artifact_editor_updates_track_point_positions() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(&root).unwrap();
-    state.scene_artifacts = sample_scene_artifacts();
+    let mut opened = open_dataset_and_render_first_frame(&root).unwrap();
+    opened.analysis_runtime.scene_artifacts = analysis_test_scene_artifacts();
     let track_id = SceneArtifactId::new("track", "track-a").unwrap();
-    let mut track = state.scene_artifacts.track(&track_id).unwrap().clone();
+    let mut track = opened
+        .analysis_runtime
+        .scene_artifacts
+        .track(&track_id)
+        .unwrap()
+        .clone();
     track.points[1].position_world = DVec3::new(5.0, 6.0, 7.0);
 
-    assert!(update_scene_track_artifact(&mut state, track).unwrap());
+    assert!(update_scene_track_artifact(&mut opened.analysis_runtime, track).unwrap());
 
     assert_eq!(
-        state.scene_artifacts.track(&track_id).unwrap().points[1].position_world,
+        opened
+            .analysis_runtime
+            .scene_artifacts
+            .track(&track_id)
+            .unwrap()
+            .points[1]
+            .position_world,
         DVec3::new(5.0, 6.0, 7.0)
     );
 }
@@ -256,26 +357,73 @@ fn app_scene_artifact_editor_updates_track_point_positions() {
 fn app_hover_readout_uses_named_volume_pick_policies() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(&root).unwrap();
+    let opened = open_dataset_and_render_first_frame(&root).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let ctx = egui::Context::default();
     let hover = ViewportHover {
-        x: state.frame.width / 2,
-        y: state.frame.height / 2,
+        x: app.render_runtime.frame.width / 2,
+        y: app.render_runtime.frame.height / 2,
         intensity: ViewportIntensity::U16(0),
     };
 
-    state.active_render_mode = RenderMode::Mip;
-    rerender_state_with_backend(&mut state, None).unwrap();
-    let mip = pick_hit_from_viewport_hover(&state, hover).unwrap();
+    let snapshot = app.application.snapshot();
+    let mip = pick_hit_from_viewport_hover(
+        &snapshot,
+        &app.dataset_runtime,
+        &app.analysis_runtime,
+        &app.ui_runtime,
+        &app.render_runtime,
+        hover,
+    )
+    .unwrap();
 
-    state.active_render_mode = RenderMode::Isosurface;
-    state.iso_display_level = iso_level_for_u16_threshold(3_000);
-    rerender_state_with_backend(&mut state, None).unwrap();
-    let iso = pick_hit_from_viewport_hover(&state, hover).unwrap();
+    set_scene_test_render_state(
+        &mut app,
+        &ctx,
+        CanonicalRenderState::iso(
+            SamplingPolicy::SmoothLinear,
+            IsoShadingPolicy::GradientLighting,
+            f32::from(3_000_u16) / f32::from(u16::MAX),
+        )
+        .unwrap(),
+    );
+    let snapshot = app.application.snapshot();
+    let iso = pick_hit_from_viewport_hover(
+        &snapshot,
+        &app.dataset_runtime,
+        &app.analysis_runtime,
+        &app.ui_runtime,
+        &app.render_runtime,
+        hover,
+    )
+    .unwrap();
 
-    state.active_render_mode = RenderMode::Dvr;
-    state.dvr_density_scale = 12.0;
-    rerender_state_with_backend(&mut state, None).unwrap();
-    let dvr = pick_hit_from_viewport_hover(&state, hover).unwrap();
+    let snapshot = app.application.snapshot();
+    let view = application_view(&snapshot);
+    let transfer = view
+        .layer(view.active_layer())
+        .expect("the canonical test view must have an active layer")
+        .transfer();
+    set_scene_test_render_state(
+        &mut app,
+        &ctx,
+        CanonicalRenderState::dvr(
+            SamplingPolicy::SmoothLinear,
+            CanonicalDvrOpacityTransfer::new(transfer.window(), transfer.curve()),
+            12.0,
+        )
+        .unwrap(),
+    );
+    let snapshot = app.application.snapshot();
+    let dvr = pick_hit_from_viewport_hover(
+        &snapshot,
+        &app.dataset_runtime,
+        &app.analysis_runtime,
+        &app.ui_runtime,
+        &app.render_runtime,
+        hover,
+    )
+    .unwrap();
 
     assert_eq!(mip.policy, PickPolicy::MipArgmax);
     assert_eq!(iso.policy, PickPolicy::FirstThresholdHit);
@@ -290,12 +438,17 @@ fn app_hover_readout_uses_named_volume_pick_policies() {
 fn app_tool_commands_commit_roi_and_measurement_artifacts() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(root).unwrap();
+    let mut opened = open_dataset_and_render_first_frame(root).unwrap();
+    let application = test_application_for_opened_source(&opened);
+    let snapshot = application.snapshot();
+    let mut ui_runtime = scene_test_ui_runtime();
     let anchor = world_tool_hit(DVec3::new(1.0, 2.0, 3.0), 4.0, 5.0);
     let current = world_tool_hit(DVec3::new(4.0, 6.0, 8.0), 9.0, 10.0);
 
     let outcome = apply_viewer_tool_commands(
-        &mut state,
+        &snapshot,
+        &mut opened.analysis_runtime,
+        &mut ui_runtime,
         vec![
             ViewerToolCommand::CommitRoi {
                 anchor: anchor.clone(),
@@ -307,72 +460,31 @@ fn app_tool_commands_commit_roi_and_measurement_artifacts() {
     .unwrap();
 
     assert!(outcome.rerender_requested);
-    assert_eq!(state.scene_artifacts.rois().count(), 1);
-    assert_eq!(state.scene_artifacts.measurements().count(), 1);
-    let roi = state.scene_artifacts.rois().next().unwrap();
+    assert_eq!(opened.analysis_runtime.scene_artifacts.rois().count(), 1);
+    assert_eq!(
+        opened
+            .analysis_runtime
+            .scene_artifacts
+            .measurements()
+            .count(),
+        1
+    );
+    let roi = opened
+        .analysis_runtime
+        .scene_artifacts
+        .rois()
+        .next()
+        .unwrap();
     assert_eq!(roi.world_bounds().unwrap().min, DVec3::new(1.0, 2.0, 3.0));
     assert_eq!(roi.world_bounds().unwrap().max, DVec3::new(4.0, 6.0, 8.0));
-    let measurement = state.scene_artifacts.measurements().next().unwrap();
+    let measurement = opened
+        .analysis_runtime
+        .scene_artifacts
+        .measurements()
+        .next()
+        .unwrap();
     assert_eq!(
         measurement.result.as_ref().unwrap().value,
         (50.0_f64).sqrt()
     );
-}
-
-#[test]
-fn project_json_atomic_write_restores_existing_file_after_commit_failure() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let project_path = tempdir.path().join("atomic-session.m4dproj");
-    fs::create_dir_all(&project_path).unwrap();
-    let project_json = project_json_path(&project_path);
-    let old_json = "{\n  \"project\": \"old\"\n}\n";
-    fs::write(&project_json, old_json).unwrap();
-
-    let err = write_project_json_atomically_with_forced_commit_failure(
-        &project_path,
-        "{\n  \"project\": \"new\"\n}",
-    )
-    .unwrap_err();
-
-    assert!(err.to_string().contains("failed to commit"));
-    assert_eq!(fs::read_to_string(&project_json).unwrap(), old_json);
-    assert!(!project_path.join(".project.json.tmp").exists());
-    assert!(!project_path.join(".project.json.replace-backup").exists());
-}
-
-#[test]
-fn project_artifact_atomic_write_restores_existing_file_after_commit_failure() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let artifact_path = tempdir
-        .path()
-        .join("atomic-session.m4dproj/artifacts/tables/table.json");
-    fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
-    let old_json = "{\n  \"artifact\": \"old\"\n}\n";
-    fs::write(&artifact_path, old_json).unwrap();
-
-    let err = write_json_artifact_atomically_with_forced_commit_failure(
-        &artifact_path,
-        "{\n  \"artifact\": \"new\"\n}",
-    )
-    .unwrap_err();
-
-    assert!(err.to_string().contains("failed to commit"));
-    assert_eq!(fs::read_to_string(&artifact_path).unwrap(), old_json);
-    assert!(!artifact_path.with_file_name(".table.json.tmp").exists());
-    assert!(
-        !artifact_path
-            .with_file_name(".table.json.replace-backup")
-            .exists()
-    );
-}
-
-#[test]
-fn rejects_file_based_m4dproj_sessions() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let path = tempdir.path().join("legacy-file.m4dproj");
-    fs::write(&path, "{}").unwrap();
-
-    let err = read_session_file(&path).unwrap_err();
-
-    assert!(err.to_string().contains(".m4dproj directory"));
 }

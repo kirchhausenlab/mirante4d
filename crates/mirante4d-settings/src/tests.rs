@@ -76,6 +76,26 @@ fn recommended_policy_uses_the_approved_formulas() {
 }
 
 #[test]
+fn linux_meminfo_parser_accepts_only_a_bounded_exact_memtotal_fact() {
+    assert_eq!(
+        parse_linux_mem_total_bytes("MemTotal:       16384000 kB\nMemFree:         1024 kB\n"),
+        Some(16_384_000_u64 * 1024)
+    );
+    assert_eq!(parse_linux_mem_total_bytes("MemTotal: 0 kB\n"), None);
+    assert_eq!(parse_linux_mem_total_bytes("MemTotal: 100 MB\n"), None);
+    assert_eq!(parse_linux_mem_total_bytes("MemTotal: nope kB\n"), None);
+    assert_eq!(parse_linux_mem_total_bytes("MemFree: 100 kB\n"), None);
+    assert_eq!(
+        parse_linux_mem_total_bytes("MemTotal: 100 kB extra\n"),
+        None
+    );
+    assert_eq!(
+        parse_linux_mem_total_bytes("MemTotal: 18446744073709551615 kB\n"),
+        None
+    );
+}
+
+#[test]
 fn known_gpu_below_the_explicit_minimum_is_rejected_not_silently_clamped() {
     assert_eq!(
         ResourcePolicy::recommended(Some(16 * GIB), Some(2 * GIB)),
@@ -309,11 +329,16 @@ fn valid_file_loads_without_rewriting_its_bytes() {
 fn background_actor_loads_and_persists_with_restart_required_event() {
     let tempdir = tempfile::tempdir().unwrap();
     let path = tempdir.path().join("config/settings.json");
-    let actor = SettingsActor::spawn(path.clone(), SettingsDocument::default()).unwrap();
+    let mut actor = SettingsActor::spawn(path.clone(), SettingsDocument::default()).unwrap();
     assert!(matches!(
-        receive_event(&actor),
-        SettingsEvent::Loaded(SettingsLoadOutcome::DefaultsActiveMissing { .. })
+        actor.receive_startup().unwrap(),
+        SettingsLoadOutcome::DefaultsActiveMissing { .. }
     ));
+    assert_eq!(
+        actor.receive_startup().unwrap_err(),
+        SettingsError::StartupAlreadyReceived
+    );
+    assert!(actor.try_recv().unwrap().is_none());
 
     let document = SettingsDocument::new(ResourcePolicy::new(6 * GIB, 3 * GIB).unwrap());
     let request_id = SettingsRequestId::new(42);
@@ -338,6 +363,22 @@ fn background_actor_loads_and_persists_with_restart_required_event() {
         document
     );
     assert_no_owned_temporaries(path.parent().unwrap());
+    actor.shutdown().unwrap();
+}
+
+#[test]
+fn actor_requires_the_initial_loaded_event_before_nonblocking_event_drains() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("settings.json");
+    let mut actor = SettingsActor::spawn(path, SettingsDocument::default()).unwrap();
+    assert_eq!(
+        actor.try_recv().unwrap_err(),
+        SettingsError::StartupNotReceived
+    );
+    assert!(matches!(
+        actor.receive_startup().unwrap(),
+        SettingsLoadOutcome::DefaultsActiveMissing { .. }
+    ));
     actor.shutdown().unwrap();
 }
 

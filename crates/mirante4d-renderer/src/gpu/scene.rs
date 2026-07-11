@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use mirante4d_core::CameraState;
+use mirante4d_render_api::CameraFrame;
 use wgpu::util::DeviceExt;
 
 use super::{
@@ -33,7 +33,7 @@ impl GpuRenderer {
         &self,
         frame: GpuDisplayFrame,
         draw_list: &crate::SceneDrawList,
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
     ) -> Result<GpuDisplayFrame, GpuRenderError> {
         if frame.viewport != viewport {
@@ -203,7 +203,7 @@ impl GpuRenderer {
         &self,
         base: &SceneRgbaImage,
         draw_list: &crate::SceneDrawList,
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
     ) -> Result<SceneRenderOutput, GpuRenderError> {
         Ok(self
@@ -215,7 +215,7 @@ impl GpuRenderer {
         &self,
         base: &SceneRgbaImage,
         draw_list: &crate::SceneDrawList,
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
     ) -> Result<GpuSceneRenderOutput, GpuRenderError> {
         if base.width != viewport.width || base.height != viewport.height {
@@ -257,7 +257,7 @@ impl GpuRenderer {
     pub fn pick_scene_object_id(
         &self,
         draw_list: &crate::SceneDrawList,
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
         query: PickQuery,
     ) -> Result<PickHit, GpuRenderError> {
@@ -269,7 +269,7 @@ impl GpuRenderer {
     pub fn pick_scene_object_id_with_timings(
         &self,
         draw_list: &crate::SceneDrawList,
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
         query: PickQuery,
     ) -> Result<GpuScenePickOutput, GpuRenderError> {

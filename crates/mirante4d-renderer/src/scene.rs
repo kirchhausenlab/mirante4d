@@ -1,7 +1,8 @@
 use std::fmt;
 
 use glam::{DMat4, DVec3};
-use mirante4d_core::{GridToWorld, LayerId, TimeIndex};
+use mirante4d_domain::{GridToWorld, TimeIndex};
+use mirante4d_format::LayerId;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
@@ -807,8 +808,8 @@ fn validate_id(kind: &'static str, value: String) -> Result<String, SceneError> 
 fn validate_interval(start: TimeIndex, end_exclusive: TimeIndex) -> Result<(), SceneError> {
     if start >= end_exclusive {
         Err(SceneError::InvalidTimeInterval {
-            start: start.0,
-            end_exclusive: end_exclusive.0,
+            start: start.get(),
+            end_exclusive: end_exclusive.get(),
         })
     } else {
         Ok(())
@@ -867,18 +868,18 @@ mod tests {
 
     #[test]
     fn time_visibility_is_explicit_and_validated() {
-        assert!(SceneTime::Static.is_visible_at(TimeIndex(99)));
-        assert!(SceneTime::Timepoint(TimeIndex(3)).is_visible_at(TimeIndex(3)));
-        assert!(!SceneTime::Timepoint(TimeIndex(3)).is_visible_at(TimeIndex(4)));
+        assert!(SceneTime::Static.is_visible_at(TimeIndex::new(99)));
+        assert!(SceneTime::Timepoint(TimeIndex::new(3)).is_visible_at(TimeIndex::new(3)));
+        assert!(!SceneTime::Timepoint(TimeIndex::new(3)).is_visible_at(TimeIndex::new(4)));
 
-        let interval = SceneTime::interval(TimeIndex(2), TimeIndex(5)).unwrap();
-        assert!(!interval.is_visible_at(TimeIndex(1)));
-        assert!(interval.is_visible_at(TimeIndex(2)));
-        assert!(interval.is_visible_at(TimeIndex(4)));
-        assert!(!interval.is_visible_at(TimeIndex(5)));
+        let interval = SceneTime::interval(TimeIndex::new(2), TimeIndex::new(5)).unwrap();
+        assert!(!interval.is_visible_at(TimeIndex::new(1)));
+        assert!(interval.is_visible_at(TimeIndex::new(2)));
+        assert!(interval.is_visible_at(TimeIndex::new(4)));
+        assert!(!interval.is_visible_at(TimeIndex::new(5)));
 
         assert_eq!(
-            SceneTime::interval(TimeIndex(4), TimeIndex(4)).unwrap_err(),
+            SceneTime::interval(TimeIndex::new(4), TimeIndex::new(4)).unwrap_err(),
             SceneError::InvalidTimeInterval {
                 start: 4,
                 end_exclusive: 4,
@@ -900,14 +901,14 @@ mod tests {
         let visible_track = SceneObject::new(
             SceneObjectId::new("track-visible").unwrap(),
             CoordinateSpace::World,
-            SceneTime::trajectory(TimeIndex(0), TimeIndex(10)).unwrap(),
+            SceneTime::trajectory(TimeIndex::new(0), TimeIndex::new(10)).unwrap(),
             OcclusionPolicy::VolumeDepthCued,
             SceneGeometry::polyline(vec![DVec3::ZERO, DVec3::X], 1.0).unwrap(),
         );
         let wrong_time = SceneObject::new(
             SceneObjectId::new("track-hidden-time").unwrap(),
             CoordinateSpace::World,
-            SceneTime::Timepoint(TimeIndex(7)),
+            SceneTime::Timepoint(TimeIndex::new(7)),
             OcclusionPolicy::VolumeDepthCued,
             SceneGeometry::Point {
                 position: DVec3::Y,
@@ -948,7 +949,7 @@ mod tests {
 
         let draw_list = extract_scene_draw_list(
             &[visible_layer, hidden_layer],
-            SceneFrameContext::new(TimeIndex(3)),
+            SceneFrameContext::new(TimeIndex::new(3)),
         );
 
         assert_eq!(draw_list.len(), 1);
@@ -984,7 +985,7 @@ mod tests {
 
         let draw_list = extract_scene_draw_list(
             &[interaction, screen_reference, track],
-            SceneFrameContext::new(TimeIndex(0)),
+            SceneFrameContext::new(TimeIndex::new(0)),
         );
         let passes = draw_list
             .items()
@@ -1024,7 +1025,8 @@ mod tests {
         )
         .with_object(object);
 
-        let draw_list = extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex(0)));
+        let draw_list =
+            extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex::new(0)));
         let item = &draw_list.items()[0];
 
         assert_eq!(
@@ -1044,7 +1046,7 @@ mod tests {
             layer_id: None,
             object_id: None,
             source_layer_id: Some(LayerId::new("ch0").unwrap()),
-            timepoint: TimeIndex(12),
+            timepoint: TimeIndex::new(12),
             world_position: Some(DVec3::new(1.0, 2.0, 3.0)),
             grid_position: Some(GridPosition {
                 z: 3.0,
@@ -1081,7 +1083,7 @@ mod tests {
         let hit = pick_scene_targets(
             &[bottom, top],
             PickQuery {
-                timepoint: TimeIndex(0),
+                timepoint: TimeIndex::new(0),
                 screen_position: ScreenPosition::new(52.0, 50.0),
             },
         );
@@ -1101,7 +1103,7 @@ mod tests {
                 PickPrimitive::point(ScreenPosition::new(10.0, 10.0), 3.0).unwrap(),
             )],
             PickQuery {
-                timepoint: TimeIndex(0),
+                timepoint: TimeIndex::new(0),
                 screen_position: ScreenPosition::new(100.0, 100.0),
             },
         );
@@ -1117,7 +1119,7 @@ mod tests {
         let hit = voxel_pick_hit_u8(
             VolumePickProbe {
                 source_layer_id: LayerId::new("u8-ch0").unwrap(),
-                timepoint: TimeIndex(6),
+                timepoint: TimeIndex::new(6),
                 screen_position: ScreenPosition::new(3.0, 4.0),
                 world_position: Some(DVec3::new(1.25, 2.5, 3.75)),
                 grid_position: Some(GridPosition {
@@ -1133,7 +1135,7 @@ mod tests {
 
         assert_eq!(hit.kind, PickHitKind::Voxel);
         assert_eq!(hit.source_layer_id.unwrap().as_str(), "u8-ch0");
-        assert_eq!(hit.timepoint, TimeIndex(6));
+        assert_eq!(hit.timepoint, TimeIndex::new(6));
         assert_eq!(hit.value, Some(PickValue::IntensityU8(u8::MAX)));
         assert_eq!(hit.policy, PickPolicy::MipArgmax);
         assert_eq!(hit.completeness, PickCompleteness::Exact);
@@ -1145,7 +1147,7 @@ mod tests {
         let hit = voxel_pick_hit_f32(
             VolumePickProbe {
                 source_layer_id: LayerId::new("float-ch0").unwrap(),
-                timepoint: TimeIndex(5),
+                timepoint: TimeIndex::new(5),
                 screen_position: ScreenPosition::new(3.0, 4.0),
                 world_position: Some(DVec3::new(1.25, 2.5, 3.75)),
                 grid_position: Some(GridPosition {
@@ -1161,7 +1163,7 @@ mod tests {
 
         assert_eq!(hit.kind, PickHitKind::Voxel);
         assert_eq!(hit.source_layer_id.unwrap().as_str(), "float-ch0");
-        assert_eq!(hit.timepoint, TimeIndex(5));
+        assert_eq!(hit.timepoint, TimeIndex::new(5));
         assert_eq!(hit.value, Some(PickValue::IntensityF32(-2.5)));
         assert_eq!(hit.policy, PickPolicy::MipArgmax);
         assert_eq!(hit.completeness, PickCompleteness::Exact);
@@ -1223,12 +1225,13 @@ mod tests {
             CoordinateSpace::World,
             OcclusionPolicy::VolumeDepthCued,
         ));
-        let draw_list = extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex(0)));
+        let draw_list =
+            extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex::new(0)));
         ScenePickTarget::from_draw_item(
             &draw_list.items()[0],
             primitive,
             PickHitKind::Annotation,
-            TimeIndex(0),
+            TimeIndex::new(0),
             PickCompleteness::Exact,
         )
     }

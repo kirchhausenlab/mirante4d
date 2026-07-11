@@ -3,27 +3,31 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use mirante4d_core::{IntensityDType, LayerId, TimeIndex};
+use mirante4d_application::CrossSectionPanelId;
 #[cfg(test)]
 use mirante4d_data::BrickReadPool;
 use mirante4d_data::{
     BrickMetadata, BrickReadOutcome, BrickReadPayload, BrickReadStatus, BrickRequestPriority,
-    CancellationToken, DataGenerationId, SpatialBrickIndex,
+    CancellationToken, DataGenerationId, DenseVolumeF32, DenseVolumeU8, DenseVolumeU16,
+    SpatialBrickIndex, VolumeBrickF32, VolumeBrickU8, VolumeBrickU16,
+    translated_region_grid_to_world,
 };
+use mirante4d_domain::{IntensityDType, TimeIndex, ViewerLayout};
+use mirante4d_format::LayerId;
+use mirante4d_project_model::ViewState;
 
 use crate::{
-    AppLayerSummary, AppState,
-    brick_streaming::{stream_layer_ids_for_state, zero_resident_brick_payload},
     cross_section_read_queue::{
         CrossSectionChunkReadSubmission, CrossSectionReadBackend,
         cross_section_read_admissions_for_refresh,
     },
     cross_section_runtime::{
-        CrossSectionBrickReadTicket, CrossSectionChunkKey, CrossSectionPanelBrickStreamState,
-        CrossSectionRuntime, CrossSectionVisibleChunkRequestKey,
+        CrossSectionBrickReadTicket, CrossSectionChunkKey, CrossSectionLayerInput,
+        CrossSectionPanelBrickStreamState, CrossSectionRuntime, CrossSectionVisibleChunkRequestKey,
     },
-    cross_section_scheduler::schedule_cross_section_panel_for_state,
-    viewer_layout::{PanelId, ViewerLayout},
+    cross_section_scheduler::{CrossSectionScheduleInput, schedule_cross_section_panel},
+    current_runtime::{dataset::CurrentDatasetRuntime, render::CurrentRenderRuntime},
+    viewer_layout::PanelId,
 };
 
 pub(crate) const CROSS_SECTION_CHUNK_READ_SUBMISSIONS_PER_REFRESH: usize = 64;
@@ -33,7 +37,7 @@ pub(crate) const CROSS_SECTION_CHUNK_READ_SUBMISSIONS_PER_PANEL_CALL: usize =
 
 #[derive(Debug, Clone)]
 struct CrossSectionVisibleChunkStreamPlan {
-    layer: AppLayerSummary,
+    layer_id: LayerId,
     metadata: BrickMetadata,
 }
 
@@ -75,8 +79,20 @@ pub(crate) struct CrossSectionBrickOutcomePartition {
     pub(crate) resident_changed: bool,
 }
 
-pub(crate) fn cross_section_panel_stream_work_active(state: &AppState, panel_id: PanelId) -> bool {
-    let Some(stream) = state.cross_section_runtime.panel_streams.get(&panel_id) else {
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CrossSectionStreamingInput<'a> {
+    pub(crate) view: &'a ViewState,
+    pub(crate) active_layer_id: &'a LayerId,
+    pub(crate) layers: &'a [CrossSectionLayerInput<'a>],
+    pub(crate) active_panel: Option<CrossSectionPanelId>,
+    pub(crate) gpu_budget_bytes: u64,
+}
+
+pub(crate) fn cross_section_panel_stream_work_active(
+    runtime: &CrossSectionRuntime,
+    panel_id: PanelId,
+) -> bool {
+    let Some(stream) = runtime.panel_streams.get(&panel_id) else {
         return false;
     };
     if stream.active() {
@@ -85,30 +101,30 @@ pub(crate) fn cross_section_panel_stream_work_active(state: &AppState, panel_id:
     if stream.complete {
         return false;
     }
-    state
-        .viewer_layout
-        .four_panel_runtime()
-        .and_then(|runtime| runtime.panel(panel_id))
+    runtime
+        .panel(panel_id)
         .and_then(|panel| panel.cross_section_schedule)
         .is_some_and(|schedule| schedule.missing_occupied_bricks > 0)
 }
 
-pub(crate) fn cross_section_runtime_work_active(state: &AppState) -> bool {
-    state
-        .cross_section_runtime
+pub(crate) fn cross_section_runtime_work_active(runtime: &CrossSectionRuntime) -> bool {
+    runtime
         .panel_streams
         .keys()
         .copied()
-        .any(|panel_id| cross_section_panel_stream_work_active(state, panel_id))
+        .any(|panel_id| cross_section_panel_stream_work_active(runtime, panel_id))
 }
 
 pub(crate) fn cross_section_request_priority_for_panel(
-    state: &AppState,
+    runtime: &CrossSectionRuntime,
+    active_panel: Option<PanelId>,
     panel_id: PanelId,
 ) -> BrickRequestPriority {
-    match state.viewer_layout.active_cross_section_panel() {
+    match active_panel {
         Some(active_panel) if active_panel == panel_id => BrickRequestPriority::CurrentFrame,
-        Some(_) if cross_section_inactive_panel_fairness_promoted(state, panel_id) => {
+        Some(active_panel)
+            if cross_section_inactive_panel_fairness_promoted(runtime, active_panel, panel_id) =>
+        {
             BrickRequestPriority::CurrentFrame
         }
         Some(_) => BrickRequestPriority::Prefetch,
@@ -117,50 +133,51 @@ pub(crate) fn cross_section_request_priority_for_panel(
 }
 
 pub(crate) fn cross_section_inactive_panel_fairness_promoted(
-    state: &AppState,
+    runtime: &CrossSectionRuntime,
+    active_panel: PanelId,
     panel_id: PanelId,
 ) -> bool {
-    let Some(active_panel) = state.viewer_layout.active_cross_section_panel() else {
-        return false;
-    };
     if active_panel == panel_id || panel_id.cross_section_panel().is_none() {
         return false;
     }
-    let active_panel_has_current_work = state
-        .cross_section_runtime
-        .panel_streams
-        .get(&active_panel)
-        .is_some_and(|stream| {
-            stream.priority == BrickRequestPriority::CurrentFrame && stream.active()
-        });
+    let active_panel_has_current_work =
+        runtime
+            .panel_streams
+            .get(&active_panel)
+            .is_some_and(|stream| {
+                stream.priority == BrickRequestPriority::CurrentFrame && stream.active()
+            });
     if !active_panel_has_current_work {
         return false;
     }
-    !state
-        .cross_section_runtime
-        .panel_streams
-        .iter()
-        .any(|(stream_panel, stream)| {
-            *stream_panel != active_panel
-                && *stream_panel != panel_id
-                && stream.fairness_promoted
-                && stream.active()
-        })
+    !runtime.panel_streams.iter().any(|(stream_panel, stream)| {
+        *stream_panel != active_panel
+            && *stream_panel != panel_id
+            && stream.fairness_promoted
+            && stream.active()
+    })
 }
 
-pub(crate) fn retire_cross_section_streaming_state(state: &mut AppState) {
-    state.cross_section_runtime.clear_visible_work();
+pub(crate) fn retire_cross_section_streaming_state(render: &mut CurrentRenderRuntime) {
+    render.cross_section_runtime.clear_visible_work();
 }
 
 #[cfg(test)]
 pub(crate) fn submit_cross_section_panel_bricks_to_pool(
-    state: &mut AppState,
+    dataset: &CurrentDatasetRuntime,
+    render: &mut CurrentRenderRuntime,
+    input: CrossSectionStreamingInput<'_>,
     panel_id: PanelId,
     pool: &BrickReadPool,
 ) -> anyhow::Result<CrossSectionBrickSubmissionResult> {
-    retire_tickets_before_generation(state, CrossSectionReadBackend::active_generation(pool));
+    retire_tickets_before_generation(
+        &mut render.cross_section_runtime,
+        CrossSectionReadBackend::active_generation(pool),
+    );
     submit_cross_section_panel_bricks_to_pool_with_budget(
-        state,
+        dataset,
+        render,
+        input,
         panel_id,
         pool,
         CROSS_SECTION_CHUNK_READ_SUBMISSIONS_PER_PANEL_CALL,
@@ -169,36 +186,52 @@ pub(crate) fn submit_cross_section_panel_bricks_to_pool(
 
 #[cfg(test)]
 pub(crate) fn submit_cross_section_visible_chunks_to_pool(
-    state: &mut AppState,
+    dataset: &CurrentDatasetRuntime,
+    render: &mut CurrentRenderRuntime,
+    input: CrossSectionStreamingInput<'_>,
     pool: &BrickReadPool,
 ) -> anyhow::Result<CrossSectionBrickSubmissionResult> {
-    submit_cross_section_visible_chunks_to_read_queue(state, pool)
+    submit_cross_section_visible_chunks_to_read_queue(dataset, render, input, pool)
 }
 
 pub(crate) fn submit_cross_section_visible_chunks_to_read_queue(
-    state: &mut AppState,
+    dataset: &CurrentDatasetRuntime,
+    render: &mut CurrentRenderRuntime,
+    input: CrossSectionStreamingInput<'_>,
     read_queue: &impl CrossSectionReadBackend,
 ) -> anyhow::Result<CrossSectionBrickSubmissionResult> {
-    if state.viewer_layout.layout() != ViewerLayout::FourPanel {
+    if input.view.layout() != ViewerLayout::FourPanel {
         return Ok(CrossSectionBrickSubmissionResult::default());
     }
 
-    retire_tickets_before_generation(state, read_queue.active_generation());
+    retire_tickets_before_generation(
+        &mut render.cross_section_runtime,
+        read_queue.active_generation(),
+    );
 
-    let panel_order = cross_section_global_submission_panel_order(state);
+    let panel_order = cross_section_global_submission_panel_order(
+        &render.cross_section_runtime,
+        input.active_panel.map(PanelId::from_application_panel),
+    );
     let panel_order =
-        cross_section_runtime_panel_submission_order(&state.cross_section_runtime, panel_order);
+        cross_section_runtime_panel_submission_order(&render.cross_section_runtime, panel_order);
 
     let mut prepared_by_panel = HashMap::new();
     for panel_id in &panel_order {
-        let Some(prepared) = prepare_cross_section_panel_submission(state, *panel_id)? else {
+        let Some(prepared) = prepare_cross_section_panel_submission(
+            dataset,
+            &mut render.cross_section_runtime,
+            input,
+            *panel_id,
+        )?
+        else {
             continue;
         };
         prepared_by_panel.insert(*panel_id, prepared);
     }
 
     let admissions = cross_section_read_admissions_for_refresh(
-        &state.cross_section_runtime,
+        &render.cross_section_runtime,
         panel_order
             .iter()
             .copied()
@@ -215,7 +248,7 @@ pub(crate) fn submit_cross_section_visible_chunks_to_read_queue(
             continue;
         };
         submit_prepared_cross_section_queue_entry(
-            state,
+            &mut render.cross_section_runtime,
             read_queue,
             queue_entry,
             admission.worker_queue_priority,
@@ -229,7 +262,7 @@ pub(crate) fn submit_cross_section_visible_chunks_to_read_queue(
             continue;
         };
         result.absorb(finalize_prepared_cross_section_panel_submission(
-            state, panel_id, prepared,
+            dataset, render, input, panel_id, prepared,
         ));
     }
 
@@ -238,22 +271,30 @@ pub(crate) fn submit_cross_section_visible_chunks_to_read_queue(
 
 #[cfg(test)]
 fn submit_cross_section_panel_bricks_to_pool_with_budget(
-    state: &mut AppState,
+    dataset: &CurrentDatasetRuntime,
+    render: &mut CurrentRenderRuntime,
+    input: CrossSectionStreamingInput<'_>,
     panel_id: PanelId,
     pool: &BrickReadPool,
     missing_submission_budget: usize,
 ) -> anyhow::Result<CrossSectionBrickSubmissionResult> {
-    let Some(mut prepared) = prepare_cross_section_panel_submission(state, panel_id)? else {
+    let Some(mut prepared) = prepare_cross_section_panel_submission(
+        dataset,
+        &mut render.cross_section_runtime,
+        input,
+        panel_id,
+    )?
+    else {
         return Ok(CrossSectionBrickSubmissionResult::default());
     };
     let admissions = cross_section_read_admissions_for_refresh(
-        &state.cross_section_runtime,
+        &render.cross_section_runtime,
         [panel_id],
         missing_submission_budget,
     );
     for admission in admissions {
         submit_prepared_cross_section_queue_entry(
-            state,
+            &mut render.cross_section_runtime,
             pool,
             admission.queue_entry,
             admission.worker_queue_priority,
@@ -261,23 +302,20 @@ fn submit_cross_section_panel_bricks_to_pool_with_budget(
         )?;
     }
     Ok(finalize_prepared_cross_section_panel_submission(
-        state, panel_id, prepared,
+        dataset, render, input, panel_id, prepared,
     ))
 }
 
 fn prepare_cross_section_panel_submission(
-    state: &mut AppState,
+    dataset: &CurrentDatasetRuntime,
+    runtime: &mut CrossSectionRuntime,
+    input: CrossSectionStreamingInput<'_>,
     panel_id: PanelId,
 ) -> anyhow::Result<Option<CrossSectionPreparedPanelSubmission>> {
-    if state.viewer_layout.layout() != ViewerLayout::FourPanel
-        || panel_id.cross_section_panel().is_none()
-    {
+    if input.view.layout() != ViewerLayout::FourPanel || panel_id.cross_section_panel().is_none() {
         return Ok(None);
     }
 
-    let Some(runtime) = state.viewer_layout.four_panel_runtime() else {
-        return Ok(None);
-    };
     let Some(panel) = runtime.panel(panel_id) else {
         return Ok(None);
     };
@@ -288,18 +326,21 @@ fn prepare_cross_section_panel_submission(
         return Ok(None);
     };
     let panel_generation = panel.generation;
-    let layer_ids = stream_layer_ids_for_state(state)?;
+    let layer_ids = input
+        .layers
+        .iter()
+        .map(|layer| layer.id.clone())
+        .collect::<Vec<_>>();
     if layer_ids.is_empty() {
         return Ok(None);
     }
-    let Some(panel_chunks) = state.cross_section_runtime.panels.get(&panel_id) else {
+    let Some(panel_chunks) = runtime.panels.get(&panel_id) else {
         return Ok(None);
     };
     if panel_chunks.generation != panel_generation || panel_chunks.scale_level != scale_level {
         return Ok(None);
     }
-    let visible_chunks = state
-        .cross_section_runtime
+    let visible_chunks = runtime
         .panel_submission_candidates(panel_id)
         .into_iter()
         .map(|candidate| candidate.key)
@@ -309,28 +350,29 @@ fn prepare_cross_section_panel_submission(
         panel_generation,
         layer_ids: layer_ids.iter().map(ToString::to_string).collect(),
         scale_level,
-        timepoint: state.active_timepoint,
+        timepoint: input.view.timepoint(),
         visible_chunk_count: visible_chunks.len(),
         visible_chunk_fingerprint: cross_section_visible_chunk_fingerprint(&visible_chunks),
     };
-    let active_panel_at_submission = state.viewer_layout.active_cross_section_panel();
-    let fairness_promoted = cross_section_inactive_panel_fairness_promoted(state, panel_id);
-    let priority = cross_section_request_priority_for_panel(state, panel_id);
+    let active_panel_at_submission = input.active_panel.map(PanelId::from_application_panel);
+    let fairness_promoted = active_panel_at_submission.is_some_and(|active_panel| {
+        cross_section_inactive_panel_fairness_promoted(runtime, active_panel, panel_id)
+    });
+    let priority =
+        cross_section_request_priority_for_panel(runtime, active_panel_at_submission, panel_id);
 
-    let request_changed = state
-        .cross_section_runtime
+    let request_changed = runtime
         .panel_streams
         .get(&panel_id)
         .is_none_or(|existing| existing.request_key != request_key);
-    if let Some(existing) = state.cross_section_runtime.panel_streams.get(&panel_id)
+    if let Some(existing) = runtime.panel_streams.get(&panel_id)
         && existing.request_key == request_key
+        && (existing.complete || (existing.active() && existing.priority == priority))
     {
-        if existing.complete || (existing.active() && existing.priority == priority) {
-            return Ok(None);
-        }
+        return Ok(None);
     }
 
-    cancel_obsolete_panel_tickets(state, panel_id);
+    cancel_obsolete_panel_tickets(runtime, panel_id);
 
     let mut result = CrossSectionBrickSubmissionResult {
         request_changed,
@@ -346,14 +388,14 @@ fn prepare_cross_section_panel_submission(
     let mut chunk_stream_plans = HashMap::new();
     let mut missing_occupied_chunks = HashSet::new();
     for chunk_key in &visible_chunks {
-        if chunk_key.dataset_id != *state.dataset.dataset_id()
+        if chunk_key.dataset_id != *dataset.dataset.dataset_id()
             || chunk_key.scale_level != request_key.scale_level
             || chunk_key.timepoint != request_key.timepoint
         {
             continue;
         }
-        let layer = layer_for_id(state, &chunk_key.layer_id)?.clone();
-        let metadata = state.dataset.brick_metadata_at_scale(
+        let layer = layer_for_id(input.layers, &chunk_key.layer_id)?;
+        let metadata = dataset.dataset.brick_metadata_at_scale(
             &chunk_key.layer_id,
             request_key.scale_level,
             request_key.timepoint,
@@ -372,51 +414,38 @@ fn prepare_cross_section_panel_submission(
         chunk_stream_plans.insert(
             chunk_key.clone(),
             CrossSectionVisibleChunkStreamPlan {
-                layer: layer.clone(),
+                layer_id: layer.id.clone(),
                 metadata,
             },
         );
-        if state
-            .cross_section_runtime
-            .has_cpu_resident_chunk(chunk_key, metadata.region)
-        {
+        if runtime.has_cpu_resident_chunk(chunk_key, metadata.region) {
             stream.requested = stream.requested.saturating_add(1);
             stream.completed = stream.completed.saturating_add(1);
             continue;
         }
-        if state
-            .cross_section_runtime
-            .has_pending_chunk(chunk_key, metadata.region)
-        {
-            if state
-                .cross_section_runtime
-                .has_live_read_ticket(chunk_key, metadata.region)
-            {
+        if runtime.has_pending_chunk(chunk_key, metadata.region) {
+            if runtime.has_live_read_ticket(chunk_key, metadata.region) {
                 stream.deferred = stream.deferred.saturating_add(1);
                 continue;
             }
-            state
-                .cross_section_runtime
-                .mark_chunk_not_resident(chunk_key);
+            runtime.mark_chunk_not_resident(chunk_key);
         }
         if !metadata.occupied {
             stream.requested = stream.requested.saturating_add(1);
             let region = metadata.region;
-            let payload = zero_resident_brick_payload(
-                state,
+            let payload = zero_cross_section_brick_payload(
+                dataset,
                 &chunk_key.layer_id,
                 request_key.timepoint,
                 metadata,
                 region,
                 layer.dtype,
             )?;
-            match state
-                .cross_section_runtime
-                .mark_chunk_cpu_resident_from_payload(
-                    chunk_key.clone(),
-                    &payload,
-                    Default::default(),
-                ) {
+            match runtime.mark_chunk_cpu_resident_from_payload(
+                chunk_key.clone(),
+                &payload,
+                Default::default(),
+            ) {
                 Ok(changed) => {
                     result.resident_changed |= changed;
                 }
@@ -443,7 +472,7 @@ fn prepare_cross_section_panel_submission(
 }
 
 fn submit_prepared_cross_section_queue_entry(
-    state: &mut AppState,
+    runtime: &mut CrossSectionRuntime,
     read_queue: &impl CrossSectionReadBackend,
     queue_entry: crate::cross_section_runtime::CrossSectionChunkQueueEntry,
     worker_queue_priority: i64,
@@ -461,26 +490,15 @@ fn submit_prepared_cross_section_queue_entry(
     let Some(chunk_plan) = prepared.chunk_stream_plans.get(&chunk_key) else {
         return Ok(());
     };
-    if state
-        .cross_section_runtime
-        .has_cpu_resident_chunk(&chunk_key, chunk_plan.metadata.region)
-    {
+    if runtime.has_cpu_resident_chunk(&chunk_key, chunk_plan.metadata.region) {
         return Ok(());
     }
-    if state
-        .cross_section_runtime
-        .has_pending_chunk(&chunk_key, chunk_plan.metadata.region)
-    {
-        if state
-            .cross_section_runtime
-            .has_live_read_ticket(&chunk_key, chunk_plan.metadata.region)
-        {
+    if runtime.has_pending_chunk(&chunk_key, chunk_plan.metadata.region) {
+        if runtime.has_live_read_ticket(&chunk_key, chunk_plan.metadata.region) {
             prepared.stream.deferred = prepared.stream.deferred.saturating_add(1);
             return Ok(());
         }
-        state
-            .cross_section_runtime
-            .mark_chunk_not_resident(&chunk_key);
+        runtime.mark_chunk_not_resident(&chunk_key);
     }
 
     let request_key = &prepared.stream.request_key;
@@ -514,13 +532,13 @@ fn submit_prepared_cross_section_queue_entry(
                 }
                 BrickRequestPriority::Warm => {}
             }
-            state.cross_section_runtime.register_read_ticket(
+            runtime.register_read_ticket(
                 chunk_key.clone(),
                 chunk_plan.metadata.region,
                 CrossSectionBrickReadTicket {
                     panel_id,
                     panel_generation: request_key.panel_generation,
-                    layer_id: chunk_plan.layer.id.clone(),
+                    layer_id: chunk_plan.layer_id.to_string(),
                     scale_level: request_key.scale_level,
                     timepoint: request_key.timepoint,
                     brick_index: chunk_key.brick_index,
@@ -530,9 +548,7 @@ fn submit_prepared_cross_section_queue_entry(
             );
         }
         Err(err) => {
-            state
-                .cross_section_runtime
-                .mark_chunk_failed(chunk_key.clone(), err.to_string());
+            runtime.mark_chunk_failed(chunk_key.clone(), err.to_string());
             prepared.stream.failed = prepared.stream.failed.saturating_add(1);
             prepared.stream.last_error = Some(err.to_string());
         }
@@ -541,7 +557,9 @@ fn submit_prepared_cross_section_queue_entry(
 }
 
 fn finalize_prepared_cross_section_panel_submission(
-    state: &mut AppState,
+    dataset: &CurrentDatasetRuntime,
+    render: &mut CurrentRenderRuntime,
+    input: CrossSectionStreamingInput<'_>,
     panel_id: PanelId,
     mut prepared: CrossSectionPreparedPanelSubmission,
 ) -> CrossSectionBrickSubmissionResult {
@@ -552,16 +570,16 @@ fn finalize_prepared_cross_section_panel_submission(
         let Some(chunk_plan) = prepared.chunk_stream_plans.get(chunk_key) else {
             continue;
         };
-        if state
+        if render
             .cross_section_runtime
             .has_cpu_resident_chunk(chunk_key, chunk_plan.metadata.region)
         {
             continue;
         }
-        if state
+        if render
             .cross_section_runtime
             .has_pending_chunk(chunk_key, chunk_plan.metadata.region)
-            && state
+            && render
                 .cross_section_runtime
                 .has_live_read_ticket(chunk_key, chunk_plan.metadata.region)
         {
@@ -571,22 +589,35 @@ fn finalize_prepared_cross_section_panel_submission(
         prepared.stream.deferred = prepared.stream.deferred.saturating_add(1);
     }
     prepared.stream.refresh_complete();
-    state
+    render
         .cross_section_runtime
         .panel_streams
         .insert(panel_id, prepared.stream);
     if prepared.result.resident_changed {
-        let _ = state.cross_section_runtime.enforce_cpu_payload_budget();
-        let _ = schedule_cross_section_panel_for_state(state, panel_id, true);
+        let _ = render.cross_section_runtime.enforce_cpu_payload_budget();
+        let _ = schedule_cross_section_panel(
+            dataset,
+            render,
+            CrossSectionScheduleInput {
+                view: input.view,
+                active_layer_id: input.active_layer_id,
+                layers: input.layers,
+                active_panel: input.active_panel,
+                gpu_budget_bytes: input.gpu_budget_bytes,
+            },
+            panel_id,
+            true,
+        );
     }
     prepared.result
 }
 
-fn cross_section_global_submission_panel_order(state: &AppState) -> Vec<PanelId> {
-    let active_panel = state.viewer_layout.active_cross_section_panel();
-    let active_panel_ready = cross_section_active_panel_visible_work_ready(state);
-    let mut panel_ids = state
-        .cross_section_runtime
+fn cross_section_global_submission_panel_order(
+    runtime: &CrossSectionRuntime,
+    active_panel: Option<PanelId>,
+) -> Vec<PanelId> {
+    let active_panel_ready = cross_section_active_panel_visible_work_ready(runtime, active_panel);
+    let mut panel_ids = runtime
         .panels
         .keys()
         .copied()
@@ -595,7 +626,7 @@ fn cross_section_global_submission_panel_order(state: &AppState) -> Vec<PanelId>
             active_panel_ready
                 || active_panel.is_none()
                 || active_panel == Some(*panel_id)
-                || cross_section_request_priority_for_panel(state, *panel_id)
+                || cross_section_request_priority_for_panel(runtime, active_panel, *panel_id)
                     == BrickRequestPriority::CurrentFrame
         })
         .collect::<Vec<_>>();
@@ -605,8 +636,7 @@ fn cross_section_global_submission_panel_order(state: &AppState) -> Vec<PanelId>
         } else {
             1
         };
-        let priority_tier = state
-            .cross_section_runtime
+        let priority_tier = runtime
             .panels
             .get(panel_id)
             .map(|panel| panel.priority_tier)
@@ -640,16 +670,16 @@ fn cross_section_runtime_panel_submission_order(
     ordered
 }
 
-fn cross_section_active_panel_visible_work_ready(state: &AppState) -> bool {
-    let Some(active_panel) = state.viewer_layout.active_cross_section_panel() else {
+fn cross_section_active_panel_visible_work_ready(
+    runtime: &CrossSectionRuntime,
+    active_panel: Option<PanelId>,
+) -> bool {
+    let Some(active_panel) = active_panel else {
         return true;
     };
     if active_panel.cross_section_panel().is_none() {
         return true;
     }
-    let Some(runtime) = state.viewer_layout.four_panel_runtime() else {
-        return false;
-    };
     let Some(panel) = runtime.panel(active_panel) else {
         return false;
     };
@@ -659,46 +689,57 @@ fn cross_section_active_panel_visible_work_ready(state: &AppState) -> bool {
     let Some(scale_level) = schedule.render_scale_level.or(schedule.target_scale_level) else {
         return false;
     };
-    state
-        .cross_section_runtime
-        .panels
-        .get(&active_panel)
-        .is_some_and(|chunks| {
-            chunks.generation == panel.generation && chunks.scale_level == scale_level
-        })
+    runtime.panels.get(&active_panel).is_some_and(|chunks| {
+        chunks.generation == panel.generation && chunks.scale_level == scale_level
+    })
 }
 
 pub(crate) fn apply_cross_section_brick_read_outcomes(
-    state: &mut AppState,
+    dataset: &CurrentDatasetRuntime,
+    render: &mut CurrentRenderRuntime,
+    view: &ViewState,
     outcomes: Vec<BrickReadOutcome>,
 ) -> CrossSectionBrickOutcomePartition {
     let mut partition = CrossSectionBrickOutcomePartition::default();
     for outcome in outcomes {
-        let Some(ticket) = state
+        let Some(ticket) = render
             .cross_section_runtime
             .take_read_ticket_for_request(outcome.request_id)
         else {
             partition.unhandled.push(outcome);
             continue;
         };
-        partition.resident_changed |=
-            apply_cross_section_brick_read_outcome(state, ticket, outcome);
+        partition.resident_changed |= apply_cross_section_brick_read_outcome(
+            dataset,
+            &mut render.cross_section_runtime,
+            view,
+            ticket,
+            outcome,
+        );
     }
     partition
 }
 
 fn apply_cross_section_brick_read_outcome(
-    state: &mut AppState,
+    dataset: &CurrentDatasetRuntime,
+    runtime: &mut CrossSectionRuntime,
+    view: &ViewState,
     ticket: CrossSectionBrickReadTicket,
     outcome: BrickReadOutcome,
 ) -> bool {
-    let ticket_panel_generation_current = ticket_matches_current_panel_generation(state, &ticket);
-    let ticket_chunk_still_visible = ticket_chunk_is_current_in_global_runtime(state, &ticket);
+    let ticket_panel_generation_current =
+        ticket_matches_current_panel_generation(runtime, view, &ticket);
+    let ticket_chunk_still_visible = ticket_chunk_is_current_in_global_runtime(
+        runtime,
+        view,
+        dataset.dataset.dataset_id(),
+        &ticket,
+    );
     if !ticket_panel_generation_current && !ticket_chunk_still_visible {
-        if let Some(chunk_key) = cross_section_chunk_key_for_ticket(state, &ticket) {
-            state
-                .cross_section_runtime
-                .mark_chunk_not_resident(&chunk_key);
+        if let Some(chunk_key) =
+            cross_section_chunk_key_for_ticket(dataset.dataset.dataset_id(), &ticket)
+        {
+            runtime.mark_chunk_not_resident(&chunk_key);
         }
         return false;
     }
@@ -723,23 +764,21 @@ fn apply_cross_section_brick_read_outcome(
                     last_error =
                         Some("cross-section brick payload did not match its ticket".to_owned());
                 } else {
-                    if let Some(chunk_key) = cross_section_chunk_key_for_ticket(state, &ticket) {
-                        match state
-                            .cross_section_runtime
-                            .mark_chunk_cpu_resident_from_payload(
-                                chunk_key.clone(),
-                                &payload,
-                                outcome.read_metrics,
-                            ) {
+                    if let Some(chunk_key) =
+                        cross_section_chunk_key_for_ticket(dataset.dataset.dataset_id(), &ticket)
+                    {
+                        match runtime.mark_chunk_cpu_resident_from_payload(
+                            chunk_key.clone(),
+                            &payload,
+                            outcome.read_metrics,
+                        ) {
                             Ok(changed) => {
                                 completed = 1;
                                 resident_changed = changed;
                             }
                             Err(err) => {
                                 let message = err.to_string();
-                                let _ = state
-                                    .cross_section_runtime
-                                    .mark_chunk_failed(chunk_key, message.clone());
+                                let _ = runtime.mark_chunk_failed(chunk_key, message.clone());
                                 failed = 1;
                                 last_error = Some(message);
                             }
@@ -753,25 +792,25 @@ fn apply_cross_section_brick_read_outcome(
             }
             BrickReadStatus::Cancelled => {
                 cancelled = 1;
-                if let Some(chunk_key) = cross_section_chunk_key_for_ticket(state, &ticket) {
-                    state
-                        .cross_section_runtime
-                        .mark_chunk_not_resident(&chunk_key);
+                if let Some(chunk_key) =
+                    cross_section_chunk_key_for_ticket(dataset.dataset.dataset_id(), &ticket)
+                {
+                    runtime.mark_chunk_not_resident(&chunk_key);
                 }
             }
             BrickReadStatus::Stale => {
                 stale = 1;
-                if let Some(chunk_key) = cross_section_chunk_key_for_ticket(state, &ticket) {
-                    state
-                        .cross_section_runtime
-                        .mark_chunk_not_resident(&chunk_key);
+                if let Some(chunk_key) =
+                    cross_section_chunk_key_for_ticket(dataset.dataset.dataset_id(), &ticket)
+                {
+                    runtime.mark_chunk_not_resident(&chunk_key);
                 }
             }
             BrickReadStatus::Failed(message) => {
-                if let Some(chunk_key) = cross_section_chunk_key_for_ticket(state, &ticket) {
-                    state
-                        .cross_section_runtime
-                        .mark_chunk_failed(chunk_key, message.clone());
+                if let Some(chunk_key) =
+                    cross_section_chunk_key_for_ticket(dataset.dataset.dataset_id(), &ticket)
+                {
+                    runtime.mark_chunk_failed(chunk_key, message.clone());
                 }
                 failed = 1;
                 last_error = Some(message);
@@ -780,10 +819,7 @@ fn apply_cross_section_brick_read_outcome(
     }
 
     if ticket_panel_generation_current
-        && let Some(stream) = state
-            .cross_section_runtime
-            .panel_streams
-            .get_mut(&ticket.panel_id)
+        && let Some(stream) = runtime.panel_streams.get_mut(&ticket.panel_id)
         && stream.request_key.panel_generation == ticket.panel_generation
         && stream.request_key.scale_level == ticket.scale_level
         && stream.request_key.timepoint == ticket.timepoint
@@ -802,23 +838,23 @@ fn apply_cross_section_brick_read_outcome(
         stream.refresh_complete();
     }
     if completed > 0
-        && let Some(chunk_key) = cross_section_chunk_key_for_ticket(state, &ticket)
+        && let Some(chunk_key) =
+            cross_section_chunk_key_for_ticket(dataset.dataset.dataset_id(), &ticket)
     {
-        credit_shared_cross_section_completion_to_visible_streams(state, &ticket, &chunk_key);
+        credit_shared_cross_section_completion_to_visible_streams(runtime, &ticket, &chunk_key);
     }
     if resident_changed {
-        let _ = state.cross_section_runtime.enforce_cpu_payload_budget();
+        let _ = runtime.enforce_cpu_payload_budget();
     }
     resident_changed
 }
 
 fn credit_shared_cross_section_completion_to_visible_streams(
-    state: &mut AppState,
+    runtime: &mut CrossSectionRuntime,
     ticket: &CrossSectionBrickReadTicket,
     chunk_key: &CrossSectionChunkKey,
 ) {
-    let linked_panels = state
-        .cross_section_runtime
+    let linked_panels = runtime
         .panels
         .iter()
         .filter(|(panel_id, panel)| {
@@ -832,7 +868,7 @@ fn credit_shared_cross_section_completion_to_visible_streams(
         .map(|(panel_id, panel)| (*panel_id, panel.generation))
         .collect::<Vec<_>>();
     for (panel_id, panel_generation) in linked_panels {
-        let Some(stream) = state.cross_section_runtime.panel_streams.get_mut(&panel_id) else {
+        let Some(stream) = runtime.panel_streams.get_mut(&panel_id) else {
             continue;
         };
         if stream.request_key.panel_generation != panel_generation
@@ -846,14 +882,14 @@ fn credit_shared_cross_section_completion_to_visible_streams(
 }
 
 fn cross_section_chunk_key_for_parts(
-    state: &AppState,
+    dataset_id: &mirante4d_format::DatasetId,
     layer_id: LayerId,
     scale_level: u32,
     timepoint: TimeIndex,
     brick_index: SpatialBrickIndex,
 ) -> CrossSectionChunkKey {
     CrossSectionChunkKey {
-        dataset_id: state.dataset.dataset_id().clone(),
+        dataset_id: dataset_id.clone(),
         layer_id,
         timepoint,
         scale_level,
@@ -862,11 +898,11 @@ fn cross_section_chunk_key_for_parts(
 }
 
 fn cross_section_chunk_key_for_ticket(
-    state: &AppState,
+    dataset_id: &mirante4d_format::DatasetId,
     ticket: &CrossSectionBrickReadTicket,
 ) -> Option<CrossSectionChunkKey> {
     Some(cross_section_chunk_key_for_parts(
-        state,
+        dataset_id,
         LayerId::new(ticket.layer_id.clone()).ok()?,
         ticket.scale_level,
         ticket.timepoint,
@@ -883,17 +919,20 @@ fn cross_section_visible_chunk_fingerprint(chunks: &[CrossSectionChunkKey]) -> u
     hasher.finish()
 }
 
-fn retire_tickets_before_generation(state: &mut AppState, active_generation: DataGenerationId) {
-    let tickets = std::mem::take(&mut state.cross_section_runtime.read_tickets);
+fn retire_tickets_before_generation(
+    runtime: &mut CrossSectionRuntime,
+    active_generation: DataGenerationId,
+) {
+    let tickets = std::mem::take(&mut runtime.read_tickets);
     for ticket in tickets {
         if ticket.ticket.generation_id.0 >= active_generation.0 {
-            state.cross_section_runtime.read_tickets.push(ticket);
+            runtime.read_tickets.push(ticket);
             continue;
         }
         let panel_id = ticket.panel_id;
         let panel_generation = ticket.panel_generation;
-        state.cross_section_runtime.cancel_read_ticket(ticket);
-        if let Some(stream) = state.cross_section_runtime.panel_streams.get_mut(&panel_id)
+        runtime.cancel_read_ticket(ticket);
+        if let Some(stream) = runtime.panel_streams.get_mut(&panel_id)
             && stream.request_key.panel_generation == panel_generation
         {
             stream.stale = stream.stale.saturating_add(1);
@@ -902,62 +941,62 @@ fn retire_tickets_before_generation(state: &mut AppState, active_generation: Dat
     }
 }
 
-fn cancel_obsolete_panel_tickets(state: &mut AppState, panel_id: PanelId) {
-    let tickets = std::mem::take(&mut state.cross_section_runtime.read_tickets);
+fn cancel_obsolete_panel_tickets(runtime: &mut CrossSectionRuntime, panel_id: PanelId) {
+    let tickets = std::mem::take(&mut runtime.read_tickets);
     for ticket in tickets {
-        if ticket.panel_id != panel_id || ticket_chunk_is_current_in_global_runtime(state, &ticket)
-        {
-            state.cross_section_runtime.read_tickets.push(ticket);
+        let current = runtime.panels.values().any(|panel| {
+            panel.scale_level == ticket.scale_level
+                && panel.generation == ticket.panel_generation
+                && panel.visible_chunks.iter().any(|key| {
+                    key.layer_id.as_str() == ticket.layer_id
+                        && key.timepoint == ticket.timepoint
+                        && key.brick_index == ticket.brick_index
+                })
+        });
+        if ticket.panel_id != panel_id || current {
+            runtime.read_tickets.push(ticket);
             continue;
         }
-        state.cross_section_runtime.cancel_read_ticket(ticket);
+        runtime.cancel_read_ticket(ticket);
     }
 }
 
 fn ticket_matches_current_panel_generation(
-    state: &AppState,
+    runtime: &CrossSectionRuntime,
+    view: &ViewState,
     ticket: &CrossSectionBrickReadTicket,
 ) -> bool {
-    if state.viewer_layout.layout() != ViewerLayout::FourPanel {
+    if view.layout() != ViewerLayout::FourPanel {
         return false;
     }
-    state
-        .viewer_layout
-        .four_panel_runtime()
-        .and_then(|runtime| runtime.panel(ticket.panel_id))
+    runtime
+        .panel(ticket.panel_id)
         .is_some_and(|panel| panel.generation == ticket.panel_generation)
 }
 
 fn ticket_chunk_is_current_in_global_runtime(
-    state: &AppState,
+    runtime: &CrossSectionRuntime,
+    view: &ViewState,
+    dataset_id: &mirante4d_format::DatasetId,
     ticket: &CrossSectionBrickReadTicket,
 ) -> bool {
-    if state.viewer_layout.layout() != ViewerLayout::FourPanel {
+    if view.layout() != ViewerLayout::FourPanel {
         return false;
     }
-    let Some(chunk_key) = cross_section_chunk_key_for_ticket(state, ticket) else {
+    let Some(chunk_key) = cross_section_chunk_key_for_ticket(dataset_id, ticket) else {
         return false;
     };
-    let Some(four_panel) = state.viewer_layout.four_panel_runtime() else {
-        return false;
-    };
-    state
-        .cross_section_runtime
-        .panels
-        .iter()
-        .any(|(panel_id, panel_runtime)| {
-            if panel_runtime.scale_level != ticket.scale_level
-                || !panel_runtime
-                    .visible_chunks
-                    .iter()
-                    .any(|visible_key| visible_key == &chunk_key)
-            {
-                return false;
-            }
-            four_panel
-                .panel(*panel_id)
-                .is_some_and(|panel| panel.generation == panel_runtime.generation)
-        })
+    runtime.panels.iter().any(|(_, panel_runtime)| {
+        if panel_runtime.scale_level != ticket.scale_level
+            || !panel_runtime
+                .visible_chunks
+                .iter()
+                .any(|visible_key| visible_key == &chunk_key)
+        {
+            return false;
+        }
+        panel_runtime.generation == ticket.panel_generation
+    })
 }
 
 fn outcome_matches_cross_section_ticket(
@@ -999,14 +1038,119 @@ fn payload_matches_cross_section_ticket(
 }
 
 fn layer_for_id<'a>(
-    state: &'a AppState,
+    layers: &'a [CrossSectionLayerInput<'a>],
     layer_id: &LayerId,
-) -> anyhow::Result<&'a AppLayerSummary> {
-    state
-        .layers
+) -> anyhow::Result<CrossSectionLayerInput<'a>> {
+    layers
         .iter()
-        .find(|layer| layer.id == layer_id.as_str())
-        .ok_or_else(|| anyhow::anyhow!("layer {} is not loaded in app state", layer_id))
+        .copied()
+        .find(|layer| layer.id == layer_id)
+        .ok_or_else(|| anyhow::anyhow!("layer {} is not available for cross-sections", layer_id))
+}
+
+fn zero_cross_section_brick_payload(
+    dataset: &CurrentDatasetRuntime,
+    layer_id: &LayerId,
+    timepoint: TimeIndex,
+    metadata: BrickMetadata,
+    region: mirante4d_data::VolumeRegion,
+    dtype: IntensityDType,
+) -> anyhow::Result<BrickReadPayload> {
+    let grid_to_world = if region == metadata.region {
+        metadata.grid_to_world
+    } else {
+        translated_region_grid_to_world(
+            dataset
+                .dataset
+                .scale_grid_to_world(layer_id, metadata.scale_level)?,
+            region,
+        )
+    };
+    let shape = region.shape()?;
+    let voxel_count = shape.element_count()? as usize;
+    match dtype {
+        IntensityDType::Uint8 => {
+            let volume = DenseVolumeU8::new(
+                dataset.dataset.dataset_id().clone(),
+                layer_id.clone(),
+                metadata.scale_level,
+                timepoint,
+                shape,
+                grid_to_world,
+                vec![0; voxel_count],
+            )?;
+            let volume = if metadata.valid_voxel_count == 0 {
+                volume.with_render_valid(vec![0; voxel_count])?
+            } else {
+                volume
+            };
+            Ok(BrickReadPayload::U8(Box::new(VolumeBrickU8 {
+                scale_level: metadata.scale_level,
+                brick_index: metadata.brick_index,
+                chunk_index: metadata.chunk_index,
+                region,
+                occupied: false,
+                valid_voxel_count: metadata.valid_voxel_count,
+                min: metadata.min,
+                max: metadata.max,
+                volume,
+            })))
+        }
+        IntensityDType::Uint16 => {
+            let volume = DenseVolumeU16::new(
+                dataset.dataset.dataset_id().clone(),
+                layer_id.clone(),
+                metadata.scale_level,
+                timepoint,
+                shape,
+                grid_to_world,
+                vec![0; voxel_count],
+            )?;
+            let volume = if metadata.valid_voxel_count == 0 {
+                volume.with_render_valid(vec![0; voxel_count])?
+            } else {
+                volume
+            };
+            Ok(BrickReadPayload::U16(Box::new(VolumeBrickU16 {
+                scale_level: metadata.scale_level,
+                brick_index: metadata.brick_index,
+                chunk_index: metadata.chunk_index,
+                region,
+                occupied: false,
+                valid_voxel_count: metadata.valid_voxel_count,
+                min: metadata.min,
+                max: metadata.max,
+                volume,
+            })))
+        }
+        IntensityDType::Float32 => {
+            let volume = DenseVolumeF32::new(
+                dataset.dataset.dataset_id().clone(),
+                layer_id.clone(),
+                metadata.scale_level,
+                timepoint,
+                shape,
+                grid_to_world,
+                vec![0.0; voxel_count],
+            )?;
+            let volume = if metadata.valid_voxel_count == 0 {
+                volume.with_render_valid(vec![0; voxel_count])?
+            } else {
+                volume
+            };
+            Ok(BrickReadPayload::F32(Box::new(VolumeBrickF32 {
+                scale_level: metadata.scale_level,
+                brick_index: metadata.brick_index,
+                chunk_index: metadata.chunk_index,
+                region,
+                occupied: false,
+                valid_voxel_count: metadata.valid_voxel_count,
+                min: metadata.min,
+                max: metadata.max,
+                volume,
+            })))
+        }
+    }
 }
 
 fn dtype_decoded_bytes(dtype: IntensityDType) -> u64 {
@@ -1020,8 +1164,9 @@ fn dtype_decoded_bytes(dtype: IntensityDType) -> u64 {
 #[cfg(test)]
 mod tests {
     use glam::DVec2;
-    use mirante4d_core::{DatasetId, LayerId, TimeIndex};
     use mirante4d_data::SpatialBrickIndex;
+    use mirante4d_domain::TimeIndex;
+    use mirante4d_format::{DatasetId, LayerId};
     use mirante4d_renderer::CrossSectionPanelBounds;
 
     use super::*;
@@ -1034,7 +1179,7 @@ mod tests {
         CrossSectionChunkKey {
             dataset_id: DatasetId::new("dataset").unwrap(),
             layer_id: LayerId::new("layer").unwrap(),
-            timepoint: TimeIndex(0),
+            timepoint: TimeIndex::new(0),
             scale_level: 0,
             brick_index: SpatialBrickIndex::new(z, y, x),
         }
@@ -1083,7 +1228,7 @@ mod tests {
             panel_generation: 1,
             layer_ids: vec!["layer".to_owned()],
             scale_level: 0,
-            timepoint: TimeIndex(0),
+            timepoint: TimeIndex::new(0),
             visible_chunk_count,
             visible_chunk_fingerprint: visible_chunk_count as u64,
         }
@@ -1126,6 +1271,7 @@ mod tests {
     #[test]
     fn refresh_download_budget_selects_chunks_by_global_runtime_queue_order() {
         let mut runtime = CrossSectionRuntime::default();
+        assert!(runtime.mark_cross_section_panels_dirty());
         let xy_best = key(0, 0, 0);
         let xz_middle = key(0, 0, 1);
         let xy_after_budget = key(0, 0, 2);
@@ -1159,6 +1305,7 @@ mod tests {
     #[test]
     fn chunk_submission_order_uses_visible_priority_score_before_key_order() {
         let mut runtime = CrossSectionRuntime::default();
+        assert!(runtime.mark_cross_section_panels_dirty());
         let far_key_order_first = key(0, 0, 0);
         let near_key_order_second = key(0, 0, 1);
         runtime.apply_visible_chunk_plan(plan(
@@ -1182,6 +1329,7 @@ mod tests {
     #[test]
     fn chunk_submission_order_prioritizes_active_tier_before_score() {
         let mut runtime = CrossSectionRuntime::default();
+        assert!(runtime.mark_cross_section_panels_dirty());
         let active_far = key(0, 0, 1);
         let linked_near = key(0, 0, 0);
         runtime.apply_visible_chunk_plan(plan(
@@ -1207,6 +1355,7 @@ mod tests {
     #[test]
     fn global_submission_candidates_deduplicate_shared_chunk_by_best_panel_priority() {
         let mut runtime = CrossSectionRuntime::default();
+        assert!(runtime.mark_cross_section_panels_dirty());
         let shared = key(0, 0, 0);
         runtime.apply_visible_chunk_plan(plan(
             PanelId::Xy,
@@ -1233,6 +1382,7 @@ mod tests {
     #[test]
     fn runtime_panel_submission_order_uses_global_candidate_priority() {
         let mut runtime = CrossSectionRuntime::default();
+        assert!(runtime.mark_cross_section_panels_dirty());
         let active_far = key(0, 0, 1);
         let linked_near = key(0, 0, 0);
         runtime.apply_visible_chunk_plan(plan(

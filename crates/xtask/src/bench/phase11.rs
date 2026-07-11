@@ -7,16 +7,16 @@ use std::{
 
 use anyhow::{Context, bail};
 use glam::DVec3;
-use mirante4d_core::{
-    CameraView, DEFAULT_PRESENTATION_VIEWPORT_POINTS, GridToWorld, IntensityDType, LayerId,
-    Projection, Shape3D, Shape4D, TimeIndex, WorldSpace, WorldUnit,
-};
 use mirante4d_data::{DatasetHandle, SpatialBrickIndex};
-use mirante4d_format::{
-    ChannelMetadata, DenseU16MultiscaleLayer, DenseU16Scale, ExistingPackagePolicy,
-    NativeU16MultiscaleDataset, ScaleReduction, default_u16_display,
-    write_native_u16_multiscale_dataset,
+use mirante4d_domain::{
+    CameraView, GridToWorld, IntensityDType, Projection, Shape3D, Shape4D, TimeIndex,
 };
+use mirante4d_format::{
+    ChannelMetadata, CurrentGridToWorldExt, CurrentShape4DExt, DenseU16MultiscaleLayer,
+    DenseU16Scale, ExistingPackagePolicy, LayerId, NativeU16MultiscaleDataset, ScaleReduction,
+    WorldSpace, WorldUnit, default_u16_display, write_native_u16_multiscale_dataset,
+};
+use mirante4d_render_api::CameraFrame;
 use mirante4d_renderer::{
     BrickFrameDiagnostics, BrickFrameDiagnosticsF32, BrickGridSpec, BrickPlanOptions,
     CameraRenderMode, CameraRenderModeF32, CameraRenderQuality, MipImageU16, RenderViewport,
@@ -35,8 +35,10 @@ use crate::host::{
 };
 use crate::reports::{phase11_gpu_interaction_timings_json, timing_summary_json};
 use crate::{
-    PHASE11_DEFAULT_MAX_RESPONSIVE_VISIBLE_BRICKS, PHASE11_GPU_MIP_BRICKS_PER_BATCH,
-    benchmark_camera_for_shape, env_u64, phase11_benchmark_viewport_for_shape,
+    BENCHMARK_PRESENTATION_POINTS, PHASE11_DEFAULT_MAX_RESPONSIVE_VISIBLE_BRICKS,
+    PHASE11_GPU_MIP_BRICKS_PER_BATCH, benchmark_camera_for_shape, benchmark_camera_frame,
+    benchmark_camera_orbit, benchmark_camera_pan, benchmark_camera_world_per_screen_point,
+    benchmark_camera_zoom, env_u64, phase11_benchmark_viewport_for_shape,
     phase11_brick_pixel_stride, phase11_gpu_brick_cache_budget_bytes,
     phase11_gpu_volume_cache_budget_bytes, phase11_interaction_steps_per_scenario,
     phase11_max_decoded_bytes, phase11_max_visible_bricks, stable_id_from_name,
@@ -66,7 +68,7 @@ pub(crate) fn bench_phase11_large_view(package: &Path) -> anyhow::Result<PathBuf
     let layer = dataset
         .layer(&layer_id)
         .context("first layer id was not found after opening dataset")?;
-    let timepoint = TimeIndex(0);
+    let timepoint = TimeIndex::new(0);
     let source_shape = dataset.scale_shape(&layer_id, 0)?;
     let source_grid_to_world = dataset.scale_grid_to_world(&layer_id, 0)?;
     let viewport = phase11_benchmark_viewport_for_shape(source_shape)?;
@@ -77,7 +79,7 @@ pub(crate) fn bench_phase11_large_view(package: &Path) -> anyhow::Result<PathBuf
     let max_visible_bricks = phase11_max_visible_bricks()?;
     let max_decoded_bytes = phase11_max_decoded_bytes()?;
     let camera_view = benchmark_camera_for_shape(source_shape, source_grid_to_world);
-    let camera = camera_view.to_camera_state(DEFAULT_PRESENTATION_VIEWPORT_POINTS);
+    let camera = benchmark_camera_frame(camera_view);
 
     let plan_started = Instant::now();
     let plan = phase11_select_lod_plan(
@@ -149,11 +151,11 @@ pub(crate) fn bench_phase11_large_view(package: &Path) -> anyhow::Result<PathBuf
         "package": package,
         "layer_id": layer_id.to_string(),
         "stored_dtype": resident.stored_dtype_label(),
-        "timepoint": timepoint.0,
+        "timepoint": timepoint.get(),
         "source_shape": {
-            "z": source_shape.z,
-            "y": source_shape.y,
-            "x": source_shape.x,
+            "z": source_shape.z(),
+            "y": source_shape.y(),
+            "x": source_shape.x(),
         },
         "viewport": {
             "width": viewport.width,
@@ -169,19 +171,19 @@ pub(crate) fn bench_phase11_large_view(package: &Path) -> anyhow::Result<PathBuf
             "estimated_decoded_bytes": plan.estimated_decoded_bytes,
         },
         "displayed_shape": {
-            "z": plan.displayed_shape.z,
-            "y": plan.displayed_shape.y,
-            "x": plan.displayed_shape.x,
+            "z": plan.displayed_shape.z(),
+            "y": plan.displayed_shape.y(),
+            "x": plan.displayed_shape.x(),
         },
         "brick_shape": {
-            "z": plan.brick_shape.z,
-            "y": plan.brick_shape.y,
-            "x": plan.brick_shape.x,
+            "z": plan.brick_shape.z(),
+            "y": plan.brick_shape.y(),
+            "x": plan.brick_shape.x(),
         },
         "brick_grid_shape": {
-            "z": plan.brick_grid_shape.z,
-            "y": plan.brick_grid_shape.y,
-            "x": plan.brick_grid_shape.x,
+            "z": plan.brick_grid_shape.z(),
+            "y": plan.brick_grid_shape.y(),
+            "x": plan.brick_grid_shape.x(),
         },
         "visible_bricks": plan.visible_bricks.len(),
         "resident_complete": resident_frame.complete,
@@ -379,7 +381,7 @@ pub(crate) fn phase11_interaction_report(
     let layer = dataset
         .layer(&layer_id)
         .context("first layer id was not found after opening dataset")?;
-    let timepoint = TimeIndex(0);
+    let timepoint = TimeIndex::new(0);
     let source_shape = dataset.scale_shape(&layer_id, 0)?;
     let source_grid_to_world = dataset.scale_grid_to_world(&layer_id, 0)?;
     let viewport = options
@@ -432,9 +434,7 @@ pub(crate) fn phase11_interaction_report(
 
     for (frame_index, camera_sample) in camera_sequence.iter().enumerate() {
         let frame_started = Instant::now();
-        let camera = camera_sample
-            .camera
-            .to_camera_state(DEFAULT_PRESENTATION_VIEWPORT_POINTS);
+        let camera = benchmark_camera_frame(camera_sample.camera);
         let plan_started = Instant::now();
         let plan = phase11_select_lod_plan(
             &dataset,
@@ -554,9 +554,9 @@ pub(crate) fn phase11_interaction_report(
                 "refinement_estimated_decoded_bytes": plan.refinement_estimated_decoded_bytes,
             },
             "displayed_shape": {
-                "z": plan.displayed_shape.z,
-                "y": plan.displayed_shape.y,
-                "x": plan.displayed_shape.x,
+                "z": plan.displayed_shape.z(),
+                "y": plan.displayed_shape.y(),
+                "x": plan.displayed_shape.x(),
             },
             "visible_bricks": plan.visible_bricks.len(),
             "timings_ms": {
@@ -595,11 +595,11 @@ pub(crate) fn phase11_interaction_report(
         "package": package,
         "layer_id": layer_id.to_string(),
         "stored_dtype": format!("{:?}", layer.dtype.stored),
-        "timepoint": timepoint.0,
+        "timepoint": timepoint.get(),
         "source_shape": {
-            "z": source_shape.z,
-            "y": source_shape.y,
-            "x": source_shape.x,
+            "z": source_shape.z(),
+            "y": source_shape.y(),
+            "x": source_shape.x(),
         },
         "viewport": {
             "width": viewport.width,
@@ -776,7 +776,7 @@ impl Phase11ResidentBrickSet {
 
     pub(crate) fn render_cpu(
         &self,
-        camera: mirante4d_core::CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
     ) -> Result<(MipImageU16, BrickFrameDiagnostics), mirante4d_renderer::RenderError> {
@@ -797,7 +797,7 @@ impl Phase11ResidentBrickSet {
 
     fn render_cpu_mip_summary(
         &self,
-        camera: mirante4d_core::CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
     ) -> Result<Phase11ResidentFrameSummary, mirante4d_renderer::RenderError> {
         match self {
@@ -840,7 +840,7 @@ impl Phase11ResidentBrickSet {
         renderer: &GpuRenderer,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
-        camera: mirante4d_core::CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
     ) -> Result<GpuMipOutput, GpuRenderError> {
@@ -873,7 +873,7 @@ impl Phase11ResidentBrickSet {
         renderer: &GpuRenderer,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
-        camera: mirante4d_core::CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
     ) -> Result<Phase11GpuMipFrame, GpuRenderError> {
         match self {
@@ -915,7 +915,7 @@ impl Phase11ResidentBrickSet {
         renderer: &GpuRenderer,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
-        camera: mirante4d_core::CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
     ) -> (
         Result<Phase11GpuMipFrame, GpuRenderError>,
@@ -1083,7 +1083,7 @@ struct Phase11GpuInteractionFrame {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Phase11LodPlanningInput {
     pub(crate) camera_view: CameraView,
-    pub(crate) camera: mirante4d_core::CameraState,
+    pub(crate) camera: CameraFrame,
     pub(crate) viewport: RenderViewport,
     pub(crate) brick_pixel_stride: u64,
     pub(crate) max_visible_bricks: usize,
@@ -1212,7 +1212,7 @@ fn phase11_coarse_loading_plan_before_selected(
 pub(crate) fn phase11_visible_bricks_at_scale(
     dataset: &DatasetHandle,
     layer_id: &LayerId,
-    camera: mirante4d_core::CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     brick_pixel_stride: u64,
     scale_level: u32,
@@ -1349,8 +1349,12 @@ pub(crate) fn phase11_estimated_decoded_bytes(
         phase11_decoded_bytes_per_voxel(phase11_stored_dtype_for_layer(dataset, layer_id)?)?;
     let mut total = 0u64;
     for brick_index in visible_bricks {
-        let metadata =
-            dataset.brick_metadata_at_scale(layer_id, scale_level, TimeIndex(0), *brick_index)?;
+        let metadata = dataset.brick_metadata_at_scale(
+            layer_id,
+            scale_level,
+            TimeIndex::new(0),
+            *brick_index,
+        )?;
         if !metadata.occupied {
             continue;
         }
@@ -1373,9 +1377,7 @@ fn phase11_screen_equivalent_scale(
     scale_count: usize,
 ) -> anyhow::Result<u32> {
     let _ = viewport;
-    let world_per_pixel = camera_view
-        .world_per_screen_point_at_target()
-        .max(f64::EPSILON);
+    let world_per_pixel = benchmark_camera_world_per_screen_point(camera_view).max(f64::EPSILON);
     let mut selected = 0;
     for scale_index in 0..scale_count {
         let scale_level = scale_index as u32;
@@ -1399,7 +1401,7 @@ fn bench_phase11_gpu_resident(
     resident: &Phase11ResidentBrickSet,
     brick_shape: Shape3D,
     brick_grid_shape: Shape3D,
-    camera: mirante4d_core::CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
 ) -> anyhow::Result<Value> {
     let started = Instant::now();
@@ -1497,7 +1499,7 @@ fn phase11_render_gpu_interaction_frame(
     resident: &Phase11ResidentBrickSet,
     brick_shape: Shape3D,
     brick_grid_shape: Shape3D,
-    camera: mirante4d_core::CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
 ) -> Phase11GpuInteractionFrame {
     let stats_before = renderer.stats().ok();
@@ -1568,7 +1570,7 @@ fn phase11_settled_refinement_report(
     timepoint: TimeIndex,
     plan: &Phase11LodPlan,
     gpu_renderer: Option<&GpuRenderer>,
-    camera: mirante4d_core::CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
 ) -> anyhow::Result<Value> {
     let Some(scale_level) = plan.refinement_scale_level else {
@@ -1673,8 +1675,7 @@ fn phase11_interaction_camera_sequence(
 
     for step in 0..steps {
         let fraction = (step + 1) as f64 / steps as f64;
-        let mut camera = base_camera;
-        camera.orbit_by(0.45 * fraction, 0.20 * fraction);
+        let camera = benchmark_camera_orbit(base_camera, 0.45 * fraction, 0.20 * fraction);
         sequence.push(Phase11InteractionCameraSample {
             scenario: "orbit",
             scenario_frame: step,
@@ -1684,14 +1685,14 @@ fn phase11_interaction_camera_sequence(
 
     for step in 0..steps {
         let fraction = (step + 1) as f64 / steps as f64;
-        let mut camera = base_camera;
-        camera.pan_by(
-            base_camera.world_per_screen_point_at_target()
-                * DEFAULT_PRESENTATION_VIEWPORT_POINTS.height_points
+        let camera = benchmark_camera_pan(
+            base_camera,
+            benchmark_camera_world_per_screen_point(base_camera)
+                * BENCHMARK_PRESENTATION_POINTS
                 * 0.10
                 * fraction,
-            -base_camera.world_per_screen_point_at_target()
-                * DEFAULT_PRESENTATION_VIEWPORT_POINTS.height_points
+            -benchmark_camera_world_per_screen_point(base_camera)
+                * BENCHMARK_PRESENTATION_POINTS
                 * 0.06
                 * fraction,
         );
@@ -1704,8 +1705,7 @@ fn phase11_interaction_camera_sequence(
 
     for step in 0..steps {
         let fraction = (step + 1) as f64 / steps as f64;
-        let mut camera = base_camera;
-        camera.zoom_by(1.0 - 0.50 * fraction);
+        let camera = benchmark_camera_zoom(base_camera, 1.0 - 0.50 * fraction);
         sequence.push(Phase11InteractionCameraSample {
             scenario: "zoom",
             scenario_frame: step,
@@ -1717,22 +1717,24 @@ fn phase11_interaction_camera_sequence(
 }
 
 fn phase11_camera_json(camera: CameraView) -> Value {
+    let target = camera.target();
+    let [orientation_x, orientation_y, orientation_z, orientation_w] = camera.orientation().xyzw();
     json!({
-        "projection": projection_label(camera.projection),
+        "projection": projection_label(camera.projection()),
         "target": {
-            "x": camera.target.x,
-            "y": camera.target.y,
-            "z": camera.target.z,
+            "x": target.x(),
+            "y": target.y(),
+            "z": target.z(),
         },
         "orientation": {
-            "x": camera.orientation.x,
-            "y": camera.orientation.y,
-            "z": camera.orientation.z,
-            "w": camera.orientation.w,
+            "x": orientation_x,
+            "y": orientation_y,
+            "z": orientation_z,
+            "w": orientation_w,
         },
-        "orthographic_world_per_screen_point": camera.orthographic_world_per_screen_point,
-        "perspective_focal_length_screen_points": camera.perspective_focal_length_screen_points,
-        "perspective_view_distance_world": camera.perspective_view_distance_world,
+        "orthographic_world_per_screen_point": camera.orthographic_world_per_screen_point(),
+        "perspective_focal_length_screen_points": camera.perspective_focal_length_screen_points(),
+        "perspective_view_distance_world": camera.perspective_view_distance_world(),
     })
 }
 
