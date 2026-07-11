@@ -14,7 +14,8 @@ Rust with `wgpu`, `winit`, and `egui`.
 - Stream datasets that are larger than RAM or VRAM.
 - Render intensity channels with MIP, DVR, and ISO modes.
 - Display multiple channels with per-channel rendering controls.
-- Save native project/session state and run analysis workflows.
+- Save native project/session state and inspect/export existing analysis
+  results; analysis execution is deferred during the foundation rebuild.
 - Build and package the application for Linux x86_64.
 
 Current implementation facts and limitations are recorded in

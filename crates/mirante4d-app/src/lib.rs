@@ -10,20 +10,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod analysis_jobs;
 mod analysis_workspace;
-mod brick_streaming;
-mod cross_section_read_queue;
 mod cross_section_readout;
 mod cross_section_runtime;
 mod cross_section_scheduler;
-mod cross_section_streaming;
 mod current_egui_shell_bridge;
 mod current_project_persistence_bridge;
 mod current_runtime;
 mod current_settings_connection;
 mod current_source_open_service;
-mod dataset_opening;
+mod dataset_demand_plan;
+mod dataset_requests;
 mod diagnostics;
 mod display_graph;
 mod display_identity;
@@ -40,13 +37,14 @@ mod render_state;
 mod resident_rendering;
 mod runtime_diagnostics_panel;
 mod scene_artifacts;
-mod scene_extraction;
+mod semantic_tiles;
 mod smoke;
 mod state;
 mod tool_interactions;
 mod tools;
 mod transfer_presets;
 mod ui_kit;
+mod unified_source_open;
 mod viewer_layout;
 mod viewport;
 mod workbench_brick_runtime;
@@ -55,16 +53,6 @@ mod workbench_import;
 mod workbench_playback_runtime;
 mod workbench_ui;
 
-#[cfg(test)]
-use analysis_jobs::{
-    AnalysisJobContext, AnalysisProgress, compute_active_roi_analysis,
-    compute_full_time_series_analysis, run_full_time_series_analysis_job,
-};
-use analysis_jobs::{
-    AnalysisJobInput, AnalysisTask, AnalysisTaskKind, AnalysisTaskMessage,
-    analysis_progress_fraction, analysis_task_status_text, spawn_analysis_task,
-    store_analysis_task_output,
-};
 #[cfg(test)]
 use analysis_workspace::{
     AnalysisPlotBounds, analysis_plot_bounds, analysis_plot_visible_bounds,
@@ -76,20 +64,8 @@ use analysis_workspace::{
     AnalysisPlotViewRange, AnalysisTableExportInput, AnalysisTableSort, AnalysisWorkspaceViewInput,
     export_selected_analysis_table, show_analysis_workspace, show_analysis_workspace_window,
 };
-#[cfg(test)]
-use brick_streaming::brick_runtime_work_active;
-use brick_streaming::create_brick_read_pool;
-#[cfg(test)]
-use brick_streaming::{
-    BrickSubmissionOptions, current_brick_stream_request_key, spatial_warm_brick_candidates,
-    submit_visible_bricks_to_pool_with_options,
-};
-use brick_streaming::{cancel_brick_tickets, reset_warm_state};
-use cross_section_read_queue::create_cross_section_read_pool;
 use cross_section_readout::cross_section_hover_readout_for_response;
 use cross_section_runtime::CrossSectionRuntime;
-use cross_section_streaming::retire_cross_section_streaming_state;
-use dataset_opening::open_dataset_with_resource_policy_and_render_first_frame;
 pub use diagnostics::{StartupDiagnostics, collect_startup_diagnostics, default_log_path};
 use display_identity::GpuDisplayedFrameIdentity;
 use display_refresh::{DisplayRefreshTiming, ViewportDisplayImage, duration_ms};
@@ -103,8 +79,6 @@ use fidelity::{
 use fidelity::{
     frame_completeness_label, frame_failure_kind_label, frame_fidelity_label, frame_reason_label,
 };
-#[cfg(test)]
-use glam::DVec3;
 use histogram::{
     active_layer_histogram_summary, auto_dense_window_from_histogram,
     auto_dvr_opacity_transfer_from_histogram, auto_signal_window_from_histogram,
@@ -120,132 +94,58 @@ use import_ui::{
     tiff_import_storage_estimate_label, tiff_source_profile_label,
     tiff_voxel_spacing_metadata_label, validate_pending_tiff_import,
 };
-#[cfg(test)]
-use import_ui::{
-    import_progress_message, import_tiff_source_options, no_data_policy_label,
-    normalize_pending_tiff_no_data_policy, set_pending_tiff_no_data_policy,
-    validate_tiff_import_options,
-};
-use lod_scheduler::update_visible_brick_plan;
-#[cfg(test)]
-use lod_scheduler::{
-    MAX_LOD_CANDIDATE_VISIBLE_BRICKS, MIN_LOD_CANDIDATE_VISIBLE_BRICKS,
-    lod_candidate_visible_brick_budget,
-};
 use mirante4d_analysis::IntensitySummary;
 #[cfg(test)]
 use mirante4d_analysis::{
-    AnalysisCell, AnalysisExecutionClass, AnalysisProvenance, AnalysisResultState,
-    AnnotationArtifact, SceneStyleRgba as AnalysisSceneStyleRgba, TrackArtifact, TrackPoint,
+    AnalysisCell, AnalysisExecutionClass, AnalysisPlot, AnalysisProvenance, AnalysisResultState,
+    AnalysisTable,
 };
 #[cfg(test)]
-use mirante4d_analysis::{
-    AnalysisPlot, AnalysisTable, MeasurementArtifact,
-    MeasurementGeometry as AnalysisMeasurementGeometry, MeasurementProvenance, RoiArtifact,
-    SceneArtifactId, SceneArtifactStore, SceneArtifactTime, SceneEditCommand,
-    WorldGeometry as AnalysisWorldGeometry,
-};
+use mirante4d_application::{AnalysisTableDescriptor, AnalysisTableId};
 use mirante4d_application::{
-    AnalysisPlotDescriptor, AnalysisPlotId, AnalysisTableDescriptor, AnalysisTableId,
     ApplicationCommand, ApplicationEvent, ApplicationFault, ApplicationFaultCode,
     ApplicationSnapshot, ApplicationState, CommandEffect, OperationCompletion,
     OperationFailureCode, OperationKind, OperationToken, SourceSessionGeneration,
     SourceVerificationSnapshot, WorkspaceSnapshot,
 };
-#[cfg(test)]
-use mirante4d_data::{BrickReadOutcome, BrickReadStatus, BrickRequestPriority, CancellationToken};
-#[cfg(test)]
-use mirante4d_data::{BrickReadPool, BrickReadTicket, SpatialBrickIndex};
 use mirante4d_dataset::DatasetSourceId;
 use mirante4d_domain::{
     CameraView, CrossSectionView, DisplayWindow, DvrOpacityTransfer as CanonicalDvrOpacityTransfer,
-    IsoLightState, IsoShadingPolicy, LayerTransfer, LogicalLayerKey,
-    RenderState as CanonicalRenderState, RgbColor, SamplingPolicy, TRANSFER_GAMMA_MAX,
-    TRANSFER_GAMMA_MIN, TransferCurve, UnitQuaternion, ViewerLayout as CanonicalViewerLayout,
-    WorldPoint3,
+    IsoLightState, IsoShadingPolicy, LayerTransfer, RenderState as CanonicalRenderState, RgbColor,
+    SamplingPolicy, ScaleLevel, TRANSFER_GAMMA_MAX, TRANSFER_GAMMA_MIN, TransferCurve,
+    UnitQuaternion, ViewerLayout as CanonicalViewerLayout, WorldPoint3,
 };
 #[cfg(test)]
-use mirante4d_domain::{IntensityDType, RenderMode, Shape3D, Shape4D, TimeIndex};
-use mirante4d_format::LayerId;
-#[cfg(test)]
-use mirante4d_format::{
-    CurrentGridToWorldExt, NoDataPolicy, NoDataPolicyKind, NoDataVisibilityPolicy,
-};
+use mirante4d_domain::{IntensityDType, RenderMode, Shape3D, TimeIndex};
 use mirante4d_import::{
     ImportCancellationToken, ImportError, TiffDirectoryImportReport, TiffImportSource,
     TiffSourceImportOptions, import_tiff_source_with_progress,
 };
-#[cfg(test)]
-use mirante4d_import::{
-    ImportProgressEvent, TiffChannelInspection, TiffDirectoryInspection, TiffImportReviewStatus,
-    TiffImportStorageEstimate, TiffMetadataConfidence, TiffNoDataPolicyReview, TiffSourceProfile,
-    TiffStackShape, TiffValueRangeSummary, default_tiff_channel_metadata_override,
-};
 use mirante4d_project_model::{ChannelPreset, LayerViewState, ViewState};
 use mirante4d_render_api::PresentationViewport;
+use mirante4d_renderer::gpu::{GpuDisplayFrame, GpuRenderer};
 #[cfg(test)]
-use mirante4d_renderer::PickValue;
-use mirante4d_renderer::{
-    FrameDiagnostics, FrameDiagnosticsF32, MipImageF32, MipImageU16,
-    gpu::{GpuDisplayFrame, GpuRenderer},
-};
-#[cfg(test)]
-use mirante4d_renderer::{
-    IsoSurfaceFrameF32, IsoSurfaceNormal, PixelCoverage, RenderError, RenderViewport,
-    gpu::GpuRenderError,
-};
-#[cfg(test)]
-use mirante4d_renderer::{PickCompleteness, PickHit, PickHitKind, PickPolicy, ScreenPosition};
+use mirante4d_renderer::{PixelCoverage, RenderViewport};
 use mirante4d_settings::{RejectedFileDisposition, ResourcePolicy, recommended_for_current_system};
 use playback::playback_status_label;
 #[cfg(test)]
 use playback::stepped_timepoint;
 use product_automation::{ProductAutomationAppUpdateTiming, ProductAutomationController};
 #[cfg(test)]
-use render_state::{
-    ResidentRenderFailureStatus, f32_frame_to_display_u16_for_mode,
-    frame_failure_kind_for_gpu_error, placeholder_frame_for_mode,
-    request_lod_downgrade_after_resident_capacity_failure,
-};
-use render_state::{
-    refresh_fidelity_resource_stats, rerender_state_with_backend, set_presentation_viewport,
-    set_render_viewport, take_lod_replan_pending, update_channel_fidelity_status,
-};
-#[cfg(test)]
-use resident_rendering::render_state_from_resident_bricks;
+use render_state::placeholder_frame_for_mode;
+use render_state::{set_presentation_viewport, set_render_viewport, take_lod_replan_pending};
 use resident_rendering::{
     render_gpu_cross_section_panel_frame_from_global_runtime,
-    render_gpu_display_frame_from_resident_bricks, render_state_from_resident_bricks_with_backend,
+    render_gpu_display_frame_from_resident_bricks,
 };
 use scene_artifacts::show_scene_artifacts_editor;
-#[cfg(test)]
-use scene_artifacts::{
-    EditableSceneArtifactKind, SceneEditHandle, SceneEditHandleId, normalize_world_geometry,
-    refresh_measurement_result, remove_scene_artifact, select_scene_artifact,
-    selected_scene_artifact_matches, update_scene_annotation_artifact, update_scene_roi_artifact,
-    update_scene_track_artifact,
-};
-#[cfg(test)]
-use scene_extraction::scene_draw_list;
-#[cfg(test)]
-use scene_extraction::selected_scene_handle_pick_targets;
-#[cfg(test)]
-use scene_extraction::{SCENE_HANDLE_LAYER_ID, world_geometry_edit_handles};
 pub use smoke::{AppSmokeOptions, AppSmokeReport, PlaybackSmokeFrame, run_headless_smoke};
 pub use state::{
     ChannelFidelityStatus, ChannelFidelityWarning, DisplayedFrameFreshness, FrameCompleteness,
     FrameFailureKind, FrameFidelityStatus, HistogramStatus, LayerHistogramSummary,
-    LodDecisionReason, LodScheduleState, RenderBackend, RenderedIntensityChannel, ViewportHover,
-    ViewportIntensity,
+    LodDecisionReason, LodScheduleState, RenderBackend, ViewportHover, ViewportIntensity,
 };
-use state::{LayerHistogramCache, ResidentHistogramSampleKey};
 use tool_interactions::apply_viewport_tool_response;
-#[cfg(test)]
-use tool_interactions::{
-    apply_viewer_tool_commands, pick_hit_from_viewport_hover, update_world_geometry_from_handle,
-};
-#[cfg(test)]
-use tools::ViewerToolCommand;
 use tools::{ViewerTool, ViewerToolState};
 use transfer_presets::{
     built_in_transfer_preset_curve, built_in_transfer_preset_label, built_in_transfer_presets,
@@ -255,16 +155,12 @@ use ui_kit::{StatusTone, WorkbenchLayoutSpec};
 use viewport::{
     default_camera_for_shape, fit_camera_to_shape_preserving_view, fit_size,
     presentation_viewport_for_display_size, render_viewport_for_display_size,
-    resident_brick_render_supported, viewport_hover_from_response, viewport_interaction_commands,
+    viewport_hover_from_response, viewport_interaction_commands,
 };
 use workbench_controls::{
     dataset_path_status_label, projection_selector, render_mode_label, render_mode_selector,
     request_background_work_repaint, request_background_work_repaint_after, show_playback_controls,
 };
-
-const SMALL_DENSE_VIEWER_VOXEL_LIMIT: u64 = 16 * 1024 * 1024;
-const GPU_RESIDENT_BRICKS_PER_BATCH: usize = 64;
-pub(crate) const SOURCE_ANALYSIS_SCALE_LEVEL: u32 = 0;
 
 const BACKGROUND_WORK_REPAINT_INTERVAL: Duration = Duration::from_millis(50);
 pub(crate) const CROSS_SECTION_INTERACTION_SETTLE_DURATION: Duration = Duration::from_millis(120);
@@ -290,25 +186,6 @@ fn application_view(snapshot: &ApplicationSnapshot) -> &ViewState {
         WorkspaceSnapshot::Unbound { workspace } => workspace.view(),
         WorkspaceSnapshot::Bound { project, .. } => project.view(),
     }
-}
-
-fn current_physical_layer_id(
-    dataset: &current_runtime::dataset::CurrentDatasetRuntime,
-    key: LogicalLayerKey,
-) -> anyhow::Result<LayerId> {
-    let id = dataset
-        .dataset
-        .manifest()
-        .layers
-        .get(key.ordinal() as usize)
-        .map(|layer| layer.id.as_str())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "logical layer key {} has no current physical layer",
-                key.ordinal()
-            )
-        })?;
-    Ok(LayerId::new(id)?)
 }
 
 fn project_failure_code(
@@ -351,7 +228,7 @@ fn project_failure_code(
 pub struct MiranteWorkbenchApp {
     application: ApplicationState,
     startup_diagnostics: StartupDiagnostics,
-    dataset_runtime: current_runtime::dataset::CurrentDatasetRuntime,
+    dataset: dataset_requests::DatasetDemandState,
     render_runtime: current_runtime::render::CurrentRenderRuntime,
     ui_runtime: current_runtime::ui::CurrentUiRuntime,
     project_runtime: current_runtime::project::CurrentProjectRuntime,
@@ -377,26 +254,22 @@ impl MiranteWorkbenchApp {
     ) -> anyhow::Result<Self> {
         let (settings_connection, resource_policy) =
             current_settings_connection::CurrentSettingsConnection::start();
-        let opened = open_dataset_with_resource_policy_and_render_first_frame(
-            path,
-            resource_policy,
-            DatasetSourceId::new(1),
-        )?;
+        let opened = unified_source_open::open(path, resource_policy, DatasetSourceId::new(1))?;
         Self::new_with_settings(cc, opened, settings_connection, resource_policy)
     }
 
     fn new_with_settings(
         cc: &eframe::CreationContext<'_>,
-        opened: dataset_opening::OpenedCurrentSource,
+        opened: unified_source_open::UnifiedOpenedSource,
         settings_connection: current_settings_connection::CurrentSettingsConnection,
         resource_policy: ResourcePolicy,
     ) -> anyhow::Result<Self> {
         ui_kit::configure_visuals(&cc.egui_ctx);
-        let dataset_opening::OpenedCurrentSource {
+        let unified_source_open::UnifiedOpenedSource {
             mut startup_diagnostics,
             catalog,
             workspace,
-            mut dataset_runtime,
+            dataset,
             mut render_runtime,
             analysis_runtime,
         } = opened;
@@ -426,28 +299,12 @@ impl MiranteWorkbenchApp {
         startup_diagnostics.gpu_adapter = Some(adapter_summary);
         let gpu_renderer = Arc::new(renderer);
         render_runtime.gpu_renderer = Some(Arc::clone(&gpu_renderer));
-        dataset_runtime.brick_read_pool = create_brick_read_pool(&dataset_runtime);
-        dataset_runtime.cross_section_read_pool = create_cross_section_read_pool(&dataset_runtime);
-        if dataset_runtime.brick_read_pool.is_none()
-            || dataset_runtime.cross_section_read_pool.is_none()
-        {
-            anyhow::bail!("failed to start bounded dataset read workers");
-        }
         let ui_runtime =
             current_runtime::ui::CurrentUiRuntime::new(resource_policy, wgpu_texture_renderer);
-        let snapshot = current_egui_shell_bridge::snapshot(&application);
-        rerender_state_with_backend(
-            &snapshot,
-            &mut dataset_runtime,
-            &analysis_runtime,
-            &ui_runtime,
-            &mut render_runtime,
-            Some(gpu_renderer.as_ref()),
-        )?;
         let mut app = Self {
             application,
             startup_diagnostics,
-            dataset_runtime,
+            dataset,
             render_runtime,
             ui_runtime,
             project_runtime: current_runtime::project::CurrentProjectRuntime::unbound(),
@@ -1058,6 +915,9 @@ impl MiranteWorkbenchApp {
                     self.install_current_source_runtime(runtime);
                 } else {
                     tracing::warn!("stale dataset open result was suppressed");
+                    if let Err(error) = runtime.dataset.request_shutdown() {
+                        tracing::warn!(%error, "stale dataset runtime shutdown request failed");
+                    }
                     std::thread::spawn(move || drop(runtime));
                 }
             }
@@ -1075,7 +935,7 @@ impl MiranteWorkbenchApp {
         transfer: current_source_open_service::CurrentSourceRuntimeTransfer,
     ) {
         let current_source_open_service::CurrentSourceRuntimeTransfer {
-            dataset_runtime,
+            dataset,
             mut render_runtime,
             analysis_runtime,
         } = transfer;
@@ -1083,7 +943,7 @@ impl MiranteWorkbenchApp {
         self.clear_gpu_display_frame();
         self.retire_gpu_display_texture_id();
         self.retire_cross_section_gpu_display_texture_ids();
-        let old_dataset_runtime = std::mem::replace(&mut self.dataset_runtime, dataset_runtime);
+        let old_dataset = std::mem::replace(&mut self.dataset, dataset);
         let old_render_runtime = std::mem::replace(&mut self.render_runtime, render_runtime);
         let old_analysis_runtime = std::mem::replace(&mut self.analysis_runtime, analysis_runtime);
         let old_import_runtime = std::mem::replace(
@@ -1097,65 +957,19 @@ impl MiranteWorkbenchApp {
         self.ui_runtime.analysis_sort = None;
         self.ui_runtime.hovered_pixel = None;
         self.ui_runtime.hovered_source_readout = None;
-        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
-        let gpu_renderer = self.render_runtime.gpu_renderer.clone();
-        if let Err(error) = rerender_state_with_backend(
-            &snapshot,
-            &mut self.dataset_runtime,
-            &self.analysis_runtime,
-            &self.ui_runtime,
-            &mut self.render_runtime,
-            gpu_renderer.as_deref(),
-        ) {
-            tracing::error!(%error, "failed to render the newly admitted source");
-            render_state::record_render_failure(
-                &snapshot,
-                &mut self.dataset_runtime,
-                &mut self.render_runtime,
-                &error,
-            );
+        if let Err(error) = old_dataset.request_shutdown() {
+            tracing::warn!(%error, "replaced dataset runtime shutdown request failed");
         }
         self.request_opened_state_visible_work(None);
 
         std::thread::spawn(move || {
             drop((
-                old_dataset_runtime,
+                old_dataset,
                 old_render_runtime,
                 old_analysis_runtime,
                 old_import_runtime,
             ));
         });
-    }
-
-    fn start_analysis_task(&mut self, kind: AnalysisTaskKind) {
-        if self.analysis_runtime.analysis_task.is_some() {
-            return;
-        }
-        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
-        let view = application_view(&snapshot);
-        let active_key = view.active_layer();
-        let Some(layer) = snapshot.catalog().layer(active_key) else {
-            return;
-        };
-        let Ok(layer_id) = current_physical_layer_id(&self.dataset_runtime, active_key) else {
-            return;
-        };
-        let Some(token) = self.begin_background_operation(OperationKind::Analysis) else {
-            return;
-        };
-        self.analysis_runtime.analysis_task = Some(spawn_analysis_task(
-            token,
-            &self.dataset_runtime,
-            &self.analysis_runtime,
-            AnalysisJobInput {
-                dataset_name: snapshot.catalog().label(),
-                active_layer_id: layer_id.as_str(),
-                active_layer_dtype: layer.dtype(),
-                active_timepoint: view.timepoint(),
-                timepoint_count: layer.shape().t(),
-            },
-            kind,
-        ));
     }
 
     fn active_histogram_summary(&mut self) -> LayerHistogramSummary {
@@ -1166,112 +980,26 @@ impl MiranteWorkbenchApp {
             .catalog()
             .layer(active_key)
             .expect("application view closes over the dataset catalog");
-        let layer_id = current_physical_layer_id(&self.dataset_runtime, active_key)
-            .expect("application catalog closes over the current physical manifest");
+        let scale = ScaleLevel::new(
+            self.render_runtime
+                .lod_schedule
+                .displayed_scale_level
+                .unwrap_or(self.render_runtime.lod_schedule.target_scale_level),
+        );
         active_layer_histogram_summary(
-            &mut self.analysis_runtime,
-            &self.dataset_runtime,
+            &self.render_runtime.lease_bridge,
             histogram::ActiveLayerHistogramInput {
-                layer_id: &layer_id,
+                requirements: self
+                    .dataset
+                    .scope_requirements(dataset_requests::SCOPE_CURRENT_3D),
+                identity: snapshot.catalog().scientific_identity().resource_identity(),
+                layer: active_key,
                 layer_name: layer.label(),
                 dtype: layer.dtype(),
                 timepoint: view.timepoint(),
+                scale,
             },
         )
-    }
-
-    fn cancel_analysis_task(&mut self) {
-        if let Some(task) = self.analysis_runtime.analysis_task.as_ref() {
-            let token = task.token.clone();
-            task.cancellation.cancel();
-            self.cancel_background_operation(&token);
-        }
-    }
-
-    fn drain_analysis_results(&mut self, ctx: &egui::Context) {
-        let mut completion = None;
-        let mut saw_progress = false;
-        if let Some(task) = self.analysis_runtime.analysis_task.as_mut() {
-            while let Ok(message) = task.receiver.try_recv() {
-                match message {
-                    AnalysisTaskMessage::Progress(progress) => {
-                        task.latest_progress = Some(progress);
-                        saw_progress = true;
-                    }
-                    AnalysisTaskMessage::Finished(result) => {
-                        completion = Some(*result);
-                    }
-                }
-            }
-        }
-
-        if let Some(result) = completion {
-            let task = self
-                .analysis_runtime
-                .analysis_task
-                .take()
-                .expect("an analysis completion has an active task");
-            let token = task.token.clone();
-            match result {
-                Ok(output) => {
-                    let table = AnalysisTableDescriptor::new(
-                        AnalysisTableId::from_operation(token.operation_id(), 0),
-                        output.table.rows.len() as u64,
-                    );
-                    let plots = match output.plot.as_ref() {
-                        Some(plot) => AnalysisPlotDescriptor::new(
-                            AnalysisPlotId::from_operation(token.operation_id(), 0),
-                            plot.series
-                                .iter()
-                                .map(|series| series.points.len() as u64)
-                                .collect(),
-                        )
-                        .map(|plot| vec![plot]),
-                        None => Ok(Vec::new()),
-                    };
-                    match plots {
-                        Ok(plots) => {
-                            if self.complete_background_operation(
-                                token,
-                                OperationCompletion::AnalysisReady {
-                                    tables: vec![table],
-                                    plots,
-                                },
-                            ) {
-                                store_analysis_task_output(&mut self.analysis_runtime, output);
-                            }
-                        }
-                        Err(error) => {
-                            self.complete_background_operation(
-                                token,
-                                OperationCompletion::Failed(
-                                    OperationFailureCode::AnalysisCapacityExceeded,
-                                ),
-                            );
-                            tracing::error!(
-                                ?error,
-                                "analysis descriptors exceeded application bounds"
-                            );
-                        }
-                    }
-                }
-                Err(error) if error == "analysis was cancelled" => {
-                    self.complete_background_operation(token, OperationCompletion::Cancelled);
-                }
-                Err(error) => {
-                    self.complete_background_operation(
-                        token,
-                        OperationCompletion::Failed(OperationFailureCode::AnalysisExecutionFailed),
-                    );
-                    tracing::warn!(%error, "analysis task failed");
-                }
-            }
-            saw_progress = true;
-        }
-
-        if saw_progress {
-            ctx.request_repaint();
-        }
     }
 
     pub(crate) fn apply_application_command(
@@ -1306,16 +1034,6 @@ impl MiranteWorkbenchApp {
         }
 
         if playback_lod_changed {
-            if playback_lod_downshift_active {
-                cancel_brick_tickets(&mut self.dataset_runtime.warm_brick_tickets);
-                reset_warm_state(&mut self.dataset_runtime);
-            }
-            update_visible_brick_plan(
-                snapshot,
-                &mut self.dataset_runtime,
-                &mut self.render_runtime,
-            );
-            self.dataset_runtime.brick_stream_request_key = None;
             self.request_visible_bricks();
         }
 
@@ -1324,43 +1042,36 @@ impl MiranteWorkbenchApp {
             return;
         }
 
-        let analysis_token = self
-            .analysis_runtime
-            .analysis_task
-            .as_ref()
-            .map(|task| task.token.clone());
         let source_selection_changed = match layer_state::reconcile_view_runtime(
             previous_view,
             snapshot,
-            &mut self.dataset_runtime,
+            &mut self.dataset,
             &mut self.render_runtime,
             &mut self.analysis_runtime,
         ) {
             Ok(changed) => changed,
             Err(error) => {
                 tracing::error!(%error, "failed to reconcile the canonical view with current runtime");
-                render_state::record_render_failure(
-                    snapshot,
-                    &mut self.dataset_runtime,
-                    &mut self.render_runtime,
-                    &error,
-                );
+                self.dataset.record_plan_error(error.to_string());
+                self.render_runtime.visible_brick_plan_error = Some(error.to_string());
+                self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Incomplete;
                 false
             }
         };
-        if source_selection_changed && let Some(token) = analysis_token.as_ref() {
-            self.cancel_background_operation(token);
-        }
         if previous_view.layout() != next_view.layout() {
             self.ui_runtime.hovered_pixel = None;
             self.ui_runtime.hovered_source_readout = None;
             self.ui_runtime.viewport_orbit_drag = None;
             if next_view.layout() == CanonicalViewerLayout::Single3d {
                 self.retire_cross_section_gpu_display_texture_ids();
-                retire_cross_section_streaming_state(&mut self.render_runtime);
+                self.render_runtime
+                    .cross_section_runtime
+                    .mark_cross_section_panels_dirty();
             }
         }
         if source_selection_changed {
+            self.clear_gpu_display_frame();
+            self.retire_gpu_display_texture_id();
             self.request_visible_bricks();
         } else {
             self.invalidate_cross_section_panel_display_frames();
@@ -1368,20 +1079,9 @@ impl MiranteWorkbenchApp {
             self.retire_gpu_display_texture_id();
             if let Err(error) = self.rerender_display_state() {
                 tracing::error!(%error, "failed to render the accepted canonical view");
-                let needs_coarser_lod = render_state::record_render_failure(
-                    snapshot,
-                    &mut self.dataset_runtime,
-                    &mut self.render_runtime,
-                    &error,
-                );
-                if needs_coarser_lod {
-                    update_visible_brick_plan(
-                        snapshot,
-                        &mut self.dataset_runtime,
-                        &mut self.render_runtime,
-                    );
-                    self.dataset_runtime.brick_stream_request_key = None;
-                }
+                self.dataset.record_plan_error(error.to_string());
+                self.render_runtime.visible_brick_plan_error = Some(error.to_string());
+                self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Incomplete;
                 self.request_visible_bricks();
             } else {
                 self.request_visible_bricks();

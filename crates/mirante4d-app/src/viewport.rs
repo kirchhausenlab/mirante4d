@@ -2,19 +2,18 @@ use eframe::egui;
 use glam::{DQuat, DVec3};
 use mirante4d_application::{ApplicationCommand, ApplicationSnapshot};
 use mirante4d_domain::{
-    CameraView, GridToWorld, IntensityDType, IsoShadingPolicy, Projection, RenderState,
-    SamplingPolicy, Shape3D, UnitQuaternion, WorldPoint3,
+    CameraView, GridToWorld, IsoShadingPolicy, Projection, RenderState, SamplingPolicy, Shape3D,
+    UnitQuaternion, WorldPoint3,
 };
 use mirante4d_format::CurrentGridToWorldExt;
 use mirante4d_project_model::ViewState;
 use mirante4d_render_api::{CameraFrame, DEFAULT_PRESENTATION_VIEWPORT, PresentationViewport};
 use mirante4d_renderer::{
-    CameraRenderQuality, IntensitySamplingPolicy, IsoShadingMode, MipImageF32, MipImageU16,
-    RenderViewport,
+    CameraRenderQuality, IntensitySamplingPolicy, IsoShadingMode, RenderViewport,
 };
 
 use crate::{
-    ViewportHover, ViewportIntensity,
+    ViewportHover,
     current_runtime::{render::CurrentRenderRuntime, ui::CurrentUiRuntime},
 };
 
@@ -215,82 +214,15 @@ fn focal_limit_for_axis(fit_points: f64, max_abs_projected_at_focal_1: f64) -> f
 }
 
 pub(crate) fn viewport_hover_from_response(
-    snapshot: &ApplicationSnapshot,
-    view: &ViewState,
-    render: &CurrentRenderRuntime,
-    response: &egui::Response,
+    _snapshot: &ApplicationSnapshot,
+    _view: &ViewState,
+    _render: &CurrentRenderRuntime,
+    _response: &egui::Response,
 ) -> Option<ViewportHover> {
-    let position = response.hover_pos()?;
-    let active_layer_dtype = snapshot.catalog().layer(view.active_layer())?.dtype();
-    viewport_hover_from_image_point(
-        &render.frame,
-        render.frame_f32.as_ref(),
-        active_layer_dtype,
-        response.rect,
-        position,
-    )
-}
-
-pub(crate) fn viewport_hover_from_image_point(
-    frame: &MipImageU16,
-    frame_f32: Option<&MipImageF32>,
-    active_layer_dtype: IntensityDType,
-    rect: egui::Rect,
-    position: egui::Pos2,
-) -> Option<ViewportHover> {
-    if frame.width == 0 || frame.height == 0 || rect.width() <= 0.0 || rect.height() <= 0.0 {
-        return None;
-    }
-    if !rect.contains(position) {
-        return None;
-    }
-    let normalized_x = ((position.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
-    let normalized_y = ((position.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
-    viewport_hover_from_normalized_point(
-        frame,
-        frame_f32,
-        active_layer_dtype,
-        normalized_x,
-        normalized_y,
-    )
-}
-
-pub(crate) fn viewport_hover_from_normalized_point(
-    frame: &MipImageU16,
-    frame_f32: Option<&MipImageF32>,
-    active_layer_dtype: IntensityDType,
-    normalized_x: f32,
-    normalized_y: f32,
-) -> Option<ViewportHover> {
-    if frame.width == 0
-        || frame.height == 0
-        || !normalized_x.is_finite()
-        || !normalized_y.is_finite()
-    {
-        return None;
-    }
-    let normalized_x = normalized_x.clamp(0.0, 1.0);
-    let normalized_y = normalized_y.clamp(0.0, 1.0);
-    let x = ((normalized_x * frame.width as f32).floor() as u64).min(frame.width - 1);
-    let y = ((normalized_y * frame.height as f32).floor() as u64).min(frame.height - 1);
-    Some(ViewportHover {
-        x,
-        y,
-        intensity: frame_f32
-            .and_then(|frame| frame.pixel(y, x))
-            .map(ViewportIntensity::F32)
-            .unwrap_or_else(|| {
-                let value = frame.pixel(y, x).unwrap_or(0);
-                match active_layer_dtype {
-                    IntensityDType::Uint8 => {
-                        ViewportIntensity::U8(u8::try_from(value).unwrap_or(u8::MAX))
-                    }
-                    IntensityDType::Uint16 | IntensityDType::Float32 => {
-                        ViewportIntensity::U16(value)
-                    }
-                }
-            }),
-    })
+    // The current product path retains only a GPU presentation texture.
+    // `frame` is always a loading placeholder, including before the first GPU
+    // frame, so 3D scientific hover remains unavailable rather than guessed.
+    None
 }
 
 pub(crate) fn viewport_interaction_commands(

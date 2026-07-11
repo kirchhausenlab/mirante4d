@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use mirante4d_dataset::CpuByteLedger;
 use mirante4d_domain::{GridToWorld, IsoLightState, Shape3D};
 use mirante4d_render_api::{CameraAxes, CameraFrame};
 use wgpu::util::DeviceExt;
@@ -21,9 +22,8 @@ use super::{
     },
 };
 use crate::{
-    CameraRenderMode, CameraRenderModeF32, CameraRenderQuality, DvrRenderParameters,
-    IntensitySamplingPolicy, IntensityTransfer, RenderError, RenderViewport, ResidentBrickSetF32,
-    ResidentBrickSetU8, ResidentBrickSetU16,
+    CameraRenderMode, CameraRenderModeF32, CameraRenderQuality, CurrentLeaseVolume,
+    DvrRenderParameters, IntensitySamplingPolicy, IntensityTransfer, RenderError, RenderViewport,
 };
 
 const DVR_CHANNEL_U32_STRIDE: usize = 18;
@@ -90,32 +90,26 @@ pub enum GpuDisplayFrameBlendMode {
     SourceOver,
 }
 
-pub enum GpuResidentDisplayChannel<'a> {
+pub enum GpuLeaseDisplayChannel<'a> {
     U8 {
-        resident: &'a ResidentBrickSetU8,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'a>,
         mode: CameraRenderMode,
         transfer: IntensityTransfer,
     },
     U16 {
-        resident: &'a ResidentBrickSetU16,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'a>,
         mode: CameraRenderMode,
         transfer: IntensityTransfer,
     },
     F32 {
-        resident: &'a ResidentBrickSetF32,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'a>,
         mode: CameraRenderModeF32,
         transfer: IntensityTransfer,
     },
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct GpuResidentDisplayRequest {
+pub struct GpuLeaseDisplayRequest {
     pub camera: CameraFrame,
     pub viewport: RenderViewport,
     pub quality: CameraRenderQuality,
@@ -123,7 +117,7 @@ pub struct GpuResidentDisplayRequest {
     pub camera_axes: CameraAxes,
 }
 
-impl GpuResidentDisplayChannel<'_> {
+impl GpuLeaseDisplayChannel<'_> {
     fn is_iso(&self) -> bool {
         matches!(
             self,
@@ -184,17 +178,17 @@ impl GpuResidentDisplayChannel<'_> {
 
     fn volume_shape(&self) -> Shape3D {
         match self {
-            Self::U8 { resident, .. } => resident.volume_shape,
-            Self::U16 { resident, .. } => resident.volume_shape,
-            Self::F32 { resident, .. } => resident.volume_shape,
+            Self::U8 { volume, .. } | Self::U16 { volume, .. } | Self::F32 { volume, .. } => {
+                volume.volume_shape()
+            }
         }
     }
 
     fn grid_to_world(&self) -> GridToWorld {
         match self {
-            Self::U8 { resident, .. } => resident.grid_to_world,
-            Self::U16 { resident, .. } => resident.grid_to_world,
-            Self::F32 { resident, .. } => resident.grid_to_world,
+            Self::U8 { volume, .. } | Self::U16 { volume, .. } | Self::F32 { volume, .. } => {
+                volume.grid_to_world()
+            }
         }
     }
 }
@@ -469,9 +463,11 @@ impl GpuRenderer {
         Ok((texture, view, texture_bytes))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_iso_channels_to_display_texture(
         &self,
-        channels: &[GpuResidentDisplayChannel<'_>],
+        cpu_ledger: &dyn CpuByteLedger,
+        channels: &[GpuLeaseDisplayChannel<'_>],
         camera: CameraFrame,
         viewport: RenderViewport,
         quality: CameraRenderQuality,
@@ -484,7 +480,7 @@ impl GpuRenderer {
             )
             .into());
         }
-        if !channels.iter().all(GpuResidentDisplayChannel::is_iso) {
+        if !channels.iter().all(GpuLeaseDisplayChannel::is_iso) {
             return Err(GpuRenderError::UnsupportedCameraMode(
                 "multi-channel GPU display ISO requires ISO channels",
             ));
@@ -519,10 +515,8 @@ impl GpuRenderer {
         for channel in channels {
             let channel_started = Instant::now();
             let rendered = match channel {
-                GpuResidentDisplayChannel::U8 {
-                    resident,
-                    brick_shape,
-                    brick_grid_shape,
+                GpuLeaseDisplayChannel::U8 {
+                    volume,
                     mode,
                     transfer,
                 } => {
@@ -537,10 +531,9 @@ impl GpuRenderer {
                             resource: "integer ISO output slots",
                         },
                     )?;
-                    let output = self.render_camera_u8_from_bricks_output_buffer(
-                        resident,
-                        *brick_shape,
-                        *brick_grid_shape,
+                    let output = self.render_camera_u8_from_lease_output_buffer(
+                        *volume,
+                        cpu_ledger,
                         camera,
                         viewport,
                         *mode,
@@ -559,10 +552,8 @@ impl GpuRenderer {
                         transfer: *transfer,
                     }
                 }
-                GpuResidentDisplayChannel::U16 {
-                    resident,
-                    brick_shape,
-                    brick_grid_shape,
+                GpuLeaseDisplayChannel::U16 {
+                    volume,
                     mode,
                     transfer,
                 } => {
@@ -577,10 +568,9 @@ impl GpuRenderer {
                             resource: "integer ISO output slots",
                         },
                     )?;
-                    let output = self.render_camera_from_bricks_output_buffer(
-                        resident,
-                        *brick_shape,
-                        *brick_grid_shape,
+                    let output = self.render_camera_u16_from_lease_output_buffer(
+                        *volume,
+                        cpu_ledger,
                         camera,
                         viewport,
                         *mode,
@@ -599,10 +589,8 @@ impl GpuRenderer {
                         transfer: *transfer,
                     }
                 }
-                GpuResidentDisplayChannel::F32 {
-                    resident,
-                    brick_shape,
-                    brick_grid_shape,
+                GpuLeaseDisplayChannel::F32 {
+                    volume,
                     mode,
                     transfer,
                 } => {
@@ -617,10 +605,9 @@ impl GpuRenderer {
                             resource: "float32 ISO output slots",
                         },
                     )?;
-                    let output = self.render_camera_f32_from_bricks_output_buffer(
-                        resident,
-                        *brick_shape,
-                        *brick_grid_shape,
+                    let output = self.render_camera_f32_from_lease_output_buffer(
+                        *volume,
+                        cpu_ledger,
                         camera,
                         viewport,
                         *mode,
@@ -853,7 +840,8 @@ impl GpuRenderer {
 
     fn dvr_display_atlas_channel(
         &self,
-        channel: &GpuResidentDisplayChannel<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
+        channel: &GpuLeaseDisplayChannel<'_>,
     ) -> Result<GpuDvrDisplayAtlasChannel, GpuRenderError> {
         let Some(parameters) = channel.dvr_parameters() else {
             return Err(GpuRenderError::UnsupportedCameraMode(
@@ -862,58 +850,31 @@ impl GpuRenderer {
         };
         let display_visible = channel.transfer().visible();
         let atlas = match channel {
-            GpuResidentDisplayChannel::U8 {
-                resident,
-                brick_shape,
-                brick_grid_shape,
-                ..
-            } => {
-                if resident.bricks().is_empty() {
+            GpuLeaseDisplayChannel::U8 { volume, .. } => {
+                if volume.resident().is_empty() {
                     return Err(RenderError::InvalidBrickAtlas(
                         "resident uint8 brick set is empty",
                     )
                     .into());
                 }
-                GpuDvrDisplayAtlas::Integer(self.cached_brick_atlas_u8(
-                    resident,
-                    *brick_shape,
-                    *brick_grid_shape,
-                )?)
+                GpuDvrDisplayAtlas::Integer(self.cached_brick_atlas_u8(*volume, cpu_ledger)?)
             }
-            GpuResidentDisplayChannel::U16 {
-                resident,
-                brick_shape,
-                brick_grid_shape,
-                ..
-            } => {
-                if resident.bricks().is_empty() {
+            GpuLeaseDisplayChannel::U16 { volume, .. } => {
+                if volume.resident().is_empty() {
                     return Err(
                         RenderError::InvalidBrickAtlas("resident brick set is empty").into(),
                     );
                 }
-                GpuDvrDisplayAtlas::Integer(self.cached_brick_atlas(
-                    resident,
-                    *brick_shape,
-                    *brick_grid_shape,
-                )?)
+                GpuDvrDisplayAtlas::Integer(self.cached_brick_atlas(*volume, cpu_ledger)?)
             }
-            GpuResidentDisplayChannel::F32 {
-                resident,
-                brick_shape,
-                brick_grid_shape,
-                ..
-            } => {
-                if resident.bricks().is_empty() {
+            GpuLeaseDisplayChannel::F32 { volume, .. } => {
+                if volume.resident().is_empty() {
                     return Err(RenderError::InvalidBrickAtlas(
                         "resident float32 brick set is empty",
                     )
                     .into());
                 }
-                GpuDvrDisplayAtlas::F32(self.cached_brick_atlas_f32(
-                    resident,
-                    *brick_shape,
-                    *brick_grid_shape,
-                )?)
+                GpuDvrDisplayAtlas::F32(self.cached_brick_atlas_f32(*volume, cpu_ledger)?)
             }
         };
         Ok(GpuDvrDisplayAtlasChannel {
@@ -925,7 +886,8 @@ impl GpuRenderer {
 
     fn render_dvr_channels_to_display_texture(
         &self,
-        channels: &[GpuResidentDisplayChannel<'_>],
+        cpu_ledger: &dyn CpuByteLedger,
+        channels: &[GpuLeaseDisplayChannel<'_>],
         camera: CameraFrame,
         viewport: RenderViewport,
         quality: CameraRenderQuality,
@@ -988,7 +950,7 @@ impl GpuRenderer {
         let upload_started = Instant::now();
         let atlas_channels = channels
             .iter()
-            .map(|channel| self.dvr_display_atlas_channel(channel))
+            .map(|channel| self.dvr_display_atlas_channel(cpu_ledger, channel))
             .collect::<Result<Vec<_>, _>>()?;
         let mut timings = GpuRenderTimings {
             upload_ns: duration_ns_u64(upload_started.elapsed()),
@@ -1329,10 +1291,11 @@ impl GpuRenderer {
         })
     }
 
-    pub fn render_resident_channels_to_display_texture(
+    pub fn render_lease_channels_to_display_texture(
         &self,
-        channels: &[GpuResidentDisplayChannel<'_>],
-        request: GpuResidentDisplayRequest,
+        cpu_ledger: &dyn CpuByteLedger,
+        channels: &[GpuLeaseDisplayChannel<'_>],
+        request: GpuLeaseDisplayRequest,
     ) -> Result<GpuDisplayFrame, GpuRenderError> {
         if channels.is_empty() {
             return Err(RenderError::InvalidChannelComposite(
@@ -1340,15 +1303,16 @@ impl GpuRenderer {
             )
             .into());
         }
-        let GpuResidentDisplayRequest {
+        let GpuLeaseDisplayRequest {
             camera,
             viewport,
             quality,
             iso_light_state,
             camera_axes,
         } = request;
-        if channels.len() > 1 && channels.iter().all(GpuResidentDisplayChannel::is_iso) {
+        if channels.len() > 1 && channels.iter().all(GpuLeaseDisplayChannel::is_iso) {
             return self.render_iso_channels_to_display_texture(
+                cpu_ledger,
                 channels,
                 camera,
                 viewport,
@@ -1357,9 +1321,10 @@ impl GpuRenderer {
                 camera_axes,
             );
         }
-        if channels.len() > 1 && channels.iter().all(GpuResidentDisplayChannel::is_dvr) {
-            return self
-                .render_dvr_channels_to_display_texture(channels, camera, viewport, quality);
+        if channels.len() > 1 && channels.iter().all(GpuLeaseDisplayChannel::is_dvr) {
+            return self.render_dvr_channels_to_display_texture(
+                cpu_ledger, channels, camera, viewport, quality,
+            );
         }
         let viewport_width = checked_u32("viewport_width", viewport.width)?;
         let viewport_height = checked_u32("viewport_height", viewport.height)?;
@@ -1416,10 +1381,8 @@ impl GpuRenderer {
                 transfer,
                 composite_pipeline,
             ) = match channel {
-                GpuResidentDisplayChannel::U8 {
-                    resident,
-                    brick_shape,
-                    brick_grid_shape,
+                GpuLeaseDisplayChannel::U8 {
+                    volume,
                     mode,
                     transfer,
                 } => {
@@ -1429,10 +1392,9 @@ impl GpuRenderer {
                             resource: "integer display output slots",
                         },
                     )?;
-                    let output = self.render_camera_u8_from_bricks_output_buffer(
-                        resident,
-                        *brick_shape,
-                        *brick_grid_shape,
+                    let output = self.render_camera_u8_from_lease_output_buffer(
+                        *volume,
+                        cpu_ledger,
                         camera,
                         viewport,
                         *mode,
@@ -1448,10 +1410,8 @@ impl GpuRenderer {
                         &self.display_composite_pipeline,
                     )
                 }
-                GpuResidentDisplayChannel::U16 {
-                    resident,
-                    brick_shape,
-                    brick_grid_shape,
+                GpuLeaseDisplayChannel::U16 {
+                    volume,
                     mode,
                     transfer,
                 } => {
@@ -1461,10 +1421,9 @@ impl GpuRenderer {
                             resource: "integer display output slots",
                         },
                     )?;
-                    let output = self.render_camera_from_bricks_output_buffer(
-                        resident,
-                        *brick_shape,
-                        *brick_grid_shape,
+                    let output = self.render_camera_u16_from_lease_output_buffer(
+                        *volume,
+                        cpu_ledger,
                         camera,
                         viewport,
                         *mode,
@@ -1480,10 +1439,8 @@ impl GpuRenderer {
                         &self.display_composite_pipeline,
                     )
                 }
-                GpuResidentDisplayChannel::F32 {
-                    resident,
-                    brick_shape,
-                    brick_grid_shape,
+                GpuLeaseDisplayChannel::F32 {
+                    volume,
                     mode,
                     transfer,
                 } => {
@@ -1493,10 +1450,9 @@ impl GpuRenderer {
                             resource: "float32 display output slots",
                         },
                     )?;
-                    let output = self.render_camera_f32_from_bricks_output_buffer(
-                        resident,
-                        *brick_shape,
-                        *brick_grid_shape,
+                    let output = self.render_camera_f32_from_lease_output_buffer(
+                        *volume,
+                        cpu_ledger,
                         camera,
                         viewport,
                         *mode,

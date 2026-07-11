@@ -1,10 +1,8 @@
 use crate::{
     ChannelFidelityStatus, ChannelFidelityWarning, FrameCompleteness, FrameFailureKind,
     FrameFidelityStatus, LodDecisionReason, RenderBackend, application_view,
-    current_runtime::{dataset::CurrentDatasetRuntime, render::CurrentRenderRuntime},
-    display_graph::DisplayGraph,
-    state::DisplayedFrameFreshness,
-    ui_kit,
+    current_runtime::render::CurrentRenderRuntime, display_graph::DisplayGraph,
+    state::DisplayedFrameFreshness, ui_kit,
 };
 use eframe::egui;
 use mirante4d_application::ApplicationSnapshot;
@@ -87,13 +85,12 @@ pub(crate) fn frame_render_time_label(fidelity: &FrameFidelityStatus) -> String 
 
 pub(crate) fn composite_fidelity_label(
     snapshot: &ApplicationSnapshot,
-    dataset: &CurrentDatasetRuntime,
     render: &CurrentRenderRuntime,
 ) -> String {
     let mut label = frame_fidelity_label(&render.frame_fidelity);
     label.push_str(" | ");
-    let display_graph = DisplayGraph::from_snapshot(snapshot, dataset);
-    if display_graph.is_ok_and(|graph| graph.is_mixed_mode()) {
+    let display_graph = DisplayGraph::from_snapshot(snapshot);
+    if display_graph.is_mixed_mode() {
         label.push_str("mixed render modes");
     } else {
         let view = application_view(snapshot);
@@ -178,6 +175,7 @@ pub(crate) fn frame_reason_label(reason: LodDecisionReason) -> &'static str {
         LodDecisionReason::ScreenEquivalentCoarserScale => "screen-equivalent LOD",
         LodDecisionReason::PlaybackDownshift => "playback LOD",
         LodDecisionReason::LoadingTargetScale => "loading target LOD",
+        LodDecisionReason::NoVisibleData => "outside selected data",
         LodDecisionReason::FrameBudgetLimited => "frame budget",
         LodDecisionReason::GpuBudgetLimited => "GPU budget",
         LodDecisionReason::CpuBudgetLimited => "CPU budget",
@@ -205,6 +203,7 @@ pub(crate) fn frame_failure_kind_label(kind: FrameFailureKind) -> &'static str {
 pub(crate) fn render_backend_label(backend: RenderBackend) -> &'static str {
     match backend {
         RenderBackend::Loading => "loading",
+        RenderBackend::Empty => "empty",
         RenderBackend::CpuReference => "CPU dense",
         RenderBackend::CpuResidentBricks => "CPU bricks",
         RenderBackend::GpuResidentBricks => "GPU bricks",

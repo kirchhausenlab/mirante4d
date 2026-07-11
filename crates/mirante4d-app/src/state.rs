@@ -1,17 +1,5 @@
-use mirante4d_data::SpatialBrickIndex;
-use mirante4d_domain::{IntensityDType, TimeIndex};
-use mirante4d_format::LayerId;
 use mirante4d_render_api::PresentationViewport;
-use mirante4d_renderer::{IntensityTransfer, MipImageF32, MipImageU16, RenderViewport};
-
-#[derive(Debug, Clone)]
-pub struct RenderedIntensityChannel {
-    pub layer_id: LayerId,
-    pub render_state: mirante4d_domain::RenderState,
-    pub transfer: IntensityTransfer,
-    pub frame: MipImageU16,
-    pub frame_f32: Option<MipImageF32>,
-}
+use mirante4d_renderer::RenderViewport;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ViewportHover {
@@ -40,6 +28,7 @@ impl std::fmt::Display for ViewportIntensity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderBackend {
     Loading,
+    Empty,
     CpuReference,
     CpuResidentBricks,
     GpuResidentBricks,
@@ -70,6 +59,7 @@ pub enum LodDecisionReason {
     ScreenEquivalentCoarserScale,
     PlaybackDownshift,
     LoadingTargetScale,
+    NoVisibleData,
     FrameBudgetLimited,
     GpuBudgetLimited,
     CpuBudgetLimited,
@@ -203,28 +193,4 @@ impl LodScheduleState {
             hard_failure_reason: None,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LayerHistogramCacheKey {
-    pub(crate) layer_id: String,
-    pub(crate) dtype: IntensityDType,
-    pub(crate) timepoint: TimeIndex,
-    pub(crate) scale_level: u32,
-    pub(crate) resident_generation: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct LayerHistogramCache {
-    pub(crate) key: LayerHistogramCacheKey,
-    pub(crate) summary: LayerHistogramSummary,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct ResidentHistogramSampleKey {
-    pub(crate) layer_id: String,
-    pub(crate) dtype: IntensityDType,
-    pub(crate) timepoint: TimeIndex,
-    pub(crate) scale_level: u32,
-    pub(crate) brick_index: SpatialBrickIndex,
 }

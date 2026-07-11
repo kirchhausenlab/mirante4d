@@ -1,67 +1,57 @@
-use crate::{
-    application_view, current_physical_layer_id, current_runtime::dataset::CurrentDatasetRuntime,
-};
 use mirante4d_application::ApplicationSnapshot;
 #[cfg(test)]
 use mirante4d_domain::RenderMode;
-use mirante4d_domain::RenderState;
-use mirante4d_format::LayerId;
+use mirante4d_domain::{LogicalLayerKey, RenderState};
+
+use crate::application_view;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DisplayGraph {
     pub(crate) channels: Vec<DisplayGraphChannel>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct DisplayGraphChannel {
-    pub(crate) layer_index: usize,
-    pub(crate) layer_id: LayerId,
+    pub(crate) layer: LogicalLayerKey,
     pub(crate) render_state: RenderState,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct DisplayChannelModeIdentity {
-    pub(crate) layer_id: LayerId,
+    pub(crate) layer: LogicalLayerKey,
     pub(crate) render_state: RenderState,
 }
 
 impl DisplayGraph {
-    pub(crate) fn from_snapshot(
-        snapshot: &ApplicationSnapshot,
-        dataset: &CurrentDatasetRuntime,
-    ) -> anyhow::Result<Self> {
+    pub(crate) fn from_snapshot(snapshot: &ApplicationSnapshot) -> Self {
         let channels = application_view(snapshot)
             .layers()
             .iter()
-            .enumerate()
-            .filter(|(_, layer)| layer.visible())
-            .map(|(layer_index, layer)| {
-                Ok(DisplayGraphChannel {
-                    layer_index,
-                    layer_id: current_physical_layer_id(dataset, layer.layer_key())?.clone(),
-                    render_state: *layer.render_state(),
-                })
+            .filter(|layer| layer.visible())
+            .map(|layer| DisplayGraphChannel {
+                layer: layer.layer_key(),
+                render_state: *layer.render_state(),
             })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(Self { channels })
+            .collect();
+        Self { channels }
     }
 
     pub(crate) fn mode_identities(&self) -> Vec<DisplayChannelModeIdentity> {
         self.channels
             .iter()
             .map(|channel| DisplayChannelModeIdentity {
-                layer_id: channel.layer_id.clone(),
+                layer: channel.layer,
                 render_state: channel.render_state,
             })
             .collect()
     }
 
     #[cfg(test)]
-    pub(crate) fn channel_ids_for_mode(&self, mode: RenderMode) -> Vec<&str> {
+    fn channel_keys_for_mode(&self, mode: RenderMode) -> Vec<LogicalLayerKey> {
         self.channels
             .iter()
             .filter(|channel| channel.render_state.mode() == mode)
-            .map(|channel| channel.layer_id.as_str())
+            .map(|channel| channel.layer)
             .collect()
     }
 
@@ -84,17 +74,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn display_graph_partitions_canonical_render_modes() {
+    fn display_graph_partitions_canonical_render_modes_by_logical_key() {
         let graph = DisplayGraph {
             channels: vec![
                 DisplayGraphChannel {
-                    layer_index: 0,
-                    layer_id: LayerId::new("ch0").unwrap(),
+                    layer: LogicalLayerKey::new(0),
                     render_state: RenderState::mip(SamplingPolicy::SmoothLinear),
                 },
                 DisplayGraphChannel {
-                    layer_index: 1,
-                    layer_id: LayerId::new("ch1").unwrap(),
+                    layer: LogicalLayerKey::new(1),
                     render_state: RenderState::dvr(
                         SamplingPolicy::VoxelExact,
                         DvrOpacityTransfer::new(
@@ -108,8 +96,14 @@ mod tests {
             ],
         };
 
-        assert_eq!(graph.channel_ids_for_mode(RenderMode::Mip), vec!["ch0"]);
-        assert_eq!(graph.channel_ids_for_mode(RenderMode::Dvr), vec!["ch1"]);
+        assert_eq!(
+            graph.channel_keys_for_mode(RenderMode::Mip),
+            vec![LogicalLayerKey::new(0)]
+        );
+        assert_eq!(
+            graph.channel_keys_for_mode(RenderMode::Dvr),
+            vec![LogicalLayerKey::new(1)]
+        );
         assert!(graph.is_mixed_mode());
         assert_eq!(graph.mode_identities().len(), 2);
     }

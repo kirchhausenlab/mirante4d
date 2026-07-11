@@ -190,7 +190,8 @@ impl MiranteWorkbenchApp {
             viewport_changed |= set_render_viewport(&mut self.render_runtime, render_viewport);
         }
         if viewport_changed {
-            self.refresh_frame(ctx);
+            self.render_runtime.lod_replan_pending = true;
+            ctx.request_repaint();
         }
     }
 
@@ -208,9 +209,14 @@ impl MiranteWorkbenchApp {
             ctx.pixels_per_point(),
             max_texture_side,
         )?;
-        self.render_runtime
+        let changed = self
+            .render_runtime
             .cross_section_runtime
             .record_panel_viewports(panel_id, presentation_viewport, render_viewport);
+        if changed {
+            self.render_runtime.lod_replan_pending = true;
+            ctx.request_repaint();
+        }
         Some(presentation_viewport)
     }
 
@@ -392,7 +398,6 @@ impl MiranteWorkbenchApp {
         }
         match apply_viewport_tool_response(
             snapshot,
-            &self.dataset_runtime,
             &mut self.analysis_runtime,
             &mut self.ui_runtime,
             &self.render_runtime,
@@ -431,7 +436,9 @@ impl MiranteWorkbenchApp {
         let available = ui.available_size();
         let ctx = ui.ctx().clone();
         let presentation_viewport = self.record_four_panel_viewport(&ctx, panel_id, available);
-        if let Err(err) = self.render_cross_section_panel_for_display_if_needed(panel_id) {
+        if !self.render_runtime.lod_replan_pending
+            && let Err(err) = self.render_cross_section_panel_for_display_if_needed(panel_id)
+        {
             tracing::error!(
                 error = %err,
                 panel = panel_id.label(),
@@ -475,31 +482,21 @@ impl MiranteWorkbenchApp {
             }
             .unwrap_or_else(|| self.show_cross_section_panel_placeholder(ui, panel_id, available));
 
-        if let Some(presentation_viewport) = presentation_viewport {
-            let active_layer_id =
-                current_physical_layer_id(&self.dataset_runtime, view.active_layer());
-            let active_layer_dtype = snapshot
-                .catalog()
-                .layer(view.active_layer())
-                .map(|layer| layer.dtype());
-            if let (Ok(active_layer_id), Some(active_layer_dtype)) =
-                (active_layer_id, active_layer_dtype)
-                && let Some(readout) = cross_section_hover_readout_for_response(
-                    &self.dataset_runtime,
-                    &self.render_runtime,
-                    cross_section_readout::CrossSectionReadoutInput {
-                        view,
-                        active_layer_id: &active_layer_id,
-                        active_layer_dtype,
-                    },
-                    panel_id,
-                    presentation_viewport,
-                    &response,
-                )
-            {
-                self.ui_runtime.hovered_pixel = None;
-                self.ui_runtime.hovered_source_readout = Some(readout.text);
-            }
+        if let Some(presentation_viewport) = presentation_viewport
+            && let Some(readout) = cross_section_hover_readout_for_response(
+                &self.render_runtime.cross_section_runtime,
+                &self.render_runtime.lease_bridge,
+                cross_section_readout::CrossSectionReadoutInput {
+                    view,
+                    catalog: snapshot.catalog(),
+                },
+                panel_id,
+                presentation_viewport,
+                &response,
+            )
+        {
+            self.ui_runtime.hovered_pixel = None;
+            self.ui_runtime.hovered_source_readout = Some(readout.text);
         }
 
         if matches!(
@@ -516,7 +513,6 @@ impl MiranteWorkbenchApp {
             ) {
                 Ok(commands) if !commands.is_empty() => {
                     application_commands.extend(commands);
-                    self.dataset_runtime.cross_section_last_interaction_at = Some(Instant::now());
                     ctx.request_repaint_after(CROSS_SECTION_INTERACTION_SETTLE_DURATION);
                 }
                 Ok(_) => {}
@@ -866,7 +862,6 @@ impl eframe::App for MiranteWorkbenchApp {
         let task_drain_started = Instant::now();
         self.drain_tiff_import_setup_results(ui.ctx());
         self.drain_import_results(ui.ctx());
-        self.drain_analysis_results(ui.ctx());
         let task_drain_ms = duration_ms(task_drain_started.elapsed());
 
         let application_snapshot = current_egui_shell_bridge::snapshot(&self.application);
@@ -891,7 +886,7 @@ impl eframe::App for MiranteWorkbenchApp {
         workbench_playback_runtime::enqueue_playback_command_if_due(
             &application_snapshot,
             view,
-            &self.dataset_runtime,
+            &self.dataset,
             &mut self.render_runtime,
             &mut application_commands,
             ui.ctx(),
@@ -1055,7 +1050,6 @@ impl eframe::App for MiranteWorkbenchApp {
                             "fidelity",
                             composite_fidelity_label(
                                 &application_snapshot,
-                                &self.dataset_runtime,
                                 &self.render_runtime,
                             ),
                         );
@@ -1077,7 +1071,7 @@ impl eframe::App for MiranteWorkbenchApp {
                         ui_kit::property_row(
                             ui,
                             "path",
-                            dataset_path_status_label(self.dataset_runtime.dataset.root()),
+                            dataset_path_status_label(self.dataset.selected_path()),
                         );
                         ui.horizontal_wrapped(|ui| {
                             show_playback_controls(
@@ -1172,12 +1166,7 @@ impl eframe::App for MiranteWorkbenchApp {
                                 }
                             });
                         }
-                        let active_id = current_physical_layer_id(
-                            &self.dataset_runtime,
-                            view.active_layer(),
-                        )
-                        .map(|id| id.as_str().to_owned())
-                        .unwrap_or_else(|_| view.active_layer().ordinal().to_string());
+                        let active_id = view.active_layer().ordinal().to_string();
                         ui_kit::property_row(ui, "active ID", active_id);
                     });
                     ui_kit::section(ui, "Channel Presets", |ui| {
@@ -1255,10 +1244,9 @@ impl eframe::App for MiranteWorkbenchApp {
                             "dtype",
                             format!("{:?}", active_catalog_layer.dtype()),
                         );
-                        if let Some(label) = active_layer_no_data_policy_label(
-                            &application_snapshot,
-                            &self.dataset_runtime,
-                        ) {
+                        if let Some(label) =
+                            active_layer_no_data_policy_label(&application_snapshot)
+                        {
                             ui_kit::property_row(ui, "no-data", label);
                         }
                         let mut visible = active_layer.visible();
@@ -1672,33 +1660,9 @@ impl eframe::App for MiranteWorkbenchApp {
                             "pixels",
                             self.render_runtime.diagnostics.output_pixels.to_string(),
                         );
-                        if matches!(
-                            self.render_runtime.render_backend,
-                            RenderBackend::GpuResidentBricks
-                        ) {
-                            ui_kit::property_row(ui, "nonzero", "unavailable");
-                            ui_kit::property_row(ui, "max", "unavailable");
-                            ui_kit::property_row(ui, "mean", "unavailable");
-                        } else {
-                            ui_kit::property_row(
-                                ui,
-                                "nonzero",
-                                self.render_runtime.diagnostics.nonzero_pixels.to_string(),
-                            );
-                            ui_kit::property_row(
-                                ui,
-                                "max",
-                                self.render_runtime.diagnostics.max_value.to_string(),
-                            );
-                            ui_kit::property_row(
-                                ui,
-                                "mean",
-                                format!(
-                                    "{:.2}",
-                                    self.analysis_runtime.active_intensity_summary.mean
-                                ),
-                            );
-                        }
+                        ui_kit::property_row(ui, "nonzero", "unavailable");
+                        ui_kit::property_row(ui, "max", "unavailable");
+                        ui_kit::property_row(ui, "mean", "unavailable");
                         for channel in &self.render_runtime.channel_fidelity {
                             ui_kit::property_row(
                                 ui,
@@ -1713,12 +1677,6 @@ impl eframe::App for MiranteWorkbenchApp {
                             ui.selectable_value(&mut active_tool, ToolKind::Navigate, "Navigate");
                             ui.selectable_value(&mut active_tool, ToolKind::Inspect, "Inspect");
                             ui.selectable_value(&mut active_tool, ToolKind::Crosshair, "Crosshair");
-                            ui.selectable_value(&mut active_tool, ToolKind::RoiBox, "ROI");
-                            ui.selectable_value(
-                                &mut active_tool,
-                                ToolKind::MeasureDistance,
-                                "Measure",
-                            );
                         });
                         if active_tool != application_snapshot.transient().active_tool() {
                             application_commands
@@ -1750,32 +1708,18 @@ impl eframe::App for MiranteWorkbenchApp {
                         },
                     );
                     ui_kit::section(ui, "Analysis", |ui| {
-                        let analysis_running = self.analysis_runtime.analysis_task.is_some();
                         let snapshot = current_egui_shell_bridge::snapshot(&self.application);
                         let transient = snapshot.transient();
                         ui.horizontal_wrapped(|ui| {
-                            if ui_kit::toolbar_button(ui, "Analyze Time", !analysis_running)
-                                .clicked()
-                            {
-                                self.start_analysis_task(AnalysisTaskKind::FullTimeSeries);
-                            }
-                            if ui_kit::toolbar_button(ui, "Analyze ROIs", !analysis_running)
-                                .clicked()
-                            {
-                                self.start_analysis_task(AnalysisTaskKind::RoiIntensity);
-                            }
-                            if analysis_running
-                                && ui_kit::toolbar_button(ui, "Cancel Analysis", true).clicked()
-                            {
-                                self.cancel_analysis_task();
-                            }
+                            ui_kit::toolbar_button(ui, "Analyze Time", false);
+                            ui_kit::toolbar_button(ui, "Analyze ROIs", false);
                             if ui_kit::toolbar_button(ui, "Workspace", true).clicked() {
                                 self.ui_runtime.analysis_workspace_open = true;
                             }
                             if ui_kit::toolbar_button(
                                 ui,
                                 "Export CSV",
-                                !analysis_running && transient.selected_analysis_table().is_some(),
+                                transient.selected_analysis_table().is_some(),
                             )
                             .clicked()
                                 && let Err(error) = export_selected_analysis_table(
@@ -1789,18 +1733,11 @@ impl eframe::App for MiranteWorkbenchApp {
                                 tracing::warn!(%error, "analysis table export rejected");
                             }
                         });
-                        if let Some(task) = &self.analysis_runtime.analysis_task {
-                            ui_kit::status_badge(
-                                ui,
-                                StatusTone::Warning,
-                                analysis_task_status_text(task),
-                            );
-                            if let Some(progress) =
-                                analysis_progress_fraction(task.latest_progress.as_ref())
-                            {
-                                ui.add(egui::ProgressBar::new(progress).show_percentage());
-                            }
-                        }
+                        ui_kit::status_badge(
+                            ui,
+                            StatusTone::Warning,
+                            current_runtime::analysis::ANALYSIS_EXECUTION_DEFERRED_MESSAGE,
+                        );
                         let commands = show_analysis_workspace(
                             ui,
                             &self.analysis_runtime,
@@ -2132,14 +2069,14 @@ impl eframe::App for MiranteWorkbenchApp {
                         if let Some(error) = &self.import_runtime.tiff_import_setup_error {
                             ui_kit::status_badge(ui, StatusTone::Error, error);
                         }
-                        if let Some(error) = &self.dataset_runtime.brick_stream_last_error {
+                        if let Some(error) = self.dataset.last_plan_error() {
                             ui_kit::status_badge(ui, StatusTone::Error, error);
                         }
                         if let Some(error) = &self.render_runtime.visible_brick_plan_error {
                             ui_kit::status_badge(ui, StatusTone::Error, error);
                         }
                         if let Some(error) = &self.render_runtime.frame_fidelity.last_capacity_error
-                            && self.dataset_runtime.brick_stream_last_error.as_ref() != Some(error)
+                            && self.dataset.last_plan_error() != Some(error.as_str())
                         {
                             ui_kit::status_badge(ui, StatusTone::Error, error);
                         }
@@ -2248,7 +2185,7 @@ impl eframe::App for MiranteWorkbenchApp {
             &snapshot,
             &self.import_runtime,
             &self.analysis_runtime,
-            &self.dataset_runtime,
+            &self.dataset,
             &self.render_runtime,
         ) {
             request_background_work_repaint_after(ui.ctx());
@@ -2275,6 +2212,9 @@ impl eframe::App for MiranteWorkbenchApp {
     }
 
     fn on_exit(&mut self) {
+        if let Err(error) = self.dataset.request_shutdown() {
+            tracing::warn!(%error, "dataset runtime shutdown request failed");
+        }
         if let Some(source_open_service) = self.source_open_service.take()
             && let Err(error) = source_open_service.shutdown()
         {

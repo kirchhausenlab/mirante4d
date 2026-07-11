@@ -1,15 +1,26 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    time::Instant,
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, bail};
 use glam::DVec3;
-use mirante4d_data::{DatasetHandle, SpatialBrickIndex};
+use mirante4d_data::{CurrentDatasetSource, DatasetHandle, SpatialBrickIndex};
+use mirante4d_dataset::{
+    CpuByteLedger, DatasetResourceIdentity, DatasetResourceKey, DatasetSource, DatasetSourceId,
+    ResourceLease, ResourceRegion,
+};
+use mirante4d_dataset_runtime::{
+    CancellationGeneration, DatasetRuntime, DatasetRuntimeConfig, RequestPriority, ResourceRequest,
+    RuntimeFault, RuntimeFaultCode, RuntimeOutcome,
+};
 use mirante4d_domain::{
-    CameraView, GridToWorld, IntensityDType, Projection, Shape3D, Shape4D, TimeIndex,
+    CameraView, GridToWorld, IntensityDType, LogicalLayerKey, Projection, ScaleLevel, Shape3D,
+    Shape4D, TimeIndex,
 };
 use mirante4d_format::{
     ChannelMetadata, CurrentGridToWorldExt, CurrentShape4DExt, DenseU16MultiscaleLayer,
@@ -19,8 +30,9 @@ use mirante4d_format::{
 use mirante4d_render_api::CameraFrame;
 use mirante4d_renderer::{
     BrickFrameDiagnostics, BrickFrameDiagnosticsF32, BrickGridSpec, BrickPlanOptions,
-    CameraRenderMode, CameraRenderModeF32, CameraRenderQuality, MipImageU16, RenderViewport,
-    ResidentBrickSetF32, ResidentBrickSetU8, ResidentBrickSetU16,
+    CameraRenderMode, CameraRenderModeF32, CameraRenderQuality, CurrentLeaseBridge,
+    CurrentLeaseVolume, MipImageU16, RenderViewport, ResidentBrickSetF32, ResidentBrickSetU8,
+    ResidentBrickSetU16,
     gpu::{GpuMipOutput, GpuMipOutputF32, GpuRenderError, GpuRenderer},
     plan_visible_bricks, render_camera_f32_from_bricks_with_quality, render_camera_from_bricks,
     render_camera_u8_from_bricks_with_quality,
@@ -36,12 +48,12 @@ use crate::host::{
 use crate::reports::{phase11_gpu_interaction_timings_json, timing_summary_json};
 use crate::{
     BENCHMARK_PRESENTATION_POINTS, PHASE11_DEFAULT_MAX_RESPONSIVE_VISIBLE_BRICKS,
-    PHASE11_GPU_MIP_BRICKS_PER_BATCH, benchmark_camera_for_shape, benchmark_camera_frame,
-    benchmark_camera_orbit, benchmark_camera_pan, benchmark_camera_world_per_screen_point,
-    benchmark_camera_zoom, env_u64, phase11_benchmark_viewport_for_shape,
-    phase11_brick_pixel_stride, phase11_gpu_brick_cache_budget_bytes,
-    phase11_gpu_volume_cache_budget_bytes, phase11_interaction_steps_per_scenario,
-    phase11_max_decoded_bytes, phase11_max_visible_bricks, stable_id_from_name,
+    benchmark_camera_for_shape, benchmark_camera_frame, benchmark_camera_orbit,
+    benchmark_camera_pan, benchmark_camera_world_per_screen_point, benchmark_camera_zoom, env_u64,
+    phase11_benchmark_viewport_for_shape, phase11_brick_pixel_stride,
+    phase11_gpu_brick_cache_budget_bytes, phase11_gpu_volume_cache_budget_bytes,
+    phase11_interaction_steps_per_scenario, phase11_max_decoded_bytes, phase11_max_visible_bricks,
+    stable_id_from_name,
 };
 
 use super::phase13::brick_skip_json;
@@ -122,13 +134,7 @@ pub(crate) fn bench_phase11_large_view(package: &Path) -> anyhow::Result<PathBuf
     let resident_frame = resident.render_cpu_mip_summary(camera, viewport)?;
     let resident_render_ms = resident_render_started.elapsed().as_secs_f64() * 1000.0;
 
-    let gpu_benchmark = bench_phase11_gpu_resident(
-        &resident,
-        plan.brick_shape,
-        plan.brick_grid_shape,
-        camera,
-        viewport,
-    )?;
+    let gpu_benchmark = bench_phase11_gpu_resident(&resident, camera, viewport)?;
     let stats = dataset.stats()?;
     let total_ms = started.elapsed().as_secs_f64() * 1000.0;
 
@@ -144,6 +150,7 @@ pub(crate) fn bench_phase11_large_view(package: &Path) -> anyhow::Result<PathBuf
     let report_json = json!({
         "benchmark": "bench-phase11-large-view",
         "benchmark_schema_version": 1,
+        "authority": "diagnostic_only_not_an_authoritative_baseline_or_product_validation",
         "baseline_class": benchmark_baseline_class(),
         "hardware_class": benchmark_hardware_class(),
         "dataset_class": dataset_class,
@@ -263,6 +270,7 @@ fn phase11_viewport_matrix_report(package: &Path) -> anyhow::Result<Value> {
     let report_json = json!({
         "benchmark": "bench-phase11-viewport-matrix",
         "benchmark_schema_version": 1,
+        "authority": "diagnostic_only_not_an_authoritative_baseline_or_product_validation",
         "baseline_class": benchmark_baseline_class(),
         "hardware_class": benchmark_hardware_class(),
         "dataset_class": dataset_class,
@@ -327,6 +335,7 @@ pub(crate) fn bench_phase11_synthetic_matrix() -> anyhow::Result<PathBuf> {
     let report_json = json!({
         "benchmark": "bench-phase11-synthetic-matrix",
         "benchmark_schema_version": 1,
+        "authority": "diagnostic_only_not_an_authoritative_baseline_or_product_validation",
         "baseline_class": benchmark_baseline_class(),
         "hardware_class": benchmark_hardware_class(),
         "dataset_class": "synthetic_fixture_matrix",
@@ -425,7 +434,6 @@ pub(crate) fn phase11_interaction_report(
     let mut refinement_scale_counts = BTreeMap::<String, u64>::new();
     let mut budget_limited_frames = 0_u64;
     let mut gpu_error_frames = 0_u64;
-    let mut gpu_batched_frames = 0_u64;
     let mut gpu_incomplete_frames = 0_u64;
     let mut gpu_missing_voxel_sample_frames = 0_u64;
     let mut gpu_max_missing_voxel_samples = 0_u64;
@@ -473,22 +481,12 @@ pub(crate) fn phase11_interaction_report(
         let read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
 
         let gpu_frame = if let Some(renderer) = &gpu_renderer {
-            let frame = phase11_render_gpu_interaction_frame(
-                renderer,
-                &resident,
-                plan.brick_shape,
-                plan.brick_grid_shape,
-                camera,
-                viewport,
-            );
+            let frame = phase11_render_gpu_interaction_frame(renderer, &resident, camera, viewport);
             if let Some(render_ms) = frame.render_ms {
                 gpu_times.push(render_ms);
             }
             if let Some(upload_ms) = frame.upload_ms {
                 gpu_upload_times.push(upload_ms);
-            }
-            if frame.batched {
-                gpu_batched_frames += 1;
             }
             if !frame.ok {
                 gpu_error_frames += 1;
@@ -588,6 +586,7 @@ pub(crate) fn phase11_interaction_report(
     let report_json = json!({
         "benchmark": "bench-phase11-interaction",
         "benchmark_schema_version": 2,
+        "authority": "diagnostic_only_not_an_authoritative_baseline_or_product_validation",
         "baseline_class": benchmark_baseline_class(),
         "hardware_class": benchmark_hardware_class(),
         "dataset_class": dataset_class,
@@ -610,7 +609,7 @@ pub(crate) fn phase11_interaction_report(
             "steps_per_scenario": steps_per_scenario,
             "max_visible_bricks": max_visible_bricks,
             "max_decoded_bytes": max_decoded_bytes,
-            "gpu_mip_bricks_per_batch": PHASE11_GPU_MIP_BRICKS_PER_BATCH,
+            "gpu_input": "runtime_issued_semantic_leases",
         },
         "gpu": {
             "available": gpu_renderer.is_some(),
@@ -639,7 +638,6 @@ pub(crate) fn phase11_interaction_report(
             "refinement_scale_counts": refinement_scale_counts,
             "budget_limited_frames": budget_limited_frames,
             "gpu_error_frames": gpu_error_frames,
-            "gpu_batched_frames": gpu_batched_frames,
             "gpu_incomplete_frames": gpu_incomplete_frames,
             "gpu_missing_voxel_sample_frames": gpu_missing_voxel_sample_frames,
             "gpu_max_missing_voxel_samples": gpu_max_missing_voxel_samples,
@@ -696,11 +694,271 @@ pub(crate) struct Phase11LodPlan {
     pub(crate) refinement_estimated_decoded_bytes: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) enum Phase11ResidentBrickSet {
+#[derive(Debug)]
+enum Phase11CpuResidentBrickSet {
     U8(ResidentBrickSetU8),
     U16(ResidentBrickSetU16),
     F32(ResidentBrickSetF32),
+}
+
+pub(crate) struct Phase11ResidentBrickSet {
+    cpu: Phase11CpuResidentBrickSet,
+    leases: Option<Arc<Phase11LeaseResident>>,
+}
+
+struct Phase11LeaseResident {
+    runtime: Arc<dyn DatasetRuntime>,
+    cpu_ledger: Arc<dyn CpuByteLedger>,
+    bridge: CurrentLeaseBridge,
+    identity: DatasetResourceIdentity,
+    layer: LogicalLayerKey,
+    timepoint: TimeIndex,
+    scale: ScaleLevel,
+    volume_shape: Shape3D,
+    resource_shape: Shape3D,
+    grid_to_world: GridToWorld,
+}
+
+impl std::fmt::Debug for Phase11LeaseResident {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Phase11LeaseResident")
+            .field("layer", &self.layer)
+            .field("timepoint", &self.timepoint)
+            .field("scale", &self.scale)
+            .field("retained_resources", &self.bridge.retained_len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for Phase11ResidentBrickSet {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Phase11ResidentBrickSet")
+            .field("cpu", &self.cpu)
+            .field("leases", &self.leases)
+            .finish()
+    }
+}
+
+impl Drop for Phase11LeaseResident {
+    fn drop(&mut self) {
+        let _ = self.runtime.request_shutdown();
+    }
+}
+
+impl Phase11LeaseResident {
+    fn volume(&self) -> CurrentLeaseVolume<'_> {
+        CurrentLeaseVolume::new(
+            self.bridge
+                .resident_set(self.identity, self.layer, self.timepoint, self.scale),
+            self.volume_shape,
+            self.resource_shape,
+            self.grid_to_world,
+        )
+    }
+
+    fn load(
+        dataset: &DatasetHandle,
+        layer_id: &LayerId,
+        input: Phase11ResidentReadInput,
+        visible_bricks: &[SpatialBrickIndex],
+    ) -> anyhow::Result<Option<Arc<Self>>> {
+        if visible_bricks.is_empty() {
+            return Ok(None);
+        }
+
+        let storage_brick_shape = dataset.brick_shape_at_scale(layer_id, input.scale_level)?;
+        let resource_shape = Shape3D::new(
+            input.volume_shape.z().min(64),
+            input.volume_shape.y().min(64),
+            input.volume_shape.x().min(64),
+        )?;
+        let regions = phase11_semantic_regions_for_visible_bricks(
+            input.volume_shape,
+            storage_brick_shape,
+            resource_shape,
+            visible_bricks,
+        )?;
+        let queue_limit = regions.len();
+        let total_cpu_bytes = phase11_max_decoded_bytes()?
+            .checked_mul(8)
+            .context("Phase 11 semantic-lease CPU budget overflowed")?
+            .max(256 * 1024 * 1024);
+        let worker_limit = thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .clamp(1, 4);
+        let config =
+            DatasetRuntimeConfig::new(total_cpu_bytes, worker_limit, queue_limit, queue_limit)
+                .map_err(|code| anyhow::anyhow!("invalid Phase 11 lease runtime config: {code}"))?;
+
+        let source_error = Arc::new(Mutex::new(None));
+        let source_error_for_factory = Arc::clone(&source_error);
+        let captured_ledger = Arc::new(Mutex::new(None));
+        let captured_ledger_for_factory = Arc::clone(&captured_ledger);
+        let source_path = dataset.root().to_path_buf();
+        let (runtime, catalog) = <dyn DatasetRuntime>::start(config, move |ledger| {
+            *captured_ledger_for_factory
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(&ledger));
+            match CurrentDatasetSource::open(source_path, DatasetSourceId::new(11), ledger) {
+                Ok(source) => {
+                    let source: Arc<dyn DatasetSource> = source;
+                    Ok(source)
+                }
+                Err(error) => {
+                    *source_error_for_factory
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner()) = Some(error.to_string());
+                    Err(RuntimeFault::new(RuntimeFaultCode::SourceRejected))
+                }
+            }
+        })
+        .map_err(|runtime_error| {
+            let source_error = source_error
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take();
+            anyhow::anyhow!(
+                "Phase 11 semantic source open failed: {}",
+                source_error.unwrap_or_else(|| runtime_error.to_string())
+            )
+        })?;
+        let cpu_ledger = captured_ledger
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+            .context("Phase 11 source did not retain the runtime CPU ledger")?;
+
+        let layer_ordinal = dataset
+            .manifest()
+            .layers
+            .iter()
+            .position(|layer| layer.id == layer_id.as_str())
+            .context("Phase 11 layer is absent from its opened manifest")?;
+        let layer_ordinal = u32::try_from(layer_ordinal)
+            .context("Phase 11 layer ordinal does not fit the semantic key")?;
+        let layer = LogicalLayerKey::new(layer_ordinal);
+        let scale = ScaleLevel::new(input.scale_level);
+        let identity = catalog.scientific_identity().resource_identity();
+        let mut keys = Vec::with_capacity(regions.len());
+        for region in regions {
+            keys.push(DatasetResourceKey::new(
+                identity,
+                layer,
+                input.timepoint,
+                scale,
+                region,
+            ));
+        }
+
+        let mut bridge = CurrentLeaseBridge::new();
+        bridge.replace_current_requirements(keys.iter().copied())?;
+        let generation = CancellationGeneration::for_scope(11, 1);
+        for key in &keys {
+            runtime.submit(ResourceRequest::new(
+                *key,
+                RequestPriority::CurrentView,
+                generation,
+            ))?;
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while bridge.retained_len() < keys.len() {
+            if Instant::now() >= deadline {
+                let _ = runtime.request_shutdown();
+                bail!(
+                    "timed out waiting for Phase 11 semantic leases ({}/{})",
+                    bridge.retained_len(),
+                    keys.len()
+                );
+            }
+            let completions = runtime.poll(keys.len())?;
+            if completions.is_empty() {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            for completion in completions {
+                match completion.outcome() {
+                    RuntimeOutcome::Ready(lease) => {
+                        let lease: Arc<dyn ResourceLease> = Arc::new(lease.clone());
+                        bridge.install(lease)?;
+                    }
+                    RuntimeOutcome::Cancelled => {
+                        let _ = runtime.request_shutdown();
+                        bail!("Phase 11 semantic lease request was cancelled");
+                    }
+                    RuntimeOutcome::Failed(fault) => {
+                        let _ = runtime.request_shutdown();
+                        bail!("Phase 11 semantic lease request failed: {}", fault.code());
+                    }
+                }
+            }
+        }
+
+        Ok(Some(Arc::new(Self {
+            runtime,
+            cpu_ledger,
+            bridge,
+            identity,
+            layer,
+            timepoint: input.timepoint,
+            scale,
+            volume_shape: input.volume_shape,
+            resource_shape,
+            grid_to_world: input.grid_to_world,
+        })))
+    }
+}
+
+fn phase11_semantic_regions_for_visible_bricks(
+    volume_shape: Shape3D,
+    storage_brick_shape: Shape3D,
+    resource_shape: Shape3D,
+    visible_bricks: &[SpatialBrickIndex],
+) -> anyhow::Result<Vec<ResourceRegion>> {
+    let volume = volume_shape.dimensions();
+    let storage = storage_brick_shape.dimensions();
+    let resource = resource_shape.dimensions();
+    let mut regions = BTreeSet::new();
+
+    for brick in visible_bricks {
+        let storage_index = [brick.z, brick.y, brick.x];
+        let mut start = [0; 3];
+        let mut end = [0; 3];
+        for axis in 0..3 {
+            start[axis] = storage_index[axis]
+                .checked_mul(storage[axis])
+                .context("Phase 11 visible storage-brick origin overflowed")?;
+            if start[axis] >= volume[axis] {
+                bail!("Phase 11 visible storage brick lies outside the semantic volume");
+            }
+            end[axis] = start[axis]
+                .checked_add(storage[axis])
+                .context("Phase 11 visible storage-brick end overflowed")?
+                .min(volume[axis]);
+        }
+
+        let first: [u64; 3] = std::array::from_fn(|axis| start[axis] / resource[axis]);
+        let last: [u64; 3] = std::array::from_fn(|axis| (end[axis] - 1) / resource[axis]);
+        for z in first[0]..=last[0] {
+            for y in first[1]..=last[1] {
+                for x in first[2]..=last[2] {
+                    let index = [z, y, x];
+                    let origin = std::array::from_fn(|axis| index[axis] * resource[axis]);
+                    let shape = Shape3D::new(
+                        resource[0].min(volume[0] - origin[0]),
+                        resource[1].min(volume[1] - origin[1]),
+                        resource[2].min(volume[2] - origin[2]),
+                    )?;
+                    regions.insert(ResourceRegion::new(origin, shape)?);
+                }
+            }
+        }
+    }
+
+    Ok(regions.into_iter().collect())
 }
 
 #[derive(Debug, Clone)]
@@ -720,11 +978,27 @@ pub(crate) enum Phase11GpuMipFrame {
 }
 
 impl Phase11ResidentBrickSet {
+    #[cfg(test)]
+    fn cpu_only(cpu: Phase11CpuResidentBrickSet) -> Self {
+        Self { cpu, leases: None }
+    }
+
     pub(crate) fn stored_dtype_label(&self) -> &'static str {
-        match self {
-            Self::U8(_) => "Uint8",
-            Self::U16(_) => "Uint16",
-            Self::F32(_) => "Float32",
+        match &self.cpu {
+            Phase11CpuResidentBrickSet::U8(_) => "Uint8",
+            Phase11CpuResidentBrickSet::U16(_) => "Uint16",
+            Phase11CpuResidentBrickSet::F32(_) => "Float32",
+        }
+    }
+
+    pub(crate) fn is_integer(&self) -> bool {
+        !matches!(&self.cpu, Phase11CpuResidentBrickSet::F32(_))
+    }
+
+    pub(crate) fn f32_resident(&self) -> Option<&ResidentBrickSetF32> {
+        match &self.cpu {
+            Phase11CpuResidentBrickSet::F32(resident) => Some(resident),
+            Phase11CpuResidentBrickSet::U8(_) | Phase11CpuResidentBrickSet::U16(_) => None,
         }
     }
 
@@ -732,8 +1006,8 @@ impl Phase11ResidentBrickSet {
         let mut resident_min = f64::INFINITY;
         let mut resident_max = f64::NEG_INFINITY;
         let mut occupied_bricks = 0_usize;
-        match self {
-            Self::U8(resident) => {
+        match &self.cpu {
+            Phase11CpuResidentBrickSet::U8(resident) => {
                 for brick in resident.bricks().iter().filter(|brick| brick.occupied) {
                     occupied_bricks += 1;
                     if brick.min.is_finite() {
@@ -744,7 +1018,7 @@ impl Phase11ResidentBrickSet {
                     }
                 }
             }
-            Self::U16(resident) => {
+            Phase11CpuResidentBrickSet::U16(resident) => {
                 for brick in resident.bricks().iter().filter(|brick| brick.occupied) {
                     occupied_bricks += 1;
                     if brick.min.is_finite() {
@@ -755,7 +1029,7 @@ impl Phase11ResidentBrickSet {
                     }
                 }
             }
-            Self::F32(resident) => {
+            Phase11CpuResidentBrickSet::F32(resident) => {
                 for brick in resident.bricks().iter().filter(|brick| brick.occupied) {
                     occupied_bricks += 1;
                     if brick.min.is_finite() {
@@ -780,18 +1054,22 @@ impl Phase11ResidentBrickSet {
         viewport: RenderViewport,
         mode: CameraRenderMode,
     ) -> Result<(MipImageU16, BrickFrameDiagnostics), mirante4d_renderer::RenderError> {
-        match self {
-            Self::U8(resident) => render_camera_u8_from_bricks_with_quality(
+        match &self.cpu {
+            Phase11CpuResidentBrickSet::U8(resident) => render_camera_u8_from_bricks_with_quality(
                 resident,
                 camera,
                 viewport,
                 mode,
                 CameraRenderQuality::voxel_exact(),
             ),
-            Self::U16(resident) => render_camera_from_bricks(resident, camera, viewport, mode),
-            Self::F32(_) => Err(mirante4d_renderer::RenderError::InvalidChannelComposite(
-                "Phase 13 integer render-mode probe does not support Float32 through CameraRenderMode",
-            )),
+            Phase11CpuResidentBrickSet::U16(resident) => {
+                render_camera_from_bricks(resident, camera, viewport, mode)
+            }
+            Phase11CpuResidentBrickSet::F32(_) => {
+                Err(mirante4d_renderer::RenderError::InvalidChannelComposite(
+                    "Phase 13 integer render-mode probe does not support Float32 through CameraRenderMode",
+                ))
+            }
         }
     }
 
@@ -800,8 +1078,8 @@ impl Phase11ResidentBrickSet {
         camera: CameraFrame,
         viewport: RenderViewport,
     ) -> Result<Phase11ResidentFrameSummary, mirante4d_renderer::RenderError> {
-        match self {
-            Self::U8(resident) => {
+        match &self.cpu {
+            Phase11CpuResidentBrickSet::U8(resident) => {
                 let (_image, diagnostics) = render_camera_u8_from_bricks_with_quality(
                     resident,
                     camera,
@@ -813,14 +1091,14 @@ impl Phase11ResidentBrickSet {
                     diagnostics,
                 ))
             }
-            Self::U16(resident) => {
+            Phase11CpuResidentBrickSet::U16(resident) => {
                 let (_image, diagnostics) =
                     render_camera_from_bricks(resident, camera, viewport, CameraRenderMode::Mip)?;
                 Ok(Phase11ResidentFrameSummary::from_integer_diagnostics(
                     diagnostics,
                 ))
             }
-            Self::F32(resident) => {
+            Phase11CpuResidentBrickSet::F32(resident) => {
                 let (_image, diagnostics) = render_camera_f32_from_bricks_with_quality(
                     resident,
                     camera,
@@ -835,132 +1113,68 @@ impl Phase11ResidentBrickSet {
         }
     }
 
-    pub(crate) fn render_gpu_direct(
+    pub(crate) fn render_gpu(
         &self,
         renderer: &GpuRenderer,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
         camera: CameraFrame,
         viewport: RenderViewport,
-        mode: CameraRenderMode,
-    ) -> Result<GpuMipOutput, GpuRenderError> {
-        match self {
-            Self::U8(resident) => renderer.render_camera_u8_from_bricks(
-                resident,
-                brick_shape,
-                brick_grid_shape,
-                camera,
-                viewport,
-                mode,
-            ),
-            Self::U16(resident) => renderer.render_camera_from_bricks(
-                resident,
-                brick_shape,
-                brick_grid_shape,
-                camera,
-                viewport,
-                mode,
-            ),
-            Self::F32(_) => Err(mirante4d_renderer::RenderError::InvalidChannelComposite(
-                "Phase 13 integer render-mode probe does not support Float32 through CameraRenderMode",
-            )
-            .into()),
-        }
-    }
-
-    fn render_gpu_mip_direct(
-        &self,
-        renderer: &GpuRenderer,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
-        camera: CameraFrame,
-        viewport: RenderViewport,
+        integer_mode: CameraRenderMode,
+        f32_mode: CameraRenderModeF32,
     ) -> Result<Phase11GpuMipFrame, GpuRenderError> {
-        match self {
-            Self::U8(resident) => renderer
-                .render_camera_u8_from_bricks(
-                    resident,
-                    brick_shape,
-                    brick_grid_shape,
+        let leases = self.lease_input()?;
+        match &self.cpu {
+            Phase11CpuResidentBrickSet::U8(_) => renderer
+                .render_camera_u8_from_leases(
+                    leases.volume(),
+                    leases.cpu_ledger.as_ref(),
                     camera,
                     viewport,
-                    CameraRenderMode::Mip,
+                    integer_mode,
                 )
                 .map(Phase11GpuMipFrame::Integer),
-            Self::U16(resident) => renderer
-                .render_camera_from_bricks(
-                    resident,
-                    brick_shape,
-                    brick_grid_shape,
+            Phase11CpuResidentBrickSet::U16(_) => renderer
+                .render_camera_u16_from_leases(
+                    leases.volume(),
+                    leases.cpu_ledger.as_ref(),
                     camera,
                     viewport,
-                    CameraRenderMode::Mip,
+                    integer_mode,
                 )
                 .map(Phase11GpuMipFrame::Integer),
-            Self::F32(resident) => renderer
-                .render_camera_f32_from_bricks(
-                    resident,
-                    brick_shape,
-                    brick_grid_shape,
+            Phase11CpuResidentBrickSet::F32(_) => renderer
+                .render_camera_f32_from_leases(
+                    leases.volume(),
+                    leases.cpu_ledger.as_ref(),
                     camera,
                     viewport,
-                    CameraRenderModeF32::Mip,
+                    f32_mode,
                 )
                 .map(Phase11GpuMipFrame::F32),
         }
     }
 
-    pub(crate) fn render_gpu_mip_with_u16_batched_fallback(
+    pub(crate) fn render_gpu_mip(
         &self,
         renderer: &GpuRenderer,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
         camera: CameraFrame,
         viewport: RenderViewport,
-    ) -> (
-        Result<Phase11GpuMipFrame, GpuRenderError>,
-        bool,
-        Option<String>,
-    ) {
-        match self {
-            Self::U8(_) | Self::F32(_) => (
-                self.render_gpu_mip_direct(
-                    renderer,
-                    brick_shape,
-                    brick_grid_shape,
-                    camera,
-                    viewport,
-                ),
-                false,
-                None,
-            ),
-            Self::U16(resident) => {
-                match renderer.render_camera_from_bricks(
-                    resident,
-                    brick_shape,
-                    brick_grid_shape,
-                    camera,
-                    viewport,
-                    CameraRenderMode::Mip,
-                ) {
-                    Ok(output) => (Ok(Phase11GpuMipFrame::Integer(output)), false, None),
-                    Err(err) => (
-                        renderer
-                            .render_camera_mip_from_bricks_batched(
-                                resident,
-                                brick_shape,
-                                brick_grid_shape,
-                                camera,
-                                viewport,
-                                PHASE11_GPU_MIP_BRICKS_PER_BATCH,
-                            )
-                            .map(Phase11GpuMipFrame::Integer),
-                        true,
-                        Some(err.to_string()),
-                    ),
-                }
-            }
-        }
+    ) -> Result<Phase11GpuMipFrame, GpuRenderError> {
+        self.render_gpu(
+            renderer,
+            camera,
+            viewport,
+            CameraRenderMode::Mip,
+            CameraRenderModeF32::Mip,
+        )
+    }
+
+    fn lease_input(&self) -> Result<&Phase11LeaseResident, GpuRenderError> {
+        self.leases.as_deref().ok_or_else(|| {
+            mirante4d_renderer::RenderError::InvalidBrickAtlas(
+                "this CPU-only diagnostic resident set has no runtime-issued semantic leases",
+            )
+            .into()
+        })
     }
 }
 
@@ -1075,7 +1289,6 @@ struct Phase11GpuInteractionFrame {
     render_ms: Option<f64>,
     upload_ms: Option<f64>,
     ok: bool,
-    batched: bool,
     complete: Option<bool>,
     missing_voxel_samples: Option<u64>,
 }
@@ -1262,7 +1475,7 @@ pub(crate) fn phase11_read_resident_for_layer(
     input: Phase11ResidentReadInput,
     visible_bricks: &[SpatialBrickIndex],
 ) -> anyhow::Result<Phase11ResidentBrickSet> {
-    match input.stored_dtype {
+    let cpu = match input.stored_dtype {
         IntensityDType::Uint8 => {
             let mut bricks = Vec::with_capacity(visible_bricks.len());
             for brick_index in visible_bricks {
@@ -1273,13 +1486,13 @@ pub(crate) fn phase11_read_resident_for_layer(
                     *brick_index,
                 )?);
             }
-            Ok(Phase11ResidentBrickSet::U8(ResidentBrickSetU8::new(
+            Phase11CpuResidentBrickSet::U8(ResidentBrickSetU8::new(
                 layer_id.clone(),
                 input.timepoint,
                 input.volume_shape,
                 input.grid_to_world,
                 bricks,
-            )))
+            ))
         }
         IntensityDType::Uint16 => {
             let mut bricks = Vec::with_capacity(visible_bricks.len());
@@ -1291,13 +1504,13 @@ pub(crate) fn phase11_read_resident_for_layer(
                     *brick_index,
                 )?);
             }
-            Ok(Phase11ResidentBrickSet::U16(ResidentBrickSetU16::new(
+            Phase11CpuResidentBrickSet::U16(ResidentBrickSetU16::new(
                 layer_id.clone(),
                 input.timepoint,
                 input.volume_shape,
                 input.grid_to_world,
                 bricks,
-            )))
+            ))
         }
         IntensityDType::Float32 => {
             let mut bricks = Vec::with_capacity(visible_bricks.len());
@@ -1309,15 +1522,17 @@ pub(crate) fn phase11_read_resident_for_layer(
                     *brick_index,
                 )?);
             }
-            Ok(Phase11ResidentBrickSet::F32(ResidentBrickSetF32::new(
+            Phase11CpuResidentBrickSet::F32(ResidentBrickSetF32::new(
                 layer_id.clone(),
                 input.timepoint,
                 input.volume_shape,
                 input.grid_to_world,
                 bricks,
-            )))
+            ))
         }
-    }
+    };
+    let leases = Phase11LeaseResident::load(dataset, layer_id, input, visible_bricks)?;
+    Ok(Phase11ResidentBrickSet { cpu, leases })
 }
 
 pub(crate) fn phase11_stored_dtype_for_layer(
@@ -1399,8 +1614,6 @@ fn representative_voxel_world_size(grid_to_world: GridToWorld) -> f64 {
 
 fn bench_phase11_gpu_resident(
     resident: &Phase11ResidentBrickSet,
-    brick_shape: Shape3D,
-    brick_grid_shape: Shape3D,
     camera: CameraFrame,
     viewport: RenderViewport,
 ) -> anyhow::Result<Value> {
@@ -1420,37 +1633,12 @@ fn bench_phase11_gpu_resident(
     let init_ms = started.elapsed().as_secs_f64() * 1000.0;
     let adapter = renderer.adapter_diagnostics().clone();
     let render_started = Instant::now();
-    let (output, mip_batched, monolithic_error) = resident
-        .render_gpu_mip_with_u16_batched_fallback(
-            &renderer,
-            brick_shape,
-            brick_grid_shape,
-            camera,
-            viewport,
-        );
+    let output = resident.render_gpu_mip(&renderer, camera, viewport);
     let render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
     match output {
         Ok(output) => {
             let cached_started = Instant::now();
-            let cached = match (mip_batched, resident) {
-                (true, Phase11ResidentBrickSet::U16(resident_u16)) => renderer
-                    .render_camera_mip_from_bricks_batched(
-                        resident_u16,
-                        brick_shape,
-                        brick_grid_shape,
-                        camera,
-                        viewport,
-                        PHASE11_GPU_MIP_BRICKS_PER_BATCH,
-                    )
-                    .map(Phase11GpuMipFrame::Integer),
-                _ => resident.render_gpu_mip_direct(
-                    &renderer,
-                    brick_shape,
-                    brick_grid_shape,
-                    camera,
-                    viewport,
-                ),
-            };
+            let cached = resident.render_gpu_mip(&renderer, camera, viewport);
             let cached_ms = cached_started.elapsed().as_secs_f64() * 1000.0;
             let cached_error = cached.err().map(|err| err.to_string());
             let stats = renderer.stats().ok();
@@ -1462,9 +1650,7 @@ fn bench_phase11_gpu_resident(
                 "driver": adapter.driver,
                 "driver_info": adapter.driver_info,
                 "stored_dtype": resident.stored_dtype_label(),
-                "mip_bricks_per_batch": PHASE11_GPU_MIP_BRICKS_PER_BATCH,
-                "mip_batched": mip_batched,
-                "monolithic_error": monolithic_error,
+                "gpu_input": "runtime_issued_semantic_leases",
                 "timings_ms": {
                     "init": init_ms,
                     "resident_first_mip": render_ms,
@@ -1483,7 +1669,7 @@ fn bench_phase11_gpu_resident(
             "driver": adapter.driver,
             "driver_info": adapter.driver_info,
             "stored_dtype": resident.stored_dtype_label(),
-            "mip_bricks_per_batch": PHASE11_GPU_MIP_BRICKS_PER_BATCH,
+            "gpu_input": "runtime_issued_semantic_leases",
             "timings_ms": {
                 "init": init_ms,
                 "resident_first_mip": render_ms,
@@ -1497,21 +1683,12 @@ fn bench_phase11_gpu_resident(
 fn phase11_render_gpu_interaction_frame(
     renderer: &GpuRenderer,
     resident: &Phase11ResidentBrickSet,
-    brick_shape: Shape3D,
-    brick_grid_shape: Shape3D,
     camera: CameraFrame,
     viewport: RenderViewport,
 ) -> Phase11GpuInteractionFrame {
     let stats_before = renderer.stats().ok();
     let started = Instant::now();
-    let (output, mip_batched, monolithic_error) = resident
-        .render_gpu_mip_with_u16_batched_fallback(
-            renderer,
-            brick_shape,
-            brick_grid_shape,
-            camera,
-            viewport,
-        );
+    let output = resident.render_gpu_mip(renderer, camera, viewport);
     let render_ms = started.elapsed().as_secs_f64() * 1000.0;
     let stats_after = renderer.stats().ok();
     let resource_delta = gpu_stats_delta_json(stats_before, stats_after);
@@ -1525,8 +1702,7 @@ fn phase11_render_gpu_interaction_frame(
                     "available": true,
                     "ok": true,
                     "stored_dtype": resident.stored_dtype_label(),
-                    "mip_batched": mip_batched,
-                    "monolithic_error": monolithic_error,
+                    "gpu_input": "runtime_issued_semantic_leases",
                     "timings_ms": phase11_gpu_interaction_timings_json(render_ms, upload_ms),
                     "upload_timing_source": "renderer_atlas_update_wall_time",
                     "resource_delta": resource_delta,
@@ -1536,7 +1712,6 @@ fn phase11_render_gpu_interaction_frame(
                 render_ms: Some(render_ms),
                 upload_ms,
                 ok: true,
-                batched: mip_batched,
                 complete,
                 missing_voxel_samples,
             }
@@ -1546,8 +1721,7 @@ fn phase11_render_gpu_interaction_frame(
                 "available": true,
                 "ok": false,
                 "stored_dtype": resident.stored_dtype_label(),
-                "mip_batched": mip_batched,
-                "monolithic_error": monolithic_error,
+                "gpu_input": "runtime_issued_semantic_leases",
                 "timings_ms": phase11_gpu_interaction_timings_json(render_ms, None),
                 "upload_timing_source": "unavailable_on_render_error",
                 "resource_delta": resource_delta,
@@ -1557,7 +1731,6 @@ fn phase11_render_gpu_interaction_frame(
             render_ms: Some(render_ms),
             upload_ms: None,
             ok: false,
-            batched: mip_batched,
             complete: None,
             missing_voxel_samples: None,
         },
@@ -1600,21 +1773,6 @@ fn phase11_settled_refinement_report(
             "scale_level": scale_level,
         }));
     };
-    let Some(brick_shape) = plan.refinement_brick_shape else {
-        return Ok(json!({
-            "available": false,
-            "reason": "missing_refinement_brick_shape",
-            "scale_level": scale_level,
-        }));
-    };
-    let Some(brick_grid_shape) = plan.refinement_brick_grid_shape else {
-        return Ok(json!({
-            "available": false,
-            "reason": "missing_refinement_brick_grid_shape",
-            "scale_level": scale_level,
-        }));
-    };
-
     let started = Instant::now();
     let stored_dtype = phase11_stored_dtype_for_layer(dataset, layer_id)?;
     let resident = phase11_read_resident_for_layer(
@@ -1632,15 +1790,7 @@ fn phase11_settled_refinement_report(
     let read_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     let gpu = if let Some(renderer) = gpu_renderer {
-        phase11_render_gpu_interaction_frame(
-            renderer,
-            &resident,
-            brick_shape,
-            brick_grid_shape,
-            camera,
-            viewport,
-        )
-        .report
+        phase11_render_gpu_interaction_frame(renderer, &resident, camera, viewport).report
     } else {
         json!({
             "available": false,

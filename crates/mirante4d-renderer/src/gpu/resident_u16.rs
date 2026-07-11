@@ -1,12 +1,13 @@
 use std::time::Instant;
 
+use mirante4d_dataset::CpuByteLedger;
 use mirante4d_domain::{GridToWorld, Shape3D};
 use mirante4d_render_api::CameraFrame;
 use wgpu::util::DeviceExt;
 
 use super::{
     GpuMipOutput, GpuRenderError, GpuRenderTimings, GpuRenderer, WORKGROUP_SIZE_X,
-    WORKGROUP_SIZE_Y, add_gpu_render_timings,
+    WORKGROUP_SIZE_Y,
     buffers::{
         checked_buffer_byte_count, checked_u32, validate_general_buffer_bytes,
         validate_storage_buffer_bytes,
@@ -31,8 +32,8 @@ use super::{
 };
 use crate::{
     BrickFrameDiagnostics, BrickSkipDiagnostics, CameraRenderMode, CameraRenderQuality,
-    DvrRgbaFrame, IsoSurfaceFrameU16, MipImageU16, PixelCoverage, RenderError, RenderViewport,
-    ResidentBrickSetU8, ResidentBrickSetU16, frame_diagnostics,
+    CurrentLeaseVolume, DvrRgbaFrame, IsoSurfaceFrameU16, MipImageU16, PixelCoverage, RenderError,
+    RenderViewport, frame_diagnostics,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,19 +70,17 @@ fn create_brick_skip_diagnostics_buffer(device: &wgpu::Device) -> wgpu::Buffer {
 }
 
 impl GpuRenderer {
-    pub fn render_camera_u8_from_bricks(
+    pub fn render_camera_u8_from_leases(
         &self,
-        resident: &ResidentBrickSetU8,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
         camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
     ) -> Result<GpuMipOutput, GpuRenderError> {
-        self.render_camera_u8_from_bricks_with_quality(
-            resident,
-            brick_shape,
-            brick_grid_shape,
+        self.render_camera_u8_from_leases_with_quality(
+            volume,
+            cpu_ledger,
             camera,
             viewport,
             mode,
@@ -90,24 +89,17 @@ impl GpuRenderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn render_camera_u8_from_bricks_with_quality(
+    pub fn render_camera_u8_from_leases_with_quality(
         &self,
-        resident: &ResidentBrickSetU8,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
         camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
         quality: CameraRenderQuality,
     ) -> Result<GpuMipOutput, GpuRenderError> {
-        let raw = self.render_camera_u8_from_bricks_raw_u32(
-            resident,
-            brick_shape,
-            brick_grid_shape,
-            camera,
-            viewport,
-            mode,
-            quality,
+        let raw = self.render_camera_u8_from_leases_raw_u32(
+            volume, cpu_ledger, camera, viewport, mode, quality,
         )?;
         Ok(GpuMipOutput {
             image: MipImageU16::try_new_with_mode_frames(
@@ -125,19 +117,17 @@ impl GpuRenderer {
         })
     }
 
-    pub fn render_camera_from_bricks(
+    pub fn render_camera_u16_from_leases(
         &self,
-        resident: &ResidentBrickSetU16,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
         camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
     ) -> Result<GpuMipOutput, GpuRenderError> {
-        self.render_camera_from_bricks_with_quality(
-            resident,
-            brick_shape,
-            brick_grid_shape,
+        self.render_camera_u16_from_leases_with_quality(
+            volume,
+            cpu_ledger,
             camera,
             viewport,
             mode,
@@ -146,24 +136,17 @@ impl GpuRenderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn render_camera_from_bricks_with_quality(
+    pub fn render_camera_u16_from_leases_with_quality(
         &self,
-        resident: &ResidentBrickSetU16,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
         camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
         quality: CameraRenderQuality,
     ) -> Result<GpuMipOutput, GpuRenderError> {
-        let raw = self.render_camera_from_bricks_raw_u32(
-            resident,
-            brick_shape,
-            brick_grid_shape,
-            camera,
-            viewport,
-            mode,
-            quality,
+        let raw = self.render_camera_u16_from_leases_raw_u32(
+            volume, cpu_ledger, camera, viewport, mode, quality,
         )?;
         Ok(GpuMipOutput {
             image: MipImageU16::try_new_with_mode_frames(
@@ -182,29 +165,30 @@ impl GpuRenderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render_camera_u8_from_bricks_raw_u32(
+    fn render_camera_u8_from_leases_raw_u32(
         &self,
-        resident: &ResidentBrickSetU8,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
         camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
         quality: CameraRenderQuality,
     ) -> Result<GpuBrickedRawOutputU16, GpuRenderError> {
-        if resident.bricks().is_empty() {
-            return Err(RenderError::InvalidBrickAtlas("resident uint8 brick set is empty").into());
+        if volume.resident().is_empty() {
+            return Err(
+                RenderError::InvalidBrickAtlas("lease-backed uint8 volume is empty").into(),
+            );
         }
 
         let upload_started = Instant::now();
-        let atlas = self.cached_brick_atlas_u8(resident, brick_shape, brick_grid_shape)?;
+        let atlas = self.cached_brick_atlas_u8(volume, cpu_ledger)?;
         let timings = GpuRenderTimings {
             upload_ns: duration_ns_u64(upload_started.elapsed()),
             ..Default::default()
         };
         self.render_camera_from_integer_atlas_raw_u32(
-            resident.volume_shape,
-            resident.grid_to_world,
+            volume.volume_shape(),
+            volume.grid_to_world(),
             atlas,
             timings,
             camera,
@@ -215,29 +199,30 @@ impl GpuRenderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render_camera_from_bricks_raw_u32(
+    fn render_camera_u16_from_leases_raw_u32(
         &self,
-        resident: &ResidentBrickSetU16,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
         camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
         quality: CameraRenderQuality,
     ) -> Result<GpuBrickedRawOutputU16, GpuRenderError> {
-        if resident.bricks().is_empty() {
-            return Err(RenderError::InvalidBrickAtlas("resident brick set is empty").into());
+        if volume.resident().is_empty() {
+            return Err(
+                RenderError::InvalidBrickAtlas("lease-backed uint16 volume is empty").into(),
+            );
         }
 
         let upload_started = Instant::now();
-        let atlas = self.cached_brick_atlas(resident, brick_shape, brick_grid_shape)?;
+        let atlas = self.cached_brick_atlas(volume, cpu_ledger)?;
         let timings = GpuRenderTimings {
             upload_ns: duration_ns_u64(upload_started.elapsed()),
             ..Default::default()
         };
         self.render_camera_from_integer_atlas_raw_u32(
-            resident.volume_shape,
-            resident.grid_to_world,
+            volume.volume_shape(),
+            volume.grid_to_world(),
             atlas,
             timings,
             camera,
@@ -248,30 +233,31 @@ impl GpuRenderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn render_camera_u8_from_bricks_output_buffer(
+    pub(super) fn render_camera_u8_from_lease_output_buffer(
         &self,
-        resident: &ResidentBrickSetU8,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
         camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
         quality: CameraRenderQuality,
         output_slot: usize,
     ) -> Result<GpuIntegerCameraOutputBuffer, GpuRenderError> {
-        if resident.bricks().is_empty() {
-            return Err(RenderError::InvalidBrickAtlas("resident uint8 brick set is empty").into());
+        if volume.resident().is_empty() {
+            return Err(
+                RenderError::InvalidBrickAtlas("lease-backed uint8 volume is empty").into(),
+            );
         }
 
         let upload_started = Instant::now();
-        let atlas = self.cached_brick_atlas_u8(resident, brick_shape, brick_grid_shape)?;
+        let atlas = self.cached_brick_atlas_u8(volume, cpu_ledger)?;
         let timings = GpuRenderTimings {
             upload_ns: duration_ns_u64(upload_started.elapsed()),
             ..Default::default()
         };
         self.render_camera_from_integer_atlas_output_buffer(
-            resident.volume_shape,
-            resident.grid_to_world,
+            volume.volume_shape(),
+            volume.grid_to_world(),
             atlas,
             timings,
             camera,
@@ -283,30 +269,31 @@ impl GpuRenderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn render_camera_from_bricks_output_buffer(
+    pub(super) fn render_camera_u16_from_lease_output_buffer(
         &self,
-        resident: &ResidentBrickSetU16,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'_>,
+        cpu_ledger: &dyn CpuByteLedger,
         camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
         quality: CameraRenderQuality,
         output_slot: usize,
     ) -> Result<GpuIntegerCameraOutputBuffer, GpuRenderError> {
-        if resident.bricks().is_empty() {
-            return Err(RenderError::InvalidBrickAtlas("resident brick set is empty").into());
+        if volume.resident().is_empty() {
+            return Err(
+                RenderError::InvalidBrickAtlas("lease-backed uint16 volume is empty").into(),
+            );
         }
 
         let upload_started = Instant::now();
-        let atlas = self.cached_brick_atlas(resident, brick_shape, brick_grid_shape)?;
+        let atlas = self.cached_brick_atlas(volume, cpu_ledger)?;
         let timings = GpuRenderTimings {
             upload_ns: duration_ns_u64(upload_started.elapsed()),
             ..Default::default()
         };
         self.render_camera_from_integer_atlas_output_buffer(
-            resident.volume_shape,
-            resident.grid_to_world,
+            volume.volume_shape(),
+            volume.grid_to_world(),
             atlas,
             timings,
             camera,
@@ -734,101 +721,6 @@ impl GpuRenderer {
             output_buffer: display_buffers.output_buffer,
             output_bytes: display_buffers.output_bytes,
             timings,
-        })
-    }
-
-    pub fn render_camera_mip_from_bricks_batched(
-        &self,
-        resident: &ResidentBrickSetU16,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
-        camera: CameraFrame,
-        viewport: RenderViewport,
-        max_bricks_per_batch: usize,
-    ) -> Result<GpuMipOutput, GpuRenderError> {
-        if max_bricks_per_batch == 0 {
-            return Err(RenderError::InvalidBrickAtlas(
-                "batched MIP requires at least one brick per batch",
-            )
-            .into());
-        }
-        if resident.bricks().is_empty() {
-            return Err(RenderError::InvalidBrickAtlas("resident brick set is empty").into());
-        }
-        if resident.bricks().len() <= max_bricks_per_batch {
-            return self.render_camera_from_bricks(
-                resident,
-                brick_shape,
-                brick_grid_shape,
-                camera,
-                viewport,
-                CameraRenderMode::Mip,
-            );
-        }
-
-        let pixel_count = (viewport.width as usize)
-            .checked_mul(viewport.height as usize)
-            .ok_or(GpuRenderError::BufferSizeOverflow {
-                resource: "batched MIP output",
-            })?;
-        let mut combined_pixels = vec![0u16; pixel_count];
-        let mut combined_coverage = vec![0u8; pixel_count];
-        let mut timings = GpuRenderTimings::default();
-        let mut skip = BrickSkipDiagnostics::default();
-        for batch in resident.bricks().chunks(max_bricks_per_batch) {
-            let batch_resident = ResidentBrickSetU16::new(
-                resident.layer_id.clone(),
-                resident.timepoint,
-                resident.volume_shape,
-                resident.grid_to_world,
-                batch.to_vec(),
-            );
-            let output = self.render_camera_from_bricks(
-                &batch_resident,
-                brick_shape,
-                brick_grid_shape,
-                camera,
-                viewport,
-                CameraRenderMode::Mip,
-            )?;
-            timings = add_gpu_render_timings(timings, output.timings.unwrap_or_default());
-            if let Some(diagnostics) = output.brick_frame {
-                skip.add_assign(diagnostics.skip);
-            }
-            for (index, (combined, value)) in combined_pixels
-                .iter_mut()
-                .zip(output.image.pixels())
-                .enumerate()
-            {
-                if output.image.is_covered_index(index) {
-                    *combined = (*combined).max(*value);
-                    combined_coverage[index] = 1;
-                }
-            }
-        }
-
-        let input_voxels = resident
-            .volume_shape
-            .element_count()
-            .map_err(RenderError::from)?;
-        let frame = frame_diagnostics(input_voxels, &combined_pixels);
-        let brick_frame = BrickFrameDiagnostics {
-            frame,
-            complete: true,
-            missing_voxel_samples: 0,
-            skip,
-        };
-        Ok(GpuMipOutput {
-            image: MipImageU16::try_new(
-                viewport.width,
-                viewport.height,
-                combined_pixels,
-                PixelCoverage::Mask(combined_coverage),
-            )?,
-            frame,
-            brick_frame: Some(brick_frame),
-            timings: Some(timings),
-            adapter: self.adapter.clone(),
         })
     }
 }

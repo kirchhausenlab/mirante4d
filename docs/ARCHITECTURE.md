@@ -22,10 +22,10 @@ The workspace has fifteen crates:
 - `mirante4d-dataset`: immutable multiscale catalog, semantic resource keys,
   source/decode-sink boundary, value-plus-validity payload views, lease
   contract, and the dependency-inverted CPU byte-ledger admission interface.
-- `mirante4d-dataset-runtime`: preparatory unified request, cancellation,
+- `mirante4d-dataset-runtime`: unified request, cancellation,
   deduplication, bounded configuration/diagnostics/progress, CPU-ledger,
-  completion, fault, and accounted-lease contract; the production scheduler
-  and workers arrive in WP-08B.
+  completion, fault, and accounted-lease contract plus the sole production
+  scheduler and worker owner.
 - `mirante4d-render-api`: backend-neutral intent, requirements, progressive
   frame status, opaque presentation lifecycle, and camera math.
 - `mirante4d-data`, `mirante4d-format`, `mirante4d-import`,
@@ -40,20 +40,20 @@ does not read files; format code does not own viewer state.
 
 ## Application Composition
 
-`MiranteWorkbenchApp` holds `ApplicationState`, process diagnostics, seven
-separate temporary runtime owners, and narrow persistence/settings/source-open
-handles. It is a composition root, not a second model.
+`MiranteWorkbenchApp` holds `ApplicationState`, payload-free
+`DatasetDemandState`, process diagnostics, six remaining temporary runtime
+owners, and narrow persistence/settings/source-open handles. It is a
+composition root, not a second model.
 
 The temporary owners and deletion gates are:
 
 | Owner | Scope | Gate |
 |---|---|---|
-| `CurrentDatasetRuntime` | workers, tickets, payloads, current data runtime | WP-08B |
 | `CurrentRenderRuntime` | render status, frames, GPU and presentation resources | WP-09B |
 | `CurrentUiRuntime` | egui-local drafts and interaction facts | WP-09C |
 | `CurrentProjectRuntime` | current project package path only | WP-10B |
 | `CurrentImportRuntime` | current import execution | WP-10C |
-| `CurrentAnalysisRuntime` | current analysis execution and payloads | WP-12 |
+| `CurrentAnalysisRuntime` | passive tables, plots, artifacts, and exports | WP-12 |
 | `CurrentValidationRuntime` | product-validation harness only | WP-14 |
 
 The private egui bridge translates UI input to `ApplicationCommand` and reads
@@ -61,39 +61,46 @@ snapshots/events. The private project-v15 bridge is the sole temporary project
 I/O route and has no compatibility reader. Both are mandatory-deletion
 bridges, not permanent public APIs.
 
-WP-08A contracts do not create a second product implementation. The current
-runtime and renderer remain authoritative until WP-08B and WP-09B delete them.
-Payload validity is explicit, so a valid zero cannot be confused with missing
-data. Cancellation generations are ordered only within their scope; unrelated
-view, playback, analysis, and verification work cannot cancel each other.
-Unverified bootstrap reads use an opaque per-open source ID, never a fabricated
-scientific-content ID. Storage and import acquire CPU capacity through the
-dataset interface; only the dataset runtime may implement and issue those
-production leases.
+`DatasetRequestDispatcher` is the sole application poll owner. It keeps only
+bounded request correlation and cancellation generations; decoded allocations
+remain owned and byte-accounted by `mirante4d-dataset-runtime`.
+`CurrentDatasetSource` is the one temporary current-storage bridge until
+WP-10C. `CurrentLeaseBridge` retains runtime leases without copying their
+payloads and is the one temporary current-renderer bridge until WP-09B. There
+is no alternate reader, scheduler, CPU display fallback, or app-owned payload
+map.
+
+Payload validity is explicit, so valid zero, invalid/no-data, and missing are
+distinct. Cancellation generations are ordered only within their scope;
+unrelated view and playback demand cannot cancel each other. Unverified reads
+use an opaque per-open source ID, never a fabricated scientific-content ID.
 
 ## Runtime Flow
 
 ```text
 native package
-  -> strict format validation and unverified logical catalog
+  -> CurrentDatasetSource and immutable logical catalog
   -> canonical application snapshot
-  -> bounded shard/brick scheduling, cancellation, and leases
-  -> resident CPU/GPU resources
-  -> per-channel render intent and render cohorts
+  -> semantic 3D / linked-panel / playback demand
+  -> one bounded scheduler and CPU byte ledger
+  -> immutable accounted leases
+  -> current lease renderer bridge and GPU residency
   -> renderer-owned GPU target
-  -> egui-wgpu presentation, overlays, picking, and diagnostics
+  -> egui-wgpu presentation and diagnostics
 ```
 
 Small fixtures and large datasets use the same path. Whole-volume residency
 for a tiny fixture is an optimization inside that path, not a second product
 architecture. Missing occupied data is loading/incomplete, never empty.
+An explicit zero-resource plan means the view is outside selected data (or no
+layer is visible); it is terminal and distinct from missing occupied data.
 
 ## Persistence And Settings
 
 Unverified sources are unbound workspaces. Project attach/open/save rejects at
-the typed identity gate until WP-08 supplies verified scientific identity.
-The private project-v15 actor exists only to exercise the future boundary; it
-is deleted by WP-10B.
+the typed identity gate because current sources do not expose a verified
+scientific-content ID. The private project-v15 actor exists only to exercise
+the future boundary; it is deleted by WP-10B.
 
 Settings use `mirante4d-settings-v1` at the Linux XDG/HOME path. The UI submits
 validated changes; one background actor owns persistence. Legacy preferences
@@ -110,9 +117,9 @@ files are neither read nor changed.
 - Rendering/loading/UI/GPU changes require real product validation under
   [testing](TESTING.md).
 
-The exact current dependency, side-effect, public-API, and allocation contract
-is [`architecture/wp08a-subsystem-contract.json`](../architecture/wp08a-subsystem-contract.json).
-The prior live-cutover contract remains enforced where WP-08A did not
-explicitly supersede it.
+The frozen subsystem boundary remains in
+[`architecture/wp08a-subsystem-contract.json`](../architecture/wp08a-subsystem-contract.json).
+The concise live owner/deletion ledger is
+[`architecture/current-state-field-ledger.json`](../architecture/current-state-field-ledger.json).
 Later target ownership is defined by the
 [workspace architecture brief](plans/active/foundation-refactor/WORKSPACE_ARCHITECTURE_BRIEF.md).

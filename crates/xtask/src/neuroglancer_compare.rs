@@ -437,24 +437,21 @@ fn required_neuroglancer_performance_fields() -> Vec<&'static str> {
 fn required_mirante_performance_fields() -> Vec<&'static str> {
     vec![
         "first_current_partial_p95_ms_max",
-        "visible_chunk_planning_p95_ms_max",
+        "semantic_resource_planning_p95_ms_max",
         "gpu_upload_p95_ms_max",
         "render_p95_ms_max",
         "ui_frame_p95_ms_max",
-        "candidate_chunks_max",
-        "emitted_visible_chunks_max",
-        "queue_depth_max",
-        "queued_chunks_max",
-        "decoding_chunks_max",
-        "cpu_resident_chunks_max",
-        "upload_queued_chunks_max",
-        "gpu_resident_chunks_max",
-        "missing_chunks_max",
-        "upload_bytes_max",
+        "cpu_total_used_bytes_max",
+        "cpu_decoded_residency_bytes_max",
+        "queued_requests_max",
+        "in_flight_decodes_max",
+        "pending_completions_max",
+        "resident_resources_max",
+        "lease_required_max",
+        "lease_retained_max",
+        "lease_missing_max",
         "cpu_rss_bytes_max",
-        "gpu_resident_chunk_bytes_max",
         "panel_target_bytes_max",
-        "eviction_count_max",
     ]
 }
 
@@ -470,28 +467,14 @@ fn required_mirante_performance_failures(coverage: &Value) -> Vec<String> {
         .collect::<Vec<_>>();
 
     if coverage
-        .pointer("/product_path/all_global_runtime_chunked_renderer")
+        .pointer("/product_path/all_unified_dataset_leases_to_gpu_renderer")
         .and_then(Value::as_bool)
         != Some(true)
     {
         failures.push(
-            "Mirante reports do not all use product_display_path global_runtime_chunked_renderer"
+            "Mirante reports do not all use product_display_path unified_dataset_leases_to_gpu_renderer"
                 .to_owned(),
         );
-    }
-    if coverage
-        .pointer("/product_path/any_old_path_fallback_used")
-        .and_then(Value::as_bool)
-        != Some(false)
-    {
-        failures.push("Mirante reports record old_path_fallback_used".to_owned());
-    }
-    if coverage
-        .pointer("/product_path/any_panel_local_resident_cache_authority")
-        .and_then(Value::as_bool)
-        != Some(false)
-    {
-        failures.push("Mirante reports record panel-local 2D resident cache authority".to_owned());
     }
 
     failures
@@ -504,41 +487,41 @@ fn required_mirante_performance_field_pointers() -> Vec<(&'static str, &'static 
             "/latency/first_current_partial_p95_ms_max",
         ),
         (
-            "visible_chunk_planning_p95_ms_max",
-            "/timing_ms/visible_chunk_planning_p95_ms_max",
+            "semantic_resource_planning_p95_ms_max",
+            "/timing_ms/semantic_resource_planning_p95_ms_max",
         ),
         ("gpu_upload_p95_ms_max", "/timing_ms/gpu_upload_p95_ms_max"),
         ("render_p95_ms_max", "/timing_ms/render_p95_ms_max"),
         ("ui_frame_p95_ms_max", "/timing_ms/ui_frame_p95_ms_max"),
-        ("candidate_chunks_max", "/chunks/candidate_chunks_max"),
         (
-            "emitted_visible_chunks_max",
-            "/chunks/emitted_visible_chunks_max",
-        ),
-        ("queue_depth_max", "/queues/queue_depth_max"),
-        ("queued_chunks_max", "/state_counts/queued_chunks_max"),
-        ("decoding_chunks_max", "/state_counts/decoding_chunks_max"),
-        (
-            "cpu_resident_chunks_max",
-            "/state_counts/cpu_resident_chunks_max",
+            "cpu_total_used_bytes_max",
+            "/dataset_runtime/cpu_total_used_bytes_max",
         ),
         (
-            "upload_queued_chunks_max",
-            "/state_counts/upload_queued_chunks_max",
+            "cpu_decoded_residency_bytes_max",
+            "/dataset_runtime/cpu_decoded_residency_bytes_max",
         ),
         (
-            "gpu_resident_chunks_max",
-            "/state_counts/gpu_resident_chunks_max",
+            "queued_requests_max",
+            "/dataset_runtime/queued_requests_max",
         ),
-        ("missing_chunks_max", "/state_counts/missing_chunks_max"),
-        ("upload_bytes_max", "/bytes/upload_bytes_max"),
+        (
+            "in_flight_decodes_max",
+            "/dataset_runtime/in_flight_decodes_max",
+        ),
+        (
+            "pending_completions_max",
+            "/dataset_runtime/pending_completions_max",
+        ),
+        (
+            "resident_resources_max",
+            "/dataset_runtime/resident_resources_max",
+        ),
+        ("lease_required_max", "/lease_bridge/required_max"),
+        ("lease_retained_max", "/lease_bridge/retained_max"),
+        ("lease_missing_max", "/lease_bridge/missing_max"),
         ("cpu_rss_bytes_max", "/memory/cpu_rss_bytes_max"),
-        (
-            "gpu_resident_chunk_bytes_max",
-            "/memory/gpu_resident_chunk_bytes_max",
-        ),
         ("panel_target_bytes_max", "/memory/panel_target_bytes_max"),
-        ("eviction_count_max", "/memory/eviction_count_max"),
     ]
 }
 
@@ -553,11 +536,11 @@ fn mirante_product_context(path: &Path, report: &Value) -> Value {
             .unwrap_or(Value::Null),
         "dataset": report.get("dataset").cloned().unwrap_or(Value::Null),
         "scenario": report.get("scenario").cloned().unwrap_or(Value::Null),
-        "old_path_fallback_used": report
+        "product_display_path": report
             .get("metrics")
-            .and_then(|metrics| metrics.get("cross_section_runtime"))
-            .and_then(|runtime| runtime.get("latest_visible_work_assertion"))
-            .and_then(|diagnostics| diagnostics.get("old_path_fallback_used"))
+            .and_then(|metrics| metrics.get("cross_section_panels"))
+            .and_then(|panels| panels.get("final"))
+            .and_then(|diagnostics| diagnostics.get("product_display_path"))
             .cloned()
             .unwrap_or(Value::Null),
     })
@@ -567,29 +550,23 @@ fn mirante_performance_contract_coverage(reports: &[(PathBuf, Value)]) -> Value 
     let mut first_current_partial_p95_ms_max = None;
     let mut display_refresh_sample_count = 0_u64;
     let mut app_update_sample_count = 0_u64;
-    let mut visible_chunk_planning_p95_ms_max = None;
+    let mut semantic_resource_planning_p95_ms_max = None;
     let mut gpu_upload_p95_ms_max = None;
     let mut render_p95_ms_max = None;
     let mut total_refresh_p95_ms_max = None;
     let mut ui_frame_p95_ms_max = None;
-    let mut candidate_chunks_max = None;
-    let mut emitted_visible_chunks_max = None;
-    let mut geometry_chunks_max = None;
-    let mut missing_chunks_max = None;
-    let mut queue_depth_max = None;
-    let mut queued_chunks_max = None;
-    let mut decoding_chunks_max = None;
-    let mut cpu_resident_chunks_max = None;
-    let mut upload_queued_chunks_max = None;
-    let mut gpu_resident_chunks_max = None;
-    let mut upload_bytes_max = None;
+    let mut cpu_total_used_bytes_max = None;
+    let mut cpu_decoded_residency_bytes_max = None;
+    let mut queued_requests_max = None;
+    let mut in_flight_decodes_max = None;
+    let mut pending_completions_max = None;
+    let mut resident_resources_max = None;
+    let mut lease_required_max = None;
+    let mut lease_retained_max = None;
+    let mut lease_missing_max = None;
     let mut cpu_rss_bytes_max = None;
-    let mut gpu_resident_chunk_bytes_max = None;
     let mut panel_target_bytes_max = None;
-    let mut eviction_count_max = None;
-    let mut all_global_runtime_chunked_renderer = true;
-    let mut any_old_path_fallback_used = false;
-    let mut any_panel_local_resident_cache_authority = false;
+    let mut all_unified_dataset_leases_to_gpu_renderer = true;
 
     for (_, report) in reports {
         for measurement in
@@ -611,7 +588,7 @@ fn mirante_performance_contract_coverage(reports: &[(PathBuf, Value)]) -> Value 
                 .unwrap_or(0),
         );
         max_f64(
-            &mut visible_chunk_planning_p95_ms_max,
+            &mut semantic_resource_planning_p95_ms_max,
             display_phase_p95(report, "visible_brick_request"),
         );
         max_f64(
@@ -646,120 +623,82 @@ fn mirante_performance_contract_coverage(reports: &[(PathBuf, Value)]) -> Value 
             max_u64(&mut cpu_rss_bytes_max, Some(value));
         }
 
-        let Some(runtime) = report
-            .get("metrics")
-            .and_then(|metrics| metrics.get("cross_section_runtime"))
-            .and_then(|runtime| runtime.get("latest_visible_work_assertion"))
+        let metrics = report.get("metrics");
+        if let Some(runtime) = metrics
+            .and_then(|metrics| metrics.get("dataset_runtime"))
+            .and_then(|runtime| runtime.get("final"))
+        {
+            max_u64(
+                &mut cpu_total_used_bytes_max,
+                runtime
+                    .pointer("/used/total_cpu_bytes")
+                    .and_then(Value::as_u64),
+            );
+            max_u64(
+                &mut cpu_decoded_residency_bytes_max,
+                runtime
+                    .pointer("/used/category_bytes/decoded_residency")
+                    .and_then(Value::as_u64),
+            );
+            let work = runtime.get("work");
+            max_u64(
+                &mut queued_requests_max,
+                work.and_then(|work| work.get("queued_requests"))
+                    .and_then(Value::as_u64),
+            );
+            max_u64(
+                &mut in_flight_decodes_max,
+                work.and_then(|work| work.get("in_flight_decodes"))
+                    .and_then(Value::as_u64),
+            );
+            max_u64(
+                &mut pending_completions_max,
+                work.and_then(|work| work.get("pending_completions"))
+                    .and_then(Value::as_u64),
+            );
+            max_u64(
+                &mut resident_resources_max,
+                work.and_then(|work| work.get("resident_resources"))
+                    .and_then(Value::as_u64),
+            );
+        }
+        if let Some(lease) = metrics
+            .and_then(|metrics| metrics.get("lease_bridge"))
+            .and_then(|lease| lease.get("final"))
+        {
+            max_u64(
+                &mut lease_required_max,
+                lease.get("required").and_then(Value::as_u64),
+            );
+            max_u64(
+                &mut lease_retained_max,
+                lease.get("retained").and_then(Value::as_u64),
+            );
+            max_u64(
+                &mut lease_missing_max,
+                lease.get("missing").and_then(Value::as_u64),
+            );
+        }
+        let Some(panel_diagnostics) = metrics
+            .and_then(|metrics| metrics.get("cross_section_panels"))
+            .and_then(|panels| panels.get("final"))
         else {
-            all_global_runtime_chunked_renderer = false;
+            all_unified_dataset_leases_to_gpu_renderer = false;
             continue;
         };
-        all_global_runtime_chunked_renderer &=
-            runtime.get("product_display_path").and_then(Value::as_str)
-                == Some("global_runtime_chunked_renderer");
-        any_old_path_fallback_used |= runtime
-            .get("old_path_fallback_used")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        any_panel_local_resident_cache_authority |= runtime
-            .get("panel_local_resident_cache_authority")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-
-        for panel in runtime
-            .get("panel_resources")
+        all_unified_dataset_leases_to_gpu_renderer &= panel_diagnostics
+            .get("product_display_path")
+            .and_then(Value::as_str)
+            == Some("unified_dataset_leases_to_gpu_renderer");
+        for panel in panel_diagnostics
+            .get("panels")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
         {
             max_u64(
-                &mut candidate_chunks_max,
-                panel.get("candidate_chunks").and_then(Value::as_u64),
-            );
-            max_u64(
-                &mut emitted_visible_chunks_max,
-                panel.get("visible_chunks").and_then(Value::as_u64),
-            );
-            max_u64(
-                &mut geometry_chunks_max,
-                panel.get("geometry_chunks").and_then(Value::as_u64),
-            );
-            max_u64(
-                &mut missing_chunks_max,
-                panel.get("missing_visible_chunks").and_then(Value::as_u64),
-            );
-            max_u64(
                 &mut panel_target_bytes_max,
                 panel_display_frame_bytes(panel),
-            );
-        }
-
-        if let Some(runtime_counts) = runtime.get("runtime") {
-            if let Some(queues) = runtime_counts.get("queues") {
-                let queue_depth = queues
-                    .get("download_promotions")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-                    .saturating_add(
-                        queues
-                            .get("gpu_promotions")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),
-                    );
-                max_u64(&mut queue_depth_max, Some(queue_depth));
-                let eviction_count = queues
-                    .get("cpu_evictions")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-                    .saturating_add(
-                        queues
-                            .get("gpu_evictions")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),
-                    );
-                max_u64(&mut eviction_count_max, Some(eviction_count));
-            }
-            if let Some(state_counts) = runtime_counts.get("state_counts") {
-                max_u64(
-                    &mut queued_chunks_max,
-                    state_counts.get("queued").and_then(Value::as_u64),
-                );
-                max_u64(
-                    &mut decoding_chunks_max,
-                    state_counts.get("decoding").and_then(Value::as_u64),
-                );
-                max_u64(
-                    &mut cpu_resident_chunks_max,
-                    state_counts.get("cpu_resident").and_then(Value::as_u64),
-                );
-                max_u64(
-                    &mut upload_queued_chunks_max,
-                    state_counts.get("upload_queued").and_then(Value::as_u64),
-                );
-                max_u64(
-                    &mut gpu_resident_chunks_max,
-                    state_counts.get("gpu_resident").and_then(Value::as_u64),
-                );
-            }
-            max_u64(
-                &mut gpu_resident_chunk_bytes_max,
-                runtime_counts
-                    .get("gpu_resident_bytes")
-                    .and_then(Value::as_u64),
-            );
-        }
-        if let Some(renderer_gpu) = runtime.get("renderer_gpu") {
-            max_u64(
-                &mut upload_bytes_max,
-                renderer_gpu
-                    .get("brick_atlas_uploaded_bytes")
-                    .and_then(Value::as_u64),
-            );
-            max_u64(
-                &mut eviction_count_max,
-                renderer_gpu
-                    .get("brick_atlas_evictions")
-                    .and_then(Value::as_u64),
             );
         }
     }
@@ -771,41 +710,31 @@ fn mirante_performance_contract_coverage(reports: &[(PathBuf, Value)]) -> Value 
         "timing_ms": {
             "display_refresh_sample_count": display_refresh_sample_count,
             "app_update_sample_count": app_update_sample_count,
-            "visible_chunk_planning_p95_ms_max": visible_chunk_planning_p95_ms_max,
+            "semantic_resource_planning_p95_ms_max": semantic_resource_planning_p95_ms_max,
             "gpu_upload_p95_ms_max": gpu_upload_p95_ms_max,
             "render_p95_ms_max": render_p95_ms_max,
             "total_refresh_p95_ms_max": total_refresh_p95_ms_max,
             "ui_frame_p95_ms_max": ui_frame_p95_ms_max,
         },
-        "chunks": {
-            "candidate_chunks_max": candidate_chunks_max,
-            "emitted_visible_chunks_max": emitted_visible_chunks_max,
-            "geometry_chunks_max": geometry_chunks_max,
+        "dataset_runtime": {
+            "cpu_total_used_bytes_max": cpu_total_used_bytes_max,
+            "cpu_decoded_residency_bytes_max": cpu_decoded_residency_bytes_max,
+            "queued_requests_max": queued_requests_max,
+            "in_flight_decodes_max": in_flight_decodes_max,
+            "pending_completions_max": pending_completions_max,
+            "resident_resources_max": resident_resources_max,
         },
-        "queues": {
-            "queue_depth_max": queue_depth_max,
-        },
-        "state_counts": {
-            "queued_chunks_max": queued_chunks_max,
-            "decoding_chunks_max": decoding_chunks_max,
-            "cpu_resident_chunks_max": cpu_resident_chunks_max,
-            "upload_queued_chunks_max": upload_queued_chunks_max,
-            "gpu_resident_chunks_max": gpu_resident_chunks_max,
-            "missing_chunks_max": missing_chunks_max,
-        },
-        "bytes": {
-            "upload_bytes_max": upload_bytes_max,
+        "lease_bridge": {
+            "required_max": lease_required_max,
+            "retained_max": lease_retained_max,
+            "missing_max": lease_missing_max,
         },
         "memory": {
             "cpu_rss_bytes_max": cpu_rss_bytes_max,
-            "gpu_resident_chunk_bytes_max": gpu_resident_chunk_bytes_max,
             "panel_target_bytes_max": panel_target_bytes_max,
-            "eviction_count_max": eviction_count_max,
         },
         "product_path": {
-            "all_global_runtime_chunked_renderer": all_global_runtime_chunked_renderer,
-            "any_old_path_fallback_used": any_old_path_fallback_used,
-            "any_panel_local_resident_cache_authority": any_panel_local_resident_cache_authority,
+            "all_unified_dataset_leases_to_gpu_renderer": all_unified_dataset_leases_to_gpu_renderer,
         },
     })
 }
@@ -877,8 +806,8 @@ fn neuroglancer_context(measurement: &Value) -> Value {
 
 fn mirante_memory_summary(reports: &[(PathBuf, Value)]) -> Value {
     let mut peak_rss_bytes = Vec::new();
-    let mut gpu_resident_bytes = Vec::new();
-    let mut upload_bytes = Vec::new();
+    let mut dataset_cpu_used_bytes = Vec::new();
+    let mut retained_resources = Vec::new();
     for (_, report) in reports {
         if let Some(value) = report
             .get("process")
@@ -887,29 +816,29 @@ fn mirante_memory_summary(reports: &[(PathBuf, Value)]) -> Value {
         {
             peak_rss_bytes.push(value);
         }
-        let runtime = report
+        if let Some(value) = report
             .get("metrics")
-            .and_then(|metrics| metrics.get("cross_section_runtime"))
-            .and_then(|runtime| runtime.get("latest_visible_work_assertion"));
-        if let Some(value) = runtime
-            .and_then(|runtime| runtime.get("runtime"))
-            .and_then(|runtime| runtime.get("gpu_resident_bytes"))
+            .and_then(|metrics| metrics.get("dataset_runtime"))
+            .and_then(|runtime| runtime.get("final"))
+            .and_then(|runtime| runtime.pointer("/used/total_cpu_bytes"))
             .and_then(Value::as_u64)
         {
-            gpu_resident_bytes.push(value);
+            dataset_cpu_used_bytes.push(value);
         }
-        if let Some(value) = runtime
-            .and_then(|runtime| runtime.get("renderer_gpu"))
-            .and_then(|renderer| renderer.get("brick_atlas_uploaded_bytes"))
+        if let Some(value) = report
+            .get("metrics")
+            .and_then(|metrics| metrics.get("lease_bridge"))
+            .and_then(|lease| lease.get("final"))
+            .and_then(|lease| lease.get("retained"))
             .and_then(Value::as_u64)
         {
-            upload_bytes.push(value);
+            retained_resources.push(value);
         }
     }
     json!({
         "peak_rss_bytes_max": peak_rss_bytes.into_iter().max(),
-        "gpu_resident_bytes_max": gpu_resident_bytes.into_iter().max(),
-        "brick_atlas_uploaded_bytes_max": upload_bytes.into_iter().max(),
+        "dataset_cpu_used_bytes_max": dataset_cpu_used_bytes.into_iter().max(),
+        "retained_resources_max": retained_resources.into_iter().max(),
     })
 }
 
@@ -946,44 +875,41 @@ mod tests {
                     "kind": "cross_section_performance_gate_table",
                     "rows": rows,
                 },
-                "cross_section_runtime": {
-                    "latest_visible_work_assertion": {
-                        "product_display_path": "global_runtime_chunked_renderer",
-                        "old_path_fallback_used": false,
-                        "panel_local_resident_cache_authority": false,
-                        "runtime": {
-                            "gpu_resident_bytes": 4096,
-                            "queues": {
-                                "download_promotions": 1,
-                                "gpu_promotions": 2,
-                                "cpu_evictions": 3,
-                                "gpu_evictions": 4
-                            },
-                            "state_counts": {
-                                "queued": 1,
-                                "decoding": 2,
-                                "cpu_resident": 3,
-                                "upload_queued": 4,
-                                "gpu_resident": 5
+                "dataset_runtime": {
+                    "final": {
+                        "used": {
+                            "total_cpu_bytes": 4096,
+                            "category_bytes": {
+                                "decoded_residency": 2048
                             }
                         },
-                        "panel_resources": [
+                        "work": {
+                            "queued_requests": 1,
+                            "in_flight_decodes": 2,
+                            "pending_completions": 3,
+                            "resident_resources": 5
+                        }
+                    }
+                },
+                "lease_bridge": {
+                    "final": {
+                        "required": 6,
+                        "retained": 5,
+                        "missing": 1
+                    }
+                },
+                "cross_section_panels": {
+                    "final": {
+                        "product_display_path": "unified_dataset_leases_to_gpu_renderer",
+                        "panels": [
                             {
-                                "candidate_chunks": 8,
-                                "visible_chunks": 6,
-                                "geometry_chunks": 6,
-                                "missing_visible_chunks": 1,
                                 "display_frame": {
                                     "output_bytes": 1024,
                                     "accumulator_bytes": 2048,
                                     "texture_bytes": 4096
                                 }
                             }
-                        ],
-                        "renderer_gpu": {
-                            "brick_atlas_uploaded_bytes": 8192,
-                            "brick_atlas_evictions": 5
-                        }
+                        ]
                     }
                 }
             }
@@ -1212,10 +1138,14 @@ mod tests {
             Vec::<String>::new()
         );
         assert_eq!(coverage["timing_ms"]["gpu_upload_p95_ms_max"], 3.0);
-        assert_eq!(coverage["chunks"]["candidate_chunks_max"], 8);
+        assert_eq!(
+            coverage["dataset_runtime"]["cpu_total_used_bytes_max"],
+            4096
+        );
+        assert_eq!(coverage["lease_bridge"]["retained_max"], 5);
         assert_eq!(coverage["memory"]["panel_target_bytes_max"], 7168);
         assert_eq!(
-            coverage["product_path"]["all_global_runtime_chunked_renderer"],
+            coverage["product_path"]["all_unified_dataset_leases_to_gpu_renderer"],
             true
         );
     }

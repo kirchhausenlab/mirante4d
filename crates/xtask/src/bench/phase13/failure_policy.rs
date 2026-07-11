@@ -34,6 +34,13 @@ pub(crate) fn phase13_failure_policy_probe_report() -> Value {
             GpuRenderError::UnsupportedCameraMode("synthetic mode"),
         ),
         phase13_failure_policy_render_case_json(
+            "budget_exceeded_resource_plan",
+            RenderError::ResourcePlanCapacityExceeded {
+                kind: mirante4d_renderer::ResourcePlanCapacityKind::Resources,
+                maximum: 1,
+            },
+        ),
+        phase13_failure_policy_render_case_json(
             "backend_limit_dimension_too_large",
             RenderError::DimensionTooLarge {
                 axis: "x",
@@ -117,6 +124,13 @@ fn phase13_failure_kind_allows_lod_downgrade(error_kind: &str) -> bool {
 pub(crate) fn phase13_gpu_error_kind(err: &GpuRenderError) -> &'static str {
     match err {
         GpuRenderError::Render(render) => phase13_render_error_kind(render),
+        GpuRenderError::CpuLedger(mirante4d_dataset::CpuLedgerError::CapacityExceeded {
+            ..
+        }) => "budget_exceeded",
+        GpuRenderError::CpuLedger(
+            mirante4d_dataset::CpuLedgerError::ZeroByteReservation
+            | mirante4d_dataset::CpuLedgerError::ShuttingDown,
+        ) => "allocation_failed",
         GpuRenderError::AdapterUnavailable(_)
         | GpuRenderError::CpuAdapterOnly(_)
         | GpuRenderError::RequestDevice(_)
@@ -135,6 +149,7 @@ pub(crate) fn phase13_gpu_error_kind(err: &GpuRenderError) -> &'static str {
 
 pub(crate) fn phase13_render_error_kind(err: &RenderError) -> &'static str {
     match err {
+        RenderError::ResourcePlanCapacityExceeded { .. } => "budget_exceeded",
         RenderError::InvalidViewport { .. }
         | RenderError::InvalidReadoutPixel { .. }
         | RenderError::InvalidBrickPixelStride
@@ -151,6 +166,7 @@ pub(crate) fn phase13_render_error_kind(err: &RenderError) -> &'static str {
         | RenderError::InvalidDvrChannelSet(_)
         | RenderError::InvalidChannelComposite(_)
         | RenderError::InvalidIntensitySummaryRegion(_)
+        | RenderError::ResourceContract(_)
         | RenderError::ResourceIdentityMismatch(_)
         | RenderError::InvalidResourceId { .. } => "invalid_mode_parameter",
         RenderError::DimensionTooLarge { .. } => "backend_limit",

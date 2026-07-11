@@ -19,7 +19,7 @@ use crate::{
 
 const PRODUCT_VALIDATION_SCHEMA: &str = "mirante4d-product-validation-report";
 const PRODUCT_AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
-const PRODUCT_AUTOMATION_SCHEMA_VERSION: u32 = 1;
+const PRODUCT_AUTOMATION_SCHEMA_VERSION: u32 = 2;
 const PRODUCT_VALIDATION_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_FIXTURE: &str = "basic-u16-16cube";
 const RENDER_MODES_FIXTURE: &str = "time-multichannel-u16-8cube-3t-2c";
@@ -665,13 +665,19 @@ fn qualifying_nonblank_viewport_capture(
         .and_then(|report| report.get("artifacts"))
         .and_then(Value::as_array)
         .ok_or_else(|| {
-            "same-run automation report is missing a nonblank viewport_capture artifact".to_owned()
+            "same-run automation report is missing a nonblank GPU viewport_capture artifact"
+                .to_owned()
         })?;
 
     artifacts
         .iter()
         .find(|artifact| {
             if artifact.get("kind").and_then(Value::as_str) != Some("viewport_capture") {
+                return false;
+            }
+            if artifact.get("capture_source").and_then(Value::as_str)
+                != Some("gpu_display_frame_readback")
+            {
                 return false;
             }
             let Some(width) = artifact.get("width").and_then(Value::as_u64) else {
@@ -702,7 +708,8 @@ fn qualifying_nonblank_viewport_capture(
                 && max_rgb.is_some_and(|value| value > 0)
         })
         .ok_or_else(|| {
-            "same-run automation report is missing a nonblank viewport_capture artifact".to_owned()
+            "same-run automation report is missing a nonblank GPU viewport_capture artifact"
+                .to_owned()
         })
 }
 
@@ -804,22 +811,29 @@ fn product_validation_package_and_script(
     }
 }
 
+fn dataset_runtime_limits(max_cpu_total_bytes: u64, max_resident_resources: u64) -> Value {
+    json!({
+        "max_cpu_total_bytes": max_cpu_total_bytes,
+        "max_cpu_decoded_residency_bytes": max_cpu_total_bytes / 2,
+        "max_cpu_upload_staging_bytes": max_cpu_total_bytes / 8,
+        "max_cpu_in_flight_decode_bytes": max_cpu_total_bytes / 8,
+        "max_cpu_metadata_and_indexes_bytes": max_cpu_total_bytes / 10,
+        "max_cpu_queues_and_results_bytes": max_cpu_total_bytes / 20,
+        "max_cpu_prefetch_bytes": max_cpu_total_bytes / 20,
+        "max_cpu_import_working_set_bytes": max_cpu_total_bytes / 20,
+        "max_runtime_queued_requests": 1_024,
+        "max_runtime_in_flight_decodes": 8,
+        "max_runtime_pending_completions": 1_024,
+        "max_runtime_resident_resources": max_resident_resources,
+    })
+}
+
 fn generated_fixture_camera_smoke_script(package: &Path) -> Value {
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": GENERATED_FIXTURE_SCENARIO,
-        "limits": {
-            "max_decoded_bytes": 8 * MIB,
-            "max_decoded_brick_bytes": 8 * MIB,
-            "max_encoded_payload_bytes_read": 8 * MIB,
-            "max_cpu_brick_cache_bytes": 64 * MIB,
-            "max_brick_requests_queued": 128,
-            "max_brick_queue_depth": 128,
-            "max_gpu_brick_atlas_uploaded_bytes": 64 * MIB,
-            "max_gpu_brick_atlas_resident_bytes": GIB,
-            "max_gpu_display_resource_resident_bytes": 256 * MIB,
-        },
+        "limits": dataset_runtime_limits(128 * MIB, 128),
         "commands": [
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
@@ -849,17 +863,7 @@ fn generated_fixture_render_modes_script(package: &Path) -> Value {
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": GENERATED_RENDER_MODES_SCENARIO,
-        "limits": {
-            "max_decoded_bytes": 12 * MIB,
-            "max_decoded_brick_bytes": 12 * MIB,
-            "max_encoded_payload_bytes_read": 12 * MIB,
-            "max_cpu_brick_cache_bytes": 64 * MIB,
-            "max_brick_requests_queued": 192,
-            "max_brick_queue_depth": 192,
-            "max_gpu_brick_atlas_uploaded_bytes": 96 * MIB,
-            "max_gpu_brick_atlas_resident_bytes": GIB,
-            "max_gpu_display_resource_resident_bytes": 256 * MIB,
-        },
+        "limits": dataset_runtime_limits(128 * MIB, 192),
         "commands": [
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
@@ -908,17 +912,7 @@ fn t5_qual_001_interaction_mip_script(package: &Path) -> Value {
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": T5_QUAL_001_INTERACTION_MIP_SCENARIO,
-        "limits": {
-            "max_decoded_bytes": GIB,
-            "max_decoded_brick_bytes": GIB,
-            "max_encoded_payload_bytes_read": 2 * GIB,
-            "max_cpu_brick_cache_bytes": 2 * GIB,
-            "max_brick_requests_queued": 4096,
-            "max_brick_queue_depth": 4096,
-            "max_gpu_brick_atlas_uploaded_bytes": GIB,
-            "max_gpu_brick_atlas_resident_bytes": 2 * GIB,
-            "max_gpu_display_resource_resident_bytes": GIB,
-        },
+        "limits": dataset_runtime_limits(4 * GIB, 4_096),
         "commands": [
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
@@ -960,17 +954,7 @@ fn t5_qual_001_interaction_render_modes_script(package: &Path) -> Value {
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": T5_QUAL_001_INTERACTION_RENDER_MODES_SCENARIO,
-        "limits": {
-            "max_decoded_bytes": 2 * GIB,
-            "max_decoded_brick_bytes": 2 * GIB,
-            "max_encoded_payload_bytes_read": 4 * GIB,
-            "max_cpu_brick_cache_bytes": 3 * GIB,
-            "max_brick_requests_queued": 8192,
-            "max_brick_queue_depth": 8192,
-            "max_gpu_brick_atlas_uploaded_bytes": 2 * GIB,
-            "max_gpu_brick_atlas_resident_bytes": 3 * GIB,
-            "max_gpu_display_resource_resident_bytes": GIB,
-        },
+        "limits": dataset_runtime_limits(6 * GIB, 8_192),
         "commands": [
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
@@ -1067,17 +1051,7 @@ fn t5_qual_001_interaction_continuous_script(package: &Path) -> Value {
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": T5_QUAL_001_INTERACTION_CONTINUOUS_SCENARIO,
-        "limits": {
-            "max_decoded_bytes": 2 * GIB,
-            "max_decoded_brick_bytes": 2 * GIB,
-            "max_encoded_payload_bytes_read": 4 * GIB,
-            "max_cpu_brick_cache_bytes": 3 * GIB,
-            "max_brick_requests_queued": 8192,
-            "max_brick_queue_depth": 8192,
-            "max_gpu_brick_atlas_uploaded_bytes": 2 * GIB,
-            "max_gpu_brick_atlas_resident_bytes": 3 * GIB,
-            "max_gpu_display_resource_resident_bytes": GIB,
-        },
+        "limits": dataset_runtime_limits(6 * GIB, 8_192),
         "commands": commands,
     })
 }
@@ -1103,17 +1077,17 @@ fn t5_qual_001_four_panel_cross_section_script(package: &Path) -> Value {
         json!({ "command": "assert", "condition": { "cross_section_panel_schedule": {
             "panel": "xy",
             "min_generation": 1,
-            "min_selected_bricks": 1
+            "min_selected_resources": 1
         } } }),
         json!({ "command": "assert", "condition": { "cross_section_panel_schedule": {
             "panel": "xz",
             "min_generation": 1,
-            "min_selected_bricks": 1
+            "min_selected_resources": 1
         } } }),
         json!({ "command": "assert", "condition": { "cross_section_panel_schedule": {
             "panel": "yz",
             "min_generation": 1,
-            "min_selected_bricks": 1
+            "min_selected_resources": 1
         } } }),
         json!({ "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 60000 }),
         json!({ "command": "assert", "condition": { "cross_section_panel_images_distinct": {
@@ -1136,32 +1110,13 @@ fn t5_qual_001_four_panel_cross_section_script(package: &Path) -> Value {
         json!({ "command": "assert", "condition": { "cross_section_panel_schedule": {
             "panel": "xz",
             "min_generation": 2,
-            "min_selected_bricks": 1
+            "min_selected_resources": 1
         } } }),
-        json!({ "command": "assert", "condition": { "cross_section_stream": {
-            "panel": "xz",
-            "priority": "current_frame",
-            "active_panel_at_submission": "xz",
-            "min_requested": 1,
-            "min_completed": 1,
-            "min_visible_chunks": 1,
-            "max_failed": 0
-        } } }),
-        json!({ "command": "assert", "condition": { "cross_section_stream": {
-            "panel": "xy",
-            "active_panel_at_submission": "xz",
-            "min_requested": 1,
-            "min_completed": 1,
-            "min_visible_chunks": 1,
-            "max_failed": 0
-        } } }),
-        json!({ "command": "assert", "condition": { "cross_section_stream": {
-            "panel": "yz",
-            "active_panel_at_submission": "xz",
-            "min_requested": 1,
-            "min_completed": 1,
-            "min_visible_chunks": 1,
-            "max_failed": 0
+        json!({ "command": "assert", "condition": { "active_lease_cohort": {
+            "min_required": 1,
+            "min_retained": 1,
+            "max_missing": 0,
+            "complete": true
         } } }),
         json!({ "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 60000 }),
         json!({ "command": "assert", "condition": { "cross_section_panel_images_distinct": {
@@ -1191,17 +1146,7 @@ fn t5_qual_001_four_panel_cross_section_script(package: &Path) -> Value {
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": T5_QUAL_001_FOUR_PANEL_CROSS_SECTION_SCENARIO,
-        "limits": {
-            "max_decoded_bytes": 2 * GIB,
-            "max_decoded_brick_bytes": 2 * GIB,
-            "max_encoded_payload_bytes_read": 4 * GIB,
-            "max_cpu_brick_cache_bytes": 3 * GIB,
-            "max_brick_requests_queued": 8192,
-            "max_brick_queue_depth": 8192,
-            "max_gpu_brick_atlas_uploaded_bytes": 2 * GIB,
-            "max_gpu_brick_atlas_resident_bytes": 3 * GIB,
-            "max_gpu_display_resource_resident_bytes": GIB,
-        },
+        "limits": dataset_runtime_limits(6 * GIB, 8_192),
         "commands": commands,
     })
 }
@@ -1254,17 +1199,7 @@ fn t5_qual_001_four_panel_fine_scale_script(package: &Path) -> Value {
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": T5_QUAL_001_FOUR_PANEL_FINE_SCALE_SCENARIO,
-        "limits": {
-            "max_decoded_bytes": 2 * GIB,
-            "max_decoded_brick_bytes": 2 * GIB,
-            "max_encoded_payload_bytes_read": 4 * GIB,
-            "max_cpu_brick_cache_bytes": 3 * GIB,
-            "max_brick_requests_queued": 8192,
-            "max_brick_queue_depth": 8192,
-            "max_gpu_brick_atlas_uploaded_bytes": 2 * GIB,
-            "max_gpu_brick_atlas_resident_bytes": 3 * GIB,
-            "max_gpu_display_resource_resident_bytes": GIB,
-        },
+        "limits": dataset_runtime_limits(6 * GIB, 8_192),
         "commands": commands,
     })
 }
@@ -1277,22 +1212,20 @@ fn append_t5_qual_001_fine_scale_panel_assertions(commands: &mut Vec<Value>, min
             "min_generation": min_generation,
             "target_scale_level": 0,
             "render_scale_level": 0,
-            "min_selected_bricks": 1,
-            "max_missing_occupied_bricks": 0,
+            "min_selected_resources": 1,
+            "max_missing_occupied_resources": 0,
             "display_current": true
         } } }),
         );
-        commands.push(
-            json!({ "command": "assert", "condition": { "cross_section_stream": {
-            "panel": panel,
-            "timepoint": 0,
-            "min_requested": 1,
-            "min_completed": 1,
-            "min_visible_chunks": 1,
-            "max_failed": 0
-        } } }),
-        );
     }
+    commands.push(
+        json!({ "command": "assert", "condition": { "active_lease_cohort": {
+        "min_required": 1,
+        "min_retained": 1,
+        "max_missing": 0,
+        "complete": true
+    } } }),
+    );
     commands.push(
         json!({ "command": "assert", "condition": { "cross_section_panel_images_distinct": {
         "min_different_pixels": 1
@@ -1355,17 +1288,7 @@ fn t5_qual_001_four_panel_continuous_cross_section_script(package: &Path) -> Val
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": T5_QUAL_001_FOUR_PANEL_CONTINUOUS_CROSS_SECTION_SCENARIO,
-        "limits": {
-            "max_decoded_bytes": 2 * GIB,
-            "max_decoded_brick_bytes": 2 * GIB,
-            "max_encoded_payload_bytes_read": 4 * GIB,
-            "max_cpu_brick_cache_bytes": 3 * GIB,
-            "max_brick_requests_queued": 8192,
-            "max_brick_queue_depth": 8192,
-            "max_gpu_brick_atlas_uploaded_bytes": 2 * GIB,
-            "max_gpu_brick_atlas_resident_bytes": 3 * GIB,
-            "max_gpu_display_resource_resident_bytes": GIB,
-        },
+        "limits": dataset_runtime_limits(6 * GIB, 8_192),
         "commands": commands,
     })
 }
@@ -1432,18 +1355,9 @@ fn append_t5_qual_001_continuous_cross_section_settled_assertions(
             json!({ "command": "assert", "condition": { "cross_section_panel_schedule": {
                 "panel": panel,
                 "min_generation": min_generation,
-                "min_selected_bricks": 1,
-                "max_missing_occupied_bricks": 0,
+                "min_selected_resources": 1,
+                "max_missing_occupied_resources": 0,
                 "display_current": true
-            } } }),
-        );
-        commands.push(
-            json!({ "command": "assert", "condition": { "cross_section_stream": {
-                "panel": panel,
-                "min_requested": 1,
-                "min_completed": 1,
-                "min_visible_chunks": 1,
-                "max_failed": 0
             } } }),
         );
         commands.push(
@@ -1453,6 +1367,14 @@ fn append_t5_qual_001_continuous_cross_section_settled_assertions(
             } } }),
         );
     }
+    commands.push(
+        json!({ "command": "assert", "condition": { "active_lease_cohort": {
+        "min_required": 1,
+        "min_retained": 1,
+        "max_missing": 0,
+        "complete": true
+    } } }),
+    );
     commands.push(
         json!({ "command": "assert", "condition": { "cross_section_panel_images_distinct": {
             "min_different_pixels": 1
@@ -1532,17 +1454,7 @@ fn t5_qual_002_four_panel_timepoint_script(package: &Path) -> Value {
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": T5_QUAL_002_FOUR_PANEL_TIMEPOINT_SCENARIO,
-        "limits": {
-            "max_decoded_bytes": 2 * GIB,
-            "max_decoded_brick_bytes": 2 * GIB,
-            "max_encoded_payload_bytes_read": 4 * GIB,
-            "max_cpu_brick_cache_bytes": 3 * GIB,
-            "max_brick_requests_queued": 8192,
-            "max_brick_queue_depth": 8192,
-            "max_gpu_brick_atlas_uploaded_bytes": 2 * GIB,
-            "max_gpu_brick_atlas_resident_bytes": 3 * GIB,
-            "max_gpu_display_resource_resident_bytes": GIB,
-        },
+        "limits": dataset_runtime_limits(6 * GIB, 8_192),
         "commands": commands,
     })
 }
@@ -1581,10 +1493,11 @@ fn t5_qual_002_four_panel_autoplay_script(package: &Path) -> Value {
         json!({ "command": "assert", "condition": { "observed_timepoints": { "min_distinct": 2 } } }),
         json!({ "command": "assert", "condition": "no_render_error" }),
         json!({ "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 120000 }),
-        json!({ "command": "assert", "condition": { "cross_section_streams_match_active_timepoint": {
-            "min_completed": 1,
-            "min_visible_chunks": 1,
-            "max_failed": 0
+        json!({ "command": "assert", "condition": { "active_lease_cohort": {
+            "min_required": 1,
+            "min_retained": 1,
+            "max_missing": 0,
+            "complete": true
         } } }),
     ]);
     append_t5_qual_002_autoplay_panel_assertions(
@@ -1608,17 +1521,7 @@ fn t5_qual_002_four_panel_autoplay_script(package: &Path) -> Value {
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": T5_QUAL_002_FOUR_PANEL_AUTOPLAY_SCENARIO,
-        "limits": {
-            "max_decoded_bytes": 2 * GIB,
-            "max_decoded_brick_bytes": 2 * GIB,
-            "max_encoded_payload_bytes_read": 4 * GIB,
-            "max_cpu_brick_cache_bytes": 3 * GIB,
-            "max_brick_requests_queued": 8192,
-            "max_brick_queue_depth": 8192,
-            "max_gpu_brick_atlas_uploaded_bytes": 2 * GIB,
-            "max_gpu_brick_atlas_resident_bytes": 3 * GIB,
-            "max_gpu_display_resource_resident_bytes": GIB,
-        },
+        "limits": dataset_runtime_limits(6 * GIB, 8_192),
         "commands": commands,
     })
 }
@@ -1634,22 +1537,23 @@ fn append_t5_qual_002_timepoint_panel_assertions(
             json!({ "command": "assert", "condition": { "cross_section_panel_schedule": {
             "panel": panel,
             "min_generation": min_generation,
-            "min_selected_bricks": 1,
-            "max_missing_occupied_bricks": 0,
+            "min_selected_resources": 1,
+            "max_missing_occupied_resources": 0,
             "display_current": true
         } } }),
         );
-        commands.push(
-            json!({ "command": "assert", "condition": { "cross_section_stream": {
-            "panel": panel,
-            "timepoint": timepoint,
-            "min_requested": 1,
-            "min_completed": 1,
-            "min_visible_chunks": 1,
-            "max_failed": 0
-        } } }),
-        );
     }
+    commands.push(json!({ "command": "assert", "condition": {
+        "active_timepoint": { "timepoint": timepoint }
+    } }));
+    commands.push(
+        json!({ "command": "assert", "condition": { "active_lease_cohort": {
+        "min_required": 1,
+        "min_retained": 1,
+        "max_missing": 0,
+        "complete": true
+    } } }),
+    );
     commands.push(
         json!({ "command": "assert", "condition": { "cross_section_panel_images_distinct": {
         "min_different_pixels": 1
@@ -1674,8 +1578,8 @@ fn append_t5_qual_002_autoplay_panel_assertions(
             json!({ "command": "assert", "condition": { "cross_section_panel_schedule": {
                 "panel": panel,
                 "min_generation": min_generation,
-                "min_selected_bricks": 1,
-                "max_missing_occupied_bricks": 0,
+                "min_selected_resources": 1,
+                "max_missing_occupied_resources": 0,
                 "display_current": true
             } } }),
         );
@@ -1794,15 +1698,18 @@ fn validate_product_automation_limits(script: &Value) -> anyhow::Result<()> {
         bail!("automation script limits must be an object");
     };
     const ALLOWED_LIMITS: &[&str] = &[
-        "max_decoded_bytes",
-        "max_decoded_brick_bytes",
-        "max_encoded_payload_bytes_read",
-        "max_cpu_brick_cache_bytes",
-        "max_brick_requests_queued",
-        "max_brick_queue_depth",
-        "max_gpu_brick_atlas_uploaded_bytes",
-        "max_gpu_brick_atlas_resident_bytes",
-        "max_gpu_display_resource_resident_bytes",
+        "max_cpu_total_bytes",
+        "max_cpu_decoded_residency_bytes",
+        "max_cpu_upload_staging_bytes",
+        "max_cpu_in_flight_decode_bytes",
+        "max_cpu_metadata_and_indexes_bytes",
+        "max_cpu_queues_and_results_bytes",
+        "max_cpu_prefetch_bytes",
+        "max_cpu_import_working_set_bytes",
+        "max_runtime_queued_requests",
+        "max_runtime_in_flight_decodes",
+        "max_runtime_pending_completions",
+        "max_runtime_resident_resources",
     ];
     for (name, value) in map {
         if !ALLOWED_LIMITS.contains(&name.as_str()) {
@@ -2029,8 +1936,12 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
         .and_then(|value| value.get("gpu_timestamp_timing"))
         .cloned()
         .unwrap_or(Value::Null);
-    let cross_section_runtime_metrics =
-        product_validation_cross_section_runtime_metrics(report.automation_report_value);
+    let dataset_runtime_metrics =
+        product_validation_dataset_runtime_metrics(report.automation_report_value);
+    let lease_bridge_metrics =
+        product_validation_lease_bridge_metrics(report.automation_report_value);
+    let cross_section_panel_metrics =
+        product_validation_cross_section_panel_metrics(report.automation_report_value);
     let cross_section_performance_gate_table =
         product_validation_cross_section_performance_gate_table(report.automation_report_value);
     let automation_script_scenario = report
@@ -2074,19 +1985,44 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
         || scenario_name == T5_QUAL_002_FOUR_PANEL_TIMEPOINT_SCENARIO
         || scenario_name == T5_QUAL_002_FOUR_PANEL_AUTOPLAY_SCENARIO;
     let automation_limits = script_limits_json(report.script_value);
-    let max_decoded_bytes = script_limit_u64(report.script_value, "max_decoded_bytes");
-    let max_decoded_brick_bytes = script_limit_u64(report.script_value, "max_decoded_brick_bytes");
-    let max_encoded_payload_bytes_read =
-        script_limit_u64(report.script_value, "max_encoded_payload_bytes_read");
-    let max_gpu_upload_bytes =
-        script_limit_u64(report.script_value, "max_gpu_brick_atlas_uploaded_bytes");
-    let max_gpu_resident_bytes =
-        script_limit_u64(report.script_value, "max_gpu_brick_atlas_resident_bytes");
-    let decoded_byte_limit_enforced = max_decoded_bytes.is_number()
-        || max_decoded_brick_bytes.is_number()
-        || max_encoded_payload_bytes_read.is_number();
-    let gpu_upload_byte_limit_enforced = max_gpu_upload_bytes.is_number();
-    let gpu_resident_byte_limit_enforced = max_gpu_resident_bytes.is_number();
+    let max_cpu_total_bytes = script_limit_u64(report.script_value, "max_cpu_total_bytes");
+    let cpu_category_byte_limits = json!({
+        "decoded_residency": script_limit_u64(report.script_value, "max_cpu_decoded_residency_bytes"),
+        "upload_staging": script_limit_u64(report.script_value, "max_cpu_upload_staging_bytes"),
+        "in_flight_decode": script_limit_u64(report.script_value, "max_cpu_in_flight_decode_bytes"),
+        "metadata_and_indexes": script_limit_u64(report.script_value, "max_cpu_metadata_and_indexes_bytes"),
+        "queues_and_results": script_limit_u64(report.script_value, "max_cpu_queues_and_results_bytes"),
+        "prefetch": script_limit_u64(report.script_value, "max_cpu_prefetch_bytes"),
+        "import_working_set": script_limit_u64(report.script_value, "max_cpu_import_working_set_bytes"),
+    });
+    let runtime_work_limits = json!({
+        "queued_requests": script_limit_u64(report.script_value, "max_runtime_queued_requests"),
+        "in_flight_decodes": script_limit_u64(report.script_value, "max_runtime_in_flight_decodes"),
+        "pending_completions": script_limit_u64(report.script_value, "max_runtime_pending_completions"),
+        "resident_resources": script_limit_u64(report.script_value, "max_runtime_resident_resources"),
+    });
+    let cpu_byte_limit_enforced = script_has_any_limit(
+        report.script_value,
+        &[
+            "max_cpu_total_bytes",
+            "max_cpu_decoded_residency_bytes",
+            "max_cpu_upload_staging_bytes",
+            "max_cpu_in_flight_decode_bytes",
+            "max_cpu_metadata_and_indexes_bytes",
+            "max_cpu_queues_and_results_bytes",
+            "max_cpu_prefetch_bytes",
+            "max_cpu_import_working_set_bytes",
+        ],
+    );
+    let runtime_work_limit_enforced = script_has_any_limit(
+        report.script_value,
+        &[
+            "max_runtime_queued_requests",
+            "max_runtime_in_flight_decodes",
+            "max_runtime_pending_completions",
+            "max_runtime_resident_resources",
+        ],
+    );
     json!({
         "schema": PRODUCT_VALIDATION_SCHEMA,
         "schema_version": PRODUCT_VALIDATION_SCHEMA_VERSION,
@@ -2139,14 +2075,11 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
             "millis_wait_count": millis_wait_count,
             "wait_timeout_ms_total": wait_timeout_ms_total,
             "automation_limits": automation_limits,
-            "decoded_byte_limit_bytes": max_decoded_bytes,
-            "decoded_brick_byte_limit_bytes": max_decoded_brick_bytes,
-            "encoded_payload_byte_limit_bytes": max_encoded_payload_bytes_read,
-            "decoded_byte_limit_enforced": decoded_byte_limit_enforced,
-            "gpu_upload_byte_limit_bytes": max_gpu_upload_bytes,
-            "gpu_resident_byte_limit_bytes": max_gpu_resident_bytes,
-            "gpu_upload_byte_limit_enforced": gpu_upload_byte_limit_enforced,
-            "gpu_resident_byte_limit_enforced": gpu_resident_byte_limit_enforced,
+            "cpu_total_byte_limit_bytes": max_cpu_total_bytes,
+            "cpu_category_byte_limits": cpu_category_byte_limits,
+            "runtime_work_limits": runtime_work_limits,
+            "cpu_byte_limit_enforced": cpu_byte_limit_enforced,
+            "runtime_work_limit_enforced": runtime_work_limit_enforced,
             "process_rss_limit_bytes": report.process_rss_limit_bytes,
         },
         "metrics": {
@@ -2156,7 +2089,9 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
             "input_to_present_timing_summary": input_to_present_summary,
             "cross_section_latency_summary": cross_section_latency_summary,
             "cross_section_performance_gate_table": cross_section_performance_gate_table,
-            "cross_section_runtime": cross_section_runtime_metrics,
+            "dataset_runtime": dataset_runtime_metrics,
+            "lease_bridge": lease_bridge_metrics,
+            "cross_section_panels": cross_section_panel_metrics,
             "gpu_timestamp_timing": gpu_timestamp_timing,
             "presentation_timing": presentation_timing,
         },
@@ -2297,7 +2232,59 @@ fn product_validation_cross_section_performance_gate_table(
     })
 }
 
-fn product_validation_cross_section_runtime_metrics(
+fn product_validation_dataset_runtime_metrics(automation_report_value: Option<&Value>) -> Value {
+    let final_snapshot = automation_report_value
+        .and_then(|value| value.get("final_diagnostics"))
+        .and_then(|value| value.get("dataset_runtime"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let snapshots = automation_report_value
+        .and_then(|value| value.get("diagnostics"))
+        .and_then(Value::as_array)
+        .map(|events| {
+            events
+                .iter()
+                .filter_map(|diagnostics| diagnostics.get("dataset_runtime").cloned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "kind": "dataset_runtime_metrics",
+        "taxonomy_version": 1,
+        "snapshot_source": "automation_copy_diagnostics_and_final_diagnostics",
+        "snapshot_count": snapshots.len(),
+        "final": final_snapshot,
+        "latest": snapshots.last().cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn product_validation_lease_bridge_metrics(automation_report_value: Option<&Value>) -> Value {
+    let final_snapshot = automation_report_value
+        .and_then(|value| value.get("final_diagnostics"))
+        .and_then(|value| value.get("lease_bridge"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let snapshots = automation_report_value
+        .and_then(|value| value.get("diagnostics"))
+        .and_then(Value::as_array)
+        .map(|events| {
+            events
+                .iter()
+                .filter_map(|diagnostics| diagnostics.get("lease_bridge").cloned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "kind": "lease_bridge_metrics",
+        "taxonomy_version": 1,
+        "snapshot_source": "automation_copy_diagnostics_and_final_diagnostics",
+        "snapshot_count": snapshots.len(),
+        "final": final_snapshot,
+        "latest": snapshots.last().cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn product_validation_cross_section_panel_metrics(
     automation_report_value: Option<&Value>,
 ) -> Value {
     let final_snapshot = automation_report_value
@@ -2320,28 +2307,13 @@ fn product_validation_cross_section_runtime_metrics(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let latest_assertion = snapshots.last().cloned().unwrap_or(Value::Null);
-    let latest_visible_work_assertion = snapshots
-        .iter()
-        .rev()
-        .find(|snapshot| {
-            snapshot.get("layout").and_then(Value::as_str) == Some("FourPanel")
-                && snapshot
-                    .get("runtime")
-                    .and_then(|runtime| runtime.get("visible_work"))
-                    .and_then(Value::as_bool)
-                    == Some(true)
-        })
-        .cloned()
-        .unwrap_or(Value::Null);
     json!({
-        "kind": "cross_section_runtime_metrics",
+        "kind": "cross_section_panel_metrics",
         "taxonomy_version": 1,
         "snapshot_source": "automation_assertion_details_and_final_diagnostics",
         "snapshot_count": snapshots.len(),
         "final": final_snapshot,
-        "latest_assertion": latest_assertion,
-        "latest_visible_work_assertion": latest_visible_work_assertion,
+        "latest_assertion": snapshots.last().cloned().unwrap_or(Value::Null),
     })
 }
 
@@ -2352,6 +2324,16 @@ fn script_limit_u64(script: &Value, name: &str) -> Value {
         .and_then(Value::as_u64)
         .map(Value::from)
         .unwrap_or(Value::Null)
+}
+
+fn script_has_any_limit(script: &Value, names: &[&str]) -> bool {
+    names.iter().any(|name| {
+        script
+            .get("limits")
+            .and_then(|limits| limits.get(name))
+            .and_then(Value::as_u64)
+            .is_some()
+    })
 }
 
 fn script_requested_window_inner_size_points_json(script: &Value) -> Value {

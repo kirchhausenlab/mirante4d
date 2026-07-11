@@ -2,7 +2,7 @@ use std::{borrow::Cow, sync::Mutex, time::Duration};
 
 use std::collections::HashSet;
 
-use mirante4d_data::SpatialBrickIndex;
+use mirante4d_dataset::{CpuLedgerError, ResourceRegion};
 use mirante4d_domain::Shape3D;
 use thiserror::Error;
 
@@ -36,10 +36,10 @@ pub use adapter::{
     adapter_preference_score, renderer_device_descriptor, renderer_required_limits_for_adapter,
 };
 pub use atlas::GpuBrickAtlasPagePriority;
-pub use cross_section::{GpuCrossSectionChunkDisplayChannel, GpuCrossSectionChunkDraw};
+pub use cross_section::{GpuCrossSectionChunkDraw, GpuLeaseCrossSectionChannel};
 pub use display::{
-    GpuDisplayFrame, GpuDisplayFrameBlendMode, GpuDisplayFrameDiagnostics,
-    GpuResidentDisplayChannel, GpuResidentDisplayRequest,
+    GpuDisplayFrame, GpuDisplayFrameBlendMode, GpuDisplayFrameDiagnostics, GpuLeaseDisplayChannel,
+    GpuLeaseDisplayRequest,
 };
 pub use scene::{GpuScenePickOutput, GpuSceneRenderOutput};
 pub use summary::{GpuIntensitySummaryF32, GpuIntensitySummaryU16};
@@ -50,8 +50,6 @@ pub use z_mip::{
 
 use adapter::{diagnostics_for_existing_device, request_device, timestamp_queries_requested};
 use atlas::{GpuBrickAtlasCache, GpuBrickAtlasF32Cache};
-#[cfg(test)]
-use atlas::{build_gpu_brick_atlas, build_gpu_brick_atlas_u8, pack_brick_f32_for_slot};
 use buffers::{storage_entry, storage_texture_entry, texture_entry, uniform_entry};
 use display_resources::GpuDisplayResourceCache;
 use shaders::{
@@ -147,8 +145,8 @@ pub struct GpuRendererStats {
 pub struct GpuBrickAtlasResidencySnapshot {
     pub retained: bool,
     pub generation: Option<u64>,
-    pub resident_pages: HashSet<SpatialBrickIndex>,
-    pub active_pages: HashSet<SpatialBrickIndex>,
+    pub resident_pages: HashSet<ResourceRegion>,
+    pub active_pages: HashSet<ResourceRegion>,
     pub bytes: u64,
     pub slot_count: usize,
 }
@@ -198,6 +196,8 @@ pub struct GpuRenderer {
 pub enum GpuRenderError {
     #[error(transparent)]
     Render(#[from] RenderError),
+    #[error(transparent)]
+    CpuLedger(#[from] CpuLedgerError),
     #[error("no compatible GPU adapter was found: {0}")]
     AdapterUnavailable(String),
     #[error("selected adapter is CPU/software only, not an acceptable renderer adapter: {0}")]
@@ -922,7 +922,9 @@ fn add_gpu_render_timings(left: GpuRenderTimings, right: GpuRenderTimings) -> Gp
 }
 
 #[cfg(test)]
-mod display_tests;
+mod lease_gpu_tests;
+#[cfg(test)]
+mod lease_input_tests;
 #[cfg(test)]
 mod scene_tests;
 #[cfg(test)]
@@ -930,6 +932,5 @@ mod shader_contract_tests;
 #[cfg(test)]
 mod summary_tests;
 #[cfg(test)]
+#[allow(dead_code)]
 mod test_support;
-#[cfg(test)]
-mod tests;

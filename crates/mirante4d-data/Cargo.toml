@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 glam.workspace = true
 mirante4d-domain.workspace = true
+mirante4d-dataset.workspace = true
 mirante4d-format.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

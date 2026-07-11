@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
-use mirante4d_data::{BrickReadQueueDiagnostics, BrickRequestPriority, DataEngineStats};
+use mirante4d_dataset::CpuLedgerCategory;
+use mirante4d_dataset_runtime::DatasetRuntimeDiagnostics;
 use mirante4d_domain::{RenderMode, ViewerLayout};
-use mirante4d_renderer::gpu::GpuRendererStats;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -55,84 +55,84 @@ impl ProductAutomationScript {
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct ProductAutomationLimits {
-    pub(super) max_decoded_bytes: Option<u64>,
-    pub(super) max_decoded_brick_bytes: Option<u64>,
-    pub(super) max_encoded_payload_bytes_read: Option<u64>,
-    pub(super) max_cpu_brick_cache_bytes: Option<u64>,
-    pub(super) max_brick_requests_queued: Option<u64>,
-    pub(super) max_brick_queue_depth: Option<u64>,
-    pub(super) max_gpu_brick_atlas_uploaded_bytes: Option<u64>,
-    pub(super) max_gpu_brick_atlas_resident_bytes: Option<u64>,
-    pub(super) max_gpu_display_resource_resident_bytes: Option<u64>,
+    pub(super) max_cpu_total_bytes: Option<u64>,
+    pub(super) max_cpu_decoded_residency_bytes: Option<u64>,
+    pub(super) max_cpu_upload_staging_bytes: Option<u64>,
+    pub(super) max_cpu_in_flight_decode_bytes: Option<u64>,
+    pub(super) max_cpu_metadata_and_indexes_bytes: Option<u64>,
+    pub(super) max_cpu_queues_and_results_bytes: Option<u64>,
+    pub(super) max_cpu_prefetch_bytes: Option<u64>,
+    pub(super) max_cpu_import_working_set_bytes: Option<u64>,
+    pub(super) max_runtime_queued_requests: Option<u64>,
+    pub(super) max_runtime_in_flight_decodes: Option<u64>,
+    pub(super) max_runtime_pending_completions: Option<u64>,
+    pub(super) max_runtime_resident_resources: Option<u64>,
 }
 
 impl ProductAutomationLimits {
-    pub(super) fn requires_data_engine(self) -> bool {
-        self.max_decoded_bytes.is_some()
-            || self.max_decoded_brick_bytes.is_some()
-            || self.max_encoded_payload_bytes_read.is_some()
-            || self.max_cpu_brick_cache_bytes.is_some()
-            || self.max_brick_requests_queued.is_some()
-    }
-
-    pub(super) fn requires_gpu_renderer(self) -> bool {
-        self.max_gpu_brick_atlas_uploaded_bytes.is_some()
-            || self.max_gpu_brick_atlas_resident_bytes.is_some()
-            || self.max_gpu_display_resource_resident_bytes.is_some()
-    }
-
-    pub(super) fn requires_brick_queue(self) -> bool {
-        self.max_brick_queue_depth.is_some()
-    }
-
-    pub(super) fn check_data_engine(self, stats: DataEngineStats) -> Result<(), String> {
-        check_limit("decoded_bytes", stats.decoded_bytes, self.max_decoded_bytes)?;
+    pub(super) fn check_dataset_runtime(
+        self,
+        diagnostics: DatasetRuntimeDiagnostics,
+    ) -> Result<(), String> {
         check_limit(
-            "decoded_brick_bytes",
-            stats.decoded_brick_bytes,
-            self.max_decoded_brick_bytes,
+            "cpu_total_bytes",
+            diagnostics.total_used_bytes(),
+            self.max_cpu_total_bytes,
         )?;
         check_limit(
-            "encoded_payload_bytes_read",
-            stats.encoded_payload_bytes_read,
-            self.max_encoded_payload_bytes_read,
+            "cpu_decoded_residency_bytes",
+            diagnostics.category_used_bytes(CpuLedgerCategory::DecodedResidency),
+            self.max_cpu_decoded_residency_bytes,
         )?;
         check_limit(
-            "cpu_brick_cache_bytes",
-            stats.brick_cache_bytes,
-            self.max_cpu_brick_cache_bytes,
+            "cpu_upload_staging_bytes",
+            diagnostics.category_used_bytes(CpuLedgerCategory::UploadStaging),
+            self.max_cpu_upload_staging_bytes,
         )?;
         check_limit(
-            "brick_requests_queued",
-            stats.brick_requests_queued,
-            self.max_brick_requests_queued,
-        )?;
-        Ok(())
-    }
-
-    pub(super) fn check_brick_queue(self, queue: &BrickReadQueueDiagnostics) -> Result<(), String> {
-        check_limit(
-            "brick_queue_depth",
-            queue.queued_total as u64,
-            self.max_brick_queue_depth,
-        )
-    }
-
-    pub(super) fn check_gpu_renderer(self, stats: GpuRendererStats) -> Result<(), String> {
-        check_limit(
-            "gpu_brick_atlas_uploaded_bytes",
-            stats.brick_atlas_uploaded_bytes,
-            self.max_gpu_brick_atlas_uploaded_bytes,
+            "cpu_in_flight_decode_bytes",
+            diagnostics.category_used_bytes(CpuLedgerCategory::InFlightDecode),
+            self.max_cpu_in_flight_decode_bytes,
         )?;
         check_limit(
-            "gpu_brick_atlas_resident_bytes",
-            stats.brick_atlas_resident_bytes,
-            self.max_gpu_brick_atlas_resident_bytes,
+            "cpu_metadata_and_indexes_bytes",
+            diagnostics.category_used_bytes(CpuLedgerCategory::MetadataAndIndexes),
+            self.max_cpu_metadata_and_indexes_bytes,
         )?;
         check_limit(
-            "gpu_display_resource_resident_bytes",
-            stats.display_resource_resident_bytes,
-            self.max_gpu_display_resource_resident_bytes,
+            "cpu_queues_and_results_bytes",
+            diagnostics.category_used_bytes(CpuLedgerCategory::QueuesAndResults),
+            self.max_cpu_queues_and_results_bytes,
+        )?;
+        check_limit(
+            "cpu_prefetch_bytes",
+            diagnostics.category_used_bytes(CpuLedgerCategory::Prefetch),
+            self.max_cpu_prefetch_bytes,
+        )?;
+        check_limit(
+            "cpu_import_working_set_bytes",
+            diagnostics.category_used_bytes(CpuLedgerCategory::ImportWorkingSet),
+            self.max_cpu_import_working_set_bytes,
+        )?;
+        check_limit(
+            "runtime_queued_requests",
+            diagnostics.queued_requests() as u64,
+            self.max_runtime_queued_requests,
+        )?;
+        check_limit(
+            "runtime_in_flight_decodes",
+            diagnostics.in_flight_decodes() as u64,
+            self.max_runtime_in_flight_decodes,
+        )?;
+        check_limit(
+            "runtime_pending_completions",
+            diagnostics.pending_completions() as u64,
+            self.max_runtime_pending_completions,
+        )?;
+        check_limit(
+            "runtime_resident_resources",
+            diagnostics.resident_resources() as u64,
+            self.max_runtime_resident_resources,
         )?;
         Ok(())
     }
@@ -151,51 +151,56 @@ fn check_limit(name: &'static str, observed: u64, limit: Option<u64>) -> Result<
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub(super) struct ProductAutomationLimitObservations {
-    pub(super) max_decoded_bytes: u64,
-    pub(super) max_decoded_brick_bytes: u64,
-    pub(super) max_encoded_payload_bytes_read: u64,
-    pub(super) max_cpu_brick_cache_bytes: u64,
-    pub(super) max_brick_requests_queued: u64,
-    pub(super) max_brick_queue_depth: u64,
-    pub(super) max_gpu_brick_atlas_uploaded_bytes: Option<u64>,
-    pub(super) max_gpu_brick_atlas_resident_bytes: Option<u64>,
-    pub(super) max_gpu_display_resource_resident_bytes: Option<u64>,
+    pub(super) max_cpu_total_bytes: u64,
+    pub(super) max_cpu_decoded_residency_bytes: u64,
+    pub(super) max_cpu_upload_staging_bytes: u64,
+    pub(super) max_cpu_in_flight_decode_bytes: u64,
+    pub(super) max_cpu_metadata_and_indexes_bytes: u64,
+    pub(super) max_cpu_queues_and_results_bytes: u64,
+    pub(super) max_cpu_prefetch_bytes: u64,
+    pub(super) max_cpu_import_working_set_bytes: u64,
+    pub(super) max_runtime_queued_requests: u64,
+    pub(super) max_runtime_in_flight_decodes: u64,
+    pub(super) max_runtime_pending_completions: u64,
+    pub(super) max_runtime_resident_resources: u64,
 }
 
 impl ProductAutomationLimitObservations {
-    pub(super) fn observe_data_engine(&mut self, stats: DataEngineStats) {
-        self.max_decoded_bytes = self.max_decoded_bytes.max(stats.decoded_bytes);
-        self.max_decoded_brick_bytes = self.max_decoded_brick_bytes.max(stats.decoded_brick_bytes);
-        self.max_encoded_payload_bytes_read = self
-            .max_encoded_payload_bytes_read
-            .max(stats.encoded_payload_bytes_read);
-        self.max_cpu_brick_cache_bytes =
-            self.max_cpu_brick_cache_bytes.max(stats.brick_cache_bytes);
-        self.max_brick_requests_queued = self
-            .max_brick_requests_queued
-            .max(stats.brick_requests_queued);
-    }
-
-    pub(super) fn observe_brick_queue(&mut self, queue: &BrickReadQueueDiagnostics) {
-        self.max_brick_queue_depth = self.max_brick_queue_depth.max(queue.queued_total as u64);
-    }
-
-    pub(super) fn observe_gpu_renderer(&mut self, stats: GpuRendererStats) {
-        self.max_gpu_brick_atlas_uploaded_bytes = Some(
-            self.max_gpu_brick_atlas_uploaded_bytes
-                .unwrap_or(0)
-                .max(stats.brick_atlas_uploaded_bytes),
-        );
-        self.max_gpu_brick_atlas_resident_bytes = Some(
-            self.max_gpu_brick_atlas_resident_bytes
-                .unwrap_or(0)
-                .max(stats.brick_atlas_resident_bytes),
-        );
-        self.max_gpu_display_resource_resident_bytes = Some(
-            self.max_gpu_display_resource_resident_bytes
-                .unwrap_or(0)
-                .max(stats.display_resource_resident_bytes),
-        );
+    pub(super) fn observe_dataset_runtime(&mut self, diagnostics: DatasetRuntimeDiagnostics) {
+        self.max_cpu_total_bytes = self.max_cpu_total_bytes.max(diagnostics.total_used_bytes());
+        self.max_cpu_decoded_residency_bytes = self
+            .max_cpu_decoded_residency_bytes
+            .max(diagnostics.category_used_bytes(CpuLedgerCategory::DecodedResidency));
+        self.max_cpu_upload_staging_bytes = self
+            .max_cpu_upload_staging_bytes
+            .max(diagnostics.category_used_bytes(CpuLedgerCategory::UploadStaging));
+        self.max_cpu_in_flight_decode_bytes = self
+            .max_cpu_in_flight_decode_bytes
+            .max(diagnostics.category_used_bytes(CpuLedgerCategory::InFlightDecode));
+        self.max_cpu_metadata_and_indexes_bytes = self
+            .max_cpu_metadata_and_indexes_bytes
+            .max(diagnostics.category_used_bytes(CpuLedgerCategory::MetadataAndIndexes));
+        self.max_cpu_queues_and_results_bytes = self
+            .max_cpu_queues_and_results_bytes
+            .max(diagnostics.category_used_bytes(CpuLedgerCategory::QueuesAndResults));
+        self.max_cpu_prefetch_bytes = self
+            .max_cpu_prefetch_bytes
+            .max(diagnostics.category_used_bytes(CpuLedgerCategory::Prefetch));
+        self.max_cpu_import_working_set_bytes = self
+            .max_cpu_import_working_set_bytes
+            .max(diagnostics.category_used_bytes(CpuLedgerCategory::ImportWorkingSet));
+        self.max_runtime_queued_requests = self
+            .max_runtime_queued_requests
+            .max(diagnostics.queued_requests() as u64);
+        self.max_runtime_in_flight_decodes = self
+            .max_runtime_in_flight_decodes
+            .max(diagnostics.in_flight_decodes() as u64);
+        self.max_runtime_pending_completions = self
+            .max_runtime_pending_completions
+            .max(diagnostics.pending_completions() as u64);
+        self.max_runtime_resident_resources = self
+            .max_runtime_resident_resources
+            .max(diagnostics.resident_resources() as u64);
     }
 
     pub(super) fn json(self) -> Value {
@@ -415,28 +420,15 @@ pub(super) enum ProductAutomationAssertCondition {
         min_generation: Option<u64>,
         target_scale_level: Option<u32>,
         render_scale_level: Option<u32>,
-        min_selected_bricks: Option<usize>,
-        max_missing_occupied_bricks: Option<usize>,
+        min_selected_resources: Option<usize>,
+        max_missing_occupied_resources: Option<usize>,
         display_current: Option<bool>,
     },
-    CrossSectionStream {
-        panel: ProductAutomationPanelId,
-        timepoint: Option<u64>,
-        priority: Option<ProductAutomationBrickPriority>,
-        fairness_promoted: Option<bool>,
-        active_panel_at_submission: Option<ProductAutomationPanelId>,
-        min_queued_current_frame: Option<usize>,
-        min_queued_prefetch: Option<usize>,
-        min_requested: Option<usize>,
-        min_completed: Option<usize>,
-        min_visible_chunks: Option<usize>,
-        max_stale: Option<usize>,
-        max_failed: Option<usize>,
-    },
-    CrossSectionStreamsMatchActiveTimepoint {
-        min_completed: Option<usize>,
-        min_visible_chunks: Option<usize>,
-        max_failed: Option<usize>,
+    ActiveLeaseCohort {
+        min_required: Option<usize>,
+        min_retained: Option<usize>,
+        max_missing: Option<usize>,
+        complete: Option<bool>,
     },
     CrossSectionPanelNonblank {
         panel: ProductAutomationPanelId,
@@ -465,10 +457,7 @@ impl ProductAutomationAssertCondition {
             Self::Playback { .. } => "playback",
             Self::CrossSectionActivePanel { .. } => "cross_section_active_panel",
             Self::CrossSectionPanelSchedule { .. } => "cross_section_panel_schedule",
-            Self::CrossSectionStream { .. } => "cross_section_stream",
-            Self::CrossSectionStreamsMatchActiveTimepoint { .. } => {
-                "cross_section_streams_match_active_timepoint"
-            }
+            Self::ActiveLeaseCohort { .. } => "active_lease_cohort",
             Self::CrossSectionPanelNonblank { .. } => "cross_section_panel_nonblank",
             Self::CrossSectionPanelImagesDistinct { .. } => "cross_section_panel_images_distinct",
             Self::FourPanelImagesDistinct { .. } => "four_panel_images_distinct",
@@ -481,8 +470,6 @@ impl ProductAutomationAssertCondition {
             self,
             Self::CrossSectionActivePanel { .. }
                 | Self::CrossSectionPanelSchedule { .. }
-                | Self::CrossSectionStream { .. }
-                | Self::CrossSectionStreamsMatchActiveTimepoint { .. }
                 | Self::CrossSectionPanelNonblank { .. }
                 | Self::CrossSectionPanelImagesDistinct { .. }
                 | Self::FourPanelImagesDistinct { .. }
@@ -565,24 +552,6 @@ pub(super) struct ProductAutomationPanelHoverProbe {
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum ProductAutomationBrickPriority {
-    CurrentFrame,
-    Prefetch,
-    Warm,
-}
-
-impl From<ProductAutomationBrickPriority> for BrickRequestPriority {
-    fn from(value: ProductAutomationBrickPriority) -> Self {
-        match value {
-            ProductAutomationBrickPriority::CurrentFrame => Self::CurrentFrame,
-            ProductAutomationBrickPriority::Prefetch => Self::Prefetch,
-            ProductAutomationBrickPriority::Warm => Self::Warm,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub(super) enum ProductAutomationCrossSectionHoverStatus {
     Value,
     Loading,
@@ -632,6 +601,7 @@ impl ProductAutomationCrossSectionGenerationStatus {
 pub(super) enum ProductAutomationCrossSectionScheduleStatus {
     MissingViewport,
     Loading,
+    Empty,
     Ready,
     Current,
     Coarse,
@@ -645,6 +615,7 @@ impl From<ProductAutomationCrossSectionScheduleStatus> for CrossSectionPanelSche
         match value {
             ProductAutomationCrossSectionScheduleStatus::MissingViewport => Self::MissingViewport,
             ProductAutomationCrossSectionScheduleStatus::Loading => Self::Loading,
+            ProductAutomationCrossSectionScheduleStatus::Empty => Self::Empty,
             ProductAutomationCrossSectionScheduleStatus::Ready => Self::Ready,
             ProductAutomationCrossSectionScheduleStatus::Current => Self::Current,
             ProductAutomationCrossSectionScheduleStatus::Coarse => Self::Coarse,

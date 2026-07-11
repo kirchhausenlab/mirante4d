@@ -1,24 +1,20 @@
 use eframe::egui;
-use glam::DVec3;
-use mirante4d_data::{VolumeBrickF32, VolumeBrickU8, VolumeBrickU16, VolumeRegion};
-use mirante4d_domain::{IntensityDType, Shape3D, ViewerLayout};
-use mirante4d_format::{CurrentGridToWorldExt, LayerId};
+use glam::{DMat4, DVec3};
+use mirante4d_dataset::DatasetCatalog;
+use mirante4d_domain::{GridToWorld, LogicalLayerKey, ScaleLevel, Shape3D, ViewerLayout};
 use mirante4d_project_model::ViewState;
 use mirante4d_render_api::PresentationViewport;
+use mirante4d_renderer::{CurrentLeaseBridge, CurrentLeaseSample};
 
 use crate::{
-    cross_section_runtime::{
-        CrossSectionChunkPayload, CrossSectionChunkState, CrossSectionPanelRuntime,
-    },
-    current_runtime::{dataset::CurrentDatasetRuntime, render::CurrentRenderRuntime},
+    cross_section_runtime::{CrossSectionPanelRuntime, CrossSectionRuntime},
     viewer_layout::{CrossSectionPanelScheduleStatus, PanelId, render_cross_section_view_state},
 };
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CrossSectionReadoutInput<'a> {
     pub(crate) view: &'a ViewState,
-    pub(crate) active_layer_id: &'a LayerId,
-    pub(crate) active_layer_dtype: IntensityDType,
+    pub(crate) catalog: &'a DatasetCatalog,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,8 +70,8 @@ pub(crate) struct CrossSectionHoverReadout {
 }
 
 pub(crate) fn cross_section_hover_readout_for_response(
-    dataset: &CurrentDatasetRuntime,
-    render: &CurrentRenderRuntime,
+    cross_section: &CrossSectionRuntime,
+    leases: &CurrentLeaseBridge,
     input: CrossSectionReadoutInput<'_>,
     panel_id: PanelId,
     presentation_viewport: PresentationViewport,
@@ -92,8 +88,8 @@ pub(crate) fn cross_section_hover_readout_for_response(
     let normalized_y =
         ((position.y - response.rect.min.y) / response.rect.height()).clamp(0.0, 1.0);
     cross_section_hover_readout_for_panel_point(
-        dataset,
-        render,
+        cross_section,
+        leases,
         input,
         panel_id,
         f64::from(normalized_x) * presentation_viewport.width_points(),
@@ -103,8 +99,8 @@ pub(crate) fn cross_section_hover_readout_for_response(
 }
 
 pub(crate) fn cross_section_hover_readout_for_panel_point(
-    dataset: &CurrentDatasetRuntime,
-    render: &CurrentRenderRuntime,
+    cross_section: &CrossSectionRuntime,
+    leases: &CurrentLeaseBridge,
     input: CrossSectionReadoutInput<'_>,
     panel_id: PanelId,
     x_points: f64,
@@ -115,8 +111,9 @@ pub(crate) fn cross_section_hover_readout_for_panel_point(
         return None;
     }
     let panel = panel_id.cross_section_panel()?;
-    let panel_runtime = render.cross_section_runtime.panel(panel_id)?;
-    let layer_id = input.active_layer_id.clone();
+    let panel_runtime = cross_section.panel(panel_id)?;
+    let layer_key = input.view.active_layer();
+    let layer_id = logical_layer_id(layer_key);
     let timepoint = input.view.timepoint();
     let unavailable_generation = ReadoutGeneration::for_panel(
         panel_runtime,
@@ -127,7 +124,7 @@ pub(crate) fn cross_section_hover_readout_for_panel_point(
     let Some(schedule) = panel_runtime.cross_section_schedule else {
         return Some(unmapped_readout(
             panel_id,
-            layer_id,
+            &layer_id,
             timepoint.get(),
             unavailable_generation,
             CrossSectionHoverStatus::Unavailable,
@@ -142,7 +139,7 @@ pub(crate) fn cross_section_hover_readout_for_panel_point(
     let Some(scale_level) = schedule.render_scale_level.or(schedule.target_scale_level) else {
         return Some(unmapped_readout(
             panel_id,
-            layer_id,
+            &layer_id,
             timepoint.get(),
             unavailable_generation,
             schedule_status_for_missing_value(schedule.status),
@@ -150,42 +147,34 @@ pub(crate) fn cross_section_hover_readout_for_panel_point(
         ));
     };
 
-    let layer_id_typed = layer_id.clone();
-    let grid_to_world = match dataset
-        .dataset
-        .scale_grid_to_world(&layer_id_typed, scale_level)
-    {
-        Ok(transform) => transform,
-        Err(_) => {
-            return Some(unmapped_readout(
-                panel_id,
-                layer_id,
-                timepoint.get(),
-                unavailable_generation,
-                CrossSectionHoverStatus::Unavailable,
-                "unavailable (missing scale transform)",
-            ));
-        }
+    let Some(layer) = input.catalog.layer(layer_key) else {
+        return Some(unmapped_readout(
+            panel_id,
+            &layer_id,
+            timepoint.get(),
+            unavailable_generation,
+            CrossSectionHoverStatus::Unavailable,
+            "unavailable (missing logical layer)",
+        ));
     };
-    let scale_shape = match dataset.dataset.scale_shape(&layer_id_typed, scale_level) {
-        Ok(shape) => shape,
-        Err(_) => {
-            return Some(unmapped_readout(
-                panel_id,
-                layer_id,
-                timepoint.get(),
-                unavailable_generation,
-                CrossSectionHoverStatus::Unavailable,
-                "unavailable (missing scale shape)",
-            ));
-        }
+    let Some(scale) = layer.scale(ScaleLevel::new(scale_level)) else {
+        return Some(unmapped_readout(
+            panel_id,
+            &layer_id,
+            timepoint.get(),
+            unavailable_generation,
+            CrossSectionHoverStatus::Unavailable,
+            "unavailable (missing scale metadata)",
+        ));
     };
-    let world_to_grid = match grid_to_world.inverse() {
-        Ok(transform) => transform,
-        Err(_) => {
+    let grid_to_world = scale.grid_to_world();
+    let scale_shape = scale.shape();
+    let world_to_grid = match inverse_grid_to_world(grid_to_world) {
+        Some(transform) => transform,
+        None => {
             return Some(unmapped_readout(
                 panel_id,
-                layer_id,
+                &layer_id,
                 timepoint.get(),
                 unavailable_generation,
                 CrossSectionHoverStatus::Unavailable,
@@ -196,11 +185,11 @@ pub(crate) fn cross_section_hover_readout_for_panel_point(
 
     let view = render_cross_section_view_state(*input.view.cross_section()).view(panel);
     let world = view.world_point_for_panel_point(x_points, y_points, presentation_viewport);
-    let grid = world_to_grid.transform_point(world);
+    let grid = world_to_grid.transform_point3(world);
     let Some(index) = nearest_grid_index(grid, scale_shape) else {
         return Some(mapped_status_readout(
             panel_id,
-            layer_id,
+            &layer_id,
             timepoint.get(),
             Some(scale_level),
             unavailable_generation,
@@ -219,7 +208,7 @@ pub(crate) fn cross_section_hover_readout_for_panel_point(
     {
         return Some(mapped_status_readout(
             panel_id,
-            layer_id,
+            &layer_id,
             timepoint.get(),
             Some(scale_level),
             unavailable_generation,
@@ -238,7 +227,7 @@ pub(crate) fn cross_section_hover_readout_for_panel_point(
         );
         return Some(mapped_status_readout(
             panel_id,
-            layer_id,
+            &layer_id,
             timepoint.get(),
             Some(scale_level),
             generation,
@@ -272,7 +261,7 @@ pub(crate) fn cross_section_hover_readout_for_panel_point(
         );
         return Some(mapped_status_readout(
             panel_id,
-            layer_id,
+            &layer_id,
             timepoint.get(),
             Some(scale_level),
             generation,
@@ -291,18 +280,16 @@ pub(crate) fn cross_section_hover_readout_for_panel_point(
     );
 
     match sample_resident_value(
-        dataset,
-        render,
-        panel_id,
-        input.active_layer_id,
-        input.active_layer_dtype,
+        leases,
+        input.catalog,
+        layer_key,
         timepoint,
         scale_level,
         index,
     ) {
         ResidentSample::Value(value) => Some(mapped_value_readout(
             panel_id,
-            layer_id,
+            &layer_id,
             timepoint.get(),
             scale_level,
             current_displayed_generation,
@@ -313,7 +300,7 @@ pub(crate) fn cross_section_hover_readout_for_panel_point(
         )),
         ResidentSample::Missing => Some(mapped_status_readout(
             panel_id,
-            layer_id,
+            &layer_id,
             timepoint.get(),
             Some(scale_level),
             current_displayed_generation,
@@ -325,7 +312,7 @@ pub(crate) fn cross_section_hover_readout_for_panel_point(
         )),
         ResidentSample::InvalidNoData => Some(mapped_status_readout(
             panel_id,
-            layer_id,
+            &layer_id,
             timepoint.get(),
             Some(scale_level),
             current_displayed_generation,
@@ -338,6 +325,7 @@ pub(crate) fn cross_section_hover_readout_for_panel_point(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum ResidentSample {
     Value(CrossSectionHoverValue),
     Missing,
@@ -369,138 +357,33 @@ impl ReadoutGeneration {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn sample_resident_value(
-    dataset: &CurrentDatasetRuntime,
-    render: &CurrentRenderRuntime,
-    panel_id: PanelId,
-    layer_id: &LayerId,
-    dtype: IntensityDType,
+    leases: &CurrentLeaseBridge,
+    catalog: &DatasetCatalog,
+    layer: LogicalLayerKey,
     timepoint: mirante4d_domain::TimeIndex,
     scale_level: u32,
     index: CrossSectionGridIndex,
 ) -> ResidentSample {
-    let Some(panel_runtime) = render.cross_section_runtime.panels.get(&panel_id) else {
-        return ResidentSample::Missing;
-    };
-    for key in &panel_runtime.visible_chunks {
-        if &key.dataset_id != dataset.dataset.dataset_id()
-            || &key.layer_id != layer_id
-            || key.timepoint != timepoint
-            || key.scale_level != scale_level
-        {
-            continue;
+    let resident = leases.resident_set(
+        catalog.scientific_identity().resource_identity(),
+        layer,
+        timepoint,
+        ScaleLevel::new(scale_level),
+    );
+    match resident.sample([index.z, index.y, index.x]) {
+        CurrentLeaseSample::Uint8(value) => {
+            ResidentSample::Value(CrossSectionHoverValue::U8(value))
         }
-        let Some(entry) = render.cross_section_runtime.chunks.get(key) else {
-            continue;
-        };
-        if !matches!(
-            entry.state,
-            CrossSectionChunkState::CpuResident
-                | CrossSectionChunkState::UploadQueued
-                | CrossSectionChunkState::GpuResident
-        ) {
-            continue;
+        CurrentLeaseSample::Uint16(value) => {
+            ResidentSample::Value(CrossSectionHoverValue::U16(value))
         }
-        let sample = match (dtype, entry.payload.as_ref()) {
-            (IntensityDType::Uint8, Some(CrossSectionChunkPayload::U8(brick))) => sample_u8_bricks(
-                std::slice::from_ref(brick.as_ref()),
-                timepoint,
-                scale_level,
-                index,
-            ),
-            (IntensityDType::Uint16, Some(CrossSectionChunkPayload::U16(brick))) => {
-                sample_u16_bricks(
-                    std::slice::from_ref(brick.as_ref()),
-                    timepoint,
-                    scale_level,
-                    index,
-                )
-            }
-            (IntensityDType::Float32, Some(CrossSectionChunkPayload::F32(brick))) => {
-                sample_f32_bricks(
-                    std::slice::from_ref(brick.as_ref()),
-                    timepoint,
-                    scale_level,
-                    index,
-                )
-            }
-            _ => ResidentSample::Missing,
-        };
-        if !matches!(sample, ResidentSample::Missing) {
-            return sample;
+        CurrentLeaseSample::Float32(value) => {
+            ResidentSample::Value(CrossSectionHoverValue::F32(value))
         }
+        CurrentLeaseSample::InvalidNoData => ResidentSample::InvalidNoData,
+        CurrentLeaseSample::Missing => ResidentSample::Missing,
     }
-    ResidentSample::Missing
-}
-
-fn sample_u8_bricks(
-    bricks: &[VolumeBrickU8],
-    timepoint: mirante4d_domain::TimeIndex,
-    scale_level: u32,
-    index: CrossSectionGridIndex,
-) -> ResidentSample {
-    let Some(brick) = bricks.iter().find(|brick| {
-        brick.scale_level == scale_level
-            && brick.volume.timepoint == timepoint
-            && region_contains(brick.region, index)
-    }) else {
-        return ResidentSample::Missing;
-    };
-    if !brick.occupied || brick.valid_voxel_count == 0 {
-        return ResidentSample::InvalidNoData;
-    }
-    let (z, y, x) = local_zyx(brick.region, index);
-    brick
-        .render_voxel(z, y, x)
-        .map(|value| ResidentSample::Value(CrossSectionHoverValue::U8(value)))
-        .unwrap_or(ResidentSample::InvalidNoData)
-}
-
-fn sample_u16_bricks(
-    bricks: &[VolumeBrickU16],
-    timepoint: mirante4d_domain::TimeIndex,
-    scale_level: u32,
-    index: CrossSectionGridIndex,
-) -> ResidentSample {
-    let Some(brick) = bricks.iter().find(|brick| {
-        brick.scale_level == scale_level
-            && brick.volume.timepoint == timepoint
-            && region_contains(brick.region, index)
-    }) else {
-        return ResidentSample::Missing;
-    };
-    if !brick.occupied || brick.valid_voxel_count == 0 {
-        return ResidentSample::InvalidNoData;
-    }
-    let (z, y, x) = local_zyx(brick.region, index);
-    brick
-        .render_voxel(z, y, x)
-        .map(|value| ResidentSample::Value(CrossSectionHoverValue::U16(value)))
-        .unwrap_or(ResidentSample::InvalidNoData)
-}
-
-fn sample_f32_bricks(
-    bricks: &[VolumeBrickF32],
-    timepoint: mirante4d_domain::TimeIndex,
-    scale_level: u32,
-    index: CrossSectionGridIndex,
-) -> ResidentSample {
-    let Some(brick) = bricks.iter().find(|brick| {
-        brick.scale_level == scale_level
-            && brick.volume.timepoint == timepoint
-            && region_contains(brick.region, index)
-    }) else {
-        return ResidentSample::Missing;
-    };
-    if !brick.occupied || brick.valid_voxel_count == 0 {
-        return ResidentSample::InvalidNoData;
-    }
-    let (z, y, x) = local_zyx(brick.region, index);
-    brick
-        .render_voxel(z, y, x)
-        .map(|value| ResidentSample::Value(CrossSectionHoverValue::F32(value)))
-        .unwrap_or(ResidentSample::InvalidNoData)
 }
 
 fn nearest_grid_index(grid: DVec3, shape: Shape3D) -> Option<CrossSectionGridIndex> {
@@ -531,21 +414,22 @@ fn nearest_i64(value: f64) -> Option<i64> {
     }
 }
 
-fn region_contains(region: VolumeRegion, index: CrossSectionGridIndex) -> bool {
-    index.z >= region.z_start
-        && index.y >= region.y_start
-        && index.x >= region.x_start
-        && index.z < region.z_start.saturating_add(region.z_size)
-        && index.y < region.y_start.saturating_add(region.y_size)
-        && index.x < region.x_start.saturating_add(region.x_size)
+fn inverse_grid_to_world(transform: GridToWorld) -> Option<DMat4> {
+    let row_major = transform.row_major();
+    let mut column_major = [0.0; 16];
+    for row in 0..4 {
+        for column in 0..4 {
+            column_major[column * 4 + row] = row_major[row * 4 + column];
+        }
+    }
+    let matrix = DMat4::from_cols_array(&column_major);
+    let inverse = matrix.inverse();
+    (inverse.is_finite() && (matrix * inverse).abs_diff_eq(DMat4::IDENTITY, 1.0e-9))
+        .then_some(inverse)
 }
 
-fn local_zyx(region: VolumeRegion, index: CrossSectionGridIndex) -> (u64, u64, u64) {
-    (
-        index.z - region.z_start,
-        index.y - region.y_start,
-        index.x - region.x_start,
-    )
+fn logical_layer_id(layer: LogicalLayerKey) -> String {
+    format!("layer-{}", layer.ordinal())
 }
 
 fn schedule_status_for_missing_value(
@@ -553,6 +437,7 @@ fn schedule_status_for_missing_value(
 ) -> CrossSectionHoverStatus {
     match status {
         CrossSectionPanelScheduleStatus::Loading => CrossSectionHoverStatus::Loading,
+        CrossSectionPanelScheduleStatus::Empty => CrossSectionHoverStatus::Outside,
         CrossSectionPanelScheduleStatus::Incomplete => CrossSectionHoverStatus::Incomplete,
         CrossSectionPanelScheduleStatus::Coarse
         | CrossSectionPanelScheduleStatus::Current
@@ -565,22 +450,23 @@ fn schedule_status_for_missing_value(
 
 fn missing_resident_label(status: CrossSectionPanelScheduleStatus) -> &'static str {
     match status {
-        CrossSectionPanelScheduleStatus::Loading => "loading (resident brick unavailable)",
-        CrossSectionPanelScheduleStatus::Incomplete => "incomplete (resident brick unavailable)",
+        CrossSectionPanelScheduleStatus::Loading => "loading (resident data unavailable)",
+        CrossSectionPanelScheduleStatus::Empty => "outside selected data",
+        CrossSectionPanelScheduleStatus::Incomplete => "incomplete (resident data unavailable)",
         CrossSectionPanelScheduleStatus::BudgetLimited => {
-            "budget limited (resident brick unavailable)"
+            "budget limited (resident data unavailable)"
         }
         CrossSectionPanelScheduleStatus::MissingViewport => "unavailable (missing panel viewport)",
         CrossSectionPanelScheduleStatus::Unavailable => "unavailable",
         CrossSectionPanelScheduleStatus::Ready
         | CrossSectionPanelScheduleStatus::Current
-        | CrossSectionPanelScheduleStatus::Coarse => "loading (resident brick unavailable)",
+        | CrossSectionPanelScheduleStatus::Coarse => "loading (resident data unavailable)",
     }
 }
 
 fn unmapped_readout(
     panel_id: PanelId,
-    layer_id: LayerId,
+    layer_id: &str,
     timepoint: u64,
     generation: ReadoutGeneration,
     status: CrossSectionHoverStatus,
@@ -595,7 +481,7 @@ fn unmapped_readout(
             label
         ),
         panel_id,
-        layer_id: layer_id.to_string(),
+        layer_id: layer_id.to_owned(),
         timepoint,
         scale_level: None,
         target_generation: generation.target_generation,
@@ -614,7 +500,7 @@ fn unmapped_readout(
 #[allow(clippy::too_many_arguments)]
 fn mapped_value_readout(
     panel_id: PanelId,
-    layer_id: LayerId,
+    layer_id: &str,
     timepoint: u64,
     scale_level: u32,
     generation: ReadoutGeneration,
@@ -637,7 +523,7 @@ fn mapped_value_readout(
     CrossSectionHoverReadout {
         text,
         panel_id,
-        layer_id: layer_id.to_string(),
+        layer_id: layer_id.to_owned(),
         timepoint,
         scale_level: Some(scale_level),
         target_generation: generation.target_generation,
@@ -656,7 +542,7 @@ fn mapped_value_readout(
 #[allow(clippy::too_many_arguments)]
 fn mapped_status_readout(
     panel_id: PanelId,
-    layer_id: LayerId,
+    layer_id: &str,
     timepoint: u64,
     scale_level: Option<u32>,
     generation: ReadoutGeneration,
@@ -686,7 +572,7 @@ fn mapped_status_readout(
     CrossSectionHoverReadout {
         text,
         panel_id,
-        layer_id: layer_id.to_string(),
+        layer_id: layer_id.to_owned(),
         timepoint,
         scale_level,
         target_generation: generation.target_generation,
@@ -715,5 +601,128 @@ fn format_value(value: CrossSectionHoverValue) -> String {
         CrossSectionHoverValue::U8(value) => value.to_string(),
         CrossSectionHoverValue::U16(value) => value.to_string(),
         CrossSectionHoverValue::F32(value) => format!("{value:.6}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use mirante4d_dataset::{
+        DatasetLayer, DatasetResourceKey, DatasetSourceId, ResourceLease,
+        ResourcePayloadDescriptor, ResourcePayloadView, ResourceRegion, ResourceValidity,
+        ScientificIdentityStatus,
+    };
+    use mirante4d_domain::{IntensityDType, Shape4D, TimeIndex};
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct FixtureLease {
+        key: DatasetResourceKey,
+        descriptor: ResourcePayloadDescriptor,
+        values: Box<[u8]>,
+        validity: Box<[u8]>,
+    }
+
+    impl ResourceLease for FixtureLease {
+        fn key(&self) -> DatasetResourceKey {
+            self.key
+        }
+
+        fn payload(&self) -> ResourcePayloadView<'_> {
+            self.descriptor
+                .view(&self.values, Some(&self.validity))
+                .expect("fixture payload remains valid")
+        }
+    }
+
+    fn fixture() -> (DatasetCatalog, CurrentLeaseBridge) {
+        let source_id = DatasetSourceId::new(7);
+        let layer_key = LogicalLayerKey::new(0);
+        let layer = DatasetLayer::new(
+            layer_key,
+            "channel",
+            Shape4D::new(2, 1, 1, 2).unwrap(),
+            IntensityDType::Uint16,
+            GridToWorld::identity(),
+            ResourceValidity::BitMask,
+        )
+        .unwrap();
+        let catalog = DatasetCatalog::new(
+            "dataset",
+            ScientificIdentityStatus::Unverified(source_id),
+            vec![layer],
+        )
+        .unwrap();
+        let key = DatasetResourceKey::new(
+            catalog.scientific_identity().resource_identity(),
+            layer_key,
+            TimeIndex::new(0),
+            ScaleLevel::BASE,
+            ResourceRegion::new([0, 0, 0], Shape3D::new(1, 1, 2).unwrap()).unwrap(),
+        );
+        let descriptor = catalog.resource_payload_descriptor(key).unwrap();
+        let values = [0_u16, 41]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let validity = vec![0b0000_0001].into_boxed_slice();
+        let lease = Arc::new(FixtureLease {
+            key,
+            descriptor,
+            values,
+            validity,
+        });
+        let mut bridge = CurrentLeaseBridge::new();
+        bridge.replace_current_requirements([key]).unwrap();
+        bridge.install(lease).unwrap();
+        (catalog, bridge)
+    }
+
+    #[test]
+    fn resident_sampling_distinguishes_valid_zero_from_invalid_no_data() {
+        let (catalog, bridge) = fixture();
+
+        assert_eq!(
+            sample_resident_value(
+                &bridge,
+                &catalog,
+                LogicalLayerKey::new(0),
+                TimeIndex::new(0),
+                0,
+                CrossSectionGridIndex { x: 0, y: 0, z: 0 },
+            ),
+            ResidentSample::Value(CrossSectionHoverValue::U16(0))
+        );
+        assert_eq!(
+            sample_resident_value(
+                &bridge,
+                &catalog,
+                LogicalLayerKey::new(0),
+                TimeIndex::new(0),
+                0,
+                CrossSectionGridIndex { x: 1, y: 0, z: 0 },
+            ),
+            ResidentSample::InvalidNoData
+        );
+    }
+
+    #[test]
+    fn resident_sampling_requires_the_exact_semantic_lease() {
+        let (catalog, bridge) = fixture();
+
+        assert_eq!(
+            sample_resident_value(
+                &bridge,
+                &catalog,
+                LogicalLayerKey::new(0),
+                TimeIndex::new(1),
+                0,
+                CrossSectionGridIndex { x: 0, y: 0, z: 0 },
+            ),
+            ResidentSample::Missing
+        );
     }
 }

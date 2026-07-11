@@ -42,24 +42,6 @@ pub(super) fn brick_record(
         })
 }
 
-pub(super) fn brick_record_and_region(
-    layer_id: &LayerId,
-    scale: &ScaleManifest,
-    timepoint: TimeIndex,
-    brick_index: SpatialBrickIndex,
-) -> Result<(BrickIndex, BrickRecord, VolumeRegion), DataError> {
-    validate_spatial_brick_index(scale, brick_index)?;
-    let chunk_index = BrickIndex {
-        t: timepoint.get() / scale.storage.brick_shape.t(),
-        z: brick_index.z,
-        y: brick_index.y,
-        x: brick_index.x,
-    };
-    let record = brick_record(layer_id, scale, chunk_index)?;
-    let region = brick_region(scale, brick_index)?;
-    Ok((chunk_index, record, region))
-}
-
 pub(super) fn brick_region(
     scale: &ScaleManifest,
     brick_index: SpatialBrickIndex,
@@ -77,37 +59,6 @@ pub(super) fn brick_region(
         brick_shape.y().min(spatial.y() - y_start),
         brick_shape.x().min(spatial.x() - x_start),
     )
-}
-
-pub(super) fn validate_region_within_brick(
-    region: VolumeRegion,
-    brick_region: VolumeRegion,
-) -> Result<(), DataError> {
-    let ends = region.ends()?;
-    let brick_ends = brick_region.ends()?;
-    if region.z_start < brick_region.z_start
-        || region.y_start < brick_region.y_start
-        || region.x_start < brick_region.x_start
-        || ends.z > brick_ends.z
-        || ends.y > brick_ends.y
-        || ends.x > brick_ends.x
-    {
-        return Err(DataError::BrickRegionOutOfBounds {
-            z_start: region.z_start,
-            z_end: ends.z,
-            y_start: region.y_start,
-            y_end: ends.y,
-            x_start: region.x_start,
-            x_end: ends.x,
-            brick_z_start: brick_region.z_start,
-            brick_z_end: brick_ends.z,
-            brick_y_start: brick_region.y_start,
-            brick_y_end: brick_ends.y,
-            brick_x_start: brick_region.x_start,
-            brick_x_end: brick_ends.x,
-        });
-    }
-    Ok(())
 }
 
 pub(super) fn validate_timepoint(

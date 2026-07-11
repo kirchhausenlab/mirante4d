@@ -1,7 +1,7 @@
 use std::{collections::HashMap, time::Instant};
 
 use bytemuck::cast_slice;
-use mirante4d_data::SpatialBrickIndex;
+use mirante4d_dataset::{CpuByteLedger, ResourceRegion};
 use mirante4d_domain::Shape3D;
 use mirante4d_format::CurrentGridToWorldExt;
 use mirante4d_render_api::PresentationViewport;
@@ -23,8 +23,8 @@ use super::{
     duration_ns_u64,
 };
 use crate::{
-    CrossSectionPanelBounds, CrossSectionView, IntensityTransfer, RenderError, RenderViewport,
-    ResidentBrickSetF32, ResidentBrickSetU8, ResidentBrickSetU16,
+    CrossSectionPanelBounds, CrossSectionView, CurrentLeaseVolume, IntensityTransfer, RenderError,
+    RenderViewport,
 };
 
 const CROSS_SECTION_PARAMS_U32_WORDS: usize = 17;
@@ -45,31 +45,25 @@ struct CrossSectionF32Params {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GpuCrossSectionChunkDraw {
-    pub brick_index: SpatialBrickIndex,
+    pub resource_region: ResourceRegion,
     pub panel_bounds: CrossSectionPanelBounds,
     pub vertex_count: u32,
     pub cache_priority: GpuBrickAtlasPagePriority,
 }
 
-pub enum GpuCrossSectionChunkDisplayChannel<'a> {
+pub enum GpuLeaseCrossSectionChannel<'a> {
     U8 {
-        resident: &'a ResidentBrickSetU8,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'a>,
         transfer: IntensityTransfer,
         chunks: &'a [GpuCrossSectionChunkDraw],
     },
     U16 {
-        resident: &'a ResidentBrickSetU16,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'a>,
         transfer: IntensityTransfer,
         chunks: &'a [GpuCrossSectionChunkDraw],
     },
     F32 {
-        resident: &'a ResidentBrickSetF32,
-        brick_shape: Shape3D,
-        brick_grid_shape: Shape3D,
+        volume: CurrentLeaseVolume<'a>,
         transfer: IntensityTransfer,
         chunks: &'a [GpuCrossSectionChunkDraw],
     },
@@ -110,11 +104,11 @@ struct GpuChunkedF32CameraOutputBuffer {
 
 fn cross_section_chunk_page_priorities(
     chunks: &[GpuCrossSectionChunkDraw],
-) -> HashMap<SpatialBrickIndex, GpuBrickAtlasPagePriority> {
+) -> HashMap<ResourceRegion, GpuBrickAtlasPagePriority> {
     let mut priorities = HashMap::with_capacity(chunks.len());
     for chunk in chunks {
         priorities
-            .entry(chunk.brick_index)
+            .entry(chunk.resource_region)
             .and_modify(|existing| {
                 if page_priority_is_better(chunk.cache_priority, *existing) {
                     *existing = chunk.cache_priority;
@@ -258,6 +252,7 @@ fn cross_section_f32_params(
 
 fn cross_section_chunk_dispatch_plan(
     chunks: &[GpuCrossSectionChunkDraw],
+    resource_shape: Shape3D,
     presentation_viewport: PresentationViewport,
     render_viewport: RenderViewport,
 ) -> Result<CrossSectionChunkDispatchPlan, GpuRenderError> {
@@ -274,9 +269,19 @@ fn cross_section_chunk_dispatch_plan(
         ) else {
             continue;
         };
-        let z = checked_u32("chunk_z", chunk.brick_index.z)?;
-        let y = checked_u32("chunk_y", chunk.brick_index.y)?;
-        let x = checked_u32("chunk_x", chunk.brick_index.x)?;
+        let origin = chunk.resource_region.origin();
+        if origin[0] % resource_shape.z() != 0
+            || origin[1] % resource_shape.y() != 0
+            || origin[2] % resource_shape.x() != 0
+        {
+            return Err(RenderError::InvalidBrickAtlas(
+                "cross-section resource region is not aligned to its semantic grid",
+            )
+            .into());
+        }
+        let z = checked_u32("chunk_z", origin[0] / resource_shape.z())?;
+        let y = checked_u32("chunk_y", origin[1] / resource_shape.y())?;
+        let x = checked_u32("chunk_x", origin[2] / resource_shape.x())?;
         words.extend_from_slice(&[
             z,
             y,
@@ -340,9 +345,10 @@ fn cross_section_chunk_pixel_bounds(
 }
 
 impl GpuRenderer {
-    pub fn render_cross_section_chunked_channels_to_display_texture(
+    pub fn render_lease_cross_section_channels_to_display_texture(
         &self,
-        channels: &[GpuCrossSectionChunkDisplayChannel<'_>],
+        cpu_ledger: &dyn CpuByteLedger,
+        channels: &[GpuLeaseCrossSectionChannel<'_>],
         view: CrossSectionView,
         presentation_viewport: PresentationViewport,
         render_viewport: RenderViewport,
@@ -423,14 +429,12 @@ impl GpuRenderer {
                 channel_draws,
                 channel_vertices,
             ) = match channel {
-                GpuCrossSectionChunkDisplayChannel::U8 {
-                    resident,
-                    brick_shape,
-                    brick_grid_shape,
+                GpuLeaseCrossSectionChannel::U8 {
+                    volume,
                     transfer,
                     chunks,
                 } => {
-                    if resident.bricks().is_empty() {
+                    if volume.resident().is_empty() {
                         return Err(RenderError::InvalidBrickAtlas(
                                 "resident uint8 brick set is empty for chunked cross-section display render",
                             )
@@ -439,9 +443,8 @@ impl GpuRenderer {
                     let upload_started = Instant::now();
                     let page_priorities = cross_section_chunk_page_priorities(chunks);
                     let atlas = self.cached_brick_atlas_u8_with_page_priorities(
-                        resident,
-                        *brick_shape,
-                        *brick_grid_shape,
+                        *volume,
+                        cpu_ledger,
                         &page_priorities,
                     )?;
                     let upload_timings = GpuRenderTimings {
@@ -449,8 +452,8 @@ impl GpuRenderer {
                         ..Default::default()
                     };
                     let output = self.render_cross_section_integer_chunk_atlas_output_buffer(
-                        resident.volume_shape,
-                        resident.grid_to_world,
+                        volume.volume_shape(),
+                        volume.grid_to_world(),
                         atlas,
                         upload_timings,
                         view,
@@ -469,14 +472,12 @@ impl GpuRenderer {
                         output.vertex_count,
                     )
                 }
-                GpuCrossSectionChunkDisplayChannel::U16 {
-                    resident,
-                    brick_shape,
-                    brick_grid_shape,
+                GpuLeaseCrossSectionChannel::U16 {
+                    volume,
                     transfer,
                     chunks,
                 } => {
-                    if resident.bricks().is_empty() {
+                    if volume.resident().is_empty() {
                         return Err(RenderError::InvalidBrickAtlas(
                                 "resident uint16 brick set is empty for chunked cross-section display render",
                             )
@@ -485,9 +486,8 @@ impl GpuRenderer {
                     let upload_started = Instant::now();
                     let page_priorities = cross_section_chunk_page_priorities(chunks);
                     let atlas = self.cached_brick_atlas_with_page_priorities(
-                        resident,
-                        *brick_shape,
-                        *brick_grid_shape,
+                        *volume,
+                        cpu_ledger,
                         &page_priorities,
                     )?;
                     let upload_timings = GpuRenderTimings {
@@ -495,8 +495,8 @@ impl GpuRenderer {
                         ..Default::default()
                     };
                     let output = self.render_cross_section_integer_chunk_atlas_output_buffer(
-                        resident.volume_shape,
-                        resident.grid_to_world,
+                        volume.volume_shape(),
+                        volume.grid_to_world(),
                         atlas,
                         upload_timings,
                         view,
@@ -515,14 +515,12 @@ impl GpuRenderer {
                         output.vertex_count,
                     )
                 }
-                GpuCrossSectionChunkDisplayChannel::F32 {
-                    resident,
-                    brick_shape,
-                    brick_grid_shape,
+                GpuLeaseCrossSectionChannel::F32 {
+                    volume,
                     transfer,
                     chunks,
                 } => {
-                    if resident.bricks().is_empty() {
+                    if volume.resident().is_empty() {
                         return Err(RenderError::InvalidBrickAtlas(
                             "resident float32 brick set is empty for chunked cross-section display render",
                         )
@@ -531,9 +529,8 @@ impl GpuRenderer {
                     let upload_started = Instant::now();
                     let page_priorities = cross_section_chunk_page_priorities(chunks);
                     let atlas = self.cached_brick_atlas_f32_with_page_priorities(
-                        resident,
-                        *brick_shape,
-                        *brick_grid_shape,
+                        *volume,
+                        cpu_ledger,
                         &page_priorities,
                     )?;
                     let upload_timings = GpuRenderTimings {
@@ -541,8 +538,8 @@ impl GpuRenderer {
                         ..Default::default()
                     };
                     let output = self.render_cross_section_f32_chunk_atlas_output_buffer(
-                        resident.volume_shape,
-                        resident.grid_to_world,
+                        volume.volume_shape(),
+                        volume.grid_to_world(),
                         atlas,
                         upload_timings,
                         view,
@@ -740,8 +737,12 @@ impl GpuRenderer {
             "chunked cross-section integer display output",
             output_bytes,
         )?;
-        let dispatch_plan =
-            cross_section_chunk_dispatch_plan(chunks, presentation_viewport, render_viewport)?;
+        let dispatch_plan = cross_section_chunk_dispatch_plan(
+            chunks,
+            atlas.brick_shape,
+            presentation_viewport,
+            render_viewport,
+        )?;
         if dispatch_plan.draw_calls == 0 {
             return Err(RenderError::InvalidBrickAtlas(
                 "chunked cross-section display has no visible chunk draw bounds",
@@ -877,8 +878,12 @@ impl GpuRenderer {
             "chunked cross-section f32 display output",
             output_bytes,
         )?;
-        let dispatch_plan =
-            cross_section_chunk_dispatch_plan(chunks, presentation_viewport, render_viewport)?;
+        let dispatch_plan = cross_section_chunk_dispatch_plan(
+            chunks,
+            atlas.brick_shape,
+            presentation_viewport,
+            render_viewport,
+        )?;
         if dispatch_plan.draw_calls == 0 {
             return Err(RenderError::InvalidBrickAtlas(
                 "chunked float32 cross-section display has no visible chunk draw bounds",
@@ -1024,380 +1029,5 @@ impl GpuRenderer {
             draw_calls: dispatch_plan.draw_calls,
             vertex_count: dispatch_plan.vertex_count,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use glam::{DQuat, DVec2, DVec3};
-    use mirante4d_data::{
-        DenseVolumeF32, DenseVolumeU8, SpatialBrickIndex, VolumeBrickF32, VolumeBrickU8,
-        VolumeRegion,
-    };
-    use mirante4d_domain::{
-        DisplayWindow, GridToWorld, LayerTransfer, Opacity, RgbColor, Shape3D, TimeIndex,
-        TransferCurve,
-    };
-    use mirante4d_format::{BrickIndex, DatasetId, LayerId};
-    use mirante4d_render_api::PresentationViewport;
-
-    use super::*;
-    use crate::{CrossSectionPanel, ResidentBrickSetF32, ResidentBrickSetU8};
-
-    fn linear_color_transfer(color_rgba: [f32; 4], window_high: f32) -> IntensityTransfer {
-        let [red, green, blue, _alpha] = color_rgba;
-        IntensityTransfer::new(
-            true,
-            LayerTransfer::new(
-                DisplayWindow::new(0.0, window_high).unwrap(),
-                RgbColor::new([red, green, blue]).unwrap(),
-                Opacity::new(1.0).unwrap(),
-                TransferCurve::linear(),
-                false,
-            ),
-        )
-    }
-
-    fn linear_white_transfer(window_high: f32) -> IntensityTransfer {
-        linear_color_transfer([1.0, 1.0, 1.0, 1.0], window_high)
-    }
-
-    fn assert_rgba_abs_diff_le(actual: &[u8], expected: &[u8], max_diff: u8) {
-        assert_eq!(actual.len(), expected.len());
-        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
-            let diff = actual.abs_diff(expected);
-            assert!(
-                diff <= max_diff,
-                "RGBA byte {index} differs by {diff}: actual={actual}, expected={expected}, max_diff={max_diff}"
-            );
-        }
-    }
-
-    #[test]
-    fn chunk_pixel_bounds_clamp_and_expand_panel_bounds() {
-        let bounds = CrossSectionPanelBounds {
-            min_points: DVec2::new(1.0, 2.0),
-            max_points: DVec2::new(5.0, 7.0),
-        };
-
-        let pixel_bounds = cross_section_chunk_pixel_bounds(
-            bounds,
-            PresentationViewport::new(10.0, 10.0).unwrap(),
-            RenderViewport::new(100, 50).unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            pixel_bounds,
-            CrossSectionChunkPixelBounds {
-                min_x: 9,
-                min_y: 9,
-                max_x: 51,
-                max_y: 36,
-            }
-        );
-    }
-
-    #[test]
-    fn chunk_dispatch_plan_serializes_visible_draws() {
-        let chunks = [
-            GpuCrossSectionChunkDraw {
-                brick_index: SpatialBrickIndex::new(2, 3, 4),
-                panel_bounds: CrossSectionPanelBounds {
-                    min_points: DVec2::new(1.0, 1.0),
-                    max_points: DVec2::new(3.0, 3.0),
-                },
-                vertex_count: 4,
-                cache_priority: GpuBrickAtlasPagePriority::default(),
-            },
-            GpuCrossSectionChunkDraw {
-                brick_index: SpatialBrickIndex::new(5, 6, 7),
-                panel_bounds: CrossSectionPanelBounds {
-                    min_points: DVec2::new(8.0, 8.0),
-                    max_points: DVec2::new(30.0, 30.0),
-                },
-                vertex_count: 6,
-                cache_priority: GpuBrickAtlasPagePriority::default(),
-            },
-        ];
-
-        let plan = cross_section_chunk_dispatch_plan(
-            &chunks,
-            PresentationViewport::new(10.0, 10.0).unwrap(),
-            RenderViewport::new(20, 20).unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(plan.draw_calls, 2);
-        assert_eq!(plan.vertex_count, 10);
-        assert_eq!(plan.words.len(), CROSS_SECTION_CHUNK_DRAW_WORDS * 2);
-        assert_eq!(&plan.words[0..8], &[2, 3, 4, 1, 1, 7, 7, 4]);
-        assert_eq!(&plan.words[8..16], &[5, 6, 7, 15, 15, 20, 20, 6]);
-        assert_eq!(plan.max_width, 6);
-        assert_eq!(plan.max_height, 6);
-    }
-
-    fn full_panel_chunk_draw(width_points: f64, height_points: f64) -> GpuCrossSectionChunkDraw {
-        GpuCrossSectionChunkDraw {
-            brick_index: SpatialBrickIndex::new(0, 0, 0),
-            panel_bounds: CrossSectionPanelBounds {
-                min_points: DVec2::ZERO,
-                max_points: DVec2::new(width_points, height_points),
-            },
-            vertex_count: 4,
-            cache_priority: GpuBrickAtlasPagePriority::default(),
-        }
-    }
-
-    #[test]
-    #[ignore = "requires a usable non-CPU GPU adapter"]
-    fn gpu_chunked_cross_section_u8_writes_display_texture() {
-        let layer_id = LayerId::new("ch0").unwrap();
-        let shape = Shape3D::new(1, 1, 4).unwrap();
-        let grid_to_world = GridToWorld::identity();
-        let volume = DenseVolumeU8::new(
-            DatasetId::new("gpu-cross-section-u8-display").unwrap(),
-            layer_id.clone(),
-            0,
-            TimeIndex::new(0),
-            shape,
-            grid_to_world,
-            vec![10, 20, 30, 40],
-        )
-        .unwrap();
-        let brick = VolumeBrickU8 {
-            scale_level: 0,
-            brick_index: SpatialBrickIndex::new(0, 0, 0),
-            chunk_index: BrickIndex {
-                t: 0,
-                z: 0,
-                y: 0,
-                x: 0,
-            },
-            region: VolumeRegion::new(0, 0, 0, 1, 1, 4).unwrap(),
-            occupied: true,
-            valid_voxel_count: 4,
-            min: 10.0,
-            max: 40.0,
-            volume,
-        };
-        let resident = ResidentBrickSetU8::new(
-            layer_id,
-            TimeIndex::new(0),
-            shape,
-            grid_to_world,
-            vec![brick],
-        );
-        let renderer = GpuRenderer::new_blocking().unwrap();
-        let chunks = [full_panel_chunk_draw(4.0, 1.0)];
-        let channels = [GpuCrossSectionChunkDisplayChannel::U8 {
-            resident: &resident,
-            brick_shape: shape,
-            brick_grid_shape: Shape3D::new(1, 1, 1).unwrap(),
-            transfer: linear_white_transfer(40.0),
-            chunks: &chunks,
-        }];
-        let frame = renderer
-            .render_cross_section_chunked_channels_to_display_texture(
-                &channels,
-                CrossSectionView::new(
-                    DVec3::new(1.5, 0.0, 0.0),
-                    CrossSectionPanel::Xy,
-                    DQuat::IDENTITY,
-                    1.0,
-                    1.0,
-                ),
-                PresentationViewport::new(4.0, 1.0).unwrap(),
-                RenderViewport::new(4, 1).unwrap(),
-            )
-            .unwrap();
-
-        assert_eq!(frame.viewport, RenderViewport::new(4, 1).unwrap());
-        assert_eq!(frame.diagnostics.channels, 1);
-        assert_eq!(frame.diagnostics.texture_bytes, 16);
-        assert_eq!(frame.diagnostics.output_bytes, 96);
-        assert_eq!(frame.diagnostics.draw_calls, 1);
-        assert_eq!(frame.diagnostics.vertex_count, 4);
-        let rgba = renderer
-            .read_display_frame_rgba_for_diagnostics(&frame)
-            .unwrap();
-        assert_rgba_abs_diff_le(
-            &rgba,
-            &[
-                64, 64, 64, 255, 128, 128, 128, 255, 191, 191, 191, 255, 255, 255, 255, 255,
-            ],
-            1,
-        );
-    }
-
-    #[test]
-    #[ignore = "requires a usable non-CPU GPU adapter"]
-    fn gpu_chunked_cross_section_u8_composites_multiple_display_channels() {
-        let layer_id = LayerId::new("ch0").unwrap();
-        let shape = Shape3D::new(1, 1, 4).unwrap();
-        let grid_to_world = GridToWorld::identity();
-        let volume = DenseVolumeU8::new(
-            DatasetId::new("gpu-cross-section-u8-multi-display").unwrap(),
-            layer_id.clone(),
-            0,
-            TimeIndex::new(0),
-            shape,
-            grid_to_world,
-            vec![10, 20, 30, 40],
-        )
-        .unwrap();
-        let brick = VolumeBrickU8 {
-            scale_level: 0,
-            brick_index: SpatialBrickIndex::new(0, 0, 0),
-            chunk_index: BrickIndex {
-                t: 0,
-                z: 0,
-                y: 0,
-                x: 0,
-            },
-            region: VolumeRegion::new(0, 0, 0, 1, 1, 4).unwrap(),
-            occupied: true,
-            valid_voxel_count: 4,
-            min: 10.0,
-            max: 40.0,
-            volume,
-        };
-        let resident = ResidentBrickSetU8::new(
-            layer_id,
-            TimeIndex::new(0),
-            shape,
-            grid_to_world,
-            vec![brick],
-        );
-        let renderer = GpuRenderer::new_blocking().unwrap();
-        let chunks = [full_panel_chunk_draw(4.0, 1.0)];
-        let channels = [
-            GpuCrossSectionChunkDisplayChannel::U8 {
-                resident: &resident,
-                brick_shape: shape,
-                brick_grid_shape: Shape3D::new(1, 1, 1).unwrap(),
-                transfer: linear_color_transfer([1.0, 0.0, 0.0, 1.0], 40.0),
-                chunks: &chunks,
-            },
-            GpuCrossSectionChunkDisplayChannel::U8 {
-                resident: &resident,
-                brick_shape: shape,
-                brick_grid_shape: Shape3D::new(1, 1, 1).unwrap(),
-                transfer: linear_color_transfer([0.0, 1.0, 0.0, 1.0], 40.0),
-                chunks: &chunks,
-            },
-        ];
-        let frame = renderer
-            .render_cross_section_chunked_channels_to_display_texture(
-                &channels,
-                CrossSectionView::new(
-                    DVec3::new(1.5, 0.0, 0.0),
-                    CrossSectionPanel::Xy,
-                    DQuat::IDENTITY,
-                    1.0,
-                    1.0,
-                ),
-                PresentationViewport::new(4.0, 1.0).unwrap(),
-                RenderViewport::new(4, 1).unwrap(),
-            )
-            .unwrap();
-
-        assert_eq!(frame.viewport, RenderViewport::new(4, 1).unwrap());
-        assert_eq!(frame.diagnostics.channels, 2);
-        assert_eq!(frame.diagnostics.texture_bytes, 16);
-        assert_eq!(frame.diagnostics.output_bytes, 192);
-        assert_eq!(frame.diagnostics.draw_calls, 2);
-        assert_eq!(frame.diagnostics.vertex_count, 8);
-        let rgba = renderer
-            .read_display_frame_rgba_for_diagnostics(&frame)
-            .unwrap();
-        assert_rgba_abs_diff_le(
-            &rgba,
-            &[
-                64, 64, 0, 255, 128, 128, 0, 255, 191, 191, 0, 255, 255, 255, 0, 255,
-            ],
-            1,
-        );
-    }
-
-    #[test]
-    #[ignore = "requires a usable non-CPU GPU adapter"]
-    fn gpu_chunked_cross_section_f32_writes_display_texture() {
-        let layer_id = LayerId::new("ch0").unwrap();
-        let shape = Shape3D::new(1, 1, 4).unwrap();
-        let grid_to_world = GridToWorld::identity();
-        let volume = DenseVolumeF32::new(
-            DatasetId::new("gpu-cross-section-f32-display").unwrap(),
-            layer_id.clone(),
-            0,
-            TimeIndex::new(0),
-            shape,
-            grid_to_world,
-            vec![0.25, 0.5, 0.75, 1.0],
-        )
-        .unwrap();
-        let brick = VolumeBrickF32 {
-            scale_level: 0,
-            brick_index: SpatialBrickIndex::new(0, 0, 0),
-            chunk_index: BrickIndex {
-                t: 0,
-                z: 0,
-                y: 0,
-                x: 0,
-            },
-            region: VolumeRegion::new(0, 0, 0, 1, 1, 4).unwrap(),
-            occupied: true,
-            valid_voxel_count: 4,
-            min: 0.25,
-            max: 1.0,
-            volume,
-        };
-        let resident = ResidentBrickSetF32::new(
-            layer_id,
-            TimeIndex::new(0),
-            shape,
-            grid_to_world,
-            vec![brick],
-        );
-        let renderer = GpuRenderer::new_blocking().unwrap();
-        let chunks = [full_panel_chunk_draw(4.0, 1.0)];
-        let channels = [GpuCrossSectionChunkDisplayChannel::F32 {
-            resident: &resident,
-            brick_shape: shape,
-            brick_grid_shape: Shape3D::new(1, 1, 1).unwrap(),
-            transfer: linear_white_transfer(1.0),
-            chunks: &chunks,
-        }];
-        let frame = renderer
-            .render_cross_section_chunked_channels_to_display_texture(
-                &channels,
-                CrossSectionView::new(
-                    DVec3::new(1.5, 0.0, 0.0),
-                    CrossSectionPanel::Xy,
-                    DQuat::IDENTITY,
-                    1.0,
-                    1.0,
-                ),
-                PresentationViewport::new(4.0, 1.0).unwrap(),
-                RenderViewport::new(4, 1).unwrap(),
-            )
-            .unwrap();
-
-        assert_eq!(frame.viewport, RenderViewport::new(4, 1).unwrap());
-        assert_eq!(frame.diagnostics.channels, 1);
-        assert_eq!(frame.diagnostics.texture_bytes, 16);
-        assert_eq!(frame.diagnostics.output_bytes, 128);
-        assert_eq!(frame.diagnostics.draw_calls, 1);
-        assert_eq!(frame.diagnostics.vertex_count, 4);
-        let rgba = renderer
-            .read_display_frame_rgba_for_diagnostics(&frame)
-            .unwrap();
-        assert_rgba_abs_diff_le(
-            &rgba,
-            &[
-                64, 64, 64, 255, 128, 128, 128, 255, 191, 191, 191, 255, 255, 255, 255, 255,
-            ],
-            1,
-        );
     }
 }

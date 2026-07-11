@@ -20,21 +20,16 @@ use mirante4d_application::{
 };
 use mirante4d_data::DataError;
 use mirante4d_dataset::{DatasetCatalog, DatasetSourceId};
+use mirante4d_dataset_runtime::{RuntimeFault, RuntimeFaultCode};
 use mirante4d_domain::ShapeError;
 use mirante4d_format::FormatError;
 use mirante4d_renderer::RenderError;
 use mirante4d_settings::ResourcePolicy;
 
 use crate::{
-    brick_streaming::create_brick_read_pool,
-    cross_section_read_queue::create_cross_section_read_pool,
-    current_runtime::{
-        analysis::CurrentAnalysisRuntime, dataset::CurrentDatasetRuntime,
-        render::CurrentRenderRuntime,
-    },
-    dataset_opening::{
-        OpenedCurrentSource, open_dataset_with_resource_policy_and_render_first_frame,
-    },
+    current_runtime::{analysis::CurrentAnalysisRuntime, render::CurrentRenderRuntime},
+    dataset_requests::DatasetDemandState,
+    unified_source_open::{self, UnifiedOpenedSource},
 };
 
 const RESULT_CHANNEL_CAPACITY: usize = 1;
@@ -66,7 +61,7 @@ pub(crate) enum CurrentSourceOpenOutcome {
 ///
 /// No input path or broad application state is retained here.
 pub(crate) struct PreparedCurrentSourceOpen {
-    pub(crate) dataset_runtime: CurrentDatasetRuntime,
+    pub(crate) dataset: DatasetDemandState,
     pub(crate) render_runtime: CurrentRenderRuntime,
     pub(crate) analysis_runtime: CurrentAnalysisRuntime,
     pub(crate) catalog: Arc<DatasetCatalog>,
@@ -77,7 +72,7 @@ pub(crate) struct PreparedCurrentSourceOpen {
 /// Current-runtime values installed only after the application reducer accepts
 /// the matching `DatasetOpened` completion.
 pub(crate) struct CurrentSourceRuntimeTransfer {
-    pub(crate) dataset_runtime: CurrentDatasetRuntime,
+    pub(crate) dataset: DatasetDemandState,
     pub(crate) render_runtime: CurrentRenderRuntime,
     pub(crate) analysis_runtime: CurrentAnalysisRuntime,
 }
@@ -245,7 +240,7 @@ impl PreparedCurrentSourceOpen {
         self,
     ) -> (CurrentSourceRuntimeTransfer, OperationCompletion) {
         let runtime = CurrentSourceRuntimeTransfer {
-            dataset_runtime: self.dataset_runtime,
+            dataset: self.dataset,
             render_runtime: self.render_runtime,
             analysis_runtime: self.analysis_runtime,
         };
@@ -290,7 +285,7 @@ fn run_open(
         return CurrentSourceOpenOutcome::Cancelled;
     }
 
-    let opened = match open_dataset_with_resource_policy_and_render_first_frame(
+    let opened = match unified_source_open::open(
         &path,
         resource_policy,
         DatasetSourceId::new(next_generation.get()),
@@ -304,36 +299,17 @@ fn run_open(
         return CurrentSourceOpenOutcome::Cancelled;
     }
 
-    let OpenedCurrentSource {
+    let UnifiedOpenedSource {
         startup_diagnostics: _,
         catalog,
         workspace,
-        mut dataset_runtime,
+        dataset,
         render_runtime,
         analysis_runtime,
     } = opened;
-    let Some(brick_read_pool) = create_brick_read_pool(&dataset_runtime) else {
-        return CurrentSourceOpenOutcome::Failed(OperationFailureCode::DatasetCapacityExceeded);
-    };
-    if is_cancelled(cancellation) {
-        drop(brick_read_pool);
-        return CurrentSourceOpenOutcome::Cancelled;
-    }
-
-    let Some(cross_section_read_pool) = create_cross_section_read_pool(&dataset_runtime) else {
-        drop(brick_read_pool);
-        return CurrentSourceOpenOutcome::Failed(OperationFailureCode::DatasetCapacityExceeded);
-    };
-    if is_cancelled(cancellation) {
-        drop(cross_section_read_pool);
-        drop(brick_read_pool);
-        return CurrentSourceOpenOutcome::Cancelled;
-    }
-    dataset_runtime.brick_read_pool = Some(brick_read_pool);
-    dataset_runtime.cross_section_read_pool = Some(cross_section_read_pool);
 
     CurrentSourceOpenOutcome::Prepared(Box::new(PreparedCurrentSourceOpen {
-        dataset_runtime,
+        dataset,
         render_runtime,
         analysis_runtime,
         catalog,
@@ -366,8 +342,24 @@ fn map_open_failure(error: &anyhow::Error, path: &Path) -> OperationFailureCode 
         if let Some(error) = cause.downcast_ref::<RenderError>() {
             return map_render_error(error);
         }
+        if let Some(error) = cause.downcast_ref::<RuntimeFault>() {
+            return map_runtime_fault(error);
+        }
     }
     OperationFailureCode::DatasetReadFailed
+}
+
+fn map_runtime_fault(error: &RuntimeFault) -> OperationFailureCode {
+    match error.code() {
+        RuntimeFaultCode::MinimumWorkUnitExceedsBudget
+        | RuntimeFaultCode::CapacityExceeded { .. }
+        | RuntimeFaultCode::QueueFull => OperationFailureCode::DatasetCapacityExceeded,
+        RuntimeFaultCode::UnsupportedResource => OperationFailureCode::DatasetUnsupported,
+        RuntimeFaultCode::SourceRejected | RuntimeFaultCode::CorruptResource => {
+            OperationFailureCode::DatasetInvalid
+        }
+        _ => OperationFailureCode::DatasetReadFailed,
+    }
 }
 
 fn map_io_kind(kind: io::ErrorKind) -> OperationFailureCode {

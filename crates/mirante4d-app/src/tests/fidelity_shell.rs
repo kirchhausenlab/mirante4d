@@ -61,6 +61,7 @@ fn frame_fidelity_labels_cover_status_reason_and_failure_vocabularies() {
         ),
         (LodDecisionReason::PlaybackDownshift, "playback LOD"),
         (LodDecisionReason::LoadingTargetScale, "loading target LOD"),
+        (LodDecisionReason::NoVisibleData, "outside selected data"),
         (LodDecisionReason::FrameBudgetLimited, "frame budget"),
         (LodDecisionReason::GpuBudgetLimited, "GPU budget"),
         (LodDecisionReason::CpuBudgetLimited, "CPU budget"),
@@ -96,72 +97,7 @@ fn frame_fidelity_labels_cover_status_reason_and_failure_vocabularies() {
     ] {
         assert_eq!(frame_failure_kind_label(value), expected);
     }
-}
-
-#[test]
-fn f32_iso_display_conversion_preserves_surface_payload() {
-    let window = DisplayWindow::new(0.0, 4.0).unwrap();
-    let surface = IsoSurfaceFrameF32::try_new(
-        1,
-        1,
-        vec![2.0],
-        vec![0.25],
-        vec![0.75],
-        vec![3.0],
-        vec![IsoSurfaceNormal::ZERO],
-        vec![123],
-        vec![45],
-        PixelCoverage::All,
-    )
-    .unwrap();
-    let frame =
-        MipImageF32::try_new_with_iso_surface(1, 1, vec![0.5], PixelCoverage::All, Some(surface))
-            .unwrap();
-
-    let converted =
-        f32_frame_to_display_u16_for_mode(&frame, RenderMode::Isosurface, window).unwrap();
-
-    assert_eq!(converted.pixels(), &[32768]);
-    let converted_surface = converted.iso_surface().unwrap();
-    assert_eq!(converted_surface.source_values(), &[32768]);
-    assert_eq!(converted_surface.display_scalars(), &[16384]);
-    assert_eq!(converted_surface.material_scalars(), &[49151]);
-    assert_eq!(converted_surface.hit_depth(), &[3.0]);
-    assert_eq!(converted_surface.normals(), &[IsoSurfaceNormal::ZERO]);
-    assert_eq!(converted_surface.diffuse_lighting(), &[123]);
-    assert_eq!(converted_surface.specular_lighting(), &[45]);
-    assert_eq!(converted_surface.coverage(), &PixelCoverage::All);
-}
-
-#[test]
-fn f32_dvr_display_conversion_preserves_normalized_rgba() {
-    let dvr_rgba = mirante4d_renderer::DvrRgbaFrame::try_new(
-        2,
-        1,
-        vec![[0.25, 0.25, 0.25, 0.5], [0.0, 0.0, 0.0, 0.0]],
-        PixelCoverage::Mask(vec![1, 0]),
-    )
-    .unwrap();
-    let frame = MipImageF32::try_new_with_mode_frames(
-        2,
-        1,
-        vec![0.5, 0.0],
-        PixelCoverage::Mask(vec![1, 0]),
-        None,
-        Some(dvr_rgba.clone()),
-    )
-    .unwrap();
-
-    let converted = f32_frame_to_display_u16_for_mode(
-        &frame,
-        RenderMode::Dvr,
-        DisplayWindow::new(97.0, 111.0).unwrap(),
-    )
-    .unwrap();
-
-    assert_eq!(converted.pixels(), &[32768, 0]);
-    assert_eq!(converted.coverage(), &PixelCoverage::Mask(vec![1, 0]));
-    assert_eq!(converted.dvr_rgba(), Some(&dvr_rgba));
+    assert_eq!(crate::fidelity::render_backend_label(RenderBackend::Empty), "empty");
 }
 
 #[test]
@@ -189,47 +125,6 @@ fn display_size_maps_to_physical_render_viewport_and_clamps_aspect() {
     assert!(render_viewport_for_display_size(egui::Vec2::ZERO, 2.0, 2048).is_none());
     assert!(render_viewport_for_display_size(egui::vec2(640.0, 360.0), 0.0, 2048).is_none());
     assert!(render_viewport_for_display_size(egui::vec2(640.0, 360.0), 2.0, 0).is_none());
-}
-
-#[test]
-fn app_renders_to_explicit_viewport_not_volume_xy_size() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut opened = open_dataset_and_render_first_frame(root).unwrap();
-    let application = test_application_for_opened_source(&opened);
-    let ui_runtime = current_runtime::ui::CurrentUiRuntime::new(ResourcePolicy::default(), None);
-    let active_shape = opened
-        .catalog
-        .layer(opened.workspace.view().active_layer())
-        .unwrap()
-        .shape()
-        .spatial();
-
-    assert_eq!(
-        crate::viewport::default_render_viewport_for_shape(active_shape).unwrap(),
-        RenderViewport::new(512, 512).unwrap()
-    );
-    assert_eq!(
-        opened.render_runtime.frame.width,
-        TEST_INITIAL_RENDER_VIEWPORT_SIDE
-    );
-    assert!(set_render_viewport(
-        &mut opened.render_runtime,
-        RenderViewport::new(80, 45).unwrap()
-    ));
-    rerender_state_with_backend(
-        &application.snapshot(),
-        &mut opened.dataset_runtime,
-        &opened.analysis_runtime,
-        &ui_runtime,
-        &mut opened.render_runtime,
-        None,
-    )
-    .unwrap();
-
-    assert_eq!(opened.render_runtime.frame.width, 80);
-    assert_eq!(opened.render_runtime.frame.height, 45);
-    assert_eq!(opened.render_runtime.diagnostics.output_pixels, 80 * 45);
 }
 
 #[test]
@@ -263,15 +158,13 @@ fn workbench_shell_exposes_primary_regions_at_high_dpi() {
 }
 
 #[test]
-fn workbench_runtime_diagnostics_exposes_data_budgets_and_cross_sections() {
+fn workbench_runtime_diagnostics_exposes_unified_runtime_bounds_and_leases() {
     use egui_kittest::{Harness, kittest::Queryable};
 
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(root).unwrap();
-    let mut app = test_workbench_app_without_background_runtime(opened);
-    app.dataset_runtime.brick_read_pool =
-        Some(BrickReadPool::new(app.dataset_runtime.dataset.clone(), 3, 7).unwrap());
+    let app = test_workbench_app_without_background_runtime(opened);
 
     let harness = Harness::builder()
         .with_size(egui::vec2(1440.0, 900.0))
@@ -282,16 +175,17 @@ fn workbench_runtime_diagnostics_exposes_data_budgets_and_cross_sections() {
         });
 
     for label in [
-        "volume cache budget",
-        "brick cache budget",
-        "upload staging budget",
-        "decoded in-flight budget",
-        "payload bytes",
-        "brick workers",
-        "brick queue capacity",
-        "brick queue depth",
-        "2D global runtime",
-        "2D chunk states",
+        "dataset CPU",
+        "decoded residency",
+        "upload staging",
+        "in-flight decode",
+        "metadata/indexes",
+        "queues/results",
+        "requests",
+        "queue bounds",
+        "resident resources",
+        "renderer leases",
+        "active 2D panel",
     ] {
         harness.get_by_label(label);
     }

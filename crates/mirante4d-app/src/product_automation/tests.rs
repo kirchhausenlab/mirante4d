@@ -2,7 +2,9 @@ use super::capture::{
     ProductAutomationArtifact, ProductAutomationImageStats, color_image_from_rgba,
     sanitize_artifact_label, write_color_image_ppm,
 };
-use super::diagnostics::{gpu_adapter_diagnostics_json, gpu_timestamp_timing_json};
+use super::diagnostics::{
+    dataset_runtime_diagnostics_json, gpu_adapter_diagnostics_json, gpu_timestamp_timing_json,
+};
 use super::timing::{
     ProductAutomationAppUpdatePhases, ProductAutomationAppUpdateSample,
     ProductAutomationCrossSectionLatencySample, ProductAutomationDisplayRefreshSample,
@@ -14,8 +16,8 @@ use super::timing::{
 use super::*;
 use std::{fs, path::PathBuf};
 
-use mirante4d_data::DataEngineStats;
-use mirante4d_renderer::gpu::{AdapterDiagnostics, GpuLimitDiagnostics, GpuRendererStats};
+use mirante4d_dataset_runtime::{DatasetRuntimeConfig, DatasetRuntimeDiagnostics};
+use mirante4d_renderer::gpu::{AdapterDiagnostics, GpuLimitDiagnostics};
 
 #[test]
 fn cross_section_hover_readout_json_records_generation_semantics() {
@@ -46,6 +48,8 @@ fn cross_section_hover_readout_json_records_generation_semantics() {
     assert_eq!(json["display_current"], false);
     assert_eq!(json["generation_status"], "retained_stale");
     assert_eq!(json["status"], "stale");
+    assert_eq!(json["logical_layer_id"], "ch0");
+    assert!(json.get("layer_id").is_none());
 }
 
 #[test]
@@ -53,11 +57,11 @@ fn automation_script_parses_semantic_camera_commands() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 1,
+          "schema_version": 2,
           "scenario": "unit",
           "limits": {
-            "max_decoded_bytes": 1024,
-            "max_gpu_brick_atlas_uploaded_bytes": 2048
+            "max_cpu_total_bytes": 1024,
+            "max_runtime_queued_requests": 128
           },
           "commands": [
             { "command": "open_dataset", "path": "/tmp/demo.m4d" },
@@ -81,8 +85,8 @@ fn automation_script_parses_semantic_camera_commands() {
 
     script.validate().unwrap();
     assert_eq!(script.commands.len(), 14);
-    assert_eq!(script.limits.max_decoded_bytes, Some(1024));
-    assert_eq!(script.limits.max_gpu_brick_atlas_uploaded_bytes, Some(2048));
+    assert_eq!(script.limits.max_cpu_total_bytes, Some(1024));
+    assert_eq!(script.limits.max_runtime_queued_requests, Some(128));
     assert_eq!(script.commands[2].name(), "set_iso_display_level");
     assert_eq!(script.commands[3].name(), "set_dvr_density_scale");
     assert_eq!(script.commands[4].name(), "set_layer_render_mode");
@@ -98,7 +102,7 @@ fn automation_script_parses_four_panel_cross_section_commands_and_assertions() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 1,
+          "schema_version": 2,
           "scenario": "unit_four_panel",
           "commands": [
             { "command": "set_viewer_layout", "layout": "four_panel" },
@@ -115,22 +119,15 @@ fn automation_script_parses_four_panel_cross_section_commands_and_assertions() {
               "min_generation": 1,
               "target_scale_level": 0,
               "render_scale_level": 1,
-              "min_selected_bricks": 1,
-              "max_missing_occupied_bricks": 8,
+              "min_selected_resources": 1,
+              "max_missing_occupied_resources": 8,
               "display_current": false
             } } },
-            { "command": "assert", "condition": { "cross_section_stream": {
-              "panel": "xz",
-              "priority": "prefetch",
-              "fairness_promoted": false,
-              "active_panel_at_submission": "xy",
-              "timepoint": 2,
-              "min_queued_prefetch": 1,
-              "min_requested": 1,
-              "min_completed": 0,
-              "min_visible_chunks": 1,
-              "max_stale": 0,
-              "max_failed": 0
+            { "command": "assert", "condition": { "active_lease_cohort": {
+              "min_required": 1,
+              "min_retained": 1,
+              "max_missing": 0,
+              "complete": true
             } } },
             { "command": "assert", "condition": { "cross_section_panel_nonblank": {
               "panel": "xz",
@@ -163,9 +160,9 @@ fn automation_script_parses_four_panel_cross_section_commands_and_assertions() {
     };
     assert_eq!(condition.name(), "viewer_layout");
     let ProductAutomationCommand::Assert { condition } = &script.commands[9] else {
-        panic!("expected stream assertion");
+        panic!("expected lease cohort assertion");
     };
-    assert_eq!(condition.name(), "cross_section_stream");
+    assert_eq!(condition.name(), "active_lease_cohort");
     let ProductAutomationCommand::Assert { condition } = &script.commands[10] else {
         panic!("expected panel nonblank assertion");
     };
@@ -189,7 +186,7 @@ fn automation_script_rejects_removed_label_probe_fields() {
     let direct_probe = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 1,
+          "schema_version": 2,
           "scenario": "removed_direct_probe_field",
           "commands": [
             {
@@ -204,7 +201,7 @@ fn automation_script_rejects_removed_label_probe_fields() {
     let nested_probe = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 1,
+          "schema_version": 2,
           "scenario": "removed_nested_probe_field",
           "commands": [
             {
@@ -236,7 +233,7 @@ fn automation_script_parses_timepoint_commands_and_assertion() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 1,
+          "schema_version": 2,
           "scenario": "unit_timepoint",
           "commands": [
             { "command": "set_timepoint", "timepoint": 1 },
@@ -245,10 +242,11 @@ fn automation_script_parses_timepoint_commands_and_assertion() {
             { "command": "assert", "condition": { "active_timepoint": { "timepoint": 0 } } },
             { "command": "assert", "condition": { "playback": { "playing": true } } },
             { "command": "assert", "condition": { "observed_timepoints": { "min_distinct": 2 } } },
-            { "command": "assert", "condition": { "cross_section_streams_match_active_timepoint": {
-              "min_completed": 1,
-              "min_visible_chunks": 1,
-              "max_failed": 0
+            { "command": "assert", "condition": { "active_lease_cohort": {
+              "min_required": 1,
+              "min_retained": 1,
+              "max_missing": 0,
+              "complete": true
             } } },
             { "command": "quit" }
           ]
@@ -274,19 +272,16 @@ fn automation_script_parses_timepoint_commands_and_assertion() {
     };
     assert_eq!(condition.name(), "observed_timepoints");
     let ProductAutomationCommand::Assert { condition } = &script.commands[6] else {
-        panic!("expected cross-section stream timepoint assertion");
+        panic!("expected active lease cohort assertion");
     };
-    assert_eq!(
-        condition.name(),
-        "cross_section_streams_match_active_timepoint"
-    );
+    assert_eq!(condition.name(), "active_lease_cohort");
 }
 
 #[test]
 fn automation_script_rejects_wrong_schema_version() {
     let script = ProductAutomationScript {
         schema: AUTOMATION_SCRIPT_SCHEMA.to_owned(),
-        schema_version: 2,
+        schema_version: 1,
         scenario: "unit".to_owned(),
         limits: ProductAutomationLimits::default(),
         commands: vec![ProductAutomationCommand::Quit],
@@ -298,32 +293,29 @@ fn automation_script_rejects_wrong_schema_version() {
 }
 
 #[test]
-fn automation_limits_reject_exceeded_data_and_gpu_counters() {
+fn automation_limits_reject_exceeded_runtime_bytes_and_work() {
     let limits = ProductAutomationLimits {
-        max_decoded_bytes: Some(100),
-        max_gpu_brick_atlas_uploaded_bytes: Some(64),
+        max_cpu_total_bytes: Some(100),
         ..ProductAutomationLimits::default()
     };
-    let data_stats = DataEngineStats {
-        decoded_bytes: 101,
-        ..DataEngineStats::default()
-    };
-    let gpu_stats = GpuRendererStats {
-        brick_atlas_uploaded_bytes: 65,
-        ..GpuRendererStats::default()
-    };
+    let diagnostics = runtime_diagnostics([101, 0, 0, 0, 0, 0, 0], 3, 1, 1, 2);
 
     assert!(
         limits
-            .check_data_engine(data_stats)
+            .check_dataset_runtime(diagnostics)
             .unwrap_err()
-            .contains("decoded_bytes")
+            .contains("cpu_total_bytes")
     );
+
+    let limits = ProductAutomationLimits {
+        max_runtime_queued_requests: Some(2),
+        ..ProductAutomationLimits::default()
+    };
     assert!(
         limits
-            .check_gpu_renderer(gpu_stats)
+            .check_dataset_runtime(diagnostics)
             .unwrap_err()
-            .contains("gpu_brick_atlas_uploaded_bytes")
+            .contains("runtime_queued_requests")
     );
 }
 
@@ -331,37 +323,64 @@ fn automation_limits_reject_exceeded_data_and_gpu_counters() {
 fn automation_limit_observations_track_maxima() {
     let mut observations = ProductAutomationLimitObservations::default();
 
-    observations.observe_data_engine(DataEngineStats {
-        decoded_bytes: 50,
-        brick_requests_queued: 3,
-        ..DataEngineStats::default()
-    });
-    observations.observe_data_engine(DataEngineStats {
-        decoded_bytes: 40,
-        brick_requests_queued: 7,
-        ..DataEngineStats::default()
-    });
-    observations.observe_gpu_renderer(GpuRendererStats {
-        brick_atlas_uploaded_bytes: 20,
-        brick_atlas_resident_bytes: 30,
-        display_resource_resident_bytes: 40,
-        ..GpuRendererStats::default()
-    });
-    observations.observe_gpu_renderer(GpuRendererStats {
-        brick_atlas_uploaded_bytes: 25,
-        brick_atlas_resident_bytes: 10,
-        display_resource_resident_bytes: 45,
-        ..GpuRendererStats::default()
-    });
+    observations.observe_dataset_runtime(runtime_diagnostics([50, 20, 10, 5, 4, 3, 2], 3, 1, 2, 4));
+    observations.observe_dataset_runtime(runtime_diagnostics([40, 25, 8, 6, 7, 1, 3], 7, 2, 1, 3));
 
-    assert_eq!(observations.max_decoded_bytes, 50);
-    assert_eq!(observations.max_brick_requests_queued, 7);
-    assert_eq!(observations.max_gpu_brick_atlas_uploaded_bytes, Some(25));
-    assert_eq!(observations.max_gpu_brick_atlas_resident_bytes, Some(30));
-    assert_eq!(
-        observations.max_gpu_display_resource_resident_bytes,
-        Some(45)
-    );
+    assert_eq!(observations.max_cpu_total_bytes, 94);
+    assert_eq!(observations.max_cpu_decoded_residency_bytes, 50);
+    assert_eq!(observations.max_cpu_upload_staging_bytes, 25);
+    assert_eq!(observations.max_cpu_queues_and_results_bytes, 7);
+    assert_eq!(observations.max_runtime_queued_requests, 7);
+    assert_eq!(observations.max_runtime_in_flight_decodes, 2);
+    assert_eq!(observations.max_runtime_pending_completions, 2);
+    assert_eq!(observations.max_runtime_resident_resources, 4);
+}
+
+#[test]
+fn dataset_runtime_diagnostics_json_names_capacity_usage_and_bounds() {
+    let diagnostics = runtime_diagnostics([50, 20, 10, 5, 4, 3, 2], 3, 1, 2, 4);
+
+    let value = dataset_runtime_diagnostics_json(diagnostics);
+
+    assert_eq!(value["capacity"]["total_cpu_bytes"], 1_000);
+    assert_eq!(value["capacity"]["worker_limit"], 4);
+    assert_eq!(value["capacity"]["request_queue_limit"], 16);
+    assert_eq!(value["capacity"]["completion_queue_limit"], 16);
+    assert_eq!(value["used"]["total_cpu_bytes"], 94);
+    assert_eq!(value["used"]["category_bytes"]["decoded_residency"], 50);
+    assert_eq!(value["work"]["queued_requests"], 3);
+    assert_eq!(value["work"]["in_flight_decodes"], 1);
+    assert_eq!(value["work"]["pending_completions"], 2);
+    assert_eq!(value["work"]["resident_resources"], 4);
+}
+
+fn runtime_diagnostics(
+    category_used: [u64; 7],
+    queued_requests: usize,
+    in_flight_decodes: usize,
+    pending_completions: usize,
+    resident_resources: usize,
+) -> DatasetRuntimeDiagnostics {
+    let config = DatasetRuntimeConfig::new(1_000, 4, 16, 16).unwrap();
+    let completed_decodes = 10;
+    let started_decodes = completed_decodes + in_flight_decodes as u64;
+    let ready_requests = 10;
+    let submitted_requests = ready_requests + queued_requests as u64 + in_flight_decodes as u64;
+    DatasetRuntimeDiagnostics::new(
+        config,
+        category_used,
+        queued_requests,
+        in_flight_decodes,
+        pending_completions,
+        resident_resources,
+        submitted_requests,
+        started_decodes,
+        completed_decodes,
+        ready_requests,
+        0,
+        0,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -891,7 +910,7 @@ fn viewport_artifact_json_includes_capture_source_and_pixel_stats() {
         width: 2,
         height: 1,
         command_index: 3,
-        capture_source: "resident_brick_cpu_snapshot",
+        capture_source: "loading_reference_color_image",
         pixel_stats: ProductAutomationImageStats {
             pixel_count: 2,
             nonzero_rgb_pixels: 1,
@@ -903,7 +922,7 @@ fn viewport_artifact_json_includes_capture_source_and_pixel_stats() {
 
     let value = artifact.json();
 
-    assert_eq!(value["capture_source"], "resident_brick_cpu_snapshot");
+    assert_eq!(value["capture_source"], "loading_reference_color_image");
     assert_eq!(value["pixel_stats"]["pixel_count"], 2);
     assert_eq!(value["pixel_stats"]["nonzero_rgb_pixels"], 1);
     assert_eq!(value["pixel_stats"]["max_rgb"], 30);

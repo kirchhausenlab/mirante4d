@@ -7,7 +7,6 @@ use std::{
 
 use eframe::egui;
 use mirante4d_application::{ApplicationCommand, CrossSectionPanelId};
-use mirante4d_data::DataEngineStats;
 use mirante4d_domain::{
     CrossSectionView as CanonicalCrossSectionView, DisplayWindow, DvrOpacityTransfer,
     IsoShadingPolicy, LayerTransfer, Opacity, RenderMode, RenderState, TimeIndex, UnitQuaternion,
@@ -15,7 +14,10 @@ use mirante4d_domain::{
 };
 use mirante4d_project_model::LayerViewState;
 use mirante4d_render_api::PresentationViewport;
-use mirante4d_renderer::gpu::{GpuDisplayFrame, GpuRenderer};
+use mirante4d_renderer::{
+    CurrentLeaseCohortStatus,
+    gpu::{GpuDisplayFrame, GpuRenderer},
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -23,23 +25,16 @@ use crate::cross_section_readout::{
     CrossSectionHoverGenerationStatus, CrossSectionHoverReadout, CrossSectionHoverStatus,
     CrossSectionHoverValue, CrossSectionReadoutInput, cross_section_hover_readout_for_panel_point,
 };
-use crate::cross_section_runtime::{CrossSectionChunkPayload, CrossSectionChunkState};
 use crate::display_refresh::DisplayRefreshTiming;
-use crate::tool_interactions::{apply_viewer_tool_commands, pick_hit_from_viewport_hover};
-use crate::tools::ViewerToolEvent;
-use crate::viewport::viewport_hover_from_normalized_point;
 use crate::{
     DVR_DENSITY_SCALE_MAX, DVR_DENSITY_SCALE_MIN, DisplayedFrameFreshness, FrameCompleteness,
-    MiranteWorkbenchApp, application_view,
-    cross_section_scheduler::cross_section_interaction_recent,
-    current_egui_shell_bridge, current_physical_layer_id,
+    MiranteWorkbenchApp, application_view, current_egui_shell_bridge,
     viewer_layout::{PanelId, render_cross_section_view_state},
 };
 
 mod capture;
 mod diagnostics;
 mod model;
-mod picking;
 mod timing;
 
 use capture::{
@@ -48,11 +43,9 @@ use capture::{
     write_color_image_ppm,
 };
 use diagnostics::{
-    brick_queue_diagnostics_json, data_engine_diagnostics_json, gpu_adapter_diagnostics_json,
-    gpu_renderer_stats_json, gpu_timestamp_timing_json,
+    dataset_runtime_diagnostics_json, gpu_adapter_diagnostics_json, gpu_timestamp_timing_json,
 };
 use model::*;
-use picking::{pick_hit_json, viewport_hover_json};
 use timing::{
     ProductAutomationAppUpdatePhases, ProductAutomationAppUpdateSample,
     ProductAutomationCrossSectionLatencySample, ProductAutomationDisplayRefreshSample,
@@ -68,7 +61,7 @@ const AUTOMATION_SCRIPT_ENV: &str = "MIRANTE4D_AUTOMATION_SCRIPT";
 const AUTOMATION_REPORT_ENV: &str = "MIRANTE4D_AUTOMATION_REPORT";
 const AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 const AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-const AUTOMATION_SCHEMA_VERSION: u32 = 1;
+const AUTOMATION_SCHEMA_VERSION: u32 = 2;
 
 fn dispatch_application_command(
     app: &mut MiranteWorkbenchApp,
@@ -180,7 +173,6 @@ fn apply_cross_section_edit(
     );
     let layout = view.layout();
     let cross_section = canonical_cross_section_view(cross_section)?;
-    app.dataset_runtime.cross_section_last_interaction_at = Some(Instant::now());
     dispatch_application_command(
         app,
         ctx,
@@ -510,17 +502,17 @@ impl ProductAutomationController {
         match command {
             ProductAutomationCommand::OpenDataset { path } => {
                 let expected = normalize_path(path);
-                let actual = normalize_path(app.dataset_runtime.dataset.root());
+                let actual = normalize_path(app.dataset.selected_path());
                 if actual != expected {
                     return Err(format!(
                         "automation dataset mismatch: product opened {}, script expected {}",
-                        app.dataset_runtime.dataset.root().display(),
+                        app.dataset.selected_path().display(),
                         path.display()
                     ));
                 }
                 Ok(CommandProgress::Done(json!({
                     "mode": "opened_by_product_startup",
-                    "path": app.dataset_runtime.dataset.root().display().to_string(),
+                    "path": app.dataset.selected_path().display().to_string(),
                 })))
             }
             ProductAutomationCommand::WaitFor {
@@ -1243,19 +1235,12 @@ impl ProductAutomationController {
         let before = panel_hover_readout_side_effect_snapshot(app);
         let snapshot = current_egui_shell_bridge::snapshot(&app.application);
         let view = application_view(&snapshot);
-        let layer = snapshot
-            .catalog()
-            .layer(view.active_layer())
-            .expect("application view closes over the dataset catalog");
-        let active_layer_id = current_physical_layer_id(&app.dataset_runtime, view.active_layer())
-            .map_err(|error| error.to_string())?;
         let readout = cross_section_hover_readout_for_panel_point(
-            &app.dataset_runtime,
-            &app.render_runtime,
+            &app.render_runtime.cross_section_runtime,
+            &app.render_runtime.lease_bridge,
             CrossSectionReadoutInput {
                 view,
-                active_layer_id: &active_layer_id,
-                active_layer_dtype: layer.dtype(),
+                catalog: snapshot.catalog(),
             },
             panel_id,
             x_points,
@@ -1383,51 +1368,14 @@ impl ProductAutomationController {
         {
             return Err("probe_hover fractions must be finite and between 0.0 and 1.0".to_owned());
         }
-
-        let snapshot = current_egui_shell_bridge::snapshot(&app.application);
-        let view = application_view(&snapshot);
-        let active_layer_dtype = snapshot
-            .catalog()
-            .layer(view.active_layer())
-            .expect("application view closes over the dataset catalog")
-            .dtype();
-        let hover = viewport_hover_from_normalized_point(
-            &app.render_runtime.frame,
-            app.render_runtime.frame_f32.as_ref(),
-            active_layer_dtype,
-            x_fraction,
-            y_fraction,
-        )
-        .ok_or_else(|| "probe_hover could not map the requested viewport point".to_owned())?;
-        let hit = pick_hit_from_viewport_hover(
-            &snapshot,
-            &app.dataset_runtime,
-            &app.analysis_runtime,
-            &app.ui_runtime,
-            &app.render_runtime,
-            hover,
-        )
-        .map_err(|err| err.to_string())?;
-        let commands = app
-            .ui_runtime
-            .viewer_tools
-            .handle_event(ViewerToolEvent::Hover(Some(hit.clone())));
-        let outcome = apply_viewer_tool_commands(
-            &snapshot,
-            &mut app.analysis_runtime,
-            &mut app.ui_runtime,
-            commands,
-        )
-        .map_err(|err| err.to_string())?;
-        app.ui_runtime.hovered_pixel = Some(hover);
+        app.ui_runtime.hovered_pixel = None;
         app.ui_runtime.hovered_source_readout = None;
         Ok(CommandProgress::Done(json!({
             "x_fraction": x_fraction,
             "y_fraction": y_fraction,
-            "hover": viewport_hover_json(hover),
-            "pick_hit": pick_hit_json(&hit),
-            "texture_refresh_requested": outcome.texture_refresh_requested,
-            "rerender_requested": outcome.rerender_requested,
+            "status": "unavailable",
+            "reason": "3D scientific intensity probing is unavailable on the current GPU presentation path",
+            "placeholder_sampled": false,
         })))
     }
 
@@ -1452,7 +1400,7 @@ impl ProductAutomationController {
                     &snapshot,
                     &app.import_runtime,
                     &app.analysis_runtime,
-                    &app.dataset_runtime,
+                    &app.dataset,
                     &app.render_runtime,
                 )
             }
@@ -1531,7 +1479,7 @@ impl ProductAutomationController {
                     &snapshot,
                     &app.import_runtime,
                     &app.analysis_runtime,
-                    &app.dataset_runtime,
+                    &app.dataset,
                     &app.render_runtime,
                 ) {
                     Err("background work is still active".to_owned())
@@ -1631,8 +1579,8 @@ impl ProductAutomationController {
                 min_generation,
                 target_scale_level,
                 render_scale_level,
-                min_selected_bricks,
-                max_missing_occupied_bricks,
+                min_selected_resources,
+                max_missing_occupied_resources,
                 display_current,
             } => {
                 let panel_id = automation_cross_section_panel_id(*panel)?;
@@ -1688,24 +1636,24 @@ impl ProductAutomationController {
                         render_scale_level
                     ));
                 }
-                if let Some(min_selected_bricks) = min_selected_bricks
-                    && schedule.selected_bricks < *min_selected_bricks
+                if let Some(min_selected_resources) = min_selected_resources
+                    && schedule.selected_bricks < *min_selected_resources
                 {
                     return Err(format!(
-                        "panel {} selected {} bricks, expected at least {}",
+                        "panel {} selected {} resources, expected at least {}",
                         panel_id.label(),
                         schedule.selected_bricks,
-                        min_selected_bricks
+                        min_selected_resources
                     ));
                 }
-                if let Some(max_missing_occupied_bricks) = max_missing_occupied_bricks
-                    && schedule.missing_occupied_bricks > *max_missing_occupied_bricks
+                if let Some(max_missing_occupied_resources) = max_missing_occupied_resources
+                    && schedule.missing_occupied_bricks > *max_missing_occupied_resources
                 {
                     return Err(format!(
-                        "panel {} missing {} occupied bricks, expected at most {}",
+                        "panel {} missing {} occupied resources, expected at most {}",
                         panel_id.label(),
                         schedule.missing_occupied_bricks,
-                        max_missing_occupied_bricks
+                        max_missing_occupied_resources
                     ));
                 }
                 if let Some(display_current) = display_current
@@ -1720,154 +1668,17 @@ impl ProductAutomationController {
                 }
                 Ok(())
             }
-            ProductAutomationAssertCondition::CrossSectionStream {
-                panel,
-                timepoint,
-                priority,
-                fairness_promoted,
-                active_panel_at_submission,
-                min_queued_current_frame,
-                min_queued_prefetch,
-                min_requested,
-                min_completed,
-                min_visible_chunks,
-                max_stale,
-                max_failed,
-            } => {
-                let panel_id = automation_cross_section_panel_id(*panel)?;
-                let stream = app
-                    .render_runtime
-                    .cross_section_runtime
-                    .panel_streams
-                    .get(&panel_id)
-                    .ok_or_else(|| {
-                        format!("panel {} has no cross-section stream", panel_id.label())
-                    })?;
-                if let Some(timepoint) = timepoint
-                    && stream.request_key.timepoint.get() != *timepoint
-                {
-                    return Err(format!(
-                        "panel {} stream timepoint is {}, expected {}",
-                        panel_id.label(),
-                        stream.request_key.timepoint.get(),
-                        timepoint
-                    ));
-                }
-                if let Some(priority) = priority {
-                    let expected = (*priority).into();
-                    if stream.priority != expected {
-                        return Err(format!(
-                            "panel {} stream priority is {:?}, expected {:?}",
-                            panel_id.label(),
-                            stream.priority,
-                            expected
-                        ));
-                    }
-                }
-                if let Some(fairness_promoted) = fairness_promoted
-                    && stream.fairness_promoted != *fairness_promoted
-                {
-                    return Err(format!(
-                        "panel {} fairness_promoted is {}, expected {}",
-                        panel_id.label(),
-                        stream.fairness_promoted,
-                        fairness_promoted
-                    ));
-                }
-                if let Some(active_panel_at_submission) = active_panel_at_submission {
-                    let expected = Some(automation_cross_section_panel_id(
-                        *active_panel_at_submission,
-                    )?);
-                    if stream.active_panel_at_submission != expected {
-                        return Err(format!(
-                            "panel {} active_panel_at_submission is {:?}, expected {:?}",
-                            panel_id.label(),
-                            stream.active_panel_at_submission,
-                            expected
-                        ));
-                    }
-                }
-                if let Some(min_queued_current_frame) = min_queued_current_frame
-                    && stream.queued_current_frame < *min_queued_current_frame
-                {
-                    return Err(format!(
-                        "panel {} queued_current_frame is {}, expected at least {}",
-                        panel_id.label(),
-                        stream.queued_current_frame,
-                        min_queued_current_frame
-                    ));
-                }
-                if let Some(min_queued_prefetch) = min_queued_prefetch
-                    && stream.queued_prefetch < *min_queued_prefetch
-                {
-                    return Err(format!(
-                        "panel {} queued_prefetch is {}, expected at least {}",
-                        panel_id.label(),
-                        stream.queued_prefetch,
-                        min_queued_prefetch
-                    ));
-                }
-                if let Some(min_requested) = min_requested
-                    && stream.requested < *min_requested
-                {
-                    return Err(format!(
-                        "panel {} stream requested {} chunks, expected at least {}",
-                        panel_id.label(),
-                        stream.requested,
-                        min_requested
-                    ));
-                }
-                if let Some(min_completed) = min_completed
-                    && stream.completed < *min_completed
-                {
-                    return Err(format!(
-                        "panel {} stream completed {} chunks, expected at least {}",
-                        panel_id.label(),
-                        stream.completed,
-                        min_completed
-                    ));
-                }
-                if let Some(min_visible_chunks) = min_visible_chunks
-                    && stream.visible_chunks < *min_visible_chunks
-                {
-                    return Err(format!(
-                        "panel {} stream has {} visible chunks, expected at least {}",
-                        panel_id.label(),
-                        stream.visible_chunks,
-                        min_visible_chunks
-                    ));
-                }
-                if let Some(max_stale) = max_stale
-                    && stream.stale > *max_stale
-                {
-                    return Err(format!(
-                        "panel {} stream stale count is {}, expected at most {}",
-                        panel_id.label(),
-                        stream.stale,
-                        max_stale
-                    ));
-                }
-                if let Some(max_failed) = max_failed
-                    && stream.failed > *max_failed
-                {
-                    return Err(format!(
-                        "panel {} stream failed count is {}, expected at most {}",
-                        panel_id.label(),
-                        stream.failed,
-                        max_failed
-                    ));
-                }
-                Ok(())
-            }
-            ProductAutomationAssertCondition::CrossSectionStreamsMatchActiveTimepoint {
-                min_completed,
-                min_visible_chunks,
-                max_failed,
-            } => assert_cross_section_streams_match_active_timepoint(
+            ProductAutomationAssertCondition::ActiveLeaseCohort {
+                min_required,
+                min_retained,
+                max_missing,
+                complete,
+            } => assert_active_lease_cohort(
                 app,
-                *min_completed,
-                *min_visible_chunks,
-                *max_failed,
+                *min_required,
+                *min_retained,
+                *max_missing,
+                *complete,
             ),
             ProductAutomationAssertCondition::CrossSectionPanelNonblank {
                 panel,
@@ -1899,13 +1710,6 @@ impl ProductAutomationController {
             .catalog()
             .layer(view.active_layer())
             .expect("application view closes over the dataset catalog");
-        let active_layer_id = current_physical_layer_id(&app.dataset_runtime, view.active_layer())
-            .expect("application catalog closes over the current physical manifest");
-        let active_scale_count = app
-            .dataset_runtime
-            .dataset
-            .scale_count(&active_layer_id)
-            .ok();
         let typed_render_error = app
             .render_runtime
             .frame_fidelity
@@ -1919,10 +1723,11 @@ impl ProductAutomationController {
             });
         json!({
             "dataset": {
-                "path": app.dataset_runtime.dataset.root().display().to_string(),
+                "path": app.dataset.selected_path().display().to_string(),
                 "name": snapshot.catalog().label(),
                 "layer_count": snapshot.catalog().len(),
-                "active_layer_id": active_layer_id.as_str(),
+                "active_logical_layer": view.active_layer().ordinal(),
+                "active_layer_label": active_layer.label(),
                 "active_layer_dtype": format!("{:?}", active_layer.dtype()),
                 "active_layer_shape": {
                     "x": active_layer.shape().x(),
@@ -1930,7 +1735,7 @@ impl ProductAutomationController {
                     "z": active_layer.shape().z(),
                     "t": active_layer.shape().t(),
                 },
-                "active_scale_count": active_scale_count,
+                "active_scale_count": active_layer.scales().len(),
                 "timepoint_count": active_layer.shape().t(),
             },
             "render": {
@@ -1940,8 +1745,6 @@ impl ProductAutomationController {
                 "adapter": app.startup_diagnostics.gpu_adapter.clone(),
                 "last_error": typed_render_error,
                 "gpu_display_frame_present": app.render_runtime.gpu_display_frame.is_some(),
-                "cpu_nonzero_pixels": app.render_runtime.diagnostics.nonzero_pixels,
-                "cpu_output_pixels": app.render_runtime.diagnostics.output_pixels,
                 "frame_fidelity": {
                     "target_scale_level": app.render_runtime.frame_fidelity.target_scale_level,
                     "displayed_scale_level": app.render_runtime.frame_fidelity.displayed_scale_level,
@@ -1949,12 +1752,6 @@ impl ProductAutomationController {
                     "reason": format!("{:?}", app.render_runtime.frame_fidelity.reason),
                     "display_freshness": format!("{:?}", app.render_runtime.frame_fidelity.display_freshness),
                     "frame_time_ms": app.render_runtime.frame_fidelity.frame_time_ms,
-                    "visible_bricks": app.render_runtime.frame_fidelity.visible_bricks,
-                    "resident_bricks": app.render_runtime.frame_fidelity.resident_bricks,
-                    "missing_occupied_bricks": app.render_runtime.frame_fidelity.missing_occupied_bricks,
-                    "cpu_cache_bytes": app.render_runtime.frame_fidelity.cpu_cache_bytes,
-                    "gpu_resident_bytes": app.render_runtime.frame_fidelity.gpu_resident_bytes,
-                    "upload_queue_depth": app.render_runtime.frame_fidelity.upload_queue_depth,
                     "last_failure_kind": app.render_runtime.frame_fidelity.last_failure_kind.map(|kind| format!("{kind:?}")),
                     "last_capacity_error": app.render_runtime.frame_fidelity.last_capacity_error.clone(),
                 },
@@ -1962,30 +1759,20 @@ impl ProductAutomationController {
                     .render_runtime.last_display_refresh_timing
                     .map(display_refresh_timing_json),
             },
-            "streaming": {
-                "visible_brick_count": app.render_runtime.visible_brick_count,
-                "visible_brick_plan_stride": app.render_runtime.visible_brick_plan_stride,
-                "visible_brick_plan_error": app.render_runtime.visible_brick_plan_error.clone(),
-                "brick_stream_scale_level": app.dataset_runtime.brick_stream_scale_level,
-                "brick_stream_requested": app.dataset_runtime.brick_stream_requested,
-                "brick_stream_completed": app.dataset_runtime.brick_stream_completed,
-                "brick_stream_cancelled": app.dataset_runtime.brick_stream_cancelled,
-                "brick_stream_stale": app.dataset_runtime.brick_stream_stale,
-                "brick_stream_failed": app.dataset_runtime.brick_stream_failed,
-                "brick_stream_complete": app.dataset_runtime.brick_stream_complete,
-                "brick_stream_last_error": app.dataset_runtime.brick_stream_last_error.clone(),
+            "dataset_demand": {
+                "current_scale_level": app.dataset.current_scale().get(),
+                "last_plan_error": app.dataset.last_plan_error(),
+                "dispatcher_pending": app.dataset.dispatcher().has_pending_work(),
+                "last_fault": app.dataset.dispatcher().last_fault().map(|fault| fault.to_string()),
             },
-            "cross_section": cross_section_diagnostics_json(app),
-            "data_engine": app
-                .dataset_runtime.dataset
+            "dataset_runtime": app
+                .dataset
+                .dispatcher()
                 .diagnostics()
                 .ok()
-                .map(data_engine_diagnostics_json),
-            "gpu_renderer": app
-                .render_runtime.gpu_renderer
-                .as_ref()
-                .and_then(|renderer| renderer.stats().ok())
-                .map(gpu_renderer_stats_json),
+                .map(dataset_runtime_diagnostics_json),
+            "lease_bridge": lease_bridge_diagnostics_json(app),
+            "cross_section": cross_section_diagnostics_json(app),
             "gpu_adapter": app
                 .render_runtime.gpu_renderer
                 .as_ref()
@@ -1995,20 +1782,6 @@ impl ProductAutomationController {
                 .as_ref()
                 .map(|renderer| gpu_timestamp_timing_json(renderer.adapter_diagnostics())),
             "presentation_timing": presentation_timing_json(),
-            "brick_queue": app
-                .dataset_runtime.brick_read_pool
-                .as_ref()
-                .and_then(|pool| pool.queue_diagnostics().ok())
-                .map(brick_queue_diagnostics_json),
-            "brick_result_drain": {
-                "limit": app.dataset_runtime.brick_result_drain_limit,
-                "time_budget_ms": app.dataset_runtime.brick_result_drain_time_budget_ms,
-                "last_count": app.dataset_runtime.brick_result_drain_last_count,
-                "last_budget_limited": app.dataset_runtime.brick_result_drain_last_budget_limited,
-                "last_repaint_reason": app.dataset_runtime.brick_result_drain_last_repaint_reason.as_deref(),
-                "budget_hit_count": app.dataset_runtime.brick_result_drain_budget_hit_count,
-                "total_drained": app.dataset_runtime.brick_result_drain_total_drained,
-            },
             "camera": {
                 "projection": format!("{:?}", view.camera().projection()),
                 "viewport": {
@@ -2016,7 +1789,6 @@ impl ProductAutomationController {
                     "height": app.render_runtime.render_viewport.height,
                 },
             },
-            "summary_text": app.diagnostics_summary_text(),
         })
     }
 
@@ -2095,7 +1867,7 @@ impl ProductAutomationController {
             "limits": self.script.limits,
             "limit_observations": self.limit_observations.json(),
             "dataset": {
-                "path": app.dataset_runtime.dataset.root().display().to_string(),
+                "path": app.dataset.selected_path().display().to_string(),
                 "name": snapshot.catalog().label(),
             },
             "events": &self.events,
@@ -2216,7 +1988,7 @@ impl ProductAutomationController {
                     &snapshot,
                     &app.import_runtime,
                     &app.analysis_runtime,
-                    &app.dataset_runtime,
+                    &app.dataset,
                     &app.render_runtime,
                 ),
                 active_timepoint: view.timepoint().get(),
@@ -2225,7 +1997,7 @@ impl ProductAutomationController {
                 target_scale_level: app.render_runtime.frame_fidelity.target_scale_level,
                 displayed_scale_level: app.render_runtime.frame_fidelity.displayed_scale_level,
                 visible_bricks: app.render_runtime.frame_fidelity.visible_bricks,
-                resident_bricks: app.render_runtime.frame_fidelity.resident_bricks,
+                resident_bricks: app.render_runtime.lease_bridge.retained_len(),
             });
     }
 
@@ -2362,66 +2134,12 @@ impl ProductAutomationController {
 
     fn observe_and_enforce_limits(&mut self, app: &MiranteWorkbenchApp) -> Result<(), String> {
         let limits = self.script.limits;
-        let data_diagnostics = app
-            .dataset_runtime
-            .dataset
-            .diagnostics()
-            .map_err(|err| err.to_string());
-        match data_diagnostics {
-            Ok(diagnostics) => {
-                self.limit_observations
-                    .observe_data_engine(diagnostics.stats);
-                limits.check_data_engine(diagnostics.stats)?;
-            }
-            Err(err) if limits.requires_data_engine() => {
-                return Err(format!(
-                    "failed to read data engine diagnostics for limits: {err}"
-                ));
-            }
-            Err(_) => {}
-        }
-
-        let queue_diagnostics = app
-            .dataset_runtime
-            .brick_read_pool
-            .as_ref()
-            .and_then(|pool| pool.queue_diagnostics().ok());
-        match queue_diagnostics.as_ref() {
-            Some(queue) => {
-                self.limit_observations.observe_brick_queue(queue);
-                limits.check_brick_queue(queue)?;
-            }
-            None if limits.requires_brick_queue() => {
-                return Err(
-                    "brick queue limits were configured but no brick queue diagnostics are active"
-                        .to_owned(),
-                );
-            }
-            None => {}
-        }
-
-        let gpu_stats = app
-            .render_runtime
-            .gpu_renderer
-            .as_ref()
-            .map(|renderer| renderer.stats().map_err(|err| err.to_string()));
-        match gpu_stats {
-            Some(Ok(stats)) => {
-                self.limit_observations.observe_gpu_renderer(stats);
-                limits.check_gpu_renderer(stats)?;
-            }
-            Some(Err(err)) if limits.requires_gpu_renderer() => {
-                return Err(format!(
-                    "failed to read GPU renderer stats for limits: {err}"
-                ));
-            }
-            None if limits.requires_gpu_renderer() => {
-                return Err(
-                    "GPU renderer limits were configured but no GPU renderer is active".to_owned(),
-                );
-            }
-            Some(Err(_)) | None => {}
-        }
+        let diagnostics =
+            app.dataset.dispatcher().diagnostics().map_err(|err| {
+                format!("failed to read unified dataset runtime diagnostics: {err}")
+            })?;
+        self.limit_observations.observe_dataset_runtime(diagnostics);
+        limits.check_dataset_runtime(diagnostics)?;
         Ok(())
     }
 
@@ -2540,7 +2258,7 @@ fn cross_section_hover_readout_json(readout: &CrossSectionHoverReadout) -> Value
     json!({
         "text": readout.text.clone(),
         "panel_id": readout.panel_id.label(),
-        "layer_id": readout.layer_id.clone(),
+        "logical_layer_id": readout.layer_id.clone(),
         "timepoint": readout.timepoint,
         "scale_level": readout.scale_level,
         "target_generation": readout.target_generation,
@@ -2598,183 +2316,105 @@ fn vec3_json(value: glam::DVec3) -> Value {
 }
 
 fn panel_hover_readout_side_effect_snapshot(app: &MiranteWorkbenchApp) -> Value {
-    let cross_section_streams = app
+    let panels = app
         .render_runtime
         .cross_section_runtime
-        .panel_streams
-        .iter()
-        .map(|(panel_id, stream)| {
+        .panels()
+        .map(|panel| {
             json!({
-                "panel_id": panel_id.label(),
-                "panel_generation": stream.request_key.panel_generation,
-                "scale_level": stream.request_key.scale_level,
-                "timepoint": stream.request_key.timepoint.get(),
-                "visible_chunks": stream.request_key.visible_chunk_count,
-                "visible_chunk_fingerprint": stream.request_key.visible_chunk_fingerprint,
-                "priority": format!("{:?}", stream.priority),
-                "active_panel_at_submission": stream
-                    .active_panel_at_submission
-                    .map(|panel_id| panel_id.label().to_owned()),
-                "fairness_promoted": stream.fairness_promoted,
-                "requested": stream.requested,
-                "deferred": stream.deferred,
-                "queued_current_frame": stream.queued_current_frame,
-                "queued_prefetch": stream.queued_prefetch,
-                "completed": stream.completed,
-                "cancelled": stream.cancelled,
-                "stale": stream.stale,
-                "failed": stream.failed,
-                "materialized_empty": stream.materialized_empty,
-                "complete": stream.complete,
-            })
-        })
-        .collect::<Vec<_>>();
-    let panel_global_chunks = [PanelId::Xy, PanelId::Xz, PanelId::Yz]
-        .into_iter()
-        .map(|panel_id| {
-            let counts = cross_section_global_panel_chunk_counts(app, panel_id);
-            json!({
-                "panel_id": panel_id.label(),
-                "visible_chunks": counts.visible,
-                "geometry_chunks": counts.geometry,
-                "cpu_resident_chunks": counts.cpu_resident,
+                "panel_id": panel.panel_id.label(),
+                "generation": panel.generation,
+                "displayed_generation": panel.displayed_generation,
+                "schedule": panel.cross_section_schedule.map(panel_schedule_json),
             })
         })
         .collect::<Vec<_>>();
     json!({
-        "data_engine_stats": app.dataset_runtime.dataset.stats().ok().map(data_engine_stats_json),
-        "streaming_3d": {
-            "brick_stream_generation": app.dataset_runtime.brick_stream_generation,
-            "brick_stream_requested": app.dataset_runtime.brick_stream_requested,
-            "brick_stream_completed": app.dataset_runtime.brick_stream_completed,
-            "brick_stream_cancelled": app.dataset_runtime.brick_stream_cancelled,
-            "brick_stream_stale": app.dataset_runtime.brick_stream_stale,
-            "brick_stream_failed": app.dataset_runtime.brick_stream_failed,
-            "brick_stream_complete": app.dataset_runtime.brick_stream_complete,
-            "current_brick_ticket_count": app.dataset_runtime.current_brick_tickets.len(),
-            "prefetch_brick_ticket_count": app.dataset_runtime.prefetch_brick_tickets.len(),
-            "warm_brick_ticket_count": app.dataset_runtime.warm_brick_tickets.len(),
-        },
-        "cross_section_brick_ticket_count": app
-            .render_runtime
-            .cross_section_runtime
-            .pending_read_ticket_count(),
-        "cross_section_streams": cross_section_streams,
-        "cross_section_global_panel_chunks": panel_global_chunks,
+        "current_scale_level": app.dataset.current_scale().get(),
+        "current_requirement_count": app
+            .dataset
+            .scope_requirements(crate::dataset_requests::SCOPE_CURRENT_3D)
+            .len(),
+        "lease_bridge_required": app.render_runtime.lease_bridge.required_len(),
+        "lease_bridge_retained": app.render_runtime.lease_bridge.retained_len(),
+        "panels": panels,
     })
 }
 
-fn data_engine_stats_json(stats: DataEngineStats) -> Value {
+fn active_lease_cohort_status(app: &MiranteWorkbenchApp) -> Option<CurrentLeaseCohortStatus> {
+    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let view = application_view(&snapshot);
+    let identity = app
+        .dataset
+        .scope_requirements(crate::dataset_requests::SCOPE_CURRENT_3D)
+        .first()?
+        .identity();
+    Some(app.render_runtime.lease_bridge.cohort_status(
+        identity,
+        view.active_layer(),
+        view.timepoint(),
+        app.dataset.current_scale(),
+    ))
+}
+
+fn lease_cohort_status_json(status: CurrentLeaseCohortStatus) -> Value {
     json!({
-        "volume_cache_hits": stats.volume_cache_hits,
-        "volume_cache_misses": stats.volume_cache_misses,
-        "volume_cache_evictions": stats.volume_cache_evictions,
-        "volume_cache_bytes": stats.volume_cache_bytes,
-        "brick_cache_hits": stats.brick_cache_hits,
-        "brick_cache_misses": stats.brick_cache_misses,
-        "brick_cache_evictions": stats.brick_cache_evictions,
-        "brick_cache_bytes": stats.brick_cache_bytes,
-        "brick_cache_u8_bytes": stats.brick_cache_u8_bytes,
-        "brick_cache_u16_bytes": stats.brick_cache_u16_bytes,
-        "brick_cache_f32_bytes": stats.brick_cache_f32_bytes,
-        "brick_reads": stats.brick_reads,
-        "decoded_brick_values": stats.decoded_brick_values,
-        "brick_requests_queued": stats.brick_requests_queued,
-        "brick_requests_completed": stats.brick_requests_completed,
-        "brick_requests_cancelled": stats.brick_requests_cancelled,
-        "brick_requests_stale": stats.brick_requests_stale,
-        "brick_requests_failed": stats.brick_requests_failed,
-        "brick_queue_full": stats.brick_queue_full,
-        "subset_reads": stats.subset_reads,
-        "decoded_values": stats.decoded_values,
-        "decoded_bytes": stats.decoded_bytes,
-        "decoded_brick_bytes": stats.decoded_brick_bytes,
-        "encoded_payload_bytes_read": stats.encoded_payload_bytes_read,
-        "encoded_shard_payloads_read": stats.encoded_shard_payloads_read,
-        "shard_index_cache_hits": stats.shard_index_cache_hits,
-        "shard_index_cache_misses": stats.shard_index_cache_misses,
-        "shard_index_cache_entries": stats.shard_index_cache_entries,
+        "required": status.required,
+        "retained": status.retained,
+        "missing": status.missing,
+        "complete": status.is_complete(),
     })
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct CrossSectionGlobalPanelChunkCounts {
-    candidate: usize,
-    visible: usize,
-    geometry: usize,
-    cpu_resident: usize,
-    cpu_resident_bytes: u64,
-    cpu_only_resident: usize,
-    cpu_only_resident_bytes: u64,
-    upload_queued: usize,
-    upload_queued_bytes: u64,
-    gpu_resident: usize,
-    gpu_resident_bytes: u64,
+fn lease_bridge_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
+    let bridge = &app.render_runtime.lease_bridge;
+    json!({
+        "required": bridge.required_len(),
+        "retained": bridge.retained_len(),
+        "missing": bridge.missing_len(),
+        "complete": bridge.is_complete(),
+        "active_cohort": active_lease_cohort_status(app).map(lease_cohort_status_json),
+    })
 }
 
-fn cross_section_global_panel_chunk_counts(
+fn assert_active_lease_cohort(
     app: &MiranteWorkbenchApp,
-    panel_id: PanelId,
-) -> CrossSectionGlobalPanelChunkCounts {
-    let Some(panel) = app
-        .render_runtime
-        .cross_section_runtime
-        .panels
-        .get(&panel_id)
-    else {
-        return CrossSectionGlobalPanelChunkCounts::default();
-    };
-    let mut cpu_resident = 0usize;
-    let mut cpu_resident_bytes = 0u64;
-    let mut cpu_only_resident = 0usize;
-    let mut cpu_only_resident_bytes = 0u64;
-    let mut upload_queued = 0usize;
-    let mut upload_queued_bytes = 0u64;
-    let mut gpu_resident = 0usize;
-    let mut gpu_resident_bytes = 0u64;
-    for key in &panel.visible_chunks {
-        let Some(entry) = app.render_runtime.cross_section_runtime.chunks.get(key) else {
-            continue;
-        };
-        let Some(payload) = entry.payload.as_ref() else {
-            continue;
-        };
-        let decoded_bytes = cross_section_payload_decoded_bytes(payload);
-        match entry.state {
-            CrossSectionChunkState::CpuResident => {
-                cpu_only_resident = cpu_only_resident.saturating_add(1);
-                cpu_only_resident_bytes = cpu_only_resident_bytes.saturating_add(decoded_bytes);
-            }
-            CrossSectionChunkState::UploadQueued => {
-                upload_queued = upload_queued.saturating_add(1);
-                upload_queued_bytes = upload_queued_bytes.saturating_add(decoded_bytes);
-            }
-            CrossSectionChunkState::GpuResident => {
-                gpu_resident = gpu_resident.saturating_add(1);
-                gpu_resident_bytes = gpu_resident_bytes.saturating_add(decoded_bytes);
-            }
-            CrossSectionChunkState::Absent
-            | CrossSectionChunkState::Queued
-            | CrossSectionChunkState::Decoding
-            | CrossSectionChunkState::Failed
-            | CrossSectionChunkState::Evicted => continue,
-        }
-        cpu_resident = cpu_resident.saturating_add(1);
-        cpu_resident_bytes = cpu_resident_bytes.saturating_add(decoded_bytes);
+    min_required: Option<usize>,
+    min_retained: Option<usize>,
+    max_missing: Option<usize>,
+    complete: Option<bool>,
+) -> Result<(), String> {
+    let status = active_lease_cohort_status(app)
+        .ok_or_else(|| "the active dataset lease cohort has no requirements".to_owned())?;
+    if min_required.is_some_and(|minimum| status.required < minimum) {
+        return Err(format!(
+            "active lease cohort requires {} resources, expected at least {}",
+            status.required,
+            min_required.expect("checked Some")
+        ));
     }
-    CrossSectionGlobalPanelChunkCounts {
-        candidate: panel.candidate_chunks,
-        visible: panel.visible_chunks.len(),
-        geometry: panel.visible_chunk_geometries.len(),
-        cpu_resident,
-        cpu_resident_bytes,
-        cpu_only_resident,
-        cpu_only_resident_bytes,
-        upload_queued,
-        upload_queued_bytes,
-        gpu_resident,
-        gpu_resident_bytes,
+    if min_retained.is_some_and(|minimum| status.retained < minimum) {
+        return Err(format!(
+            "active lease cohort retains {} resources, expected at least {}",
+            status.retained,
+            min_retained.expect("checked Some")
+        ));
     }
+    if max_missing.is_some_and(|maximum| status.missing > maximum) {
+        return Err(format!(
+            "active lease cohort is missing {} resources, expected at most {}",
+            status.missing,
+            max_missing.expect("checked Some")
+        ));
+    }
+    if complete.is_some_and(|expected| status.is_complete() != expected) {
+        return Err(format!(
+            "active lease cohort completeness is {}, expected {}",
+            status.is_complete(),
+            complete.expect("checked Some")
+        ));
+    }
+    Ok(())
 }
 
 fn assert_cross_section_panel_images_distinct(
@@ -2805,63 +2445,6 @@ fn assert_cross_section_panel_images_distinct(
         )?);
     }
     assert_gpu_display_images_distinct("cross-section panels", &images, min_different_pixels)
-}
-
-fn assert_cross_section_streams_match_active_timepoint(
-    app: &MiranteWorkbenchApp,
-    min_completed: Option<usize>,
-    min_visible_chunks: Option<usize>,
-    max_failed: Option<usize>,
-) -> Result<(), String> {
-    let active_timepoint =
-        application_view(&current_egui_shell_bridge::snapshot(&app.application)).timepoint();
-    for panel_id in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
-        let stream = app
-            .render_runtime
-            .cross_section_runtime
-            .panel_streams
-            .get(&panel_id)
-            .ok_or_else(|| format!("panel {} has no cross-section stream", panel_id.label()))?;
-        if stream.request_key.timepoint != active_timepoint {
-            return Err(format!(
-                "panel {} stream timepoint is {}, expected active timepoint {}",
-                panel_id.label(),
-                stream.request_key.timepoint.get(),
-                active_timepoint.get()
-            ));
-        }
-        if let Some(min_completed) = min_completed
-            && stream.completed < min_completed
-        {
-            return Err(format!(
-                "panel {} stream completed {} chunks, expected at least {}",
-                panel_id.label(),
-                stream.completed,
-                min_completed
-            ));
-        }
-        if let Some(min_visible_chunks) = min_visible_chunks
-            && stream.visible_chunks < min_visible_chunks
-        {
-            return Err(format!(
-                "panel {} stream has {} visible chunks, expected at least {}",
-                panel_id.label(),
-                stream.visible_chunks,
-                min_visible_chunks
-            ));
-        }
-        if let Some(max_failed) = max_failed
-            && stream.failed > max_failed
-        {
-            return Err(format!(
-                "panel {} stream failed count is {}, expected at most {}",
-                panel_id.label(),
-                stream.failed,
-                max_failed
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn assert_cross_section_panel_nonblank(
@@ -3001,32 +2584,16 @@ fn assert_cross_section_retired(app: &MiranteWorkbenchApp) -> Result<(), String>
             view.layout()
         ));
     }
-    if !app
-        .render_runtime
-        .cross_section_runtime
-        .panel_streams
-        .is_empty()
-    {
-        return Err(format!(
-            "cross-section streams are still active: {}",
-            app.render_runtime.cross_section_runtime.panel_streams.len()
-        ));
-    }
-    if app
-        .render_runtime
-        .cross_section_runtime
-        .pending_read_ticket_count()
-        != 0
-    {
-        return Err(format!(
-            "cross-section brick tickets are still active: {}",
-            app.render_runtime
-                .cross_section_runtime
-                .pending_read_ticket_count()
-        ));
-    }
-    if app.render_runtime.cross_section_runtime.has_visible_work() {
-        return Err("cross-section global runtime still has visible work".to_owned());
+    for scope in [
+        crate::dataset_requests::SCOPE_CROSS_SECTION_XY,
+        crate::dataset_requests::SCOPE_CROSS_SECTION_XZ,
+        crate::dataset_requests::SCOPE_CROSS_SECTION_YZ,
+    ] {
+        if !app.dataset.scope_requirements(scope).is_empty() {
+            return Err(format!(
+                "cross-section dataset demand scope {scope} is still active"
+            ));
+        }
     }
     if !app
         .render_runtime
@@ -3066,102 +2633,28 @@ fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
                         "height": viewport.height,
                     })
                 }),
-                "schedule": panel.cross_section_schedule.map(|schedule| {
-                    json!({
-                        "generation": schedule.generation,
-                        "target_scale_level": schedule.target_scale_level,
-                        "render_scale_level": schedule.render_scale_level,
-                        "fallback_scale_level": schedule.fallback_scale_level,
-                        "selected_bricks": schedule.selected_bricks,
-                        "occupied_selected_bricks": schedule.occupied_selected_bricks,
-                        "missing_occupied_bricks": schedule.missing_occupied_bricks,
-                        "estimated_decoded_bytes": schedule.estimated_decoded_bytes,
-                        "decoded_budget_bytes": schedule.decoded_budget_bytes,
-                        "status": format!("{:?}", schedule.status),
-                        "reason": format!("{:?}", schedule.reason),
-                    })
-                }),
+                "schedule": panel.cross_section_schedule.map(panel_schedule_json),
+                "display_frame": app
+                    .render_runtime
+                    .cross_section_gpu_display_frames
+                    .get(&panel.panel_id)
+                    .map(|displayed| {
+                        let diagnostics = displayed.frame.diagnostics;
+                        json!({
+                            "generation": displayed.generation,
+                            "channels": diagnostics.channels,
+                            "output_bytes": diagnostics.output_bytes,
+                            "accumulator_bytes": diagnostics.accumulator_bytes,
+                            "texture_bytes": diagnostics.texture_bytes,
+                            "draw_calls": diagnostics.draw_calls,
+                            "vertex_count": diagnostics.vertex_count,
+                        })
+                    }),
             })
         })
         .collect::<Vec<_>>();
-    let streams = app
-        .render_runtime
-        .cross_section_runtime
-        .panel_streams
-        .iter()
-        .map(|(panel_id, stream)| {
-            json!({
-                "panel_id": panel_id.label(),
-                "priority": format!("{:?}", stream.priority),
-                "active_panel_at_submission": stream
-                    .active_panel_at_submission
-                    .map(|panel_id| panel_id.label().to_owned()),
-                "fairness_promoted": stream.fairness_promoted,
-                "requested": stream.requested,
-                "deferred": stream.deferred,
-                "queued_current_frame": stream.queued_current_frame,
-                "queued_prefetch": stream.queued_prefetch,
-                "completed": stream.completed,
-                "cancelled": stream.cancelled,
-                "stale": stream.stale,
-                "failed": stream.failed,
-                "materialized_empty": stream.materialized_empty,
-                "visible_chunks": stream.visible_chunks,
-                "occupied_visible_chunks": stream.occupied_visible_chunks,
-                "decoded_bytes": stream.decoded_bytes,
-                "encoded_payload_bytes_read": stream.encoded_payload_bytes_read,
-                "last_error": stream.last_error.clone(),
-                "complete": stream.complete,
-            })
-        })
-        .collect::<Vec<_>>();
-    let panel_resources = [PanelId::Xy, PanelId::Xz, PanelId::Yz]
-        .into_iter()
-        .map(|panel_id| {
-            let chunk_counts = cross_section_global_panel_chunk_counts(app, panel_id);
-            let display_frame = app
-                .render_runtime
-                .cross_section_gpu_display_frames
-                .get(&panel_id)
-                .map(|displayed| {
-                    let diagnostics = displayed.frame.diagnostics;
-                    json!({
-                        "channels": diagnostics.channels,
-                        "output_bytes": diagnostics.output_bytes,
-                        "accumulator_bytes": diagnostics.accumulator_bytes,
-                        "texture_bytes": diagnostics.texture_bytes,
-                        "draw_calls": diagnostics.draw_calls,
-                        "vertex_count": diagnostics.vertex_count,
-                    })
-                });
-            json!({
-                "panel_id": panel_id.label(),
-                "candidate_chunks": chunk_counts.candidate,
-                "visible_chunks": chunk_counts.visible,
-                "geometry_chunks": chunk_counts.geometry,
-                "cpu_resident_chunks": chunk_counts.cpu_resident,
-                "cpu_resident_bytes": chunk_counts.cpu_resident_bytes,
-                "cpu_only_resident_chunks": chunk_counts.cpu_only_resident,
-                "cpu_only_resident_bytes": chunk_counts.cpu_only_resident_bytes,
-                "upload_queued_chunks": chunk_counts.upload_queued,
-                "upload_queued_bytes": chunk_counts.upload_queued_bytes,
-                "gpu_resident_chunks": chunk_counts.gpu_resident,
-                "gpu_resident_bytes": chunk_counts.gpu_resident_bytes,
-                "missing_visible_chunks": chunk_counts.visible.saturating_sub(chunk_counts.cpu_resident),
-                "display_frame_present": app.render_runtime.cross_section_gpu_display_frames.contains_key(&panel_id),
-                "display_frame": display_frame,
-            })
-        })
-        .collect::<Vec<_>>();
-    let runtime_counts = cross_section_runtime_counts_json(app);
-    let renderer_gpu = app
-        .render_runtime
-        .gpu_renderer
-        .as_ref()
-        .and_then(|renderer| renderer.stats().ok())
-        .map(gpu_renderer_stats_json);
     json!({
-        "schema": "mirante4d-cross-section-runtime-diagnostics",
+        "schema": "mirante4d-cross-section-panel-diagnostics",
         "schema_version": 1,
         "layout": format!("{:?}", view.layout()),
         "active_panel": snapshot
@@ -3169,150 +2662,32 @@ fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
             .active_cross_section_panel()
             .map(PanelId::from_application_panel)
             .map(|panel_id| panel_id.label().to_owned()),
-        "interaction_recent": cross_section_interaction_recent(&app.dataset_runtime),
-        "last_interaction_age_ms": app
-            .dataset_runtime
-            .cross_section_last_interaction_at
-            .map(|instant| instant.elapsed().as_millis()),
-        "pending_ticket_count": app
-            .render_runtime
-            .cross_section_runtime
-            .pending_read_ticket_count(),
         "display_frame_count": app.render_runtime.cross_section_gpu_display_frames.len(),
-        "read_submission_budget_per_refresh": crate::cross_section_streaming::CROSS_SECTION_CHUNK_READ_SUBMISSIONS_PER_REFRESH,
-        "product_display_path": "global_runtime_chunked_renderer",
-        "old_path_fallback_used": false,
-        "panel_local_resident_cache_authority": false,
-        "renderer_gpu": renderer_gpu,
-        "runtime": runtime_counts,
-        "panel_resources": panel_resources,
+        "product_display_path": "unified_dataset_leases_to_gpu_renderer",
+        "demand_scopes": {
+            "xy": app.dataset.scope_requirements(crate::dataset_requests::SCOPE_CROSS_SECTION_XY).len(),
+            "xz": app.dataset.scope_requirements(crate::dataset_requests::SCOPE_CROSS_SECTION_XZ).len(),
+            "yz": app.dataset.scope_requirements(crate::dataset_requests::SCOPE_CROSS_SECTION_YZ).len(),
+        },
+        "active_lease_cohort": active_lease_cohort_status(app).map(lease_cohort_status_json),
         "panels": panels,
-        "streams": streams,
     })
 }
 
-fn cross_section_runtime_counts_json(app: &MiranteWorkbenchApp) -> Value {
-    let runtime = &app.render_runtime.cross_section_runtime;
-    let mut absent = 0usize;
-    let mut queued = 0usize;
-    let mut decoding = 0usize;
-    let mut cpu_resident = 0usize;
-    let mut upload_queued = 0usize;
-    let mut gpu_resident = 0usize;
-    let mut failed = 0usize;
-    let mut evicted = 0usize;
-    let mut cpu_resident_bytes = 0u64;
-    let mut cpu_only_resident_bytes = 0u64;
-    let mut upload_queued_bytes = 0u64;
-    let mut gpu_resident_bytes = 0u64;
-    let mut decoded_bytes = 0u64;
-    let mut encoded_payload_bytes_read = 0u64;
-    for entry in runtime.chunks.values() {
-        match entry.state {
-            CrossSectionChunkState::Absent => absent = absent.saturating_add(1),
-            CrossSectionChunkState::Queued => queued = queued.saturating_add(1),
-            CrossSectionChunkState::Decoding => decoding = decoding.saturating_add(1),
-            CrossSectionChunkState::CpuResident => cpu_resident = cpu_resident.saturating_add(1),
-            CrossSectionChunkState::UploadQueued => upload_queued = upload_queued.saturating_add(1),
-            CrossSectionChunkState::GpuResident => gpu_resident = gpu_resident.saturating_add(1),
-            CrossSectionChunkState::Failed => failed = failed.saturating_add(1),
-            CrossSectionChunkState::Evicted => evicted = evicted.saturating_add(1),
-        }
-        if matches!(
-            entry.state,
-            CrossSectionChunkState::CpuResident
-                | CrossSectionChunkState::UploadQueued
-                | CrossSectionChunkState::GpuResident
-        ) && let Some(payload) = entry.payload.as_ref()
-        {
-            let payload_bytes = cross_section_payload_decoded_bytes(payload);
-            cpu_resident_bytes = cpu_resident_bytes.saturating_add(payload_bytes);
-            match entry.state {
-                CrossSectionChunkState::CpuResident => {
-                    cpu_only_resident_bytes = cpu_only_resident_bytes.saturating_add(payload_bytes);
-                }
-                CrossSectionChunkState::UploadQueued => {
-                    upload_queued_bytes = upload_queued_bytes.saturating_add(payload_bytes);
-                }
-                CrossSectionChunkState::GpuResident => {
-                    gpu_resident_bytes = gpu_resident_bytes.saturating_add(payload_bytes);
-                }
-                CrossSectionChunkState::Absent
-                | CrossSectionChunkState::Queued
-                | CrossSectionChunkState::Decoding
-                | CrossSectionChunkState::Failed
-                | CrossSectionChunkState::Evicted => {}
-            }
-        }
-        decoded_bytes = decoded_bytes.saturating_add(entry.decoded_bytes);
-        encoded_payload_bytes_read =
-            encoded_payload_bytes_read.saturating_add(entry.encoded_payload_bytes_read);
-    }
+fn panel_schedule_json(schedule: crate::viewer_layout::CrossSectionPanelScheduleState) -> Value {
     json!({
-        "global_chunks": runtime.chunks.len(),
-        "panels": runtime.panels.len(),
-        "visible_work": runtime.has_visible_work(),
-        "cpu_payload_budget_bytes": runtime.cpu_payload_budget_bytes,
-        "cpu_payload_eviction_passes": runtime.cpu_payload_eviction_passes,
-        "cpu_payload_evicted_chunks": runtime.cpu_payload_evicted_chunks,
-        "cpu_payload_evicted_bytes": runtime.cpu_payload_evicted_bytes,
-        "cpu_payload_last_eviction": {
-            "budget_bytes": runtime.cpu_payload_last_eviction.budget_bytes,
-            "payload_bytes_before": runtime.cpu_payload_last_eviction.payload_bytes_before,
-            "payload_bytes_after": runtime.cpu_payload_last_eviction.payload_bytes_after,
-            "evicted_chunks": runtime.cpu_payload_last_eviction.evicted_chunks,
-            "evicted_bytes": runtime.cpu_payload_last_eviction.evicted_bytes,
-            "protected_visible_chunks": runtime.cpu_payload_last_eviction.protected_visible_chunks,
-            "protected_visible_bytes": runtime.cpu_payload_last_eviction.protected_visible_bytes,
-            "over_budget_after": runtime.cpu_payload_last_eviction.over_budget_after,
-        },
-        "queues": {
-            "revision": runtime.queues.revision,
-            "download_promotions": runtime.queues.download_promotions.entries().len(),
-            "gpu_promotions": runtime.queues.gpu_promotions.entries().len(),
-            "cpu_evictions": runtime.queues.cpu_evictions.entries().len(),
-            "gpu_evictions": runtime.queues.gpu_evictions.entries().len(),
-        },
-        "state_counts": {
-            "absent": absent,
-            "queued": queued,
-            "decoding": decoding,
-            "cpu_resident": cpu_resident,
-            "upload_queued": upload_queued,
-            "gpu_resident": gpu_resident,
-            "failed": failed,
-            "evicted": evicted,
-        },
-        "cpu_resident_bytes": cpu_resident_bytes,
-        "cpu_only_resident_bytes": cpu_only_resident_bytes,
-        "upload_queued_bytes": upload_queued_bytes,
-        "gpu_resident_bytes": gpu_resident_bytes,
-        "decoded_bytes": decoded_bytes,
-        "encoded_payload_bytes_read": encoded_payload_bytes_read,
+        "generation": schedule.generation,
+        "target_scale_level": schedule.target_scale_level,
+        "render_scale_level": schedule.render_scale_level,
+        "fallback_scale_level": schedule.fallback_scale_level,
+        "selected_resources": schedule.selected_bricks,
+        "occupied_selected_resources": schedule.occupied_selected_bricks,
+        "missing_occupied_resources": schedule.missing_occupied_bricks,
+        "estimated_decoded_bytes": schedule.estimated_decoded_bytes,
+        "decoded_budget_bytes": schedule.decoded_budget_bytes,
+        "status": format!("{:?}", schedule.status),
+        "reason": format!("{:?}", schedule.reason),
     })
-}
-
-fn cross_section_payload_decoded_bytes(payload: &CrossSectionChunkPayload) -> u64 {
-    match payload {
-        CrossSectionChunkPayload::U8(brick) => cross_section_region_decoded_bytes(&brick.region, 1),
-        CrossSectionChunkPayload::U16(brick) => {
-            cross_section_region_decoded_bytes(&brick.region, 2)
-        }
-        CrossSectionChunkPayload::F32(brick) => {
-            cross_section_region_decoded_bytes(&brick.region, 4)
-        }
-    }
-}
-
-fn cross_section_region_decoded_bytes(
-    region: &mirante4d_data::VolumeRegion,
-    bytes_per_voxel: u64,
-) -> u64 {
-    region
-        .shape()
-        .and_then(|shape| shape.element_count())
-        .map(|values| values.saturating_mul(bytes_per_voxel))
-        .unwrap_or(0)
 }
 
 #[derive(Debug, Serialize)]
