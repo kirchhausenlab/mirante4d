@@ -106,15 +106,16 @@ viewer exercise at 1280x720 and 1920x1080 before
 `foundation-wp-07a-exit-1` (`5383cbb93c13c59e6f035bfa551356c75fb426dc`).
 WP-07B is accepted at `foundation-wp-07b-exit-1`. WP-08A's corrected contract
 is accepted at `foundation-wp-08a-exit-2`
-(`f2e520da891134d1b3f65d8fcac7afb4140579a2`). WP-08B is active. Its exit
-requires the normal public verification plus exact-main trusted-GPU and real-
-display 1280x720 T2 exercises of 3D, linked panels, playback, histogram, and
-readout through the unified runtime. Internal smoke and schema-v2 product
-automation remain supporting evidence, not product-open proof.
+(`f2e520da891134d1b3f65d8fcac7afb4140579a2`). WP-08B is accepted at
+`foundation-wp-08b-exit-1`
+(`0e3bdb0f5257c820841cee215cee38747efbda75`) after exact-main public,
+trusted-GPU, source-nonmutation, and real-display 1280x720 T2 product checks.
+Internal automation remains supporting evidence, not product-open proof.
 
 The checked independent report supports only the WP-03 source-TIFF archive.
-Current schema-1 packages remain non-authoritative T2 support fixtures;
-target-format T1 conformance cannot begin before WP-10A.
+WP-10A entry work is active. Current schema-1 packages remain non-authoritative
+T2 support fixtures until WP-10A accepts the target profile with independent
+T1 conformance, negative cases, and storage/object-count evidence.
 
 The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).

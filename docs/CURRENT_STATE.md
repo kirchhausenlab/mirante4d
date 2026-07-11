@@ -44,12 +44,15 @@ WP-08A's corrected contract exit was accepted at
 `f2e520da891134d1b3f65d8fcac7afb4140579a2`, tagged
 `foundation-wp-08a-exit-2`.
 
-WP-08B is active. Its production code now uses one unified scheduler and CPU
-byte ledger, one current-storage source bridge, and one lease-to-current-
-renderer bridge. The predecessor app/data read pools, unbounded interactive
-result channels, resident payload mirrors, and analysis execution worker are
-deleted. This remains an implemented candidate until the full WP-08B exit
-checks and real-viewer validation are accepted on protected `main`.
+WP-08B accepted the unified dataset runtime at
+`0e3bdb0f5257c820841cee215cee38747efbda75`, tagged
+`foundation-wp-08b-exit-1`. One scheduler and CPU byte ledger now own live
+interactive demand; the predecessor app/data read pools, unbounded result
+channels, resident payload mirrors, and analysis execution worker are deleted.
+
+WP-10A entry work is active. Current schema-1 packages remain transitional T2
+fixtures; WP-10A owns the off-product target dataset schema, sharded storage,
+indexes, provenance, identity, independent corpus, and negative-case evidence.
 
 ## Current Verification Boundary
 
