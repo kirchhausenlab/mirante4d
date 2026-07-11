@@ -2,8 +2,11 @@
 
 Status: ACTIVE PUBLIC-EPOCH PROGRAM
 Last reviewed: 2026-07-11
-Current technical sequence: WP-05 through WP-15
+Current technical sequence: WP-06 through WP-15
 Public-data publication: deferred to a separate future handoff
+WP-05 predecessor: WP-04 complete; public protected `main` is canonical
+Completed through: WP-05 documentation and governance reset
+Next package: WP-06 verification bootstrap; entry not yet created
 
 ## Purpose
 

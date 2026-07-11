@@ -580,7 +580,8 @@ Required work:
   not become a late cleanup bucket that carries two architectures to the end.
 - Remove only incidental stray dead material whose deletion does not hide a
   missed architectural cutover.
-- Update current-state, roadmap, release, format, testing, and contributor docs.
+- Update current-state, current-work, backlog, release, format, testing, and
+  contributor docs.
 - Archive the final handoff and execution evidence after concise active
   contracts absorb the result.
 

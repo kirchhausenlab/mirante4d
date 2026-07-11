@@ -25,7 +25,6 @@ enable = [
   "MD080",
 ]
 exclude = [
-  "docs/archive/**",
   "target/**",
   "vendor/**",
 ]

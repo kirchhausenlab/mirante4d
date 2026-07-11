@@ -1,13 +1,14 @@
 # Architecture Decision Records
 
 Program version: 0.21
-Last updated: 2026-07-10
+Last updated: 2026-07-11
 
-These ADRs record accepted **target** decisions for the foundation program.
-None independently authorizes implementation or replaces
-`docs/CURRENT_STATE.md` as the authority for current facts.
-The [foundation implementation handoff](../plans/active/FOUNDATION_REFACTOR_HANDOFF.md) owns program
-status, sequencing, promotion, and the same-version brief bundle.
+These ADRs record accepted decisions for the foundation program. Most remain
+targets; implementation notes say when an owning package completed one. None
+independently authorizes implementation or replaces
+`docs/CURRENT_STATE.md` as the authority for current facts. The
+[foundation implementation handoff](../plans/active/FOUNDATION_REFACTOR_HANDOFF.md)
+owns program status, sequencing, promotion, and the same-version brief bundle.
 
 | ADR | Target decision | Decision IDs |
 | --- | --- | --- |
@@ -20,7 +21,7 @@ status, sequencing, promotion, and the same-version brief bundle.
 | [ADR-0007](ADR-0007-foundation-dataset-hardware-product-envelope.md) | Profile-based dataset/hardware envelope, required GPU, Linux/Vulkan, 1080p, no segmentation | D-004/D-005/D-006/D-015/D-016 |
 | [ADR-0008](ADR-0008-contribution-governance.md) | Maintainer-led MIT contributions with no CLA/DCO initially | D-003 |
 
-D-003 contribution governance is implemented in source and becomes operational
-with the public repository controls. D-011 through D-014 and D-020 belong only
-to the deferred open-data follow-on. New ADRs must not convert a later-gated
-decision into implementation authority.
+D-003 contribution governance is implemented and operational in the public
+repository; WP-04 applied and read back its remote controls. D-011 through
+D-014 and D-020 belong only to the deferred open-data follow-on. New ADRs must
+not convert a later-gated decision into implementation authority.

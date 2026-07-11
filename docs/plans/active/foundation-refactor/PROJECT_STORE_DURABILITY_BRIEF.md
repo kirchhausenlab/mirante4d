@@ -2,7 +2,7 @@
 
 Status: HANDOFF_READY SUBORDINATE
 Program version: 0.21
-Last updated: 2026-07-10
+Last updated: 2026-07-11
 Implementation authorization: INHERITED ONLY THROUGH THE ACTIVATED HANDOFF AND PACKAGE ENTRY GATES
 Parent authority: `docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md`
 Authority scope: D-010 project transactions, commit protocol, concurrency, recovery, autosave, garbage collection, and durability evidence
@@ -165,13 +165,12 @@ project generation only after D-009 scientific identity is verified; a trusted
 release may bind an alternate exact package with the same science. A
 self-declared content-ID field alone is not trusted.
 
-Before implementation, `mirante4d-project-v13` remains the factual experimental
-identity. WP-02 first replaces it with segmentation-free transitional
-`mirante4d-project-v14`. WP-10B then hard-cuts that eligible predecessor to the
-owner-approved target store: no v13/v14 core reader, in-place mutation,
-fallback branch, or converter remains. Existing disposable development
-projects are regenerated;
-a converter would require a separate explicit owner request.
+WP-02 completed the hard cut from `mirante4d-project-v13` to the current
+segmentation-free transitional `mirante4d-project-v14`. WP-10B then hard-cuts
+that eligible predecessor to the owner-approved target store: no v13/v14 core
+reader, in-place mutation, fallback branch, or converter remains. Existing
+disposable development projects are regenerated; a converter would require a
+separate explicit owner request.
 
 ### Project Store Alternatives
 
@@ -229,8 +228,8 @@ The owner approved D-009 and D-010 together on 2026-07-09 through OD-020:
    maintenance leases, expected-parent conflict, independent recovery refs,
    autosave/recovery, conservative GC, and qualified-filesystem durability
    policies; and
-4. after WP-02 has hard-cut v13 to transitional v14, replace v14 with the
-   project store without a v13/v14 compatibility reader or converter.
+4. after WP-02's completed hard cut from v13 to transitional v14, replace v14
+   with the project store without a v13/v14 compatibility reader or converter.
 
 Approval settles the target boundary; it does not bless byte-level
 implementation by inspection. WP-10A/WP-10B still must freeze normative

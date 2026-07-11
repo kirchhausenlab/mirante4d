@@ -2,40 +2,31 @@
 
 Last updated: 2026-07-11
 
-The foundation program is active. WP-01 through WP-03 are complete in source.
-The publication operation in WP-04 precedes further public development and
-does not alter the deterministic root.
+## Current Checkpoint
 
-## Completed
+WP-05 is the completion checkpoint represented by this revision. It is bound
+to the clean `foundation-wp-04-exit-1` predecessor at
+`5872e7cdf27040dd65fe324d6daf6b0e4e7bd32e`.
 
-- Rust is pinned to 1.96.1.
-- `cargo xtask verify-bootstrap` provides bounded 169-test local feedback.
-- All 1,055 predecessor verification records have a sanitized, semantically
-  checked disposition for WP-06.
-- Segmentation and its production, UI, persistence, renderer, command,
-  scenario, and fuzz surfaces are absent.
-- Projects use `mirante4d-project-v14`; old formats fail before artifact access.
-- The five publication-blocking dependency advisories are cleared.
-- Four deterministic synthetic TIFF families have independent byte producer,
-  fact-oracle, and reader validation.
-- Public MIT licensing, contribution/security guidance, templates, provenance,
-  and the sole bounded bootstrap workflow are installed.
-- The public source is sanitized and reproducible as one parentless Git root.
+WP-05 installs one 32-document authority tree, deletes the 50-file
+specification directory and ten other redundant documents, replaces the nested
+release document, and adds the bounded `cargo xtask docs-check`. It changes
+documentation and developer verification only; it does not change product
+behavior.
 
-## Next Source Package
+## Next Package
 
-WP-05 installs the final concise documentation and governance authority tree,
-removing remaining duplicated or ambiguous ownership. WP-06 then replaces the
-temporary bridge and inefficient legacy verification topology.
+WP-06 replaces the temporary bootstrap and legacy test topology with bounded,
+nonrecursive, requirement-owned verification leaves. No WP-06 implementation
+starts until its entry brief is bound to the accepted WP-05 exit revision.
 
-## Known Inputs
+Known inputs to WP-06:
 
-- `verify-fast` still fails on the superseded 2,000-line rule.
-- `report-audit` still has a blocking legacy evidence mismatch.
-- The current full test topology is too slow and duplicated.
-- Unsaved autosave recovery is not wired into the packaged runtime.
-- Direct X11 close of a clean project can panic during inherited Winit
-  shutdown; the dirty-project close prompt exits cleanly.
+- `verify-fast` has a superseded source-size failure;
+- `report-audit` has an inherited evidence mismatch;
+- the full test topology is slow and duplicated; and
+- the current hosted workflow is a provisional single bootstrap job.
 
-The full package order is defined in the
-[foundation handoff](../plans/active/FOUNDATION_REFACTOR_HANDOFF.md).
+The complete package order and acceptance rules live in the
+[foundation handoff](../plans/active/FOUNDATION_REFACTOR_HANDOFF.md). The
+[backlog](../BACKLOG.md) contains only unresolved work outside this checkpoint.

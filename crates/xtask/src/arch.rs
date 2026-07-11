@@ -593,7 +593,7 @@ mirante4d-renderer.workspace = true
         );
         assert!(
             tracked_artifact_policy_violation(
-                Path::new("docs/specs/ARCHITECTURE_ENFORCEMENT_SPEC.md"),
+                Path::new("docs/ARCHITECTURE.md"),
                 MAX_TRACKED_GENERATED_ARTIFACT_BYTES + 1,
             )
             .is_none()

@@ -3,6 +3,12 @@
 Status: ACCEPTED
 Accepted: 2026-07-09
 Last reviewed: 2026-07-11
+Implementation authorization: NONE INDEPENDENT; ACTIVE HANDOFF AND PACKAGE ENTRY ONLY
+Current-state effect: WP-04 PUBLIC CUTOVER COMPLETE
+
+WP-04 completed the clean-root publication cutover. The public repository is
+now canonical, protected `main` is operational, and the private predecessor
+history remains outside the public object graph.
 
 ## Context
 
@@ -32,10 +38,11 @@ technical-foundation work.
 
 ## Enforcement
 
-The public root must pass disclosure, credential, dependency, provenance,
-license, workflow, clean-clone, and reproducibility gates. Any unresolved
-secret or rights uncertainty blocks publication. External dataset
-contributions remain closed until a later governance decision.
+The WP-04 cutover passed its disclosure, credential, dependency, provenance,
+license, workflow, clean-clone, and reproducibility gates. The public
+repository must preserve those boundaries. Any new secret or rights uncertainty
+blocks the affected release, and external dataset contributions remain closed
+until a later governance decision.
 
 ## Owning Documents
 

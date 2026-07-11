@@ -1,108 +1,95 @@
 # Architecture
 
-Last updated: 2026-07-10
+Last updated: 2026-07-11
 
-## Purpose
-
-This is the concise current architecture map for Mirante4D. Binding
-implementation facts live in `docs/CURRENT_STATE.md`; target replacement
-architecture lives in the active foundation handoff and its owning briefs.
+This document describes the current source tree. The
+[foundation handoff](plans/active/FOUNDATION_REFACTOR_HANDOFF.md) and its
+briefs describe approved replacements; they are not implemented merely because
+they are accepted.
 
 ## Product Shape
 
-Mirante4D is a native Rust desktop viewer and analysis workbench for large 4D
-microscopy datasets. It is not a browser app, server app, headless product, or
-compatibility layer for `llsm_viewer`.
+Mirante4D is a native Rust desktop viewer and analysis workbench. It opens
+strict `.m4d` dataset packages and `.m4dproj` project packages. Source
+microscopy data enters through explicit import/preprocessing workflows.
 
-The core app opens strict native `.m4d` dataset packages and `.m4dproj`
-project packages. Source microscopy data enters through explicit
-import/preprocessing workflows that write the current native package format.
+The current workspace has eight crates:
 
-Current persisted identities:
-
-- Native dataset format: `mirante4d-v1`, schema version `1`.
-- Project/session format: `mirante4d-project-v14`.
-- Preferences format: `mirante4d-preferences-v1`.
-
-## Crate Boundaries
-
-- `mirante4d-app`: egui/wgpu workbench, application state, project/session
-  workflows, UI commands, import dialogs, and product orchestration.
-- `mirante4d-analysis`: typed analysis operations, measurements, tables, plots,
-  ROI helpers, and scene-artifact models.
+- `mirante4d-app`: egui/wgpu workbench, application state, UI workflows, and
+  product composition.
+- `mirante4d-analysis`: typed operations, tables, plots, measurements, and
+  scene artifacts.
 - `mirante4d-core`: shared IDs, units, geometry, coordinates, transforms, and
-  pure domain types.
-- `mirante4d-data`: validated dataset access, async brick reads, cache budgets,
-  prefetch, cancellation, and runtime diagnostics.
-- `mirante4d-format`: native manifest/schema models, validation, checksums,
-  Zarr-backed storage, fixtures, and writers.
-- `mirante4d-import`: GUI-backed TIFF/OME-TIFF import and preprocessing into
-  native packages.
-- `mirante4d-renderer`: CPU/GPU rendering, camera rays, transfer mapping,
-  render products, GPU-resident display targets, and GPU resource contracts.
-- `xtask`: developer, CI, benchmark, packaging, and evidence automation only.
-  It is not a user-facing product mode.
+  domain types.
+- `mirante4d-data`: dataset access, asynchronous brick reads, caches, prefetch,
+  cancellation, and runtime diagnostics.
+- `mirante4d-format`: manifests, validation, checksums, sharded Zarr storage,
+  fixtures, and writers.
+- `mirante4d-import`: TIFF/OME-TIFF review, preprocessing, and native-package
+  publication.
+- `mirante4d-renderer`: CPU/GPU rendering, cameras, transfer mapping, display
+  targets, and GPU resources.
+- `xtask`: developer, verification, benchmark, packaging, and evidence tools;
+  it is not a product mode.
 
-Dependency direction stays narrow: app orchestrates; lower crates do not import
-app/UI layers; renderer does not read files directly; format does not know
-viewer state.
+The application orchestrates lower crates. Lower crates do not depend on the
+app/UI layer; the renderer does not read files; format code does not own viewer
+state; analysis reads dataset contracts rather than incidental renderer
+residency.
 
-These are current implementation facts. The owner-approved replacement graph
-and staged deletion/cutover mechanics are in the [workspace architecture
-brief](plans/active/foundation-refactor/WORKSPACE_ARCHITECTURE_BRIEF.md), under
-the sole program authority of the [foundation implementation
-handoff](plans/active/FOUNDATION_REFACTOR_HANDOFF.md). They remain an unimplemented target
-and are not current source architecture authority.
-
-## Runtime Flow
+## Current Runtime
 
 ```text
 native package/project
   -> strict format and identity validation
-  -> data engine handle
-  -> async brick/shard reads plus bounded cache/prefetch
-  -> resident CPU/GPU brick sets
+  -> data-engine handle
+  -> bounded asynchronous shard/brick reads and cache/prefetch
+  -> resident CPU/GPU resources
   -> per-channel display graph and render cohorts
-  -> renderer-owned GPU display texture
-  -> egui-wgpu presentation, overlays, hover, picking, diagnostics
+  -> renderer-owned GPU target
+  -> egui-wgpu presentation, overlays, picking, and diagnostics
 ```
 
-Small fixtures and huge local datasets use the same runtime contracts. Full
-residency may happen because a dataset is tiny or budgets are large, but it is
-not a separate product architecture.
+Small fixtures and large datasets use the same path. Full residency can occur
+for a tiny dataset but is not a separate product architecture. Large work must
+remain bounded, cancellable, and generation-aware so stale results are not
+presented as current.
 
-## Current Display Architecture
+## Display And Fidelity
 
-The viewer uses per-channel render state. Fresh native datasets open visible
-intensity channels in `MIP`. A project restores per-channel render modes and
-typed mode parameters only after strict dataset identity validation.
+Current intensity modes are per-channel `MIP`, `DVR`, and `ISO`. Visible
+channels form render cohorts and are composited deterministically. Hidden
+channels must not schedule, decode, upload, render, pick, or report current-
+frame intensity values.
 
-The supported intensity render modes are:
+Normal interactive display uses renderer-owned GPU targets. CPU images are
+reference, diagnostic, export, benchmark, and test tools—not a silent product
+fallback. Status must distinguish shown and target scale, completeness,
+backend, viewport, timing, and freshness. Missing occupied data means loading
+or incomplete, never empty.
 
-- `MIP`
-- `DVR`
-- `ISO`
+## Errors And Observability
 
-The live product display is built from a mixed display graph. Visible channels
-are grouped into render cohorts, cohort products are composited deterministically,
-and hidden channels must not schedule, decode, upload, render, composite, pick,
-or report current-frame intensity values.
+Unsupported formats, invalid data, cancellation, capacity exhaustion, and GPU
+capability failures should remain typed across ownership boundaries. User-
+facing errors must be actionable; capacity failure must not silently choose an
+alternate dense, CPU, or legacy path.
 
-Normal eligible interactive display uses renderer-owned GPU display targets.
-CPU-visible frame products remain reference, diagnostic, export, benchmark, and
-test machinery, not the normal product presentation path.
+Diagnostics and logs are local only; there is no telemetry service. Public
+reports, logs, screenshots, and evidence must redact private paths, dataset
+identities, credentials, and unpublished metadata.
 
-## Guardrails
+## Change Guardrails
 
-- No legacy readers, compatibility shims, silent downgrade paths, or old-format
-  fallback branches unless the user explicitly asks for them.
-- No full-dataset in-memory product architecture.
-- Missing occupied data is loading/incomplete, not empty.
-- Analysis must use data-engine contracts, not incidental renderer residency.
-- Project/session changes are hard cutovers while the project is greenfield.
-- Renderer, data-loading, GPU, interaction, or large-dataset work needs
-  product-open validation before completion is claimed unless explicitly waived.
-- Broad architecture, renderer, format, preprocessing, data residency, or
-  corrective refactor work follows the high-risk workflow in `docs/AGENTS.md`.
-- `cargo xtask verify-fast` enforces the current source-size architecture gate;
-  new large files require explicit policy, not silent growth.
+- One live authority per model, resource, operation, and persisted identity.
+- No compatibility reader, fallback renderer, or parallel old path by default.
+- No full-dataset in-memory product path or file-per-brick storage layout.
+- Product-visible large work has explicit CPU/GPU byte and queue budgets.
+- Rendering, loading, GPU, interaction, and large-data work requires real
+  product validation as defined in [testing](TESTING.md).
+- Broad or corrective work follows the high-risk workflow in
+  [the agent guide](AGENTS.md).
+
+The approved replacement ownership graph is in the
+[workspace architecture brief](plans/active/foundation-refactor/WORKSPACE_ARCHITECTURE_BRIEF.md).
+It becomes current only through its owning hard cutovers.

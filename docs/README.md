@@ -1,44 +1,44 @@
 # Documentation
 
-Mirante4D keeps the default read path short. Detailed specifications and the
-foundation handoff are available when a task needs them; they are not required
-reading for ordinary contributions.
+This is the sole owner of Mirante4D's documentation read order and human
+index. The machine inventory is
+[`documentation-index.json`](documentation-index.json).
 
 ## Read Order
 
-1. [Product](PRODUCT.md) — who the application is for and what it is trying to
-   achieve.
-2. [Current state](CURRENT_STATE.md) — what exists today, including known
-   limitations.
-3. [Current work](planning/NOW.md) — the one active work package and what comes
-   next.
-4. The relevant domain document:
+1. [Product](PRODUCT.md) — product scope and non-goals.
+2. [Current state](CURRENT_STATE.md) — implemented facts and limitations.
+3. [Current work](planning/NOW.md) — the current checkpoint and next package.
+4. The document that owns the task:
    - [Architecture](ARCHITECTURE.md)
-   - [Data format](DATA_FORMAT.md)
-   - [Testing](TESTING.md)
-   - [Development](DEVELOPMENT.md)
+   - [Data format and safety](DATA_FORMAT.md)
+   - [Testing and evidence](TESTING.md)
+   - [Development commands](DEVELOPMENT.md)
+   - [Release status](RELEASE.md)
+   - [Decisions](decisions/README.md)
+   - [Unresolved backlog](BACKLOG.md)
 
-Agents must also follow the root `AGENTS.md` and [agent guide](AGENTS.md).
+Agents must also follow the [agent guide](AGENTS.md). Dependency-policy
+exceptions have one separate tool-owned
+[ledger](DEPENDENCY_EXCEPTIONS.md).
 
-## Reference Material
+## Plans
 
-- [Foundation implementation handoff](plans/active/FOUNDATION_REFACTOR_HANDOFF.md)
-  — approved scope, package order, and hard-cutover requirements.
-- [Specifications](specs/README.md) — detailed contracts for the current code
-  and approved replacement work.
-- [Decisions](decisions/README.md) — durable architectural decisions.
-- [Benchmarks](benchmarks/README.md) — measurement policy and curated baselines.
-- [Release](release/README.md) — current Linux packaging status.
-- [Open data](open-data/README.md) — public-data boundary and future release
-  process.
+The [foundation handoff](plans/active/FOUNDATION_REFACTOR_HANDOFF.md) owns the
+approved package order and links its active technical contracts. These are
+targets until the current-state authority says they are implemented.
+
+Two future outcomes are deliberately separate:
+
+- [public microscopy data](plans/deferred/OPEN_DATA_FOLLOW_ON.md);
+- [possible post-foundation segmentation](plans/deferred/SEGMENTATION.md).
 
 ## Documentation Rules
 
-- Describe implemented behavior as current and proposed behavior as planned.
-- Keep one authority for each fact; link instead of copying long rule lists.
-- Update documentation with the code or decision that changes it.
-- Move completed plans and historical evidence out of the active tree.
-- Keep private datasets, workstation paths, credentials, and unpublished
-  metadata out of public documentation.
-- Verify local links before merging documentation changes; the normal local
-  Markdown command is still owned by WP-01.
+- Keep one authority for each fact and link to it instead of copying it.
+- Label implemented, target, deferred, and reference material honestly.
+- Update the owning document in the same change that changes a fact.
+- Delete superseded plans and policies; Git history is the archive.
+- Keep private datasets, machine paths, credentials, and unpublished metadata
+  out of public documentation.
+- Run `cargo xtask docs-check` before merging documentation changes.

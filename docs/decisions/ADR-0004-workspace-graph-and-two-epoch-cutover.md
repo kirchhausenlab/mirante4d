@@ -3,6 +3,7 @@
 Status: ACCEPTED TARGET DECISION
 Accepted: 2026-07-09
 Last reviewed: 2026-07-11
+Implementation authorization: NONE INDEPENDENT; ACTIVE HANDOFF AND PACKAGE ENTRY ONLY
 
 ## Context
 

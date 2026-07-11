@@ -1,0 +1,203 @@
+{
+  "schema": "mirante4d-documentation-index",
+  "schema_version": 1,
+  "read_order": [
+    "docs/PRODUCT.md",
+    "docs/CURRENT_STATE.md",
+    "docs/planning/NOW.md"
+  ],
+  "documents": [
+    {
+      "path": "docs/AGENTS.md",
+      "truth_scope": "current",
+      "authorities": ["agent-policy"],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/ARCHITECTURE.md",
+      "truth_scope": "current",
+      "authorities": ["architecture"],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/BACKLOG.md",
+      "truth_scope": "current",
+      "authorities": ["unresolved-backlog"],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/CURRENT_STATE.md",
+      "truth_scope": "current",
+      "authorities": ["current-state"],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/DATA_FORMAT.md",
+      "truth_scope": "current",
+      "authorities": ["data-format"],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/DEPENDENCY_EXCEPTIONS.md",
+      "truth_scope": "current",
+      "authorities": ["dependency-exceptions"],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/DEVELOPMENT.md",
+      "truth_scope": "current",
+      "authorities": ["development-commands"],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/PRODUCT.md",
+      "truth_scope": "current",
+      "authorities": ["product-charter"],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/README.md",
+      "truth_scope": "current",
+      "authorities": ["documentation-index"],
+      "listed_in": null
+    },
+    {
+      "path": "docs/RELEASE.md",
+      "truth_scope": "current",
+      "authorities": ["release"],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/TESTING.md",
+      "truth_scope": "current",
+      "authorities": ["verification"],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/benchmarks/baselines/README.md",
+      "truth_scope": "reference",
+      "authorities": [],
+      "listed_in": "docs/TESTING.md"
+    },
+    {
+      "path": "docs/decisions/ADR-0001-foundation-program-and-hard-cutovers.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/decisions/README.md"
+    },
+    {
+      "path": "docs/decisions/ADR-0002-strict-m4d-format-lifecycle-and-identity.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/decisions/README.md"
+    },
+    {
+      "path": "docs/decisions/ADR-0003-immutable-project-generations.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/decisions/README.md"
+    },
+    {
+      "path": "docs/decisions/ADR-0004-workspace-graph-and-two-epoch-cutover.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/decisions/README.md"
+    },
+    {
+      "path": "docs/decisions/ADR-0005-verification-and-zero-cost-ci.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/decisions/README.md"
+    },
+    {
+      "path": "docs/decisions/ADR-0006-publication-clean-root-source-first.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/decisions/README.md"
+    },
+    {
+      "path": "docs/decisions/ADR-0007-foundation-dataset-hardware-product-envelope.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/decisions/README.md"
+    },
+    {
+      "path": "docs/decisions/ADR-0008-contribution-governance.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/decisions/README.md"
+    },
+    {
+      "path": "docs/decisions/README.md",
+      "truth_scope": "target",
+      "authorities": ["decisions"],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/planning/NOW.md",
+      "truth_scope": "current",
+      "authorities": ["current-work"],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/active/foundation-refactor/DATASET_HARDWARE_ENVELOPE_BRIEF.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md"
+    },
+    {
+      "path": "docs/plans/active/foundation-refactor/DATA_FORMAT_IDENTITY_BRIEF.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md"
+    },
+    {
+      "path": "docs/plans/active/foundation-refactor/FOUNDATION_ENTRY_WORK_PACKAGES.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md"
+    },
+    {
+      "path": "docs/plans/active/foundation-refactor/PROJECT_STORE_DURABILITY_BRIEF.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md"
+    },
+    {
+      "path": "docs/plans/active/foundation-refactor/TECHNICAL_CUTOVER_WORK_PACKAGES.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md"
+    },
+    {
+      "path": "docs/plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md"
+    },
+    {
+      "path": "docs/plans/active/foundation-refactor/WORKSPACE_ARCHITECTURE_BRIEF.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md"
+    },
+    {
+      "path": "docs/plans/deferred/OPEN_DATA_FOLLOW_ON.md",
+      "truth_scope": "deferred",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/deferred/SEGMENTATION.md",
+      "truth_scope": "deferred",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    }
+  ]
+}

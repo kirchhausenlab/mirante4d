@@ -2,16 +2,16 @@
 
 Status: ACCEPTED TARGET DECISION
 Accepted: 2026-07-09
-Last reviewed: 2026-07-10
+Last reviewed: 2026-07-11
 Decision IDs: D-007, D-008, D-009
-Implementation authorization: NO
+Implementation authorization: NONE INDEPENDENT; ACTIVE HANDOFF AND PACKAGE ENTRY ONLY
 
-This ADR records owner-approved target policy. It carries no independent implementation
-or persisted-format change. The current `mirante4d-v1` schema-1 package,
-reader/writer behavior, project identity, and existing identity fields remain
-the factual implementation until an approved work package hard-cuts them. No
-current persisted contract becomes OME-NGFF-compatible, candidate, or stable
-merely because this ADR is accepted.
+This ADR records owner-approved target policy. It carries no independent
+implementation or persisted-format change. The current `mirante4d-v1` schema-1
+package, reader/writer behavior, project identity, and existing identity fields
+remain the factual implementation until an approved work package hard-cuts
+them. No current persisted contract becomes OME-NGFF-compatible, candidate, or
+stable merely because this ADR is accepted.
 
 ## Context
 

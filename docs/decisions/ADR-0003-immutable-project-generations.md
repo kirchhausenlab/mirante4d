@@ -2,15 +2,14 @@
 
 Status: ACCEPTED TARGET DECISION
 Accepted: 2026-07-09
-Last reviewed: 2026-07-10
+Last reviewed: 2026-07-11
 Decision ID: D-010
-Implementation authorization: NO
+Implementation authorization: NONE INDEPENDENT; ACTIVE HANDOFF AND PACKAGE ENTRY ONLY
 
-This ADR records owner-approved target policy. It carries no independent implementation
-or project-format change. Before implementation, `mirante4d-project-v13` and
-its current save/open and autosave behavior remain factual. WP-02 first hard-
-cuts that identity to the segmentation-free transitional
-`mirante4d-project-v14`; only the later authorized WP-10B hard cut replaces
+This ADR records owner-approved target policy. It carries no independent
+implementation or project-format change. WP-02 completed the hard cut from
+`mirante4d-project-v13` to the current segmentation-free transitional
+`mirante4d-project-v14`. Only the later authorized WP-10B hard cut replaces
 that eligible predecessor with this store. No existing project gains the
 transaction or durability guarantees described here.
 

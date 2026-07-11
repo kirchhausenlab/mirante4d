@@ -1,23 +1,23 @@
-# Backlog
+# Unresolved Backlog
 
-This file contains unresolved work only. The current package and its exit
-criteria live in [planning/NOW.md](planning/NOW.md).
+The current checkpoint lives in [planning/NOW.md](planning/NOW.md). This file
+contains unresolved work only.
 
-## Remaining Foundation Sequence
+## Foundation Program
 
-- WP-05/WP-06: finish documentation ownership and replace the verification
-  architecture.
-- WP-07 through WP-15: execute the model, runtime, renderer, storage, import,
-  analysis, release, and deletion cutovers defined by the active handoff.
+- WP-06: replace the verification architecture and provisional hosted job.
+- WP-07A through WP-15: perform the model, state, runtime, storage, renderer,
+  import, analysis, UI, release, and final-deletion cutovers in the
+  [foundation handoff](plans/active/FOUNDATION_REFACTOR_HANDOFF.md).
+- Expose packaged unsaved-autosave recovery in its owning application package.
+- Repair the inherited clean-state X11/Winit shutdown panic in its owning
+  application package.
 
 ## Deferred
 
-- Select and publish full microscopy datasets through the separate open-data
-  follow-on.
-- Expand release support beyond Linux x86_64 only after verified platform work.
-- Reconsider the deferred derived-label capability only after the foundation
-  is complete and through a new approved plan.
-- Reconsider 4K qualification only if an actual scientific use case requires
-  it.
-- Wire packaged unsaved-autosave recovery and repair the inherited clean-state
-  X11 close panic in the owning application work package.
+- Select and publish full microscopy datasets through the separate
+  [open-data handoff](plans/deferred/OPEN_DATA_FOLLOW_ON.md).
+- Reconsider [segmentation](plans/deferred/SEGMENTATION.md) only after the
+  foundation is complete and through a new approved plan.
+- Consider non-Linux targets or 4K qualification only after a concrete need
+  and separately approved scope.
