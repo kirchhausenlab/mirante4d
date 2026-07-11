@@ -55,11 +55,11 @@ fn generated_fixture_render_modes_script_switches_supported_modes() {
     );
     assert_eq!(script["limits"]["max_gpu_brick_atlas_resident_bytes"], GIB);
     assert_eq!(
-        script_viewport_json(&script)["width"],
+        script_requested_window_inner_size_points_json(&script)["width"],
         GENERATED_VIEWPORT_WIDTH
     );
     assert_eq!(
-        script_viewport_json(&script)["height"],
+        script_requested_window_inner_size_points_json(&script)["height"],
         GENERATED_VIEWPORT_HEIGHT
     );
     assert_eq!(
@@ -165,11 +165,11 @@ fn t5_qual_001_interaction_mip_script_records_bounded_mip_camera_sequence() {
     assert_eq!(script["limits"]["max_decoded_bytes"], GIB);
     assert_eq!(script["limits"]["max_gpu_brick_atlas_uploaded_bytes"], GIB);
     assert_eq!(
-        script_viewport_json(&script)["width"],
+        script_requested_window_inner_size_points_json(&script)["width"],
         T5_QUAL_001_VIEWPORT_WIDTH
     );
     assert_eq!(
-        script_viewport_json(&script)["height"],
+        script_requested_window_inner_size_points_json(&script)["height"],
         T5_QUAL_001_VIEWPORT_HEIGHT
     );
     assert_eq!(script_render_modes_json(&script), json!(["mip"]));
@@ -222,11 +222,11 @@ fn t5_qual_001_interaction_render_modes_script_records_bounded_mode_sequence() {
         2 * GIB
     );
     assert_eq!(
-        script_viewport_json(&script)["width"],
+        script_requested_window_inner_size_points_json(&script)["width"],
         T5_QUAL_001_VIEWPORT_WIDTH
     );
     assert_eq!(
-        script_viewport_json(&script)["height"],
+        script_requested_window_inner_size_points_json(&script)["height"],
         T5_QUAL_001_VIEWPORT_HEIGHT
     );
     assert_eq!(
@@ -303,11 +303,11 @@ fn t5_qual_001_four_panel_cross_section_script_records_layout_and_2d_interaction
         2 * GIB
     );
     assert_eq!(
-        script_viewport_json(&script)["width"],
+        script_requested_window_inner_size_points_json(&script)["width"],
         T5_QUAL_001_VIEWPORT_WIDTH
     );
     assert_eq!(
-        script_viewport_json(&script)["height"],
+        script_requested_window_inner_size_points_json(&script)["height"],
         T5_QUAL_001_VIEWPORT_HEIGHT
     );
     assert_eq!(script_render_modes_json(&script), json!(["mip"]));
@@ -327,10 +327,7 @@ fn t5_qual_001_four_panel_cross_section_script_records_layout_and_2d_interaction
         "cross_section_rotate",
         "probe_panel_hover",
     ] {
-        assert!(
-            command_names.iter().any(|&name| name == expected),
-            "missing {expected}"
-        );
+        assert!(command_names.contains(&expected), "missing {expected}");
     }
     let xz_stream_assert = commands
         .iter()
@@ -421,11 +418,11 @@ fn t5_qual_001_four_panel_fine_scale_script_records_zoomed_s0_gate() {
     );
     assert_eq!(script["limits"]["max_decoded_bytes"], 2 * GIB);
     assert_eq!(
-        script_viewport_json(&script)["width"],
+        script_requested_window_inner_size_points_json(&script)["width"],
         T5_QUAL_001_VIEWPORT_WIDTH
     );
     assert_eq!(
-        script_viewport_json(&script)["height"],
+        script_requested_window_inner_size_points_json(&script)["height"],
         T5_QUAL_001_VIEWPORT_HEIGHT
     );
     assert_eq!(script_render_modes_json(&script), json!(["mip"]));
@@ -505,11 +502,11 @@ fn t5_qual_001_four_panel_continuous_cross_section_script_records_nonblank_stres
         2 * GIB
     );
     assert_eq!(
-        script_viewport_json(&script)["width"],
+        script_requested_window_inner_size_points_json(&script)["width"],
         T5_QUAL_001_VIEWPORT_WIDTH
     );
     assert_eq!(
-        script_viewport_json(&script)["height"],
+        script_requested_window_inner_size_points_json(&script)["height"],
         T5_QUAL_001_VIEWPORT_HEIGHT
     );
     assert_eq!(script_render_modes_json(&script), json!(["mip"]));
@@ -611,11 +608,11 @@ fn t5_qual_002_four_panel_timepoint_script_records_2d_timepoint_updates() {
         2 * GIB
     );
     assert_eq!(
-        script_viewport_json(&script)["width"],
+        script_requested_window_inner_size_points_json(&script)["width"],
         T5_QUAL_002_VIEWPORT_WIDTH
     );
     assert_eq!(
-        script_viewport_json(&script)["height"],
+        script_requested_window_inner_size_points_json(&script)["height"],
         T5_QUAL_002_VIEWPORT_HEIGHT
     );
     assert_eq!(script_render_modes_json(&script), json!(["mip"]));
@@ -706,11 +703,11 @@ fn t5_qual_002_four_panel_autoplay_script_records_2d_playback_updates() {
         2 * GIB
     );
     assert_eq!(
-        script_viewport_json(&script)["width"],
+        script_requested_window_inner_size_points_json(&script)["width"],
         T5_QUAL_002_VIEWPORT_WIDTH
     );
     assert_eq!(
-        script_viewport_json(&script)["height"],
+        script_requested_window_inner_size_points_json(&script)["height"],
         T5_QUAL_002_VIEWPORT_HEIGHT
     );
     assert_eq!(script_render_modes_json(&script), json!(["mip"]));
@@ -810,11 +807,11 @@ fn t5_qual_001_interaction_continuous_script_records_paced_mode_sequences() {
         2 * GIB
     );
     assert_eq!(
-        script_viewport_json(&script)["width"],
+        script_requested_window_inner_size_points_json(&script)["width"],
         T5_QUAL_001_VIEWPORT_WIDTH
     );
     assert_eq!(
-        script_viewport_json(&script)["height"],
+        script_requested_window_inner_size_points_json(&script)["height"],
         T5_QUAL_001_VIEWPORT_HEIGHT
     );
     assert_eq!(
@@ -1025,78 +1022,6 @@ fn heavy_local_sample_scenarios_require_package_before_heavy_work() {
 }
 
 #[test]
-fn t5_qual_001_completion_plan_records_heavy_product_open_commands() {
-    let current_report = json!({
-        "status": "unsupported",
-        "failure_reason": "preflight",
-        "environment": {
-            "product_validate_preflight_only": true,
-            "display_class": "unsupported"
-        },
-        "dataset": {
-            "package_path": "/samples/T5-QUAL-001.m4d",
-            "id": "phase20-extreme-T5-QUAL-001",
-            "name": "Phase 20 Extreme T5Qual001",
-            "active_layer": {
-                "shape": {"t": 1, "z": 2563, "y": 2240, "x": 4183},
-                "dtype": {"stored": "uint8"}
-            }
-        },
-        "scenario": {
-            "command_count": 31,
-            "render_modes": ["mip"],
-            "viewport": {"width": T5_QUAL_001_VIEWPORT_WIDTH, "height": T5_QUAL_001_VIEWPORT_HEIGHT},
-            "automation_limits": {"max_decoded_bytes": GIB}
-        },
-        "process": {
-            "rss_limit_bytes": 8 * GIB
-        },
-        "logs": {
-            "stdout": "stdout.log",
-            "stderr": "stderr.log"
-        }
-    });
-
-    let plan = t5_qual_001_product_validation_completion_plan_json(
-        T5_QUAL_001_INTERACTION_MIP_SCENARIO,
-        Some(&current_report),
-    );
-
-    assert_eq!(
-        plan["schema"],
-        "mirante4d-t5-qual-001-product-validation-completion-plan"
-    );
-    assert_eq!(plan["scenario"], T5_QUAL_001_INTERACTION_MIP_SCENARIO);
-    assert_eq!(plan["requires_explicit_heavy_opt_in"], true);
-    assert_eq!(plan["requires_real_display"], true);
-    assert_eq!(
-        plan["current_evidence"]["dataset_id"],
-        "phase20-extreme-T5-QUAL-001"
-    );
-    assert_eq!(plan["current_evidence"]["preflight_only"], true);
-    assert!(
-        plan["product_open_command"]["shell_command"]
-            .as_str()
-            .unwrap()
-            .contains("MIRANTE4D_XTASK_ALLOW_HEAVY_BENCHMARK=1")
-    );
-    assert!(
-        plan["product_open_command"]["shell_command"]
-            .as_str()
-            .unwrap()
-            .contains(
-                "cargo xtask product-validate /samples/T5-QUAL-001.m4d t5_qual_001_interaction_mip"
-            )
-    );
-    assert!(
-        plan["preflight_command"]["shell_command"]
-            .as_str()
-            .unwrap()
-            .contains("MIRANTE4D_PRODUCT_VALIDATE_PREFLIGHT_ONLY=1")
-    );
-}
-
-#[test]
 fn custom_product_automation_script_validation_rejects_wrong_schema() {
     let script = json!({
         "schema": "wrong",
@@ -1291,6 +1216,73 @@ fn product_validation_status_labels_and_failures_are_report_stable() {
 }
 
 #[test]
+fn completed_product_validation_fails_without_viewport_capture() {
+    let automation_report = json!({
+        "status": "passed",
+        "artifacts": []
+    });
+
+    let (status, failure_reason) =
+        completed_product_validation_outcome(true, Some("passed"), None, Some(&automation_report));
+
+    assert_eq!(status, ProductValidationStatus::Failed);
+    assert!(
+        failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("missing a nonblank viewport_capture artifact")
+    );
+}
+
+#[test]
+fn completed_product_validation_fails_with_blank_viewport_capture() {
+    let automation_report = json!({
+        "status": "passed",
+        "artifacts": [{
+            "kind": "viewport_capture",
+            "path": "blank.ppm",
+            "width": 2,
+            "height": 2,
+            "pixel_stats": {
+                "pixel_count": 4,
+                "nonzero_rgb_pixels": 0,
+                "max_rgb": 0
+            }
+        }]
+    });
+
+    let (status, failure_reason) =
+        completed_product_validation_outcome(true, Some("passed"), None, Some(&automation_report));
+
+    assert_eq!(status, ProductValidationStatus::Failed);
+    assert!(failure_reason.is_some());
+}
+
+#[test]
+fn completed_product_validation_passes_with_nonblank_viewport_capture() {
+    let automation_report = json!({
+        "status": "passed",
+        "artifacts": [{
+            "kind": "viewport_capture",
+            "path": "nonblank.ppm",
+            "width": 2,
+            "height": 2,
+            "pixel_stats": {
+                "pixel_count": 4,
+                "nonzero_rgb_pixels": 1,
+                "max_rgb": 255
+            }
+        }]
+    });
+
+    let (status, failure_reason) =
+        completed_product_validation_outcome(true, Some("passed"), None, Some(&automation_report));
+
+    assert_eq!(status, ProductValidationStatus::Passed);
+    assert_eq!(failure_reason, None);
+}
+
+#[test]
 fn unix_epoch_ms_to_utc_rfc3339_formats_report_timestamps() {
     assert_eq!(unix_epoch_ms_to_utc_rfc3339(0), "1970-01-01T00:00:00.000Z");
     assert_eq!(
@@ -1306,6 +1298,12 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
     let script = generated_fixture_camera_smoke_script(&package);
     let automation_report = json!({
         "status": "passed",
+        "viewport_evidence": {
+            "requested_window_inner_size_points": {"width": 960, "height": 720},
+            "pixels_per_point": 1.5,
+            "observed_client_area_pixels": null,
+            "render_target_pixels": {"width": 16, "height": 16}
+        },
         "artifacts": [
             {
                 "kind": "viewport_capture",
@@ -1619,10 +1617,25 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
     assert_eq!(report["process"]["rss_limit_bytes"], 8 * GIB);
     assert_eq!(report["process"]["peak_rss_bytes"], 64 * MIB);
     assert_eq!(report["process"]["rss_limit_exceeded"], false);
+    assert_eq!(report["evidence_level"], "E1");
     assert_eq!(
-        report["scenario"]["viewport"]["width"],
+        report["claim_boundary"]["evidence_type"],
+        "internal_native_window_product_automation"
+    );
+    assert_eq!(
+        report["claim_boundary"]["closure_authority"],
+        "integration_support_only_not_black_box_product_open"
+    );
+    assert_eq!(report["claim_boundary"]["e4_product_open_satisfied"], false);
+    assert_eq!(
+        report["scenario"]["requested_window_inner_size_points"]["width"],
         GENERATED_VIEWPORT_WIDTH
     );
+    assert_eq!(report["scenario"]["pixels_per_point"], 1.5);
+    assert!(report["scenario"]["observed_client_area_pixels"].is_null());
+    assert_eq!(report["scenario"]["render_target_pixels"]["width"], 16);
+    assert!(report["scenario"].get("viewport").is_none());
+    assert!(report["limits"].get("viewport").is_none());
     assert_eq!(report["scenario"]["name"], GENERATED_FIXTURE_SCENARIO);
     assert_eq!(
         report["scenario"]["automation_script_scenario"],

@@ -8,6 +8,107 @@ use tiff::encoder::{TiffEncoder, colortype};
 
 use super::*;
 
+const SOURCE_FIXTURE_ARCHIVE: &[u8] =
+    include_bytes!("../../../fixtures/source/mirante4d-source-tiff-fixtures-v1.tar");
+const SOURCE_FIXTURE_READER_REPORT: &str =
+    include_str!("../../../fixtures/source/independent-reader-report.json");
+
+fn ustar_regular_file<'a>(archive: &'a [u8], expected_path: &str) -> &'a [u8] {
+    let mut offset = 0usize;
+    while offset + 512 <= archive.len() {
+        let header = &archive[offset..offset + 512];
+        if header.iter().all(|byte| *byte == 0) {
+            break;
+        }
+        let name_end = header[..100]
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(100);
+        let name = std::str::from_utf8(&header[..name_end]).expect("fixture paths are ASCII");
+        let size_text = std::str::from_utf8(&header[124..136])
+            .expect("ustar size is ASCII")
+            .trim_matches(['\0', ' ']);
+        let size = usize::from_str_radix(size_text, 8).expect("valid ustar size");
+        let data_start = offset + 512;
+        let data_end = data_start.checked_add(size).expect("ustar size overflow");
+        assert!(
+            data_end <= archive.len(),
+            "truncated fixture archive member"
+        );
+        if name == expected_path {
+            assert!(
+                matches!(header[156], 0 | b'0'),
+                "member is not a regular file"
+            );
+            return &archive[data_start..data_end];
+        }
+        offset = data_start + size.div_ceil(512) * 512;
+    }
+    panic!("fixture archive is missing {expected_path}");
+}
+
+fn observed_value_edges(values: &TiffStackValues) -> (String, String, bool) {
+    match values {
+        TiffStackValues::U8(values) => (
+            format!("{:02x}", values.first().unwrap()),
+            format!("{:02x}", values.last().unwrap()),
+            true,
+        ),
+        TiffStackValues::U16(values) => (
+            format!("{:04x}", values.first().unwrap()),
+            format!("{:04x}", values.last().unwrap()),
+            true,
+        ),
+        TiffStackValues::F32(values) => (
+            format!("{:08x}", values.first().unwrap().to_bits()),
+            format!("{:08x}", values.last().unwrap().to_bits()),
+            values.iter().all(|value| value.is_finite()),
+        ),
+    }
+}
+
+#[test]
+fn source_tiff_archive_matches_independent_reader_observations() {
+    let report: serde_json::Value = serde_json::from_str(SOURCE_FIXTURE_READER_REPORT).unwrap();
+    assert_eq!(report["status"], "passed");
+    assert_eq!(report["lineage_id"], "SRC-READER-001");
+    assert_eq!(report["logical_voxel_bytes"], 491);
+
+    for observation in report["files"].as_array().unwrap() {
+        let path = observation["path"].as_str().unwrap();
+        let bytes = ustar_regular_file(SOURCE_FIXTURE_ARCHIVE, path);
+        let tempdir = tempfile::tempdir().unwrap();
+        let input = tempdir.path().join("source.tif");
+        fs::write(&input, bytes).unwrap();
+
+        match observation["expected_class"].as_str().unwrap() {
+            "reject_unsupported_dtype" => {
+                assert!(
+                    read_tiff_stack(&input).is_err(),
+                    "unsupported {path} was accepted"
+                );
+            }
+            expected_class @ ("accepted" | "reject_nonfinite") => {
+                let stack = read_tiff_stack(&input).unwrap();
+                assert_eq!(stack.shape.z, observation["ifd_count"].as_u64().unwrap());
+                assert_eq!(stack.shape.y, observation["height"].as_u64().unwrap());
+                assert_eq!(stack.shape.x, observation["width"].as_u64().unwrap());
+                let observed_dtype = match stack.source_dtype {
+                    IntensityDType::Uint8 => "u8",
+                    IntensityDType::Uint16 => "u16",
+                    IntensityDType::Float32 => "f32",
+                };
+                assert_eq!(observed_dtype, observation["dtype"].as_str().unwrap());
+                let (first, last, all_finite) = observed_value_edges(&stack.values_zyx);
+                assert_eq!(first, observation["first_value_bits_hex"].as_str().unwrap());
+                assert_eq!(last, observation["last_value_bits_hex"].as_str().unwrap());
+                assert_eq!(all_finite, expected_class == "accepted");
+            }
+            other => panic!("unknown independent-reader classification {other}"),
+        }
+    }
+}
+
 fn assert_grid_to_world_close(actual: GridToWorld, expected: GridToWorld) {
     for (index, (actual, expected)) in actual
         .matrix4x4_row_major

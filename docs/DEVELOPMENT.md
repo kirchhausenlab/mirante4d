@@ -15,11 +15,12 @@ Mirante4D currently develops and packages on Linux x86_64.
 
 2. Install Rust through `rustup` and clone the repository. The checkout selects
    the pinned `rust-toolchain.toml` toolchain.
-3. Until WP-06 replaces the bootstrap, install its two pinned tools:
+3. Install the tools pinned by the verification registry:
 
    ```bash
    cargo install cargo-nextest --version 0.9.138 --locked
    cargo install rumdl --version 0.2.30 --locked
+   cargo install cargo-deny --version 0.20.2 --locked
    ```
 
 Running the application also requires a working Vulkan-capable graphics
@@ -33,10 +34,22 @@ Run the generated development dataset:
 cargo xtask run-dev
 ```
 
-Run the temporary bounded check or documentation-only check:
+Run the current PR profile or one focused leaf:
 
 ```bash
-cargo xtask verify-bootstrap
+cargo xtask verify-pr
+cargo xtask verify-leaf policy
+cargo xtask verify-leaf lint
+cargo xtask verify-leaf unit
+cargo xtask verify-leaf contract
+cargo xtask verify-leaf ui
+cargo xtask verify-leaf doctest
+```
+
+Check generated verification files or documentation only:
+
+```bash
+cargo xtask verification-sync --check
 cargo xtask docs-check
 ```
 
@@ -46,9 +59,17 @@ Discover the complete current command surface from the executable authority:
 cargo xtask --help
 ```
 
-`verify-bootstrap` is partial; [testing](TESTING.md) states its exact scope and
-the additional evidence required. `verify-fast` is an inherited failing gate,
-not the recommended command.
+`verify-pr policy` and `verify-pr rust` run one public group. The protected
+repository still uses `verify-bootstrap` as its sole required transitional
+check while the new jobs run in shadow. It is not the development profile.
+
+Trusted GPU verification is separate and requires the designated Vulkan
+workstation:
+
+```bash
+MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
+  cargo xtask verify-local trusted-gpu
+```
 
 ## Working Rules
 

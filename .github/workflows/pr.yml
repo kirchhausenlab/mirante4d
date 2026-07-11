@@ -1,0 +1,130 @@
+name: PR
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  NEXTEST_USER_CONFIG_FILE: none
+
+jobs:
+  policy:
+    name: PR / policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    env:
+      CARGO_HOME: ${{ runner.temp }}/cargo-home-policy
+      CARGO_TARGET_DIR: ${{ runner.temp }}/target-policy
+    steps:
+      - name: Check out the candidate revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Verify the pinned Rust manifest and compiler commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(sha256sum rust-toolchain.toml | cut -d ' ' -f1)" = "4d0674575b116a100c7d0ad754308dc6dea178b4808c760afc43136db967c7a6"
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 120 \
+            https://static.rust-lang.org/dist/channel-rust-1.96.1.toml \
+            --output "${RUNNER_TEMP}/channel-rust-1.96.1.toml"
+          echo "87eb76c53073e72b766083bed5530820694253b832a762d8385bda5759f03975  ${RUNNER_TEMP}/channel-rust-1.96.1.toml" | sha256sum --check --strict
+          test "$(rustc --version --verbose | sed -n 's/^commit-hash: //p')" = "31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd"
+          test "$(cargo --version --verbose | sed -n 's/^commit-hash: //p')" = "356927216a2d746168cf76e5e88cc3f4b58e029d"
+
+      - name: Install checksum-bound policy tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools_dir="${RUNNER_TEMP}/mirante4d-policy-tools"
+          mkdir -p "${tools_dir}"
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 120 \
+            https://github.com/rvben/rumdl/releases/download/v0.2.30/rumdl-v0.2.30-x86_64-unknown-linux-gnu.tar.gz \
+            --output "${RUNNER_TEMP}/rumdl.tar.gz"
+          echo "eb51e28ef9dff2b2d29b4527bc40123e840bb997dc8bae39d99496b898ee9f72  ${RUNNER_TEMP}/rumdl.tar.gz" | sha256sum --check --strict
+          tar -xzf "${RUNNER_TEMP}/rumdl.tar.gz" -C "${tools_dir}"
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 120 \
+            https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz \
+            --output "${RUNNER_TEMP}/cargo-deny.tar.gz"
+          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  ${RUNNER_TEMP}/cargo-deny.tar.gz" | sha256sum --check --strict
+          tar -xzf "${RUNNER_TEMP}/cargo-deny.tar.gz" -C "${tools_dir}" --strip-components=1 \
+            cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny
+          echo "${tools_dir}" >> "${GITHUB_PATH}"
+
+      - name: Fetch locked dependencies without a shared cache
+        shell: bash
+        run: timeout 120s cargo fetch --locked --target x86_64-unknown-linux-gnu
+
+      - name: Run the policy group
+        shell: bash
+        run: timeout 360s cargo xtask verify-pr policy
+
+  rust:
+    name: PR / rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_HOME: ${{ runner.temp }}/cargo-home-rust
+      CARGO_TARGET_DIR: ${{ runner.temp }}/target-rust
+    steps:
+      - name: Check out the candidate revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Verify the pinned Rust manifest and compiler commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(sha256sum rust-toolchain.toml | cut -d ' ' -f1)" = "4d0674575b116a100c7d0ad754308dc6dea178b4808c760afc43136db967c7a6"
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 120 \
+            https://static.rust-lang.org/dist/channel-rust-1.96.1.toml \
+            --output "${RUNNER_TEMP}/channel-rust-1.96.1.toml"
+          echo "87eb76c53073e72b766083bed5530820694253b832a762d8385bda5759f03975  ${RUNNER_TEMP}/channel-rust-1.96.1.toml" | sha256sum --check --strict
+          test "$(rustc --version --verbose | sed -n 's/^commit-hash: //p')" = "31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd"
+          test "$(cargo --version --verbose | sed -n 's/^commit-hash: //p')" = "356927216a2d746168cf76e5e88cc3f4b58e029d"
+
+      - name: Install checksum-bound Nextest
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools_dir="${RUNNER_TEMP}/mirante4d-rust-tools"
+          mkdir -p "${tools_dir}"
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 120 \
+            https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.138/cargo-nextest-0.9.138-x86_64-unknown-linux-gnu.tar.gz \
+            --output "${RUNNER_TEMP}/cargo-nextest.tar.gz"
+          echo "3793bf0c27607b196f502c39b2108f571de89fcda7586ae6beefa11ee177b216  ${RUNNER_TEMP}/cargo-nextest.tar.gz" | sha256sum --check --strict
+          tar -xzf "${RUNNER_TEMP}/cargo-nextest.tar.gz" -C "${tools_dir}"
+          echo "${tools_dir}" >> "${GITHUB_PATH}"
+
+      - name: Install Linux build libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 120s sudo apt-get update
+          timeout 120s sudo apt-get install --yes --no-install-recommends \
+            libgtk-3-dev \
+            libudev-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev
+
+      - name: Fetch locked dependencies without a shared cache
+        shell: bash
+        run: timeout 120s cargo fetch --locked --target x86_64-unknown-linux-gnu
+
+      - name: Run the Rust group
+        shell: bash
+        run: timeout 900s cargo xtask verify-pr rust

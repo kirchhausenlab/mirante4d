@@ -39,24 +39,37 @@ The preserved parentless root is
 (`foundation-wp-04-exit-1`). The correction made a cold hosted bootstrap
 possible without changing product behavior.
 
-WP-05 is complete at the revision containing this documentation reset. It
-replaces the fragmented specification tree with 32 registered documents and a
-bounded `cargo xtask docs-check`. WP-06 is the next package; later technical
-cutovers remain targets, not current implementation.
+WP-05 is complete at `97ba103463a419d696b445c414515b17a5df215f`
+(`foundation-wp-05-exit-1`).
+
+This revision implements the WP-06A shadow verification machinery. It adds six
+nonrecursive leaves (`policy`, `lint`, `unit`, `contract`, `ui`, and
+`doctest`), explicit trusted-local separation, fixture and test-inventory
+enforcement, and shadow PR/Main workflows. It also removes the superseded
+`verify-fast` and `report-audit` authorities. WP-06 is not yet accepted.
 
 ## Current Verification Boundary
 
-`cargo xtask verify-bootstrap` is temporary partial feedback: formatting,
-workspace compilation, 169 selected CPU tests, and documentation checks. The
-single `Bootstrap / required` pull-request job runs that bridge on a standard
-public runner. WP-06 replaces both the bridge and the inefficient legacy test
-topology.
+The WP-06A checkpoint discovers 879 live tests: 839 normal tests assigned once
+across the public CPU leaves and 40 ignored tests assigned to the trusted GPU
+lane. The six leaves are available through `cargo xtask verify-leaf`, while
+`cargo xtask verify-pr` runs the two public groups without recursive aggregate
+commands.
+
+On the protected repository, `Bootstrap / required` remains the sole required
+status context. Candidate `PR / policy`, `PR / rust`, `Main / policy`, and
+`Main / rust` checks are shadow, non-required results until calibration and the
+explicit branch-rule flip.
 
 ## Known Limitations
 
-- `verify-fast` stops on a superseded source-size rule, and `report-audit`
-  reports an inherited evidence mismatch.
-- Raw workspace Clippy still reports inherited warnings outside the bridge.
+- WP-06 still needs protected integration and acceptance of this checkpoint,
+  twenty-run cache-free calibration, the required-context flip, separate
+  bootstrap cleanup, product-open validation, and its exit tag.
+- The package-capability lane remains pending because there is not yet an
+  honest unsupported-GPU package command.
+- The committed T1 source archive checks source TIFF facts only. Target-format
+  T1 conformance remains false until WP-10A.
 - Packaged runtime does not expose unsaved-autosave recovery.
 - Direct X11 close of a clean project can hit an inherited Winit shutdown
   panic; the dirty-project save/discard/cancel route exits cleanly.

@@ -51,26 +51,48 @@ pub(crate) const COMMAND_AUDIT_ENTRIES: &[CommandAuditEntry] = &[
         notes: "Temporary WP-01 format, compile, targeted-correctness, and active-documentation bridge; explicitly incomplete and replaced by WP-06.",
     },
     CommandAuditEntry {
-        command: "verify-fast",
+        command: "verify-leaf",
         family: "verify",
-        evidence_class: "correctness_gate",
+        evidence_class: "nonrecursive_verification_leaf",
         default_safety: "routine",
         requires_heavy_opt_in: false,
         product_evidence_role: "automated_verification_only",
-        stale_or_unsafe_status: "known_broken_source_size_gate",
-        report_paths: &[],
-        notes: "Stops before its intended checks on the superseded 2,000-line source-size rule; retained only as legacy inventory until WP-06.",
+        stale_or_unsafe_status: "current_registry_owned",
+        report_paths: &["target/mirante4d/verification/"],
+        notes: "Runs exactly one registry-owned policy, lint, unit, contract, UI, or doctest leaf.",
     },
     CommandAuditEntry {
-        command: "verify-full",
+        command: "verify-pr",
         family: "verify",
-        evidence_class: "correctness_gate",
+        evidence_class: "public_verification_group",
         default_safety: "routine",
         requires_heavy_opt_in: false,
         product_evidence_role: "automated_verification_only",
-        stale_or_unsafe_status: "known_broken_recursive_verify_fast",
-        report_paths: &[],
-        notes: "Recursively delegates to the broken verify-fast aggregate before dependency governance; retained only as legacy inventory until WP-06.",
+        stale_or_unsafe_status: "current_nonrecursive",
+        report_paths: &["target/mirante4d/verification/"],
+        notes: "Runs the public policy and/or Rust verification group in-process without recursively invoking xtask.",
+    },
+    CommandAuditEntry {
+        command: "verify-local",
+        family: "verify",
+        evidence_class: "trusted_local_verification",
+        default_safety: "trusted_machine_opt_in_required",
+        requires_heavy_opt_in: true,
+        product_evidence_role: "trusted_gpu_support_only",
+        stale_or_unsafe_status: "current_registry_owned",
+        report_paths: &["target/mirante4d/verification/"],
+        notes: "Runs the single registry-generated trusted-GPU ignored-case union; it is forbidden in GitHub Actions.",
+    },
+    CommandAuditEntry {
+        command: "verification-sync",
+        family: "verify",
+        evidence_class: "verification_registry_generation",
+        default_safety: "routine",
+        requires_heavy_opt_in: false,
+        product_evidence_role: "documentation_and_traceability_only",
+        stale_or_unsafe_status: "current_registry_authority",
+        report_paths: &["verification/generated/", ".config/nextest.toml"],
+        notes: "Generates or checks the registry-derived selector manifest and Nextest configuration.",
     },
     CommandAuditEntry {
         command: "verify-deps",
@@ -84,39 +106,6 @@ pub(crate) const COMMAND_AUDIT_ENTRIES: &[CommandAuditEntry] = &[
         notes: "Dependency source/license/advisory policy gate.",
     },
     CommandAuditEntry {
-        command: "verify-render",
-        family: "verify",
-        evidence_class: "gpu_render_gate",
-        default_safety: "gpu_required",
-        requires_heavy_opt_in: false,
-        product_evidence_role: "gpu_supporting_evidence",
-        stale_or_unsafe_status: "current_requires_gpu",
-        report_paths: &["target/mirante4d/verify-render/verify-render-report.json"],
-        notes: "Requires a usable non-CPU GPU adapter and records adapter limits plus explicit renderer/app GPU tests.",
-    },
-    CommandAuditEntry {
-        command: "verify-ui",
-        family: "verify",
-        evidence_class: "ui_visual_gate",
-        default_safety: "routine_when_snapshots_are_stable",
-        requires_heavy_opt_in: false,
-        product_evidence_role: "ui_supporting_evidence",
-        stale_or_unsafe_status: "current_needs_expansion",
-        report_paths: &["target/mirante4d/verify-ui/verify-ui-report.json"],
-        notes: "Runs ignored UI screenshot/layout checks; semantic product automation does not replace this layer.",
-    },
-    CommandAuditEntry {
-        command: "verify-e2e",
-        family: "verify",
-        evidence_class: "workflow_gate",
-        default_safety: "routine_with_no_display_unsupported_portion",
-        requires_heavy_opt_in: false,
-        product_evidence_role: "mixed_library_virtual_and_real_window_product_evidence",
-        stale_or_unsafe_status: "current_real_window_depends_on_display",
-        report_paths: &["target/mirante4d/verify-e2e/verify-e2e-report.json"],
-        notes: "Separates library, virtual-window semantic automation, and real-window product validation portions.",
-    },
-    CommandAuditEntry {
         command: "verify-coverage",
         family: "verify",
         evidence_class: "coverage_gate",
@@ -126,17 +115,6 @@ pub(crate) const COMMAND_AUDIT_ENTRIES: &[CommandAuditEntry] = &[
         stale_or_unsafe_status: "current",
         report_paths: &["target/mirante4d/coverage/summary.json"],
         notes: "Coverage is a guardrail and not proof of product behavior.",
-    },
-    CommandAuditEntry {
-        command: "verify-nightly",
-        family: "verify",
-        evidence_class: "deep_quality_gate",
-        default_safety: "nightly_or_manual",
-        requires_heavy_opt_in: false,
-        product_evidence_role: "automated_verification_only",
-        stale_or_unsafe_status: "current",
-        report_paths: &[],
-        notes: "Runs full verification, e2e, coverage, fuzzing, mutation audit, and bounded benchmark smoke.",
     },
     CommandAuditEntry {
         command: "generate-fixture",
@@ -375,31 +353,6 @@ pub(crate) const COMMAND_AUDIT_ENTRIES: &[CommandAuditEntry] = &[
         notes: "Checks the exact documentation inventory, authority ownership, read order, listing graph, local links, and anchors.",
     },
     CommandAuditEntry {
-        command: "external-ci-evidence",
-        family: "ci",
-        evidence_class: "external_ci_run_evidence",
-        default_safety: "manual_or_ci_surface_metadata_required",
-        requires_heavy_opt_in: false,
-        product_evidence_role: "external_ci_and_gpu_run_evidence",
-        stale_or_unsafe_status: "current_requires_checked_or_captured_runs",
-        report_paths: &[
-            "target/mirante4d/external-ci/external-ci-evidence.json",
-            "target/mirante4d/external-ci/surfaces/*.json",
-        ],
-        notes: "Records externally inspected hosted CPU and self-hosted GPU run metadata, or captures per-workflow CI surface artifacts for later merge; static workflow-audit remains CI configuration evidence only.",
-    },
-    CommandAuditEntry {
-        command: "completion-waiver",
-        family: "audit",
-        evidence_class: "completion_readiness_waiver",
-        default_safety: "manual_user_approval_required",
-        requires_heavy_opt_in: false,
-        product_evidence_role: "explicit_completion_exception_only",
-        stale_or_unsafe_status: "current_requires_user_approval_metadata",
-        report_paths: &["target/mirante4d/completion-waivers/completion-waivers.json"],
-        notes: "Records explicit user-approved exceptions for completion-readiness blockers; it is not product or CI evidence.",
-    },
-    CommandAuditEntry {
         command: "app-smoke",
         family: "smoke",
         evidence_class: "smoke_only",
@@ -412,14 +365,14 @@ pub(crate) const COMMAND_AUDIT_ENTRIES: &[CommandAuditEntry] = &[
     },
     CommandAuditEntry {
         command: "product-validate",
-        family: "product_validation",
-        evidence_class: "product_automation_validation",
+        family: "product_automation",
+        evidence_class: "internal_e1_automation",
         default_safety: "routine_generated_fixture_or_heavy_local_sample_opt_in",
         requires_heavy_opt_in: false,
-        product_evidence_role: "native_product_validation_when_display_available",
-        stale_or_unsafe_status: "current_display_dependent",
+        product_evidence_role: "e1_instrumented_support_only_not_product_open",
+        stale_or_unsafe_status: "current_internal_automation_not_e3_or_e4",
         report_paths: &["target/mirante4d/product-validation/"],
-        notes: "Launches the real release app with env-gated semantic automation; generated fixture scenarios are routine, and heavy local-sample scenarios have their own opt-in.",
+        notes: "Launches the release app with env-gated semantic commands and internal state/readback. This is E1 support only; it cannot satisfy E3, E4, or product-open validation.",
     },
     CommandAuditEntry {
         command: "phase10-audit",
@@ -554,17 +507,6 @@ pub(crate) const COMMAND_AUDIT_ENTRIES: &[CommandAuditEntry] = &[
         notes: "Machine-readable inventory of xtask command classifications and quarantine status.",
     },
     CommandAuditEntry {
-        command: "report-audit",
-        family: "audit",
-        evidence_class: "report_surface_audit",
-        default_safety: "routine",
-        requires_heavy_opt_in: false,
-        product_evidence_role: "documentation_and_traceability_only",
-        stale_or_unsafe_status: "current",
-        report_paths: &["target/mirante4d/report-audit/report-audit-report.json"],
-        notes: "Schema-checks current target reports, flags stale legacy product-validation artifacts, and quarantines discovered historical evidence.",
-    },
-    CommandAuditEntry {
         command: "run-dev",
         family: "developer",
         evidence_class: "developer_helper",
@@ -598,9 +540,9 @@ fn command_audit_report_json() -> Value {
         .iter()
         .filter(|entry| entry.evidence_class.contains("smoke"))
         .count();
-    let product_validation_count = COMMAND_AUDIT_ENTRIES
+    let internal_e1_automation_count = COMMAND_AUDIT_ENTRIES
         .iter()
-        .filter(|entry| entry.evidence_class == "product_automation_validation")
+        .filter(|entry| entry.evidence_class == "internal_e1_automation")
         .count();
 
     json!({
@@ -612,7 +554,7 @@ fn command_audit_report_json() -> Value {
             "command_count": COMMAND_AUDIT_ENTRIES.len(),
             "heavy_opt_in_count": heavy_opt_in_count,
             "smoke_only_count": smoke_only_count,
-            "product_validation_count": product_validation_count,
+            "internal_e1_automation_count": internal_e1_automation_count,
         },
         "entries": COMMAND_AUDIT_ENTRIES
             .iter()
@@ -663,14 +605,12 @@ mod tests {
     const HANDLED_COMMANDS: &[&str] = &[
         "help",
         "verify-bootstrap",
-        "verify-fast",
-        "verify-full",
+        "verify-leaf",
+        "verify-pr",
+        "verify-local",
+        "verification-sync",
         "verify-deps",
-        "verify-render",
-        "verify-ui",
-        "verify-e2e",
         "verify-coverage",
-        "verify-nightly",
         "generate-fixture",
         "package-dev",
         "package-linux-release",
@@ -705,10 +645,7 @@ mod tests {
         "baseline-promote-manifest",
         "workflow-audit",
         "docs-check",
-        "external-ci-evidence",
-        "completion-waiver",
         "command-audit",
-        "report-audit",
         "run-dev",
     ];
 
@@ -749,21 +686,20 @@ mod tests {
     #[test]
     fn command_audit_keeps_product_validation_distinct_from_benchmarks() {
         let product_validate = entry("product-validate");
-        assert_eq!(
-            product_validate.evidence_class,
-            "product_automation_validation"
-        );
+        assert_eq!(product_validate.family, "product_automation");
+        assert_eq!(product_validate.evidence_class, "internal_e1_automation");
         assert_eq!(
             product_validate.product_evidence_role,
-            "native_product_validation_when_display_available"
+            "e1_instrumented_support_only_not_product_open"
         );
+        assert!(product_validate.notes.contains("cannot satisfy E3, E4"));
 
         for benchmark in ["bench-smoke", "bench-runtime-stress", "bench-check"] {
             let entry = entry(benchmark);
-            assert_ne!(entry.evidence_class, "product_automation_validation");
+            assert_ne!(entry.evidence_class, "internal_e1_automation");
             assert_ne!(
                 entry.product_evidence_role,
-                "native_product_validation_when_display_available"
+                "e1_instrumented_support_only_not_product_open"
             );
         }
 
@@ -775,21 +711,6 @@ mod tests {
         assert_eq!(
             neuroglancer_compare.stale_or_unsafe_status,
             "current_requires_external_neuroglancer_measurement"
-        );
-    }
-
-    #[test]
-    fn command_audit_tracks_report_audit_as_evidence_hygiene() {
-        let report_audit = entry("report-audit");
-
-        assert_eq!(report_audit.evidence_class, "report_surface_audit");
-        assert_eq!(
-            report_audit.product_evidence_role,
-            "documentation_and_traceability_only"
-        );
-        assert_eq!(
-            report_audit.report_paths,
-            &["target/mirante4d/report-audit/report-audit-report.json"]
         );
     }
 
@@ -886,44 +807,6 @@ mod tests {
     }
 
     #[test]
-    fn command_audit_tracks_external_ci_evidence_as_run_evidence() {
-        let external_ci = entry("external-ci-evidence");
-
-        assert_eq!(external_ci.evidence_class, "external_ci_run_evidence");
-        assert_eq!(
-            external_ci.product_evidence_role,
-            "external_ci_and_gpu_run_evidence"
-        );
-        assert_eq!(
-            external_ci.stale_or_unsafe_status,
-            "current_requires_checked_or_captured_runs"
-        );
-        assert_eq!(
-            external_ci.report_paths,
-            &[
-                "target/mirante4d/external-ci/external-ci-evidence.json",
-                "target/mirante4d/external-ci/surfaces/*.json"
-            ]
-        );
-    }
-
-    #[test]
-    fn command_audit_tracks_completion_waiver_as_explicit_exception() {
-        let waiver = entry("completion-waiver");
-
-        assert_eq!(waiver.evidence_class, "completion_readiness_waiver");
-        assert_eq!(waiver.default_safety, "manual_user_approval_required");
-        assert_eq!(
-            waiver.product_evidence_role,
-            "explicit_completion_exception_only"
-        );
-        assert_eq!(
-            waiver.report_paths,
-            &["target/mirante4d/completion-waivers/completion-waivers.json"]
-        );
-    }
-
-    #[test]
     fn command_audit_report_counts_are_stable() {
         let report = command_audit_report_json();
 
@@ -933,7 +816,8 @@ mod tests {
             report["summary"]["command_count"],
             COMMAND_AUDIT_ENTRIES.len()
         );
-        assert_eq!(report["summary"]["product_validation_count"], 1);
+        assert_eq!(report["summary"]["internal_e1_automation_count"], 1);
+        assert!(report["summary"].get("product_validation_count").is_none());
         assert!(
             report["summary"]["heavy_opt_in_count"].as_u64().unwrap() >= 8,
             "heavy local paths must remain visible in the audit"

@@ -410,15 +410,17 @@ impl ProductAutomationController {
             }
             ProductAutomationCommand::SetViewportSize { width, height } => {
                 if *width == 0 || *height == 0 {
-                    return Err("viewport size must be nonzero".to_owned());
+                    return Err("requested window inner size in points must be nonzero".to_owned());
                 }
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                     *width as f32,
                     *height as f32,
                 )));
                 Ok(CommandProgress::Done(json!({
-                    "width": width,
-                    "height": height,
+                    "requested_window_inner_size_points": {
+                        "width": width,
+                        "height": height,
+                    },
                 })))
             }
             ProductAutomationCommand::SetViewerLayout { layout } => {
@@ -1730,11 +1732,50 @@ impl ProductAutomationController {
         {
             tracing::error!(error = %err, "failed to capture product automation failure artifact");
         }
+        let requested_window_inner_size_points = self
+            .script
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                ProductAutomationCommand::SetViewportSize { width, height } => Some(json!({
+                    "width": width,
+                    "height": height,
+                })),
+                _ => None,
+            })
+            .unwrap_or(Value::Null);
+        let render_target_pixels = self
+            .artifacts
+            .iter()
+            .rev()
+            .find(|artifact| {
+                artifact.kind == "viewport_capture" && !artifact.pixel_stats.is_blank()
+            })
+            .map(|artifact| {
+                json!({
+                    "width": artifact.width,
+                    "height": artifact.height,
+                })
+            })
+            .unwrap_or(Value::Null);
         let report = json!({
             "schema": AUTOMATION_REPORT_SCHEMA,
             "schema_version": AUTOMATION_SCHEMA_VERSION,
             "status": status,
             "failure_reason": failure_reason,
+            "evidence_level": "E1",
+            "claim_boundary": {
+                "evidence_type": "internal_native_window_product_automation",
+                "source": "instrumented_application_commands_internal_state_and_readback",
+                "closure_authority": "integration_support_only_not_black_box_product_open",
+                "e4_product_open_satisfied": false,
+            },
+            "viewport_evidence": {
+                "requested_window_inner_size_points": requested_window_inner_size_points,
+                "pixels_per_point": ctx.pixels_per_point(),
+                "observed_client_area_pixels": Value::Null,
+                "render_target_pixels": render_target_pixels,
+            },
             "started_at_epoch_ms": self.started_at_epoch_ms,
             "finished_at_epoch_ms": epoch_ms(),
             "duration_ms": duration_ms(self.started_at.elapsed()),
@@ -2836,27 +2877,25 @@ fn cross_section_runtime_counts_json(app: &MiranteWorkbenchApp) -> Value {
             CrossSectionChunkState::CpuResident
                 | CrossSectionChunkState::UploadQueued
                 | CrossSectionChunkState::GpuResident
-        ) {
-            if let Some(payload) = entry.payload.as_ref() {
-                let payload_bytes = cross_section_payload_decoded_bytes(payload);
-                cpu_resident_bytes = cpu_resident_bytes.saturating_add(payload_bytes);
-                match entry.state {
-                    CrossSectionChunkState::CpuResident => {
-                        cpu_only_resident_bytes =
-                            cpu_only_resident_bytes.saturating_add(payload_bytes);
-                    }
-                    CrossSectionChunkState::UploadQueued => {
-                        upload_queued_bytes = upload_queued_bytes.saturating_add(payload_bytes);
-                    }
-                    CrossSectionChunkState::GpuResident => {
-                        gpu_resident_bytes = gpu_resident_bytes.saturating_add(payload_bytes);
-                    }
-                    CrossSectionChunkState::Absent
-                    | CrossSectionChunkState::Queued
-                    | CrossSectionChunkState::Decoding
-                    | CrossSectionChunkState::Failed
-                    | CrossSectionChunkState::Evicted => {}
+        ) && let Some(payload) = entry.payload.as_ref()
+        {
+            let payload_bytes = cross_section_payload_decoded_bytes(payload);
+            cpu_resident_bytes = cpu_resident_bytes.saturating_add(payload_bytes);
+            match entry.state {
+                CrossSectionChunkState::CpuResident => {
+                    cpu_only_resident_bytes = cpu_only_resident_bytes.saturating_add(payload_bytes);
                 }
+                CrossSectionChunkState::UploadQueued => {
+                    upload_queued_bytes = upload_queued_bytes.saturating_add(payload_bytes);
+                }
+                CrossSectionChunkState::GpuResident => {
+                    gpu_resident_bytes = gpu_resident_bytes.saturating_add(payload_bytes);
+                }
+                CrossSectionChunkState::Absent
+                | CrossSectionChunkState::Queued
+                | CrossSectionChunkState::Decoding
+                | CrossSectionChunkState::Failed
+                | CrossSectionChunkState::Evicted => {}
             }
         }
         decoded_bytes = decoded_bytes.saturating_add(entry.decoded_bytes);

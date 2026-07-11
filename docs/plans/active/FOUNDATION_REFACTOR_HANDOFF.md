@@ -4,9 +4,11 @@ Status: ACTIVE PUBLIC-EPOCH PROGRAM
 Last reviewed: 2026-07-11
 Current technical sequence: WP-06 through WP-15
 Public-data publication: deferred to a separate future handoff
-WP-05 predecessor: WP-04 complete; public protected `main` is canonical
+WP-06 predecessor: `foundation-wp-05-exit-1`
 Completed through: WP-05 documentation and governance reset
-Next package: WP-06 verification bootstrap; entry not yet created
+Current checkpoint: WP-06A shadow machinery implemented in this revision;
+WP-06 not yet accepted
+Next checkpoint: integrate and accept WP-06A under Bootstrap, then calibrate
 
 ## Purpose
 
@@ -141,11 +143,18 @@ same checkpoint that changes the behavior.
 
 ## Verification Topology
 
-Public pull requests eventually expose exactly two required GitHub checks:
-`PR / policy` and `PR / rust`. They summarize six nonrecursive leaves: policy,
-lint, unit, contract, UI, and doctest. Only the unit/contract/UI test-binary
-build may be shared. The uncached public target is p95 below ten minutes with a
-fifteen-minute ceiling over the fixed calibration window.
+The WP-06A checkpoint exposes six nonrecursive leaves: policy, lint, unit,
+contract, UI, and doctest. Candidate `PR / policy` and `PR / rust` checks and
+matching Main results are shadow and non-required; `Bootstrap / required`
+remains the sole required context until the fixed calibration window is
+accepted and the branch-rule replacement is read back. Only the
+unit/contract/UI test-binary build may be shared. The uncached public target is
+p95 below ten minutes with a fifteen-minute ceiling over the fixed calibration
+window.
+
+The checkpoint discovers 879 live tests: 839 normal tests owned by the public
+CPU leaves and 40 ignored tests owned by the trusted GPU lane. Package
+capability remains pending. WP-06A makes no target-format T1 claim.
 
 Trusted local lanes own GPU, package, E0-E4, performance, stress, private T5,
 and scientific evidence. E4 means the packaged application, OS-level input,
@@ -156,6 +165,10 @@ Evidence is bound to one immutable commit/tree, executable or package digest,
 fixture/dataset identity, toolchain, hardware/display facts, commands, and
 results. Zero retry is the default. A failure remains part of the evidence set;
 quarantine is remediation-only, time-bounded, and never a silent pass.
+
+WP-06 remains incomplete until protected integration and acceptance, twenty
+cache-free calibration attempts, the required-context flip, separate bootstrap
+cleanup, product-open validation, and the create-once exit tag are accepted.
 
 ## Dataset And Fixture Boundary
 

@@ -15,19 +15,40 @@ Do not collapse these claims. Unit tests, smoke tests, virtual/no-display
 automation, snapshots, benchmarks, preflight runs, and render readbacks are
 supporting evidence, not product validation.
 
-## Current Local Checks
+## WP-06A Checks
 
-The temporary general check is:
+This revision exposes six independently selectable leaves:
 
 ```bash
-cargo xtask verify-bootstrap
+cargo xtask verify-leaf policy
+cargo xtask verify-leaf lint
+cargo xtask verify-leaf unit
+cargo xtask verify-leaf contract
+cargo xtask verify-leaf ui
+cargo xtask verify-leaf doctest
 ```
 
-It checks formatting, workspace compilation, exactly 169 selected CPU tests,
-and documentation. It has bounded phase timeouts and zero test retries. It
-explicitly excludes the complete suite, Clippy, doctests, dependency policy,
-GPU, UI snapshots, E2E, packaging, performance, scientific data, real data,
-and product validation.
+Run both public groups locally with:
+
+```bash
+cargo xtask verify-pr
+```
+
+`verify-pr policy` and `verify-pr rust` select one group when focused feedback
+is useful. The Rust group performs one discovery/build, checks exact ownership,
+then runs the unit/contract/UI union once before doctests. Tests are never
+retried.
+
+The generated selectors and Nextest configuration must match their registry:
+
+```bash
+cargo xtask verification-sync --check
+```
+
+The checkpoint inventory has 879 live tests: 839 normal public-CPU tests and 40
+ignored trusted-GPU tests. The old recursive aggregates, `verify-fast`, and
+target-directory `report-audit` are no longer live authorities in the
+checkpoint.
 
 Documentation alone can be checked with:
 
@@ -39,21 +60,30 @@ That command validates the exact documentation inventory, authority ownership,
 navigation, local links, and heading anchors. Command discovery is owned by
 `cargo xtask --help`; this document does not duplicate the full command list.
 
-The old aggregate topology is not trusted: `verify-fast` fails a superseded
-source-size rule, recursive aggregates duplicate work, `report-audit` has an
-inherited mismatch, and the full suite is slow and integration-heavy.
-
 ## Hosted And Trusted-Local Boundary
 
-The current public repository has one provisional required pull-request job,
-`Bootstrap / required`, on a standard hosted runner. It executes the temporary
-bridge. Hosted verification has a hard `$0` budget, no public self-hosted
-workstation, no private data, no automatic retry, and no cache or artifact
-storage by default.
+The protected repository still has one required pull-request context,
+`Bootstrap / required`. Candidate `PR / policy` and `PR / rust` jobs, plus
+matching non-required `Main / ...` jobs, run in shadow on standard public
+runners. They do not become required until the twenty-run cache-free window is
+accepted and the branch rule is replaced and read back.
 
-GPU, packaged E2E, E0-E4, performance, stress, private T5, and scientific
-evidence run only on trusted local machines. Private dataset paths stay in
-local resolvers and never enter the public tree or hosted logs.
+Hosted verification has a hard `$0` budget, no public self-hosted workstation,
+no private data, no automatic retry, and no cache or artifact storage.
+
+GPU, product E1-E4, packaged E2E, performance, stress, private T5, and
+scientific evidence are separate trusted-local lanes. The current GPU command
+is deliberately local-only:
+
+```bash
+MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
+  cargo xtask verify-local trusted-gpu
+```
+
+Run it only on the designated clean Vulkan workstation. Private dataset paths
+stay in local resolvers and never enter the public tree or hosted logs. The
+package-capability lane is registered as pending; WP-06 does not invent a
+passing package claim before an honest unsupported-GPU command exists.
 
 No benchmark baseline is currently authoritative. The temporary tool-owned
 [baseline directory](benchmarks/baselines/README.md) remains only for WP-06
@@ -68,17 +98,19 @@ Validation must exercise the changed workflow, confirm the app remains alive
 without a hidden fallback or repeated GPU error, and inspect the resulting
 logs and evidence. Packaging or release changes use the packaged application.
 
-## WP-06 Target
+## WP-06 Remaining Gates
 
-WP-06 replaces the current bridge with six nonrecursive leaves and exactly two
-required public checks, while keeping GPU/product/performance/scientific work
-trusted-local. It also owns independent T1 fixtures, generated T2 support data,
-private T5 identity, E0-E4 evidence, timeout policy, and the complete test
-inventory disposition.
+The machinery alone is not a completed cutover. WP-06 still requires protected
+integration and acceptance, twenty consecutive qualifying cache-free Main
+attempts, required-context replacement, separate bootstrap cleanup,
+exact-revision product-open validation, and its create-once exit tag.
 
-The exact target and thresholds live in the
+The checked independent report supports only the WP-03 source-TIFF archive.
+Current schema-1 packages remain non-authoritative T2 support fixtures;
+target-format T1 conformance cannot begin before WP-10A.
+
+The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).
-They are not current commands or proof until WP-06 accepts them.
 
 ## Reporting
 

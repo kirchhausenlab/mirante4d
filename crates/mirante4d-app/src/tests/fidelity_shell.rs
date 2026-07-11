@@ -5,7 +5,7 @@ fn iso_level_for_u16_threshold(threshold: u16) -> f32 {
 #[test]
 fn frame_fidelity_label_names_currently_shown_lod() {
     let mut fidelity = FrameFidelityStatus::new_with_presentation(
-        RenderViewport::new(3840, 2160).unwrap(),
+        RenderViewport::new(1920, 1080).unwrap(),
         crate::viewport::default_presentation_viewport(),
     );
     fidelity.displayed_scale_level = Some(2);
@@ -22,7 +22,7 @@ fn frame_fidelity_label_names_currently_shown_lod() {
     assert!(label.contains("budget-limited"));
     assert!(label.contains("GPU budget"));
     assert!(label.contains("GPU bricks"));
-    assert!(label.contains("3840x2160"));
+    assert!(label.contains("1920x1080"));
     assert!(label.contains("display current"));
     assert!(label.contains("render 12.5 ms"));
     assert!(!label.contains("FPS"));
@@ -357,13 +357,13 @@ fn app_shell_opens_fixture_and_renders_first_frame() {
     assert_eq!(state.active_render_mode, RenderMode::Mip);
     assert_eq!(state.active_layer_display, default_u16_display());
     assert_eq!(state.render_backend, RenderBackend::CpuReference);
-    assert_eq!(state.frame.width, 512);
-    assert_eq!(state.frame.height, 512);
+    assert_eq!(state.frame.width, TEST_INITIAL_RENDER_VIEWPORT_SIDE);
+    assert_eq!(state.frame.height, TEST_INITIAL_RENDER_VIEWPORT_SIDE);
     assert!(state.diagnostics.nonzero_pixels > 0);
     assert_eq!(state.active_intensity_summary.voxel_count, 4096);
     assert_eq!(state.active_intensity_summary.max, 4125);
     assert_eq!(state.visible_brick_count, 1);
-    assert_eq!(state.visible_brick_plan_stride, 4);
+    assert_eq!(state.visible_brick_plan_stride, 1);
     assert!(state.visible_brick_plan_error.is_none());
 
     state.viewer_layout.switch_to_four_panel();
@@ -398,15 +398,15 @@ fn app_shell_opens_float32_dataset_and_preserves_exact_pick_readout() {
     assert_eq!(state.active_layer_dtype, IntensityDType::Float32);
     assert_eq!(state.active_projection, Projection::Orthographic);
     assert_eq!(state.render_backend, RenderBackend::CpuReference);
-    assert_eq!(state.frame.width, 512);
-    assert_eq!(state.frame.height, 512);
+    assert_eq!(state.frame.width, TEST_INITIAL_RENDER_VIEWPORT_SIDE);
+    assert_eq!(state.frame.height, TEST_INITIAL_RENDER_VIEWPORT_SIDE);
     assert!(state.frame_f32.is_some());
     assert!(state.diagnostics_f32.is_some());
     assert!(state.frame_f32.as_ref().unwrap().pixels().contains(&2.25));
     assert!(state.diagnostics_f32.unwrap().nonzero_pixels > 0);
 
     let color = color_image_for_state(&state);
-    assert_eq!(color.size, [512, 512]);
+    assert_eq!(color.size, [TEST_INITIAL_RENDER_VIEWPORT_SIDE as usize; 2]);
     assert!(color.pixels.iter().any(|pixel| pixel.a() != 0));
 
     let hit = pick_hit_from_viewport_hover(
@@ -1122,98 +1122,6 @@ fn analysis_workspace_window_exposes_selected_results() {
 }
 
 #[test]
-#[ignore = "run with cargo xtask verify-ui; requires the egui_kittest wgpu snapshot renderer"]
-fn workbench_shell_image_snapshot_matches_baseline() {
-    use egui_kittest::{Harness, SnapshotOptions};
-
-    let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(root).unwrap();
-    state.fixed_frame_time_ms_for_snapshots = Some(12.5);
-
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(960.0, 640.0))
-        .with_pixels_per_point(1.0)
-        .wgpu()
-        .build_eframe(|cc| {
-            let mut app = MiranteWorkbenchApp::new(cc, state);
-            app.state.fixed_frame_time_ms_for_snapshots = Some(12.5);
-            app
-        });
-
-    harness.snapshot_options(
-        "workbench_shell_basic",
-        &SnapshotOptions::new().failed_pixel_count_threshold(128),
-    );
-}
-
-#[test]
-#[ignore = "run with cargo xtask verify-ui; requires the egui_kittest wgpu snapshot renderer"]
-fn workbench_shell_image_snapshot_iso_hidpi_matches_baseline() {
-    workbench_shell_hidpi_mode_snapshot(
-        "workbench_shell_iso_hidpi",
-        RenderMode::Isosurface,
-        |state| {
-            state.iso_display_level = iso_level_for_u16_threshold(3_000);
-        },
-        128,
-    );
-}
-
-#[test]
-#[ignore = "run with cargo xtask verify-ui; requires the egui_kittest wgpu snapshot renderer"]
-fn workbench_shell_image_snapshot_dvr_hidpi_matches_baseline() {
-    workbench_shell_hidpi_mode_snapshot(
-        "workbench_shell_dvr_hidpi",
-        RenderMode::Dvr,
-        |state| {
-            state.dvr_density_scale = 12.0;
-        },
-        128,
-    );
-}
-
-fn workbench_shell_hidpi_mode_snapshot(
-    snapshot_name: &str,
-    render_mode: RenderMode,
-    configure: impl FnOnce(&mut AppState),
-    allowed_diff_pixels: usize,
-) {
-    use egui_kittest::{Harness, SnapshotOptions};
-
-    let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let mut state = open_dataset_and_render_first_frame(root).unwrap();
-    state.fixed_frame_time_ms_for_snapshots = Some(12.5);
-    state.active_render_mode = render_mode;
-    configure(&mut state);
-    rerender_state_with_backend(&mut state, None).unwrap();
-    assert!(
-        state.diagnostics.nonzero_pixels > 0,
-        "{snapshot_name} rendered a blank frame"
-    );
-
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(1280.0, 720.0))
-        .with_pixels_per_point(1.5)
-        .wgpu()
-        .build_eframe(|cc| {
-            let mut app = MiranteWorkbenchApp::new(cc, state);
-            app.state.fixed_frame_time_ms_for_snapshots = Some(12.5);
-            app
-        });
-
-    if allowed_diff_pixels == 0 {
-        harness.snapshot(snapshot_name);
-    } else {
-        harness.snapshot_options(
-            snapshot_name,
-            &SnapshotOptions::new().failed_pixel_count_threshold(allowed_diff_pixels),
-        );
-    }
-}
-
-#[test]
 fn display_size_maps_to_physical_render_viewport() {
     let viewport = render_viewport_for_display_size(egui::vec2(640.2, 360.2), 2.0, 2048).unwrap();
 
@@ -1236,8 +1144,13 @@ fn app_renders_to_explicit_viewport_not_volume_xy_size() {
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
     let mut state = open_dataset_and_render_first_frame(root).unwrap();
 
-    assert_eq!(state.frame.width, 512);
-    assert_eq!(state.frame.height, 512);
+    assert_eq!(
+        crate::viewport::default_render_viewport_for_shape(state.active_source_shape).unwrap(),
+        RenderViewport::new(512, 512).unwrap(),
+        "the production initial viewport remains unchanged"
+    );
+    assert_eq!(state.frame.width, TEST_INITIAL_RENDER_VIEWPORT_SIDE);
+    assert_eq!(state.frame.height, TEST_INITIAL_RENDER_VIEWPORT_SIDE);
     assert!(set_render_viewport(
         &mut state,
         RenderViewport::new(80, 45).unwrap()
@@ -1263,8 +1176,8 @@ fn app_shell_exposes_time_and_channel_metadata() {
     assert_eq!(state.layers[0].display, default_u16_display());
     assert_eq!(state.active_timepoint, TimeIndex(0));
     assert_eq!(state.timepoint_count, 3);
-    assert_eq!(state.frame.width, 512);
-    assert_eq!(state.frame.height, 512);
+    assert_eq!(state.frame.width, TEST_INITIAL_RENDER_VIEWPORT_SIDE);
+    assert_eq!(state.frame.height, TEST_INITIAL_RENDER_VIEWPORT_SIDE);
     assert_eq!(state.visible_brick_count, 1);
 }
 

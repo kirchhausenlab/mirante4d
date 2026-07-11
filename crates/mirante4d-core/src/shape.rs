@@ -114,6 +114,7 @@ fn div_ceil(value: u64, divisor: u64) -> u64 {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
 
     #[test]
     fn validates_positive_shape() {
@@ -142,6 +143,9 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 64,
+            max_shrink_iters: 1_024,
+            failure_persistence: None,
+            rng_seed: RngSeed::Fixed(0x4d34_5348_4150_4531),
             .. ProptestConfig::default()
         })]
 

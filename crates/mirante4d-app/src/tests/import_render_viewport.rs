@@ -519,8 +519,11 @@ fn mip_texture_conversion_preserves_dimensions_and_nonzero_signal() {
 
     let image = mip_to_color_image(&state.frame, state.active_layer_display);
 
-    assert_eq!(image.size, [512, 512]);
-    assert_eq!(image.pixels.len(), 512 * 512);
+    assert_eq!(image.size, [TEST_INITIAL_RENDER_VIEWPORT_SIDE as usize; 2]);
+    assert_eq!(
+        image.pixels.len(),
+        (TEST_INITIAL_RENDER_VIEWPORT_SIDE * TEST_INITIAL_RENDER_VIEWPORT_SIDE) as usize
+    );
     assert!(
         image
             .pixels
@@ -3240,9 +3243,9 @@ fn write_multiscale_app_dataset(output_root: &Path) -> PathBuf {
 
 fn write_large_multiscale_app_dataset(output_root: &Path) -> PathBuf {
     let package_root = output_root.join("app-large-multiscale.m4d");
-    let s0_shape = Shape4D::new(1, 258, 258, 258).unwrap();
-    let s1_shape = Shape4D::new(1, 33, 33, 33).unwrap();
-    let s0_grid_to_world = mirante4d_core::GridToWorld::scale_um(1.0, 1.0, 1.0);
+    let s0_shape = Shape4D::new(1, 33, 33, 33).unwrap();
+    let s1_shape = Shape4D::new(1, 5, 5, 5).unwrap();
+    let s0_grid_to_world = mirante4d_core::GridToWorld::scale_um(8.0, 8.0, 8.0);
     let s1_grid_to_world = s0_grid_to_world
         .downsampled_integer_centered(8, 8, 8)
         .unwrap();
@@ -3269,7 +3272,7 @@ fn write_large_multiscale_app_dataset(output_root: &Path) -> PathBuf {
                     DenseU16Scale {
                         level: 0,
                         shape: s0_shape,
-                        brick_shape: Shape4D::new(1, 32, 32, 32).unwrap(),
+                        brick_shape: Shape4D::new(1, 4, 4, 4).unwrap(),
                         grid_to_world: s0_grid_to_world,
                         source_scale: None,
                         reduction: ScaleReduction::Source,
@@ -3278,7 +3281,7 @@ fn write_large_multiscale_app_dataset(output_root: &Path) -> PathBuf {
                     DenseU16Scale {
                         level: 1,
                         shape: s1_shape,
-                        brick_shape: Shape4D::new(1, 33, 33, 33).unwrap(),
+                        brick_shape: Shape4D::new(1, 5, 5, 5).unwrap(),
                         grid_to_world: s1_grid_to_world,
                         source_scale: Some(0),
                         reduction: ScaleReduction::Mean,
@@ -3295,10 +3298,10 @@ fn write_large_multiscale_app_dataset(output_root: &Path) -> PathBuf {
 
 fn write_three_scale_budgeted_app_dataset(output_root: &Path) -> PathBuf {
     let package_root = output_root.join("app-three-scale-budgeted.m4d");
-    let s0_shape = Shape4D::new(1, 288, 288, 288).unwrap();
-    let s1_shape = Shape4D::new(1, 144, 144, 144).unwrap();
-    let s2_shape = Shape4D::new(1, 72, 72, 72).unwrap();
-    let s0_grid_to_world = mirante4d_core::GridToWorld::scale_um(1.0, 1.0, 1.0);
+    let s0_shape = Shape4D::new(1, 36, 36, 36).unwrap();
+    let s1_shape = Shape4D::new(1, 18, 18, 18).unwrap();
+    let s2_shape = Shape4D::new(1, 9, 9, 9).unwrap();
+    let s0_grid_to_world = mirante4d_core::GridToWorld::scale_um(8.0, 8.0, 8.0);
     let s1_grid_to_world = s0_grid_to_world
         .downsampled_integer_centered(2, 2, 2)
         .unwrap();
@@ -3328,7 +3331,7 @@ fn write_three_scale_budgeted_app_dataset(output_root: &Path) -> PathBuf {
                     DenseU16Scale {
                         level: 0,
                         shape: s0_shape,
-                        brick_shape: Shape4D::new(1, 24, 24, 24).unwrap(),
+                        brick_shape: Shape4D::new(1, 3, 3, 3).unwrap(),
                         grid_to_world: s0_grid_to_world,
                         source_scale: None,
                         reduction: ScaleReduction::Source,
@@ -3337,7 +3340,7 @@ fn write_three_scale_budgeted_app_dataset(output_root: &Path) -> PathBuf {
                     DenseU16Scale {
                         level: 1,
                         shape: s1_shape,
-                        brick_shape: Shape4D::new(1, 24, 24, 24).unwrap(),
+                        brick_shape: Shape4D::new(1, 3, 3, 3).unwrap(),
                         grid_to_world: s1_grid_to_world,
                         source_scale: Some(0),
                         reduction: ScaleReduction::Mean,
@@ -3346,7 +3349,7 @@ fn write_three_scale_budgeted_app_dataset(output_root: &Path) -> PathBuf {
                     DenseU16Scale {
                         level: 2,
                         shape: s2_shape,
-                        brick_shape: Shape4D::new(1, 24, 24, 24).unwrap(),
+                        brick_shape: Shape4D::new(1, 3, 3, 3).unwrap(),
                         grid_to_world: s2_grid_to_world,
                         source_scale: Some(1),
                         reduction: ScaleReduction::Mean,
@@ -3363,10 +3366,10 @@ fn write_three_scale_budgeted_app_dataset(output_root: &Path) -> PathBuf {
 
 fn write_above_minimum_cap_app_dataset(output_root: &Path) -> PathBuf {
     let package_root = output_root.join("app-above-minimum-cap.m4d");
-    let s0_shape = Shape4D::new(1, 288, 288, 288).unwrap();
-    let s1_shape = Shape4D::new(1, 144, 144, 144).unwrap();
-    let s2_shape = Shape4D::new(1, 72, 72, 72).unwrap();
-    let s0_grid_to_world = mirante4d_core::GridToWorld::scale_um(1.0, 1.0, 1.0);
+    let s0_shape = Shape4D::new(1, 48, 48, 48).unwrap();
+    let s1_shape = Shape4D::new(1, 24, 24, 24).unwrap();
+    let s2_shape = Shape4D::new(1, 12, 12, 12).unwrap();
+    let s0_grid_to_world = mirante4d_core::GridToWorld::scale_um(6.0, 6.0, 6.0);
     let s1_grid_to_world = s0_grid_to_world
         .downsampled_integer_centered(2, 2, 2)
         .unwrap();
@@ -3396,7 +3399,7 @@ fn write_above_minimum_cap_app_dataset(output_root: &Path) -> PathBuf {
                     DenseU16Scale {
                         level: 0,
                         shape: s0_shape,
-                        brick_shape: Shape4D::new(1, 18, 18, 18).unwrap(),
+                        brick_shape: Shape4D::new(1, 3, 3, 3).unwrap(),
                         grid_to_world: s0_grid_to_world,
                         source_scale: None,
                         reduction: ScaleReduction::Source,
@@ -3405,7 +3408,7 @@ fn write_above_minimum_cap_app_dataset(output_root: &Path) -> PathBuf {
                     DenseU16Scale {
                         level: 1,
                         shape: s1_shape,
-                        brick_shape: Shape4D::new(1, 18, 18, 18).unwrap(),
+                        brick_shape: Shape4D::new(1, 3, 3, 3).unwrap(),
                         grid_to_world: s1_grid_to_world,
                         source_scale: Some(0),
                         reduction: ScaleReduction::Mean,
@@ -3414,7 +3417,7 @@ fn write_above_minimum_cap_app_dataset(output_root: &Path) -> PathBuf {
                     DenseU16Scale {
                         level: 2,
                         shape: s2_shape,
-                        brick_shape: Shape4D::new(1, 36, 36, 36).unwrap(),
+                        brick_shape: Shape4D::new(1, 6, 6, 6).unwrap(),
                         grid_to_world: s2_grid_to_world,
                         source_scale: Some(1),
                         reduction: ScaleReduction::Mean,

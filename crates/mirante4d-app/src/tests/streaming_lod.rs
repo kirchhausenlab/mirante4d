@@ -864,7 +864,6 @@ fn app_submits_one_selected_budget_fallback_without_extra_lod_work() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_above_minimum_cap_app_dataset(tempdir.path());
     let mut state = open_dataset_and_render_first_frame(root).unwrap();
-    state.render_viewport = RenderViewport::new(512, 512).unwrap();
     set_orthographic_world_per_screen_point_for_height(&mut state, 288.0);
 
     rerender_state_with_backend(&mut state, None).unwrap();
@@ -1379,6 +1378,11 @@ fn app_streams_selected_lod_scale_into_resident_renderer() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_multiscale_app_dataset(tempdir.path());
     let mut state = open_dataset_and_render_first_frame(root).unwrap();
+    assert!(set_render_viewport(
+        &mut state,
+        RenderViewport::new(64, 64).unwrap()
+    ));
+    state.presentation_viewport = PresentationViewport::new(64.0, 64.0).unwrap();
     set_orthographic_world_per_screen_point(&mut state, 2.5);
     rerender_state_with_backend(&mut state, None).unwrap();
     let pool = BrickReadPool::new(state.dataset.clone(), 1, 4).unwrap();

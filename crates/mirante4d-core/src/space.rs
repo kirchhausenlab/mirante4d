@@ -118,6 +118,7 @@ mod tests {
     use super::*;
     use approx::assert_abs_diff_eq;
     use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
 
     #[test]
     fn anisotropic_scale_round_trips_points() {
@@ -177,6 +178,9 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 64,
+            max_shrink_iters: 1_024,
+            failure_persistence: None,
+            rng_seed: RngSeed::Fixed(0x4d34_5350_4143_4531),
             .. ProptestConfig::default()
         })]
 
