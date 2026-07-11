@@ -14,7 +14,7 @@ use crate::reports::write_json_file;
 const OUTPUT_DIR: &str = "target/mirante4d/workflow-audit";
 const REPORT_JSON: &str = "target/mirante4d/workflow-audit/workflow-audit-report.json";
 const REPORT_MD: &str = "target/mirante4d/workflow-audit/workflow-audit-report.md";
-const CHECKOUT: &str = "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0";
+const CHECKOUT: &str = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683";
 
 #[derive(Clone, Copy)]
 struct Spec {
