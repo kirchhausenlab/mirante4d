@@ -2,7 +2,7 @@ use super::*;
 
 pub fn render_camera_mip_from_bricks(
     resident: &ResidentBrickSetU16,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
 ) -> Result<(MipImageU16, BrickFrameDiagnostics), RenderError> {
     render_camera_from_bricks(resident, camera, viewport, CameraRenderMode::Mip)
@@ -10,7 +10,7 @@ pub fn render_camera_mip_from_bricks(
 
 pub fn render_camera_from_bricks(
     resident: &ResidentBrickSetU16,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     mode: CameraRenderMode,
 ) -> Result<(MipImageU16, BrickFrameDiagnostics), RenderError> {
@@ -25,7 +25,7 @@ pub fn render_camera_from_bricks(
 
 pub fn render_camera_from_bricks_with_quality(
     resident: &ResidentBrickSetU16,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     mode: CameraRenderMode,
     quality: CameraRenderQuality,
@@ -35,7 +35,7 @@ pub fn render_camera_from_bricks_with_quality(
 
 pub fn render_camera_u8_from_bricks_with_quality(
     resident: &ResidentBrickSetU8,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     mode: CameraRenderMode,
     quality: CameraRenderQuality,
@@ -45,7 +45,7 @@ pub fn render_camera_u8_from_bricks_with_quality(
 
 fn render_camera_from_integer_bricks_with_quality(
     resident: &impl IntegerResidentSet,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     mode: CameraRenderMode,
     quality: CameraRenderQuality,
@@ -61,12 +61,9 @@ fn render_camera_from_integer_bricks_with_quality(
 
     for row in 0..viewport.height {
         for col in 0..viewport.width {
-            let world_ray = camera.ray_for_render_pixel(
-                col as f64,
-                row as f64,
-                viewport.width as f64,
-                viewport.height as f64,
-            );
+            let world_ray = crate::current_camera::ray_for_render_pixel(
+                camera, col as f64, row as f64, viewport,
+            )?;
             let grid_ray = GridRay {
                 origin: world_to_grid.transform_point(world_ray.origin),
                 direction: world_to_grid.transform_vector(world_ray.direction),
@@ -113,7 +110,7 @@ fn render_camera_from_integer_bricks_with_quality(
 
 pub fn render_camera_f32_from_bricks(
     resident: &ResidentBrickSetF32,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     mode: CameraRenderModeF32,
 ) -> Result<(MipImageF32, BrickFrameDiagnosticsF32), RenderError> {
@@ -128,7 +125,7 @@ pub fn render_camera_f32_from_bricks(
 
 pub fn render_camera_f32_from_bricks_with_quality(
     resident: &ResidentBrickSetF32,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     mode: CameraRenderModeF32,
     quality: CameraRenderQuality,
@@ -144,12 +141,9 @@ pub fn render_camera_f32_from_bricks_with_quality(
 
     for row in 0..viewport.height {
         for col in 0..viewport.width {
-            let world_ray = camera.ray_for_render_pixel(
-                col as f64,
-                row as f64,
-                viewport.width as f64,
-                viewport.height as f64,
-            );
+            let world_ray = crate::current_camera::ray_for_render_pixel(
+                camera, col as f64, row as f64, viewport,
+            )?;
             let grid_ray = GridRay {
                 origin: world_to_grid.transform_point(world_ray.origin),
                 direction: world_to_grid.transform_vector(world_ray.direction),
@@ -195,7 +189,7 @@ pub fn render_camera_f32_from_bricks_with_quality(
 
 pub fn render_dvr_channels_from_bricks_with_quality(
     channels: &[DvrResidentChannel<'_>],
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     quality: CameraRenderQuality,
 ) -> Result<(MipImageU16, BrickFrameDiagnostics), RenderError> {
@@ -231,12 +225,9 @@ pub fn render_dvr_channels_from_bricks_with_quality(
 
     for row in 0..viewport.height {
         for col in 0..viewport.width {
-            let world_ray = camera.ray_for_render_pixel(
-                col as f64,
-                row as f64,
-                viewport.width as f64,
-                viewport.height as f64,
-            );
+            let world_ray = crate::current_camera::ray_for_render_pixel(
+                camera, col as f64, row as f64, viewport,
+            )?;
             let grid_ray = GridRay {
                 origin: world_to_grid.transform_point(world_ray.origin),
                 direction: world_to_grid.transform_vector(world_ray.direction),
@@ -628,9 +619,9 @@ fn project_dvr_channels_from_bricks_along_grid_ray(
     }
 
     let entry = ray.origin + ray.direction * hit.enter;
-    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, volume_shape.x);
-    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, volume_shape.y);
-    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, volume_shape.z);
+    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, volume_shape.x());
+    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, volume_shape.y());
+    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, volume_shape.z());
 
     let mut accumulated_rgba = [0.0; 4];
     let mut accumulated_alpha = 0.0;
@@ -843,9 +834,9 @@ fn project_volume_along_grid_ray(
 
     let entry = ray.origin + ray.direction * hit.enter;
     let volume_shape = resident.volume_shape();
-    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, volume_shape.x);
-    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, volume_shape.y);
-    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, volume_shape.z);
+    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, volume_shape.x());
+    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, volume_shape.y());
+    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, volume_shape.z());
     let mut max_value = 0u16;
     let mut accumulated_rgba = [0.0; 4];
     let mut accumulated_alpha = 0.0;
@@ -983,9 +974,24 @@ fn project_f32_volume_along_grid_ray(
     }
 
     let entry = ray.origin + ray.direction * hit.enter;
-    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, resident.volume_shape.x);
-    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, resident.volume_shape.y);
-    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, resident.volume_shape.z);
+    let mut x = AxisTraversal::new(
+        entry.x,
+        ray.direction.x,
+        hit.enter,
+        resident.volume_shape.x(),
+    );
+    let mut y = AxisTraversal::new(
+        entry.y,
+        ray.direction.y,
+        hit.enter,
+        resident.volume_shape.y(),
+    );
+    let mut z = AxisTraversal::new(
+        entry.z,
+        ray.direction.z,
+        hit.enter,
+        resident.volume_shape.z(),
+    );
     let mut max_value: Option<f32> = None;
     let mut accumulated_rgba = [0.0; 4];
     let mut accumulated_alpha = 0.0;

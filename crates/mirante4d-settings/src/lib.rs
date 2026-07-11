@@ -84,6 +84,12 @@ pub enum SettingsError {
     ActorUnavailable,
     #[error("settings actor event channel is disconnected")]
     ActorEventChannelDisconnected,
+    #[error("settings startup outcome has already been received")]
+    StartupAlreadyReceived,
+    #[error("settings startup outcome must be received before later actor events")]
+    StartupNotReceived,
+    #[error("settings actor emitted a non-startup event before its initial load outcome")]
+    UnexpectedStartupEvent,
     #[error("the rejected settings file requires explicit replacement")]
     ExplicitReplacementRequired,
     #[error("settings actor thread panicked during shutdown")]
@@ -177,6 +183,47 @@ impl Default for ResourcePolicy {
             gpu_budget_bytes: DEFAULT_UNKNOWN_GPU_BUDGET_BYTES,
         }
     }
+}
+
+/// Builds the approved default policy from this Linux host's RAM and the
+/// caller's best available dedicated-GPU capacity.
+///
+/// Unavailable or malformed `/proc/meminfo` is treated as unknown capacity and
+/// therefore uses the explicit 4 GiB CPU default. An unavailable GPU capacity
+/// uses the explicit 1 GiB GPU default.
+pub fn recommended_for_current_system(
+    dedicated_gpu_memory_bytes: Option<u64>,
+) -> Result<ResourcePolicy, SettingsError> {
+    ResourcePolicy::recommended(
+        detect_linux_installed_memory_bytes(),
+        dedicated_gpu_memory_bytes,
+    )
+}
+
+fn detect_linux_installed_memory_bytes() -> Option<u64> {
+    let file = File::open("/proc/meminfo").ok()?;
+    let mut encoded = Vec::with_capacity(4 * 1024);
+    file.take(MAX_SETTINGS_DOCUMENT_BYTES as u64 + 1)
+        .read_to_end(&mut encoded)
+        .ok()?;
+    if encoded.len() > MAX_SETTINGS_DOCUMENT_BYTES {
+        return None;
+    }
+    let encoded = std::str::from_utf8(&encoded).ok()?;
+    parse_linux_mem_total_bytes(encoded)
+}
+
+fn parse_linux_mem_total_bytes(encoded: &str) -> Option<u64> {
+    let line = encoded.lines().find(|line| line.starts_with("MemTotal:"))?;
+    let mut fields = line.split_ascii_whitespace();
+    if fields.next()? != "MemTotal:" {
+        return None;
+    }
+    let kibibytes = fields.next()?.parse::<u64>().ok()?;
+    if kibibytes == 0 || fields.next()? != "kB" || fields.next().is_some() {
+        return None;
+    }
+    kibibytes.checked_mul(1024)
 }
 
 fn recommended_cpu_dataset_budget_bytes(installed_memory_bytes: u64) -> u64 {
@@ -412,6 +459,7 @@ pub struct SettingsActor {
     sender: SyncSender<SettingsRequest>,
     events: Option<Receiver<SettingsEvent>>,
     worker: Option<JoinHandle<()>>,
+    startup_received: bool,
 }
 
 impl SettingsActor {
@@ -426,7 +474,33 @@ impl SettingsActor {
             sender,
             events: Some(events),
             worker: Some(worker),
+            startup_received: false,
         })
+    }
+
+    /// Waits for and consumes exactly the actor's initial load outcome.
+    ///
+    /// Composition calls this before creating the UI. Settings loading remains
+    /// on the actor thread; no polling or UI-thread filesystem access is
+    /// required.
+    pub fn receive_startup(&mut self) -> Result<SettingsLoadOutcome, SettingsError> {
+        if self.startup_received {
+            return Err(SettingsError::StartupAlreadyReceived);
+        }
+        let events = self
+            .events
+            .as_ref()
+            .ok_or(SettingsError::ActorEventChannelDisconnected)?;
+        match events
+            .recv()
+            .map_err(|_| SettingsError::ActorEventChannelDisconnected)?
+        {
+            SettingsEvent::Loaded(outcome) => {
+                self.startup_received = true;
+                Ok(outcome)
+            }
+            _ => Err(SettingsError::UnexpectedStartupEvent),
+        }
     }
 
     pub fn request_save(
@@ -445,6 +519,9 @@ impl SettingsActor {
     }
 
     pub fn try_recv(&self) -> Result<Option<SettingsEvent>, SettingsError> {
+        if !self.startup_received {
+            return Err(SettingsError::StartupNotReceived);
+        }
         let events = self
             .events
             .as_ref()

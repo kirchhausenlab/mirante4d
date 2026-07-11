@@ -1,6 +1,8 @@
 use glam::DVec3;
-use mirante4d_core::{CameraState, GridToWorld, Shape3D};
 use mirante4d_data::{DenseVolumeF32, DenseVolumeU8, DenseVolumeU16};
+use mirante4d_domain::{GridToWorld, Shape3D};
+use mirante4d_format::CurrentGridToWorldExt;
+use mirante4d_render_api::CameraFrame;
 
 use crate::{
     DvrRgbaFrame, FrameDiagnostics, FrameDiagnosticsF32, GridPosition, IsoSurfaceFrameF32,

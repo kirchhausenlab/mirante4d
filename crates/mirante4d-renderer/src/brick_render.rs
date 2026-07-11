@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
 use glam::DVec3;
-use mirante4d_core::{CameraState, GridToWorld, LayerId, Shape3D, TimeIndex};
 use mirante4d_data::{SpatialBrickIndex, VolumeBrickF32, VolumeBrickU8, VolumeBrickU16};
+use mirante4d_domain::{GridToWorld, Shape3D, TimeIndex};
+use mirante4d_format::{CurrentGridToWorldExt, LayerId};
+use mirante4d_render_api::CameraFrame;
 
 use crate::{
     CameraRenderMode, CameraRenderModeF32, CameraRenderQuality, DvrRenderParameters, DvrRgbaFrame,
@@ -237,9 +239,9 @@ impl ResidentBrickSetU16 {
 
     fn brick_at(&self, z: u64, y: u64, x: u64) -> Option<&VolumeBrickU16> {
         let brick_index = SpatialBrickIndex::new(
-            z / self.brick_shape.z,
-            y / self.brick_shape.y,
-            x / self.brick_shape.x,
+            z / self.brick_shape.z(),
+            y / self.brick_shape.y(),
+            x / self.brick_shape.x(),
         );
         self.brick_slots.get(&brick_index).and_then(|slot| {
             self.bricks
@@ -407,9 +409,9 @@ impl ResidentBrickSetU8 {
 
     fn brick_at(&self, z: u64, y: u64, x: u64) -> Option<&VolumeBrickU8> {
         let brick_index = SpatialBrickIndex::new(
-            z / self.brick_shape.z,
-            y / self.brick_shape.y,
-            x / self.brick_shape.x,
+            z / self.brick_shape.z(),
+            y / self.brick_shape.y(),
+            x / self.brick_shape.x(),
         );
         self.brick_slots.get(&brick_index).and_then(|slot| {
             self.bricks
@@ -632,9 +634,9 @@ impl ResidentBrickSetF32 {
 
     fn brick_at(&self, z: u64, y: u64, x: u64) -> Option<&VolumeBrickF32> {
         let brick_index = SpatialBrickIndex::new(
-            z / self.brick_shape.z,
-            y / self.brick_shape.y,
-            x / self.brick_shape.x,
+            z / self.brick_shape.z(),
+            y / self.brick_shape.y(),
+            x / self.brick_shape.x(),
         );
         self.brick_slots.get(&brick_index).and_then(|slot| {
             self.bricks
@@ -724,7 +726,7 @@ fn indexed_f32_brick_slots(bricks: &[VolumeBrickF32]) -> HashMap<SpatialBrickInd
 
 fn infer_u8_brick_shape(volume_shape: Shape3D, bricks: &[VolumeBrickU8]) -> Shape3D {
     let z = infer_axis_brick_size(
-        volume_shape.z,
+        volume_shape.z(),
         bricks.iter().map(|brick| {
             (
                 brick.brick_index.z,
@@ -734,7 +736,7 @@ fn infer_u8_brick_shape(volume_shape: Shape3D, bricks: &[VolumeBrickU8]) -> Shap
         }),
     );
     let y = infer_axis_brick_size(
-        volume_shape.y,
+        volume_shape.y(),
         bricks.iter().map(|brick| {
             (
                 brick.brick_index.y,
@@ -744,7 +746,7 @@ fn infer_u8_brick_shape(volume_shape: Shape3D, bricks: &[VolumeBrickU8]) -> Shap
         }),
     );
     let x = infer_axis_brick_size(
-        volume_shape.x,
+        volume_shape.x(),
         bricks.iter().map(|brick| {
             (
                 brick.brick_index.x,
@@ -753,12 +755,12 @@ fn infer_u8_brick_shape(volume_shape: Shape3D, bricks: &[VolumeBrickU8]) -> Shap
             )
         }),
     );
-    Shape3D { z, y, x }
+    Shape3D::new(z, y, x).expect("inferred brick dimensions remain positive and bounded")
 }
 
 fn infer_u16_brick_shape(volume_shape: Shape3D, bricks: &[VolumeBrickU16]) -> Shape3D {
     let z = infer_axis_brick_size(
-        volume_shape.z,
+        volume_shape.z(),
         bricks.iter().map(|brick| {
             (
                 brick.brick_index.z,
@@ -768,7 +770,7 @@ fn infer_u16_brick_shape(volume_shape: Shape3D, bricks: &[VolumeBrickU16]) -> Sh
         }),
     );
     let y = infer_axis_brick_size(
-        volume_shape.y,
+        volume_shape.y(),
         bricks.iter().map(|brick| {
             (
                 brick.brick_index.y,
@@ -778,7 +780,7 @@ fn infer_u16_brick_shape(volume_shape: Shape3D, bricks: &[VolumeBrickU16]) -> Sh
         }),
     );
     let x = infer_axis_brick_size(
-        volume_shape.x,
+        volume_shape.x(),
         bricks.iter().map(|brick| {
             (
                 brick.brick_index.x,
@@ -787,12 +789,12 @@ fn infer_u16_brick_shape(volume_shape: Shape3D, bricks: &[VolumeBrickU16]) -> Sh
             )
         }),
     );
-    Shape3D { z, y, x }
+    Shape3D::new(z, y, x).expect("inferred brick dimensions remain positive and bounded")
 }
 
 fn infer_f32_brick_shape(volume_shape: Shape3D, bricks: &[VolumeBrickF32]) -> Shape3D {
     let z = infer_axis_brick_size(
-        volume_shape.z,
+        volume_shape.z(),
         bricks.iter().map(|brick| {
             (
                 brick.brick_index.z,
@@ -802,7 +804,7 @@ fn infer_f32_brick_shape(volume_shape: Shape3D, bricks: &[VolumeBrickF32]) -> Sh
         }),
     );
     let y = infer_axis_brick_size(
-        volume_shape.y,
+        volume_shape.y(),
         bricks.iter().map(|brick| {
             (
                 brick.brick_index.y,
@@ -812,7 +814,7 @@ fn infer_f32_brick_shape(volume_shape: Shape3D, bricks: &[VolumeBrickF32]) -> Sh
         }),
     );
     let x = infer_axis_brick_size(
-        volume_shape.x,
+        volume_shape.x(),
         bricks.iter().map(|brick| {
             (
                 brick.brick_index.x,
@@ -821,7 +823,7 @@ fn infer_f32_brick_shape(volume_shape: Shape3D, bricks: &[VolumeBrickF32]) -> Sh
             )
         }),
     );
-    Shape3D { z, y, x }
+    Shape3D::new(z, y, x).expect("inferred brick dimensions remain positive and bounded")
 }
 
 fn infer_axis_brick_size(

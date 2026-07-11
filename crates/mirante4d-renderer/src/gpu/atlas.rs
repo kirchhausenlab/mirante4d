@@ -4,8 +4,8 @@ use std::{
     sync::Arc,
 };
 
-use mirante4d_core::Shape3D;
 use mirante4d_data::{SpatialBrickIndex, VolumeRegion};
+use mirante4d_domain::Shape3D;
 use wgpu::util::DeviceExt;
 
 use super::{GpuBrickAtlasResidencySnapshot, GpuRenderError, GpuRenderer, GpuRendererStats};
@@ -1179,9 +1179,9 @@ impl GpuBrickAtlasF32Resource {
                 }
             })?,
             value_words,
-            x_size: checked_u32("f32_brick_x_size", brick.volume.shape.x)?,
-            y_size: checked_u32("f32_brick_y_size", brick.volume.shape.y)?,
-            z_size: checked_u32("f32_brick_z_size", brick.volume.shape.z)?,
+            x_size: checked_u32("f32_brick_x_size", brick.volume.shape.x())?,
+            y_size: checked_u32("f32_brick_y_size", brick.volume.shape.y())?,
+            z_size: checked_u32("f32_brick_z_size", brick.volume.shape.z())?,
             x_start: checked_u32("f32_brick_x_start", brick.region.x_start)?,
             y_start: checked_u32("f32_brick_y_start", brick.region.y_start)?,
             z_start: checked_u32("f32_brick_z_start", brick.region.z_start)?,
@@ -1362,6 +1362,7 @@ impl GpuBrickAtlasCache {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn get_or_update_u8(
         &mut self,
         device: &wgpu::Device,
@@ -1439,6 +1440,7 @@ impl GpuBrickAtlasCache {
         self.store_resource(key, resource)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn get_or_update(
         &mut self,
         device: &wgpu::Device,
@@ -1740,6 +1742,7 @@ impl GpuBrickAtlasF32Cache {
         Ok(low)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn get_or_update(
         &mut self,
         device: &wgpu::Device,
@@ -1872,17 +1875,17 @@ fn validate_resident_pages_u8(
     }
     let mut pages = HashSet::with_capacity(resident.bricks().len());
     for brick in resident.bricks() {
-        if brick.brick_index.z >= brick_grid_shape.z
-            || brick.brick_index.y >= brick_grid_shape.y
-            || brick.brick_index.x >= brick_grid_shape.x
+        if brick.brick_index.z >= brick_grid_shape.z()
+            || brick.brick_index.y >= brick_grid_shape.y()
+            || brick.brick_index.x >= brick_grid_shape.x()
         {
             return Err(RenderError::InvalidBrickAtlas(
                 "resident brick index exceeds brick grid",
             ));
         }
-        if brick.volume.shape.z > brick_shape.z
-            || brick.volume.shape.y > brick_shape.y
-            || brick.volume.shape.x > brick_shape.x
+        if brick.volume.shape.z() > brick_shape.z()
+            || brick.volume.shape.y() > brick_shape.y()
+            || brick.volume.shape.x() > brick_shape.x()
         {
             return Err(RenderError::InvalidBrickAtlas(
                 "resident brick shape exceeds declared brick shape",
@@ -1967,17 +1970,17 @@ fn validate_resident_pages_u16(
     }
     let mut pages = HashSet::with_capacity(resident.bricks().len());
     for brick in resident.bricks() {
-        if brick.brick_index.z >= brick_grid_shape.z
-            || brick.brick_index.y >= brick_grid_shape.y
-            || brick.brick_index.x >= brick_grid_shape.x
+        if brick.brick_index.z >= brick_grid_shape.z()
+            || brick.brick_index.y >= brick_grid_shape.y()
+            || brick.brick_index.x >= brick_grid_shape.x()
         {
             return Err(RenderError::InvalidBrickAtlas(
                 "resident brick index exceeds brick grid",
             ));
         }
-        if brick.volume.shape.z > brick_shape.z
-            || brick.volume.shape.y > brick_shape.y
-            || brick.volume.shape.x > brick_shape.x
+        if brick.volume.shape.z() > brick_shape.z()
+            || brick.volume.shape.y() > brick_shape.y()
+            || brick.volume.shape.x() > brick_shape.x()
         {
             return Err(RenderError::InvalidBrickAtlas(
                 "resident brick shape exceeds declared brick shape",
@@ -1999,17 +2002,17 @@ fn validate_resident_pages_f32(
 ) -> Result<HashSet<SpatialBrickIndex>, RenderError> {
     let mut pages = HashSet::with_capacity(resident.bricks().len());
     for brick in resident.bricks() {
-        if brick.brick_index.z >= brick_grid_shape.z
-            || brick.brick_index.y >= brick_grid_shape.y
-            || brick.brick_index.x >= brick_grid_shape.x
+        if brick.brick_index.z >= brick_grid_shape.z()
+            || brick.brick_index.y >= brick_grid_shape.y()
+            || brick.brick_index.x >= brick_grid_shape.x()
         {
             return Err(RenderError::InvalidBrickAtlas(
                 "resident brick index exceeds brick grid",
             ));
         }
-        if brick.volume.shape.z > brick_shape.z
-            || brick.volume.shape.y > brick_shape.y
-            || brick.volume.shape.x > brick_shape.x
+        if brick.volume.shape.z() > brick_shape.z()
+            || brick.volume.shape.y() > brick_shape.y()
+            || brick.volume.shape.x() > brick_shape.x()
         {
             return Err(RenderError::InvalidBrickAtlas(
                 "resident brick shape exceeds declared brick shape",
@@ -2060,7 +2063,7 @@ fn page_eviction_order(
 }
 
 fn brick_page_index(index: SpatialBrickIndex, brick_grid_shape: Shape3D) -> usize {
-    ((index.z * brick_grid_shape.y + index.y) * brick_grid_shape.x + index.x) as usize
+    ((index.z * brick_grid_shape.y() + index.y) * brick_grid_shape.x() + index.x) as usize
 }
 
 fn f32_page_table_word_count(brick_grid_shape: Shape3D) -> Result<u64, GpuRenderError> {

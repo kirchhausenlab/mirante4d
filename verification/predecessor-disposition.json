@@ -24,21 +24,24 @@
       "deletion_gate": "WP-02-segmentation-hard-removal"
     },
     {
-      "id": "source-moved-ui-case",
+      "id": "delete-wp07b-moved-dense-camera-case",
       "match": {
         "source_dispositions": ["moved"]
       },
-      "disposition": "moved",
-      "reason": "The non-segmentation application case survived WP-02 at its recorded replacement identity and now belongs to the UI leaf.",
-      "lane": "ui",
+      "disposition": "deleted",
+      "reason": "WP-07B deleted the predecessor dense-camera application harness with the old application-state authority.",
+      "lane": null,
       "requirement_ids": ["D-022-ui"],
       "replacement_command": "cargo xtask verify-leaf ui",
-      "deletion_gate": null
+      "deletion_gate": "WP-07B-B-live-cutover"
     },
     {
       "id": "source-rewritten-ui-cases",
       "match": {
-        "source_dispositions": ["rewritten"]
+        "source_dispositions": ["rewritten"],
+        "exclude_ids": [
+          "libtest:mirante4d-app:tests::viewport_hover_maps_pointer_to_intensity_and_label_pixel"
+        ]
       },
       "disposition": "rewritten",
       "reason": "WP-02 removed label coupling from these application assertions; their recorded replacement identities belong to the UI leaf.",
@@ -46,6 +49,21 @@
       "requirement_ids": ["D-020-segmentation-absence", "D-022-ui"],
       "replacement_command": "cargo xtask verify-leaf ui",
       "deletion_gate": null
+    },
+    {
+      "id": "delete-wp07b-rewritten-viewport-hover-case",
+      "match": {
+        "source_dispositions": ["rewritten"],
+        "ids": [
+          "libtest:mirante4d-app:tests::viewport_hover_maps_pointer_to_intensity_and_label_pixel"
+        ]
+      },
+      "disposition": "deleted",
+      "reason": "WP-07B deleted the predecessor viewport probe harness with the old application-state authority.",
+      "lane": null,
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "replacement_command": "cargo xtask verify-leaf ui",
+      "deletion_gate": "WP-07B-B-live-cutover"
     },
     {
       "id": "delete-wgpu-png-snapshot-tests",
@@ -66,7 +84,7 @@
       "deletion_gate": "WP06-A-shadow-machinery"
     },
     {
-      "id": "move-application-gpu-cases",
+      "id": "delete-wp07b-application-gpu-cases",
       "match": {
         "source_dispositions": ["retained"],
         "kinds": ["libtest"],
@@ -74,12 +92,12 @@
         "ignored": true,
         "id_prefixes": ["libtest:mirante4d-app:tests::app_backend_uses_gpu"]
       },
-      "disposition": "moved",
-      "reason": "Application cases requiring an actual GPU are explicit trusted-local evidence and cannot satisfy a hosted PR result.",
-      "lane": "trusted-gpu",
+      "disposition": "deleted",
+      "reason": "WP-07B deleted the six ignored application GPU cases with the predecessor application-state harness; renderer GPU evidence remains in the trusted-local lane.",
+      "lane": null,
       "requirement_ids": ["D-022-trusted-gpu-separation"],
       "replacement_command": "cargo xtask verify-local trusted-gpu",
-      "deletion_gate": null
+      "deletion_gate": "WP-07B-B-live-cutover"
     },
     {
       "id": "move-renderer-gpu-cases",
@@ -125,10 +143,10 @@
         "source_path_prefixes": ["crates/mirante4d-core/benches/"]
       },
       "disposition": "deleted",
-      "reason": "These are duplicate libtest discovery records for Criterion benchmark functions; correctness discovery no longer uses --all-targets and the Criterion records remain in performance.",
+      "reason": "These were duplicate libtest discovery records for Criterion benchmark functions; correctness discovery stopped using --all-targets in WP-06 and WP-07B later deleted the owning core benchmark target.",
       "lane": null,
       "requirement_ids": ["D-022-unit", "D-023-performance", "VER-BLOCK-004"],
-      "replacement_command": "cargo bench --frozen -p mirante4d-core --bench core_primitives",
+      "replacement_command": null,
       "deletion_gate": "WP06-A-shadow-machinery"
     },
     {
@@ -188,12 +206,233 @@
       "deletion_gate": null
     },
     {
+      "id": "delete-wp07b-application-ui-predecessors",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["libtest"],
+        "owners": ["mirante4d-app"],
+        "ignored": false,
+        "ids": [
+          "libtest:mirante4d-app:cross_section_runtime::tests::scheduler_populates_global_visible_runtime_keys",
+          "libtest:mirante4d-app:cross_section_runtime::tests::stale_panel_generation_does_not_replace_newer_visible_set",
+          "libtest:mirante4d-app:display_graph::tests::display_graph_omits_hidden_channels",
+          "libtest:mirante4d-app:display_graph::tests::display_graph_partitions_render_modes",
+          "libtest:mirante4d-app:display_graph::tests::display_graph_partitions_visible_channels_by_render_mode",
+          "libtest:mirante4d-app:display_graph::tests::display_graph_uses_active_runtime_render_state_for_active_channel",
+          "libtest:mirante4d-app:playback::tests::default_playback_state_is_stopped_with_frame_interval",
+          "libtest:mirante4d-app:preferences::tests::app_preferences_reject_invalid_format_and_tiny_budget",
+          "libtest:mirante4d-app:preferences::tests::linux_meminfo_parser_reads_total_memory_bytes",
+          "libtest:mirante4d-app:preferences::tests::preferences_path_for_platform_uses_os_conventions",
+          "libtest:mirante4d-app:preferences::tests::runtime_preferences_use_bounded_system_ram_policy",
+          "libtest:mirante4d-app:tests::analysis_plot_point_selection_is_cleared_when_out_of_scope",
+          "libtest:mirante4d-app:tests::analysis_selection_defaults_to_latest_and_clamps_out_of_range",
+          "libtest:mirante4d-app:tests::analysis_workspace_window_exposes_selected_results",
+          "libtest:mirante4d-app:tests::app_can_switch_channel_and_timepoint_and_rerender",
+          "libtest:mirante4d-app:tests::app_color_image_keeps_uncovered_pixels_dark_under_invert_lut",
+          "libtest:mirante4d-app:tests::app_color_image_returns_empty_dvr_frame_when_rgba_payload_is_missing",
+          "libtest:mirante4d-app:tests::app_color_image_returns_empty_iso_frame_when_surface_payload_is_missing",
+          "libtest:mirante4d-app:tests::app_color_image_uses_dvr_rgba_payload_without_scalar_transfer",
+          "libtest:mirante4d-app:tests::app_preferences_round_trip_and_apply_runtime_config",
+          "libtest:mirante4d-app:tests::app_shell_exposes_time_and_channel_metadata",
+          "libtest:mirante4d-app:tests::app_shell_opens_fixture_and_renders_first_frame",
+          "libtest:mirante4d-app:tests::app_shell_opens_float32_dataset_and_preserves_exact_pick_readout",
+          "libtest:mirante4d-app:tests::app_streams_float32_bricks_into_cpu_resident_renderer",
+          "libtest:mirante4d-app:tests::camera_drag_orbits_without_changing_projection",
+          "libtest:mirante4d-app:tests::camera_pan_moves_target_without_changing_orientation",
+          "libtest:mirante4d-app:tests::camera_scroll_zoom_changes_apparent_scale",
+          "libtest:mirante4d-app:tests::channel_display_preset_applies_full_transfer_and_rejects_stale_layer_identity",
+          "libtest:mirante4d-app:tests::computed_analysis_outputs_select_new_table_and_plot",
+          "libtest:mirante4d-app:tests::cross_section_commands_update_shared_state_without_mutating_3d_camera",
+          "libtest:mirante4d-app:tests::cross_section_panel_render_request_requires_visible_panel_viewport_generation",
+          "libtest:mirante4d-app:tests::dataset_reference_paths_are_relative_to_project_package_when_possible",
+          "libtest:mirante4d-app:tests::default_camera_for_shape_uses_source_z_zero_front_and_fiji_xy",
+          "libtest:mirante4d-app:tests::dirty_project_close_prompt_exposes_save_discard_and_cancel",
+          "libtest:mirante4d-app:tests::display_commands_dirty_cross_section_panels_without_dirtying_3d_panel",
+          "libtest:mirante4d-app:tests::display_size_clamps_to_max_texture_side_without_changing_aspect",
+          "libtest:mirante4d-app:tests::display_size_maps_to_physical_render_viewport",
+          "libtest:mirante4d-app:tests::f32_dvr_display_conversion_uses_normalized_alpha_not_source_window",
+          "libtest:mirante4d-app:tests::fast_frame_time_samples_do_not_mutate_lod_selection",
+          "libtest:mirante4d-app:tests::fit_camera_to_shape_preserves_projection_orientation_and_refits_scale",
+          "libtest:mirante4d-app:tests::frame_fidelity_label_exposes_loading_complete_and_failure_reasons",
+          "libtest:mirante4d-app:tests::frame_fidelity_label_reports_display_staleness_when_known",
+          "libtest:mirante4d-app:tests::frame_fidelity_status_labels_cover_phase12_states",
+          "libtest:mirante4d-app:tests::full_time_series_analysis_records_no_data_policy_and_exclusion",
+          "libtest:mirante4d-app:tests::full_time_series_analysis_uses_exact_float32_source_values",
+          "libtest:mirante4d-app:tests::hidden_active_layer_does_not_block_visible_channel_resident_rendering",
+          "libtest:mirante4d-app:tests::hidden_active_layer_is_removed_from_stream_layer_set",
+          "libtest:mirante4d-app:tests::hidden_active_layer_suppresses_intensity_pick_readout",
+          "libtest:mirante4d-app:tests::hidden_non_active_layer_is_removed_from_stream_layer_set",
+          "libtest:mirante4d-app:tests::iso_light_commands_relight_cached_frame_without_rerendering",
+          "libtest:mirante4d-app:tests::layer_display_state_update_syncs_active_and_rendered_channel_state",
+          "libtest:mirante4d-app:tests::layer_invert_update_syncs_active_and_rendered_channel_state",
+          "libtest:mirante4d-app:tests::mip_texture_conversion_preserves_dimensions_and_nonzero_signal",
+          "libtest:mirante4d-app:tests::mip_texture_conversion_uses_layer_display_window_and_opacity",
+          "libtest:mirante4d-app:tests::perspective_fit_contains_transformed_volume_bounds",
+          "libtest:mirante4d-app:tests::playback_commands_step_timepoints_and_toggle_state",
+          "libtest:mirante4d-app:tests::playback_scheduler_steps_even_when_next_prefetch_is_not_ready",
+          "libtest:mirante4d-app:tests::playback_scheduler_waits_after_step_until_requested_timepoint_finishes",
+          "libtest:mirante4d-app:tests::playback_stays_stopped_for_single_timepoint_dataset",
+          "libtest:mirante4d-app:tests::project_artifact_atomic_write_restores_existing_file_after_commit_failure",
+          "libtest:mirante4d-app:tests::project_autosave_snapshot_restores_recovery_state_without_authoritative_project_json",
+          "libtest:mirante4d-app:tests::project_dataset_relocation_opens_matching_dataset_and_marks_project_dirty",
+          "libtest:mirante4d-app:tests::project_dataset_relocation_rejects_identity_mismatch",
+          "libtest:mirante4d-app:tests::project_dirty_snapshot_tracks_viewer_changes_and_successful_save",
+          "libtest:mirante4d-app:tests::project_json_atomic_write_restores_existing_file_after_commit_failure",
+          "libtest:mirante4d-app:tests::project_package_rejects_analysis_artifact_id_mismatch",
+          "libtest:mirante4d-app:tests::project_package_rejects_dataset_manifest_fingerprint_mismatch",
+          "libtest:mirante4d-app:tests::project_package_rejects_invalid_cross_section_session_state",
+          "libtest:mirante4d-app:tests::project_package_roundtrip_does_not_persist_viewer_tool_state",
+          "libtest:mirante4d-app:tests::project_package_roundtrip_preserves_active_no_data_status",
+          "libtest:mirante4d-app:tests::project_package_roundtrip_restores_analysis_results",
+          "libtest:mirante4d-app:tests::project_package_roundtrip_restores_four_panel_cross_section_without_runtime_state",
+          "libtest:mirante4d-app:tests::project_package_roundtrip_restores_layer_display_states",
+          "libtest:mirante4d-app:tests::project_package_roundtrip_restores_scene_artifacts",
+          "libtest:mirante4d-app:tests::project_package_roundtrip_restores_single3d_without_hidden_four_panel_runtime",
+          "libtest:mirante4d-app:tests::rejects_file_based_m4dproj_sessions",
+          "libtest:mirante4d-app:tests::reset_view_resets_cross_section_oblique_orientation",
+          "libtest:mirante4d-app:tests::roi_analysis_uses_exact_float32_source_values",
+          "libtest:mirante4d-app:tests::slow_frame_time_samples_do_not_mutate_lod_selection",
+          "libtest:mirante4d-app:tests::tiff_import_setup_window_exposes_inspection_state",
+          "libtest:mirante4d-app:tests::viewport_fit_preserves_aspect_ratio",
+          "libtest:mirante4d-app:tests::viewport_hover_maps_normalized_probe_to_pixel",
+          "libtest:mirante4d-app:tests::viewport_hover_rejects_points_outside_image_rect",
+          "libtest:mirante4d-app:tests::viewport_hover_reports_uint8_intensity_for_uint8_layers",
+          "libtest:mirante4d-app:tests::virtual_product_automation_generated_fixture_camera_sequence",
+          "libtest:mirante4d-app:tests::virtual_product_automation_generated_fixture_render_mode_sequence",
+          "libtest:mirante4d-app:tests::workbench_command_switches_viewer_layout_without_mutating_3d_state",
+          "libtest:mirante4d-app:tests::workbench_commands_update_core_viewer_state",
+          "libtest:mirante4d-app:tests::workbench_runtime_diagnostics_exposes_data_runtime_budgets",
+          "libtest:mirante4d-app:tests::workbench_settings_panel_exposes_runtime_budget_controls",
+          "libtest:mirante4d-app:tests::workbench_settings_save_persists_runtime_preferences",
+          "libtest:mirante4d-app:tests::workbench_shell_exposes_four_panel_layout_shell",
+          "libtest:mirante4d-app:tests::workbench_shell_handles_long_dataset_name_in_narrow_layout",
+          "libtest:mirante4d-app:transfer_presets::tests::transfer_preset_label_falls_back_to_custom_id",
+          "libtest:mirante4d-app:viewer_layout::tests::cross_section_schedule_state_is_panel_generation_guarded",
+          "libtest:mirante4d-app:viewer_layout::tests::four_panel_dirty_mark_invalidates_only_cross_section_panels",
+          "libtest:mirante4d-app:viewer_layout::tests::four_panel_runtime_tracks_panel_viewport_generations",
+          "libtest:mirante4d-app:viewer_layout::tests::four_panel_shell_uses_neuroglancer_panel_order",
+          "libtest:mirante4d-app:viewer_layout::tests::four_panel_tracks_active_cross_section_panel_without_marking_3d",
+          "libtest:mirante4d-app:viewer_layout::tests::single_3d_layout_does_not_allocate_four_panel_runtime",
+          "libtest:mirante4d-app:viewer_layout::tests::single_3d_layout_ignores_panel_viewport_recording"
+        ]
+      },
+      "disposition": "deleted",
+      "reason": "WP-07B deleted predecessor application-state, project/session, preferences, playback, display, and shell assertions; their retained requirements now use the canonical boundary tests recorded below.",
+      "lane": null,
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "replacement_command": "cargo xtask verify-leaf ui",
+      "deletion_gate": "WP-07B-B-live-cutover"
+    },
+    {
       "id": "keep-application-ui-tests",
       "match": {
         "source_dispositions": ["retained"],
         "kinds": ["libtest"],
         "owners": ["mirante4d-app"],
-        "ignored": false
+        "ignored": false,
+        "exclude_ids": [
+          "libtest:mirante4d-app:cross_section_runtime::tests::scheduler_populates_global_visible_runtime_keys",
+          "libtest:mirante4d-app:cross_section_runtime::tests::stale_panel_generation_does_not_replace_newer_visible_set",
+          "libtest:mirante4d-app:display_graph::tests::display_graph_omits_hidden_channels",
+          "libtest:mirante4d-app:display_graph::tests::display_graph_partitions_render_modes",
+          "libtest:mirante4d-app:display_graph::tests::display_graph_partitions_visible_channels_by_render_mode",
+          "libtest:mirante4d-app:display_graph::tests::display_graph_uses_active_runtime_render_state_for_active_channel",
+          "libtest:mirante4d-app:playback::tests::default_playback_state_is_stopped_with_frame_interval",
+          "libtest:mirante4d-app:preferences::tests::app_preferences_reject_invalid_format_and_tiny_budget",
+          "libtest:mirante4d-app:preferences::tests::linux_meminfo_parser_reads_total_memory_bytes",
+          "libtest:mirante4d-app:preferences::tests::preferences_path_for_platform_uses_os_conventions",
+          "libtest:mirante4d-app:preferences::tests::runtime_preferences_use_bounded_system_ram_policy",
+          "libtest:mirante4d-app:tests::analysis_plot_point_selection_is_cleared_when_out_of_scope",
+          "libtest:mirante4d-app:tests::analysis_selection_defaults_to_latest_and_clamps_out_of_range",
+          "libtest:mirante4d-app:tests::analysis_workspace_window_exposes_selected_results",
+          "libtest:mirante4d-app:tests::app_can_switch_channel_and_timepoint_and_rerender",
+          "libtest:mirante4d-app:tests::app_color_image_keeps_uncovered_pixels_dark_under_invert_lut",
+          "libtest:mirante4d-app:tests::app_color_image_returns_empty_dvr_frame_when_rgba_payload_is_missing",
+          "libtest:mirante4d-app:tests::app_color_image_returns_empty_iso_frame_when_surface_payload_is_missing",
+          "libtest:mirante4d-app:tests::app_color_image_uses_dvr_rgba_payload_without_scalar_transfer",
+          "libtest:mirante4d-app:tests::app_preferences_round_trip_and_apply_runtime_config",
+          "libtest:mirante4d-app:tests::app_shell_exposes_time_and_channel_metadata",
+          "libtest:mirante4d-app:tests::app_shell_opens_fixture_and_renders_first_frame",
+          "libtest:mirante4d-app:tests::app_shell_opens_float32_dataset_and_preserves_exact_pick_readout",
+          "libtest:mirante4d-app:tests::app_streams_float32_bricks_into_cpu_resident_renderer",
+          "libtest:mirante4d-app:tests::camera_drag_orbits_without_changing_projection",
+          "libtest:mirante4d-app:tests::camera_pan_moves_target_without_changing_orientation",
+          "libtest:mirante4d-app:tests::camera_scroll_zoom_changes_apparent_scale",
+          "libtest:mirante4d-app:tests::channel_display_preset_applies_full_transfer_and_rejects_stale_layer_identity",
+          "libtest:mirante4d-app:tests::computed_analysis_outputs_select_new_table_and_plot",
+          "libtest:mirante4d-app:tests::cross_section_commands_update_shared_state_without_mutating_3d_camera",
+          "libtest:mirante4d-app:tests::cross_section_panel_render_request_requires_visible_panel_viewport_generation",
+          "libtest:mirante4d-app:tests::dataset_reference_paths_are_relative_to_project_package_when_possible",
+          "libtest:mirante4d-app:tests::default_camera_for_shape_uses_source_z_zero_front_and_fiji_xy",
+          "libtest:mirante4d-app:tests::dirty_project_close_prompt_exposes_save_discard_and_cancel",
+          "libtest:mirante4d-app:tests::display_commands_dirty_cross_section_panels_without_dirtying_3d_panel",
+          "libtest:mirante4d-app:tests::display_size_clamps_to_max_texture_side_without_changing_aspect",
+          "libtest:mirante4d-app:tests::display_size_maps_to_physical_render_viewport",
+          "libtest:mirante4d-app:tests::f32_dvr_display_conversion_uses_normalized_alpha_not_source_window",
+          "libtest:mirante4d-app:tests::fast_frame_time_samples_do_not_mutate_lod_selection",
+          "libtest:mirante4d-app:tests::fit_camera_to_shape_preserves_projection_orientation_and_refits_scale",
+          "libtest:mirante4d-app:tests::frame_fidelity_label_exposes_loading_complete_and_failure_reasons",
+          "libtest:mirante4d-app:tests::frame_fidelity_label_reports_display_staleness_when_known",
+          "libtest:mirante4d-app:tests::frame_fidelity_status_labels_cover_phase12_states",
+          "libtest:mirante4d-app:tests::full_time_series_analysis_records_no_data_policy_and_exclusion",
+          "libtest:mirante4d-app:tests::full_time_series_analysis_uses_exact_float32_source_values",
+          "libtest:mirante4d-app:tests::hidden_active_layer_does_not_block_visible_channel_resident_rendering",
+          "libtest:mirante4d-app:tests::hidden_active_layer_is_removed_from_stream_layer_set",
+          "libtest:mirante4d-app:tests::hidden_active_layer_suppresses_intensity_pick_readout",
+          "libtest:mirante4d-app:tests::hidden_non_active_layer_is_removed_from_stream_layer_set",
+          "libtest:mirante4d-app:tests::iso_light_commands_relight_cached_frame_without_rerendering",
+          "libtest:mirante4d-app:tests::layer_display_state_update_syncs_active_and_rendered_channel_state",
+          "libtest:mirante4d-app:tests::layer_invert_update_syncs_active_and_rendered_channel_state",
+          "libtest:mirante4d-app:tests::mip_texture_conversion_preserves_dimensions_and_nonzero_signal",
+          "libtest:mirante4d-app:tests::mip_texture_conversion_uses_layer_display_window_and_opacity",
+          "libtest:mirante4d-app:tests::perspective_fit_contains_transformed_volume_bounds",
+          "libtest:mirante4d-app:tests::playback_commands_step_timepoints_and_toggle_state",
+          "libtest:mirante4d-app:tests::playback_scheduler_steps_even_when_next_prefetch_is_not_ready",
+          "libtest:mirante4d-app:tests::playback_scheduler_waits_after_step_until_requested_timepoint_finishes",
+          "libtest:mirante4d-app:tests::playback_stays_stopped_for_single_timepoint_dataset",
+          "libtest:mirante4d-app:tests::project_artifact_atomic_write_restores_existing_file_after_commit_failure",
+          "libtest:mirante4d-app:tests::project_autosave_snapshot_restores_recovery_state_without_authoritative_project_json",
+          "libtest:mirante4d-app:tests::project_dataset_relocation_opens_matching_dataset_and_marks_project_dirty",
+          "libtest:mirante4d-app:tests::project_dataset_relocation_rejects_identity_mismatch",
+          "libtest:mirante4d-app:tests::project_dirty_snapshot_tracks_viewer_changes_and_successful_save",
+          "libtest:mirante4d-app:tests::project_json_atomic_write_restores_existing_file_after_commit_failure",
+          "libtest:mirante4d-app:tests::project_package_rejects_analysis_artifact_id_mismatch",
+          "libtest:mirante4d-app:tests::project_package_rejects_dataset_manifest_fingerprint_mismatch",
+          "libtest:mirante4d-app:tests::project_package_rejects_invalid_cross_section_session_state",
+          "libtest:mirante4d-app:tests::project_package_roundtrip_does_not_persist_viewer_tool_state",
+          "libtest:mirante4d-app:tests::project_package_roundtrip_preserves_active_no_data_status",
+          "libtest:mirante4d-app:tests::project_package_roundtrip_restores_analysis_results",
+          "libtest:mirante4d-app:tests::project_package_roundtrip_restores_four_panel_cross_section_without_runtime_state",
+          "libtest:mirante4d-app:tests::project_package_roundtrip_restores_layer_display_states",
+          "libtest:mirante4d-app:tests::project_package_roundtrip_restores_scene_artifacts",
+          "libtest:mirante4d-app:tests::project_package_roundtrip_restores_single3d_without_hidden_four_panel_runtime",
+          "libtest:mirante4d-app:tests::rejects_file_based_m4dproj_sessions",
+          "libtest:mirante4d-app:tests::reset_view_resets_cross_section_oblique_orientation",
+          "libtest:mirante4d-app:tests::roi_analysis_uses_exact_float32_source_values",
+          "libtest:mirante4d-app:tests::slow_frame_time_samples_do_not_mutate_lod_selection",
+          "libtest:mirante4d-app:tests::tiff_import_setup_window_exposes_inspection_state",
+          "libtest:mirante4d-app:tests::viewport_fit_preserves_aspect_ratio",
+          "libtest:mirante4d-app:tests::viewport_hover_maps_normalized_probe_to_pixel",
+          "libtest:mirante4d-app:tests::viewport_hover_rejects_points_outside_image_rect",
+          "libtest:mirante4d-app:tests::viewport_hover_reports_uint8_intensity_for_uint8_layers",
+          "libtest:mirante4d-app:tests::virtual_product_automation_generated_fixture_camera_sequence",
+          "libtest:mirante4d-app:tests::virtual_product_automation_generated_fixture_render_mode_sequence",
+          "libtest:mirante4d-app:tests::workbench_command_switches_viewer_layout_without_mutating_3d_state",
+          "libtest:mirante4d-app:tests::workbench_commands_update_core_viewer_state",
+          "libtest:mirante4d-app:tests::workbench_runtime_diagnostics_exposes_data_runtime_budgets",
+          "libtest:mirante4d-app:tests::workbench_settings_panel_exposes_runtime_budget_controls",
+          "libtest:mirante4d-app:tests::workbench_settings_save_persists_runtime_preferences",
+          "libtest:mirante4d-app:tests::workbench_shell_exposes_four_panel_layout_shell",
+          "libtest:mirante4d-app:tests::workbench_shell_handles_long_dataset_name_in_narrow_layout",
+          "libtest:mirante4d-app:transfer_presets::tests::transfer_preset_label_falls_back_to_custom_id",
+          "libtest:mirante4d-app:viewer_layout::tests::cross_section_schedule_state_is_panel_generation_guarded",
+          "libtest:mirante4d-app:viewer_layout::tests::four_panel_dirty_mark_invalidates_only_cross_section_panels",
+          "libtest:mirante4d-app:viewer_layout::tests::four_panel_runtime_tracks_panel_viewport_generations",
+          "libtest:mirante4d-app:viewer_layout::tests::four_panel_shell_uses_neuroglancer_panel_order",
+          "libtest:mirante4d-app:viewer_layout::tests::four_panel_tracks_active_cross_section_panel_without_marking_3d",
+          "libtest:mirante4d-app:viewer_layout::tests::single_3d_layout_does_not_allocate_four_panel_runtime",
+          "libtest:mirante4d-app:viewer_layout::tests::single_3d_layout_ignores_panel_viewport_recording"
+        ]
       },
       "disposition": "kept",
       "reason": "Normal application tests are headless semantic, state, and interaction evidence owned by the UI leaf.",
@@ -203,7 +442,7 @@
       "deletion_gate": null
     },
     {
-      "id": "keep-core-unit-tests",
+      "id": "delete-wp07b-core-unit-tests",
       "match": {
         "source_dispositions": ["retained"],
         "kinds": ["libtest"],
@@ -211,12 +450,12 @@
         "ignored": false,
         "source_path_prefixes": ["crates/mirante4d-core/src/"]
       },
-      "disposition": "kept",
-      "reason": "Core geometry, identity, and state cases remain ordinary hosted CPU unit evidence.",
-      "lane": "unit",
-      "requirement_ids": ["D-022-unit"],
+      "disposition": "deleted",
+      "reason": "WP-07B moved the accepted contracts to their canonical owners and deleted mirante4d-core and its predecessor unit harness.",
+      "lane": null,
+      "requirement_ids": ["D-022-unit", "WP-07B-B-live-cutover"],
       "replacement_command": "cargo xtask verify-leaf unit",
-      "deletion_gate": null
+      "deletion_gate": "WP-07B-B-live-cutover"
     },
     {
       "id": "keep-data-unit-tests",
@@ -357,23 +596,38 @@
       "deletion_gate": "WP06-A-shadow-machinery"
     },
     {
-      "id": "keep-criterion-benchmarks",
+      "id": "delete-wp07b-core-criterion-benchmarks",
       "match": {
         "source_dispositions": ["retained"],
         "kinds": ["criterion_benchmark"]
       },
-      "disposition": "kept",
-      "reason": "Criterion is the single representation of these measurements and runs only in the non-PR performance lane.",
-      "lane": "performance",
-      "requirement_ids": ["D-023-performance"],
-      "replacement_command": "cargo bench --frozen -p mirante4d-core --bench core_primitives",
-      "deletion_gate": null
+      "disposition": "deleted",
+      "reason": "WP-07B deleted the core benchmark target with mirante4d-core; no performance baseline from that predecessor remains authoritative.",
+      "lane": null,
+      "requirement_ids": ["D-023-performance", "WP-07B-B-live-cutover"],
+      "replacement_command": null,
+      "deletion_gate": "WP-07B-B-live-cutover"
+    },
+    {
+      "id": "delete-wp07b-project-metadata-fuzz-target",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["fuzz_target"],
+        "ids": ["fuzz_target:project_metadata_parser"]
+      },
+      "disposition": "deleted",
+      "reason": "WP-07B deleted the predecessor project-session parser and its format authority, so its dedicated fuzz target is obsolete.",
+      "lane": null,
+      "requirement_ids": ["D-022-seeded-crash-discovery", "WP-07B-B-live-cutover"],
+      "replacement_command": null,
+      "deletion_gate": "WP-07B-B-live-cutover"
     },
     {
       "id": "move-fuzz-targets",
       "match": {
         "source_dispositions": ["retained"],
-        "kinds": ["fuzz_target"]
+        "kinds": ["fuzz_target"],
+        "exclude_ids": ["fuzz_target:project_metadata_parser"]
       },
       "disposition": "moved",
       "reason": "Seeded fuzzing is explicit bounded deep evidence and is never part of either required PR check.",
@@ -681,30 +935,6 @@
   "current_additions": [
     {
       "id": "libtest:mirante4d-app:product_automation::tests::automation_script_rejects_removed_label_probe_fields",
-      "kind": "libtest",
-      "owner": "mirante4d-app",
-      "lane": "ui",
-      "requirement_ids": ["D-020-segmentation-absence", "D-022-ui"],
-      "reason": "WP-02 regression coverage added after the frozen predecessor inventory."
-    },
-    {
-      "id": "libtest:mirante4d-app:tests::project_v13_and_autosave_rejection_leave_m4dseg_sentinels_untouched",
-      "kind": "libtest",
-      "owner": "mirante4d-app",
-      "lane": "ui",
-      "requirement_ids": ["D-020-segmentation-absence", "D-022-ui"],
-      "reason": "WP-02 regression coverage added after the frozen predecessor inventory."
-    },
-    {
-      "id": "libtest:mirante4d-app:tests::project_v14_rejects_removed_active_segmentation_field",
-      "kind": "libtest",
-      "owner": "mirante4d-app",
-      "lane": "ui",
-      "requirement_ids": ["D-020-segmentation-absence", "D-022-ui"],
-      "reason": "WP-02 regression coverage added after the frozen predecessor inventory."
-    },
-    {
-      "id": "libtest:mirante4d-app:tests::project_v14_save_autosave_and_recovery_leave_m4dseg_sentinels_untouched",
       "kind": "libtest",
       "owner": "mirante4d-app",
       "lane": "ui",
@@ -1610,17 +1840,6 @@
       "reason": "WP-07A adds machine-enforced canonical-model and current-state ledger evidence."
     },
     {
-      "id": "libtest:xtask::bin/xtask:arch::tests::wp07a_model_and_current_state_contracts_match_the_repository",
-      "kind": "libtest",
-      "owner": "xtask",
-      "lane": "unit",
-      "requirement_ids": [
-        "D-022-unit",
-        "WP-07A-canonical-model"
-      ],
-      "reason": "WP-07A adds machine-enforced canonical-model and current-state ledger evidence."
-    },
-    {
       "id": "libtest:mirante4d-application:tests::a_second_save_is_rejected_until_the_active_save_finishes",
       "kind": "libtest",
       "owner": "mirante4d-application",
@@ -1710,14 +1929,6 @@
     },
     {
       "id": "libtest:mirante4d-application:tests::source_replacement_is_central_generation_guarded_and_resets_bound_transients",
-      "kind": "libtest",
-      "owner": "mirante4d-application",
-      "lane": "unit",
-      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
-      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
-    },
-    {
-      "id": "libtest:mirante4d-application:tests::source_replacement_rejects_while_an_operation_is_active",
       "kind": "libtest",
       "owner": "mirante4d-application",
       "lane": "unit",
@@ -2053,14 +2264,6 @@
       "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
     },
     {
-      "id": "libtest:xtask::bin/xtask:arch::tests::wp07b_boundary_candidates_match_the_frozen_unreachable_contract",
-      "kind": "libtest",
-      "owner": "xtask",
-      "lane": "unit",
-      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
-      "reason": "WP-07B-A adds machine-enforced boundary ownership, dependency, API, and unreachability evidence."
-    },
-    {
       "id": "libtest:mirante4d-settings:tests::file_that_becomes_invalid_after_startup_is_not_silently_overwritten",
       "kind": "libtest",
       "owner": "mirante4d-settings",
@@ -2075,14 +2278,422 @@
       "lane": "unit",
       "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
       "reason": "WP-07B-A adds product-unreachable backend-neutral render boundary evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:cross_section_runtime::tests::non_current_panel_generation_does_not_replace_visible_set",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_project_persistence_bridge::tests::actor_preserves_exact_tokens_for_open_save_and_cancel",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_project_persistence_bridge::tests::cancellation_stops_open_and_save_before_visible_commit",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_project_persistence_bridge::tests::closed_v15_document_rejects_unknown_forbidden_and_invalid_values",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_project_persistence_bridge::tests::document_and_actor_inputs_are_bounded",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_project_persistence_bridge::tests::explicit_shutdown_joins_an_idle_actor",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_project_persistence_bridge::tests::file_and_incomplete_directory_targets_are_refused_unchanged",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_project_persistence_bridge::tests::full_projection_round_trips_through_only_validated_values",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_project_persistence_bridge::tests::malformed_and_non_v15_existing_targets_are_preserved",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_project_persistence_bridge::tests::malformed_schema_and_versions_are_rejected_without_fallback",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_project_persistence_bridge::tests::new_package_commit_failure_never_publishes_an_incomplete_destination",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_project_persistence_bridge::tests::new_package_parent_sync_failure_is_commit_indeterminate",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_project_persistence_bridge::tests::post_rename_directory_sync_failure_is_commit_indeterminate",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_project_persistence_bridge::tests::pre_commit_failure_preserves_old_v15_and_removes_owned_temporary",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_project_persistence_bridge::tests::symlinked_package_document_and_parent_are_rejected_without_touching_outside_data",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_project_persistence_bridge::tests::unsupported_predecessor_document_is_never_opened_or_replaced_and_remains_byte_exact",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_project_persistence_bridge::tests::v15_json_is_exact_and_uses_fixed_typed_identities",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_settings_connection::tests::correlation_never_consumes_or_completes_a_different_pending_token",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_settings_connection::tests::explicit_shutdown_joins_and_is_idempotent",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_settings_connection::tests::rejected_file_is_preserved_until_exact_explicit_replacement",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_settings_connection::tests::startup_reports_loaded_missing_and_rejected_without_rewriting",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_settings_connection::tests::unavailable_and_bounded_failures_map_to_exact_typed_completions",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:display_graph::tests::display_graph_partitions_canonical_render_modes",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:playback::tests::ui_time_maps_to_stable_playback_ticks",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:tests::application_playback_commands_reconcile_transient_state_and_timepoint",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:tests::display_size_maps_to_physical_render_viewport_and_clamps_aspect",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:tests::f32_dvr_display_conversion_preserves_normalized_rgba",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:tests::frame_fidelity_labels_cover_status_reason_and_failure_vocabularies",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-app:tests::workbench_runtime_diagnostics_exposes_data_budgets_and_cross_sections",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical application and explicit-runtime integration evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::analysis_descriptors_reject_wrong_operation_slots_and_all_bounds_atomically",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical reducer and operation-boundary evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::analysis_ready_appends_bounded_descriptors_with_deterministic_ids_and_selections",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical reducer and operation-boundary evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::catalog_is_owned_by_snapshot_and_closes_every_view_transition",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical reducer and operation-boundary evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::dataset_open_completion_rejects_verified_or_view_incompatible_catalogs_atomically",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical reducer and operation-boundary evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::dataset_open_failure_is_typed_and_does_not_replace_the_source",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical reducer and operation-boundary evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::dataset_open_request_rejects_while_an_operation_is_active",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical reducer and operation-boundary evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::logical_playback_ticks_replace_wall_clock_state_and_obey_catalog_bounds",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical reducer and operation-boundary evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::project_execution_failure_is_distinct_from_reducer_rejection",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical reducer and operation-boundary evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::replace_view_and_apply_preset_are_each_one_atomic_view_transition",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical reducer and operation-boundary evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::settings_replacement_disposition_is_part_of_the_atomic_change_token",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds canonical reducer and operation-boundary evidence."
+    },
+    {
+      "id": "libtest:mirante4d-format:current_profile::tests::layer_display_wire_conversion_validates_domain_values",
+      "kind": "libtest",
+      "owner": "mirante4d-format",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds current-format bridge contract evidence after deleting mirante4d-core."
+    },
+    {
+      "id": "libtest:mirante4d-format:current_profile::tests::physical_ids_remain_strict_current_profile_labels",
+      "kind": "libtest",
+      "owner": "mirante4d-format",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds current-format bridge contract evidence after deleting mirante4d-core."
+    },
+    {
+      "id": "libtest:mirante4d-format:current_profile::tests::shape_grid_and_transform_operations_keep_predecessor_behavior",
+      "kind": "libtest",
+      "owner": "mirante4d-format",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds current-format bridge contract evidence after deleting mirante4d-core."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::actor_requires_the_initial_loaded_event_before_nonblocking_event_drains",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds live settings-actor contract evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::linux_meminfo_parser_accepts_only_a_bounded_exact_memtotal_fact",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B adds live settings-actor contract evidence."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::tests::wp07a_model_contract_matches_the_repository",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B replaces unreachable-candidate checks with live-cutover architecture evidence."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::tests::wp07b_live_cutover_matches_the_repository",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B replaces unreachable-candidate checks with live-cutover architecture evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::operation_failure_codes_are_closed_over_their_operation_kind",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B closes typed worker failures over the operation kind admitted by the canonical reducer."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::stale_dataset_open_completion_can_be_explicitly_retired_after_atomic_rejection",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B proves stale source-open suppression cannot orphan the canonical operation registry."
+    },
+    {
+      "id": "libtest:mirante4d-app:workbench_playback_runtime::tests::pending_settings_keep_application_services_polling_without_an_operation",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B proves a pending settings actor result keeps the event-loop polling without user input."
+    },
+    {
+      "id": "libtest:mirante4d-app:workbench_playback_runtime::tests::source_and_project_operations_keep_application_services_polling",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B proves pending source and project actors keep the event-loop polling without user input."
+    },
+    {
+      "id": "libtest:mirante4d-app:cross_section_runtime::tests::panel_render_failure_suppresses_same_generation_until_residency_changes",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-07B-B-live-cutover"],
+      "reason": "WP-07B-B makes cross-section GPU failures visible and prevents repaint-driven retry loops until meaningful residency changes."
     }
   ],
   "expected_summary": {
     "source_records": 1055,
-    "kept": 836,
-    "moved": 57,
-    "rewritten": 8,
-    "deleted": 154,
-    "current_additions": 154
+    "kept": 696,
+    "moved": 49,
+    "rewritten": 7,
+    "deleted": 303,
+    "current_additions": 199
   }
 }

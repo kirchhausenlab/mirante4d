@@ -7,8 +7,8 @@ use std::{
     },
 };
 
-use mirante4d_core::{DisplayError, IntensityDType, Shape3D, SpaceError};
-use mirante4d_format::ExistingPackagePolicy;
+use mirante4d_domain::{DisplayError, IntensityDType, Shape3D, ShapeError};
+use mirante4d_format::{CurrentTransformError, ExistingPackagePolicy};
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
@@ -536,9 +536,9 @@ pub enum ImportError {
     #[error(transparent)]
     Format(#[from] mirante4d_format::FormatError),
     #[error(transparent)]
-    Shape(#[from] mirante4d_core::ShapeError),
+    Shape(#[from] ShapeError),
     #[error(transparent)]
-    Space(#[from] SpaceError),
+    Space(#[from] CurrentTransformError),
     #[error(transparent)]
     Display(#[from] DisplayError),
 }

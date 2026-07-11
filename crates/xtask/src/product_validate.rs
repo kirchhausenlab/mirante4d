@@ -2436,14 +2436,19 @@ fn dataset_context_json(package: &Path) -> Value {
                     "id": layer.id,
                     "name": layer.name,
                     "kind": layer.kind,
-                    "shape": layer.shape,
+                    "shape": {
+                        "t": layer.shape.t(),
+                        "z": layer.shape.z(),
+                        "y": layer.shape.y(),
+                        "x": layer.shape.x(),
+                    },
                     "dtype": {
-                        "source": layer.dtype.source,
-                        "stored": layer.dtype.stored,
+                        "source": format!("{:?}", layer.dtype.source),
+                        "stored": format!("{:?}", layer.dtype.stored),
                         "conversion": layer.dtype.conversion,
                     },
                     "scale_count": layer.scales.len(),
-                    "timepoint_count": layer.shape.t,
+                    "timepoint_count": layer.shape.t(),
                 })
             });
             let timepoint_count = active_layer

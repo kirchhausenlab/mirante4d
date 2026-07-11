@@ -1,36 +1,39 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    path::Path,
-};
+use std::{path::Path, sync::Arc};
 
-use mirante4d_analysis::{SceneArtifactStore, summarize_u8_volume, summarize_u16_volume};
-use mirante4d_core::{
-    CameraView, ChannelColor, ChannelTransferFunction, GridToWorld, IntensityDType, IsoLightState,
-    LayerDisplay, LayerId, PresentationViewport, Projection, Shape3D, TimeIndex, TransferCurve,
-    TransferPresetId,
+use mirante4d_analysis::{summarize_u8_volume, summarize_u16_volume};
+use mirante4d_application::UnboundWorkspace;
+use mirante4d_data::{
+    DataRuntimeConfig, DatasetHandle, DenseVolumeF32, DenseVolumeU8, DenseVolumeU16,
 };
-use mirante4d_data::{DatasetHandle, DenseVolumeF32, DenseVolumeU8, DenseVolumeU16};
+use mirante4d_dataset::{DatasetCatalog, DatasetLayer, ScientificIdentityStatus};
+use mirante4d_domain::{
+    CameraView, CrossSectionView, GridToWorld, IntensityDType, IsoLightState, LayerTransfer,
+    LogicalLayerKey, RenderMode as CanonicalRenderMode, RenderState, RgbColor, SamplingPolicy,
+    Shape3D, TimeIndex, TransferCurve, UnitQuaternion, ViewerLayout,
+};
+use mirante4d_format::{LayerDisplay, LayerId};
+use mirante4d_project_model::{LayerViewState, ProjectId, ViewState};
+use mirante4d_render_api::PresentationViewport;
 use mirante4d_renderer::{
-    FrameDiagnostics, FrameDiagnosticsF32, IntensitySamplingPolicy, IsoShadingMode, MipImageF32,
-    MipImageU16, RenderViewport,
+    FrameDiagnostics, FrameDiagnosticsF32, IntensitySamplingPolicy, IntensityTransfer,
+    IsoShadingMode, MipImageF32, MipImageU16, RenderViewport,
 };
+use mirante4d_settings::ResourcePolicy;
 
 use crate::{
-    AppLayerSummary, AppPreferences, AppState, ChannelRenderState, DEFAULT_DVR_DENSITY_SCALE,
-    DEFAULT_ISO_DISPLAY_LEVEL, DvrOpacityTransfer, FrameCompleteness, FrameFidelityStatus,
-    IntensitySummary, LodDecisionReason, LodScheduleState, RenderBackend, RenderIsoShadingPolicy,
-    RenderMode, RenderSamplingPolicy, RenderedIntensityChannel, ViewerToolState,
-    collect_startup_diagnostics,
+    FrameCompleteness, FrameFidelityStatus, IntensitySummary, LodDecisionReason, LodScheduleState,
+    RenderBackend, RenderedIntensityChannel, StartupDiagnostics, collect_startup_diagnostics,
     cross_section_runtime::CrossSectionRuntime,
-    default_channel_presets_from_layers,
-    layer_state::default_dvr_opacity_transfer,
+    current_runtime::{
+        analysis::CurrentAnalysisRuntime, dataset::CurrentDatasetRuntime,
+        render::CurrentRenderRuntime,
+    },
     render_state::{
         dense_startup_allowed, f32_frame_to_display_u16_for_mode, f32_values_to_display_u16,
         metadata_intensity_summary, placeholder_frame_for_mode, render_app_frame,
-        render_f32_app_frame, render_u8_app_frame, update_channel_fidelity_status,
+        render_f32_app_frame, render_u8_app_frame,
     },
-    update_visible_brick_plan,
-    viewer_layout::ViewerLayoutState,
+    transfer_presets::default_channel_presets,
     viewport::{
         default_camera_for_shape, default_presentation_viewport, default_render_viewport_for_shape,
     },
@@ -66,7 +69,7 @@ pub(crate) const TEST_DENSE_STARTUP_VOXEL_LIMIT: u64 = 16 * 16 * 16;
 fn placeholder_open_frame(
     source_shape: Shape3D,
     render_viewport: RenderViewport,
-    mode: RenderMode,
+    mode: CanonicalRenderMode,
 ) -> anyhow::Result<(MipImageU16, FrameDiagnostics)> {
     let frame = placeholder_frame_for_mode(render_viewport, mode);
     let diagnostics =
@@ -77,28 +80,10 @@ fn placeholder_open_frame(
 #[derive(Debug, Clone)]
 pub(crate) struct ScalarLayerOpenOptions {
     pub(crate) display: LayerDisplay,
-    pub(crate) transfer: ChannelTransferFunction,
-    pub(crate) dvr_opacity_transfer: DvrOpacityTransfer,
+    pub(crate) transfer: IntensityTransfer,
     pub(crate) presentation_viewport: PresentationViewport,
     pub(crate) timepoint: TimeIndex,
-    pub(crate) mode: RenderMode,
-    pub(crate) iso_display_level: f32,
-    pub(crate) dvr_density_scale: f64,
-}
-
-pub(crate) fn open_initial_scalar_layer(
-    dataset: &DatasetHandle,
-    layer_id: &LayerId,
-    stored_dtype: IntensityDType,
-    options: ScalarLayerOpenOptions,
-) -> anyhow::Result<OpenedScalarLayer> {
-    open_initial_scalar_layer_with_overrides(
-        dataset,
-        layer_id,
-        stored_dtype,
-        options,
-        InitialScalarLayerOverrides::default(),
-    )
+    pub(crate) render_state: RenderState,
 }
 
 fn open_initial_scalar_layer_with_overrides(
@@ -131,7 +116,7 @@ fn open_initial_scalar_layer_with_overrides(
         .unwrap_or_else(|| dense_startup_allowed(source_shape));
     if !dense_startup_is_allowed {
         let (frame, diagnostics) =
-            placeholder_open_frame(source_shape, render_viewport, options.mode)?;
+            placeholder_open_frame(source_shape, render_viewport, options.render_state.mode())?;
         return Ok(OpenedScalarLayer {
             source_shape,
             source_grid_to_world,
@@ -152,7 +137,8 @@ fn open_initial_scalar_layer_with_overrides(
     match stored_dtype {
         IntensityDType::Float32 => {
             let volume_f32 = dataset.read_f32_volume(layer_id, options.timepoint)?;
-            let display_values = f32_values_to_display_u16(volume_f32.values(), options.display);
+            let display_values =
+                f32_values_to_display_u16(volume_f32.values(), options.display.window());
             let active_volume = DenseVolumeU16::new(
                 volume_f32.dataset_id.clone(),
                 volume_f32.layer_id.clone(),
@@ -167,16 +153,15 @@ fn open_initial_scalar_layer_with_overrides(
                 camera,
                 presentation_viewport,
                 render_viewport,
-                options.mode,
+                options.render_state,
                 &options.transfer,
-                options.display,
-                options.dvr_opacity_transfer,
-                options.iso_display_level,
-                options.dvr_density_scale,
                 quality,
             )?;
-            let frame =
-                f32_frame_to_display_u16_for_mode(&frame_f32, options.mode, options.display)?;
+            let frame = f32_frame_to_display_u16_for_mode(
+                &frame_f32,
+                options.render_state.mode(),
+                options.display.window(),
+            )?;
             let diagnostics = mirante4d_renderer::frame_diagnostics(
                 active_volume.shape.element_count()?,
                 frame.pixels(),
@@ -205,11 +190,8 @@ fn open_initial_scalar_layer_with_overrides(
                 camera,
                 presentation_viewport,
                 render_viewport,
-                options.mode,
+                options.render_state,
                 &options.transfer,
-                options.dvr_opacity_transfer,
-                options.iso_display_level,
-                options.dvr_density_scale,
                 quality,
             )?;
             let active_intensity_summary = summarize_u8_volume(&volume);
@@ -236,11 +218,8 @@ fn open_initial_scalar_layer_with_overrides(
                 camera,
                 presentation_viewport,
                 render_viewport,
-                options.mode,
+                options.render_state,
                 &options.transfer,
-                options.dvr_opacity_transfer,
-                options.iso_display_level,
-                options.dvr_density_scale,
                 quality,
             )?;
             let active_intensity_summary = summarize_u16_volume(&volume);
@@ -263,19 +242,27 @@ fn open_initial_scalar_layer_with_overrides(
     }
 }
 
-pub fn open_dataset_and_render_first_frame(path: impl AsRef<Path>) -> anyhow::Result<AppState> {
-    open_dataset_with_preferences_and_render_first_frame(path, &AppPreferences::default())
+/// One source-derived construction result. It is consumed immediately by the
+/// composition root or by the bounded source-open actor and is never retained
+/// as another live runtime aggregate.
+pub(crate) struct OpenedCurrentSource {
+    pub(crate) startup_diagnostics: StartupDiagnostics,
+    pub(crate) catalog: Arc<DatasetCatalog>,
+    pub(crate) workspace: UnboundWorkspace,
+    pub(crate) dataset_runtime: CurrentDatasetRuntime,
+    pub(crate) render_runtime: CurrentRenderRuntime,
+    pub(crate) analysis_runtime: CurrentAnalysisRuntime,
 }
 
-pub fn open_dataset_with_preferences_and_render_first_frame(
+pub(crate) fn open_dataset_with_resource_policy_and_render_first_frame(
     path: impl AsRef<Path>,
-    preferences: &AppPreferences,
-) -> anyhow::Result<AppState> {
+    resource_policy: ResourcePolicy,
+) -> anyhow::Result<OpenedCurrentSource> {
     #[cfg(test)]
     {
-        open_test_dataset_with_preferences_and_render_first_frame(
+        open_test_dataset_with_resource_policy_and_render_first_frame(
             path,
-            preferences,
+            resource_policy,
             RenderViewport::new(
                 TEST_INITIAL_RENDER_VIEWPORT_SIDE,
                 TEST_INITIAL_RENDER_VIEWPORT_SIDE,
@@ -286,23 +273,29 @@ pub fn open_dataset_with_preferences_and_render_first_frame(
     }
 
     #[cfg(not(test))]
-    open_dataset_with_preferences_and_overrides(
+    open_dataset_with_resource_policy_and_overrides(
         path,
-        preferences,
-        InitialScalarLayerOverrides::default(),
+        resource_policy,
+        // The interactive product always enters through the progressive brick
+        // path. Dense whole-volume startup is retained only by the explicit
+        // test/reference override below.
+        InitialScalarLayerOverrides {
+            render_viewport: None,
+            dense_startup_voxel_limit: Some(0),
+        },
     )
 }
 
 #[cfg(test)]
-pub(crate) fn open_test_dataset_with_preferences_and_render_first_frame(
+pub(crate) fn open_test_dataset_with_resource_policy_and_render_first_frame(
     path: impl AsRef<Path>,
-    preferences: &AppPreferences,
+    resource_policy: ResourcePolicy,
     render_viewport: RenderViewport,
     dense_startup_voxel_limit: u64,
-) -> anyhow::Result<AppState> {
-    open_dataset_with_preferences_and_overrides(
+) -> anyhow::Result<OpenedCurrentSource> {
+    open_dataset_with_resource_policy_and_overrides(
         path,
-        preferences,
+        resource_policy,
         InitialScalarLayerOverrides {
             render_viewport: Some(render_viewport),
             dense_startup_voxel_limit: Some(dense_startup_voxel_limit),
@@ -310,61 +303,78 @@ pub(crate) fn open_test_dataset_with_preferences_and_render_first_frame(
     )
 }
 
-fn open_dataset_with_preferences_and_overrides(
+fn open_dataset_with_resource_policy_and_overrides(
     path: impl AsRef<Path>,
-    preferences: &AppPreferences,
+    resource_policy: ResourcePolicy,
     overrides: InitialScalarLayerOverrides,
-) -> anyhow::Result<AppState> {
-    preferences.validate()?;
-    let dataset = DatasetHandle::open_with_runtime_config(&path, preferences.runtime_config())?;
+) -> anyhow::Result<OpenedCurrentSource> {
+    let adapter = resource_policy.current_runtime_adapter();
+    let dataset = DatasetHandle::open_with_runtime_config(
+        &path,
+        DataRuntimeConfig::from_cache_budgets(
+            adapter.cpu_whole_volume_cache_budget_bytes(),
+            adapter.cpu_brick_cache_budget_bytes(),
+        ),
+    )?;
     let layer_id = dataset.first_layer_id()?;
     let layer = dataset
         .layer(&layer_id)
         .expect("first layer id comes from manifest")
         .clone();
-    let layers = dataset
-        .manifest()
-        .layers
-        .iter()
-        .map(|layer| {
-            let color = ChannelColor::new(layer.channel.color_rgba)
-                .expect("dataset validation rejects invalid channel colors");
-            AppLayerSummary {
-                id: layer.id.clone(),
-                name: layer.name.clone(),
-                shape: layer.shape,
-                dtype: layer.dtype.stored,
-                display: layer.display,
-                color,
-                curve: TransferCurve::Linear,
-                preset: TransferPresetId::linear(),
-                invert: false,
-                dvr_opacity_transfer: default_dvr_opacity_transfer(layer.display),
-                render_state: ChannelRenderState::mip(),
-            }
-        })
-        .collect::<Vec<_>>();
-    let active_render_mode = RenderMode::Mip;
-    let iso_display_level = DEFAULT_ISO_DISPLAY_LEVEL;
-    let iso_light_state = IsoLightState::attached_camera();
-    let dvr_density_scale = DEFAULT_DVR_DENSITY_SCALE;
-    let active_dvr_opacity_transfer = default_dvr_opacity_transfer(layer.display);
-    let active_color = ChannelColor::new(layer.channel.color_rgba)
-        .expect("dataset validation rejects invalid channel colors");
-    let active_transfer = ChannelTransferFunction::linear(layer.display, active_color);
+    let mut catalog_layers = Vec::with_capacity(dataset.layer_count());
+    let mut view_layers = Vec::with_capacity(dataset.layer_count());
+    for (index, layer) in dataset.manifest().layers.iter().enumerate() {
+        let physical_layer_id =
+            LayerId::new(layer.id.clone()).expect("dataset validation rejects invalid layer ids");
+        let layer_key = LogicalLayerKey::new(u32::try_from(index)?);
+        let grid_to_world = dataset.scale_grid_to_world(&physical_layer_id, 0)?;
+        catalog_layers.push(DatasetLayer::new(
+            layer_key,
+            &layer.name,
+            layer.shape,
+            layer.dtype.stored,
+            grid_to_world,
+        )?);
+        view_layers.push(LayerViewState::new(
+            layer_key,
+            layer.display.visible(),
+            LayerTransfer::new(
+                layer.display.window(),
+                RgbColor::new(layer.channel.color_rgba[..3].try_into().unwrap())
+                    .expect("dataset validation rejects invalid channel colors"),
+                layer.display.opacity(),
+                TransferCurve::linear(),
+                false,
+            ),
+            RenderState::mip(SamplingPolicy::SmoothLinear),
+        ));
+    }
+    let catalog = Arc::new(DatasetCatalog::new(
+        dataset.dataset_name(),
+        ScientificIdentityStatus::Unverified,
+        catalog_layers,
+    )?);
+    let active_key = LogicalLayerKey::new(0);
+    let active_layer_view = view_layers
+        .first()
+        .expect("the current dataset format requires at least one layer")
+        .clone();
+    let active_transfer = IntensityTransfer::new(
+        active_layer_view.visible(),
+        active_layer_view.transfer().clone(),
+    );
+    let active_render_state = *active_layer_view.render_state();
+    let legacy_display = layer.display;
     let opened = open_initial_scalar_layer_with_overrides(
         &dataset,
         &layer_id,
         layer.dtype.stored,
         ScalarLayerOpenOptions {
-            display: layer.display,
-            transfer: active_transfer.clone(),
-            dvr_opacity_transfer: active_dvr_opacity_transfer,
+            display: legacy_display,
+            transfer: active_transfer,
             presentation_viewport: default_presentation_viewport(),
-            timepoint: TimeIndex(0),
-            mode: active_render_mode,
-            iso_display_level,
-            dvr_density_scale,
+            timepoint: TimeIndex::new(0),
+            render_state: active_render_state,
         },
         overrides,
     )?;
@@ -383,160 +393,79 @@ fn open_dataset_with_preferences_and_overrides(
         diagnostics_f32,
         active_intensity_summary,
     } = opened;
-    let render_sampling_policy = RenderSamplingPolicy::default();
-    let render_iso_shading_policy = RenderIsoShadingPolicy::default();
+    let cross_section = CrossSectionView::new(
+        camera.target(),
+        UnitQuaternion::identity(),
+        camera.orthographic_world_per_screen_point(),
+        effective_voxel_world_step(source_grid_to_world),
+    )?;
+    let view = ViewState::new(
+        view_layers,
+        active_key,
+        TimeIndex::new(0),
+        camera,
+        ViewerLayout::Single3d,
+        cross_section,
+        IsoLightState::attached_camera(),
+    )?;
+    let presets = default_channel_presets(&catalog, &view)?;
+    let workspace = UnboundWorkspace::new(
+        ProjectId::from_bytes(*uuid::Uuid::new_v4().as_bytes()),
+        view,
+        presets,
+    )
+    .map_err(|code| anyhow::anyhow!("initial application workspace rejected: {code:?}"))?;
+    let dense_frame_is_exact =
+        active_volume_u8.is_some() || active_volume.is_some() || active_volume_f32.is_some();
     let rendered_channels = vec![RenderedIntensityChannel {
-        layer_id: layer_id.to_string(),
-        render_state: ChannelRenderState::mip(),
-        transfer: active_transfer.clone(),
+        layer_id: layer_id.clone(),
+        render_state: active_render_state,
+        transfer: active_transfer,
         frame: frame.clone(),
         frame_f32: frame_f32.clone(),
     }];
-    let mut state = AppState {
-        startup_diagnostics: collect_startup_diagnostics(),
-        dataset_name: dataset.dataset_name().to_owned(),
-        dataset_path: path.as_ref().to_path_buf(),
-        layer_count: dataset.layer_count(),
-        layers,
-        active_layer_index: 0,
-        active_layer_name: layer.name,
-        active_layer_id: layer_id.to_string(),
-        active_layer_shape: layer.shape,
-        active_layer_dtype: layer.dtype.stored,
-        active_layer_display: layer.display,
-        active_layer_color: active_color,
-        active_layer_transfer: active_transfer,
-        active_dvr_opacity_transfer,
-        active_source_shape: source_shape,
-        active_source_grid_to_world: source_grid_to_world,
-        active_timepoint: TimeIndex(0),
-        timepoint_count: layer.shape.t,
-        active_projection: Projection::Orthographic,
-        active_render_mode,
-        render_sampling_policy,
-        render_iso_shading_policy,
-        iso_display_level,
-        iso_light_state,
-        dvr_density_scale,
-        presentation_viewport,
-        render_viewport,
-        viewer_layout: ViewerLayoutState::single_3d_for_dataset(
-            source_shape,
-            source_grid_to_world,
-            presentation_viewport,
-        ),
-        render_backend: RenderBackend::CpuReference,
-        frame_fidelity: FrameFidelityStatus::new_with_presentation(
-            render_viewport,
-            presentation_viewport,
-        ),
-        channel_fidelity: Vec::new(),
-        lod_schedule: LodScheduleState::new(
-            (active_volume_u8.is_some() || active_volume.is_some() || active_volume_f32.is_some())
-                .then_some(0),
-        ),
-        lod_replan_pending: false,
-        playback_lod_downshift_active: false,
-        renderer_gpu_brick_budget_bytes: preferences.runtime.gpu_brick_cache_budget_bytes,
-        visible_brick_count: 0,
-        visible_brick_plan_stride: 1,
-        visible_brick_plan_error: None,
-        visible_bricks: Vec::new(),
-        brick_stream_scale_level: 0,
-        brick_stream_scale_shape: source_shape,
-        brick_stream_generation: 0,
-        brick_stream_requested: 0,
-        brick_stream_completed: 0,
-        brick_stream_cancelled: 0,
-        brick_stream_stale: 0,
-        brick_stream_failed: 0,
-        brick_stream_last_error: None,
-        brick_stream_complete: false,
-        brick_result_drain_limit: 0,
-        brick_result_drain_time_budget_ms: 0.0,
-        brick_result_drain_last_count: 0,
-        brick_result_drain_last_budget_limited: false,
-        brick_result_drain_last_repaint_reason: None,
-        brick_result_drain_budget_hit_count: 0,
-        brick_result_drain_total_drained: 0,
-        brick_prefetch_timepoints: Vec::new(),
-        brick_prefetch_requested: 0,
-        brick_prefetch_completed: 0,
-        brick_prefetch_cancelled: 0,
-        brick_prefetch_stale: 0,
-        brick_prefetch_failed: 0,
-        brick_prefetch_skipped: 0,
-        brick_prefetch_last_error: None,
-        brick_warm_brick_count: 0,
-        brick_warm_requested: 0,
-        brick_warm_completed: 0,
-        brick_warm_cancelled: 0,
-        brick_warm_stale: 0,
-        brick_warm_failed: 0,
-        brick_warm_skipped: 0,
-        brick_warm_last_error: None,
-        resident_bricks_u8: Vec::new(),
-        resident_bricks_u8_by_layer: BTreeMap::new(),
-        resident_bricks: Vec::new(),
-        resident_bricks_by_layer: BTreeMap::new(),
-        resident_bricks_f32: Vec::new(),
-        resident_bricks_f32_by_layer: BTreeMap::new(),
-        cross_section_runtime: CrossSectionRuntime::default(),
-        cross_section_last_interaction_at: None,
-        resident_histogram_generation: 0,
-        resident_histogram_samples: HashMap::new(),
-        prefetched_brick_payloads: Vec::new(),
-        adapter_summary: None,
-        camera,
-        viewport_orbit_drag: None,
-        frame,
-        frame_f32,
-        diagnostics,
-        diagnostics_f32,
-        active_intensity_summary,
-        channel_presets: Vec::new(),
-        selected_channel_preset_index: None,
-        channel_preset_warnings: Vec::new(),
-        analysis_tables: Vec::new(),
-        analysis_plots: Vec::new(),
-        analysis_operations: Vec::new(),
-        last_analysis_export_csv: None,
-        selected_analysis_table_index: None,
-        selected_analysis_plot_index: None,
-        selected_analysis_plot_point: None,
-        analysis_plot_view: None,
-        analysis_filter: String::new(),
-        analysis_sort: None,
-        rendered_channels,
-        scene_artifacts: SceneArtifactStore::default(),
-        viewer_tools: ViewerToolState::default(),
-        hovered_pixel: None,
-        hovered_source_readout: None,
-        last_render_error: None,
-        last_workflow_message: None,
+    let dataset_runtime = CurrentDatasetRuntime::opened(
         dataset,
+        source_shape,
         active_volume_u8,
         active_volume,
         active_volume_f32,
-        active_histogram_cache: None,
-        brick_stream_request_key: None,
-        brick_prefetch_request_key: None,
-        brick_warm_request_key: None,
-        #[cfg(test)]
-        fixed_frame_time_ms_for_snapshots: None,
-    };
-    update_visible_brick_plan(&mut state);
-    state.channel_presets = default_channel_presets_from_layers(&state.layers);
-    update_channel_fidelity_status(&mut state);
-    if state.active_volume_u8.is_some()
-        || state.active_volume.is_some()
-        || state.active_volume_f32.is_some()
-    {
-        state.frame_fidelity.displayed_scale_level = Some(0);
-        state.lod_schedule.displayed_scale_level = Some(0);
-        state.frame_fidelity.completeness = FrameCompleteness::Exact;
-        state.frame_fidelity.reason = LodDecisionReason::ExactS0;
-        state.frame_fidelity.backend = state.render_backend;
+    );
+    let mut render_runtime = CurrentRenderRuntime::opened(
+        presentation_viewport,
+        render_viewport,
+        FrameFidelityStatus::new_with_presentation(render_viewport, presentation_viewport),
+        LodScheduleState::new(dense_frame_is_exact.then_some(0)),
+        diagnostics,
+        diagnostics_f32,
+        CrossSectionRuntime::default(),
+        frame,
+        frame_f32,
+        rendered_channels,
+    );
+    if dense_frame_is_exact {
+        render_runtime.frame_fidelity.displayed_scale_level = Some(0);
+        render_runtime.frame_fidelity.completeness = FrameCompleteness::Exact;
+        render_runtime.frame_fidelity.reason = LodDecisionReason::ExactS0;
+        render_runtime.frame_fidelity.backend = RenderBackend::CpuReference;
+        render_runtime.lod_schedule.displayed_scale_level = Some(0);
+        render_runtime.lod_schedule.pending_scale_level = None;
     }
-    Ok(state)
+
+    Ok(OpenedCurrentSource {
+        startup_diagnostics: collect_startup_diagnostics(),
+        catalog,
+        workspace,
+        dataset_runtime,
+        render_runtime,
+        analysis_runtime: CurrentAnalysisRuntime::empty(active_intensity_summary),
+    })
+}
+
+fn effective_voxel_world_step(grid_to_world: GridToWorld) -> f64 {
+    let matrix = grid_to_world.row_major();
+    let x = (matrix[0] * matrix[0] + matrix[4] * matrix[4] + matrix[8] * matrix[8]).sqrt();
+    let y = (matrix[1] * matrix[1] + matrix[5] * matrix[5] + matrix[9] * matrix[9]).sqrt();
+    let z = (matrix[2] * matrix[2] + matrix[6] * matrix[6] + matrix[10] * matrix[10]).sqrt();
+    x.min(y).min(z).max(f64::EPSILON)
 }

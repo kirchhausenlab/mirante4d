@@ -1,14 +1,12 @@
 use std::path::PathBuf;
 
 use mirante4d_data::{BrickReadQueueDiagnostics, BrickRequestPriority, DataEngineStats};
+use mirante4d_domain::{RenderMode, ViewerLayout};
 use mirante4d_renderer::gpu::GpuRendererStats;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{
-    RenderMode,
-    viewer_layout::{CrossSectionPanelScheduleStatus, PanelId, ViewerLayout},
-};
+use crate::viewer_layout::{CrossSectionPanelScheduleStatus, PanelId};
 
 use super::{AUTOMATION_SCHEMA_VERSION, AUTOMATION_SCRIPT_SCHEMA};
 

@@ -1,6 +1,8 @@
 use glam::{DQuat, DVec2, DVec3};
-use mirante4d_core::{GridToWorld, PresentationViewport, Shape3D};
 use mirante4d_data::SpatialBrickIndex;
+use mirante4d_domain::{GridToWorld, Shape3D};
+use mirante4d_format::CurrentGridToWorldExt;
+use mirante4d_render_api::PresentationViewport;
 
 use crate::BrickGridSpec;
 
@@ -131,8 +133,8 @@ impl CrossSectionView {
         CrossSectionSlab {
             center_world: self.center_world,
             basis: self.basis,
-            half_width_world: viewport.width_points * self.scale_world_per_screen_point * 0.5,
-            half_height_world: viewport.height_points * self.scale_world_per_screen_point * 0.5,
+            half_width_world: viewport.width_points() * self.scale_world_per_screen_point * 0.5,
+            half_height_world: viewport.height_points() * self.scale_world_per_screen_point * 0.5,
             half_depth_world: self.depth_world * 0.5,
         }
     }
@@ -143,8 +145,8 @@ impl CrossSectionView {
         y_points: f64,
         viewport: PresentationViewport,
     ) -> DVec3 {
-        let dx = (x_points - viewport.width_points * 0.5) * self.scale_world_per_screen_point;
-        let dy = (y_points - viewport.height_points * 0.5) * self.scale_world_per_screen_point;
+        let dx = (x_points - viewport.width_points() * 0.5) * self.scale_world_per_screen_point;
+        let dy = (y_points - viewport.height_points() * 0.5) * self.scale_world_per_screen_point;
         self.center_world + self.basis.right_world * dx + self.basis.down_world * dy
     }
 }
@@ -210,8 +212,8 @@ impl CrossSectionViewState {
         let old_view = self.view(panel);
         let anchored_world = old_view.world_point_for_panel_point(x_points, y_points, viewport);
         let new_scale = (self.scale_world_per_screen_point * factor).max(EPSILON);
-        let dx_points = x_points - viewport.width_points * 0.5;
-        let dy_points = y_points - viewport.height_points * 0.5;
+        let dx_points = x_points - viewport.width_points() * 0.5;
+        let dy_points = y_points - viewport.height_points() * 0.5;
         self.scale_world_per_screen_point = new_scale;
         self.center_world = anchored_world
             - old_view.basis.right_world * dx_points * new_scale
@@ -384,9 +386,9 @@ pub fn cross_section_chunk_plane_polygon(
 
 fn brick_grid_shape(volume_shape: Shape3D, brick_shape: Shape3D) -> Shape3D {
     Shape3D::new(
-        volume_shape.z.div_ceil(brick_shape.z),
-        volume_shape.y.div_ceil(brick_shape.y),
-        volume_shape.x.div_ceil(brick_shape.x),
+        volume_shape.z().div_ceil(brick_shape.z()),
+        volume_shape.y().div_ceil(brick_shape.y()),
+        volume_shape.x().div_ceil(brick_shape.x()),
     )
     .expect("nonzero Shape3D dimensions produce a nonzero brick grid")
 }
@@ -409,23 +411,23 @@ fn cross_section_candidate_brick_bounds(
     let x_bounds = candidate_axis_bounds(
         grid_min.x,
         grid_max.x,
-        spec.volume_shape.x,
-        spec.brick_shape.x,
-        grid_shape.x,
+        spec.volume_shape.x(),
+        spec.brick_shape.x(),
+        grid_shape.x(),
     )?;
     let y_bounds = candidate_axis_bounds(
         grid_min.y,
         grid_max.y,
-        spec.volume_shape.y,
-        spec.brick_shape.y,
-        grid_shape.y,
+        spec.volume_shape.y(),
+        spec.brick_shape.y(),
+        grid_shape.y(),
     )?;
     let z_bounds = candidate_axis_bounds(
         grid_min.z,
         grid_max.z,
-        spec.volume_shape.z,
-        spec.brick_shape.z,
-        grid_shape.z,
+        spec.volume_shape.z(),
+        spec.brick_shape.z(),
+        grid_shape.z(),
     )?;
 
     Some(CrossSectionBrickCandidateBounds {
@@ -496,22 +498,24 @@ impl CrossSectionBrickCandidateBounds {
 }
 
 fn brick_world_corners(spec: BrickGridSpec, brick: SpatialBrickIndex) -> Option<[DVec3; 8]> {
-    let min_x = brick.x.checked_mul(spec.brick_shape.x)?;
-    let min_y = brick.y.checked_mul(spec.brick_shape.y)?;
-    let min_z = brick.z.checked_mul(spec.brick_shape.z)?;
-    if min_x >= spec.volume_shape.x || min_y >= spec.volume_shape.y || min_z >= spec.volume_shape.z
+    let min_x = brick.x.checked_mul(spec.brick_shape.x())?;
+    let min_y = brick.y.checked_mul(spec.brick_shape.y())?;
+    let min_z = brick.z.checked_mul(spec.brick_shape.z())?;
+    if min_x >= spec.volume_shape.x()
+        || min_y >= spec.volume_shape.y()
+        || min_z >= spec.volume_shape.z()
     {
         return None;
     }
     let max_x = min_x
-        .saturating_add(spec.brick_shape.x)
-        .min(spec.volume_shape.x);
+        .saturating_add(spec.brick_shape.x())
+        .min(spec.volume_shape.x());
     let max_y = min_y
-        .saturating_add(spec.brick_shape.y)
-        .min(spec.volume_shape.y);
+        .saturating_add(spec.brick_shape.y())
+        .min(spec.volume_shape.y());
     let max_z = min_z
-        .saturating_add(spec.brick_shape.z)
-        .min(spec.volume_shape.z);
+        .saturating_add(spec.brick_shape.z())
+        .min(spec.volume_shape.z());
     let xs = [min_x as f64 - 0.5, max_x as f64 - 0.5];
     let ys = [min_y as f64 - 0.5, max_y as f64 - 0.5];
     let zs = [min_z as f64 - 0.5, max_z as f64 - 0.5];
@@ -529,7 +533,7 @@ fn brick_world_corners(spec: BrickGridSpec, brick: SpatialBrickIndex) -> Option<
 }
 
 fn grid_point_to_world(grid_to_world: GridToWorld, x: f64, y: f64, z: f64) -> DVec3 {
-    grid_to_world.transform_point(DVec3::new(x, y, z))
+    grid_to_world.transform_point_vec(DVec3::new(x, y, z))
 }
 
 const BOX_EDGE_INDICES: [(usize, usize); 12] = [
@@ -582,9 +586,9 @@ fn panel_points_for_world(
 ) -> DVec2 {
     let relative = world - view.center_world;
     DVec2::new(
-        presentation_viewport.width_points * 0.5
+        presentation_viewport.width_points() * 0.5
             + relative.dot(view.basis.right_world) / view.scale_world_per_screen_point,
-        presentation_viewport.height_points * 0.5
+        presentation_viewport.height_points() * 0.5
             + relative.dot(view.basis.down_world) / view.scale_world_per_screen_point,
     )
 }
@@ -635,8 +639,9 @@ fn normalized_orientation_or_identity(orientation: DQuat) -> DQuat {
 mod tests {
     use approx::assert_abs_diff_eq;
     use glam::{DQuat, DVec2, DVec3};
-    use mirante4d_core::{GridToWorld, PresentationViewport, Shape3D};
     use mirante4d_data::SpatialBrickIndex;
+    use mirante4d_domain::{GridToWorld, Shape3D};
+    use mirante4d_render_api::PresentationViewport;
 
     use crate::{BrickGridSpec, cross_section::*};
 
@@ -985,7 +990,7 @@ mod tests {
         let spec = BrickGridSpec {
             volume_shape: Shape3D::new(32, 32, 32).unwrap(),
             brick_shape: Shape3D::new(4, 4, 4).unwrap(),
-            grid_to_world: GridToWorld::scale_um(1.0, 1.5, 2.0),
+            grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.5, 2.0),
         };
         let view = CrossSectionView::new(
             DVec3::new(15.5, 22.5, 31.0),
@@ -998,9 +1003,9 @@ mod tests {
         let plan = plan_cross_section_bricks_with_diagnostics(slab, spec);
         let mut brute_force = Vec::new();
         let grid_shape = brick_grid_shape(spec.volume_shape, spec.brick_shape);
-        for z in 0..grid_shape.z {
-            for y in 0..grid_shape.y {
-                for x in 0..grid_shape.x {
+        for z in 0..grid_shape.z() {
+            for y in 0..grid_shape.y() {
+                for x in 0..grid_shape.x() {
                     let brick = SpatialBrickIndex::new(z, y, x);
                     if slab.intersects_brick(spec, brick) {
                         brute_force.push(brick);
@@ -1058,7 +1063,7 @@ mod tests {
         let spec = BrickGridSpec {
             volume_shape: Shape3D::new(8, 8, 8).unwrap(),
             brick_shape: Shape3D::new(4, 4, 4).unwrap(),
-            grid_to_world: GridToWorld::scale_um(1.0, 1.0, 4.0),
+            grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 4.0),
         };
         let view = CrossSectionView::new(
             DVec3::new(3.5, 3.5, 7.0),

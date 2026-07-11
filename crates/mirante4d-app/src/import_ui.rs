@@ -5,7 +5,8 @@ use std::{
 };
 
 use eframe::egui;
-use mirante4d_core::IntensityDType;
+use mirante4d_application::{ApplicationSnapshot, OperationToken, WorkspaceSnapshot};
+use mirante4d_domain::IntensityDType;
 use mirante4d_format::{
     ExistingPackagePolicy, NoDataPolicy, NoDataPolicyKind, NoDataVisibilityPolicy,
 };
@@ -20,7 +21,7 @@ use mirante4d_import::{
 };
 
 use crate::{
-    AppState,
+    current_runtime::dataset::CurrentDatasetRuntime,
     ui_kit::{self, StatusTone},
 };
 
@@ -43,6 +44,7 @@ pub(crate) struct PendingTiffImport {
 }
 
 pub(crate) struct ImportTask {
+    pub(crate) token: OperationToken,
     pub(crate) cancellation: ImportCancellationToken,
     pub(crate) receiver: Receiver<ImportTaskMessage>,
     pub(crate) latest_event: Option<ImportProgressEvent>,
@@ -319,13 +321,19 @@ pub(crate) fn show_tiff_no_data_controls(ui: &mut egui::Ui, pending: &mut Pendin
     }
 }
 
-pub(crate) fn active_layer_no_data_policy_label(state: &AppState) -> Option<String> {
-    state
+pub(crate) fn active_layer_no_data_policy_label(
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+) -> Option<String> {
+    let active_layer = match snapshot.workspace() {
+        WorkspaceSnapshot::Unbound { workspace } => workspace.view().active_layer(),
+        WorkspaceSnapshot::Bound { project, .. } => project.view().active_layer(),
+    };
+    dataset
         .dataset
         .manifest()
         .layers
-        .iter()
-        .find(|layer| layer.id == state.active_layer_id)
+        .get(active_layer.ordinal() as usize)
         .and_then(|layer| layer.no_data_policy.as_ref())
         .map(no_data_policy_label)
 }

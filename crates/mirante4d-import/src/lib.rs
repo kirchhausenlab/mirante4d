@@ -7,17 +7,16 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use mirante4d_core::{
-    DisplayWindow, GridToWorld, IntensityDType, LayerDisplay, Shape4D, WorldSpace, WorldUnit,
-};
+use mirante4d_domain::{DisplayWindow, GridToWorld, IntensityDType, Shape4D};
 use mirante4d_format::{
-    ChannelMetadata, ExistingPackagePolicy, NativeDatasetProvenance, NativeDatasetProvenanceKind,
-    NativeMultiscaleDatasetWriter, NoDataPolicy, NoDataPolicyKind, NoDataVisibilityPolicy,
-    ScaleReduction, SourceFileProvenance, SourceMetadataProvenance, Statistics,
-    StoragePolicyProvenance, StreamingF32LayerSpec, StreamingF32LayerWriter, StreamingF32ScaleSpec,
-    StreamingU8LayerSpec, StreamingU8LayerWriter, StreamingU8ScaleSpec, StreamingU16LayerSpec,
-    StreamingU16LayerWriter, StreamingU16ScaleSpec, UserCorrectionProvenance, ValueRangeProvenance,
-    default_f32_display, default_u16_display, load_and_validate_dataset,
+    ChannelMetadata, CurrentGridToWorldExt, ExistingPackagePolicy, LayerDisplay,
+    NativeDatasetProvenance, NativeDatasetProvenanceKind, NativeMultiscaleDatasetWriter,
+    NoDataPolicy, NoDataPolicyKind, NoDataVisibilityPolicy, ScaleReduction, SourceFileProvenance,
+    SourceMetadataProvenance, Statistics, StoragePolicyProvenance, StreamingF32LayerSpec,
+    StreamingF32LayerWriter, StreamingF32ScaleSpec, StreamingU8LayerSpec, StreamingU8LayerWriter,
+    StreamingU8ScaleSpec, StreamingU16LayerSpec, StreamingU16LayerWriter, StreamingU16ScaleSpec,
+    UserCorrectionProvenance, ValueRangeProvenance, WorldSpace, WorldUnit, default_f32_display,
+    default_u16_display, load_and_validate_dataset,
 };
 use quick_xml::Reader as XmlReader;
 use quick_xml::events::{BytesStart, Event as XmlEvent};

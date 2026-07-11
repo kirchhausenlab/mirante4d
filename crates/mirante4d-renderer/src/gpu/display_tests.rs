@@ -1,15 +1,16 @@
 use std::sync::mpsc;
 
 use glam::DVec3;
-use mirante4d_core::{
-    CameraAxes, CameraState, ChannelColor, ChannelTransferFunction, DatasetId, DisplayWindow,
-    GridToWorld, IsoLightState, LayerDisplay, LayerId, TimeIndex, TransferCurve, TransferPresetId,
-};
 use mirante4d_data::{
     DatasetHandle, DenseVolumeF32, DenseVolumeU16, SpatialBrickIndex, VolumeBrickF32,
     VolumeBrickU16, VolumeRegion,
 };
-use mirante4d_format::{FixtureKind, write_fixture};
+use mirante4d_domain::{
+    DisplayWindow, GridToWorld, IsoLightState, LayerTransfer, Opacity, RgbColor, TimeIndex,
+    TransferCurve,
+};
+use mirante4d_format::{DatasetId, FixtureKind, LayerId, write_fixture};
+use mirante4d_render_api::{CameraAxes, CameraFrame};
 
 use crate::camera_mip::CameraRenderModeF32;
 use crate::{
@@ -151,18 +152,18 @@ fn assert_gpu_compute_timing_when_enabled(renderer: &GpuRenderer, frame: &GpuDis
     }
 }
 
-fn display_transfer(
-    color_rgba: [f32; 4],
-    opacity: f32,
-    window_high: f32,
-) -> ChannelTransferFunction {
-    ChannelTransferFunction::new(
-        LayerDisplay::new(true, DisplayWindow::new(0.0, window_high).unwrap(), opacity).unwrap(),
-        ChannelColor::new(color_rgba).unwrap(),
-        TransferCurve::Linear,
-        TransferPresetId::linear(),
+fn display_transfer(color_rgba: [f32; 4], opacity: f32, window_high: f32) -> IntensityTransfer {
+    let [red, green, blue, _alpha] = color_rgba;
+    IntensityTransfer::new(
+        true,
+        LayerTransfer::new(
+            DisplayWindow::new(0.0, window_high).unwrap(),
+            RgbColor::new([red, green, blue]).unwrap(),
+            Opacity::new(opacity).unwrap(),
+            TransferCurve::linear(),
+            false,
+        ),
     )
-    .unwrap()
 }
 
 fn display_transfer_window(
@@ -170,38 +171,39 @@ fn display_transfer_window(
     opacity: f32,
     low: f32,
     high: f32,
-) -> ChannelTransferFunction {
-    ChannelTransferFunction::new(
-        LayerDisplay::new(true, DisplayWindow::new(low, high).unwrap(), opacity).unwrap(),
-        ChannelColor::new(color_rgba).unwrap(),
-        TransferCurve::Linear,
-        TransferPresetId::linear(),
+) -> IntensityTransfer {
+    let [red, green, blue, _alpha] = color_rgba;
+    IntensityTransfer::new(
+        true,
+        LayerTransfer::new(
+            DisplayWindow::new(low, high).unwrap(),
+            RgbColor::new([red, green, blue]).unwrap(),
+            Opacity::new(opacity).unwrap(),
+            TransferCurve::linear(),
+            false,
+        ),
     )
-    .unwrap()
 }
 
 fn dvr_parameters_for_transfer(
-    transfer: &ChannelTransferFunction,
+    transfer: &IntensityTransfer,
     density_scale: f64,
 ) -> DvrRenderParameters {
     DvrRenderParameters::new(
-        ScalarDisplayTransfer::from_transfer_function(transfer),
-        ScalarDisplayTransfer::new(transfer.display.window, transfer.curve, false),
-        transfer.color.color_rgba,
-        transfer.display.opacity,
+        ScalarDisplayTransfer::from_intensity_transfer(*transfer),
+        ScalarDisplayTransfer::new(transfer.window(), transfer.curve(), false),
+        transfer.color_rgba(),
+        transfer.opacity().get(),
         density_scale,
     )
 }
 
-fn camera_state_axes(camera: CameraState) -> CameraAxes {
-    let forward = (camera.target - camera.eye).normalize();
-    let right = forward.cross(camera.up).normalize();
-    let up = right.cross(forward).normalize();
-    CameraAxes { forward, right, up }
+fn camera_state_axes(camera: CameraFrame) -> CameraAxes {
+    camera.axes()
 }
 
 fn display_request_for_camera(
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     quality: CameraRenderQuality,
 ) -> GpuResidentDisplayRequest {
@@ -215,7 +217,7 @@ fn display_request_for_camera(
 }
 
 fn display_request_for_camera_with_light(
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     quality: CameraRenderQuality,
     iso_light_state: IsoLightState,
@@ -237,9 +239,9 @@ fn resident_u16_z_slab(
     let layer_id = LayerId::new(layer_id).unwrap();
     let shape = Shape3D::new(4, 4, 4).unwrap();
     let mut values = Vec::with_capacity(shape.element_count().unwrap() as usize);
-    for z in 0..shape.z {
-        for _y in 0..shape.y {
-            for _x in 0..shape.x {
+    for z in 0..shape.z() {
+        for _y in 0..shape.y() {
+            for _x in 0..shape.x() {
                 values.push(if z == active_z { u16::MAX } else { 0 });
             }
         }
@@ -248,7 +250,7 @@ fn resident_u16_z_slab(
         DatasetId::new("gpu-iso-depth-order").unwrap(),
         layer_id.clone(),
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         GridToWorld::identity(),
         values,
@@ -263,7 +265,7 @@ fn resident_u16_z_slab(
             y: 0,
             x: 0,
         },
-        region: VolumeRegion::new(0, 0, 0, shape.z, shape.y, shape.x).unwrap(),
+        region: VolumeRegion::new(0, 0, 0, shape.z(), shape.y(), shape.x()).unwrap(),
         occupied: true,
         valid_voxel_count: shape.element_count().unwrap(),
         min: 0.0,
@@ -274,7 +276,7 @@ fn resident_u16_z_slab(
         volume,
         ResidentBrickSetU16::new(
             layer_id,
-            TimeIndex(0),
+            TimeIndex::new(0),
             shape,
             GridToWorld::identity(),
             vec![brick],
@@ -291,9 +293,9 @@ fn resident_f32_z_slab(
     let layer_id = LayerId::new(layer_id).unwrap();
     let shape = Shape3D::new(4, 4, 4).unwrap();
     let mut values = Vec::with_capacity(shape.element_count().unwrap() as usize);
-    for z in 0..shape.z {
-        for _y in 0..shape.y {
-            for _x in 0..shape.x {
+    for z in 0..shape.z() {
+        for _y in 0..shape.y() {
+            for _x in 0..shape.x() {
                 values.push(if z == active_z { 1.0 } else { 0.0 });
             }
         }
@@ -302,7 +304,7 @@ fn resident_f32_z_slab(
         DatasetId::new("gpu-iso-depth-order-f32").unwrap(),
         layer_id.clone(),
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         GridToWorld::identity(),
         values,
@@ -317,7 +319,7 @@ fn resident_f32_z_slab(
             y: 0,
             x: 0,
         },
-        region: VolumeRegion::new(0, 0, 0, shape.z, shape.y, shape.x).unwrap(),
+        region: VolumeRegion::new(0, 0, 0, shape.z(), shape.y(), shape.x()).unwrap(),
         occupied: true,
         valid_voxel_count: shape.element_count().unwrap(),
         min: 0.0,
@@ -328,7 +330,7 @@ fn resident_f32_z_slab(
         volume,
         ResidentBrickSetF32::new(
             layer_id,
-            TimeIndex(0),
+            TimeIndex::new(0),
             shape,
             GridToWorld::identity(),
             vec![brick],
@@ -345,19 +347,21 @@ fn gpu_resident_display_texture_matches_cpu_intensity_compositor() {
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let brick_shape = dataset.brick_shape(&layer_id).unwrap();
     let brick_grid_shape = dataset.brick_grid_shape(&layer_id).unwrap();
     let brick = dataset
         .read_u16_brick(
             &layer_id,
-            TimeIndex(0),
+            TimeIndex::new(0),
             mirante4d_data::SpatialBrickIndex::new(0, 0, 0),
         )
         .unwrap();
     let resident = ResidentBrickSetU16::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         volume.shape,
         volume.grid_to_world,
         vec![brick],
@@ -376,14 +380,8 @@ fn gpu_resident_display_texture_matches_cpu_intensity_compositor() {
         "CPU resident-brick reference must be complete"
     );
     let expected = composite_intensity_channels(&[
-        IntensityChannelFrame::new(
-            &cpu_frame,
-            IntensityTransfer::from_transfer_function(red.clone()),
-        ),
-        IntensityChannelFrame::new(
-            &cpu_frame,
-            IntensityTransfer::from_transfer_function(green.clone()),
-        ),
+        IntensityChannelFrame::new(&cpu_frame, red),
+        IntensityChannelFrame::new(&cpu_frame, green),
     ])
     .unwrap();
 
@@ -395,14 +393,14 @@ fn gpu_resident_display_texture_matches_cpu_intensity_compositor() {
                     brick_shape,
                     brick_grid_shape,
                     mode: CameraRenderMode::Mip,
-                    transfer: red.clone(),
+                    transfer: red,
                 },
                 GpuResidentDisplayChannel::U16 {
                     resident: &resident,
                     brick_shape,
                     brick_grid_shape,
                     mode: CameraRenderMode::Mip,
-                    transfer: green.clone(),
+                    transfer: green,
                 },
             ],
             display_request_for_camera(camera, viewport, CameraRenderQuality::voxel_exact()),
@@ -431,7 +429,8 @@ fn gpu_resident_display_texture_matches_cpu_intensity_compositor() {
             radius_px: 2.0,
         },
     ));
-    let draw_list = extract_scene_draw_list(&[scene_layer], SceneFrameContext::new(TimeIndex(0)));
+    let draw_list =
+        extract_scene_draw_list(&[scene_layer], SceneFrameContext::new(TimeIndex::new(0)));
     let scene_frame = renderer
         .render_scene_layers_to_display_texture(display_frame, &draw_list, camera, viewport)
         .unwrap();
@@ -485,19 +484,21 @@ fn gpu_display_frame_blend_pass_matches_additive_display_frame_reference() {
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let brick_shape = dataset.brick_shape(&layer_id).unwrap();
     let brick_grid_shape = dataset.brick_grid_shape(&layer_id).unwrap();
     let brick = dataset
         .read_u16_brick(
             &layer_id,
-            TimeIndex(0),
+            TimeIndex::new(0),
             mirante4d_data::SpatialBrickIndex::new(0, 0, 0),
         )
         .unwrap();
     let resident = ResidentBrickSetU16::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         volume.shape,
         volume.grid_to_world,
         vec![brick],
@@ -560,15 +561,21 @@ fn gpu_resident_display_texture_matches_cpu_same_ray_multi_channel_dvr() {
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let brick_shape = dataset.brick_shape(&layer_id).unwrap();
     let brick_grid_shape = dataset.brick_grid_shape(&layer_id).unwrap();
     let brick = dataset
-        .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+        .read_u16_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 0),
+        )
         .unwrap();
     let resident = ResidentBrickSetU16::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         volume.shape,
         volume.grid_to_world,
         vec![brick],
@@ -611,7 +618,7 @@ fn gpu_resident_display_texture_matches_cpu_same_ray_multi_channel_dvr() {
                     mode: CameraRenderMode::Dvr {
                         parameters: red_params,
                     },
-                    transfer: red_transfer.clone(),
+                    transfer: red_transfer,
                 },
                 GpuResidentDisplayChannel::U16 {
                     resident: &resident,
@@ -620,7 +627,7 @@ fn gpu_resident_display_texture_matches_cpu_same_ray_multi_channel_dvr() {
                     mode: CameraRenderMode::Dvr {
                         parameters: green_params,
                     },
-                    transfer: green_transfer.clone(),
+                    transfer: green_transfer,
                 },
             ],
             display_request_for_camera(camera, viewport, quality),
@@ -714,7 +721,7 @@ fn gpu_resident_display_texture_matches_cpu_same_ray_multi_channel_f32_dvr() {
                     mode: CameraRenderModeF32::Dvr {
                         parameters: green_params,
                     },
-                    transfer: green_transfer.clone(),
+                    transfer: green_transfer,
                 },
                 GpuResidentDisplayChannel::F32 {
                     resident: &far_resident,
@@ -723,7 +730,7 @@ fn gpu_resident_display_texture_matches_cpu_same_ray_multi_channel_f32_dvr() {
                     mode: CameraRenderModeF32::Dvr {
                         parameters: red_params,
                     },
-                    transfer: red_transfer.clone(),
+                    transfer: red_transfer,
                 },
             ],
             display_request_for_camera(camera, viewport, quality),
@@ -814,14 +821,8 @@ fn gpu_resident_display_texture_matches_cpu_depth_sorted_multi_channel_iso() {
 
     let expected = composite_iso_surface_channels(
         &[
-            IsoSurfaceChannelFrame::new(
-                near_surface,
-                IntensityTransfer::from_transfer_function(near_green.clone()),
-            ),
-            IsoSurfaceChannelFrame::new(
-                far_surface,
-                IntensityTransfer::from_transfer_function(far_red.clone()),
-            ),
+            IsoSurfaceChannelFrame::new(near_surface, near_green),
+            IsoSurfaceChannelFrame::new(far_surface, far_red),
         ],
         light_state,
         camera_axes,
@@ -841,14 +842,14 @@ fn gpu_resident_display_texture_matches_cpu_depth_sorted_multi_channel_iso() {
                     brick_shape,
                     brick_grid_shape,
                     mode,
-                    transfer: near_green.clone(),
+                    transfer: near_green,
                 },
                 GpuResidentDisplayChannel::U16 {
                     resident: &far_resident,
                     brick_shape: far_brick_shape,
                     brick_grid_shape: far_brick_grid_shape,
                     mode,
-                    transfer: far_red.clone(),
+                    transfer: far_red,
                 },
             ],
             display_request_for_camera_with_light(
@@ -947,14 +948,8 @@ fn gpu_resident_display_texture_matches_cpu_depth_sorted_multi_channel_f32_iso()
 
     let expected = composite_iso_surface_f32_channels(
         &[
-            IsoSurfaceChannelFrameF32::new(
-                near_surface,
-                IntensityTransfer::from_transfer_function(near_green.clone()),
-            ),
-            IsoSurfaceChannelFrameF32::new(
-                far_surface,
-                IntensityTransfer::from_transfer_function(far_red.clone()),
-            ),
+            IsoSurfaceChannelFrameF32::new(near_surface, near_green),
+            IsoSurfaceChannelFrameF32::new(far_surface, far_red),
         ],
         light_state,
         camera_axes,
@@ -974,14 +969,14 @@ fn gpu_resident_display_texture_matches_cpu_depth_sorted_multi_channel_f32_iso()
                     brick_shape,
                     brick_grid_shape,
                     mode,
-                    transfer: near_green.clone(),
+                    transfer: near_green,
                 },
                 GpuResidentDisplayChannel::F32 {
                     resident: &far_resident,
                     brick_shape: far_brick_shape,
                     brick_grid_shape: far_brick_grid_shape,
                     mode,
-                    transfer: far_red.clone(),
+                    transfer: far_red,
                 },
             ],
             display_request_for_camera_with_light(
@@ -1045,7 +1040,9 @@ fn gpu_resident_display_texture_matches_cpu_f32_display_compositor() {
     let root = write_three_brick_f32_gpu_fixture(tempdir.path());
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_f32_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_f32_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let brick_shape = dataset.brick_shape(&layer_id).unwrap();
     let brick_grid_shape = dataset.brick_grid_shape(&layer_id).unwrap();
     let bricks = [
@@ -1056,13 +1053,13 @@ fn gpu_resident_display_texture_matches_cpu_f32_display_compositor() {
     .into_iter()
     .map(|index| {
         dataset
-            .read_f32_brick(&layer_id, TimeIndex(0), index)
+            .read_f32_brick(&layer_id, TimeIndex::new(0), index)
             .unwrap()
     })
     .collect::<Vec<_>>();
     let resident = ResidentBrickSetF32::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         volume.shape,
         volume.grid_to_world,
         bricks,
@@ -1079,11 +1076,9 @@ fn gpu_resident_display_texture_matches_cpu_f32_display_compositor() {
         cpu_mip_diagnostics.complete,
         "CPU resident f32 MIP reference must be complete"
     );
-    let expected_mip = composite_f32_intensity_channels(&[IntensityChannelFrameF32::new(
-        &cpu_mip,
-        IntensityTransfer::from_transfer_function(transfer.clone()),
-    )])
-    .unwrap();
+    let expected_mip =
+        composite_f32_intensity_channels(&[IntensityChannelFrameF32::new(&cpu_mip, transfer)])
+            .unwrap();
     let mip_frame = renderer
         .render_resident_channels_to_display_texture(
             &[GpuResidentDisplayChannel::F32 {
@@ -1091,7 +1086,7 @@ fn gpu_resident_display_texture_matches_cpu_f32_display_compositor() {
                 brick_shape,
                 brick_grid_shape,
                 mode: CameraRenderModeF32::Mip,
-                transfer: transfer.clone(),
+                transfer,
             }],
             display_request_for_camera(camera, viewport, CameraRenderQuality::voxel_exact()),
         )

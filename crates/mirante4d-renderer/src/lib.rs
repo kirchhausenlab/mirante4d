@@ -3,13 +3,16 @@ pub mod brick_render;
 pub mod camera_mip;
 pub mod cpu;
 pub mod cross_section;
+mod current_camera;
 pub mod gpu;
 pub mod resources;
 pub mod scene;
 pub mod scene_render;
 pub mod transfer;
 
-use mirante4d_core::{ShapeError, SpaceError};
+use mirante4d_domain::ShapeError;
+use mirante4d_format::CurrentTransformError;
+use mirante4d_render_api::RenderApiError;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -115,7 +118,9 @@ pub enum RenderError {
     #[error(transparent)]
     Shape(#[from] ShapeError),
     #[error(transparent)]
-    Space(#[from] SpaceError),
+    Space(#[from] CurrentTransformError),
+    #[error(transparent)]
+    Camera(#[from] RenderApiError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

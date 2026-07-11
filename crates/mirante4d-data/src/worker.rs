@@ -9,7 +9,8 @@ use std::{
     time::Duration,
 };
 
-use mirante4d_core::{IntensityDType, LayerId, TimeIndex};
+use mirante4d_domain::{IntensityDType, TimeIndex};
+use mirante4d_format::LayerId;
 
 use crate::{
     DataEngineStats, DataError, DatasetHandle, SpatialBrickIndex, VolumeBrickF32, VolumeBrickU8,

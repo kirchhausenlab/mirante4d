@@ -1,4 +1,6 @@
-use mirante4d_core::{GridToWorld, Shape4D, SpaceError};
+use mirante4d_domain::{GridToWorld, Shape4D};
+
+use crate::{CurrentGridToWorldExt, CurrentTransformError};
 
 pub(crate) const GRID_TO_WORLD_EPSILON: f64 = 1.0e-9;
 
@@ -13,9 +15,9 @@ pub(crate) fn infer_downsample_factors(
     previous_shape: Shape4D,
     shape: Shape4D,
 ) -> Option<DownsampleFactors> {
-    let x = infer_axis_factor(previous_shape.x, shape.x)?;
-    let y = infer_axis_factor(previous_shape.y, shape.y)?;
-    let z = infer_axis_factor(previous_shape.z, shape.z)?;
+    let x = infer_axis_factor(previous_shape.x(), shape.x())?;
+    let y = infer_axis_factor(previous_shape.y(), shape.y())?;
+    let z = infer_axis_factor(previous_shape.z(), shape.z())?;
     if x == 1 && y == 1 && z == 1 {
         return None;
     }
@@ -25,7 +27,7 @@ pub(crate) fn infer_downsample_factors(
 pub(crate) fn expected_downsampled_grid_to_world(
     previous_grid_to_world: GridToWorld,
     factors: DownsampleFactors,
-) -> Result<GridToWorld, SpaceError> {
+) -> Result<GridToWorld, CurrentTransformError> {
     previous_grid_to_world.downsampled_integer_centered(factors.x, factors.y, factors.z)
 }
 
@@ -35,9 +37,9 @@ pub(crate) fn grid_to_world_approx_eq(
     epsilon: f64,
 ) -> bool {
     actual
-        .matrix4x4_row_major
+        .row_major()
         .iter()
-        .zip(expected.matrix4x4_row_major.iter())
+        .zip(expected.row_major().iter())
         .all(|(actual, expected)| (actual - expected).abs() <= epsilon)
 }
 

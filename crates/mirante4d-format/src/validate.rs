@@ -4,11 +4,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use mirante4d_core::{
-    AXES_TZYX, ChannelColor, DatasetId, DisplayWindow, IdError, IntensityDType, LayerDisplay,
-    LayerId, Shape4D, ShapeError, SpaceError, validate_axes_tzyx,
-};
+use mirante4d_domain::{GridToWorld, IntensityDType, RgbColor, Shape4D, ShapeError};
 use thiserror::Error;
+
+use crate::{
+    AXES_TZYX, CurrentFormatIdError, CurrentGridToWorldExt, CurrentShape4DExt,
+    CurrentTransformError, DatasetId, LayerId, validate_axes_tzyx,
+};
 
 use crate::manifest::{
     BOOTSTRAP_CHECKSUM_ALGORITHM, BOOTSTRAP_CHECKSUM_SCOPE, BrickIndex, BrickRangeHierarchy,
@@ -57,7 +59,7 @@ pub enum FormatError {
     #[error("invalid native provenance: {0}")]
     InvalidProvenance(String),
     #[error("invalid id: {0}")]
-    InvalidId(#[from] IdError),
+    InvalidId(#[from] CurrentFormatIdError),
     #[error("duplicate layer id {0:?}")]
     DuplicateLayerId(String),
     #[error("invalid shape: {0}")]
@@ -80,7 +82,7 @@ pub enum FormatError {
     #[error("invalid transform for layer {layer_id}: {source}")]
     InvalidTransform {
         layer_id: String,
-        source: SpaceError,
+        source: CurrentTransformError,
     },
     #[error("layer {layer_id} must contain at least source scale s0")]
     InvalidScaleCount { layer_id: String },
@@ -379,10 +381,10 @@ fn validate_provenance(manifest: &NativeManifest) -> Result<(), FormatError> {
                 "source metadata must record channels_as_layers=true".to_owned(),
             ));
         }
-        if source_metadata.shape_tzyx.t == 0
-            || source_metadata.shape_tzyx.z == 0
-            || source_metadata.shape_tzyx.y == 0
-            || source_metadata.shape_tzyx.x == 0
+        if source_metadata.shape_tzyx.t() == 0
+            || source_metadata.shape_tzyx.z() == 0
+            || source_metadata.shape_tzyx.y() == 0
+            || source_metadata.shape_tzyx.x() == 0
         {
             return Err(FormatError::InvalidProvenance(
                 "source metadata shape_tzyx must be nonzero".to_owned(),
@@ -421,8 +423,6 @@ fn validate_layer(
             kind: layer.kind,
         });
     }
-    layer.shape.validate()?;
-
     if layer.dtype.conversion != DTypeConversion::Lossless {
         return Err(FormatError::InvalidDTypeConversion {
             layer_id: layer.id.clone(),
@@ -431,24 +431,16 @@ fn validate_layer(
     }
     validate_no_data_policy(layer)?;
 
-    ChannelColor::new(layer.channel.color_rgba).map_err(|_| FormatError::InvalidColor {
-        layer_id: layer.id.clone(),
-        color: layer.channel.color_rgba,
-    })?;
-    DisplayWindow::new(layer.display.window.low, layer.display.window.high).map_err(|_| {
-        FormatError::InvalidDisplayWindow {
+    let color = layer.channel.color_rgba;
+    if RgbColor::new([color[0], color[1], color[2]]).is_err()
+        || !color[3].is_finite()
+        || !(0.0..=1.0).contains(&color[3])
+    {
+        return Err(FormatError::InvalidColor {
             layer_id: layer.id.clone(),
-        }
-    })?;
-    LayerDisplay::new(
-        layer.display.visible,
-        layer.display.window,
-        layer.display.opacity,
-    )
-    .map_err(|_| FormatError::InvalidOpacity {
-        layer_id: layer.id.clone(),
-        opacity: layer.display.opacity,
-    })?;
+            color,
+        });
+    }
     layer
         .grid_to_world
         .inverse()
@@ -491,7 +483,7 @@ fn validate_scale(
                 layer_id: layer.id.clone(),
             });
         }
-    } else if scale.shape.t != layer.shape.t
+    } else if scale.shape.t() != layer.shape.t()
         || scale.source_scale != Some(scale.level - 1)
         || scale.reduction == ScaleReduction::Source
     {
@@ -518,7 +510,6 @@ fn validate_scale(
             source,
         })?;
     let brick_shape = scale.storage.brick_shape;
-    brick_shape.validate()?;
     validate_scale_storage(layer.id.as_str(), layer.dtype.stored, scale)?;
     let expected_grid = scale.shape.chunk_grid(brick_shape)?;
     if scale.bricks.grid_shape != expected_grid {
@@ -582,7 +573,6 @@ fn validate_storage_metadata(
         });
     }
     let brick_shape = storage.brick_shape;
-    brick_shape.validate()?;
     if storage.subchunk_shape != brick_shape {
         return Err(FormatError::ZarrMetadataMismatch {
             layer_id: layer_id.to_owned(),
@@ -595,17 +585,17 @@ fn validate_storage_metadata(
             layer_id: layer_id.to_owned(),
         });
     }
-    if storage.chunks_per_shard.t != 1 {
+    if storage.chunks_per_shard.t() != 1 {
         return Err(FormatError::ZarrMetadataMismatch {
             layer_id: layer_id.to_owned(),
             message: "shards must not span multiple timepoints".to_owned(),
         });
     }
     let expected_shard_shape = Shape4D::new(
-        storage.brick_shape.t * storage.chunks_per_shard.t,
-        storage.brick_shape.z * storage.chunks_per_shard.z,
-        storage.brick_shape.y * storage.chunks_per_shard.y,
-        storage.brick_shape.x * storage.chunks_per_shard.x,
+        storage.brick_shape.t() * storage.chunks_per_shard.t(),
+        storage.brick_shape.z() * storage.chunks_per_shard.z(),
+        storage.brick_shape.y() * storage.chunks_per_shard.y(),
+        storage.brick_shape.x() * storage.chunks_per_shard.x(),
     )?;
     if storage.shard_shape != expected_shard_shape {
         return Err(FormatError::ZarrMetadataMismatch {
@@ -632,10 +622,10 @@ fn validate_storage_metadata(
 fn validate_shard_records(layer_id: &str, storage: &ScaleStorage) -> Result<(), FormatError> {
     let mut seen = HashSet::new();
     for record in &storage.shard_records {
-        if record.index.t >= storage.shard_grid_shape.t
-            || record.index.z >= storage.shard_grid_shape.z
-            || record.index.y >= storage.shard_grid_shape.y
-            || record.index.x >= storage.shard_grid_shape.x
+        if record.index.t >= storage.shard_grid_shape.t()
+            || record.index.z >= storage.shard_grid_shape.z()
+            || record.index.y >= storage.shard_grid_shape.y()
+            || record.index.x >= storage.shard_grid_shape.x()
             || !seen.insert(record.index)
         {
             return Err(FormatError::BrickRecordGridMismatch {
@@ -733,9 +723,9 @@ fn validate_scale_registration(
     layer_id: &str,
     level: u32,
     previous_shape: Shape4D,
-    previous_grid_to_world: mirante4d_core::GridToWorld,
+    previous_grid_to_world: GridToWorld,
     shape: Shape4D,
-    grid_to_world: mirante4d_core::GridToWorld,
+    grid_to_world: GridToWorld,
 ) -> Result<(), FormatError> {
     let Some(factors) = infer_downsample_factors(previous_shape, shape) else {
         return Err(FormatError::ScaleTransformMismatch {
@@ -766,10 +756,10 @@ fn validate_bricks(
 ) -> Result<(), FormatError> {
     let mut seen = HashSet::new();
     for record in &scale.bricks.records {
-        if record.index.t >= expected_grid.t
-            || record.index.z >= expected_grid.z
-            || record.index.y >= expected_grid.y
-            || record.index.x >= expected_grid.x
+        if record.index.t >= expected_grid.t()
+            || record.index.z >= expected_grid.z()
+            || record.index.y >= expected_grid.y()
+            || record.index.x >= expected_grid.x()
             || !seen.insert(record.index)
         {
             return Err(FormatError::BrickRecordGridMismatch {
@@ -901,13 +891,13 @@ fn validate_scale_validity_metadata(
             layer_id: layer.id.clone(),
             message: err.to_string(),
         })?;
-    if shape != scale.shape.as_zarr_shape() {
+    if shape != scale.shape.to_zarr_shape() {
         return Err(FormatError::ValidityMaskMismatch {
             layer_id: layer.id.clone(),
             level: scale.level,
             message: format!(
                 "validity shape {shape:?} != intensity shape {:?}",
-                scale.shape.as_zarr_shape()
+                scale.shape.to_zarr_shape()
             ),
         });
     }
@@ -916,13 +906,13 @@ fn validate_scale_validity_metadata(
             layer_id: layer.id.clone(),
             message: err.to_string(),
         })?;
-    if chunk_shape != validity.storage.shard_shape.as_zarr_shape() {
+    if chunk_shape != validity.storage.shard_shape.to_zarr_shape() {
         return Err(FormatError::ValidityMaskMismatch {
             layer_id: layer.id.clone(),
             level: scale.level,
             message: format!(
                 "validity shard shape {chunk_shape:?} != storage shard shape {:?}",
-                validity.storage.shard_shape.as_zarr_shape()
+                validity.storage.shard_shape.to_zarr_shape()
             ),
         });
     }
@@ -932,13 +922,13 @@ fn validate_scale_validity_metadata(
             message: err.to_string(),
         }
     })?;
-    if subchunk_shape != Some(validity.storage.subchunk_shape.as_zarr_shape()) {
+    if subchunk_shape != Some(validity.storage.subchunk_shape.to_zarr_shape()) {
         return Err(FormatError::ValidityMaskMismatch {
             layer_id: layer.id.clone(),
             level: scale.level,
             message: format!(
                 "validity subchunk shape {subchunk_shape:?} != storage subchunk shape {:?}",
-                validity.storage.subchunk_shape.as_zarr_shape()
+                validity.storage.subchunk_shape.to_zarr_shape()
             ),
         });
     }
@@ -960,10 +950,10 @@ fn validate_scale_validity_metadata(
     let mut seen = HashSet::new();
     let mut record_valid_sum = 0_u64;
     for record in &validity.records {
-        if record.index.t >= expected_grid.t
-            || record.index.z >= expected_grid.z
-            || record.index.y >= expected_grid.y
-            || record.index.x >= expected_grid.x
+        if record.index.t >= expected_grid.t()
+            || record.index.z >= expected_grid.z()
+            || record.index.y >= expected_grid.y()
+            || record.index.x >= expected_grid.x()
             || !seen.insert(record.index)
         {
             return Err(FormatError::ValidityMaskMismatch {
@@ -1132,15 +1122,15 @@ fn chunk_ranges(
     chunk_shape: Shape4D,
     index: BrickIndex,
 ) -> [std::ops::Range<u64>; 4] {
-    let t0 = index.t * chunk_shape.t;
-    let z0 = index.z * chunk_shape.z;
-    let y0 = index.y * chunk_shape.y;
-    let x0 = index.x * chunk_shape.x;
+    let t0 = index.t * chunk_shape.t();
+    let z0 = index.z * chunk_shape.z();
+    let y0 = index.y * chunk_shape.y();
+    let x0 = index.x * chunk_shape.x();
     [
-        t0..(t0 + chunk_shape.t).min(shape.t),
-        z0..(z0 + chunk_shape.z).min(shape.z),
-        y0..(y0 + chunk_shape.y).min(shape.y),
-        x0..(x0 + chunk_shape.x).min(shape.x),
+        t0..(t0 + chunk_shape.t()).min(shape.t()),
+        z0..(z0 + chunk_shape.z()).min(shape.z()),
+        y0..(y0 + chunk_shape.y()).min(shape.y()),
+        x0..(x0 + chunk_shape.x()).min(shape.x()),
     ]
 }
 
@@ -1164,12 +1154,12 @@ fn validate_array_metadata(
         layer_id: layer_id.to_owned(),
         message: err.to_string(),
     })?;
-    if shape != scale.shape.as_zarr_shape() {
+    if shape != scale.shape.to_zarr_shape() {
         return Err(FormatError::ZarrMetadataMismatch {
             layer_id: layer_id.to_owned(),
             message: format!(
                 "shape {shape:?} != manifest {:?}",
-                scale.shape.as_zarr_shape()
+                scale.shape.to_zarr_shape()
             ),
         });
     }
@@ -1179,12 +1169,12 @@ fn validate_array_metadata(
             layer_id: layer_id.to_owned(),
             message: err.to_string(),
         })?;
-    if chunk_shape != scale.storage.shard_shape.as_zarr_shape() {
+    if chunk_shape != scale.storage.shard_shape.to_zarr_shape() {
         return Err(FormatError::ZarrMetadataMismatch {
             layer_id: layer_id.to_owned(),
             message: format!(
                 "shard shape {chunk_shape:?} != manifest {:?}",
-                scale.storage.shard_shape.as_zarr_shape()
+                scale.storage.shard_shape.to_zarr_shape()
             ),
         });
     }
@@ -1193,12 +1183,12 @@ fn validate_array_metadata(
             layer_id: layer_id.to_owned(),
             message: err.to_string(),
         })?;
-    if subchunk_shape != Some(scale.storage.subchunk_shape.as_zarr_shape()) {
+    if subchunk_shape != Some(scale.storage.subchunk_shape.to_zarr_shape()) {
         return Err(FormatError::ZarrMetadataMismatch {
             layer_id: layer_id.to_owned(),
             message: format!(
                 "subchunk shape {subchunk_shape:?} != manifest {:?}",
-                scale.storage.subchunk_shape.as_zarr_shape()
+                scale.storage.subchunk_shape.to_zarr_shape()
             ),
         });
     }

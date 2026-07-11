@@ -3,19 +3,26 @@ use std::{
     collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
 };
 
-use mirante4d_core::{DatasetId, LayerId, TimeIndex};
 use mirante4d_data::{
     BrickReadMetrics, BrickReadPayload, BrickReadTicket, BrickRequestPriority, DataRequestId,
     SpatialBrickIndex, VolumeBrickF32, VolumeBrickU8, VolumeBrickU16, VolumeRegion,
 };
+use mirante4d_domain::{TimeIndex, ViewerLayout};
+use mirante4d_format::{DatasetId, LayerId};
+use mirante4d_project_model::ViewState;
+use mirante4d_render_api::PresentationViewport;
 use mirante4d_renderer::{
-    BrickGridSpec, CrossSectionPanelBounds, cross_section_chunk_plane_polygon,
+    BrickGridSpec, CrossSectionPanelBounds, RenderViewport, cross_section_chunk_plane_polygon,
     plan_cross_section_bricks_with_diagnostics,
 };
 
 use crate::{
-    AppState, brick_streaming::stream_layer_ids_for_state,
-    resident_rendering::cross_section_panel_render_request_for_state, viewer_layout::PanelId,
+    current_runtime::dataset::CurrentDatasetRuntime,
+    render_state::ResidentRenderFailureStatus,
+    viewer_layout::{
+        CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
+        CrossSectionPanelScheduleStatus, PanelId, PanelKind, render_cross_section_view_state,
+    },
 };
 
 pub(crate) const CROSS_SECTION_RUNTIME_CPU_PAYLOAD_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
@@ -178,6 +185,26 @@ pub(crate) struct CrossSectionVisibleChunkPlan {
     pub(crate) visible_chunk_geometries: Vec<CrossSectionVisibleChunkGeometry>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CrossSectionVisiblePlanInput<'a> {
+    pub(crate) view: &'a ViewState,
+    pub(crate) active_panel: Option<PanelId>,
+    pub(crate) layer_ids: &'a [LayerId],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CrossSectionLayerInput<'a> {
+    pub(crate) id: &'a LayerId,
+    pub(crate) dtype: mirante4d_domain::IntensityDType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CrossSectionPanelViewRequest {
+    generation: u64,
+    view: mirante4d_renderer::CrossSectionView,
+    presentation_viewport: PresentationViewport,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CrossSectionChunkSubmissionCandidate {
     pub(crate) key: CrossSectionChunkKey,
@@ -256,8 +283,15 @@ pub(crate) struct CrossSectionChunkEntry {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct CrossSectionPanelChunkRuntime {
+pub(crate) struct CrossSectionPanelRuntime {
+    pub(crate) panel_id: PanelId,
+    pub(crate) kind: PanelKind,
+    pub(crate) presentation_viewport: Option<PresentationViewport>,
+    pub(crate) render_viewport: Option<RenderViewport>,
     pub(crate) generation: u64,
+    pub(crate) displayed_generation: Option<u64>,
+    pub(crate) cross_section_schedule: Option<CrossSectionPanelScheduleState>,
+    pub(crate) render_failure: Option<ResidentRenderFailureStatus>,
     pub(crate) scale_level: u32,
     pub(crate) priority_tier: CrossSectionChunkPriorityTier,
     pub(crate) candidate_chunks: usize,
@@ -268,7 +302,7 @@ pub(crate) struct CrossSectionPanelChunkRuntime {
 #[derive(Debug)]
 pub(crate) struct CrossSectionRuntime {
     pub(crate) chunks: HashMap<CrossSectionChunkKey, CrossSectionChunkEntry>,
-    pub(crate) panels: BTreeMap<PanelId, CrossSectionPanelChunkRuntime>,
+    pub(crate) panels: BTreeMap<PanelId, CrossSectionPanelRuntime>,
     pub(crate) panel_streams: BTreeMap<PanelId, CrossSectionPanelBrickStreamState>,
     pub(crate) read_tickets: Vec<CrossSectionBrickReadTicket>,
     pub(crate) queues: CrossSectionRuntimeQueues,
@@ -300,7 +334,10 @@ impl Default for CrossSectionRuntime {
     fn default() -> Self {
         Self {
             chunks: HashMap::new(),
-            panels: BTreeMap::new(),
+            panels: [PanelId::Xy, PanelId::Xz, PanelId::ThreeD, PanelId::Yz]
+                .into_iter()
+                .map(|panel_id| (panel_id, CrossSectionPanelRuntime::new(panel_id)))
+                .collect(),
             panel_streams: BTreeMap::new(),
             read_tickets: Vec::new(),
             queues: CrossSectionRuntimeQueues::default(),
@@ -335,6 +372,104 @@ impl CrossSectionChunkQueue {
     }
 }
 
+impl CrossSectionPanelRuntime {
+    fn new(panel_id: PanelId) -> Self {
+        Self {
+            panel_id,
+            kind: panel_id.kind(),
+            presentation_viewport: None,
+            render_viewport: None,
+            generation: 0,
+            displayed_generation: None,
+            cross_section_schedule: panel_id
+                .cross_section_panel()
+                .map(|_| CrossSectionPanelScheduleState::missing_viewport(0)),
+            render_failure: None,
+            scale_level: 0,
+            priority_tier: CrossSectionChunkPriorityTier::Prefetch,
+            candidate_chunks: 0,
+            visible_chunks: Vec::new(),
+            visible_chunk_geometries: Vec::new(),
+        }
+    }
+
+    pub(crate) fn display_current(&self) -> bool {
+        self.displayed_generation == Some(self.generation)
+    }
+
+    fn record_viewports(
+        &mut self,
+        presentation_viewport: PresentationViewport,
+        render_viewport: RenderViewport,
+    ) -> bool {
+        if self.presentation_viewport == Some(presentation_viewport)
+            && self.render_viewport == Some(render_viewport)
+        {
+            return false;
+        }
+        self.presentation_viewport = Some(presentation_viewport);
+        self.render_viewport = Some(render_viewport);
+        self.generation = self.generation.saturating_add(1);
+        self.displayed_generation = None;
+        self.render_failure = None;
+        self.clear_visible_plan();
+        if let Some(schedule) = self.cross_section_schedule.as_mut() {
+            *schedule = CrossSectionPanelScheduleState::missing_viewport(self.generation);
+        }
+        true
+    }
+
+    fn mark_displayed(&mut self, generation: u64) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.displayed_generation = Some(generation);
+        self.render_failure = None;
+        true
+    }
+
+    fn mark_dirty(&mut self) {
+        self.generation = self.generation.saturating_add(1);
+        self.render_failure = None;
+        self.visible_chunks.clear();
+        self.visible_chunk_geometries.clear();
+        self.candidate_chunks = 0;
+        if let Some(schedule) = self.cross_section_schedule.as_mut() {
+            schedule.generation = self.generation;
+            schedule.status = crate::viewer_layout::CrossSectionPanelScheduleStatus::Loading;
+            schedule.reason =
+                crate::viewer_layout::CrossSectionPanelScheduleReason::ResidentFramePending;
+        }
+    }
+
+    fn set_schedule(&mut self, schedule: CrossSectionPanelScheduleState) -> bool {
+        if self.panel_id.cross_section_panel().is_none() || schedule.generation != self.generation {
+            return false;
+        }
+        self.cross_section_schedule = Some(schedule);
+        true
+    }
+
+    fn mark_render_failed(
+        &mut self,
+        generation: u64,
+        failure: ResidentRenderFailureStatus,
+    ) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.render_failure = Some(failure);
+        true
+    }
+
+    fn clear_visible_plan(&mut self) {
+        self.visible_chunks.clear();
+        self.visible_chunk_geometries.clear();
+        self.candidate_chunks = 0;
+        self.priority_tier = CrossSectionChunkPriorityTier::Prefetch;
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CrossSectionChunkQueueHeapItem {
     kind: CrossSectionChunkQueueKind,
@@ -364,6 +499,84 @@ impl Ord for CrossSectionChunkQueueHeapItem {
 }
 
 impl CrossSectionRuntime {
+    pub(crate) fn panels(&self) -> impl ExactSizeIterator<Item = &CrossSectionPanelRuntime> {
+        self.panels.values()
+    }
+
+    pub(crate) fn panel(&self, panel_id: PanelId) -> Option<&CrossSectionPanelRuntime> {
+        self.panels.get(&panel_id)
+    }
+
+    pub(crate) fn record_panel_viewports(
+        &mut self,
+        panel_id: PanelId,
+        presentation_viewport: PresentationViewport,
+        render_viewport: RenderViewport,
+    ) -> bool {
+        self.panels
+            .get_mut(&panel_id)
+            .is_some_and(|panel| panel.record_viewports(presentation_viewport, render_viewport))
+    }
+
+    pub(crate) fn mark_panel_displayed(&mut self, panel_id: PanelId, generation: u64) -> bool {
+        self.panels
+            .get_mut(&panel_id)
+            .is_some_and(|panel| panel.mark_displayed(generation))
+    }
+
+    pub(crate) fn set_panel_schedule(
+        &mut self,
+        panel_id: PanelId,
+        schedule: CrossSectionPanelScheduleState,
+    ) -> bool {
+        self.panels
+            .get_mut(&panel_id)
+            .is_some_and(|panel| panel.set_schedule(schedule))
+    }
+
+    pub(crate) fn mark_panel_render_failed(
+        &mut self,
+        panel_id: PanelId,
+        generation: u64,
+        failure: ResidentRenderFailureStatus,
+    ) -> bool {
+        self.panels
+            .get_mut(&panel_id)
+            .is_some_and(|panel| panel.mark_render_failed(generation, failure))
+    }
+
+    pub(crate) fn clear_render_failures_after_residency_change(&mut self) -> bool {
+        let mut changed = false;
+        for panel in self.panels.values_mut() {
+            if panel.render_failure.take().is_none() {
+                continue;
+            }
+            if let Some(schedule) = panel.cross_section_schedule.as_mut()
+                && schedule.reason == CrossSectionPanelScheduleReason::RenderFailed
+            {
+                schedule.status = CrossSectionPanelScheduleStatus::Loading;
+                schedule.reason = CrossSectionPanelScheduleReason::ResidentFramePending;
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    pub(crate) fn mark_cross_section_panels_dirty(&mut self) -> bool {
+        let mut changed = false;
+        for panel in self.panels.values_mut() {
+            if panel.panel_id.cross_section_panel().is_some() {
+                panel.mark_dirty();
+                changed = true;
+            }
+        }
+        if changed {
+            self.recompute_chunk_priorities_from_panels();
+            self.rebuild_queues();
+        }
+        changed
+    }
+
     pub(crate) fn apply_visible_chunk_plan(&mut self, plan: CrossSectionVisibleChunkPlan) -> bool {
         if self
             .panels
@@ -373,24 +586,26 @@ impl CrossSectionRuntime {
             return false;
         }
 
-        self.panels.insert(
-            plan.panel_id,
-            CrossSectionPanelChunkRuntime {
-                generation: plan.generation,
-                scale_level: plan.scale_level,
-                priority_tier: plan.priority_tier,
-                candidate_chunks: plan.candidate_chunks,
-                visible_chunks: plan.visible_chunks,
-                visible_chunk_geometries: plan.visible_chunk_geometries,
-            },
-        );
+        let Some(panel) = self.panels.get_mut(&plan.panel_id) else {
+            return false;
+        };
+        if panel.generation != plan.generation {
+            return false;
+        }
+        panel.scale_level = plan.scale_level;
+        panel.priority_tier = plan.priority_tier;
+        panel.candidate_chunks = plan.candidate_chunks;
+        panel.visible_chunks = plan.visible_chunks;
+        panel.visible_chunk_geometries = plan.visible_chunk_geometries;
         self.recompute_chunk_priorities_from_panels();
         self.rebuild_queues();
         true
     }
 
     pub(crate) fn clear_visible_work(&mut self) {
-        self.panels.clear();
+        for panel in self.panels.values_mut() {
+            panel.clear_visible_plan();
+        }
         self.panel_streams.clear();
         self.cancel_read_tickets();
         for entry in self.chunks.values_mut() {
@@ -409,7 +624,9 @@ impl CrossSectionRuntime {
     }
 
     pub(crate) fn has_visible_work(&self) -> bool {
-        !self.panels.is_empty()
+        self.panels
+            .values()
+            .any(|panel| !panel.visible_chunks.is_empty())
     }
 
     pub(crate) fn pending_read_ticket_count(&self) -> usize {
@@ -1051,7 +1268,7 @@ impl CrossSectionRuntime {
 
 fn panel_submission_candidates(
     panel_id: PanelId,
-    panel: &CrossSectionPanelChunkRuntime,
+    panel: &CrossSectionPanelRuntime,
 ) -> Vec<CrossSectionChunkSubmissionCandidate> {
     let geometry_priority_scores = panel
         .visible_chunk_geometries
@@ -1091,7 +1308,7 @@ pub(crate) fn cross_section_chunk_key_order(
     (
         left.dataset_id.to_string(),
         left.layer_id.to_string(),
-        left.timepoint.0,
+        left.timepoint.get(),
         left.scale_level,
         left.brick_index.z,
         left.brick_index.y,
@@ -1100,7 +1317,7 @@ pub(crate) fn cross_section_chunk_key_order(
         .cmp(&(
             right.dataset_id.to_string(),
             right.layer_id.to_string(),
-            right.timepoint.0,
+            right.timepoint.get(),
             right.scale_level,
             right.brick_index.z,
             right.brick_index.y,
@@ -1245,23 +1462,26 @@ fn cross_section_region_decoded_bytes(region: &VolumeRegion, bytes_per_voxel: u6
         .unwrap_or(0)
 }
 
-pub(crate) fn plan_cross_section_visible_chunks_for_state(
-    state: &AppState,
+pub(crate) fn plan_cross_section_visible_chunks(
+    dataset: &CurrentDatasetRuntime,
+    runtime: &CrossSectionRuntime,
+    input: CrossSectionVisiblePlanInput<'_>,
     panel_id: PanelId,
     scale_level: u32,
 ) -> anyhow::Result<CrossSectionVisibleChunkPlan> {
-    let request = cross_section_panel_render_request_for_state(state, panel_id)?;
-    let layer_ids = stream_layer_ids_for_state(state)?;
-    let dataset_id = state.dataset.dataset_id().clone();
-    let priority_tier = cross_section_priority_tier_for_panel(state, panel_id);
+    let request = cross_section_panel_view_request(runtime, input.view, panel_id)?;
+    let dataset_id = dataset.dataset.dataset_id().clone();
+    let priority_tier = cross_section_priority_tier_for_panel(input.active_panel, panel_id);
     let mut visible_chunks = Vec::new();
     let mut visible_chunk_geometries = Vec::new();
     let mut candidate_chunks = 0usize;
 
-    for layer_id in layer_ids {
-        let brick_shape = state.dataset.brick_shape_at_scale(&layer_id, scale_level)?;
-        let scale_shape = state.dataset.scale_shape(&layer_id, scale_level)?;
-        let grid_to_world = state.dataset.scale_grid_to_world(&layer_id, scale_level)?;
+    for layer_id in input.layer_ids {
+        let brick_shape = dataset
+            .dataset
+            .brick_shape_at_scale(layer_id, scale_level)?;
+        let scale_shape = dataset.dataset.scale_shape(layer_id, scale_level)?;
+        let grid_to_world = dataset.dataset.scale_grid_to_world(layer_id, scale_level)?;
         let spec = BrickGridSpec {
             volume_shape: scale_shape,
             brick_shape,
@@ -1284,7 +1504,7 @@ pub(crate) fn plan_cross_section_visible_chunks_for_state(
             let key = CrossSectionChunkKey {
                 dataset_id: dataset_id.clone(),
                 layer_id: layer_id.clone(),
-                timepoint: state.active_timepoint,
+                timepoint: input.view.timepoint(),
                 scale_level,
                 brick_index,
             };
@@ -1312,21 +1532,50 @@ pub(crate) fn plan_cross_section_visible_chunks_for_state(
     })
 }
 
+fn cross_section_panel_view_request(
+    runtime: &CrossSectionRuntime,
+    view: &ViewState,
+    panel_id: PanelId,
+) -> anyhow::Result<CrossSectionPanelViewRequest> {
+    if view.layout() != ViewerLayout::FourPanel {
+        anyhow::bail!("cross-section rendering requires the four-panel layout");
+    }
+    let cross_section_panel = panel_id
+        .cross_section_panel()
+        .ok_or_else(|| anyhow::anyhow!("the 3D panel is not a cross-section target"))?;
+    let panel = runtime.panel(panel_id).ok_or_else(|| {
+        anyhow::anyhow!("cross-section panel {} is unavailable", panel_id.label())
+    })?;
+    let presentation_viewport = panel.presentation_viewport.ok_or_else(|| {
+        anyhow::anyhow!(
+            "cross-section panel {} has no presentation viewport",
+            panel_id.label()
+        )
+    })?;
+    Ok(CrossSectionPanelViewRequest {
+        generation: panel.generation,
+        view: render_cross_section_view_state(*view.cross_section()).view(cross_section_panel),
+        presentation_viewport,
+    })
+}
+
 fn cross_section_chunk_priority_score(
     panel_bounds: CrossSectionPanelBounds,
-    viewport: mirante4d_core::PresentationViewport,
+    viewport: PresentationViewport,
 ) -> f64 {
     let center = (panel_bounds.min_points + panel_bounds.max_points) * 0.5;
-    let viewport_center =
-        glam::DVec2::new(viewport.width_points * 0.5, viewport.height_points * 0.5);
+    let viewport_center = glam::DVec2::new(
+        viewport.width_points() * 0.5,
+        viewport.height_points() * 0.5,
+    );
     -center.distance(viewport_center)
 }
 
 fn cross_section_priority_tier_for_panel(
-    state: &AppState,
+    active_panel: Option<PanelId>,
     panel_id: PanelId,
 ) -> CrossSectionChunkPriorityTier {
-    match state.viewer_layout.active_cross_section_panel() {
+    match active_panel {
         Some(active_panel) if active_panel == panel_id => {
             CrossSectionChunkPriorityTier::VisibleActive
         }
@@ -1339,31 +1588,32 @@ fn cross_section_priority_tier_for_panel(
 mod tests {
     use std::collections::HashSet;
 
-    use mirante4d_core::Shape3D;
-    use mirante4d_core::{DatasetId, GridToWorld, LayerId, PresentationViewport, TimeIndex};
     use mirante4d_data::{
         BrickReadPayload, BrickReadTicket, CancellationToken, DataGenerationId, DataRequestId,
         DenseVolumeU16, SpatialBrickIndex, VolumeBrickU16, VolumeRegion,
     };
-    use mirante4d_format::{BrickIndex, FixtureKind, write_fixture};
-    use mirante4d_renderer::RenderViewport;
+    use mirante4d_domain::{GridToWorld, Shape3D, TimeIndex};
+    use mirante4d_format::BrickIndex;
+    use mirante4d_format::{DatasetId, LayerId};
 
     use crate::{
+        FrameFailureKind,
         cross_section_runtime::{
             CrossSectionBrickReadTicket, CrossSectionChunkKey, CrossSectionChunkPayload,
             CrossSectionChunkPriorityTier, CrossSectionChunkState, CrossSectionRuntime,
             CrossSectionVisibleChunkPlan,
         },
-        cross_section_scheduler::schedule_cross_section_panel_for_state,
-        open_dataset_and_render_first_frame,
-        viewer_layout::PanelId,
+        render_state::ResidentRenderFailureStatus,
+        viewer_layout::{
+            CrossSectionPanelScheduleReason, CrossSectionPanelScheduleStatus, PanelId,
+        },
     };
 
     fn key(timepoint: u64, z: u64, y: u64, x: u64) -> CrossSectionChunkKey {
         CrossSectionChunkKey {
             dataset_id: DatasetId::new("dataset").unwrap(),
             layer_id: LayerId::new("layer").unwrap(),
-            timepoint: TimeIndex(timepoint),
+            timepoint: TimeIndex::new(timepoint),
             scale_level: 0,
             brick_index: SpatialBrickIndex::new(z, y, x),
         }
@@ -1373,7 +1623,7 @@ mod tests {
     fn registering_live_read_ticket_marks_chunk_decoding_and_takes_by_request() {
         let mut runtime = CrossSectionRuntime::default();
         let chunk_key = key(0, 0, 0, 0);
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             1,
             CrossSectionChunkPriorityTier::VisibleActive,
@@ -1417,7 +1667,7 @@ mod tests {
     fn cancelling_live_read_ticket_clears_decoding_chunk_state() {
         let mut runtime = CrossSectionRuntime::default();
         let chunk_key = key(0, 0, 0, 0);
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             1,
             CrossSectionChunkPriorityTier::VisibleActive,
@@ -1462,7 +1712,7 @@ mod tests {
             panel_generation: 1,
             layer_id: "layer".to_owned(),
             scale_level: 0,
-            timepoint: TimeIndex(0),
+            timepoint: TimeIndex::new(0),
             brick_index: SpatialBrickIndex::new(0, 0, 0),
             region: VolumeRegion::new(0, 0, 0, 1, 1, 1).unwrap(),
             ticket: BrickReadTicket {
@@ -1497,7 +1747,7 @@ mod tests {
             scale_level: key.scale_level,
             brick_index: key.brick_index,
             chunk_index: BrickIndex {
-                t: key.timepoint.0,
+                t: key.timepoint.get(),
                 z: key.brick_index.z,
                 y: key.brick_index.y,
                 x: key.brick_index.x,
@@ -1535,9 +1785,56 @@ mod tests {
         }
     }
 
+    impl CrossSectionRuntime {
+        fn apply_test_visible_plan(&mut self, plan: CrossSectionVisibleChunkPlan) -> bool {
+            let panel = self.panels.get_mut(&plan.panel_id).unwrap();
+            while panel.generation < plan.generation {
+                panel.mark_dirty();
+            }
+            self.apply_visible_chunk_plan(plan)
+        }
+    }
+
     #[test]
     fn chunk_identity_includes_timepoint() {
         assert_ne!(key(0, 0, 0, 0), key(1, 0, 0, 0));
+    }
+
+    #[test]
+    fn panel_render_failure_suppresses_same_generation_until_residency_changes() {
+        let mut runtime = CrossSectionRuntime::default();
+        let generation = runtime.panel(PanelId::Xy).unwrap().generation;
+        assert!(runtime.mark_panel_render_failed(
+            PanelId::Xy,
+            generation,
+            ResidentRenderFailureStatus::new(
+                FrameFailureKind::BudgetExceeded,
+                "cross-section GPU budget exceeded",
+            ),
+        ));
+        let panel = runtime.panel(PanelId::Xy).unwrap();
+        assert_eq!(
+            panel.render_failure.as_ref().map(|failure| failure.kind),
+            Some(FrameFailureKind::BudgetExceeded)
+        );
+
+        let schedule = runtime
+            .panels
+            .get_mut(&PanelId::Xy)
+            .unwrap()
+            .cross_section_schedule
+            .as_mut()
+            .unwrap();
+        schedule.status = CrossSectionPanelScheduleStatus::Unavailable;
+        schedule.reason = CrossSectionPanelScheduleReason::RenderFailed;
+        assert!(runtime.clear_render_failures_after_residency_change());
+        let panel = runtime.panel(PanelId::Xy).unwrap();
+        assert!(panel.render_failure.is_none());
+        assert_eq!(
+            panel.cross_section_schedule.unwrap().reason,
+            CrossSectionPanelScheduleReason::ResidentFramePending
+        );
+        assert!(!runtime.clear_render_failures_after_residency_change());
     }
 
     #[test]
@@ -1545,7 +1842,7 @@ mod tests {
         let mut runtime = CrossSectionRuntime::default();
         let visible = vec![key(0, 0, 0, 0), key(0, 0, 0, 1)];
 
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             7,
             CrossSectionChunkPriorityTier::VisibleActive,
@@ -1565,20 +1862,26 @@ mod tests {
     }
 
     #[test]
-    fn stale_panel_generation_does_not_replace_newer_visible_set() {
+    fn non_current_panel_generation_does_not_replace_visible_set() {
         let mut runtime = CrossSectionRuntime::default();
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             8,
             CrossSectionChunkPriorityTier::VisibleActive,
             vec![key(0, 0, 0, 0)],
         )));
 
-        assert!(!runtime.apply_visible_chunk_plan(plan(
+        assert!(!runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             7,
             CrossSectionChunkPriorityTier::VisibleActive,
             vec![key(0, 0, 0, 1)],
+        )));
+        assert!(!runtime.apply_visible_chunk_plan(plan(
+            PanelId::Xy,
+            9,
+            CrossSectionChunkPriorityTier::VisibleActive,
+            vec![key(0, 0, 0, 2)],
         )));
 
         assert_eq!(runtime.panels[&PanelId::Xy].generation, 8);
@@ -1593,13 +1896,13 @@ mod tests {
         let mut runtime = CrossSectionRuntime::default();
         let shared = key(0, 0, 0, 0);
 
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             1,
             CrossSectionChunkPriorityTier::VisibleActive,
             vec![shared.clone()],
         )));
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xz,
             1,
             CrossSectionChunkPriorityTier::VisibleLinked,
@@ -1617,7 +1920,7 @@ mod tests {
         let mut runtime = CrossSectionRuntime::default();
         let missing_near = key(0, 0, 0, 1);
         let missing_far = key(0, 0, 0, 0);
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             1,
             CrossSectionChunkPriorityTier::VisibleActive,
@@ -1665,7 +1968,7 @@ mod tests {
     fn queue_state_removes_queued_chunks_from_download_promotions() {
         let mut runtime = CrossSectionRuntime::default();
         let visible = key(0, 0, 0, 0);
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             1,
             CrossSectionChunkPriorityTier::VisibleActive,
@@ -1689,13 +1992,13 @@ mod tests {
         let mut runtime = CrossSectionRuntime::default();
         let active_missing = key(0, 0, 0, 0);
         let linked_missing = key(0, 0, 0, 1);
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             1,
             CrossSectionChunkPriorityTier::VisibleActive,
             vec![active_missing.clone()],
         )));
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xz,
             1,
             CrossSectionChunkPriorityTier::VisibleLinked,
@@ -1742,13 +2045,13 @@ mod tests {
         let mut runtime = CrossSectionRuntime::default();
         let active_missing = key(0, 0, 0, 0);
         let linked_missing = key(0, 0, 0, 1);
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xz,
             1,
             CrossSectionChunkPriorityTier::VisibleLinked,
             vec![linked_missing],
         )));
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             1,
             CrossSectionChunkPriorityTier::VisibleActive,
@@ -1766,7 +2069,7 @@ mod tests {
         let mut runtime = CrossSectionRuntime::default();
         let stale = key(0, 0, 0, 0);
         let current = key(0, 0, 0, 1);
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             1,
             CrossSectionChunkPriorityTier::VisibleActive,
@@ -1787,7 +2090,7 @@ mod tests {
         );
         assert_eq!(stats.promoted, 1);
 
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             2,
             CrossSectionChunkPriorityTier::VisibleActive,
@@ -1819,13 +2122,13 @@ mod tests {
         let stale = key(0, 0, 0, 0);
         let current = key(0, 0, 0, 1);
 
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             1,
             CrossSectionChunkPriorityTier::VisibleActive,
             vec![stale.clone()],
         )));
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             2,
             CrossSectionChunkPriorityTier::VisibleActive,
@@ -1843,12 +2146,14 @@ mod tests {
 
     #[test]
     fn cpu_payload_budget_eviction_protects_current_visible_chunks() {
-        let mut runtime = CrossSectionRuntime::default();
-        runtime.cpu_payload_budget_bytes = 2;
+        let mut runtime = CrossSectionRuntime {
+            cpu_payload_budget_bytes: 2,
+            ..Default::default()
+        };
         let stale = key(0, 0, 0, 0);
         let current = key(0, 0, 0, 1);
 
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             1,
             CrossSectionChunkPriorityTier::VisibleActive,
@@ -1859,7 +2164,7 @@ mod tests {
             entry.state = CrossSectionChunkState::CpuResident;
             entry.payload = Some(resident_u16_payload(&stale));
         }
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             2,
             CrossSectionChunkPriorityTier::VisibleActive,
@@ -1897,11 +2202,13 @@ mod tests {
 
     #[test]
     fn cpu_payload_budget_does_not_evict_current_visible_chunk() {
-        let mut runtime = CrossSectionRuntime::default();
-        runtime.cpu_payload_budget_bytes = 1;
+        let mut runtime = CrossSectionRuntime {
+            cpu_payload_budget_bytes: 1,
+            ..Default::default()
+        };
         let current = key(0, 0, 0, 0);
 
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             1,
             CrossSectionChunkPriorityTier::VisibleActive,
@@ -1930,7 +2237,7 @@ mod tests {
     #[test]
     fn clearing_visible_work_stops_panel_priority_without_deleting_cache_entries() {
         let mut runtime = CrossSectionRuntime::default();
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             1,
             CrossSectionChunkPriorityTier::VisibleActive,
@@ -1955,7 +2262,7 @@ mod tests {
         let queued = key(0, 0, 0, 0);
         let decoding = key(0, 0, 0, 1);
         let resident = key(0, 0, 0, 2);
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             1,
             CrossSectionChunkPriorityTier::VisibleActive,
@@ -1994,7 +2301,7 @@ mod tests {
     fn stale_ticket_cannot_clear_cpu_resident_chunk() {
         let mut runtime = CrossSectionRuntime::default();
         let key = key(0, 0, 0, 0);
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             1,
             CrossSectionChunkPriorityTier::VisibleActive,
@@ -2014,7 +2321,7 @@ mod tests {
         let mut runtime = CrossSectionRuntime::default();
         let current = key(0, 0, 0, 0);
         let missing = key(0, 0, 0, 1);
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             9,
             CrossSectionChunkPriorityTier::VisibleActive,
@@ -2095,7 +2402,7 @@ mod tests {
         let mut runtime = CrossSectionRuntime::default();
         let retained = key(0, 0, 0, 0);
         let not_retained = key(0, 0, 0, 1);
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             9,
             CrossSectionChunkPriorityTier::VisibleActive,
@@ -2134,7 +2441,7 @@ mod tests {
     fn stale_panel_gpu_residency_reconcile_is_ignored() {
         let mut runtime = CrossSectionRuntime::default();
         let retained = key(0, 0, 0, 0);
-        assert!(runtime.apply_visible_chunk_plan(plan(
+        assert!(runtime.apply_test_visible_plan(plan(
             PanelId::Xy,
             9,
             CrossSectionChunkPriorityTier::VisibleActive,
@@ -2157,60 +2464,6 @@ mod tests {
         assert_eq!(
             runtime.chunks[&retained].state,
             CrossSectionChunkState::UploadQueued
-        );
-    }
-
-    #[test]
-    fn scheduler_populates_global_visible_runtime_keys() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-        let mut state = open_dataset_and_render_first_frame(root).unwrap();
-        state.viewer_layout.switch_to_four_panel();
-        state.viewer_layout.record_panel_viewports(
-            PanelId::Xy,
-            PresentationViewport::new(256.0, 256.0).unwrap(),
-            RenderViewport::new(256, 256).unwrap(),
-        );
-
-        schedule_cross_section_panel_for_state(&mut state, PanelId::Xy, true).unwrap();
-
-        let panel_runtime = state
-            .cross_section_runtime
-            .panels
-            .get(&PanelId::Xy)
-            .unwrap();
-        assert!(!panel_runtime.visible_chunks.is_empty());
-        assert_eq!(
-            panel_runtime.visible_chunk_geometries.len(),
-            panel_runtime.visible_chunks.len()
-        );
-        assert!(
-            panel_runtime
-                .visible_chunk_geometries
-                .iter()
-                .all(|geometry| (3..=6).contains(&geometry.vertex_count)
-                    && geometry.panel_bounds.min_points.x.is_finite()
-                    && geometry.panel_bounds.min_points.y.is_finite()
-                    && geometry.panel_bounds.max_points.x.is_finite()
-                    && geometry.panel_bounds.max_points.y.is_finite()
-                    && geometry.priority_score.is_finite())
-        );
-        assert!(panel_runtime.visible_chunks.iter().all(|key| {
-            state.cross_section_runtime.chunks[key]
-                .priority_score
-                .is_some_and(f64::is_finite)
-        }));
-        assert!(
-            panel_runtime
-                .visible_chunks
-                .iter()
-                .all(|key| &key.dataset_id == state.dataset.dataset_id()
-                    && key.timepoint == state.active_timepoint
-                    && key.scale_level == panel_runtime.scale_level)
-        );
-        assert_eq!(
-            state.cross_section_runtime.chunks.len(),
-            panel_runtime.visible_chunks.len()
         );
     }
 }

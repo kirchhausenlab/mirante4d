@@ -1,9 +1,14 @@
 use crate::{
-    AppState, ChannelFidelityStatus, ChannelFidelityWarning, FrameCompleteness, FrameFailureKind,
-    FrameFidelityStatus, LodDecisionReason, RenderBackend, RenderIsoShadingPolicy, RenderMode,
-    RenderSamplingPolicy, display_graph::DisplayGraph, state::DisplayedFrameFreshness, ui_kit,
+    ChannelFidelityStatus, ChannelFidelityWarning, FrameCompleteness, FrameFailureKind,
+    FrameFidelityStatus, LodDecisionReason, RenderBackend, application_view,
+    current_runtime::{dataset::CurrentDatasetRuntime, render::CurrentRenderRuntime},
+    display_graph::DisplayGraph,
+    state::DisplayedFrameFreshness,
+    ui_kit,
 };
 use eframe::egui;
+use mirante4d_application::ApplicationSnapshot;
+use mirante4d_domain::{IsoShadingPolicy, RenderMode, SamplingPolicy};
 use mirante4d_renderer::gpu::GpuRenderer;
 
 pub(crate) fn visible_channel_fidelity_is_mixed(channels: &[ChannelFidelityStatus]) -> bool {
@@ -80,16 +85,26 @@ pub(crate) fn frame_render_time_label(fidelity: &FrameFidelityStatus) -> String 
         .unwrap_or_else(|| "render pending".to_owned())
 }
 
-pub(crate) fn composite_fidelity_label(state: &AppState) -> String {
-    let mut label = frame_fidelity_label(&state.frame_fidelity);
+pub(crate) fn composite_fidelity_label(
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &CurrentRenderRuntime,
+) -> String {
+    let mut label = frame_fidelity_label(&render.frame_fidelity);
     label.push_str(" | ");
-    let display_graph = DisplayGraph::from_state(state);
-    if display_graph.is_mixed_mode() {
+    let display_graph = DisplayGraph::from_snapshot(snapshot, dataset);
+    if display_graph.is_ok_and(|graph| graph.is_mixed_mode()) {
         label.push_str("mixed render modes");
     } else {
-        label.push_str(render_sampling_policy_label(state.render_sampling_policy));
+        let view = application_view(snapshot);
+        let sampling = view
+            .layer(view.active_layer())
+            .expect("application view contains its active layer")
+            .render_state()
+            .sampling_policy();
+        label.push_str(render_sampling_policy_label(sampling));
     }
-    if visible_channel_fidelity_is_mixed(&state.channel_fidelity) {
+    if visible_channel_fidelity_is_mixed(&render.channel_fidelity) {
         label.push_str(" | mixed channel fidelity");
     }
     label
@@ -206,10 +221,11 @@ pub(crate) fn frame_viewport_label(fidelity: &FrameFidelityStatus) -> String {
     );
     let presentation = format!(
         "{:.0}x{:.0} pt",
-        fidelity.presentation_viewport.width_points, fidelity.presentation_viewport.height_points
+        fidelity.presentation_viewport.width_points(),
+        fidelity.presentation_viewport.height_points()
     );
-    if (fidelity.presentation_viewport.width_points - fidelity.viewport.width as f64).abs() < 0.5
-        && (fidelity.presentation_viewport.height_points - fidelity.viewport.height as f64).abs()
+    if (fidelity.presentation_viewport.width_points() - fidelity.viewport.width as f64).abs() < 0.5
+        && (fidelity.presentation_viewport.height_points() - fidelity.viewport.height as f64).abs()
             < 0.5
     {
         render
@@ -218,17 +234,17 @@ pub(crate) fn frame_viewport_label(fidelity: &FrameFidelityStatus) -> String {
     }
 }
 
-pub(crate) fn render_sampling_policy_label(policy: RenderSamplingPolicy) -> &'static str {
+pub(crate) fn render_sampling_policy_label(policy: SamplingPolicy) -> &'static str {
     match policy {
-        RenderSamplingPolicy::SmoothLinear => "Smooth linear",
-        RenderSamplingPolicy::VoxelExact => "Voxel exact",
+        SamplingPolicy::SmoothLinear => "Smooth linear",
+        SamplingPolicy::VoxelExact => "Voxel exact",
     }
 }
 
-pub(crate) fn iso_shading_policy_label(policy: RenderIsoShadingPolicy) -> &'static str {
+pub(crate) fn iso_shading_policy_label(policy: IsoShadingPolicy) -> &'static str {
     match policy {
-        RenderIsoShadingPolicy::GradientLighting => "Gradient lighting",
-        RenderIsoShadingPolicy::Flat => "Flat threshold hit",
+        IsoShadingPolicy::GradientLighting => "Gradient lighting",
+        IsoShadingPolicy::Flat => "Flat threshold hit",
     }
 }
 

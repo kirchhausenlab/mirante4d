@@ -1,6 +1,8 @@
 use glam::{DMat4, DVec3};
-use mirante4d_core::{CameraState, GridToWorld, Projection};
 use mirante4d_data::DenseVolumeU16;
+use mirante4d_domain::{GridToWorld, Projection};
+use mirante4d_format::CurrentGridToWorldExt;
+use mirante4d_render_api::CameraFrame;
 
 use super::GpuRenderError;
 use crate::{
@@ -59,7 +61,7 @@ pub(super) struct GpuModeParamsF32 {
 
 pub(super) fn camera_grid_params(
     volume: &DenseVolumeU16,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
 ) -> Result<[f32; GPU_CAMERA_PARAM_F32_COUNT], RenderError> {
     camera_grid_params_for_transform(volume.grid_to_world, camera, viewport)
@@ -67,12 +69,12 @@ pub(super) fn camera_grid_params(
 
 pub(super) fn camera_grid_params_for_transform(
     grid_to_world: GridToWorld,
-    camera: CameraState,
+    camera: CameraFrame,
     _viewport: RenderViewport,
 ) -> Result<[f32; GPU_CAMERA_PARAM_F32_COUNT], RenderError> {
     let world_to_grid = grid_to_world.inverse()?;
     let (forward, right, up) = camera_world_basis(camera);
-    let grid_eye = world_to_grid.transform_point(camera.eye);
+    let grid_eye = world_to_grid.transform_point(crate::current_camera::eye(camera));
     let grid_forward = world_to_grid.transform_vector(forward);
     let grid_right = world_to_grid.transform_vector(right);
     let grid_up = world_to_grid.transform_vector(up);
@@ -89,10 +91,10 @@ pub(super) fn camera_grid_params_for_transform(
     params[9] = grid_up.x as f32;
     params[10] = grid_up.y as f32;
     params[11] = grid_up.z as f32;
-    params[12] = camera.orthographic_world_per_screen_point as f32;
-    params[13] = camera.perspective_focal_length_screen_points as f32;
-    params[14] = camera.presentation_width_points as f32;
-    params[16] = camera.presentation_height_points as f32;
+    params[12] = crate::current_camera::orthographic_world_per_screen_point(camera) as f32;
+    params[13] = crate::current_camera::perspective_focal_length_screen_points(camera) as f32;
+    params[14] = crate::current_camera::presentation_width_points(camera) as f32;
+    params[16] = crate::current_camera::presentation_height_points(camera) as f32;
     params[GPU_PARAM_GRID_X_SPACING_INDEX] =
         grid_to_world.transform_vector(DVec3::X).length() as f32;
     params[GPU_PARAM_GRID_Y_SPACING_INDEX] =
@@ -135,7 +137,7 @@ pub(super) fn camera_grid_params_for_transform(
 
 pub(super) fn camera_grid_params_f32_for_transform(
     grid_to_world: GridToWorld,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
 ) -> Result<[f32; GPU_CAMERA_PARAM_F32_COUNT], RenderError> {
     let base = camera_grid_params_for_transform(grid_to_world, camera, viewport)?;
@@ -256,9 +258,10 @@ pub(super) fn gpu_mode_params_f32_for_transform(
     }
 }
 
-fn camera_world_basis(camera: CameraState) -> (DVec3, DVec3, DVec3) {
-    let forward = (camera.target - camera.eye).normalize();
-    let right = forward.cross(camera.up).normalize();
+fn camera_world_basis(camera: CameraFrame) -> (DVec3, DVec3, DVec3) {
+    let forward =
+        (crate::current_camera::target(camera) - crate::current_camera::eye(camera)).normalize();
+    let right = forward.cross(crate::current_camera::up(camera)).normalize();
     let up = right.cross(forward).normalize();
     (forward, right, up)
 }
@@ -280,10 +283,8 @@ fn normal_transform_grid_gradient_to_world(grid_to_world: GridToWorld) -> DMat4 
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
-    use mirante4d_core::{
-        CameraState, DatasetId, DisplayWindow, LayerId, PresentationViewport, Projection, Shape3D,
-        TimeIndex, TransferCurve,
-    };
+    use mirante4d_domain::{DisplayWindow, Projection, Shape3D, TimeIndex, TransferCurve};
+    use mirante4d_format::{DatasetId, LayerId};
 
     use super::*;
 
@@ -348,20 +349,21 @@ mod tests {
 
     #[test]
     fn camera_grid_params_store_inverse_transpose_normal_transform() {
-        let grid_to_world = GridToWorld::from_dmat4(DMat4::from_cols_array(&[
+        let grid_to_world = mirante4d_format::grid_to_world_from_dmat4(DMat4::from_cols_array(&[
             2.0, 0.0, 0.0, 0.0, //
             0.25, 3.0, 0.0, 0.0, //
             0.0, 0.5, 4.0, 0.0, //
             7.0, 11.0, 13.0, 1.0,
-        ]));
-        let camera = CameraState::new(
+        ]))
+        .unwrap();
+        let camera = crate::current_camera::frame_from_look_at(
             Projection::Orthographic,
             DVec3::new(0.0, 0.0, 10.0),
             DVec3::ZERO,
             DVec3::Y,
             1.0,
             8.0,
-            PresentationViewport::new_unchecked(8.0, 8.0),
+            crate::current_camera::presentation(8.0, 8.0),
         );
         let params = camera_grid_params_for_transform(
             grid_to_world,
@@ -389,7 +391,7 @@ mod tests {
             DatasetId::new("gpu-params").unwrap(),
             LayerId::new("ch0").unwrap(),
             0,
-            TimeIndex(0),
+            TimeIndex::new(0),
             Shape3D::new(2, 2, 2).unwrap(),
             GridToWorld::identity(),
             vec![0; 8],
@@ -410,8 +412,11 @@ mod tests {
         density_scale: f64,
         invert: bool,
     ) -> crate::DvrRenderParameters {
-        let transfer =
-            ScalarDisplayTransfer::new(DisplayWindow { low, high }, TransferCurve::Linear, invert);
+        let transfer = ScalarDisplayTransfer::new(
+            DisplayWindow::new(low, high).unwrap(),
+            TransferCurve::linear(),
+            invert,
+        );
         crate::DvrRenderParameters::new(
             transfer,
             transfer,

@@ -35,22 +35,22 @@ pub(super) fn build_mean_multiscale_specs_with_storage(
     let mut cumulative_x_factor = 1.0;
     loop {
         let previous = scales.last().expect("s0 was inserted");
-        if previous.shape.z == 1 && previous.shape.y == 1 && previous.shape.x == 1 {
+        if previous.shape.z() == 1 && previous.shape.y() == 1 && previous.shape.x() == 1 {
             break;
         }
         let next_shape = Shape4D::new(
-            previous.shape.t,
-            previous.shape.z.div_ceil(2),
-            previous.shape.y.div_ceil(2),
-            previous.shape.x.div_ceil(2),
+            previous.shape.t(),
+            previous.shape.z().div_ceil(2),
+            previous.shape.y().div_ceil(2),
+            previous.shape.x().div_ceil(2),
         )?;
-        if previous.shape.z > 1 {
+        if previous.shape.z() > 1 {
             cumulative_z_factor *= 2.0;
         }
-        if previous.shape.y > 1 {
+        if previous.shape.y() > 1 {
             cumulative_y_factor *= 2.0;
         }
-        if previous.shape.x > 1 {
+        if previous.shape.x() > 1 {
             cumulative_x_factor *= 2.0;
         }
         let level = scales.len() as u32;
@@ -80,9 +80,9 @@ pub(super) fn import_chunk_shape_with_storage(
     if let Some(brick_shape) = storage.brick_shape_zyx {
         return Shape4D::new(
             1,
-            shape.z.min(brick_shape.z),
-            shape.y.min(brick_shape.y),
-            shape.x.min(brick_shape.x),
+            shape.z().min(brick_shape.z()),
+            shape.y().min(brick_shape.y()),
+            shape.x().min(brick_shape.x()),
         )
         .map_err(ImportError::from);
     }
@@ -90,39 +90,39 @@ pub(super) fn import_chunk_shape_with_storage(
 }
 
 pub(super) fn import_chunk_shape(shape: Shape4D) -> Result<Shape4D, ImportError> {
-    if shape.z <= 1 {
+    if shape.z() <= 1 {
         Shape4D::new(
             1,
             1,
-            shape.y.min(IMPORT_2D_CHUNK_Y),
-            shape.x.min(IMPORT_2D_CHUNK_X),
+            shape.y().min(IMPORT_2D_CHUNK_Y),
+            shape.x().min(IMPORT_2D_CHUNK_X),
         )
         .map_err(ImportError::from)
     } else {
         Shape4D::new(
             1,
-            shape.z.min(IMPORT_3D_CHUNK_Z),
-            shape.y.min(IMPORT_3D_CHUNK_Y),
-            shape.x.min(IMPORT_3D_CHUNK_X),
+            shape.z().min(IMPORT_3D_CHUNK_Z),
+            shape.y().min(IMPORT_3D_CHUNK_Y),
+            shape.x().min(IMPORT_3D_CHUNK_X),
         )
         .map_err(ImportError::from)
     }
 }
 
 pub(super) fn should_start_multiscale(shape: Shape4D) -> bool {
-    shape.z.max(shape.y).max(shape.x) > MULTISCALE_GENERATE_THRESHOLD
+    shape.z().max(shape.y()).max(shape.x()) > MULTISCALE_GENERATE_THRESHOLD
 }
 
 pub(super) fn is_terminal_multiscale_shape(shape: Shape4D) -> bool {
-    shape.z.max(shape.y).max(shape.x) <= MULTISCALE_STOP_MAX_DIMENSION
+    shape.z().max(shape.y()).max(shape.x()) <= MULTISCALE_STOP_MAX_DIMENSION
         || spatial_voxels_per_timepoint(shape) <= MULTISCALE_STOP_VOXELS_PER_TIMEPOINT
 }
 
 pub(super) fn spatial_voxels_per_timepoint(shape: Shape4D) -> u64 {
     shape
-        .z
-        .checked_mul(shape.y)
-        .and_then(|zy| zy.checked_mul(shape.x))
+        .z()
+        .checked_mul(shape.y())
+        .and_then(|zy| zy.checked_mul(shape.x()))
         .unwrap_or(u64::MAX)
 }
 
@@ -1008,13 +1008,13 @@ pub(super) fn downsample_mean_u16_zyx(
     output_shape: Shape4D,
     cancellation: &ImportCancellationToken,
 ) -> Result<Vec<u16>, ImportError> {
-    let output_len =
-        Shape4D::new(1, output_shape.z, output_shape.y, output_shape.x)?.element_count()? as usize;
+    let output_len = Shape4D::new(1, output_shape.z(), output_shape.y(), output_shape.x())?
+        .element_count()? as usize;
     let mut output = Vec::with_capacity(output_len);
-    for z in 0..output_shape.z {
+    for z in 0..output_shape.z() {
         check_import_cancelled(cancellation)?;
-        for y in 0..output_shape.y {
-            for x in 0..output_shape.x {
+        for y in 0..output_shape.y() {
+            for x in 0..output_shape.x() {
                 output.push(downsample_mean_voxel_zyx(
                     source,
                     source_shape,
@@ -1034,13 +1034,13 @@ pub(super) fn downsample_mean_f32_zyx(
     output_shape: Shape4D,
     cancellation: &ImportCancellationToken,
 ) -> Result<Vec<f32>, ImportError> {
-    let output_len =
-        Shape4D::new(1, output_shape.z, output_shape.y, output_shape.x)?.element_count()? as usize;
+    let output_len = Shape4D::new(1, output_shape.z(), output_shape.y(), output_shape.x())?
+        .element_count()? as usize;
     let mut output = Vec::with_capacity(output_len);
-    for z in 0..output_shape.z {
+    for z in 0..output_shape.z() {
         check_import_cancelled(cancellation)?;
-        for y in 0..output_shape.y {
-            for x in 0..output_shape.x {
+        for y in 0..output_shape.y() {
+            for x in 0..output_shape.x() {
                 output.push(downsample_mean_f32_voxel_zyx(
                     source,
                     source_shape,
@@ -1060,13 +1060,13 @@ pub(super) fn downsample_mean_u8_zyx(
     output_shape: Shape4D,
     cancellation: &ImportCancellationToken,
 ) -> Result<Vec<u8>, ImportError> {
-    let output_len =
-        Shape4D::new(1, output_shape.z, output_shape.y, output_shape.x)?.element_count()? as usize;
+    let output_len = Shape4D::new(1, output_shape.z(), output_shape.y(), output_shape.x())?
+        .element_count()? as usize;
     let mut output = Vec::with_capacity(output_len);
-    for z in 0..output_shape.z {
+    for z in 0..output_shape.z() {
         check_import_cancelled(cancellation)?;
-        for y in 0..output_shape.y {
-            for x in 0..output_shape.x {
+        for y in 0..output_shape.y() {
+            for x in 0..output_shape.x() {
                 output.push(downsample_mean_u8_voxel_zyx(
                     source,
                     source_shape,
@@ -1097,11 +1097,11 @@ pub(super) fn render_valid_after_one_voxel_invalid_dilation(
     shape: Shape4D,
 ) -> Vec<u8> {
     let mut render_valid = vec![1_u8; source_valid.len()];
-    let z_radius = if shape.z > 1 { 1_i64 } else { 0_i64 };
-    for z in 0..shape.z {
-        for y in 0..shape.y {
-            for x in 0..shape.x {
-                let index = ((z * shape.y + y) * shape.x + x) as usize;
+    let z_radius = if shape.z() > 1 { 1_i64 } else { 0_i64 };
+    for z in 0..shape.z() {
+        for y in 0..shape.y() {
+            for x in 0..shape.x() {
+                let index = ((z * shape.y() + y) * shape.x() + x) as usize;
                 if source_valid[index] == 1 {
                     continue;
                 }
@@ -1114,14 +1114,14 @@ pub(super) fn render_valid_after_one_voxel_invalid_dilation(
                             if zz < 0
                                 || yy < 0
                                 || xx < 0
-                                || zz >= shape.z as i64
-                                || yy >= shape.y as i64
-                                || xx >= shape.x as i64
+                                || zz >= shape.z() as i64
+                                || yy >= shape.y() as i64
+                                || xx >= shape.x() as i64
                             {
                                 continue;
                             }
-                            let invalidated =
-                                ((zz as u64 * shape.y + yy as u64) * shape.x + xx as u64) as usize;
+                            let invalidated = ((zz as u64 * shape.y() + yy as u64) * shape.x()
+                                + xx as u64) as usize;
                             render_valid[invalidated] = 0;
                         }
                     }
@@ -1140,8 +1140,8 @@ pub(super) fn render_valid_plane_after_one_voxel_invalid_dilation(
 ) -> Result<Vec<u8>, ImportError> {
     let plane_len = usize::try_from(
         shape
-            .y
-            .checked_mul(shape.x)
+            .y()
+            .checked_mul(shape.x())
             .ok_or(ImportError::StorageEstimateOverflow)?,
     )
     .map_err(|_| ImportError::StorageEstimateOverflow)?;
@@ -1149,7 +1149,7 @@ pub(super) fn render_valid_plane_after_one_voxel_invalid_dilation(
         return Err(ImportError::StorageEstimateOverflow);
     }
     let mut render_valid = vec![1_u8; plane_len];
-    if shape.z > 1 {
+    if shape.z() > 1 {
         if let Some(previous) = previous_source_valid_yx {
             invalidate_render_valid_plane_from_source_valid(&mut render_valid, previous, shape)?;
         }
@@ -1172,23 +1172,23 @@ pub(super) fn invalidate_render_valid_plane_from_source_valid(
 ) -> Result<(), ImportError> {
     let plane_len = usize::try_from(
         shape
-            .y
-            .checked_mul(shape.x)
+            .y()
+            .checked_mul(shape.x())
             .ok_or(ImportError::StorageEstimateOverflow)?,
     )
     .map_err(|_| ImportError::StorageEstimateOverflow)?;
     if source_valid_yx.len() != plane_len || render_valid_yx.len() != plane_len {
         return Err(ImportError::StorageEstimateOverflow);
     }
-    for y in 0..shape.y {
-        for x in 0..shape.x {
-            let index = (y * shape.x + x) as usize;
+    for y in 0..shape.y() {
+        for x in 0..shape.x() {
+            let index = (y * shape.x() + x) as usize;
             if source_valid_yx[index] == 1 {
                 continue;
             }
-            for yy in y.saturating_sub(1)..=(y + 1).min(shape.y - 1) {
-                for xx in x.saturating_sub(1)..=(x + 1).min(shape.x - 1) {
-                    render_valid_yx[(yy * shape.x + xx) as usize] = 0;
+            for yy in y.saturating_sub(1)..=(y + 1).min(shape.y() - 1) {
+                for xx in x.saturating_sub(1)..=(x + 1).min(shape.x() - 1) {
+                    render_valid_yx[(yy * shape.x() + xx) as usize] = 0;
                 }
             }
         }
@@ -1203,14 +1203,14 @@ pub(super) fn downsample_mean_u8_zyx_masked(
     output_shape: Shape4D,
     cancellation: &ImportCancellationToken,
 ) -> Result<(Vec<u8>, Vec<u8>), ImportError> {
-    let output_len =
-        Shape4D::new(1, output_shape.z, output_shape.y, output_shape.x)?.element_count()? as usize;
+    let output_len = Shape4D::new(1, output_shape.z(), output_shape.y(), output_shape.x())?
+        .element_count()? as usize;
     let mut output = Vec::with_capacity(output_len);
     let mut support_valid = Vec::with_capacity(output_len);
-    for z in 0..output_shape.z {
+    for z in 0..output_shape.z() {
         check_import_cancelled(cancellation)?;
-        for y in 0..output_shape.y {
-            for x in 0..output_shape.x {
+        for y in 0..output_shape.y() {
+            for x in 0..output_shape.x() {
                 let (value, has_support) = downsample_mean_u8_masked_voxel_zyx(
                     source,
                     source_render_valid,
@@ -1237,10 +1237,10 @@ pub(super) fn downsample_mean_voxel_zyx(
 ) -> u16 {
     let mut sum = 0u64;
     let mut count = 0u64;
-    for z in z_start..(z_start + 2).min(source_shape.z) {
-        for y in y_start..(y_start + 2).min(source_shape.y) {
-            for x in x_start..(x_start + 2).min(source_shape.x) {
-                let index = ((z * source_shape.y + y) * source_shape.x + x) as usize;
+    for z in z_start..(z_start + 2).min(source_shape.z()) {
+        for y in y_start..(y_start + 2).min(source_shape.y()) {
+            for x in x_start..(x_start + 2).min(source_shape.x()) {
+                let index = ((z * source_shape.y() + y) * source_shape.x() + x) as usize;
                 sum += u64::from(source[index]);
                 count += 1;
             }
@@ -1258,10 +1258,10 @@ pub(super) fn downsample_mean_f32_voxel_zyx(
 ) -> f32 {
     let mut sum = 0.0_f64;
     let mut count = 0u64;
-    for z in z_start..(z_start + 2).min(source_shape.z) {
-        for y in y_start..(y_start + 2).min(source_shape.y) {
-            for x in x_start..(x_start + 2).min(source_shape.x) {
-                let index = ((z * source_shape.y + y) * source_shape.x + x) as usize;
+    for z in z_start..(z_start + 2).min(source_shape.z()) {
+        for y in y_start..(y_start + 2).min(source_shape.y()) {
+            for x in x_start..(x_start + 2).min(source_shape.x()) {
+                let index = ((z * source_shape.y() + y) * source_shape.x() + x) as usize;
                 sum += f64::from(source[index]);
                 count += 1;
             }
@@ -1279,10 +1279,11 @@ pub(super) fn downsample_mean_u8_voxel_zyx(
 ) -> u8 {
     let mut sum = 0u64;
     let mut count = 0u64;
-    for z in z0..(z0 + 2).min(source_shape.z) {
-        for y in y0..(y0 + 2).min(source_shape.y) {
-            for x in x0..(x0 + 2).min(source_shape.x) {
-                sum += u64::from(source[((z * source_shape.y + y) * source_shape.x + x) as usize]);
+    for z in z0..(z0 + 2).min(source_shape.z()) {
+        for y in y0..(y0 + 2).min(source_shape.y()) {
+            for x in x0..(x0 + 2).min(source_shape.x()) {
+                sum +=
+                    u64::from(source[((z * source_shape.y() + y) * source_shape.x() + x) as usize]);
                 count += 1;
             }
         }
@@ -1301,10 +1302,10 @@ pub(super) fn downsample_mean_u8_masked_voxel_zyx(
 ) -> (u8, bool) {
     let mut sum = 0u64;
     let mut count = 0u64;
-    for z in z0..(z0 + 2).min(source_shape.z) {
-        for y in y0..(y0 + 2).min(source_shape.y) {
-            for x in x0..(x0 + 2).min(source_shape.x) {
-                let index = ((z * source_shape.y + y) * source_shape.x + x) as usize;
+    for z in z0..(z0 + 2).min(source_shape.z()) {
+        for y in y0..(y0 + 2).min(source_shape.y()) {
+            for x in x0..(x0 + 2).min(source_shape.x()) {
+                let index = ((z * source_shape.y() + y) * source_shape.x() + x) as usize;
                 if source_render_valid[index] != 1 {
                     continue;
                 }
@@ -1327,19 +1328,19 @@ pub(super) fn downsample_mean_u16_plane_pair(
     cancellation: &ImportCancellationToken,
 ) -> Result<Vec<u16>, ImportError> {
     let output_len = output_shape
-        .y
-        .checked_mul(output_shape.x)
+        .y()
+        .checked_mul(output_shape.x())
         .ok_or(ImportError::StorageEstimateOverflow)? as usize;
     let mut output = Vec::with_capacity(output_len);
-    for y in 0..output_shape.y {
+    for y in 0..output_shape.y() {
         check_import_cancelled(cancellation)?;
-        for x in 0..output_shape.x {
+        for x in 0..output_shape.x() {
             let mut sum = 0u64;
             let mut count = 0u64;
             for plane in [Some(first_yx), second_yx].into_iter().flatten() {
-                for yy in y * 2..(y * 2 + 2).min(source_shape.y) {
-                    for xx in x * 2..(x * 2 + 2).min(source_shape.x) {
-                        sum += u64::from(plane[(yy * source_shape.x + xx) as usize]);
+                for yy in y * 2..(y * 2 + 2).min(source_shape.y()) {
+                    for xx in x * 2..(x * 2 + 2).min(source_shape.x()) {
+                        sum += u64::from(plane[(yy * source_shape.x() + xx) as usize]);
                         count += 1;
                     }
                 }
@@ -1358,19 +1359,19 @@ pub(super) fn downsample_mean_u8_plane_pair(
     cancellation: &ImportCancellationToken,
 ) -> Result<Vec<u8>, ImportError> {
     let output_len = output_shape
-        .y
-        .checked_mul(output_shape.x)
+        .y()
+        .checked_mul(output_shape.x())
         .ok_or(ImportError::StorageEstimateOverflow)? as usize;
     let mut output = Vec::with_capacity(output_len);
-    for y in 0..output_shape.y {
+    for y in 0..output_shape.y() {
         check_import_cancelled(cancellation)?;
-        for x in 0..output_shape.x {
+        for x in 0..output_shape.x() {
             let mut sum = 0u64;
             let mut count = 0u64;
             for plane in [Some(first_yx), second_yx].into_iter().flatten() {
-                for yy in y * 2..(y * 2 + 2).min(source_shape.y) {
-                    for xx in x * 2..(x * 2 + 2).min(source_shape.x) {
-                        sum += u64::from(plane[(yy * source_shape.x + xx) as usize]);
+                for yy in y * 2..(y * 2 + 2).min(source_shape.y()) {
+                    for xx in x * 2..(x * 2 + 2).min(source_shape.x()) {
+                        sum += u64::from(plane[(yy * source_shape.x() + xx) as usize]);
                         count += 1;
                     }
                 }
@@ -1392,14 +1393,14 @@ pub(super) fn downsample_mean_u8_rendered_plane_pair(
     cancellation: &ImportCancellationToken,
 ) -> Result<(Vec<u8>, Vec<u8>), ImportError> {
     let output_len = output_shape
-        .y
-        .checked_mul(output_shape.x)
+        .y()
+        .checked_mul(output_shape.x())
         .ok_or(ImportError::StorageEstimateOverflow)? as usize;
     let mut output = Vec::with_capacity(output_len);
     let mut support_valid = Vec::with_capacity(output_len);
-    for y in 0..output_shape.y {
+    for y in 0..output_shape.y() {
         check_import_cancelled(cancellation)?;
-        for x in 0..output_shape.x {
+        for x in 0..output_shape.x() {
             let mut sum = 0u64;
             let mut count = 0u64;
             for (plane, render_valid) in [
@@ -1409,9 +1410,9 @@ pub(super) fn downsample_mean_u8_rendered_plane_pair(
             .into_iter()
             .flatten()
             {
-                for yy in y * 2..(y * 2 + 2).min(source_shape.y) {
-                    for xx in x * 2..(x * 2 + 2).min(source_shape.x) {
-                        let source_index = (yy * source_shape.x + xx) as usize;
+                for yy in y * 2..(y * 2 + 2).min(source_shape.y()) {
+                    for xx in x * 2..(x * 2 + 2).min(source_shape.x()) {
+                        let source_index = (yy * source_shape.x() + xx) as usize;
                         if render_valid[source_index] != 1 {
                             continue;
                         }
@@ -1440,19 +1441,19 @@ pub(super) fn downsample_mean_f32_plane_pair(
     cancellation: &ImportCancellationToken,
 ) -> Result<Vec<f32>, ImportError> {
     let output_len = output_shape
-        .y
-        .checked_mul(output_shape.x)
+        .y()
+        .checked_mul(output_shape.x())
         .ok_or(ImportError::StorageEstimateOverflow)? as usize;
     let mut output = Vec::with_capacity(output_len);
-    for y in 0..output_shape.y {
+    for y in 0..output_shape.y() {
         check_import_cancelled(cancellation)?;
-        for x in 0..output_shape.x {
+        for x in 0..output_shape.x() {
             let mut sum = 0.0_f64;
             let mut count = 0u64;
             for plane in [Some(first_yx), second_yx].into_iter().flatten() {
-                for yy in y * 2..(y * 2 + 2).min(source_shape.y) {
-                    for xx in x * 2..(x * 2 + 2).min(source_shape.x) {
-                        sum += f64::from(plane[(yy * source_shape.x + xx) as usize]);
+                for yy in y * 2..(y * 2 + 2).min(source_shape.y()) {
+                    for xx in x * 2..(x * 2 + 2).min(source_shape.x()) {
+                        sum += f64::from(plane[(yy * source_shape.x() + xx) as usize]);
                         count += 1;
                     }
                 }

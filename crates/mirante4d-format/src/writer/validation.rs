@@ -29,7 +29,7 @@ pub(super) fn validate_layer_scales(
             });
         }
         if scale.level > 0
-            && (scale.shape.t != layer_shape.t
+            && (scale.shape.t() != layer_shape.t()
                 || scale.source_scale != Some(scale.level - 1)
                 || scale.reduction == ScaleReduction::Source)
         {
@@ -88,7 +88,7 @@ pub(super) fn validate_streaming_layer_scales(
             });
         }
         if scale.level > 0
-            && (scale.shape.t != layer_shape.t
+            && (scale.shape.t() != layer_shape.t()
                 || scale.source_scale != Some(scale.level - 1)
                 || scale.reduction == ScaleReduction::Source)
         {
@@ -114,7 +114,6 @@ pub(super) fn validate_streaming_layer_scales(
                 layer_id: layer_id.to_owned(),
                 source,
             })?;
-        scale.brick_shape.validate()?;
         scale.shape.chunk_grid(scale.brick_shape)?;
     }
     Ok(())
@@ -149,7 +148,7 @@ pub(super) fn validate_streaming_u8_layer_scales(
             });
         }
         if scale.level > 0
-            && (scale.shape.t != layer_shape.t
+            && (scale.shape.t() != layer_shape.t()
                 || scale.source_scale != Some(scale.level - 1)
                 || scale.reduction == ScaleReduction::Source)
         {
@@ -175,7 +174,6 @@ pub(super) fn validate_streaming_u8_layer_scales(
                 layer_id: layer_id.to_owned(),
                 source,
             })?;
-        scale.brick_shape.validate()?;
         scale.shape.chunk_grid(scale.brick_shape)?;
     }
     Ok(())
@@ -210,7 +208,7 @@ pub(super) fn validate_streaming_f32_layer_scales(
             });
         }
         if scale.level > 0
-            && (scale.shape.t != layer_shape.t
+            && (scale.shape.t() != layer_shape.t()
                 || scale.source_scale != Some(scale.level - 1)
                 || scale.reduction == ScaleReduction::Source)
         {
@@ -236,7 +234,6 @@ pub(super) fn validate_streaming_f32_layer_scales(
                 layer_id: layer_id.to_owned(),
                 source,
             })?;
-        scale.brick_shape.validate()?;
         scale.shape.chunk_grid(scale.brick_shape)?;
     }
     Ok(())
@@ -271,7 +268,7 @@ pub(super) fn validate_f32_layer_scales(
             });
         }
         if scale.level > 0
-            && (scale.shape.t != layer_shape.t
+            && (scale.shape.t() != layer_shape.t()
                 || scale.source_scale != Some(scale.level - 1)
                 || scale.reduction == ScaleReduction::Source)
         {
@@ -371,3 +368,4 @@ pub(super) fn validate_f32_scale_values(
     }
     Ok(())
 }
+use crate::{CurrentGridToWorldExt, CurrentShape4DExt};

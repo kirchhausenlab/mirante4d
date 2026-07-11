@@ -1,39 +1,27 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use mirante4d_core::TimeIndex;
+use mirante4d_domain::TimeIndex;
 
 use crate::LodDecisionReason;
 
-const PLAYBACK_FRAME_INTERVAL: Duration = Duration::from_millis(42);
+pub(crate) const PLAYBACK_FRAME_INTERVAL: Duration = Duration::from_millis(42);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PlaybackState {
-    pub(crate) playing: bool,
-    pub(crate) frame_interval: Duration,
-    pub(crate) last_step_at: Option<Instant>,
-    pub(crate) waiting_for_timepoint: Option<TimeIndex>,
-}
-
-impl Default for PlaybackState {
-    fn default() -> Self {
-        Self {
-            playing: false,
-            frame_interval: PLAYBACK_FRAME_INTERVAL,
-            last_step_at: None,
-            waiting_for_timepoint: None,
-        }
+pub(crate) fn playback_tick_for_ui_time(time_seconds: f64) -> u64 {
+    if !time_seconds.is_finite() || time_seconds <= 0.0 {
+        return 0;
     }
+    (time_seconds / PLAYBACK_FRAME_INTERVAL.as_secs_f64()).floor() as u64
 }
 
 pub(crate) fn stepped_timepoint(current: TimeIndex, count: u64, delta: i64) -> TimeIndex {
     if count == 0 {
-        return TimeIndex(0);
+        return TimeIndex::new(0);
     }
     let count_i128 = i128::from(count);
-    let current_i128 = i128::from(current.0.min(count - 1));
+    let current_i128 = i128::from(current.get().min(count - 1));
     let delta_i128 = i128::from(delta);
     let wrapped = (current_i128 + delta_i128).rem_euclid(count_i128);
-    TimeIndex(wrapped as u64)
+    TimeIndex::new(wrapped as u64)
 }
 
 pub(crate) fn playback_effective_lod_target(
@@ -53,20 +41,12 @@ pub(crate) fn playback_effective_lod_target(
     }
 }
 
-pub(crate) fn playback_status_label(
-    playback: PlaybackState,
-    active: TimeIndex,
-    count: u64,
-) -> String {
+pub(crate) fn playback_status_label(playing: bool, active: TimeIndex, count: u64) -> String {
     if count <= 1 {
         return "playback stopped | t 1/1".to_owned();
     }
-    let state = if playback.playing {
-        "playing"
-    } else {
-        "stopped"
-    };
-    format!("playback {state} | t {}/{}", active.0 + 1, count)
+    let state = if playing { "playing" } else { "stopped" };
+    format!("playback {state} | t {}/{}", active.get() + 1, count)
 }
 
 #[cfg(test)]
@@ -74,22 +54,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_playback_state_is_stopped_with_frame_interval() {
-        let playback = PlaybackState::default();
-
-        assert!(!playback.playing);
-        assert_eq!(playback.frame_interval, PLAYBACK_FRAME_INTERVAL);
-        assert_eq!(playback.last_step_at, None);
-        assert_eq!(playback.waiting_for_timepoint, None);
+    fn ui_time_maps_to_stable_playback_ticks() {
+        assert_eq!(playback_tick_for_ui_time(f64::NAN), 0);
+        assert_eq!(playback_tick_for_ui_time(-1.0), 0);
+        assert_eq!(playback_tick_for_ui_time(0.0), 0);
+        assert_eq!(playback_tick_for_ui_time(0.041), 0);
+        assert_eq!(playback_tick_for_ui_time(0.042), 1);
+        assert_eq!(playback_tick_for_ui_time(0.084), 2);
     }
 
     #[test]
     fn stepped_timepoint_wraps_forward_backward_and_large_delta() {
-        assert_eq!(stepped_timepoint(TimeIndex(0), 0, 1), TimeIndex(0));
-        assert_eq!(stepped_timepoint(TimeIndex(0), 3, -1), TimeIndex(2));
-        assert_eq!(stepped_timepoint(TimeIndex(2), 3, 1), TimeIndex(0));
-        assert_eq!(stepped_timepoint(TimeIndex(1), 3, 5), TimeIndex(0));
-        assert_eq!(stepped_timepoint(TimeIndex(7), 3, 1), TimeIndex(0));
+        assert_eq!(
+            stepped_timepoint(TimeIndex::new(0), 0, 1),
+            TimeIndex::new(0)
+        );
+        assert_eq!(
+            stepped_timepoint(TimeIndex::new(0), 3, -1),
+            TimeIndex::new(2)
+        );
+        assert_eq!(
+            stepped_timepoint(TimeIndex::new(2), 3, 1),
+            TimeIndex::new(0)
+        );
+        assert_eq!(
+            stepped_timepoint(TimeIndex::new(1), 3, 5),
+            TimeIndex::new(0)
+        );
+        assert_eq!(
+            stepped_timepoint(TimeIndex::new(7), 3, 1),
+            TimeIndex::new(0)
+        );
     }
 
     #[test]
@@ -114,20 +109,17 @@ mod tests {
 
     #[test]
     fn playback_status_label_reports_playing_stopped_and_single_timepoint() {
-        let mut playback = PlaybackState::default();
-
         assert_eq!(
-            playback_status_label(playback, TimeIndex(0), 3),
+            playback_status_label(false, TimeIndex::new(0), 3),
             "playback stopped | t 1/3"
         );
 
-        playback.playing = true;
         assert_eq!(
-            playback_status_label(playback, TimeIndex(1), 3),
+            playback_status_label(true, TimeIndex::new(1), 3),
             "playback playing | t 2/3"
         );
         assert_eq!(
-            playback_status_label(playback, TimeIndex(0), 1),
+            playback_status_label(true, TimeIndex::new(0), 1),
             "playback stopped | t 1/1"
         );
     }

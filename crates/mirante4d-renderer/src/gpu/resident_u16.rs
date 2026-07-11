@@ -1,6 +1,7 @@
 use std::time::Instant;
 
-use mirante4d_core::{CameraState, GridToWorld, Shape3D};
+use mirante4d_domain::{GridToWorld, Shape3D};
+use mirante4d_render_api::CameraFrame;
 use wgpu::util::DeviceExt;
 
 use super::{
@@ -73,7 +74,7 @@ impl GpuRenderer {
         resident: &ResidentBrickSetU8,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
     ) -> Result<GpuMipOutput, GpuRenderError> {
@@ -94,7 +95,7 @@ impl GpuRenderer {
         resident: &ResidentBrickSetU8,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
         quality: CameraRenderQuality,
@@ -129,7 +130,7 @@ impl GpuRenderer {
         resident: &ResidentBrickSetU16,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
     ) -> Result<GpuMipOutput, GpuRenderError> {
@@ -150,7 +151,7 @@ impl GpuRenderer {
         resident: &ResidentBrickSetU16,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
         quality: CameraRenderQuality,
@@ -186,7 +187,7 @@ impl GpuRenderer {
         resident: &ResidentBrickSetU8,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
         quality: CameraRenderQuality,
@@ -219,7 +220,7 @@ impl GpuRenderer {
         resident: &ResidentBrickSetU16,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
         quality: CameraRenderQuality,
@@ -252,7 +253,7 @@ impl GpuRenderer {
         resident: &ResidentBrickSetU8,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
         quality: CameraRenderQuality,
@@ -287,7 +288,7 @@ impl GpuRenderer {
         resident: &ResidentBrickSetU16,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
         quality: CameraRenderQuality,
@@ -323,22 +324,22 @@ impl GpuRenderer {
         grid_to_world: GridToWorld,
         atlas: super::atlas::GpuBrickAtlasResource,
         mut timings: GpuRenderTimings,
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
         quality: CameraRenderQuality,
     ) -> Result<GpuBrickedRawOutputU16, GpuRenderError> {
         let viewport_width = checked_u32("viewport_width", viewport.width)?;
         let viewport_height = checked_u32("viewport_height", viewport.height)?;
-        let shape_x = checked_u32("x", volume_shape.x)?;
-        let shape_y = checked_u32("y", volume_shape.y)?;
-        let shape_z = checked_u32("z", volume_shape.z)?;
-        let brick_x = checked_u32("brick_x", atlas.brick_shape.x)?;
-        let brick_y = checked_u32("brick_y", atlas.brick_shape.y)?;
-        let brick_z = checked_u32("brick_z", atlas.brick_shape.z)?;
-        let grid_x = checked_u32("grid_x", atlas.brick_grid_shape.x)?;
-        let grid_y = checked_u32("grid_y", atlas.brick_grid_shape.y)?;
-        let grid_z = checked_u32("grid_z", atlas.brick_grid_shape.z)?;
+        let shape_x = checked_u32("x", volume_shape.x())?;
+        let shape_y = checked_u32("y", volume_shape.y())?;
+        let shape_z = checked_u32("z", volume_shape.z())?;
+        let brick_x = checked_u32("brick_x", atlas.brick_shape.x())?;
+        let brick_y = checked_u32("brick_y", atlas.brick_shape.y())?;
+        let brick_z = checked_u32("brick_z", atlas.brick_shape.z())?;
+        let grid_x = checked_u32("grid_x", atlas.brick_grid_shape.x())?;
+        let grid_y = checked_u32("grid_y", atlas.brick_grid_shape.y())?;
+        let grid_z = checked_u32("grid_z", atlas.brick_grid_shape.z())?;
         let brick_voxel_count = checked_u32("brick_voxel_count", atlas.brick_voxel_count)?;
         let packed_u32_per_brick = checked_u32("packed_u32_per_brick", atlas.packed_u32_per_brick)?;
         let valid_u32_per_brick = checked_u32("valid_u32_per_brick", atlas.valid_u32_per_brick)?;
@@ -347,17 +348,17 @@ impl GpuRenderer {
         let mode_params = gpu_mode_params_for_transform(grid_to_world, mode)?;
         camera_params[15] = mode_params.density_scale;
         camera_params[GPU_PARAM_ISO_LEVEL_INDEX] = mode_params.iso_display_level;
-        camera_params[GPU_PARAM_ISO_DISPLAY_LOW_INDEX] = mode_params.iso_transfer.window.low;
-        camera_params[GPU_PARAM_ISO_DISPLAY_HIGH_INDEX] = mode_params.iso_transfer.window.high;
+        camera_params[GPU_PARAM_ISO_DISPLAY_LOW_INDEX] = mode_params.iso_transfer.window.low();
+        camera_params[GPU_PARAM_ISO_DISPLAY_HIGH_INDEX] = mode_params.iso_transfer.window.high();
         camera_params[GPU_PARAM_ISO_GAMMA_INDEX] = mode_params.iso_transfer.curve.gamma_value();
         camera_params[GPU_PARAM_DVR_COLOR_R_INDEX] = mode_params.dvr_color_rgb[0];
         camera_params[GPU_PARAM_DVR_COLOR_G_INDEX] = mode_params.dvr_color_rgb[1];
         camera_params[GPU_PARAM_DVR_COLOR_B_INDEX] = mode_params.dvr_color_rgb[2];
         camera_params[GPU_PARAM_DVR_ALPHA_MULTIPLIER_INDEX] = mode_params.dvr_alpha_multiplier;
         camera_params[GPU_PARAM_DVR_OPACITY_LOW_INDEX] =
-            mode_params.dvr_opacity_transfer.window.low;
+            mode_params.dvr_opacity_transfer.window.low();
         camera_params[GPU_PARAM_DVR_OPACITY_HIGH_INDEX] =
-            mode_params.dvr_opacity_transfer.window.high;
+            mode_params.dvr_opacity_transfer.window.high();
         camera_params[GPU_PARAM_DVR_OPACITY_GAMMA_INDEX] =
             mode_params.dvr_opacity_transfer.curve.gamma_value();
         apply_gpu_quality_params(&mut camera_params, quality);
@@ -411,7 +412,7 @@ impl GpuRenderer {
             shape_x,
             shape_y,
             shape_z,
-            projection_code(camera.projection),
+            projection_code(crate::current_camera::projection(camera)),
             mode_params.mode_code,
             mode_params.iso_invert,
             brick_x,
@@ -581,7 +582,7 @@ impl GpuRenderer {
         grid_to_world: GridToWorld,
         atlas: super::atlas::GpuBrickAtlasResource,
         mut timings: GpuRenderTimings,
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
         mode: CameraRenderMode,
         quality: CameraRenderQuality,
@@ -589,15 +590,15 @@ impl GpuRenderer {
     ) -> Result<GpuIntegerCameraOutputBuffer, GpuRenderError> {
         let viewport_width = checked_u32("viewport_width", viewport.width)?;
         let viewport_height = checked_u32("viewport_height", viewport.height)?;
-        let shape_x = checked_u32("x", volume_shape.x)?;
-        let shape_y = checked_u32("y", volume_shape.y)?;
-        let shape_z = checked_u32("z", volume_shape.z)?;
-        let brick_x = checked_u32("brick_x", atlas.brick_shape.x)?;
-        let brick_y = checked_u32("brick_y", atlas.brick_shape.y)?;
-        let brick_z = checked_u32("brick_z", atlas.brick_shape.z)?;
-        let grid_x = checked_u32("grid_x", atlas.brick_grid_shape.x)?;
-        let grid_y = checked_u32("grid_y", atlas.brick_grid_shape.y)?;
-        let grid_z = checked_u32("grid_z", atlas.brick_grid_shape.z)?;
+        let shape_x = checked_u32("x", volume_shape.x())?;
+        let shape_y = checked_u32("y", volume_shape.y())?;
+        let shape_z = checked_u32("z", volume_shape.z())?;
+        let brick_x = checked_u32("brick_x", atlas.brick_shape.x())?;
+        let brick_y = checked_u32("brick_y", atlas.brick_shape.y())?;
+        let brick_z = checked_u32("brick_z", atlas.brick_shape.z())?;
+        let grid_x = checked_u32("grid_x", atlas.brick_grid_shape.x())?;
+        let grid_y = checked_u32("grid_y", atlas.brick_grid_shape.y())?;
+        let grid_z = checked_u32("grid_z", atlas.brick_grid_shape.z())?;
         let brick_voxel_count = checked_u32("brick_voxel_count", atlas.brick_voxel_count)?;
         let packed_u32_per_brick = checked_u32("packed_u32_per_brick", atlas.packed_u32_per_brick)?;
         let valid_u32_per_brick = checked_u32("valid_u32_per_brick", atlas.valid_u32_per_brick)?;
@@ -606,17 +607,17 @@ impl GpuRenderer {
         let mode_params = gpu_mode_params_for_transform(grid_to_world, mode)?;
         camera_params[15] = mode_params.density_scale;
         camera_params[GPU_PARAM_ISO_LEVEL_INDEX] = mode_params.iso_display_level;
-        camera_params[GPU_PARAM_ISO_DISPLAY_LOW_INDEX] = mode_params.iso_transfer.window.low;
-        camera_params[GPU_PARAM_ISO_DISPLAY_HIGH_INDEX] = mode_params.iso_transfer.window.high;
+        camera_params[GPU_PARAM_ISO_DISPLAY_LOW_INDEX] = mode_params.iso_transfer.window.low();
+        camera_params[GPU_PARAM_ISO_DISPLAY_HIGH_INDEX] = mode_params.iso_transfer.window.high();
         camera_params[GPU_PARAM_ISO_GAMMA_INDEX] = mode_params.iso_transfer.curve.gamma_value();
         camera_params[GPU_PARAM_DVR_COLOR_R_INDEX] = mode_params.dvr_color_rgb[0];
         camera_params[GPU_PARAM_DVR_COLOR_G_INDEX] = mode_params.dvr_color_rgb[1];
         camera_params[GPU_PARAM_DVR_COLOR_B_INDEX] = mode_params.dvr_color_rgb[2];
         camera_params[GPU_PARAM_DVR_ALPHA_MULTIPLIER_INDEX] = mode_params.dvr_alpha_multiplier;
         camera_params[GPU_PARAM_DVR_OPACITY_LOW_INDEX] =
-            mode_params.dvr_opacity_transfer.window.low;
+            mode_params.dvr_opacity_transfer.window.low();
         camera_params[GPU_PARAM_DVR_OPACITY_HIGH_INDEX] =
-            mode_params.dvr_opacity_transfer.window.high;
+            mode_params.dvr_opacity_transfer.window.high();
         camera_params[GPU_PARAM_DVR_OPACITY_GAMMA_INDEX] =
             mode_params.dvr_opacity_transfer.curve.gamma_value();
         apply_gpu_quality_params(&mut camera_params, quality);
@@ -642,7 +643,7 @@ impl GpuRenderer {
             shape_x,
             shape_y,
             shape_z,
-            projection_code(camera.projection),
+            projection_code(crate::current_camera::projection(camera)),
             mode_params.mode_code,
             mode_params.iso_invert,
             brick_x,
@@ -741,7 +742,7 @@ impl GpuRenderer {
         resident: &ResidentBrickSetU16,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
-        camera: CameraState,
+        camera: CameraFrame,
         viewport: RenderViewport,
         max_bricks_per_batch: usize,
     ) -> Result<GpuMipOutput, GpuRenderError> {

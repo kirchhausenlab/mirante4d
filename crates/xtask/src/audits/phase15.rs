@@ -17,8 +17,9 @@ use mirante4d_analysis::{
     summarize_u16_volume_as_roi, table_export_metadata, time_trace_plot_from_table,
     write_table_csv_with_metadata,
 };
-use mirante4d_core::{LayerId, TimeIndex};
 use mirante4d_data::{DatasetHandle, SpatialBrickIndex};
+use mirante4d_domain::TimeIndex;
+use mirante4d_format::LayerId;
 use serde_json::{Value, json};
 
 use crate::fixtures::generate_fixture;
@@ -164,18 +165,18 @@ fn phase15_full_intensity_analysis(
         .layer(layer_id)
         .context("phase15 full analysis requires a layer")?
         .shape
-        .t;
+        .t();
     let mut rows = Vec::with_capacity(timepoint_count as usize);
     for timepoint in 0..timepoint_count {
         let brick_grid = dataset.brick_grid_shape_at_scale(layer_id, 0)?;
         let mut accumulator = IntensitySummaryAccumulator::default();
-        for z in 0..brick_grid.z {
-            for y in 0..brick_grid.y {
-                for x in 0..brick_grid.x {
+        for z in 0..brick_grid.z() {
+            for y in 0..brick_grid.y() {
+                for x in 0..brick_grid.x() {
                     let brick = dataset.read_u16_brick_at_scale(
                         layer_id,
                         0,
-                        TimeIndex(timepoint),
+                        TimeIndex::new(timepoint),
                         SpatialBrickIndex::new(z, y, x),
                     )?;
                     accumulator.include_volume(&brick.volume);
@@ -238,13 +239,13 @@ fn phase15_roi_analysis(
             min: DVec3::new(0.0, 0.0, 0.0),
             max: DVec3::new(0.4, 0.4, 0.4),
         },
-        SceneArtifactTime::Timepoint(TimeIndex(0)),
+        SceneArtifactTime::Timepoint(TimeIndex::new(0)),
     )?;
     let shape = dataset.scale_shape(layer_id, 0)?;
     let grid_to_world = dataset.scale_grid_to_world(layer_id, 0)?;
     let region = box_roi_grid_region(grid_to_world, shape, &roi)?
         .context("phase15 ROI should intersect fixture source volume")?;
-    let region_volume = dataset.read_u16_region(layer_id, TimeIndex(0), region)?;
+    let region_volume = dataset.read_u16_region(layer_id, TimeIndex::new(0), region)?;
     let statistics = summarize_u16_volume_as_roi(&region_volume, roi.id.as_str());
     let provenance = phase15_provenance(
         dataset,

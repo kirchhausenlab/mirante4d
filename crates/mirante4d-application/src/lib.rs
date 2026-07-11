@@ -11,6 +11,7 @@ use std::{
     sync::Arc,
 };
 
+use mirante4d_dataset::{DatasetCatalog, ScientificIdentityStatus};
 use mirante4d_domain::{
     CameraView, CrossSectionView, IsoLightState, LogicalLayerKey, TimeIndex, ToolKind, ViewerLayout,
 };
@@ -21,7 +22,7 @@ use mirante4d_project_model::{
     ProjectGenerationProjection, ProjectId, ProjectRevisionHighWater, ProjectRevisionId,
     ProjectState, ViewState,
 };
-use mirante4d_settings::ResourcePolicy;
+use mirante4d_settings::{RejectedFileDisposition, ResourcePolicy};
 
 /// Maximum number of project revisions retained for undo/redo.
 pub const MAX_HISTORY_ENTRIES: usize = 128;
@@ -29,6 +30,14 @@ pub const MAX_HISTORY_ENTRIES: usize = 128;
 pub const MAX_PENDING_EVENTS: usize = 256;
 /// Maximum number of concurrently registered background operations.
 pub const MAX_ACTIVE_OPERATIONS: usize = 64;
+/// Maximum number of transient analysis tables retained in one source session.
+pub const MAX_ANALYSIS_TABLES: usize = 1_024;
+/// Maximum number of transient analysis plots retained in one source session.
+pub const MAX_ANALYSIS_PLOTS: usize = 1_024;
+/// Maximum number of series described by one transient analysis plot.
+pub const MAX_ANALYSIS_PLOT_SERIES: usize = 1_024;
+/// Maximum number of points described by one transient analysis plot.
+pub const MAX_ANALYSIS_PLOT_POINTS: u64 = 16_777_216;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SourceSessionGeneration(u64);
@@ -65,6 +74,151 @@ impl OperationId {
     }
 }
 
+/// Stable key for a table payload retained by the current analysis owner.
+///
+/// The application retains only this descriptor key. The table payload stays
+/// outside the reducer and can derive the same key from the operation token
+/// and result slot without a second allocator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AnalysisTableId {
+    operation_id: OperationId,
+    slot: u16,
+}
+
+impl AnalysisTableId {
+    pub const fn from_operation(operation_id: OperationId, slot: u16) -> Self {
+        Self { operation_id, slot }
+    }
+
+    pub const fn operation_id(self) -> OperationId {
+        self.operation_id
+    }
+
+    pub const fn slot(self) -> u16 {
+        self.slot
+    }
+}
+
+/// Stable key for a plot payload retained by the current analysis owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AnalysisPlotId {
+    operation_id: OperationId,
+    slot: u16,
+}
+
+impl AnalysisPlotId {
+    pub const fn from_operation(operation_id: OperationId, slot: u16) -> Self {
+        Self { operation_id, slot }
+    }
+
+    pub const fn operation_id(self) -> OperationId {
+        self.operation_id
+    }
+
+    pub const fn slot(self) -> u16 {
+        self.slot
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisDescriptorError {
+    TooManySeries,
+    TooManyPoints,
+    PointCountOverflow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalysisTableDescriptor {
+    id: AnalysisTableId,
+    row_count: u64,
+}
+
+impl AnalysisTableDescriptor {
+    pub const fn new(id: AnalysisTableId, row_count: u64) -> Self {
+        Self { id, row_count }
+    }
+
+    pub const fn id(&self) -> AnalysisTableId {
+        self.id
+    }
+
+    pub const fn row_count(&self) -> u64 {
+        self.row_count
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalysisPlotDescriptor {
+    id: AnalysisPlotId,
+    series_point_counts: Vec<u64>,
+}
+
+impl AnalysisPlotDescriptor {
+    pub fn new(
+        id: AnalysisPlotId,
+        series_point_counts: Vec<u64>,
+    ) -> Result<Self, AnalysisDescriptorError> {
+        if series_point_counts.len() > MAX_ANALYSIS_PLOT_SERIES {
+            return Err(AnalysisDescriptorError::TooManySeries);
+        }
+        let total = series_point_counts.iter().try_fold(0_u64, |total, count| {
+            total
+                .checked_add(*count)
+                .ok_or(AnalysisDescriptorError::PointCountOverflow)
+        })?;
+        if total > MAX_ANALYSIS_PLOT_POINTS {
+            return Err(AnalysisDescriptorError::TooManyPoints);
+        }
+        Ok(Self {
+            id,
+            series_point_counts,
+        })
+    }
+
+    pub const fn id(&self) -> AnalysisPlotId {
+        self.id
+    }
+
+    pub fn series_point_counts(&self) -> &[u64] {
+        &self.series_point_counts
+    }
+
+    pub fn point_count(&self, series_index: u16) -> Option<u64> {
+        self.series_point_counts
+            .get(usize::from(series_index))
+            .copied()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnalysisPlotPointSelection {
+    plot_id: AnalysisPlotId,
+    series_index: u16,
+    point_index: u64,
+}
+
+impl AnalysisPlotPointSelection {
+    pub const fn new(plot_id: AnalysisPlotId, series_index: u16, point_index: u64) -> Self {
+        Self {
+            plot_id,
+            series_index,
+            point_index,
+        }
+    }
+
+    pub const fn plot_id(self) -> AnalysisPlotId {
+        self.plot_id
+    }
+
+    pub const fn series_index(self) -> u16 {
+        self.series_index
+    }
+
+    pub const fn point_index(self) -> u64 {
+        self.point_index
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TaskId(u64);
 
@@ -87,6 +241,7 @@ impl SettingsChangeId {
 pub struct SettingsChangeToken {
     id: SettingsChangeId,
     policy: ResourcePolicy,
+    rejected_file_disposition: RejectedFileDisposition,
 }
 
 impl SettingsChangeToken {
@@ -97,10 +252,15 @@ impl SettingsChangeToken {
     pub const fn policy(self) -> ResourcePolicy {
         self.policy
     }
+
+    pub const fn rejected_file_disposition(self) -> RejectedFileDisposition {
+        self.rejected_file_disposition
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OperationKind {
+    DatasetOpen,
     ProjectOpen,
     ProjectSave,
     Analysis,
@@ -155,17 +315,62 @@ impl OperationToken {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourcePolicyRejection {
+    InvalidPolicy,
+    UnsupportedDocument,
+    DocumentTooLarge,
     AtomicWriteFailed,
     CommitIndeterminate,
     InvalidDocument,
     PermissionDenied,
+    PathUnavailable,
+    ExplicitReplacementRequired,
+    ActorQueueFull,
+    ActorUnavailable,
+    ReadFailed,
+}
+
+/// Closed execution-failure vocabulary reported by operation workers.
+///
+/// Reducer rejection is represented separately by [`ApplicationFaultCode`].
+/// This type describes work that was validly admitted and then failed outside
+/// the pure application boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationFailureCode {
+    DatasetNotFound,
+    DatasetPermissionDenied,
+    DatasetInvalid,
+    DatasetUnsupported,
+    DatasetCapacityExceeded,
+    DatasetReadFailed,
+    ProjectNotFound,
+    ProjectPermissionDenied,
+    ProjectInvalidDocument,
+    ProjectUnsupportedSchema,
+    ProjectReadFailed,
+    ProjectWriteFailed,
+    ProjectCommitIndeterminate,
+    AnalysisInvalidInput,
+    AnalysisCapacityExceeded,
+    AnalysisExecutionFailed,
+    ImportInvalidInput,
+    ImportCapacityExceeded,
+    ImportExecutionFailed,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OperationCompletion {
     Succeeded,
     Cancelled,
-    Failed(ApplicationFaultCode),
+    Failed(OperationFailureCode),
+    DatasetOpened {
+        source_generation: SourceSessionGeneration,
+        catalog: Arc<DatasetCatalog>,
+        workspace: Box<UnboundWorkspace>,
+    },
+    AnalysisReady {
+        tables: Vec<AnalysisTableDescriptor>,
+        plots: Vec<AnalysisPlotDescriptor>,
+    },
     ArtifactReady(Box<ArtifactReference>),
     ProjectOpened(Box<ProjectGenerationProjection>),
     ProjectSaved(ProjectRevisionId),
@@ -187,20 +392,32 @@ pub enum CrossSectionPanelId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransientApplicationState {
     playback_active: bool,
+    last_playback_tick: Option<u64>,
     active_tool: ToolKind,
     selected_channel_preset: Option<ChannelPresetId>,
     selected_artifact: Option<ArtifactHandleId>,
     active_cross_section_panel: Option<CrossSectionPanelId>,
+    analysis_tables: Arc<[AnalysisTableDescriptor]>,
+    analysis_plots: Arc<[AnalysisPlotDescriptor]>,
+    selected_analysis_table: Option<AnalysisTableId>,
+    selected_analysis_plot: Option<AnalysisPlotId>,
+    selected_analysis_plot_point: Option<AnalysisPlotPointSelection>,
 }
 
 impl Default for TransientApplicationState {
     fn default() -> Self {
         Self {
             playback_active: false,
+            last_playback_tick: None,
             active_tool: ToolKind::Navigate,
             selected_channel_preset: None,
             selected_artifact: None,
             active_cross_section_panel: None,
+            analysis_tables: Arc::from([]),
+            analysis_plots: Arc::from([]),
+            selected_analysis_table: None,
+            selected_analysis_plot: None,
+            selected_analysis_plot_point: None,
         }
     }
 }
@@ -208,6 +425,10 @@ impl Default for TransientApplicationState {
 impl TransientApplicationState {
     pub const fn playback_active(&self) -> bool {
         self.playback_active
+    }
+
+    pub const fn last_playback_tick(&self) -> Option<u64> {
+        self.last_playback_tick
     }
 
     pub const fn active_tool(&self) -> ToolKind {
@@ -225,18 +446,36 @@ impl TransientApplicationState {
     pub const fn active_cross_section_panel(&self) -> Option<CrossSectionPanelId> {
         self.active_cross_section_panel
     }
+
+    pub fn analysis_tables(&self) -> &[AnalysisTableDescriptor] {
+        &self.analysis_tables
+    }
+
+    pub fn analysis_plots(&self) -> &[AnalysisPlotDescriptor] {
+        &self.analysis_plots
+    }
+
+    pub const fn selected_analysis_table(&self) -> Option<AnalysisTableId> {
+        self.selected_analysis_table
+    }
+
+    pub const fn selected_analysis_plot(&self) -> Option<AnalysisPlotId> {
+        self.selected_analysis_plot
+    }
+
+    pub const fn selected_analysis_plot_point(&self) -> Option<AnalysisPlotPointSelection> {
+        self.selected_analysis_plot_point
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApplicationCommand {
-    ReplaceCurrentSource {
-        source_generation: SourceSessionGeneration,
-        workspace: UnboundWorkspace,
-    },
+    RequestDatasetOpen,
     AttachVerifiedDataset,
     SetActiveLayer(LogicalLayerKey),
     SetTimepoint(TimeIndex),
     SetLayerView(LayerViewState),
+    ReplaceView(ViewState),
     /// Commits one camera interaction. The UI bridge must not dispatch every
     /// raw pointer sample as a durable project revision.
     SetCamera(CameraView),
@@ -248,13 +487,18 @@ pub enum ApplicationCommand {
     SetLayerOrder(Vec<LogicalLayerKey>),
     UpsertChannelPreset(ChannelPreset),
     RemoveChannelPreset(ChannelPresetId),
+    ApplyChannelPreset(ChannelPresetId),
     UpsertArtifact(ArtifactReference),
     RemoveArtifact(ArtifactHandleId),
     SetPlaybackActive(bool),
+    AdvancePlaybackTick(u64),
     SetActiveTool(ToolKind),
     SelectChannelPreset(Option<ChannelPresetId>),
     SelectArtifact(Option<ArtifactHandleId>),
     SetActiveCrossSectionPanel(Option<CrossSectionPanelId>),
+    SelectAnalysisTable(Option<AnalysisTableId>),
+    SelectAnalysisPlot(Option<AnalysisPlotId>),
+    SelectAnalysisPlotPoint(Option<AnalysisPlotPointSelection>),
     Undo,
     Redo,
     RequestProjectOpen,
@@ -265,7 +509,10 @@ pub enum ApplicationCommand {
         completion: OperationCompletion,
     },
     CancelOperation(OperationId),
-    RequestResourcePolicyChange(ResourcePolicy),
+    RequestResourcePolicyChange {
+        policy: ResourcePolicy,
+        rejected_file_disposition: RejectedFileDisposition,
+    },
     CompleteResourcePolicyPersistence {
         token: SettingsChangeToken,
         outcome: ResourcePolicyPersistenceOutcome,
@@ -274,24 +521,30 @@ pub enum ApplicationCommand {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplicationCommandKind {
-    ReplaceCurrentSource,
+    RequestDatasetOpen,
     AttachVerifiedDataset,
     SetActiveLayer,
     SetTimepoint,
     SetLayerView,
+    ReplaceView,
     SetCamera,
     SetLayout,
     SetIsoLight,
     SetLayerOrder,
     UpsertChannelPreset,
     RemoveChannelPreset,
+    ApplyChannelPreset,
     UpsertArtifact,
     RemoveArtifact,
     SetPlaybackActive,
+    AdvancePlaybackTick,
     SetActiveTool,
     SelectChannelPreset,
     SelectArtifact,
     SetActiveCrossSectionPanel,
+    SelectAnalysisTable,
+    SelectAnalysisPlot,
+    SelectAnalysisPlotPoint,
     Undo,
     Redo,
     RequestProjectOpen,
@@ -306,26 +559,32 @@ pub enum ApplicationCommandKind {
 impl ApplicationCommand {
     pub const fn kind(&self) -> ApplicationCommandKind {
         match self {
-            Self::ReplaceCurrentSource { .. } => ApplicationCommandKind::ReplaceCurrentSource,
+            Self::RequestDatasetOpen => ApplicationCommandKind::RequestDatasetOpen,
             Self::AttachVerifiedDataset => ApplicationCommandKind::AttachVerifiedDataset,
             Self::SetActiveLayer(_) => ApplicationCommandKind::SetActiveLayer,
             Self::SetTimepoint(_) => ApplicationCommandKind::SetTimepoint,
             Self::SetLayerView(_) => ApplicationCommandKind::SetLayerView,
+            Self::ReplaceView(_) => ApplicationCommandKind::ReplaceView,
             Self::SetCamera(_) => ApplicationCommandKind::SetCamera,
             Self::SetLayout { .. } => ApplicationCommandKind::SetLayout,
             Self::SetIsoLight(_) => ApplicationCommandKind::SetIsoLight,
             Self::SetLayerOrder(_) => ApplicationCommandKind::SetLayerOrder,
             Self::UpsertChannelPreset(_) => ApplicationCommandKind::UpsertChannelPreset,
             Self::RemoveChannelPreset(_) => ApplicationCommandKind::RemoveChannelPreset,
+            Self::ApplyChannelPreset(_) => ApplicationCommandKind::ApplyChannelPreset,
             Self::UpsertArtifact(_) => ApplicationCommandKind::UpsertArtifact,
             Self::RemoveArtifact(_) => ApplicationCommandKind::RemoveArtifact,
             Self::SetPlaybackActive(_) => ApplicationCommandKind::SetPlaybackActive,
+            Self::AdvancePlaybackTick(_) => ApplicationCommandKind::AdvancePlaybackTick,
             Self::SetActiveTool(_) => ApplicationCommandKind::SetActiveTool,
             Self::SelectChannelPreset(_) => ApplicationCommandKind::SelectChannelPreset,
             Self::SelectArtifact(_) => ApplicationCommandKind::SelectArtifact,
             Self::SetActiveCrossSectionPanel(_) => {
                 ApplicationCommandKind::SetActiveCrossSectionPanel
             }
+            Self::SelectAnalysisTable(_) => ApplicationCommandKind::SelectAnalysisTable,
+            Self::SelectAnalysisPlot(_) => ApplicationCommandKind::SelectAnalysisPlot,
+            Self::SelectAnalysisPlotPoint(_) => ApplicationCommandKind::SelectAnalysisPlotPoint,
             Self::Undo => ApplicationCommandKind::Undo,
             Self::Redo => ApplicationCommandKind::Redo,
             Self::RequestProjectOpen => ApplicationCommandKind::RequestProjectOpen,
@@ -333,7 +592,7 @@ impl ApplicationCommand {
             Self::BeginOperation(_) => ApplicationCommandKind::BeginOperation,
             Self::CompleteOperation { .. } => ApplicationCommandKind::CompleteOperation,
             Self::CancelOperation(_) => ApplicationCommandKind::CancelOperation,
-            Self::RequestResourcePolicyChange(_) => {
+            Self::RequestResourcePolicyChange { .. } => {
                 ApplicationCommandKind::RequestResourcePolicyChange
             }
             Self::CompleteResourcePolicyPersistence { .. } => {
@@ -352,9 +611,15 @@ pub enum ApplicationFaultCode {
     WorkspaceAlreadyBound,
     WorkspaceUnbound,
     InvalidProjectTransition,
+    DatasetLayerClosureMismatch,
+    TimepointOutOfBounds,
     LayerNotFound,
     ChannelPresetNotFound,
     ArtifactNotFound,
+    AnalysisTableNotFound,
+    AnalysisPlotNotFound,
+    AnalysisPointOutOfBounds,
+    AnalysisRegistryFull,
     UndoUnavailable,
     RedoUnavailable,
     EventQueueFull,
@@ -413,6 +678,9 @@ pub enum CommandEffect {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApplicationEvent {
+    DatasetOpenRequested {
+        token: OperationToken,
+    },
     CurrentSourceReplaced {
         source_generation: SourceSessionGeneration,
         provisional_project_id: ProjectId,
@@ -471,7 +739,9 @@ pub enum ApplicationEvent {
 pub enum OperationOutcome {
     Succeeded,
     Cancelled,
-    Failed(ApplicationFaultCode),
+    Failed(OperationFailureCode),
+    DatasetOpened,
+    AnalysisReady,
     ArtifactAdmitted,
     ProjectOpened,
     ProjectSaved,
@@ -653,6 +923,7 @@ struct ActiveOperation {
 #[derive(Debug, PartialEq)]
 pub struct ApplicationState {
     source_generation: SourceSessionGeneration,
+    catalog: Arc<DatasetCatalog>,
     verified_source: Option<DatasetReference>,
     workspace: Workspace,
     transient: TransientApplicationState,
@@ -664,16 +935,21 @@ pub struct ApplicationState {
     events: VecDeque<ApplicationEvent>,
     resource_policy: ResourcePolicy,
     pending_settings_change: Option<SettingsChangeToken>,
+    latest_problem: Option<ApplicationEvent>,
 }
 
 impl ApplicationState {
     pub fn new_unbound(
         source_generation: SourceSessionGeneration,
+        catalog: DatasetCatalog,
         workspace: UnboundWorkspace,
         resource_policy: ResourcePolicy,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ApplicationFaultCode> {
+        require_unverified_catalog(&catalog)?;
+        validate_view_against_catalog(&catalog, workspace.view())?;
+        Ok(Self {
             source_generation,
+            catalog: Arc::new(catalog),
             verified_source: None,
             workspace: Workspace::Unbound(Arc::new(workspace)),
             transient: TransientApplicationState::default(),
@@ -685,12 +961,14 @@ impl ApplicationState {
             events: VecDeque::new(),
             resource_policy,
             pending_settings_change: None,
-        }
+            latest_problem: None,
+        })
     }
 
     fn fork_for_dispatch(&self) -> Self {
         Self {
             source_generation: self.source_generation,
+            catalog: Arc::clone(&self.catalog),
             verified_source: self.verified_source.clone(),
             workspace: self.workspace.clone(),
             transient: self.transient.clone(),
@@ -702,6 +980,7 @@ impl ApplicationState {
             events: self.events.clone(),
             resource_policy: self.resource_policy,
             pending_settings_change: self.pending_settings_change,
+            latest_problem: self.latest_problem.clone(),
         }
     }
 
@@ -721,6 +1000,23 @@ impl ApplicationState {
         }
         if self.verified_source.as_ref() == Some(&dataset) {
             return Ok(CommandEffect::NoChange);
+        }
+        match self.catalog.scientific_identity() {
+            ScientificIdentityStatus::Unverified => {
+                self.catalog = Arc::new(
+                    DatasetCatalog::new(
+                        self.catalog.label(),
+                        ScientificIdentityStatus::Verified(*dataset.scientific_content_id()),
+                        self.catalog.layers().cloned().collect(),
+                    )
+                    .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)?,
+                );
+            }
+            ScientificIdentityStatus::Verified(identity)
+                if identity == dataset.scientific_content_id() => {}
+            ScientificIdentityStatus::Verified(_) => {
+                return Err(ApplicationFaultCode::DatasetIdentityMismatch);
+            }
         }
         self.push_event(ApplicationEvent::SourceVerified {
             source_generation,
@@ -779,6 +1075,7 @@ impl ApplicationState {
             .collect();
         ApplicationSnapshot {
             source_generation: self.source_generation,
+            catalog: Arc::clone(&self.catalog),
             source,
             workspace,
             transient: self.transient.clone(),
@@ -787,6 +1084,7 @@ impl ApplicationState {
             resource_policy: self.resource_policy,
             pending_settings_change: self.pending_settings_change,
             pending_event_count: self.events.len(),
+            latest_problem: self.latest_problem.clone(),
         }
     }
 
@@ -801,10 +1099,7 @@ impl ApplicationState {
         command_kind: ApplicationCommandKind,
     ) -> Result<CommandEffect, ApplicationFaultCode> {
         match command {
-            ApplicationCommand::ReplaceCurrentSource {
-                source_generation,
-                workspace,
-            } => self.replace_current_source(source_generation, workspace),
+            ApplicationCommand::RequestDatasetOpen => self.request_dataset_open(),
             ApplicationCommand::AttachVerifiedDataset => self.attach_verified_dataset(),
             ApplicationCommand::SetActiveLayer(layer) => self.update_view(command_kind, |view| {
                 rebuild_view(view, ViewUpdate::Active(layer))
@@ -815,6 +1110,7 @@ impl ApplicationState {
             ApplicationCommand::SetLayerView(layer) => self.update_view(command_kind, |view| {
                 rebuild_view(view, ViewUpdate::Layer(layer))
             }),
+            ApplicationCommand::ReplaceView(view) => self.update_view(command_kind, |_| Ok(view)),
             ApplicationCommand::SetCamera(camera) => self.update_view(command_kind, |view| {
                 rebuild_view(view, ViewUpdate::Camera(camera))
             }),
@@ -837,16 +1133,27 @@ impl ApplicationState {
             ApplicationCommand::RemoveChannelPreset(id) => {
                 self.remove_channel_preset(command_kind, &id)
             }
+            ApplicationCommand::ApplyChannelPreset(id) => {
+                self.apply_channel_preset(command_kind, &id)
+            }
             ApplicationCommand::UpsertArtifact(artifact) => {
                 self.upsert_artifact(command_kind, artifact)
             }
             ApplicationCommand::RemoveArtifact(id) => self.remove_artifact(command_kind, &id),
             ApplicationCommand::SetPlaybackActive(active) => self.set_playback_active(active),
+            ApplicationCommand::AdvancePlaybackTick(tick) => {
+                self.advance_playback_tick(command_kind, tick)
+            }
             ApplicationCommand::SetActiveTool(tool) => self.set_active_tool(tool),
             ApplicationCommand::SelectChannelPreset(id) => self.select_channel_preset(id),
             ApplicationCommand::SelectArtifact(id) => self.select_artifact(id),
             ApplicationCommand::SetActiveCrossSectionPanel(panel) => {
                 self.set_active_cross_section_panel(panel)
+            }
+            ApplicationCommand::SelectAnalysisTable(id) => self.select_analysis_table(id),
+            ApplicationCommand::SelectAnalysisPlot(id) => self.select_analysis_plot(id),
+            ApplicationCommand::SelectAnalysisPlotPoint(selection) => {
+                self.select_analysis_plot_point(selection)
             }
             ApplicationCommand::Undo => self.move_history(command_kind, false),
             ApplicationCommand::Redo => self.move_history(command_kind, true),
@@ -855,7 +1162,9 @@ impl ApplicationState {
             ApplicationCommand::BeginOperation(kind) => {
                 if matches!(
                     kind,
-                    OperationKind::ProjectOpen | OperationKind::ProjectSave
+                    OperationKind::DatasetOpen
+                        | OperationKind::ProjectOpen
+                        | OperationKind::ProjectSave
                 ) {
                     return Err(ApplicationFaultCode::InvalidProjectTransition);
                 }
@@ -865,28 +1174,30 @@ impl ApplicationState {
                 self.complete_operation(command_kind, token, completion)
             }
             ApplicationCommand::CancelOperation(id) => self.cancel_operation(id),
-            ApplicationCommand::RequestResourcePolicyChange(policy) => {
-                self.request_resource_policy_change(policy)
-            }
+            ApplicationCommand::RequestResourcePolicyChange {
+                policy,
+                rejected_file_disposition,
+            } => self.request_resource_policy_change(policy, rejected_file_disposition),
             ApplicationCommand::CompleteResourcePolicyPersistence { token, outcome } => {
                 self.complete_resource_policy_persistence(token, outcome)
             }
         }
     }
 
-    fn replace_current_source(
+    fn admit_opened_source(
         &mut self,
         source_generation: SourceSessionGeneration,
+        catalog: Arc<DatasetCatalog>,
         workspace: UnboundWorkspace,
     ) -> Result<CommandEffect, ApplicationFaultCode> {
-        if !self.operations.is_empty() {
-            return Err(ApplicationFaultCode::OperationConflict);
-        }
         if source_generation.get() <= self.source_generation.get() {
             return Err(ApplicationFaultCode::SourceGenerationNotAdvanced);
         }
+        require_unverified_catalog(&catalog)?;
+        validate_view_against_catalog(&catalog, workspace.view())?;
         let provisional_project_id = workspace.provisional_project_id();
         self.source_generation = source_generation;
+        self.catalog = catalog;
         self.verified_source = None;
         self.workspace = Workspace::Unbound(Arc::new(workspace));
         self.transient = TransientApplicationState::default();
@@ -895,6 +1206,15 @@ impl ApplicationState {
             source_generation,
             provisional_project_id,
         })?;
+        Ok(CommandEffect::Changed)
+    }
+
+    fn request_dataset_open(&mut self) -> Result<CommandEffect, ApplicationFaultCode> {
+        if !self.operations.is_empty() {
+            return Err(ApplicationFaultCode::OperationConflict);
+        }
+        let token = self.create_operation(OperationKind::DatasetOpen)?;
+        self.push_event(ApplicationEvent::DatasetOpenRequested { token })?;
         Ok(CommandEffect::Changed)
     }
 
@@ -935,6 +1255,7 @@ impl ApplicationState {
         match &self.workspace {
             Workspace::Unbound(unbound) => {
                 let view = update(&unbound.view)?;
+                validate_view_against_catalog(&self.catalog, &view)?;
                 if view == unbound.view {
                     return Ok(CommandEffect::NoChange);
                 }
@@ -951,6 +1272,7 @@ impl ApplicationState {
             }
             Workspace::Bound(bound) => {
                 let view = update(bound.current_state().view())?;
+                validate_view_against_catalog(&self.catalog, &view)?;
                 if &view == bound.current_state().view() {
                     return Ok(CommandEffect::NoChange);
                 }
@@ -965,34 +1287,40 @@ impl ApplicationState {
         _command_kind: ApplicationCommandKind,
         preset: ChannelPreset,
     ) -> Result<CommandEffect, ApplicationFaultCode> {
-        match &self.workspace {
+        let selected_id = preset.id().clone();
+        let workspace_effect = match &self.workspace {
             Workspace::Unbound(unbound) => {
                 let mut presets = unbound.channel_presets.clone();
                 upsert_preset(&mut presets, preset);
                 if presets == unbound.channel_presets {
-                    return Ok(CommandEffect::NoChange);
+                    CommandEffect::NoChange
+                } else {
+                    validate_unbound_presets(&unbound.view, &presets)?;
+                    let mut next = unbound.as_ref().clone();
+                    next.channel_presets = presets;
+                    self.advance_currentness()?;
+                    self.push_event(ApplicationEvent::WorkspaceChanged {
+                        currentness: self.currentness,
+                    })?;
+                    self.workspace = Workspace::Unbound(Arc::new(next));
+                    self.normalize_transient_selections();
+                    CommandEffect::Changed
                 }
-                validate_unbound_presets(&unbound.view, &presets)?;
-                let mut next = unbound.as_ref().clone();
-                next.channel_presets = presets;
-                self.advance_currentness()?;
-                self.push_event(ApplicationEvent::WorkspaceChanged {
-                    currentness: self.currentness,
-                })?;
-                self.workspace = Workspace::Unbound(Arc::new(next));
-                self.normalize_transient_selections();
-                Ok(CommandEffect::Changed)
             }
             Workspace::Bound(bound) => {
                 let mut presets = bound.current_state().channel_presets().to_vec();
                 upsert_preset(&mut presets, preset);
                 if presets == bound.current_state().channel_presets() {
-                    return Ok(CommandEffect::NoChange);
+                    CommandEffect::NoChange
+                } else {
+                    let project =
+                        rebuild_project(bound.current_state(), None, Some(presets), None)?;
+                    self.commit_project(project)?
                 }
-                let project = rebuild_project(bound.current_state(), None, Some(presets), None)?;
-                self.commit_project(project)
             }
-        }
+        };
+        let selection_effect = self.select_channel_preset(Some(selected_id))?;
+        Ok(combine_effects(workspace_effect, selection_effect))
     }
 
     fn remove_channel_preset(
@@ -1027,6 +1355,32 @@ impl ApplicationState {
                 self.commit_project(project)
             }
         }
+    }
+
+    fn apply_channel_preset(
+        &mut self,
+        command_kind: ApplicationCommandKind,
+        id: &ChannelPresetId,
+    ) -> Result<CommandEffect, ApplicationFaultCode> {
+        let (view, preset) = match &self.workspace {
+            Workspace::Unbound(workspace) => (
+                workspace.view.clone(),
+                workspace
+                    .channel_presets
+                    .iter()
+                    .find(|preset| preset.id() == id)
+                    .cloned(),
+            ),
+            Workspace::Bound(workspace) => (
+                workspace.current_state().view().clone(),
+                workspace.current_state().channel_preset(id).cloned(),
+            ),
+        };
+        let preset = preset.ok_or(ApplicationFaultCode::ChannelPresetNotFound)?;
+        let next_view = apply_preset_to_view(&view, &preset)?;
+        let view_effect = self.update_view(command_kind, |_| Ok(next_view))?;
+        let selection_effect = self.select_channel_preset(Some(id.clone()))?;
+        Ok(combine_effects(view_effect, selection_effect))
     }
 
     fn upsert_artifact(
@@ -1067,11 +1421,54 @@ impl ApplicationState {
     }
 
     fn set_playback_active(&mut self, active: bool) -> Result<CommandEffect, ApplicationFaultCode> {
+        let active = active && catalog_timepoint_count(&self.catalog) > 1;
         if self.transient.playback_active == active {
             return Ok(CommandEffect::NoChange);
         }
         self.transient.playback_active = active;
+        self.transient.last_playback_tick = None;
         self.push_event(ApplicationEvent::TransientStateChanged)?;
+        Ok(CommandEffect::Changed)
+    }
+
+    fn advance_playback_tick(
+        &mut self,
+        command_kind: ApplicationCommandKind,
+        tick: u64,
+    ) -> Result<CommandEffect, ApplicationFaultCode> {
+        if !self.transient.playback_active {
+            return Ok(CommandEffect::NoChange);
+        }
+        if self
+            .transient
+            .last_playback_tick
+            .is_some_and(|last| tick <= last)
+        {
+            return Ok(CommandEffect::NoChange);
+        }
+        let Some(last_tick) = self.transient.last_playback_tick else {
+            self.transient.last_playback_tick = Some(tick);
+            self.push_event(ApplicationEvent::TransientStateChanged)?;
+            return Ok(CommandEffect::Changed);
+        };
+        debug_assert!(tick > last_tick);
+
+        let count = catalog_timepoint_count(&self.catalog);
+        if count <= 1 {
+            self.transient.playback_active = false;
+            self.transient.last_playback_tick = None;
+            self.push_event(ApplicationEvent::TransientStateChanged)?;
+            return Ok(CommandEffect::Changed);
+        }
+        let current = match &self.workspace {
+            Workspace::Unbound(workspace) => workspace.view.timepoint(),
+            Workspace::Bound(workspace) => workspace.current_state().view().timepoint(),
+        };
+        let next = TimeIndex::new((current.get() + 1) % count);
+        self.update_view(command_kind, |view| {
+            rebuild_view(view, ViewUpdate::Timepoint(next))
+        })?;
+        self.transient.last_playback_tick = Some(tick);
         Ok(CommandEffect::Changed)
     }
 
@@ -1138,6 +1535,78 @@ impl ApplicationState {
             return Ok(CommandEffect::NoChange);
         }
         self.transient.active_cross_section_panel = panel;
+        self.push_event(ApplicationEvent::TransientStateChanged)?;
+        Ok(CommandEffect::Changed)
+    }
+
+    fn select_analysis_table(
+        &mut self,
+        id: Option<AnalysisTableId>,
+    ) -> Result<CommandEffect, ApplicationFaultCode> {
+        if id.is_some_and(|id| {
+            !self
+                .transient
+                .analysis_tables
+                .iter()
+                .any(|descriptor| descriptor.id == id)
+        }) {
+            return Err(ApplicationFaultCode::AnalysisTableNotFound);
+        }
+        if self.transient.selected_analysis_table == id {
+            return Ok(CommandEffect::NoChange);
+        }
+        self.transient.selected_analysis_table = id;
+        self.push_event(ApplicationEvent::TransientStateChanged)?;
+        Ok(CommandEffect::Changed)
+    }
+
+    fn select_analysis_plot(
+        &mut self,
+        id: Option<AnalysisPlotId>,
+    ) -> Result<CommandEffect, ApplicationFaultCode> {
+        if id.is_some_and(|id| {
+            !self
+                .transient
+                .analysis_plots
+                .iter()
+                .any(|descriptor| descriptor.id == id)
+        }) {
+            return Err(ApplicationFaultCode::AnalysisPlotNotFound);
+        }
+        if self.transient.selected_analysis_plot == id {
+            return Ok(CommandEffect::NoChange);
+        }
+        self.transient.selected_analysis_plot = id;
+        self.transient.selected_analysis_plot_point = None;
+        self.push_event(ApplicationEvent::TransientStateChanged)?;
+        Ok(CommandEffect::Changed)
+    }
+
+    fn select_analysis_plot_point(
+        &mut self,
+        selection: Option<AnalysisPlotPointSelection>,
+    ) -> Result<CommandEffect, ApplicationFaultCode> {
+        if let Some(selection) = selection {
+            if self.transient.selected_analysis_plot != Some(selection.plot_id) {
+                return Err(ApplicationFaultCode::AnalysisPlotNotFound);
+            }
+            let plot = self
+                .transient
+                .analysis_plots
+                .iter()
+                .find(|descriptor| descriptor.id == selection.plot_id)
+                .ok_or(ApplicationFaultCode::AnalysisPlotNotFound)?;
+            let point_count = plot
+                .point_count(selection.series_index)
+                .ok_or(ApplicationFaultCode::AnalysisPointOutOfBounds)?;
+            if selection.point_index >= point_count {
+                return Err(ApplicationFaultCode::AnalysisPointOutOfBounds);
+            }
+        }
+        if self.transient.selected_analysis_plot_point == selection {
+            return Ok(CommandEffect::NoChange);
+        }
+        self.transient.selected_analysis_plot_point = selection;
         self.push_event(ApplicationEvent::TransientStateChanged)?;
         Ok(CommandEffect::Changed)
     }
@@ -1349,6 +1818,24 @@ impl ApplicationState {
             OperationCompletion::Succeeded => OperationOutcome::Succeeded,
             OperationCompletion::Cancelled => OperationOutcome::Cancelled,
             OperationCompletion::Failed(code) => OperationOutcome::Failed(code),
+            OperationCompletion::DatasetOpened {
+                source_generation,
+                catalog,
+                workspace,
+            } => {
+                if token.kind != OperationKind::DatasetOpen {
+                    return Err(ApplicationFaultCode::InvalidOperationCompletion);
+                }
+                self.admit_opened_source(source_generation, catalog, *workspace)?;
+                OperationOutcome::DatasetOpened
+            }
+            OperationCompletion::AnalysisReady { tables, plots } => {
+                if token.kind != OperationKind::Analysis {
+                    return Err(ApplicationFaultCode::InvalidOperationCompletion);
+                }
+                self.admit_analysis_descriptors(token.operation_id, tables, plots)?;
+                OperationOutcome::AnalysisReady
+            }
             OperationCompletion::ArtifactReady(artifact) => {
                 if token.kind != OperationKind::Analysis {
                     return Err(ApplicationFaultCode::InvalidOperationCompletion);
@@ -1377,6 +1864,7 @@ impl ApplicationState {
                     .verified_source
                     .as_ref()
                     .ok_or(ApplicationFaultCode::IdentityVerificationRequired)?;
+                validate_view_against_catalog(&self.catalog, projection.state().view())?;
                 let (bound, rebound_revision) =
                     BoundWorkspace::restored_for_verified_source(*projection, source)?;
                 let project_id = bound.current_state().project_id();
@@ -1410,6 +1898,64 @@ impl ApplicationState {
         self.operations.remove(&token.operation_id);
         self.push_event(ApplicationEvent::OperationCompleted { token, outcome })?;
         Ok(CommandEffect::Changed)
+    }
+
+    fn admit_analysis_descriptors(
+        &mut self,
+        operation_id: OperationId,
+        tables: Vec<AnalysisTableDescriptor>,
+        plots: Vec<AnalysisPlotDescriptor>,
+    ) -> Result<(), ApplicationFaultCode> {
+        if tables.is_empty() && plots.is_empty() {
+            return Err(ApplicationFaultCode::InvalidOperationCompletion);
+        }
+        let table_count = self
+            .transient
+            .analysis_tables
+            .len()
+            .checked_add(tables.len())
+            .ok_or(ApplicationFaultCode::AnalysisRegistryFull)?;
+        let plot_count = self
+            .transient
+            .analysis_plots
+            .len()
+            .checked_add(plots.len())
+            .ok_or(ApplicationFaultCode::AnalysisRegistryFull)?;
+        if table_count > MAX_ANALYSIS_TABLES || plot_count > MAX_ANALYSIS_PLOTS {
+            return Err(ApplicationFaultCode::AnalysisRegistryFull);
+        }
+        for (slot, table) in tables.iter().enumerate() {
+            let slot = u16::try_from(slot)
+                .map_err(|_| ApplicationFaultCode::InvalidOperationCompletion)?;
+            if table.id != AnalysisTableId::from_operation(operation_id, slot) {
+                return Err(ApplicationFaultCode::InvalidOperationCompletion);
+            }
+        }
+        for (slot, plot) in plots.iter().enumerate() {
+            let slot = u16::try_from(slot)
+                .map_err(|_| ApplicationFaultCode::InvalidOperationCompletion)?;
+            if plot.id != AnalysisPlotId::from_operation(operation_id, slot) {
+                return Err(ApplicationFaultCode::InvalidOperationCompletion);
+            }
+        }
+
+        let selected_table = tables.last().map(AnalysisTableDescriptor::id);
+        let selected_plot = plots.last().map(AnalysisPlotDescriptor::id);
+        let mut all_tables = self.transient.analysis_tables.to_vec();
+        all_tables.extend(tables);
+        self.transient.analysis_tables = Arc::from(all_tables);
+        let mut all_plots = self.transient.analysis_plots.to_vec();
+        all_plots.extend(plots);
+        self.transient.analysis_plots = Arc::from(all_plots);
+        if let Some(id) = selected_table {
+            self.transient.selected_analysis_table = Some(id);
+        }
+        if let Some(id) = selected_plot {
+            self.transient.selected_analysis_plot = Some(id);
+            self.transient.selected_analysis_plot_point = None;
+        }
+        self.push_event(ApplicationEvent::TransientStateChanged)?;
+        Ok(())
     }
 
     fn cancel_operation(
@@ -1473,20 +2019,23 @@ impl ApplicationState {
     fn request_resource_policy_change(
         &mut self,
         policy: ResourcePolicy,
+        rejected_file_disposition: RejectedFileDisposition,
     ) -> Result<CommandEffect, ApplicationFaultCode> {
         if let Some(pending) = self.pending_settings_change {
-            return if pending.policy == policy {
+            return if pending.policy == policy
+                && pending.rejected_file_disposition == rejected_file_disposition
+            {
                 Ok(CommandEffect::NoChange)
             } else {
                 Err(ApplicationFaultCode::ResourcePolicyChangePending)
             };
         }
-        if self.resource_policy == policy {
-            return Ok(CommandEffect::NoChange);
-        }
+        // Persistence is part of this command: the active policy may still
+        // need to create a missing settings document.
         let token = SettingsChangeToken {
             id: SettingsChangeId(self.next_settings_change_id),
             policy,
+            rejected_file_disposition,
         };
         self.next_settings_change_id = self
             .next_settings_change_id
@@ -1534,6 +2083,23 @@ impl ApplicationState {
     fn push_event(&mut self, event: ApplicationEvent) -> Result<(), ApplicationFaultCode> {
         if self.events.len() >= MAX_PENDING_EVENTS {
             return Err(ApplicationFaultCode::EventQueueFull);
+        }
+        match &event {
+            ApplicationEvent::OperationCompleted {
+                outcome: OperationOutcome::Failed(_),
+                ..
+            }
+            | ApplicationEvent::ResourcePolicyRejected { .. } => {
+                self.latest_problem = Some(event.clone());
+            }
+            ApplicationEvent::OperationStarted { .. }
+            | ApplicationEvent::DatasetOpenRequested { .. }
+            | ApplicationEvent::ProjectOpenRequested { .. }
+            | ApplicationEvent::ProjectSaveRequested { .. }
+            | ApplicationEvent::ResourcePolicyChangePending { .. } => {
+                self.latest_problem = None;
+            }
+            _ => {}
         }
         self.events.push_back(event);
         Ok(())
@@ -1585,6 +2151,7 @@ pub enum WorkspaceSnapshot {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApplicationSnapshot {
     source_generation: SourceSessionGeneration,
+    catalog: Arc<DatasetCatalog>,
     source: SourceVerificationSnapshot,
     workspace: WorkspaceSnapshot,
     transient: TransientApplicationState,
@@ -1593,11 +2160,16 @@ pub struct ApplicationSnapshot {
     resource_policy: ResourcePolicy,
     pending_settings_change: Option<SettingsChangeToken>,
     pending_event_count: usize,
+    latest_problem: Option<ApplicationEvent>,
 }
 
 impl ApplicationSnapshot {
     pub const fn source_generation(&self) -> SourceSessionGeneration {
         self.source_generation
+    }
+
+    pub fn catalog(&self) -> &Arc<DatasetCatalog> {
+        &self.catalog
     }
 
     pub fn source(&self) -> &SourceVerificationSnapshot {
@@ -1635,6 +2207,12 @@ impl ApplicationSnapshot {
 
     pub const fn pending_event_count(&self) -> usize {
         self.pending_event_count
+    }
+
+    /// Latest typed operation/settings problem retained after the event queue
+    /// has been drained by composition services. A new retry clears it.
+    pub fn latest_problem(&self) -> Option<&ApplicationEvent> {
+        self.latest_problem.as_ref()
     }
 
     pub const fn is_bound(&self) -> bool {
@@ -1718,6 +2296,88 @@ fn rebuild_project(
     .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)
 }
 
+fn validate_view_against_catalog(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+) -> Result<(), ApplicationFaultCode> {
+    if view.layers().len() != catalog.len()
+        || view
+            .layers()
+            .iter()
+            .any(|layer| catalog.layer(layer.layer_key()).is_none())
+        || catalog
+            .layers()
+            .any(|layer| view.layer(layer.key()).is_none())
+    {
+        return Err(ApplicationFaultCode::DatasetLayerClosureMismatch);
+    }
+    if catalog
+        .layers()
+        .any(|layer| view.timepoint().get() >= layer.shape().t())
+    {
+        return Err(ApplicationFaultCode::TimepointOutOfBounds);
+    }
+    Ok(())
+}
+
+fn require_unverified_catalog(catalog: &DatasetCatalog) -> Result<(), ApplicationFaultCode> {
+    if matches!(
+        catalog.scientific_identity(),
+        ScientificIdentityStatus::Unverified
+    ) {
+        Ok(())
+    } else {
+        Err(ApplicationFaultCode::DatasetIdentityMismatch)
+    }
+}
+
+fn catalog_timepoint_count(catalog: &DatasetCatalog) -> u64 {
+    catalog
+        .layers()
+        .map(|layer| layer.shape().t())
+        .min()
+        .expect("DatasetCatalog is non-empty by construction")
+}
+
+fn apply_preset_to_view(
+    view: &ViewState,
+    preset: &ChannelPreset,
+) -> Result<ViewState, ApplicationFaultCode> {
+    let layers = view
+        .layers()
+        .iter()
+        .map(|layer| {
+            let entry = preset
+                .entry(layer.layer_key())
+                .ok_or(ApplicationFaultCode::InvalidProjectTransition)?;
+            Ok(LayerViewState::new(
+                layer.layer_key(),
+                entry.visible(),
+                entry.transfer().clone(),
+                *entry.render_state(),
+            ))
+        })
+        .collect::<Result<Vec<_>, ApplicationFaultCode>>()?;
+    ViewState::new(
+        layers,
+        view.active_layer(),
+        view.timepoint(),
+        *view.camera(),
+        view.layout(),
+        *view.cross_section(),
+        *view.iso_light(),
+    )
+    .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)
+}
+
+const fn combine_effects(left: CommandEffect, right: CommandEffect) -> CommandEffect {
+    if matches!(left, CommandEffect::Changed) || matches!(right, CommandEffect::Changed) {
+        CommandEffect::Changed
+    } else {
+        CommandEffect::NoChange
+    }
+}
+
 fn validate_unbound_presets(
     view: &ViewState,
     presets: &[ChannelPreset],
@@ -1778,31 +2438,73 @@ fn upsert_artifact(artifacts: &mut Vec<ArtifactReference>, artifact: ArtifactRef
 }
 
 fn completion_matches_kind(kind: OperationKind, completion: &OperationCompletion) -> bool {
+    if let OperationCompletion::Failed(code) = completion {
+        return failure_code_matches_kind(kind, *code);
+    }
     match kind {
+        OperationKind::DatasetOpen => matches!(
+            completion,
+            OperationCompletion::DatasetOpened { .. } | OperationCompletion::Cancelled
+        ),
         OperationKind::ProjectOpen => matches!(
             completion,
-            OperationCompletion::ProjectOpened(_)
-                | OperationCompletion::Cancelled
-                | OperationCompletion::Failed(_)
+            OperationCompletion::ProjectOpened(_) | OperationCompletion::Cancelled
         ),
         OperationKind::ProjectSave => matches!(
             completion,
-            OperationCompletion::ProjectSaved(_)
-                | OperationCompletion::Cancelled
-                | OperationCompletion::Failed(_)
+            OperationCompletion::ProjectSaved(_) | OperationCompletion::Cancelled
         ),
         OperationKind::Analysis => matches!(
             completion,
-            OperationCompletion::ArtifactReady(_)
+            OperationCompletion::AnalysisReady { .. }
+                | OperationCompletion::ArtifactReady(_)
                 | OperationCompletion::Succeeded
                 | OperationCompletion::Cancelled
-                | OperationCompletion::Failed(_)
         ),
         OperationKind::Import => matches!(
             completion,
-            OperationCompletion::Succeeded
-                | OperationCompletion::Cancelled
-                | OperationCompletion::Failed(_)
+            OperationCompletion::Succeeded | OperationCompletion::Cancelled
+        ),
+    }
+}
+
+const fn failure_code_matches_kind(kind: OperationKind, code: OperationFailureCode) -> bool {
+    match kind {
+        OperationKind::DatasetOpen => matches!(
+            code,
+            OperationFailureCode::DatasetNotFound
+                | OperationFailureCode::DatasetPermissionDenied
+                | OperationFailureCode::DatasetInvalid
+                | OperationFailureCode::DatasetUnsupported
+                | OperationFailureCode::DatasetCapacityExceeded
+                | OperationFailureCode::DatasetReadFailed
+        ),
+        OperationKind::ProjectOpen => matches!(
+            code,
+            OperationFailureCode::ProjectNotFound
+                | OperationFailureCode::ProjectPermissionDenied
+                | OperationFailureCode::ProjectInvalidDocument
+                | OperationFailureCode::ProjectUnsupportedSchema
+                | OperationFailureCode::ProjectReadFailed
+        ),
+        OperationKind::ProjectSave => matches!(
+            code,
+            OperationFailureCode::ProjectPermissionDenied
+                | OperationFailureCode::ProjectInvalidDocument
+                | OperationFailureCode::ProjectWriteFailed
+                | OperationFailureCode::ProjectCommitIndeterminate
+        ),
+        OperationKind::Analysis => matches!(
+            code,
+            OperationFailureCode::AnalysisInvalidInput
+                | OperationFailureCode::AnalysisCapacityExceeded
+                | OperationFailureCode::AnalysisExecutionFailed
+        ),
+        OperationKind::Import => matches!(
+            code,
+            OperationFailureCode::ImportInvalidInput
+                | OperationFailureCode::ImportCapacityExceeded
+                | OperationFailureCode::ImportExecutionFailed
         ),
     }
 }

@@ -1,16 +1,14 @@
 use std::path::{Path, PathBuf};
 
 use glam::DVec3;
-use mirante4d_core::{
-    CameraState, DisplayWindow, GridToWorld, PresentationViewport, Projection, Shape4D,
-    TransferCurve, WorldSpace, WorldUnit,
-};
 use mirante4d_data::{DenseVolumeF32, DenseVolumeU16, VolumeRegion};
+use mirante4d_domain::{DisplayWindow, Projection, Shape4D, TransferCurve};
 use mirante4d_format::{
-    ChannelMetadata, DenseF32Layer, DenseU16Layer, ExistingPackagePolicy, NativeF32Dataset,
-    NativeU16Dataset, default_f32_display, default_u16_display, write_native_f32_dataset,
-    write_native_u16_dataset,
+    ChannelMetadata, CurrentGridToWorldExt, DenseF32Layer, DenseU16Layer, ExistingPackagePolicy,
+    NativeF32Dataset, NativeU16Dataset, WorldSpace, WorldUnit, default_f32_display,
+    default_u16_display, write_native_f32_dataset, write_native_u16_dataset,
 };
+use mirante4d_render_api::CameraFrame;
 
 use crate::{
     CoordinateSpace, DvrRgbaFrame, OcclusionPolicy, ScalarDisplayTransfer, SceneColorRgba,
@@ -34,7 +32,11 @@ pub(super) fn iso_f32_threshold(
 ) -> crate::IsoSurfaceParameters {
     crate::IsoSurfaceParameters::new(
         ((threshold - low) / (high - low)).clamp(0.0, 1.0),
-        ScalarDisplayTransfer::new(DisplayWindow { low, high }, TransferCurve::Linear, false),
+        ScalarDisplayTransfer::new(
+            DisplayWindow::new(low, high).unwrap(),
+            TransferCurve::linear(),
+            false,
+        ),
     )
 }
 
@@ -44,8 +46,11 @@ pub(super) fn dvr_parameters(
     density_scale: f64,
     invert: bool,
 ) -> crate::DvrRenderParameters {
-    let transfer =
-        ScalarDisplayTransfer::new(DisplayWindow { low, high }, TransferCurve::Linear, invert);
+    let transfer = ScalarDisplayTransfer::new(
+        DisplayWindow::new(low, high).unwrap(),
+        TransferCurve::linear(),
+        invert,
+    );
     crate::DvrRenderParameters::new(transfer, transfer, [1.0, 1.0, 1.0, 1.0], 1.0, density_scale)
 }
 
@@ -54,39 +59,39 @@ fn orthographic_camera_state(
     target: DVec3,
     up: DVec3,
     orthographic_height_world: f64,
-) -> CameraState {
-    CameraState::new(
+) -> CameraFrame {
+    crate::current_camera::frame_from_look_at(
         Projection::Orthographic,
         eye,
         target,
         up,
         1.0,
         orthographic_height_world / (2.0 * (std::f64::consts::FRAC_PI_3 * 0.5).tan()),
-        PresentationViewport::new_unchecked(orthographic_height_world, orthographic_height_world),
+        crate::current_camera::presentation(orthographic_height_world, orthographic_height_world),
     )
 }
 
 pub(super) fn front_orthographic_camera(
     volume: &DenseVolumeU16,
     orthographic_height_grid: f64,
-) -> CameraState {
-    let center_x = (volume.shape.x.saturating_sub(1)) as f64 * 0.5;
-    let center_y = (volume.shape.y.saturating_sub(1)) as f64 * 0.5;
-    let center_z = (volume.shape.z.saturating_sub(1)) as f64 * 0.5;
-    let depth = volume.shape.z as f64;
+) -> CameraFrame {
+    let center_x = (volume.shape.x().saturating_sub(1)) as f64 * 0.5;
+    let center_y = (volume.shape.y().saturating_sub(1)) as f64 * 0.5;
+    let center_z = (volume.shape.z().saturating_sub(1)) as f64 * 0.5;
+    let depth = volume.shape.z() as f64;
     let height = volume
         .grid_to_world
         .transform_vector(DVec3::Y * orthographic_height_grid)
         .length();
     orthographic_camera_state(
-        volume.grid_to_world.transform_point(DVec3::new(
+        volume.grid_to_world.transform_point_vec(DVec3::new(
             center_x,
             center_y,
             center_z - depth * 1.5,
         )),
         volume
             .grid_to_world
-            .transform_point(DVec3::new(center_x, center_y, center_z)),
+            .transform_point_vec(DVec3::new(center_x, center_y, center_z)),
         volume.grid_to_world.transform_vector(-DVec3::Y).normalize(),
         height,
     )
@@ -95,24 +100,24 @@ pub(super) fn front_orthographic_camera(
 pub(super) fn front_orthographic_camera_f32(
     volume: &mirante4d_data::DenseVolumeF32,
     orthographic_height_grid: f64,
-) -> CameraState {
-    let center_x = (volume.shape.x.saturating_sub(1)) as f64 * 0.5;
-    let center_y = (volume.shape.y.saturating_sub(1)) as f64 * 0.5;
-    let center_z = (volume.shape.z.saturating_sub(1)) as f64 * 0.5;
-    let depth = volume.shape.z as f64;
+) -> CameraFrame {
+    let center_x = (volume.shape.x().saturating_sub(1)) as f64 * 0.5;
+    let center_y = (volume.shape.y().saturating_sub(1)) as f64 * 0.5;
+    let center_z = (volume.shape.z().saturating_sub(1)) as f64 * 0.5;
+    let depth = volume.shape.z() as f64;
     let height = volume
         .grid_to_world
         .transform_vector(DVec3::Y * orthographic_height_grid)
         .length();
     orthographic_camera_state(
-        volume.grid_to_world.transform_point(DVec3::new(
+        volume.grid_to_world.transform_point_vec(DVec3::new(
             center_x,
             center_y,
             center_z - depth * 1.5,
         )),
         volume
             .grid_to_world
-            .transform_point(DVec3::new(center_x, center_y, center_z)),
+            .transform_point_vec(DVec3::new(center_x, center_y, center_z)),
         volume.grid_to_world.transform_vector(-DVec3::Y).normalize(),
         height,
     )
@@ -121,24 +126,24 @@ pub(super) fn front_orthographic_camera_f32(
 pub(super) fn far_front_orthographic_camera(
     volume: &DenseVolumeU16,
     orthographic_height_grid: f64,
-) -> CameraState {
-    let center_x = (volume.shape.x.saturating_sub(1)) as f64 * 0.5;
-    let center_y = (volume.shape.y.saturating_sub(1)) as f64 * 0.5;
-    let center_z = (volume.shape.z.saturating_sub(1)) as f64 * 0.5;
-    let depth = volume.shape.z as f64;
+) -> CameraFrame {
+    let center_x = (volume.shape.x().saturating_sub(1)) as f64 * 0.5;
+    let center_y = (volume.shape.y().saturating_sub(1)) as f64 * 0.5;
+    let center_z = (volume.shape.z().saturating_sub(1)) as f64 * 0.5;
+    let depth = volume.shape.z() as f64;
     let height = volume
         .grid_to_world
         .transform_vector(DVec3::Y * orthographic_height_grid)
         .length();
     orthographic_camera_state(
-        volume.grid_to_world.transform_point(DVec3::new(
+        volume.grid_to_world.transform_point_vec(DVec3::new(
             center_x,
             center_y,
             center_z - depth * 7.5,
         )),
         volume
             .grid_to_world
-            .transform_point(DVec3::new(center_x, center_y, center_z)),
+            .transform_point_vec(DVec3::new(center_x, center_y, center_z)),
         volume.grid_to_world.transform_vector(-DVec3::Y).normalize(),
         height,
     )
@@ -147,24 +152,24 @@ pub(super) fn far_front_orthographic_camera(
 pub(super) fn side_orthographic_camera(
     volume: &DenseVolumeU16,
     orthographic_height_grid: f64,
-) -> CameraState {
-    let width = volume.shape.x as f64;
-    let center_x = (volume.shape.x.saturating_sub(1)) as f64 * 0.5;
-    let center_y = (volume.shape.y.saturating_sub(1)) as f64 * 0.5;
-    let center_z = (volume.shape.z.saturating_sub(1)) as f64 * 0.5;
+) -> CameraFrame {
+    let width = volume.shape.x() as f64;
+    let center_x = (volume.shape.x().saturating_sub(1)) as f64 * 0.5;
+    let center_y = (volume.shape.y().saturating_sub(1)) as f64 * 0.5;
+    let center_z = (volume.shape.z().saturating_sub(1)) as f64 * 0.5;
     let height = volume
         .grid_to_world
         .transform_vector(DVec3::Y * orthographic_height_grid)
         .length();
     orthographic_camera_state(
-        volume.grid_to_world.transform_point(DVec3::new(
+        volume.grid_to_world.transform_point_vec(DVec3::new(
             center_x + width * 7.5,
             center_y,
             center_z,
         )),
         volume
             .grid_to_world
-            .transform_point(DVec3::new(center_x, center_y, center_z)),
+            .transform_point_vec(DVec3::new(center_x, center_y, center_z)),
         volume.grid_to_world.transform_vector(DVec3::Y).normalize(),
         height,
     )
@@ -345,7 +350,7 @@ pub(super) fn write_three_brick_gpu_fixture(output_root: &Path) -> PathBuf {
                 },
                 shape: Shape4D::new(1, 2, 2, 6).unwrap(),
                 brick_shape: Shape4D::new(1, 2, 2, 2).unwrap(),
-                grid_to_world: GridToWorld::scale_um(1.0, 1.0, 1.0),
+                grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
                 display: default_u16_display(),
                 values_tzyx: (0..24).collect(),
             }],
@@ -376,7 +381,7 @@ pub(super) fn write_three_brick_f32_gpu_fixture(output_root: &Path) -> PathBuf {
                 },
                 shape: Shape4D::new(1, 2, 2, 6).unwrap(),
                 brick_shape: Shape4D::new(1, 2, 2, 2).unwrap(),
-                grid_to_world: GridToWorld::scale_um(1.0, 1.0, 1.0),
+                grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
                 display: default_f32_display(),
                 values_tzyx: (0..24).map(|value| value as f32 * 0.5 - 5.75).collect(),
             }],
@@ -387,7 +392,7 @@ pub(super) fn write_three_brick_f32_gpu_fixture(output_root: &Path) -> PathBuf {
     root
 }
 
-pub(super) fn scene_test_camera() -> CameraState {
+pub(super) fn scene_test_camera() -> CameraFrame {
     orthographic_camera_state(DVec3::new(0.0, 0.0, 10.0), DVec3::ZERO, DVec3::Y, 10.0)
 }
 

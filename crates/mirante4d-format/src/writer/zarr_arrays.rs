@@ -9,12 +9,12 @@ pub(super) fn create_u16_array(
     let shard_shape = default_shard_shape(shape, brick_shape)?;
     let zarr_array_path = format!("/{array_path}");
     let array = ArrayBuilder::new(
-        shape.as_zarr_shape(),
-        shard_shape.as_zarr_shape(),
+        shape.to_zarr_shape(),
+        shard_shape.to_zarr_shape(),
         data_type::uint16(),
         0u16,
     )
-    .subchunk_shape(brick_shape.as_zarr_shape())
+    .subchunk_shape(brick_shape.to_zarr_shape())
     .bytes_to_bytes_codecs(vec![Arc::new(ZstdCodec::new(
         DENSE_INTENSITY_ZSTD_LEVEL,
         false,
@@ -35,12 +35,12 @@ pub(super) fn create_u8_array(
     let shard_shape = default_shard_shape(shape, brick_shape)?;
     let zarr_array_path = format!("/{array_path}");
     let array = ArrayBuilder::new(
-        shape.as_zarr_shape(),
-        shard_shape.as_zarr_shape(),
+        shape.to_zarr_shape(),
+        shard_shape.to_zarr_shape(),
         data_type::uint8(),
         0u8,
     )
-    .subchunk_shape(brick_shape.as_zarr_shape())
+    .subchunk_shape(brick_shape.to_zarr_shape())
     .bytes_to_bytes_codecs(vec![Arc::new(ZstdCodec::new(
         DENSE_INTENSITY_ZSTD_LEVEL,
         false,
@@ -61,12 +61,12 @@ pub(super) fn create_f32_array(
     let shard_shape = default_shard_shape(shape, brick_shape)?;
     let zarr_array_path = format!("/{array_path}");
     let array = ArrayBuilder::new(
-        shape.as_zarr_shape(),
-        shard_shape.as_zarr_shape(),
+        shape.to_zarr_shape(),
+        shard_shape.to_zarr_shape(),
         data_type::float32(),
         0.0f32,
     )
-    .subchunk_shape(brick_shape.as_zarr_shape())
+    .subchunk_shape(brick_shape.to_zarr_shape())
     .bytes_to_bytes_codecs(vec![Arc::new(ZstdCodec::new(
         DENSE_INTENSITY_ZSTD_LEVEL,
         false,
@@ -86,14 +86,13 @@ pub(super) fn default_shard_shape(
     shape: Shape4D,
     brick_shape: Shape4D,
 ) -> Result<Shape4D, FormatError> {
-    brick_shape.validate()?;
-    if brick_shape.t != 1 {
+    if brick_shape.t() != 1 {
         return Err(FormatError::ZarrStorage {
             layer_id: "storage".to_owned(),
-            message: "dense shard policy requires brick_shape.t = 1".to_owned(),
+            message: "dense shard policy requires brick_shape.t() = 1".to_owned(),
         });
     }
-    let grouping = if shape.z == 1 && brick_shape.z == 1 {
+    let grouping = if shape.z() == 1 && brick_shape.z() == 1 {
         Shape4D::new(1, 1, 8, 8)?
     } else {
         Shape4D::new(1, 4, 4, 4)?
@@ -106,10 +105,10 @@ pub(super) fn default_shard_shape(
             })
     };
     Shape4D::new(
-        brick_shape.t,
-        checked_axis(brick_shape.z, grouping.z, "z")?,
-        checked_axis(brick_shape.y, grouping.y, "y")?,
-        checked_axis(brick_shape.x, grouping.x, "x")?,
+        brick_shape.t(),
+        checked_axis(brick_shape.z(), grouping.z(), "z")?,
+        checked_axis(brick_shape.y(), grouping.y(), "y")?,
+        checked_axis(brick_shape.x(), grouping.x(), "x")?,
     )
     .map_err(FormatError::InvalidShape)
 }
@@ -125,10 +124,10 @@ pub(super) fn sharded_storage_metadata(
     let shard_shape = default_shard_shape(shape, brick_shape)?;
     let shard_grid = shape.chunk_grid(shard_shape)?;
     let mut shard_records = Vec::with_capacity(shard_grid.element_count()? as usize);
-    for t in 0..shard_grid.t {
-        for z in 0..shard_grid.z {
-            for y in 0..shard_grid.y {
-                for x in 0..shard_grid.x {
+    for t in 0..shard_grid.t() {
+        for z in 0..shard_grid.z() {
+            for y in 0..shard_grid.y() {
+                for x in 0..shard_grid.x() {
                     let index = BrickIndex { t, z, y, x };
                     let shard_indices = [t, z, y, x];
                     let bytes = array
@@ -161,3 +160,4 @@ pub(super) fn sharded_storage_metadata(
     )
     .map_err(FormatError::InvalidShape)
 }
+use crate::CurrentShape4DExt;

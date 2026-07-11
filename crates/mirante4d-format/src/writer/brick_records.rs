@@ -41,7 +41,7 @@ impl BrickStatisticsAccumulator {
             let local_z = z - slab_z_start;
             for y in y_range.clone() {
                 for x in x_range.clone() {
-                    let value = values_zyx[((local_z * shape.y + y) * shape.x + x) as usize];
+                    let value = values_zyx[((local_z * shape.y() + y) * shape.x() + x) as usize];
                     self.min = self.min.min(value);
                     self.max = self.max.max(value);
                     self.observed = true;
@@ -58,7 +58,8 @@ impl BrickStatisticsAccumulator {
             for y in region.y_range.clone() {
                 for x in region.x_range.clone() {
                     let value = u16::from(
-                        values_zyx[((local_z * region.shape.y + y) * region.shape.x + x) as usize],
+                        values_zyx
+                            [((local_z * region.shape.y() + y) * region.shape.x() + x) as usize],
                     );
                     self.min = self.min.min(value);
                     self.max = self.max.max(value);
@@ -80,7 +81,7 @@ impl BrickStatisticsAccumulator {
             let local_z = z - region.z_start;
             for y in region.y_range.clone() {
                 for x in region.x_range.clone() {
-                    let offset = ((local_z * region.shape.y + y) * region.shape.x + x) as usize;
+                    let offset = ((local_z * region.shape.y() + y) * region.shape.x() + x) as usize;
                     if render_valid_zyx[offset] != 1 {
                         continue;
                     }
@@ -161,7 +162,7 @@ impl F32BrickStatisticsAccumulator {
             let local_z = z - slab_z_start;
             for y in y_range.clone() {
                 for x in x_range.clone() {
-                    let value = values_zyx[((local_z * shape.y + y) * shape.x + x) as usize];
+                    let value = values_zyx[((local_z * shape.y() + y) * shape.x() + x) as usize];
                     self.min = self.min.min(value);
                     self.max = self.max.max(value);
                     self.observed = true;
@@ -193,10 +194,10 @@ pub(super) fn build_brick_table(
 ) -> Result<BrickTable, FormatError> {
     let grid_shape = scale.shape.chunk_grid(scale.brick_shape)?;
     let mut records = Vec::with_capacity(grid_shape.element_count()? as usize);
-    for t in 0..grid_shape.t {
-        for z in 0..grid_shape.z {
-            for y in 0..grid_shape.y {
-                for x in 0..grid_shape.x {
+    for t in 0..grid_shape.t() {
+        for z in 0..grid_shape.z() {
+            for y in 0..grid_shape.y() {
+                for x in 0..grid_shape.x() {
                     let index = BrickIndex { t, z, y, x };
                     let stats = brick_statistics(scale, index);
                     records.push(BrickRecord {
@@ -222,10 +223,10 @@ pub(super) fn build_f32_brick_table(
 ) -> Result<BrickTable, FormatError> {
     let grid_shape = scale.shape.chunk_grid(scale.brick_shape)?;
     let mut records = Vec::with_capacity(grid_shape.element_count()? as usize);
-    for t in 0..grid_shape.t {
-        for z in 0..grid_shape.z {
-            for y in 0..grid_shape.y {
-                for x in 0..grid_shape.x {
+    for t in 0..grid_shape.t() {
+        for z in 0..grid_shape.z() {
+            for y in 0..grid_shape.y() {
+                for x in 0..grid_shape.x() {
                     let index = BrickIndex { t, z, y, x };
                     let stats = f32_brick_statistics(scale, index);
                     records.push(BrickRecord {
@@ -245,14 +246,14 @@ pub(super) fn build_f32_brick_table(
 }
 
 pub(super) fn brick_statistics(scale: &DenseU16Scale, index: BrickIndex) -> BrickStatistics {
-    let t0 = index.t * scale.brick_shape.t;
-    let z0 = index.z * scale.brick_shape.z;
-    let y0 = index.y * scale.brick_shape.y;
-    let x0 = index.x * scale.brick_shape.x;
-    let t1 = (t0 + scale.brick_shape.t).min(scale.shape.t);
-    let z1 = (z0 + scale.brick_shape.z).min(scale.shape.z);
-    let y1 = (y0 + scale.brick_shape.y).min(scale.shape.y);
-    let x1 = (x0 + scale.brick_shape.x).min(scale.shape.x);
+    let t0 = index.t * scale.brick_shape.t();
+    let z0 = index.z * scale.brick_shape.z();
+    let y0 = index.y * scale.brick_shape.y();
+    let x0 = index.x * scale.brick_shape.x();
+    let t1 = (t0 + scale.brick_shape.t()).min(scale.shape.t());
+    let z1 = (z0 + scale.brick_shape.z()).min(scale.shape.z());
+    let y1 = (y0 + scale.brick_shape.y()).min(scale.shape.y());
+    let x1 = (x0 + scale.brick_shape.x()).min(scale.shape.x());
 
     let mut min = u16::MAX;
     let mut max = u16::MIN;
@@ -305,14 +306,14 @@ impl F32BrickStatistics {
 }
 
 pub(super) fn f32_brick_statistics(scale: &DenseF32Scale, index: BrickIndex) -> F32BrickStatistics {
-    let t0 = index.t * scale.brick_shape.t;
-    let z0 = index.z * scale.brick_shape.z;
-    let y0 = index.y * scale.brick_shape.y;
-    let x0 = index.x * scale.brick_shape.x;
-    let t1 = (t0 + scale.brick_shape.t).min(scale.shape.t);
-    let z1 = (z0 + scale.brick_shape.z).min(scale.shape.z);
-    let y1 = (y0 + scale.brick_shape.y).min(scale.shape.y);
-    let x1 = (x0 + scale.brick_shape.x).min(scale.shape.x);
+    let t0 = index.t * scale.brick_shape.t();
+    let z0 = index.z * scale.brick_shape.z();
+    let y0 = index.y * scale.brick_shape.y();
+    let x0 = index.x * scale.brick_shape.x();
+    let t1 = (t0 + scale.brick_shape.t()).min(scale.shape.t());
+    let z1 = (z0 + scale.brick_shape.z()).min(scale.shape.z());
+    let y1 = (y0 + scale.brick_shape.y()).min(scale.shape.y());
+    let x1 = (x0 + scale.brick_shape.x()).min(scale.shape.x());
 
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
@@ -344,3 +345,4 @@ pub(super) fn f32_brick_statistics(scale: &DenseF32Scale, index: BrickIndex) -> 
         F32BrickStatistics::empty()
     }
 }
+use crate::CurrentShape4DExt;

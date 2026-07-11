@@ -1,4 +1,4 @@
-use mirante4d_core::Shape3D;
+use mirante4d_domain::Shape3D;
 
 use super::GpuRenderError;
 use crate::RenderError;

@@ -215,7 +215,7 @@ pub fn selection_from_hit(hit: &PickHit) -> Option<ToolSelection> {
 
 #[cfg(test)]
 mod tests {
-    use mirante4d_core::TimeIndex;
+    use mirante4d_domain::TimeIndex;
     use mirante4d_renderer::{
         PickCompleteness, PickHitKind, PickPolicy, PickValue, ScreenPosition, empty_pick_hit,
     };
@@ -325,7 +325,7 @@ mod tests {
             layer_id: None,
             object_id: Some(mirante4d_renderer::SceneObjectId::new(object_id).unwrap()),
             source_layer_id: None,
-            timepoint: TimeIndex(0),
+            timepoint: TimeIndex::new(0),
             world_position: None,
             grid_position: None,
             screen_position: Some(ScreenPosition::new(1.0, 2.0)),
@@ -337,7 +337,7 @@ mod tests {
 
     fn empty_hit() -> PickHit {
         empty_pick_hit(mirante4d_renderer::PickQuery {
-            timepoint: TimeIndex(0),
+            timepoint: TimeIndex::new(0),
             screen_position: ScreenPosition::new(1.0, 2.0),
         })
     }

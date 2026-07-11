@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+mirante4d-dataset.workspace = true
 mirante4d-domain.workspace = true
 mirante4d-identity.workspace = true
 mirante4d-project-model.workspace = true

@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 
-use mirante4d_core::{IntensityDType, LayerId, TimeIndex};
 use mirante4d_data::{BrickReadPayload, SpatialBrickIndex, VolumeRegion};
+use mirante4d_domain::{IntensityDType, TimeIndex};
+use mirante4d_format::LayerId;
 
-use crate::{AppLayerSummary, AppState};
+use crate::current_runtime::{dataset::CurrentDatasetRuntime, render::CurrentRenderRuntime};
 
-use super::{BrickStreamRequestKey, stream_layer_ids_for_state};
+use super::{BrickStreamRequestKey, stream_layer_ids_for_snapshot, view_for_snapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct BrickSourceRegion {
@@ -16,7 +17,7 @@ pub(super) struct BrickSourceRegion {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BrickPrefetchRequestKey {
-    pub(super) layer_id: String,
+    pub(super) layer_id: LayerId,
     pub(super) scale_level: u32,
     pub(super) active_timepoint: TimeIndex,
     pub(super) timepoints: Vec<TimeIndex>,
@@ -25,7 +26,7 @@ pub(crate) struct BrickPrefetchRequestKey {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BrickWarmRequestKey {
-    pub(super) layer_id: String,
+    pub(super) layer_id: LayerId,
     pub(super) scale_level: u32,
     pub(super) timepoint: TimeIndex,
     pub(super) bricks: Vec<SpatialBrickIndex>,
@@ -33,7 +34,7 @@ pub(crate) struct BrickWarmRequestKey {
 
 #[derive(Debug)]
 pub(crate) struct PrefetchedBrickPayload {
-    pub(super) layer_id: String,
+    pub(super) layer_id: LayerId,
     pub(super) scale_level: u32,
     pub(super) timepoint: TimeIndex,
     pub(super) brick_index: SpatialBrickIndex,
@@ -65,80 +66,85 @@ fn clone_brick_read_payload(payload: &BrickReadPayload) -> BrickReadPayload {
     }
 }
 
-fn resident_layer_available(state: &AppState, layer: &AppLayerSummary) -> bool {
-    match layer.dtype {
-        IntensityDType::Float32 => {
-            state
-                .resident_bricks_f32_by_layer
-                .get(&layer.id)
-                .is_some_and(|bricks| !bricks.is_empty())
-                || (layer.id == state.active_layer_id && !state.resident_bricks_f32.is_empty())
-        }
-        IntensityDType::Uint8 => {
-            state
-                .resident_bricks_u8_by_layer
-                .get(&layer.id)
-                .is_some_and(|bricks| !bricks.is_empty())
-                || (layer.id == state.active_layer_id && !state.resident_bricks_u8.is_empty())
-        }
-        IntensityDType::Uint16 => {
-            state
-                .resident_bricks_by_layer
-                .get(&layer.id)
-                .is_some_and(|bricks| !bricks.is_empty())
-                || (layer.id == state.active_layer_id && !state.resident_bricks.is_empty())
-        }
+fn resident_layer_available(
+    dataset: &CurrentDatasetRuntime,
+    layer_id: &LayerId,
+    dtype: IntensityDType,
+) -> bool {
+    match dtype {
+        IntensityDType::Float32 => dataset
+            .resident_bricks_f32_by_layer
+            .get(layer_id)
+            .is_some_and(|bricks| !bricks.is_empty()),
+        IntensityDType::Uint8 => dataset
+            .resident_bricks_u8_by_layer
+            .get(layer_id)
+            .is_some_and(|bricks| !bricks.is_empty()),
+        IntensityDType::Uint16 => dataset
+            .resident_bricks_by_layer
+            .get(layer_id)
+            .is_some_and(|bricks| !bricks.is_empty()),
     }
 }
 
-pub(super) fn visible_resident_layers_ready(state: &AppState) -> bool {
-    let Ok(layer_ids) = stream_layer_ids_for_state(state) else {
+pub(super) fn visible_resident_layers_ready(
+    snapshot: &mirante4d_application::ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+) -> bool {
+    let Ok(layer_ids) = stream_layer_ids_for_snapshot(snapshot, dataset) else {
         return false;
     };
-    resident_layer_ids_ready(state, &layer_ids)
-}
-
-fn resident_layer_ids_ready(state: &AppState, layer_ids: &[LayerId]) -> bool {
+    let view = view_for_snapshot(snapshot);
     layer_ids.iter().all(|layer_id| {
-        state
+        dataset
+            .dataset
+            .manifest()
             .layers
             .iter()
-            .find(|layer| layer.id == layer_id.as_str())
-            .is_some_and(|layer| resident_layer_available(state, layer))
+            .position(|layer| layer.id == layer_id.as_str())
+            .and_then(|ordinal| {
+                let key = mirante4d_domain::LogicalLayerKey::new(u32::try_from(ordinal).ok()?);
+                view.layer(key)
+                    .filter(|layer| layer.visible())
+                    .and_then(|_| snapshot.catalog().layer(key))
+            })
+            .is_some_and(|layer| resident_layer_available(dataset, layer_id, layer.dtype()))
     })
 }
 
 pub(crate) fn current_brick_stream_request_key(
-    state: &AppState,
+    snapshot: &mirante4d_application::ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &CurrentRenderRuntime,
 ) -> anyhow::Result<BrickStreamRequestKey> {
-    let stream_layer_ids = stream_layer_ids_for_state(state)?;
-    let source_regions = current_brick_source_regions_for_state(state, stream_layer_ids.first())?;
-    let layer_ids = stream_layer_ids
-        .into_iter()
-        .map(|layer_id| layer_id.to_string())
-        .collect::<Vec<_>>();
+    let stream_layer_ids = stream_layer_ids_for_snapshot(snapshot, dataset)?;
+    let timepoint = view_for_snapshot(snapshot).timepoint();
+    let source_regions =
+        current_brick_source_regions(dataset, render, timepoint, stream_layer_ids.first())?;
     Ok(BrickStreamRequestKey {
-        layer_ids,
-        scale_level: state.brick_stream_scale_level,
-        timepoint: state.active_timepoint,
-        visible_bricks: state.visible_bricks.clone(),
+        layer_ids: stream_layer_ids,
+        scale_level: dataset.brick_stream_scale_level,
+        timepoint,
+        visible_bricks: render.visible_bricks.clone(),
         source_regions,
     })
 }
 
-fn current_brick_source_regions_for_state(
-    state: &AppState,
+fn current_brick_source_regions(
+    dataset: &CurrentDatasetRuntime,
+    render: &CurrentRenderRuntime,
+    timepoint: TimeIndex,
     layer_id: Option<&LayerId>,
 ) -> anyhow::Result<Vec<BrickSourceRegion>> {
     let Some(layer_id) = layer_id else {
         return Ok(Vec::new());
     };
-    let mut regions = Vec::with_capacity(state.visible_bricks.len());
-    for brick in &state.visible_bricks {
-        let metadata = state.dataset.brick_metadata_at_scale(
+    let mut regions = Vec::with_capacity(render.visible_bricks.len());
+    for brick in &render.visible_bricks {
+        let metadata = dataset.dataset.brick_metadata_at_scale(
             layer_id,
-            state.brick_stream_scale_level,
-            state.active_timepoint,
+            dataset.brick_stream_scale_level,
+            timepoint,
             *brick,
         )?;
         regions.push(BrickSourceRegion {

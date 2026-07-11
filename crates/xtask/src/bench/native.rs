@@ -5,22 +5,23 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use mirante4d_core::{
-    CameraAxes, CameraState, ChannelColor, ChannelTransferFunction,
-    DEFAULT_PRESENTATION_VIEWPORT_POINTS, DisplayWindow, GridToWorld, IntensityDType,
-    IsoLightState, LayerDisplay, LayerId, Shape3D, Shape4D, TimeIndex, WorldSpace, WorldUnit,
-};
 use mirante4d_data::{
     BrickReadPool, BrickReadStatus, BrickRequestPriority, DatasetHandle, DenseVolumeU16,
     SpatialBrickIndex,
 };
+use mirante4d_domain::{
+    DisplayWindow, IntensityDType, IsoLightState, LayerTransfer, Opacity, RgbColor, Shape3D,
+    Shape4D, TimeIndex, TransferCurve,
+};
 use mirante4d_format::{
-    ChannelMetadata, DenseU16Layer, ExistingPackagePolicy, NativeU16Dataset, default_u16_display,
+    ChannelMetadata, CurrentShape4DExt, DenseU16Layer, ExistingPackagePolicy, LayerId,
+    NativeU16Dataset, WorldSpace, WorldUnit, default_u16_display, grid_to_world_scale_um,
     write_native_u16_dataset,
 };
+use mirante4d_render_api::{CameraAxes, CameraFrame};
 use mirante4d_renderer::{
     BrickGridSpec, BrickPlanOptions, BrickSkipDiagnostics, CameraRenderMode, CameraRenderQuality,
-    RenderViewport, ResidentBrickSetU8, ResidentBrickSetU16,
+    IntensityTransfer, RenderViewport, ResidentBrickSetU8, ResidentBrickSetU16,
     gpu::{GpuDisplayFrame, GpuRenderer, GpuResidentDisplayChannel, GpuResidentDisplayRequest},
     plan_visible_bricks, render_camera, render_camera_from_bricks, render_camera_u8,
     render_camera_u8_from_bricks_with_quality,
@@ -32,7 +33,7 @@ use crate::host::{
     benchmark_native_package_dataset_class, gpu_stats_json,
 };
 use crate::{
-    benchmark_camera_for_shape, benchmark_camera_for_volume, env_u64,
+    benchmark_camera_for_shape, benchmark_camera_for_volume, benchmark_camera_frame, env_u64,
     phase11_gpu_brick_cache_budget_bytes, phase11_gpu_volume_cache_budget_bytes,
     stable_id_from_name,
 };
@@ -77,7 +78,7 @@ pub(crate) fn bench_native_package_with_overrides(
     let layer_id = dataset.first_layer_id()?;
     let dataset_class =
         benchmark_native_package_dataset_class(package, dataset.manifest().provenance.kind);
-    let timepoint = TimeIndex(0);
+    let timepoint = TimeIndex::new(0);
     let stored_dtype = dataset
         .layer(&layer_id)
         .context("first layer id was not found after opening dataset")?
@@ -104,8 +105,7 @@ pub(crate) fn bench_native_package_with_overrides(
 
     let viewport = benchmark_viewport_for_volume_with_overrides(&volume, overrides)?;
     let brick_pixel_stride = benchmark_brick_pixel_stride_with_overrides(overrides)?;
-    let camera =
-        benchmark_camera_for_volume(&volume).to_camera_state(DEFAULT_PRESENTATION_VIEWPORT_POINTS);
+    let camera = benchmark_camera_frame(benchmark_camera_for_volume(&volume));
     let brick_shape = dataset.brick_shape_at_scale(&layer_id, volume.scale_level)?;
     let brick_grid_shape = dataset.brick_grid_shape_at_scale(&layer_id, volume.scale_level)?;
     let plan_started = Instant::now();
@@ -184,22 +184,22 @@ pub(crate) fn bench_native_package_with_overrides(
         "hardware": benchmark_host_context(),
         "package": package,
         "layer_id": layer_id.to_string(),
-        "timepoint": timepoint.0,
+        "timepoint": timepoint.get(),
         "scale_level": volume.scale_level,
         "shape": {
-            "z": volume.shape.z,
-            "y": volume.shape.y,
-            "x": volume.shape.x,
+            "z": volume.shape.z(),
+            "y": volume.shape.y(),
+            "x": volume.shape.x(),
         },
         "brick_shape": {
-            "z": brick_shape.z,
-            "y": brick_shape.y,
-            "x": brick_shape.x,
+            "z": brick_shape.z(),
+            "y": brick_shape.y(),
+            "x": brick_shape.x(),
         },
         "brick_grid_shape": {
-            "z": brick_grid_shape.z,
-            "y": brick_grid_shape.y,
-            "x": brick_grid_shape.x,
+            "z": brick_grid_shape.z(),
+            "y": brick_grid_shape.y(),
+            "x": brick_grid_shape.x(),
         },
         "viewport": {
             "width": viewport.width,
@@ -274,8 +274,10 @@ fn bench_native_package_u8(
 
     let viewport = benchmark_viewport_for_shape_with_overrides(volume.shape, overrides)?;
     let brick_pixel_stride = benchmark_brick_pixel_stride_with_overrides(overrides)?;
-    let camera = benchmark_camera_for_shape(volume.shape, volume.grid_to_world)
-        .to_camera_state(DEFAULT_PRESENTATION_VIEWPORT_POINTS);
+    let camera = benchmark_camera_frame(benchmark_camera_for_shape(
+        volume.shape,
+        volume.grid_to_world,
+    ));
     let brick_shape = dataset.brick_shape_at_scale(&layer_id, volume.scale_level)?;
     let brick_grid_shape = dataset.brick_grid_shape_at_scale(&layer_id, volume.scale_level)?;
     let plan_started = Instant::now();
@@ -354,22 +356,22 @@ fn bench_native_package_u8(
         "package": package,
         "layer_id": layer_id.to_string(),
         "stored_dtype": "Uint8",
-        "timepoint": timepoint.0,
+        "timepoint": timepoint.get(),
         "scale_level": volume.scale_level,
         "shape": {
-            "z": volume.shape.z,
-            "y": volume.shape.y,
-            "x": volume.shape.x,
+            "z": volume.shape.z(),
+            "y": volume.shape.y(),
+            "x": volume.shape.x(),
         },
         "brick_shape": {
-            "z": brick_shape.z,
-            "y": brick_shape.y,
-            "x": brick_shape.x,
+            "z": brick_shape.z(),
+            "y": brick_shape.y(),
+            "x": brick_shape.x(),
         },
         "brick_grid_shape": {
-            "z": brick_grid_shape.z,
-            "y": brick_grid_shape.y,
-            "x": brick_grid_shape.x,
+            "z": brick_grid_shape.z(),
+            "y": brick_grid_shape.y(),
+            "x": brick_grid_shape.x(),
         },
         "viewport": {
             "width": viewport.width,
@@ -450,15 +452,14 @@ pub(crate) fn bench_runtime_stress() -> anyhow::Result<PathBuf> {
     let open_ms = open_started.elapsed().as_secs_f64() * 1000.0;
 
     let layer_id = dataset.first_layer_id()?;
-    let timepoint = TimeIndex(0);
+    let timepoint = TimeIndex::new(0);
     let read_started = Instant::now();
     let volume = dataset.read_u16_volume(&layer_id, timepoint)?;
     let read_volume_ms = read_started.elapsed().as_secs_f64() * 1000.0;
 
     let viewport = benchmark_viewport_for_volume(&volume)?;
     let brick_pixel_stride = runtime_stress_brick_pixel_stride()?;
-    let camera =
-        benchmark_camera_for_volume(&volume).to_camera_state(DEFAULT_PRESENTATION_VIEWPORT_POINTS);
+    let camera = benchmark_camera_frame(benchmark_camera_for_volume(&volume));
     let brick_shape = dataset.brick_shape_at_scale(&layer_id, volume.scale_level)?;
     let brick_grid_shape = dataset.brick_grid_shape_at_scale(&layer_id, volume.scale_level)?;
     let plan_started = Instant::now();
@@ -501,7 +502,7 @@ pub(crate) fn bench_runtime_stress() -> anyhow::Result<PathBuf> {
         dataset.clone(),
         layer_id.clone(),
         volume.scale_level,
-        shape.t,
+        shape.t(),
         &visible_bricks,
     )?;
 
@@ -544,22 +545,22 @@ pub(crate) fn bench_runtime_stress() -> anyhow::Result<PathBuf> {
         "package": package,
         "layer_id": layer_id.to_string(),
         "shape": {
-            "t": shape.t,
-            "z": shape.z,
-            "y": shape.y,
-            "x": shape.x,
+            "t": shape.t(),
+            "z": shape.z(),
+            "y": shape.y(),
+            "x": shape.x(),
         },
         "brick_shape": {
-            "t": chunk_shape.t,
-            "z": chunk_shape.z,
-            "y": chunk_shape.y,
-            "x": chunk_shape.x,
+            "t": chunk_shape.t(),
+            "z": chunk_shape.z(),
+            "y": chunk_shape.y(),
+            "x": chunk_shape.x(),
         },
         "brick_grid_shape": {
-            "t": shape.chunk_grid(chunk_shape)?.t,
-            "z": brick_grid_shape.z,
-            "y": brick_grid_shape.y,
-            "x": brick_grid_shape.x,
+            "t": shape.chunk_grid(chunk_shape)?.t(),
+            "z": brick_grid_shape.z(),
+            "y": brick_grid_shape.y(),
+            "x": brick_grid_shape.x(),
         },
         "viewport": {
             "width": viewport.width,
@@ -646,7 +647,7 @@ fn write_runtime_stress_package(
                 },
                 shape,
                 brick_shape,
-                grid_to_world: GridToWorld::scale_um(0.2, 0.2, 0.2),
+                grid_to_world: grid_to_world_scale_um(0.2, 0.2, 0.2),
                 display: default_u16_display(),
                 values_tzyx,
             }],
@@ -658,10 +659,10 @@ fn write_runtime_stress_package(
 
 fn runtime_stress_values(shape: Shape4D) -> anyhow::Result<Vec<u16>> {
     let mut values = Vec::with_capacity(shape.element_count()? as usize);
-    for t in 0..shape.t {
-        for z in 0..shape.z {
-            for y in 0..shape.y {
-                for x in 0..shape.x {
+    for t in 0..shape.t() {
+        for z in 0..shape.z() {
+            for y in 0..shape.y() {
+                for x in 0..shape.x() {
                     values.push(runtime_stress_value(t, z, y, x));
                 }
             }
@@ -687,14 +688,14 @@ fn bench_worker_prefetch(
         .unwrap_or((visible_bricks.len() as u64).saturating_mul(2).max(1));
     let pool = BrickReadPool::new(dataset, worker_count as usize, queue_capacity as usize)?;
     let generation = pool.advance_generation();
-    let prefetch_timepoint = (timepoint_count > 1).then_some(TimeIndex(1));
+    let prefetch_timepoint = (timepoint_count > 1).then_some(TimeIndex::new(1));
     let mut submitted_current = 0usize;
     let mut submitted_prefetch = 0usize;
     for brick_index in visible_bricks {
         pool.submit_brick_at_scale(
             layer_id.clone(),
             scale_level,
-            TimeIndex(0),
+            TimeIndex::new(0),
             *brick_index,
             BrickRequestPriority::CurrentFrame,
         )?;
@@ -759,9 +760,9 @@ fn bench_gpu_runtime_stress(
     layer_id: &LayerId,
     volume: &DenseVolumeU16,
     resident_bricks: &[mirante4d_data::VolumeBrickU16],
-    brick_shape: mirante4d_core::Shape3D,
-    brick_grid_shape: mirante4d_core::Shape3D,
-    camera: mirante4d_core::CameraState,
+    brick_shape: Shape3D,
+    brick_grid_shape: Shape3D,
+    camera: CameraFrame,
     viewport: RenderViewport,
 ) -> anyhow::Result<Value> {
     if resident_bricks.len() < 2 {
@@ -778,14 +779,14 @@ fn bench_gpu_runtime_stress(
     let second_start = (set_size / 2).min(resident_bricks.len() - 1);
     let first = ResidentBrickSetU16::new(
         layer_id.clone(),
-        TimeIndex(0),
+        TimeIndex::new(0),
         volume.shape,
         volume.grid_to_world,
         resident_bricks.iter().take(set_size).cloned().collect(),
     );
     let second = ResidentBrickSetU16::new(
         layer_id.clone(),
-        TimeIndex(0),
+        TimeIndex::new(0),
         volume.shape,
         volume.grid_to_world,
         resident_bricks
@@ -878,9 +879,9 @@ fn bench_gpu_runtime_stress(
 fn bench_gpu_render_paths(
     volume: &DenseVolumeU16,
     resident: &ResidentBrickSetU16,
-    brick_shape: mirante4d_core::Shape3D,
-    brick_grid_shape: mirante4d_core::Shape3D,
-    camera: mirante4d_core::CameraState,
+    brick_shape: Shape3D,
+    brick_grid_shape: Shape3D,
+    camera: CameraFrame,
     viewport: RenderViewport,
 ) -> serde_json::Value {
     let started = Instant::now();
@@ -976,7 +977,7 @@ fn bench_gpu_render_paths(
             brick_shape,
             brick_grid_shape,
             mode: CameraRenderMode::Mip,
-            transfer: display_transfer.clone(),
+            transfer: display_transfer,
         }],
         display_request_for_camera(camera, viewport, CameraRenderQuality::voxel_exact()),
     );
@@ -1060,9 +1061,9 @@ fn new_native_benchmark_gpu_renderer() -> anyhow::Result<GpuRenderer> {
 
 fn bench_gpu_render_paths_u8(
     resident: &ResidentBrickSetU8,
-    brick_shape: mirante4d_core::Shape3D,
-    brick_grid_shape: mirante4d_core::Shape3D,
-    camera: mirante4d_core::CameraState,
+    brick_shape: Shape3D,
+    brick_grid_shape: Shape3D,
+    camera: CameraFrame,
     viewport: RenderViewport,
 ) -> serde_json::Value {
     let started = Instant::now();
@@ -1131,7 +1132,7 @@ fn bench_gpu_render_paths_u8(
             brick_shape,
             brick_grid_shape,
             mode: CameraRenderMode::Mip,
-            transfer: display_transfer.clone(),
+            transfer: display_transfer,
         }],
         display_request_for_camera(camera, viewport, CameraRenderQuality::voxel_exact()),
     );
@@ -1191,27 +1192,25 @@ fn bench_gpu_render_paths_u8(
     })
 }
 
-fn benchmark_display_transfer(window_high: f32) -> ChannelTransferFunction {
-    ChannelTransferFunction::linear(
-        LayerDisplay::new(
-            true,
+fn benchmark_display_transfer(window_high: f32) -> IntensityTransfer {
+    IntensityTransfer::new(
+        true,
+        LayerTransfer::new(
             DisplayWindow::new(0.0, window_high).expect("benchmark display window is valid"),
-            1.0,
-        )
-        .expect("benchmark display opacity is valid"),
-        ChannelColor::new([1.0, 1.0, 1.0, 1.0]).expect("benchmark display color is valid"),
+            RgbColor::new([1.0, 1.0, 1.0]).expect("benchmark display color is valid"),
+            Opacity::new(1.0).expect("benchmark display opacity is valid"),
+            TransferCurve::linear(),
+            false,
+        ),
     )
 }
 
-fn camera_axes(camera: CameraState) -> CameraAxes {
-    let forward = (camera.target - camera.eye).normalize();
-    let right = forward.cross(camera.up).normalize();
-    let up = right.cross(forward).normalize();
-    CameraAxes { forward, right, up }
+fn camera_axes(camera: CameraFrame) -> CameraAxes {
+    camera.axes()
 }
 
 fn display_request_for_camera(
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     quality: CameraRenderQuality,
 ) -> GpuResidentDisplayRequest {
@@ -1277,11 +1276,11 @@ fn benchmark_viewport_for_shape_with_overrides(
     let width = overrides
         .viewport_width
         .or(env_u64("MIRANTE4D_BENCH_VIEWPORT_WIDTH")?)
-        .unwrap_or(shape.x.min(1024));
+        .unwrap_or(shape.x().min(1024));
     let height = overrides
         .viewport_height
         .or(env_u64("MIRANTE4D_BENCH_VIEWPORT_HEIGHT")?)
-        .unwrap_or(shape.y.min(1024));
+        .unwrap_or(shape.y().min(1024));
     Ok(RenderViewport::new(width, height)?)
 }
 

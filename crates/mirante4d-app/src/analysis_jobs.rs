@@ -1,9 +1,6 @@
 use std::{
     collections::BTreeMap,
-    sync::{
-        Arc,
-        mpsc::{self, Receiver},
-    },
+    sync::mpsc::{self, Receiver},
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -21,16 +18,19 @@ use mirante4d_analysis::{
     summarize_f32_volume_as_roi, summarize_u8_volume_as_roi, summarize_u16_volume_as_roi,
     time_trace_plot_from_table,
 };
-use mirante4d_core::{IntensityDType, LayerId, TimeIndex};
+use mirante4d_application::OperationToken;
 use mirante4d_data::{CancellationToken, DatasetHandle, SpatialBrickIndex};
-use mirante4d_renderer::gpu::GpuRenderer;
+use mirante4d_domain::{IntensityDType, TimeIndex};
+use mirante4d_format::LayerId;
 
 use crate::{
-    AppState, SOURCE_ANALYSIS_SCALE_LEVEL, analysis_workspace::normalize_analysis_selection,
+    SOURCE_ANALYSIS_SCALE_LEVEL,
+    current_runtime::{analysis::CurrentAnalysisRuntime, dataset::CurrentDatasetRuntime},
     import_ui::no_data_policy_label,
 };
 
 pub(crate) struct AnalysisTask {
+    pub(crate) token: OperationToken,
     pub(crate) kind: AnalysisTaskKind,
     pub(crate) cancellation: CancellationToken,
     pub(crate) receiver: Receiver<AnalysisTaskMessage>,
@@ -66,7 +66,15 @@ pub(crate) struct AnalysisTaskOutput {
     pub(crate) operation: AnalysisOperationRecord,
     pub(crate) table: AnalysisTable,
     pub(crate) plot: Option<AnalysisPlot>,
-    pub(crate) message: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AnalysisJobInput<'a> {
+    pub(crate) dataset_name: &'a str,
+    pub(crate) active_layer_id: &'a str,
+    pub(crate) active_layer_dtype: IntensityDType,
+    pub(crate) active_timepoint: TimeIndex,
+    pub(crate) timepoint_count: u64,
 }
 
 #[derive(Clone)]
@@ -86,37 +94,43 @@ pub(crate) struct AnalysisJobContext {
 }
 
 impl AnalysisJobContext {
-    pub(crate) fn from_state(state: &AppState, _gpu_renderer: Option<Arc<GpuRenderer>>) -> Self {
-        let manifest = state.dataset.manifest();
+    pub(crate) fn from_runtime(
+        dataset: &CurrentDatasetRuntime,
+        analysis: &CurrentAnalysisRuntime,
+        input: AnalysisJobInput<'_>,
+    ) -> Self {
+        let manifest = dataset.dataset.manifest();
         let active_no_data_policy_label = manifest
             .layers
             .iter()
-            .find(|layer| layer.id == state.active_layer_id)
+            .find(|layer| layer.id == input.active_layer_id)
             .and_then(|layer| layer.no_data_policy.as_ref())
             .map(no_data_policy_label);
         Self {
             dataset_id: manifest.dataset.id.clone(),
-            dataset_name: state.dataset_name.clone(),
+            dataset_name: input.dataset_name.to_owned(),
             native_format: manifest.format.clone(),
             native_schema_version: manifest.schema_version,
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
-            dataset: state.dataset.clone(),
-            active_layer_id: state.active_layer_id.clone(),
+            dataset: dataset.dataset.clone(),
+            active_layer_id: input.active_layer_id.to_owned(),
             active_no_data_policy_label,
-            active_layer_dtype: state.active_layer_dtype,
-            active_timepoint: state.active_timepoint,
-            timepoint_count: state.timepoint_count,
-            scene_artifacts: state.scene_artifacts.clone(),
+            active_layer_dtype: input.active_layer_dtype,
+            active_timepoint: input.active_timepoint,
+            timepoint_count: input.timepoint_count,
+            scene_artifacts: analysis.scene_artifacts.clone(),
         }
     }
 }
 
 pub(crate) fn spawn_analysis_task(
-    state: &AppState,
-    gpu_renderer: Option<Arc<GpuRenderer>>,
+    token: OperationToken,
+    dataset: &CurrentDatasetRuntime,
+    analysis: &CurrentAnalysisRuntime,
+    input: AnalysisJobInput<'_>,
     kind: AnalysisTaskKind,
 ) -> AnalysisTask {
-    let context = AnalysisJobContext::from_state(state, gpu_renderer);
+    let context = AnalysisJobContext::from_runtime(dataset, analysis, input);
     let cancellation = CancellationToken::new();
     let worker_cancellation = cancellation.clone();
     let (sender, receiver) = mpsc::channel();
@@ -141,6 +155,7 @@ pub(crate) fn spawn_analysis_task(
         let _ = sender.send(AnalysisTaskMessage::Finished(Box::new(result)));
     });
     AnalysisTask {
+        token,
         kind,
         cancellation,
         receiver,
@@ -181,7 +196,12 @@ where
         check_analysis_cancelled(cancellation)?;
         rows.push(intensity_summary_row(
             timepoint,
-            stream_u16_timepoint_summary(context, layer_id, TimeIndex(timepoint), cancellation)?,
+            stream_u16_timepoint_summary(
+                context,
+                layer_id,
+                TimeIndex::new(timepoint),
+                cancellation,
+            )?,
         ));
         progress(AnalysisProgress {
             completed: timepoint + 1,
@@ -243,7 +263,6 @@ where
         )?,
         table,
         plot: Some(plot),
-        message: "Computed full time-series intensity summary".to_owned(),
     })
 }
 
@@ -261,7 +280,12 @@ where
         check_analysis_cancelled(cancellation)?;
         rows.push(intensity_summary_f32_row(
             timepoint,
-            stream_f32_timepoint_summary(context, layer_id, TimeIndex(timepoint), cancellation)?,
+            stream_f32_timepoint_summary(
+                context,
+                layer_id,
+                TimeIndex::new(timepoint),
+                cancellation,
+            )?,
         ));
         progress(AnalysisProgress {
             completed: timepoint + 1,
@@ -323,7 +347,6 @@ where
         )?,
         table,
         plot: Some(plot),
-        message: "Computed full time-series intensity summary".to_owned(),
     })
 }
 
@@ -367,7 +390,7 @@ where
     for (index, roi) in rois.iter().enumerate() {
         check_analysis_cancelled(cancellation)?;
         rows.push(roi_intensity_row(
-            context.active_timepoint.0,
+            context.active_timepoint.get(),
             measure_u16_roi_with_data_engine(context, layer_id, roi)?,
         ));
         progress(AnalysisProgress {
@@ -389,7 +412,7 @@ where
         "roi_intensity_statistics",
         format!(
             "visible ROI artifacts at timepoint {}",
-            context.active_timepoint.0
+            context.active_timepoint.get()
         ),
         AnalysisExecutionClass::RoiLocalExact,
         AnalysisResultState::Complete,
@@ -420,13 +443,12 @@ where
             ROI_INTENSITY_OPERATION_VERSION,
             AnalysisOperationKind::RoiIntensityStatistics,
             AnalysisSpatialScope::Roi {
-                roi_id: format!("visible_rois_at_t{}", context.active_timepoint.0),
+                roi_id: format!("visible_rois_at_t{}", context.active_timepoint.get()),
             },
             provenance,
         )?,
         table,
         plot: None,
-        message: "Computed ROI intensity statistics".to_owned(),
     })
 }
 
@@ -450,7 +472,7 @@ where
     for (index, roi) in rois.iter().enumerate() {
         check_analysis_cancelled(cancellation)?;
         rows.push(roi_intensity_f32_row(
-            context.active_timepoint.0,
+            context.active_timepoint.get(),
             measure_f32_roi_with_data_engine(context, layer_id, roi)?,
         ));
         progress(AnalysisProgress {
@@ -472,7 +494,7 @@ where
         "roi_intensity_statistics",
         format!(
             "visible ROI artifacts at timepoint {}",
-            context.active_timepoint.0
+            context.active_timepoint.get()
         ),
         AnalysisExecutionClass::RoiLocalExact,
         AnalysisResultState::Complete,
@@ -503,13 +525,12 @@ where
             ROI_INTENSITY_OPERATION_VERSION,
             AnalysisOperationKind::RoiIntensityStatistics,
             AnalysisSpatialScope::Roi {
-                roi_id: format!("visible_rois_at_t{}", context.active_timepoint.0),
+                roi_id: format!("visible_rois_at_t{}", context.active_timepoint.get()),
             },
             provenance,
         )?,
         table,
         plot: None,
-        message: "Computed ROI intensity statistics".to_owned(),
     })
 }
 
@@ -523,9 +544,9 @@ fn stream_u16_timepoint_summary(
         .dataset
         .brick_grid_shape_at_scale(layer_id, SOURCE_ANALYSIS_SCALE_LEVEL)?;
     let mut accumulator = IntensitySummaryAccumulator::default();
-    for z in 0..brick_grid.z {
-        for y in 0..brick_grid.y {
-            for x in 0..brick_grid.x {
+    for z in 0..brick_grid.z() {
+        for y in 0..brick_grid.y() {
+            for x in 0..brick_grid.x() {
                 check_analysis_cancelled(cancellation)?;
                 match context.active_layer_dtype {
                     IntensityDType::Uint8 => {
@@ -564,9 +585,9 @@ fn stream_f32_timepoint_summary(
         .dataset
         .brick_grid_shape_at_scale(layer_id, SOURCE_ANALYSIS_SCALE_LEVEL)?;
     let mut accumulator = IntensitySummaryF32Accumulator::default();
-    for z in 0..brick_grid.z {
-        for y in 0..brick_grid.y {
-            for x in 0..brick_grid.x {
+    for z in 0..brick_grid.z() {
+        for y in 0..brick_grid.y() {
+            for x in 0..brick_grid.x() {
                 check_analysis_cancelled(cancellation)?;
                 let brick = context.dataset.read_f32_brick_at_scale(
                     layer_id,
@@ -666,46 +687,43 @@ fn f32_roi_analysis_compute_precision() -> &'static str {
 }
 
 pub(crate) fn store_analysis_task_output(
-    state: &mut AppState,
+    analysis: &mut CurrentAnalysisRuntime,
     output: AnalysisTaskOutput,
-) -> String {
+) {
     let AnalysisTaskOutput {
         operation,
         table,
         plot,
-        message,
     } = output;
-    state.analysis_operations.push(operation);
-    let table_index = state.analysis_tables.len();
-    state.analysis_tables.push(table);
-    state.selected_analysis_table_index = Some(table_index);
+    analysis.analysis_operations.push(operation);
+    analysis.analysis_tables.push(table);
     if let Some(plot) = plot {
-        let plot_index = state.analysis_plots.len();
-        state.analysis_plots.push(plot);
-        state.selected_analysis_plot_index = Some(plot_index);
-        state.selected_analysis_plot_point = None;
-        state.analysis_plot_view = None;
+        analysis.analysis_plots.push(plot);
     }
-    normalize_analysis_selection(state);
-    message
 }
 
 #[cfg(test)]
-pub(crate) fn compute_full_time_series_analysis(state: &mut AppState) -> anyhow::Result<()> {
-    let context = AnalysisJobContext::from_state(state, None);
+pub(crate) fn compute_full_time_series_analysis(
+    dataset: &CurrentDatasetRuntime,
+    analysis: &mut CurrentAnalysisRuntime,
+    input: AnalysisJobInput<'_>,
+) -> anyhow::Result<()> {
+    let context = AnalysisJobContext::from_runtime(dataset, analysis, input);
     let output =
         run_full_time_series_analysis_job(&context, &CancellationToken::new(), |_| Ok(()))?;
-    let message = store_analysis_task_output(state, output);
-    state.last_workflow_message = Some(message);
+    store_analysis_task_output(analysis, output);
     Ok(())
 }
 
 #[cfg(test)]
-pub(crate) fn compute_active_roi_analysis(state: &mut AppState) -> anyhow::Result<()> {
-    let context = AnalysisJobContext::from_state(state, None);
+pub(crate) fn compute_active_roi_analysis(
+    dataset: &CurrentDatasetRuntime,
+    analysis: &mut CurrentAnalysisRuntime,
+    input: AnalysisJobInput<'_>,
+) -> anyhow::Result<()> {
+    let context = AnalysisJobContext::from_runtime(dataset, analysis, input);
     let output = run_roi_intensity_analysis_job(&context, &CancellationToken::new(), |_| Ok(()))?;
-    let message = store_analysis_task_output(state, output);
-    state.last_workflow_message = Some(message);
+    store_analysis_task_output(analysis, output);
     Ok(())
 }
 
@@ -737,8 +755,8 @@ pub(crate) fn analysis_provenance_from_context(
         app_version: context.app_version.clone(),
         created_at_utc: analysis_created_at_utc(),
         source_layer_id: context.active_layer_id.clone(),
-        timepoint_start: context.active_timepoint.0,
-        timepoint_end_exclusive: context.active_timepoint.0.saturating_add(1),
+        timepoint_start: context.active_timepoint.get(),
+        timepoint_end_exclusive: context.active_timepoint.get().saturating_add(1),
         scale_level: SOURCE_ANALYSIS_SCALE_LEVEL,
         operation,
         operation_version,

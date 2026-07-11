@@ -4,7 +4,7 @@ pub(super) fn write_phase11_sparse_empty_package(output_root: &Path) -> anyhow::
     let package = output_root.join("phase11-large-sparse-empty-bricks.m4d");
     let s0_shape = Shape4D::new(1, 128, 128, 128)?;
     let chunk_shape = Shape4D::new(1, 16, 16, 16)?;
-    let s0_grid_to_world = GridToWorld::scale_um(0.2, 0.2, 0.2);
+    let s0_grid_to_world = mirante4d_format::grid_to_world_scale_um(0.2, 0.2, 0.2);
     let s0_values = phase11_sparse_empty_values(s0_shape)?;
     let (s1_shape, s1_values) = phase11_downsample_u16_mean2(s0_shape, &s0_values)?;
     let (s2_shape, s2_values) = phase11_downsample_u16_mean2(s1_shape, &s1_values)?;
@@ -74,16 +74,16 @@ pub(super) fn phase11_sparse_empty_fixture_metadata() -> anyhow::Result<Value> {
     let (s2_shape, s2_values) = phase11_downsample_u16_mean2(s1_shape, &s1_values)?;
     Ok(json!({
         "source_shape": {
-            "t": s0_shape.t,
-            "z": s0_shape.z,
-            "y": s0_shape.y,
-            "x": s0_shape.x,
+            "t": s0_shape.t(),
+            "z": s0_shape.z(),
+            "y": s0_shape.y(),
+            "x": s0_shape.x(),
         },
         "chunk_shape": {
-            "t": chunk_shape.t,
-            "z": chunk_shape.z,
-            "y": chunk_shape.y,
-            "x": chunk_shape.x,
+            "t": chunk_shape.t(),
+            "z": chunk_shape.z(),
+            "y": chunk_shape.y(),
+            "x": chunk_shape.x(),
         },
         "scales": [
             phase11_sparse_scale_metadata(0, s0_shape, &s0_values, chunk_shape)?,
@@ -103,10 +103,10 @@ fn phase11_sparse_scale_metadata(
     Ok(json!({
         "level": level,
         "shape": {
-            "t": shape.t,
-            "z": shape.z,
-            "y": shape.y,
-            "x": shape.x,
+            "t": shape.t(),
+            "z": shape.z(),
+            "y": shape.y(),
+            "x": shape.x(),
         },
         "brick_count": total,
         "occupied_bricks": occupied,
@@ -115,7 +115,7 @@ fn phase11_sparse_scale_metadata(
 }
 
 pub(super) fn phase11_sparse_empty_values(shape: Shape4D) -> anyhow::Result<Vec<u16>> {
-    if shape.t != 1 || shape.z < 112 || shape.y < 112 || shape.x < 112 {
+    if shape.t() != 1 || shape.z() < 112 || shape.y() < 112 || shape.x() < 112 {
         bail!("Phase 11 sparse fixture requires t=1 and at least 112 voxels on every spatial axis");
     }
     let element_count = usize::try_from(shape.element_count()?)
@@ -137,9 +137,9 @@ fn phase11_fill_sparse_box(
     if z_range.0 >= z_range.1
         || y_range.0 >= y_range.1
         || x_range.0 >= x_range.1
-        || z_range.1 > shape.z
-        || y_range.1 > shape.y
-        || x_range.1 > shape.x
+        || z_range.1 > shape.z()
+        || y_range.1 > shape.y()
+        || x_range.1 > shape.x()
     {
         bail!("invalid Phase 11 sparse fixture box for shape {shape:?}");
     }
@@ -168,26 +168,26 @@ pub(super) fn phase11_downsample_u16_mean2(
             expected_source_len
         );
     }
-    if !source_shape.z.is_multiple_of(2)
-        || !source_shape.y.is_multiple_of(2)
-        || !source_shape.x.is_multiple_of(2)
+    if !source_shape.z().is_multiple_of(2)
+        || !source_shape.y().is_multiple_of(2)
+        || !source_shape.x().is_multiple_of(2)
     {
         bail!("Phase 11 downsample requires even spatial dimensions");
     }
 
     let output_shape = Shape4D::new(
-        source_shape.t,
-        source_shape.z / 2,
-        source_shape.y / 2,
-        source_shape.x / 2,
+        source_shape.t(),
+        source_shape.z() / 2,
+        source_shape.y() / 2,
+        source_shape.x() / 2,
     )?;
     let output_len = usize::try_from(output_shape.element_count()?)
         .context("Phase 11 downsample output shape does not fit usize")?;
     let mut output_values = Vec::with_capacity(output_len);
-    for t in 0..output_shape.t {
-        for z in 0..output_shape.z {
-            for y in 0..output_shape.y {
-                for x in 0..output_shape.x {
+    for t in 0..output_shape.t() {
+        for z in 0..output_shape.z() {
+            for y in 0..output_shape.y() {
+                for x in 0..output_shape.x() {
                     let mut sum = 0u64;
                     for dz in 0..2 {
                         for dy in 0..2 {
@@ -227,10 +227,10 @@ pub(super) fn phase11_sparse_occupied_brick_count(
     }
     let grid = shape.chunk_grid(brick_shape)?;
     let mut occupied = 0u64;
-    for bt in 0..grid.t {
-        for bz in 0..grid.z {
-            for by in 0..grid.y {
-                for bx in 0..grid.x {
+    for bt in 0..grid.t() {
+        for bz in 0..grid.z() {
+            for by in 0..grid.y() {
+                for bx in 0..grid.x() {
                     if phase11_sparse_brick_has_nonzero(values, shape, brick_shape, bt, bz, by, bx)?
                     {
                         occupied += 1;
@@ -251,14 +251,14 @@ fn phase11_sparse_brick_has_nonzero(
     by: u64,
     bx: u64,
 ) -> anyhow::Result<bool> {
-    let t_end = ((bt + 1) * brick_shape.t).min(shape.t);
-    let z_end = ((bz + 1) * brick_shape.z).min(shape.z);
-    let y_end = ((by + 1) * brick_shape.y).min(shape.y);
-    let x_end = ((bx + 1) * brick_shape.x).min(shape.x);
-    for t in (bt * brick_shape.t)..t_end {
-        for z in (bz * brick_shape.z)..z_end {
-            for y in (by * brick_shape.y)..y_end {
-                for x in (bx * brick_shape.x)..x_end {
+    let t_end = ((bt + 1) * brick_shape.t()).min(shape.t());
+    let z_end = ((bz + 1) * brick_shape.z()).min(shape.z());
+    let y_end = ((by + 1) * brick_shape.y()).min(shape.y());
+    let x_end = ((bx + 1) * brick_shape.x()).min(shape.x());
+    for t in (bt * brick_shape.t())..t_end {
+        for z in (bz * brick_shape.z())..z_end {
+            for y in (by * brick_shape.y())..y_end {
+                for x in (bx * brick_shape.x())..x_end {
                     if values[phase11_tzyx_index(shape, t, z, y, x)?] != 0 {
                         return Ok(true);
                     }
@@ -270,9 +270,9 @@ fn phase11_sparse_brick_has_nonzero(
 }
 
 fn phase11_tzyx_index(shape: Shape4D, t: u64, z: u64, y: u64, x: u64) -> anyhow::Result<usize> {
-    if t >= shape.t || z >= shape.z || y >= shape.y || x >= shape.x {
+    if t >= shape.t() || z >= shape.z() || y >= shape.y() || x >= shape.x() {
         bail!("index t={t}, z={z}, y={y}, x={x} is outside shape {shape:?}");
     }
-    let index = (((t * shape.z + z) * shape.y + y) * shape.x) + x;
+    let index = (((t * shape.z() + z) * shape.y() + y) * shape.x()) + x;
     usize::try_from(index).context("Phase 11 sparse fixture index does not fit usize")
 }

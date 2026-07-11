@@ -1,6 +1,7 @@
 {
   "schema": "mirante4d-current-state-field-ledger",
   "schema_version": 1,
+  "status": "wp07b-live-cutover-enforced",
   "source_revision": "9f398f6d19b9ce918395cb4191ccbd9d134e2344",
   "sources": [
     {
@@ -14,13 +15,29 @@
       "expected_fields": 32
     }
   ],
+  "enforcement": {
+    "historical_inventory_fields": 152,
+    "finalized_or_deleted_at_wp07b": 44,
+    "temporary_non_durable_fields": 108,
+    "predecessor_appstate_deleted": true,
+    "predecessor_project_v14_authority_deleted": true,
+    "temporary_owners": [
+      { "owner": "CurrentDatasetRuntime", "fields": 53, "expires": "WP-08B" },
+      { "owner": "CurrentRenderRuntime", "fields": 24, "expires": "WP-09B" },
+      { "owner": "CurrentUiRuntime", "fields": 14, "expires": "WP-09C" },
+      { "owner": "CurrentProjectRuntime", "fields": 1, "expires": "WP-10B" },
+      { "owner": "CurrentImportRuntime", "fields": 4, "expires": "WP-10C" },
+      { "owner": "CurrentAnalysisRuntime", "fields": 10, "expires": "WP-12" },
+      { "owner": "CurrentValidationRuntime", "fields": 2, "expires": "WP-14" }
+    ]
+  },
   "invariants": {
     "every_source_field_exactly_once": true,
     "one_target_owner_or_deletion": true,
     "product_cutover_gate": "WP-07B",
     "no_live_target_model_in_wp07a": true,
     "appstate_predecessor_field_removal_gate": "WP-07B",
-    "finalization_gate_meaning": "Latest gate for reaching the named final owner or deletion; the WP-07B entry must name a bounded temporary non-durable owner for every later-gated AppState fact."
+    "finalization_gate_meaning": "Latest gate for reaching the named final owner or deletion. At the live WP-07B cutover, every later-gated fact is held by exactly one bounded temporary non-durable owner listed above."
   },
   "dispositions": [
     {

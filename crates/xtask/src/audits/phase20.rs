@@ -6,10 +6,10 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use mirante4d_core::{IntensityDType, LayerId, Shape3D, TimeIndex};
 use mirante4d_data::{DatasetHandle, SpatialBrickIndex};
+use mirante4d_domain::{IntensityDType, Shape3D, TimeIndex};
 use mirante4d_format::validate::load_manifest;
-use mirante4d_format::{ExistingPackagePolicy, NativeManifest};
+use mirante4d_format::{ExistingPackagePolicy, LayerId, NativeManifest};
 use mirante4d_import::{
     ImportCancellationToken, TiffImportSource, TiffImportStorageOptions, TiffNoDataPolicyReview,
     TiffSourceImportOptions, TiffSourceProfile, accepted_tiff_reviewed_import_plan,
@@ -300,6 +300,7 @@ fn phase20_real_sample_source(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn phase20_import_source_evidence(
     source: TiffImportSource,
     output_package: PathBuf,
@@ -418,9 +419,9 @@ fn phase20_import_source_evidence(
             "dataset_opened": true,
             "first_layer_id": layer_id.as_str(),
             "first_volume_shape": {
-                "z": first_volume_shape.z,
-                "y": first_volume_shape.y,
-                "x": first_volume_shape.x,
+                "z": first_volume_shape.z(),
+                "y": first_volume_shape.y(),
+                "x": first_volume_shape.x(),
             },
             "first_brick_probe": first_brick_probe,
             "app_smoke_report": app_smoke_report,
@@ -437,9 +438,9 @@ fn import_storage_evidence_json(
         .brick_shape_zyx
         .map(|shape| {
             json!({
-                "z": shape.z,
-                "y": shape.y,
-                "x": shape.x,
+                "z": shape.z(),
+                "y": shape.y(),
+                "x": shape.x(),
             })
         })
         .unwrap_or(Value::Null);
@@ -453,11 +454,36 @@ fn import_storage_evidence_json(
                 .map(|scale| {
                     json!({
                         "level": scale.level,
-                        "shape": scale.shape,
-                        "brick_shape": scale.storage.brick_shape,
-                        "brick_grid_shape": scale.storage.brick_grid_shape,
-                        "shard_shape": scale.storage.shard_shape,
-                        "chunks_per_shard": scale.storage.chunks_per_shard,
+                        "shape": {
+                            "t": scale.shape.t(),
+                            "z": scale.shape.z(),
+                            "y": scale.shape.y(),
+                            "x": scale.shape.x(),
+                        },
+                        "brick_shape": {
+                            "t": scale.storage.brick_shape.t(),
+                            "z": scale.storage.brick_shape.z(),
+                            "y": scale.storage.brick_shape.y(),
+                            "x": scale.storage.brick_shape.x(),
+                        },
+                        "brick_grid_shape": {
+                            "t": scale.storage.brick_grid_shape.t(),
+                            "z": scale.storage.brick_grid_shape.z(),
+                            "y": scale.storage.brick_grid_shape.y(),
+                            "x": scale.storage.brick_grid_shape.x(),
+                        },
+                        "shard_shape": {
+                            "t": scale.storage.shard_shape.t(),
+                            "z": scale.storage.shard_shape.z(),
+                            "y": scale.storage.shard_shape.y(),
+                            "x": scale.storage.shard_shape.x(),
+                        },
+                        "chunks_per_shard": {
+                            "t": scale.storage.chunks_per_shard.t(),
+                            "z": scale.storage.chunks_per_shard.z(),
+                            "y": scale.storage.chunks_per_shard.y(),
+                            "x": scale.storage.chunks_per_shard.x(),
+                        },
                     })
                 })
                 .collect::<Vec<_>>()
@@ -485,7 +511,11 @@ fn first_layer_shape_from_manifest(
         .iter()
         .find(|layer| layer.id == layer_id.as_str())
         .with_context(|| format!("manifest missing first layer {}", layer_id.as_str()))?;
-    Ok(Shape3D::new(layer.shape.z, layer.shape.y, layer.shape.x)?)
+    Ok(Shape3D::new(
+        layer.shape.z(),
+        layer.shape.y(),
+        layer.shape.x(),
+    )?)
 }
 
 fn first_layer_dtype_from_manifest(
@@ -510,7 +540,7 @@ fn read_first_brick_probe(
             let brick = dataset.read_u8_brick_at_scale(
                 layer_id,
                 0,
-                TimeIndex(0),
+                TimeIndex::new(0),
                 SpatialBrickIndex::new(0, 0, 0),
             )?;
             Ok(json!({
@@ -537,7 +567,7 @@ fn read_first_brick_probe(
             let brick = dataset.read_u16_brick_at_scale(
                 layer_id,
                 0,
-                TimeIndex(0),
+                TimeIndex::new(0),
                 SpatialBrickIndex::new(0, 0, 0),
             )?;
             Ok(json!({
@@ -564,7 +594,7 @@ fn read_first_brick_probe(
             let brick = dataset.read_f32_brick_at_scale(
                 layer_id,
                 0,
-                TimeIndex(0),
+                TimeIndex::new(0),
                 SpatialBrickIndex::new(0, 0, 0),
             )?;
             Ok(json!({

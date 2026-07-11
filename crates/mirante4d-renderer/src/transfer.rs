@@ -1,7 +1,8 @@
-use mirante4d_core::{
-    CameraAxes, ChannelColor, ChannelTransferFunction, DisplayWindow, IsoLightState, LayerDisplay,
-    TransferCurve,
+use glam::DVec3;
+use mirante4d_domain::{
+    DisplayWindow, IsoLightState, LayerTransfer, Opacity, RgbColor, TransferCurve,
 };
+use mirante4d_render_api::CameraAxes;
 
 use crate::{
     DvrRgbaFrame, IsoSurfaceFrameF32, IsoSurfaceFrameU16, MipImageF32, MipImageU16, RenderError,
@@ -9,10 +10,12 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IntensityTransfer {
-    pub display: LayerDisplay,
-    pub color: ChannelColor,
-    pub curve: TransferCurve,
-    pub invert: bool,
+    visible: bool,
+    window: DisplayWindow,
+    color: RgbColor,
+    opacity: Opacity,
+    curve: TransferCurve,
+    invert: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -59,36 +62,68 @@ pub struct DisplayRgbaImage {
 }
 
 impl IntensityTransfer {
-    pub fn new(display: LayerDisplay, color: ChannelColor) -> Self {
+    pub fn new(visible: bool, transfer: LayerTransfer) -> Self {
         Self {
-            display,
-            color,
-            curve: TransferCurve::Linear,
-            invert: false,
+            visible,
+            window: transfer.window(),
+            color: transfer.color(),
+            opacity: transfer.opacity(),
+            curve: transfer.curve(),
+            invert: transfer.invert(),
         }
     }
 
-    pub fn from_transfer_function(transfer: ChannelTransferFunction) -> Self {
-        Self {
-            display: transfer.display,
-            color: transfer.color,
-            curve: transfer.curve,
-            invert: transfer.invert,
-        }
+    pub const fn visible(self) -> bool {
+        self.visible
     }
 
-    pub fn with_curve(mut self, curve: TransferCurve) -> Self {
+    pub const fn window(self) -> DisplayWindow {
+        self.window
+    }
+
+    pub const fn color(self) -> RgbColor {
+        self.color
+    }
+
+    pub const fn opacity(self) -> Opacity {
+        self.opacity
+    }
+
+    pub const fn curve(self) -> TransferCurve {
+        self.curve
+    }
+
+    pub const fn invert(self) -> bool {
+        self.invert
+    }
+
+    pub fn layer_transfer(self) -> LayerTransfer {
+        LayerTransfer::new(
+            self.window,
+            self.color,
+            self.opacity,
+            self.curve,
+            self.invert,
+        )
+    }
+
+    pub const fn with_curve(mut self, curve: TransferCurve) -> Self {
         self.curve = curve;
         self
     }
 
-    pub fn with_invert(mut self, invert: bool) -> Self {
+    pub const fn with_invert(mut self, invert: bool) -> Self {
         self.invert = invert;
         self
     }
 
+    pub fn color_rgba(self) -> [f32; 4] {
+        let [red, green, blue] = self.color().rgb();
+        [red, green, blue, 1.0]
+    }
+
     pub fn scalar_transfer(self) -> ScalarDisplayTransfer {
-        ScalarDisplayTransfer::new(self.display.window, self.curve, self.invert)
+        ScalarDisplayTransfer::new(self.window(), self.curve(), self.invert())
     }
 }
 
@@ -101,39 +136,33 @@ impl ScalarDisplayTransfer {
         }
     }
 
-    pub fn from_transfer_function(transfer: &ChannelTransferFunction) -> Self {
-        Self::new(transfer.display.window, transfer.curve, transfer.invert)
+    pub fn from_intensity_transfer(transfer: IntensityTransfer) -> Self {
+        Self::new(transfer.window(), transfer.curve(), transfer.invert())
     }
 
     pub fn identity_u16() -> Self {
         Self::new(
-            DisplayWindow {
-                low: 0.0,
-                high: f32::from(u16::MAX),
-            },
-            TransferCurve::Linear,
+            DisplayWindow::new(0.0, f32::from(u16::MAX)).expect("identity window is valid"),
+            TransferCurve::linear(),
             false,
         )
     }
 
     pub fn identity_f32() -> Self {
         Self::new(
-            DisplayWindow {
-                low: 0.0,
-                high: 1.0,
-            },
-            TransferCurve::Linear,
+            DisplayWindow::new(0.0, 1.0).expect("identity window is valid"),
+            TransferCurve::linear(),
             false,
         )
     }
 
     pub fn map_source_value(self, value: f32) -> f32 {
-        let window_width = self.window.high - self.window.low;
+        let window_width = self.window.high() - self.window.low();
         if window_width <= f32::EPSILON {
             return 0.0;
         }
-        let normalized = ((value - self.window.low) / window_width).clamp(0.0, 1.0);
-        apply_invert(self.curve.map_normalized(normalized), self.invert)
+        let normalized = ((value - self.window.low()) / window_width).clamp(0.0, 1.0);
+        apply_invert(map_curve(self.curve, normalized), self.invert)
     }
 
     pub fn map_source_value_f64(self, value: f64) -> f64 {
@@ -433,15 +462,15 @@ pub fn composite_dvr_rgba_channels(
 
 fn composite_one_channel(channel: &IntensityChannelFrame<'_>, premultiplied: &mut [[f32; 4]]) {
     let transfer = channel.transfer;
-    if !transfer.display.visible {
+    if !transfer.visible() {
         return;
     }
-    let window_width = transfer.display.window.high - transfer.display.window.low;
+    let window_width = transfer.window().high() - transfer.window().low();
     if window_width <= f32::EPSILON {
         return;
     }
-    let [red, green, blue, color_alpha] = transfer.color.color_rgba;
-    let channel_alpha = transfer.display.opacity.clamp(0.0, 1.0) * color_alpha.clamp(0.0, 1.0);
+    let [red, green, blue, color_alpha] = transfer.color_rgba();
+    let channel_alpha = transfer.opacity().get().clamp(0.0, 1.0) * color_alpha.clamp(0.0, 1.0);
     if channel_alpha <= f32::EPSILON {
         return;
     }
@@ -472,15 +501,15 @@ fn composite_one_f32_channel(
     premultiplied: &mut [[f32; 4]],
 ) {
     let transfer = channel.transfer;
-    if !transfer.display.visible {
+    if !transfer.visible() {
         return;
     }
-    let window_width = transfer.display.window.high - transfer.display.window.low;
+    let window_width = transfer.window().high() - transfer.window().low();
     if window_width <= f32::EPSILON {
         return;
     }
-    let [red, green, blue, color_alpha] = transfer.color.color_rgba;
-    let channel_alpha = transfer.display.opacity.clamp(0.0, 1.0) * color_alpha.clamp(0.0, 1.0);
+    let [red, green, blue, color_alpha] = transfer.color_rgba();
+    let channel_alpha = transfer.opacity().get().clamp(0.0, 1.0) * color_alpha.clamp(0.0, 1.0);
     if channel_alpha <= f32::EPSILON {
         return;
     }
@@ -650,9 +679,11 @@ struct IsoLighting {
 
 impl IsoLightVectors {
     fn new(light_state: IsoLightState, camera_axes: CameraAxes) -> Self {
+        let forward = DVec3::from_array(camera_axes.forward());
+        let light = crate::current_camera::iso_light_direction(light_state, camera_axes);
         Self {
-            light: dvec3_to_f32(light_state.light_direction_world(camera_axes)),
-            view: dvec3_to_f32((-camera_axes.forward).normalize_or_zero()),
+            light: dvec3_to_f32(light),
+            view: dvec3_to_f32((-forward).normalize_or_zero()),
         }
     }
 }
@@ -719,9 +750,9 @@ fn to_u16_lighting(value: f32) -> u16 {
 }
 
 fn iso_surface_channel_visible(transfer: IntensityTransfer) -> bool {
-    transfer.display.visible
-        && transfer.display.opacity > f32::EPSILON
-        && transfer.color.color_rgba[3] > f32::EPSILON
+    transfer.visible()
+        && transfer.opacity().get() > f32::EPSILON
+        && transfer.color_rgba()[3] > f32::EPSILON
 }
 
 fn iso_source_rgba(
@@ -730,8 +761,8 @@ fn iso_source_rgba(
     specular_lighting: u16,
     transfer: IntensityTransfer,
 ) -> [f32; 4] {
-    let [red, green, blue, color_alpha] = transfer.color.color_rgba;
-    let alpha = transfer.display.opacity.clamp(0.0, 1.0) * color_alpha.clamp(0.0, 1.0);
+    let [red, green, blue, color_alpha] = transfer.color_rgba();
+    let alpha = transfer.opacity().get().clamp(0.0, 1.0) * color_alpha.clamp(0.0, 1.0);
     let material = material_scalar.clamp(0.0, 1.0);
     let diffuse = f32::from(diffuse_lighting) / f32::from(u16::MAX);
     let specular = f32::from(specular_lighting) / f32::from(u16::MAX);
@@ -780,26 +811,35 @@ fn apply_invert(mapped: f32, invert: bool) -> f32 {
     }
 }
 
+fn map_curve(curve: TransferCurve, value: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    if curve.is_linear() {
+        value
+    } else {
+        value.powf(1.0 / curve.gamma_value())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use glam::{DQuat, DVec3};
-    use mirante4d_core::{
-        CameraAxes, CameraView, ChannelColor, DisplayWindow, IsoLightState, LayerDisplay,
-        Projection, TransferCurve,
-    };
+    use glam::DVec3;
+    use mirante4d_domain::{DisplayWindow, IsoLightState, Projection, RgbColor, TransferCurve};
+    use mirante4d_format::LayerDisplay;
+    use mirante4d_render_api::CameraAxes;
 
     use crate::{IsoSurfaceFrameF32, IsoSurfaceFrameU16, IsoSurfaceNormal, PixelCoverage};
 
     use super::*;
 
     fn default_iso_light() -> (IsoLightState, CameraAxes) {
-        let camera = CameraView::new(
+        let camera = crate::current_camera::frame_from_look_at(
             Projection::Orthographic,
             DVec3::ZERO,
-            DQuat::IDENTITY,
+            -DVec3::Z,
+            DVec3::Y,
             10.0,
             320.0,
-            40.0,
+            crate::current_camera::presentation(512.0, 512.0),
         );
         (IsoLightState::attached_camera(), camera.axes())
     }
@@ -809,11 +849,11 @@ mod tests {
         let frame = MipImageU16::new(4, 1, vec![500, 1_000, 1_058, 1_115]);
         let display =
             LayerDisplay::new(true, DisplayWindow::new(1_000.0, 1_115.0).unwrap(), 0.5).unwrap();
-        let color = ChannelColor::new([1.0, 1.0, 1.0, 1.0]).unwrap();
+        let color = RgbColor::new([1.0, 1.0, 1.0]).unwrap();
 
         let image = composite_intensity_channels(&[IntensityChannelFrame::new(
             &frame,
-            IntensityTransfer::new(display, color),
+            IntensityTransfer::new(display.visible(), display.layer_transfer(color)),
         )])
         .unwrap();
 
@@ -834,17 +874,29 @@ mod tests {
         let green_frame = MipImageU16::new(1, 1, vec![100]);
         let display =
             LayerDisplay::new(true, DisplayWindow::new(0.0, 100.0).unwrap(), 1.0).unwrap();
-        let red = ChannelColor::new([1.0, 0.0, 0.0, 1.0]).unwrap();
-        let green = ChannelColor::new([0.0, 1.0, 0.0, 1.0]).unwrap();
+        let red = RgbColor::new([1.0, 0.0, 0.0]).unwrap();
+        let green = RgbColor::new([0.0, 1.0, 0.0]).unwrap();
 
         let red_green = composite_intensity_channels(&[
-            IntensityChannelFrame::new(&red_frame, IntensityTransfer::new(display, red)),
-            IntensityChannelFrame::new(&green_frame, IntensityTransfer::new(display, green)),
+            IntensityChannelFrame::new(
+                &red_frame,
+                IntensityTransfer::new(display.visible(), display.layer_transfer(red)),
+            ),
+            IntensityChannelFrame::new(
+                &green_frame,
+                IntensityTransfer::new(display.visible(), display.layer_transfer(green)),
+            ),
         ])
         .unwrap();
         let green_red = composite_intensity_channels(&[
-            IntensityChannelFrame::new(&green_frame, IntensityTransfer::new(display, green)),
-            IntensityChannelFrame::new(&red_frame, IntensityTransfer::new(display, red)),
+            IntensityChannelFrame::new(
+                &green_frame,
+                IntensityTransfer::new(display.visible(), display.layer_transfer(green)),
+            ),
+            IntensityChannelFrame::new(
+                &red_frame,
+                IntensityTransfer::new(display.visible(), display.layer_transfer(red)),
+            ),
         ])
         .unwrap();
 
@@ -857,11 +909,11 @@ mod tests {
         let frame = MipImageU16::new(1, 1, vec![100]);
         let display =
             LayerDisplay::new(false, DisplayWindow::new(0.0, 100.0).unwrap(), 1.0).unwrap();
-        let color = ChannelColor::new([1.0, 0.0, 0.0, 1.0]).unwrap();
+        let color = RgbColor::new([1.0, 0.0, 0.0]).unwrap();
 
         let image = composite_intensity_channels(&[IntensityChannelFrame::new(
             &frame,
-            IntensityTransfer::new(display, color),
+            IntensityTransfer::new(display.visible(), display.layer_transfer(color)),
         )])
         .unwrap();
 
@@ -873,11 +925,12 @@ mod tests {
         let frame = MipImageU16::new(1, 1, vec![25]);
         let display =
             LayerDisplay::new(true, DisplayWindow::new(0.0, 100.0).unwrap(), 1.0).unwrap();
-        let color = ChannelColor::new([1.0, 1.0, 1.0, 1.0]).unwrap();
+        let color = RgbColor::new([1.0, 1.0, 1.0]).unwrap();
 
         let image = composite_intensity_channels(&[IntensityChannelFrame::new(
             &frame,
-            IntensityTransfer::new(display, color).with_curve(TransferCurve::gamma(2.0).unwrap()),
+            IntensityTransfer::new(display.visible(), display.layer_transfer(color))
+                .with_curve(TransferCurve::gamma(2.0).unwrap()),
         )])
         .unwrap();
 
@@ -910,11 +963,11 @@ mod tests {
         .unwrap();
         let display =
             LayerDisplay::new(true, DisplayWindow::new(0.0, 100.0).unwrap(), 1.0).unwrap();
-        let color = ChannelColor::new([1.0, 0.0, 0.0, 1.0]).unwrap();
+        let color = RgbColor::new([1.0, 0.0, 0.0]).unwrap();
 
         let image = composite_intensity_channels(&[IntensityChannelFrame::new(
             &frame,
-            IntensityTransfer::new(display, color),
+            IntensityTransfer::new(display.visible(), display.layer_transfer(color)),
         )])
         .unwrap();
 
@@ -951,10 +1004,14 @@ mod tests {
         )
         .unwrap();
         let display = LayerDisplay::new(true, DisplayWindow::new(0.0, 1.0).unwrap(), 1.0).unwrap();
-        let far_red =
-            IntensityTransfer::new(display, ChannelColor::new([1.0, 0.0, 0.0, 1.0]).unwrap());
-        let near_green =
-            IntensityTransfer::new(display, ChannelColor::new([0.0, 1.0, 0.0, 1.0]).unwrap());
+        let far_red = IntensityTransfer::new(
+            display.visible(),
+            display.layer_transfer(RgbColor::new([1.0, 0.0, 0.0]).unwrap()),
+        );
+        let near_green = IntensityTransfer::new(
+            display.visible(),
+            display.layer_transfer(RgbColor::new([0.0, 1.0, 0.0]).unwrap()),
+        );
 
         let (light_state, camera_axes) = default_iso_light();
         let far_then_near = composite_iso_surface_channels(
@@ -998,8 +1055,10 @@ mod tests {
         .unwrap();
         let before = surface.clone();
         let display = LayerDisplay::new(true, DisplayWindow::new(0.0, 1.0).unwrap(), 1.0).unwrap();
-        let transfer =
-            IntensityTransfer::new(display, ChannelColor::new([1.0, 0.0, 0.0, 1.0]).unwrap());
+        let transfer = IntensityTransfer::new(
+            display.visible(),
+            display.layer_transfer(RgbColor::new([1.0, 0.0, 0.0]).unwrap()),
+        );
         let (attached, camera_axes) = default_iso_light();
 
         let attached_image = composite_iso_surface_channels(
@@ -1039,8 +1098,10 @@ mod tests {
         )
         .unwrap();
         let display = LayerDisplay::new(true, DisplayWindow::new(0.0, 1.0).unwrap(), 1.0).unwrap();
-        let transfer =
-            IntensityTransfer::new(display, ChannelColor::new([0.0, 1.0, 0.0, 1.0]).unwrap());
+        let transfer = IntensityTransfer::new(
+            display.visible(),
+            display.layer_transfer(RgbColor::new([0.0, 1.0, 0.0]).unwrap()),
+        );
         let (attached, camera_axes) = default_iso_light();
 
         let attached_image = composite_iso_surface_f32_channels(
@@ -1093,12 +1154,12 @@ mod tests {
         let visible_display =
             LayerDisplay::new(true, DisplayWindow::new(0.0, 1.0).unwrap(), 1.0).unwrap();
         let hidden_transfer = IntensityTransfer::new(
-            hidden_display,
-            ChannelColor::new([1.0, 0.0, 0.0, 1.0]).unwrap(),
+            hidden_display.visible(),
+            hidden_display.layer_transfer(RgbColor::new([1.0, 0.0, 0.0]).unwrap()),
         );
         let visible_transfer = IntensityTransfer::new(
-            visible_display,
-            ChannelColor::new([0.0, 1.0, 0.0, 1.0]).unwrap(),
+            visible_display.visible(),
+            visible_display.layer_transfer(RgbColor::new([0.0, 1.0, 0.0]).unwrap()),
         );
         let (light_state, camera_axes) = default_iso_light();
 
@@ -1120,11 +1181,12 @@ mod tests {
         let frame = MipImageU16::new(3, 1, vec![0, 50, 100]);
         let display =
             LayerDisplay::new(true, DisplayWindow::new(0.0, 100.0).unwrap(), 1.0).unwrap();
-        let color = ChannelColor::new([1.0, 1.0, 1.0, 1.0]).unwrap();
+        let color = RgbColor::new([1.0, 1.0, 1.0]).unwrap();
 
         let image = composite_intensity_channels(&[IntensityChannelFrame::new(
             &frame,
-            IntensityTransfer::new(display, color).with_invert(true),
+            IntensityTransfer::new(display.visible(), display.layer_transfer(color))
+                .with_invert(true),
         )])
         .unwrap();
 
@@ -1143,11 +1205,12 @@ mod tests {
         let frame = MipImageU16::with_coverage(3, 1, vec![0, 0, 100], vec![0, 1, 1]).unwrap();
         let display =
             LayerDisplay::new(true, DisplayWindow::new(0.0, 100.0).unwrap(), 1.0).unwrap();
-        let color = ChannelColor::new([1.0, 1.0, 1.0, 1.0]).unwrap();
+        let color = RgbColor::new([1.0, 1.0, 1.0]).unwrap();
 
         let image = composite_intensity_channels(&[IntensityChannelFrame::new(
             &frame,
-            IntensityTransfer::new(display, color).with_invert(true),
+            IntensityTransfer::new(display.visible(), display.layer_transfer(color))
+                .with_invert(true),
         )])
         .unwrap();
 
@@ -1167,11 +1230,17 @@ mod tests {
         let right = MipImageU16::new(2, 1, vec![1, 2]);
         let display =
             LayerDisplay::new(true, DisplayWindow::new(0.0, 100.0).unwrap(), 1.0).unwrap();
-        let color = ChannelColor::new([1.0, 1.0, 1.0, 1.0]).unwrap();
+        let color = RgbColor::new([1.0, 1.0, 1.0]).unwrap();
 
         let result = composite_intensity_channels(&[
-            IntensityChannelFrame::new(&left, IntensityTransfer::new(display, color)),
-            IntensityChannelFrame::new(&right, IntensityTransfer::new(display, color)),
+            IntensityChannelFrame::new(
+                &left,
+                IntensityTransfer::new(display.visible(), display.layer_transfer(color)),
+            ),
+            IntensityChannelFrame::new(
+                &right,
+                IntensityTransfer::new(display.visible(), display.layer_transfer(color)),
+            ),
         ]);
 
         assert_eq!(
@@ -1186,11 +1255,11 @@ mod tests {
     fn float32_channel_transfer_uses_explicit_display_window_without_quantizing_source_values() {
         let frame = MipImageF32::new(4, 1, vec![-1.0, 0.0, 0.5, 1.0]);
         let display = LayerDisplay::new(true, DisplayWindow::new(0.0, 1.0).unwrap(), 1.0).unwrap();
-        let color = ChannelColor::new([1.0, 1.0, 1.0, 1.0]).unwrap();
+        let color = RgbColor::new([1.0, 1.0, 1.0]).unwrap();
 
         let image = composite_f32_intensity_channels(&[IntensityChannelFrameF32::new(
             &frame,
-            IntensityTransfer::new(display, color),
+            IntensityTransfer::new(display.visible(), display.layer_transfer(color)),
         )])
         .unwrap();
 
@@ -1209,11 +1278,12 @@ mod tests {
     fn float32_invert_lut_reverses_mapped_display_values() {
         let frame = MipImageF32::new(3, 1, vec![0.0, 0.5, 1.0]);
         let display = LayerDisplay::new(true, DisplayWindow::new(0.0, 1.0).unwrap(), 1.0).unwrap();
-        let color = ChannelColor::new([1.0, 1.0, 1.0, 1.0]).unwrap();
+        let color = RgbColor::new([1.0, 1.0, 1.0]).unwrap();
 
         let image = composite_f32_intensity_channels(&[IntensityChannelFrameF32::new(
             &frame,
-            IntensityTransfer::new(display, color).with_invert(true),
+            IntensityTransfer::new(display.visible(), display.layer_transfer(color))
+                .with_invert(true),
         )])
         .unwrap();
 
@@ -1231,11 +1301,12 @@ mod tests {
     fn invert_lut_skips_uncovered_f32_pixels() {
         let frame = MipImageF32::with_coverage(3, 1, vec![0.0, 0.0, 1.0], vec![0, 1, 1]).unwrap();
         let display = LayerDisplay::new(true, DisplayWindow::new(0.0, 1.0).unwrap(), 1.0).unwrap();
-        let color = ChannelColor::new([1.0, 1.0, 1.0, 1.0]).unwrap();
+        let color = RgbColor::new([1.0, 1.0, 1.0]).unwrap();
 
         let image = composite_f32_intensity_channels(&[IntensityChannelFrameF32::new(
             &frame,
-            IntensityTransfer::new(display, color).with_invert(true),
+            IntensityTransfer::new(display.visible(), display.layer_transfer(color))
+                .with_invert(true),
         )])
         .unwrap();
 

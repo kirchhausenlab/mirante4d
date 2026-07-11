@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 blake3.workspace = true
-mirante4d-core.workspace = true
+mirante4d-domain.workspace = true
 mirante4d-format.workspace = true
 quick-xml.workspace = true
 thiserror.workspace = true

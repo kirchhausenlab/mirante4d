@@ -2,16 +2,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use glam::DVec3;
-use mirante4d_core::{
-    GridToWorld, IntensityDType, LayerId, Shape3D, Shape4D, TimeIndex, WorldSpace, WorldUnit,
-};
+use mirante4d_domain::{IntensityDType, Shape3D, Shape4D, TimeIndex};
 use mirante4d_format::{
-    ChannelMetadata, DenseF32Layer, DenseU16Layer, DenseU16MultiscaleLayer, DenseU16Scale,
-    ExistingPackagePolicy, FixtureKind, NativeF32Dataset, NativeMultiscaleDatasetWriter,
-    NativeU16Dataset, NativeU16MultiscaleDataset, ScaleReduction, StreamingU8LayerSpec,
-    StreamingU8ScaleSpec, default_f32_display, default_u16_display, expected_fixture_value,
-    expected_fixture_value_for_channel, write_fixture, write_native_f32_dataset,
-    write_native_u16_dataset, write_native_u16_multiscale_dataset,
+    ChannelMetadata, CurrentGridToWorldExt, DenseF32Layer, DenseU16Layer, DenseU16MultiscaleLayer,
+    DenseU16Scale, ExistingPackagePolicy, FixtureKind, LayerId, NativeF32Dataset,
+    NativeMultiscaleDatasetWriter, NativeU16Dataset, NativeU16MultiscaleDataset, ScaleReduction,
+    StreamingU8LayerSpec, StreamingU8ScaleSpec, WorldSpace, WorldUnit, default_f32_display,
+    default_u16_display, expected_fixture_value, expected_fixture_value_for_channel, write_fixture,
+    write_native_f32_dataset, write_native_u16_dataset, write_native_u16_multiscale_dataset,
 };
 
 use super::*;
@@ -85,7 +83,7 @@ fn exposes_brick_metadata_without_decoding_payloads() {
                 },
                 shape,
                 brick_shape: Shape4D::new(1, 2, 2, 2).unwrap(),
-                grid_to_world: GridToWorld::scale_um(1.0, 1.0, 1.0),
+                grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
                 display: default_u16_display(),
                 values_tzyx: values,
             }],
@@ -97,10 +95,18 @@ fn exposes_brick_metadata_without_decoding_payloads() {
     let layer_id = dataset.first_layer_id().unwrap();
 
     let occupied = dataset
-        .brick_metadata(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+        .brick_metadata(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 0),
+        )
         .unwrap();
     let empty = dataset
-        .brick_metadata(&layer_id, TimeIndex(0), SpatialBrickIndex::new(1, 1, 1))
+        .brick_metadata(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(1, 1, 1),
+        )
         .unwrap();
     let stats = dataset.stats().unwrap();
 
@@ -138,7 +144,9 @@ fn opens_valid_fixture_and_reads_known_values() {
     let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
 
     assert_eq!(volume.shape, Shape3D::new(16, 16, 16).unwrap());
     assert_eq!(
@@ -156,7 +164,7 @@ fn reads_uint8_stored_layer_as_uint8_volume() {
     let tempdir = tempfile::tempdir().unwrap();
     let package = tempdir.path().join("u8-readable.m4d");
     let shape = Shape4D::new(1, 1, 2, 4).unwrap();
-    let grid_to_world = GridToWorld::scale_um(1.0, 1.0, 1.0);
+    let grid_to_world = mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0);
     let mut writer = NativeMultiscaleDatasetWriter::create(
         &package,
         "u8-readable".to_owned(),
@@ -198,16 +206,23 @@ fn reads_uint8_stored_layer_as_uint8_volume() {
 
     let dataset = DatasetHandle::open(&package).unwrap();
     let layer_id = LayerId::new("ch0").unwrap();
-    let volume = dataset.read_u8_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_u8_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     assert_eq!(volume.values(), &[0, 1, 2, 3, 250, 251, 252, 253]);
 
     let brick = dataset
-        .read_u8_brick_at_scale(&layer_id, 0, TimeIndex(0), SpatialBrickIndex::new(0, 0, 1))
+        .read_u8_brick_at_scale(
+            &layer_id,
+            0,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 1),
+        )
         .unwrap();
     assert_eq!(brick.values(), &[2, 3]);
 
     assert!(matches!(
-        dataset.read_u16_volume(&layer_id, TimeIndex(0)),
+        dataset.read_u16_volume(&layer_id, TimeIndex::new(0)),
         Err(DataError::UnsupportedDType {
             dtype: IntensityDType::Uint8,
             ..
@@ -239,7 +254,7 @@ fn reads_float32_stored_layer_as_float32_volume_and_region() {
                 },
                 shape,
                 brick_shape: Shape4D::new(1, 1, 1, 2).unwrap(),
-                grid_to_world: GridToWorld::scale_um(1.0, 1.0, 1.0),
+                grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
                 display: default_f32_display(),
                 values_tzyx: values.clone(),
             }],
@@ -250,7 +265,9 @@ fn reads_float32_stored_layer_as_float32_volume_and_region() {
 
     let dataset = DatasetHandle::open(&package).unwrap();
     let layer_id = LayerId::new("ch0").unwrap();
-    let volume = dataset.read_f32_volume(&layer_id, TimeIndex(0)).unwrap();
+    let volume = dataset
+        .read_f32_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     assert_eq!(volume.shape, Shape3D::new(1, 2, 4).unwrap());
     assert_eq!(volume.values(), values.as_slice());
     assert_eq!(volume.voxel(0, 1, 3), Some(13.75));
@@ -258,7 +275,7 @@ fn reads_float32_stored_layer_as_float32_volume_and_region() {
     let region = dataset
         .read_f32_region(
             &layer_id,
-            TimeIndex(0),
+            TimeIndex::new(0),
             VolumeRegion::new(0, 0, 1, 1, 2, 2).unwrap(),
         )
         .unwrap();
@@ -266,7 +283,11 @@ fn reads_float32_stored_layer_as_float32_volume_and_region() {
     assert_eq!(region.values(), &[0.25, 1.5, 11.25, 12.5]);
 
     let brick = dataset
-        .read_f32_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 1, 1))
+        .read_f32_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 1, 1),
+        )
         .unwrap();
     assert_eq!(brick.scale_level, 0);
     assert_eq!(
@@ -319,7 +340,7 @@ fn read_u16_volume_rejects_float32_layer_without_lossy_conversion() {
                 },
                 shape,
                 brick_shape: Shape4D::new(1, 1, 1, 2).unwrap(),
-                grid_to_world: GridToWorld::scale_um(1.0, 1.0, 1.0),
+                grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
                 display: default_f32_display(),
                 values_tzyx: vec![0.5, 1.5],
             }],
@@ -330,7 +351,7 @@ fn read_u16_volume_rejects_float32_layer_without_lossy_conversion() {
 
     let dataset = DatasetHandle::open(&package).unwrap();
     let err = dataset
-        .read_u16_volume(&LayerId::new("ch0").unwrap(), TimeIndex(0))
+        .read_u16_volume(&LayerId::new("ch0").unwrap(), TimeIndex::new(0))
         .unwrap_err();
 
     assert!(matches!(
@@ -348,7 +369,9 @@ fn reads_requested_timepoint() {
     let root = write_fixture(FixtureKind::TimeU16_8Cube3T, tempdir.path()).unwrap();
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
-    let volume = dataset.read_u16_volume(&layer_id, TimeIndex(2)).unwrap();
+    let volume = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(2))
+        .unwrap();
 
     assert_eq!(volume.shape, Shape3D::new(8, 8, 8).unwrap());
     assert_eq!(
@@ -364,7 +387,9 @@ fn reads_only_requested_timepoint_subset() {
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
 
-    let volume = dataset.read_u16_volume(&layer_id, TimeIndex(2)).unwrap();
+    let volume = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(2))
+        .unwrap();
     let stats = dataset.stats().unwrap();
 
     assert_eq!(volume.values().len(), 8 * 8 * 8);
@@ -384,12 +409,14 @@ fn volume_read_records_encoded_payload_and_decoded_byte_counts() {
     let expected_payload_bytes = encoded_payload_bytes_for_timepoint_region(
         &layer_id,
         dataset.scale(&layer_id, 0).unwrap(),
-        TimeIndex(2),
+        TimeIndex::new(2),
         &region,
     )
     .unwrap();
 
-    dataset.read_u16_volume(&layer_id, TimeIndex(2)).unwrap();
+    dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(2))
+        .unwrap();
     let stats = dataset.stats().unwrap();
 
     assert!(expected_payload_bytes > 0);
@@ -410,7 +437,11 @@ fn neighboring_brick_reads_reuse_cached_shard_index() {
     let layer_id = dataset.first_layer_id().unwrap();
 
     dataset
-        .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+        .read_u16_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 0),
+        )
         .unwrap();
     let after_first = dataset.stats().unwrap();
     assert_eq!(after_first.subset_reads, 1);
@@ -420,7 +451,11 @@ fn neighboring_brick_reads_reuse_cached_shard_index() {
     assert_eq!(after_first.shard_index_cache_entries, 1);
 
     dataset
-        .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 1))
+        .read_u16_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 1),
+        )
         .unwrap();
     let after_second = dataset.stats().unwrap();
     assert_eq!(after_second.subset_reads, 2);
@@ -439,7 +474,11 @@ fn brick_cache_reports_resident_bytes_by_stored_dtype() {
     let u8_dataset = DatasetHandle::open_with_cache_budgets(&u8_root, 0, 1024).unwrap();
     let u8_layer = u8_dataset.first_layer_id().unwrap();
     u8_dataset
-        .read_u8_brick(&u8_layer, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+        .read_u8_brick(
+            &u8_layer,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 0),
+        )
         .unwrap();
     let u8_stats = u8_dataset.stats().unwrap();
     assert_eq!(u8_stats.brick_cache_bytes, 2);
@@ -455,7 +494,11 @@ fn brick_cache_reports_resident_bytes_by_stored_dtype() {
     let u16_dataset = DatasetHandle::open_with_cache_budgets(&u16_root, 0, 1024).unwrap();
     let u16_layer = u16_dataset.first_layer_id().unwrap();
     u16_dataset
-        .read_u16_brick(&u16_layer, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+        .read_u16_brick(
+            &u16_layer,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 0),
+        )
         .unwrap();
     let u16_stats = u16_dataset.stats().unwrap();
     assert_eq!(u16_stats.brick_cache_bytes, 16);
@@ -467,7 +510,11 @@ fn brick_cache_reports_resident_bytes_by_stored_dtype() {
     let f32_dataset = DatasetHandle::open_with_cache_budgets(&f32_root, 0, 1024).unwrap();
     let f32_layer = f32_dataset.first_layer_id().unwrap();
     f32_dataset
-        .read_f32_brick(&f32_layer, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+        .read_f32_brick(
+            &f32_layer,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 0),
+        )
         .unwrap();
     let f32_stats = f32_dataset.stats().unwrap();
     assert_eq!(f32_stats.brick_cache_bytes, 8);
@@ -483,8 +530,12 @@ fn reuses_cached_timepoint_volume() {
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
 
-    let first = dataset.read_u16_volume(&layer_id, TimeIndex(1)).unwrap();
-    let second = dataset.read_u16_volume(&layer_id, TimeIndex(1)).unwrap();
+    let first = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(1))
+        .unwrap();
+    let second = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(1))
+        .unwrap();
     let stats = dataset.stats().unwrap();
 
     assert_eq!(second.values(), first.values());
@@ -502,9 +553,15 @@ fn evicts_cached_volumes_when_byte_budget_is_exceeded() {
     let dataset = DatasetHandle::open_with_cache_budget(&root, one_volume_bytes).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
 
-    dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
-    dataset.read_u16_volume(&layer_id, TimeIndex(1)).unwrap();
-    dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
+    dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
+    dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(1))
+        .unwrap();
+    dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(0))
+        .unwrap();
     let stats = dataset.stats().unwrap();
 
     assert_eq!(stats.subset_reads, 3);
@@ -520,7 +577,9 @@ fn reads_requested_channel_layer() {
     let root = write_fixture(FixtureKind::TimeMultiChannelU16_8Cube3T2C, tempdir.path()).unwrap();
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = LayerId::new("ch1").unwrap();
-    let volume = dataset.read_u16_volume(&layer_id, TimeIndex(2)).unwrap();
+    let volume = dataset
+        .read_u16_volume(&layer_id, TimeIndex::new(2))
+        .unwrap();
 
     assert_eq!(
         volume.voxel(7, 7, 7),
@@ -537,7 +596,7 @@ fn reads_requested_spatial_region_subset() {
     let region = VolumeRegion::new(2, 3, 4, 5, 6, 7).unwrap();
 
     let volume = dataset
-        .read_u16_region(&layer_id, TimeIndex(0), region)
+        .read_u16_region(&layer_id, TimeIndex::new(0), region)
         .unwrap();
     let stats = dataset.stats().unwrap();
 
@@ -554,12 +613,12 @@ fn reads_requested_spatial_region_subset() {
     assert_eq!(stats.decoded_values, 5 * 6 * 7);
 
     let original_grid_to_world = dataset.layer(&layer_id).unwrap().grid_to_world;
-    let expected_world_origin = original_grid_to_world.transform_point(DVec3::new(
+    let expected_world_origin = original_grid_to_world.transform_point_vec(DVec3::new(
         region.x_start as f64,
         region.y_start as f64,
         region.z_start as f64,
     ));
-    let actual_world_origin = volume.grid_to_world.transform_point(DVec3::ZERO);
+    let actual_world_origin = volume.grid_to_world.transform_point_vec(DVec3::ZERO);
     assert!(
         (actual_world_origin - expected_world_origin).length() < 1.0e-12,
         "region local origin must map to original grid offset"
@@ -575,7 +634,7 @@ fn rejects_out_of_bounds_spatial_region() {
     let region = VolumeRegion::new(15, 0, 0, 2, 1, 1).unwrap();
 
     let err = dataset
-        .read_u16_region(&layer_id, TimeIndex(0), region)
+        .read_u16_region(&layer_id, TimeIndex::new(0), region)
         .unwrap_err();
 
     assert!(matches!(err, DataError::RegionOutOfBounds { .. }));
@@ -624,10 +683,15 @@ fn reads_scale_addressed_volume_and_brick() {
     );
 
     let volume = dataset
-        .read_u16_volume_at_scale(&layer_id, 1, TimeIndex(0))
+        .read_u16_volume_at_scale(&layer_id, 1, TimeIndex::new(0))
         .unwrap();
     let brick = dataset
-        .read_u16_brick_at_scale(&layer_id, 1, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+        .read_u16_brick_at_scale(
+            &layer_id,
+            1,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 0),
+        )
         .unwrap();
 
     assert_eq!(volume.scale_level, 1);
@@ -641,8 +705,8 @@ fn reads_scale_addressed_volume_and_brick() {
     let s1_origin = dataset
         .scale_grid_to_world(&layer_id, 1)
         .unwrap()
-        .transform_point(DVec3::ZERO);
-    let brick_origin = brick.volume.grid_to_world.transform_point(DVec3::ZERO);
+        .transform_point_vec(DVec3::ZERO);
+    let brick_origin = brick.volume.grid_to_world.transform_point_vec(DVec3::ZERO);
     assert!((brick_origin - s1_origin).length() < 1.0e-12);
 }
 
@@ -654,13 +718,27 @@ fn scale_addressed_brick_cache_does_not_alias_between_scales() {
     let layer_id = dataset.first_layer_id().unwrap();
 
     let s0 = dataset
-        .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+        .read_u16_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 0),
+        )
         .unwrap();
     let s1_first = dataset
-        .read_u16_brick_at_scale(&layer_id, 1, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+        .read_u16_brick_at_scale(
+            &layer_id,
+            1,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 0),
+        )
         .unwrap();
     let s1_second = dataset
-        .read_u16_brick_at_scale(&layer_id, 1, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+        .read_u16_brick_at_scale(
+            &layer_id,
+            1,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 0),
+        )
         .unwrap();
     let stats = dataset.stats().unwrap();
 
@@ -686,7 +764,7 @@ fn reads_edge_spatial_brick_subset_and_metadata() {
     let brick_index = SpatialBrickIndex::new(2, 1, 1);
 
     let brick = dataset
-        .read_u16_brick(&layer_id, TimeIndex(0), brick_index)
+        .read_u16_brick(&layer_id, TimeIndex::new(0), brick_index)
         .unwrap();
     let stats = dataset.stats().unwrap();
 
@@ -718,7 +796,7 @@ fn reads_edge_spatial_brick_subset_and_metadata() {
     assert_eq!(stats.decoded_bytes, 18);
     assert_eq!(stats.decoded_brick_bytes, 18);
     let metadata = dataset
-        .brick_metadata_at_scale(&layer_id, 0, TimeIndex(0), brick.brick_index)
+        .brick_metadata_at_scale(&layer_id, 0, TimeIndex::new(0), brick.brick_index)
         .unwrap();
     assert_eq!(stats.encoded_payload_bytes_read, metadata.payload_bytes);
     assert_eq!(stats.brick_cache_misses, 1);
@@ -726,8 +804,9 @@ fn reads_edge_spatial_brick_subset_and_metadata() {
     assert_eq!(stats.brick_cache_bytes, 18);
 
     let original_grid_to_world = dataset.layer(&layer_id).unwrap().grid_to_world;
-    let expected_world_origin = original_grid_to_world.transform_point(DVec3::new(4.0, 3.0, 4.0));
-    let actual_world_origin = brick.volume.grid_to_world.transform_point(DVec3::ZERO);
+    let expected_world_origin =
+        original_grid_to_world.transform_point_vec(DVec3::new(4.0, 3.0, 4.0));
+    let actual_world_origin = brick.volume.grid_to_world.transform_point_vec(DVec3::ZERO);
     assert!(
         (actual_world_origin - expected_world_origin).length() < 1.0e-12,
         "brick local origin must map to original grid offset"
@@ -751,7 +830,7 @@ fn reads_partial_brick_region_without_full_brick_cache_aliasing() {
         .read_u16_brick_region_at_scale_cancellable(
             &layer_id,
             0,
-            TimeIndex(0),
+            TimeIndex::new(0),
             brick_index,
             region,
             || false,
@@ -795,10 +874,10 @@ fn reuses_cached_spatial_brick() {
     let brick_index = SpatialBrickIndex::new(0, 0, 0);
 
     let first = dataset
-        .read_u16_brick(&layer_id, TimeIndex(0), brick_index)
+        .read_u16_brick(&layer_id, TimeIndex::new(0), brick_index)
         .unwrap();
     let second = dataset
-        .read_u16_brick(&layer_id, TimeIndex(0), brick_index)
+        .read_u16_brick(&layer_id, TimeIndex::new(0), brick_index)
         .unwrap();
     let stats = dataset.stats().unwrap();
 
@@ -824,13 +903,25 @@ fn evicts_cached_spatial_bricks_when_byte_budget_is_exceeded() {
     let layer_id = dataset.first_layer_id().unwrap();
 
     dataset
-        .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+        .read_u16_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 0),
+        )
         .unwrap();
     dataset
-        .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 1))
+        .read_u16_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 1),
+        )
         .unwrap();
     dataset
-        .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(0, 0, 0))
+        .read_u16_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(0, 0, 0),
+        )
         .unwrap();
     let stats = dataset.stats().unwrap();
 
@@ -854,7 +945,11 @@ fn rejects_out_of_bounds_spatial_brick() {
     let layer_id = dataset.first_layer_id().unwrap();
 
     let err = dataset
-        .read_u16_brick(&layer_id, TimeIndex(0), SpatialBrickIndex::new(2, 0, 0))
+        .read_u16_brick(
+            &layer_id,
+            TimeIndex::new(0),
+            SpatialBrickIndex::new(2, 0, 0),
+        )
         .unwrap_err();
 
     assert!(matches!(err, DataError::BrickIndexOutOfBounds { .. }));
@@ -868,7 +963,11 @@ fn reads_timepoint_local_brick_from_temporal_chunk_grid() {
     let layer_id = dataset.first_layer_id().unwrap();
 
     let brick = dataset
-        .read_u16_brick(&layer_id, TimeIndex(2), SpatialBrickIndex::new(0, 0, 0))
+        .read_u16_brick(
+            &layer_id,
+            TimeIndex::new(2),
+            SpatialBrickIndex::new(0, 0, 0),
+        )
         .unwrap();
 
     assert_eq!(brick.chunk_index.t, 2);
@@ -894,7 +993,7 @@ fn async_worker_reads_spatial_brick() {
     let ticket = pool
         .submit_brick(
             layer_id,
-            TimeIndex(0),
+            TimeIndex::new(0),
             SpatialBrickIndex::new(1, 1, 1),
             BrickRequestPriority::CurrentFrame,
         )
@@ -938,7 +1037,7 @@ fn cross_section_chunk_read_pool_reads_full_chunk_without_histogram_sampling() {
             CrossSectionChunkReadSpec {
                 layer_id,
                 scale_level: 0,
-                timepoint: TimeIndex(0),
+                timepoint: TimeIndex::new(0),
                 brick_index: SpatialBrickIndex::new(1, 1, 1),
                 priority: BrickRequestPriority::CurrentFrame,
                 queue_priority: 5,
@@ -994,7 +1093,7 @@ fn async_worker_reads_scale_addressed_brick() {
         .submit_brick_at_scale(
             layer_id,
             1,
-            TimeIndex(0),
+            TimeIndex::new(0),
             SpatialBrickIndex::new(0, 0, 0),
             BrickRequestPriority::CurrentFrame,
         )
@@ -1040,7 +1139,7 @@ fn async_worker_reads_float32_brick_without_u16_conversion_and_reuses_cache() {
                 },
                 shape,
                 brick_shape: Shape4D::new(1, 1, 1, 2).unwrap(),
-                grid_to_world: GridToWorld::scale_um(1.0, 1.0, 1.0),
+                grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
                 display: default_f32_display(),
                 values_tzyx: vec![0.0, 0.25, 1.5, -2.0, 10.0, 11.25, 12.5, 13.75],
             }],
@@ -1055,7 +1154,7 @@ fn async_worker_reads_float32_brick_without_u16_conversion_and_reuses_cache() {
     for _ in 0..2 {
         pool.submit_brick(
             layer_id.clone(),
-            TimeIndex(0),
+            TimeIndex::new(0),
             SpatialBrickIndex::new(0, 1, 1),
             BrickRequestPriority::CurrentFrame,
         )
@@ -1094,7 +1193,7 @@ fn async_worker_reuses_brick_cache() {
 
     pool.submit_brick(
         layer_id.clone(),
-        TimeIndex(0),
+        TimeIndex::new(0),
         SpatialBrickIndex::new(0, 0, 0),
         BrickRequestPriority::CurrentFrame,
     )
@@ -1105,7 +1204,7 @@ fn async_worker_reuses_brick_cache() {
     ));
     pool.submit_brick(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         SpatialBrickIndex::new(0, 0, 0),
         BrickRequestPriority::CurrentFrame,
     )
@@ -1138,7 +1237,7 @@ fn async_worker_cancellation_does_not_populate_cache() {
 
     pool.submit_brick_with_token(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         SpatialBrickIndex::new(0, 0, 0),
         BrickRequestPriority::Prefetch,
         cancellation,
@@ -1170,7 +1269,7 @@ fn async_worker_rejects_stale_generation_without_reading() {
     pool.submit_brick_for_generation(
         DataGenerationId(0),
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         SpatialBrickIndex::new(0, 0, 0),
         BrickRequestPriority::Prefetch,
         CancellationToken::new(),
@@ -1193,7 +1292,7 @@ fn rejects_out_of_range_timepoint() {
     let dataset = DatasetHandle::open(&root).unwrap();
     let layer_id = dataset.first_layer_id().unwrap();
     let err = dataset
-        .read_u16_volume(&layer_id, TimeIndex(1))
+        .read_u16_volume(&layer_id, TimeIndex::new(1))
         .unwrap_err();
 
     assert!(matches!(err, DataError::TimepointOutOfRange { .. }));
@@ -1223,7 +1322,7 @@ fn write_spatially_chunked_dataset(
                 },
                 shape,
                 brick_shape,
-                grid_to_world: GridToWorld::scale_um(0.2, 0.3, 0.5),
+                grid_to_world: mirante4d_format::grid_to_world_scale_um(0.2, 0.3, 0.5),
                 display: default_u16_display(),
                 values_tzyx: fixture_values(shape),
             }],
@@ -1237,7 +1336,7 @@ fn write_spatially_chunked_dataset(
 fn write_tiny_u8_dataset(output_root: &Path) -> PathBuf {
     let package_root = output_root.join("tiny-u8.m4d");
     let shape = Shape4D::new(1, 1, 2, 4).unwrap();
-    let grid_to_world = GridToWorld::scale_um(1.0, 1.0, 1.0);
+    let grid_to_world = mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0);
     let mut writer = NativeMultiscaleDatasetWriter::create(
         &package_root,
         "tiny-u8".to_owned(),
@@ -1300,7 +1399,7 @@ fn write_tiny_f32_dataset(output_root: &Path) -> PathBuf {
                 },
                 shape,
                 brick_shape: Shape4D::new(1, 1, 1, 2).unwrap(),
-                grid_to_world: GridToWorld::scale_um(1.0, 1.0, 1.0),
+                grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
                 display: default_f32_display(),
                 values_tzyx: vec![0.0, 0.25, 1.5, -2.0, 10.0, 11.25, 12.5, 13.75],
             }],
@@ -1315,7 +1414,7 @@ fn write_multiscale_dataset(output_root: &Path) -> PathBuf {
     let package_root = output_root.join("multiscale.m4d");
     let s0_shape = Shape4D::new(1, 4, 4, 4).unwrap();
     let s1_shape = Shape4D::new(1, 2, 2, 2).unwrap();
-    let s0_grid_to_world = GridToWorld::scale_um(0.2, 0.3, 0.5);
+    let s0_grid_to_world = mirante4d_format::grid_to_world_scale_um(0.2, 0.3, 0.5);
     let s1_grid_to_world = s0_grid_to_world
         .downsampled_integer_centered(2, 2, 2)
         .unwrap();
@@ -1368,10 +1467,10 @@ fn write_multiscale_dataset(output_root: &Path) -> PathBuf {
 
 fn fixture_values(shape: Shape4D) -> Vec<u16> {
     let mut values = Vec::with_capacity(shape.element_count().unwrap() as usize);
-    for t in 0..shape.t {
-        for z in 0..shape.z {
-            for y in 0..shape.y {
-                for x in 0..shape.x {
+    for t in 0..shape.t() {
+        for z in 0..shape.z() {
+            for y in 0..shape.y() {
+                for x in 0..shape.x() {
                     values.push(expected_fixture_value(t, z, y, x));
                 }
             }
@@ -1382,10 +1481,10 @@ fn fixture_values(shape: Shape4D) -> Vec<u16> {
 
 fn multiscale_s1_values(shape: Shape4D) -> Vec<u16> {
     let mut values = Vec::with_capacity(shape.element_count().unwrap() as usize);
-    for t in 0..shape.t {
-        for z in 0..shape.z {
-            for y in 0..shape.y {
-                for x in 0..shape.x {
+    for t in 0..shape.t() {
+        for z in 0..shape.z() {
+            for y in 0..shape.y() {
+                for x in 0..shape.x() {
                     values.push(multiscale_s1_value(t, z, y, x));
                 }
             }

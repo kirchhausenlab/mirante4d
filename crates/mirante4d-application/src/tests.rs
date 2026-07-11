@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
+use mirante4d_dataset::{DatasetCatalog, DatasetLayer, ScientificIdentityStatus};
 use mirante4d_domain::{
-    CameraView, CrossSectionView, DisplayWindow, IsoLightState, LayerTransfer, Opacity, Projection,
-    RenderState, RgbColor, SamplingPolicy, TimeIndex, ToolKind, TransferCurve, UnitQuaternion,
-    ViewerLayout, WorldPoint3,
+    CameraView, CrossSectionView, DisplayWindow, GridToWorld, IntensityDType, IsoLightState,
+    LayerTransfer, Opacity, Projection, RenderState, RgbColor, SamplingPolicy, Shape4D, TimeIndex,
+    ToolKind, TransferCurve, UnitQuaternion, ViewerLayout, WorldPoint3,
 };
 use mirante4d_identity::{
     ArtifactContentId, ExactBytesDigest, MediaType, ObjectRole, RawObjectDescriptor,
@@ -12,7 +13,7 @@ use mirante4d_project_model::{
     ArtifactCompleteness, ArtifactRecoverability, ArtifactSchema, ChannelPresetEntry,
     DatasetLocatorHint,
 };
-use mirante4d_settings::GIB;
+use mirante4d_settings::{GIB, RejectedFileDisposition};
 
 use super::*;
 
@@ -49,6 +50,188 @@ fn unbound_view_changes_are_transient_and_invalid_or_noop_commands_are_atomic() 
 }
 
 #[test]
+fn catalog_is_owned_by_snapshot_and_closes_every_view_transition() {
+    let application = application();
+    let first = application.snapshot();
+    let second = application.snapshot();
+    assert!(Arc::ptr_eq(first.catalog(), second.catalog()));
+    assert_eq!(first.catalog().layers().count(), first.catalog().len());
+
+    let missing_layer_catalog = DatasetCatalog::new(
+        "incomplete",
+        ScientificIdentityStatus::Unverified,
+        vec![dataset_layer(0, 4)],
+    )
+    .unwrap();
+    assert_eq!(
+        ApplicationState::new_unbound(
+            SourceSessionGeneration::new(1),
+            missing_layer_catalog,
+            unbound_workspace(project_id(1)),
+            ResourcePolicy::default(),
+        )
+        .unwrap_err(),
+        ApplicationFaultCode::DatasetLayerClosureMismatch
+    );
+
+    let mut bounded = ApplicationState::new_unbound(
+        SourceSessionGeneration::new(1),
+        catalog_with_timepoints(3),
+        unbound_workspace(project_id(2)),
+        ResourcePolicy::default(),
+    )
+    .unwrap();
+    let before = bounded.fork_for_dispatch();
+    assert_eq!(
+        bounded
+            .dispatch(ApplicationCommand::SetTimepoint(TimeIndex::new(3)))
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::TimepointOutOfBounds
+    );
+    assert_eq!(bounded, before);
+}
+
+#[test]
+fn replace_view_and_apply_preset_are_each_one_atomic_view_transition() {
+    let mut application = bound_application();
+    application.drain_events(MAX_PENDING_EVENTS);
+
+    let replaced = ViewState::new(
+        view().layers().to_vec(),
+        LogicalLayerKey::new(1),
+        TimeIndex::new(7),
+        camera(),
+        ViewerLayout::Single3d,
+        cross_section(),
+        IsoLightState::attached_camera(),
+    )
+    .unwrap();
+    application
+        .dispatch(ApplicationCommand::ReplaceView(replaced))
+        .unwrap();
+    assert_bound_revision(&application.snapshot(), 1, 1, true);
+    let WorkspaceSnapshot::Bound { project, .. } = application.snapshot().workspace().clone()
+    else {
+        panic!("workspace was not bound");
+    };
+    assert_eq!(project.view().active_layer(), LogicalLayerKey::new(1));
+    assert_eq!(project.view().timepoint(), TimeIndex::new(7));
+
+    let vivid = vivid_preset();
+    let vivid_id = vivid.id().clone();
+    application
+        .dispatch(ApplicationCommand::UpsertChannelPreset(vivid))
+        .unwrap();
+    assert_bound_revision(&application.snapshot(), 2, 2, true);
+    assert_eq!(
+        application.snapshot().transient().selected_channel_preset(),
+        Some(&vivid_id)
+    );
+
+    application
+        .dispatch(ApplicationCommand::ApplyChannelPreset(vivid_id.clone()))
+        .unwrap();
+    let snapshot = application.snapshot();
+    assert_bound_revision(&snapshot, 3, 3, true);
+    let WorkspaceSnapshot::Bound { project, .. } = snapshot.workspace() else {
+        panic!("workspace was not bound");
+    };
+    assert!(project.view().layers().iter().all(|layer| !layer.visible()));
+    assert_eq!(
+        snapshot.transient().selected_channel_preset(),
+        Some(&vivid_id)
+    );
+
+    let before_noop = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::ApplyChannelPreset(vivid_id))
+            .unwrap(),
+        CommandEffect::NoChange
+    );
+    assert_eq!(application, before_noop);
+}
+
+#[test]
+fn logical_playback_ticks_replace_wall_clock_state_and_obey_catalog_bounds() {
+    let mut application = ApplicationState::new_unbound(
+        SourceSessionGeneration::new(1),
+        catalog_with_timepoints(3),
+        unbound_workspace(project_id(2)),
+        ResourcePolicy::default(),
+    )
+    .unwrap();
+    application
+        .dispatch(ApplicationCommand::SetPlaybackActive(true))
+        .unwrap();
+    application.drain_events(MAX_PENDING_EVENTS);
+
+    application
+        .dispatch(ApplicationCommand::AdvancePlaybackTick(100))
+        .unwrap();
+    assert_eq!(
+        application.snapshot().transient().last_playback_tick(),
+        Some(100)
+    );
+    assert_eq!(
+        unbound_view(&application.snapshot()).timepoint(),
+        TimeIndex::new(0)
+    );
+    assert_eq!(
+        application.snapshot().currentness(),
+        CurrentnessGeneration::initial()
+    );
+
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::AdvancePlaybackTick(100))
+            .unwrap(),
+        CommandEffect::NoChange
+    );
+    application
+        .dispatch(ApplicationCommand::AdvancePlaybackTick(101))
+        .unwrap();
+    application
+        .dispatch(ApplicationCommand::AdvancePlaybackTick(102))
+        .unwrap();
+    application
+        .dispatch(ApplicationCommand::AdvancePlaybackTick(103))
+        .unwrap();
+    assert_eq!(
+        unbound_view(&application.snapshot()).timepoint(),
+        TimeIndex::new(0)
+    );
+    assert_eq!(application.snapshot().currentness().get(), 3);
+    assert_eq!(
+        application.snapshot().transient().last_playback_tick(),
+        Some(103)
+    );
+
+    application
+        .dispatch(ApplicationCommand::SetPlaybackActive(false))
+        .unwrap();
+    assert_eq!(
+        application.snapshot().transient().last_playback_tick(),
+        None
+    );
+
+    let mut single = ApplicationState::new_unbound(
+        SourceSessionGeneration::new(1),
+        catalog_with_timepoints(1),
+        unbound_workspace(project_id(3)),
+        ResourcePolicy::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        single
+            .dispatch(ApplicationCommand::SetPlaybackActive(true))
+            .unwrap(),
+        CommandEffect::NoChange
+    );
+}
+
+#[test]
 fn all_project_io_and_attachment_are_identity_gated_before_verification() {
     let mut application = application();
     for command in [
@@ -75,11 +258,38 @@ fn source_verification_requires_the_exact_current_session_generation() {
     assert_eq!(fault, ApplicationFaultCode::SourceSessionMismatch);
     assert_eq!(application, before);
 
-    verify(&mut application, dataset_reference('1'));
+    let reference = dataset_reference('1');
+    let identity = *reference.scientific_content_id();
+    verify(&mut application, reference);
     assert!(matches!(
         application.snapshot().source(),
         SourceVerificationSnapshot::Verified(_)
     ));
+    assert_eq!(
+        application
+            .snapshot()
+            .catalog()
+            .scientific_identity()
+            .verified_id(),
+        Some(&identity)
+    );
+
+    let verified_catalog = DatasetCatalog::new(
+        "preverified",
+        ScientificIdentityStatus::Verified(identity),
+        vec![dataset_layer(0, 4), dataset_layer(1, 4)],
+    )
+    .unwrap();
+    assert_eq!(
+        ApplicationState::new_unbound(
+            SourceSessionGeneration::new(1),
+            verified_catalog,
+            unbound_workspace(project_id(3)),
+            ResourcePolicy::default(),
+        )
+        .unwrap_err(),
+        ApplicationFaultCode::DatasetIdentityMismatch
+    );
 }
 
 #[test]
@@ -426,6 +636,80 @@ fn stale_and_mismatched_completions_are_rejected_with_operation_context() {
 }
 
 #[test]
+fn stale_dataset_open_completion_can_be_explicitly_retired_after_atomic_rejection() {
+    let mut application = application();
+    application
+        .dispatch(ApplicationCommand::RequestDatasetOpen)
+        .unwrap();
+    let token = dataset_open_token(&mut application);
+    application
+        .dispatch(ApplicationCommand::SetTimepoint(TimeIndex::new(1)))
+        .unwrap();
+
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token: token.clone(),
+                completion: OperationCompletion::Failed(OperationFailureCode::DatasetReadFailed,),
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::StaleOperationCompletion
+    );
+    assert_eq!(
+        application.snapshot().active_operations(),
+        std::slice::from_ref(&token)
+    );
+
+    application
+        .dispatch(ApplicationCommand::CancelOperation(token.operation_id()))
+        .unwrap();
+    assert!(application.snapshot().active_operations().is_empty());
+}
+
+#[test]
+fn operation_failure_codes_are_closed_over_their_operation_kind() {
+    let cases = [
+        (
+            OperationKind::DatasetOpen,
+            OperationFailureCode::DatasetReadFailed,
+            OperationFailureCode::AnalysisExecutionFailed,
+        ),
+        (
+            OperationKind::ProjectOpen,
+            OperationFailureCode::ProjectReadFailed,
+            OperationFailureCode::ProjectWriteFailed,
+        ),
+        (
+            OperationKind::ProjectSave,
+            OperationFailureCode::ProjectCommitIndeterminate,
+            OperationFailureCode::ProjectNotFound,
+        ),
+        (
+            OperationKind::Analysis,
+            OperationFailureCode::AnalysisCapacityExceeded,
+            OperationFailureCode::ImportCapacityExceeded,
+        ),
+        (
+            OperationKind::Import,
+            OperationFailureCode::ImportExecutionFailed,
+            OperationFailureCode::DatasetInvalid,
+        ),
+    ];
+
+    for (kind, accepted, rejected) in cases {
+        assert!(completion_matches_kind(
+            kind,
+            &OperationCompletion::Failed(accepted)
+        ));
+        assert!(!completion_matches_kind(
+            kind,
+            &OperationCompletion::Failed(rejected)
+        ));
+    }
+}
+
+#[test]
 fn verified_analysis_artifact_admission_is_one_durable_revision() {
     let mut application = bound_application();
     application.drain_events(MAX_PENDING_EVENTS);
@@ -448,6 +732,174 @@ fn verified_analysis_artifact_admission_is_one_durable_revision() {
     assert_eq!(revision.sequence(), 1);
     assert_eq!(project.artifacts().len(), 1);
     assert!(application.snapshot().active_operations().is_empty());
+}
+
+#[test]
+fn analysis_ready_appends_bounded_descriptors_with_deterministic_ids_and_selections() {
+    let mut application = application();
+    application
+        .dispatch(ApplicationCommand::BeginOperation(OperationKind::Analysis))
+        .unwrap();
+    let token = started_token(&mut application, OperationKind::Analysis);
+    let table_0 =
+        AnalysisTableDescriptor::new(AnalysisTableId::from_operation(token.operation_id(), 0), 12);
+    let table_1 =
+        AnalysisTableDescriptor::new(AnalysisTableId::from_operation(token.operation_id(), 1), 5);
+    let plot_0 = AnalysisPlotDescriptor::new(
+        AnalysisPlotId::from_operation(token.operation_id(), 0),
+        vec![2, 3],
+    )
+    .unwrap();
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token: token.clone(),
+            completion: OperationCompletion::AnalysisReady {
+                tables: vec![table_0.clone(), table_1.clone()],
+                plots: vec![plot_0.clone()],
+            },
+        })
+        .unwrap();
+
+    let snapshot = application.snapshot();
+    let transient = snapshot.transient();
+    assert_eq!(transient.analysis_tables(), &[table_0, table_1.clone()]);
+    assert_eq!(transient.analysis_plots(), std::slice::from_ref(&plot_0));
+    assert_eq!(transient.selected_analysis_table(), Some(table_1.id()));
+    assert_eq!(transient.selected_analysis_plot(), Some(plot_0.id()));
+    assert_eq!(transient.selected_analysis_plot_point(), None);
+    assert!(snapshot.active_operations().is_empty());
+    assert_eq!(snapshot.dirty(), None);
+    assert_eq!(snapshot.currentness(), CurrentnessGeneration::initial());
+
+    let before_missing = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::SelectAnalysisTable(Some(
+                AnalysisTableId::from_operation(OperationId(999), 0),
+            )))
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::AnalysisTableNotFound
+    );
+    assert_eq!(application, before_missing);
+
+    let point = AnalysisPlotPointSelection::new(plot_0.id(), 1, 2);
+    application
+        .dispatch(ApplicationCommand::SelectAnalysisPlotPoint(Some(point)))
+        .unwrap();
+    assert_eq!(
+        application
+            .snapshot()
+            .transient()
+            .selected_analysis_plot_point(),
+        Some(point)
+    );
+
+    let before_invalid = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::SelectAnalysisPlotPoint(Some(
+                AnalysisPlotPointSelection::new(plot_0.id(), 1, 3),
+            )))
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::AnalysisPointOutOfBounds
+    );
+    assert_eq!(application, before_invalid);
+
+    application
+        .dispatch(ApplicationCommand::BeginOperation(OperationKind::Analysis))
+        .unwrap();
+    let next = started_token(&mut application, OperationKind::Analysis);
+    let next_table =
+        AnalysisTableDescriptor::new(AnalysisTableId::from_operation(next.operation_id(), 0), 7);
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token: next,
+            completion: OperationCompletion::AnalysisReady {
+                tables: vec![next_table.clone()],
+                plots: Vec::new(),
+            },
+        })
+        .unwrap();
+    let transient = application.snapshot().transient().clone();
+    assert_eq!(transient.analysis_tables().len(), 3);
+    assert_eq!(transient.analysis_plots(), std::slice::from_ref(&plot_0));
+    assert_eq!(transient.selected_analysis_table(), Some(next_table.id()));
+    assert_eq!(transient.selected_analysis_plot(), Some(plot_0.id()));
+    assert_eq!(transient.selected_analysis_plot_point(), Some(point));
+}
+
+#[test]
+fn analysis_descriptors_reject_wrong_operation_slots_and_all_bounds_atomically() {
+    assert_eq!(
+        AnalysisPlotDescriptor::new(
+            AnalysisPlotId::from_operation(OperationId(1), 0),
+            vec![0; MAX_ANALYSIS_PLOT_SERIES + 1],
+        ),
+        Err(AnalysisDescriptorError::TooManySeries)
+    );
+    assert_eq!(
+        AnalysisPlotDescriptor::new(
+            AnalysisPlotId::from_operation(OperationId(1), 0),
+            vec![MAX_ANALYSIS_PLOT_POINTS + 1],
+        ),
+        Err(AnalysisDescriptorError::TooManyPoints)
+    );
+    assert_eq!(
+        AnalysisPlotDescriptor::new(
+            AnalysisPlotId::from_operation(OperationId(1), 0),
+            vec![u64::MAX, 1],
+        ),
+        Err(AnalysisDescriptorError::PointCountOverflow)
+    );
+
+    let mut application = application();
+    application
+        .dispatch(ApplicationCommand::BeginOperation(OperationKind::Analysis))
+        .unwrap();
+    let token = started_token(&mut application, OperationKind::Analysis);
+    let before = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token: token.clone(),
+                completion: OperationCompletion::AnalysisReady {
+                    tables: vec![AnalysisTableDescriptor::new(
+                        AnalysisTableId::from_operation(token.operation_id(), 1),
+                        1,
+                    )],
+                    plots: Vec::new(),
+                },
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::InvalidOperationCompletion
+    );
+    assert_eq!(application, before);
+
+    let too_many = (0..=MAX_ANALYSIS_TABLES)
+        .map(|slot| {
+            AnalysisTableDescriptor::new(
+                AnalysisTableId::from_operation(token.operation_id(), u16::try_from(slot).unwrap()),
+                0,
+            )
+        })
+        .collect();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token,
+                completion: OperationCompletion::AnalysisReady {
+                    tables: too_many,
+                    plots: Vec::new(),
+                },
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::AnalysisRegistryFull
+    );
+    assert_eq!(application, before);
 }
 
 #[test]
@@ -499,14 +951,20 @@ fn resource_policy_changes_are_pending_then_persisted_or_rejected_with_restart_i
     let other = ResourcePolicy::new(12 * GIB, 5 * GIB).unwrap();
 
     application
-        .dispatch(ApplicationCommand::RequestResourcePolicyChange(next))
+        .dispatch(ApplicationCommand::RequestResourcePolicyChange {
+            policy: next,
+            rejected_file_disposition: RejectedFileDisposition::Preserve,
+        })
         .unwrap();
     let next_token = application.snapshot().pending_settings_change().unwrap();
     assert_eq!(application.snapshot().resource_policy(), original);
     assert_eq!(application.snapshot().pending_resource_policy(), Some(next));
     assert_eq!(
         application
-            .dispatch(ApplicationCommand::RequestResourcePolicyChange(next))
+            .dispatch(ApplicationCommand::RequestResourcePolicyChange {
+                policy: next,
+                rejected_file_disposition: RejectedFileDisposition::Preserve,
+            })
             .unwrap(),
         CommandEffect::NoChange
     );
@@ -514,6 +972,7 @@ fn resource_policy_changes_are_pending_then_persisted_or_rejected_with_restart_i
     let mismatched_token = SettingsChangeToken {
         id: next_token.id(),
         policy: other,
+        rejected_file_disposition: RejectedFileDisposition::Preserve,
     };
     assert_eq!(
         application
@@ -535,6 +994,7 @@ fn resource_policy_changes_are_pending_then_persisted_or_rejected_with_restart_i
         .unwrap();
     assert_eq!(application.snapshot().resource_policy(), next);
     assert_eq!(application.snapshot().pending_resource_policy(), None);
+    assert!(application.snapshot().latest_problem().is_none());
     assert!(
         application
             .drain_events(MAX_PENDING_EVENTS)
@@ -551,7 +1011,10 @@ fn resource_policy_changes_are_pending_then_persisted_or_rejected_with_restart_i
     );
 
     application
-        .dispatch(ApplicationCommand::RequestResourcePolicyChange(other))
+        .dispatch(ApplicationCommand::RequestResourcePolicyChange {
+            policy: other,
+            rejected_file_disposition: RejectedFileDisposition::Preserve,
+        })
         .unwrap();
     let other_token = application.snapshot().pending_settings_change().unwrap();
     assert_ne!(other_token.id(), next_token.id());
@@ -577,6 +1040,13 @@ fn resource_policy_changes_are_pending_then_persisted_or_rejected_with_restart_i
         .unwrap();
     assert_eq!(application.snapshot().resource_policy(), next);
     assert_eq!(application.snapshot().pending_resource_policy(), None);
+    assert!(matches!(
+        application.snapshot().latest_problem(),
+        Some(ApplicationEvent::ResourcePolicyRejected {
+            reason: ResourcePolicyRejection::CommitIndeterminate,
+            ..
+        })
+    ));
     assert!(
         application
             .drain_events(MAX_PENDING_EVENTS)
@@ -591,6 +1061,59 @@ fn resource_policy_changes_are_pending_then_persisted_or_rejected_with_restart_i
                 )
             })
     );
+}
+
+#[test]
+fn settings_replacement_disposition_is_part_of_the_atomic_change_token() {
+    let mut application = application();
+    let active = application.snapshot().resource_policy();
+    application
+        .dispatch(ApplicationCommand::RequestResourcePolicyChange {
+            policy: active,
+            rejected_file_disposition: RejectedFileDisposition::Preserve,
+        })
+        .unwrap();
+    let preserve_token = application.snapshot().pending_settings_change().unwrap();
+    assert_eq!(preserve_token.policy(), active);
+    application
+        .dispatch(ApplicationCommand::CompleteResourcePolicyPersistence {
+            token: preserve_token,
+            outcome: ResourcePolicyPersistenceOutcome::Persisted,
+        })
+        .unwrap();
+
+    application
+        .dispatch(ApplicationCommand::RequestResourcePolicyChange {
+            policy: active,
+            rejected_file_disposition: RejectedFileDisposition::ReplaceExplicitly,
+        })
+        .unwrap();
+    let token = application.snapshot().pending_settings_change().unwrap();
+    assert_eq!(token.policy(), active);
+    assert_eq!(
+        token.rejected_file_disposition(),
+        RejectedFileDisposition::ReplaceExplicitly
+    );
+
+    let before = application.fork_for_dispatch();
+    let mismatched = SettingsChangeToken {
+        id: token.id(),
+        policy: active,
+        rejected_file_disposition: RejectedFileDisposition::Preserve,
+    };
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteResourcePolicyPersistence {
+                token: mismatched,
+                outcome: ResourcePolicyPersistenceOutcome::Rejected(
+                    ResourcePolicyRejection::ExplicitReplacementRequired,
+                ),
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::ResourcePolicyCompletionMismatch
+    );
+    assert_eq!(application, before);
 }
 
 #[test]
@@ -672,11 +1195,18 @@ fn source_replacement_is_central_generation_guarded_and_resets_bound_transients(
     application
         .dispatch(ApplicationCommand::SetActiveTool(ToolKind::MeasureDistance))
         .unwrap();
-    let replacement = unbound_workspace(project_id(9));
     application
-        .dispatch(ApplicationCommand::ReplaceCurrentSource {
-            source_generation: SourceSessionGeneration::new(2),
-            workspace: replacement,
+        .dispatch(ApplicationCommand::RequestDatasetOpen)
+        .unwrap();
+    let token = dataset_open_token(&mut application);
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::DatasetOpened {
+                catalog: Arc::new(catalog(4)),
+                workspace: Box::new(unbound_workspace(project_id(9))),
+                source_generation: SourceSessionGeneration::new(2),
+            },
         })
         .unwrap();
     let snapshot = application.snapshot();
@@ -686,14 +1216,23 @@ fn source_replacement_is_central_generation_guarded_and_resets_bound_transients(
         SourceVerificationSnapshot::Required
     ));
     assert_eq!(snapshot.source_generation().get(), 2);
+    assert_eq!(snapshot.catalog().label(), "catalog-4");
     assert_eq!(snapshot.transient(), &TransientApplicationState::default());
 
+    application
+        .dispatch(ApplicationCommand::RequestDatasetOpen)
+        .unwrap();
+    let token = dataset_open_token(&mut application);
     let before = application.fork_for_dispatch();
     assert_eq!(
         application
-            .dispatch(ApplicationCommand::ReplaceCurrentSource {
-                source_generation: SourceSessionGeneration::new(2),
-                workspace: unbound_workspace(project_id(10)),
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token,
+                completion: OperationCompletion::DatasetOpened {
+                    catalog: Arc::new(catalog(5)),
+                    workspace: Box::new(unbound_workspace(project_id(10))),
+                    source_generation: SourceSessionGeneration::new(2),
+                },
             })
             .unwrap_err()
             .code(),
@@ -703,7 +1242,7 @@ fn source_replacement_is_central_generation_guarded_and_resets_bound_transients(
 }
 
 #[test]
-fn source_replacement_rejects_while_an_operation_is_active() {
+fn dataset_open_request_rejects_while_an_operation_is_active() {
     let mut application = application();
     application
         .dispatch(ApplicationCommand::BeginOperation(OperationKind::Import))
@@ -711,15 +1250,134 @@ fn source_replacement_rejects_while_an_operation_is_active() {
     let before = application.fork_for_dispatch();
     assert_eq!(
         application
-            .dispatch(ApplicationCommand::ReplaceCurrentSource {
-                source_generation: SourceSessionGeneration::new(2),
-                workspace: unbound_workspace(project_id(9)),
-            })
+            .dispatch(ApplicationCommand::RequestDatasetOpen)
             .unwrap_err()
             .code(),
         ApplicationFaultCode::OperationConflict
     );
     assert_eq!(application, before);
+}
+
+#[test]
+fn dataset_open_failure_is_typed_and_does_not_replace_the_source() {
+    let mut application = application();
+    application
+        .dispatch(ApplicationCommand::RequestDatasetOpen)
+        .unwrap();
+    let token = dataset_open_token(&mut application);
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::Failed(OperationFailureCode::DatasetPermissionDenied),
+        })
+        .unwrap();
+    let snapshot = application.snapshot();
+    assert_eq!(
+        snapshot.source_generation(),
+        SourceSessionGeneration::new(1)
+    );
+    assert_eq!(snapshot.catalog().label(), "catalog-3");
+    assert!(snapshot.active_operations().is_empty());
+    assert!(matches!(
+        snapshot.latest_problem(),
+        Some(ApplicationEvent::OperationCompleted {
+            outcome: OperationOutcome::Failed(OperationFailureCode::DatasetPermissionDenied),
+            ..
+        })
+    ));
+    application.drain_events(MAX_PENDING_EVENTS);
+    assert!(application.snapshot().latest_problem().is_some());
+
+    application
+        .dispatch(ApplicationCommand::RequestDatasetOpen)
+        .unwrap();
+    assert!(application.snapshot().latest_problem().is_none());
+}
+
+#[test]
+fn project_execution_failure_is_distinct_from_reducer_rejection() {
+    let mut application = application_for_project_open('1');
+    let token = project_open_token(&mut application);
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token: token.clone(),
+            completion: OperationCompletion::Failed(OperationFailureCode::ProjectInvalidDocument),
+        })
+        .unwrap();
+    assert!(!application.snapshot().is_bound());
+    assert!(application.snapshot().active_operations().is_empty());
+    assert!(
+        application
+            .drain_events(MAX_PENDING_EVENTS)
+            .iter()
+            .any(|event| matches!(
+                event,
+                ApplicationEvent::OperationCompleted {
+                    token: completed,
+                    outcome: OperationOutcome::Failed(OperationFailureCode::ProjectInvalidDocument),
+                } if completed == &token
+            ))
+    );
+}
+
+#[test]
+fn dataset_open_completion_rejects_verified_or_view_incompatible_catalogs_atomically() {
+    let mut incompatible = application();
+    incompatible
+        .dispatch(ApplicationCommand::RequestDatasetOpen)
+        .unwrap();
+    let token = dataset_open_token(&mut incompatible);
+    let before = incompatible.fork_for_dispatch();
+    let incomplete = DatasetCatalog::new(
+        "incomplete",
+        ScientificIdentityStatus::Unverified,
+        vec![dataset_layer(0, 4)],
+    )
+    .unwrap();
+    assert_eq!(
+        incompatible
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token,
+                completion: OperationCompletion::DatasetOpened {
+                    source_generation: SourceSessionGeneration::new(2),
+                    catalog: Arc::new(incomplete),
+                    workspace: Box::new(unbound_workspace(project_id(7))),
+                },
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::DatasetLayerClosureMismatch
+    );
+    assert_eq!(incompatible, before);
+
+    let mut preverified = application();
+    preverified
+        .dispatch(ApplicationCommand::RequestDatasetOpen)
+        .unwrap();
+    let token = dataset_open_token(&mut preverified);
+    let reference = dataset_reference('7');
+    let catalog = DatasetCatalog::new(
+        "preverified",
+        ScientificIdentityStatus::Verified(*reference.scientific_content_id()),
+        vec![dataset_layer(0, 4), dataset_layer(1, 4)],
+    )
+    .unwrap();
+    let before = preverified.fork_for_dispatch();
+    assert_eq!(
+        preverified
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token,
+                completion: OperationCompletion::DatasetOpened {
+                    source_generation: SourceSessionGeneration::new(2),
+                    catalog: Arc::new(catalog),
+                    workspace: Box::new(unbound_workspace(project_id(8))),
+                },
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::DatasetIdentityMismatch
+    );
+    assert_eq!(preverified, before);
 }
 
 #[test]
@@ -753,9 +1411,11 @@ fn unbound_workspace_rejects_a_preset_that_does_not_close_over_view_layers() {
 fn application() -> ApplicationState {
     ApplicationState::new_unbound(
         SourceSessionGeneration::new(1),
+        catalog(3),
         unbound_workspace(project_id(4)),
         ResourcePolicy::new(4 * GIB, GIB).unwrap(),
     )
+    .unwrap()
 }
 
 fn bound_application() -> ApplicationState {
@@ -833,6 +1493,25 @@ fn preset_entry(ordinal: u32) -> ChannelPresetEntry {
     )
 }
 
+fn vivid_preset() -> ChannelPreset {
+    ChannelPreset::new(
+        ChannelPresetId::new("vivid").unwrap(),
+        "Vivid",
+        [0, 1]
+            .into_iter()
+            .map(|ordinal| {
+                ChannelPresetEntry::new(
+                    LogicalLayerKey::new(ordinal),
+                    false,
+                    transfer(),
+                    RenderState::mip(SamplingPolicy::VoxelExact),
+                )
+            })
+            .collect(),
+    )
+    .unwrap()
+}
+
 fn camera() -> CameraView {
     CameraView::new(
         Projection::Orthographic,
@@ -858,6 +1537,37 @@ fn view() -> ViewState {
         ViewerLayout::Single3d,
         cross_section(),
         IsoLightState::attached_camera(),
+    )
+    .unwrap()
+}
+
+fn catalog(label_digit: u8) -> DatasetCatalog {
+    catalog_named_with_timepoints(format!("catalog-{label_digit}"), 10_000)
+}
+
+fn catalog_with_timepoints(timepoints: u64) -> DatasetCatalog {
+    catalog_named_with_timepoints(format!("catalog-t{timepoints}"), timepoints)
+}
+
+fn catalog_named_with_timepoints(label: String, timepoints: u64) -> DatasetCatalog {
+    DatasetCatalog::new(
+        label,
+        ScientificIdentityStatus::Unverified,
+        [0, 1]
+            .into_iter()
+            .map(|ordinal| dataset_layer(ordinal, timepoints))
+            .collect(),
+    )
+    .unwrap()
+}
+
+fn dataset_layer(ordinal: u32, timepoints: u64) -> DatasetLayer {
+    DatasetLayer::new(
+        LogicalLayerKey::new(ordinal),
+        format!("layer-{ordinal}"),
+        Shape4D::new(timepoints, 5, 7, 11).unwrap(),
+        IntensityDType::Uint16,
+        GridToWorld::identity(),
     )
     .unwrap()
 }
@@ -958,6 +1668,17 @@ fn project_open_token(application: &mut ApplicationState) -> OperationToken {
             _ => None,
         })
         .expect("project-open event")
+}
+
+fn dataset_open_token(application: &mut ApplicationState) -> OperationToken {
+    application
+        .drain_events(MAX_PENDING_EVENTS)
+        .into_iter()
+        .find_map(|event| match event {
+            ApplicationEvent::DatasetOpenRequested { token } => Some(token),
+            _ => None,
+        })
+        .expect("dataset-open event")
 }
 
 fn save_request(application: &mut ApplicationState) -> (OperationToken, ProjectRevisionId) {

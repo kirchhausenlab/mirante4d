@@ -38,8 +38,15 @@ impl GpuRenderer {
         if volume.render_valid_mask().is_some() {
             return Ok(summarize_u16_region_render_valid(
                 volume,
-                VolumeRegion::new(0, 0, 0, volume.shape.z, volume.shape.y, volume.shape.x)
-                    .expect("volume shape is a valid full-volume region"),
+                VolumeRegion::new(
+                    0,
+                    0,
+                    0,
+                    volume.shape.z(),
+                    volume.shape.y(),
+                    volume.shape.x(),
+                )
+                .expect("volume shape is a valid full-volume region"),
             ));
         }
         let sample_count = volume.values().len() as u64;
@@ -51,15 +58,15 @@ impl GpuRenderer {
                 INTENSITY_SUMMARY_CHUNK_VOXELS,
                 INTENSITY_SUMMARY_PARTIAL_FIELDS as u32,
                 0,
-                super::buffers::checked_u32("z", volume.shape.z)?,
-                super::buffers::checked_u32("y", volume.shape.y)?,
-                super::buffers::checked_u32("x", volume.shape.x)?,
+                super::buffers::checked_u32("z", volume.shape.z())?,
+                super::buffers::checked_u32("y", volume.shape.y())?,
+                super::buffers::checked_u32("x", volume.shape.x())?,
                 0,
                 0,
                 0,
-                super::buffers::checked_u32("z", volume.shape.z)?,
-                super::buffers::checked_u32("y", volume.shape.y)?,
-                super::buffers::checked_u32("x", volume.shape.x)?,
+                super::buffers::checked_u32("z", volume.shape.z())?,
+                super::buffers::checked_u32("y", volume.shape.y())?,
+                super::buffers::checked_u32("x", volume.shape.x())?,
                 0,
                 0,
                 0,
@@ -92,9 +99,9 @@ impl GpuRenderer {
                 INTENSITY_SUMMARY_CHUNK_VOXELS,
                 INTENSITY_SUMMARY_PARTIAL_FIELDS as u32,
                 1,
-                super::buffers::checked_u32("z", volume.shape.z)?,
-                super::buffers::checked_u32("y", volume.shape.y)?,
-                super::buffers::checked_u32("x", volume.shape.x)?,
+                super::buffers::checked_u32("z", volume.shape.z())?,
+                super::buffers::checked_u32("y", volume.shape.y())?,
+                super::buffers::checked_u32("x", volume.shape.x())?,
                 super::buffers::checked_u32("z_start", region.z_start)?,
                 super::buffers::checked_u32("y_start", region.y_start)?,
                 super::buffers::checked_u32("x_start", region.x_start)?,
@@ -115,8 +122,15 @@ impl GpuRenderer {
         if volume.render_valid_mask().is_some() {
             return Ok(summarize_f32_region_render_valid(
                 volume,
-                VolumeRegion::new(0, 0, 0, volume.shape.z, volume.shape.y, volume.shape.x)
-                    .expect("volume shape is a valid full-volume region"),
+                VolumeRegion::new(
+                    0,
+                    0,
+                    0,
+                    volume.shape.z(),
+                    volume.shape.y(),
+                    volume.shape.x(),
+                )
+                .expect("volume shape is a valid full-volume region"),
             ));
         }
         let sample_count = volume.values().len() as u64;
@@ -128,15 +142,15 @@ impl GpuRenderer {
                 INTENSITY_SUMMARY_CHUNK_VOXELS,
                 INTENSITY_SUMMARY_PARTIAL_FIELDS as u32,
                 0,
-                super::buffers::checked_u32("z", volume.shape.z)?,
-                super::buffers::checked_u32("y", volume.shape.y)?,
-                super::buffers::checked_u32("x", volume.shape.x)?,
+                super::buffers::checked_u32("z", volume.shape.z())?,
+                super::buffers::checked_u32("y", volume.shape.y())?,
+                super::buffers::checked_u32("x", volume.shape.x())?,
                 0,
                 0,
                 0,
-                super::buffers::checked_u32("z", volume.shape.z)?,
-                super::buffers::checked_u32("y", volume.shape.y)?,
-                super::buffers::checked_u32("x", volume.shape.x)?,
+                super::buffers::checked_u32("z", volume.shape.z())?,
+                super::buffers::checked_u32("y", volume.shape.y())?,
+                super::buffers::checked_u32("x", volume.shape.x())?,
                 0,
                 0,
                 0,
@@ -169,9 +183,9 @@ impl GpuRenderer {
                 INTENSITY_SUMMARY_CHUNK_VOXELS,
                 INTENSITY_SUMMARY_PARTIAL_FIELDS as u32,
                 1,
-                super::buffers::checked_u32("z", volume.shape.z)?,
-                super::buffers::checked_u32("y", volume.shape.y)?,
-                super::buffers::checked_u32("x", volume.shape.x)?,
+                super::buffers::checked_u32("z", volume.shape.z())?,
+                super::buffers::checked_u32("y", volume.shape.y())?,
+                super::buffers::checked_u32("x", volume.shape.x())?,
                 super::buffers::checked_u32("z_start", region.z_start)?,
                 super::buffers::checked_u32("y_start", region.y_start)?,
                 super::buffers::checked_u32("x_start", region.x_start)?,
@@ -400,7 +414,7 @@ fn validate_summary_region(
     let x_end = region.x_start.checked_add(region.x_size).ok_or(
         RenderError::InvalidIntensitySummaryRegion("region x end overflows"),
     )?;
-    if z_end > volume.shape.z || y_end > volume.shape.y || x_end > volume.shape.x {
+    if z_end > volume.shape.z() || y_end > volume.shape.y() || x_end > volume.shape.x() {
         return Err(RenderError::InvalidIntensitySummaryRegion(
             "region exceeds volume shape",
         ));
@@ -426,7 +440,7 @@ fn validate_f32_summary_region(
     let x_end = region.x_start.checked_add(region.x_size).ok_or(
         RenderError::InvalidIntensitySummaryRegion("region x end overflows"),
     )?;
-    if z_end > volume.shape.z || y_end > volume.shape.y || x_end > volume.shape.x {
+    if z_end > volume.shape.z() || y_end > volume.shape.y() || x_end > volume.shape.x() {
         return Err(RenderError::InvalidIntensitySummaryRegion(
             "region exceeds volume shape",
         ));
@@ -632,7 +646,8 @@ fn summarize_intensity_partials_f32(
 
 #[cfg(test)]
 mod tests {
-    use mirante4d_core::{DatasetId, GridToWorld, LayerId, Shape3D, TimeIndex};
+    use mirante4d_domain::{GridToWorld, Shape3D, TimeIndex};
+    use mirante4d_format::{DatasetId, LayerId};
 
     use super::*;
 
@@ -642,7 +657,7 @@ mod tests {
             DatasetId::new("gpu-masked-summary").unwrap(),
             LayerId::new("ch0").unwrap(),
             0,
-            TimeIndex(0),
+            TimeIndex::new(0),
             Shape3D::new(1, 1, 4).unwrap(),
             GridToWorld::identity(),
             vec![255, 5, 0, 7],
@@ -675,7 +690,7 @@ mod tests {
             DatasetId::new("gpu-masked-summary-f32").unwrap(),
             LayerId::new("ch0").unwrap(),
             0,
-            TimeIndex(0),
+            TimeIndex::new(0),
             Shape3D::new(1, 1, 3).unwrap(),
             GridToWorld::identity(),
             vec![-10.0, 0.0, 4.5],
@@ -702,7 +717,7 @@ mod tests {
             DatasetId::new("gpu-masked-empty-summary").unwrap(),
             LayerId::new("ch0").unwrap(),
             0,
-            TimeIndex(0),
+            TimeIndex::new(0),
             Shape3D::new(1, 1, 2).unwrap(),
             GridToWorld::identity(),
             vec![255, 1],
@@ -792,7 +807,7 @@ mod tests {
             DatasetId::new("summary-validation").unwrap(),
             LayerId::new("ch0").unwrap(),
             0,
-            TimeIndex(0),
+            TimeIndex::new(0),
             Shape3D::new(2, 2, 2).unwrap(),
             GridToWorld::identity(),
             vec![0; 8],

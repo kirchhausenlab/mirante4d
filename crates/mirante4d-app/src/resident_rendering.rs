@@ -1,12 +1,13 @@
 use std::{collections::HashSet, time::Instant};
 
-use mirante4d_core::{
-    ChannelTransferFunction, IntensityDType, LayerDisplay, LayerId, PresentationViewport,
-};
+use mirante4d_application::ApplicationSnapshot;
+use mirante4d_domain::{IntensityDType, RenderMode, RenderState, Shape3D, ViewerLayout};
+use mirante4d_format::LayerId;
+use mirante4d_render_api::{CameraFrame, PresentationViewport};
 use mirante4d_renderer::{
     BrickAtlasResourceKey, CameraRenderMode, CameraRenderModeF32, CrossSectionView,
-    FrameDiagnostics, FrameDiagnosticsF32, MipImageF32, MipImageU16, RenderViewport,
-    ResidentBrickSetF32, ResidentBrickSetU8, ResidentBrickSetU16,
+    FrameDiagnostics, FrameDiagnosticsF32, IntensityTransfer, MipImageF32, MipImageU16,
+    RenderViewport, ResidentBrickSetF32, ResidentBrickSetU8, ResidentBrickSetU16,
     gpu::{
         GpuBrickAtlasPagePriority, GpuCrossSectionChunkDisplayChannel, GpuCrossSectionChunkDraw,
         GpuDisplayFrame, GpuRenderer, GpuResidentDisplayChannel, GpuResidentDisplayRequest,
@@ -16,57 +17,48 @@ use mirante4d_renderer::{
 };
 
 use crate::{
-    AppLayerSummary, AppState, ChannelRenderState, DvrOpacityTransfer, FrameFailureKind,
-    GPU_RESIDENT_BRICKS_PER_BATCH, LodDecisionReason, RenderBackend, RenderMode,
-    RenderedIntensityChannel,
-    brick_streaming::{current_resident_frame_ready, stream_layer_ids_for_state},
+    FrameFailureKind, GPU_RESIDENT_BRICKS_PER_BATCH, LodDecisionReason, RenderBackend,
+    RenderedIntensityChannel, application_view,
+    brick_streaming::{current_resident_frame_ready, stream_layer_ids_for_snapshot},
     cross_section_runtime::{
         CrossSectionChunkKey, CrossSectionChunkPayload, CrossSectionChunkPriorityTier,
         CrossSectionChunkState,
     },
+    current_physical_layer_id,
+    current_runtime::{
+        analysis::CurrentAnalysisRuntime, dataset::CurrentDatasetRuntime,
+        render::CurrentRenderRuntime, ui::CurrentUiRuntime,
+    },
     display_graph::DisplayGraph,
-    layer_state::active_layer_render_state_from_runtime,
     render_state::{
         f32_frame_to_display_u16_for_mode, frame_completeness_for_rendered_scale,
         placeholder_frame_for_mode, record_completed_frame_time, refresh_fidelity_resource_stats,
         renderer_mode, renderer_mode_f32, resident_render_failure_error,
         resident_render_failure_from_gpu_error, update_channel_fidelity_status,
     },
-    scene_draw_list_for_state,
-    transfer_presets::transfer_from_layer_summary,
-    viewer_layout::{PanelId, ViewerLayout},
-    viewport::{
-        camera_render_quality, camera_render_quality_for_render_state,
-        resident_brick_render_supported,
-    },
+    scene_extraction::{SceneViewInput, scene_draw_list},
+    viewer_layout::{PanelId, render_cross_section_view_state},
+    viewport::{camera_render_quality_for_render_state, resident_brick_render_supported},
 };
 
 mod dvr;
 
 use self::dvr::render_dvr_state_from_resident_bricks;
 
-fn render_state_for_layer(state: &AppState, layer: &AppLayerSummary) -> ChannelRenderState {
-    if layer.id == state.active_layer_id {
-        active_layer_render_state_from_runtime(state)
-    } else {
-        layer.render_state
-    }
+#[derive(Debug, Clone)]
+pub(super) struct ResidentLayer {
+    id: LayerId,
+    dtype: IntensityDType,
+    render_state: RenderState,
+    transfer: IntensityTransfer,
 }
 
-fn transfer_for_layer(state: &AppState, layer: &AppLayerSummary) -> ChannelTransferFunction {
-    if layer.id == state.active_layer_id {
-        state.active_layer_transfer.clone()
-    } else {
-        transfer_from_layer_summary(layer)
-    }
+fn render_state_for_layer(layer: &ResidentLayer) -> RenderState {
+    layer.render_state
 }
 
-fn display_for_layer(state: &AppState, layer: &AppLayerSummary) -> LayerDisplay {
-    if layer.id == state.active_layer_id {
-        state.active_layer_display
-    } else {
-        layer.display
-    }
+fn transfer_for_layer(layer: &ResidentLayer) -> IntensityTransfer {
+    layer.transfer
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -86,11 +78,13 @@ pub(crate) struct CrossSectionPanelDisplayFrame {
     pub(crate) renderer_gpu_resident_chunks: HashSet<CrossSectionChunkKey>,
 }
 
-pub(crate) fn cross_section_panel_render_request_for_state(
-    state: &AppState,
+pub(crate) fn cross_section_panel_render_request(
+    snapshot: &ApplicationSnapshot,
+    render: &CurrentRenderRuntime,
     panel_id: PanelId,
 ) -> anyhow::Result<CrossSectionPanelRenderRequest> {
-    if state.viewer_layout.layout() != ViewerLayout::FourPanel {
+    let view = application_view(snapshot);
+    if view.layout() != ViewerLayout::FourPanel {
         return Err(resident_render_failure_error(
             FrameFailureKind::InvalidModeParameter,
             "cross-section panel rendering requires the FourPanel layout",
@@ -102,21 +96,18 @@ pub(crate) fn cross_section_panel_render_request_for_state(
             "the 3D panel is not a cross-section render target",
         )
     })?;
-    let runtime = state.viewer_layout.four_panel_runtime().ok_or_else(|| {
-        resident_render_failure_error(
-            FrameFailureKind::InvalidModeParameter,
-            "FourPanel layout is missing panel runtime state",
-        )
-    })?;
-    let panel = runtime.panel(panel_id).ok_or_else(|| {
-        resident_render_failure_error(
-            FrameFailureKind::InvalidModeParameter,
-            format!(
-                "panel {} is not present in FourPanel runtime",
-                panel_id.label()
-            ),
-        )
-    })?;
+    let panel = render
+        .cross_section_runtime
+        .panel(panel_id)
+        .ok_or_else(|| {
+            resident_render_failure_error(
+                FrameFailureKind::InvalidModeParameter,
+                format!(
+                    "panel {} is not present in FourPanel runtime",
+                    panel_id.label()
+                ),
+            )
+        })?;
     let presentation_viewport = panel.presentation_viewport.ok_or_else(|| {
         resident_render_failure_error(
             FrameFailureKind::InvalidModeParameter,
@@ -135,28 +126,23 @@ pub(crate) fn cross_section_panel_render_request_for_state(
     Ok(CrossSectionPanelRenderRequest {
         panel_id,
         generation: panel.generation,
-        view: state.viewer_layout.cross_section.view(cross_section_panel),
+        view: render_cross_section_view_state(*view.cross_section()).view(cross_section_panel),
         presentation_viewport,
         render_viewport,
     })
 }
 
-fn dvr_opacity_transfer_for_layer(
-    state: &AppState,
-    layer: &AppLayerSummary,
-    render_state: ChannelRenderState,
-) -> DvrOpacityTransfer {
-    let default = if layer.id == state.active_layer_id {
-        state.active_dvr_opacity_transfer
-    } else {
-        layer.dvr_opacity_transfer
-    };
-    render_state.dvr_opacity_transfer(default)
-}
-
 #[cfg(test)]
-pub(crate) fn render_state_from_resident_bricks(state: &mut AppState) -> anyhow::Result<()> {
-    render_state_from_resident_bricks_with_backend(state, None)
+pub(crate) fn render_state_from_resident_bricks(
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &mut CurrentRenderRuntime,
+    analysis: &CurrentAnalysisRuntime,
+    ui_runtime: &CurrentUiRuntime,
+) -> anyhow::Result<()> {
+    render_state_from_resident_bricks_with_backend(
+        snapshot, dataset, render, analysis, ui_runtime, None,
+    )
 }
 
 #[cfg(test)]
@@ -184,11 +170,15 @@ mod tests {
 }
 
 pub(crate) fn render_state_from_resident_bricks_with_backend(
-    state: &mut AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &mut CurrentRenderRuntime,
+    analysis: &CurrentAnalysisRuntime,
+    ui_runtime: &CurrentUiRuntime,
     gpu_renderer: Option<&GpuRenderer>,
 ) -> anyhow::Result<()> {
     let render_start = Instant::now();
-    let display_graph = DisplayGraph::from_state(state);
+    let display_graph = DisplayGraph::from_snapshot(snapshot, dataset)?;
     if display_graph
         .channels
         .iter()
@@ -199,31 +189,45 @@ pub(crate) fn render_state_from_resident_bricks_with_backend(
             "resident-brick rendering does not support one or more visible channel modes",
         ));
     }
-    if !state.brick_stream_complete {
+    if !dataset.brick_stream_complete {
         return Err(resident_render_failure_error(
             FrameFailureKind::IncompleteResidency,
             "resident brick set is incomplete",
         ));
     }
-    if !current_resident_frame_ready(state) {
+    if !current_resident_frame_ready(snapshot, dataset, render) {
         return Err(resident_render_failure_error(
             FrameFailureKind::IncompleteResidency,
             "resident brick set does not match the current visible brick plan",
         ));
     }
-    let layers = resident_render_layers_for_state(state)?;
+    let view = application_view(snapshot);
+    let active_layer_id = current_physical_layer_id(dataset, view.active_layer())?;
+    let active_render_state = *view
+        .layer(view.active_layer())
+        .expect("application view has an active layer")
+        .render_state();
+    let layers = resident_render_layers(snapshot, dataset)?;
     let all_layers_dvr = layers
         .iter()
-        .all(|layer| render_state_for_layer(state, layer).mode() == RenderMode::Dvr);
+        .all(|layer| render_state_for_layer(layer).mode() == RenderMode::Dvr);
     if all_layers_dvr && layers.len() > 1 {
-        render_dvr_state_from_resident_bricks(state, render_start, gpu_renderer, layers)?;
+        render_dvr_state_from_resident_bricks(
+            snapshot,
+            dataset,
+            render,
+            render_start,
+            gpu_renderer,
+            layers,
+        )?;
         return Ok(());
     }
     let mut rendered_channels = Vec::with_capacity(layers.len());
     let mut active_frame = None;
     for layer in layers {
-        let rendered = render_resident_layer_with_backend(state, &layer, gpu_renderer)?;
-        if layer.id == state.active_layer_id {
+        let rendered =
+            render_resident_layer_with_backend(snapshot, dataset, render, &layer, gpu_renderer)?;
+        if layer.id == active_layer_id {
             active_frame = Some((
                 rendered.frame.clone(),
                 rendered.frame_f32.clone(),
@@ -234,8 +238,8 @@ pub(crate) fn render_state_from_resident_bricks_with_backend(
         }
         rendered_channels.push(RenderedIntensityChannel {
             layer_id: layer.id.clone(),
-            render_state: render_state_for_layer(state, &layer),
-            transfer: transfer_for_layer(state, &layer),
+            render_state: render_state_for_layer(&layer),
+            transfer: transfer_for_layer(&layer),
             frame: rendered.frame,
             frame_f32: rendered.frame_f32,
         });
@@ -243,7 +247,8 @@ pub(crate) fn render_state_from_resident_bricks_with_backend(
 
     let (frame, frame_f32, diagnostics, diagnostics_f32, backend) =
         active_frame.unwrap_or_else(|| {
-            let frame = placeholder_frame_for_mode(state.render_viewport, state.active_render_mode);
+            let frame =
+                placeholder_frame_for_mode(render.render_viewport, active_render_state.mode());
             let diagnostics = mirante4d_renderer::frame_diagnostics(0, frame.pixels());
             (
                 frame,
@@ -253,39 +258,44 @@ pub(crate) fn render_state_from_resident_bricks_with_backend(
                 RenderBackend::CpuResidentBricks,
             )
         });
-    state.frame = frame;
-    state.frame_f32 = frame_f32;
-    state.diagnostics = diagnostics;
-    state.diagnostics_f32 = diagnostics_f32;
-    state.render_backend = backend;
-    state.rendered_channels = rendered_channels;
-    state.frame_fidelity.displayed_scale_level = Some(state.brick_stream_scale_level);
-    state.lod_schedule.displayed_scale_level = Some(state.brick_stream_scale_level);
-    state.lod_schedule.pending_scale_level = None;
-    state.frame_fidelity.completeness = frame_completeness_for_rendered_scale(
-        state.brick_stream_scale_level,
-        state.frame_fidelity.target_scale_level,
-        state.frame_fidelity.reason,
+    render.frame = frame;
+    render.frame_f32 = frame_f32;
+    render.diagnostics = diagnostics;
+    render.diagnostics_f32 = diagnostics_f32;
+    render.render_backend = backend;
+    render.rendered_channels = rendered_channels;
+    render.frame_fidelity.displayed_scale_level = Some(dataset.brick_stream_scale_level);
+    render.lod_schedule.displayed_scale_level = Some(dataset.brick_stream_scale_level);
+    render.lod_schedule.pending_scale_level = None;
+    render.frame_fidelity.completeness = frame_completeness_for_rendered_scale(
+        dataset.brick_stream_scale_level,
+        render.frame_fidelity.target_scale_level,
+        render.frame_fidelity.reason,
     );
-    state.frame_fidelity.reason = if state.brick_stream_scale_level == 0 {
+    render.frame_fidelity.reason = if dataset.brick_stream_scale_level == 0 {
         LodDecisionReason::ExactS0
     } else {
-        state.frame_fidelity.reason
+        render.frame_fidelity.reason
     };
-    state.frame_fidelity.backend = backend;
-    record_completed_frame_time(state, render_start);
-    state.frame_fidelity.last_failure_kind = None;
-    state.frame_fidelity.last_capacity_error = None;
-    refresh_fidelity_resource_stats(state, gpu_renderer);
-    update_channel_fidelity_status(state);
+    render.frame_fidelity.backend = backend;
+    record_completed_frame_time(render, render_start);
+    render.frame_fidelity.last_failure_kind = None;
+    render.frame_fidelity.last_capacity_error = None;
+    refresh_fidelity_resource_stats(snapshot, dataset, render, gpu_renderer);
+    update_channel_fidelity_status(snapshot, dataset, render);
+    let _ = (analysis, ui_runtime);
     Ok(())
 }
 
 pub(crate) fn render_gpu_display_frame_from_resident_bricks(
-    state: &mut AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &mut CurrentRenderRuntime,
+    analysis: &CurrentAnalysisRuntime,
+    ui_runtime: &CurrentUiRuntime,
     gpu_renderer: &GpuRenderer,
 ) -> anyhow::Result<GpuDisplayFrame> {
-    let display_graph = DisplayGraph::from_state(state);
+    let display_graph = DisplayGraph::from_snapshot(snapshot, dataset)?;
     let render_start = Instant::now();
     if display_graph
         .channels
@@ -297,18 +307,27 @@ pub(crate) fn render_gpu_display_frame_from_resident_bricks(
             "GPU display rendering does not support one or more visible channel modes",
         ));
     }
-    if !state.brick_stream_complete || !current_resident_frame_ready(state) {
+    if !dataset.brick_stream_complete || !current_resident_frame_ready(snapshot, dataset, render) {
         return Err(resident_render_failure_error(
             FrameFailureKind::IncompleteResidency,
             "resident brick set is incomplete for GPU display rendering",
         ));
     }
-    let layers = resident_render_layers_for_state(state)?;
-    let (frame, rendered_channels) =
-        render_gpu_display_frame_for_resident_layers(state, gpu_renderer, &layers)?;
-    let displayed_scale_level = state.brick_stream_scale_level;
+    let layers = resident_render_layers(snapshot, dataset)?;
+    let (frame, rendered_channels) = render_gpu_display_frame_for_resident_layers(
+        snapshot,
+        dataset,
+        render,
+        gpu_renderer,
+        &layers,
+    )?;
+    let displayed_scale_level = dataset.brick_stream_scale_level;
     finalize_gpu_display_frame_state(
-        state,
+        snapshot,
+        dataset,
+        render,
+        analysis,
+        ui_runtime,
         gpu_renderer,
         frame,
         rendered_channels,
@@ -319,13 +338,15 @@ pub(crate) fn render_gpu_display_frame_from_resident_bricks(
 }
 
 pub(crate) fn render_gpu_cross_section_panel_frame_from_global_runtime(
-    state: &AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &CurrentRenderRuntime,
     gpu_renderer: &GpuRenderer,
     panel_id: PanelId,
 ) -> anyhow::Result<CrossSectionPanelDisplayFrame> {
-    let request = cross_section_panel_render_request_for_state(state, panel_id)?;
-    let render_scale_level = cross_section_panel_render_scale_for_state(state, panel_id)?;
-    let layers = resident_render_layers_for_state(state)?;
+    let request = cross_section_panel_render_request(snapshot, render, panel_id)?;
+    let render_scale_level = cross_section_panel_render_scale(render, panel_id)?;
+    let layers = resident_render_layers(snapshot, dataset)?;
     if layers.is_empty() {
         return Err(resident_render_failure_error(
             FrameFailureKind::InvalidModeParameter,
@@ -335,7 +356,9 @@ pub(crate) fn render_gpu_cross_section_panel_frame_from_global_runtime(
     let mut owned_layers = Vec::with_capacity(layers.len());
     for layer in &layers {
         if !cross_section_global_runtime_panel_layer_has_resident_payload(
-            state,
+            snapshot,
+            dataset,
+            render,
             panel_id,
             layer,
             render_scale_level,
@@ -343,10 +366,12 @@ pub(crate) fn render_gpu_cross_section_panel_frame_from_global_runtime(
             continue;
         }
         owned_layers.push(GpuCrossSectionLayerInput::new_for_panel(
-            state,
+            snapshot,
+            dataset,
+            render,
             panel_id,
             layer,
-            transfer_for_layer(state, layer),
+            transfer_for_layer(layer),
             render_scale_level,
         )?);
     }
@@ -383,14 +408,13 @@ pub(crate) fn render_gpu_cross_section_panel_frame_from_global_runtime(
     })
 }
 
-fn cross_section_panel_render_scale_for_state(
-    state: &AppState,
+fn cross_section_panel_render_scale(
+    render: &CurrentRenderRuntime,
     panel_id: PanelId,
 ) -> anyhow::Result<u32> {
-    state
-        .viewer_layout
-        .four_panel_runtime()
-        .and_then(|runtime| runtime.panel(panel_id))
+    render
+        .cross_section_runtime
+        .panel(panel_id)
         .and_then(|panel| panel.cross_section_schedule)
         .and_then(|schedule| schedule.render_scale_level)
         .ok_or_else(|| {
@@ -405,9 +429,11 @@ fn cross_section_panel_render_scale_for_state(
 }
 
 fn render_gpu_display_frame_for_resident_layers(
-    state: &AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &CurrentRenderRuntime,
     gpu_renderer: &GpuRenderer,
-    layers: &[AppLayerSummary],
+    layers: &[ResidentLayer],
 ) -> anyhow::Result<(GpuDisplayFrame, Vec<RenderedIntensityChannel>)> {
     if layers.is_empty() {
         return Err(resident_render_failure_error(
@@ -418,32 +444,31 @@ fn render_gpu_display_frame_for_resident_layers(
 
     let mut owned_layers = Vec::with_capacity(layers.len());
     for layer in layers {
-        let render_state = render_state_for_layer(state, layer);
-        let transfer = transfer_for_layer(state, layer);
-        let display = display_for_layer(state, layer);
-        let dvr_opacity_transfer = dvr_opacity_transfer_for_layer(state, layer, render_state);
-        let (mode, mode_f32) = gpu_display_layer_modes_for_render_state(
-            render_state,
-            &transfer,
-            display,
-            dvr_opacity_transfer,
-        )?;
+        let render_state = render_state_for_layer(layer);
+        let transfer = transfer_for_layer(layer);
+        let (mode, mode_f32) = gpu_display_layer_modes_for_render_state(render_state, &transfer)?;
         owned_layers.push(GpuDisplayLayerInput::new(
-            state, layer, transfer, mode, mode_f32,
+            snapshot, dataset, layer, transfer, mode, mode_f32,
         )?);
     }
     let channels = owned_layers
         .iter()
         .map(GpuDisplayLayerInput::channel)
         .collect::<Vec<_>>();
+    let view = application_view(snapshot);
+    let active_render_state = *view
+        .layer(view.active_layer())
+        .expect("application view has an active layer")
+        .render_state();
+    let camera = CameraFrame::new(*view.camera(), render.presentation_viewport)?;
     let frame = gpu_renderer.render_resident_channels_to_display_texture(
         &channels,
         GpuResidentDisplayRequest {
-            camera: state.camera.to_camera_state(state.presentation_viewport),
-            viewport: state.render_viewport,
-            quality: camera_render_quality(state),
-            iso_light_state: state.iso_light_state,
-            camera_axes: state.camera.axes(),
+            camera,
+            viewport: render.render_viewport,
+            quality: camera_render_quality_for_render_state(active_render_state),
+            iso_light_state: *view.iso_light(),
+            camera_axes: camera.axes(),
         },
     )?;
     let rendered_channels = layers
@@ -451,11 +476,11 @@ fn render_gpu_display_frame_for_resident_layers(
         .zip(owned_layers.iter())
         .map(|(layer, input)| RenderedIntensityChannel {
             layer_id: layer.id.clone(),
-            render_state: render_state_for_layer(state, layer),
-            transfer: input.transfer().clone(),
+            render_state: render_state_for_layer(layer),
+            transfer: *input.transfer(),
             frame: placeholder_frame_for_mode(
-                state.render_viewport,
-                render_state_for_layer(state, layer).mode(),
+                render.render_viewport,
+                render_state_for_layer(layer).mode(),
             ),
             frame_f32: None,
         })
@@ -465,7 +490,11 @@ fn render_gpu_display_frame_for_resident_layers(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finalize_gpu_display_frame_state(
-    state: &mut AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &mut CurrentRenderRuntime,
+    analysis: &CurrentAnalysisRuntime,
+    ui_runtime: &CurrentUiRuntime,
     gpu_renderer: &GpuRenderer,
     mut frame: GpuDisplayFrame,
     rendered_channels: Vec<RenderedIntensityChannel>,
@@ -473,40 +502,59 @@ pub(crate) fn finalize_gpu_display_frame_state(
     displayed_scale_level: u32,
     render_start: Instant,
 ) -> anyhow::Result<GpuDisplayFrame> {
-    state.frame = placeholder_frame_for_mode(state.render_viewport, state.active_render_mode);
-    state.frame_f32 = None;
-    state.diagnostics = mirante4d_renderer::frame_diagnostics(0, state.frame.pixels());
-    state.diagnostics_f32 = None;
-    state.render_backend = backend;
-    let draw_list = scene_draw_list_for_state(state)?;
+    let view = application_view(snapshot);
+    let active_render_state = *view
+        .layer(view.active_layer())
+        .expect("application view has an active layer")
+        .render_state();
+    render.frame = placeholder_frame_for_mode(render.render_viewport, active_render_state.mode());
+    render.frame_f32 = None;
+    render.diagnostics = mirante4d_renderer::frame_diagnostics(0, render.frame.pixels());
+    render.diagnostics_f32 = None;
+    render.render_backend = backend;
+    let active_layer_id = current_physical_layer_id(dataset, view.active_layer())?;
+    let draw_list = scene_draw_list(
+        analysis,
+        ui_runtime,
+        SceneViewInput {
+            active_layer_id: &active_layer_id,
+            active_timepoint: view.timepoint(),
+            active_source_grid_to_world: snapshot
+                .catalog()
+                .layer(view.active_layer())
+                .expect("application view closes over the dataset catalog")
+                .grid_to_world(),
+            camera: *view.camera(),
+        },
+    )?;
     if !draw_list.is_empty() {
         frame = gpu_renderer.render_scene_layers_to_display_texture(
             frame,
             &draw_list,
-            state.camera.to_camera_state(state.presentation_viewport),
-            state.render_viewport,
+            CameraFrame::new(*view.camera(), render.presentation_viewport)?,
+            render.render_viewport,
         )?;
     }
-    state.rendered_channels = rendered_channels;
-    state.frame_fidelity.displayed_scale_level = Some(displayed_scale_level);
-    state.lod_schedule.displayed_scale_level = Some(displayed_scale_level);
-    state.lod_schedule.pending_scale_level = None;
-    state.frame_fidelity.completeness = frame_completeness_for_rendered_scale(
+    render.rendered_channels = rendered_channels;
+    render.frame_fidelity.displayed_scale_level = Some(displayed_scale_level);
+    render.lod_schedule.displayed_scale_level = Some(displayed_scale_level);
+    render.lod_schedule.pending_scale_level = None;
+    render.frame_fidelity.completeness = frame_completeness_for_rendered_scale(
         displayed_scale_level,
-        state.frame_fidelity.target_scale_level,
-        state.frame_fidelity.reason,
+        render.frame_fidelity.target_scale_level,
+        render.frame_fidelity.reason,
     );
-    state.frame_fidelity.reason = if displayed_scale_level == 0 {
+    render.frame_fidelity.reason = if displayed_scale_level == 0 {
         LodDecisionReason::ExactS0
     } else {
-        state.frame_fidelity.reason
+        render.frame_fidelity.reason
     };
-    state.frame_fidelity.backend = state.render_backend;
-    record_completed_frame_time(state, render_start);
-    state.frame_fidelity.last_failure_kind = None;
-    state.frame_fidelity.last_capacity_error = None;
-    refresh_fidelity_resource_stats(state, Some(gpu_renderer));
-    update_channel_fidelity_status(state);
+    render.frame_fidelity.backend = render.render_backend;
+    record_completed_frame_time(render, render_start);
+    render.frame_fidelity.last_failure_kind = None;
+    render.frame_fidelity.last_capacity_error = None;
+    refresh_fidelity_resource_stats(snapshot, dataset, render, Some(gpu_renderer));
+    update_channel_fidelity_status(snapshot, dataset, render);
     Ok(frame)
 }
 
@@ -558,29 +606,29 @@ impl ResidentSetInputF32 {
 enum GpuDisplayLayerSet {
     F32 {
         set: ResidentSetInputF32,
-        brick_shape: mirante4d_core::Shape3D,
-        brick_grid_shape: mirante4d_core::Shape3D,
+        brick_shape: Shape3D,
+        brick_grid_shape: Shape3D,
     },
     U8 {
         set: ResidentSetInputU8,
-        brick_shape: mirante4d_core::Shape3D,
-        brick_grid_shape: mirante4d_core::Shape3D,
+        brick_shape: Shape3D,
+        brick_grid_shape: Shape3D,
     },
     U16 {
         set: ResidentSetInputU16,
-        brick_shape: mirante4d_core::Shape3D,
-        brick_grid_shape: mirante4d_core::Shape3D,
+        brick_shape: Shape3D,
+        brick_grid_shape: Shape3D,
     },
 }
 
 struct GpuDisplayLayerInput {
-    transfer: ChannelTransferFunction,
+    transfer: IntensityTransfer,
     mode: GpuDisplayLayerMode,
     set: GpuDisplayLayerSet,
 }
 
 struct GpuCrossSectionLayerInput {
-    transfer: ChannelTransferFunction,
+    transfer: IntensityTransfer,
     set: GpuDisplayLayerSet,
     chunk_draws: Vec<GpuCrossSectionChunkDraw>,
 }
@@ -592,61 +640,49 @@ enum GpuDisplayLayerMode {
 }
 
 pub(crate) fn gpu_display_layer_modes_for_render_state(
-    render_state: ChannelRenderState,
-    transfer: &ChannelTransferFunction,
-    display: LayerDisplay,
-    dvr_opacity_transfer: DvrOpacityTransfer,
+    render_state: RenderState,
+    transfer: &IntensityTransfer,
 ) -> anyhow::Result<(CameraRenderMode, CameraRenderModeF32)> {
     Ok((
-        renderer_mode(
-            render_state.mode(),
-            transfer,
-            dvr_opacity_transfer,
-            render_state.iso_display_level(),
-            render_state.dvr_density_scale(),
-        )?,
-        renderer_mode_f32(
-            render_state.mode(),
-            transfer,
-            display,
-            dvr_opacity_transfer,
-            render_state.iso_display_level(),
-            render_state.dvr_density_scale(),
-        )?,
+        renderer_mode(render_state, transfer)?,
+        renderer_mode_f32(render_state, transfer)?,
     ))
 }
 
 impl GpuDisplayLayerInput {
     fn new(
-        state: &AppState,
-        layer: &AppLayerSummary,
-        transfer: ChannelTransferFunction,
+        snapshot: &ApplicationSnapshot,
+        dataset: &CurrentDatasetRuntime,
+        layer: &ResidentLayer,
+        transfer: IntensityTransfer,
         integer_mode: mirante4d_renderer::CameraRenderMode,
         f32_mode: mirante4d_renderer::CameraRenderModeF32,
     ) -> anyhow::Result<Self> {
-        let layer_id = LayerId::new(layer.id.clone())?;
-        let brick_shape = state
+        let layer_id = layer.id.clone();
+        let brick_shape = dataset
             .dataset
-            .brick_shape_at_scale(&layer_id, state.brick_stream_scale_level)?;
-        let brick_grid_shape = state
+            .brick_shape_at_scale(&layer_id, dataset.brick_stream_scale_level)?;
+        let brick_grid_shape = dataset
             .dataset
-            .brick_grid_shape_at_scale(&layer_id, state.brick_stream_scale_level)?;
+            .brick_grid_shape_at_scale(&layer_id, dataset.brick_stream_scale_level)?;
         let set = match layer.dtype {
             IntensityDType::Uint8 => GpuDisplayLayerSet::U8 {
-                set: ResidentSetInputU8::Owned(Box::new(resident_u8_set_for_layer(state, layer)?)),
+                set: ResidentSetInputU8::Owned(Box::new(resident_u8_set_for_layer(
+                    snapshot, dataset, layer,
+                )?)),
                 brick_shape,
                 brick_grid_shape,
             },
             IntensityDType::Uint16 => GpuDisplayLayerSet::U16 {
                 set: ResidentSetInputU16::Owned(Box::new(resident_u16_set_for_layer(
-                    state, layer,
+                    snapshot, dataset, layer,
                 )?)),
                 brick_shape,
                 brick_grid_shape,
             },
             IntensityDType::Float32 => GpuDisplayLayerSet::F32 {
                 set: ResidentSetInputF32::Owned(Box::new(resident_f32_set_for_layer(
-                    state, layer,
+                    snapshot, dataset, layer,
                 )?)),
                 brick_shape,
                 brick_grid_shape,
@@ -665,7 +701,7 @@ impl GpuDisplayLayerInput {
         })
     }
 
-    fn transfer(&self) -> &ChannelTransferFunction {
+    fn transfer(&self) -> &IntensityTransfer {
         &self.transfer
     }
 
@@ -683,7 +719,7 @@ impl GpuDisplayLayerInput {
                 brick_shape: *brick_shape,
                 brick_grid_shape: *brick_grid_shape,
                 mode,
-                transfer: self.transfer.clone(),
+                transfer: self.transfer,
             },
             (
                 GpuDisplayLayerSet::U8 {
@@ -697,7 +733,7 @@ impl GpuDisplayLayerInput {
                 brick_shape: *brick_shape,
                 brick_grid_shape: *brick_grid_shape,
                 mode,
-                transfer: self.transfer.clone(),
+                transfer: self.transfer,
             },
             (
                 GpuDisplayLayerSet::U16 {
@@ -711,7 +747,7 @@ impl GpuDisplayLayerInput {
                 brick_shape: *brick_shape,
                 brick_grid_shape: *brick_grid_shape,
                 mode,
-                transfer: self.transfer.clone(),
+                transfer: self.transfer,
             },
             (GpuDisplayLayerSet::F32 { .. }, GpuDisplayLayerMode::Integer(_))
             | (
@@ -726,22 +762,28 @@ impl GpuDisplayLayerInput {
 
 impl GpuCrossSectionLayerInput {
     fn new_for_panel(
-        state: &AppState,
+        snapshot: &ApplicationSnapshot,
+        dataset: &CurrentDatasetRuntime,
+        render: &CurrentRenderRuntime,
         panel_id: PanelId,
-        layer: &AppLayerSummary,
-        transfer: ChannelTransferFunction,
+        layer: &ResidentLayer,
+        transfer: IntensityTransfer,
         scale_level: u32,
     ) -> anyhow::Result<Self> {
-        let layer_id = LayerId::new(layer.id.clone())?;
-        let brick_shape = state.dataset.brick_shape_at_scale(&layer_id, scale_level)?;
-        let brick_grid_shape = state
+        let layer_id = layer.id.clone();
+        let brick_shape = dataset
+            .dataset
+            .brick_shape_at_scale(&layer_id, scale_level)?;
+        let brick_grid_shape = dataset
             .dataset
             .brick_grid_shape_at_scale(&layer_id, scale_level)?;
         let set = match layer.dtype {
             IntensityDType::Uint8 => GpuDisplayLayerSet::U8 {
                 set: ResidentSetInputU8::Owned(Box::new(
                     cross_section_u8_set_for_global_runtime_panel_layer(
-                        state,
+                        snapshot,
+                        dataset,
+                        render,
                         panel_id,
                         layer,
                         scale_level,
@@ -753,7 +795,9 @@ impl GpuCrossSectionLayerInput {
             IntensityDType::Uint16 => GpuDisplayLayerSet::U16 {
                 set: ResidentSetInputU16::Owned(Box::new(
                     cross_section_u16_set_for_global_runtime_panel_layer(
-                        state,
+                        snapshot,
+                        dataset,
+                        render,
                         panel_id,
                         layer,
                         scale_level,
@@ -765,7 +809,9 @@ impl GpuCrossSectionLayerInput {
             IntensityDType::Float32 => GpuDisplayLayerSet::F32 {
                 set: ResidentSetInputF32::Owned(Box::new(
                     cross_section_f32_set_for_global_runtime_panel_layer(
-                        state,
+                        snapshot,
+                        dataset,
+                        render,
                         panel_id,
                         layer,
                         scale_level,
@@ -776,7 +822,9 @@ impl GpuCrossSectionLayerInput {
             },
         };
         let chunk_draws = cross_section_chunk_draws_for_panel_layer(
-            state,
+            snapshot,
+            dataset,
+            render,
             panel_id,
             &layer_id,
             layer.dtype,
@@ -809,7 +857,7 @@ impl GpuCrossSectionLayerInput {
                 resident: set.as_ref(),
                 brick_shape: *brick_shape,
                 brick_grid_shape: *brick_grid_shape,
-                transfer: self.transfer.clone(),
+                transfer: self.transfer,
                 chunks: &self.chunk_draws,
             },
             GpuDisplayLayerSet::U16 {
@@ -820,7 +868,7 @@ impl GpuCrossSectionLayerInput {
                 resident: set.as_ref(),
                 brick_shape: *brick_shape,
                 brick_grid_shape: *brick_grid_shape,
-                transfer: self.transfer.clone(),
+                transfer: self.transfer,
                 chunks: &self.chunk_draws,
             },
             GpuDisplayLayerSet::F32 {
@@ -831,7 +879,7 @@ impl GpuCrossSectionLayerInput {
                 resident: set.as_ref(),
                 brick_shape: *brick_shape,
                 brick_grid_shape: *brick_grid_shape,
-                transfer: self.transfer.clone(),
+                transfer: self.transfer,
                 chunks: &self.chunk_draws,
             },
         }
@@ -892,7 +940,7 @@ fn renderer_gpu_resident_cross_section_chunks(
                 dataset_id: atlas_key.dataset_id.clone(),
                 layer_id: atlas_key.layer_id.clone(),
                 timepoint: atlas_key.timepoint,
-                scale_level: atlas_key.scale_level.0,
+                scale_level: atlas_key.scale_level.get(),
                 brick_index,
             });
         }
@@ -900,51 +948,76 @@ fn renderer_gpu_resident_cross_section_chunks(
     Ok(retained_chunks)
 }
 
-fn resident_render_layers_for_state(state: &AppState) -> anyhow::Result<Vec<AppLayerSummary>> {
-    let layer_ids = stream_layer_ids_for_state(state)?
-        .into_iter()
-        .map(|layer_id| layer_id.to_string())
+fn resident_render_layers(
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+) -> anyhow::Result<Vec<ResidentLayer>> {
+    let view = application_view(snapshot);
+    let layer_ids = stream_layer_ids_for_snapshot(snapshot, dataset)?;
+    let visible_layers = view
+        .layers()
+        .iter()
+        .filter(|layer| layer.visible())
         .collect::<Vec<_>>();
-    let mut layers = Vec::with_capacity(layer_ids.len());
-    for layer_id in layer_ids {
-        let layer = state
-            .layers
-            .iter()
-            .find(|layer| layer.id == layer_id)
-            .ok_or_else(|| anyhow::anyhow!("layer {layer_id} is not loaded in app state"))?;
-        layers.push(layer.clone());
+    if layer_ids.len() != visible_layers.len() {
+        anyhow::bail!("visible logical and physical layer sets are inconsistent");
     }
-    Ok(layers)
+    Ok(layer_ids
+        .into_iter()
+        .zip(visible_layers)
+        .map(|(id, layer_view)| {
+            let layer = snapshot
+                .catalog()
+                .layer(layer_view.layer_key())
+                .expect("application view closes over the dataset catalog");
+            ResidentLayer {
+                id,
+                dtype: layer.dtype(),
+                render_state: *layer_view.render_state(),
+                transfer: IntensityTransfer::new(
+                    layer_view.visible(),
+                    layer_view.transfer().clone(),
+                ),
+            }
+        })
+        .collect())
 }
 
 fn render_resident_layer_with_backend(
-    state: &AppState,
-    layer: &AppLayerSummary,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &CurrentRenderRuntime,
+    layer: &ResidentLayer,
     gpu_renderer: Option<&GpuRenderer>,
 ) -> anyhow::Result<ResidentLayerRender> {
     match layer.dtype {
         IntensityDType::Float32 => {
-            render_resident_f32_layer_with_backend(state, layer, gpu_renderer)
+            render_resident_f32_layer_with_backend(snapshot, dataset, render, layer, gpu_renderer)
         }
-        IntensityDType::Uint8 => render_resident_u8_layer_with_backend(state, layer, gpu_renderer),
+        IntensityDType::Uint8 => {
+            render_resident_u8_layer_with_backend(snapshot, dataset, render, layer, gpu_renderer)
+        }
         IntensityDType::Uint16 => {
-            render_resident_u16_layer_with_backend(state, layer, gpu_renderer)
+            render_resident_u16_layer_with_backend(snapshot, dataset, render, layer, gpu_renderer)
         }
     }
 }
 
 fn resident_u8_set_for_layer(
-    state: &AppState,
-    layer: &AppLayerSummary,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    layer: &ResidentLayer,
 ) -> anyhow::Result<ResidentBrickSetU8> {
-    let layer_id = LayerId::new(layer.id.clone())?;
-    let bricks = state
+    let layer_id = layer.id.clone();
+    let active_layer_id =
+        current_physical_layer_id(dataset, application_view(snapshot).active_layer())?;
+    let bricks = dataset
         .resident_bricks_u8_by_layer
         .get(&layer.id)
         .cloned()
         .unwrap_or_else(|| {
-            if layer.id == state.active_layer_id {
-                state.resident_bricks_u8.clone()
+            if layer.id == active_layer_id {
+                dataset.resident_bricks_u8.clone()
             } else {
                 Vec::new()
             }
@@ -955,15 +1028,15 @@ fn resident_u8_set_for_layer(
             format!("resident uint8 brick set for layer {} is empty", layer.id),
         ));
     }
-    let scale_shape = state
+    let scale_shape = dataset
         .dataset
-        .scale_shape(&layer_id, state.brick_stream_scale_level)?;
-    let grid_to_world = state
+        .scale_shape(&layer_id, dataset.brick_stream_scale_level)?;
+    let grid_to_world = dataset
         .dataset
-        .scale_grid_to_world(&layer_id, state.brick_stream_scale_level)?;
+        .scale_grid_to_world(&layer_id, dataset.brick_stream_scale_level)?;
     Ok(ResidentBrickSetU8::new(
         layer_id,
-        state.active_timepoint,
+        application_view(snapshot).timepoint(),
         scale_shape,
         grid_to_world,
         bricks,
@@ -971,17 +1044,20 @@ fn resident_u8_set_for_layer(
 }
 
 fn resident_u16_set_for_layer(
-    state: &AppState,
-    layer: &AppLayerSummary,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    layer: &ResidentLayer,
 ) -> anyhow::Result<ResidentBrickSetU16> {
-    let layer_id = LayerId::new(layer.id.clone())?;
-    let bricks = state
+    let layer_id = layer.id.clone();
+    let active_layer_id =
+        current_physical_layer_id(dataset, application_view(snapshot).active_layer())?;
+    let bricks = dataset
         .resident_bricks_by_layer
         .get(&layer.id)
         .cloned()
         .unwrap_or_else(|| {
-            if layer.id == state.active_layer_id {
-                state.resident_bricks.clone()
+            if layer.id == active_layer_id {
+                dataset.resident_bricks.clone()
             } else {
                 Vec::new()
             }
@@ -992,15 +1068,15 @@ fn resident_u16_set_for_layer(
             format!("resident brick set for layer {} is empty", layer.id),
         ));
     }
-    let scale_shape = state
+    let scale_shape = dataset
         .dataset
-        .scale_shape(&layer_id, state.brick_stream_scale_level)?;
-    let grid_to_world = state
+        .scale_shape(&layer_id, dataset.brick_stream_scale_level)?;
+    let grid_to_world = dataset
         .dataset
-        .scale_grid_to_world(&layer_id, state.brick_stream_scale_level)?;
+        .scale_grid_to_world(&layer_id, dataset.brick_stream_scale_level)?;
     Ok(ResidentBrickSetU16::new(
         layer_id,
-        state.active_timepoint,
+        application_view(snapshot).timepoint(),
         scale_shape,
         grid_to_world,
         bricks,
@@ -1008,17 +1084,20 @@ fn resident_u16_set_for_layer(
 }
 
 fn resident_f32_set_for_layer(
-    state: &AppState,
-    layer: &AppLayerSummary,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    layer: &ResidentLayer,
 ) -> anyhow::Result<ResidentBrickSetF32> {
-    let layer_id = LayerId::new(layer.id.clone())?;
-    let bricks = state
+    let layer_id = layer.id.clone();
+    let active_layer_id =
+        current_physical_layer_id(dataset, application_view(snapshot).active_layer())?;
+    let bricks = dataset
         .resident_bricks_f32_by_layer
         .get(&layer.id)
         .cloned()
         .unwrap_or_else(|| {
-            if layer.id == state.active_layer_id {
-                state.resident_bricks_f32.clone()
+            if layer.id == active_layer_id {
+                dataset.resident_bricks_f32.clone()
             } else {
                 Vec::new()
             }
@@ -1029,15 +1108,15 @@ fn resident_f32_set_for_layer(
             format!("resident float32 brick set for layer {} is empty", layer.id),
         ));
     }
-    let scale_shape = state
+    let scale_shape = dataset
         .dataset
-        .scale_shape(&layer_id, state.brick_stream_scale_level)?;
-    let grid_to_world = state
+        .scale_shape(&layer_id, dataset.brick_stream_scale_level)?;
+    let grid_to_world = dataset
         .dataset
-        .scale_grid_to_world(&layer_id, state.brick_stream_scale_level)?;
+        .scale_grid_to_world(&layer_id, dataset.brick_stream_scale_level)?;
     Ok(ResidentBrickSetF32::new(
         layer_id,
-        state.active_timepoint,
+        application_view(snapshot).timepoint(),
         scale_shape,
         grid_to_world,
         bricks,
@@ -1045,14 +1124,22 @@ fn resident_f32_set_for_layer(
 }
 
 fn cross_section_u8_set_for_global_runtime_panel_layer(
-    state: &AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &CurrentRenderRuntime,
     panel_id: PanelId,
-    layer: &AppLayerSummary,
+    layer: &ResidentLayer,
     scale_level: u32,
 ) -> anyhow::Result<ResidentBrickSetU8> {
-    let layer_id = LayerId::new(layer.id.clone())?;
-    let bricks =
-        cross_section_runtime_u8_bricks_for_panel_layer(state, panel_id, &layer_id, scale_level)?;
+    let layer_id = layer.id.clone();
+    let bricks = cross_section_runtime_u8_bricks_for_panel_layer(
+        snapshot,
+        dataset,
+        render,
+        panel_id,
+        &layer_id,
+        scale_level,
+    )?;
     if bricks.is_empty() {
         return Err(resident_render_failure_error(
             FrameFailureKind::IncompleteResidency,
@@ -1063,11 +1150,13 @@ fn cross_section_u8_set_for_global_runtime_panel_layer(
             ),
         ));
     }
-    let scale_shape = state.dataset.scale_shape(&layer_id, scale_level)?;
-    let grid_to_world = state.dataset.scale_grid_to_world(&layer_id, scale_level)?;
+    let scale_shape = dataset.dataset.scale_shape(&layer_id, scale_level)?;
+    let grid_to_world = dataset
+        .dataset
+        .scale_grid_to_world(&layer_id, scale_level)?;
     Ok(ResidentBrickSetU8::new(
         layer_id,
-        state.active_timepoint,
+        application_view(snapshot).timepoint(),
         scale_shape,
         grid_to_world,
         bricks,
@@ -1075,14 +1164,22 @@ fn cross_section_u8_set_for_global_runtime_panel_layer(
 }
 
 fn cross_section_u16_set_for_global_runtime_panel_layer(
-    state: &AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &CurrentRenderRuntime,
     panel_id: PanelId,
-    layer: &AppLayerSummary,
+    layer: &ResidentLayer,
     scale_level: u32,
 ) -> anyhow::Result<ResidentBrickSetU16> {
-    let layer_id = LayerId::new(layer.id.clone())?;
-    let bricks =
-        cross_section_runtime_u16_bricks_for_panel_layer(state, panel_id, &layer_id, scale_level)?;
+    let layer_id = layer.id.clone();
+    let bricks = cross_section_runtime_u16_bricks_for_panel_layer(
+        snapshot,
+        dataset,
+        render,
+        panel_id,
+        &layer_id,
+        scale_level,
+    )?;
     if bricks.is_empty() {
         return Err(resident_render_failure_error(
             FrameFailureKind::IncompleteResidency,
@@ -1093,11 +1190,13 @@ fn cross_section_u16_set_for_global_runtime_panel_layer(
             ),
         ));
     }
-    let scale_shape = state.dataset.scale_shape(&layer_id, scale_level)?;
-    let grid_to_world = state.dataset.scale_grid_to_world(&layer_id, scale_level)?;
+    let scale_shape = dataset.dataset.scale_shape(&layer_id, scale_level)?;
+    let grid_to_world = dataset
+        .dataset
+        .scale_grid_to_world(&layer_id, scale_level)?;
     Ok(ResidentBrickSetU16::new(
         layer_id,
-        state.active_timepoint,
+        application_view(snapshot).timepoint(),
         scale_shape,
         grid_to_world,
         bricks,
@@ -1105,14 +1204,22 @@ fn cross_section_u16_set_for_global_runtime_panel_layer(
 }
 
 fn cross_section_f32_set_for_global_runtime_panel_layer(
-    state: &AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &CurrentRenderRuntime,
     panel_id: PanelId,
-    layer: &AppLayerSummary,
+    layer: &ResidentLayer,
     scale_level: u32,
 ) -> anyhow::Result<ResidentBrickSetF32> {
-    let layer_id = LayerId::new(layer.id.clone())?;
-    let bricks =
-        cross_section_runtime_f32_bricks_for_panel_layer(state, panel_id, &layer_id, scale_level)?;
+    let layer_id = layer.id.clone();
+    let bricks = cross_section_runtime_f32_bricks_for_panel_layer(
+        snapshot,
+        dataset,
+        render,
+        panel_id,
+        &layer_id,
+        scale_level,
+    )?;
     if bricks.is_empty() {
         return Err(resident_render_failure_error(
             FrameFailureKind::IncompleteResidency,
@@ -1123,11 +1230,13 @@ fn cross_section_f32_set_for_global_runtime_panel_layer(
             ),
         ));
     }
-    let scale_shape = state.dataset.scale_shape(&layer_id, scale_level)?;
-    let grid_to_world = state.dataset.scale_grid_to_world(&layer_id, scale_level)?;
+    let scale_shape = dataset.dataset.scale_shape(&layer_id, scale_level)?;
+    let grid_to_world = dataset
+        .dataset
+        .scale_grid_to_world(&layer_id, scale_level)?;
     Ok(ResidentBrickSetF32::new(
         layer_id,
-        state.active_timepoint,
+        application_view(snapshot).timepoint(),
         scale_shape,
         grid_to_world,
         bricks,
@@ -1135,12 +1244,14 @@ fn cross_section_f32_set_for_global_runtime_panel_layer(
 }
 
 fn cross_section_runtime_u8_bricks_for_panel_layer(
-    state: &AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &CurrentRenderRuntime,
     panel_id: PanelId,
     layer_id: &LayerId,
     scale_level: u32,
 ) -> anyhow::Result<Vec<mirante4d_data::VolumeBrickU8>> {
-    let panel_runtime = state
+    let panel_runtime = render
         .cross_section_runtime
         .panels
         .get(&panel_id)
@@ -1155,10 +1266,16 @@ fn cross_section_runtime_u8_bricks_for_panel_layer(
         })?;
     let mut bricks = Vec::new();
     for key in &panel_runtime.visible_chunks {
-        if !cross_section_runtime_key_matches_current_layer(state, key, layer_id, scale_level) {
+        if !cross_section_runtime_key_matches_current_layer(
+            snapshot,
+            dataset,
+            key,
+            layer_id,
+            scale_level,
+        ) {
             continue;
         }
-        let Some(entry) = state.cross_section_runtime.chunks.get(key) else {
+        let Some(entry) = render.cross_section_runtime.chunks.get(key) else {
             continue;
         };
         if !matches!(
@@ -1184,12 +1301,14 @@ fn cross_section_runtime_u8_bricks_for_panel_layer(
 }
 
 fn cross_section_runtime_u16_bricks_for_panel_layer(
-    state: &AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &CurrentRenderRuntime,
     panel_id: PanelId,
     layer_id: &LayerId,
     scale_level: u32,
 ) -> anyhow::Result<Vec<mirante4d_data::VolumeBrickU16>> {
-    let panel_runtime = state
+    let panel_runtime = render
         .cross_section_runtime
         .panels
         .get(&panel_id)
@@ -1204,10 +1323,16 @@ fn cross_section_runtime_u16_bricks_for_panel_layer(
         })?;
     let mut bricks = Vec::new();
     for key in &panel_runtime.visible_chunks {
-        if !cross_section_runtime_key_matches_current_layer(state, key, layer_id, scale_level) {
+        if !cross_section_runtime_key_matches_current_layer(
+            snapshot,
+            dataset,
+            key,
+            layer_id,
+            scale_level,
+        ) {
             continue;
         }
-        let Some(entry) = state.cross_section_runtime.chunks.get(key) else {
+        let Some(entry) = render.cross_section_runtime.chunks.get(key) else {
             continue;
         };
         if !matches!(
@@ -1233,12 +1358,14 @@ fn cross_section_runtime_u16_bricks_for_panel_layer(
 }
 
 fn cross_section_runtime_f32_bricks_for_panel_layer(
-    state: &AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &CurrentRenderRuntime,
     panel_id: PanelId,
     layer_id: &LayerId,
     scale_level: u32,
 ) -> anyhow::Result<Vec<mirante4d_data::VolumeBrickF32>> {
-    let panel_runtime = state
+    let panel_runtime = render
         .cross_section_runtime
         .panels
         .get(&panel_id)
@@ -1253,10 +1380,16 @@ fn cross_section_runtime_f32_bricks_for_panel_layer(
         })?;
     let mut bricks = Vec::new();
     for key in &panel_runtime.visible_chunks {
-        if !cross_section_runtime_key_matches_current_layer(state, key, layer_id, scale_level) {
+        if !cross_section_runtime_key_matches_current_layer(
+            snapshot,
+            dataset,
+            key,
+            layer_id,
+            scale_level,
+        ) {
             continue;
         }
-        let Some(entry) = state.cross_section_runtime.chunks.get(key) else {
+        let Some(entry) = render.cross_section_runtime.chunks.get(key) else {
             continue;
         };
         if !matches!(
@@ -1282,13 +1415,15 @@ fn cross_section_runtime_f32_bricks_for_panel_layer(
 }
 
 fn cross_section_chunk_draws_for_panel_layer(
-    state: &AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &CurrentRenderRuntime,
     panel_id: PanelId,
     layer_id: &LayerId,
     dtype: IntensityDType,
     scale_level: u32,
 ) -> anyhow::Result<Vec<GpuCrossSectionChunkDraw>> {
-    let panel_runtime = state
+    let panel_runtime = render
         .cross_section_runtime
         .panels
         .get(&panel_id)
@@ -1304,10 +1439,16 @@ fn cross_section_chunk_draws_for_panel_layer(
     let mut chunk_draws = Vec::new();
     for geometry in &panel_runtime.visible_chunk_geometries {
         let key = &geometry.key;
-        if !cross_section_runtime_key_matches_current_layer(state, key, layer_id, scale_level) {
+        if !cross_section_runtime_key_matches_current_layer(
+            snapshot,
+            dataset,
+            key,
+            layer_id,
+            scale_level,
+        ) {
             continue;
         }
-        let Some(entry) = state.cross_section_runtime.chunks.get(key) else {
+        let Some(entry) = render.cross_section_runtime.chunks.get(key) else {
             continue;
         };
         if !matches!(
@@ -1389,34 +1530,41 @@ fn cross_section_cache_priority_tier_rank(
 }
 
 fn cross_section_runtime_key_matches_current_layer(
-    state: &AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
     key: &crate::cross_section_runtime::CrossSectionChunkKey,
     layer_id: &LayerId,
     scale_level: u32,
 ) -> bool {
-    key.dataset_id == *state.dataset.dataset_id()
+    key.dataset_id == *dataset.dataset.dataset_id()
         && key.layer_id == *layer_id
-        && key.timepoint == state.active_timepoint
+        && key.timepoint == application_view(snapshot).timepoint()
         && key.scale_level == scale_level
 }
 
 fn cross_section_global_runtime_panel_layer_has_resident_payload(
-    state: &AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &CurrentRenderRuntime,
     panel_id: PanelId,
-    layer: &AppLayerSummary,
+    layer: &ResidentLayer,
     scale_level: u32,
 ) -> bool {
-    let Ok(layer_id) = LayerId::new(layer.id.clone()) else {
-        return false;
-    };
-    let Some(panel_runtime) = state.cross_section_runtime.panels.get(&panel_id) else {
+    let layer_id = layer.id.clone();
+    let Some(panel_runtime) = render.cross_section_runtime.panels.get(&panel_id) else {
         return false;
     };
     panel_runtime.visible_chunks.iter().any(|key| {
-        if !cross_section_runtime_key_matches_current_layer(state, key, &layer_id, scale_level) {
+        if !cross_section_runtime_key_matches_current_layer(
+            snapshot,
+            dataset,
+            key,
+            &layer_id,
+            scale_level,
+        ) {
             return false;
         }
-        let Some(entry) = state.cross_section_runtime.chunks.get(key) else {
+        let Some(entry) = render.cross_section_runtime.chunks.get(key) else {
             return false;
         };
         if !matches!(
@@ -1443,29 +1591,27 @@ fn cross_section_global_runtime_panel_layer_has_resident_payload(
 }
 
 fn render_resident_u8_layer_with_backend(
-    state: &AppState,
-    layer: &AppLayerSummary,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &CurrentRenderRuntime,
+    layer: &ResidentLayer,
     gpu_renderer: Option<&GpuRenderer>,
 ) -> anyhow::Result<ResidentLayerRender> {
-    let layer_id = LayerId::new(layer.id.clone())?;
-    let resident = resident_u8_set_for_layer(state, layer)?;
-    let brick_shape = state
+    let layer_id = layer.id.clone();
+    let resident = resident_u8_set_for_layer(snapshot, dataset, layer)?;
+    let brick_shape = dataset
         .dataset
-        .brick_shape_at_scale(&layer_id, state.brick_stream_scale_level)?;
-    let brick_grid_shape = state
+        .brick_shape_at_scale(&layer_id, dataset.brick_stream_scale_level)?;
+    let brick_grid_shape = dataset
         .dataset
-        .brick_grid_shape_at_scale(&layer_id, state.brick_stream_scale_level)?;
-    let camera = state.camera.to_camera_state(state.presentation_viewport);
-    let render_state = render_state_for_layer(state, layer);
-    let transfer = transfer_for_layer(state, layer);
-    let dvr_opacity_transfer = dvr_opacity_transfer_for_layer(state, layer, render_state);
-    let camera_mode = renderer_mode(
-        render_state.mode(),
-        &transfer,
-        dvr_opacity_transfer,
-        render_state.iso_display_level(),
-        render_state.dvr_density_scale(),
+        .brick_grid_shape_at_scale(&layer_id, dataset.brick_stream_scale_level)?;
+    let camera = CameraFrame::new(
+        *application_view(snapshot).camera(),
+        render.presentation_viewport,
     )?;
+    let render_state = render_state_for_layer(layer);
+    let transfer = transfer_for_layer(layer);
+    let camera_mode = renderer_mode(render_state, &transfer)?;
     let quality = camera_render_quality_for_render_state(render_state);
     if let Some(gpu_renderer) = gpu_renderer {
         let output = gpu_renderer
@@ -1474,7 +1620,7 @@ fn render_resident_u8_layer_with_backend(
                 brick_shape,
                 brick_grid_shape,
                 camera,
-                state.render_viewport,
+                render.render_viewport,
                 camera_mode,
                 quality,
             )
@@ -1503,7 +1649,7 @@ fn render_resident_u8_layer_with_backend(
     let (frame, diagnostics) = render_camera_u8_from_bricks_with_quality(
         &resident,
         camera,
-        state.render_viewport,
+        render.render_viewport,
         camera_mode,
         quality,
     )?;
@@ -1526,49 +1672,23 @@ fn render_resident_u8_layer_with_backend(
 }
 
 fn render_resident_u16_layer_with_backend(
-    state: &AppState,
-    layer: &AppLayerSummary,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &CurrentRenderRuntime,
+    layer: &ResidentLayer,
     gpu_renderer: Option<&GpuRenderer>,
 ) -> anyhow::Result<ResidentLayerRender> {
-    let layer_id = LayerId::new(layer.id.clone())?;
-    let bricks = state
-        .resident_bricks_by_layer
-        .get(&layer.id)
-        .cloned()
-        .unwrap_or_else(|| {
-            if layer.id == state.active_layer_id {
-                state.resident_bricks.clone()
-            } else {
-                Vec::new()
-            }
-        });
-    if bricks.is_empty() {
-        return Err(resident_render_failure_error(
-            FrameFailureKind::IncompleteResidency,
-            format!("resident brick set for layer {} is empty", layer.id),
-        ));
-    }
-    let brick_shape = state
+    let layer_id = layer.id.clone();
+    let resident = resident_u16_set_for_layer(snapshot, dataset, layer)?;
+    let brick_shape = dataset
         .dataset
-        .brick_shape_at_scale(&layer_id, state.brick_stream_scale_level)?;
-    let brick_grid_shape = state
+        .brick_shape_at_scale(&layer_id, dataset.brick_stream_scale_level)?;
+    let brick_grid_shape = dataset
         .dataset
-        .brick_grid_shape_at_scale(&layer_id, state.brick_stream_scale_level)?;
-    let scale_shape = state
-        .dataset
-        .scale_shape(&layer_id, state.brick_stream_scale_level)?;
-    let grid_to_world = state
-        .dataset
-        .scale_grid_to_world(&layer_id, state.brick_stream_scale_level)?;
-    let resident = ResidentBrickSetU16::new(
-        layer_id,
-        state.active_timepoint,
-        scale_shape,
-        grid_to_world,
-        bricks,
-    );
+        .brick_grid_shape_at_scale(&layer_id, dataset.brick_stream_scale_level)?;
     render_resident_u16_set_with_backend(
-        state,
+        snapshot,
+        render,
         layer,
         resident,
         brick_shape,
@@ -1578,24 +1698,21 @@ fn render_resident_u16_layer_with_backend(
 }
 
 fn render_resident_u16_set_with_backend(
-    state: &AppState,
-    layer: &AppLayerSummary,
+    snapshot: &ApplicationSnapshot,
+    render: &CurrentRenderRuntime,
+    layer: &ResidentLayer,
     resident: ResidentBrickSetU16,
-    brick_shape: mirante4d_core::Shape3D,
-    brick_grid_shape: mirante4d_core::Shape3D,
+    brick_shape: Shape3D,
+    brick_grid_shape: Shape3D,
     gpu_renderer: Option<&GpuRenderer>,
 ) -> anyhow::Result<ResidentLayerRender> {
-    let camera = state.camera.to_camera_state(state.presentation_viewport);
-    let render_state = render_state_for_layer(state, layer);
-    let transfer = transfer_for_layer(state, layer);
-    let dvr_opacity_transfer = dvr_opacity_transfer_for_layer(state, layer, render_state);
-    let camera_mode = renderer_mode(
-        render_state.mode(),
-        &transfer,
-        dvr_opacity_transfer,
-        render_state.iso_display_level(),
-        render_state.dvr_density_scale(),
+    let camera = CameraFrame::new(
+        *application_view(snapshot).camera(),
+        render.presentation_viewport,
     )?;
+    let render_state = render_state_for_layer(layer);
+    let transfer = transfer_for_layer(layer);
+    let camera_mode = renderer_mode(render_state, &transfer)?;
     let quality = camera_render_quality_for_render_state(render_state);
     if let Some(gpu_renderer) = gpu_renderer {
         let output = match gpu_renderer.render_camera_from_bricks_with_quality(
@@ -1603,7 +1720,7 @@ fn render_resident_u16_set_with_backend(
             brick_shape,
             brick_grid_shape,
             camera,
-            state.render_viewport,
+            render.render_viewport,
             camera_mode,
             quality,
         ) {
@@ -1620,7 +1737,7 @@ fn render_resident_u16_set_with_backend(
                         brick_shape,
                         brick_grid_shape,
                         camera,
-                        state.render_viewport,
+                        render.render_viewport,
                         GPU_RESIDENT_BRICKS_PER_BATCH,
                     )
                     .map_err(resident_render_failure_from_gpu_error)?
@@ -1651,7 +1768,7 @@ fn render_resident_u16_set_with_backend(
     let (frame, diagnostics) = render_camera_from_bricks_with_quality(
         &resident,
         camera,
-        state.render_viewport,
+        render.render_viewport,
         camera_mode,
         quality,
     )?;
@@ -1674,60 +1791,30 @@ fn render_resident_u16_set_with_backend(
 }
 
 fn render_resident_f32_layer_with_backend(
-    state: &AppState,
-    layer: &AppLayerSummary,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    render: &CurrentRenderRuntime,
+    layer: &ResidentLayer,
     gpu_renderer: Option<&GpuRenderer>,
 ) -> anyhow::Result<ResidentLayerRender> {
-    let layer_id = LayerId::new(layer.id.clone())?;
-    let bricks = state
-        .resident_bricks_f32_by_layer
-        .get(&layer.id)
-        .cloned()
-        .unwrap_or_else(|| {
-            if layer.id == state.active_layer_id {
-                state.resident_bricks_f32.clone()
-            } else {
-                Vec::new()
-            }
-        });
-    if bricks.is_empty() {
-        return Err(resident_render_failure_error(
-            FrameFailureKind::IncompleteResidency,
-            format!("resident float32 brick set for layer {} is empty", layer.id),
-        ));
-    }
-    let brick_shape = state
+    let layer_id = layer.id.clone();
+    let resident = resident_f32_set_for_layer(snapshot, dataset, layer)?;
+    let brick_shape = dataset
         .dataset
-        .brick_shape_at_scale(&layer_id, state.brick_stream_scale_level)?;
-    let brick_grid_shape = state
+        .brick_shape_at_scale(&layer_id, dataset.brick_stream_scale_level)?;
+    let brick_grid_shape = dataset
         .dataset
-        .brick_grid_shape_at_scale(&layer_id, state.brick_stream_scale_level)?;
-    let scale_shape = state
+        .brick_grid_shape_at_scale(&layer_id, dataset.brick_stream_scale_level)?;
+    let scale_shape = dataset
         .dataset
-        .scale_shape(&layer_id, state.brick_stream_scale_level)?;
-    let grid_to_world = state
-        .dataset
-        .scale_grid_to_world(&layer_id, state.brick_stream_scale_level)?;
-    let resident = ResidentBrickSetF32::new(
-        layer_id,
-        state.active_timepoint,
-        scale_shape,
-        grid_to_world,
-        bricks,
-    );
-    let camera = state.camera.to_camera_state(state.presentation_viewport);
-    let render_state = render_state_for_layer(state, layer);
-    let display = display_for_layer(state, layer);
-    let transfer = transfer_for_layer(state, layer);
-    let dvr_opacity_transfer = dvr_opacity_transfer_for_layer(state, layer, render_state);
-    let camera_mode = renderer_mode_f32(
-        render_state.mode(),
-        &transfer,
-        display,
-        dvr_opacity_transfer,
-        render_state.iso_display_level(),
-        render_state.dvr_density_scale(),
+        .scale_shape(&layer_id, dataset.brick_stream_scale_level)?;
+    let camera = CameraFrame::new(
+        *application_view(snapshot).camera(),
+        render.presentation_viewport,
     )?;
+    let render_state = render_state_for_layer(layer);
+    let transfer = transfer_for_layer(layer);
+    let camera_mode = renderer_mode_f32(render_state, &transfer)?;
     let quality = camera_render_quality_for_render_state(render_state);
     let (frame_f32, diagnostics, backend) = if let Some(gpu_renderer) = gpu_renderer {
         let output = match gpu_renderer.render_camera_f32_from_bricks_with_quality(
@@ -1735,7 +1822,7 @@ fn render_resident_f32_layer_with_backend(
             brick_shape,
             brick_grid_shape,
             camera,
-            state.render_viewport,
+            render.render_viewport,
             camera_mode,
             quality,
         ) {
@@ -1763,7 +1850,7 @@ fn render_resident_f32_layer_with_backend(
         let (frame_f32, diagnostics) = render_camera_f32_from_bricks_with_quality(
             &resident,
             camera,
-            state.render_viewport,
+            render.render_viewport,
             camera_mode,
             quality,
         )?;
@@ -1782,7 +1869,8 @@ fn render_resident_f32_layer_with_backend(
             RenderBackend::CpuResidentBricks,
         )
     };
-    let frame = f32_frame_to_display_u16_for_mode(&frame_f32, render_state.mode(), display)?;
+    let frame =
+        f32_frame_to_display_u16_for_mode(&frame_f32, render_state.mode(), transfer.window())?;
     let display_diagnostics =
         mirante4d_renderer::frame_diagnostics(scale_shape.element_count()?, frame.pixels());
     Ok(ResidentLayerRender {

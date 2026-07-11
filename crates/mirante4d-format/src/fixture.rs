@@ -1,8 +1,9 @@
 use std::path::Path;
 
-use mirante4d_core::{GridToWorld, Shape4D, WorldSpace, WorldUnit};
+use mirante4d_domain::{GridToWorld, Shape4D};
 
 use crate::{
+    WorldSpace, WorldUnit,
     manifest::ChannelMetadata,
     validate::FormatError,
     writer::{
@@ -75,8 +76,8 @@ impl FixtureKind {
             | Self::TimeU16_8Cube3T
             | Self::TimeMultiChannelU16_8Cube3T2C
             | Self::MultiChannelU16_8Cube4C
-            | Self::BasicF32_8Cube => GridToWorld::scale_um(0.2, 0.2, 0.2),
-            Self::AnisotropicU16_16Cube => GridToWorld::scale_um(0.2, 0.2, 0.5),
+            | Self::BasicF32_8Cube => crate::grid_to_world_scale_um(0.2, 0.2, 0.2),
+            Self::AnisotropicU16_16Cube => crate::grid_to_world_scale_um(0.2, 0.2, 0.5),
         }
     }
 
@@ -185,10 +186,10 @@ pub fn expected_f32_fixture_value(t: u64, z: u64, y: u64, x: u64) -> f32 {
 
 fn fixture_values(shape: Shape4D, channel: u32) -> Vec<u16> {
     let mut values = Vec::with_capacity(shape.element_count().unwrap() as usize);
-    for t in 0..shape.t {
-        for z in 0..shape.z {
-            for y in 0..shape.y {
-                for x in 0..shape.x {
+    for t in 0..shape.t() {
+        for z in 0..shape.z() {
+            for y in 0..shape.y() {
+                for x in 0..shape.x() {
                     values.push(expected_fixture_value_for_channel(channel, t, z, y, x));
                 }
             }
@@ -199,10 +200,10 @@ fn fixture_values(shape: Shape4D, channel: u32) -> Vec<u16> {
 
 fn f32_fixture_values(shape: Shape4D) -> Vec<f32> {
     let mut values = Vec::with_capacity(shape.element_count().unwrap() as usize);
-    for t in 0..shape.t {
-        for z in 0..shape.z {
-            for y in 0..shape.y {
-                for x in 0..shape.x {
+    for t in 0..shape.t() {
+        for z in 0..shape.z() {
+            for y in 0..shape.y() {
+                for x in 0..shape.x() {
                     values.push(expected_f32_fixture_value(t, z, y, x));
                 }
             }
@@ -224,6 +225,7 @@ fn channel_color(channel: u32) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CurrentGridToWorldExt;
     use crate::{
         load_and_validate_dataset, load_and_validate_dataset_quick,
         manifest::{FORMAT_ID, ScaleReduction},
@@ -234,6 +236,7 @@ mod tests {
         },
         zarr_io::open_array,
     };
+    use mirante4d_domain::IntensityDType;
 
     #[test]
     fn writes_and_validates_basic_fixture() {
@@ -322,8 +325,8 @@ mod tests {
         assert_eq!(manifest.axes, ["t", "z", "y", "x"]);
         assert_eq!(manifest.layers.len(), 1);
         let layer = &manifest.layers[0];
-        assert_eq!(layer.dtype.source, mirante4d_core::IntensityDType::Float32);
-        assert_eq!(layer.dtype.stored, mirante4d_core::IntensityDType::Float32);
+        assert_eq!(layer.dtype.source, IntensityDType::Float32);
+        assert_eq!(layer.dtype.stored, IntensityDType::Float32);
         assert_eq!(layer.scales[0].shape, Shape4D::new(1, 8, 8, 8).unwrap());
         assert_eq!(layer.scales[0].statistics.min, 0.0);
         assert_eq!(layer.scales[0].statistics.max, 1.0);
@@ -345,7 +348,7 @@ mod tests {
         let package_root = tempdir.path().join("multiscale-format.m4d");
         let s0_shape = Shape4D::new(1, 4, 4, 4).unwrap();
         let s1_shape = Shape4D::new(1, 2, 2, 2).unwrap();
-        let s0_grid_to_world = GridToWorld::scale_um(0.2, 0.2, 0.2);
+        let s0_grid_to_world = crate::grid_to_world_scale_um(0.2, 0.2, 0.2);
         let s1_grid_to_world = s0_grid_to_world
             .downsampled_integer_centered(2, 2, 2)
             .unwrap();

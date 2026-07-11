@@ -1,5 +1,7 @@
 use glam::DVec3;
-use mirante4d_core::{CameraState, LayerId, Projection};
+use mirante4d_domain::Projection;
+use mirante4d_format::{CurrentGridToWorldExt, LayerId};
+use mirante4d_render_api::CameraFrame;
 
 use crate::{
     CoordinateSpace, RenderError, RenderViewport, SceneColorRgba, SceneDrawList, SceneGeometry,
@@ -237,7 +239,7 @@ impl SceneRenderCommandList {
 pub fn render_scene_layers_rgba_cpu(
     base: &SceneRgbaImage,
     draw_list: &SceneDrawList,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
 ) -> Result<SceneRenderOutput, RenderError> {
     if base.width != viewport.width || base.height != viewport.height {
@@ -262,7 +264,7 @@ pub fn render_scene_layers_rgba_cpu(
 
 pub fn build_scene_render_commands(
     draw_list: &SceneDrawList,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
 ) -> SceneRenderCommandList {
     let projector = SceneProjector::new(camera, viewport);
@@ -454,7 +456,7 @@ pub struct ScreenPoint {
 
 #[derive(Debug, Clone, Copy)]
 pub struct SceneProjector {
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     forward: DVec3,
     right: DVec3,
@@ -462,10 +464,10 @@ pub struct SceneProjector {
 }
 
 impl SceneProjector {
-    pub fn new(camera: CameraState, viewport: RenderViewport) -> Self {
-        let forward = (camera.target - camera.eye).normalize();
-        let right = forward.cross(camera.up).normalize();
-        let up = right.cross(forward).normalize();
+    pub fn new(camera: CameraFrame, viewport: RenderViewport) -> Self {
+        let forward = crate::current_camera::forward(camera);
+        let right = crate::current_camera::right(camera);
+        let up = crate::current_camera::up(camera);
         Self {
             camera,
             viewport,
@@ -476,34 +478,46 @@ impl SceneProjector {
     }
 
     pub fn project_world(self, position: DVec3) -> Option<ScreenPoint> {
-        let view = position - self.camera.eye;
+        let view = position - crate::current_camera::eye(self.camera);
         let depth = view.dot(self.forward);
-        let (screen_x_points, screen_y_points) = match self.camera.projection {
-            Projection::Perspective => {
-                if depth <= EPSILON {
-                    return None;
+        let (screen_x_points, screen_y_points) =
+            match crate::current_camera::projection(self.camera) {
+                Projection::Perspective => {
+                    if depth <= EPSILON {
+                        return None;
+                    }
+                    (
+                        crate::current_camera::perspective_focal_length_screen_points(self.camera)
+                            * view.dot(self.right)
+                            / depth,
+                        crate::current_camera::perspective_focal_length_screen_points(self.camera)
+                            * view.dot(self.up)
+                            / depth,
+                    )
                 }
-                (
-                    self.camera.perspective_focal_length_screen_points * view.dot(self.right)
-                        / depth,
-                    self.camera.perspective_focal_length_screen_points * view.dot(self.up) / depth,
-                )
-            }
-            Projection::Orthographic => {
-                let from_target = position - self.camera.target;
-                (
-                    from_target.dot(self.right) / self.camera.orthographic_world_per_screen_point,
-                    from_target.dot(self.up) / self.camera.orthographic_world_per_screen_point,
-                )
-            }
-        };
+                Projection::Orthographic => {
+                    let from_target = position - crate::current_camera::target(self.camera);
+                    (
+                        from_target.dot(self.right)
+                            / crate::current_camera::orthographic_world_per_screen_point(
+                                self.camera,
+                            ),
+                        from_target.dot(self.up)
+                            / crate::current_camera::orthographic_world_per_screen_point(
+                                self.camera,
+                            ),
+                    )
+                }
+            };
         if !(screen_x_points.is_finite() && screen_y_points.is_finite()) {
             return None;
         }
         Some(ScreenPoint {
-            x: ((screen_x_points / self.camera.presentation_width_points + 0.5)
+            x: ((screen_x_points / crate::current_camera::presentation_width_points(self.camera)
+                + 0.5)
                 * self.viewport.width as f64) as f32,
-            y: ((0.5 - screen_y_points / self.camera.presentation_height_points)
+            y: ((0.5
+                - screen_y_points / crate::current_camera::presentation_height_points(self.camera))
                 * self.viewport.height as f64) as f32,
         })
     }
@@ -649,7 +663,7 @@ fn project_item_point(
     match &item.coordinate_space {
         CoordinateSpace::World => projector.project_world(position),
         CoordinateSpace::Grid { .. } => item.grid_to_world.and_then(|grid_to_world| {
-            projector.project_world(grid_to_world.transform_point(position))
+            projector.project_world(grid_to_world.transform_point_vec(position))
         }),
         CoordinateSpace::Plane { .. } => item.plane_to_world.and_then(|plane_to_world| {
             projector.project_world(plane_to_world.transform_point3(position))
@@ -1037,9 +1051,11 @@ mod tests {
         extract_scene_draw_list,
     };
     use glam::DMat4;
-    use mirante4d_core::{CameraState, GridToWorld, LayerId, PresentationViewport, TimeIndex};
+    use mirante4d_domain::TimeIndex;
+    use mirante4d_format::LayerId;
+    use mirante4d_render_api::CameraFrame;
 
-    fn camera() -> CameraState {
+    fn camera() -> CameraFrame {
         camera_with_height(
             Projection::Orthographic,
             DVec3::new(0.0, 0.0, 10.0),
@@ -1055,15 +1071,15 @@ mod tests {
         target: DVec3,
         up: DVec3,
         height: f64,
-    ) -> CameraState {
-        CameraState::new(
+    ) -> CameraFrame {
+        crate::current_camera::frame_from_look_at(
             projection,
             eye,
             target,
             up,
             1.0,
             height / (2.0 * (std::f64::consts::FRAC_PI_3 * 0.5).tan()),
-            PresentationViewport::new_unchecked(height, height),
+            crate::current_camera::presentation(height, height),
         )
     }
 
@@ -1100,7 +1116,7 @@ mod tests {
                 SceneObject::new(
                     SceneObjectId::new("handle-a").unwrap(),
                     CoordinateSpace::World,
-                    crate::SceneTime::Timepoint(TimeIndex(0)),
+                    crate::SceneTime::Timepoint(TimeIndex::new(0)),
                     OcclusionPolicy::AlwaysOnTop,
                     SceneGeometry::Point {
                         position: DVec3::ZERO,
@@ -1109,7 +1125,7 @@ mod tests {
                 )
                 .with_style(SceneStyle::new(SceneColorRgba::MAGENTA)),
             )],
-            SceneFrameContext::new(TimeIndex(0)),
+            SceneFrameContext::new(TimeIndex::new(0)),
         );
         let base = SceneRgbaImage::solid(32, 32, SceneColorRgba::new(0, 0, 0, 255)).unwrap();
 
@@ -1151,7 +1167,8 @@ mod tests {
         .with_style(layer_style)
         .with_object(styled_object)
         .with_object(default_object);
-        let draw_list = extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex(0)));
+        let draw_list =
+            extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex::new(0)));
 
         let styled = draw_list
             .items()
@@ -1196,7 +1213,8 @@ mod tests {
         )
         .with_object(non_selectable)
         .with_object(selectable);
-        let draw_list = extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex(0)));
+        let draw_list =
+            extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex::new(0)));
 
         let commands =
             build_scene_render_commands(&draw_list, camera(), RenderViewport::new(32, 32).unwrap());
@@ -1232,7 +1250,8 @@ mod tests {
                     width_px: 3.0,
                 },
             ));
-        let draw_list = extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex(0)));
+        let draw_list =
+            extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex::new(0)));
         let commands = build_scene_render_commands(
             &draw_list,
             camera(),
@@ -1275,7 +1294,8 @@ mod tests {
                 text: "t0".to_owned(),
             },
         ));
-        let draw_list = extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex(0)));
+        let draw_list =
+            extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex::new(0)));
         let commands = build_scene_render_commands(
             &draw_list,
             camera(),
@@ -1324,8 +1344,10 @@ mod tests {
         ));
         let draw_list = extract_scene_draw_list(
             &[layer],
-            SceneFrameContext::new(TimeIndex(0))
-                .with_grid_to_world(source_layer_id, GridToWorld::scale_um(2.0, 1.0, 1.0)),
+            SceneFrameContext::new(TimeIndex::new(0)).with_grid_to_world(
+                source_layer_id,
+                mirante4d_format::grid_to_world_scale_um(2.0, 1.0, 1.0),
+            ),
         );
         let commands = build_scene_render_commands(
             &draw_list,
@@ -1362,7 +1384,7 @@ mod tests {
         ));
         let draw_list = extract_scene_draw_list(
             &[layer],
-            SceneFrameContext::new(TimeIndex(0))
+            SceneFrameContext::new(TimeIndex::new(0))
                 .with_plane_to_world(plane_id, DMat4::from_translation(DVec3::new(2.0, 0.0, 0.0))),
         );
         let commands = build_scene_render_commands(
@@ -1410,12 +1432,12 @@ mod tests {
             },
         ));
         let a_commands = build_scene_render_commands(
-            &extract_scene_draw_list(&[text_a], SceneFrameContext::new(TimeIndex(0))),
+            &extract_scene_draw_list(&[text_a], SceneFrameContext::new(TimeIndex::new(0))),
             camera(),
             RenderViewport::new(100, 100).unwrap(),
         );
         let ab_commands = build_scene_render_commands(
-            &extract_scene_draw_list(&[text_ab], SceneFrameContext::new(TimeIndex(0))),
+            &extract_scene_draw_list(&[text_ab], SceneFrameContext::new(TimeIndex::new(0))),
             camera(),
             RenderViewport::new(100, 100).unwrap(),
         );
@@ -1451,7 +1473,7 @@ mod tests {
             },
         ));
         let commands = build_scene_render_commands(
-            &extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex(0))),
+            &extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex::new(0))),
             camera(),
             RenderViewport::new(100, 100).unwrap(),
         );
@@ -1489,7 +1511,7 @@ mod tests {
             },
         ));
         let commands = build_scene_render_commands(
-            &extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex(0))),
+            &extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex::new(0))),
             camera(),
             RenderViewport::new(40, 16).unwrap(),
         );
@@ -1526,7 +1548,7 @@ mod tests {
             },
         ));
         let commands = build_scene_render_commands(
-            &extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex(0))),
+            &extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex::new(0))),
             camera(),
             RenderViewport::new(100, 100).unwrap(),
         );
@@ -1551,7 +1573,7 @@ mod tests {
 
     #[test]
     fn unsupported_coordinate_space_is_reported() {
-        let layer_id = mirante4d_core::LayerId::new("ch0").unwrap();
+        let layer_id = mirante4d_format::LayerId::new("ch0").unwrap();
         let layer = SceneLayer::new(
             SceneLayerId::new("grid-objects").unwrap(),
             SceneLayerKind::Annotation,
@@ -1566,7 +1588,8 @@ mod tests {
                 radius_px: 2.0,
             },
         ));
-        let draw_list = extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex(0)));
+        let draw_list =
+            extract_scene_draw_list(&[layer], SceneFrameContext::new(TimeIndex::new(0)));
         let commands = build_scene_render_commands(
             &draw_list,
             camera(),

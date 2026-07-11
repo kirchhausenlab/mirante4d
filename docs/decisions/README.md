@@ -25,6 +25,6 @@ owns program status, sequencing, promotion, and the same-version brief bundle.
 D-003 contribution governance is implemented and operational in the public
 repository; WP-04 applied and read back its remote controls. ADR-0009 was
 implemented and accepted by WP-07A at `foundation-wp-07a-exit-1`; its model
-remains unreachable until the WP-07B-B live cutover. D-011 through D-014 and
-D-020 belong only to the deferred open-data follow-on. New ADRs must not
-convert a later-gated decision into implementation authority.
+is now the live authority through the WP-07B-B hard cutover. D-011 through
+D-014 and D-020 belong only to the deferred open-data follow-on. New ADRs must
+not convert a later-gated decision into implementation authority.

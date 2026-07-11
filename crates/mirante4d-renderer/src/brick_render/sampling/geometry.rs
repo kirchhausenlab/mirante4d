@@ -215,9 +215,9 @@ pub(super) fn sample_trilinear_u16_checked(
     point: DVec3,
 ) -> Option<BrickLinearSample> {
     let volume_shape = resident.volume_shape();
-    let x = interpolation_axis(point.x, volume_shape.x)?;
-    let y = interpolation_axis(point.y, volume_shape.y)?;
-    let z = interpolation_axis(point.z, volume_shape.z)?;
+    let x = interpolation_axis(point.x, volume_shape.x())?;
+    let y = interpolation_axis(point.y, volume_shape.y())?;
+    let z = interpolation_axis(point.z, volume_shape.z())?;
     let c000 = resident_sample_u16(resident, z.lower, y.lower, x.lower);
     let c100 = resident_sample_u16(resident, z.lower, y.lower, x.upper);
     let c010 = resident_sample_u16(resident, z.lower, y.upper, x.lower);
@@ -277,9 +277,9 @@ pub(super) fn sample_trilinear_f32_checked(
     resident: &ResidentBrickSetF32,
     point: DVec3,
 ) -> Option<BrickRaySampleF32> {
-    let x = interpolation_axis(point.x, resident.volume_shape.x)?;
-    let y = interpolation_axis(point.y, resident.volume_shape.y)?;
-    let z = interpolation_axis(point.z, resident.volume_shape.z)?;
+    let x = interpolation_axis(point.x, resident.volume_shape.x())?;
+    let y = interpolation_axis(point.y, resident.volume_shape.y())?;
+    let z = interpolation_axis(point.z, resident.volume_shape.z())?;
     let c000 = resident_sample_f32(resident, z.lower, y.lower, x.lower);
     let c100 = resident_sample_f32(resident, z.lower, y.lower, x.upper);
     let c010 = resident_sample_f32(resident, z.lower, y.upper, x.lower);
@@ -722,7 +722,7 @@ pub(super) fn intersect_grid_box(ray: GridRay, shape: Shape3D) -> Option<RayBoxH
         ray.origin.x,
         ray.direction.x,
         -0.5,
-        shape.x as f64 - 0.5,
+        shape.x() as f64 - 0.5,
         &mut enter,
         &mut exit,
     )?;
@@ -730,7 +730,7 @@ pub(super) fn intersect_grid_box(ray: GridRay, shape: Shape3D) -> Option<RayBoxH
         ray.origin.y,
         ray.direction.y,
         -0.5,
-        shape.y as f64 - 0.5,
+        shape.y() as f64 - 0.5,
         &mut enter,
         &mut exit,
     )?;
@@ -738,7 +738,7 @@ pub(super) fn intersect_grid_box(ray: GridRay, shape: Shape3D) -> Option<RayBoxH
         ray.origin.z,
         ray.direction.z,
         -0.5,
-        shape.z as f64 - 0.5,
+        shape.z() as f64 - 0.5,
         &mut enter,
         &mut exit,
     )?;
@@ -786,12 +786,13 @@ mod tests {
 
     #[test]
     fn world_space_gradient_uses_inverse_transpose_transform() {
-        let grid_to_world = GridToWorld::from_dmat4(DMat4::from_cols_array(&[
+        let grid_to_world = mirante4d_format::grid_to_world_from_dmat4(DMat4::from_cols_array(&[
             2.0, 0.0, 0.0, 0.0, //
             0.25, 3.0, 0.0, 0.0, //
             0.0, 0.5, 4.0, 0.0, //
             7.0, 11.0, 13.0, 1.0,
-        ]));
+        ]))
+        .unwrap();
         let grid_gradient = DVec3::new(1.0, 2.0, 3.0);
 
         let actual = world_space_gradient(grid_gradient, grid_to_world).normalize();

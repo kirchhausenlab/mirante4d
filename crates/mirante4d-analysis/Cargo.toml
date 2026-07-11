@@ -8,13 +8,13 @@ repository.workspace = true
 
 [dependencies]
 glam.workspace = true
-mirante4d-core.workspace = true
 mirante4d-data.workspace = true
+mirante4d-domain.workspace = true
+mirante4d-format.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
-mirante4d-format.workspace = true
 tempfile.workspace = true

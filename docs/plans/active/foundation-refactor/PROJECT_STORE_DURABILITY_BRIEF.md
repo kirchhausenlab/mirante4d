@@ -168,9 +168,9 @@ project generation only after D-009 scientific identity is verified; a trusted
 release may bind an alternate exact package with the same science. A
 self-declared content-ID field alone is not trusted.
 
-WP-02 completed the hard cut from `mirante4d-project-v13` to the current
-segmentation-free transitional `mirante4d-project-v14`. WP-10B then hard-cuts
-that eligible predecessor to the owner-approved target store: no v13/v14 core
+WP-02 cut project v13 to the segmentation-free v14 predecessor. WP-07B deleted
+v14 and installed the private experimental project-v15 bridge. WP-10B
+hard-cuts that bridge to the owner-approved target store: no v13/v14/v15
 reader, in-place mutation, fallback branch, or converter remains. Existing
 disposable development projects are regenerated; a converter would require a
 separate explicit owner request.

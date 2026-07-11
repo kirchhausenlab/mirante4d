@@ -5,7 +5,9 @@ use mirante4d_analysis::{
     SceneStyleRgba as AnalysisSceneStyleRgba, TrackTrailWindow,
     WorldGeometry as AnalysisWorldGeometry,
 };
-use mirante4d_core::{LayerId, TimeIndex};
+use mirante4d_domain::{CameraView, GridToWorld, TimeIndex};
+use mirante4d_format::LayerId;
+use mirante4d_render_api::CameraFrame;
 use mirante4d_renderer::scene_render::SceneProjector;
 use mirante4d_renderer::{
     CoordinateSpace, OcclusionPolicy, PickCompleteness, PickHit, PickHitKind, PickPolicy,
@@ -15,7 +17,9 @@ use mirante4d_renderer::{
 };
 
 use crate::{
-    AppState,
+    current_runtime::{
+        analysis::CurrentAnalysisRuntime, render::CurrentRenderRuntime, ui::CurrentUiRuntime,
+    },
     scene_artifacts::{EditableSceneArtifactKind, SceneEditHandle, SceneEditHandleId},
     tools::ToolSelection,
 };
@@ -24,19 +28,36 @@ const SCENE_HANDLE_RADIUS_PX: f32 = 5.0;
 const SCENE_HANDLE_PICK_RADIUS_PX: f32 = 9.0;
 pub(crate) const SCENE_HANDLE_LAYER_ID: &str = "scene-handles";
 
-pub(crate) fn scene_draw_list_for_state(state: &AppState) -> anyhow::Result<SceneDrawList> {
-    let layers = scene_layers_for_state(state)?;
-    let active_layer_id = LayerId::new(state.active_layer_id.clone())?;
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SceneViewInput<'a> {
+    pub(crate) active_layer_id: &'a LayerId,
+    pub(crate) active_timepoint: TimeIndex,
+    pub(crate) active_source_grid_to_world: GridToWorld,
+    pub(crate) camera: CameraView,
+}
+
+pub(crate) fn scene_draw_list(
+    analysis: &CurrentAnalysisRuntime,
+    ui_runtime: &CurrentUiRuntime,
+    view: SceneViewInput<'_>,
+) -> anyhow::Result<SceneDrawList> {
+    let layers = scene_layers(analysis, ui_runtime, view)?;
     Ok(extract_scene_draw_list(
         &layers,
-        SceneFrameContext::new(state.active_timepoint)
-            .with_grid_to_world(active_layer_id, state.active_source_grid_to_world),
+        SceneFrameContext::new(view.active_timepoint).with_grid_to_world(
+            view.active_layer_id.clone(),
+            view.active_source_grid_to_world,
+        ),
     ))
 }
 
-fn scene_layers_for_state(state: &AppState) -> anyhow::Result<Vec<SceneLayer>> {
-    let mut layers = scene_layers_from_artifacts(&state.scene_artifacts, state.active_timepoint)?;
-    if let Some(handle_layer) = selected_scene_handle_layer(state)? {
+fn scene_layers(
+    analysis: &CurrentAnalysisRuntime,
+    ui_runtime: &CurrentUiRuntime,
+    view: SceneViewInput<'_>,
+) -> anyhow::Result<Vec<SceneLayer>> {
+    let mut layers = scene_layers_from_artifacts(&analysis.scene_artifacts, view.active_timepoint)?;
+    if let Some(handle_layer) = selected_scene_handle_layer(analysis, ui_runtime, view)? {
         layers.push(handle_layer);
     }
     Ok(layers)
@@ -54,8 +75,8 @@ fn scene_layers_from_artifacts(
             let object_id = SceneObjectId::new(format!(
                 "{}_seg_{}_{}",
                 segment.track_id.as_str(),
-                segment.start_timepoint.0,
-                segment.end_timepoint.0
+                segment.start_timepoint.get(),
+                segment.end_timepoint.get()
             ))?;
             tracks = tracks.with_object(
                 SceneObject::new(
@@ -217,12 +238,16 @@ fn push_scene_layer_if_nonempty(layers: &mut Vec<SceneLayer>, layer: SceneLayer)
     }
 }
 
-fn selected_scene_handle_layer(state: &AppState) -> anyhow::Result<Option<SceneLayer>> {
+fn selected_scene_handle_layer(
+    analysis: &CurrentAnalysisRuntime,
+    ui_runtime: &CurrentUiRuntime,
+    view: SceneViewInput<'_>,
+) -> anyhow::Result<Option<SceneLayer>> {
     let mut layer = SceneLayer::new(
         SceneLayerId::new(SCENE_HANDLE_LAYER_ID)?,
         SceneLayerKind::Interaction,
     );
-    for handle in selected_scene_edit_handles(state)? {
+    for handle in selected_scene_edit_handles(analysis, ui_runtime, view.active_timepoint)? {
         layer = layer.with_object(
             SceneObject::new(
                 SceneObjectId::new(format!(
@@ -231,10 +256,10 @@ fn selected_scene_handle_layer(state: &AppState) -> anyhow::Result<Option<SceneL
                     handle.object_suffix()
                 ))?,
                 CoordinateSpace::World,
-                SceneTime::Timepoint(state.active_timepoint),
+                SceneTime::Timepoint(view.active_timepoint),
                 OcclusionPolicy::AlwaysOnTop,
                 SceneGeometry::Point {
-                    position: handle_position(state, &handle)?,
+                    position: handle_position(analysis, &handle)?,
                     radius_px: SCENE_HANDLE_RADIUS_PX,
                 },
             )
@@ -244,17 +269,22 @@ fn selected_scene_handle_layer(state: &AppState) -> anyhow::Result<Option<SceneL
     Ok((!layer.objects().is_empty()).then_some(layer))
 }
 
-fn selected_scene_edit_handles(state: &AppState) -> anyhow::Result<Vec<SceneEditHandleId>> {
-    let Some(ToolSelection::SceneObject { kind, object_id }) = &state.viewer_tools.selection else {
+fn selected_scene_edit_handles(
+    analysis: &CurrentAnalysisRuntime,
+    ui_runtime: &CurrentUiRuntime,
+    active_timepoint: TimeIndex,
+) -> anyhow::Result<Vec<SceneEditHandleId>> {
+    let Some(ToolSelection::SceneObject { kind, object_id }) = &ui_runtime.viewer_tools.selection
+    else {
         return Ok(Vec::new());
     };
     match kind {
         PickHitKind::Roi => {
             let id = SceneArtifactId::new("roi", object_id.clone())?;
-            let Some(roi) = state.scene_artifacts.roi(&id) else {
+            let Some(roi) = analysis.scene_artifacts.roi(&id) else {
                 return Ok(Vec::new());
             };
-            if !roi.visible || !roi.time.is_visible_at(state.active_timepoint) {
+            if !roi.visible || !roi.time.is_visible_at(active_timepoint) {
                 return Ok(Vec::new());
             }
             Ok(world_geometry_edit_handles(
@@ -265,10 +295,10 @@ fn selected_scene_edit_handles(state: &AppState) -> anyhow::Result<Vec<SceneEdit
         }
         PickHitKind::Annotation => {
             let id = SceneArtifactId::new("annotation", object_id.clone())?;
-            let Some(annotation) = state.scene_artifacts.annotation(&id) else {
+            let Some(annotation) = analysis.scene_artifacts.annotation(&id) else {
                 return Ok(Vec::new());
             };
-            if !annotation.visible || !annotation.time.is_visible_at(state.active_timepoint) {
+            if !annotation.visible || !annotation.time.is_visible_at(active_timepoint) {
                 return Ok(Vec::new());
             }
             Ok(world_geometry_edit_handles(
@@ -279,7 +309,7 @@ fn selected_scene_edit_handles(state: &AppState) -> anyhow::Result<Vec<SceneEdit
         }
         PickHitKind::Track => {
             let id = SceneArtifactId::new("track", object_id.clone())?;
-            let Some(track) = state.scene_artifacts.track(&id) else {
+            let Some(track) = analysis.scene_artifacts.track(&id) else {
                 return Ok(Vec::new());
             };
             if !track.visible {
@@ -298,10 +328,10 @@ fn selected_scene_edit_handles(state: &AppState) -> anyhow::Result<Vec<SceneEdit
         }
         PickHitKind::Measurement => {
             let id = SceneArtifactId::new("measurement", object_id.clone())?;
-            let Some(measurement) = state.scene_artifacts.measurement(&id) else {
+            let Some(measurement) = analysis.scene_artifacts.measurement(&id) else {
                 return Ok(Vec::new());
             };
-            if !measurement.visible || !measurement.time.is_visible_at(state.active_timepoint) {
+            if !measurement.visible || !measurement.time.is_visible_at(active_timepoint) {
                 return Ok(Vec::new());
             }
             Ok(match measurement.geometry {
@@ -361,11 +391,14 @@ pub(crate) fn world_geometry_edit_handles(
         .collect()
 }
 
-fn handle_position(state: &AppState, handle: &SceneEditHandleId) -> anyhow::Result<DVec3> {
+fn handle_position(
+    analysis: &CurrentAnalysisRuntime,
+    handle: &SceneEditHandleId,
+) -> anyhow::Result<DVec3> {
     match handle.artifact_kind {
         EditableSceneArtifactKind::Track => {
             let id = SceneArtifactId::new("track", handle.artifact_id.clone())?;
-            let track = state
+            let track = analysis
                 .scene_artifacts
                 .track(&id)
                 .ok_or_else(|| anyhow::anyhow!("track {} was not found", id.as_str()))?;
@@ -382,7 +415,7 @@ fn handle_position(state: &AppState, handle: &SceneEditHandleId) -> anyhow::Resu
         }
         EditableSceneArtifactKind::Roi => {
             let id = SceneArtifactId::new("roi", handle.artifact_id.clone())?;
-            let roi = state
+            let roi = analysis
                 .scene_artifacts
                 .roi(&id)
                 .ok_or_else(|| anyhow::anyhow!("ROI {} was not found", id.as_str()))?;
@@ -390,7 +423,7 @@ fn handle_position(state: &AppState, handle: &SceneEditHandleId) -> anyhow::Resu
         }
         EditableSceneArtifactKind::Annotation => {
             let id = SceneArtifactId::new("annotation", handle.artifact_id.clone())?;
-            let annotation = state
+            let annotation = analysis
                 .scene_artifacts
                 .annotation(&id)
                 .ok_or_else(|| anyhow::anyhow!("annotation {} was not found", id.as_str()))?;
@@ -398,7 +431,7 @@ fn handle_position(state: &AppState, handle: &SceneEditHandleId) -> anyhow::Resu
         }
         EditableSceneArtifactKind::Measurement => {
             let id = SceneArtifactId::new("measurement", handle.artifact_id.clone())?;
-            let measurement = state
+            let measurement = analysis
                 .scene_artifacts
                 .measurement(&id)
                 .ok_or_else(|| anyhow::anyhow!("measurement {} was not found", id.as_str()))?;
@@ -459,15 +492,18 @@ fn world_geometry_handle_position(
 }
 
 pub(crate) fn selected_scene_handle_pick_targets(
-    state: &AppState,
+    analysis: &CurrentAnalysisRuntime,
+    ui_runtime: &CurrentUiRuntime,
+    render: &CurrentRenderRuntime,
+    view: SceneViewInput<'_>,
 ) -> anyhow::Result<Vec<ScenePickTarget>> {
     let projector = SceneProjector::new(
-        state.camera.to_camera_state(state.presentation_viewport),
-        state.render_viewport,
+        CameraFrame::new(view.camera, render.presentation_viewport)?,
+        render.render_viewport,
     );
     let mut targets = Vec::new();
-    for handle in selected_scene_edit_handles(state)? {
-        let world_position = handle_position(state, &handle)?;
+    for handle in selected_scene_edit_handles(analysis, ui_runtime, view.active_timepoint)? {
+        let world_position = handle_position(analysis, &handle)?;
         let Some(screen_point) = projector.project_world(world_position) else {
             continue;
         };
@@ -479,7 +515,7 @@ pub(crate) fn selected_scene_handle_pick_targets(
                 layer_id: Some(SceneLayerId::new(SCENE_HANDLE_LAYER_ID)?),
                 object_id: Some(SceneObjectId::new(handle.artifact_id.clone())?),
                 source_layer_id: None,
-                timepoint: state.active_timepoint,
+                timepoint: view.active_timepoint,
                 world_position: Some(world_position),
                 grid_position: None,
                 screen_position: Some(screen_position),

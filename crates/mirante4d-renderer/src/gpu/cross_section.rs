@@ -1,8 +1,10 @@
 use std::{collections::HashMap, time::Instant};
 
 use bytemuck::cast_slice;
-use mirante4d_core::{ChannelTransferFunction, PresentationViewport, Shape3D};
 use mirante4d_data::SpatialBrickIndex;
+use mirante4d_domain::Shape3D;
+use mirante4d_format::CurrentGridToWorldExt;
+use mirante4d_render_api::PresentationViewport;
 use wgpu::util::DeviceExt;
 
 use super::{
@@ -21,8 +23,8 @@ use super::{
     duration_ns_u64,
 };
 use crate::{
-    CrossSectionPanelBounds, CrossSectionView, RenderError, RenderViewport, ResidentBrickSetF32,
-    ResidentBrickSetU8, ResidentBrickSetU16,
+    CrossSectionPanelBounds, CrossSectionView, IntensityTransfer, RenderError, RenderViewport,
+    ResidentBrickSetF32, ResidentBrickSetU8, ResidentBrickSetU16,
 };
 
 const CROSS_SECTION_PARAMS_U32_WORDS: usize = 17;
@@ -54,21 +56,21 @@ pub enum GpuCrossSectionChunkDisplayChannel<'a> {
         resident: &'a ResidentBrickSetU8,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
-        transfer: ChannelTransferFunction,
+        transfer: IntensityTransfer,
         chunks: &'a [GpuCrossSectionChunkDraw],
     },
     U16 {
         resident: &'a ResidentBrickSetU16,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
-        transfer: ChannelTransferFunction,
+        transfer: IntensityTransfer,
         chunks: &'a [GpuCrossSectionChunkDraw],
     },
     F32 {
         resident: &'a ResidentBrickSetF32,
         brick_shape: Shape3D,
         brick_grid_shape: Shape3D,
-        transfer: ChannelTransferFunction,
+        transfer: IntensityTransfer,
         chunks: &'a [GpuCrossSectionChunkDraw],
     },
 }
@@ -132,8 +134,8 @@ fn page_priority_is_better(
 }
 
 fn cross_section_integer_params(
-    volume_shape: mirante4d_core::Shape3D,
-    grid_to_world: mirante4d_core::GridToWorld,
+    volume_shape: mirante4d_domain::Shape3D,
+    grid_to_world: mirante4d_domain::GridToWorld,
     atlas: &GpuBrickAtlasResource,
     view: CrossSectionView,
     presentation_viewport: PresentationViewport,
@@ -141,15 +143,15 @@ fn cross_section_integer_params(
 ) -> Result<CrossSectionIntegerParams, GpuRenderError> {
     let viewport_width = checked_u32("viewport_width", render_viewport.width)?;
     let viewport_height = checked_u32("viewport_height", render_viewport.height)?;
-    let shape_x = checked_u32("x", volume_shape.x)?;
-    let shape_y = checked_u32("y", volume_shape.y)?;
-    let shape_z = checked_u32("z", volume_shape.z)?;
-    let brick_x = checked_u32("brick_x", atlas.brick_shape.x)?;
-    let brick_y = checked_u32("brick_y", atlas.brick_shape.y)?;
-    let brick_z = checked_u32("brick_z", atlas.brick_shape.z)?;
-    let grid_x = checked_u32("grid_x", atlas.brick_grid_shape.x)?;
-    let grid_y = checked_u32("grid_y", atlas.brick_grid_shape.y)?;
-    let grid_z = checked_u32("grid_z", atlas.brick_grid_shape.z)?;
+    let shape_x = checked_u32("x", volume_shape.x())?;
+    let shape_y = checked_u32("y", volume_shape.y())?;
+    let shape_z = checked_u32("z", volume_shape.z())?;
+    let brick_x = checked_u32("brick_x", atlas.brick_shape.x())?;
+    let brick_y = checked_u32("brick_y", atlas.brick_shape.y())?;
+    let brick_z = checked_u32("brick_z", atlas.brick_shape.z())?;
+    let grid_x = checked_u32("grid_x", atlas.brick_grid_shape.x())?;
+    let grid_y = checked_u32("grid_y", atlas.brick_grid_shape.y())?;
+    let grid_z = checked_u32("grid_z", atlas.brick_grid_shape.z())?;
     let brick_voxel_count = checked_u32("brick_voxel_count", atlas.brick_voxel_count)?;
     let packed_u32_per_brick = checked_u32("packed_u32_per_brick", atlas.packed_u32_per_brick)?;
     let valid_u32_per_brick = checked_u32("valid_u32_per_brick", atlas.valid_u32_per_brick)?;
@@ -188,8 +190,8 @@ fn cross_section_integer_params(
         down_grid_per_point.x as f32,
         down_grid_per_point.y as f32,
         down_grid_per_point.z as f32,
-        presentation_viewport.width_points as f32,
-        presentation_viewport.height_points as f32,
+        presentation_viewport.width_points() as f32,
+        presentation_viewport.height_points() as f32,
     ];
     Ok(CrossSectionIntegerParams {
         params_u32,
@@ -199,7 +201,7 @@ fn cross_section_integer_params(
 
 fn cross_section_f32_params(
     volume_shape: Shape3D,
-    grid_to_world: mirante4d_core::GridToWorld,
+    grid_to_world: mirante4d_domain::GridToWorld,
     atlas: &GpuBrickAtlasF32Resource,
     view: CrossSectionView,
     presentation_viewport: PresentationViewport,
@@ -207,15 +209,15 @@ fn cross_section_f32_params(
 ) -> Result<CrossSectionF32Params, GpuRenderError> {
     let viewport_width = checked_u32("viewport_width", render_viewport.width)?;
     let viewport_height = checked_u32("viewport_height", render_viewport.height)?;
-    let shape_x = checked_u32("x", volume_shape.x)?;
-    let shape_y = checked_u32("y", volume_shape.y)?;
-    let shape_z = checked_u32("z", volume_shape.z)?;
-    let brick_x = checked_u32("brick_x", atlas.brick_shape.x)?;
-    let brick_y = checked_u32("brick_y", atlas.brick_shape.y)?;
-    let brick_z = checked_u32("brick_z", atlas.brick_shape.z)?;
-    let grid_x = checked_u32("grid_x", atlas.brick_grid_shape.x)?;
-    let grid_y = checked_u32("grid_y", atlas.brick_grid_shape.y)?;
-    let grid_z = checked_u32("grid_z", atlas.brick_grid_shape.z)?;
+    let shape_x = checked_u32("x", volume_shape.x())?;
+    let shape_y = checked_u32("y", volume_shape.y())?;
+    let shape_z = checked_u32("z", volume_shape.z())?;
+    let brick_x = checked_u32("brick_x", atlas.brick_shape.x())?;
+    let brick_y = checked_u32("brick_y", atlas.brick_shape.y())?;
+    let brick_z = checked_u32("brick_z", atlas.brick_shape.z())?;
+    let grid_x = checked_u32("grid_x", atlas.brick_grid_shape.x())?;
+    let grid_y = checked_u32("grid_y", atlas.brick_grid_shape.y())?;
+    let grid_z = checked_u32("grid_z", atlas.brick_grid_shape.z())?;
     let world_to_grid = grid_to_world.inverse().map_err(RenderError::from)?;
     let center_grid = world_to_grid.transform_point(view.center_world);
     let right_grid_per_point =
@@ -245,8 +247,8 @@ fn cross_section_f32_params(
         down_grid_per_point.x as f32,
         down_grid_per_point.y as f32,
         down_grid_per_point.z as f32,
-        presentation_viewport.width_points as f32,
-        presentation_viewport.height_points as f32,
+        presentation_viewport.width_points() as f32,
+        presentation_viewport.height_points() as f32,
     ];
     Ok(CrossSectionF32Params {
         params_u32,
@@ -311,8 +313,8 @@ fn cross_section_chunk_pixel_bounds(
     {
         return None;
     }
-    let width_points = presentation_viewport.width_points;
-    let height_points = presentation_viewport.height_points;
+    let width_points = presentation_viewport.width_points();
+    let height_points = presentation_viewport.height_points();
     if width_points <= 0.0 || height_points <= 0.0 {
         return None;
     }
@@ -569,19 +571,19 @@ impl GpuRenderer {
                 viewport_width,
                 viewport_height,
                 0,
-                u32::from(transfer.display.visible),
-                u32::from(transfer.invert),
+                u32::from(transfer.visible()),
+                u32::from(transfer.invert()),
                 0,
             ];
             let params_f32 = [
-                transfer.display.window.low,
-                transfer.display.window.high,
-                transfer.curve.gamma_value(),
-                transfer.display.opacity,
-                transfer.color.color_rgba[0],
-                transfer.color.color_rgba[1],
-                transfer.color.color_rgba[2],
-                transfer.color.color_rgba[3],
+                transfer.window().low(),
+                transfer.window().high(),
+                transfer.curve().gamma_value(),
+                transfer.opacity().get(),
+                transfer.color_rgba()[0],
+                transfer.color_rgba()[1],
+                transfer.color_rgba()[2],
+                transfer.color_rgba()[3],
                 0.0,
                 0.0,
                 0.0,
@@ -595,8 +597,8 @@ impl GpuRenderer {
                 0.0,
                 0.0,
                 1.0,
-                presentation_viewport.width_points as f32,
-                presentation_viewport.height_points as f32,
+                presentation_viewport.width_points() as f32,
+                presentation_viewport.height_points() as f32,
             ];
             let params_u32_bytes = checked_buffer_byte_count(
                 "chunked cross-section display composite u32 parameters",
@@ -722,8 +724,8 @@ impl GpuRenderer {
     #[allow(clippy::too_many_arguments)]
     fn render_cross_section_integer_chunk_atlas_output_buffer(
         &self,
-        volume_shape: mirante4d_core::Shape3D,
-        grid_to_world: mirante4d_core::GridToWorld,
+        volume_shape: mirante4d_domain::Shape3D,
+        grid_to_world: mirante4d_domain::GridToWorld,
         atlas: GpuBrickAtlasResource,
         mut timings: GpuRenderTimings,
         view: CrossSectionView,
@@ -860,7 +862,7 @@ impl GpuRenderer {
     fn render_cross_section_f32_chunk_atlas_output_buffer(
         &self,
         volume_shape: Shape3D,
-        grid_to_world: mirante4d_core::GridToWorld,
+        grid_to_world: mirante4d_domain::GridToWorld,
         atlas: GpuBrickAtlasF32Resource,
         mut timings: GpuRenderTimings,
         view: CrossSectionView,
@@ -1028,30 +1030,35 @@ impl GpuRenderer {
 #[cfg(test)]
 mod tests {
     use glam::{DQuat, DVec2, DVec3};
-    use mirante4d_core::{
-        ChannelColor, ChannelTransferFunction, DatasetId, DisplayWindow, GridToWorld, LayerDisplay,
-        LayerId, PresentationViewport, Shape3D, TimeIndex, TransferCurve, TransferPresetId,
-    };
     use mirante4d_data::{
         DenseVolumeF32, DenseVolumeU8, SpatialBrickIndex, VolumeBrickF32, VolumeBrickU8,
         VolumeRegion,
     };
-    use mirante4d_format::BrickIndex;
+    use mirante4d_domain::{
+        DisplayWindow, GridToWorld, LayerTransfer, Opacity, RgbColor, Shape3D, TimeIndex,
+        TransferCurve,
+    };
+    use mirante4d_format::{BrickIndex, DatasetId, LayerId};
+    use mirante4d_render_api::PresentationViewport;
 
     use super::*;
     use crate::{CrossSectionPanel, ResidentBrickSetF32, ResidentBrickSetU8};
 
-    fn linear_color_transfer(color_rgba: [f32; 4], window_high: f32) -> ChannelTransferFunction {
-        ChannelTransferFunction::new(
-            LayerDisplay::new(true, DisplayWindow::new(0.0, window_high).unwrap(), 1.0).unwrap(),
-            ChannelColor::new(color_rgba).unwrap(),
-            TransferCurve::Linear,
-            TransferPresetId::linear(),
+    fn linear_color_transfer(color_rgba: [f32; 4], window_high: f32) -> IntensityTransfer {
+        let [red, green, blue, _alpha] = color_rgba;
+        IntensityTransfer::new(
+            true,
+            LayerTransfer::new(
+                DisplayWindow::new(0.0, window_high).unwrap(),
+                RgbColor::new([red, green, blue]).unwrap(),
+                Opacity::new(1.0).unwrap(),
+                TransferCurve::linear(),
+                false,
+            ),
         )
-        .unwrap()
     }
 
-    fn linear_white_transfer(window_high: f32) -> ChannelTransferFunction {
+    fn linear_white_transfer(window_high: f32) -> IntensityTransfer {
         linear_color_transfer([1.0, 1.0, 1.0, 1.0], window_high)
     }
 
@@ -1152,7 +1159,7 @@ mod tests {
             DatasetId::new("gpu-cross-section-u8-display").unwrap(),
             layer_id.clone(),
             0,
-            TimeIndex(0),
+            TimeIndex::new(0),
             shape,
             grid_to_world,
             vec![10, 20, 30, 40],
@@ -1174,8 +1181,13 @@ mod tests {
             max: 40.0,
             volume,
         };
-        let resident =
-            ResidentBrickSetU8::new(layer_id, TimeIndex(0), shape, grid_to_world, vec![brick]);
+        let resident = ResidentBrickSetU8::new(
+            layer_id,
+            TimeIndex::new(0),
+            shape,
+            grid_to_world,
+            vec![brick],
+        );
         let renderer = GpuRenderer::new_blocking().unwrap();
         let chunks = [full_panel_chunk_draw(4.0, 1.0)];
         let channels = [GpuCrossSectionChunkDisplayChannel::U8 {
@@ -1228,7 +1240,7 @@ mod tests {
             DatasetId::new("gpu-cross-section-u8-multi-display").unwrap(),
             layer_id.clone(),
             0,
-            TimeIndex(0),
+            TimeIndex::new(0),
             shape,
             grid_to_world,
             vec![10, 20, 30, 40],
@@ -1250,8 +1262,13 @@ mod tests {
             max: 40.0,
             volume,
         };
-        let resident =
-            ResidentBrickSetU8::new(layer_id, TimeIndex(0), shape, grid_to_world, vec![brick]);
+        let resident = ResidentBrickSetU8::new(
+            layer_id,
+            TimeIndex::new(0),
+            shape,
+            grid_to_world,
+            vec![brick],
+        );
         let renderer = GpuRenderer::new_blocking().unwrap();
         let chunks = [full_panel_chunk_draw(4.0, 1.0)];
         let channels = [
@@ -1313,7 +1330,7 @@ mod tests {
             DatasetId::new("gpu-cross-section-f32-display").unwrap(),
             layer_id.clone(),
             0,
-            TimeIndex(0),
+            TimeIndex::new(0),
             shape,
             grid_to_world,
             vec![0.25, 0.5, 0.75, 1.0],
@@ -1335,8 +1352,13 @@ mod tests {
             max: 1.0,
             volume,
         };
-        let resident =
-            ResidentBrickSetF32::new(layer_id, TimeIndex(0), shape, grid_to_world, vec![brick]);
+        let resident = ResidentBrickSetF32::new(
+            layer_id,
+            TimeIndex::new(0),
+            shape,
+            grid_to_world,
+            vec![brick],
+        );
         let renderer = GpuRenderer::new_blocking().unwrap();
         let chunks = [full_panel_chunk_draw(4.0, 1.0)];
         let channels = [GpuCrossSectionChunkDisplayChannel::F32 {

@@ -11,7 +11,7 @@ use mirante4d_analysis::{
 use mirante4d_renderer::{PickHit, PickHitKind, PickValue};
 
 use crate::{
-    AppState,
+    current_runtime::{analysis::CurrentAnalysisRuntime, ui::CurrentUiRuntime},
     tools::ToolSelection,
     ui_kit::{self, StatusTone},
 };
@@ -62,39 +62,38 @@ pub(crate) enum SceneEditHandle {
     MeasurementEnd,
 }
 
-pub(crate) fn show_scene_artifacts_editor(ui: &mut egui::Ui, state: &mut AppState) -> bool {
-    let mut changed = false;
-    ui.horizontal_wrapped(|ui| {
-        if ui_kit::toolbar_button(ui, "Undo", state.scene_artifacts.can_undo()).clicked() {
-            match state.scene_artifacts.undo() {
-                Ok(()) => {
-                    changed = true;
-                    state.last_render_error = None;
-                    state.last_workflow_message = Some("Undid scene artifact edit".to_owned());
-                }
-                Err(err) => state.last_render_error = Some(err.to_string()),
+pub(crate) fn show_scene_artifacts_editor(
+    ui: &mut egui::Ui,
+    analysis: &mut CurrentAnalysisRuntime,
+    ui_runtime: &mut CurrentUiRuntime,
+) -> anyhow::Result<bool> {
+    let mut changed = ui
+        .horizontal_wrapped(|ui| -> anyhow::Result<bool> {
+            let mut changed = false;
+            if ui_kit::toolbar_button(ui, "Undo", analysis.scene_artifacts.can_undo()).clicked() {
+                analysis.scene_artifacts.undo()?;
+                changed = true;
             }
-        }
-        if ui_kit::toolbar_button(ui, "Redo", state.scene_artifacts.can_redo()).clicked() {
-            match state.scene_artifacts.redo() {
-                Ok(()) => {
-                    changed = true;
-                    state.last_render_error = None;
-                    state.last_workflow_message = Some("Redid scene artifact edit".to_owned());
-                }
-                Err(err) => state.last_render_error = Some(err.to_string()),
+            if ui_kit::toolbar_button(ui, "Redo", analysis.scene_artifacts.can_redo()).clicked() {
+                analysis.scene_artifacts.redo()?;
+                changed = true;
             }
-        }
-    });
+            Ok(changed)
+        })
+        .inner?;
 
-    let tracks = state.scene_artifacts.tracks().cloned().collect::<Vec<_>>();
-    let rois = state.scene_artifacts.rois().cloned().collect::<Vec<_>>();
-    let annotations = state
+    let tracks = analysis
+        .scene_artifacts
+        .tracks()
+        .cloned()
+        .collect::<Vec<_>>();
+    let rois = analysis.scene_artifacts.rois().cloned().collect::<Vec<_>>();
+    let annotations = analysis
         .scene_artifacts
         .annotations()
         .cloned()
         .collect::<Vec<_>>();
-    let measurements = state
+    let measurements = analysis
         .scene_artifacts
         .measurements()
         .cloned()
@@ -103,49 +102,44 @@ pub(crate) fn show_scene_artifacts_editor(ui: &mut egui::Ui, state: &mut AppStat
     ui_kit::property_row(ui, "rois", rois.len());
     ui_kit::property_row(ui, "notes", annotations.len());
     ui_kit::property_row(ui, "measure", measurements.len());
-    ui_kit::property_row(ui, "revision", state.scene_artifacts.revision());
+    ui_kit::property_row(ui, "revision", analysis.scene_artifacts.revision());
 
     if tracks.is_empty() && rois.is_empty() && annotations.is_empty() && measurements.is_empty() {
         ui_kit::status_badge(ui, StatusTone::Ready, "no editable artifacts");
-        return changed;
+        return Ok(changed);
     }
 
-    egui::ScrollArea::vertical()
+    let rows_changed = egui::ScrollArea::vertical()
         .id_salt("scene-artifact-editor-scroll")
         .max_height(220.0)
         .auto_shrink([false, false])
-        .show(ui, |ui| {
+        .show(ui, |ui| -> anyhow::Result<bool> {
+            let mut changed = false;
             for track in tracks {
-                match show_scene_track_artifact_row(ui, state, track) {
-                    Ok(row_changed) => changed |= row_changed,
-                    Err(err) => state.last_render_error = Some(err.to_string()),
-                }
+                changed |= show_scene_track_artifact_row(ui, analysis, ui_runtime, track)?;
             }
             for roi in rois {
-                match show_scene_roi_artifact_row(ui, state, roi) {
-                    Ok(row_changed) => changed |= row_changed,
-                    Err(err) => state.last_render_error = Some(err.to_string()),
-                }
+                changed |= show_scene_roi_artifact_row(ui, analysis, ui_runtime, roi)?;
             }
             for annotation in annotations {
-                match show_scene_annotation_artifact_row(ui, state, annotation) {
-                    Ok(row_changed) => changed |= row_changed,
-                    Err(err) => state.last_render_error = Some(err.to_string()),
-                }
+                changed |=
+                    show_scene_annotation_artifact_row(ui, analysis, ui_runtime, annotation)?;
             }
             for measurement in measurements {
-                match show_scene_measurement_artifact_row(ui, state, measurement) {
-                    Ok(row_changed) => changed |= row_changed,
-                    Err(err) => state.last_render_error = Some(err.to_string()),
-                }
+                changed |=
+                    show_scene_measurement_artifact_row(ui, analysis, ui_runtime, measurement)?;
             }
-        });
-    changed
+            Ok(changed)
+        })
+        .inner?;
+    changed |= rows_changed;
+    Ok(changed)
 }
 
 fn show_scene_roi_artifact_row(
     ui: &mut egui::Ui,
-    state: &mut AppState,
+    analysis: &mut CurrentAnalysisRuntime,
+    ui_runtime: &mut CurrentUiRuntime,
     artifact: RoiArtifact,
 ) -> anyhow::Result<bool> {
     let mut name = artifact.name.clone();
@@ -154,7 +148,7 @@ fn show_scene_roi_artifact_row(
     let mut select_clicked = false;
     let mut remove_clicked = false;
     let selected =
-        selected_scene_artifact_matches(state, EditableSceneArtifactKind::Roi, &artifact.id);
+        selected_scene_artifact_matches(ui_runtime, EditableSceneArtifactKind::Roi, &artifact.id);
 
     ui.horizontal_wrapped(|ui| {
         if ui
@@ -172,10 +166,15 @@ fn show_scene_roi_artifact_row(
     });
 
     if select_clicked {
-        select_scene_artifact(state, EditableSceneArtifactKind::Roi, &artifact.id);
+        select_scene_artifact(ui_runtime, EditableSceneArtifactKind::Roi, &artifact.id);
     }
     if remove_clicked {
-        return remove_scene_artifact(state, EditableSceneArtifactKind::Roi, &artifact.id);
+        return remove_scene_artifact(
+            analysis,
+            ui_runtime,
+            EditableSceneArtifactKind::Roi,
+            &artifact.id,
+        );
     }
 
     let mut updated = artifact.clone();
@@ -186,14 +185,15 @@ fn show_scene_roi_artifact_row(
         show_roi_geometry_controls(ui, &mut updated)?;
     }
     if updated != artifact {
-        return update_scene_roi_artifact(state, updated);
+        return update_scene_roi_artifact(analysis, updated);
     }
     Ok(false)
 }
 
 fn show_scene_track_artifact_row(
     ui: &mut egui::Ui,
-    state: &mut AppState,
+    analysis: &mut CurrentAnalysisRuntime,
+    ui_runtime: &mut CurrentUiRuntime,
     artifact: TrackArtifact,
 ) -> anyhow::Result<bool> {
     let mut name = artifact.name.clone();
@@ -202,7 +202,7 @@ fn show_scene_track_artifact_row(
     let mut select_clicked = false;
     let mut remove_clicked = false;
     let selected =
-        selected_scene_artifact_matches(state, EditableSceneArtifactKind::Track, &artifact.id);
+        selected_scene_artifact_matches(ui_runtime, EditableSceneArtifactKind::Track, &artifact.id);
 
     ui.horizontal_wrapped(|ui| {
         if ui
@@ -221,10 +221,15 @@ fn show_scene_track_artifact_row(
     });
 
     if select_clicked {
-        select_scene_artifact(state, EditableSceneArtifactKind::Track, &artifact.id);
+        select_scene_artifact(ui_runtime, EditableSceneArtifactKind::Track, &artifact.id);
     }
     if remove_clicked {
-        return remove_scene_artifact(state, EditableSceneArtifactKind::Track, &artifact.id);
+        return remove_scene_artifact(
+            analysis,
+            ui_runtime,
+            EditableSceneArtifactKind::Track,
+            &artifact.id,
+        );
     }
 
     let mut updated = artifact.clone();
@@ -235,14 +240,15 @@ fn show_scene_track_artifact_row(
         show_track_points_controls(ui, &mut updated);
     }
     if updated != artifact {
-        return update_scene_track_artifact(state, updated);
+        return update_scene_track_artifact(analysis, updated);
     }
     Ok(false)
 }
 
 fn show_scene_annotation_artifact_row(
     ui: &mut egui::Ui,
-    state: &mut AppState,
+    analysis: &mut CurrentAnalysisRuntime,
+    ui_runtime: &mut CurrentUiRuntime,
     artifact: AnnotationArtifact,
 ) -> anyhow::Result<bool> {
     let mut name = artifact.name.clone();
@@ -251,8 +257,11 @@ fn show_scene_annotation_artifact_row(
     let mut color = artifact.style.color_rgba;
     let mut select_clicked = false;
     let mut remove_clicked = false;
-    let selected =
-        selected_scene_artifact_matches(state, EditableSceneArtifactKind::Annotation, &artifact.id);
+    let selected = selected_scene_artifact_matches(
+        ui_runtime,
+        EditableSceneArtifactKind::Annotation,
+        &artifact.id,
+    );
 
     ui.horizontal_wrapped(|ui| {
         if ui
@@ -271,10 +280,19 @@ fn show_scene_annotation_artifact_row(
     });
 
     if select_clicked {
-        select_scene_artifact(state, EditableSceneArtifactKind::Annotation, &artifact.id);
+        select_scene_artifact(
+            ui_runtime,
+            EditableSceneArtifactKind::Annotation,
+            &artifact.id,
+        );
     }
     if remove_clicked {
-        return remove_scene_artifact(state, EditableSceneArtifactKind::Annotation, &artifact.id);
+        return remove_scene_artifact(
+            analysis,
+            ui_runtime,
+            EditableSceneArtifactKind::Annotation,
+            &artifact.id,
+        );
     }
 
     let mut updated = artifact.clone();
@@ -294,14 +312,15 @@ fn show_scene_annotation_artifact_row(
         )?;
     }
     if updated != artifact {
-        return update_scene_annotation_artifact(state, updated);
+        return update_scene_annotation_artifact(analysis, updated);
     }
     Ok(false)
 }
 
 fn show_scene_measurement_artifact_row(
     ui: &mut egui::Ui,
-    state: &mut AppState,
+    analysis: &mut CurrentAnalysisRuntime,
+    ui_runtime: &mut CurrentUiRuntime,
     artifact: MeasurementArtifact,
 ) -> anyhow::Result<bool> {
     let mut name = artifact.name.clone();
@@ -310,7 +329,7 @@ fn show_scene_measurement_artifact_row(
     let mut select_clicked = false;
     let mut remove_clicked = false;
     let selected = selected_scene_artifact_matches(
-        state,
+        ui_runtime,
         EditableSceneArtifactKind::Measurement,
         &artifact.id,
     );
@@ -337,10 +356,19 @@ fn show_scene_measurement_artifact_row(
     });
 
     if select_clicked {
-        select_scene_artifact(state, EditableSceneArtifactKind::Measurement, &artifact.id);
+        select_scene_artifact(
+            ui_runtime,
+            EditableSceneArtifactKind::Measurement,
+            &artifact.id,
+        );
     }
     if remove_clicked {
-        return remove_scene_artifact(state, EditableSceneArtifactKind::Measurement, &artifact.id);
+        return remove_scene_artifact(
+            analysis,
+            ui_runtime,
+            EditableSceneArtifactKind::Measurement,
+            &artifact.id,
+        );
     }
 
     let mut updated = artifact.clone();
@@ -351,7 +379,7 @@ fn show_scene_measurement_artifact_row(
         show_measurement_geometry_controls(ui, &mut updated)?;
     }
     if updated != artifact {
-        return update_scene_measurement_artifact(state, updated);
+        return update_scene_measurement_artifact(analysis, updated);
     }
     Ok(false)
 }
@@ -388,7 +416,7 @@ fn show_track_points_controls(ui: &mut egui::Ui, artifact: &mut TrackArtifact) {
         ui.label("points");
         for point in &mut artifact.points {
             ui.horizontal_wrapped(|ui| {
-                ui.label(format!("t{}", point.timepoint.0));
+                ui.label(format!("t{}", point.timepoint.get()));
                 ui.add(
                     egui::DragValue::new(&mut point.position_world.x)
                         .speed(0.05)
@@ -529,59 +557,51 @@ fn validated_scene_artifact_name(name: &str) -> anyhow::Result<String> {
 }
 
 pub(crate) fn update_scene_roi_artifact(
-    state: &mut AppState,
+    analysis: &mut CurrentAnalysisRuntime,
     artifact: RoiArtifact,
 ) -> anyhow::Result<bool> {
-    state
+    analysis
         .scene_artifacts
         .apply(SceneEditCommand::PutRoi { artifact })?;
-    state.last_render_error = None;
-    state.last_workflow_message = Some("Updated ROI artifact".to_owned());
     Ok(true)
 }
 
 pub(crate) fn update_scene_track_artifact(
-    state: &mut AppState,
+    analysis: &mut CurrentAnalysisRuntime,
     artifact: TrackArtifact,
 ) -> anyhow::Result<bool> {
-    state
+    analysis
         .scene_artifacts
         .apply(SceneEditCommand::PutTrack { artifact })?;
-    state.last_render_error = None;
-    state.last_workflow_message = Some("Updated track artifact".to_owned());
     Ok(true)
 }
 
 pub(crate) fn update_scene_annotation_artifact(
-    state: &mut AppState,
+    analysis: &mut CurrentAnalysisRuntime,
     artifact: AnnotationArtifact,
 ) -> anyhow::Result<bool> {
-    state
+    analysis
         .scene_artifacts
         .apply(SceneEditCommand::PutAnnotation { artifact })?;
-    state.last_render_error = None;
-    state.last_workflow_message = Some("Updated annotation artifact".to_owned());
     Ok(true)
 }
 
 pub(crate) fn update_scene_measurement_artifact(
-    state: &mut AppState,
+    analysis: &mut CurrentAnalysisRuntime,
     artifact: MeasurementArtifact,
 ) -> anyhow::Result<bool> {
-    state
+    analysis
         .scene_artifacts
         .apply(SceneEditCommand::PutMeasurement { artifact })?;
-    state.last_render_error = None;
-    state.last_workflow_message = Some("Updated measurement artifact".to_owned());
     Ok(true)
 }
 
 pub(crate) fn remove_scene_artifact(
-    state: &mut AppState,
+    analysis: &mut CurrentAnalysisRuntime,
+    ui_runtime: &mut CurrentUiRuntime,
     kind: EditableSceneArtifactKind,
     id: &SceneArtifactId,
 ) -> anyhow::Result<bool> {
-    let message = format!("Removed {} {}", kind.label(), id.as_str());
     let command = match kind {
         EditableSceneArtifactKind::Track => SceneEditCommand::RemoveTrack { id: id.clone() },
         EditableSceneArtifactKind::Roi => SceneEditCommand::RemoveRoi { id: id.clone() },
@@ -592,41 +612,39 @@ pub(crate) fn remove_scene_artifact(
             SceneEditCommand::RemoveMeasurement { id: id.clone() }
         }
     };
-    state.scene_artifacts.apply(command)?;
-    clear_scene_selection_if_matches(state, kind, id);
-    state.last_render_error = None;
-    state.last_workflow_message = Some(message);
+    analysis.scene_artifacts.apply(command)?;
+    clear_scene_selection_if_matches(ui_runtime, kind, id);
     Ok(true)
 }
 
 pub(crate) fn select_scene_artifact(
-    state: &mut AppState,
+    ui_runtime: &mut CurrentUiRuntime,
     kind: EditableSceneArtifactKind,
     id: &SceneArtifactId,
 ) {
-    state.viewer_tools.selection = Some(ToolSelection::SceneObject {
+    ui_runtime.viewer_tools.selection = Some(ToolSelection::SceneObject {
         kind: kind.pick_hit_kind(),
         object_id: id.as_str().to_owned(),
     });
 }
 
 fn clear_scene_selection_if_matches(
-    state: &mut AppState,
+    ui_runtime: &mut CurrentUiRuntime,
     kind: EditableSceneArtifactKind,
     id: &SceneArtifactId,
 ) {
-    if selected_scene_artifact_matches(state, kind, id) {
-        state.viewer_tools.selection = None;
+    if selected_scene_artifact_matches(ui_runtime, kind, id) {
+        ui_runtime.viewer_tools.selection = None;
     }
 }
 
 pub(crate) fn selected_scene_artifact_matches(
-    state: &AppState,
+    ui_runtime: &CurrentUiRuntime,
     kind: EditableSceneArtifactKind,
     id: &SceneArtifactId,
 ) -> bool {
     matches!(
-        &state.viewer_tools.selection,
+        &ui_runtime.viewer_tools.selection,
         Some(ToolSelection::SceneObject {
             kind: selected_kind,
             object_id,
@@ -635,15 +653,6 @@ pub(crate) fn selected_scene_artifact_matches(
 }
 
 impl EditableSceneArtifactKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Track => "track",
-            Self::Roi => "ROI",
-            Self::Annotation => "annotation",
-            Self::Measurement => "measurement",
-        }
-    }
-
     pub(crate) fn pick_hit_kind(self) -> PickHitKind {
         match self {
             Self::Track => PickHitKind::Track,

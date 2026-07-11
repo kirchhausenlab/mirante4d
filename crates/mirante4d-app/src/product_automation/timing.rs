@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 
+use mirante4d_domain::RenderMode;
 use serde_json::{Map, Value, json};
 
 use crate::display_refresh::DisplayRefreshTiming;
 use crate::viewer_layout::PanelId;
-use crate::{DisplayedFrameFreshness, MiranteWorkbenchApp, RenderMode};
+use crate::{DisplayedFrameFreshness, MiranteWorkbenchApp};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ProductAutomationAppUpdatePhases {
@@ -178,7 +179,7 @@ fn latest_new_display_refresh_timing(
     app: &MiranteWorkbenchApp,
     previous_display_refresh_timing: Option<DisplayRefreshTiming>,
 ) -> Option<DisplayRefreshTiming> {
-    let timing = app.last_display_refresh_timing?;
+    let timing = app.render_runtime.last_display_refresh_timing?;
     (Some(timing) != previous_display_refresh_timing).then_some(timing)
 }
 

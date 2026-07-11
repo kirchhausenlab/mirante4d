@@ -64,11 +64,10 @@ exactly once in
 
 The three crates were accepted at
 `5383cbb93c13c59e6f035bfa551356c75fb426dc`
-(`foundation-wp-07a-exit-1`) and remain deliberately unreachable from the
-current product. They do not create a second live model. WP-07B-B must switch
-the product to these authorities and delete predecessor durable mirrors in the
-same checkpoint; it may not add synchronization, a compatibility DTO, a
-re-export facade, or an index/name fallback.
+(`foundation-wp-07a-exit-1`). WP-07B-B made them the sole live product
+authorities and deleted predecessor durable mirrors in the same hard cutover;
+there is no synchronized second model, compatibility DTO, re-export facade,
+or index/name fallback.
 
 Canonical preimage encoding, hashing, scientific-content verification,
 project-store wire DTOs, and I/O remain owned by their later packages. Strictly

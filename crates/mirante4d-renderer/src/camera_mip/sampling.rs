@@ -2,7 +2,7 @@ use super::*;
 
 pub fn render_camera_mip(
     volume: &DenseVolumeU16,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
 ) -> Result<(MipImageU16, FrameDiagnostics), RenderError> {
     render_camera(volume, camera, viewport, CameraRenderMode::Mip)
@@ -10,7 +10,7 @@ pub fn render_camera_mip(
 
 pub fn render_camera_mip_f32(
     volume: &DenseVolumeF32,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
 ) -> Result<(MipImageF32, FrameDiagnosticsF32), RenderError> {
     render_camera_f32(volume, camera, viewport, CameraRenderModeF32::Mip)
@@ -18,7 +18,7 @@ pub fn render_camera_mip_f32(
 
 pub fn render_camera(
     volume: &DenseVolumeU16,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     mode: CameraRenderMode,
 ) -> Result<(MipImageU16, FrameDiagnostics), RenderError> {
@@ -33,7 +33,7 @@ pub fn render_camera(
 
 pub fn render_camera_with_quality(
     volume: &DenseVolumeU16,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     mode: CameraRenderMode,
     quality: CameraRenderQuality,
@@ -52,12 +52,9 @@ pub fn render_camera_with_quality(
 
     for row in 0..viewport.height {
         for col in 0..viewport.width {
-            let world_ray = camera.ray_for_render_pixel(
-                col as f64,
-                row as f64,
-                viewport.width as f64,
-                viewport.height as f64,
-            );
+            let world_ray = crate::current_camera::ray_for_render_pixel(
+                camera, col as f64, row as f64, viewport,
+            )?;
             let grid_ray = GridRay {
                 origin: world_to_grid.transform_point(world_ray.origin),
                 direction: world_to_grid.transform_vector(world_ray.direction),
@@ -98,7 +95,7 @@ pub fn render_camera_with_quality(
 
 pub fn render_camera_u8(
     volume: &DenseVolumeU8,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     mode: CameraRenderMode,
 ) -> Result<(MipImageU16, FrameDiagnostics), RenderError> {
@@ -113,7 +110,7 @@ pub fn render_camera_u8(
 
 pub fn render_camera_u8_with_quality(
     volume: &DenseVolumeU8,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     mode: CameraRenderMode,
     quality: CameraRenderQuality,
@@ -132,12 +129,9 @@ pub fn render_camera_u8_with_quality(
 
     for row in 0..viewport.height {
         for col in 0..viewport.width {
-            let world_ray = camera.ray_for_render_pixel(
-                col as f64,
-                row as f64,
-                viewport.width as f64,
-                viewport.height as f64,
-            );
+            let world_ray = crate::current_camera::ray_for_render_pixel(
+                camera, col as f64, row as f64, viewport,
+            )?;
             let grid_ray = GridRay {
                 origin: world_to_grid.transform_point(world_ray.origin),
                 direction: world_to_grid.transform_vector(world_ray.direction),
@@ -178,7 +172,7 @@ pub fn render_camera_u8_with_quality(
 
 pub fn render_camera_f32(
     volume: &DenseVolumeF32,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     mode: CameraRenderModeF32,
 ) -> Result<(MipImageF32, FrameDiagnosticsF32), RenderError> {
@@ -193,7 +187,7 @@ pub fn render_camera_f32(
 
 pub fn render_camera_f32_with_quality(
     volume: &DenseVolumeF32,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     mode: CameraRenderModeF32,
     quality: CameraRenderQuality,
@@ -212,12 +206,9 @@ pub fn render_camera_f32_with_quality(
 
     for row in 0..viewport.height {
         for col in 0..viewport.width {
-            let world_ray = camera.ray_for_render_pixel(
-                col as f64,
-                row as f64,
-                viewport.width as f64,
-                viewport.height as f64,
-            );
+            let world_ray = crate::current_camera::ray_for_render_pixel(
+                camera, col as f64, row as f64, viewport,
+            )?;
             let grid_ray = GridRay {
                 origin: world_to_grid.transform_point(world_ray.origin),
                 direction: world_to_grid.transform_vector(world_ray.direction),
@@ -258,7 +249,7 @@ pub fn render_camera_f32_with_quality(
 
 pub fn render_dvr_channels_with_quality(
     channels: &[DvrVolumeChannel<'_>],
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     quality: CameraRenderQuality,
 ) -> Result<(MipImageU16, FrameDiagnostics), RenderError> {
@@ -293,12 +284,9 @@ pub fn render_dvr_channels_with_quality(
 
     for row in 0..viewport.height {
         for col in 0..viewport.width {
-            let world_ray = camera.ray_for_render_pixel(
-                col as f64,
-                row as f64,
-                viewport.width as f64,
-                viewport.height as f64,
-            );
+            let world_ray = crate::current_camera::ray_for_render_pixel(
+                camera, col as f64, row as f64, viewport,
+            )?;
             let grid_ray = GridRay {
                 origin: world_to_grid.transform_point(world_ray.origin),
                 direction: world_to_grid.transform_vector(world_ray.direction),
@@ -341,7 +329,7 @@ pub fn render_dvr_channels_with_quality(
 
 pub fn pick_camera_volume(
     volume: &DenseVolumeU16,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     pixel_x: u64,
     pixel_y: u64,
@@ -360,12 +348,12 @@ pub fn pick_camera_volume(
     }
 
     let world_to_grid = volume.grid_to_world.inverse()?;
-    let world_ray = camera.ray_for_render_pixel(
+    let world_ray = crate::current_camera::ray_for_render_pixel(
+        camera,
         pixel_x as f64,
         pixel_y as f64,
-        viewport.width as f64,
-        viewport.height as f64,
-    );
+        viewport,
+    )?;
     let grid_ray = GridRay {
         origin: world_to_grid.transform_point(world_ray.origin),
         direction: world_to_grid.transform_vector(world_ray.direction),
@@ -376,7 +364,7 @@ pub fn pick_camera_volume(
 
 pub fn pick_camera_volume_u8(
     volume: &DenseVolumeU8,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     pixel_x: u64,
     pixel_y: u64,
@@ -395,12 +383,12 @@ pub fn pick_camera_volume_u8(
     }
 
     let world_to_grid = volume.grid_to_world.inverse()?;
-    let world_ray = camera.ray_for_render_pixel(
+    let world_ray = crate::current_camera::ray_for_render_pixel(
+        camera,
         pixel_x as f64,
         pixel_y as f64,
-        viewport.width as f64,
-        viewport.height as f64,
-    );
+        viewport,
+    )?;
     let grid_ray = GridRay {
         origin: world_to_grid.transform_point(world_ray.origin),
         direction: world_to_grid.transform_vector(world_ray.direction),
@@ -411,7 +399,7 @@ pub fn pick_camera_volume_u8(
 
 pub fn pick_camera_volume_f32(
     volume: &DenseVolumeF32,
-    camera: CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     pixel_x: u64,
     pixel_y: u64,
@@ -430,12 +418,12 @@ pub fn pick_camera_volume_f32(
     }
 
     let world_to_grid = volume.grid_to_world.inverse()?;
-    let world_ray = camera.ray_for_render_pixel(
+    let world_ray = crate::current_camera::ray_for_render_pixel(
+        camera,
         pixel_x as f64,
         pixel_y as f64,
-        viewport.width as f64,
-        viewport.height as f64,
-    );
+        viewport,
+    )?;
     let grid_ray = GridRay {
         origin: world_to_grid.transform_point(world_ray.origin),
         direction: world_to_grid.transform_vector(world_ray.direction),
@@ -866,9 +854,9 @@ fn project_dvr_channels_along_grid_ray(
     }
 
     let entry = ray.origin + ray.direction * hit.enter;
-    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, shape.x);
-    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, shape.y);
-    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, shape.z);
+    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, shape.x());
+    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, shape.y());
+    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, shape.z());
 
     let mut accumulated_rgba = [0.0; 4];
     let mut accumulated_alpha = 0.0;
@@ -1023,9 +1011,9 @@ fn project_along_grid_ray_u8(
     }
 
     let entry = ray.origin + ray.direction * hit.enter;
-    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, volume.shape.x);
-    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, volume.shape.y);
-    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, volume.shape.z);
+    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, volume.shape.x());
+    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, volume.shape.y());
+    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, volume.shape.z());
 
     let mut max_value = 0u8;
     let mut accumulated_rgba = [0.0; 4];
@@ -1144,9 +1132,9 @@ fn project_along_grid_ray(
     }
 
     let entry = ray.origin + ray.direction * hit.enter;
-    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, volume.shape.x);
-    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, volume.shape.y);
-    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, volume.shape.z);
+    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, volume.shape.x());
+    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, volume.shape.y());
+    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, volume.shape.z());
 
     let mut max_value = 0u16;
     let mut accumulated_rgba = [0.0; 4];
@@ -1265,9 +1253,9 @@ fn project_along_grid_ray_f32(
     }
 
     let entry = ray.origin + ray.direction * hit.enter;
-    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, volume.shape.x);
-    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, volume.shape.y);
-    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, volume.shape.z);
+    let mut x = AxisTraversal::new(entry.x, ray.direction.x, hit.enter, volume.shape.x());
+    let mut y = AxisTraversal::new(entry.y, ray.direction.y, hit.enter, volume.shape.y());
+    let mut z = AxisTraversal::new(entry.z, ray.direction.z, hit.enter, volume.shape.z());
 
     let mut max_value: Option<f32> = None;
     let mut accumulated_rgba = [0.0; 4];

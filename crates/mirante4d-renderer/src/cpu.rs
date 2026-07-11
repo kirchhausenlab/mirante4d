@@ -12,14 +12,14 @@ pub fn render_mip_z(
         return Err(RenderError::EmptyVolume);
     }
 
-    let width = volume.shape.x;
-    let height = volume.shape.y;
+    let width = volume.shape.x();
+    let height = volume.shape.y();
     let mut pixels = vec![0u16; (width * height) as usize];
     let mut coverage = vec![false; (width * height) as usize];
 
-    for z in 0..volume.shape.z {
-        for y in 0..volume.shape.y {
-            for x in 0..volume.shape.x {
+    for z in 0..volume.shape.z() {
+        for y in 0..volume.shape.y() {
+            for x in 0..volume.shape.x() {
                 let pixel_index = (y * width + x) as usize;
                 if let Some(value) = volume.render_voxel(z, y, x) {
                     pixels[pixel_index] = pixels[pixel_index].max(value);
@@ -48,14 +48,14 @@ pub fn render_mip_z_f32(
         return Err(RenderError::EmptyVolume);
     }
 
-    let width = volume.shape.x;
-    let height = volume.shape.y;
+    let width = volume.shape.x();
+    let height = volume.shape.y();
     let mut pixels = vec![0.0f32; (width * height) as usize];
     let mut coverage = vec![false; (width * height) as usize];
 
-    for z in 0..volume.shape.z {
-        for y in 0..volume.shape.y {
-            for x in 0..volume.shape.x {
+    for z in 0..volume.shape.z() {
+        for y in 0..volume.shape.y() {
+            for x in 0..volume.shape.x() {
                 let pixel_index = (y * width + x) as usize;
                 if let Some(value) = volume.render_voxel(z, y, x) {
                     if coverage[pixel_index] {
@@ -83,11 +83,12 @@ pub fn render_mip_z_f32(
 
 #[cfg(test)]
 mod tests {
-    use mirante4d_core::{DatasetId, GridToWorld, LayerId, Shape3D, TimeIndex};
     use mirante4d_data::DatasetHandle;
+    use mirante4d_domain::{GridToWorld, Shape3D, TimeIndex};
     use mirante4d_format::{
-        ChannelMetadata, DenseF32Layer, ExistingPackagePolicy, FixtureKind, NativeF32Dataset,
-        default_f32_display, expected_fixture_value, write_fixture, write_native_f32_dataset,
+        ChannelMetadata, DatasetId, DenseF32Layer, ExistingPackagePolicy, FixtureKind, LayerId,
+        NativeF32Dataset, default_f32_display, expected_fixture_value, write_fixture,
+        write_native_f32_dataset,
     };
 
     use super::*;
@@ -98,7 +99,9 @@ mod tests {
         let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
         let dataset = DatasetHandle::open(&root).unwrap();
         let layer_id = dataset.first_layer_id().unwrap();
-        let volume = dataset.read_u16_volume(&layer_id, TimeIndex(0)).unwrap();
+        let volume = dataset
+            .read_u16_volume(&layer_id, TimeIndex::new(0))
+            .unwrap();
 
         let (image, diagnostics) = render_mip_z(&volume).unwrap();
 
@@ -118,7 +121,7 @@ mod tests {
             DatasetId::new("masked-mip").unwrap(),
             LayerId::new("ch0").unwrap(),
             0,
-            TimeIndex(0),
+            TimeIndex::new(0),
             Shape3D::new(2, 1, 1).unwrap(),
             GridToWorld::identity(),
             vec![u16::MAX, 12],
@@ -141,7 +144,7 @@ mod tests {
             DatasetId::new("zero-mip").unwrap(),
             LayerId::new("ch0").unwrap(),
             0,
-            TimeIndex(0),
+            TimeIndex::new(0),
             Shape3D::new(1, 1, 1).unwrap(),
             GridToWorld::identity(),
             vec![0],
@@ -161,7 +164,7 @@ mod tests {
             DatasetId::new("invalid-mip").unwrap(),
             LayerId::new("ch0").unwrap(),
             0,
-            TimeIndex(0),
+            TimeIndex::new(0),
             Shape3D::new(1, 1, 1).unwrap(),
             GridToWorld::identity(),
             vec![255],
@@ -183,7 +186,7 @@ mod tests {
             DatasetId::new("masked-f32-mip").unwrap(),
             LayerId::new("ch0").unwrap(),
             0,
-            TimeIndex(0),
+            TimeIndex::new(0),
             Shape3D::new(2, 1, 1).unwrap(),
             GridToWorld::identity(),
             vec![255.0, -2.0],
@@ -205,15 +208,15 @@ mod tests {
     fn renders_known_z_mip_from_float32_native_dataset() {
         let tempdir = tempfile::tempdir().unwrap();
         let package = tempdir.path().join("float32-render.m4d");
-        let shape = mirante4d_core::Shape4D::new(1, 2, 2, 3).unwrap();
+        let shape = mirante4d_domain::Shape4D::new(1, 2, 2, 3).unwrap();
         write_native_f32_dataset(
             &package,
             NativeF32Dataset {
                 id: "float32-render".to_owned(),
                 name: "Float32 Render".to_owned(),
-                world_space: mirante4d_core::WorldSpace {
+                world_space: mirante4d_format::WorldSpace {
                     name: "sample".to_owned(),
-                    unit: mirante4d_core::WorldUnit::Micrometer,
+                    unit: mirante4d_format::WorldUnit::Micrometer,
                 },
                 layers: vec![DenseF32Layer {
                     id: "ch0".to_owned(),
@@ -223,8 +226,8 @@ mod tests {
                         color_rgba: [1.0, 1.0, 1.0, 1.0],
                     },
                     shape,
-                    brick_shape: mirante4d_core::Shape4D::new(1, 1, 2, 3).unwrap(),
-                    grid_to_world: mirante4d_core::GridToWorld::scale_um(1.0, 1.0, 1.0),
+                    brick_shape: mirante4d_domain::Shape4D::new(1, 1, 2, 3).unwrap(),
+                    grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
                     display: default_f32_display(),
                     values_tzyx: vec![
                         -3.0, 0.25, 1.5, //
@@ -239,7 +242,9 @@ mod tests {
         .unwrap();
         let dataset = DatasetHandle::open(&package).unwrap();
         let layer_id = dataset.first_layer_id().unwrap();
-        let volume = dataset.read_f32_volume(&layer_id, TimeIndex(0)).unwrap();
+        let volume = dataset
+            .read_f32_volume(&layer_id, TimeIndex::new(0))
+            .unwrap();
 
         let (image, diagnostics) = render_mip_z_f32(&volume).unwrap();
 

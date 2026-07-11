@@ -4,9 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use mirante4d_core::{
-    DisplayWindow, GridToWorld, IntensityDType, LayerDisplay, Shape4D, WorldSpace,
-};
+use mirante4d_domain::{DisplayWindow, GridToWorld, IntensityDType, Shape4D};
 use zarrs::{
     array::{ArrayBuilder, ArraySubset, CodecOptions, codec::ZstdCodec, data_type},
     filesystem::FilesystemStore,
@@ -15,6 +13,7 @@ use zarrs::{
 };
 
 use crate::{
+    LayerDisplay, WorldSpace,
     manifest::{
         BOOTSTRAP_CHECKSUM_ALGORITHM, BrickIndex, BrickRecord, BrickTable, ChannelMetadata,
         DENSE_INTENSITY_ZSTD_LEVEL, DTypeConversion, DTypeMetadata, FORMAT_ID, Histogram,
@@ -179,7 +178,7 @@ impl NativeMultiscaleDatasetWriter {
 }
 
 fn linear_tzyx(shape: Shape4D, t: u64, z: u64, y: u64, x: u64) -> usize {
-    (((t * shape.z + z) * shape.y + y) * shape.x + x) as usize
+    (((t * shape.z() + z) * shape.y() + y) * shape.x() + x) as usize
 }
 
 fn zarr_storage_error(err: impl std::fmt::Display) -> FormatError {

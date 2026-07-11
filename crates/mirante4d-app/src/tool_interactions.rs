@@ -5,15 +5,24 @@ use mirante4d_analysis::{
     RoiArtifact, SceneArtifactId, SceneArtifactTime, SceneEditCommand,
     WorldGeometry as AnalysisWorldGeometry,
 };
-use mirante4d_core::LayerId;
+use mirante4d_application::ApplicationSnapshot;
+use mirante4d_domain::{RenderMode, TimeIndex};
+use mirante4d_format::LayerId;
+use mirante4d_render_api::CameraFrame;
 use mirante4d_renderer::{
-    PickCompleteness, PickHit, PickHitKind, PickPolicy, PickQuery, ScreenPosition, VolumePickProbe,
-    empty_pick_hit, pick_camera_volume, pick_camera_volume_f32, pick_camera_volume_u8,
-    pick_scene_targets, voxel_pick_hit, voxel_pick_hit_f32, voxel_pick_hit_u8,
+    IntensityTransfer, PickCompleteness, PickHit, PickHitKind, PickPolicy, PickQuery,
+    ScreenPosition, VolumePickProbe, empty_pick_hit, pick_camera_volume, pick_camera_volume_f32,
+    pick_camera_volume_u8, pick_scene_targets, voxel_pick_hit, voxel_pick_hit_f32,
+    voxel_pick_hit_u8,
 };
 
 use crate::{
-    AppState, FrameCompleteness, RenderMode, ViewportHover, ViewportIntensity,
+    FrameCompleteness, ViewportHover, ViewportIntensity, application_view,
+    current_physical_layer_id,
+    current_runtime::{
+        analysis::CurrentAnalysisRuntime, dataset::CurrentDatasetRuntime,
+        render::CurrentRenderRuntime, ui::CurrentUiRuntime,
+    },
     render_state::{renderer_mode, renderer_mode_f32},
     scene_artifacts::{
         EditableSceneArtifactKind, SceneEditHandle, next_scene_artifact_id,
@@ -21,7 +30,7 @@ use crate::{
         select_scene_artifact, update_scene_annotation_artifact, update_scene_measurement_artifact,
         update_scene_roi_artifact, update_scene_track_artifact,
     },
-    scene_extraction::selected_scene_handle_pick_targets,
+    scene_extraction::{SceneViewInput, selected_scene_handle_pick_targets},
     tools::{ViewerToolCommand, ViewerToolEvent},
 };
 
@@ -32,88 +41,119 @@ pub(crate) struct ToolInteractionOutcome {
 }
 
 pub(crate) fn apply_viewport_tool_response(
-    state: &mut AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    analysis: &mut CurrentAnalysisRuntime,
+    ui_runtime: &mut CurrentUiRuntime,
+    render: &CurrentRenderRuntime,
     response: &egui::Response,
     hover: Option<ViewportHover>,
 ) -> anyhow::Result<ToolInteractionOutcome> {
     let hit = match hover {
-        Some(hover) => Some(pick_hit_from_viewport_hover_inner(state, hover, true)?),
+        Some(hover) => Some(pick_hit_from_viewport_hover_inner(
+            snapshot, dataset, analysis, ui_runtime, render, hover, true,
+        )?),
         None => None,
     };
-    let mut commands = state
+    let mut commands = ui_runtime
         .viewer_tools
         .handle_event(ViewerToolEvent::Hover(hit.clone()));
+    if response
+        .ctx
+        .input(|input| input.key_pressed(egui::Key::Escape))
+    {
+        commands.extend(
+            ui_runtime
+                .viewer_tools
+                .handle_event(ViewerToolEvent::Cancel),
+        );
+    }
     if let Some(hit) = hit {
         if response.clicked_by(egui::PointerButton::Primary) {
             commands.extend(
-                state
+                ui_runtime
                     .viewer_tools
                     .handle_event(ViewerToolEvent::PrimaryClick(hit.clone())),
             );
         }
         if response.dragged_by(egui::PointerButton::Primary) {
             commands.extend(
-                state
+                ui_runtime
                     .viewer_tools
                     .handle_event(ViewerToolEvent::PrimaryDrag(hit.clone())),
             );
         }
         if response.drag_stopped_by(egui::PointerButton::Primary) {
             commands.extend(
-                state
+                ui_runtime
                     .viewer_tools
                     .handle_event(ViewerToolEvent::PrimaryRelease(hit)),
             );
         }
     }
-    apply_viewer_tool_commands(state, commands)
+    apply_viewer_tool_commands(snapshot, analysis, ui_runtime, commands)
 }
 
 pub(crate) fn pick_hit_from_viewport_hover(
-    state: &AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    analysis: &CurrentAnalysisRuntime,
+    ui_runtime: &CurrentUiRuntime,
+    render: &CurrentRenderRuntime,
     hover: ViewportHover,
 ) -> anyhow::Result<PickHit> {
-    pick_hit_from_viewport_hover_inner(state, hover, true)
+    pick_hit_from_viewport_hover_inner(snapshot, dataset, analysis, ui_runtime, render, hover, true)
 }
 
 fn pick_hit_from_viewport_hover_inner(
-    state: &AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    analysis: &CurrentAnalysisRuntime,
+    ui_runtime: &CurrentUiRuntime,
+    render: &CurrentRenderRuntime,
     hover: ViewportHover,
     include_scene_handles: bool,
 ) -> anyhow::Result<PickHit> {
     let query_position = ScreenPosition::new(hover.x as f32, hover.y as f32);
     if include_scene_handles
-        && state.viewer_tools.active_scene_handle_drag.is_none()
-        && let Some(handle_hit) = pick_selected_scene_handle(state, query_position)?
+        && ui_runtime.viewer_tools.active_scene_handle_drag.is_none()
+        && let Some(handle_hit) = pick_selected_scene_handle(
+            snapshot,
+            dataset,
+            analysis,
+            ui_runtime,
+            render,
+            query_position,
+        )?
     {
         return Ok(handle_hit);
     }
-    let layer_id = LayerId::new(state.active_layer_id.clone())?;
-    if !active_intensity_layer_is_visible(state) {
+    let view = application_view(snapshot);
+    let active_layer = view
+        .layer(view.active_layer())
+        .expect("application view has an active layer");
+    let layer_id = current_physical_layer_id(dataset, view.active_layer())?;
+    let render_state = *active_layer.render_state();
+    let transfer = IntensityTransfer::new(active_layer.visible(), active_layer.transfer().clone());
+    let camera = CameraFrame::new(*view.camera(), render.presentation_viewport)?;
+    if !active_layer.visible() {
         return Ok(empty_pick_hit(PickQuery {
-            timepoint: state.active_timepoint,
+            timepoint: view.timepoint(),
             screen_position: query_position,
         }));
     }
-    if let Some(volume_f32) = &state.active_volume_f32 {
+    if let Some(volume_f32) = &dataset.active_volume_f32 {
         let readout = pick_camera_volume_f32(
             volume_f32,
-            state.camera.to_camera_state(state.presentation_viewport),
-            state.render_viewport,
+            camera,
+            render.render_viewport,
             hover.x,
             hover.y,
-            renderer_mode_f32(
-                state.active_render_mode,
-                &state.active_layer_transfer,
-                state.active_layer_display,
-                state.active_dvr_opacity_transfer,
-                state.iso_display_level,
-                state.dvr_density_scale,
-            )?,
+            renderer_mode_f32(render_state, &transfer)?,
         )?;
         let probe = VolumePickProbe {
             source_layer_id: layer_id.clone(),
-            timepoint: state.active_timepoint,
+            timepoint: view.timepoint(),
             screen_position: ScreenPosition::new(hover.x as f32, hover.y as f32),
             world_position: readout.world_position,
             grid_position: readout.grid_position,
@@ -122,24 +162,18 @@ fn pick_hit_from_viewport_hover_inner(
         };
         return Ok(voxel_pick_hit_f32(probe, readout.intensity));
     }
-    if let Some(volume_u8) = &state.active_volume_u8 {
+    if let Some(volume_u8) = &dataset.active_volume_u8 {
         let readout = pick_camera_volume_u8(
             volume_u8,
-            state.camera.to_camera_state(state.presentation_viewport),
-            state.render_viewport,
+            camera,
+            render.render_viewport,
             hover.x,
             hover.y,
-            renderer_mode(
-                state.active_render_mode,
-                &state.active_layer_transfer,
-                state.active_dvr_opacity_transfer,
-                state.iso_display_level,
-                state.dvr_density_scale,
-            )?,
+            renderer_mode(render_state, &transfer)?,
         )?;
         let probe = VolumePickProbe {
             source_layer_id: layer_id.clone(),
-            timepoint: state.active_timepoint,
+            timepoint: view.timepoint(),
             screen_position: ScreenPosition::new(hover.x as f32, hover.y as f32),
             world_position: readout.world_position,
             grid_position: readout.grid_position,
@@ -148,24 +182,18 @@ fn pick_hit_from_viewport_hover_inner(
         };
         return Ok(voxel_pick_hit_u8(probe, readout.intensity));
     }
-    if let Some(active_volume) = state.active_volume.as_ref() {
+    if let Some(active_volume) = dataset.active_volume.as_ref() {
         let readout = pick_camera_volume(
             active_volume,
-            state.camera.to_camera_state(state.presentation_viewport),
-            state.render_viewport,
+            camera,
+            render.render_viewport,
             hover.x,
             hover.y,
-            renderer_mode(
-                state.active_render_mode,
-                &state.active_layer_transfer,
-                state.active_dvr_opacity_transfer,
-                state.iso_display_level,
-                state.dvr_density_scale,
-            )?,
+            renderer_mode(render_state, &transfer)?,
         )?;
         let probe = VolumePickProbe {
             source_layer_id: layer_id.clone(),
-            timepoint: state.active_timepoint,
+            timepoint: view.timepoint(),
             screen_position: ScreenPosition::new(hover.x as f32, hover.y as f32),
             world_position: readout.world_position,
             grid_position: readout.grid_position,
@@ -174,7 +202,13 @@ fn pick_hit_from_viewport_hover_inner(
         };
         return Ok(voxel_pick_hit(probe, readout.intensity));
     }
-    let probe = approximate_pick_probe_from_hover(state, layer_id, hover);
+    let probe = approximate_pick_probe_from_hover(
+        view.timepoint(),
+        render_state.mode(),
+        render,
+        layer_id,
+        hover,
+    );
     Ok(match hover.intensity {
         ViewportIntensity::U8(value) => voxel_pick_hit_u8(probe, value),
         ViewportIntensity::U16(value) => voxel_pick_hit(probe, value),
@@ -183,28 +217,21 @@ fn pick_hit_from_viewport_hover_inner(
 }
 
 fn approximate_pick_probe_from_hover(
-    state: &AppState,
+    timepoint: TimeIndex,
+    mode: RenderMode,
+    render: &CurrentRenderRuntime,
     layer_id: LayerId,
     hover: ViewportHover,
 ) -> VolumePickProbe {
     VolumePickProbe {
         source_layer_id: layer_id,
-        timepoint: state.active_timepoint,
+        timepoint,
         screen_position: ScreenPosition::new(hover.x as f32, hover.y as f32),
         world_position: None,
         grid_position: None,
-        policy: pick_policy_for_render_mode(state.active_render_mode),
-        completeness: pick_completeness_for_frame(state.frame_fidelity.completeness),
+        policy: pick_policy_for_render_mode(mode),
+        completeness: pick_completeness_for_frame(render.frame_fidelity.completeness),
     }
-}
-
-fn active_intensity_layer_is_visible(state: &AppState) -> bool {
-    state
-        .layers
-        .get(state.active_layer_index)
-        .filter(|layer| layer.id == state.active_layer_id)
-        .map(|layer| layer.display.visible)
-        .unwrap_or(state.active_layer_display.visible)
 }
 
 fn pick_policy_for_render_mode(mode: RenderMode) -> PickPolicy {
@@ -227,17 +254,37 @@ fn pick_completeness_for_frame(completeness: FrameCompleteness) -> PickCompleten
 }
 
 fn pick_selected_scene_handle(
-    state: &AppState,
+    snapshot: &ApplicationSnapshot,
+    dataset: &CurrentDatasetRuntime,
+    analysis: &CurrentAnalysisRuntime,
+    ui_runtime: &CurrentUiRuntime,
+    render: &CurrentRenderRuntime,
     screen_position: ScreenPosition,
 ) -> anyhow::Result<Option<PickHit>> {
-    let targets = selected_scene_handle_pick_targets(state)?;
+    let view = application_view(snapshot);
+    let active_layer_id = current_physical_layer_id(dataset, view.active_layer())?;
+    let targets = selected_scene_handle_pick_targets(
+        analysis,
+        ui_runtime,
+        render,
+        SceneViewInput {
+            active_layer_id: &active_layer_id,
+            active_timepoint: view.timepoint(),
+            active_source_grid_to_world: snapshot
+                .catalog()
+                .layer(view.active_layer())
+                .expect("application view closes over the dataset catalog")
+                .grid_to_world(),
+            camera: *view.camera(),
+        },
+    )?;
     if targets.is_empty() {
         return Ok(None);
     }
     let hit = pick_scene_targets(
         &targets,
         PickQuery {
-            timepoint: state.active_timepoint,
+            timepoint: view.timepoint(),
             screen_position,
         },
     );
@@ -245,12 +292,14 @@ fn pick_selected_scene_handle(
 }
 
 pub(crate) fn apply_viewer_tool_commands(
-    state: &mut AppState,
+    snapshot: &ApplicationSnapshot,
+    analysis: &mut CurrentAnalysisRuntime,
+    ui_runtime: &mut CurrentUiRuntime,
     commands: Vec<ViewerToolCommand>,
 ) -> anyhow::Result<ToolInteractionOutcome> {
     let mut outcome = ToolInteractionOutcome::default();
     for command in commands {
-        let command_outcome = apply_viewer_tool_command(state, command)?;
+        let command_outcome = apply_viewer_tool_command(snapshot, analysis, ui_runtime, command)?;
         outcome.texture_refresh_requested |= command_outcome.texture_refresh_requested;
         outcome.rerender_requested |= command_outcome.rerender_requested;
     }
@@ -258,27 +307,29 @@ pub(crate) fn apply_viewer_tool_commands(
 }
 
 fn apply_viewer_tool_command(
-    state: &mut AppState,
+    snapshot: &ApplicationSnapshot,
+    analysis: &mut CurrentAnalysisRuntime,
+    ui_runtime: &mut CurrentUiRuntime,
     command: ViewerToolCommand,
 ) -> anyhow::Result<ToolInteractionOutcome> {
     match command {
         ViewerToolCommand::SetHover(hit) => {
-            state.viewer_tools.hover = hit;
+            ui_runtime.viewer_tools.hover = hit;
             Ok(ToolInteractionOutcome::default())
         }
         ViewerToolCommand::Select(selection) => {
-            state.viewer_tools.selection = selection;
+            ui_runtime.viewer_tools.selection = selection;
             Ok(ToolInteractionOutcome::default())
         }
         ViewerToolCommand::SetCrosshair(hit) => {
-            state.viewer_tools.crosshair = Some(hit);
+            ui_runtime.viewer_tools.crosshair = Some(hit);
             Ok(ToolInteractionOutcome::default())
         }
         ViewerToolCommand::BeginRoi { .. } | ViewerToolCommand::PreviewRoi { .. } => {
             Ok(ToolInteractionOutcome::default())
         }
         ViewerToolCommand::CommitRoi { anchor, current } => {
-            commit_roi_from_tool_command(state, &anchor, &current)?;
+            commit_roi_from_tool_command(snapshot, analysis, &anchor, &current)?;
             Ok(ToolInteractionOutcome {
                 texture_refresh_requested: false,
                 rerender_requested: true,
@@ -287,20 +338,20 @@ fn apply_viewer_tool_command(
         ViewerToolCommand::BeginMeasurement { .. }
         | ViewerToolCommand::PreviewMeasurement { .. } => Ok(ToolInteractionOutcome::default()),
         ViewerToolCommand::CommitMeasurement { anchor, current } => {
-            commit_measurement_from_tool_command(state, &anchor, &current)?;
+            commit_measurement_from_tool_command(snapshot, analysis, &anchor, &current)?;
             Ok(ToolInteractionOutcome {
                 texture_refresh_requested: false,
                 rerender_requested: true,
             })
         }
         ViewerToolCommand::BeginSceneHandleDrag { handle } => {
-            state.viewer_tools.active_scene_handle_drag = Some(handle);
+            ui_runtime.viewer_tools.active_scene_handle_drag = Some(handle);
             Ok(ToolInteractionOutcome::default())
         }
         ViewerToolCommand::DragSceneHandle { .. } => Ok(ToolInteractionOutcome::default()),
         ViewerToolCommand::CommitSceneHandleDrag { handle, current } => {
-            update_scene_artifact_from_handle_drag(state, &handle, &current)?;
-            state.viewer_tools.active_scene_handle_drag = None;
+            update_scene_artifact_from_handle_drag(analysis, ui_runtime, &handle, &current)?;
+            ui_runtime.viewer_tools.active_scene_handle_drag = None;
             Ok(ToolInteractionOutcome {
                 texture_refresh_requested: false,
                 rerender_requested: true,
@@ -311,13 +362,15 @@ fn apply_viewer_tool_command(
 }
 
 fn commit_roi_from_tool_command(
-    state: &mut AppState,
+    snapshot: &ApplicationSnapshot,
+    analysis: &mut CurrentAnalysisRuntime,
     anchor: &PickHit,
     current: &PickHit,
 ) -> anyhow::Result<()> {
+    let view = application_view(snapshot);
     let start = tool_hit_world_position(anchor)?;
     let end = tool_hit_world_position(current)?;
-    let id = next_scene_artifact_id(&state.scene_artifacts, "roi", "roi")?;
+    let id = next_scene_artifact_id(&analysis.scene_artifacts, "roi", "roi")?;
     let name = id.as_str().to_owned();
     let artifact = RoiArtifact::new(
         id,
@@ -326,23 +379,28 @@ fn commit_roi_from_tool_command(
             min: start.min(end),
             max: start.max(end),
         },
-        SceneArtifactTime::Timepoint(state.active_timepoint),
+        SceneArtifactTime::Timepoint(view.timepoint()),
     )?;
-    state
+    analysis
         .scene_artifacts
         .apply(SceneEditCommand::PutRoi { artifact })?;
-    state.last_workflow_message = Some("Created ROI".to_owned());
     Ok(())
 }
 
 fn commit_measurement_from_tool_command(
-    state: &mut AppState,
+    snapshot: &ApplicationSnapshot,
+    analysis: &mut CurrentAnalysisRuntime,
     anchor: &PickHit,
     current: &PickHit,
 ) -> anyhow::Result<()> {
+    let view = application_view(snapshot);
+    let layer = snapshot
+        .catalog()
+        .layer(view.active_layer())
+        .expect("application view closes over the dataset catalog");
     let start = tool_hit_world_position(anchor)?;
     let end = tool_hit_world_position(current)?;
-    let id = next_scene_artifact_id(&state.scene_artifacts, "measurement", "measurement")?;
+    let id = next_scene_artifact_id(&analysis.scene_artifacts, "measurement", "measurement")?;
     let name = id.as_str().to_owned();
     let artifact = MeasurementArtifact::distance(
         id,
@@ -353,20 +411,22 @@ fn commit_measurement_from_tool_command(
             source: "viewer_tool".to_owned(),
             scope: format!(
                 "dataset={} layer={} timepoint={}",
-                state.dataset_name, state.active_layer_id, state.active_timepoint.0
+                snapshot.catalog().label(),
+                layer.label(),
+                view.timepoint().get()
             ),
         },
-        SceneArtifactTime::Timepoint(state.active_timepoint),
+        SceneArtifactTime::Timepoint(view.timepoint()),
     )?;
-    state
+    analysis
         .scene_artifacts
         .apply(SceneEditCommand::PutMeasurement { artifact })?;
-    state.last_workflow_message = Some("Created distance measurement".to_owned());
     Ok(())
 }
 
 fn update_scene_artifact_from_handle_drag(
-    state: &mut AppState,
+    analysis: &mut CurrentAnalysisRuntime,
+    ui_runtime: &mut CurrentUiRuntime,
     handle_hit: &PickHit,
     current_hit: &PickHit,
 ) -> anyhow::Result<()> {
@@ -375,7 +435,7 @@ fn update_scene_artifact_from_handle_drag(
     match handle.artifact_kind {
         EditableSceneArtifactKind::Track => {
             let id = SceneArtifactId::new("track", handle.artifact_id.clone())?;
-            let mut track = state
+            let mut track = analysis
                 .scene_artifacts
                 .track(&id)
                 .ok_or_else(|| anyhow::anyhow!("track {} was not found", id.as_str()))?
@@ -389,23 +449,23 @@ fn update_scene_artifact_from_handle_drag(
                 }
                 _ => anyhow::bail!("unsupported track handle {:?}", handle.handle),
             }
-            update_scene_track_artifact(state, track)?;
-            select_scene_artifact(state, EditableSceneArtifactKind::Track, &id);
+            update_scene_track_artifact(analysis, track)?;
+            select_scene_artifact(ui_runtime, EditableSceneArtifactKind::Track, &id);
         }
         EditableSceneArtifactKind::Roi => {
             let id = SceneArtifactId::new("roi", handle.artifact_id.clone())?;
-            let mut roi = state
+            let mut roi = analysis
                 .scene_artifacts
                 .roi(&id)
                 .ok_or_else(|| anyhow::anyhow!("ROI {} was not found", id.as_str()))?
                 .clone();
             update_world_geometry_from_handle(&mut roi.geometry, &handle.handle, world_position)?;
-            update_scene_roi_artifact(state, roi)?;
-            select_scene_artifact(state, EditableSceneArtifactKind::Roi, &id);
+            update_scene_roi_artifact(analysis, roi)?;
+            select_scene_artifact(ui_runtime, EditableSceneArtifactKind::Roi, &id);
         }
         EditableSceneArtifactKind::Annotation => {
             let id = SceneArtifactId::new("annotation", handle.artifact_id.clone())?;
-            let mut annotation = state
+            let mut annotation = analysis
                 .scene_artifacts
                 .annotation(&id)
                 .ok_or_else(|| anyhow::anyhow!("annotation {} was not found", id.as_str()))?
@@ -415,12 +475,12 @@ fn update_scene_artifact_from_handle_drag(
                 &handle.handle,
                 world_position,
             )?;
-            update_scene_annotation_artifact(state, annotation)?;
-            select_scene_artifact(state, EditableSceneArtifactKind::Annotation, &id);
+            update_scene_annotation_artifact(analysis, annotation)?;
+            select_scene_artifact(ui_runtime, EditableSceneArtifactKind::Annotation, &id);
         }
         EditableSceneArtifactKind::Measurement => {
             let id = SceneArtifactId::new("measurement", handle.artifact_id.clone())?;
-            let mut measurement = state
+            let mut measurement = analysis
                 .scene_artifacts
                 .measurement(&id)
                 .ok_or_else(|| anyhow::anyhow!("measurement {} was not found", id.as_str()))?
@@ -433,11 +493,10 @@ fn update_scene_artifact_from_handle_drag(
                 },
             }
             refresh_measurement_result(&mut measurement);
-            update_scene_measurement_artifact(state, measurement)?;
-            select_scene_artifact(state, EditableSceneArtifactKind::Measurement, &id);
+            update_scene_measurement_artifact(analysis, measurement)?;
+            select_scene_artifact(ui_runtime, EditableSceneArtifactKind::Measurement, &id);
         }
     }
-    state.last_workflow_message = Some("Updated scene artifact from viewport handle".to_owned());
     Ok(())
 }
 

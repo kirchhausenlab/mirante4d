@@ -2,7 +2,8 @@ use super::*;
 
 #[test]
 fn phase11_interaction_camera_sequence_covers_required_scenarios() {
-    let base = CameraView::default_for_bounds(10.0, 20.0, 30.0);
+    let base =
+        benchmark_camera_for_shape(Shape3D::new(30, 20, 10).unwrap(), GridToWorld::identity());
     let sequence = phase11_interaction_camera_sequence(base, 2);
 
     assert_eq!(sequence.len(), 7);
@@ -10,22 +11,18 @@ fn phase11_interaction_camera_sequence_covers_required_scenarios() {
     assert_eq!(sequence[1].scenario, "orbit");
     assert_eq!(sequence[3].scenario, "pan");
     assert_eq!(sequence[5].scenario, "zoom");
-    assert_ne!(sequence[1].camera.orientation, base.orientation);
-    assert_ne!(sequence[3].camera.target, base.target);
+    assert_ne!(sequence[1].camera.orientation(), base.orientation());
+    assert_ne!(sequence[3].camera.target(), base.target());
     assert!(
-        sequence[5].camera.world_per_screen_point_at_target()
-            < base.world_per_screen_point_at_target()
+        benchmark_camera_world_per_screen_point(sequence[5].camera)
+            < benchmark_camera_world_per_screen_point(base)
     );
 }
 
 #[test]
 fn phase11_viewport_matrix_covers_required_default_scenarios() {
-    let scenarios = phase11_viewport_matrix_for_shape(Shape3D {
-        z: 600,
-        y: 1148,
-        x: 998,
-    })
-    .unwrap();
+    let scenarios =
+        phase11_viewport_matrix_for_shape(Shape3D::new(600, 1148, 998).unwrap()).unwrap();
     let labels = scenarios
         .iter()
         .map(|scenario| scenario.label.as_str())
@@ -63,7 +60,7 @@ fn phase11_decoded_byte_estimator_uses_stored_dtype_size() {
 
 #[test]
 fn phase11_u8_resident_wrapper_renders_without_u16_read_path() {
-    let dataset_id = mirante4d_core::DatasetId::new("bench-u8").unwrap();
+    let dataset_id = mirante4d_format::DatasetId::new("bench-u8").unwrap();
     let layer_id = LayerId::new("ch0").unwrap();
     let shape = Shape3D::new(1, 2, 2).unwrap();
     let grid_to_world = GridToWorld::identity();
@@ -71,7 +68,7 @@ fn phase11_u8_resident_wrapper_renders_without_u16_read_path() {
         dataset_id,
         layer_id.clone(),
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         grid_to_world,
         vec![0, 64, 128, 255],
@@ -95,13 +92,12 @@ fn phase11_u8_resident_wrapper_renders_without_u16_read_path() {
     };
     let resident = Phase11ResidentBrickSet::U8(ResidentBrickSetU8::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         grid_to_world,
         vec![brick],
     ));
-    let camera = benchmark_camera_for_shape(shape, grid_to_world)
-        .to_camera_state(DEFAULT_PRESENTATION_VIEWPORT_POINTS);
+    let camera = benchmark_camera_frame(benchmark_camera_for_shape(shape, grid_to_world));
     let viewport = RenderViewport::new(8, 8).unwrap();
 
     let (_image, diagnostics) = resident
@@ -114,7 +110,7 @@ fn phase11_u8_resident_wrapper_renders_without_u16_read_path() {
 
 #[test]
 fn phase11_f32_resident_wrapper_renders_without_integer_conversion() {
-    let dataset_id = mirante4d_core::DatasetId::new("bench-f32").unwrap();
+    let dataset_id = mirante4d_format::DatasetId::new("bench-f32").unwrap();
     let layer_id = LayerId::new("ch0").unwrap();
     let shape = Shape3D::new(1, 2, 2).unwrap();
     let grid_to_world = GridToWorld::identity();
@@ -122,7 +118,7 @@ fn phase11_f32_resident_wrapper_renders_without_integer_conversion() {
         dataset_id,
         layer_id.clone(),
         0,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         grid_to_world,
         vec![0.0, 0.25, 0.5, 1.0],
@@ -146,13 +142,12 @@ fn phase11_f32_resident_wrapper_renders_without_integer_conversion() {
     };
     let resident = Phase11ResidentBrickSet::F32(ResidentBrickSetF32::new(
         layer_id,
-        TimeIndex(0),
+        TimeIndex::new(0),
         shape,
         grid_to_world,
         vec![brick],
     ));
-    let camera = benchmark_camera_for_shape(shape, grid_to_world)
-        .to_camera_state(DEFAULT_PRESENTATION_VIEWPORT_POINTS);
+    let camera = benchmark_camera_frame(benchmark_camera_for_shape(shape, grid_to_world));
     let viewport = RenderViewport::new(8, 8).unwrap();
 
     let summary = resident.render_cpu_mip_summary(camera, viewport).unwrap();
@@ -182,15 +177,14 @@ fn phase11_f32_fixture_read_dispatch_uses_f32_bricks() {
         Phase11ResidentReadInput {
             stored_dtype,
             scale_level: 0,
-            timepoint: TimeIndex(0),
+            timepoint: TimeIndex::new(0),
             volume_shape,
             grid_to_world,
         },
         &[SpatialBrickIndex::new(0, 0, 0)],
     )
     .unwrap();
-    let camera = benchmark_camera_for_shape(volume_shape, grid_to_world)
-        .to_camera_state(DEFAULT_PRESENTATION_VIEWPORT_POINTS);
+    let camera = benchmark_camera_frame(benchmark_camera_for_shape(volume_shape, grid_to_world));
     let viewport = RenderViewport::new(8, 8).unwrap();
     let summary = resident.render_cpu_mip_summary(camera, viewport).unwrap();
     let stats = dataset.stats().unwrap();

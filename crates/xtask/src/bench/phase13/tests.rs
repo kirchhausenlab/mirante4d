@@ -27,7 +27,7 @@ fn phase13_renderer_mode_cases_cover_supported_modes() {
     match cases[2].integer_mode {
         CameraRenderMode::Isosurface { parameters } => {
             assert_eq!(parameters.transfer.window, display_window);
-            assert_eq!(parameters.transfer.curve, TransferCurve::Linear);
+            assert_eq!(parameters.transfer.curve, TransferCurve::linear());
             assert!(!parameters.transfer.invert);
             assert_eq!(
                 parameters.display_level,
@@ -39,7 +39,7 @@ fn phase13_renderer_mode_cases_cover_supported_modes() {
     match cases[2].f32_mode {
         CameraRenderModeF32::Isosurface { parameters } => {
             assert_eq!(parameters.transfer.window, display_window);
-            assert_eq!(parameters.transfer.curve, TransferCurve::Linear);
+            assert_eq!(parameters.transfer.curve, TransferCurve::linear());
             assert!(!parameters.transfer.invert);
             assert_eq!(
                 parameters.display_level,
@@ -290,12 +290,8 @@ fn phase13_cache_expectation_distinguishes_reuse_from_identity_change() {
 
 #[test]
 fn phase13_viewport_matrix_uses_phase11_default_scenarios() {
-    let scenarios = phase11_viewport_matrix_for_shape(Shape3D {
-        z: 64,
-        y: 768,
-        x: 1536,
-    })
-    .unwrap();
+    let scenarios =
+        phase11_viewport_matrix_for_shape(Shape3D::new(64, 768, 1536).unwrap()).unwrap();
     let labels = scenarios
         .iter()
         .map(|scenario| scenario.label.as_str())

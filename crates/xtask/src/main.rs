@@ -51,8 +51,10 @@ mod verify;
 mod workflow_audit;
 
 pub(crate) use bench::{
-    PHASE11_DEFAULT_MAX_RESPONSIVE_VISIBLE_BRICKS, PHASE11_GPU_MIP_BRICKS_PER_BATCH,
-    benchmark_camera_for_shape, benchmark_camera_for_volume, env_u64,
+    BENCHMARK_PRESENTATION_POINTS, PHASE11_DEFAULT_MAX_RESPONSIVE_VISIBLE_BRICKS,
+    PHASE11_GPU_MIP_BRICKS_PER_BATCH, benchmark_camera_for_shape, benchmark_camera_for_volume,
+    benchmark_camera_frame, benchmark_camera_orbit, benchmark_camera_pan,
+    benchmark_camera_world_per_screen_point, benchmark_camera_zoom, env_u64,
     phase11_benchmark_viewport_for_shape, phase11_brick_pixel_stride,
     phase11_gpu_brick_cache_budget_bytes, phase11_gpu_volume_cache_budget_bytes,
     phase11_interaction_steps_per_scenario, phase11_max_decoded_bytes, phase11_max_visible_bricks,

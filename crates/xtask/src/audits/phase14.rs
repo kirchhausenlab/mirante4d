@@ -4,8 +4,9 @@ use std::{
 };
 
 use anyhow::Context;
-use mirante4d_core::{IntensityDType, LayerId, Shape3D, TimeIndex};
 use mirante4d_data::{DatasetHandle, SpatialBrickIndex};
+use mirante4d_domain::{IntensityDType, Shape3D, TimeIndex};
+use mirante4d_format::LayerId;
 use serde_json::{Value, json};
 
 use crate::fixtures::generate_fixture;
@@ -58,12 +59,12 @@ fn phase14_multichannel_report() -> anyhow::Result<Value> {
                 "name": layer.name,
                 "dtype": format!("{:?}", layer.dtype.stored),
                 "shape": {
-                    "t": layer.shape.t,
-                    "z": layer.shape.z,
-                    "y": layer.shape.y,
-                    "x": layer.shape.x,
+                    "t": layer.shape.t(),
+                    "z": layer.shape.z(),
+                    "y": layer.shape.y(),
+                    "x": layer.shape.x(),
                 },
-                "timepoints": layer.shape.t,
+                "timepoints": layer.shape.t(),
                 "value_range_t0_s0": value_range,
                 "metadata_complete": !layer.name.trim().is_empty()
                     && layer.channel.color_rgba.iter().all(|value| value.is_finite()),
@@ -143,7 +144,7 @@ fn phase14_multichannel_report() -> anyhow::Result<Value> {
 }
 
 fn phase14_layer_value_range(dataset: &DatasetHandle, layer_id: &LayerId) -> anyhow::Result<Value> {
-    let volume = dataset.read_u16_volume(layer_id, TimeIndex(0))?;
+    let volume = dataset.read_u16_volume(layer_id, TimeIndex::new(0))?;
     let min = volume.values().iter().copied().min().unwrap_or(0);
     let max = volume.values().iter().copied().max().unwrap_or(0);
     Ok(json!({
@@ -206,7 +207,8 @@ fn phase14_resource_case(dataset: &DatasetHandle, layer_ids: &[LayerId]) -> anyh
         let mut layer_requests = 0u64;
         let mut layer_decoded_bytes = 0u64;
         for brick in bricks {
-            let metadata = dataset.brick_metadata_at_scale(layer_id, 0, TimeIndex(0), brick)?;
+            let metadata =
+                dataset.brick_metadata_at_scale(layer_id, 0, TimeIndex::new(0), brick)?;
             if metadata.occupied {
                 layer_requests += 1;
                 layer_decoded_bytes = layer_decoded_bytes
@@ -231,9 +233,9 @@ fn phase14_resource_case(dataset: &DatasetHandle, layer_ids: &[LayerId]) -> anyh
 
 fn phase14_all_bricks(grid: Shape3D) -> Vec<SpatialBrickIndex> {
     let mut bricks = Vec::new();
-    for z in 0..grid.z {
-        for y in 0..grid.y {
-            for x in 0..grid.x {
+    for z in 0..grid.z() {
+        for y in 0..grid.y() {
+            for x in 0..grid.x() {
                 bricks.push(SpatialBrickIndex::new(z, y, x));
             }
         }

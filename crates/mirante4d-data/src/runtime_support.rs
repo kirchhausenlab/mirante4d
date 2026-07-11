@@ -5,8 +5,8 @@ use std::{
     sync::Arc,
 };
 
-use mirante4d_core::{IntensityDType, LayerId, TimeIndex};
-use mirante4d_format::{BrickIndex, LayerKind, LayerManifest, ScaleManifest};
+use mirante4d_domain::{IntensityDType, TimeIndex};
+use mirante4d_format::{BrickIndex, LayerId, LayerKind, LayerManifest, ScaleManifest};
 use zarrs::array::{
     ArrayShardedReadableExt, ArrayShardedReadableExtCache, CodecOptions, FromArrayBytes,
 };
@@ -208,10 +208,13 @@ pub(super) fn encoded_payload_diagnostics_for_timepoint_region(
     region: &VolumeRegion,
 ) -> Result<EncodedPayloadDiagnostics, DataError> {
     let ends = region.ends()?;
-    let t_chunks = chunk_index_range(timepoint.0..timepoint.0 + 1, scale.storage.shard_shape.t);
-    let z_chunks = chunk_index_range(region.z_start..ends.z, scale.storage.shard_shape.z);
-    let y_chunks = chunk_index_range(region.y_start..ends.y, scale.storage.shard_shape.y);
-    let x_chunks = chunk_index_range(region.x_start..ends.x, scale.storage.shard_shape.x);
+    let t_chunks = chunk_index_range(
+        timepoint.get()..timepoint.get() + 1,
+        scale.storage.shard_shape.t(),
+    );
+    let z_chunks = chunk_index_range(region.z_start..ends.z, scale.storage.shard_shape.z());
+    let y_chunks = chunk_index_range(region.y_start..ends.y, scale.storage.shard_shape.y());
+    let x_chunks = chunk_index_range(region.x_start..ends.x, scale.storage.shard_shape.x());
 
     let mut diagnostics = EncodedPayloadDiagnostics::default();
     let mut seen = HashSet::new();

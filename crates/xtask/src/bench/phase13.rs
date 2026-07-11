@@ -6,12 +6,13 @@ use std::{
 
 use crate::deps::cargo_metadata;
 use anyhow::{Context, bail};
-use mirante4d_core::{
-    CameraView, ChannelColor, DEFAULT_PRESENTATION_VIEWPORT_POINTS, DisplayWindow, GridToWorld,
-    IsoLightState, LayerDisplay, LayerId, Shape3D, TimeIndex, TransferCurve,
-};
 use mirante4d_data::DatasetHandle;
-use mirante4d_format::LayerKind;
+use mirante4d_domain::{
+    CameraView, DisplayWindow, GridToWorld, IsoLightState, LayerTransfer, Opacity, RgbColor,
+    Shape3D, TimeIndex, TransferCurve,
+};
+use mirante4d_format::{LayerDisplay, LayerId, LayerKind};
+use mirante4d_render_api::CameraFrame;
 use mirante4d_renderer::{
     CameraRenderMode, CameraRenderModeF32, CameraRenderQuality, DvrRenderParameters,
     IsoSurfaceFrameF32, IsoSurfaceFrameU16, IsoSurfaceNormal, IsoSurfaceParameters, PixelCoverage,
@@ -40,8 +41,10 @@ use crate::host::{
 use crate::package;
 use crate::reports::{phase13_gpu_timings_json, timing_summary_json};
 use crate::{
-    PHASE11_DEFAULT_MAX_RESPONSIVE_VISIBLE_BRICKS, PHASE11_GPU_MIP_BRICKS_PER_BATCH,
-    benchmark_camera_for_shape, phase11_benchmark_viewport_for_shape, phase11_brick_pixel_stride,
+    BENCHMARK_PRESENTATION_POINTS, PHASE11_DEFAULT_MAX_RESPONSIVE_VISIBLE_BRICKS,
+    PHASE11_GPU_MIP_BRICKS_PER_BATCH, benchmark_camera_for_shape, benchmark_camera_frame,
+    benchmark_camera_orbit, benchmark_camera_pan, benchmark_camera_world_per_screen_point,
+    benchmark_camera_zoom, phase11_benchmark_viewport_for_shape, phase11_brick_pixel_stride,
     phase11_gpu_brick_cache_budget_bytes, phase11_gpu_volume_cache_budget_bytes,
     phase11_max_decoded_bytes, phase11_max_visible_bricks, stable_id_from_name,
 };
@@ -159,7 +162,7 @@ pub(crate) fn phase13_renderer_report(
         .layer(&layer_id)
         .context("first layer id was not found after opening dataset")?;
 
-    let timepoint = TimeIndex(0);
+    let timepoint = TimeIndex::new(0);
     let source_shape = dataset.scale_shape(&layer_id, 0)?;
     let source_grid_to_world = dataset.scale_grid_to_world(&layer_id, 0)?;
     let viewport = options
@@ -170,7 +173,7 @@ pub(crate) fn phase13_renderer_report(
     let max_visible_bricks = phase11_max_visible_bricks()?;
     let max_decoded_bytes = phase11_max_decoded_bytes()?;
     let camera_view = benchmark_camera_for_shape(source_shape, source_grid_to_world);
-    let camera = camera_view.to_camera_state(DEFAULT_PRESENTATION_VIEWPORT_POINTS);
+    let camera = benchmark_camera_frame(camera_view);
 
     let plan_started = Instant::now();
     let plan = phase11_select_lod_plan(
@@ -355,11 +358,11 @@ pub(crate) fn phase13_renderer_report(
             "stored_dtype": format!("{:?}", layer.dtype.stored),
         },
         "visible_layers": [layer_id.to_string()],
-        "timepoint": timepoint.0,
+        "timepoint": timepoint.get(),
         "source_shape": {
-            "z": source_shape.z,
-            "y": source_shape.y,
-            "x": source_shape.x,
+            "z": source_shape.z(),
+            "y": source_shape.y(),
+            "x": source_shape.x(),
         },
         "viewport": {
             "width": viewport.width,
@@ -367,7 +370,7 @@ pub(crate) fn phase13_renderer_report(
             "physical_pixels": viewport.width.saturating_mul(viewport.height),
             "brick_pixel_stride": brick_pixel_stride,
         },
-        "projection": format!("{:?}", camera_view.projection),
+        "projection": format!("{:?}", camera_view.projection()),
         "lod": {
             "target_scale_level": plan.target_scale_level,
             "displayed_scale_level": plan.displayed_scale_level,
@@ -515,7 +518,7 @@ fn phase13_render_mode_cases(
 ) -> Vec<Phase13RenderModeCase> {
     let iso_transfer = ScalarDisplayTransfer::new(
         iso_threshold_policy.display_window,
-        TransferCurve::Linear,
+        TransferCurve::linear(),
         false,
     );
     let iso_parameters = IsoSurfaceParameters::new(
@@ -595,8 +598,8 @@ impl Phase13IsoThresholdPolicy {
             "threshold_source_value": self.threshold_source_value,
             "source": self.source,
             "display_window": {
-                "low": self.display_window.low,
-                "high": self.display_window.high,
+                "low": self.display_window.low(),
+                "high": self.display_window.high(),
             },
             "resident_signal": {
                 "min": self.resident_min,
@@ -620,7 +623,7 @@ fn phase13_iso_threshold_policy(
         threshold,
         threshold_source_value,
         source,
-        display_window: display.window,
+        display_window: display.window(),
         resident_min,
         resident_max,
         occupied_bricks,
@@ -652,8 +655,8 @@ fn phase13_iso_threshold_source_value_from_range(
         return (1.0, "no_positive_resident_signal_default");
     };
 
-    let low = f64::from(display.window.low);
-    let high = f64::from(display.window.high);
+    let low = f64::from(display.window().low());
+    let high = f64::from(display.window().high());
     let midpoint = (low + high) * 0.5;
     let display_window_matches_resident_data = low.is_finite()
         && high.is_finite()
@@ -678,7 +681,7 @@ fn phase13_render_mode_report(
     resident: &Phase11ResidentBrickSet,
     brick_shape: Shape3D,
     brick_grid_shape: Shape3D,
-    camera: mirante4d_core::CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     mode_case: &Phase13RenderModeCase,
     gpu_renderer: Option<&GpuRenderer>,
@@ -752,7 +755,7 @@ struct Phase13CpuModeFrame {
 
 fn phase13_render_cpu_mode(
     resident: &Phase11ResidentBrickSet,
-    camera: mirante4d_core::CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     mode_case: &Phase13RenderModeCase,
 ) -> Result<Phase13CpuModeFrame, mirante4d_renderer::RenderError> {
@@ -785,7 +788,7 @@ fn phase13_render_cpu_mode(
 
 fn phase13_iso_relighting_probe_report(
     resident: &Phase11ResidentBrickSet,
-    camera: mirante4d_core::CameraState,
+    camera: CameraFrame,
     camera_view: CameraView,
     viewport: RenderViewport,
     mode_cases: &[Phase13RenderModeCase],
@@ -820,7 +823,7 @@ fn phase13_iso_relighting_probe_report(
 
 fn phase13_package_iso_relighting_case(
     resident: &Phase11ResidentBrickSet,
-    camera: mirante4d_core::CameraState,
+    camera: CameraFrame,
     camera_view: CameraView,
     viewport: RenderViewport,
     iso_mode: &Phase13RenderModeCase,
@@ -926,8 +929,14 @@ fn phase13_relight_cached_surfaces(
 ) -> anyhow::Result<Value> {
     let pixel_count = phase13_viewport_pixel_count(viewport)?;
     let transfer = IntensityTransfer::new(
-        LayerDisplay::new(true, DisplayWindow::new(0.0, 1.0)?, 1.0)?,
-        ChannelColor::new([1.0, 1.0, 1.0, 1.0])?,
+        true,
+        LayerTransfer::new(
+            DisplayWindow::new(0.0, 1.0)?,
+            RgbColor::new([1.0, 1.0, 1.0])?,
+            Opacity::new(1.0)?,
+            TransferCurve::linear(),
+            false,
+        ),
     );
     let channels = surfaces
         .iter()
@@ -938,7 +947,7 @@ fn phase13_relight_cached_surfaces(
         IsoLightState::detached_screen(0.8, 0.0)?,
         IsoLightState::detached_screen(-0.35, 0.55)?,
     ];
-    let axes = camera_view.axes();
+    let axes = benchmark_camera_frame(camera_view).axes();
     let covered_surface_pixels = surfaces
         .iter()
         .map(|surface| surface.coverage().covered_count(pixel_count))
@@ -988,8 +997,14 @@ fn phase13_relight_cached_f32_surfaces(
 ) -> anyhow::Result<Value> {
     let pixel_count = phase13_viewport_pixel_count(viewport)?;
     let transfer = IntensityTransfer::new(
-        LayerDisplay::new(true, DisplayWindow::new(0.0, 1.0)?, 1.0)?,
-        ChannelColor::new([1.0, 1.0, 1.0, 1.0])?,
+        true,
+        LayerTransfer::new(
+            DisplayWindow::new(0.0, 1.0)?,
+            RgbColor::new([1.0, 1.0, 1.0])?,
+            Opacity::new(1.0)?,
+            TransferCurve::linear(),
+            false,
+        ),
     );
     let channels = surfaces
         .iter()
@@ -1000,7 +1015,7 @@ fn phase13_relight_cached_f32_surfaces(
         IsoLightState::detached_screen(0.8, 0.0)?,
         IsoLightState::detached_screen(-0.35, 0.55)?,
     ];
-    let axes = camera_view.axes();
+    let axes = benchmark_camera_frame(camera_view).axes();
     let covered_surface_pixels = surfaces
         .iter()
         .map(|surface| surface.coverage().covered_count(pixel_count))
@@ -1069,7 +1084,7 @@ fn phase13_gpu_render_mode_report(
     resident: &Phase11ResidentBrickSet,
     brick_shape: Shape3D,
     brick_grid_shape: Shape3D,
-    camera: mirante4d_core::CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     mode_case: &Phase13RenderModeCase,
     gpu_renderer: Option<&GpuRenderer>,
@@ -1167,7 +1182,7 @@ fn phase13_render_gpu_direct(
     renderer: &GpuRenderer,
     brick_shape: Shape3D,
     brick_grid_shape: Shape3D,
-    camera: mirante4d_core::CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     mode_case: &Phase13RenderModeCase,
 ) -> Result<Phase11GpuMipFrame, GpuRenderError> {
@@ -1199,7 +1214,7 @@ fn phase13_capacity_probe_report(
     resident: &Phase11ResidentBrickSet,
     brick_shape: Shape3D,
     brick_grid_shape: Shape3D,
-    camera: mirante4d_core::CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     mode_cases: &[Phase13RenderModeCase],
 ) -> anyhow::Result<Value> {
@@ -1310,8 +1325,8 @@ fn phase13_transition_cache_probe_report(
         }
     };
     let init_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let base_resident = phase13_read_resident_for_plan(dataset, layer_id, plan, TimeIndex(0))?;
-    let base_camera = camera_view.to_camera_state(DEFAULT_PRESENTATION_VIEWPORT_POINTS);
+    let base_resident = phase13_read_resident_for_plan(dataset, layer_id, plan, TimeIndex::new(0))?;
+    let base_camera = benchmark_camera_frame(camera_view);
     let mip_mode = phase13_mip_mode_case();
 
     let baseline = phase13_transition_render_probe_item(Phase13TransitionProbeRender {
@@ -1329,8 +1344,7 @@ fn phase13_transition_cache_probe_report(
     });
 
     let mut transitions = Vec::new();
-    let mut orbit_camera = camera_view;
-    orbit_camera.orbit_by(0.22, 0.10);
+    let orbit_camera = benchmark_camera_orbit(camera_view, 0.22, 0.10);
     transitions.push(phase13_transition_render_probe_item(
         Phase13TransitionProbeRender {
             label: "camera_orbit_same_identity",
@@ -1340,18 +1354,16 @@ fn phase13_transition_cache_probe_report(
             resident: &base_resident,
             brick_shape: plan.brick_shape,
             brick_grid_shape: plan.brick_grid_shape,
-            camera: orbit_camera.to_camera_state(DEFAULT_PRESENTATION_VIEWPORT_POINTS),
+            camera: benchmark_camera_frame(orbit_camera),
             viewport,
             mode_case: mip_mode,
             cache_expectation: Some(Phase13CacheExpectation::ReuseExistingAtlas),
         },
     ));
 
-    let mut pan_camera = camera_view;
-    let pan_distance = camera_view.world_per_screen_point_at_target()
-        * DEFAULT_PRESENTATION_VIEWPORT_POINTS.height_points
-        * 0.05;
-    pan_camera.pan_by(pan_distance, -pan_distance * 0.5);
+    let pan_distance =
+        benchmark_camera_world_per_screen_point(camera_view) * BENCHMARK_PRESENTATION_POINTS * 0.05;
+    let pan_camera = benchmark_camera_pan(camera_view, pan_distance, -pan_distance * 0.5);
     transitions.push(phase13_transition_render_probe_item(
         Phase13TransitionProbeRender {
             label: "camera_pan_same_identity",
@@ -1361,15 +1373,14 @@ fn phase13_transition_cache_probe_report(
             resident: &base_resident,
             brick_shape: plan.brick_shape,
             brick_grid_shape: plan.brick_grid_shape,
-            camera: pan_camera.to_camera_state(DEFAULT_PRESENTATION_VIEWPORT_POINTS),
+            camera: benchmark_camera_frame(pan_camera),
             viewport,
             mode_case: mip_mode,
             cache_expectation: Some(Phase13CacheExpectation::ReuseExistingAtlas),
         },
     ));
 
-    let mut zoom_camera = camera_view;
-    zoom_camera.zoom_by(0.75);
+    let zoom_camera = benchmark_camera_zoom(camera_view, 0.75);
     transitions.push(phase13_transition_render_probe_item(
         Phase13TransitionProbeRender {
             label: "camera_zoom_same_identity",
@@ -1379,7 +1390,7 @@ fn phase13_transition_cache_probe_report(
             resident: &base_resident,
             brick_shape: plan.brick_shape,
             brick_grid_shape: plan.brick_grid_shape,
-            camera: zoom_camera.to_camera_state(DEFAULT_PRESENTATION_VIEWPORT_POINTS),
+            camera: benchmark_camera_frame(zoom_camera),
             viewport,
             mode_case: mip_mode,
             cache_expectation: Some(Phase13CacheExpectation::ReuseExistingAtlas),
@@ -1592,10 +1603,10 @@ fn phase13_timepoint_transition_resident(
     let Some(layer) = dataset.layer(layer_id) else {
         return Ok(None);
     };
-    if layer.shape.t <= 1 {
+    if layer.shape.t() <= 1 {
         return Ok(None);
     }
-    phase13_read_resident_for_plan(dataset, layer_id, plan, TimeIndex(1)).map(Some)
+    phase13_read_resident_for_plan(dataset, layer_id, plan, TimeIndex::new(1)).map(Some)
 }
 
 fn phase13_channel_transition_resident(
@@ -1606,7 +1617,7 @@ fn phase13_channel_transition_resident(
     for candidate in &dataset.manifest().layers {
         if candidate.id == layer_id.as_str()
             || candidate.kind != LayerKind::DenseIntensity
-            || candidate.shape.t == 0
+            || candidate.shape.t() == 0
         {
             continue;
         }
@@ -1641,7 +1652,7 @@ fn phase13_channel_transition_resident(
             Phase11ResidentReadInput {
                 stored_dtype: candidate.dtype.stored,
                 scale_level: plan.displayed_scale_level,
-                timepoint: TimeIndex(0),
+                timepoint: TimeIndex::new(0),
                 volume_shape: candidate_shape,
                 grid_to_world: candidate_grid_to_world,
             },
@@ -1664,7 +1675,7 @@ fn phase13_scale_transition_resident(
     dataset: &DatasetHandle,
     layer_id: &LayerId,
     plan: &Phase11LodPlan,
-    camera: mirante4d_core::CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
 ) -> anyhow::Result<Option<Phase13ScaleTransitionResident>> {
     let scale_count = dataset.scale_count(layer_id)?;
@@ -1700,7 +1711,7 @@ fn phase13_scale_transition_resident(
             Phase11ResidentReadInput {
                 stored_dtype: phase11_stored_dtype_for_layer(dataset, layer_id)?,
                 scale_level,
-                timepoint: TimeIndex(0),
+                timepoint: TimeIndex::new(0),
                 volume_shape: scale_plan.displayed_shape,
                 grid_to_world: scale_plan.displayed_grid_to_world,
             },
@@ -1724,7 +1735,7 @@ struct Phase13TransitionProbeRender<'a> {
     resident: &'a Phase11ResidentBrickSet,
     brick_shape: Shape3D,
     brick_grid_shape: Shape3D,
-    camera: mirante4d_core::CameraState,
+    camera: CameraFrame,
     viewport: RenderViewport,
     mode_case: Phase13RenderModeCase,
     cache_expectation: Option<Phase13CacheExpectation>,
@@ -1920,9 +1931,9 @@ pub(crate) fn brick_skip_json(diagnostics: mirante4d_renderer::BrickSkipDiagnost
 
 pub(crate) fn shape3d_json(shape: Shape3D) -> Value {
     json!({
-        "z": shape.z,
-        "y": shape.y,
-        "x": shape.x,
+        "z": shape.z(),
+        "y": shape.y(),
+        "x": shape.x(),
     })
 }
 

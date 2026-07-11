@@ -812,7 +812,6 @@ fn validate_tool_pins(tools: &[ToolPin]) -> anyhow::Result<()> {
 
 fn validate_property_groups(groups: &[PropertyGroup]) -> anyhow::Result<()> {
     let expected = BTreeMap::from([
-        ("camera", ("mirante4d-core", "0x4d3443414d455241", 64)),
         (
             "domain-display",
             ("mirante4d-domain", "0x4d34444f4d444953", 64),
@@ -845,8 +844,6 @@ fn validate_property_groups(groups: &[PropertyGroup]) -> anyhow::Result<()> {
             "project-model",
             ("mirante4d-project-model", "0x4d3450524f4a4d4f", 128),
         ),
-        ("shape", ("mirante4d-core", "0x4d34534841504531", 64)),
-        ("space", ("mirante4d-core", "0x4d34535041434531", 64)),
     ]);
     if groups.len() != expected.len() {
         bail!("verification property group set drifted");

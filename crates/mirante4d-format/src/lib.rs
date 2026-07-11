@@ -1,10 +1,17 @@
+pub mod current_profile;
 pub mod fixture;
 pub mod manifest;
+mod manifest_wire;
 pub(crate) mod multiscale;
 pub mod validate;
 pub mod writer;
 pub mod zarr_io;
 
+pub use current_profile::{
+    AXES_TZYX, CurrentAxisError, CurrentFormatIdError, CurrentGridToWorldExt, CurrentShape4DExt,
+    CurrentTransformError, DatasetId, LayerDisplay, LayerId, WorldSpace, WorldToGrid, WorldUnit,
+    grid_to_world_from_dmat4, grid_to_world_scale_um, validate_axes_tzyx,
+};
 pub use fixture::{
     FixtureKind, expected_f32_fixture_value, expected_fixture_value,
     expected_fixture_value_for_channel, write_fixture,

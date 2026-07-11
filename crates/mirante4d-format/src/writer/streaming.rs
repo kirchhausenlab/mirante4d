@@ -37,7 +37,10 @@ impl StreamingU16LayerWriter {
                 grid_to_world: scale.grid_to_world,
                 source_scale: scale.source_scale,
                 reduction: scale.reduction,
-                written_z_planes: vec![vec![false; scale.shape.z as usize]; scale.shape.t as usize],
+                written_z_planes: vec![
+                    vec![false; scale.shape.z() as usize];
+                    scale.shape.t() as usize
+                ],
                 statistics: U16StatisticsAccumulator::new(),
                 brick_grid,
                 brick_statistics: vec![
@@ -157,7 +160,7 @@ impl StreamingU16ScaleState {
         timepoint: u64,
         values_zyx: &[u16],
     ) -> Result<(), FormatError> {
-        if timepoint >= self.shape.t {
+        if timepoint >= self.shape.t() {
             return Err(FormatError::InvalidTimepoint {
                 layer_id: layer_id.to_owned(),
                 level: self.level,
@@ -175,8 +178,8 @@ impl StreamingU16ScaleState {
             });
         }
 
-        let expected =
-            Shape4D::new(1, self.shape.z, self.shape.y, self.shape.x)?.element_count()? as usize;
+        let expected = Shape4D::new(1, self.shape.z(), self.shape.y(), self.shape.x())?
+            .element_count()? as usize;
         let actual = values_zyx.len();
         if actual != expected {
             return Err(FormatError::InvalidLayerValues {
@@ -188,9 +191,9 @@ impl StreamingU16ScaleState {
 
         let subset = ArraySubset::new_with_ranges(&[
             timepoint..timepoint + 1,
-            0..self.shape.z,
-            0..self.shape.y,
-            0..self.shape.x,
+            0..self.shape.z(),
+            0..self.shape.y(),
+            0..self.shape.x(),
         ]);
         self.array
             .store_array_subset_opt(&subset, values_zyx, &store_all_chunks_options())
@@ -211,7 +214,7 @@ impl StreamingU16ScaleState {
         z_start: u64,
         values_zyx: &[u16],
     ) -> Result<(), FormatError> {
-        if timepoint >= self.shape.t {
+        if timepoint >= self.shape.t() {
             return Err(FormatError::InvalidTimepoint {
                 layer_id: layer_id.to_owned(),
                 level: self.level,
@@ -220,8 +223,8 @@ impl StreamingU16ScaleState {
         }
         let plane_voxels =
             self.shape
-                .y
-                .checked_mul(self.shape.x)
+                .y()
+                .checked_mul(self.shape.x())
                 .ok_or_else(|| FormatError::ZarrStorage {
                     layer_id: layer_id.to_owned(),
                     message: "plane voxel count overflow".to_owned(),
@@ -244,11 +247,11 @@ impl StreamingU16ScaleState {
                 layer_id: layer_id.to_owned(),
                 message: "z slab range overflow".to_owned(),
             })?;
-        if z_start >= self.shape.z || z_end > self.shape.z {
+        if z_start >= self.shape.z() || z_end > self.shape.z() {
             return Err(FormatError::InvalidLayerValues {
                 layer_id: layer_id.to_owned(),
                 actual: values_zyx.len(),
-                expected: usize::try_from(plane_voxels * self.shape.z).unwrap_or(usize::MAX),
+                expected: usize::try_from(plane_voxels * self.shape.z()).unwrap_or(usize::MAX),
             });
         }
         if (z_start..z_end).any(|z| self.written_z_planes[timepoint as usize][z as usize]) {
@@ -262,8 +265,8 @@ impl StreamingU16ScaleState {
         let subset = ArraySubset::new_with_ranges(&[
             timepoint..timepoint + 1,
             z_start..z_end,
-            0..self.shape.y,
-            0..self.shape.x,
+            0..self.shape.y(),
+            0..self.shape.x(),
         ]);
         self.array
             .store_array_subset_opt(&subset, values_zyx, &store_all_chunks_options())
@@ -279,7 +282,7 @@ impl StreamingU16ScaleState {
     }
 
     fn observe_brick_statistics(&mut self, timepoint: u64, values_zyx: &[u16]) {
-        self.observe_brick_statistics_for_slab(timepoint, 0, self.shape.z, values_zyx);
+        self.observe_brick_statistics_for_slab(timepoint, 0, self.shape.z(), values_zyx);
     }
 
     fn observe_brick_statistics_for_slab(
@@ -289,20 +292,20 @@ impl StreamingU16ScaleState {
         z_end: u64,
         values_zyx: &[u16],
     ) {
-        let brick_t = timepoint / self.brick_shape.t;
-        let first_brick_z = z_start / self.brick_shape.z;
-        let last_brick_z = (z_end - 1) / self.brick_shape.z;
+        let brick_t = timepoint / self.brick_shape.t();
+        let first_brick_z = z_start / self.brick_shape.z();
+        let last_brick_z = (z_end - 1) / self.brick_shape.z();
         for brick_z in first_brick_z..=last_brick_z {
-            let z0 = brick_z * self.brick_shape.z;
-            let z1 = (z0 + self.brick_shape.z).min(self.shape.z);
+            let z0 = brick_z * self.brick_shape.z();
+            let z1 = (z0 + self.brick_shape.z()).min(self.shape.z());
             let intersect_z0 = z0.max(z_start);
             let intersect_z1 = z1.min(z_end);
-            for brick_y in 0..self.brick_grid.y {
-                let y0 = brick_y * self.brick_shape.y;
-                let y1 = (y0 + self.brick_shape.y).min(self.shape.y);
-                for brick_x in 0..self.brick_grid.x {
-                    let x0 = brick_x * self.brick_shape.x;
-                    let x1 = (x0 + self.brick_shape.x).min(self.shape.x);
+            for brick_y in 0..self.brick_grid.y() {
+                let y0 = brick_y * self.brick_shape.y();
+                let y1 = (y0 + self.brick_shape.y()).min(self.shape.y());
+                for brick_x in 0..self.brick_grid.x() {
+                    let x0 = brick_x * self.brick_shape.x();
+                    let x1 = (x0 + self.brick_shape.x()).min(self.shape.x());
                     let index = linear_tzyx(self.brick_grid, brick_t, brick_z, brick_y, brick_x);
                     self.brick_statistics[index].observe_slab_region(
                         values_zyx,
@@ -333,10 +336,10 @@ impl StreamingU16ScaleState {
         }
 
         let mut records = Vec::with_capacity(self.brick_statistics.len());
-        for t in 0..self.brick_grid.t {
-            for z in 0..self.brick_grid.z {
-                for y in 0..self.brick_grid.y {
-                    for x in 0..self.brick_grid.x {
+        for t in 0..self.brick_grid.t() {
+            for z in 0..self.brick_grid.z() {
+                for y in 0..self.brick_grid.y() {
+                    for x in 0..self.brick_grid.x() {
                         let index = BrickIndex { t, z, y, x };
                         let stats =
                             &self.brick_statistics[linear_tzyx(self.brick_grid, t, z, y, x)];
@@ -396,14 +399,14 @@ impl StreamingValidityScaleState {
     ) -> Result<(), FormatError> {
         let subset = ArraySubset::new_with_ranges(&[
             timepoint..timepoint + 1,
-            0..self.shape.z,
-            0..self.shape.y,
-            0..self.shape.x,
+            0..self.shape.z(),
+            0..self.shape.y(),
+            0..self.shape.x(),
         ]);
         self.array
             .store_array_subset_opt(&subset, render_valid_zyx, &store_all_chunks_options())
             .map_err(zarr_storage_error)?;
-        self.observe_counts_for_slab(timepoint, 0, self.shape.z, render_valid_zyx);
+        self.observe_counts_for_slab(timepoint, 0, self.shape.z(), render_valid_zyx);
         Ok(())
     }
 
@@ -416,8 +419,8 @@ impl StreamingValidityScaleState {
     ) -> Result<(), FormatError> {
         let plane_voxels =
             self.shape
-                .y
-                .checked_mul(self.shape.x)
+                .y()
+                .checked_mul(self.shape.x())
                 .ok_or_else(|| FormatError::ZarrStorage {
                     layer_id: layer_id.to_owned(),
                     message: "validity plane voxel count overflow".to_owned(),
@@ -432,8 +435,8 @@ impl StreamingValidityScaleState {
         let subset = ArraySubset::new_with_ranges(&[
             timepoint..timepoint + 1,
             z_start..z_end,
-            0..self.shape.y,
-            0..self.shape.x,
+            0..self.shape.y(),
+            0..self.shape.x(),
         ]);
         self.array
             .store_array_subset_opt(&subset, render_valid_zyx, &store_all_chunks_options())
@@ -449,20 +452,20 @@ impl StreamingValidityScaleState {
         z_end: u64,
         render_valid_zyx: &[u8],
     ) {
-        let brick_t = timepoint / self.brick_shape.t;
-        let first_brick_z = z_start / self.brick_shape.z;
-        let last_brick_z = (z_end - 1) / self.brick_shape.z;
+        let brick_t = timepoint / self.brick_shape.t();
+        let first_brick_z = z_start / self.brick_shape.z();
+        let last_brick_z = (z_end - 1) / self.brick_shape.z();
         for brick_z in first_brick_z..=last_brick_z {
-            let z0 = brick_z * self.brick_shape.z;
-            let z1 = (z0 + self.brick_shape.z).min(self.shape.z);
+            let z0 = brick_z * self.brick_shape.z();
+            let z1 = (z0 + self.brick_shape.z()).min(self.shape.z());
             let intersect_z0 = z0.max(z_start);
             let intersect_z1 = z1.min(z_end);
-            for brick_y in 0..self.brick_grid.y {
-                let y0 = brick_y * self.brick_shape.y;
-                let y1 = (y0 + self.brick_shape.y).min(self.shape.y);
-                for brick_x in 0..self.brick_grid.x {
-                    let x0 = brick_x * self.brick_shape.x;
-                    let x1 = (x0 + self.brick_shape.x).min(self.shape.x);
+            for brick_y in 0..self.brick_grid.y() {
+                let y0 = brick_y * self.brick_shape.y();
+                let y1 = (y0 + self.brick_shape.y()).min(self.shape.y());
+                for brick_x in 0..self.brick_grid.x() {
+                    let x0 = brick_x * self.brick_shape.x();
+                    let x1 = (x0 + self.brick_shape.x()).min(self.shape.x());
                     let index = linear_tzyx(self.brick_grid, brick_t, brick_z, brick_y, brick_x);
                     let mut count = 0_u64;
                     for z in intersect_z0..intersect_z1 {
@@ -470,7 +473,7 @@ impl StreamingValidityScaleState {
                         for y in y0..y1 {
                             for x in x0..x1 {
                                 let offset =
-                                    ((local_z * self.shape.y + y) * self.shape.x + x) as usize;
+                                    ((local_z * self.shape.y() + y) * self.shape.x() + x) as usize;
                                 count += u64::from(render_valid_zyx[offset] == 1);
                             }
                         }
@@ -484,10 +487,10 @@ impl StreamingValidityScaleState {
     fn finish(self, layer_id: &str) -> Result<ScaleValidityMask, FormatError> {
         let mut records = Vec::with_capacity(self.valid_counts.len());
         let mut valid_voxel_count = 0_u64;
-        for t in 0..self.brick_grid.t {
-            for z in 0..self.brick_grid.z {
-                for y in 0..self.brick_grid.y {
-                    for x in 0..self.brick_grid.x {
+        for t in 0..self.brick_grid.t() {
+            for z in 0..self.brick_grid.z() {
+                for y in 0..self.brick_grid.y() {
+                    for x in 0..self.brick_grid.x() {
                         let index = BrickIndex { t, z, y, x };
                         let count = self.valid_counts[linear_tzyx(self.brick_grid, t, z, y, x)];
                         valid_voxel_count += count;
@@ -574,7 +577,10 @@ impl StreamingU8LayerWriter {
                 grid_to_world: scale.grid_to_world,
                 source_scale: scale.source_scale,
                 reduction: scale.reduction,
-                written_z_planes: vec![vec![false; scale.shape.z as usize]; scale.shape.t as usize],
+                written_z_planes: vec![
+                    vec![false; scale.shape.z() as usize];
+                    scale.shape.t() as usize
+                ],
                 statistics: U8StatisticsAccumulator::new(),
                 brick_grid,
                 validity,
@@ -733,7 +739,7 @@ impl StreamingU8ScaleState {
         values_zyx: &[u8],
         render_valid_zyx: Option<&[u8]>,
     ) -> Result<(), FormatError> {
-        if timepoint >= self.shape.t {
+        if timepoint >= self.shape.t() {
             return Err(FormatError::InvalidTimepoint {
                 layer_id: layer_id.to_owned(),
                 level: self.level,
@@ -751,8 +757,8 @@ impl StreamingU8ScaleState {
             });
         }
 
-        let expected =
-            Shape4D::new(1, self.shape.z, self.shape.y, self.shape.x)?.element_count()? as usize;
+        let expected = Shape4D::new(1, self.shape.z(), self.shape.y(), self.shape.x())?
+            .element_count()? as usize;
         let actual = values_zyx.len();
         if actual != expected {
             return Err(FormatError::InvalidLayerValues {
@@ -765,9 +771,9 @@ impl StreamingU8ScaleState {
 
         let subset = ArraySubset::new_with_ranges(&[
             timepoint..timepoint + 1,
-            0..self.shape.z,
-            0..self.shape.y,
-            0..self.shape.x,
+            0..self.shape.z(),
+            0..self.shape.y(),
+            0..self.shape.x(),
         ]);
         self.array
             .store_array_subset_opt(&subset, values_zyx, &store_all_chunks_options())
@@ -798,7 +804,7 @@ impl StreamingU8ScaleState {
         values_zyx: &[u8],
         render_valid_zyx: Option<&[u8]>,
     ) -> Result<(), FormatError> {
-        if timepoint >= self.shape.t {
+        if timepoint >= self.shape.t() {
             return Err(FormatError::InvalidTimepoint {
                 layer_id: layer_id.to_owned(),
                 level: self.level,
@@ -807,8 +813,8 @@ impl StreamingU8ScaleState {
         }
         let plane_voxels =
             self.shape
-                .y
-                .checked_mul(self.shape.x)
+                .y()
+                .checked_mul(self.shape.x())
                 .ok_or_else(|| FormatError::ZarrStorage {
                     layer_id: layer_id.to_owned(),
                     message: "plane voxel count overflow".to_owned(),
@@ -832,11 +838,11 @@ impl StreamingU8ScaleState {
                 layer_id: layer_id.to_owned(),
                 message: "z slab range overflow".to_owned(),
             })?;
-        if z_start >= self.shape.z || z_end > self.shape.z {
+        if z_start >= self.shape.z() || z_end > self.shape.z() {
             return Err(FormatError::InvalidLayerValues {
                 layer_id: layer_id.to_owned(),
                 actual: values_zyx.len(),
-                expected: usize::try_from(plane_voxels * self.shape.z).unwrap_or(usize::MAX),
+                expected: usize::try_from(plane_voxels * self.shape.z()).unwrap_or(usize::MAX),
             });
         }
         if (z_start..z_end).any(|z| self.written_z_planes[timepoint as usize][z as usize]) {
@@ -850,8 +856,8 @@ impl StreamingU8ScaleState {
         let subset = ArraySubset::new_with_ranges(&[
             timepoint..timepoint + 1,
             z_start..z_end,
-            0..self.shape.y,
-            0..self.shape.x,
+            0..self.shape.y(),
+            0..self.shape.x(),
         ]);
         self.array
             .store_array_subset_opt(&subset, values_zyx, &store_all_chunks_options())
@@ -927,7 +933,7 @@ impl StreamingU8ScaleState {
         self.observe_brick_statistics_for_slab(
             timepoint,
             0,
-            self.shape.z,
+            self.shape.z(),
             values_zyx,
             render_valid_zyx,
         );
@@ -941,20 +947,20 @@ impl StreamingU8ScaleState {
         values_zyx: &[u8],
         render_valid_zyx: Option<&[u8]>,
     ) {
-        let brick_t = timepoint / self.brick_shape.t;
-        let first_brick_z = z_start / self.brick_shape.z;
-        let last_brick_z = (z_end - 1) / self.brick_shape.z;
+        let brick_t = timepoint / self.brick_shape.t();
+        let first_brick_z = z_start / self.brick_shape.z();
+        let last_brick_z = (z_end - 1) / self.brick_shape.z();
         for brick_z in first_brick_z..=last_brick_z {
-            let z0 = brick_z * self.brick_shape.z;
-            let z1 = (z0 + self.brick_shape.z).min(self.shape.z);
+            let z0 = brick_z * self.brick_shape.z();
+            let z1 = (z0 + self.brick_shape.z()).min(self.shape.z());
             let intersect_z0 = z0.max(z_start);
             let intersect_z1 = z1.min(z_end);
-            for brick_y in 0..self.brick_grid.y {
-                let y0 = brick_y * self.brick_shape.y;
-                let y1 = (y0 + self.brick_shape.y).min(self.shape.y);
-                for brick_x in 0..self.brick_grid.x {
-                    let x0 = brick_x * self.brick_shape.x;
-                    let x1 = (x0 + self.brick_shape.x).min(self.shape.x);
+            for brick_y in 0..self.brick_grid.y() {
+                let y0 = brick_y * self.brick_shape.y();
+                let y1 = (y0 + self.brick_shape.y()).min(self.shape.y());
+                for brick_x in 0..self.brick_grid.x() {
+                    let x0 = brick_x * self.brick_shape.x();
+                    let x1 = (x0 + self.brick_shape.x()).min(self.shape.x());
                     let index = linear_tzyx(self.brick_grid, brick_t, brick_z, brick_y, brick_x);
                     let region = BrickSlabRegion {
                         shape: self.shape,
@@ -993,10 +999,10 @@ impl StreamingU8ScaleState {
         }
 
         let mut records = Vec::with_capacity(self.brick_statistics.len());
-        for t in 0..self.brick_grid.t {
-            for z in 0..self.brick_grid.z {
-                for y in 0..self.brick_grid.y {
-                    for x in 0..self.brick_grid.x {
+        for t in 0..self.brick_grid.t() {
+            for z in 0..self.brick_grid.z() {
+                for y in 0..self.brick_grid.y() {
+                    for x in 0..self.brick_grid.x() {
                         let index = BrickIndex { t, z, y, x };
                         let record_offset = linear_tzyx(self.brick_grid, t, z, y, x);
                         let stats = &self.brick_statistics[record_offset];
@@ -1083,7 +1089,10 @@ impl StreamingF32LayerWriter {
                 grid_to_world: scale.grid_to_world,
                 source_scale: scale.source_scale,
                 reduction: scale.reduction,
-                written_z_planes: vec![vec![false; scale.shape.z as usize]; scale.shape.t as usize],
+                written_z_planes: vec![
+                    vec![false; scale.shape.z() as usize];
+                    scale.shape.t() as usize
+                ],
                 statistics: F32StreamingStatisticsAccumulator::new(),
                 brick_grid,
                 brick_statistics: vec![
@@ -1202,7 +1211,7 @@ impl StreamingF32ScaleState {
         timepoint: u64,
         values_zyx: &[f32],
     ) -> Result<(), FormatError> {
-        if timepoint >= self.shape.t {
+        if timepoint >= self.shape.t() {
             return Err(FormatError::InvalidTimepoint {
                 layer_id: layer_id.to_owned(),
                 level: self.level,
@@ -1220,8 +1229,8 @@ impl StreamingF32ScaleState {
             });
         }
 
-        let expected =
-            Shape4D::new(1, self.shape.z, self.shape.y, self.shape.x)?.element_count()? as usize;
+        let expected = Shape4D::new(1, self.shape.z(), self.shape.y(), self.shape.x())?
+            .element_count()? as usize;
         let actual = values_zyx.len();
         if actual != expected {
             return Err(FormatError::InvalidLayerValues {
@@ -1235,9 +1244,9 @@ impl StreamingF32ScaleState {
 
         let subset = ArraySubset::new_with_ranges(&[
             timepoint..timepoint + 1,
-            0..self.shape.z,
-            0..self.shape.y,
-            0..self.shape.x,
+            0..self.shape.z(),
+            0..self.shape.y(),
+            0..self.shape.x(),
         ]);
         self.array
             .store_array_subset_opt(&subset, values_zyx, &store_all_chunks_options())
@@ -1257,7 +1266,7 @@ impl StreamingF32ScaleState {
         z_start: u64,
         values_zyx: &[f32],
     ) -> Result<(), FormatError> {
-        if timepoint >= self.shape.t {
+        if timepoint >= self.shape.t() {
             return Err(FormatError::InvalidTimepoint {
                 layer_id: layer_id.to_owned(),
                 level: self.level,
@@ -1266,8 +1275,8 @@ impl StreamingF32ScaleState {
         }
         let plane_voxels =
             self.shape
-                .y
-                .checked_mul(self.shape.x)
+                .y()
+                .checked_mul(self.shape.x())
                 .ok_or_else(|| FormatError::ZarrStorage {
                     layer_id: layer_id.to_owned(),
                     message: "plane voxel count overflow".to_owned(),
@@ -1290,11 +1299,11 @@ impl StreamingF32ScaleState {
                 layer_id: layer_id.to_owned(),
                 message: "z slab range overflow".to_owned(),
             })?;
-        if z_start >= self.shape.z || z_end > self.shape.z {
+        if z_start >= self.shape.z() || z_end > self.shape.z() {
             return Err(FormatError::InvalidLayerValues {
                 layer_id: layer_id.to_owned(),
                 actual: values_zyx.len(),
-                expected: usize::try_from(plane_voxels * self.shape.z).unwrap_or(usize::MAX),
+                expected: usize::try_from(plane_voxels * self.shape.z()).unwrap_or(usize::MAX),
             });
         }
         if (z_start..z_end).any(|z| self.written_z_planes[timepoint as usize][z as usize]) {
@@ -1310,8 +1319,8 @@ impl StreamingF32ScaleState {
         let subset = ArraySubset::new_with_ranges(&[
             timepoint..timepoint + 1,
             z_start..z_end,
-            0..self.shape.y,
-            0..self.shape.x,
+            0..self.shape.y(),
+            0..self.shape.x(),
         ]);
         self.array
             .store_array_subset_opt(&subset, values_zyx, &store_all_chunks_options())
@@ -1326,7 +1335,7 @@ impl StreamingF32ScaleState {
     }
 
     fn observe_brick_statistics(&mut self, timepoint: u64, values_zyx: &[f32]) {
-        self.observe_brick_statistics_for_slab(timepoint, 0, self.shape.z, values_zyx);
+        self.observe_brick_statistics_for_slab(timepoint, 0, self.shape.z(), values_zyx);
     }
 
     fn observe_brick_statistics_for_slab(
@@ -1336,20 +1345,20 @@ impl StreamingF32ScaleState {
         z_end: u64,
         values_zyx: &[f32],
     ) {
-        let brick_t = timepoint / self.brick_shape.t;
-        let first_brick_z = z_start / self.brick_shape.z;
-        let last_brick_z = (z_end - 1) / self.brick_shape.z;
+        let brick_t = timepoint / self.brick_shape.t();
+        let first_brick_z = z_start / self.brick_shape.z();
+        let last_brick_z = (z_end - 1) / self.brick_shape.z();
         for brick_z in first_brick_z..=last_brick_z {
-            let z0 = brick_z * self.brick_shape.z;
-            let z1 = (z0 + self.brick_shape.z).min(self.shape.z);
+            let z0 = brick_z * self.brick_shape.z();
+            let z1 = (z0 + self.brick_shape.z()).min(self.shape.z());
             let intersect_z0 = z0.max(z_start);
             let intersect_z1 = z1.min(z_end);
-            for brick_y in 0..self.brick_grid.y {
-                let y0 = brick_y * self.brick_shape.y;
-                let y1 = (y0 + self.brick_shape.y).min(self.shape.y);
-                for brick_x in 0..self.brick_grid.x {
-                    let x0 = brick_x * self.brick_shape.x;
-                    let x1 = (x0 + self.brick_shape.x).min(self.shape.x);
+            for brick_y in 0..self.brick_grid.y() {
+                let y0 = brick_y * self.brick_shape.y();
+                let y1 = (y0 + self.brick_shape.y()).min(self.shape.y());
+                for brick_x in 0..self.brick_grid.x() {
+                    let x0 = brick_x * self.brick_shape.x();
+                    let x1 = (x0 + self.brick_shape.x()).min(self.shape.x());
                     let index = linear_tzyx(self.brick_grid, brick_t, brick_z, brick_y, brick_x);
                     self.brick_statistics[index].observe_slab_region(
                         values_zyx,
@@ -1386,10 +1395,10 @@ impl StreamingF32ScaleState {
 
         let statistics = self.finish_statistics(layer_id)?;
         let mut records = Vec::with_capacity(self.brick_statistics.len());
-        for t in 0..self.brick_grid.t {
-            for z in 0..self.brick_grid.z {
-                for y in 0..self.brick_grid.y {
-                    for x in 0..self.brick_grid.x {
+        for t in 0..self.brick_grid.t() {
+            for z in 0..self.brick_grid.z() {
+                for y in 0..self.brick_grid.y() {
+                    for x in 0..self.brick_grid.x() {
                         let index = BrickIndex { t, z, y, x };
                         let stats =
                             &self.brick_statistics[linear_tzyx(self.brick_grid, t, z, y, x)];
@@ -1430,3 +1439,4 @@ impl StreamingF32ScaleState {
         })
     }
 }
+use crate::CurrentShape4DExt;

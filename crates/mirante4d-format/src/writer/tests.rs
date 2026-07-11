@@ -1,8 +1,8 @@
-use mirante4d_core::{ChannelColor, DisplayWindow, LayerDisplay};
+use mirante4d_domain::DisplayWindow;
 
 use super::*;
 use crate::{
-    NoDataPolicyKind, NoDataVisibilityPolicy,
+    LayerDisplay, NoDataPolicyKind, NoDataVisibilityPolicy, WorldUnit,
     validate::{load_and_validate_dataset, load_manifest, validate_manifest, write_manifest},
     zarr_io::open_array,
 };
@@ -63,7 +63,7 @@ fn validator_rejects_invalid_native_provenance() {
             name: "Invalid Provenance".to_owned(),
             world_space: WorldSpace {
                 name: "sample".to_owned(),
-                unit: mirante4d_core::WorldUnit::Micrometer,
+                unit: WorldUnit::Micrometer,
             },
             layers: vec![DenseU16Layer {
                 id: "ch0".to_owned(),
@@ -74,7 +74,7 @@ fn validator_rejects_invalid_native_provenance() {
                 },
                 shape: Shape4D::new(1, 1, 1, 2).unwrap(),
                 brick_shape: Shape4D::new(1, 1, 1, 2).unwrap(),
-                grid_to_world: GridToWorld::scale_um(1.0, 1.0, 1.0),
+                grid_to_world: crate::grid_to_world_scale_um(1.0, 1.0, 1.0),
                 display: default_u16_display(),
                 values_tzyx: vec![1, 2],
             }],
@@ -98,14 +98,14 @@ fn streaming_layer_writer_writes_valid_timepoint_subsets() {
     let tempdir = tempfile::tempdir().unwrap();
     let package = tempdir.path().join("streaming.m4d");
     let shape = Shape4D::new(2, 2, 2, 3).unwrap();
-    let grid_to_world = GridToWorld::scale_um(0.2, 0.3, 0.5);
+    let grid_to_world = crate::grid_to_world_scale_um(0.2, 0.3, 0.5);
     let mut writer = NativeMultiscaleDatasetWriter::create(
         &package,
         "streaming-test".to_owned(),
         "Streaming Test".to_owned(),
         WorldSpace {
             name: "sample".to_owned(),
-            unit: mirante4d_core::WorldUnit::Micrometer,
+            unit: WorldUnit::Micrometer,
         },
         ExistingPackagePolicy::Fail,
     )
@@ -117,7 +117,7 @@ fn streaming_layer_writer_writes_valid_timepoint_subsets() {
             name: "Channel 0".to_owned(),
             channel: ChannelMetadata {
                 index: 0,
-                color_rgba: ChannelColor::new([0.0, 1.0, 0.0, 1.0]).unwrap().color_rgba,
+                color_rgba: [0.0, 1.0, 0.0, 1.0],
             },
             source_dtype: IntensityDType::Uint16,
             shape,
@@ -187,14 +187,14 @@ fn streaming_u8_layer_writer_preserves_uint8_storage_and_metadata() {
     let tempdir = tempfile::tempdir().unwrap();
     let package = tempdir.path().join("streaming-u8.m4d");
     let shape = Shape4D::new(2, 1, 2, 4).unwrap();
-    let grid_to_world = GridToWorld::scale_um(0.2, 0.3, 0.5);
+    let grid_to_world = crate::grid_to_world_scale_um(0.2, 0.3, 0.5);
     let mut writer = NativeMultiscaleDatasetWriter::create(
         &package,
         "streaming-u8-test".to_owned(),
         "Streaming U8 Test".to_owned(),
         WorldSpace {
             name: "sample".to_owned(),
-            unit: mirante4d_core::WorldUnit::Micrometer,
+            unit: WorldUnit::Micrometer,
         },
         ExistingPackagePolicy::Fail,
     )
@@ -206,7 +206,7 @@ fn streaming_u8_layer_writer_preserves_uint8_storage_and_metadata() {
             name: "Channel 0".to_owned(),
             channel: ChannelMetadata {
                 index: 0,
-                color_rgba: ChannelColor::new([0.0, 1.0, 0.0, 1.0]).unwrap().color_rgba,
+                color_rgba: [0.0, 1.0, 0.0, 1.0],
             },
             shape,
             no_data_policy: None,
@@ -267,7 +267,7 @@ fn validator_rejects_uint8_no_data_value_outside_source_range() {
         "Invalid No Data".to_owned(),
         WorldSpace {
             name: "sample".to_owned(),
-            unit: mirante4d_core::WorldUnit::Micrometer,
+            unit: WorldUnit::Micrometer,
         },
         ExistingPackagePolicy::Fail,
     )
@@ -324,7 +324,7 @@ fn streaming_u8_no_data_marks_all_invalid_brick_unoccupied() {
         "All Invalid No Data".to_owned(),
         WorldSpace {
             name: "sample".to_owned(),
-            unit: mirante4d_core::WorldUnit::Micrometer,
+            unit: WorldUnit::Micrometer,
         },
         ExistingPackagePolicy::Fail,
     )
@@ -387,7 +387,7 @@ fn manifest_records_brick_shape_in_storage_not_legacy_chunk_shape() {
         "Storage Brick Shape".to_owned(),
         WorldSpace {
             name: "sample".to_owned(),
-            unit: mirante4d_core::WorldUnit::Micrometer,
+            unit: WorldUnit::Micrometer,
         },
         ExistingPackagePolicy::Fail,
     )
@@ -442,14 +442,14 @@ fn streaming_u8_layer_writer_writes_z_slabs_incrementally() {
     let tempdir = tempfile::tempdir().unwrap();
     let package = tempdir.path().join("streaming-u8-slabs.m4d");
     let shape = Shape4D::new(1, 3, 2, 2).unwrap();
-    let grid_to_world = GridToWorld::scale_um(1.0, 1.0, 1.0);
+    let grid_to_world = crate::grid_to_world_scale_um(1.0, 1.0, 1.0);
     let mut writer = NativeMultiscaleDatasetWriter::create(
         &package,
         "streaming-u8-slabs".to_owned(),
         "Streaming U8 Slabs".to_owned(),
         WorldSpace {
             name: "sample".to_owned(),
-            unit: mirante4d_core::WorldUnit::Micrometer,
+            unit: WorldUnit::Micrometer,
         },
         ExistingPackagePolicy::Fail,
     )
@@ -461,7 +461,7 @@ fn streaming_u8_layer_writer_writes_z_slabs_incrementally() {
             name: "Channel 0".to_owned(),
             channel: ChannelMetadata {
                 index: 0,
-                color_rgba: ChannelColor::new([0.0, 1.0, 0.0, 1.0]).unwrap().color_rgba,
+                color_rgba: [0.0, 1.0, 0.0, 1.0],
             },
             shape,
             no_data_policy: None,
@@ -516,14 +516,14 @@ fn streaming_u16_layer_writer_writes_z_slabs_incrementally() {
     let tempdir = tempfile::tempdir().unwrap();
     let package = tempdir.path().join("streaming-u16-slabs.m4d");
     let shape = Shape4D::new(1, 3, 2, 2).unwrap();
-    let grid_to_world = GridToWorld::scale_um(1.0, 1.0, 1.0);
+    let grid_to_world = crate::grid_to_world_scale_um(1.0, 1.0, 1.0);
     let mut writer = NativeMultiscaleDatasetWriter::create(
         &package,
         "streaming-u16-slabs".to_owned(),
         "Streaming U16 Slabs".to_owned(),
         WorldSpace {
             name: "sample".to_owned(),
-            unit: mirante4d_core::WorldUnit::Micrometer,
+            unit: WorldUnit::Micrometer,
         },
         ExistingPackagePolicy::Fail,
     )
@@ -535,7 +535,7 @@ fn streaming_u16_layer_writer_writes_z_slabs_incrementally() {
             name: "Channel 0".to_owned(),
             channel: ChannelMetadata {
                 index: 0,
-                color_rgba: ChannelColor::new([0.0, 1.0, 0.0, 1.0]).unwrap().color_rgba,
+                color_rgba: [0.0, 1.0, 0.0, 1.0],
             },
             source_dtype: IntensityDType::Uint16,
             shape,
@@ -580,14 +580,14 @@ fn streaming_f32_layer_writer_writes_z_slabs_incrementally() {
     let tempdir = tempfile::tempdir().unwrap();
     let package = tempdir.path().join("streaming-f32-slabs.m4d");
     let shape = Shape4D::new(1, 3, 2, 2).unwrap();
-    let grid_to_world = GridToWorld::scale_um(1.0, 1.0, 1.0);
+    let grid_to_world = crate::grid_to_world_scale_um(1.0, 1.0, 1.0);
     let mut writer = NativeMultiscaleDatasetWriter::create(
         &package,
         "streaming-f32-slabs".to_owned(),
         "Streaming F32 Slabs".to_owned(),
         WorldSpace {
             name: "sample".to_owned(),
-            unit: mirante4d_core::WorldUnit::Micrometer,
+            unit: WorldUnit::Micrometer,
         },
         ExistingPackagePolicy::Fail,
     )
@@ -599,7 +599,7 @@ fn streaming_f32_layer_writer_writes_z_slabs_incrementally() {
             name: "Channel 0".to_owned(),
             channel: ChannelMetadata {
                 index: 0,
-                color_rgba: ChannelColor::new([1.0, 1.0, 1.0, 1.0]).unwrap().color_rgba,
+                color_rgba: [1.0, 1.0, 1.0, 1.0],
             },
             shape,
             grid_to_world,
@@ -649,14 +649,14 @@ fn streaming_f32_layer_writer_preserves_float32_storage_and_metadata() {
     let tempdir = tempfile::tempdir().unwrap();
     let package = tempdir.path().join("streaming-f32.m4d");
     let shape = Shape4D::new(2, 1, 2, 4).unwrap();
-    let grid_to_world = GridToWorld::scale_um(0.2, 0.3, 0.5);
+    let grid_to_world = crate::grid_to_world_scale_um(0.2, 0.3, 0.5);
     let mut writer = NativeMultiscaleDatasetWriter::create(
         &package,
         "streaming-f32-test".to_owned(),
         "Streaming F32 Test".to_owned(),
         WorldSpace {
             name: "sample".to_owned(),
-            unit: mirante4d_core::WorldUnit::Micrometer,
+            unit: WorldUnit::Micrometer,
         },
         ExistingPackagePolicy::Fail,
     )
@@ -668,7 +668,7 @@ fn streaming_f32_layer_writer_preserves_float32_storage_and_metadata() {
             name: "Channel 0".to_owned(),
             channel: ChannelMetadata {
                 index: 0,
-                color_rgba: ChannelColor::new([1.0, 1.0, 1.0, 1.0]).unwrap().color_rgba,
+                color_rgba: [1.0, 1.0, 1.0, 1.0],
             },
             shape,
             grid_to_world,
@@ -736,14 +736,14 @@ fn streaming_f32_layer_writer_rejects_nonfinite_values() {
     let tempdir = tempfile::tempdir().unwrap();
     let package = tempdir.path().join("streaming-f32-nan.m4d");
     let shape = Shape4D::new(1, 1, 1, 2).unwrap();
-    let grid_to_world = GridToWorld::scale_um(1.0, 1.0, 1.0);
+    let grid_to_world = crate::grid_to_world_scale_um(1.0, 1.0, 1.0);
     let writer = NativeMultiscaleDatasetWriter::create(
         &package,
         "streaming-f32-nan".to_owned(),
         "Streaming F32 NaN".to_owned(),
         WorldSpace {
             name: "sample".to_owned(),
-            unit: mirante4d_core::WorldUnit::Micrometer,
+            unit: WorldUnit::Micrometer,
         },
         ExistingPackagePolicy::Fail,
     )
@@ -755,7 +755,7 @@ fn streaming_f32_layer_writer_rejects_nonfinite_values() {
             name: "Channel 0".to_owned(),
             channel: ChannelMetadata {
                 index: 0,
-                color_rgba: ChannelColor::new([1.0, 1.0, 1.0, 1.0]).unwrap().color_rgba,
+                color_rgba: [1.0, 1.0, 1.0, 1.0],
             },
             shape,
             grid_to_world,
@@ -788,7 +788,7 @@ fn dense_f32_layer_writer_preserves_float32_storage_and_metadata() {
     let tempdir = tempfile::tempdir().unwrap();
     let package = tempdir.path().join("native-f32.m4d");
     let shape = Shape4D::new(1, 1, 2, 4).unwrap();
-    let grid_to_world = GridToWorld::scale_um(0.2, 0.3, 0.5);
+    let grid_to_world = crate::grid_to_world_scale_um(0.2, 0.3, 0.5);
     let values = vec![0.0, 0.25, 1.5, -2.0, 10.0, 11.25, 12.5, 13.75];
 
     write_native_f32_dataset(
@@ -798,7 +798,7 @@ fn dense_f32_layer_writer_preserves_float32_storage_and_metadata() {
             name: "Native F32".to_owned(),
             world_space: WorldSpace {
                 name: "sample".to_owned(),
-                unit: mirante4d_core::WorldUnit::Micrometer,
+                unit: WorldUnit::Micrometer,
             },
             layers: vec![DenseF32Layer {
                 id: "ch0".to_owned(),
@@ -865,7 +865,7 @@ fn dense_f32_writer_rejects_nonfinite_values() {
             name: "Native F32 NaN".to_owned(),
             world_space: WorldSpace {
                 name: "sample".to_owned(),
-                unit: mirante4d_core::WorldUnit::Micrometer,
+                unit: WorldUnit::Micrometer,
             },
             layers: vec![DenseF32Layer {
                 id: "ch0".to_owned(),
@@ -876,7 +876,7 @@ fn dense_f32_writer_rejects_nonfinite_values() {
                 },
                 shape,
                 brick_shape: Shape4D::new(1, 1, 1, 2).unwrap(),
-                grid_to_world: GridToWorld::scale_um(1.0, 1.0, 1.0),
+                grid_to_world: crate::grid_to_world_scale_um(1.0, 1.0, 1.0),
                 display: default_f32_display(),
                 values_tzyx: vec![0.0, f32::NAN],
             }],
@@ -908,7 +908,7 @@ fn validator_rejects_unsupported_dense_array_codec_configuration() {
             name: "Unsupported Codec".to_owned(),
             world_space: WorldSpace {
                 name: "sample".to_owned(),
-                unit: mirante4d_core::WorldUnit::Micrometer,
+                unit: WorldUnit::Micrometer,
             },
             layers: vec![DenseU16Layer {
                 id: "ch0".to_owned(),
@@ -919,7 +919,7 @@ fn validator_rejects_unsupported_dense_array_codec_configuration() {
                 },
                 shape,
                 brick_shape: shape,
-                grid_to_world: GridToWorld::scale_um(1.0, 1.0, 1.0),
+                grid_to_world: crate::grid_to_world_scale_um(1.0, 1.0, 1.0),
                 display: default_u16_display(),
                 values_tzyx: vec![1, 2],
             }],
@@ -962,7 +962,7 @@ fn validator_rejects_stale_brick_range_hierarchy() {
             name: "Stale Range Hierarchy".to_owned(),
             world_space: WorldSpace {
                 name: "sample".to_owned(),
-                unit: mirante4d_core::WorldUnit::Micrometer,
+                unit: WorldUnit::Micrometer,
             },
             layers: vec![DenseU16Layer {
                 id: "ch0".to_owned(),
@@ -973,7 +973,7 @@ fn validator_rejects_stale_brick_range_hierarchy() {
                 },
                 shape,
                 brick_shape: Shape4D::new(1, 1, 1, 2).unwrap(),
-                grid_to_world: GridToWorld::scale_um(1.0, 1.0, 1.0),
+                grid_to_world: crate::grid_to_world_scale_um(1.0, 1.0, 1.0),
                 display: default_u16_display(),
                 values_tzyx: vec![0, 0, 7, 0],
             }],
@@ -999,8 +999,8 @@ fn writer_rejects_stale_origin_multiscale_transform() {
     let package = tempdir.path().join("stale-origin-scale.m4d");
     let s0_shape = Shape4D::new(1, 4, 4, 4).unwrap();
     let s1_shape = Shape4D::new(1, 2, 2, 2).unwrap();
-    let s0_grid_to_world = GridToWorld::scale_um(0.2, 0.2, 0.2);
-    let stale_s1_grid_to_world = GridToWorld::scale_um(0.4, 0.4, 0.4);
+    let s0_grid_to_world = crate::grid_to_world_scale_um(0.2, 0.2, 0.2);
+    let stale_s1_grid_to_world = crate::grid_to_world_scale_um(0.4, 0.4, 0.4);
 
     let err = write_native_u16_multiscale_dataset(
         &package,
@@ -1009,7 +1009,7 @@ fn writer_rejects_stale_origin_multiscale_transform() {
             name: "Stale Origin Scale".to_owned(),
             world_space: WorldSpace {
                 name: "sample".to_owned(),
-                unit: mirante4d_core::WorldUnit::Micrometer,
+                unit: WorldUnit::Micrometer,
             },
             layers: vec![DenseU16MultiscaleLayer {
                 id: "ch0".to_owned(),
@@ -1059,14 +1059,14 @@ fn streaming_layer_writer_marks_zero_only_dense_bricks_valid() {
     let tempdir = tempfile::tempdir().unwrap();
     let package = tempdir.path().join("streaming-valid-zero.m4d");
     let shape = Shape4D::new(1, 1, 1, 4).unwrap();
-    let grid_to_world = GridToWorld::scale_um(1.0, 1.0, 1.0);
+    let grid_to_world = crate::grid_to_world_scale_um(1.0, 1.0, 1.0);
     let mut writer = NativeMultiscaleDatasetWriter::create(
         &package,
         "streaming-valid-zero".to_owned(),
         "Streaming Valid Zero".to_owned(),
         WorldSpace {
             name: "sample".to_owned(),
-            unit: mirante4d_core::WorldUnit::Micrometer,
+            unit: WorldUnit::Micrometer,
         },
         ExistingPackagePolicy::Fail,
     )
@@ -1134,7 +1134,7 @@ fn dense_layer_writer_marks_zero_only_dense_bricks_valid() {
     let tempdir = tempfile::tempdir().unwrap();
     let package = tempdir.path().join("dense-valid-zero.m4d");
     let shape = Shape4D::new(1, 1, 1, 4).unwrap();
-    let grid_to_world = GridToWorld::scale_um(1.0, 1.0, 1.0);
+    let grid_to_world = crate::grid_to_world_scale_um(1.0, 1.0, 1.0);
 
     write_native_u16_multiscale_dataset(
         &package,
@@ -1143,7 +1143,7 @@ fn dense_layer_writer_marks_zero_only_dense_bricks_valid() {
             name: "Dense Valid Zero".to_owned(),
             world_space: WorldSpace {
                 name: "sample".to_owned(),
-                unit: mirante4d_core::WorldUnit::Micrometer,
+                unit: WorldUnit::Micrometer,
             },
             layers: vec![DenseU16MultiscaleLayer {
                 id: "ch0".to_owned(),
@@ -1188,14 +1188,14 @@ fn streaming_layer_writer_rejects_duplicate_timepoint_write() {
     let tempdir = tempfile::tempdir().unwrap();
     let package = tempdir.path().join("streaming.m4d");
     let shape = Shape4D::new(1, 1, 1, 2).unwrap();
-    let grid_to_world = GridToWorld::scale_um(1.0, 1.0, 1.0);
+    let grid_to_world = crate::grid_to_world_scale_um(1.0, 1.0, 1.0);
     let writer = NativeMultiscaleDatasetWriter::create(
         &package,
         "streaming-test".to_owned(),
         "Streaming Test".to_owned(),
         WorldSpace {
             name: "sample".to_owned(),
-            unit: mirante4d_core::WorldUnit::Micrometer,
+            unit: WorldUnit::Micrometer,
         },
         ExistingPackagePolicy::Fail,
     )
@@ -1234,14 +1234,14 @@ fn streaming_layer_writer_rejects_incomplete_scale_on_finish() {
     let tempdir = tempfile::tempdir().unwrap();
     let package = tempdir.path().join("streaming.m4d");
     let shape = Shape4D::new(2, 1, 1, 2).unwrap();
-    let grid_to_world = GridToWorld::scale_um(1.0, 1.0, 1.0);
+    let grid_to_world = crate::grid_to_world_scale_um(1.0, 1.0, 1.0);
     let mut writer = NativeMultiscaleDatasetWriter::create(
         &package,
         "streaming-test".to_owned(),
         "Streaming Test".to_owned(),
         WorldSpace {
             name: "sample".to_owned(),
-            unit: mirante4d_core::WorldUnit::Micrometer,
+            unit: WorldUnit::Micrometer,
         },
         ExistingPackagePolicy::Fail,
     )
