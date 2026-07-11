@@ -29,6 +29,12 @@ const FORBIDDEN_AXIS_ALIGNED_2D_CHUNK_PATTERNS: &[&str] = &[
 ];
 const ALLOWED_LOCAL_CARGO_OVERRIDES: &[(&str, &str)] =
     &[("wayland-scanner", "vendor/wayland-scanner")];
+const WP07B_BOUNDARY_CANDIDATE_CRATES: &[&str] = &[
+    "mirante4d-application",
+    "mirante4d-dataset",
+    "mirante4d-render-api",
+    "mirante4d-settings",
+];
 
 pub(crate) fn architecture_self_check() -> anyhow::Result<()> {
     let required = [
@@ -37,10 +43,14 @@ pub(crate) fn architecture_self_check() -> anyhow::Result<()> {
         "crates/mirante4d-format",
         "crates/mirante4d-import",
         "crates/mirante4d-data",
+        "crates/mirante4d-dataset",
         "crates/mirante4d-domain",
         "crates/mirante4d-identity",
         "crates/mirante4d-project-model",
+        "crates/mirante4d-render-api",
         "crates/mirante4d-renderer",
+        "crates/mirante4d-settings",
+        "crates/mirante4d-application",
         "crates/mirante4d-app",
         "crates/xtask",
     ];
@@ -57,6 +67,7 @@ pub(crate) fn architecture_self_check() -> anyhow::Result<()> {
     check_crate_dependency_policy()?;
     check_source_architecture_policy()?;
     check_wp07a_contracts(Path::new("."))?;
+    check_wp07b_boundary_contract(Path::new("."))?;
     check_tracked_artifact_policy()?;
     Ok(())
 }
@@ -68,6 +79,26 @@ fn check_crate_dependency_policy() -> anyhow::Result<()> {
         (
             "mirante4d-project-model",
             &["mirante4d-domain", "mirante4d-identity"][..],
+        ),
+        (
+            "mirante4d-dataset",
+            &["mirante4d-domain", "mirante4d-identity"][..],
+        ),
+        (
+            "mirante4d-render-api",
+            &["mirante4d-dataset", "mirante4d-domain"][..],
+        ),
+        ("mirante4d-settings", &["mirante4d-domain"][..]),
+        (
+            "mirante4d-application",
+            &[
+                "mirante4d-dataset",
+                "mirante4d-domain",
+                "mirante4d-identity",
+                "mirante4d-project-model",
+                "mirante4d-render-api",
+                "mirante4d-settings",
+            ][..],
         ),
         ("mirante4d-core", &[][..]),
         ("mirante4d-format", &["mirante4d-core"][..]),
@@ -262,18 +293,28 @@ fn source_architecture_violations(path: &Path, source: &str) -> Vec<String> {
 }
 
 fn forbidden_canonical_model_std_use_violations(path: &Path, source: &str) -> Vec<String> {
-    let Ok(file) = syn::parse_file(source) else {
-        return vec![format!(
-            "{} cannot be parsed for WP-07A side-effect ownership",
-            path.display()
-        )];
-    };
     let forbidden = BTreeSet::from([
         "env", "fs", "io", "net", "os", "path", "process", "sync", "thread", "time",
     ]);
+    forbidden_std_authority_violations(path, source, &forbidden, "WP-07A canonical-model crate")
+}
+
+fn forbidden_std_authority_violations(
+    path: &Path,
+    source: &str,
+    forbidden: &BTreeSet<&'static str>,
+    policy: &'static str,
+) -> Vec<String> {
+    let Ok(file) = syn::parse_file(source) else {
+        return vec![format!(
+            "{} cannot be parsed for {policy} side-effect ownership",
+            path.display()
+        )];
+    };
     let mut visitor = ForbiddenStdUseVisitor {
         source_path: path,
-        forbidden: &forbidden,
+        forbidden,
+        policy,
         violations: Vec::new(),
     };
     visitor.visit_file(&file);
@@ -283,26 +324,85 @@ fn forbidden_canonical_model_std_use_violations(path: &Path, source: &str) -> Ve
 struct ForbiddenStdUseVisitor<'a> {
     source_path: &'a Path,
     forbidden: &'a BTreeSet<&'static str>,
+    policy: &'static str,
     violations: Vec<String>,
 }
 
 impl<'ast> Visit<'ast> for ForbiddenStdUseVisitor<'_> {
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        if use_tree_aliases_std_root(&item.tree, true, false) {
+            self.violations.push(format!(
+                "{}: {} may not alias the std crate",
+                self.source_path.display(),
+                self.policy,
+            ));
+        }
         let mut paths = Vec::new();
         flatten_use_tree(&item.tree, &mut Vec::new(), &mut paths);
         for segments in paths {
-            if segments.first().is_some_and(|segment| segment == "std")
+            let imports_forbidden = segments.first().is_some_and(|segment| segment == "std")
                 && segments
                     .get(1)
-                    .is_some_and(|segment| self.forbidden.contains(segment.as_str()))
-            {
+                    .is_some_and(|segment| self.forbidden.contains(segment.as_str()));
+            if imports_forbidden {
                 self.violations.push(format!(
-                    "{}: WP-07A canonical-model crate imports forbidden std authority {}",
+                    "{}: {} imports forbidden std authority {}",
                     self.source_path.display(),
+                    self.policy,
                     segments.join("::")
                 ));
             }
         }
+    }
+
+    fn visit_item_extern_crate(&mut self, item: &'ast syn::ItemExternCrate) {
+        if item.ident == "std" {
+            self.violations.push(format!(
+                "{}: {} may not alias the std crate",
+                self.source_path.display(),
+                self.policy,
+            ));
+        }
+    }
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        let mut segments = path.segments.iter();
+        let root = segments.next().map(|segment| segment.ident.to_string());
+        let authority = segments.next().map(|segment| segment.ident.to_string());
+        if root.as_deref() == Some("std")
+            && authority
+                .as_deref()
+                .is_some_and(|segment| self.forbidden.contains(segment))
+        {
+            self.violations.push(format!(
+                "{}: {} uses forbidden std authority std::{}",
+                self.source_path.display(),
+                self.policy,
+                authority.expect("checked as present"),
+            ));
+        }
+        syn::visit::visit_path(self, path);
+    }
+}
+
+fn use_tree_aliases_std_root(tree: &syn::UseTree, at_root: bool, beneath_std: bool) -> bool {
+    match tree {
+        syn::UseTree::Path(path) => {
+            let beneath_std = if at_root {
+                path.ident == "std"
+            } else {
+                beneath_std
+            };
+            use_tree_aliases_std_root(&path.tree, false, beneath_std)
+        }
+        syn::UseTree::Rename(rename) => {
+            (at_root && rename.ident == "std") || (beneath_std && rename.ident == "self")
+        }
+        syn::UseTree::Group(group) => group
+            .items
+            .iter()
+            .any(|tree| use_tree_aliases_std_root(tree, at_root, beneath_std)),
+        syn::UseTree::Name(_) | syn::UseTree::Glob(_) => false,
     }
 }
 
@@ -329,6 +429,63 @@ fn flatten_use_tree(tree: &syn::UseTree, prefix: &mut Vec<String>, paths: &mut V
             }
         }
         syn::UseTree::Glob(_) => paths.push(prefix.clone()),
+    }
+}
+
+fn check_wp07b_boundary_source_ownership(repo_root: &Path) -> anyhow::Result<()> {
+    let pure_forbidden_std = BTreeSet::from([
+        "env", "fs", "io", "net", "os", "path", "process", "thread", "time",
+    ]);
+    let settings_forbidden_std = BTreeSet::from(["net", "process"]);
+    let forbidden_frameworks = [
+        "async_std::",
+        "eframe::",
+        "egui::",
+        "rfd::",
+        "tokio::",
+        "wgpu::",
+        "winit::",
+        "zarrs::",
+        "mirante4d_analysis",
+        "mirante4d_app",
+        "mirante4d_core",
+        "mirante4d_data",
+        "mirante4d_format",
+        "mirante4d_import",
+        "mirante4d_renderer",
+    ];
+    let mut violations = Vec::new();
+    for crate_name in WP07B_BOUNDARY_CANDIDATE_CRATES {
+        let source_root = repo_root.join("crates").join(crate_name).join("src");
+        for path in collect_rust_source_files(&source_root)? {
+            let source = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            violations.extend(source_pattern_violations(
+                &path,
+                &source,
+                &forbidden_frameworks,
+                "WP-07B boundary crate imports a forbidden predecessor/runtime/UI authority",
+            ));
+            let (forbidden_std, policy) = if *crate_name == "mirante4d-settings" {
+                (&settings_forbidden_std, "WP-07B settings crate")
+            } else {
+                (&pure_forbidden_std, "pure WP-07B boundary crate")
+            };
+            violations.extend(forbidden_std_authority_violations(
+                &path,
+                &source,
+                forbidden_std,
+                policy,
+            ));
+        }
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "WP-07B boundary source ownership failed:\n{}",
+            violations.join("\n")
+        )
     }
 }
 
@@ -386,6 +543,399 @@ struct ProjectDtoDisposition {
 fn check_wp07a_contracts(repo_root: &Path) -> anyhow::Result<()> {
     let (predecessor, state_class_mapping) = check_wp07a_model_contract(repo_root)?;
     check_current_state_field_ledger(repo_root, &predecessor, &state_class_mapping)
+}
+
+fn check_wp07b_boundary_contract(repo_root: &Path) -> anyhow::Result<()> {
+    let path = repo_root.join("architecture/wp07b-boundary-contract.json");
+    let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let contract: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    if contract.get("schema").and_then(serde_json::Value::as_str)
+        != Some("mirante4d-wp07b-boundary-contract")
+        || contract
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+        || contract.get("status").and_then(serde_json::Value::as_str)
+            != Some("candidate-unreachable")
+        || contract
+            .pointer("/scope/existing_product_reachable")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        || contract
+            .pointer("/scope/product_behavior_changed")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+    {
+        bail!("{} has an unsupported WP-07B-A boundary", path.display());
+    }
+    if contract
+        .get("predecessor_tag")
+        .and_then(serde_json::Value::as_str)
+        != Some("foundation-wp-07a-exit-1")
+        || contract
+            .get("predecessor_revision")
+            .and_then(serde_json::Value::as_str)
+            != Some("5383cbb93c13c59e6f035bfa551356c75fb426dc")
+    {
+        bail!("WP-07B-A boundary is not bound to the accepted WP-07A exit");
+    }
+    if contract
+        .get("entry_sha256")
+        .and_then(serde_json::Value::as_str)
+        != Some("ee14dae5433626e19fa28d0bcc13cabfdbc259604845ee967c0404d978a27d15")
+        || contract
+            .get("entry_correction_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some("d4309d2cdd342c84d536f34de4bfa05013f46b6e009f7e37516c93f814067ac6")
+    {
+        bail!("WP-07B-A boundary entry hashes drifted from the accepted private records");
+    }
+    let expected_scope = serde_json::json!({
+        "checkpoint": "WP07B-A-boundary-candidates",
+        "existing_product_reachable": false,
+        "product_behavior_changed": false,
+        "project_serialization_changed": false,
+        "settings_product_path_changed": false,
+        "core_deleted": false,
+        "live_cutover_gate": "WP07B-B-atomic-product-cutover"
+    });
+    if contract.get("scope") != Some(&expected_scope) {
+        bail!("WP-07B-A boundary scope drifted from its frozen checkpoint");
+    }
+    let expected_activation_invariants = serde_json::json!([
+        "No existing product, test, benchmark, build, or tool target depends on any WP-07B boundary crate in checkpoint A.",
+        "The frozen WP-07A model APIs remain unchanged.",
+        "The application reducer owns no filesystem, thread, UI, renderer, runtime payload, or serialization authority.",
+        "The dataset and render-api candidates own no storage, scheduling, cache, lease, backend, or UI behavior.",
+        "Settings is the only checkpoint-A boundary allowed external side effects, and it remains unreachable from the product.",
+        "ScientificIdentityStatus is representational only at checkpoint A; application verification remains unavailable until the verifier-owned WP-08 admission route exists.",
+        "Product activation and predecessor deletion occur together only in WP07B-B."
+    ]);
+    if contract.get("activation_invariants") != Some(&expected_activation_invariants)
+        || contract.get("unresolved_decisions") != Some(&serde_json::json!([]))
+    {
+        bail!("WP-07B-A activation invariants or decision closure drifted");
+    }
+
+    let expected_mirante4d_dependencies = BTreeMap::from([
+        (
+            "mirante4d-application",
+            BTreeSet::from(
+                [
+                    "mirante4d-domain",
+                    "mirante4d-identity",
+                    "mirante4d-project-model",
+                    "mirante4d-settings",
+                ]
+                .map(str::to_owned),
+            ),
+        ),
+        (
+            "mirante4d-dataset",
+            BTreeSet::from(["mirante4d-domain", "mirante4d-identity"].map(str::to_owned)),
+        ),
+        (
+            "mirante4d-render-api",
+            BTreeSet::from(["mirante4d-domain"].map(str::to_owned)),
+        ),
+        ("mirante4d-settings", BTreeSet::<String>::new()),
+    ]);
+    let expected_external_dependencies = BTreeMap::from([
+        ("mirante4d-application", BTreeSet::<String>::new()),
+        (
+            "mirante4d-dataset",
+            BTreeSet::from(["thiserror"].map(str::to_owned)),
+        ),
+        (
+            "mirante4d-render-api",
+            BTreeSet::from(["thiserror"].map(str::to_owned)),
+        ),
+        (
+            "mirante4d-settings",
+            BTreeSet::from(["serde", "serde_json", "thiserror"].map(str::to_owned)),
+        ),
+    ]);
+    let expected_dev_dependencies = BTreeMap::from([
+        ("mirante4d-application", BTreeSet::<String>::new()),
+        ("mirante4d-dataset", BTreeSet::<String>::new()),
+        ("mirante4d-render-api", BTreeSet::<String>::new()),
+        (
+            "mirante4d-settings",
+            BTreeSet::from(["tempfile"].map(str::to_owned)),
+        ),
+    ]);
+    let expected_side_effects = BTreeMap::from([
+        ("mirante4d-application", BTreeSet::<String>::new()),
+        ("mirante4d-dataset", BTreeSet::<String>::new()),
+        ("mirante4d-render-api", BTreeSet::<String>::new()),
+        (
+            "mirante4d-settings",
+            BTreeSet::from(
+                ["background_thread", "clock", "environment", "filesystem"].map(str::to_owned),
+            ),
+        ),
+    ]);
+    let expected_authorities = BTreeMap::from([
+        (
+            "mirante4d-application",
+            "Pure bounded application commands, reducer, events, snapshots, project revision/history movement, transient semantic selection, operation currentness, and typed faults",
+        ),
+        (
+            "mirante4d-dataset",
+            "Bounded immutable logical-layer catalog and explicit verified/unverified scientific identity status",
+        ),
+        (
+            "mirante4d-render-api",
+            "Narrow framework-neutral presentation viewport and canonical-camera projection math; broader render contracts remain WP-08A work",
+        ),
+        (
+            "mirante4d-settings",
+            "Closed validated two-ledger settings document, Linux path, bounded background load/write actor, and typed persistence outcomes",
+        ),
+    ]);
+    let crate_contracts = contract
+        .get("crate_contracts")
+        .and_then(serde_json::Value::as_array)
+        .context("WP-07B boundary crate_contracts must be an array")?;
+    let workspace_metadata = workspace_dependency_metadata(repo_root)?;
+    let mut observed = BTreeSet::new();
+    for crate_contract in crate_contracts {
+        let name = crate_contract
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .context("WP-07B boundary crate name must be a string")?;
+        if !expected_mirante4d_dependencies.contains_key(name) || !observed.insert(name) {
+            bail!("unexpected or duplicate WP-07B boundary crate {name}");
+        }
+        if crate_contract
+            .get("authority")
+            .and_then(serde_json::Value::as_str)
+            != expected_authorities.get(name).copied()
+        {
+            bail!("WP-07B boundary crate {name} authority text drifted");
+        }
+        let crate_path = crate_contract
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .context("WP-07B boundary crate path must be a string")?;
+        if crate_path != format!("crates/{name}")
+            || repo_root.join(crate_path).join("build.rs").exists()
+        {
+            bail!("WP-07B boundary crate {name} has a forbidden path or build script");
+        }
+        let package_id = workspace_metadata
+            .workspace_package_ids_by_name
+            .get(name)
+            .with_context(|| format!("cargo metadata is missing WP-07B crate {name}"))?;
+        if workspace_metadata
+            .custom_build_package_ids
+            .contains(package_id)
+        {
+            bail!("WP-07B boundary crate {name} must not have a custom-build target");
+        }
+
+        let mirante4d_dependencies = json_string_set(
+            crate_contract,
+            "permitted_normal_mirante4d_dependencies",
+            "WP-07B Mirante4D dependency allowlist",
+        )?;
+        let external_dependencies = json_string_set(
+            crate_contract,
+            "permitted_normal_external_dependencies",
+            "WP-07B external dependency allowlist",
+        )?;
+        let dev_dependencies = json_string_set(
+            crate_contract,
+            "permitted_dev_dependencies",
+            "WP-07B dev-dependency allowlist",
+        )?;
+        let side_effects = json_string_set(
+            crate_contract,
+            "permitted_external_side_effects",
+            "WP-07B side-effect allowlist",
+        )?;
+        if &mirante4d_dependencies != expected_mirante4d_dependencies.get(name).unwrap()
+            || &external_dependencies != expected_external_dependencies.get(name).unwrap()
+            || &dev_dependencies != expected_dev_dependencies.get(name).unwrap()
+            || &side_effects != expected_side_effects.get(name).unwrap()
+        {
+            bail!("WP-07B boundary crate {name} contract drifted from its frozen allowlists");
+        }
+        let actual_kinds = workspace_metadata
+            .declared_dependency_kinds_by_name
+            .get(name)
+            .with_context(|| format!("cargo metadata is missing WP-07B crate {name}"))?;
+        let expected_normal = mirante4d_dependencies
+            .iter()
+            .chain(&external_dependencies)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if actual_kinds.get("normal").cloned().unwrap_or_default() != expected_normal
+            || actual_kinds.get("dev").cloned().unwrap_or_default() != dev_dependencies
+            || actual_kinds
+                .get("build")
+                .is_some_and(|dependencies| !dependencies.is_empty())
+        {
+            bail!("WP-07B boundary crate {name} declared dependency kinds drifted");
+        }
+
+        let public_api =
+            json_string_set(crate_contract, "public_api", "WP-07B public API allowlist")?;
+        if public_api.is_empty() {
+            bail!("WP-07B boundary crate {name} must have a nonempty public API");
+        }
+        let actual_public_api =
+            public_root_api_names(&repo_root.join(crate_path).join("src/lib.rs"))?;
+        if actual_public_api != public_api {
+            let missing = public_api
+                .difference(&actual_public_api)
+                .collect::<Vec<_>>();
+            let unexpected = actual_public_api
+                .difference(&public_api)
+                .collect::<Vec<_>>();
+            bail!(
+                "WP-07B boundary crate {name} public API drifted: missing={missing:?}, unexpected={unexpected:?}"
+            );
+        }
+    }
+    if observed
+        != WP07B_BOUNDARY_CANDIDATE_CRATES
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+    {
+        bail!("WP-07B boundary contract must cover exactly the four approved crates");
+    }
+
+    let boundary_candidates = WP07B_BOUNDARY_CANDIDATE_CRATES
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for (package, kinds) in &workspace_metadata.declared_dependency_kinds_by_name {
+        if boundary_candidates.contains(package.as_str()) {
+            continue;
+        }
+        let forbidden = kinds
+            .values()
+            .flatten()
+            .filter(|dependency| boundary_candidates.contains(dependency.as_str()))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if !forbidden.is_empty() {
+            bail!(
+                "existing workspace package {package} reaches unreachable WP-07B-A boundary crates: {forbidden:?}"
+            );
+        }
+    }
+    check_non_workspace_manifest_reachability(repo_root, &boundary_candidates)?;
+    check_wp07b_boundary_source_ownership(repo_root)
+}
+
+fn check_non_workspace_manifest_reachability(
+    repo_root: &Path,
+    boundary_candidates: &BTreeSet<&str>,
+) -> anyhow::Result<()> {
+    let mut manifests = Vec::new();
+    collect_non_workspace_cargo_manifests(repo_root, repo_root, &mut manifests)?;
+    manifests.sort();
+    for manifest_path in manifests {
+        let source = fs::read_to_string(&manifest_path)
+            .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+        let manifest = source
+            .parse::<toml::Table>()
+            .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+        let dependencies = manifest_dependency_package_names(&manifest)?;
+        let forbidden = dependencies
+            .iter()
+            .filter(|dependency| boundary_candidates.contains(dependency.as_str()))
+            .collect::<Vec<_>>();
+        if !forbidden.is_empty() {
+            bail!(
+                "non-workspace target {} reaches unreachable WP-07B-A boundary crates: {forbidden:?}",
+                manifest_path.display(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn collect_non_workspace_cargo_manifests(
+    repo_root: &Path,
+    directory: &Path,
+    manifests: &mut Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    for entry in fs::read_dir(directory)
+        .with_context(|| format!("failed to read directory {}", directory.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            let name = entry.file_name();
+            if name == ".git" || name == "crates" || name == "target" || name == "vendor" {
+                continue;
+            }
+            collect_non_workspace_cargo_manifests(repo_root, &path, manifests)?;
+        } else if file_type.is_file()
+            && entry.file_name() == "Cargo.toml"
+            && path != repo_root.join("Cargo.toml")
+        {
+            manifests.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn manifest_dependency_package_names(manifest: &toml::Table) -> anyhow::Result<BTreeSet<String>> {
+    let mut dependencies = BTreeSet::new();
+    for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        if let Some(table) = manifest.get(key) {
+            add_manifest_dependency_table(table, &mut dependencies, key)?;
+        }
+    }
+    if let Some(targets) = manifest.get("target") {
+        let targets = targets
+            .as_table()
+            .context("Cargo target dependencies must be a table")?;
+        for (target, target_specification) in targets {
+            let target_specification = target_specification
+                .as_table()
+                .with_context(|| format!("Cargo target {target:?} must be a table"))?;
+            for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                if let Some(table) = target_specification.get(key) {
+                    add_manifest_dependency_table(
+                        table,
+                        &mut dependencies,
+                        &format!("target.{target}.{key}"),
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(dependencies)
+}
+
+fn add_manifest_dependency_table(
+    value: &toml::Value,
+    dependencies: &mut BTreeSet<String>,
+    context: &str,
+) -> anyhow::Result<()> {
+    let table = value
+        .as_table()
+        .with_context(|| format!("Cargo {context} must be a table"))?;
+    for (declared_name, specification) in table {
+        let package_name = specification
+            .as_table()
+            .and_then(|specification| specification.get("package"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or(declared_name);
+        dependencies.insert(package_name.to_owned());
+    }
+    Ok(())
 }
 
 fn check_wp07a_model_contract(
@@ -565,8 +1115,14 @@ fn check_wp07a_model_contract(
         bail!("WP-07A crate dependency contracts do not match the frozen three-crate boundary");
     }
     let preparatory_crates = expected.keys().copied().collect::<BTreeSet<_>>();
+    let boundary_candidates = WP07B_BOUNDARY_CANDIDATE_CRATES
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
     for (package, kinds) in &workspace_metadata.declared_dependency_kinds_by_name {
-        if preparatory_crates.contains(package.as_str()) {
+        if preparatory_crates.contains(package.as_str())
+            || boundary_candidates.contains(package.as_str())
+        {
             continue;
         }
         let forbidden = kinds
@@ -1691,6 +2247,45 @@ directory = "vendor"
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
 
         check_wp07a_contracts(&repo_root).unwrap();
+    }
+
+    #[test]
+    fn wp07b_boundary_candidates_match_the_frozen_unreachable_contract() {
+        let forbidden = BTreeSet::from(["fs"]);
+        let violations = forbidden_std_authority_violations(
+            Path::new("crates/example/src/lib.rs"),
+            r#"
+fn direct() { let _ = std::fs::read("x"); }
+mod root_alias { use std as platform; }
+mod self_alias { use std::{self as platform}; }
+extern crate std as platform_std;
+"#,
+            &forbidden,
+            "test boundary",
+        );
+        assert_eq!(violations.len(), 4, "{violations:#?}");
+
+        let external_manifest = r#"
+[package]
+name = "external-target"
+version = "0.0.0"
+[dev-dependencies]
+app-boundary = { package = "mirante4d-application", path = "../application" }
+[target.'cfg(unix)'.build-dependencies]
+mirante4d-settings = { path = "../settings" }
+"#
+        .parse::<toml::Table>()
+        .unwrap();
+        assert_eq!(
+            manifest_dependency_package_names(&external_manifest).unwrap(),
+            BTreeSet::from([
+                "mirante4d-application".to_owned(),
+                "mirante4d-settings".to_owned(),
+            ])
+        );
+
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        check_wp07b_boundary_contract(&repo_root).unwrap();
     }
 
     #[test]

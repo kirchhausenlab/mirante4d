@@ -2,12 +2,12 @@
 
 Status: ACTIVE PUBLIC-EPOCH PROGRAM
 Last reviewed: 2026-07-11
-Current technical sequence: WP-07A through WP-15
+Current technical sequence: WP-07B through WP-15
 Public-data publication: deferred to a separate future handoff
-WP-07A predecessor: `foundation-wp-06-exit-1`
-Completed through: WP-06 verification bootstrap
-Current checkpoint: WP-07A canonical-model candidate implemented; promotion pending
-Next checkpoint: protected-main acceptance and `foundation-wp-07a-exit-1`, then WP-07B
+WP-07B predecessor: `foundation-wp-07a-exit-1`
+Completed through: WP-07A canonical model contract
+Current checkpoint: unreachable WP-07B-A boundary candidate implemented; promotion pending
+Next checkpoint: WP-07B-A protected-main acceptance, then atomic WP-07B-B live cutover
 
 ## Purpose
 
@@ -165,10 +165,11 @@ quarantine is remediation-only, time-bounded, and never a silent pass.
 
 WP-06 is complete at `foundation-wp-06-exit-1`. Its exact protected-main
 revision passed the required real product-open exercise before the create-once
-tag was accepted. The WP-07A candidate adds pure model contracts only, so its
-exit does not require another product-open run; it still requires exact-main
-checks and the create-once tag. WP-07B changes live viewer behavior and does
-require the package-stamped real product scenario.
+tag was accepted. WP-07A is complete at
+`5383cbb93c13c59e6f035bfa551356c75fb426dc`
+(`foundation-wp-07a-exit-1`). The current WP-07B-A boundary candidate remains
+unreachable and makes no product claim. WP-07B-B changes live viewer behavior
+and requires the package-stamped real product scenario.
 
 ## Dataset And Fixture Boundary
 

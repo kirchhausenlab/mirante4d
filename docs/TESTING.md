@@ -45,7 +45,7 @@ The generated selectors and Nextest configuration must match their registry:
 cargo xtask verification-sync --check
 ```
 
-The checkpoint inventory has 933 live tests: 893 normal public-CPU tests and 40
+The checkpoint inventory has 990 live tests: 950 normal public-CPU tests and 40
 ignored trusted-GPU tests. The old recursive aggregates, `verify-fast`, and
 target-directory `report-audit` are no longer live authorities in the
 checkpoint.
@@ -102,11 +102,12 @@ logs and evidence. Packaging or release changes use the packaged application.
 
 WP-06 is complete: its exact protected-main revision passed the real Vulkan
 viewer exercise at 1280x720 and 1920x1080 before
-`foundation-wp-06-exit-1` was created. The WP-07A candidate adds only pure,
-product-unreachable model code, so automated contract and architecture evidence
-is its proof class; acceptance still requires protected-main checks and the
-exit tag. WP-07B changes live state and must use its entry-stamped product-open
-scenario.
+`foundation-wp-06-exit-1` was created. WP-07A is accepted at
+`foundation-wp-07a-exit-1` (`5383cbb93c13c59e6f035bfa551356c75fb426dc`).
+The current WP-07B-A candidate adds four product-unreachable boundary crates,
+so automated contract and architecture evidence is its proof class; it still
+requires protected-main acceptance. WP-07B-B changes live state, must use its
+entry-stamped product-open scenario, and owns the package exit tag.
 
 The checked independent report supports only the WP-03 source-TIFF archive.
 Current schema-1 packages remain non-authoritative T2 support fixtures;

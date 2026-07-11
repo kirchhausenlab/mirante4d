@@ -1,0 +1,13 @@
+[package]
+name = "mirante4d-application"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mirante4d-domain.workspace = true
+mirante4d-identity.workspace = true
+mirante4d-project-model.workspace = true
+mirante4d-settings.workspace = true
