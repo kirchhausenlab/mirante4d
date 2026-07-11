@@ -1,18 +1,35 @@
-use std::{fs, path::Path, process::Stdio};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+    process::Stdio,
+};
 
 use anyhow::{Context, bail};
 use serde::Deserialize;
 
 const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const DEPENDENCY_EXCEPTIONS_DOC: &str = "docs/DEPENDENCY_EXCEPTIONS.md";
+const DENY_CONFIG: &str = "deny.toml";
+const PASTE_EXCEPTION_ID: &str = "EXC-PASTE-WP10A-1";
+const REVIEWED_PASTE_PARENTS: &[(&str, &str)] = &[
+    ("zarrs", "0.23.13"),
+    ("zarrs_data_type", "0.9.0"),
+    ("zarrs_plugin", "0.4.1"),
+];
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct CargoMetadata {
     pub(crate) packages: Vec<CargoMetadataPackage>,
+    #[serde(default)]
+    workspace_members: Vec<String>,
+    resolve: Option<CargoMetadataResolve>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct CargoMetadataPackage {
+    #[serde(default)]
+    id: String,
     pub(crate) name: String,
     pub(crate) version: String,
     source: Option<String>,
@@ -20,17 +37,43 @@ pub(crate) struct CargoMetadataPackage {
     pub(crate) license_file: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct CargoMetadataResolve {
+    nodes: Vec<CargoMetadataNode>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CargoMetadataNode {
+    id: String,
+    deps: Vec<CargoMetadataNodeDependency>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CargoMetadataNodeDependency {
+    pkg: String,
+}
+
 pub(crate) fn verify_deps() -> anyhow::Result<()> {
-    let metadata = cargo_metadata()?;
+    let metadata = cargo_metadata_all_features()?;
     check_package_source_policy(&metadata)?;
     check_package_license_policy(&metadata)?;
     ensure_dependency_exceptions_doc()?;
+    check_paste_exception_inclusion_graph(&metadata)?;
     run_cargo_deny()
 }
 
 pub(crate) fn cargo_metadata() -> anyhow::Result<CargoMetadata> {
+    cargo_metadata_with_args(&[])
+}
+
+fn cargo_metadata_all_features() -> anyhow::Result<CargoMetadata> {
+    cargo_metadata_with_args(&["--all-features"])
+}
+
+fn cargo_metadata_with_args(extra_args: &[&str]) -> anyhow::Result<CargoMetadata> {
     let output = crate::process::cargo_command()
         .args(["metadata", "--format-version", "1", "--locked"])
+        .args(extra_args)
         .output()
         .context("failed to run cargo metadata")?;
     if !output.status.success() {
@@ -151,13 +194,216 @@ fn ensure_dependency_exceptions_doc() -> anyhow::Result<()> {
         "MPL-2.0",
         "paste",
         "RUSTSEC-2024-0436",
+        PASTE_EXCEPTION_ID,
+        "paste 1.0.15",
+        "zarrs 0.23.13",
+        "zarrs_data_type 0.9.0",
+        "zarrs_plugin 0.4.1",
+        "current schema-1",
+        "WP-10C",
+        "target storage to inherit the exception",
+        "every Zarr dependency update",
     ];
     for needle in required {
         if !text.contains(needle) {
             bail!("{DEPENDENCY_EXCEPTIONS_DOC} must document dependency exception {needle:?}");
         }
     }
+    let deny =
+        fs::read_to_string(DENY_CONFIG).with_context(|| format!("failed to read {DENY_CONFIG}"))?;
+    for needle in [PASTE_EXCEPTION_ID, "RUSTSEC-2024-0436"] {
+        if !deny.contains(needle) {
+            bail!("{DENY_CONFIG} must bind dependency exception {needle:?}");
+        }
+    }
     Ok(())
+}
+
+fn check_paste_exception_inclusion_graph(metadata: &CargoMetadata) -> anyhow::Result<()> {
+    let resolve = metadata
+        .resolve
+        .as_ref()
+        .context("cargo metadata omitted the resolved dependency graph")?;
+    let packages = metadata
+        .packages
+        .iter()
+        .map(|package| (package.id.as_str(), package))
+        .collect::<BTreeMap<_, _>>();
+    let graph = resolve
+        .nodes
+        .iter()
+        .map(|node| {
+            (
+                node.id.as_str(),
+                node.deps
+                    .iter()
+                    .map(|dependency| dependency.pkg.as_str())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let paste = reviewed_crates_io_package(metadata, "paste", "1.0.15")?;
+    let paste_packages = metadata
+        .packages
+        .iter()
+        .filter(|package| package.name == "paste")
+        .count();
+    if paste_packages != 1 {
+        bail!("{PASTE_EXCEPTION_ID} expected exactly one paste package, found {paste_packages}");
+    }
+
+    let expected = REVIEWED_PASTE_PARENTS
+        .iter()
+        .map(|(name, version)| reviewed_crates_io_package(metadata, name, version))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let expected = expected
+        .iter()
+        .map(|package| package.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut actual = BTreeSet::new();
+    for node in &resolve.nodes {
+        if node
+            .deps
+            .iter()
+            .any(|dependency| dependency.pkg == paste.id)
+        {
+            actual.insert(node.id.as_str());
+        }
+    }
+    if actual != expected {
+        bail!(
+            "{PASTE_EXCEPTION_ID} direct-parent graph changed; reviewed={expected:?}, actual={actual:?}"
+        );
+    }
+
+    let bridges = ["mirante4d-data", "mirante4d-format"]
+        .map(|name| workspace_package(metadata, &packages, name))
+        .into_iter()
+        .collect::<anyhow::Result<BTreeSet<_>>>()?;
+    let no_blocks = BTreeSet::new();
+    for bridge in &bridges {
+        if !dependency_reachable(&graph, bridge, &paste.id, &no_blocks) {
+            bail!(
+                "{PASTE_EXCEPTION_ID} bridge {} no longer reaches paste",
+                package_label(packages[bridge])
+            );
+        }
+    }
+
+    for storage in metadata
+        .packages
+        .iter()
+        .filter(|package| package.name == "mirante4d-storage")
+    {
+        if dependency_reachable(&graph, &storage.id, &paste.id, &no_blocks) {
+            bail!(
+                "{PASTE_EXCEPTION_ID} cannot be inherited by target storage: {} reaches paste",
+                package_label(storage)
+            );
+        }
+    }
+
+    let mut bypasses = Vec::new();
+    for member in &metadata.workspace_members {
+        if bridges.contains(member.as_str()) {
+            continue;
+        }
+        if dependency_reachable(&graph, member, &paste.id, &bridges) {
+            let package = packages.get(member.as_str()).with_context(|| {
+                format!("cargo metadata omitted workspace package record for {member}")
+            })?;
+            bypasses.push(package_label(package));
+        }
+    }
+    if bypasses.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "{PASTE_EXCEPTION_ID} workspace paths bypass mirante4d-data/mirante4d-format: {}",
+            bypasses.join(", ")
+        )
+    }
+}
+
+fn reviewed_crates_io_package<'a>(
+    metadata: &'a CargoMetadata,
+    name: &str,
+    version: &str,
+) -> anyhow::Result<&'a CargoMetadataPackage> {
+    let matches = metadata
+        .packages
+        .iter()
+        .filter(|package| {
+            package.name == name
+                && package.version == version
+                && package.source.as_deref() == Some(CRATES_IO_SOURCE)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [package] => Ok(package),
+        _ => bail!(
+            "{PASTE_EXCEPTION_ID} expected exactly one crates.io {name} {version} package, found {}",
+            matches.len()
+        ),
+    }
+}
+
+fn workspace_package<'a>(
+    metadata: &'a CargoMetadata,
+    packages: &BTreeMap<&str, &'a CargoMetadataPackage>,
+    name: &str,
+) -> anyhow::Result<&'a str> {
+    let matches = metadata
+        .workspace_members
+        .iter()
+        .filter(|member| {
+            packages
+                .get(member.as_str())
+                .is_some_and(|package| package.name == name)
+        })
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [package] => Ok(package),
+        _ => bail!(
+            "{PASTE_EXCEPTION_ID} expected exactly one {name} workspace package, found {}",
+            matches.len()
+        ),
+    }
+}
+
+fn dependency_reachable<'a>(
+    graph: &BTreeMap<&'a str, Vec<&'a str>>,
+    start: &'a str,
+    target: &str,
+    blocked: &BTreeSet<&str>,
+) -> bool {
+    let mut pending = vec![start];
+    let mut visited = BTreeSet::new();
+    while let Some(package) = pending.pop() {
+        if !visited.insert(package) {
+            continue;
+        }
+        if package == target {
+            return true;
+        }
+        if package != start && blocked.contains(package) {
+            continue;
+        }
+        if let Some(dependencies) = graph.get(package) {
+            pending.extend(dependencies.iter().copied());
+        }
+    }
+    false
+}
+
+fn package_label(package: &CargoMetadataPackage) -> String {
+    let proc_macro = if package.name == "paste" {
+        " (proc-macro)"
+    } else {
+        ""
+    };
+    format!("{} v{}{}", package.name, package.version, proc_macro)
 }
 
 fn run_cargo_deny() -> anyhow::Result<()> {
@@ -236,6 +482,7 @@ mod tests {
         let metadata = CargoMetadata {
             packages: vec![
                 CargoMetadataPackage {
+                    id: "local".to_owned(),
                     name: "local".to_owned(),
                     version: "0.1.0".to_owned(),
                     source: None,
@@ -243,6 +490,7 @@ mod tests {
                     license_file: None,
                 },
                 CargoMetadataPackage {
+                    id: "external".to_owned(),
                     name: "external".to_owned(),
                     version: "1.0.0".to_owned(),
                     source: Some(CRATES_IO_SOURCE.to_owned()),
@@ -250,6 +498,8 @@ mod tests {
                     license_file: None,
                 },
             ],
+            workspace_members: Vec::new(),
+            resolve: None,
         };
 
         check_package_source_policy(&metadata).unwrap();
@@ -259,14 +509,145 @@ mod tests {
     fn source_policy_rejects_unknown_sources() {
         let metadata = CargoMetadata {
             packages: vec![CargoMetadataPackage {
+                id: "external".to_owned(),
                 name: "external".to_owned(),
                 version: "1.0.0".to_owned(),
                 source: Some("git+https://example.invalid/repo".to_owned()),
                 license: Some("MIT".to_owned()),
                 license_file: None,
             }],
+            workspace_members: Vec::new(),
+            resolve: None,
         };
 
         assert!(check_package_source_policy(&metadata).is_err());
+    }
+
+    #[test]
+    fn paste_exception_requires_exact_reviewed_inclusion_graph() {
+        let reviewed = reviewed_paste_metadata();
+        check_paste_exception_inclusion_graph(&reviewed).unwrap();
+
+        let mut extra_parent = reviewed.clone();
+        extra_parent
+            .packages
+            .push(test_package("extra", "unreviewed", "1.0.0"));
+        extra_parent
+            .resolve
+            .as_mut()
+            .unwrap()
+            .nodes
+            .push(test_node("extra", &["paste"]));
+        assert!(check_paste_exception_inclusion_graph(&extra_parent).is_err());
+
+        let mut alternate_paste = reviewed.clone();
+        alternate_paste
+            .packages
+            .push(test_package("paste-old", "paste", "1.0.14"));
+        alternate_paste
+            .resolve
+            .as_mut()
+            .unwrap()
+            .nodes
+            .push(test_node("paste-old", &[]));
+        assert!(check_paste_exception_inclusion_graph(&alternate_paste).is_err());
+
+        let mut unrelated_zarrs = reviewed.clone();
+        unrelated_zarrs
+            .packages
+            .push(test_package("zarrs-new", "zarrs", "0.24.0"));
+        unrelated_zarrs
+            .resolve
+            .as_mut()
+            .unwrap()
+            .nodes
+            .push(test_node("zarrs-new", &[]));
+        check_paste_exception_inclusion_graph(&unrelated_zarrs).unwrap();
+
+        let mut path_patched_parent = reviewed.clone();
+        path_patched_parent
+            .packages
+            .iter_mut()
+            .find(|package| package.name == "zarrs")
+            .unwrap()
+            .source = None;
+        assert!(check_paste_exception_inclusion_graph(&path_patched_parent).is_err());
+
+        let mut bypass = reviewed.clone();
+        bypass
+            .resolve
+            .as_mut()
+            .unwrap()
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "app")
+            .unwrap()
+            .deps
+            .push(CargoMetadataNodeDependency {
+                pkg: "zarrs".to_owned(),
+            });
+        assert!(check_paste_exception_inclusion_graph(&bypass).is_err());
+
+        let mut target_storage = reviewed;
+        target_storage.workspace_members.push("storage".to_owned());
+        target_storage
+            .packages
+            .push(test_package("storage", "mirante4d-storage", "0.1.0"));
+        target_storage
+            .resolve
+            .as_mut()
+            .unwrap()
+            .nodes
+            .push(test_node("storage", &["data"]));
+        assert!(check_paste_exception_inclusion_graph(&target_storage).is_err());
+    }
+
+    fn reviewed_paste_metadata() -> CargoMetadata {
+        CargoMetadata {
+            packages: vec![
+                test_package("paste", "paste", "1.0.15"),
+                test_package("zarrs", "zarrs", "0.23.13"),
+                test_package("zarrs-data-type", "zarrs_data_type", "0.9.0"),
+                test_package("zarrs-plugin", "zarrs_plugin", "0.4.1"),
+                test_package("data", "mirante4d-data", "0.1.0"),
+                test_package("format", "mirante4d-format", "0.1.0"),
+                test_package("app", "mirante4d-app", "0.1.0"),
+            ],
+            workspace_members: vec!["data".to_owned(), "format".to_owned(), "app".to_owned()],
+            resolve: Some(CargoMetadataResolve {
+                nodes: vec![
+                    test_node("paste", &[]),
+                    test_node("zarrs", &["paste"]),
+                    test_node("zarrs-data-type", &["paste"]),
+                    test_node("zarrs-plugin", &["paste"]),
+                    test_node("data", &["zarrs"]),
+                    test_node("format", &["zarrs"]),
+                    test_node("app", &["data", "format"]),
+                ],
+            }),
+        }
+    }
+
+    fn test_package(id: &str, name: &str, version: &str) -> CargoMetadataPackage {
+        CargoMetadataPackage {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            version: version.to_owned(),
+            source: (!name.starts_with("mirante4d-")).then(|| CRATES_IO_SOURCE.to_owned()),
+            license: Some("MIT".to_owned()),
+            license_file: None,
+        }
+    }
+
+    fn test_node(id: &str, dependencies: &[&str]) -> CargoMetadataNode {
+        CargoMetadataNode {
+            id: id.to_owned(),
+            deps: dependencies
+                .iter()
+                .map(|dependency| CargoMetadataNodeDependency {
+                    pkg: (*dependency).to_owned(),
+                })
+                .collect(),
+        }
     }
 }

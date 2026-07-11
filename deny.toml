@@ -2,8 +2,8 @@
 version = 2
 yanked = "deny"
 ignore = [
-    # Transitive through zarrs/zarrs_*; no safe upgrade exists yet.
-    # Owner/expiry are documented in docs/DEPENDENCY_EXCEPTIONS.md.
+    # EXC-PASTE-WP10A-1: exact current-schema1 Zarr bridge graph only.
+    # Reviewed inclusion and expiry are in docs/DEPENDENCY_EXCEPTIONS.md.
     "RUSTSEC-2024-0436",
 ]
 
