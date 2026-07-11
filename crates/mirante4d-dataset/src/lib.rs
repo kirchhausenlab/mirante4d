@@ -166,27 +166,55 @@ impl DatasetResourceKey {
     }
 }
 
-/// Dtype-neutral metadata for one decoded payload allocation.
+/// Effective validity representation for one semantic resource.
+///
+/// `AllValid` has no validity allocation. `BitMask` carries exactly one bit
+/// per sample in canonical `z,y,x` order, least-significant bit first within
+/// each byte. Unused high bits in the final byte must be zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResourceValidity {
+    AllValid,
+    BitMask,
+}
+
+/// Dtype-neutral metadata for one decoded payload reservation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResourcePayloadDescriptor {
     dtype: IntensityDType,
     shape: Shape3D,
+    validity: ResourceValidity,
     sample_count: u64,
+    value_byte_len: u64,
+    validity_byte_len: u64,
     byte_len: u64,
 }
 
 impl ResourcePayloadDescriptor {
-    pub fn new(dtype: IntensityDType, shape: Shape3D) -> Result<Self, ResourceContractError> {
+    pub fn new(
+        dtype: IntensityDType,
+        shape: Shape3D,
+        validity: ResourceValidity,
+    ) -> Result<Self, ResourceContractError> {
         let sample_count = shape
             .element_count()
             .map_err(|_| ResourceContractError::PayloadByteLengthOverflow)?;
-        let byte_len = sample_count
+        let value_byte_len = sample_count
             .checked_mul(u64::from(dtype.bytes_per_sample()))
+            .ok_or(ResourceContractError::PayloadByteLengthOverflow)?;
+        let validity_byte_len = match validity {
+            ResourceValidity::AllValid => 0,
+            ResourceValidity::BitMask => sample_count / 8 + u64::from(sample_count % 8 != 0),
+        };
+        let byte_len = value_byte_len
+            .checked_add(validity_byte_len)
             .ok_or(ResourceContractError::PayloadByteLengthOverflow)?;
         Ok(Self {
             dtype,
             shape,
+            validity,
             sample_count,
+            value_byte_len,
+            validity_byte_len,
             byte_len,
         })
     }
@@ -199,61 +227,114 @@ impl ResourcePayloadDescriptor {
         self.shape
     }
 
+    pub const fn validity(self) -> ResourceValidity {
+        self.validity
+    }
+
     pub const fn sample_count(self) -> u64 {
         self.sample_count
     }
 
+    pub const fn value_byte_len(self) -> u64 {
+        self.value_byte_len
+    }
+
+    pub const fn validity_byte_len(self) -> u64 {
+        self.validity_byte_len
+    }
+
+    /// Total reservation size: decoded values plus any validity bitmask.
     pub const fn byte_len(self) -> u64 {
         self.byte_len
     }
 
     pub fn view<'a>(
         self,
-        bytes: &'a [u8],
+        value_bytes: &'a [u8],
+        validity_bits: Option<&'a [u8]>,
     ) -> Result<ResourcePayloadView<'a>, ResourceContractError> {
-        ResourcePayloadView::from_descriptor(self, bytes)
+        ResourcePayloadView::from_descriptor(self, value_bytes, validity_bits)
     }
 }
 
-/// Immutable contiguous decoded samples in canonical little-endian `z,y,x`
-/// order.
+/// Immutable decoded samples and their explicit validity in canonical
+/// little-endian `z,y,x` order.
 ///
-/// The view borrows bytes from its owner and therefore cannot transfer or
-/// duplicate the allocation. `Uint8` is byte-order independent; multi-byte
-/// values use little-endian representation.
+/// The view borrows its value and optional validity allocations from its owner
+/// and therefore cannot transfer or duplicate either allocation. `Uint8` is
+/// byte-order independent; multi-byte values use little-endian representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourcePayloadView<'a> {
     descriptor: ResourcePayloadDescriptor,
-    bytes: &'a [u8],
+    value_bytes: &'a [u8],
+    validity_bits: Option<&'a [u8]>,
 }
 
 impl<'a> ResourcePayloadView<'a> {
-    pub fn expected_byte_len(
-        dtype: IntensityDType,
-        shape: Shape3D,
-    ) -> Result<u64, ResourceContractError> {
-        ResourcePayloadDescriptor::new(dtype, shape).map(ResourcePayloadDescriptor::byte_len)
-    }
-
     pub fn new(
         dtype: IntensityDType,
         shape: Shape3D,
-        bytes: &'a [u8],
+        validity: ResourceValidity,
+        value_bytes: &'a [u8],
+        validity_bits: Option<&'a [u8]>,
     ) -> Result<Self, ResourceContractError> {
-        ResourcePayloadDescriptor::new(dtype, shape)?.view(bytes)
+        ResourcePayloadDescriptor::new(dtype, shape, validity)?.view(value_bytes, validity_bits)
     }
 
     fn from_descriptor(
         descriptor: ResourcePayloadDescriptor,
-        bytes: &'a [u8],
+        value_bytes: &'a [u8],
+        validity_bits: Option<&'a [u8]>,
     ) -> Result<Self, ResourceContractError> {
-        let expected = descriptor.byte_len();
-        let actual = u64::try_from(bytes.len())
+        let expected = descriptor.value_byte_len();
+        let actual = u64::try_from(value_bytes.len())
             .map_err(|_| ResourceContractError::PayloadByteLengthOverflow)?;
         if actual != expected {
-            return Err(ResourceContractError::PayloadByteLengthMismatch { expected, actual });
+            return Err(ResourceContractError::PayloadValueByteLengthMismatch { expected, actual });
         }
-        Ok(Self { descriptor, bytes })
+
+        match (descriptor.validity(), validity_bits) {
+            (ResourceValidity::AllValid, None) => {}
+            (ResourceValidity::AllValid, Some(_)) => {
+                return Err(ResourceContractError::UnexpectedValidityBits);
+            }
+            (ResourceValidity::BitMask, None) => {
+                return Err(ResourceContractError::MissingValidityBits);
+            }
+            (ResourceValidity::BitMask, Some(bits)) => {
+                let expected = descriptor.validity_byte_len();
+                let actual = u64::try_from(bits.len())
+                    .map_err(|_| ResourceContractError::PayloadByteLengthOverflow)?;
+                if actual != expected {
+                    return Err(ResourceContractError::PayloadValidityByteLengthMismatch {
+                        expected,
+                        actual,
+                    });
+                }
+
+                let used_bits = u8::try_from(descriptor.sample_count() % 8)
+                    .expect("a remainder modulo eight fits in u8");
+                if used_bits != 0 {
+                    let used_mask = (1_u8 << used_bits) - 1;
+                    let last = bits
+                        .last()
+                        .copied()
+                        .expect("a nonzero sample count has a nonempty validity bitmask");
+                    if last & !used_mask != 0 {
+                        return Err(ResourceContractError::ValidityPaddingBitsNonZero {
+                            used_bits,
+                            final_byte: last,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            descriptor,
+            value_bytes,
+            validity_bits,
+        })
     }
 
     pub const fn descriptor(self) -> ResourcePayloadDescriptor {
@@ -268,20 +349,52 @@ impl<'a> ResourcePayloadView<'a> {
         self.descriptor.shape()
     }
 
-    pub const fn bytes(self) -> &'a [u8] {
-        self.bytes
+    pub const fn validity(self) -> ResourceValidity {
+        self.descriptor.validity()
+    }
+
+    pub const fn value_bytes(self) -> &'a [u8] {
+        self.value_bytes
+    }
+
+    pub const fn validity_bits(self) -> Option<&'a [u8]> {
+        self.validity_bits
     }
 
     pub const fn sample_count(self) -> u64 {
         self.descriptor.sample_count()
     }
 
-    pub fn byte_len(self) -> usize {
-        self.bytes.len()
+    pub const fn value_byte_len(self) -> u64 {
+        self.descriptor.value_byte_len()
     }
 
-    pub fn is_empty(self) -> bool {
-        self.bytes.is_empty()
+    pub const fn validity_byte_len(self) -> u64 {
+        self.descriptor.validity_byte_len()
+    }
+
+    pub const fn byte_len(self) -> u64 {
+        self.descriptor.byte_len()
+    }
+
+    /// Returns whether the sample at `index` is scientifically valid.
+    ///
+    /// Bitmask samples use least-significant-bit-first ordering within each
+    /// byte. The index is checked before the bitmask is accessed.
+    pub fn sample_is_valid(self, index: u64) -> Result<bool, ResourceContractError> {
+        if index >= self.sample_count() {
+            return Err(ResourceContractError::SampleIndexOutOfBounds {
+                index,
+                sample_count: self.sample_count(),
+            });
+        }
+        let Some(bits) = self.validity_bits else {
+            return Ok(true);
+        };
+        let byte_index = usize::try_from(index / 8)
+            .map_err(|_| ResourceContractError::PayloadByteLengthOverflow)?;
+        let bit_index = u8::try_from(index % 8).expect("a remainder modulo eight fits in u8");
+        Ok(bits[byte_index] & (1_u8 << bit_index) != 0)
     }
 }
 
@@ -365,9 +478,13 @@ pub trait ResourceLease: Send + Sync {
 /// A decoded-buffer reservation owned by the dataset runtime.
 ///
 /// A source receives this sink from its caller and writes sequential decoded
-/// bytes into the already-reserved capacity. Implementors must reject writes
-/// beyond `reserved_bytes`, writes after completion, incomplete completion,
-/// and cancellation. Storage never returns an owning decoded buffer.
+/// bytes into the already-reserved capacity. The layout is exactly
+/// `descriptor.value_byte_len()` canonical value bytes followed by
+/// `descriptor.validity_byte_len()` packed validity bytes; an all-valid
+/// descriptor therefore has no trailing validity bytes. Implementors must
+/// reject writes beyond `reserved_bytes`, writes after completion, incomplete
+/// completion, and cancellation. Storage never returns an owning decoded
+/// buffer.
 pub trait ReservedDecodeSink {
     fn resource_key(&self) -> DatasetResourceKey;
     fn payload_descriptor(&self) -> ResourcePayloadDescriptor;
@@ -375,6 +492,12 @@ pub trait ReservedDecodeSink {
         self.payload_descriptor().byte_len()
     }
     fn written_bytes(&self) -> u64;
+    /// Returns whether the caller has cancelled this exact reservation.
+    ///
+    /// Sources must checkpoint this before starting decode and throughout
+    /// every long read/decode stage; relying only on a rejected write is not a
+    /// cancellation checkpoint.
+    fn is_cancelled(&self) -> bool;
     fn write(&mut self, bytes: &[u8]) -> Result<(), DecodeSinkError>;
     fn finish(&mut self) -> Result<(), DecodeSinkError>;
     fn is_finished(&self) -> bool;
@@ -399,8 +522,20 @@ pub enum ResourceContractError {
     RegionEndOverflow { axis: usize },
     #[error("decoded payload byte length overflows")]
     PayloadByteLengthOverflow,
-    #[error("decoded payload has {actual} bytes; expected exactly {expected}")]
-    PayloadByteLengthMismatch { expected: u64, actual: u64 },
+    #[error("decoded value payload has {actual} bytes; expected exactly {expected}")]
+    PayloadValueByteLengthMismatch { expected: u64, actual: u64 },
+    #[error("an all-valid payload must not carry validity bits")]
+    UnexpectedValidityBits,
+    #[error("a bitmask-validity payload is missing its validity bits")]
+    MissingValidityBits,
+    #[error("validity bitmask has {actual} bytes; expected exactly {expected}")]
+    PayloadValidityByteLengthMismatch { expected: u64, actual: u64 },
+    #[error(
+        "validity bitmask final byte {final_byte:#04x} has nonzero padding above its {used_bits} used bits"
+    )]
+    ValidityPaddingBitsNonZero { used_bits: u8, final_byte: u8 },
+    #[error("sample index {index} is outside the payload's {sample_count} samples")]
+    SampleIndexOutOfBounds { index: u64, sample_count: u64 },
     #[error("decode reservation descriptor does not match the catalog resource")]
     PayloadDescriptorMismatch,
     #[error("the resource key belongs to a different source identity")]
@@ -446,6 +581,19 @@ pub enum DatasetSourceFault {
     UnsupportedResource { key: DatasetResourceKey },
     #[error("semantic resource decoding was cancelled")]
     Cancelled { key: DatasetResourceKey },
+    #[error("CPU capacity cannot satisfy the semantic resource reservation")]
+    CapacityExceeded {
+        key: DatasetResourceKey,
+        category: CpuLedgerCategory,
+        requested_bytes: u64,
+        available_bytes: u64,
+    },
+    #[error("the dataset resource authority is shutting down")]
+    ShuttingDown {
+        key: DatasetResourceKey,
+        category: CpuLedgerCategory,
+        requested_bytes: u64,
+    },
     #[error("semantic resource decoding failed")]
     DecodeFailed { key: DatasetResourceKey },
     #[error("decode sink rejected semantic resource: {reason}")]
@@ -504,14 +652,21 @@ pub struct DatasetScale {
     level: ScaleLevel,
     shape: Shape3D,
     grid_to_world: GridToWorld,
+    validity: ResourceValidity,
 }
 
 impl DatasetScale {
-    pub const fn new(level: ScaleLevel, shape: Shape3D, grid_to_world: GridToWorld) -> Self {
+    pub const fn new(
+        level: ScaleLevel,
+        shape: Shape3D,
+        grid_to_world: GridToWorld,
+        validity: ResourceValidity,
+    ) -> Self {
         Self {
             level,
             shape,
             grid_to_world,
+            validity,
         }
     }
 
@@ -525,6 +680,10 @@ impl DatasetScale {
 
     pub const fn grid_to_world(self) -> GridToWorld {
         self.grid_to_world
+    }
+
+    pub const fn validity(self) -> ResourceValidity {
+        self.validity
     }
 }
 
@@ -546,6 +705,7 @@ impl DatasetLayer {
         shape: Shape4D,
         dtype: IntensityDType,
         grid_to_world: GridToWorld,
+        validity: ResourceValidity,
     ) -> Result<Self, DatasetCatalogError> {
         Self::new_multiscale(
             key,
@@ -556,6 +716,7 @@ impl DatasetLayer {
                 ScaleLevel::BASE,
                 shape.spatial(),
                 grid_to_world,
+                validity,
             )],
         )
     }
@@ -641,6 +802,10 @@ impl DatasetLayer {
 
     pub fn scale(&self, level: ScaleLevel) -> Option<&DatasetScale> {
         self.scales.get(&level)
+    }
+
+    pub fn validity(&self, level: ScaleLevel) -> Option<ResourceValidity> {
+        self.scale(level).map(|scale| scale.validity())
     }
 
     pub fn scales(&self) -> impl ExactSizeIterator<Item = &DatasetScale> {
@@ -749,7 +914,22 @@ impl DatasetCatalog {
         key: DatasetResourceKey,
     ) -> Result<ResourcePayloadDescriptor, ResourceContractError> {
         let dtype = self.validate_resource_key(key)?;
-        ResourcePayloadDescriptor::new(dtype, key.region().shape())
+        let validity = self
+            .layer(key.layer())
+            .and_then(|layer| layer.validity(key.scale()))
+            .expect("resource-key validation proves the layer and scale exist");
+        ResourcePayloadDescriptor::new(dtype, key.region().shape(), validity)
+    }
+
+    pub fn resource_validity(
+        &self,
+        key: DatasetResourceKey,
+    ) -> Result<ResourceValidity, ResourceContractError> {
+        self.validate_resource_key(key)?;
+        Ok(self
+            .layer(key.layer())
+            .and_then(|layer| layer.validity(key.scale()))
+            .expect("resource-key validation proves the layer and scale exist"))
     }
 
     pub fn validate_decode_reservation(
@@ -833,6 +1013,7 @@ mod tests {
             Shape4D::new(3, 5, 7, 11).unwrap(),
             IntensityDType::Uint16,
             GridToWorld::scale(0.5, 0.75, 2.0).unwrap(),
+            ResourceValidity::AllValid,
         )
         .unwrap()
     }
@@ -913,6 +1094,10 @@ mod tests {
         assert_eq!(layer.shape().dimensions(), [3, 5, 7, 11]);
         assert_eq!(layer.dtype(), IntensityDType::Uint16);
         assert_eq!(
+            layer.validity(ScaleLevel::BASE),
+            Some(ResourceValidity::AllValid)
+        );
+        assert_eq!(
             layer.grid_to_world().row_major(),
             GridToWorld::scale(0.5, 0.75, 2.0).unwrap().row_major()
         );
@@ -945,6 +1130,7 @@ mod tests {
                 Shape4D::new(1, 1, 1, 1).unwrap(),
                 IntensityDType::Uint8,
                 GridToWorld::identity(),
+                ResourceValidity::AllValid,
             ),
             Err(DatasetCatalogError::LabelContainsControl {
                 kind: "layer label"
@@ -996,11 +1182,13 @@ mod tests {
                     ScaleLevel::BASE,
                     Shape3D::new(4, 6, 8).unwrap(),
                     GridToWorld::identity(),
+                    ResourceValidity::AllValid,
                 ),
                 DatasetScale::new(
                     ScaleLevel::new(1),
                     Shape3D::new(2, 3, 4).unwrap(),
                     GridToWorld::scale(2.0, 2.0, 2.0).unwrap(),
+                    ResourceValidity::BitMask,
                 ),
             ],
         )
@@ -1049,35 +1237,193 @@ mod tests {
     }
 
     #[test]
-    fn regions_and_payload_views_validate_bounds_without_scanning_payloads() {
+    fn resource_regions_reject_overflowing_exclusive_ends() {
         assert_eq!(
             ResourceRegion::new([0, 0, u64::MAX], Shape3D::new(1, 1, 2).unwrap(),),
             Err(ResourceContractError::RegionEndOverflow { axis: 2 })
         );
+    }
 
-        let bytes = [0_u8, 1, 2, 3];
-        let view = ResourcePayloadView::new(
+    #[test]
+    fn payload_descriptor_bounds_value_validity_and_total_bytes_exactly() {
+        let nine_samples = Shape3D::new(1, 1, 9).unwrap();
+        let all_valid = ResourcePayloadDescriptor::new(
             IntensityDType::Uint16,
-            Shape3D::new(1, 1, 2).unwrap(),
-            &bytes,
+            nine_samples,
+            ResourceValidity::AllValid,
         )
         .unwrap();
-        assert_eq!(view.dtype(), IntensityDType::Uint16);
-        assert_eq!(view.shape().dimensions(), [1, 1, 2]);
-        assert_eq!(view.sample_count(), 2);
-        assert_eq!(view.bytes().as_ptr(), bytes.as_ptr());
-        assert_eq!(view.byte_len(), 4);
-        assert!(!view.is_empty());
+        assert_eq!(all_valid.sample_count(), 9);
+        assert_eq!(all_valid.value_byte_len(), 18);
+        assert_eq!(all_valid.validity_byte_len(), 0);
+        assert_eq!(all_valid.byte_len(), 18);
+
+        let bitmask = ResourcePayloadDescriptor::new(
+            IntensityDType::Uint16,
+            nine_samples,
+            ResourceValidity::BitMask,
+        )
+        .unwrap();
+        assert_eq!(bitmask.value_byte_len(), 18);
+        assert_eq!(bitmask.validity_byte_len(), 2);
+        assert_eq!(bitmask.byte_len(), 20);
+
+        let eight_samples = ResourcePayloadDescriptor::new(
+            IntensityDType::Uint8,
+            Shape3D::new(1, 1, 8).unwrap(),
+            ResourceValidity::BitMask,
+        )
+        .unwrap();
+        assert_eq!(eight_samples.validity_byte_len(), 1);
+        assert_eq!(eight_samples.byte_len(), 9);
+
+        let maximum_samples = Shape3D::new(1, 1, u64::MAX).unwrap();
+        assert_eq!(
+            ResourcePayloadDescriptor::new(
+                IntensityDType::Uint16,
+                maximum_samples,
+                ResourceValidity::AllValid,
+            ),
+            Err(ResourceContractError::PayloadByteLengthOverflow)
+        );
+        assert_eq!(
+            ResourcePayloadDescriptor::new(
+                IntensityDType::Uint8,
+                maximum_samples,
+                ResourceValidity::BitMask,
+            ),
+            Err(ResourceContractError::PayloadByteLengthOverflow)
+        );
+    }
+
+    #[test]
+    fn all_valid_payload_keeps_valid_zero_and_rejects_any_mask() {
+        let values = [0_u8, 17];
+        let view = ResourcePayloadView::new(
+            IntensityDType::Uint8,
+            Shape3D::new(1, 1, 2).unwrap(),
+            ResourceValidity::AllValid,
+            &values,
+            None,
+        )
+        .unwrap();
+        assert_eq!(view.dtype(), IntensityDType::Uint8);
+        assert_eq!(view.validity(), ResourceValidity::AllValid);
+        assert_eq!(view.value_bytes().as_ptr(), values.as_ptr());
+        assert_eq!(view.validity_bits(), None);
+        assert_eq!(view.value_byte_len(), 2);
+        assert_eq!(view.validity_byte_len(), 0);
+        assert_eq!(view.byte_len(), 2);
+        assert_eq!(view.sample_is_valid(0), Ok(true));
+        assert_eq!(values[0], 0, "a valid zero remains scientific data");
+        assert_eq!(view.sample_is_valid(1), Ok(true));
+        assert_eq!(
+            view.sample_is_valid(2),
+            Err(ResourceContractError::SampleIndexOutOfBounds {
+                index: 2,
+                sample_count: 2,
+            })
+        );
 
         assert_eq!(
             ResourcePayloadView::new(
-                IntensityDType::Uint16,
+                IntensityDType::Uint8,
                 Shape3D::new(1, 1, 2).unwrap(),
-                &bytes[..3],
+                ResourceValidity::AllValid,
+                &values,
+                Some(&[]),
             ),
-            Err(ResourceContractError::PayloadByteLengthMismatch {
-                expected: 4,
-                actual: 3,
+            Err(ResourceContractError::UnexpectedValidityBits)
+        );
+    }
+
+    #[test]
+    fn bitmask_payload_supports_mixed_and_all_invalid_samples_lsb_first() {
+        let values = [0_u8; 9];
+        let mixed_bits = [0b1000_0101, 0b0000_0001];
+        let mixed = ResourcePayloadView::new(
+            IntensityDType::Uint8,
+            Shape3D::new(1, 1, 9).unwrap(),
+            ResourceValidity::BitMask,
+            &values,
+            Some(&mixed_bits),
+        )
+        .unwrap();
+        assert_eq!(mixed.validity_bits(), Some(mixed_bits.as_slice()));
+        assert_eq!(mixed.value_byte_len(), 9);
+        assert_eq!(mixed.validity_byte_len(), 2);
+        assert_eq!(mixed.byte_len(), 11);
+        assert_eq!(mixed.sample_is_valid(0), Ok(true));
+        assert_eq!(values[0], 0, "the explicitly valid sample may be zero");
+        assert_eq!(mixed.sample_is_valid(1), Ok(false));
+        assert_eq!(mixed.sample_is_valid(2), Ok(true));
+        assert_eq!(mixed.sample_is_valid(7), Ok(true));
+        assert_eq!(mixed.sample_is_valid(8), Ok(true));
+
+        let all_invalid_bits = [0_u8; 2];
+        let all_invalid = ResourcePayloadView::new(
+            IntensityDType::Uint8,
+            Shape3D::new(1, 1, 9).unwrap(),
+            ResourceValidity::BitMask,
+            &values,
+            Some(&all_invalid_bits),
+        )
+        .unwrap();
+        assert!((0..9).all(|index| all_invalid.sample_is_valid(index) == Ok(false)));
+    }
+
+    #[test]
+    fn payload_view_rejects_noncanonical_masks_and_inexact_lengths() {
+        let shape = Shape3D::new(1, 1, 10).unwrap();
+        let values = [0_u8; 10];
+
+        assert_eq!(
+            ResourcePayloadView::new(
+                IntensityDType::Uint8,
+                shape,
+                ResourceValidity::BitMask,
+                &values,
+                Some(&[0, 0b0000_0100]),
+            ),
+            Err(ResourceContractError::ValidityPaddingBitsNonZero {
+                used_bits: 2,
+                final_byte: 0b0000_0100,
+            })
+        );
+        assert_eq!(
+            ResourcePayloadView::new(
+                IntensityDType::Uint8,
+                shape,
+                ResourceValidity::BitMask,
+                &values,
+                None,
+            ),
+            Err(ResourceContractError::MissingValidityBits)
+        );
+        assert_eq!(
+            ResourcePayloadView::new(
+                IntensityDType::Uint8,
+                shape,
+                ResourceValidity::BitMask,
+                &values,
+                Some(&[0]),
+            ),
+            Err(ResourceContractError::PayloadValidityByteLengthMismatch {
+                expected: 2,
+                actual: 1,
+            })
+        );
+        assert_eq!(
+            ResourcePayloadView::new(
+                IntensityDType::Uint8,
+                shape,
+                ResourceValidity::BitMask,
+                &values[..9],
+                Some(&[0, 0]),
+            ),
+            Err(ResourceContractError::PayloadValueByteLengthMismatch {
+                expected: 10,
+                actual: 9,
             })
         );
     }
@@ -1092,6 +1438,15 @@ mod tests {
             Ok(IntensityDType::Uint16)
         );
         assert_eq!(
+            catalog.resource_validity(key),
+            Ok(ResourceValidity::BitMask)
+        );
+        let descriptor = catalog.resource_payload_descriptor(key).unwrap();
+        assert_eq!(descriptor.validity(), ResourceValidity::BitMask);
+        assert_eq!(descriptor.value_byte_len(), 4);
+        assert_eq!(descriptor.validity_byte_len(), 1);
+        assert_eq!(descriptor.byte_len(), 5);
+        assert_eq!(
             catalog
                 .layer(LogicalLayerKey::new(3))
                 .unwrap()
@@ -1099,6 +1454,18 @@ mod tests {
                 .map(|scale| scale.level())
                 .collect::<Vec<_>>(),
             vec![ScaleLevel::BASE, ScaleLevel::new(1)]
+        );
+
+        let base_key = DatasetResourceKey::new(
+            DatasetResourceIdentity::Verified(identity),
+            key.layer(),
+            key.timepoint(),
+            ScaleLevel::BASE,
+            key.region(),
+        );
+        assert_eq!(
+            catalog.resource_validity(base_key),
+            Ok(ResourceValidity::AllValid)
         );
 
         let wrong_identity = DatasetResourceKey::new(
@@ -1198,6 +1565,7 @@ mod tests {
                     ScaleLevel::new(1),
                     Shape3D::new(1, 1, 1).unwrap(),
                     GridToWorld::identity(),
+                    ResourceValidity::AllValid,
                 )],
             ),
             Err(DatasetCatalogError::MissingBaseScale)
@@ -1207,6 +1575,7 @@ mod tests {
             ScaleLevel::BASE,
             Shape3D::new(2, 2, 2).unwrap(),
             GridToWorld::identity(),
+            ResourceValidity::AllValid,
         );
         assert_eq!(
             DatasetLayer::new_multiscale(
@@ -1230,6 +1599,7 @@ mod tests {
                         ScaleLevel::new(1),
                         Shape3D::new(3, 2, 2).unwrap(),
                         GridToWorld::identity(),
+                        ResourceValidity::AllValid,
                     ),
                 ],
             ),
@@ -1242,6 +1612,7 @@ mod tests {
                     ScaleLevel::new(u32::try_from(level).unwrap()),
                     Shape3D::new(1, 1, 1).unwrap(),
                     GridToWorld::identity(),
+                    ResourceValidity::AllValid,
                 )
             })
             .collect();
@@ -1265,6 +1636,7 @@ mod tests {
         descriptor: ResourcePayloadDescriptor,
         bytes: Box<[u8]>,
         written: usize,
+        write_calls: usize,
         finished: bool,
         cancelled: bool,
     }
@@ -1277,9 +1649,21 @@ mod tests {
                 descriptor,
                 bytes: vec![0; byte_len].into_boxed_slice(),
                 written: 0,
+                write_calls: 0,
                 finished: false,
                 cancelled: false,
             }
+        }
+
+        fn payload_view(&self) -> Result<ResourcePayloadView<'_>, ResourceContractError> {
+            let value_end = usize::try_from(self.descriptor.value_byte_len())
+                .expect("the test reservation fits in addressable memory");
+            let (value_bytes, validity_bytes) = self.bytes.split_at(value_end);
+            let validity_bits = match self.descriptor.validity() {
+                ResourceValidity::AllValid => None,
+                ResourceValidity::BitMask => Some(validity_bytes),
+            };
+            self.descriptor.view(value_bytes, validity_bits)
         }
     }
 
@@ -1296,7 +1680,12 @@ mod tests {
             u64::try_from(self.written).unwrap()
         }
 
+        fn is_cancelled(&self) -> bool {
+            self.cancelled
+        }
+
         fn write(&mut self, bytes: &[u8]) -> Result<(), DecodeSinkError> {
+            self.write_calls += 1;
             if self.cancelled {
                 return Err(DecodeSinkError::Cancelled);
             }
@@ -1366,6 +1755,9 @@ mod tests {
 
         fn decode_into(&self, sink: &mut dyn ReservedDecodeSink) -> Result<(), DatasetSourceFault> {
             let key = sink.resource_key();
+            if sink.is_cancelled() {
+                return Err(DatasetSourceFault::Cancelled { key });
+            }
             self.catalog
                 .validate_decode_reservation(sink)
                 .map_err(|reason| DatasetSourceFault::InvalidResource {
@@ -1377,7 +1769,13 @@ mod tests {
                 .get(&key)
                 .ok_or(DatasetSourceFault::ResourceUnavailable { key })?;
             for part in bytes.chunks(3) {
+                if sink.is_cancelled() {
+                    return Err(DatasetSourceFault::Cancelled { key });
+                }
                 sink.write(part).map_err(|reason| sink_fault(key, reason))?;
+            }
+            if sink.is_cancelled() {
+                return Err(DatasetSourceFault::Cancelled { key });
             }
             sink.finish().map_err(|reason| sink_fault(key, reason))
         }
@@ -1395,6 +1793,9 @@ mod tests {
 
         fn decode_into(&self, sink: &mut dyn ReservedDecodeSink) -> Result<(), DatasetSourceFault> {
             let key = sink.resource_key();
+            if sink.is_cancelled() {
+                return Err(DatasetSourceFault::Cancelled { key });
+            }
             let descriptor = self
                 .catalog
                 .validate_decode_reservation(sink)
@@ -1402,9 +1803,12 @@ mod tests {
                     key,
                     reason: Box::new(reason),
                 })?;
-            let mut remaining = descriptor.byte_len();
+            let mut remaining = descriptor.value_byte_len();
             let block = [self.fill; 64];
             while remaining > 0 {
+                if sink.is_cancelled() {
+                    return Err(DatasetSourceFault::Cancelled { key });
+                }
                 let count = usize::try_from(remaining.min(block.len() as u64))
                     .map_err(|_| DatasetSourceFault::DecodeFailed { key })?;
                 sink.write(&block[..count])
@@ -1412,18 +1816,50 @@ mod tests {
                 remaining -=
                     u64::try_from(count).map_err(|_| DatasetSourceFault::DecodeFailed { key })?;
             }
+
+            let mut remaining = descriptor.validity_byte_len();
+            let full_block = [u8::MAX; 64];
+            while remaining > 0 {
+                if sink.is_cancelled() {
+                    return Err(DatasetSourceFault::Cancelled { key });
+                }
+                let count = usize::try_from(remaining.min(full_block.len() as u64))
+                    .map_err(|_| DatasetSourceFault::DecodeFailed { key })?;
+                let is_final_write = remaining == u64::try_from(count).unwrap();
+                if is_final_write && descriptor.sample_count() % 8 != 0 {
+                    let mut final_block = [u8::MAX; 64];
+                    let used_bits = u8::try_from(descriptor.sample_count() % 8)
+                        .expect("a remainder modulo eight fits in u8");
+                    final_block[count - 1] = (1_u8 << used_bits) - 1;
+                    sink.write(&final_block[..count])
+                        .map_err(|reason| sink_fault(key, reason))?;
+                } else {
+                    sink.write(&full_block[..count])
+                        .map_err(|reason| sink_fault(key, reason))?;
+                }
+                remaining -=
+                    u64::try_from(count).map_err(|_| DatasetSourceFault::DecodeFailed { key })?;
+            }
+            if sink.is_cancelled() {
+                return Err(DatasetSourceFault::Cancelled { key });
+            }
             sink.finish().map_err(|reason| sink_fault(key, reason))
         }
     }
 
-    fn decode_from(source: &dyn DatasetSource, key: DatasetResourceKey) -> Vec<u8> {
+    fn decode_from(
+        source: &dyn DatasetSource,
+        key: DatasetResourceKey,
+    ) -> (ResourcePayloadDescriptor, Vec<u8>) {
         let catalog = source.catalog().unwrap();
         let descriptor = catalog.resource_payload_descriptor(key).unwrap();
         let mut sink = TestSink::new(key, descriptor);
         source.decode_into(&mut sink).unwrap();
         assert!(sink.is_finished());
         assert_eq!(sink.written_bytes(), sink.reserved_bytes());
-        sink.bytes.into_vec()
+        let view = sink.payload_view().unwrap();
+        assert_eq!(view.descriptor(), descriptor);
+        (descriptor, sink.bytes.into_vec())
     }
 
     #[test]
@@ -1433,12 +1869,18 @@ mod tests {
         let key = resource_key(identity);
         let table = TableSource {
             catalog: Arc::clone(&catalog),
-            resources: BTreeMap::from([(key, Arc::from([10_u8, 11, 12, 13]))]),
+            resources: BTreeMap::from([(key, Arc::from([10_u8, 11, 12, 13, 0b0000_0011]))]),
         };
         let formula = FormulaSource { catalog, fill: 7 };
 
-        assert_eq!(decode_from(&table, key), vec![10, 11, 12, 13]);
-        assert_eq!(decode_from(&formula, key), vec![7, 7, 7, 7]);
+        let (table_descriptor, table_bytes) = decode_from(&table, key);
+        assert_eq!(table_descriptor.value_byte_len(), 4);
+        assert_eq!(table_descriptor.validity_byte_len(), 1);
+        assert_eq!(table_bytes, vec![10, 11, 12, 13, 0b0000_0011]);
+
+        let (formula_descriptor, formula_bytes) = decode_from(&formula, key);
+        assert_eq!(formula_descriptor, table_descriptor);
+        assert_eq!(formula_bytes, vec![7, 7, 7, 7, 0b0000_0011]);
     }
 
     #[test]
@@ -1463,7 +1905,7 @@ mod tests {
         );
         let source = FormulaSource { catalog, fill: 9 };
 
-        assert_eq!(decode_from(&source, key), vec![9, 9, 9, 9]);
+        assert_eq!(decode_from(&source, key).1, vec![9, 9, 9, 9, 0b0000_0011]);
     }
 
     #[test]
@@ -1475,8 +1917,12 @@ mod tests {
             catalog: Arc::clone(&catalog),
             resources: BTreeMap::new(),
         };
-        let wrong_descriptor =
-            ResourcePayloadDescriptor::new(IntensityDType::Uint8, key.region().shape()).unwrap();
+        let wrong_descriptor = ResourcePayloadDescriptor::new(
+            IntensityDType::Uint8,
+            key.region().shape(),
+            ResourceValidity::BitMask,
+        )
+        .unwrap();
         let mut mismatched = TestSink::new(key, wrong_descriptor);
         assert_eq!(
             source.decode_into(&mut mismatched),
@@ -1496,22 +1942,67 @@ mod tests {
         assert_eq!(safe_message, "semantic resource is unavailable");
         assert!(!safe_message.contains(&identity.to_string()));
 
+        let capacity = DatasetSourceFault::CapacityExceeded {
+            key,
+            category: CpuLedgerCategory::InFlightDecode,
+            requested_bytes: 5,
+            available_bytes: 4,
+        };
         assert_eq!(
-            sink.write(&[0; 5]),
+            capacity,
+            DatasetSourceFault::CapacityExceeded {
+                key,
+                category: CpuLedgerCategory::InFlightDecode,
+                requested_bytes: 5,
+                available_bytes: 4,
+            }
+        );
+        assert!(!capacity.to_string().contains(&identity.to_string()));
+        let shutdown = DatasetSourceFault::ShuttingDown {
+            key,
+            category: CpuLedgerCategory::InFlightDecode,
+            requested_bytes: 5,
+        };
+        assert!(!shutdown.to_string().contains(&identity.to_string()));
+
+        assert_eq!(
+            sink.write(&[0; 6]),
             Err(DecodeSinkError::ReservationExceeded {
-                reserved: 4,
-                attempted: 5,
+                reserved: 5,
+                attempted: 6,
             })
         );
         sink.write(&[0; 2]).unwrap();
         assert_eq!(
             sink.finish(),
             Err(DecodeSinkError::Incomplete {
-                reserved: 4,
+                reserved: 5,
                 written: 2,
             })
         );
         sink.cancelled = true;
         assert_eq!(sink.write(&[0]), Err(DecodeSinkError::Cancelled));
+    }
+
+    #[test]
+    fn source_checks_cancellation_before_reading_or_writing() {
+        let identity = scientific_id('7');
+        let catalog = multiscale_catalog(identity);
+        let key = resource_key(identity);
+        let source = TableSource {
+            catalog: Arc::clone(&catalog),
+            resources: BTreeMap::from([(key, Arc::from([1_u8, 2, 3, 4, 0b0000_0011]))]),
+        };
+        let descriptor = catalog.resource_payload_descriptor(key).unwrap();
+        let mut sink = TestSink::new(key, descriptor);
+        sink.cancelled = true;
+
+        assert_eq!(
+            source.decode_into(&mut sink),
+            Err(DatasetSourceFault::Cancelled { key })
+        );
+        assert_eq!(sink.write_calls, 0);
+        assert_eq!(sink.written_bytes(), 0);
+        assert!(!sink.is_finished());
     }
 }

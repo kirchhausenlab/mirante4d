@@ -425,6 +425,7 @@ mod tests {
                     Shape4D::new(1, 1, 1, 1).unwrap(),
                     IntensityDType::Uint16,
                     GridToWorld::identity(),
+                    mirante4d_dataset::ResourceValidity::AllValid,
                 )
                 .unwrap(),
             ],

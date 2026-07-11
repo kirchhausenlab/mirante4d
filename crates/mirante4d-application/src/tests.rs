@@ -1645,6 +1645,7 @@ fn dataset_layer(ordinal: u32, timepoints: u64) -> DatasetLayer {
         Shape4D::new(timepoints, 5, 7, 11).unwrap(),
         IntensityDType::Uint16,
         GridToWorld::identity(),
+        mirante4d_dataset::ResourceValidity::AllValid,
     )
     .unwrap()
 }

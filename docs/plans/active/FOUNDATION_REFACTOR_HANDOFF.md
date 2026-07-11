@@ -5,9 +5,9 @@ Last reviewed: 2026-07-11
 Current technical sequence: WP-08A through WP-15
 Public-data publication: deferred to a separate future handoff
 WP-08A predecessor: `foundation-wp-07b-exit-1`
-Completed through: WP-07B live cutover and exit acceptance
-Current checkpoint: WP-08A subsystem contract and ownership freeze
-Next checkpoint: WP-08A exit acceptance, then WP-08B unified dataset runtime
+Completed through: WP-08A exit 1 at `foundation-wp-08a-exit-1`
+Current checkpoint: narrow WP-08A contract correction and exit 2
+Next checkpoint: WP-08B unified dataset runtime
 
 ## Purpose
 
@@ -172,6 +172,12 @@ tag was accepted. WP-07A is complete at
 and exact-revision exit acceptance at
 `61cd39263d5f663d9af3fc75fa63ef054c3f4540`
 (`foundation-wp-07b-exit-1`).
+WP-08A exit 1 was accepted at
+`f1692d985730779e03b1d8cdd9806eec637e585e`
+(`foundation-wp-08a-exit-1`). Before WP-08B, the contract was reopened for one
+corrective exit covering effective validity, scoped cancellation, runtime-owned
+request IDs, bounded configuration/diagnostics/progress, and future worker
+ownership. Exit 1 remains immutable.
 
 ## Dataset And Fixture Boundary
 

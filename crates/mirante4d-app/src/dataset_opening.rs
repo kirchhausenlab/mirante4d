@@ -5,7 +5,9 @@ use mirante4d_application::UnboundWorkspace;
 use mirante4d_data::{
     DataRuntimeConfig, DatasetHandle, DenseVolumeF32, DenseVolumeU8, DenseVolumeU16,
 };
-use mirante4d_dataset::{DatasetCatalog, DatasetLayer, DatasetSourceId, ScientificIdentityStatus};
+use mirante4d_dataset::{
+    DatasetCatalog, DatasetLayer, DatasetSourceId, ResourceValidity, ScientificIdentityStatus,
+};
 use mirante4d_domain::{
     CameraView, CrossSectionView, GridToWorld, IntensityDType, IsoLightState, LayerTransfer,
     LogicalLayerKey, RenderMode as CanonicalRenderMode, RenderState, RgbColor, SamplingPolicy,
@@ -334,12 +336,25 @@ fn open_dataset_with_resource_policy_and_overrides(
             LayerId::new(layer.id.clone()).expect("dataset validation rejects invalid layer ids");
         let layer_key = LogicalLayerKey::new(u32::try_from(index)?);
         let grid_to_world = dataset.scale_grid_to_world(&physical_layer_id, 0)?;
+        let validity = if layer
+            .scales
+            .iter()
+            .find(|scale| scale.level == 0)
+            .expect("dataset validation requires the base scale")
+            .validity
+            .is_some()
+        {
+            ResourceValidity::BitMask
+        } else {
+            ResourceValidity::AllValid
+        };
         catalog_layers.push(DatasetLayer::new(
             layer_key,
             &layer.name,
             layer.shape,
             layer.dtype.stored,
             grid_to_world,
+            validity,
         )?);
         view_layers.push(LayerViewState::new(
             layer_key,

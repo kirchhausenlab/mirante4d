@@ -99,11 +99,15 @@ render work proceeds in parallel.
 Required contracts:
 
 - exact D-017 crate dependency and external side-effect ownership matrices;
-- resource keys, immutable payload views, and lease semantics;
+- resource keys, immutable value-plus-validity payload views, and lease
+  semantics;
 - runtime-reserved decode-buffer/sink semantics and the rule that only dataset
   runtime issues/accounts lease lifetimes while storage owns codecs;
 - byte-ledger categories and the sole owner of every large CPU/GPU allocation;
-- request priorities, cancellation generations, deduplication, and shutdown;
+- request priorities, scope-isolated cancellation generations, runtime-owned
+  request IDs, deduplication, and shutdown;
+- bounded runtime configuration, immutable diagnostics, and per-request
+  progress;
 - render intent, resource requirements, frame identity, and progressive
   coverage/completeness semantics;
 - opaque presentation-token registration/update/retirement across render-wgpu,

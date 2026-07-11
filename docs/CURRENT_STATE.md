@@ -40,11 +40,14 @@ WP-07A accepted the canonical domain, identity, and project model at
 at `61cd39263d5f663d9af3fc75fa63ef054c3f4540`, tagged
 `foundation-wp-07b-exit-1`.
 
-The current WP-08A candidate freezes semantic dataset/source/lease, unified
-runtime, progressive render, opaque presentation, dependency, side-effect,
-and resource-ledger contracts. These contracts are preparatory: the existing
-`CurrentDatasetRuntime`, reader, renderer, and egui-wgpu bridge remain the sole
-live product route until their later hard-cutover packages.
+WP-08A exit 1 was accepted at
+`f1692d985730779e03b1d8cdd9806eec637e585e`, tagged
+`foundation-wp-08a-exit-1`. Its preparatory contracts were then reopened for a
+narrow correction before WP-08B: payloads must preserve effective validity,
+cancellation generations must be scoped, and the runtime boundary must expose
+bounded configuration, diagnostics, and progress. No production runtime or
+product route changes in this correction. The existing `CurrentDatasetRuntime`,
+reader, renderer, and egui-wgpu bridge remain the sole live route.
 
 ## Current Verification Boundary
 

@@ -20,11 +20,12 @@ The workspace has fifteen crates:
   transient semantic state, operations, events, snapshots, and typed faults.
 - `mirante4d-settings`: closed settings document and bounded background I/O.
 - `mirante4d-dataset`: immutable multiscale catalog, semantic resource keys,
-  source/decode-sink boundary, payload views, lease contract, and the
-  dependency-inverted CPU byte-ledger admission interface.
+  source/decode-sink boundary, value-plus-validity payload views, lease
+  contract, and the dependency-inverted CPU byte-ledger admission interface.
 - `mirante4d-dataset-runtime`: preparatory unified request, cancellation,
-  deduplication, CPU-ledger, completion, fault, and accounted-lease contract;
-  the production scheduler arrives in WP-08B.
+  deduplication, bounded configuration/diagnostics/progress, CPU-ledger,
+  completion, fault, and accounted-lease contract; the production scheduler
+  and workers arrive in WP-08B.
 - `mirante4d-render-api`: backend-neutral intent, requirements, progressive
   frame status, opaque presentation lifecycle, and camera math.
 - `mirante4d-data`, `mirante4d-format`, `mirante4d-import`,
@@ -62,6 +63,9 @@ bridges, not permanent public APIs.
 
 WP-08A contracts do not create a second product implementation. The current
 runtime and renderer remain authoritative until WP-08B and WP-09B delete them.
+Payload validity is explicit, so a valid zero cannot be confused with missing
+data. Cancellation generations are ordered only within their scope; unrelated
+view, playback, analysis, and verification work cannot cancel each other.
 Unverified bootstrap reads use an opaque per-open source ID, never a fabricated
 scientific-content ID. Storage and import acquire CPU capacity through the
 dataset interface; only the dataset runtime may implement and issue those
