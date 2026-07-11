@@ -1,6 +1,6 @@
 # ADR-0009 — Freeze The Canonical Model Before Product Cutover
 
-Status: ACCEPTED DECISION; WP-07A CANDIDATE IMPLEMENTED, PROMOTION PENDING
+Status: ACCEPTED AND IMPLEMENTED BY WP-07A
 Accepted: 2026-07-11
 Last reviewed: 2026-07-11
 Owning package: WP-07A
@@ -62,11 +62,13 @@ exactly once in
 
 ## Consequences
 
-The three crates are real and tested, but deliberately unreachable from the
-current product. They do not create a second live model. WP-07B must switch the
-product to these authorities and delete predecessor durable mirrors in the same
-checkpoint; it may not add synchronization, a compatibility DTO, a re-export
-facade, or an index/name fallback.
+The three crates were accepted at
+`5383cbb93c13c59e6f035bfa551356c75fb426dc`
+(`foundation-wp-07a-exit-1`) and remain deliberately unreachable from the
+current product. They do not create a second live model. WP-07B-B must switch
+the product to these authorities and delete predecessor durable mirrors in the
+same checkpoint; it may not add synchronization, a compatibility DTO, a
+re-export facade, or an index/name fallback.
 
 Canonical preimage encoding, hashing, scientific-content verification,
 project-store wire DTOs, and I/O remain owned by their later packages. Strictly
@@ -81,8 +83,8 @@ parsing an identity string is not a T1 conformance claim.
   application fields.
 - Pure unit and fixed-seed property tests prove value validation, typed identity
   separation, ID-stable selection, project closure, and revision invariants.
-- WP-07B is a hard cutover. Product-open validation becomes mandatory there
-  because that package changes live state and interaction behavior.
+- WP-07B-B is the hard cutover. Product-open validation becomes mandatory
+  there because that checkpoint changes live state and interaction behavior.
 
 ## Owning Documents
 

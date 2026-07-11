@@ -2,14 +2,18 @@
 members = [
     "crates/mirante4d-analysis",
     "crates/mirante4d-app",
+    "crates/mirante4d-application",
     "crates/mirante4d-core",
     "crates/mirante4d-data",
+    "crates/mirante4d-dataset",
     "crates/mirante4d-domain",
     "crates/mirante4d-format",
     "crates/mirante4d-identity",
     "crates/mirante4d-import",
     "crates/mirante4d-project-model",
+    "crates/mirante4d-render-api",
     "crates/mirante4d-renderer",
+    "crates/mirante4d-settings",
     "crates/xtask",
 ]
 exclude = ["fuzz", "vendor/wayland-scanner"]
@@ -52,14 +56,18 @@ zarrs = { version = "0.23.13", default-features = false, features = ["crc32c", "
 
 mirante4d-app = { path = "crates/mirante4d-app" }
 mirante4d-analysis = { path = "crates/mirante4d-analysis" }
+mirante4d-application = { path = "crates/mirante4d-application" }
 mirante4d-core = { path = "crates/mirante4d-core" }
 mirante4d-data = { path = "crates/mirante4d-data" }
+mirante4d-dataset = { path = "crates/mirante4d-dataset" }
 mirante4d-domain = { path = "crates/mirante4d-domain" }
 mirante4d-format = { path = "crates/mirante4d-format" }
 mirante4d-identity = { path = "crates/mirante4d-identity" }
 mirante4d-import = { path = "crates/mirante4d-import" }
 mirante4d-project-model = { path = "crates/mirante4d-project-model" }
+mirante4d-render-api = { path = "crates/mirante4d-render-api" }
 mirante4d-renderer = { path = "crates/mirante4d-renderer" }
+mirante4d-settings = { path = "crates/mirante4d-settings" }
 
 [patch.crates-io]
 wayland-scanner = { path = "vendor/wayland-scanner" }

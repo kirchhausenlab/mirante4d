@@ -1,0 +1,163 @@
+{
+  "schema": "mirante4d-wp07b-boundary-contract",
+  "schema_version": 1,
+  "status": "candidate-unreachable",
+  "predecessor_tag": "foundation-wp-07a-exit-1",
+  "predecessor_revision": "5383cbb93c13c59e6f035bfa551356c75fb426dc",
+  "entry_sha256": "ee14dae5433626e19fa28d0bcc13cabfdbc259604845ee967c0404d978a27d15",
+  "entry_correction_sha256": "d4309d2cdd342c84d536f34de4bfa05013f46b6e009f7e37516c93f814067ac6",
+  "scope": {
+    "checkpoint": "WP07B-A-boundary-candidates",
+    "existing_product_reachable": false,
+    "product_behavior_changed": false,
+    "project_serialization_changed": false,
+    "settings_product_path_changed": false,
+    "core_deleted": false,
+    "live_cutover_gate": "WP07B-B-atomic-product-cutover"
+  },
+  "crate_contracts": [
+    {
+      "name": "mirante4d-application",
+      "path": "crates/mirante4d-application",
+      "authority": "Pure bounded application commands, reducer, events, snapshots, project revision/history movement, transient semantic selection, operation currentness, and typed faults",
+      "permitted_normal_mirante4d_dependencies": [
+        "mirante4d-domain",
+        "mirante4d-identity",
+        "mirante4d-project-model",
+        "mirante4d-settings"
+      ],
+      "permitted_normal_external_dependencies": [],
+      "permitted_dev_dependencies": [],
+      "permitted_external_side_effects": [],
+      "public_api": [
+        "ApplicationCommand",
+        "ApplicationCommandKind",
+        "ApplicationEvent",
+        "ApplicationFault",
+        "ApplicationFaultCode",
+        "ApplicationSnapshot",
+        "ApplicationState",
+        "CommandEffect",
+        "CrossSectionPanelId",
+        "CurrentnessGeneration",
+        "MAX_ACTIVE_OPERATIONS",
+        "MAX_HISTORY_ENTRIES",
+        "MAX_PENDING_EVENTS",
+        "OperationCompletion",
+        "OperationId",
+        "OperationKind",
+        "OperationOutcome",
+        "OperationToken",
+        "ResourcePolicyPersistenceOutcome",
+        "ResourcePolicyRejection",
+        "SettingsChangeId",
+        "SettingsChangeToken",
+        "SourceSessionGeneration",
+        "SourceVerificationSnapshot",
+        "TaskId",
+        "TransientApplicationState",
+        "UnboundWorkspace",
+        "WorkspaceSnapshot"
+      ]
+    },
+    {
+      "name": "mirante4d-dataset",
+      "path": "crates/mirante4d-dataset",
+      "authority": "Bounded immutable logical-layer catalog and explicit verified/unverified scientific identity status",
+      "permitted_normal_mirante4d_dependencies": [
+        "mirante4d-domain",
+        "mirante4d-identity"
+      ],
+      "permitted_normal_external_dependencies": [
+        "thiserror"
+      ],
+      "permitted_dev_dependencies": [],
+      "permitted_external_side_effects": [],
+      "public_api": [
+        "DatasetCatalog",
+        "DatasetCatalogError",
+        "DatasetLayer",
+        "MAX_DATASET_LABEL_BYTES",
+        "MAX_DATASET_LAYERS",
+        "MAX_LAYER_LABEL_BYTES",
+        "ScientificIdentityStatus"
+      ]
+    },
+    {
+      "name": "mirante4d-render-api",
+      "path": "crates/mirante4d-render-api",
+      "authority": "Narrow framework-neutral presentation viewport and canonical-camera projection math; broader render contracts remain WP-08A work",
+      "permitted_normal_mirante4d_dependencies": [
+        "mirante4d-domain"
+      ],
+      "permitted_normal_external_dependencies": [
+        "thiserror"
+      ],
+      "permitted_dev_dependencies": [],
+      "permitted_external_side_effects": [],
+      "public_api": [
+        "CameraAxes",
+        "CameraFrame",
+        "DEFAULT_PRESENTATION_VIEWPORT",
+        "PresentationViewport",
+        "RenderApiError",
+        "ViewRay"
+      ]
+    },
+    {
+      "name": "mirante4d-settings",
+      "path": "crates/mirante4d-settings",
+      "authority": "Closed validated two-ledger settings document, Linux path, bounded background load/write actor, and typed persistence outcomes",
+      "permitted_normal_mirante4d_dependencies": [],
+      "permitted_normal_external_dependencies": [
+        "serde",
+        "serde_json",
+        "thiserror"
+      ],
+      "permitted_dev_dependencies": [
+        "tempfile"
+      ],
+      "permitted_external_side_effects": [
+        "background_thread",
+        "clock",
+        "environment",
+        "filesystem"
+      ],
+      "public_api": [
+        "CurrentRuntimeResourcePolicy",
+        "DEFAULT_UNKNOWN_CPU_DATASET_BUDGET_BYTES",
+        "DEFAULT_UNKNOWN_GPU_BUDGET_BYTES",
+        "GIB",
+        "MAX_CPU_DATASET_BUDGET_BYTES",
+        "MAX_GPU_BUDGET_BYTES",
+        "MAX_SETTINGS_DOCUMENT_BYTES",
+        "MIN_CPU_DATASET_BUDGET_BYTES",
+        "MIN_GPU_BUDGET_BYTES",
+        "RejectedFileDisposition",
+        "ResourcePolicy",
+        "SETTINGS_IDENTITY",
+        "SETTINGS_SCHEMA",
+        "SETTINGS_SCHEMA_VERSION",
+        "SettingsActor",
+        "SettingsDocument",
+        "SettingsError",
+        "SettingsEvent",
+        "SettingsIoStage",
+        "SettingsLoadOutcome",
+        "SettingsRequestId",
+        "default_linux_settings_path",
+        "linux_settings_path"
+      ]
+    }
+  ],
+  "activation_invariants": [
+    "No existing product, test, benchmark, build, or tool target depends on any WP-07B boundary crate in checkpoint A.",
+    "The frozen WP-07A model APIs remain unchanged.",
+    "The application reducer owns no filesystem, thread, UI, renderer, runtime payload, or serialization authority.",
+    "The dataset and render-api candidates own no storage, scheduling, cache, lease, backend, or UI behavior.",
+    "Settings is the only checkpoint-A boundary allowed external side effects, and it remains unreachable from the product.",
+    "ScientificIdentityStatus is representational only at checkpoint A; application verification remains unavailable until the verifier-owned WP-08 admission route exists.",
+    "Product activation and predecessor deletion occur together only in WP07B-B."
+  ],
+  "unresolved_decisions": []
+}

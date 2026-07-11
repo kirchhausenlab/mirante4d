@@ -13,8 +13,9 @@ Mirante4D is a native Rust desktop viewer and analysis workbench. It opens
 strict `.m4d` dataset packages and `.m4dproj` project packages. Source
 microscopy data enters through explicit import/preprocessing workflows.
 
-The current workspace has eleven crates: seven on the live product path, one
-developer-automation crate, and three preparatory crates.
+The current workspace has fifteen crates: seven on the live product path, one
+developer-automation crate, three accepted canonical-model crates, and four
+unreachable WP-07B-A boundary candidates.
 
 - `mirante4d-app`: egui/wgpu workbench, application state, UI workflows, and
   product composition.
@@ -33,8 +34,7 @@ developer-automation crate, and three preparatory crates.
 - `xtask`: developer, verification, benchmark, packaging, and evidence tools;
   it is not a product mode.
 
-WP-07A adds three pure preparatory crates that no existing product crate can
-reach yet:
+WP-07A accepted three pure crates that no existing product crate reaches yet:
 
 - `mirante4d-domain`: validated framework-neutral scientific, geometry, view,
   transfer, render-intent, and tool values.
@@ -47,14 +47,33 @@ Their exact boundary is frozen in
 [`architecture/model-contract.json`](../architecture/model-contract.json), and
 the disposition of every current application field is frozen in
 [`architecture/current-state-field-ledger.json`](../architecture/current-state-field-ledger.json).
-WP-07B must make this model authoritative and delete the predecessor state in
-one hard cutover; WP-07A does not synchronize two live models.
+WP-07B-B must make this model authoritative and delete the predecessor state
+in one hard cutover; no checkpoint synchronizes two live models.
+
+The WP-07B-A candidate adds four real but still product-unreachable boundary
+crates:
+
+- `mirante4d-application`: typed commands, reducer transitions, revisions,
+  events, snapshots, operations, and faults;
+- `mirante4d-settings`: the closed settings-v1 model and bounded background
+  settings I/O owner;
+- `mirante4d-dataset`: bounded immutable logical-layer catalog and explicit
+  verified/unverified scientific-identity status; and
+- `mirante4d-render-api`: framework-neutral presentation viewport values and
+  canonical-camera projection math.
+
+Semantic resource keys, leases, render requirements, frame identity, coverage,
+and presentation lifecycle remain WP-08A contract work.
+
+These crates are candidates, not live authorities. The application still uses
+`AppState`, project-v14, preferences-v1, and `mirante4d-core`; viewer behavior
+and persistence are unchanged until the atomic WP-07B-B cutover.
 
 The application orchestrates its existing lower crates. Lower crates do not
 depend on the app/UI layer; the renderer does not read files; format code does
 not own viewer state; analysis reads dataset contracts rather than incidental
-renderer residency. Cargo policy additionally prevents the live product crates
-from depending on the preparatory model crates before WP-07B.
+renderer residency. Cargo policy prevents the live product crates from
+depending on the seven unreachable foundation crates before WP-07B-B.
 
 ## Current Runtime
 

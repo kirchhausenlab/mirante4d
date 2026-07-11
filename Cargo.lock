@@ -2359,6 +2359,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mirante4d-application"
+version = "0.1.0"
+dependencies = [
+ "mirante4d-domain",
+ "mirante4d-identity",
+ "mirante4d-project-model",
+ "mirante4d-settings",
+]
+
+[[package]]
 name = "mirante4d-core"
 version = "0.1.0"
 dependencies = [
@@ -2383,6 +2393,15 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "zarrs",
+]
+
+[[package]]
+name = "mirante4d-dataset"
+version = "0.1.0"
+dependencies = [
+ "mirante4d-domain",
+ "mirante4d-identity",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2440,6 +2459,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mirante4d-render-api"
+version = "0.1.0"
+dependencies = [
+ "mirante4d-domain",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "mirante4d-renderer"
 version = "0.1.0"
 dependencies = [
@@ -2453,6 +2480,16 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "wgpu",
+]
+
+[[package]]
+name = "mirante4d-settings"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

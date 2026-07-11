@@ -21,9 +21,10 @@ or public full microscopy dataset yet.
 - Linux release-directory, tarball, and AppImage build paths.
 - No segmentation or derived-label subsystem.
 
-The workspace has those eight live product/developer crates plus three pure,
-product-unreachable WP-07A model crates described in
-[architecture](ARCHITECTURE.md).
+The workspace has those eight live product/developer crates plus seven
+product-unreachable foundation crates described in
+[architecture](ARCHITECTURE.md): the three accepted WP-07A model crates and
+four WP-07B-A boundary candidates.
 
 ## Foundation Status
 
@@ -49,23 +50,24 @@ passed, with policy p95/max at 92/95 seconds and Rust critical-path p95/max at
 `PR / rust`. The exact protected-main revision also passed real product-open
 validation at 1280x720 and 1920x1080 before the exit tag was created.
 
-This revision implements the WP-07A canonical-model candidate: pure
-`mirante4d-domain`, `mirante4d-identity`, and `mirante4d-project-model` crates,
-a frozen model contract, and a machine-checked disposition for all 152 fields
-in the current application state. Existing product crates cannot depend on the
-new crates, so viewer behavior and live state authority are unchanged. WP-07A
-is not accepted until this candidate passes protected-main checks and receives
-the create-once `foundation-wp-07a-exit-1` tag. WP-07B owns the later atomic
-product cutover and predecessor deletion.
+WP-07A is complete at `5383cbb93c13c59e6f035bfa551356c75fb426dc`
+(`foundation-wp-07a-exit-1`). It accepted the pure `mirante4d-domain`,
+`mirante4d-identity`, and `mirante4d-project-model` crates, the frozen model
+contract, and the disposition of all 152 predecessor application fields.
+
+This revision implements the unreachable WP-07B-A candidate: real
+`mirante4d-application`, `mirante4d-settings`, `mirante4d-dataset`, and
+`mirante4d-render-api` boundary crates. Existing product crates cannot reach
+them. The candidate therefore changes no viewer behavior, live state,
+project/preferences persistence, settings path, or `mirante4d-core` authority.
+WP-07B-A is not accepted yet; WP-07B-B remains the atomic live cutover and
+predecessor-deletion checkpoint.
 
 ## Current Verification Boundary
 
-The current checkpoint discovers 933 live tests: 893 normal tests assigned once
-across the public CPU leaves and 40 ignored tests assigned to the trusted GPU
-lane. This includes 53 pure canonical-model tests plus two architecture/ledger
-enforcement tests. The six leaves are available through
-`cargo xtask verify-leaf`, while `cargo xtask verify-pr` runs the two public
-groups without recursive aggregate commands.
+The six WP-06 leaves remain available through `cargo xtask verify-leaf`, while
+`cargo xtask verify-pr` runs the two public groups without recursive aggregate
+commands. [Testing](TESTING.md) owns the current test inventory.
 
 On the protected repository, `PR / policy` and `PR / rust` are the only
 required pull-request contexts. Matching `Main / policy` and `Main / rust`
@@ -74,11 +76,11 @@ without caches or artifacts.
 
 ## Known Limitations
 
-- The canonical WP-07A model is intentionally not live in the product; the
-  current application god-state and experimental project-v14 DTO remain until
-  WP-07B deletes them in one hard cutover.
-- The WP-07A candidate still requires protected-main acceptance and its
-  create-once exit tag.
+- The accepted canonical model and the WP-07B-A boundary candidate remain
+  intentionally unreachable. The current application god-state,
+  project-v14/preferences persistence, and `mirante4d-core` remain live until
+  WP-07B-B deletes them in one hard cutover.
+- The WP-07B-A candidate still requires protected-main acceptance.
 - The package-capability lane remains pending because there is not yet an
   honest unsupported-GPU package command.
 - Typed WP-07A identities validate already-computed strings only. The committed

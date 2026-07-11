@@ -1619,6 +1619,462 @@
         "WP-07A-canonical-model"
       ],
       "reason": "WP-07A adds machine-enforced canonical-model and current-state ledger evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::a_second_save_is_rejected_until_the_active_save_finishes",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::all_project_io_and_attachment_are_identity_gated_before_verification",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::bound_noops_and_invalid_commands_do_not_advance_revision_or_high_water",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::exact_current_save_completion_marks_the_project_clean",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::operation_registry_and_event_queue_are_hard_bounded",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::project_open_rebinds_same_content_to_the_verified_reference_as_dirty",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::resource_policy_changes_are_pending_then_persisted_or_rejected_with_restart_intent",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::retained_history_is_bounded_without_rolling_back_high_water",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::save_completion_for_captured_revision_survives_a_later_edit_and_remains_dirty",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::selected_ids_are_normalized_after_removal_and_history_movement",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::snapshots_and_candidate_clones_share_project_history_storage",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::source_replacement_is_central_generation_guarded_and_resets_bound_transients",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::source_replacement_rejects_while_an_operation_is_active",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::source_verification_requires_the_exact_current_session_generation",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::stale_and_mismatched_completions_are_rejected_with_operation_context",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::transient_commands_never_dirty_or_advance_the_project_revision",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::unbound_view_changes_are_transient_and_invalid_or_noop_commands_are_atomic",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::unbound_workspace_rejects_a_preset_that_does_not_close_over_view_layers",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::undo_redo_and_branching_never_reuse_a_revision_sequence",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::unverified_analysis_and_import_operations_are_allowed_but_cannot_admit_artifacts",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::verified_analysis_artifact_admission_is_one_durable_revision",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::verified_attachment_creates_the_only_project_state_and_revision_authority",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::verified_project_open_restores_revision_and_rejects_another_scientific_identity",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable application reducer and state invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-dataset:tests::catalog_and_labels_are_bounded_before_collection",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable logical dataset boundary invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-dataset:tests::catalog_is_keyed_and_iterated_by_logical_layer_key",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable logical dataset boundary invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-dataset:tests::duplicate_human_labels_are_not_identity_but_duplicate_keys_reject",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable logical dataset boundary invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-dataset:tests::identity_status_cannot_confuse_unverified_catalogs_with_verified_content",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable logical dataset boundary invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-dataset:tests::layer_preserves_canonical_scientific_facts",
+      "kind": "libtest",
+      "owner": "mirante4d-dataset",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable logical dataset boundary invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-render-api:tests::canonical_identity_orientation_defines_expected_axes_and_eye",
+      "kind": "libtest",
+      "owner": "mirante4d-render-api",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable backend-neutral render boundary evidence."
+    },
+    {
+      "id": "libtest:mirante4d-render-api:tests::invalid_queries_and_nonfinite_results_fail_explicitly",
+      "kind": "libtest",
+      "owner": "mirante4d-render-api",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable backend-neutral render boundary evidence."
+    },
+    {
+      "id": "libtest:mirante4d-render-api:tests::orthographic_rays_are_parallel_with_screen_shifted_origins",
+      "kind": "libtest",
+      "owner": "mirante4d-render-api",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable backend-neutral render boundary evidence."
+    },
+    {
+      "id": "libtest:mirante4d-render-api:tests::perspective_rays_diverge_from_one_eye",
+      "kind": "libtest",
+      "owner": "mirante4d-render-api",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable backend-neutral render boundary evidence."
+    },
+    {
+      "id": "libtest:mirante4d-render-api:tests::presentation_viewport_rejects_nonpositive_or_nonfinite_dimensions",
+      "kind": "libtest",
+      "owner": "mirante4d-render-api",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable backend-neutral render boundary evidence."
+    },
+    {
+      "id": "libtest:mirante4d-render-api:tests::projection_measurements_use_canonical_view_values",
+      "kind": "libtest",
+      "owner": "mirante4d-render-api",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable backend-neutral render boundary evidence."
+    },
+    {
+      "id": "libtest:mirante4d-render-api:tests::render_pixel_centers_map_y_opposite_camera_up",
+      "kind": "libtest",
+      "owner": "mirante4d-render-api",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable backend-neutral render boundary evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::actor_never_inspects_or_changes_legacy_preferences_file",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::background_actor_loads_and_persists_with_restart_required_event",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::bounded_event_backpressure_cannot_deadlock_joined_shutdown",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::directory_sync_failure_after_replace_is_typed_as_commit_indeterminate",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::forced_commit_failure_preserves_prior_valid_file_and_cleans_its_temporary",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::known_gpu_below_the_explicit_minimum_is_rejected_not_silently_clamped",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::linux_path_uses_xdg_then_home_and_never_names_preferences",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::missing_and_invalid_files_keep_defaults_active_without_writing",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::oversized_file_is_rejected_without_reading_or_rewriting_it_unboundedly",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::recommended_policy_uses_the_approved_formulas",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::rejected_file_requires_explicit_replacement_and_preserves_bytes",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::resource_policy_enforces_exact_inclusive_bounds",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::settings_document_has_the_exact_closed_shape_and_round_trips",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::settings_document_rejects_unknown_fields_at_every_level",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::settings_document_rejects_wrong_identity_version_and_budgets",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::temporary_names_are_unique_and_created_in_the_target_directory",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::temporary_runtime_adapter_uses_the_frozen_percentages",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::unknown_field_file_is_rejected_and_preserved_byte_for_byte",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::valid_file_loads_without_rewriting_its_bytes",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::tests::wp07b_boundary_candidates_match_the_frozen_unreachable_contract",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds machine-enforced boundary ownership, dependency, API, and unreachability evidence."
+    },
+    {
+      "id": "libtest:mirante4d-settings:tests::file_that_becomes_invalid_after_startup_is_not_silently_overwritten",
+      "kind": "libtest",
+      "owner": "mirante4d-settings",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable settings policy and persistence invariant evidence."
+    },
+    {
+      "id": "libtest:mirante4d-render-api:tests::quarter_turn_camera_orientation_has_known_axes_and_eye",
+      "kind": "libtest",
+      "owner": "mirante4d-render-api",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-07B-A-boundary-candidates"],
+      "reason": "WP-07B-A adds product-unreachable backend-neutral render boundary evidence."
     }
   ],
   "expected_summary": {
@@ -1627,6 +2083,6 @@
     "moved": 57,
     "rewritten": 8,
     "deleted": 154,
-    "current_additions": 97
+    "current_additions": 154
   }
 }
