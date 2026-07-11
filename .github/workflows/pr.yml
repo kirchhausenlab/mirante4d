@@ -20,15 +20,18 @@ jobs:
     name: PR / policy
     runs-on: ubuntu-24.04
     timeout-minutes: 6
-    env:
-      CARGO_HOME: ${{ runner.temp }}/cargo-home-policy
-      CARGO_TARGET_DIR: ${{ runner.temp }}/target-policy
     steps:
       - name: Check out the candidate revision
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
           fetch-depth: 0
+
+      - name: Isolate Cargo state
+        shell: bash
+        run: |
+          echo "CARGO_HOME=${RUNNER_TEMP}/cargo-home-policy" >> "${GITHUB_ENV}"
+          echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/target-policy" >> "${GITHUB_ENV}"
 
       - name: Verify the pinned Rust manifest and compiler commits
         shell: bash
@@ -73,15 +76,18 @@ jobs:
     name: PR / rust
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    env:
-      CARGO_HOME: ${{ runner.temp }}/cargo-home-rust
-      CARGO_TARGET_DIR: ${{ runner.temp }}/target-rust
     steps:
       - name: Check out the candidate revision
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
           fetch-depth: 0
+
+      - name: Isolate Cargo state
+        shell: bash
+        run: |
+          echo "CARGO_HOME=${RUNNER_TEMP}/cargo-home-rust" >> "${GITHUB_ENV}"
+          echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/target-rust" >> "${GITHUB_ENV}"
 
       - name: Verify the pinned Rust manifest and compiler commits
         shell: bash
