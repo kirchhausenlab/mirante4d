@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -27,6 +27,8 @@ const FORBIDDEN_AXIS_ALIGNED_2D_CHUNK_PATTERNS: &[&str] = &[
     "SliceChunk",
     "SliceChunks",
 ];
+const ALLOWED_LOCAL_CARGO_OVERRIDES: &[(&str, &str)] =
+    &[("wayland-scanner", "vendor/wayland-scanner")];
 
 pub(crate) fn architecture_self_check() -> anyhow::Result<()> {
     let required = [
@@ -563,38 +565,19 @@ fn check_wp07a_model_contract(
         bail!("WP-07A crate dependency contracts do not match the frozen three-crate boundary");
     }
     let preparatory_crates = expected.keys().copied().collect::<BTreeSet<_>>();
-    let preparatory_package_ids = preparatory_crates
-        .iter()
-        .map(|name| {
-            workspace_metadata
-                .workspace_package_ids_by_name
-                .get(*name)
-                .cloned()
-                .with_context(|| format!("cargo metadata is missing WP-07A crate {name}"))
-        })
-        .collect::<anyhow::Result<BTreeSet<_>>>()?;
-    for (package, package_id) in &workspace_metadata.workspace_package_ids_by_name {
-        if preparatory_package_ids.contains(package_id) {
+    for (package, kinds) in &workspace_metadata.declared_dependency_kinds_by_name {
+        if preparatory_crates.contains(package.as_str()) {
             continue;
         }
-        if let Some(path) = dependency_path_to_any(
-            package_id,
-            &preparatory_package_ids,
-            &workspace_metadata.dependency_graph,
-        ) {
-            let path = path
-                .iter()
-                .map(|id| {
-                    workspace_metadata
-                        .package_names_by_id
-                        .get(id)
-                        .map(String::as_str)
-                        .unwrap_or("<unknown package>")
-                })
-                .collect::<Vec<_>>()
-                .join(" -> ");
+        let forbidden = kinds
+            .values()
+            .flatten()
+            .filter(|dependency| preparatory_crates.contains(dependency.as_str()))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if !forbidden.is_empty() {
             bail!(
-                "existing workspace package {package} reaches a WP-07A preparatory crate through the full Cargo dependency graph: {path}"
+                "existing workspace package {package} reaches WP-07A preparatory crates through some declared dependency kind or target: {forbidden:?}"
             );
         }
     }
@@ -660,14 +643,19 @@ fn json_string_set(
 struct WorkspaceDependencyMetadata {
     declared_dependency_kinds_by_name: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
     workspace_package_ids_by_name: BTreeMap<String, String>,
-    package_names_by_id: BTreeMap<String, String>,
-    dependency_graph: BTreeMap<String, BTreeSet<String>>,
     custom_build_package_ids: BTreeSet<String>,
 }
 
 fn workspace_dependency_metadata(repo_root: &Path) -> anyhow::Result<WorkspaceDependencyMetadata> {
+    validate_local_cargo_overrides(repo_root)?;
     let output = Command::new("cargo")
-        .args(["metadata", "--format-version=1", "--locked", "--offline"])
+        .args([
+            "metadata",
+            "--format-version=1",
+            "--no-deps",
+            "--locked",
+            "--offline",
+        ])
         .current_dir(repo_root)
         .output()
         .context("failed to run cargo metadata for WP-07A dependency contract")?;
@@ -679,6 +667,154 @@ fn workspace_dependency_metadata(repo_root: &Path) -> anyhow::Result<WorkspaceDe
     }
     let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     parse_workspace_dependency_metadata(&metadata)
+}
+
+fn validate_local_cargo_overrides(repo_root: &Path) -> anyhow::Result<()> {
+    validate_repository_cargo_config(repo_root)?;
+    let root_manifest_path = repo_root.join("Cargo.toml");
+    let root_manifest = fs::read_to_string(&root_manifest_path)
+        .with_context(|| format!("failed to read {}", root_manifest_path.display()))?;
+    let actual = local_cargo_override_paths(&root_manifest)?;
+    let expected = ALLOWED_LOCAL_CARGO_OVERRIDES
+        .iter()
+        .map(|(package, path)| ((*package).to_owned(), (*path).to_owned()))
+        .collect::<BTreeMap<_, _>>();
+    if actual != expected {
+        bail!("local Cargo patch/replace paths drifted: expected={expected:?}, actual={actual:?}");
+    }
+
+    for (package, relative_path) in actual {
+        let manifest_path = repo_root.join(&relative_path).join("Cargo.toml");
+        let override_manifest = fs::read_to_string(&manifest_path)
+            .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+        reject_nested_local_cargo_overrides(&override_manifest, &relative_path)?;
+        let output = Command::new("cargo")
+            .args([
+                "metadata",
+                "--manifest-path",
+                manifest_path
+                    .to_str()
+                    .context("local Cargo override manifest path is not UTF-8")?,
+                "--format-version=1",
+                "--no-deps",
+                "--locked",
+                "--offline",
+            ])
+            .current_dir(repo_root)
+            .output()
+            .with_context(|| format!("failed to inspect local Cargo override {relative_path}"))?;
+        if !output.status.success() {
+            bail!(
+                "cargo metadata failed for local Cargo override {relative_path}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let parsed = parse_workspace_dependency_metadata(&metadata)?;
+        if parsed.workspace_package_ids_by_name.len() != 1
+            || !parsed.workspace_package_ids_by_name.contains_key(&package)
+        {
+            bail!(
+                "local Cargo override {relative_path} must contain only the frozen package {package}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_repository_cargo_config(repo_root: &Path) -> anyhow::Result<()> {
+    for relative_path in [".cargo/config.toml", ".cargo/config"] {
+        let path = repo_root.join(relative_path);
+        if !path.exists() {
+            continue;
+        }
+        let source = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let config = source
+            .parse::<toml::Table>()
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        validate_repository_cargo_config_table(&config, relative_path)?;
+    }
+    Ok(())
+}
+
+fn validate_repository_cargo_config_table(
+    config: &toml::Table,
+    relative_path: &str,
+) -> anyhow::Result<()> {
+    if config.get("paths").is_some() {
+        bail!("{relative_path} must not define Cargo path overrides");
+    }
+    if config.get("patch").is_some() {
+        bail!("{relative_path} must not define Cargo patch overrides");
+    }
+    if let Some(sources) = config.get("source").and_then(toml::Value::as_table) {
+        for (name, specification) in sources {
+            let specification = specification
+                .as_table()
+                .context("Cargo source configuration must be a table")?;
+            let forbidden = ["replace-with", "local-registry", "directory"]
+                .into_iter()
+                .filter(|key| specification.contains_key(*key))
+                .collect::<Vec<_>>();
+            if !forbidden.is_empty() {
+                bail!(
+                    "{relative_path} source {name:?} defines forbidden replacement keys {forbidden:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_nested_local_cargo_overrides(manifest: &str, relative_path: &str) -> anyhow::Result<()> {
+    let nested = local_cargo_override_paths(manifest)?;
+    if nested.is_empty() {
+        Ok(())
+    } else {
+        bail!("local Cargo override {relative_path} defines nested local overrides: {nested:?}")
+    }
+}
+
+fn local_cargo_override_paths(manifest: &str) -> anyhow::Result<BTreeMap<String, String>> {
+    let manifest = manifest
+        .parse::<toml::Table>()
+        .context("failed to parse root Cargo.toml while checking local overrides")?;
+    let mut paths = BTreeMap::new();
+
+    if let Some(registries) = manifest.get("patch").and_then(toml::Value::as_table) {
+        for packages in registries.values() {
+            let packages = packages
+                .as_table()
+                .context("Cargo [patch] registry must be a table")?;
+            for (package, specification) in packages {
+                insert_local_cargo_override(&mut paths, package, specification)?;
+            }
+        }
+    }
+    if let Some(replacements) = manifest.get("replace").and_then(toml::Value::as_table) {
+        for (package, specification) in replacements {
+            insert_local_cargo_override(&mut paths, package, specification)?;
+        }
+    }
+    Ok(paths)
+}
+
+fn insert_local_cargo_override(
+    paths: &mut BTreeMap<String, String>,
+    package: &str,
+    specification: &toml::Value,
+) -> anyhow::Result<()> {
+    let Some(path) = specification.as_table().and_then(|table| table.get("path")) else {
+        return Ok(());
+    };
+    let path = path
+        .as_str()
+        .context("local Cargo patch/replace path must be a string")?;
+    if paths.insert(package.to_owned(), path.to_owned()).is_some() {
+        bail!("duplicate local Cargo override for package {package}");
+    }
+    Ok(())
 }
 
 fn parse_workspace_dependency_metadata(
@@ -699,9 +835,30 @@ fn parse_workspace_dependency_metadata(
         .get("packages")
         .and_then(serde_json::Value::as_array)
         .context("cargo metadata has no packages array")?;
+    let workspace_packages_by_path = packages
+        .iter()
+        .filter_map(|package| {
+            let id = package.get("id")?.as_str()?;
+            workspace_member_ids.contains(id).then_some(package)
+        })
+        .map(|package| {
+            let name = package
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .context("cargo metadata workspace package has no name")?;
+            let manifest_path = package
+                .get("manifest_path")
+                .and_then(serde_json::Value::as_str)
+                .context("cargo metadata workspace package has no manifest_path")?;
+            let package_path = Path::new(manifest_path)
+                .parent()
+                .map(|path| path.to_string_lossy().into_owned())
+                .context("cargo metadata workspace manifest has no parent directory")?;
+            Ok((package_path, name.to_owned()))
+        })
+        .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
     let mut declared_dependency_kinds_by_name = BTreeMap::new();
     let mut workspace_package_ids_by_name = BTreeMap::new();
-    let mut package_names_by_id = BTreeMap::new();
     let mut custom_build_package_ids = BTreeSet::new();
     let mut seen_workspace_member_ids = BTreeSet::new();
     for package in packages {
@@ -713,12 +870,6 @@ fn parse_workspace_dependency_metadata(
             .get("name")
             .and_then(serde_json::Value::as_str)
             .context("cargo metadata package has no name")?;
-        if package_names_by_id
-            .insert(id.to_owned(), name.to_owned())
-            .is_some()
-        {
-            bail!("cargo metadata contains duplicate package ID {id:?}");
-        }
         if !workspace_member_ids.contains(id) {
             continue;
         }
@@ -743,6 +894,14 @@ fn parse_workspace_dependency_metadata(
                 .get("kind")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("normal");
+            let dependency_name = match dependency.get("path").and_then(serde_json::Value::as_str) {
+                Some(path) => workspace_packages_by_path.get(path).with_context(|| {
+                    format!(
+                        "workspace package {name} declares non-workspace local path dependency {dependency_name} at {path}; WP-07A forbids path wrappers around preparatory crates"
+                    )
+                })?,
+                None => dependency_name,
+            };
             kinds
                 .entry(kind.to_owned())
                 .or_default()
@@ -760,66 +919,9 @@ fn parse_workspace_dependency_metadata(
         bail!("cargo metadata omits workspace member packages: {missing:?}");
     }
 
-    let resolve_nodes = metadata
-        .get("resolve")
-        .and_then(serde_json::Value::as_object)
-        .and_then(|resolve| resolve.get("nodes"))
-        .and_then(serde_json::Value::as_array)
-        .context("full cargo metadata has no resolve.nodes array")?;
-    let mut dependency_graph = BTreeMap::new();
-    for node in resolve_nodes {
-        let id = node
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .context("cargo metadata resolve node has no package ID")?;
-        let mut dependencies = BTreeSet::new();
-        for dependency in node
-            .get("deps")
-            .and_then(serde_json::Value::as_array)
-            .context("cargo metadata resolve node has no deps array")?
-        {
-            let dependency_id = dependency
-                .get("pkg")
-                .and_then(serde_json::Value::as_str)
-                .context("cargo metadata resolve dependency has no package ID")?;
-            dependency
-                .get("dep_kinds")
-                .and_then(serde_json::Value::as_array)
-                .filter(|kinds| !kinds.is_empty())
-                .context("cargo metadata resolve dependency has no dependency kinds")?;
-            if !package_names_by_id.contains_key(dependency_id) {
-                bail!(
-                    "cargo metadata resolve graph references unknown package ID {dependency_id:?}"
-                );
-            }
-            // Follow every edge regardless of whether Cargo labels it normal, dev,
-            // build, or target-specific. Reachability must cover every dependency kind.
-            dependencies.insert(dependency_id.to_owned());
-        }
-        if dependency_graph
-            .insert(id.to_owned(), dependencies)
-            .is_some()
-        {
-            bail!("cargo metadata resolve graph contains duplicate node {id:?}");
-        }
-    }
-    for workspace_member_id in &workspace_member_ids {
-        if !dependency_graph.contains_key(workspace_member_id) {
-            bail!(
-                "cargo metadata resolve graph omits workspace member package {:?}",
-                package_names_by_id
-                    .get(workspace_member_id)
-                    .map(String::as_str)
-                    .unwrap_or("<unknown package>")
-            );
-        }
-    }
-
     Ok(WorkspaceDependencyMetadata {
         declared_dependency_kinds_by_name,
         workspace_package_ids_by_name,
-        package_names_by_id,
-        dependency_graph,
         custom_build_package_ids,
     })
 }
@@ -844,36 +946,6 @@ fn package_has_custom_build_target(package: &serde_json::Value) -> anyhow::Resul
         }
     }
     Ok(false)
-}
-
-fn dependency_path_to_any(
-    start: &str,
-    targets: &BTreeSet<String>,
-    graph: &BTreeMap<String, BTreeSet<String>>,
-) -> Option<Vec<String>> {
-    let mut parents = BTreeMap::<String, Option<String>>::new();
-    let mut queue = VecDeque::from([start.to_owned()]);
-    parents.insert(start.to_owned(), None);
-
-    while let Some(current) = queue.pop_front() {
-        if targets.contains(&current) {
-            let mut path = vec![current.clone()];
-            let mut cursor = current;
-            while let Some(Some(parent)) = parents.get(&cursor) {
-                cursor = parent.clone();
-                path.push(cursor.clone());
-            }
-            path.reverse();
-            return Some(path);
-        }
-        for dependency in graph.get(&current).into_iter().flatten() {
-            if !parents.contains_key(dependency) {
-                parents.insert(dependency.clone(), Some(current.clone()));
-                queue.push_back(dependency.clone());
-            }
-        }
-    }
-    None
 }
 
 fn public_root_api_names(path: &Path) -> anyhow::Result<BTreeSet<String>> {
@@ -1542,28 +1614,69 @@ mod nested {
             2
         );
 
-        let dependency_graph = BTreeMap::from([
-            (
-                "product-package-id".to_owned(),
-                BTreeSet::from(["bridge-package-id".to_owned()]),
-            ),
-            (
-                "bridge-package-id".to_owned(),
-                BTreeSet::from(["preparatory-package-id".to_owned()]),
-            ),
-            ("preparatory-package-id".to_owned(), BTreeSet::new()),
-        ]);
         assert_eq!(
-            dependency_path_to_any(
-                "product-package-id",
-                &BTreeSet::from(["preparatory-package-id".to_owned()]),
-                &dependency_graph,
-            ),
-            Some(vec![
-                "product-package-id".to_owned(),
-                "bridge-package-id".to_owned(),
-                "preparatory-package-id".to_owned(),
-            ])
+            local_cargo_override_paths(
+                r#"
+[patch.crates-io]
+local-wrapper = { path = "vendor/local-wrapper" }
+"#,
+            )
+            .unwrap(),
+            BTreeMap::from([(
+                "local-wrapper".to_owned(),
+                "vendor/local-wrapper".to_owned(),
+            )])
+        );
+        assert!(
+            reject_nested_local_cargo_overrides(
+                r#"
+[patch.crates-io]
+mirante4d-domain = { path = "../../crates/mirante4d-domain" }
+"#,
+                "vendor/local-wrapper",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("nested local overrides")
+        );
+        for config in [
+            r#"paths = ["../wrapper"]"#,
+            r#"
+[patch.crates-io]
+mirante4d-domain = { path = "crates/mirante4d-domain" }
+"#,
+            r#"
+[source.crates-io]
+replace-with = "vendored-sources"
+[source.vendored-sources]
+directory = "vendor"
+"#,
+        ] {
+            let config = config.parse::<toml::Table>().unwrap();
+            assert!(validate_repository_cargo_config_table(&config, ".cargo/config.toml").is_err());
+        }
+        let patched_wrapper_metadata = serde_json::json!({
+            "workspace_members": ["path+file:///repo/vendor/local-wrapper#0.1.0"],
+            "packages": [{
+                "id": "path+file:///repo/vendor/local-wrapper#0.1.0",
+                "name": "local-wrapper",
+                "manifest_path": "/repo/vendor/local-wrapper/Cargo.toml",
+                "dependencies": [{
+                    "name": "mirante4d-domain",
+                    "kind": null,
+                    "source": null,
+                    "path": "/repo/crates/mirante4d-domain",
+                    "target": "cfg(target_os = \"macos\")"
+                }],
+                "targets": [{ "kind": ["lib"] }]
+            }],
+            "resolve": null
+        });
+        assert!(
+            parse_workspace_dependency_metadata(&patched_wrapper_metadata)
+                .unwrap_err()
+                .to_string()
+                .contains("non-workspace local path dependency")
         );
         assert!(
             package_has_custom_build_target(&serde_json::json!({
