@@ -21,8 +21,8 @@ or public full microscopy dataset yet.
 - Linux release-directory, tarball, and AppImage build paths.
 - No segmentation or derived-label subsystem.
 
-The workspace currently has the application, analysis, core, data, format,
-import, renderer, and developer-automation crates described in
+The workspace has those eight live product/developer crates plus three pure,
+product-unreachable WP-07A model crates described in
 [architecture](ARCHITECTURE.md).
 
 ## Foundation Status
@@ -42,22 +42,30 @@ possible without changing product behavior.
 WP-05 is complete at `97ba103463a419d696b445c414515b17a5df215f`
 (`foundation-wp-05-exit-1`).
 
-WP-06A merged at `c7cc4636a6fd8555fb58100311f1db35e40db28b`. Its
-twenty-attempt cache-free Main calibration passed, with policy p95/max at 92/95
-seconds and Rust critical-path p95/max at 403/408 seconds. Repository rules now
-require exactly `PR / policy` and `PR / rust`.
+WP-06 is complete at `9f398f6d19b9ce918395cb4191ccbd9d134e2344`
+(`foundation-wp-06-exit-1`). Its twenty-attempt cache-free Main calibration
+passed, with policy p95/max at 92/95 seconds and Rust critical-path p95/max at
+403/408 seconds. Repository rules require exactly `PR / policy` and
+`PR / rust`. The exact protected-main revision also passed real product-open
+validation at 1280x720 and 1920x1080 before the exit tag was created.
 
-This revision removes the transitional Bootstrap workflow, command, profile,
-and audit rules. WP-06 is not yet accepted because its exact protected-main
-merge revision still needs product-open validation and the exit tag.
+This revision implements the WP-07A canonical-model candidate: pure
+`mirante4d-domain`, `mirante4d-identity`, and `mirante4d-project-model` crates,
+a frozen model contract, and a machine-checked disposition for all 152 fields
+in the current application state. Existing product crates cannot depend on the
+new crates, so viewer behavior and live state authority are unchanged. WP-07A
+is not accepted until this candidate passes protected-main checks and receives
+the create-once `foundation-wp-07a-exit-1` tag. WP-07B owns the later atomic
+product cutover and predecessor deletion.
 
 ## Current Verification Boundary
 
-The WP-06 checkpoint discovers 878 live tests: 838 normal tests assigned once
+The current checkpoint discovers 933 live tests: 893 normal tests assigned once
 across the public CPU leaves and 40 ignored tests assigned to the trusted GPU
-lane. The six leaves are available through `cargo xtask verify-leaf`, while
-`cargo xtask verify-pr` runs the two public groups without recursive aggregate
-commands.
+lane. This includes 53 pure canonical-model tests plus two architecture/ledger
+enforcement tests. The six leaves are available through
+`cargo xtask verify-leaf`, while `cargo xtask verify-pr` runs the two public
+groups without recursive aggregate commands.
 
 On the protected repository, `PR / policy` and `PR / rust` are the only
 required pull-request contexts. Matching `Main / policy` and `Main / rust`
@@ -66,12 +74,16 @@ without caches or artifacts.
 
 ## Known Limitations
 
-- WP-06 still needs exact protected-main product-open validation and its
+- The canonical WP-07A model is intentionally not live in the product; the
+  current application god-state and experimental project-v14 DTO remain until
+  WP-07B deletes them in one hard cutover.
+- The WP-07A candidate still requires protected-main acceptance and its
   create-once exit tag.
 - The package-capability lane remains pending because there is not yet an
   honest unsupported-GPU package command.
-- The committed T1 source archive checks source TIFF facts only. Target-format
-  T1 conformance remains false until WP-10A.
+- Typed WP-07A identities validate already-computed strings only. The committed
+  T1 source archive checks source TIFF facts; canonical hashing and target-format
+  T1 conformance remain false until their later owning packages.
 - Packaged runtime does not expose unsaved-autosave recovery.
 - Direct X11 close of a clean project can hit an inherited Winit shutdown
   panic; the dirty-project save/discard/cancel route exits cleanly.

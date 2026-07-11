@@ -300,14 +300,16 @@ The owner approved D-017 and D-018 together on 2026-07-09 through OD-021:
    product-cutover revisions, and revision/deployment rollback without a
    product fallback.
 
-WP-03 completed the public-source readiness work, and WP-04 completed the clean
-public-root transition. The protected public repository is now canonical, and
-the remaining technical sequence begins with WP-06.
+WP-03 completed public-source readiness, WP-04 completed the clean public-root
+transition, and WP-06 installed the accepted verification topology. The WP-07A
+candidate freezes the first pure model boundary; after its protected-main
+acceptance, the remaining technical sequence begins with WP-07B.
 
 This approval fixes the architecture and execution topology, not every internal
-module name or checkpoint size. WP-07A/WP-08A execution briefs still must freeze
-the exact API schemas, external dependency allowlist, field/resource ownership
-ledger, and checkpoint decomposition before source movement.
+module name or checkpoint size. The WP-07A candidate freezes the canonical
+model API, dependency/side-effect allowlists, and current-field ledger. WP-08A
+must still freeze the subsystem API, resource ownership, and checkpoint
+decomposition before its source movement.
 
 ## Operation Classification
 

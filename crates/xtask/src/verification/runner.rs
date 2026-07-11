@@ -201,7 +201,7 @@ fn run_policy_phases(phases: &mut PhaseCollector) {
     );
     phases.run(
         "architecture",
-        "cargo xtask architecture-self-check",
+        "in-process architecture self-check",
         crate::arch::architecture_self_check,
     );
     phases.run(

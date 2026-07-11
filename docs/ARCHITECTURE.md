@@ -13,7 +13,8 @@ Mirante4D is a native Rust desktop viewer and analysis workbench. It opens
 strict `.m4d` dataset packages and `.m4dproj` project packages. Source
 microscopy data enters through explicit import/preprocessing workflows.
 
-The current workspace has eight crates:
+The current workspace has eleven crates: seven on the live product path, one
+developer-automation crate, and three preparatory crates.
 
 - `mirante4d-app`: egui/wgpu workbench, application state, UI workflows, and
   product composition.
@@ -32,10 +33,28 @@ The current workspace has eight crates:
 - `xtask`: developer, verification, benchmark, packaging, and evidence tools;
   it is not a product mode.
 
-The application orchestrates lower crates. Lower crates do not depend on the
-app/UI layer; the renderer does not read files; format code does not own viewer
-state; analysis reads dataset contracts rather than incidental renderer
-residency.
+WP-07A adds three pure preparatory crates that no existing product crate can
+reach yet:
+
+- `mirante4d-domain`: validated framework-neutral scientific, geometry, view,
+  transfer, render-intent, and tool values.
+- `mirante4d-identity`: strict typed SHA-256 identity strings and package-object
+  descriptors; no hashing or I/O.
+- `mirante4d-project-model`: validated durable project/view state, dataset and
+  artifact references, and persistence-neutral generation projections.
+
+Their exact boundary is frozen in
+[`architecture/model-contract.json`](../architecture/model-contract.json), and
+the disposition of every current application field is frozen in
+[`architecture/current-state-field-ledger.json`](../architecture/current-state-field-ledger.json).
+WP-07B must make this model authoritative and delete the predecessor state in
+one hard cutover; WP-07A does not synchronize two live models.
+
+The application orchestrates its existing lower crates. Lower crates do not
+depend on the app/UI layer; the renderer does not read files; format code does
+not own viewer state; analysis reads dataset contracts rather than incidental
+renderer residency. Cargo policy additionally prevents the live product crates
+from depending on the preparatory model crates before WP-07B.
 
 ## Current Runtime
 

@@ -128,6 +128,12 @@
       "listed_in": "docs/decisions/README.md"
     },
     {
+      "path": "docs/decisions/ADR-0009-canonical-model-contract.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/decisions/README.md"
+    },
+    {
       "path": "docs/decisions/README.md",
       "truth_scope": "target",
       "authorities": ["decisions"],

@@ -2,7 +2,7 @@
 
 Status: HANDOFF_READY SUBORDINATE
 Program version: 0.21
-Last updated: 2026-07-10
+Last updated: 2026-07-11
 Implementation authorization: INHERITED ONLY THROUGH THE ACTIVATED HANDOFF AND PACKAGE ENTRY GATES
 Parent authority: `docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md`
 Authority scope: WP-07A through WP-12 and WP-14/WP-15 package contracts; package definitions occur only here
@@ -11,10 +11,10 @@ This brief cannot override program scope/status, the canonical D-018 repository 
 
 ## Package Definitions
 
-Each package inherits its `PRG-*`, `UB-*`, and `INV-*` set from the parent
-handoff's Promotion-Time Package Contract Index. An entry-stamped brief expands
-those IDs into exact current paths, commands, checkpoints, datasets, thresholds,
-and evidence artifacts without changing the contract.
+Before implementation, each package receives a short entry record that freezes
+its exact current paths, commands, checkpoints, datasets, thresholds, and
+evidence artifacts. The entry specializes those details but cannot weaken,
+narrow, expand, or replace the required work or exit proof below.
 
 ### WP-07A — Canonical Model Contract
 

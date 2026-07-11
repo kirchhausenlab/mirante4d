@@ -10,6 +10,14 @@
   ],
   "property_groups": [
     { "id": "camera", "owner": "mirante4d-core", "seed": "0x4d3443414d455241", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
+    { "id": "domain-display", "owner": "mirante4d-domain", "seed": "0x4d34444f4d444953", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
+    { "id": "domain-geometry", "owner": "mirante4d-domain", "seed": "0x4d34444f4d47454f", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
+    { "id": "domain-render", "owner": "mirante4d-domain", "seed": "0x4d34444f4d52454e", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
+    { "id": "domain-shape", "owner": "mirante4d-domain", "seed": "0x4d34444f4d534850", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
+    { "id": "domain-view", "owner": "mirante4d-domain", "seed": "0x4d34444f4d564945", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
+    { "id": "identity-digest", "owner": "mirante4d-identity", "seed": "0x4d34494444494731", "cases": 128, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
+    { "id": "identity-object", "owner": "mirante4d-identity", "seed": "0x4d344f424a454354", "cases": 128, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
+    { "id": "project-model", "owner": "mirante4d-project-model", "seed": "0x4d3450524f4a4d4f", "cases": 128, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
     { "id": "space", "owner": "mirante4d-core", "seed": "0x4d34535041434531", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
     { "id": "shape", "owner": "mirante4d-core", "seed": "0x4d34534841504531", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" }
   ],
@@ -18,8 +26,8 @@
       "code": "clippy::too_many_arguments",
       "path": "crates/mirante4d-core/src/camera.rs",
       "primary_line": 255,
-      "reason": "The inherited camera gesture API remains until the canonical model cutover.",
-      "deletion_gate": "WP-07A"
+      "reason": "The inherited camera gesture API remains until the application and durable-state cutover.",
+      "deletion_gate": "WP-07B"
     },
     {
       "code": "clippy::too_many_arguments",
@@ -154,10 +162,13 @@
         "mirante4d-analysis",
         "mirante4d-core",
         "mirante4d-data",
+        "mirante4d-domain",
+        "mirante4d-identity",
+        "mirante4d-project-model",
         "mirante4d-renderer",
         "xtask"
       ],
-      "selector": "package(mirante4d-analysis) | package(mirante4d-core) | package(mirante4d-data) | package(mirante4d-renderer) | package(xtask)",
+      "selector": "package(mirante4d-analysis) | package(mirante4d-core) | package(mirante4d-data) | package(mirante4d-domain) | package(mirante4d-identity) | package(mirante4d-project-model) | package(mirante4d-renderer) | package(xtask)",
       "warn_ms": 500,
       "terminate_ms": 2000,
       "aggregate_timeout_secs": 720
