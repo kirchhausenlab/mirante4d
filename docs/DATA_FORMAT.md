@@ -144,9 +144,12 @@ WP-10B B1 freezes a new experimental project-store wire authority: canonical
 immutable generations and exact-byte objects, checksummed 160-byte refs, and
 deterministic 16 MiB paging only for large artifact payloads. Its promoted
 independent fixture covers manual/autosave recovery, divergence, object reuse,
-and corruption. B2 now implements typed canonical generation records, direct
-and deterministic 16 MiB paged closure, and generation-last immutable
-publication off-product. A prepared fresh store can publish the exact initial
-160-byte manual head once; it cannot yet replace an established head. This is
-not a public Create/Save or durability claim. B4 deletes project-v15 and makes
-the new store the sole product path.
+and corruption. In each lane, a recovery ref normally names `head.previous`; a
+recovery ref equal to `head.current` is also valid only as an interrupted
+pre-head commit, with the existing head still authoritative and no automatic
+repair. Any unrelated recovery target is corruption. B2 now implements typed
+canonical generation records, direct and deterministic 16 MiB paged closure,
+and generation-last immutable publication off-product. A prepared fresh store
+can publish the exact initial 160-byte manual head once; it cannot yet replace
+an established head. This is not a public Create/Save or durability claim. B4
+deletes project-v15 and makes the new store the sole product path.

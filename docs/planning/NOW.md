@@ -14,8 +14,9 @@ checkpoint adds typed canonical generations, direct and deterministic paged
 closure, generation-last immutable publication, process-held maintenance and
 writer leases, and an exact no-replace initial manual head in a prepared
 unpublished root. Before an established head can advance, the frozen recovery
-pair rule must explicitly accept the safe recovery-ahead crash window; then the
-recovery-before-head update is next. Product activation stays at B4.
+pair rule now explicitly accepts the safe recovery-ahead crash window. The
+recovery-before-head established-head update is next. Product activation stays
+at B4.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.

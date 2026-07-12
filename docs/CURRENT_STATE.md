@@ -132,7 +132,9 @@ limits, public boundary, transition inventory, and independent project fixture;
 B2 transactional implementation is active off-product. Its current slice owns
 typed canonical generations, direct and deterministic paged object closure,
 immutable generation-last publication, process-held maintenance/writer leases,
-and exact initial manual-head publication in a prepared unpublished root.
+and exact initial manual-head publication in a prepared unpublished root. A
+narrow B1 correction recognizes a recovery ref equal to the still-authoritative
+head as an interrupted pre-head commit, without repairing or promoting it.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
@@ -158,8 +160,9 @@ See [testing](TESTING.md) for commands and claim language.
   control-record wire, typed generation/direct-and-paged closure, and
   generation-last immutable publication. Its only live-ref mutation is a
   no-replace initial manual head under held leases; established-head updates,
-  recovery, actor execution, garbage collection, public Create/Save, durability
-  qualification, and every product path remain unimplemented.
+  recovery-before-head writes, actor execution, garbage collection, public
+  Create/Save, durability qualification, and every product path remain
+  unimplemented.
 - The package-capability lane remains pending until there is an honest
   unsupported-GPU package command.
 - Packaged runtime does not expose unsaved-autosave recovery.

@@ -134,7 +134,9 @@ WP-10B's independent project-store wire authority is checked in the public
 policy group with `python3 tools/project-fixtures/validate.py --manifest
 fixtures/project/manifest.json --self-test`. It proves exact canonical bytes,
 refs, object/page closure, recovery classification, and declared corruptions;
-it does not independently conform repeated reuse of one physical page within a
+its self-test accepts manual and autosave recovery-ahead states both with and
+without `head.previous`, and rejects unrelated same-lane recovery targets. It
+does not independently conform repeated reuse of one physical page within a
 generation and does not claim filesystem durability or product save/open
 support.
 
