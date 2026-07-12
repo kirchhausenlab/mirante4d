@@ -1,0 +1,19 @@
+# Exact wheels tested for the diagnostic WP-10A-C reader probe.
+# Platform: CPython 3.12, Linux x86_64. Generated from zarr==3.2.1 and
+# reduced to the one platform-specific artifact accepted for each package.
+donfig==0.8.1.post1 \
+    --hash=sha256:2a3175ce74a06109ff9307d90a230f81215cbac9a751f4d1c6194644b8204f9d
+google-crc32c==1.8.0 \
+    --hash=sha256:14f87e04d613dfa218d6135e81b78272c3b904e2a7053b841481b38a7d901411
+numcodecs==0.16.5 \
+    --hash=sha256:ad1a379a45bd3491deab8ae6548313946744f868c21d5340116977ea3be5b1d6
+numpy==2.5.1 \
+    --hash=sha256:59fda5e192b570217ec2580c96f00e9a7e12ef6866a900eb089b62c1a32545ca
+packaging==26.2 \
+    --hash=sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e
+pyyaml==6.0.3 \
+    --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc
+typing-extensions==4.16.0 \
+    --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8
+zarr==3.2.1 \
+    --hash=sha256:f78cdd3d9687ad0e9f9cba2c5683b64f0c52589c19f685eeabe872e93cc0d2c7

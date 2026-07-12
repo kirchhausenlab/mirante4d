@@ -27,6 +27,7 @@ enable = [
 exclude = [
   "target/**",
   "vendor/**",
+  "verification/standards/**",
 ]
 respect-gitignore = true
 flavor = "standard"

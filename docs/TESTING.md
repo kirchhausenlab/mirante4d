@@ -112,8 +112,9 @@ is accepted at `foundation-wp-08a-exit-2`
 trusted-GPU, source-nonmutation, and real-display 1280x720 T2 product checks.
 Internal automation remains supporting evidence, not product-open proof.
 
-The checked independent report supports only the WP-03 source-TIFF archive.
-WP-10A-B implementation is active. `mirante4d-storage` is assigned to the
+The checked independent source report supports only the WP-03 source-TIFF
+archive. WP-10A-B is implemented off-product and WP-10A-C evidence work is
+active. `mirante4d-storage` is assigned to the
 existing contract leaf, but its current tests prove only pure profile, path,
 arithmetic, supporting exact-identity, scalar-wire, and restricted-JCS
 contracts, including the closed profile, canonical-value, scientific, and
@@ -196,6 +197,14 @@ post-rename durability-indeterminate handling. A selected-profile limit-plus-
 one case proves that the writer stops consuming a lazy shard input and
 publishes nothing. This is a T2 writer/reader component proof, not independent
 T1 conformance, import, replacement, product support, or a performance claim.
+
+The WP-10A-C standards check verifies an exact 12-file, 162,831-byte offline
+mirror against immutable OME and Zarr revisions, lengths, and SHA-256 values.
+The diagnostic external-reader probe builds the same tiny shard twice without
+Mirante code and observes its exact shape, chunk/shard geometry, dtype, and
+values through a hash-locked zarr-python 3.2.1 environment. It is only a
+selected-codec feasibility result: no target fixture is promoted, and it makes
+no T1, OME, IO-3, identity, complete-package, product, or performance claim.
 
 The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).

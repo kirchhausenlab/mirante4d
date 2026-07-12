@@ -110,7 +110,12 @@ objects while writing; performs DS admission, structural reconciliation,
 inventory, and snapshot checks in a private sibling stage; and publishes with
 Linux `RENAME_NOREPLACE` followed by parent-directory sync. It does not replace
 packages, compute scientific identity, generate multiscales, perform import,
-or activate the product.
+or activate the product. The exact official OME-NGFF 0.5.2 image artifacts,
+Zarr core 3.0 and selected codec specifications are now retained offline by
+immutable source revision, length, and SHA-256. A separately pinned
+zarr-python reader decodes one hand-built selected-subset shard. This is an
+interoperability stop/go result only; it is not T1, IO-3, official-schema,
+complete-package, or generic OME-Zarr evidence.
 
 WP-10B separately installs immutable content-addressed project objects,
 complete generations, atomic head/recovery refs, leases, autosave/recovery,
