@@ -2300,29 +2300,56 @@ mod tests {
 
     #[test]
     fn established_manual_sync_failures_preserve_retry_and_head_indeterminacy() {
-        let g1 = frozen_generation("recoverable.m4dproj", RECOVERABLE_G1);
-        let g2 = frozen_generation("recoverable.m4dproj", RECOVERABLE_G2);
+        let manual = frozen_generation("stale.m4dproj", STALE_GENERATION);
+        let project_id = manual.projection().state().project_id();
+        let manual_id = ProjectGenerationId::parse(STALE_GENERATION).unwrap();
+        let expected_generation = GenerationDocument::build_from_projection(
+            manual.projection().clone(),
+            Some(manual_id),
+            None,
+            manual.forked_from(),
+            GenerationKind::Manual,
+            2,
+            manual.bindings().clone(),
+            manual.reachable_objects().to_vec(),
+            ProjectStoreLimits::default(),
+        )
+        .unwrap()
+        .encode(ProjectStoreLimits::default())
+        .unwrap()
+        .id();
+        let expected_recovery =
+            RefRecord::new(RefKind::ManualRecovery, project_id, manual_id, None, None)
+                .unwrap()
+                .encode();
+        let expected_head = RefRecord::new(
+            RefKind::ManualHead,
+            project_id,
+            expected_generation,
+            Some(manual_id),
+            None,
+        )
+        .unwrap()
+        .encode();
 
         for failed_sync in [0, 1] {
-            let directory = prepared_frozen_root_from_store(
+            let directory = extracted_frozen_root(
                 &format!("established-recovery-sync-{failed_sync}"),
-                "recoverable.m4dproj",
+                "stale.m4dproj",
             );
             let root = LocalStoreRoot::open(directory.path()).unwrap();
             let leases =
                 ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
-            let (initial, _) = frozen_capture("recoverable.m4dproj", &g1);
-            publish_initial_manual_generation(
-                &root,
-                &leases,
-                initial,
-                ProjectStoreLimits::default(),
-                || false,
-            )
-            .unwrap();
             let old_head = fs::read(directory.path().join("refs/head")).unwrap();
+            let autosave_head = fs::read(directory.path().join("refs/autosave-head")).unwrap();
             root.fail_ref_commit_directory_sync_at(failed_sync);
-            let (capture, _) = frozen_capture("recoverable.m4dproj", &g2);
+            let (capture, _) = frozen_capture_with_facts(
+                "stale.m4dproj",
+                &manual,
+                manual.projection().clone(),
+                Some(manual_id),
+                None,
+            );
             assert!(matches!(
                 publish_established_manual_generation(
                     &root,
@@ -2340,9 +2367,19 @@ mod tests {
                 fs::read(directory.path().join("refs/head")).unwrap(),
                 old_head
             );
+            assert_eq!(
+                fs::read(directory.path().join("refs/recovery")).unwrap(),
+                expected_recovery
+            );
             assert!(leases.confirm_writer(&root).unwrap());
 
-            let (retry, _) = frozen_capture("recoverable.m4dproj", &g2);
+            let (retry, _) = frozen_capture_with_facts(
+                "stale.m4dproj",
+                &manual,
+                manual.projection().clone(),
+                Some(manual_id),
+                None,
+            );
             let receipt = publish_established_manual_generation(
                 &root,
                 &leases,
@@ -2351,38 +2388,42 @@ mod tests {
                 || false,
             )
             .unwrap();
+            assert_eq!(receipt.new_generation_id(), expected_generation);
             assert_eq!(receipt.published_objects(), 0);
+            assert_eq!(receipt.published_bytes(), 0);
             assert_eq!(
                 fs::read(directory.path().join("refs/recovery")).unwrap(),
-                fixture_extract("recoverable.m4dproj/refs/recovery")
+                expected_recovery
             );
             assert_eq!(
                 fs::read(directory.path().join("refs/head")).unwrap(),
-                fixture_extract("recoverable.m4dproj/refs/head")
+                expected_head
+            );
+            assert_eq!(
+                fs::read(directory.path().join("refs/autosave-head")).unwrap(),
+                autosave_head
             );
         }
 
         for failed_sync in [2, 3] {
-            let directory = prepared_frozen_root_from_store(
+            let directory = extracted_frozen_root(
                 &format!("established-head-sync-{failed_sync}"),
-                "recoverable.m4dproj",
+                "stale.m4dproj",
             );
             let root = LocalStoreRoot::open(directory.path()).unwrap();
             let leases =
                 ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
-            let (initial, _) = frozen_capture("recoverable.m4dproj", &g1);
-            publish_initial_manual_generation(
-                &root,
-                &leases,
-                initial,
-                ProjectStoreLimits::default(),
-                || false,
-            )
-            .unwrap();
             let old_head = fs::read(directory.path().join("refs/head")).unwrap();
+            let autosave_head = fs::read(directory.path().join("refs/autosave-head")).unwrap();
             root.fail_ref_commit_directory_sync_at(failed_sync);
 
-            let (capture, _) = frozen_capture("recoverable.m4dproj", &g2);
+            let (capture, _) = frozen_capture_with_facts(
+                "stale.m4dproj",
+                &manual,
+                manual.projection().clone(),
+                Some(manual_id),
+                None,
+            );
             assert!(matches!(
                 publish_established_manual_generation(
                     &root,
@@ -2397,11 +2438,15 @@ mod tests {
             assert_eq!(root.ref_commit_directory_sync_attempts(), 4);
             assert_eq!(
                 fs::read(directory.path().join("refs/recovery")).unwrap(),
-                fixture_extract("recoverable.m4dproj/refs/recovery")
+                expected_recovery
             );
             assert_eq!(
                 fs::read(directory.path().join("refs/head")).unwrap(),
-                fixture_extract("recoverable.m4dproj/refs/head")
+                expected_head
+            );
+            assert_eq!(
+                fs::read(directory.path().join("refs/autosave-head")).unwrap(),
+                autosave_head
             );
             assert!(matches!(
                 leases.confirm_writer(&root),
