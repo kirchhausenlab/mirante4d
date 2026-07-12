@@ -141,8 +141,12 @@ lane head authoritative and supports an exact retry without repair or
 promotion. A crate-private established-session actor owns the root and leases,
 serializes those manual/autosave transactions, bounds requests and completions,
 coalesces queued autosaves, cancels active or queued work, and releases its
-session through Close or shutdown. The frozen public actor remains
-non-constructible and the crate remains off-product.
+session through Close or shutdown. A shared private inspection core now opens
+and validates established stores for actor startup and transaction preflight,
+including exact ref/generation continuity, bounded physical metadata closure,
+autosave classification, and explicit read-only writer fallback without eager
+bulk-payload hashing. The frozen public actor remains non-constructible and the
+crate remains off-product.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
@@ -170,10 +174,11 @@ See [testing](TESTING.md) for commands and claim language.
   can create the initial manual head and advance an established manual head
   under held leases, and can create or advance an established-project autosave
   head. Its private established-session actor executes and bounds those two
-  established save lanes only. Create/Open/Save As execution, provisional
-  autosave, recovery selection/open, timers, garbage collection, full
-  verification, public actor construction, durability qualification, and every
-  product path remain unimplemented.
+  established save lanes only, using the same private established-store
+  inspection authority as transaction preflight. Public Create/Open/Save As
+  execution, provisional autosave, recovery selection/open, timers, garbage
+  collection, full verification, public actor construction, durability
+  qualification, and every product path remain unimplemented.
 - The package-capability lane remains pending until there is an honest
   unsupported-GPU package command.
 - Packaged runtime does not expose unsaved-autosave recovery.

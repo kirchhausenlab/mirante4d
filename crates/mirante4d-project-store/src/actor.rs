@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 use crate::{
     ProjectCommitCapture, ProjectOpenMode, ProjectStoreCommand, ProjectStoreCompletion,
     ProjectStoreConfig, ProjectStoreFault, ProjectStorePath, ProjectStoreRequestId,
-    lease::{LeaseError, ProjectStoreLeases},
+    inspection::open_established_store,
+    lease::ProjectStoreLeases,
     local::LocalStoreRoot,
     transaction::{publish_established_autosave_generation, publish_established_manual_generation},
 };
@@ -124,7 +125,7 @@ impl EstablishedProjectActor {
         let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name(String::from("mirante4d-project-store"))
-            .spawn(move || match open_resources(&worker_path) {
+            .spawn(move || match open_resources(&worker_path, limits) {
                 Ok((root, leases)) => {
                     if startup_sender.send(Ok(())).is_ok() {
                         worker_main(worker_shared, root, leases, limits);
@@ -536,27 +537,15 @@ fn worker_main(
     shared.wake.notify_all();
 }
 
-fn map_lease_error(error: LeaseError) -> ProjectStoreFault {
-    match error {
-        LeaseError::Indeterminate => ProjectStoreFault::CommitIndeterminate,
-        LeaseError::InvalidAnchor | LeaseError::Io { .. } => ProjectStoreFault::Corruption {
-            stage: "actor_lease",
-        },
-    }
-}
-
 fn open_resources(
     path: &ProjectStorePath,
+    limits: crate::ProjectStoreLimits,
 ) -> Result<(LocalStoreRoot, ProjectStoreLeases), ProjectStoreFault> {
-    let root = LocalStoreRoot::open(path.as_path()).map_err(|_| ProjectStoreFault::Corruption {
-        stage: "actor_open",
-    })?;
-    let leases = ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable)
-        .map_err(map_lease_error)?;
-    if !leases.has_writer() {
+    let opened = open_established_store(path, ProjectOpenMode::PreferWritable, limits, || false)?;
+    if opened.effective_mode() != ProjectOpenMode::PreferWritable {
         return Err(ProjectStoreFault::WriterContended);
     }
-    Ok((root, leases))
+    Ok(opened.into_resources())
 }
 
 #[cfg(test)]
