@@ -126,7 +126,7 @@ independent CPU reference at
 `1b1e7d5534f29b010cc346d434811a3906fb40e1`, tagged
 `foundation-wp-09a-exit-1`. Exact protected-main policy/Rust and trusted Vulkan
 evidence passed; product activation and product-open validation remain WP-09B
-work. WP-10B entry work is active.
+work. WP-10B's entry is accepted and its B1 contract/fixture work is active.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
