@@ -219,6 +219,12 @@ impl F64Bits {
             self
         }
     }
+
+    pub(crate) fn from_finite_value(value: f64) -> Option<Self> {
+        value
+            .is_finite()
+            .then(|| Self(value.to_bits()).normalized_zero())
+    }
 }
 
 impl fmt::Display for F64Bits {

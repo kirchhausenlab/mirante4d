@@ -28,7 +28,7 @@ const CONTROL_WIRE_PATH: &str = "architecture/wp10a-control-wire-specialization.
 const CONTROL_WIRE_SCHEMA: &str = "mirante4d-wp10a-control-wire-specialization";
 const CONTROL_WIRE_SCHEMA_VERSION: u64 = 1;
 const CONTROL_WIRE_SHA256: &str =
-    "4c1440db68bd79e73a7646b2c8f19ab8b1d765261407aaa50c976e89dd789598";
+    "5e1b5960cfc2185fd2e855350eb4379264f9d4c14959c2a1d6c460c157089841";
 const STORAGE_CRATE: &str = "mirante4d-storage";
 const STORAGE_PATH: &str = "crates/mirante4d-storage";
 const DEPENDENCY_KINDS: [&str; 3] = ["normal", "dev", "build"];
@@ -508,7 +508,9 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "MAX_ZARR_METADATA_BYTES",
         "NfcText",
         "OUTER_CODEC",
+        "OmeImageGroupMetadata",
         "OmeInteroperabilityBase",
+        "OmeLevelTransform",
         "OneBrickAmplification",
         "PACKED_INDEX_RECORD_BYTES",
         "PACKED_INDEX_RECORDS_PER_INNER_CHUNK",

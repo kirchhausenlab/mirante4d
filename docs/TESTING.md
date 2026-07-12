@@ -123,8 +123,9 @@ canonical bytes; derivation and detached-release tests additionally prove typed
 identity verification. Packed-index and shard-codec tests prove the closed
 record layout, bounded zstd/CRC32C pipeline, exact end-index sizes, and strict
 structural rejection. Storage-metadata and range-read tests prove the nine
-closed Zarr rows, semantic JSON validation, exact range bounds, and rejection of
-symlink, hardlink, and non-regular objects. They make no complete-package, T1
+closed Zarr rows, the closed OME axes/transform projection, semantic JSON
+validation, exact range bounds, and rejection of symlink, hardlink, and non-
+regular objects. They make no official-schema, complete-package, T1
 conformance, independent-reader, lifecycle, or product-support claim. Current
 schema-1 packages remain non-authoritative T2 support fixtures until WP-10A
 accepts the independent target evidence.

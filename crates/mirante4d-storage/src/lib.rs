@@ -3,14 +3,16 @@
 //! This crate is not reachable from the application before WP-10C. The first
 //! WP-10A-B owns immutable profile facts, strict control primitives, checked
 //! preflight arithmetic, portable package paths, packed-index records, the
-//! in-memory shard codec, strict storage metadata, and root-confined read-only
-//! range I/O. It has no writer and makes no product target-package claim.
+//! in-memory shard codec, strict Zarr/OME storage metadata, and root-confined
+//! read-only range I/O. It has no writer and makes no product target-package
+//! claim.
 
 #![forbid(unsafe_code)]
 
 mod control;
 mod error;
 mod limits;
+mod ome_metadata;
 mod packed_index;
 mod paths;
 mod profile;
@@ -44,6 +46,7 @@ pub use limits::{
     ProfileLimits, ScaleCounts, amplification_2d, amplification_3d, checked_ceil_div,
     count_3d_pyramid, encoded_inner_payload_limit, encoded_outer_shard_limit,
 };
+pub use ome_metadata::{OmeImageGroupMetadata, OmeLevelTransform};
 pub use packed_index::{
     PackedIndexCoordinates, PackedIndexError, PackedIndexRecord, PackedIndexStatistics,
 };

@@ -61,7 +61,19 @@
       "x_byte"
     ],
     "packed_index_dimension_names": "the member is omitted and any present member is rejected",
-    "scope": "storage-only Zarr group and array metadata; OME image-group attributes remain a later DTO bound to the accepted OME wire contract"
+    "scope": "empty Zarr groups, the nine storage-array rows, and the closed OME image-group DTO"
+  },
+  "ome_image_group": {
+    "location": "images/i########/zarr.json",
+    "closed_members": "unknown or duplicate members are rejected at the group, attributes, ome, multiscale, axis, dataset, and transform levels",
+    "namespace": "attributes contains only ome; ome contains version=0.5 and exactly one multiscales item; omero is forbidden",
+    "multiscale": "contains exactly axes and one through seven datasets ordered by relative path s00 through s06",
+    "axes": "exactly ordered t,c,z,y,x; regular time carries second; nonregular time omits unit; diagonal spatial axes carry micrometer; arbitrary-affine projection omits spatial units",
+    "transforms": "each dataset contains one five-value scale followed by at most one five-value translation; channel scale is one; time and channel translations are positive zero; time and channel are never downsampled",
+    "spatial_projection": "diagonal geometry stores exact micrometer scale/translation; arbitrary affine stores unitless identity spatial transforms and remains M4D-owned",
+    "translation_omission": "translation is omitted exactly when all five values are positive zero",
+    "number_semantics": "the reader accepts finite semantic JSON numbers but rejects stored negative zero; the writer normalizes zero and emits one deterministic compact representation",
+    "official_schema_boundary": "offline pinned OME schema validation and independent readback remain package-validator and T1 evidence gates"
   },
   "normalization": {
     "transform_negative_zero": "normalize to positive zero before encoding; a stored negative-zero spelling is noncanonical"

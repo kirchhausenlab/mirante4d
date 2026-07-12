@@ -72,9 +72,10 @@ omitted from the accepted freeze, plus the closed portable-record and detached-
 release scalar choices. Exact source, recipe, derivation, rights, citation, and
 release DTOs are implemented. The fixed packed-index record and bounded
 zstd/CRC32C inner-payload and end-index codecs implement the selected binary
-layer in memory. Strict storage-only Zarr group/array metadata and bounded,
-root-confined Unix object-range reads are implemented. OME image attributes and
-the integrated package reader, writer, and validator are not yet implemented.
+layer in memory. Strict Zarr group/array metadata, closed OME image-group axes
+and transforms, and bounded root-confined Unix object-range reads are
+implemented. The integrated package reader, writer, and validator are not yet
+implemented.
 
 WP-10B separately installs immutable content-addressed project objects,
 complete generations, atomic head/recovery refs, leases, autosave/recovery,
