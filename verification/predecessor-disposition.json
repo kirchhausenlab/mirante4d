@@ -2467,6 +2467,14 @@
       "reason": "WP-10B B2 proves fail-closed canonical, identity, nullable-field, and collection bounds."
     },
     {
+      "id": "libtest:mirante4d-project-store:lease::tests::process_contention_preserves_shared_maintenance_and_single_writer_ownership",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves process-held shared maintenance exclusion, one writer, read-only contention fallback, and lease release."
+    },
+    {
       "id": "libtest:mirante4d-project-store:local::tests::opens_every_root_component_without_following_symlinks",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -2529,6 +2537,30 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 proves digest-keyed physical closure reuse for repeated exact pages."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::first_manual_commit_cancellation_after_generation_leaves_no_ref",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves cancellation after immutable generation publication leaves authority refs absent."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::first_manual_commit_matches_the_frozen_initial_head",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 reproduces the independent frozen initial manual generation and exact 160-byte head ref."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::first_manual_commit_rejects_stale_or_corrupt_head_before_publication",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves read-only, stale-head, and corrupt-head failures consume no sources and publish no generation."
     },
     {
       "id": "libtest:mirante4d-project-store:transaction::tests::preflight_and_second_pass_drift_publish_no_generation",
@@ -5556,6 +5588,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 488
+    "current_additions": 492
   }
 }

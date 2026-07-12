@@ -142,10 +142,13 @@ The unreachable `mirante4d-project-store` crate is assigned to the hosted
 contract lane. Its current tests cover the frozen API/limits, canonical
 envelope/ref identities, typed canonical generations, direct and deterministic
 paged closure, held-descriptor traversal, bounded immutable object and
-generation-last publication, exact deduplication, collision rejection, and
-cancellation. They do not claim live ref mutation, leases, actor execution,
-recovery, garbage collection, a committed save, qualified writable durability,
-product reachability, or product-open validation.
+generation-last publication, process lease contention, and exact reproduction
+of the fixture's initial manual generation and head ref. Failure tests keep
+new authority absent and leave any existing ref unchanged on read-only, stale,
+corrupt, pinned, and cancelled paths. They do not claim established-head
+replacement, recovery-before-head behavior, actor
+execution, autosave, Save As, garbage collection, public Create/Save, qualified
+writable durability, product reachability, or product-open validation.
 
 The checked independent source report supports only the WP-03 source-TIFF
 archive. WP-10A is accepted off-product and its target authority is promoted.

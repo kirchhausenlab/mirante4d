@@ -25,7 +25,7 @@ use mirante4d_identity::{ExactBytesDigest, ExactBytesFacts, ExactBytesHasher};
 use rustix::{
     fd::OwnedFd,
     fs::{
-        AtFlags, CWD, FileType, Mode, OFlags, RenameFlags, fstat, fsync, mkdirat, openat,
+        AtFlags, CWD, Dir, FileType, Mode, OFlags, RenameFlags, fstat, fsync, mkdirat, openat,
         renameat_with, statat, unlinkat,
     },
     io::Errno,
@@ -33,14 +33,18 @@ use rustix::{
 use thiserror::Error;
 
 use crate::{
-    ProjectGenerationId, generation::EncodedGeneration,
-    wire::generation_id_from_validated_canonical,
+    ProjectGenerationId, ProjectStoreLimits,
+    generation::EncodedGeneration,
+    wire::{
+        ProjectEnvelope, REF_BYTES, RefKind, RefRecord, generation_id_from_validated_canonical,
+    },
 };
 
 const STREAM_BUFFER_BYTES: usize = 1024 * 1024;
 const STAGE_CREATE_ATTEMPTS: u64 = 128;
 const STAGING_DIRECTORY: &str = "staging";
 const STAGED_FILE: &str = "payload";
+const AUTHORITY_SYNC_ATTEMPTS: usize = 2;
 
 static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -134,6 +138,12 @@ pub(crate) enum LocalPublicationError {
     AtomicPublishUnsupported,
     #[error("an internally encoded generation has an invalid framed identity")]
     InvalidGeneration,
+    #[error("a project envelope or ref control record is invalid")]
+    InvalidControl,
+    #[error("the initial manual head appeared after the empty-ref check")]
+    RefAlreadyPresent,
+    #[error("the initial manual head may be visible but its directory durability is indeterminate")]
+    RefCommitIndeterminate,
     #[error("project-store I/O failed while attempting to {operation}: {source}")]
     Io {
         operation: &'static str,
@@ -185,6 +195,197 @@ impl LocalStoreRoot {
             }
         }
         Ok(Self { root: current })
+    }
+
+    pub(crate) const fn descriptor(&self) -> &OwnedFd {
+        &self.root
+    }
+
+    /// Reads the fixed project envelope without creating any path component.
+    pub(crate) fn read_project_envelope<C>(
+        &self,
+        limits: ProjectStoreLimits,
+        is_cancelled: C,
+    ) -> Result<ProjectEnvelope, LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        let bytes = self
+            .read_optional_small_file(
+                Path::new("project.json"),
+                u64::try_from(limits.project_envelope_bytes_max)
+                    .map_err(|_| LocalPublicationError::InvalidControl)?,
+                is_cancelled,
+            )?
+            .ok_or(LocalPublicationError::InvalidControl)?;
+        ProjectEnvelope::decode(&bytes).map_err(|_| LocalPublicationError::InvalidControl)
+    }
+
+    /// Reads one exact lane ref through held descriptors. Missing refs remain
+    /// distinct from invalid records and no directory is created.
+    pub(crate) fn read_ref<C>(
+        &self,
+        kind: RefKind,
+        limits: ProjectStoreLimits,
+        is_cancelled: C,
+    ) -> Result<Option<RefRecord>, LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        let path = ref_relative_path(kind)?;
+        let Some(bytes) = self.read_optional_small_file(
+            &path,
+            u64::try_from(limits.ref_record_bytes_max)
+                .map_err(|_| LocalPublicationError::InvalidControl)?,
+            is_cancelled,
+        )?
+        else {
+            return Ok(None);
+        };
+        if bytes.len() != limits.ref_record_bytes_exact || bytes.len() != REF_BYTES {
+            return Err(LocalPublicationError::InvalidControl);
+        }
+        RefRecord::decode(kind, &bytes)
+            .map(Some)
+            .map_err(|_| LocalPublicationError::InvalidControl)
+    }
+
+    /// Requires the prepared store's ref namespace to contain no fixed,
+    /// pinned, or unknown ref. An empty `refs/pins` directory is harmless;
+    /// every visible entry is bounded and checked through held descriptors.
+    pub(crate) fn require_empty_ref_namespace<C>(
+        &self,
+        limits: ProjectStoreLimits,
+        mut is_cancelled: C,
+    ) -> Result<(), LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        check_cancelled(&mut is_cancelled)?;
+        let refs = match openat(
+            &self.root,
+            OsStr::new("refs"),
+            DIRECTORY_OPEN_FLAGS,
+            Mode::empty(),
+        ) {
+            Ok(refs) => refs,
+            Err(Errno::NOENT) => return Ok(()),
+            Err(_) => return Err(LocalPublicationError::InvalidControl),
+        };
+        let mut entries = 0_usize;
+        for entry in Dir::read_from(&refs).map_err(|_| LocalPublicationError::InvalidControl)? {
+            check_cancelled(&mut is_cancelled)?;
+            let entry = entry.map_err(|_| LocalPublicationError::InvalidControl)?;
+            let name = entry.file_name();
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            entries = entries
+                .checked_add(1)
+                .ok_or(LocalPublicationError::InvalidControl)?;
+            if entries > limits.directory_fanout_entries_max {
+                return Err(LocalPublicationError::Capacity {
+                    declared: u64::try_from(entries).unwrap_or(u64::MAX),
+                    maximum: u64::try_from(limits.directory_fanout_entries_max).unwrap_or(u64::MAX),
+                });
+            }
+            if name.to_bytes() != b"pins" {
+                return Err(LocalPublicationError::InvalidControl);
+            }
+            let pins = openat(&refs, name, DIRECTORY_OPEN_FLAGS, Mode::empty())
+                .map_err(|_| LocalPublicationError::InvalidControl)?;
+            let mut pin_entries = 0_usize;
+            for pin in Dir::read_from(&pins).map_err(|_| LocalPublicationError::InvalidControl)? {
+                check_cancelled(&mut is_cancelled)?;
+                let pin = pin.map_err(|_| LocalPublicationError::InvalidControl)?;
+                let pin_name = pin.file_name().to_bytes();
+                if pin_name == b"." || pin_name == b".." {
+                    continue;
+                }
+                pin_entries = pin_entries
+                    .checked_add(1)
+                    .ok_or(LocalPublicationError::InvalidControl)?;
+                if pin_entries > limits.pin_refs_max {
+                    return Err(LocalPublicationError::Capacity {
+                        declared: u64::try_from(pin_entries).unwrap_or(u64::MAX),
+                        maximum: u64::try_from(limits.pin_refs_max).unwrap_or(u64::MAX),
+                    });
+                }
+                return Err(LocalPublicationError::InvalidControl);
+            }
+        }
+        Ok(())
+    }
+
+    /// Publishes the first manual head exactly once. There is deliberately no
+    /// replacement path here: established-head commits remain deferred until
+    /// the frozen recovery/head crash-state rule is corrected.
+    pub(crate) fn publish_initial_manual_head<C>(
+        &self,
+        record: RefRecord,
+        limits: ProjectStoreLimits,
+        mut is_cancelled: C,
+    ) -> Result<(), LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        if record.kind() != RefKind::ManualHead
+            || record.previous().is_some()
+            || record.base().is_some()
+            || limits.ref_record_bytes_exact != REF_BYTES
+        {
+            return Err(LocalPublicationError::InvalidControl);
+        }
+        check_cancelled(&mut is_cancelled)?;
+        let destination = ref_relative_path(RefKind::ManualHead)?;
+        let (destination_parent, destination_name) = self.open_or_create_parent(&destination)?;
+        match statat(
+            &destination_parent,
+            &destination_name,
+            AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Err(Errno::NOENT) => {}
+            Ok(_) => return Err(LocalPublicationError::RefAlreadyPresent),
+            Err(_) => return Err(LocalPublicationError::ExistingMismatch),
+        }
+
+        let mut stage = Stage::begin(self)?;
+        let mut staged_file = stage.create_file()?;
+        staged_file
+            .write_all(&record.encode())
+            .map_err(|source| LocalPublicationError::Io {
+                operation: "write the initial manual head",
+                source,
+            })?;
+        fsync(&staged_file)
+            .map_err(|error| io_error("synchronize the staged initial manual head", error))?;
+        drop(staged_file);
+        check_cancelled(&mut is_cancelled)?;
+
+        match renameat_with(
+            &stage.directory,
+            OsStr::new(STAGED_FILE),
+            &destination_parent,
+            &destination_name,
+            RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => {
+                stage.file_owned = false;
+                if sync_with_retry(&stage.directory).is_err()
+                    || sync_with_retry(&destination_parent).is_err()
+                {
+                    return Err(LocalPublicationError::RefCommitIndeterminate);
+                }
+                Ok(())
+            }
+            Err(Errno::EXIST) => Err(LocalPublicationError::RefAlreadyPresent),
+            Err(error)
+                if error == Errno::NOSYS || error == Errno::INVAL || error == Errno::OPNOTSUPP =>
+            {
+                Err(LocalPublicationError::AtomicPublishUnsupported)
+            }
+            Err(error) => Err(io_error("publish the initial manual head", error)),
+        }
     }
 
     pub(crate) fn publish_object<R, C>(
@@ -485,6 +686,61 @@ impl LocalStoreRoot {
             current = open_or_create_directory(&current, &component)?;
         }
         Ok((current, file_name))
+    }
+
+    fn read_optional_small_file<C>(
+        &self,
+        path: &Path,
+        maximum_bytes: u64,
+        mut is_cancelled: C,
+    ) -> Result<Option<Vec<u8>>, LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        check_cancelled(&mut is_cancelled)?;
+        let Some((parent, name)) = self.open_existing_parent_if_present(path)? else {
+            return Ok(None);
+        };
+        let descriptor = match openat(&parent, &name, FILE_READ_FLAGS, Mode::empty()) {
+            Ok(descriptor) => descriptor,
+            Err(Errno::NOENT) => return Ok(None),
+            Err(_) => return Err(LocalPublicationError::ExistingMismatch),
+        };
+        let before = FileIdentity::from_stat(
+            fstat(&descriptor).map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        if before.bytes > maximum_bytes {
+            return Err(LocalPublicationError::Capacity {
+                declared: before.bytes,
+                maximum: maximum_bytes,
+            });
+        }
+        let length =
+            usize::try_from(before.bytes).map_err(|_| LocalPublicationError::InvalidControl)?;
+        let mut file = File::from(descriptor);
+        let mut bytes = vec![0_u8; length];
+        file.read_exact(&mut bytes)
+            .map_err(|_| LocalPublicationError::ExistingMismatch)?;
+        let mut extra = [0_u8; 1];
+        if file
+            .read(&mut extra)
+            .map_err(|_| LocalPublicationError::ExistingMismatch)?
+            != 0
+        {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+        check_cancelled(&mut is_cancelled)?;
+        let after = FileIdentity::from_stat(
+            fstat(&file).map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        let named = FileIdentity::from_stat(
+            statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        if before != after || before != named {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+        Ok(Some(bytes))
     }
 }
 
@@ -896,6 +1152,29 @@ fn sync_published_rename(
         .map_err(|error| io_error("synchronize an immutable staging directory", error))?;
     fsync(destination_directory)
         .map_err(|error| io_error("synchronize an immutable destination directory", error))
+}
+
+fn sync_with_retry(directory: &OwnedFd) -> Result<(), Errno> {
+    let mut last_error = None;
+    for _ in 0..AUTHORITY_SYNC_ATTEMPTS {
+        match fsync(directory) {
+            Ok(()) => return Ok(()),
+            Err(Errno::INTR) => {}
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or(Errno::INTR))
+}
+
+fn ref_relative_path(kind: RefKind) -> Result<PathBuf, LocalPublicationError> {
+    let name = match kind {
+        RefKind::ManualHead => "head",
+        RefKind::ManualRecovery => "recovery",
+        RefKind::AutosaveHead => "autosave-head",
+        RefKind::AutosaveRecovery => "autosave-recovery",
+        RefKind::Pin => return Err(LocalPublicationError::InvalidControl),
+    };
+    Ok(PathBuf::from("refs").join(name))
 }
 
 fn duplicate_directory(directory: &OwnedFd) -> Result<OwnedFd, LocalPublicationError> {

@@ -133,8 +133,10 @@ payload-paging, API, and failure-transition contract plus an independent
 project fixture. B2 now has an unreachable `mirante4d-project-store` crate with
 the frozen public boundary, typed canonical generation records, deterministic
 direct and paged object closure, and descriptor-relative immutable object and
-generation-last publication. It still owns no live refs, leases, actor,
-recovery, garbage collection, or product path.
+generation-last publication. Its private lease core now enforces shared
+maintenance and one writer, and a prepared fresh store can publish its initial
+manual head once. It still owns no established-head replacement, recovery
+protocol, actor, garbage collection, public Create/Save, or product path.
 
 Settings use `mirante4d-settings-v1` at the Linux XDG/HOME path. The UI submits
 validated changes; one background actor owns persistence. Legacy preferences
