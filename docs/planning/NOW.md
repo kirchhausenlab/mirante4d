@@ -18,10 +18,13 @@ inventory and recovery-ahead retry. The same transaction now creates and
 advances an established-project autosave lane, including divergent-base and
 lower-revision cases. A crate-private established-session actor now owns the
 root and leases, serializes those manual/autosave primitives, and enforces the
-frozen queue, coalescing, cancellation, close, and shutdown rules. B2 remains
-active off-product: Create/Open/Save As execution, provisional autosave,
-recovery/open, timers, garbage collection, full verification, and public actor
-wiring remain later work, with product activation at B4.
+frozen queue, coalescing, cancellation, close, and shutdown rules. One shared
+private inspection core now opens and validates established stores for actor
+startup and transaction preflight, with bounded object-metadata checks and no
+eager bulk-payload hashing. B2 remains active off-product: public Create/Open/
+Save As execution, provisional autosave, recovery/open, timers, garbage
+collection, full verification, and public actor wiring remain later work, with
+product activation at B4.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.

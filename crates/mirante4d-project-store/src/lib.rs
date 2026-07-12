@@ -11,6 +11,8 @@ mod actor;
 mod api;
 mod generation;
 #[cfg(target_os = "linux")]
+mod inspection;
+#[cfg(target_os = "linux")]
 mod lease;
 #[cfg(target_os = "linux")]
 mod local;

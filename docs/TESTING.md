@@ -160,10 +160,15 @@ failure from write-suspending head indeterminacy. Five actor cases exercise the
 real established manual/autosave primitives under one worker and prove exact
 request correlation, the request/completion bounds, queued-autosave coalescing,
 active and queued cancellation, close rejection, writer-lease lifetime, and
-joined or nonblocking shutdown. They do not claim Create/Open/Save As
-execution, provisional autosave, recovery selection/open, timers, garbage
-collection, full verification, public actor wiring, the exhaustive fault matrix
-or power-cut durability, product reachability, or product-open validation.
+joined or nonblocking shutdown. Five inspection cases cover the three promoted
+established-store states, exact heads and autosave classification, read-only and
+writer-contention modes, recovery-ahead without mutation, metadata-only payload
+validation, deferred payload digests, and fail-closed cancellation, capacity,
+symlink, hardlink, length, and control corruption. They do not claim public
+Create/Open/Save As execution, provisional autosave, recovery selection/open,
+timers, garbage collection, full verification, public actor wiring, the
+exhaustive fault matrix or power-cut durability, product reachability, or
+product-open validation.
 
 The checked independent source report supports only the WP-03 source-TIFF
 archive. WP-10A is accepted off-product and its target authority is promoted.

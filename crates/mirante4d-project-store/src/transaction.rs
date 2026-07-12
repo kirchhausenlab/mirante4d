@@ -25,6 +25,9 @@ use crate::{
         ArtifactStorage, EncodedGeneration, GenerationCodecError, GenerationDocument,
         GenerationKind, LogicalObjectBinding, LogicalObjectPage, PAGE_BYTES, PhysicalObject,
     },
+    inspection::{
+        EstablishedStoreInspection, LaneSnapshot, inspect_established_store, read_lane_snapshot,
+    },
     lease::{LeaseError, ProjectStoreLeases},
     local::{ImmutablePublication, LocalPublicationError, LocalStoreRoot, PublicationDisposition},
     wire::{RefKind, RefRecord},
@@ -184,19 +187,6 @@ where
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LaneSnapshot {
-    head: RefRecord,
-    recovery: Option<RefRecord>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct EstablishedStoreSnapshot {
-    manual: LaneSnapshot,
-    autosave: Option<LaneSnapshot>,
-    next_generation_sequence: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CommitLane {
     Manual,
     Autosave,
@@ -224,10 +214,10 @@ impl CommitLane {
         }
     }
 
-    const fn target(self, snapshot: EstablishedStoreSnapshot) -> Option<LaneSnapshot> {
+    const fn target(self, inspection: &EstablishedStoreInspection) -> Option<LaneSnapshot> {
         match self {
-            Self::Manual => Some(snapshot.manual),
-            Self::Autosave => snapshot.autosave,
+            Self::Manual => Some(inspection.manual()),
+            Self::Autosave => inspection.autosave(),
         }
     }
 
@@ -315,16 +305,17 @@ where
         return Err(ProjectStoreFault::ReadOnly);
     }
     let project_id = capture.projection().state().project_id();
-    let envelope = root
-        .read_project_envelope(limits, &mut is_cancelled)
-        .map_err(|error| map_local_error(error, "project_envelope"))?;
-    if envelope.project_id() != project_id {
+    let inspection = inspect_established_store(root, limits, &mut is_cancelled)?;
+    if inspection.project_id() != project_id {
         return Err(ProjectStoreFault::Corruption {
             stage: "project_envelope_identity",
         });
     }
-    let snapshot =
-        inspect_established_store(root, &capture, project_id, lane, limits, &mut is_cancelled)?;
+    validate_established_capture(&capture, lane, &inspection)?;
+    let next_generation_sequence = inspection.next_generation_sequence()?;
+    let expected_manual = inspection.manual();
+    let expected_autosave = inspection.autosave();
+    let target = lane.target(&inspection);
 
     let captured_revision = capture.projection().revision();
     let captured_revision_high_water = capture.projection().revision_high_water().clone();
@@ -333,13 +324,12 @@ where
         root,
         capture,
         lane.generation_kind(),
-        snapshot.next_generation_sequence,
+        next_generation_sequence,
         limits,
         &mut is_cancelled,
     )
     .map_err(map_generation_error)?;
 
-    let target = lane.target(snapshot);
     let (pending_fixed_refs, replaces_fixed_ref) = match target {
         Some(target) => (usize::from(target.recovery.is_none()), true),
         None => (1, false),
@@ -377,7 +367,8 @@ where
     require_unchanged_established_refs(
         root,
         project_id,
-        snapshot,
+        expected_manual,
+        expected_autosave,
         lane,
         limits,
         &mut is_cancelled,
@@ -436,26 +427,12 @@ where
     Ok(receipt)
 }
 
-fn inspect_established_store<C>(
-    root: &LocalStoreRoot,
+fn validate_established_capture(
     capture: &ProjectCommitCapture,
-    project_id: mirante4d_project_model::ProjectId,
     lane: CommitLane,
-    limits: ProjectStoreLimits,
-    is_cancelled: &mut C,
-) -> Result<EstablishedStoreSnapshot, ProjectStoreFault>
-where
-    C: FnMut() -> bool,
-{
-    let manual = read_lane_snapshot(
-        root,
-        project_id,
-        RefKind::ManualHead,
-        RefKind::ManualRecovery,
-        limits,
-        &mut *is_cancelled,
-    )?
-    .ok_or(ProjectStoreFault::StaleParent)?;
+    inspection: &EstablishedStoreInspection,
+) -> Result<(), ProjectStoreFault> {
+    let manual = inspection.manual();
     match lane {
         CommitLane::Manual => {
             if capture.autosave_base().is_some() {
@@ -474,29 +451,14 @@ where
         }
     }
 
-    let autosave = read_lane_snapshot(
-        root,
-        project_id,
-        RefKind::AutosaveHead,
-        RefKind::AutosaveRecovery,
-        limits,
-        &mut *is_cancelled,
-    )?;
+    let autosave = inspection.autosave();
     if lane == CommitLane::Autosave
         && capture.expected_parent() != autosave.map(|lane| lane.head.current())
     {
         return Err(ProjectStoreFault::StaleParent);
     }
 
-    let manual_generation = read_current_generation(
-        root,
-        project_id,
-        manual,
-        GenerationKind::Manual,
-        limits,
-        &mut *is_cancelled,
-        "manual_generation",
-    )?;
+    let manual_generation = inspection.manual_generation();
     if capture.forked_from() != manual_generation.forked_from()
         || !capture
             .projection()
@@ -508,270 +470,12 @@ where
             stage: "manual_generation_continuity",
         });
     }
-    let pins = root
-        .read_pin_refs(limits, &mut *is_cancelled)
-        .map_err(|error| map_local_error(error, "ref_namespace"))?;
-    if pins.iter().any(|pin| pin.project_id() != project_id) {
-        return Err(ProjectStoreFault::Corruption {
-            stage: "pin_identity",
-        });
-    }
-    let mut maximum_generation_sequence = manual_generation.generation_sequence();
-    let mut maximum_revision_high_water = manual_generation
-        .projection()
-        .revision_high_water()
-        .sequence();
-    let autosave_generation = if let Some(autosave_lane) = autosave {
-        let autosave_generation = read_current_generation(
-            root,
-            project_id,
-            autosave_lane,
-            GenerationKind::Autosave,
-            limits,
-            &mut *is_cancelled,
-            "autosave_generation",
-        )?;
-        if autosave_lane.head.base().is_none()
-            || autosave_generation.forked_from() != manual_generation.forked_from()
-            || !autosave_generation
-                .projection()
-                .state()
-                .dataset()
-                .has_same_scientific_content(manual_generation.projection().state().dataset())
-        {
-            return Err(ProjectStoreFault::Corruption {
-                stage: "autosave_generation_continuity",
-            });
-        }
-        maximum_generation_sequence =
-            maximum_generation_sequence.max(autosave_generation.generation_sequence());
-        maximum_revision_high_water = maximum_revision_high_water.max(
-            autosave_generation
-                .projection()
-                .revision_high_water()
-                .sequence(),
-        );
-        Some(autosave_generation)
-    } else {
-        None
-    };
-    validate_referenced_generations(
-        root,
-        project_id,
-        manual,
-        autosave,
-        &pins,
-        &manual_generation,
-        autosave_generation.as_ref(),
-        limits,
-        &mut *is_cancelled,
-    )?;
-    if capture.projection().revision_high_water().sequence() < maximum_revision_high_water {
+    if capture.projection().revision_high_water().sequence()
+        < inspection.maximum_revision_high_water()
+    {
         return Err(ProjectStoreFault::Corruption {
             stage: "revision_high_water_regression",
         });
-    }
-    let next_generation_sequence =
-        maximum_generation_sequence
-            .checked_add(1)
-            .ok_or(ProjectStoreFault::Capacity {
-                stage: "generation_sequence",
-            })?;
-    Ok(EstablishedStoreSnapshot {
-        manual,
-        autosave,
-        next_generation_sequence,
-    })
-}
-
-fn read_lane_snapshot<C>(
-    root: &LocalStoreRoot,
-    project_id: mirante4d_project_model::ProjectId,
-    head_kind: RefKind,
-    recovery_kind: RefKind,
-    limits: ProjectStoreLimits,
-    is_cancelled: &mut C,
-) -> Result<Option<LaneSnapshot>, ProjectStoreFault>
-where
-    C: FnMut() -> bool,
-{
-    let head = root
-        .read_ref(head_kind, limits, &mut *is_cancelled)
-        .map_err(|error| map_local_error(error, "lane_head"))?;
-    let recovery = root
-        .read_ref(recovery_kind, limits, &mut *is_cancelled)
-        .map_err(|error| map_local_error(error, "lane_recovery"))?;
-    let Some(head) = head else {
-        if recovery.is_some() {
-            return Err(ProjectStoreFault::Corruption {
-                stage: "recovery_without_head",
-            });
-        }
-        return Ok(None);
-    };
-    if head.project_id() != project_id
-        || head.previous() == Some(head.current())
-        || recovery.is_some_and(|record| record.project_id() != project_id)
-    {
-        return Err(ProjectStoreFault::Corruption {
-            stage: "lane_ref_identity",
-        });
-    }
-    let pair_valid = match recovery {
-        None => head.previous().is_none(),
-        Some(record) => {
-            record.current() == head.current() || Some(record.current()) == head.previous()
-        }
-    };
-    if !pair_valid {
-        return Err(ProjectStoreFault::Corruption {
-            stage: "recovery_pair",
-        });
-    }
-    Ok(Some(LaneSnapshot { head, recovery }))
-}
-
-fn read_current_generation<C>(
-    root: &LocalStoreRoot,
-    project_id: mirante4d_project_model::ProjectId,
-    lane: LaneSnapshot,
-    kind: GenerationKind,
-    limits: ProjectStoreLimits,
-    is_cancelled: &mut C,
-    stage: &'static str,
-) -> Result<GenerationDocument, ProjectStoreFault>
-where
-    C: FnMut() -> bool,
-{
-    let bytes = root
-        .read_generation_bytes(
-            lane.head.current(),
-            limits.generation_bytes_max,
-            &mut *is_cancelled,
-        )
-        .map_err(|error| map_local_error(error, stage))?;
-    let document = GenerationDocument::decode(lane.head.current(), project_id, &bytes, limits)
-        .map_err(|_| ProjectStoreFault::Corruption { stage })?;
-    if document.kind() != kind
-        || document.parent_generation_id() != lane.head.previous()
-        || document.base_manual_generation_id() != lane.head.base()
-    {
-        return Err(ProjectStoreFault::Corruption { stage });
-    }
-    validate_physical_closure(root, &document, limits, &mut *is_cancelled)
-        .map_err(map_generation_error)?;
-    Ok(document)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_referenced_generations<C>(
-    root: &LocalStoreRoot,
-    project_id: mirante4d_project_model::ProjectId,
-    manual: LaneSnapshot,
-    autosave: Option<LaneSnapshot>,
-    pins: &[RefRecord],
-    manual_current: &GenerationDocument,
-    autosave_current: Option<&GenerationDocument>,
-    limits: ProjectStoreLimits,
-    is_cancelled: &mut C,
-) -> Result<(), ProjectStoreFault>
-where
-    C: FnMut() -> bool,
-{
-    let mut targets = BTreeMap::<ProjectGenerationId, Option<GenerationKind>>::new();
-    for id in [
-        Some(manual.head.current()),
-        manual.head.previous(),
-        manual.recovery.map(RefRecord::current),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        insert_expected_generation(&mut targets, id, Some(GenerationKind::Manual))?;
-    }
-    if let Some(autosave) = autosave {
-        for id in [
-            Some(autosave.head.current()),
-            autosave.head.previous(),
-            autosave.recovery.map(RefRecord::current),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            insert_expected_generation(&mut targets, id, Some(GenerationKind::Autosave))?;
-        }
-        if let Some(base) = autosave.head.base() {
-            insert_expected_generation(&mut targets, base, Some(GenerationKind::Manual))?;
-        }
-    }
-    for pin in pins {
-        insert_expected_generation(&mut targets, pin.current(), None)?;
-    }
-
-    let autosave_current_id = autosave.map(|lane| lane.head.current());
-    for (id, expected_kind) in targets {
-        if id == manual.head.current() || Some(id) == autosave_current_id {
-            continue;
-        }
-        let bytes = root
-            .read_generation_bytes(id, limits.generation_bytes_max, &mut *is_cancelled)
-            .map_err(|error| map_local_error(error, "referenced_generation"))?;
-        let document =
-            GenerationDocument::decode(id, project_id, &bytes, limits).map_err(|_| {
-                ProjectStoreFault::Corruption {
-                    stage: "referenced_generation",
-                }
-            })?;
-        if expected_kind.is_some_and(|kind| document.kind() != kind)
-            || document.forked_from() != manual_current.forked_from()
-            || !document
-                .projection()
-                .state()
-                .dataset()
-                .has_same_scientific_content(manual_current.projection().state().dataset())
-        {
-            return Err(ProjectStoreFault::Corruption {
-                stage: "referenced_generation",
-            });
-        }
-        validate_physical_closure(root, &document, limits, &mut *is_cancelled)
-            .map_err(map_generation_error)?;
-    }
-    if autosave_current.is_some_and(|document| {
-        document.forked_from() != manual_current.forked_from()
-            || !document
-                .projection()
-                .state()
-                .dataset()
-                .has_same_scientific_content(manual_current.projection().state().dataset())
-    }) {
-        return Err(ProjectStoreFault::Corruption {
-            stage: "autosave_generation_continuity",
-        });
-    }
-    Ok(())
-}
-
-fn insert_expected_generation(
-    targets: &mut BTreeMap<ProjectGenerationId, Option<GenerationKind>>,
-    id: ProjectGenerationId,
-    kind: Option<GenerationKind>,
-) -> Result<(), ProjectStoreFault> {
-    match targets.entry(id) {
-        Entry::Vacant(entry) => {
-            entry.insert(kind);
-        }
-        Entry::Occupied(mut entry) => match (*entry.get(), kind) {
-            (Some(existing), Some(observed)) if existing != observed => {
-                return Err(ProjectStoreFault::Corruption {
-                    stage: "generation_lane",
-                });
-            }
-            (None, Some(observed)) => {
-                entry.insert(Some(observed));
-            }
-            _ => {}
-        },
     }
     Ok(())
 }
@@ -779,7 +483,8 @@ fn insert_expected_generation(
 fn require_unchanged_established_refs<C>(
     root: &LocalStoreRoot,
     project_id: mirante4d_project_model::ProjectId,
-    expected: EstablishedStoreSnapshot,
+    expected_manual: LaneSnapshot,
+    expected_autosave: Option<LaneSnapshot>,
     lane: CommitLane,
     limits: ProjectStoreLimits,
     is_cancelled: &mut C,
@@ -796,7 +501,7 @@ where
         &mut *is_cancelled,
     )?
     .ok_or(ProjectStoreFault::StaleParent)?;
-    if manual.head.current() != expected.manual.head.current() {
+    if manual.head.current() != expected_manual.head.current() {
         return Err(ProjectStoreFault::StaleParent);
     }
     let autosave = read_lane_snapshot(
@@ -809,11 +514,11 @@ where
     )?;
     if lane == CommitLane::Autosave
         && autosave.map(|lane| lane.head.current())
-            != expected.autosave.map(|lane| lane.head.current())
+            != expected_autosave.map(|lane| lane.head.current())
     {
         return Err(ProjectStoreFault::StaleParent);
     }
-    if manual != expected.manual || autosave != expected.autosave {
+    if manual != expected_manual || autosave != expected_autosave {
         return Err(ProjectStoreFault::Corruption {
             stage: "lane_ref_drift",
         });

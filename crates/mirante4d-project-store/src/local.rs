@@ -68,6 +68,7 @@ const FILE_READ_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::CLOEXEC)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::NONBLOCK);
+const FILE_METADATA_FLAGS: OFlags = OFlags::PATH.union(OFlags::CLOEXEC).union(OFlags::NOFOLLOW);
 const FILE_CREATE_FLAGS: OFlags = OFlags::WRONLY
     .union(OFlags::CREATE)
     .union(OFlags::EXCL)
@@ -896,6 +897,70 @@ impl LocalStoreRoot {
             &mut on_chunk,
         )?
         .ok_or(LocalPublicationError::ExistingMismatch)
+    }
+
+    /// Validates only the immutable object's descriptor-relative file
+    /// identity and declared length. Bulk bytes are deliberately not read or
+    /// hashed during eager store inspection.
+    pub(crate) fn validate_exact_object_metadata<C>(
+        &self,
+        digest: ExactBytesDigest,
+        byte_length: u64,
+        maximum_bytes: u64,
+        mut is_cancelled: C,
+    ) -> Result<(), LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        let expected = DeclaredExactFile::new(digest, byte_length);
+        validate_capacity(expected, maximum_bytes)?;
+        check_cancelled(&mut is_cancelled)?;
+        let (parent, name) = self.open_existing_parent(&object_relative_path(digest))?;
+        let descriptor = openat(&parent, &name, FILE_METADATA_FLAGS, Mode::empty())
+            .map_err(|_| LocalPublicationError::ExistingMismatch)?;
+        let opened = FileIdentity::from_stat(
+            fstat(&descriptor).map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        if opened.bytes != byte_length {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+        let named = FileIdentity::from_stat(
+            statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        check_cancelled(&mut is_cancelled)?;
+        if opened != named {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+        Ok(())
+    }
+
+    /// Reads one bounded control object and validates its exact digest without
+    /// synchronizing or otherwise mutating the store.
+    pub(crate) fn read_exact_object_bytes<C>(
+        &self,
+        digest: ExactBytesDigest,
+        byte_length: u64,
+        maximum_bytes: u64,
+        is_cancelled: C,
+    ) -> Result<Vec<u8>, LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        let expected = DeclaredExactFile::new(digest, byte_length);
+        validate_capacity(expected, maximum_bytes)?;
+        let bytes = self
+            .read_optional_small_file(&object_relative_path(digest), maximum_bytes, is_cancelled)?
+            .ok_or(LocalPublicationError::ExistingMismatch)?;
+        if u64::try_from(bytes.len()).ok() != Some(byte_length)
+            || ExactBytesHasher::hash(&bytes)
+                .map_err(|_| LocalPublicationError::ExistingMismatch)?
+                .digest()
+                != digest
+        {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+        Ok(bytes)
     }
 
     fn publish<R, C>(

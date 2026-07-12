@@ -2507,6 +2507,46 @@
       "reason": "WP-10B B2 proves fail-closed canonical, identity, nullable-field, and collection bounds."
     },
     {
+      "id": "libtest:mirante4d-project-store:inspection::tests::cancellation_capacity_and_control_corruption_fail_without_mutation",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves established-store inspection fails closed on cancellation, inventory capacity, and corrupt control bytes without mutation."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:inspection::tests::eager_inspection_checks_object_metadata_but_defers_payload_digests",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves eager inspection validates descriptor-relative object metadata while deferring bulk payload digests."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:inspection::tests::established_fixtures_report_exact_heads_and_autosave_classification",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves one shared inspection authority accepts the exact newer, divergent, and stale established fixtures."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:inspection::tests::recovery_ahead_is_accepted_without_changing_head_authority_or_bytes",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves established recovery-ahead remains valid read-only state and never replaces head authority."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:inspection::tests::requested_mode_and_writer_contention_are_reported_without_losing_leases",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves established open holds session leases and reports writable contention as an explicit read-only fallback."
+    },
+    {
       "id": "libtest:mirante4d-project-store:lease::tests::process_contention_preserves_shared_maintenance_and_single_writer_ownership",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -5716,6 +5756,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 508
+    "current_additions": 513
   }
 }
