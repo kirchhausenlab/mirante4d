@@ -94,8 +94,12 @@ PackageId until whole-object manifest SHA-256 validation exists. Explicit
 caller-selected DS admission now distinguishes arithmetic addressed shards
 from actual files, validates every listed shard coordinate, requires complete
 packed-index shard coverage, and applies the selected count ceilings without
-enumerating logical bricks. It does not infer or persist a DS label. Structural
-and complete-package validation remain incomplete.
+enumerating logical bricks. It does not infer or persist a DS label. A crate-
+private structural pass then verifies packed-index object digests and every
+record's coordinates, edge capacity, validity mode, canonical padding, and
+pixel/validity inner-slot presence without reading those large payloads. The
+catalog exposes the root digest only as the declared PackageId. Full package-
+closure validation remains incomplete and no read is PackageId-authorized.
 
 WP-10B separately installs immutable content-addressed project objects,
 complete generations, atomic head/recovery refs, leases, autosave/recovery,

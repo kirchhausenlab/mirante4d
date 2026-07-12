@@ -152,6 +152,7 @@
     "portable_record_policy": "profile paths and manifest descriptor roles are checked during open; portable record bytes remain lazy",
     "descriptor_set": "every non-shard descriptor must be exactly one profile-derived required metadata/control path; shard descriptors remain authenticated claims but their files are not read",
     "cross_object_checks": "profile/science/display identity and layer sets match; physical channels exactly cover c; OME level/time/base geometry and IO-2 eligibility match science; co-grouped layers share science grids; per-level pixel dtype and ceil-divided shapes, validity t,c,z,y,ceil(x/8), packed-index logical-brick counts, and packed-coordinate u32 capacity match",
+    "reported_identity": "the root digest is exposed only as the declared PackageId until full closure validation proves every descriptor payload digest",
     "reported_metric": "exact metadata bytes read is retained for the later metadata-open evidence gate",
     "non_claims": "open does not enumerate directory closure, verify shard bytes, decode indexes, compute scientific identity, or imply full package validation"
   },
@@ -198,6 +199,16 @@
     "amplification": "enforce the frozen absolute cold-request, encoded-read-byte, and decoded-byte ceilings for regular and fully elided one-brick reads",
     "authority_stability": "file device, inode, length, mtime, and ctime are checked around each component read and every used shard receives one final bounded identity sweep",
     "non_claims": "returned bytes cannot be attributed to the catalog PackageId; the operation does not verify whole-object manifest SHA-256, perform DS-specific admission or complete-package validation, compute scientific identity, or establish product support"
+  },
+  "package_structural_reconciliation": {
+    "exposure": "crate-private precursor composed after explicit DS admission; it issues no public validation report or read capability",
+    "packed_index_scan": "read each bounded packed-index shard coherently once, verify its descriptor length and SHA-256, canonical tail and inner CRC32C, decode exactly the logical records in C-order, and require zero array-fill bytes after the final logical record in its decoded inner chunk",
+    "record_checks": "each record must contain its exact image, scale, t, c, z, y, x coordinates; validate statistics against the exact nonpadded edge-brick capacity and require the profile's validity mode",
+    "canonical_slots": "required packed-index inner slots are present and all unused outer slots are missing; pixel inner-slot presence is exactly pixel_payload_present; explicit-validity inner-slot presence is exactly valid_voxel_count greater than zero; every out-of-grid slot is missing",
+    "empty_shards": "a listed pixel or validity shard must contain at least one record-required inner payload; all-missing physical shard objects are noncanonical",
+    "bounds": "run in bounded O((logical records plus addressed shard slots) times log addressed shards), retain only per-shard bitmasks, object snapshots, and one packed-index shard, use checked counters, and poll cancellation throughout",
+    "final_recheck": "repeat the exact directory and manifest-authority inspection after reconciliation, then revalidate every inspected shard snapshot as the last success gate; detected mutation or cancellation fails the attempt",
+    "non_claims": "reconciliation does not hash pixel or validity shard payloads, recompute their scientific statistics, prove the declared PackageId closure, authorize PackageId-attributed reads, compute ScientificContentId, establish IO-3, qualify T1, activate the product, or freeze a stable format"
   },
   "portable_records": {
     "scope": "initial package-contained version-1 portable records; adding another source or license literal is a hard schema change",

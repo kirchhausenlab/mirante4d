@@ -307,7 +307,7 @@ pub(crate) fn brick_grid(
     ])
 }
 
-fn pixel_brick(kind: ShardProfileKind) -> Option<([u64; 3], bool)> {
+pub(crate) fn pixel_brick(kind: ShardProfileKind) -> Option<([u64; 3], bool)> {
     match kind {
         ShardProfileKind::Pixel3dUint8
         | ShardProfileKind::Pixel3dUint16
@@ -333,7 +333,7 @@ fn linear_record_ordinal(grid: [u64; 5], coordinates: [u64; 5]) -> Result<u64, B
         })
 }
 
-fn spatial_inner_chunk(z: u64, y: u64, x: u64, two_dimensional: bool) -> u64 {
+pub(crate) fn spatial_inner_chunk(z: u64, y: u64, x: u64, two_dimensional: bool) -> u64 {
     let z = if two_dimensional {
         0
     } else {
@@ -344,7 +344,7 @@ fn spatial_inner_chunk(z: u64, y: u64, x: u64, two_dimensional: bool) -> u64 {
         + x % SPATIAL_INNER_CHUNKS_PER_SHARD_AXIS
 }
 
-fn edge_extent(
+pub(crate) fn edge_extent(
     shape: [u64; 5],
     brick_zyx: [u64; 3],
     coordinates_zyx: [u64; 3],

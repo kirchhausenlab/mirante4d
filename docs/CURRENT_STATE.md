@@ -78,9 +78,11 @@ counters. It remains crate-private until full SHA-256 validation can gate
 PackageId-attributed reads. Caller-selected DS admission now derives logical
 and addressed counts arithmetically, separates actual shard files, bounds every
 listed shard coordinate, and requires exact packed-index shard coverage. The
-writer,
-structural/full validation, the independent T1 corpus, and product activation
-remain incomplete.
+crate-private structural pass now verifies every packed-index shard digest,
+record coordinate, edge capacity, canonical padding, and pixel/validity inner-
+slot presence, with a final identity/inventory sweep. It still issues no
+PackageId authority. The writer, full validation, independent T1 corpus, and
+product activation remain incomplete.
 Current schema-1 packages remain transitional T2 fixtures and the sole product
 route.
 

@@ -57,7 +57,9 @@ impl LocalObjectInfo {
 ///
 /// WP-10A currently claims Linux/Unix local storage only. Every object open
 /// rejects symlinks, hardlinks, non-regular files, root escape, and identity
-/// changes around the open before any bytes are returned.
+/// changes around the open before any bytes are returned. This is unverified
+/// raw access: it does not authenticate a manifest digest or authorize a
+/// declared package identity.
 #[derive(Debug)]
 pub struct LocalPackageReader {
     root: PathBuf,
@@ -114,10 +116,24 @@ impl LocalPackageReader {
         path: &PackagePath,
         object_bytes_max: u64,
     ) -> Result<Vec<u8>, RangeReadError> {
+        self.read_object_with_snapshot(path, object_bytes_max)
+            .map(|(bytes, _snapshot)| bytes)
+    }
+
+    pub(crate) fn read_object_with_snapshot(
+        &self,
+        path: &PackagePath,
+        object_bytes_max: u64,
+    ) -> Result<(Vec<u8>, LocalObjectSnapshot), RangeReadError> {
         let mut checked = self.open_object(path, object_bytes_max)?;
         let bytes = read_exact_at(&mut checked.file, path, 0, checked.bytes)?;
         self.revalidate_open_object(path, &checked)?;
-        Ok(bytes)
+        let snapshot = LocalObjectSnapshot {
+            path: path.clone(),
+            bytes: checked.bytes,
+            identity: checked.identity,
+        };
+        Ok((bytes, snapshot))
     }
 
     /// Reads one nonempty checked `(object, offset, length)` range.
@@ -154,6 +170,16 @@ impl LocalPackageReader {
         tail_bytes: u64,
         object_bytes_max: u64,
     ) -> Result<(Vec<u8>, u64), RangeReadError> {
+        self.read_shard_index_tail_with_snapshot(path, tail_bytes, object_bytes_max)
+            .map(|(tail, payload_bytes, _snapshot)| (tail, payload_bytes))
+    }
+
+    pub(crate) fn read_shard_index_tail_with_snapshot(
+        &self,
+        path: &PackagePath,
+        tail_bytes: u64,
+        object_bytes_max: u64,
+    ) -> Result<(Vec<u8>, u64, LocalObjectSnapshot), RangeReadError> {
         if tail_bytes == 0 || tail_bytes > SHARD_INDEX_RANGE_READ_BYTES_MAX {
             return Err(RangeReadError::InvalidShardIndexRange {
                 actual: tail_bytes,
@@ -171,7 +197,12 @@ impl LocalPackageReader {
         let payload_bytes = checked.bytes - tail_bytes;
         let bytes = read_exact_at(&mut checked.file, path, payload_bytes, tail_bytes)?;
         self.revalidate_open_object(path, &checked)?;
-        Ok((bytes, payload_bytes))
+        let snapshot = LocalObjectSnapshot {
+            path: path.clone(),
+            bytes: checked.bytes,
+            identity: checked.identity,
+        };
+        Ok((bytes, payload_bytes, snapshot))
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -260,6 +291,19 @@ impl LocalPackageReader {
             self.revalidate_open_object(&snapshot.path, &checked)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn revalidate_snapshot(
+        &self,
+        snapshot: &LocalObjectSnapshot,
+    ) -> Result<(), RangeReadError> {
+        let checked = self.open_object(&snapshot.path, snapshot.bytes)?;
+        if checked.bytes != snapshot.bytes || checked.identity != snapshot.identity {
+            return Err(RangeReadError::ObjectChanged {
+                path: snapshot.path.to_string(),
+            });
+        }
+        self.revalidate_open_object(&snapshot.path, &checked)
     }
 
     #[cfg(unix)]
@@ -625,6 +669,15 @@ mod tests {
         let (tail, payload_bytes) = reader.read_shard_index_tail(&path, 260, 8_192).unwrap();
         assert_eq!(payload_bytes, 7_932);
         assert_eq!(tail, bytes[7_932..]);
+
+        let (_whole, snapshot) = reader.read_object_with_snapshot(&path, 8_192).unwrap();
+        let replacement = root.0.join("replacement.bin");
+        fs::write(&replacement, vec![7; 8_192]).unwrap();
+        fs::rename(replacement, root.0.join(path.as_str())).unwrap();
+        assert!(matches!(
+            reader.revalidate_snapshot(&snapshot),
+            Err(RangeReadError::ObjectChanged { .. })
+        ));
     }
 
     #[test]

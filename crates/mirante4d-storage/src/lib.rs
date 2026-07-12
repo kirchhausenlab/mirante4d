@@ -18,6 +18,7 @@ mod limits;
 mod ome_metadata;
 mod package_admission;
 mod package_catalog;
+mod package_structure;
 // Staged behind the future full-SHA package-integrity capability.
 #[cfg_attr(not(test), allow(dead_code))]
 mod package_read;

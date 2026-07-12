@@ -16,7 +16,7 @@
     "path": "architecture/wp10a-control-wire-specialization.json",
     "schema": "mirante4d-wp10a-control-wire-specialization",
     "schema_version": 1,
-    "sha256": "fee3b50667a06254d726f89681ca90947e682c4302c9939c22a7058026d7557a"
+    "sha256": "a31a22f110d56da77cb9a1d170281d458a7e439a9e97d52f5f6f505fa5dfb062"
   },
   "activation": {
     "crate_name": "mirante4d-storage",

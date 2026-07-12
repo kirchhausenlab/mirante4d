@@ -159,6 +159,19 @@ reproduces every frozen 3D/multiscale logical-brick, addressed-shard, and
 logical-S0 boundary vector. These tests do not qualify an exact DS fixture or
 validate packed records, payload digests, or scientific identity.
 
+The package-wide structural reconciliation test covers pixel-present, all-
+fill, explicit-validity, and explicit-all-invalid packages. It rejects record
+coordinate/validity drift, missing or extra packed slots, nonzero final packed
+padding, missing/extra pixel and validity payload slots, all-missing shard
+objects, out-of-grid payload slots, packed-index digest drift, mid-pass/final-
+sweep cancellation, and same-length replacement before the last snapshot
+gate. A focused arithmetic test covers nondivisible edge capacities, C-order
+slot masks, and packed records 255/256 and 16383/16384. The pass reads packed-
+index shards completely and only pixel/validity shard tails, so it does not validate
+pixel/validity payload digests or values,
+prove the declared PackageId closure, recompute scientific identity, or
+qualify an exact DS fixture.
+
 The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).
 

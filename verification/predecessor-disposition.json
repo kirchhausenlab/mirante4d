@@ -4813,6 +4813,14 @@
       "reason": "WP-10A derives exact logical, addressed, and actual DS facts; permits zero-file all-fill pixels; requires packed coverage; rejects out-of-grid shards; and propagates cancellation."
     },
     {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::reconciles_every_packed_record_with_canonical_shard_slots",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A reconciles every packed record with exact coordinates, edge capacity, validity mode, canonical padding, descriptor presence, and pixel/validity inner-slot state while preserving cancellation and rejecting packed-index digest drift."
+    },
+    {
       "id": "libtest:mirante4d-storage:package_catalog::tests::derives_descriptor_bound_brick_address_plan",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -4869,12 +4877,20 @@
       "reason": "WP-10A accepts exact regular and all-fill one-brick amplification limits and rejects each metric immediately above its ceiling."
     },
     {
+      "id": "libtest:mirante4d-storage:package_structure::tests::c_order_edges_slots_and_packed_boundaries_are_exact",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A fixes multi-record C-order inversion, nondivisible 2D edge capacities, sparse inner-slot masks, and the packed inner/outer boundaries at records 255/256 and 16383/16384."
+    },
+    {
       "id": "libtest:mirante4d-storage:range_io::tests::reads_only_the_requested_nonempty_range_and_index_tail",
       "kind": "libtest",
       "owner": "mirante4d-storage",
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
-      "reason": "WP-10A proves local reads fetch one exact nonempty range and at most the fixed shard-index tail."
+      "reason": "WP-10A proves local reads fetch one exact nonempty range and at most the fixed shard-index tail, while a retained object snapshot rejects same-length replacement."
     },
     {
       "id": "libtest:mirante4d-storage:range_io::tests::rejects_empty_overflowing_out_of_bounds_and_oversized_reads",
@@ -5003,6 +5019,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 420
+    "current_additions": 422
   }
 }
