@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -447,7 +447,7 @@ fn cargo_metadata(repo_root: &Path) -> anyhow::Result<Value> {
             "--format-version=1",
             "--locked",
             "--offline",
-            "--all-features",
+            "--no-deps",
         ])
         .current_dir(repo_root)
         .output()
@@ -512,13 +512,7 @@ fn validate_storage_package(
     validate_direct_dependencies(storage, contract)?;
     validate_identity_dependencies(identity[0], contract)?;
     validate_locked_dependencies(repo_root, contract)?;
-    validate_dependency_graph(
-        repo_root,
-        metadata,
-        &package_by_id,
-        &workspace_members,
-        contract,
-    )
+    validate_dependency_graph(repo_root, &package_by_id, &workspace_members, contract)
 }
 
 fn validate_storage_manifest_path(repo_root: &Path, package: &Value) -> anyhow::Result<()> {
@@ -722,34 +716,13 @@ fn validate_identity_dependencies(
 
 fn validate_dependency_graph(
     repo_root: &Path,
-    metadata: &Value,
     package_by_id: &BTreeMap<String, &Value>,
     workspace_members: &BTreeSet<String>,
     contract: &StorageContract,
 ) -> anyhow::Result<()> {
-    let nodes = metadata
-        .pointer("/resolve/nodes")
-        .and_then(Value::as_array)
-        .context("cargo metadata has no resolve graph")?;
-    let node_by_id = nodes
-        .iter()
-        .map(|node| Ok((string_field(node, "id", "resolve node")?.to_owned(), node)))
-        .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-    let storage_id = workspace_members
-        .iter()
-        .find(|id| {
-            package_by_id
-                .get(*id)
-                .and_then(|package| package.get("name"))
-                .and_then(Value::as_str)
-                == Some(STORAGE_CRATE)
-        })
-        .context("storage package is absent from the resolve graph")?;
-
-    // Workspace-wide Cargo metadata unifies features across every selected
-    // package. Use Cargo's package-selected tree for the storage closure so
-    // unrelated workspace features and target dependencies cannot inflate or
-    // hide this off-product crate's actual graph.
+    // Workspace manifests own reverse reachability below. Use Cargo's
+    // package-selected tree for the forward storage closure so unrelated
+    // workspace features and target dependencies cannot inflate or hide it.
     let all_reachable = cargo_tree_closure(repo_root, "normal,build,dev")?;
     let production_reachable = cargo_tree_closure(repo_root, "normal,build")?;
     let forbidden = unique_set(
@@ -807,20 +780,41 @@ fn validate_dependency_graph(
         );
     }
 
-    for origin in workspace_members {
-        if origin == storage_id {
-            continue;
-        }
-        if reachable_package_ids(origin, &node_by_id, true)?.contains(storage_id) {
-            let origin_name = package_by_id
-                .get(origin)
-                .and_then(|package| package.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or("<unknown>");
-            bail!("off-product storage is reachable from workspace package {origin_name:?}");
-        }
+    let actual_dependents =
+        declared_workspace_dependents(package_by_id, workspace_members, STORAGE_CRATE)?;
+    let allowed_dependents = unique_set(
+        &contract.dependencies.allowed_workspace_dependents,
+        "allowed workspace dependent",
+    )?;
+    if actual_dependents != allowed_dependents {
+        bail!(
+            "off-product storage workspace dependents drifted: expected={allowed_dependents:?}, actual={actual_dependents:?}"
+        );
     }
     Ok(())
+}
+
+fn declared_workspace_dependents(
+    package_by_id: &BTreeMap<String, &Value>,
+    workspace_members: &BTreeSet<String>,
+    dependency_name: &str,
+) -> anyhow::Result<BTreeSet<String>> {
+    workspace_members
+        .iter()
+        .filter_map(|id| package_by_id.get(id).copied())
+        .filter(|package| {
+            package.get("name").and_then(Value::as_str) != Some(dependency_name)
+                && package
+                    .get("dependencies")
+                    .and_then(Value::as_array)
+                    .is_some_and(|dependencies| {
+                        dependencies.iter().any(|dependency| {
+                            dependency.get("name").and_then(Value::as_str) == Some(dependency_name)
+                        })
+                    })
+        })
+        .map(|package| string_field(package, "name", "workspace package").map(str::to_owned))
+        .collect()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -834,7 +828,6 @@ fn cargo_tree_closure(repo_root: &Path, edges: &str) -> anyhow::Result<CargoTree
         .args([
             "tree",
             "--locked",
-            "--offline",
             "--package",
             STORAGE_CRATE,
             "--all-features",
@@ -885,43 +878,6 @@ fn parse_cargo_tree_closure(stdout: &str) -> anyhow::Result<CargoTreeClosure> {
         bail!("cargo tree returned an empty package closure");
     }
     Ok(CargoTreeClosure { packages, names })
-}
-
-fn reachable_package_ids(
-    root: &str,
-    node_by_id: &BTreeMap<String, &Value>,
-    include_dev: bool,
-) -> anyhow::Result<BTreeSet<String>> {
-    let mut reached = BTreeSet::from([root.to_owned()]);
-    let mut queue = VecDeque::from([root.to_owned()]);
-    while let Some(id) = queue.pop_front() {
-        let node = node_by_id
-            .get(&id)
-            .with_context(|| format!("resolve graph has no node for {id}"))?;
-        let dependencies = node
-            .get("deps")
-            .and_then(Value::as_array)
-            .context("resolve node has no dependencies")?;
-        for dependency in dependencies {
-            let admitted = dependency
-                .get("dep_kinds")
-                .and_then(Value::as_array)
-                .context("resolve dependency has no kind inventory")?
-                .iter()
-                .any(|kind| {
-                    include_dev
-                        || kind.get("kind").and_then(Value::as_str).unwrap_or("normal") != "dev"
-                });
-            if !admitted {
-                continue;
-            }
-            let dependency_id = string_field(dependency, "pkg", "resolve dependency")?;
-            if reached.insert(dependency_id.to_owned()) {
-                queue.push_back(dependency_id.to_owned());
-            }
-        }
-    }
-    Ok(reached)
 }
 
 fn kinds_as_sets(kinds: &DependencyKinds) -> anyhow::Result<BTreeMap<String, BTreeSet<String>>> {
@@ -1146,29 +1102,50 @@ mod tests {
     }
 
     #[test]
-    fn reachability_distinguishes_production_from_dev_edges() {
-        let root = serde_json::json!({
-            "id": "storage",
-            "deps": [
-                {"pkg": "normal", "dep_kinds": [{"kind": null, "target": null}]},
-                {"pkg": "dev", "dep_kinds": [{"kind": "dev", "target": null}]}
-            ]
+    fn declared_dependents_cover_all_dependency_kinds_and_targets() {
+        let storage = serde_json::json!({"name": STORAGE_CRATE, "dependencies": []});
+        let normal = serde_json::json!({
+            "name": "normal",
+            "dependencies": [{"name": STORAGE_CRATE, "kind": null, "target": null}]
         });
-        let normal = serde_json::json!({"id": "normal", "deps": []});
-        let dev = serde_json::json!({"id": "dev", "deps": []});
-        let nodes = BTreeMap::from([
-            ("storage".to_owned(), &root),
+        let dev = serde_json::json!({
+            "name": "dev",
+            "dependencies": [{"name": STORAGE_CRATE, "kind": "dev", "target": null}]
+        });
+        let build = serde_json::json!({
+            "name": "build",
+            "dependencies": [{"name": STORAGE_CRATE, "kind": "build", "target": null}]
+        });
+        let targeted = serde_json::json!({
+            "name": "targeted",
+            "dependencies": [{
+                "name": STORAGE_CRATE,
+                "kind": null,
+                "target": "cfg(target_os = \"macos\")"
+            }]
+        });
+        let unrelated = serde_json::json!({
+            "name": "unrelated",
+            "dependencies": [{"name": "something-else", "kind": null, "target": null}]
+        });
+        let packages = BTreeMap::from([
+            ("storage".to_owned(), &storage),
             ("normal".to_owned(), &normal),
             ("dev".to_owned(), &dev),
+            ("build".to_owned(), &build),
+            ("targeted".to_owned(), &targeted),
+            ("unrelated".to_owned(), &unrelated),
         ]);
+        let members = packages.keys().cloned().collect();
 
         assert_eq!(
-            reachable_package_ids("storage", &nodes, false).unwrap(),
-            BTreeSet::from(["normal".to_owned(), "storage".to_owned()])
-        );
-        assert_eq!(
-            reachable_package_ids("storage", &nodes, true).unwrap(),
-            BTreeSet::from(["dev".to_owned(), "normal".to_owned(), "storage".to_owned()])
+            declared_workspace_dependents(&packages, &members, STORAGE_CRATE).unwrap(),
+            BTreeSet::from([
+                "build".into(),
+                "dev".into(),
+                "normal".into(),
+                "targeted".into()
+            ])
         );
     }
 

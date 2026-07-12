@@ -4542,12 +4542,12 @@
       "reason": "WP-10A counts every selected third-party package version against the frozen dependency ceiling."
     },
     {
-      "id": "libtest:xtask::bin/xtask:arch::wp10a::tests::reachability_distinguishes_production_from_dev_edges",
+      "id": "libtest:xtask::bin/xtask:arch::wp10a::tests::declared_dependents_cover_all_dependency_kinds_and_targets",
       "kind": "libtest",
       "owner": "xtask",
       "lane": "unit",
       "requirement_ids": ["D-022-unit", "WP-10A-off-product-storage-profile"],
-      "reason": "WP-10A enforces the off-product storage successor boundary and exact predecessor delegation."
+      "reason": "WP-10A proves product nonreachability scans normal, dev, build, and target-specific workspace dependencies without resolving unrelated platforms."
     },
     {
       "id": "libtest:xtask::bin/xtask:arch::wp10a::tests::source_policy_rejects_forbidden_authority_and_unsafe",
