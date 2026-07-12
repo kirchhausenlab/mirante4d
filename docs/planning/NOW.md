@@ -33,8 +33,10 @@ closure, final mutation checks, and the owning exact-package capability now
 gate PackageId-attributed reads. The deterministic create-only writer and its
 staged publication checks are present. Continue with WP-10A-C, which promotes
 the independent target-format authorities. Its exact standards mirror and
-external-reader codec probe are present; the full pairwise-independent corpus,
-oracle, reader report, identity vectors, and promotion remain. WP-10A-D then
+external-reader codec probe are present. The three-case declarative corpus
+input, zero-dependency scientific oracle, and static critical hand vectors are
+also present but unpromoted; exact archives, mutations, the full independent
+reader/schema report, and the atomic registry promotion remain. WP-10A-D then
 consumes those authorities and closes the package evidence. Current schema 1
 remains the sole product route until WP-10C.
 

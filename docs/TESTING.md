@@ -206,6 +206,14 @@ values through a hash-locked zarr-python 3.2.1 environment. It is only a
 selected-codec feasibility result: no target fixture is promoted, and it makes
 no T1, OME, IO-3, identity, complete-package, product, or performance claim.
 
+The unpromoted WP-10A-C corpus inputs define the three required DS-0 cases.
+Their zero-dependency Rust oracle reads only the declarative TSV and passes
+independent SHA-256, one-voxel scientific, and Merkle 1/1023/1024/1025 checks.
+A separate stdlib-only verifier checks the frozen packed-index, manifest,
+package, recipe, derivation, release, artifact, and scientific hand vectors.
+These are candidate inputs, not target T1 authority; they create no archive,
+reader report, registry flip, production conformance, or product claim.
+
 The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).
 
