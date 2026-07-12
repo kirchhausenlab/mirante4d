@@ -17,9 +17,9 @@ The pure profile/identity core and its product-nonreachability contract are
 present. Exact D-009 object, package, recipe, derivation-record, and release
 hash framing is implemented; strict control schemas must now validate the
 canonical bytes supplied to it. Their scalar grammars, restricted JCS encoder,
-closed canonical-value, scientific, and display-defaults grammars, and exact
-compatibility tuple bytes are present. Continue WP-10A-B with the closed
-profile/record/manifest/release DTOs, then shard/index I/O, reader, writer, and
+closed profile, canonical-value, scientific, and display-defaults grammars,
+and exact compatibility tuple bytes are present. Continue WP-10A-B with the
+closed record/manifest/release DTOs, then shard/index I/O, reader, writer, and
 validator.
 WP-10A-C then promotes the independent target-format authorities; WP-10A-D
 consumes them and closes the package evidence. Current schema 1 remains the

@@ -116,7 +116,7 @@ The checked independent report supports only the WP-03 source-TIFF archive.
 WP-10A-B implementation is active. `mirante4d-storage` is assigned to the
 existing contract leaf, but its current tests prove only pure profile, path,
 arithmetic, supporting exact-identity, scalar-wire, and restricted-JCS
-contracts, including the closed canonical-value, scientific, and
+contracts, including the closed profile, canonical-value, scientific, and
 display-defaults grammars. They make no complete-control-schema,
 target-package, T1 conformance, independent-reader, lifecycle, or
 product-support claim. Current schema-1 packages remain non-authoritative T2

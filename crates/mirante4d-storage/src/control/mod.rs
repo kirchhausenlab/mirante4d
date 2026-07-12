@@ -1,4 +1,5 @@
 mod display;
+mod header;
 mod jcs;
 mod scalar;
 mod science;
@@ -7,6 +8,10 @@ mod value;
 use thiserror::Error;
 
 pub use display::{DisplayDefaults, DisplayLayerDefaults};
+pub use header::{
+    OmeInteroperabilityBase, ProfileHeader, ProfileImage, ProfileLevel, ProfileLogicalLayer,
+    ProfileValidityMode,
+};
 pub use scalar::{
     AsciiToken, F32Bits, F64Bits, I64Decimal, MAX_ASCII_TOKEN_BYTES, MAX_NFC_TEXT_BYTES, NfcText,
     Rgb24, TypedId, U64Decimal,
@@ -18,6 +23,8 @@ pub use value::{CanonicalMapEntry, CanonicalValue, CanonicalValueKind};
 
 /// Maximum canonical UTF-8 bytes in one portable version-1 control object.
 pub const MAX_PORTABLE_CONTROL_OBJECT_BYTES: usize = 1_048_576;
+/// Maximum canonical UTF-8 bytes in the version-1 bootstrap profile header.
+pub const MAX_PROFILE_HEADER_BYTES: usize = 4_194_304;
 
 /// A strict experimental-v1 control-wire validation failure.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]

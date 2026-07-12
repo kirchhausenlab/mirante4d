@@ -4437,6 +4437,22 @@
       "reason": "WP-10A proves the closed display-defaults DTO has one exact canonical encoding."
     },
     {
+      "id": "libtest:mirante4d-storage:control::header::tests::profile_header_rejects_malformed_noncanonical_and_inconsistent_mappings",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects malformed, alternate, inconsistent, overbound, and forbidden profile-header mappings."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::header::tests::profile_header_roundtrips_exact_frozen_bytes",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the bootstrap profile header carries the exact frozen compatibility, capabilities, paths, and mappings."
+    },
+    {
       "id": "libtest:mirante4d-storage:control::jcs::tests::number_depth_and_size_rejection",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -4659,6 +4675,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 377
+    "current_additions": 379
   }
 }
