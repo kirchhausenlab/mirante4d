@@ -137,6 +137,12 @@ refs, object/page closure, recovery classification, and declared corruptions;
 it does not claim implemented transactions, filesystem durability, or product
 save/open support.
 
+The unreachable `mirante4d-project-store` crate is assigned to the hosted
+contract lane. Its current tests cover the frozen API/limits, canonical
+envelope/ref/generation identities, held-descriptor traversal, bounded
+immutable publication, exact deduplication, collision rejection, and
+cancellation. They do not claim a complete transaction or writable durability.
+
 The checked independent source report supports only the WP-03 source-TIFF
 archive. WP-10A is accepted off-product and its target authority is promoted.
 `mirante4d-storage` is assigned to the existing contract leaf. Its lower-level

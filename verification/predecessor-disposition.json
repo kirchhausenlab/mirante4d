@@ -2411,6 +2411,110 @@
       "reason": "WP-07A adds pure durable project-model invariant evidence."
     },
     {
+      "id": "libtest:mirante4d-project-store:api::tests::accepted_defaults_match_the_frozen_b2_work_bounds",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves the off-product project-store boundary and frozen work limits."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:api::tests::generation_id_round_trips_only_the_frozen_typed_form",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves the off-product project-store boundary and frozen work limits."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:api::tests::project_store_path_requires_the_product_suffix_without_touching_disk",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves the off-product project-store boundary and frozen work limits."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:local::tests::opens_every_root_component_without_following_symlinks",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves descriptor-relative immutable publication without path or replacement fallbacks."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:local::tests::publishes_and_deduplicates_an_exact_object_with_bounded_staging",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves descriptor-relative immutable publication without path or replacement fallbacks."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:local::tests::refuses_changed_hardlinked_and_symlinked_existing_destinations",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves descriptor-relative immutable publication without path or replacement fallbacks."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:local::tests::source_capacity_length_digest_and_cancellation_fail_before_publication",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves descriptor-relative immutable publication without path or replacement fallbacks."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:wire::tests::all_ref_shapes_round_trip_and_forbidden_slots_are_rejected",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves canonical envelope, ref, and generation-identity bytes against the independent authority."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:wire::tests::envelope_matches_the_frozen_canonical_vector",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves canonical envelope, ref, and generation-identity bytes against the independent authority."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:wire::tests::envelope_rejects_noncanonical_unknown_and_invalid_identity_bytes",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves canonical envelope, ref, and generation-identity bytes against the independent authority."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:wire::tests::generation_identity_matches_hand_vector_and_rejects_noncanonical_json",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves canonical envelope, ref, and generation-identity bytes against the independent authority."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:wire::tests::manual_head_matches_the_independent_fixture_vector",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves canonical envelope, ref, and generation-identity bytes against the independent authority."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:wire::tests::ref_decoder_rejects_length_checksum_kind_and_presence_corruption",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves canonical envelope, ref, and generation-identity bytes against the independent authority."
+    },
+    {
       "id": "libtest:xtask::bin/xtask:arch::tests::rust_struct_field_extraction_handles_visibility_attributes_and_split_types",
       "kind": "libtest",
       "owner": "xtask",
@@ -5372,6 +5476,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 465
+    "current_additions": 478
   }
 }

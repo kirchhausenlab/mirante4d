@@ -127,8 +127,10 @@ the future boundary; it is deleted by WP-10B.
 
 WP-10B B1 freezes the successor's canonical envelope, generation, ref, object,
 payload-paging, API, and failure-transition contract plus an independent
-project fixture. No project-store crate is reachable yet; B2 implements the
-off-product transactional authority before the B4 product hard cutover.
+project fixture. B2 now has an unreachable `mirante4d-project-store` crate with
+the frozen public boundary, canonical envelope/ref/generation identities, and
+descriptor-relative immutable publication. It still owns no live refs, leases,
+actor, or product path; those precede the B4 product hard cutover.
 
 Settings use `mirante4d-settings-v1` at the Linux XDG/HOME path. The UI submits
 validated changes; one background actor owns persistence. Legacy preferences

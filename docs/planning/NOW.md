@@ -8,7 +8,9 @@ WP-09A is accepted and immutable at `foundation-wp-09a-exit-1`
 (`1b1e7d5534f29b010cc346d434811a3906fb40e1`). WP-10B's entry is accepted at
 `4d0e4853637a0466ca37548134822c5ec83a240f`. Its B1 wire contract and
 independent fixture are frozen; B2 transactional store implementation is
-active off-product.
+active off-product. Its first core checkpoint provides the exact crate/API
+boundary, control-record wire, and immutable publication primitive; complete
+generation transactions and refs are next.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.

@@ -46,7 +46,8 @@ const TARGET_CRATES: [&str; 17] = [
     "mirante4d-storage",
     "mirante4d-ui-egui",
 ];
-const SUCCESSOR_OWNED_WORKSPACE_CRATES: [&str; 3] = [
+const SUCCESSOR_OWNED_WORKSPACE_CRATES: [&str; 4] = [
+    "mirante4d-project-store",
     "mirante4d-render-reference",
     "mirante4d-render-wgpu",
     "mirante4d-storage",
@@ -62,6 +63,7 @@ pub(super) fn accepted_successor_normal_dependency_additions(
         "mirante4d-app" => &["mirante4d-dataset-runtime"],
         "mirante4d-data" | "mirante4d-renderer" => &["mirante4d-dataset"],
         "mirante4d-identity" => &["mirante4d-domain", "sha2", "unicode-normalization"],
+        "mirante4d-project-store" => &["mirante4d-domain"],
         "xtask" => &["mirante4d-dataset", "mirante4d-dataset-runtime"],
         _ => &[],
     }
