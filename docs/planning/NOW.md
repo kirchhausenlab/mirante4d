@@ -6,8 +6,8 @@ Last updated: 2026-07-12
 
 WP-08B is accepted and immutable at `foundation-wp-08b-exit-1`
 (`0e3bdb0f5257c820841cee215cee38747efbda75`). WP-10A-B is implemented
-off-product. WP-10A-C independent-evidence work is active against that clean
-checkpoint and the accepted profile freeze.
+off-product and WP-10A-C's independent `target-m4d-v1` authority is promoted.
+WP-10A-D is next against the accepted profile freeze.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.
@@ -31,16 +31,12 @@ from the descriptor-derived address plan are present. Caller-selected DS
 admission, package-wide structural reconciliation, fixed-buffer full SHA-256
 closure, final mutation checks, and the owning exact-package capability now
 gate PackageId-attributed reads. The deterministic create-only writer and its
-staged publication checks are present. Continue with WP-10A-C, which promotes
-the independent target-format authorities. Its exact standards mirror and
-external-reader codec probe are present. The three-case declarative corpus
-input, zero-dependency scientific oracle, and static critical hand vectors are
-also present. The independent producer, compact mutation recipes, and three
-bounded deterministic candidate archives are present but unpromoted.
-Independent reader/schema validation, mutation execution, two-run authority
-assembly, and the atomic registry promotion remain. WP-10A-D then consumes
-those authorities and closes the package evidence. Current schema 1 remains
-the sole product route until WP-10C.
+staged publication checks are present. WP-10A-C now promotes three bounded
+archives with independent facts, critical vectors, full-array reader and OME-
+schema evidence, 15 executed mutations, deterministic two-run reproduction,
+and the affirmative registry guard. WP-10A-D now consumes that authority and
+closes the production package evidence. Current schema 1 remains the sole
+product route until WP-10C.
 
 WP-09A is the next protected-branch checkpoint after WP-10A, following the
 approved integration order in the

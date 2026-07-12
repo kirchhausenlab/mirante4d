@@ -9,13 +9,14 @@ tooling. It never imports Mirante4D production crates.
 - `mutations-v1.json` defines compact negative derivations without copying
   package trees into the repository.
 - `hand_vectors/` verifies separately frozen critical byte/hash vectors.
+- `reader/` independently reads every logical array and exact package fact.
+- `validate.py` checks the promoted authority offline and fail-closed.
+- `reproduce.py` assembles the candidate authority twice and compares bytes.
 
-C4 adds the independent reader, offline validator, and two-run reproducer
-before any authority is promoted.
-
-Generation writes only below `target/mirante4d/fixture-candidates`. Tracked
-files under `fixtures/target` appear only in the separately reviewed promotion
-checkpoint.
+The reviewed C4 checkpoint promotes the exact `target-m4d-v1` authority under
+`fixtures/target`. Generation still writes only below
+`target/mirante4d/fixture-candidates`; the reproducer never writes tracked
+authority files.
 
 For `affine_mod_decimate`, level 0 is
 `(10000*t + 4000*c + 97*z + 13*y + 3*x) mod 65521`; level `L` samples level-0

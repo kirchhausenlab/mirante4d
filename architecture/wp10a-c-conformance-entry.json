@@ -143,7 +143,7 @@
   "evidence": {
     "root": "target/mirante4d/fixture-candidates/target-m4d-v1",
     "commands": [
-      "python3 tools/target-fixtures/t1/validate.py --self-test --reader-report fixtures/target/independent-reader-report.json",
+      "python3 tools/target-fixtures/t1/validate.py --manifest fixtures/target/manifest.json --self-test",
       "python3 tools/target-fixtures/t1/reproduce.py",
       "cargo xtask verification-sync --check",
       "cargo xtask verify-pr policy",

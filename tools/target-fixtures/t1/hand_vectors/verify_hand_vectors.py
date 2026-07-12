@@ -10,7 +10,6 @@ import struct
 import sys
 
 
-VECTORS = Path(__file__).with_name("hand-vectors-v1.json")
 HEX = set("0123456789abcdef")
 
 
@@ -285,10 +284,11 @@ def verify(document):
 
 
 def main():
-    require(len(sys.argv) == 1, "this verifier accepts no arguments")
-    require(VECTORS.is_file() and not VECTORS.is_symlink(), "vector authority is absent or symlinked")
+    require(len(sys.argv) == 3 and sys.argv[1] == "--vectors", "usage: verify_hand_vectors.py --vectors PATH")
+    vectors = Path(sys.argv[2])
+    require(vectors.is_file() and not vectors.is_symlink(), "vector authority is absent or symlinked")
     document = json.loads(
-        VECTORS.read_text(encoding="utf-8"),
+        vectors.read_text(encoding="utf-8"),
         object_pairs_hook=unique_object,
         parse_float=reject_number,
         parse_constant=reject_number,

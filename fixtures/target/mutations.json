@@ -1,0 +1,175 @@
+{
+  "schema": "mirante4d-target-t1-mutation-recipes",
+  "schema_version": 1,
+  "execution_boundary": "C4 derives each case in a fresh ignored directory; no mutated package is committed",
+  "recipes": [
+    {
+      "id": "missing-pixel-shard",
+      "case_id": "m4d-t1-u8-2d-sparse",
+      "operation": "remove_object",
+      "object": "images/i00000000/s00/c/0/0/0/0/1",
+      "package_manifest": "preserve",
+      "expected_stage": "package-closure",
+      "expected_rejection": "missing-declared-object"
+    },
+    {
+      "id": "truncated-pixel-shard",
+      "case_id": "m4d-t1-u16-3d-multiscale",
+      "operation": "truncate_object_tail",
+      "object": "images/i00000000/s00/c/0/0/0/0/0",
+      "remove_bytes": 1,
+      "package_manifest": "preserve",
+      "expected_stage": "package-closure",
+      "expected_rejection": "declared-object-length-mismatch"
+    },
+    {
+      "id": "bit-flipped-pixel-shard",
+      "case_id": "m4d-t1-u16-3d-multiscale",
+      "operation": "xor_object_byte",
+      "object": "images/i00000000/s00/c/0/0/0/0/0",
+      "byte_offset": 0,
+      "xor_mask": 1,
+      "package_manifest": "preserve",
+      "expected_stage": "package-closure",
+      "expected_rejection": "declared-object-digest-mismatch"
+    },
+    {
+      "id": "inner-crc32c-failure",
+      "case_id": "m4d-t1-u8-2d-sparse",
+      "operation": "xor_inner_crc32c_byte",
+      "object": "images/i00000000/s00/c/0/0/0/0/0",
+      "inner_slot": 0,
+      "crc_byte": 0,
+      "xor_mask": 1,
+      "package_manifest": "reseal",
+      "expected_stage": "shard-decode",
+      "expected_rejection": "inner-crc32c-mismatch"
+    },
+    {
+      "id": "end-index-crc32c-failure",
+      "case_id": "m4d-t1-u8-2d-sparse",
+      "operation": "xor_end_index_crc32c_byte",
+      "object": "images/i00000000/s00/c/0/0/0/0/0",
+      "crc_byte": 0,
+      "xor_mask": 1,
+      "package_manifest": "reseal",
+      "expected_stage": "shard-decode",
+      "expected_rejection": "shard-index-crc32c-mismatch"
+    },
+    {
+      "id": "noncanonical-index-offset",
+      "case_id": "m4d-t1-u8-2d-sparse",
+      "operation": "copy_inner_offset",
+      "object": "images/i00000000/s00/c/0/0/0/0/0",
+      "source_slot": 0,
+      "target_slot": 1,
+      "recompute_end_index_crc32c": true,
+      "package_manifest": "reseal",
+      "expected_stage": "shard-decode",
+      "expected_rejection": "noncanonical-shard-index"
+    },
+    {
+      "id": "contradictory-axis-names",
+      "case_id": "m4d-t1-f32-3d-validity",
+      "operation": "replace_json_value",
+      "object": "images/i00000000/s00/zarr.json",
+      "json_pointer": "/dimension_names/4",
+      "original": "x",
+      "replacement": "x_byte",
+      "package_manifest": "reseal",
+      "expected_stage": "metadata-validation",
+      "expected_rejection": "axis-name-mismatch"
+    },
+    {
+      "id": "contradictory-transform",
+      "case_id": "m4d-t1-u16-3d-multiscale",
+      "operation": "replace_json_value",
+      "object": "images/i00000000/zarr.json",
+      "json_pointer": "/attributes/ome/multiscales/0/datasets/0/coordinateTransformations/0/scale/2",
+      "original": 2.0,
+      "replacement": 2.5,
+      "package_manifest": "reseal",
+      "expected_stage": "metadata-validation",
+      "expected_rejection": "transform-mismatch"
+    },
+    {
+      "id": "unsupported-codec",
+      "case_id": "m4d-t1-u8-2d-sparse",
+      "operation": "replace_json_value",
+      "object": "images/i00000000/s00/zarr.json",
+      "json_pointer": "/codecs/0/configuration/codecs/1/name",
+      "original": "zstd",
+      "replacement": "gzip",
+      "package_manifest": "reseal",
+      "expected_stage": "metadata-validation",
+      "expected_rejection": "unsupported-codec"
+    },
+    {
+      "id": "unsupported-dtype",
+      "case_id": "m4d-t1-u16-3d-multiscale",
+      "operation": "replace_json_value",
+      "object": "images/i00000000/s00/zarr.json",
+      "json_pointer": "/data_type",
+      "original": "uint16",
+      "replacement": "uint32",
+      "package_manifest": "reseal",
+      "expected_stage": "metadata-validation",
+      "expected_rejection": "unsupported-dtype"
+    },
+    {
+      "id": "unsupported-inner-chunk-layout",
+      "case_id": "m4d-t1-u16-3d-multiscale",
+      "operation": "replace_json_value",
+      "object": "images/i00000000/s00/zarr.json",
+      "json_pointer": "/codecs/0/configuration/chunk_shape/4",
+      "original": 64,
+      "replacement": 32,
+      "package_manifest": "reseal",
+      "expected_stage": "metadata-validation",
+      "expected_rejection": "unsupported-storage-layout"
+    },
+    {
+      "id": "unexpected-object",
+      "case_id": "m4d-t1-u8-2d-sparse",
+      "operation": "add_object",
+      "object": "unexpected.bin",
+      "bytes_hex": "00",
+      "package_manifest": "preserve",
+      "expected_stage": "package-closure",
+      "expected_rejection": "unexpected-object"
+    },
+    {
+      "id": "nonfinite-quiet-nan",
+      "case_id": "m4d-t1-f32-3d-validity",
+      "operation": "replace_valid_sample_bits",
+      "logical_coordinate_tczyx": [0, 0, 0, 0, 1],
+      "original_bits": "80000000",
+      "replacement_bits": "7fc00000",
+      "package_manifest": "reseal",
+      "expected_stage": "scientific-readback",
+      "expected_rejection": "nonfinite-float"
+    },
+    {
+      "id": "nonfinite-positive-infinity",
+      "case_id": "m4d-t1-f32-3d-validity",
+      "operation": "replace_valid_sample_bits",
+      "logical_coordinate_tczyx": [0, 0, 0, 0, 1],
+      "original_bits": "80000000",
+      "replacement_bits": "7f800000",
+      "package_manifest": "reseal",
+      "expected_stage": "scientific-readback",
+      "expected_rejection": "nonfinite-float"
+    },
+    {
+      "id": "nonfinite-negative-infinity",
+      "case_id": "m4d-t1-f32-3d-validity",
+      "operation": "replace_valid_sample_bits",
+      "logical_coordinate_tczyx": [0, 0, 0, 0, 1],
+      "original_bits": "80000000",
+      "replacement_bits": "ff800000",
+      "package_manifest": "reseal",
+      "expected_stage": "scientific-readback",
+      "expected_rejection": "nonfinite-float"
+    }
+  ]
+}

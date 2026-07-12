@@ -1,19 +1,25 @@
 {
   "schema": "mirante4d-verification-fixture-registry",
   "schema_version": 1,
-  "record_count": 6,
+  "record_count": 7,
   "rules": {
     "maximum_records": 64,
     "candidate_output_root": "target/mirante4d/fixture-candidates",
     "candidate_cannot_promote_itself": true,
     "one_promoted_authority_per_claim_scope": true,
-    "target_format_t1_available": false
+    "target_format_t1_available": true
   },
   "promotions": [
     {
       "fixture_id": "source-tiff-v1",
       "authority": "fixtures/source/manifest.json#/approvals",
       "approved_on": "2026-07-10",
+      "changed_bytes_or_facts_require_new_version": true
+    },
+    {
+      "fixture_id": "target-m4d-v1",
+      "authority": "fixtures/target/manifest.json#/approvals",
+      "approved_on": "2026-07-12",
       "changed_bytes_or_facts_require_new_version": true
     },
     {
@@ -96,6 +102,27 @@
       "expiry": null,
       "deletion_gate": null,
       "target_format_conformance": false
+    },
+    {
+      "id": "target-m4d-v1",
+      "tier": "T1-target",
+      "claim_scope": "target-m4d-v1-independent-format-conformance",
+      "authority_state": "promoted-target-format",
+      "owner": "WP-10A target authority",
+      "capability": "public-cpu",
+      "publication": "public-safe-synthetic",
+      "license": "MIT",
+      "path": "fixtures/target/manifest.json",
+      "sha256": "0b2bad3c976b431d83cda1e24fae1ff50524a9865d7c5b260ccfc0a7d84e2321",
+      "validation_command": "python3 tools/target-fixtures/t1/validate.py --manifest fixtures/target/manifest.json --self-test",
+      "promotion": {
+        "authority": "fixtures/target/manifest.json#/approvals",
+        "approved_on": "2026-07-12",
+        "changed_authority_requires_new_version": true
+      },
+      "expiry": null,
+      "deletion_gate": null,
+      "target_format_conformance": true
     },
     {
       "id": "bootstrap-m4d-schema1",

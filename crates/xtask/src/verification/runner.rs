@@ -20,6 +20,7 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const PR_TEST_UNION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DOCTEST_PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
 const SOURCE_FIXTURE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(120);
+const TARGET_FIXTURE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Leaf {
@@ -197,6 +198,20 @@ fn run_policy_phases(phases: &mut PhaseCollector) {
                 "fixtures/source/independent-reader-report.json",
             ]);
             run_command_with_timeout(&mut command, SOURCE_FIXTURE_VALIDATION_TIMEOUT)
+        },
+    );
+    phases.run(
+        "target-fixture-validation",
+        "python3 tools/target-fixtures/t1/validate.py --manifest fixtures/target/manifest.json --self-test",
+        || {
+            let mut command = Command::new("python3");
+            command.args([
+                "tools/target-fixtures/t1/validate.py",
+                "--manifest",
+                "fixtures/target/manifest.json",
+                "--self-test",
+            ]);
+            run_command_with_timeout(&mut command, TARGET_FIXTURE_VALIDATION_TIMEOUT)
         },
     );
     phases.run(

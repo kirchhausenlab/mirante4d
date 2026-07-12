@@ -585,8 +585,10 @@ fn validate_registry(registry: &Registry) -> anyhow::Result<()> {
     let allowed_fixture_tiers = [
         "none",
         "none-or-T2",
+        "T1-or-T2",
         "T1-source",
         "T1-source-or-T2",
+        "T1-target",
         "T2",
         "T5",
     ];

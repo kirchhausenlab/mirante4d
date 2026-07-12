@@ -1,0 +1,21 @@
+{
+  "schema": "mirante4d-target-t1-toolchain-lock",
+  "schema_version": 1,
+  "lineage_id": "TGT-PRODUCER-001",
+  "platform": "Linux x86_64",
+  "tools": [
+    {
+      "name": "CPython",
+      "version": "3.12.3",
+      "command": "/usr/bin/python3.12",
+      "installed_sha256": "1643dacd9feaedc58f3cc581e4d22577dfe25c09b10282936186ccf0f2e61118"
+    },
+    {
+      "name": "zstd",
+      "version": "1.5.5",
+      "command": "/usr/bin/zstd",
+      "installed_sha256": "7c5468b370f7c47eda07281e3437fafc568f95d10420051e3aa522709f9342c5"
+    }
+  ],
+  "third_party_python_dependencies": []
+}

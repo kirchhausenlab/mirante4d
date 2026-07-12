@@ -1,0 +1,16 @@
+{
+  "schema": "mirante4d-target-t1-toolchain-lock",
+  "schema_version": 1,
+  "lineage_id": "TGT-FACT-001",
+  "platform": "Linux x86_64",
+  "tools": [
+    {
+      "name": "Rust",
+      "version": "1.96.1",
+      "command": "rustc +1.96.1",
+      "source_commit": "31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd",
+      "installed_sha256": "4a84e05991ad6f2a84c1361c29b52b38c390365bd1fc269b1936c88d482a8928"
+    }
+  ],
+  "external_crates": []
+}

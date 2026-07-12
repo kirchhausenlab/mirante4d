@@ -113,8 +113,8 @@ trusted-GPU, source-nonmutation, and real-display 1280x720 T2 product checks.
 Internal automation remains supporting evidence, not product-open proof.
 
 The checked independent source report supports only the WP-03 source-TIFF
-archive. WP-10A-B is implemented off-product and WP-10A-C evidence work is
-active. `mirante4d-storage` is assigned to the
+archive. WP-10A-B is implemented off-product and the WP-10A-C target authority
+is promoted. `mirante4d-storage` is assigned to the
 existing contract leaf, but its current tests prove only pure profile, path,
 arithmetic, supporting exact-identity, scalar-wire, and restricted-JCS
 contracts, including the closed profile, canonical-value, scientific, and
@@ -133,8 +133,8 @@ closure counts, cancellation, extra-directory rejection, and post-open length-
 drift rejection, including same-length manifest-authority drift. These tests
 alone make no DS-specific admission, shard-payload, official-schema, complete-
 package, T1 conformance, independent-reader, lifecycle, or product-support
-claim. Current schema-1 packages remain non-authoritative T2 support fixtures
-until WP-10A accepts the independent target evidence.
+claim. Current schema-1 packages remain non-authoritative T2 support fixtures;
+the promoted target authority is separate and off-product.
 
 Address-planning tests prove 2D/3D grid, C-order ordinal, inner-slot, and edge-
 extent arithmetic plus the exact baseline catalog-derived paths and packed-
@@ -202,20 +202,24 @@ The WP-10A-C standards check verifies an exact 12-file, 162,831-byte offline
 mirror against immutable OME and Zarr revisions, lengths, and SHA-256 values.
 The diagnostic external-reader probe builds the same tiny shard twice without
 Mirante code and observes its exact shape, chunk/shard geometry, dtype, and
-values through a hash-locked zarr-python 3.2.1 environment. It is only a
-selected-codec feasibility result: no target fixture is promoted, and it makes
-no T1, OME, IO-3, identity, complete-package, product, or performance claim.
+values through a hash-locked zarr-python 3.2.1 environment. That older probe
+remains only a selected-codec feasibility result; the separate promoted corpus
+carries the target T1 authority.
 
-The unpromoted WP-10A-C corpus inputs define the three required DS-0 cases.
-Their zero-dependency Rust oracle reads only the declarative TSV and passes
-independent SHA-256, one-voxel scientific, and Merkle 1/1023/1024/1025 checks.
-A separate stdlib-only verifier checks the frozen packed-index, manifest,
-package, recipe, derivation, release, artifact, and scientific hand vectors.
-The C3 producer imports no Mirante, NumPy, or zarr-python code and uses oracle
-ScientificContentIds only as opaque inputs. Its three deterministic candidate
-archives, operational reports, and compact unexecuted mutation recipes are
-producer evidence only: they supply no independent readback, T1 authority,
-registry promotion, IO-3, production conformance, or product claim.
+Validate the promoted authority with:
+
+```bash
+python3 tools/target-fixtures/t1/validate.py \
+  --manifest fixtures/target/manifest.json --self-test
+```
+
+`target-m4d-v1` proves bounded archive safety and exact closure, independent
+lineage bindings and expected facts, full-array readback, pinned OME-schema
+results, critical identity vectors, exact rejection of 15 mutations, and
+byte-identical two-run reproduction for the frozen EXPERIMENTAL profile. It
+does not establish IO-3, production package conformance, stable-format,
+product-support, performance, or generic OME-Zarr claims. WP-10A-D remains the
+production package-conformance step.
 
 The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).

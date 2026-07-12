@@ -358,7 +358,7 @@ class CaseSpec:
         else:
             raise ProducerError(f"unsupported validity rule {self.validity_rule!r}")
 
-        logical_bytes = self.t * self.c * self.z * self.y * self.x * self.sample_bytes
+        logical_bytes = self.logical_voxel_bytes
         require(
             logical_bytes <= COMBINED_LOGICAL_VOXEL_BYTES_MAX,
             "case exceeds the combined logical-byte ceiling",
@@ -367,6 +367,11 @@ class CaseSpec:
     @property
     def sample_bytes(self) -> int:
         return {"uint8": 1, "uint16": 2, "float32": 4}[self.dtype]
+
+    @property
+    def logical_voxel_bytes(self) -> int:
+        level_voxels = sum(product(self.level_shape(level)) for level in range(self.levels))
+        return self.t * self.c * level_voxels * self.sample_bytes
 
     @property
     def is_2d(self) -> bool:
@@ -1302,10 +1307,7 @@ def produce(spec_path: Path, facts_path: Path, output: Path) -> dict[str, Any]:
     require(parent.is_dir() and not parent.is_symlink(), "producer output parent must be a directory")
     cases = load_specs(spec_path)
     identities = load_opaque_ids(facts_path)
-    logical_voxel_bytes = sum(
-        case.t * case.c * case.z * case.y * case.x * case.sample_bytes
-        for case in cases
-    )
+    logical_voxel_bytes = sum(case.logical_voxel_bytes for case in cases)
     require(
         logical_voxel_bytes <= COMBINED_LOGICAL_VOXEL_BYTES_MAX,
         "corpus exceeds the combined logical-byte ceiling",
