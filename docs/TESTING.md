@@ -145,12 +145,16 @@ contract lane. Its current tests cover the frozen API/limits, canonical
 envelope/ref identities, typed canonical generations, direct and deterministic
 paged closure, held-descriptor traversal, bounded immutable object and
 generation-last publication, process lease contention, and exact reproduction
-of the fixture's initial manual generation and head ref. Failure tests keep
-new authority absent and leave any existing ref unchanged on read-only, stale,
-corrupt, pinned, and cancelled paths. They do not claim established-head
-replacement, recovery-before-head behavior, actor
-execution, autosave, Save As, garbage collection, public Create/Save, qualified
-writable durability, product reachability, or product-open validation.
+of the fixture's initial and established manual refs. Established-manual cases
+cover exact g1-to-g2 recovery-before-head bytes, sequence derivation across an
+autosave head, zero immutable rewrites on full reuse, rejection before source
+reads, exact global-entry/fan-out capacity rejection without a ref change,
+cancellation/retry through recovery-ahead, retry after either recovery sync
+leg fails, and either final head sync-leg failure as write-suspending
+`CommitIndeterminate`. They do not claim actor execution,
+autosave commits, Save As, recovery selection/open, garbage collection, public
+Create/Save, the exhaustive fault matrix or power-cut durability, product
+reachability, or product-open validation.
 
 The checked independent source report supports only the WP-03 source-TIFF
 archive. WP-10A is accepted off-product and its target authority is promoted.

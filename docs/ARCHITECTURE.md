@@ -134,9 +134,13 @@ project fixture. B2 now has an unreachable `mirante4d-project-store` crate with
 the frozen public boundary, typed canonical generation records, deterministic
 direct and paged object closure, and descriptor-relative immutable object and
 generation-last publication. Its private lease core now enforces shared
-maintenance and one writer, and a prepared fresh store can publish its initial
-manual head once. It still owns no established-head replacement, recovery
-protocol, actor, garbage collection, public Create/Save, or product path.
+maintenance and one writer. A prepared fresh store can publish its initial
+manual head, and the private transaction core can advance an established
+manual head through bounded live-ref/closure validation, a descriptor-relative
+global-entry/fan-out inventory, and exact recovery-before-head replacement. It
+still owns no autosave commit, recovery
+selection, actor, garbage collection, public Create/Save, qualified durability,
+or product path.
 
 Settings use `mirante4d-settings-v1` at the Linux XDG/HOME path. The UI submits
 validated changes; one background actor owns persistence. Legacy preferences
