@@ -43,6 +43,30 @@ pub(crate) struct LocalObjectSnapshot {
 }
 
 impl LocalObjectSnapshot {
+    #[cfg(unix)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_metadata(
+        path: PackagePath,
+        metadata: &Metadata,
+    ) -> Result<Self, RangeReadError> {
+        if !metadata.is_file() {
+            return Err(RangeReadError::NonRegularObject {
+                path: path.to_string(),
+            });
+        }
+        if metadata.nlink() != 1 {
+            return Err(RangeReadError::Hardlink {
+                path: path.to_string(),
+                links: metadata.nlink(),
+            });
+        }
+        Ok(Self {
+            path,
+            bytes: metadata.len(),
+            identity: FileIdentity::from_metadata(metadata),
+        })
+    }
+
     pub(crate) const fn path(&self) -> &PackagePath {
         &self.path
     }
@@ -755,8 +779,14 @@ mod tests {
         root.write("images/i00000000/s00/c/0/0/0/0/0", &bytes);
         let reader = LocalPackageReader::open(&root.0).unwrap();
         let path = PackagePath::parse("images/i00000000/s00/c/0/0/0/0/0").unwrap();
+        let write_time_snapshot = LocalObjectSnapshot::from_metadata(
+            path.clone(),
+            &fs::metadata(root.0.join(path.as_str())).unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(reader.object_info(&path, 8_192).unwrap().bytes(), 8_192);
+        reader.revalidate_snapshot(&write_time_snapshot).unwrap();
         assert_eq!(
             reader.read_range(&path, 17, 31, 8_192).unwrap(),
             bytes[17..48]
@@ -771,6 +801,10 @@ mod tests {
         fs::rename(replacement, root.0.join(path.as_str())).unwrap();
         assert!(matches!(
             reader.revalidate_snapshot(&snapshot),
+            Err(RangeReadError::ObjectChanged { .. })
+        ));
+        assert!(matches!(
+            reader.revalidate_snapshot(&write_time_snapshot),
             Err(RangeReadError::ObjectChanged { .. })
         ));
     }

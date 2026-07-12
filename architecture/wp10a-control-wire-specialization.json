@@ -221,6 +221,21 @@
     "bounds": "validation is O(total finalized object bytes plus structural work plus finalized objects times log finalized objects), retains O(finalized physical objects) bounded snapshots and paths plus one 65536-byte hash buffer, accumulates checked counters, and polls cancellation through every phase",
     "non_claims": "exact package validation does not create an atomic filesystem snapshot or lock out concurrent writers, parse lazy portable-record semantics, recompute ScientificContentId or pixel statistics, establish official OME schema conformance or IO-3, qualify independent T1, implement a writer or publication, activate the product, prove post-issuance immutability of unrelated files on every brick read, make a product-open or performance claim, or freeze a stable format"
   },
+  "deterministic_package_writer": {
+    "entry": "WP-10A-B create-only off-product writer, bound to foundation-wp-08b-exit-1 and the accepted profile freeze; rollback is one writer checkpoint with no product authority flip",
+    "input": "typed profile, science, display, portable-record, OME, and Zarr facts plus a lazy sequence of decoded shard inputs; callers cannot supply encoded shards, object descriptors, manifest pages, manifest roots, or package paths outside the typed profile",
+    "ownership": "the writer derives canonical control and metadata bytes, default-key shard paths, deterministic zstd/CRC32C shard bytes, exact object descriptors, greedy pages, root bytes, and PackageId",
+    "bounds": "consume one outer-shard input at a time, retain at most that profile-bounded decoded shard, one encoded inner payload, one fixed shard index, and the DS-4-bounded descriptor/page set; poll cancellation throughout encoding, writing, validation, synchronization, and immediately before publication",
+    "canonicality": "input enumeration order cannot affect final paths or bytes; omit all-missing pixel and validity shards, require packed-index coverage through structural reconciliation, and emit lexicographic zero-slack shard payloads",
+    "staging": "create one private mode-0700 sibling directory on the destination filesystem, create every file once, write payloads before manifest pages and the root, hash exact bytes while writing, then sync every file and created directory",
+    "validation": "open a fresh catalog, perform the caller-selected DS admission, structural reconciliation, exact inventory, and final writer-snapshot sweep before commit; do not repeat a whole-payload hash scan because write-time hashing already produced every descriptor digest",
+    "publication": "the destination must be absent; publish with Linux renameat2 RENAME_NOREPLACE in the already-open parent directory and then sync that parent; no existing package is replaced in this slice",
+    "failure": "failure or cancellation before rename leaves the destination absent and performs fd-held best-effort cleanup of the owned stage; a parent-sync failure after rename returns a typed commit-indeterminate error and never removes the valid published package",
+    "local_threat_model": "mode-0700 staging, fd-relative no-follow creation, inode checks, and RENAME_NOREPLACE protect normal operation and accidental destination races; any hostile actor able to mutate the destination-parent namespace is outside this academic local-writer claim",
+    "source_safety": "the API accepts no mutable source path and publication never edits, renames, or deletes source microscopy data",
+    "evidence": "prove byte-identical output and PackageId across different parents and input order, exact open/admission/structural/full-read compatibility, fill and explicit-validity edges, cancellation cleanup, injected pre/post-commit failures, destination collision and symlink safety, bounds, and source immutability",
+    "non_claims": "no TIFF/import pipeline, multiscale generation, scientific-ID computation, replacement, resume journal, product wiring, IO-3, independent T1, release packaging, remote/archive store, performance qualification, product-open validation, or stable-format promise"
+  },
   "portable_records": {
     "scope": "initial package-contained version-1 portable records; adding another source or license literal is a hard schema change",
     "collection_items_max": 4096,

@@ -11,10 +11,9 @@ use crate::package_integrity::{
     ExactPackageCapability, PackageIntegrityInput, PackageValidationError,
     validate_package_integrity,
 };
-#[cfg(test)]
-use crate::package_structure::PackageStructureReport;
 use crate::package_structure::{
-    PackageStructureError, PackageStructureInput, reconcile_package_structure,
+    PackageStructureError, PackageStructureInput, PackageStructureReport,
+    reconcile_package_structure,
 };
 use crate::{
     ControlError, DisplayDefaults, LocalPackageReader, MAX_PORTABLE_CONTROL_OBJECT_BYTES,
@@ -301,14 +300,24 @@ impl LocalPackageCatalog {
         &self.reader
     }
 
-    #[cfg(test)]
-    fn reconcile_structure_for_test(
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn validate_package_structure(
         &self,
         requested: crate::ProfileKind,
         mut is_cancelled: impl FnMut() -> bool,
-    ) -> Result<PackageStructureReport, PackageStructureError> {
+    ) -> Result<crate::DatasetProfileAdmission, PackageStructureError> {
+        self.validate_package_structure_with_report(requested, &mut is_cancelled)
+            .map(|(admission, _report)| admission)
+    }
+
+    fn validate_package_structure_with_report(
+        &self,
+        requested: crate::ProfileKind,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<(crate::DatasetProfileAdmission, PackageStructureReport), PackageStructureError>
+    {
         let admission = self
-            .admit_dataset_profile(requested, &mut is_cancelled)
+            .admit_dataset_profile(requested, &mut *is_cancelled)
             .map_err(PackageStructureError::from)?;
         let report = reconcile_package_structure(
             PackageStructureInput {
@@ -318,13 +327,23 @@ impl LocalPackageCatalog {
                 descriptors: &self.descriptors,
                 admission,
             },
-            &mut is_cancelled,
+            &mut *is_cancelled,
         )?;
-        self.inspect_directory_closure(&mut is_cancelled)
+        self.inspect_directory_closure(&mut *is_cancelled)
             .map_err(crate::PackageAdmissionError::from)
             .map_err(PackageStructureError::from)?;
-        report.revalidate_snapshots(&self.reader, &mut is_cancelled)?;
-        Ok(report)
+        report.revalidate_snapshots(&self.reader, &mut *is_cancelled)?;
+        Ok((admission, report))
+    }
+
+    #[cfg(test)]
+    fn reconcile_structure_for_test(
+        &self,
+        requested: crate::ProfileKind,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<PackageStructureReport, PackageStructureError> {
+        self.validate_package_structure_with_report(requested, &mut is_cancelled)
+            .map(|(_admission, report)| report)
     }
 
     #[cfg(test)]
@@ -1539,6 +1558,12 @@ mod tests {
             .admit_dataset_profile(crate::ProfileKind::Ds0, || false)
             .unwrap();
         assert_eq!(admission.profile(), crate::ProfileKind::Ds0);
+        assert_eq!(
+            catalog
+                .validate_package_structure(crate::ProfileKind::Ds0, || false)
+                .unwrap(),
+            admission
+        );
         let counts = admission.counts();
         assert_eq!(counts.maximum_scales_per_image, 1);
         assert_eq!(counts.logical_s0_bytes, 6);

@@ -392,6 +392,70 @@ pub fn decode_shard_index_tail(
     })
 }
 
+/// Encodes the sole canonical fixed end-index from payload lengths in slot
+/// order.
+///
+/// Present payloads must already have been written contiguously in increasing
+/// slot order. Offsets are derived here so callers cannot introduce gaps,
+/// overlap, or an alternate index layout.
+pub(crate) fn encode_shard_index_tail(
+    kind: ShardProfileKind,
+    encoded_chunk_lengths: &[Option<u64>],
+) -> Result<Vec<u8>, ShardCodecError> {
+    let expected = kind.chunks_per_shard();
+    if encoded_chunk_lengths.len() != expected {
+        return Err(ShardCodecError::ChunkCount {
+            expected,
+            actual: encoded_chunk_lengths.len(),
+        });
+    }
+
+    let inner_limit = u64::try_from(kind.encoded_inner_bytes_max())
+        .map_err(|_| ShardCodecError::LengthOverflow)?;
+    let mut index_bytes = Vec::with_capacity(expected * INDEX_ENTRY_BYTES);
+    let mut next_offset = 0_u64;
+    for (chunk_index, encoded_length) in encoded_chunk_lengths.iter().copied().enumerate() {
+        let (offset, nbytes) = match encoded_length {
+            None => (MISSING, MISSING),
+            Some(0) => return Err(ShardCodecError::ZeroLengthEntry { chunk_index }),
+            Some(nbytes) if nbytes > inner_limit => {
+                return Err(ShardCodecError::IndexEntryTooLarge {
+                    chunk_index,
+                    limit: inner_limit,
+                    actual: nbytes,
+                });
+            }
+            Some(nbytes) => {
+                let offset = next_offset;
+                next_offset = next_offset
+                    .checked_add(nbytes)
+                    .ok_or(ShardCodecError::IndexRangeOverflow { chunk_index })?;
+                (offset, nbytes)
+            }
+        };
+        index_bytes.extend_from_slice(&offset.to_le_bytes());
+        index_bytes.extend_from_slice(&nbytes.to_le_bytes());
+    }
+
+    let tail_bytes = kind.index_tail_bytes();
+    let complete_bytes = next_offset
+        .checked_add(u64::try_from(tail_bytes).map_err(|_| ShardCodecError::LengthOverflow)?)
+        .ok_or(ShardCodecError::LengthOverflow)?;
+    let shard_limit = u64::try_from(kind.encoded_shard_bytes_max())
+        .map_err(|_| ShardCodecError::LengthOverflow)?;
+    if complete_bytes > shard_limit {
+        return Err(ShardCodecError::EncodedShardTooLarge {
+            limit: shard_limit,
+            actual: complete_bytes,
+        });
+    }
+
+    let checksum = crc32c::crc32c(&index_bytes);
+    index_bytes.extend_from_slice(&checksum.to_le_bytes());
+    debug_assert_eq!(index_bytes.len(), tail_bytes);
+    Ok(index_bytes)
+}
+
 /// Internal deterministic assembler. The package writer will supply missing
 /// slots only after semantic fill-elision validation exists.
 #[cfg(test)]
@@ -408,36 +472,20 @@ pub(crate) fn assemble_shard(
     }
 
     let mut shard = Vec::new();
-    let mut pairs = Vec::with_capacity(expected);
+    let mut encoded_chunk_lengths = Vec::with_capacity(expected);
     for decoded in decoded_chunks {
         if let Some(decoded) = decoded {
-            let offset = u64::try_from(shard.len()).map_err(|_| ShardCodecError::LengthOverflow)?;
             let encoded = encode_inner_payload(kind, decoded)?;
             let nbytes =
                 u64::try_from(encoded.len()).map_err(|_| ShardCodecError::LengthOverflow)?;
             shard.extend_from_slice(&encoded);
-            pairs.push((offset, nbytes));
+            encoded_chunk_lengths.push(Some(nbytes));
         } else {
-            pairs.push((MISSING, MISSING));
+            encoded_chunk_lengths.push(None);
         }
     }
 
-    let mut index_bytes = Vec::with_capacity(expected * INDEX_ENTRY_BYTES);
-    for (offset, nbytes) in pairs {
-        index_bytes.extend_from_slice(&offset.to_le_bytes());
-        index_bytes.extend_from_slice(&nbytes.to_le_bytes());
-    }
-    let checksum = crc32c::crc32c(&index_bytes);
-    shard.extend_from_slice(&index_bytes);
-    shard.extend_from_slice(&checksum.to_le_bytes());
-
-    let limit = kind.encoded_shard_bytes_max();
-    if shard.len() > limit {
-        return Err(ShardCodecError::EncodedShardTooLarge {
-            limit: u64::try_from(limit).map_err(|_| ShardCodecError::LengthOverflow)?,
-            actual: u64::try_from(shard.len()).map_err(|_| ShardCodecError::LengthOverflow)?,
-        });
-    }
+    shard.extend_from_slice(&encode_shard_index_tail(kind, &encoded_chunk_lengths)?);
     Ok(shard)
 }
 
@@ -619,6 +667,70 @@ mod tests {
             Err(ShardCodecError::MissingRequiredPayload { chunk_index: 1 })
         );
         assert_eq!(tail.len(), 260);
+    }
+
+    #[test]
+    fn canonical_tail_encoder_derives_offsets_missing_pairs_and_checksum() {
+        let kind = ShardProfileKind::Validity2d;
+        let mut lengths = vec![None; kind.chunks_per_shard()];
+        lengths[0] = Some(7);
+        lengths[2] = Some(11);
+
+        let first = encode_shard_index_tail(kind, &lengths).unwrap();
+        let second = encode_shard_index_tail(kind, &lengths).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), kind.index_tail_bytes());
+
+        let pair = |slot: usize| {
+            let at = slot * INDEX_ENTRY_BYTES;
+            (
+                u64::from_le_bytes(first[at..at + 8].try_into().unwrap()),
+                u64::from_le_bytes(first[at + 8..at + 16].try_into().unwrap()),
+            )
+        };
+        assert_eq!(pair(0), (0, 7));
+        assert_eq!(pair(1), (MISSING, MISSING));
+        assert_eq!(pair(2), (7, 11));
+
+        let checksum_at = first.len() - CRC32C_BYTES;
+        assert_eq!(
+            u32::from_le_bytes(first[checksum_at..].try_into().unwrap()),
+            crc32c::crc32c(&first[..checksum_at])
+        );
+        let decoded = decode_shard_index_tail(kind, &first, 18).unwrap();
+        assert_eq!(decoded.require_entry(0).unwrap().range(), 0..7);
+        assert_eq!(decoded.require_entry(2).unwrap().range(), 7..18);
+        assert_eq!(decoded.entry(1).unwrap(), None);
+    }
+
+    #[test]
+    fn canonical_tail_encoder_rejects_count_zero_and_oversized_entries() {
+        let kind = ShardProfileKind::Pixel2dUint8;
+        assert_eq!(
+            encode_shard_index_tail(kind, &[]),
+            Err(ShardCodecError::ChunkCount {
+                expected: kind.chunks_per_shard(),
+                actual: 0,
+            })
+        );
+
+        let mut lengths = vec![None; kind.chunks_per_shard()];
+        lengths[3] = Some(0);
+        assert_eq!(
+            encode_shard_index_tail(kind, &lengths),
+            Err(ShardCodecError::ZeroLengthEntry { chunk_index: 3 })
+        );
+
+        let oversized = u64::try_from(kind.encoded_inner_bytes_max()).unwrap() + 1;
+        lengths[3] = Some(oversized);
+        assert_eq!(
+            encode_shard_index_tail(kind, &lengths),
+            Err(ShardCodecError::IndexEntryTooLarge {
+                chunk_index: 3,
+                limit: u64::try_from(kind.encoded_inner_bytes_max()).unwrap(),
+                actual: oversized,
+            })
+        );
     }
 
     #[test]

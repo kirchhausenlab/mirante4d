@@ -29,9 +29,9 @@ exact finalized file and directory inventory. CRC-checked bounded brick reads
 from the descriptor-derived address plan are present. Caller-selected DS
 admission, package-wide structural reconciliation, fixed-buffer full SHA-256
 closure, final mutation checks, and the owning exact-package capability now
-gate PackageId-attributed reads. Continue WP-10A-B with the deterministic
-writer and publication checks.
-WP-10A-C then promotes the independent target-format authorities; WP-10A-D
+gate PackageId-attributed reads. The deterministic create-only writer and its
+staged publication checks are present. Continue with WP-10A-C, which promotes
+the independent target-format authorities; WP-10A-D
 consumes them and closes the package evidence. Current schema 1 remains the
 sole product route until WP-10C.
 

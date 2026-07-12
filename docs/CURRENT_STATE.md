@@ -84,8 +84,16 @@ every descriptor object with fixed memory, requires structural/hash snapshot
 coherence, repeats inventory, and finishes with a cancellable identity sweep.
 Only its owning exact-package capability exposes PackageId-attributed brick
 reads, checking manifest authority and every consumed shard against the proved
-snapshot. The writer, independent T1 corpus, and product activation remain
-incomplete.
+snapshot. A deterministic off-product writer now derives encoded objects and
+manifest bytes from typed metadata and a lazy sequence of bounded decoded outer
+shards, hashes while writing, structurally validates a private sibling stage,
+and publishes a previously absent destination with Linux
+`RENAME_NOREPLACE`. Cancellation and precommit failure remove only the owned
+stage during normal operation under the documented local threat model; a
+post-rename parent-sync failure is reported as durability-indeterminate without
+deleting the valid package. Replacement, import/multiscale generation,
+scientific-ID computation, the independent T1 corpus, and product activation
+remain incomplete.
 Current schema-1 packages remain transitional T2 fixtures and the sole product
 route.
 

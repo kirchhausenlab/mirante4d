@@ -184,7 +184,18 @@ is deliberately a sequential mutation check, not an atomic snapshot of a
 concurrently writable directory. This is exact package-byte integrity only: it
 does not parse lazy portable-record semantics, recompute ScientificContentId,
 qualify IO-3 or independent T1, make a product/performance claim, or implement
-the writer.
+an importer.
+
+Writer tests prove byte-identical package trees and PackageId values across
+different parents and reversed input order, then reopen output through full
+exact validation and PackageId-attributed brick reads. They cover pixel-
+present, all-fill, explicit-validity, and explicit-all-invalid storage, plus
+cancellation cleanup, create-only collision safety, source nonmutation,
+private mode-0700 staging, no-replace symlink races, precommit cleanup, and
+post-rename durability-indeterminate handling. A selected-profile limit-plus-
+one case proves that the writer stops consuming a lazy shard input and
+publishes nothing. This is a T2 writer/reader component proof, not independent
+T1 conformance, import, replacement, product support, or a performance claim.
 
 The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).

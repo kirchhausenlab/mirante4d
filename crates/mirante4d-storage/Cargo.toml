@@ -11,6 +11,7 @@ crc32c.workspace = true
 mirante4d-dataset.workspace = true
 mirante4d-domain.workspace = true
 mirante4d-identity.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

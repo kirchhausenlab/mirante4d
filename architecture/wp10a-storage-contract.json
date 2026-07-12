@@ -16,7 +16,7 @@
     "path": "architecture/wp10a-control-wire-specialization.json",
     "schema": "mirante4d-wp10a-control-wire-specialization",
     "schema_version": 1,
-    "sha256": "9522f088bfe2fc9a7897a5fa595fec00ac954c69408c3448fd0eb5abf78e4654"
+    "sha256": "8724f95905bbcbd1feed3847eab36966c051406e8527dfa8d84146488297a37e"
   },
   "activation": {
     "crate_name": "mirante4d-storage",
@@ -73,6 +73,7 @@
       "LocalObjectInfo",
       "LocalPackageCatalog",
       "LocalPackageReader",
+      "LocalPackageWriter",
       "MANIFEST_DESCRIPTORS_PER_PAGE_GUARANTEED",
       "ManifestPage",
       "ManifestPageReference",
@@ -98,6 +99,7 @@
       "PROFILE",
       "PackageCounts",
       "PackageAdmissionError",
+      "PackageArrayInput",
       "PackageObjectDescriptor",
       "PackageObjectKind",
       "PackagePath",
@@ -107,8 +109,12 @@
       "PackedIndexStatistics",
       "PackageOpenError",
       "PackageReadError",
+      "PackageShardInput",
       "PackageStructureError",
       "PackageValidationError",
+      "PackageWriteError",
+      "PackageWriteInput",
+      "PackageWriteReceipt",
       "PortableRecord",
       "PortableRecordKind",
       "PortableRecordPayload",
@@ -259,6 +265,16 @@
         "features": []
       },
       {
+        "name": "rustix",
+        "version": "1.1.4",
+        "requirement": "=1.1.4",
+        "checksum": "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190",
+        "default_features": true,
+        "features": [
+          "fs"
+        ]
+      },
+      {
         "name": "zarrs_metadata",
         "version": "0.7.5",
         "requirement": "=0.7.5",
@@ -278,6 +294,7 @@
     "direct_external_by_kind": {
       "normal": [
         "crc32c",
+        "rustix",
         "serde",
         "serde_json",
         "thiserror",
@@ -288,7 +305,7 @@
       "build": []
     },
     "production_closure_scope": "package-selected-all-features-all-target-normal-and-build",
-    "production_third_party_packages_max": 55,
+    "production_third_party_packages_max": 61,
     "forbidden_transitive_packages": [
       "paste",
       "zarrs"

@@ -38,8 +38,8 @@ is forbidden.
 
 - Import, validation, recovery, and maintenance never modify source microscopy
   data.
-- Writers stage output, validate it, and publish by an explicit replacement;
-  incomplete output must never appear complete.
+- Writers stage output, validate it, and publish atomically under an explicit
+  create or replacement policy; incomplete output must never appear complete.
 - Persisted identities are strict. There are no compatibility readers or
   in-application migrations during pre-alpha development.
 - Analysis results carry source and operation provenance. Preview,
@@ -74,8 +74,8 @@ release DTOs are implemented. The fixed packed-index record and bounded
 zstd/CRC32C inner-payload and end-index codecs implement the selected binary
 layer in memory. Strict Zarr group/array metadata, closed OME image-group axes
 and transforms, and bounded root-confined Unix object-range reads are
-implemented. The product reader, writer, and independent conformance validator
-are not yet implemented. A bounded local catalog authenticates the manifest
+implemented. The product reader and independent conformance validator are not
+yet implemented. A bounded local catalog authenticates the manifest
 root/pages, verifies opening-critical metadata bytes, parses the closed
 control/Zarr/OME objects, and checks their layer, time, geometry, dtype, shape,
 validity, and packed-index-count relationships. A separate cancellable
@@ -103,15 +103,21 @@ the same shard versions, repeats inventory, and performs a final snapshot
 sweep. Its owning capability is the only PackageId-authorized brick-read path;
 it checks manifest authority and each consumed shard against that proof. Lazy
 portable-record semantics, atomic snapshotting of a concurrently mutable
-directory, scientific identity, the writer, independent T1, IO-3, and product
-support remain outside this claim.
+directory, scientific identity, independent T1, IO-3, and product support
+remain outside this claim. A create-only off-product writer derives canonical
+metadata, shards, descriptors, pages, and root bytes from typed inputs; hashes
+objects while writing; performs DS admission, structural reconciliation,
+inventory, and snapshot checks in a private sibling stage; and publishes with
+Linux `RENAME_NOREPLACE` followed by parent-directory sync. It does not replace
+packages, compute scientific identity, generate multiscales, perform import,
+or activate the product.
 
 WP-10B separately installs immutable content-addressed project objects,
 complete generations, atomic head/recovery refs, leases, autosave/recovery,
 and conservative garbage collection.
 
-The remaining target writer, independent validator/corpus, and project-store
-work is approved but not implemented. Its authorities are the
+The remaining independent validator/corpus and project-store work is approved
+but not implemented. Its authorities are the
 [data-format brief](plans/active/foundation-refactor/DATA_FORMAT_IDENTITY_BRIEF.md),
 [project-store brief](plans/active/foundation-refactor/PROJECT_STORE_DURABILITY_BRIEF.md),
 and their accepted work-package entries.

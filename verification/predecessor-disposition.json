@@ -4805,6 +4805,86 @@
       "reason": "WP-10A applies DS scale rules independently to every image and never rejects a valid multi-image package by summing level counts."
     },
     {
+      "id": "libtest:mirante4d-storage:local_publication::tests::cleanup_does_not_remove_a_replacement_at_the_stage_name",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A cleanup works from the held stage descriptor and leaves a detected replacement name untouched under the documented local threat model."
+    },
+    {
+      "id": "libtest:mirante4d-storage:local_publication::tests::creates_fd_relative_tree_syncs_and_publishes_once",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A creates and synchronizes a private fd-relative package tree before create-only publication."
+    },
+    {
+      "id": "libtest:mirante4d-storage:local_publication::tests::destination_symlink_is_a_collision_and_owned_stage_is_removed",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A treats a destination symlink race as a no-replace collision without changing its target."
+    },
+    {
+      "id": "libtest:mirante4d-storage:local_publication::tests::postrename_failure_reports_indeterminate_and_never_rolls_back",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A reports post-rename durability failure as indeterminate and preserves the complete visible package."
+    },
+    {
+      "id": "libtest:mirante4d-storage:local_publication::tests::precommit_failure_removes_stage_without_publishing",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A precommit failure removes its private stage without exposing a destination."
+    },
+    {
+      "id": "libtest:mirante4d-storage:local_publication::tests::rename_capability_errors_are_typed_without_fallback",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A types no-replace capability failures and never falls back to an overwriting rename."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_write::tests::cancellation_and_collision_never_touch_destination_or_source",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A cancellation across early, middle, validation, and final gates cleans staging while collision and source bytes remain untouched."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_write::tests::lazy_shard_input_stops_at_the_selected_profile_bound",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A stops a lazy shard source exactly at the selected profile limit plus one and publishes nothing."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_write::tests::writer_outputs_cover_fill_and_explicit_validity_modes",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A writer output passes exact validation and readback for all-fill, explicit-validity, and explicit-all-invalid storage."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_write::tests::writes_byte_identical_exact_packages_independent_of_parent_and_input_order",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A derives byte-identical package trees and PackageId values across parent paths and reversed typed input order."
+    },
+    {
       "id": "libtest:mirante4d-storage:package_catalog::tests::admits_explicit_dataset_profile_from_addressed_and_actual_facts",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -4933,6 +5013,22 @@
       "reason": "WP-10A proves complete multi-buffer exact-object hashing, mid-stream cancellation, bounded retained memory, and same-length replacement detection."
     },
     {
+      "id": "libtest:mirante4d-storage:shard::tests::canonical_tail_encoder_derives_offsets_missing_pairs_and_checksum",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A derives canonical zero-slack shard offsets, missing pairs, and the exact end-index checksum."
+    },
+    {
+      "id": "libtest:mirante4d-storage:shard::tests::canonical_tail_encoder_rejects_count_zero_and_oversized_entries",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A shard-tail encoding rejects slot-count, zero-length, and encoded-inner bound violations."
+    },
+    {
       "id": "libtest:mirante4d-storage:shard::tests::deterministic_shard_tail_drives_present_and_missing_range_reads",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -5043,6 +5139,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 425
+    "current_additions": 437
   }
 }

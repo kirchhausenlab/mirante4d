@@ -28,7 +28,7 @@ const CONTROL_WIRE_PATH: &str = "architecture/wp10a-control-wire-specialization.
 const CONTROL_WIRE_SCHEMA: &str = "mirante4d-wp10a-control-wire-specialization";
 const CONTROL_WIRE_SCHEMA_VERSION: u64 = 1;
 const CONTROL_WIRE_SHA256: &str =
-    "9522f088bfe2fc9a7897a5fa595fec00ac954c69408c3448fd0eb5abf78e4654";
+    "8724f95905bbcbd1feed3847eab36966c051406e8527dfa8d84146488297a37e";
 const STORAGE_CRATE: &str = "mirante4d-storage";
 const STORAGE_PATH: &str = "crates/mirante4d-storage";
 const DEPENDENCY_KINDS: [&str; 3] = ["normal", "dev", "build"];
@@ -259,6 +259,7 @@ fn validate_contract_header(contract: &StorageContract) -> anyhow::Result<()> {
         &contract.dependencies.direct_external_by_kind,
         &[
             "crc32c",
+            "rustix",
             "serde",
             "serde_json",
             "thiserror",
@@ -290,10 +291,10 @@ fn validate_contract_header(contract: &StorageContract) -> anyhow::Result<()> {
         .is_empty()
         || contract.dependencies.production_closure_scope
             != "package-selected-all-features-all-target-normal-and-build"
-        || contract.dependencies.production_third_party_packages_max != 55
+        || contract.dependencies.production_third_party_packages_max != 61
     {
         bail!(
-            "WP-10A storage must have no workspace dependents and at most 55 production third-party packages"
+            "WP-10A storage must have no workspace dependents and at most 61 production third-party packages"
         );
     }
 
@@ -305,6 +306,14 @@ fn validate_contract_header(contract: &StorageContract) -> anyhow::Result<()> {
             checksum: "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47".to_owned(),
             default_features: true,
             features: Vec::new(),
+        },
+        ExternalDependency {
+            name: "rustix".to_owned(),
+            version: "1.1.4".to_owned(),
+            requirement: "=1.1.4".to_owned(),
+            checksum: "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190".to_owned(),
+            default_features: true,
+            features: vec!["fs".to_owned()],
         },
         ExternalDependency {
             name: "zarrs_metadata".to_owned(),
@@ -502,6 +511,7 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "LocalObjectInfo",
         "LocalPackageCatalog",
         "LocalPackageReader",
+        "LocalPackageWriter",
         "MANIFEST_DESCRIPTORS_PER_PAGE_GUARANTEED",
         "ManifestPage",
         "ManifestPageReference",
@@ -527,6 +537,7 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "PROFILE",
         "PackageCounts",
         "PackageAdmissionError",
+        "PackageArrayInput",
         "PackageObjectDescriptor",
         "PackageObjectKind",
         "PackagePath",
@@ -536,8 +547,12 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "PackedIndexStatistics",
         "PackageOpenError",
         "PackageReadError",
+        "PackageShardInput",
         "PackageStructureError",
         "PackageValidationError",
+        "PackageWriteError",
+        "PackageWriteInput",
+        "PackageWriteReceipt",
         "PortableRecord",
         "PortableRecordKind",
         "PortableRecordPayload",
