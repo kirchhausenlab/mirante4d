@@ -80,6 +80,17 @@ impl LocalPackageReader {
         })
     }
 
+    pub(crate) fn read_object(
+        &self,
+        path: &PackagePath,
+        object_bytes_max: u64,
+    ) -> Result<Vec<u8>, RangeReadError> {
+        let mut checked = self.open_object(path, object_bytes_max)?;
+        let bytes = read_exact_at(&mut checked.file, path, 0, checked.bytes)?;
+        self.revalidate_open_object(path, &checked)?;
+        Ok(bytes)
+    }
+
     /// Reads one nonempty checked `(object, offset, length)` range.
     pub fn read_range(
         &self,

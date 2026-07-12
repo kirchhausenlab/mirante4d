@@ -146,6 +146,15 @@
     "cross_page_verification": "each reference matches exact count, bounds, bytes, and digest and flattening then repacking reproduces the identical greedy pages",
     "root_package_id": "SHA-256 of the exact canonical root bytes; package_id is not stored inside the root"
   },
+  "local_metadata_catalog": {
+    "entry_order": "parse the bounded profile, then the canonical manifest root and all one through six authenticated manifest pages",
+    "verified_objects": "verify exact bytes and parse the profile, science, display, empty Zarr groups, image-group OME metadata, and every profile-addressed Zarr array metadata object",
+    "portable_record_policy": "profile paths and manifest descriptor roles are checked during open; portable record bytes remain lazy",
+    "descriptor_set": "every non-shard descriptor must be exactly one profile-derived required metadata/control path; shard descriptors remain authenticated claims but their files are not read",
+    "cross_object_checks": "profile/science/display identity and layer sets match; OME image level counts and time calibration match; layers sharing one physical image have equal science dtype, shape, time, and transform",
+    "reported_metric": "exact metadata bytes read is retained for the later metadata-open evidence gate",
+    "non_claims": "open does not enumerate directory closure, verify shard bytes, decode indexes, compute scientific identity, or imply full package validation"
+  },
   "portable_records": {
     "scope": "initial package-contained version-1 portable records; adding another source or license literal is a hard schema change",
     "collection_items_max": 4096,

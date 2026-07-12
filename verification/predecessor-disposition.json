@@ -4773,6 +4773,30 @@
       "reason": "WP-10A rejects unknown OME members, alternate paths/transforms, negative zero, mixed spatial modes, and oversized metadata."
     },
     {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::opens_authenticated_metadata_catalog_without_reading_shards",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A authenticates canonical manifest pages and exact opening metadata without implicitly sweeping shard payloads."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::rejects_cross_object_layer_drift_and_unexpected_metadata",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects unexpected metadata roles and inconsistent profile, science, display, OME, or physical-image layer facts."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::rejects_manifest_page_and_metadata_byte_corruption",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects manifest-page and opening-metadata length or digest corruption before catalog admission."
+    },
+    {
       "id": "libtest:mirante4d-storage:range_io::tests::reads_only_the_requested_nonempty_range_and_index_tail",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -4907,6 +4931,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 408
+    "current_additions": 411
   }
 }

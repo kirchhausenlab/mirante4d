@@ -16,7 +16,7 @@
     "path": "architecture/wp10a-control-wire-specialization.json",
     "schema": "mirante4d-wp10a-control-wire-specialization",
     "schema_version": 1,
-    "sha256": "5e1b5960cfc2185fd2e855350eb4379264f9d4c14959c2a1d6c460c157089841"
+    "sha256": "c2dc58579f42f4beb77b61f9231a1ce19270f2d41e637a9f7b08aa8f58bd4130"
   },
   "activation": {
     "crate_name": "mirante4d-storage",
@@ -64,6 +64,7 @@
       "INDEX_LOCATION",
       "INNER_CODECS",
       "LocalObjectInfo",
+      "LocalPackageCatalog",
       "LocalPackageReader",
       "MANIFEST_DESCRIPTORS_PER_PAGE_GUARANTEED",
       "ManifestPage",
@@ -96,6 +97,7 @@
       "PackedIndexError",
       "PackedIndexRecord",
       "PackedIndexStatistics",
+      "PackageOpenError",
       "PortableRecord",
       "PortableRecordKind",
       "PortableRecordPayload",

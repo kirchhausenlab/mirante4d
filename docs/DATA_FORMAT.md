@@ -75,7 +75,10 @@ zstd/CRC32C inner-payload and end-index codecs implement the selected binary
 layer in memory. Strict Zarr group/array metadata, closed OME image-group axes
 and transforms, and bounded root-confined Unix object-range reads are
 implemented. The integrated package reader, writer, and validator are not yet
-implemented.
+implemented. A bounded local catalog now authenticates the manifest root/pages,
+verifies opening-critical metadata bytes, parses the closed control/Zarr/OME
+objects, and checks their initial layer/time relationships; it does not yet
+enumerate full directory closure or verify shard payloads.
 
 WP-10B separately installs immutable content-addressed project objects,
 complete generations, atomic head/recovery refs, leases, autosave/recovery,

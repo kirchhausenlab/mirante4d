@@ -66,10 +66,12 @@ recipe, derivation, rights, and citation records have exact closed schemas;
 embedded recipe and derivation payloads and detached release records verify
 their typed identities. Exact 64-byte packed-index records and the bounded
 in-memory zstd/CRC32C shard and end-index codec also exist. Strict Zarr
-group/array metadata, closed OME image-group metadata, and root-confined
-bounded Unix range reads now exist. The package reader, writer, validator,
-independent T1 corpus, and product activation remain incomplete. Current
-schema-1 packages remain transitional T2 fixtures and the sole product route.
+group/array metadata, closed OME image-group metadata, root-confined bounded
+Unix range reads, and an authenticated local metadata catalog now exist. Full
+directory closure, shard addressing/reads, the writer, structural/full
+validator, independent T1 corpus, and product activation remain incomplete.
+Current schema-1 packages remain transitional T2 fixtures and the sole product
+route.
 
 ## Current Verification Boundary
 

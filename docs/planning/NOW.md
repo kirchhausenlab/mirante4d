@@ -23,7 +23,10 @@ present. Exact object descriptors, greedy manifest pages, authenticated roots,
 PackageId derivation, portable records, derivation records, and detached
 release records are present. The fixed packed-index, inner-payload, and shard-
 tail codecs, strict Zarr/OME metadata, and bounded local range reader are
-present. Continue WP-10A-B with the package reader, writer, and validator.
+present. An authenticated local metadata catalog now opens the manifest and
+opening-critical metadata closure. Continue WP-10A-B with complete cross-
+object addressing, directory closure and shard reads, then the writer and
+structural/full validator.
 WP-10A-C then promotes the independent target-format authorities; WP-10A-D
 consumes them and closes the package evidence. Current schema 1 remains the
 sole product route until WP-10C.

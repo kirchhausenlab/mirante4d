@@ -28,7 +28,7 @@ const CONTROL_WIRE_PATH: &str = "architecture/wp10a-control-wire-specialization.
 const CONTROL_WIRE_SCHEMA: &str = "mirante4d-wp10a-control-wire-specialization";
 const CONTROL_WIRE_SCHEMA_VERSION: u64 = 1;
 const CONTROL_WIRE_SHA256: &str =
-    "5e1b5960cfc2185fd2e855350eb4379264f9d4c14959c2a1d6c460c157089841";
+    "c2dc58579f42f4beb77b61f9231a1ce19270f2d41e637a9f7b08aa8f58bd4130";
 const STORAGE_CRATE: &str = "mirante4d-storage";
 const STORAGE_PATH: &str = "crates/mirante4d-storage";
 const DEPENDENCY_KINDS: [&str; 3] = ["normal", "dev", "build"];
@@ -493,6 +493,7 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "INDEX_LOCATION",
         "INNER_CODECS",
         "LocalObjectInfo",
+        "LocalPackageCatalog",
         "LocalPackageReader",
         "MANIFEST_DESCRIPTORS_PER_PAGE_GUARANTEED",
         "ManifestPage",
@@ -525,6 +526,7 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "PackedIndexError",
         "PackedIndexRecord",
         "PackedIndexStatistics",
+        "PackageOpenError",
         "PortableRecord",
         "PortableRecordKind",
         "PortableRecordPayload",
