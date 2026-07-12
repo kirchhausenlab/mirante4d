@@ -1,0 +1,53 @@
+{
+  "schema": "mirante4d-foundation-package-entry-correction",
+  "schema_version": 1,
+  "package": "WP-10B",
+  "status": "accepted",
+  "authorization": {
+    "approved_by": "Mirante4D repository owner",
+    "approved_on": "2026-07-12",
+    "reference": "WP10B-PREAUTH-2026-07-12",
+    "scope": "exact persistence restoration for an already-validated unit quaternion"
+  },
+  "accepted_boundary": {
+    "entry_path": "architecture/wp10b-project-store-entry.json",
+    "entry_sha256": "b5a189658d0f0d40f7ca0023bd3a688b3ca7926d28e028bb19acdc764920c793",
+    "dependency_correction_path": "architecture/wp10b-project-store-entry-correction.json",
+    "dependency_correction_sha256": "e9fdbca7e78bdb34eca3533e28c5caa811c6cc0d8e71d8e40324a8b896eefa79",
+    "protected_main_commit": "b6e0267802f8ac2d0d49a0f04302fd321ef2f617",
+    "protected_main_tree": "b20b598603b47fdbe7c85c3b6d1cba8c78fd433e",
+    "hosted_run": "https://github.com/kirchhausenlab/mirante4d/actions/runs/29199277402",
+    "hosted_result": "success"
+  },
+  "discovered_gap": {
+    "fact": "UnitQuaternion::new_xyzw renormalizes its input, and renormalizing ordinary already-valid quaternion components can change their IEEE-754 bits.",
+    "risk": "A project save/open/save cycle could drift canonical camera and cross-section bytes even when the user made no edit.",
+    "rejected_workarounds": [
+      "accept repeated normalization drift",
+      "use approximate or debug-text persistence",
+      "bypass the private representation with unsafe code",
+      "move quaternion reconstruction outside the project-store authority"
+    ]
+  },
+  "correction": {
+    "api": "add UnitQuaternion::from_canonical_xyzw([f64; 4])",
+    "validation": "require finite components, positive-zero encoding, canonical quaternion sign, and squared norm within sixteen f64 epsilon of one; preserve accepted bits exactly",
+    "error": "add one typed GeometryError variant for a non-canonical stored quaternion",
+    "public_root_change": false,
+    "dependency_change": false,
+    "serialization_in_domain": false,
+    "supersedes": "the dependency correction's domain-unchanged invariant only for this one method and error variant"
+  },
+  "allowed_paths": [
+    "architecture/wp10b-project-store-quaternion-correction.json",
+    "crates/mirante4d-domain/src/geometry.rs"
+  ],
+  "evidence": [
+    "a concrete ordinary quaternion whose second normalization changes bits",
+    "fixed-seed property coverage proving every constructor output restores bit-exactly",
+    "rejection of non-finite, non-unit, negative-sign, and negative-zero encodings",
+    "the independent WP-10B project fixture round-trips nontrivial camera and cross-section orientations"
+  ],
+  "stop_condition": "Any other domain type, dependency, invariant, or public root must change.",
+  "rollback": "revert this correction and the method before accepting the B1 wire contract; no runtime or persistence authority is active yet"
+}

@@ -8,6 +8,8 @@ pub enum GeometryError {
     NonFiniteQuaternion,
     #[error("quaternion must have nonzero length")]
     ZeroQuaternion,
+    #[error("stored quaternion must have canonical sign, zeros, and unit length")]
+    NonCanonicalQuaternion,
     #[error("grid-to-world matrix components must be finite")]
     NonFiniteTransform,
     #[error("grid-to-world matrix must be affine with final row [0, 0, 0, 1]")]
@@ -81,6 +83,26 @@ impl UnitQuaternion {
 
     pub const fn identity() -> Self {
         Self([0.0, 0.0, 0.0, 1.0])
+    }
+
+    /// Restores already-canonical persisted components without renormalizing
+    /// their IEEE-754 representation.
+    pub fn from_canonical_xyzw(components: [f64; 4]) -> Result<Self, GeometryError> {
+        const UNIT_NORM_TOLERANCE: f64 = 16.0 * f64::EPSILON;
+
+        let finite = components.iter().all(|value| value.is_finite());
+        let positive_zeros = components
+            .iter()
+            .all(|value| *value != 0.0 || value.is_sign_positive());
+        let norm_squared = components.iter().map(|value| value * value).sum::<f64>();
+        if !finite
+            || !positive_zeros
+            || quaternion_sign_is_negative(components)
+            || (norm_squared - 1.0).abs() > UNIT_NORM_TOLERANCE
+        {
+            return Err(GeometryError::NonCanonicalQuaternion);
+        }
+        Ok(Self(components))
     }
 
     pub const fn xyzw(self) -> [f64; 4] {
@@ -170,6 +192,44 @@ mod tests {
     }
 
     #[test]
+    fn exact_restore_does_not_renormalize_persisted_components() {
+        let components = [
+            f64::from_bits(0xbfcb_c807_19f3_8873),
+            f64::from_bits(0x3fe7_c0dc_6e9a_5f8d),
+            f64::from_bits(0xbfe3_eb28_a469_d27b),
+            f64::from_bits(0x3fbe_c418_bb9a_d9b8),
+        ];
+        let renormalized =
+            UnitQuaternion::new_xyzw(components[0], components[1], components[2], components[3])
+                .unwrap();
+        assert_ne!(
+            renormalized.xyzw().map(f64::to_bits),
+            components.map(f64::to_bits)
+        );
+
+        let restored = UnitQuaternion::from_canonical_xyzw(components).unwrap();
+        assert_eq!(
+            restored.xyzw().map(f64::to_bits),
+            components.map(f64::to_bits)
+        );
+    }
+
+    #[test]
+    fn exact_restore_rejects_noncanonical_encodings() {
+        for components in [
+            [f64::NAN, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 2.0],
+            [0.0, 0.0, 0.0, -1.0],
+            [-0.0, 0.0, 0.0, 1.0],
+        ] {
+            assert_eq!(
+                UnitQuaternion::from_canonical_xyzw(components),
+                Err(GeometryError::NonCanonicalQuaternion)
+            );
+        }
+    }
+
+    #[test]
     fn preserves_finite_affine_transforms_without_invertibility_policy() {
         let mut non_affine = GridToWorld::identity().row_major();
         non_affine[15] = 2.0;
@@ -217,6 +277,23 @@ mod tests {
             let quaternion = UnitQuaternion::new_xyzw(x, y, z, w).unwrap();
             let squared_norm = quaternion.xyzw().iter().map(|value| value * value).sum::<f64>();
             prop_assert!((squared_norm - 1.0).abs() <= 1.0e-12);
+        }
+
+        #[test]
+        fn every_constructor_output_restores_bit_exactly(
+            x in any::<f64>(),
+            y in any::<f64>(),
+            z in any::<f64>(),
+            w in any::<f64>(),
+        ) {
+            prop_assume!([x, y, z, w].iter().all(|value| value.is_finite()));
+            prop_assume!(x != 0.0 || y != 0.0 || z != 0.0 || w != 0.0);
+            let quaternion = UnitQuaternion::new_xyzw(x, y, z, w).unwrap();
+            let restored = UnitQuaternion::from_canonical_xyzw(quaternion.xyzw()).unwrap();
+            prop_assert_eq!(
+                restored.xyzw().map(f64::to_bits),
+                quaternion.xyzw().map(f64::to_bits)
+            );
         }
     }
 }

@@ -126,7 +126,9 @@ independent CPU reference at
 `1b1e7d5534f29b010cc346d434811a3906fb40e1`, tagged
 `foundation-wp-09a-exit-1`. Exact protected-main policy/Rust and trusted Vulkan
 evidence passed; product activation and product-open validation remain WP-09B
-work. WP-10B's entry is accepted and its B1 contract/fixture work is active.
+work. WP-10B's entry is accepted. B1 freezes the successor project-store wire,
+limits, public boundary, transition inventory, and independent project fixture;
+B2 transactional implementation is active off-product.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
@@ -148,6 +150,8 @@ See [testing](TESTING.md) for commands and claim language.
   open, and save therefore reject at the typed identity gate before I/O.
 - Dataset schema 1 and the private project-v15 bridge are experimental, not
   target-format conformance claims.
+- The project-store wire contract is independently validated, but no successor
+  project-store crate or product path exists yet.
 - The package-capability lane remains pending until there is an honest
   unsupported-GPU package command.
 - Packaged runtime does not expose unsaved-autosave recovery.

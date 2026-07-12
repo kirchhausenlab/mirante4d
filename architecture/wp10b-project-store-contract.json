@@ -1,0 +1,599 @@
+{
+  "schema": "mirante4d-wp10b-project-store-contract",
+  "schema_version": 1,
+  "status": "accepted-wire-authority",
+  "bindings": {
+    "entry": {
+      "path": "architecture/wp10b-project-store-entry.json",
+      "sha256": "b5a189658d0f0d40f7ca0023bd3a688b3ca7926d28e028bb19acdc764920c793"
+    },
+    "dependency_correction": {
+      "path": "architecture/wp10b-project-store-entry-correction.json",
+      "sha256": "e9fdbca7e78bdb34eca3533e28c5caa811c6cc0d8e71d8e40324a8b896eefa79"
+    },
+    "quaternion_correction": {
+      "path": "architecture/wp10b-project-store-quaternion-correction.json",
+      "sha256": "f2ec1d537e90536e8e67212d663e49823edac5eee30d0d45fccd0fb8e5d6876f"
+    },
+    "protected_main": {
+      "commit": "b6e0267802f8ac2d0d49a0f04302fd321ef2f617",
+      "tree": "b20b598603b47fdbe7c85c3b6d1cba8c78fd433e",
+      "hosted_run": "https://github.com/kirchhausenlab/mirante4d/actions/runs/29199277402",
+      "hosted_result": "success"
+    }
+  },
+  "activation": {
+    "crate_name": "mirante4d-project-store",
+    "crate_path": "crates/mirante4d-project-store",
+    "lifecycle": "EXPERIMENTAL",
+    "product_status": "off-product-through-B3",
+    "product_activation_checkpoint": "B4",
+    "product_reachability": false
+  },
+  "dependencies": {
+    "normal_workspace": [
+      "mirante4d-domain",
+      "mirante4d-identity",
+      "mirante4d-project-model"
+    ],
+    "normal_external": [
+      "rustix",
+      "serde",
+      "serde_json",
+      "thiserror"
+    ],
+    "dev_workspace": [],
+    "dev_external": []
+  },
+  "layout": {
+    "envelope": "project.json",
+    "manual_head": "refs/head",
+    "manual_recovery": "refs/recovery",
+    "autosave_head": "refs/autosave-head",
+    "autosave_recovery": "refs/autosave-recovery",
+    "pins": "refs/pins/<checkpoint-id>",
+    "checkpoint_id": "1 through 64 lowercase ASCII bytes matching [a-z0-9][a-z0-9_-]*",
+    "generation": "generations/sha256/<first-two-digest-hex>/<remaining-sixty-two-digest-hex>.json",
+    "object": "objects/sha256/<first-two-digest-hex>/<remaining-sixty-two-digest-hex>",
+    "staging": "staging/<transaction-id>",
+    "locks": "locks",
+    "trash": "trash",
+    "digest_fanout_hex_bytes": 1
+  },
+  "canonical_json": {
+    "profile": "mirante4d-project-restricted-jcs-v1",
+    "encoding": "UTF-8 without BOM, whitespace, or trailing newline",
+    "object_members": "closed and sorted by Unicode code point",
+    "arrays": "preserve declared semantic order unless a record explicitly declares sorting",
+    "strings": "preserve raw Unicode scalar values without normalization; emit raw UTF-8 except JSON-required quote, reverse-solidus, and control escapes",
+    "u64": "minimal unsigned decimal string; zero is exactly 0 and no leading zero is allowed",
+    "u32": "JSON integer from 0 through 4294967295 with no fraction or exponent",
+    "f32": "exact IEEE-754 bits as exactly eight lowercase hexadecimal characters",
+    "f64": "exact IEEE-754 bits as exactly sixteen lowercase hexadecimal characters",
+    "numbers_forbidden": "all JSON numbers except fields declared u32",
+    "non_finite": "rejected by the owning domain type before encoding and after decoding"
+  },
+  "digests": {
+    "exact_object": "SHA-256 over exact stored bytes with no domain prefix; typed form sha256:<64-lowercase-hex>",
+    "generation_domain_ascii_nul": "M4D-PROJECT-GENERATION-V1\\0",
+    "generation_preimage": "domain || canonical-generation-byte-length as big-endian u64 || canonical-generation-bytes",
+    "generation_typed_prefix": "m4d-project-generation-v1-sha256:",
+    "ref_checksum_domain_ascii_nul": "M4D-PROJECT-REF-V1\\0",
+    "ref_checksum_preimage": "domain || ref bytes 0 through 127",
+    "path_digest": "the bare 64 lowercase hexadecimal characters from the applicable digest"
+  },
+  "records": {
+    "envelope": {
+      "schema": "mirante4d-project-store-envelope",
+      "schema_version": 1,
+      "profile": "mirante4d-project-store-v1",
+      "fields": [
+        "profile",
+        "project_id",
+        "schema",
+        "schema_version"
+      ],
+      "project_id": "canonical lowercase hyphenated UUID",
+      "mutable_state_forbidden": true
+    },
+    "ref": {
+      "bytes_exact": 160,
+      "magic_hex": "4d34445245463100",
+      "header": "bytes 0..7 magic; 8..9 schema-version big-endian u16; 10 kind u8; 11 presence u8; 12..15 total-length big-endian u32",
+      "schema_version": 1,
+      "project_uuid": "bytes 16..31 in UUID network byte order",
+      "current_digest": "bytes 32..63 raw generation digest; always present",
+      "previous_digest": "bytes 64..95 raw generation digest or all zero when absent",
+      "base_digest": "bytes 96..127 raw manual-generation digest or all zero when absent",
+      "checksum": "bytes 128..159 raw SHA-256 defined by digests.ref_checksum_preimage",
+      "presence_previous_bit": 0,
+      "presence_base_bit": 1,
+      "other_presence_bits": "zero",
+      "path_kind_binding": "refs/head=manual_head, refs/recovery=manual_recovery, refs/autosave-head=autosave_head, refs/autosave-recovery=autosave_recovery, and refs/pins/<checkpoint-id>=pin; swapping kinds is corruption",
+      "unused_slots": "every slot forbidden or absent for its kind is all zero; presence bits and the allowed per-kind slot combination must agree exactly",
+      "kinds": [
+        {
+          "code": 1,
+          "name": "manual_head",
+          "previous": "optional",
+          "base": "forbidden"
+        },
+        {
+          "code": 2,
+          "name": "manual_recovery",
+          "previous": "forbidden",
+          "base": "forbidden"
+        },
+        {
+          "code": 3,
+          "name": "autosave_head",
+          "previous": "optional",
+          "base": "optional only for a provisional project; otherwise required"
+        },
+        {
+          "code": 4,
+          "name": "autosave_recovery",
+          "previous": "forbidden",
+          "base": "forbidden"
+        },
+        {
+          "code": 5,
+          "name": "pin",
+          "previous": "forbidden",
+          "base": "forbidden"
+        }
+      ],
+      "store_states": {
+        "established": "refs/head is present; refs/autosave-head, when present, has a required base equal to its current generation's base_manual_generation_id; comparison with refs/head.current classifies it as same-base or divergent",
+        "provisional": "refs/head and refs/recovery are absent; refs/autosave-head is present with base absent, and its current autosave generation has base_manual_generation_id=null; every other combination without refs/head is corruption"
+      },
+      "recovery_pair_rule": "independently for the manual and autosave lanes, the recovery ref is present if and only if the corresponding head ref has previous present, and recovery.current equals head.previous exactly; a recovery ref never selects an independent generation"
+    },
+    "generation": {
+      "schema": "mirante4d-project-generation",
+      "schema_version": 1,
+      "fields": [
+        "artifacts",
+        "base_manual_generation_id",
+        "dataset",
+        "forked_from",
+        "generation_kind",
+        "generation_sequence",
+        "parent_generation_id",
+        "project_id",
+        "reachable_objects",
+        "revision_high_water_sequence",
+        "revision_sequence",
+        "schema",
+        "schema_version",
+        "state"
+      ],
+      "generation_kind": [
+        "manual",
+        "autosave"
+      ],
+      "generation_sequence": "u64; initial zero and otherwise one greater than the maximum sequence in the current manual and autosave heads observed under the writer lease; diagnostic ordering only, never authority",
+      "revision_sequence": "u64",
+      "revision_high_water_sequence": "u64 and not less than revision_sequence",
+      "parent_generation_id": "same-lane generation ID or null; provenance only and never a GC liveness edge",
+      "base_manual_generation_id": "required for autosave after a manual save, null for manual and provisional autosave",
+      "forked_from": "null or closed {project_id,generation_id}; fixed for the project and repeated unchanged in every generation created after Save As",
+      "artifacts": "the ProjectState artifact records in semantic order; every record contains one logical_object and one closed storage binding",
+      "reachable_object_fields": [
+        "byte_length",
+        "digest"
+      ],
+      "reachable_objects": "the exact physical object closure derived from all artifact storage bindings, sorted by digest then byte length; duplicate digests are forbidden and no extra object is permitted"
+    },
+    "state_projection": {
+      "dataset_fields": [
+        "locator_hint",
+        "package_id",
+        "release_id",
+        "scientific_content_id"
+      ],
+      "optional_fields": "dataset locator_hint/package_id/release_id and artifact derivation_id/recipe_id are always present and encode absence as JSON null",
+      "state_fields": [
+        "channel_presets",
+        "view"
+      ],
+      "view_fields": [
+        "active_layer",
+        "camera",
+        "cross_section",
+        "iso_light",
+        "layers",
+        "layout",
+        "timepoint"
+      ],
+      "layer_fields": [
+        "layer",
+        "render",
+        "transfer",
+        "visible"
+      ],
+      "transfer_fields": [
+        "color_rgb",
+        "curve",
+        "invert",
+        "opacity",
+        "window"
+      ],
+      "display_window_fields": [
+        "high",
+        "low"
+      ],
+      "transfer_curve_variants": [
+        "linear",
+        "gamma"
+      ],
+      "render_variants": [
+        "mip",
+        "isosurface",
+        "dvr"
+      ],
+      "sampling_variants": [
+        "smooth_linear",
+        "voxel_exact"
+      ],
+      "iso_shading_variants": [
+        "gradient_lighting",
+        "flat"
+      ],
+      "projection_variants": [
+        "perspective",
+        "orthographic"
+      ],
+      "layout_variants": [
+        "single3d",
+        "four_panel"
+      ],
+      "iso_light_variants": [
+        "attached_camera",
+        "detached_screen"
+      ],
+      "tagged_variant_shapes": {
+        "transfer_linear": "closed {kind} with kind=linear",
+        "transfer_gamma": "closed {kind,value} with kind=gamma and value=f32",
+        "render_mip": "closed {mode,sampling} with mode=mip",
+        "render_isosurface": "closed {display_level,mode,sampling,shading} with mode=isosurface",
+        "render_dvr": "closed {density_scale,mode,opacity_transfer,sampling} with mode=dvr; opacity_transfer is closed {curve,window}",
+        "iso_light_attached": "closed {kind} with kind=attached_camera",
+        "iso_light_detached": "closed {kind,x,y} with kind=detached_screen and x/y=f32"
+      },
+      "camera_fields": [
+        "orientation_xyzw",
+        "orthographic_world_per_screen_point",
+        "perspective_focal_length_screen_points",
+        "perspective_view_distance_world",
+        "projection",
+        "target"
+      ],
+      "cross_section_fields": [
+        "center",
+        "depth_world",
+        "orientation_xyzw",
+        "scale_world_per_screen_point"
+      ],
+      "channel_preset_fields": [
+        "entries",
+        "id",
+        "label"
+      ],
+      "channel_preset_entry_fields": [
+        "layer",
+        "render",
+        "transfer",
+        "visible"
+      ],
+      "artifact_fields": [
+        "completeness",
+        "content_id",
+        "derivation_id",
+        "handle_id",
+        "label",
+        "logical_object",
+        "recipe_id",
+        "recoverability",
+        "schema",
+        "source_layers",
+        "storage",
+        "visible"
+      ],
+      "raw_object_descriptor_fields": [
+        "byte_length",
+        "digest",
+        "media_type",
+        "role"
+      ],
+      "artifact_schema_variants": [
+        "roi.v1",
+        "track.v1",
+        "annotation.v1",
+        "measurement.v1",
+        "analysis-table.v1",
+        "analysis-plot.v1"
+      ],
+      "artifact_completeness_variants": [
+        "partial",
+        "complete"
+      ],
+      "artifact_recoverability_variants": [
+        "regenerable",
+        "non_regenerable"
+      ],
+      "quaternion_restore": "UnitQuaternion::from_canonical_xyzw preserves accepted f64 bits exactly"
+    },
+    "logical_object_binding": {
+      "schema": "mirante4d-project-logical-object-binding",
+      "schema_version": 1,
+      "media_type": "application/vnd.mirante4d.project-object-binding-v1+json",
+      "role": "project.object-binding.v1",
+      "fields": [
+        "logical_descriptor",
+        "pages",
+        "schema",
+        "schema_version"
+      ],
+      "page_fields": [
+        "byte_length",
+        "digest",
+        "offset",
+        "ordinal"
+      ],
+      "page_field_types": "ordinal is u32; offset and byte_length are u64; digest is ExactBytesDigest",
+      "page_media_type": "application/octet-stream",
+      "page_role": "project.object-page.v1",
+      "page_rules": "pages are nonempty and sorted by ordinal; ordinal starts at zero, offset starts at zero, offsets are contiguous, every non-final page is exactly 16777216 bytes, the final page is 1 through 16777216 bytes, and concatenated length/digest equal logical_descriptor",
+      "storage_variants": {
+        "direct": {
+          "fields": [
+            "kind",
+            "object"
+          ],
+          "object_fields": [
+            "byte_length",
+            "digest"
+          ],
+          "rule": "object digest and byte length equal the artifact logical_object descriptor"
+        },
+        "paged": {
+          "fields": [
+            "binding_manifest",
+            "kind"
+          ],
+          "binding_manifest_fields": [
+            "byte_length",
+            "digest",
+            "media_type",
+            "role"
+          ],
+          "rule": "media type and role equal this record's fixed logical-object-binding values"
+        }
+      }
+    }
+  },
+  "payload_storage": {
+    "direct": "a logical object of at most 16777216 bytes is stored once at its own ExactBytesDigest and its stored descriptor exactly equals the logical descriptor",
+    "paged": "a logical object above 16777216 bytes is split at deterministic 16777216-byte offsets; pages and one canonical logical-object-binding manifest are stored as exact objects",
+    "paged_validation": "page ordinals and offsets are contiguous from zero, every non-final page is exactly 16777216 bytes, page digests validate, concatenated bytes match the logical length and digest, and manifest logical facts equal the ProjectState RawObjectDescriptor",
+    "logical_binding_in_generation": "each artifact record binds its logical descriptor to direct or paged storage; reachable_objects separately lists exactly every direct object or binding manifest and page object needed by those bindings",
+    "forbidden_granularity": [
+      "semantic voxel",
+      "logical dataset brick",
+      "table row",
+      "timepoint"
+    ]
+  },
+  "public_api": [
+    "ProjectCommitCapture",
+    "ProjectGenerationId",
+    "ProjectObjectSource",
+    "ProjectOpenMode",
+    "ProjectRecoveryCandidate",
+    "ProjectStoreActor",
+    "ProjectStoreCommand",
+    "ProjectStoreCompletion",
+    "ProjectStoreConfig",
+    "ProjectStoreDiagnostics",
+    "ProjectStoreFault",
+    "ProjectStoreLimits",
+    "ProjectStorePath",
+    "ProjectStoreReceipt",
+    "ProjectStoreRequestId",
+    "ProjectStoreSession"
+  ],
+  "public_api_contract": {
+    "actor": "owns exactly one live session, every OS lease, the bounded request/completion queues, and the sole active filesystem transaction",
+    "session": "immutable safe metadata only: project ID, current manual/autosave generation IDs, effective open mode, and a display-safe package root; no lock or internal object paths",
+    "open_modes": [
+      "read_only",
+      "prefer_writable"
+    ],
+    "writable_fallback": "only prefer_writable may become an explicitly reported read_only session when the writer lease is unavailable",
+    "commit_capture": "immutable validated ProjectGenerationProjection plus expected lane parent, autosave base when applicable, fork provenance for Save As, and bounded lazy object sources",
+    "object_source": "opaque cancellable stream factory bound to one expected RawObjectDescriptor; no PathBuf, unbounded owned bytes, or preopened object collection",
+    "commands": [
+      "create",
+      "open",
+      "manual_save",
+      "save_as",
+      "autosave",
+      "inspect_recovery",
+      "open_recovery",
+      "pin",
+      "unpin",
+      "plan_compaction",
+      "trash",
+      "purge",
+      "full_verify",
+      "cancel",
+      "close"
+    ],
+    "save_as": "caller supplies a projection with the new ProjectId and explicit source generation; the actor changes session only after durable destination installation and retains the old session on failure",
+    "completion": "every accepted request produces exactly one terminal completion carrying its ProjectStoreRequestId, including cancellation and an autosave superseded by coalescing",
+    "receipt": "opaque operation-specific anti-TOCTOU token; durable commits carry captured revision/high-water and new/current/previous generation IDs; autosave receipts also carry base manual generation and cannot mark a project saved",
+    "recovery_candidate": "bounded metadata only with generation, captured revision, origin, base/current relation, provisional/newer/stale/divergent classification, and recoverability summary; projection bytes load only after explicit selection",
+    "autosave_classification": {
+      "provisional": "no manual head exists and autosave base is absent",
+      "divergent": "a manual head exists and autosave base differs from manual head current",
+      "newer": "autosave base equals manual head current and autosave revision_sequence differs from manual head revision_sequence; revision IDs are immutable state identities, so undo may make the autosave sequence numerically lower",
+      "stale": "autosave base equals manual head current and autosave revision_sequence equals manual head revision_sequence"
+    },
+    "diagnostics": "bounded counters and stable reason codes only; no absolute/internal paths or raw OS error strings",
+    "fault_variants": [
+      "queue_full",
+      "read_only",
+      "writer_contended",
+      "stale_parent",
+      "destination_exists",
+      "unsupported_filesystem",
+      "capacity",
+      "source_changed",
+      "digest_mismatch",
+      "corruption",
+      "cancelled",
+      "commit_indeterminate"
+    ],
+    "config": "contains no filesystem-qualification bypass, hard-limit bypass, retry, compatibility, or alternate-path switch"
+  },
+  "limits": {
+    "project_envelope_bytes_max": 16384,
+    "ref_record_bytes_exact": 160,
+    "ref_record_bytes_max": 4096,
+    "generation_bytes_max": 67108864,
+    "object_or_page_bytes_max": 16777216,
+    "stream_buffer_bytes_max": 1048576,
+    "artifact_records_per_generation_max": 16384,
+    "reachable_objects_per_generation_max": 65536,
+    "generations_scanned_max": 4096,
+    "directory_fanout_entries_max": 4096,
+    "physical_store_entries_max": 131072,
+    "pin_refs_max": 64,
+    "recovery_candidates_max": 64,
+    "actor_request_queue_max": 8,
+    "actor_completion_queue_max": 8,
+    "active_transactions_max": 1,
+    "open_file_descriptors_max": 64,
+    "autosave_queued_requests_max": 1,
+    "autosave_idle_delay_seconds": 30,
+    "autosave_max_delay_seconds": 120,
+    "gc_batch_entries_max": 1024,
+    "gc_batch_bytes_max": 268435456
+  },
+  "transition_inventory": {
+    "injection": "each named transition supports before and after injection plus a zero-based occurrence for repeated writes, objects, pages, generations, refs, and GC moves",
+    "open": [
+      "maintenance_lease_acquire",
+      "writer_lease_try_acquire",
+      "envelope_read",
+      "ref_read",
+      "generation_validate",
+      "payload_binding_validate",
+      "object_inventory"
+    ],
+    "commit_prefix": [
+      "writer_lease_confirm",
+      "expected_parent_check"
+    ],
+    "object": [
+      "object_stage_create",
+      "object_write",
+      "object_file_sync",
+      "object_publish_noreplace",
+      "object_directory_sync"
+    ],
+    "generation": [
+      "generation_stage_create",
+      "generation_write",
+      "generation_file_sync",
+      "generation_publish_noreplace",
+      "generation_directory_sync"
+    ],
+    "ref_lane_parameter": [
+      "manual",
+      "autosave"
+    ],
+    "recovery_ref": [
+      "recovery_stage_create",
+      "recovery_write",
+      "recovery_file_sync",
+      "recovery_replace",
+      "recovery_directory_sync"
+    ],
+    "head_ref": [
+      "head_stage_create",
+      "head_write",
+      "head_file_sync",
+      "head_replace",
+      "head_directory_sync"
+    ],
+    "save_as": [
+      "package_stage_create",
+      "closure_copy_rehash",
+      "package_tree_sync",
+      "package_install_noreplace",
+      "destination_parent_sync"
+    ],
+    "gc": [
+      "gc_root_scan",
+      "gc_candidate_listing",
+      "gc_trash_move",
+      "gc_source_directory_sync",
+      "gc_trash_directory_sync"
+    ],
+    "purge_is_separate": true,
+    "commit_indeterminate": "failure to establish final ref-directory durability after retry suspends writes, keeps the revision dirty, and requires close/reopen",
+    "saved_revision_rule": "only a durable manual-head completion may advance exactly its captured revision; autosave never advances saved_revision"
+  },
+  "source_policy": {
+    "unsafe_allowed": false,
+    "roots": [
+      "crates/mirante4d-project-store/src",
+      "crates/mirante4d-project-store/tests"
+    ],
+    "forbidden_import_roots": [
+      "eframe",
+      "egui",
+      "mirante4d_analysis",
+      "mirante4d_app",
+      "mirante4d_application",
+      "mirante4d_data",
+      "mirante4d_dataset",
+      "mirante4d_dataset_runtime",
+      "mirante4d_format",
+      "mirante4d_import",
+      "mirante4d_render_api",
+      "mirante4d_render_reference",
+      "mirante4d_render_wgpu",
+      "mirante4d_renderer",
+      "mirante4d_settings",
+      "mirante4d_storage",
+      "wgpu",
+      "winit"
+    ],
+    "forbidden_paths": [
+      "crates/mirante4d-project-store/build.rs",
+      "crates/mirante4d-project-store/src/main.rs",
+      "crates/mirante4d-project-store/src/bin"
+    ]
+  },
+  "fixture_manifest": {
+    "path": "fixtures/project/manifest.json",
+    "schema": "mirante4d-foundation-project-fixture-manifest",
+    "schema_version": 1,
+    "tier": "T1-project",
+    "sha256": "f7509169e1557a46fcfebe14a0eb2c6a4622681b5c6682515b2a89440494a1d2",
+    "archive_bytes_max": 4194304,
+    "producer": "independent Python producer",
+    "validator": "dependency-isolated read-only Python validator",
+    "required_cases": "established newer autosave, stale same-base autosave, divergent autosave, provisional autosave-only project, and exact manual/autosave recovery-to-previous pairing"
+  },
+  "verification": {
+    "trusted_lane": "cargo xtask verify-local project-store-lifecycle",
+    "trusted_lane_timeout_seconds": 900,
+    "fixture_self_test": "python3 tools/project-fixtures/validate.py --manifest fixtures/project/manifest.json --self-test",
+    "product_activation_checkpoint": "B4",
+    "retries": 0
+  }
+}

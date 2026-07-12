@@ -140,6 +140,9 @@ WP-10A is immutable at `foundation-wp-10a-exit-1`. The format stays
 EXPERIMENTAL and off-product, with no stable, generic OME-Zarr, importer,
 product-support, or product-activation claim.
 
-WP-10B separately installs immutable content-addressed project objects,
-complete generations, atomic head/recovery refs, leases, autosave/recovery,
-and conservative garbage collection.
+WP-10B B1 freezes a new experimental project-store wire authority: canonical
+immutable generations and exact-byte objects, checksummed 160-byte refs, and
+deterministic 16 MiB paging only for large artifact payloads. Its promoted
+independent fixture covers manual/autosave recovery, divergence, object reuse,
+and corruption. B2 implements transactions; B4 deletes project-v15 and makes
+the new store the sole product path.

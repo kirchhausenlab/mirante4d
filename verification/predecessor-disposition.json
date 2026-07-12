@@ -1862,6 +1862,39 @@
       "reason": "WP-07A adds pure validated domain-model contract evidence."
     },
     {
+      "id": "libtest:mirante4d-domain:geometry::tests::every_constructor_output_restores_bit_exactly",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-10B-project-store"
+      ],
+      "reason": "WP-10B proves persisted canonical orientations restore without changing their component bits."
+    },
+    {
+      "id": "libtest:mirante4d-domain:geometry::tests::exact_restore_does_not_renormalize_persisted_components",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-10B-project-store"
+      ],
+      "reason": "WP-10B proves persisted canonical orientations restore without changing their component bits."
+    },
+    {
+      "id": "libtest:mirante4d-domain:geometry::tests::exact_restore_rejects_noncanonical_encodings",
+      "kind": "libtest",
+      "owner": "mirante4d-domain",
+      "lane": "unit",
+      "requirement_ids": [
+        "D-022-unit",
+        "WP-10B-project-store"
+      ],
+      "reason": "WP-10B rejects noncanonical persisted orientations instead of silently normalizing them."
+    },
+    {
       "id": "libtest:mirante4d-domain:geometry::tests::finite_nonzero_quaternions_are_normalized",
       "kind": "libtest",
       "owner": "mirante4d-domain",
@@ -5339,6 +5372,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 462
+    "current_additions": 465
   }
 }
