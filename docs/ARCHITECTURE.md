@@ -140,9 +140,13 @@ manual head through bounded live-ref/closure validation, a descriptor-relative
 global-entry/fan-out inventory, and exact recovery-before-head replacement. The
 same crate-private transaction can create the first established-project
 autosave or advance its autosave lane, including changed-base divergence and
-recovery-ahead retry. It still owns no provisional autosave, recovery selection,
-actor, garbage collection, public Create/Save, qualified durability, or product
-path.
+recovery-ahead retry. A crate-private established-session actor now solely owns
+the opened store root and leases, serializes those manual/autosave transactions,
+and enforces bounded requests, completions, autosave coalescing, cancellation,
+close, and shutdown. The frozen public actor remains non-constructible and
+unwired. The crate still owns no Create/Open/Save As execution, provisional
+autosave, recovery selection, timers, garbage collection, full verification,
+qualified durability, or product path.
 
 Settings use `mirante4d-settings-v1` at the Linux XDG/HOME path. The UI submits
 validated changes; one background actor owns persistence. Legacy preferences

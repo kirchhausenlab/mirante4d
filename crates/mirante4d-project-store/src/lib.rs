@@ -6,6 +6,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(target_os = "linux")]
+mod actor;
 mod api;
 mod generation;
 #[cfg(target_os = "linux")]

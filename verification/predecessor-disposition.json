@@ -2411,6 +2411,46 @@
       "reason": "WP-07A adds pure durable project-model invariant evidence."
     },
     {
+      "id": "libtest:mirante4d-project-store:actor::tests::active_and_queued_requests_cancel_immediately_with_exact_correlation",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves immediate active and queued cancellation with one correlated terminal completion per accepted request."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:actor::tests::drop_is_nonblocking_and_joined_shutdown_releases_session_resources",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves nonblocking drop and joined shutdown release the established session's held leases."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:actor::tests::established_commands_are_serialized_and_close_releases_the_writer_lease",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves one worker serializes established manual/autosave commits and releases its writer lease before Close completes."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:actor::tests::queued_autosaves_coalesce_and_completion_obligations_stay_bounded",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves queued autosaves coalesce with terminal supersession while all completion obligations remain bounded."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:actor::tests::the_eight_request_queue_rejects_a_ninth_queued_save",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves the frozen eight-request queue bound while allowing in-place queued-autosave replacement."
+    },
+    {
       "id": "libtest:mirante4d-project-store:api::tests::accepted_defaults_match_the_frozen_b2_work_bounds",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -5676,6 +5716,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 503
+    "current_additions": 508
   }
 }
