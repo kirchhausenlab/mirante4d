@@ -1,6 +1,6 @@
 # Architecture
 
-Last updated: 2026-07-11
+Last updated: 2026-07-12
 
 Mirante4D is a native Rust desktop viewer and analysis workbench. It opens
 strict `.m4d` packages; source microscopy data enters through explicit
@@ -8,12 +8,12 @@ import/preprocessing workflows.
 
 ## Workspace Boundaries
 
-The workspace has fifteen crates:
+The workspace has sixteen crates:
 
 - `mirante4d-domain`: validated framework-neutral geometry, view, transfer,
   render-intent, and tool values.
-- `mirante4d-identity`: strict typed scientific/package/artifact identities;
-  no hashing or I/O.
+- `mirante4d-identity`: strict typed identities plus pure SHA-256, NFC, and
+  scientific-tree primitives; no filesystem I/O.
 - `mirante4d-project-model`: canonical durable project/view state and
   persistence-neutral generation projections.
 - `mirante4d-application`: the sole command reducer, revision/history owner,
@@ -28,6 +28,9 @@ The workspace has fifteen crates:
   scheduler and worker owner.
 - `mirante4d-render-api`: backend-neutral intent, requirements, progressive
   frame status, opaque presentation lifecycle, and camera math.
+- `mirante4d-storage`: off-product target-profile facts, checked ceilings and
+  preflight arithmetic, and portable package paths; currently no filesystem,
+  reader, writer, or product authority.
 - `mirante4d-data`, `mirante4d-format`, `mirante4d-import`,
   `mirante4d-analysis`, and `mirante4d-renderer`: current storage/runtime,
   format, import, analysis, and rendering implementations.
@@ -37,6 +40,8 @@ The workspace has fifteen crates:
 `mirante4d-core` and the predecessor application/session/preferences models
 do not exist. Lower crates do not depend on the app/UI layer; the renderer
 does not read files; format code does not own viewer state.
+No product crate depends on `mirante4d-storage`; WP-10C owns that future hard
+cutover.
 
 ## Application Composition
 
@@ -119,6 +124,8 @@ files are neither read nor changed.
 
 The frozen subsystem boundary remains in
 [`architecture/wp08a-subsystem-contract.json`](../architecture/wp08a-subsystem-contract.json).
+The accepted off-product storage successor boundary is
+[`architecture/wp10a-storage-contract.json`](../architecture/wp10a-storage-contract.json).
 The concise live owner/deletion ledger is
 [`architecture/current-state-field-ledger.json`](../architecture/current-state-field-ledger.json).
 Later target ownership is defined by the

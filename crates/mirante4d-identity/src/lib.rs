@@ -1,21 +1,36 @@
-//! Typed identity and package-object descriptor values.
+//! Typed identities, canonical scientific preimages, and bounded Merkle
+//! hashing for Mirante4D.
 //!
-//! This crate deliberately parses and carries already-computed SHA-256
-//! identities. Canonical preimages and hashing belong to later format and
-//! storage work.
+//! This crate is pure computation. It owns no filesystem, serialization,
+//! storage, runtime, UI, or device behavior.
 
 #![forbid(unsafe_code)]
 
+mod artifact;
+mod canonical;
 mod digest;
+mod hash;
 mod object;
+mod scientific;
 
+pub use artifact::{
+    WP10A_ARTIFACT_HAND_VECTOR_BODY, WP10A_ARTIFACT_HAND_VECTOR_ID,
+    verify_wp10a_artifact_hand_vector,
+};
+pub use canonical::{M4D_UNICODE_VERSION, is_nfc, normalize_nfc};
 pub use digest::{
     ArtifactContentId, DerivationRecordId, ExactBytesDigest, PackageId, RecipeId, ReleaseId,
     ScientificContentId, Sha256Digest,
 };
+pub use hash::Sha256Hasher;
 pub use object::{
     MAX_MEDIA_TYPE_BYTES, MAX_OBJECT_PATH_BYTES, MAX_OBJECT_ROLE_BYTES, MediaType, ObjectPath,
     ObjectRole, PackageObjectDescriptor, RawObjectDescriptor,
+};
+pub use scientific::{
+    SCIENTIFIC_TILE_SHAPE_TZYX, ScientificDatasetHasher, ScientificHashError,
+    ScientificLayerDescriptor, ScientificLayerHasher, ScientificLayerRoot,
+    ScientificTemporalCalibration, ScientificTile,
 };
 
 use thiserror::Error;

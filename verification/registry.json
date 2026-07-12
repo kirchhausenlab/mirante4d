@@ -78,13 +78,13 @@
     {
       "id": "contract",
       "kind": "nextest",
-      "owner": "format-import-contract-owners",
+      "owner": "format-import-storage-contract-owners",
       "requirements": ["D-022-contract"],
       "fixture_tier": "T1-source-or-T2",
       "capability": "hosted-cpu",
       "hosted_required": true,
-      "packages": ["mirante4d-format", "mirante4d-import"],
-      "selector": "package(mirante4d-format) | package(mirante4d-import)",
+      "packages": ["mirante4d-format", "mirante4d-import", "mirante4d-storage"],
+      "selector": "package(mirante4d-format) | package(mirante4d-import) | package(mirante4d-storage)",
       "warn_ms": 5000,
       "terminate_ms": 20000,
       "aggregate_timeout_secs": 720

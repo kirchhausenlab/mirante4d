@@ -1,6 +1,6 @@
 # Current State
 
-Last reviewed: 2026-07-11
+Last reviewed: 2026-07-12
 
 Mirante4D is public, pre-alpha academic research software. Persisted formats
 and APIs can change through explicit hard cutovers; there is no supported
@@ -22,7 +22,12 @@ public release or public full microscopy dataset yet.
 - Linux release-directory, tarball, and AppImage build paths.
 - No segmentation or derived-label subsystem.
 
-The workspace has fifteen crates. `mirante4d-core`, the application
+The workspace has sixteen crates. `mirante4d-storage` is an off-product
+WP-10A library whose first slice owns frozen profile facts, portable package
+paths, checked package-count arithmetic, and size/amplification ceilings. It
+performs no filesystem I/O and is unreachable from the product.
+
+`mirante4d-core`, the application
 `AppState` god-state, `WorkbenchCommand`, project-v14 authority, and
 preferences-v1 authority have been deleted. There is one live canonical
 application reducer and one canonical project model.
@@ -50,9 +55,12 @@ WP-08B accepted the unified dataset runtime at
 interactive demand; the predecessor app/data read pools, unbounded result
 channels, resident payload mirrors, and analysis execution worker are deleted.
 
-WP-10A entry work is active. Current schema-1 packages remain transitional T2
-fixtures; WP-10A owns the off-product target dataset schema, sharded storage,
-indexes, provenance, identity, independent corpus, and negative-case evidence.
+WP-10A entry, dependency disposition, and profile freeze are accepted.
+WP-10A-B implementation is active: the initial storage-profile and scientific-
+identity primitives exist, while target metadata, shard/index I/O, reader,
+writer, validator, independent T1 corpus, and product activation remain
+incomplete. Current schema-1 packages remain transitional T2 fixtures and the
+sole product route.
 
 ## Current Verification Boundary
 

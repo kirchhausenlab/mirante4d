@@ -1,0 +1,165 @@
+{
+  "schema": "mirante4d-wp10a-storage-successor-contract",
+  "schema_version": 1,
+  "status": "accepted-off-product",
+  "predecessor": {
+    "path": "architecture/wp08a-subsystem-contract.json",
+    "schema": "mirante4d-wp08a-subsystem-contract",
+    "schema_version": 2,
+    "sha256": "0500c27c9c4e13ce2eb0d833534a865c01efb0eabfea34df30015cf9af416cd3"
+  },
+  "authorization": {
+    "accepted_profile_freeze_sha256": "68266ce2c1cf782881824befc2df1c76712068fd445cecccfcd62156aa420807",
+    "normative_decision_proposal_sha256": "a6edba8779e704664d56c872c62f8051e3b914cec27db460fab247568e7d4f6d"
+  },
+  "activation": {
+    "crate_name": "mirante4d-storage",
+    "crate_path": "crates/mirante4d-storage",
+    "lifecycle": "EXPERIMENTAL",
+    "format_family": "mirante4d",
+    "storage_profile": "m4d-zarr3-local-1.0",
+    "product_status": "off-product",
+    "product_activation_gate": "WP-10C",
+    "product_reachability": false,
+    "library_and_tests_only": true
+  },
+  "identity_successor": {
+    "crate_name": "mirante4d-identity",
+    "normal_dependency_additions": [
+      "mirante4d-domain",
+      "sha2",
+      "unicode-normalization"
+    ],
+    "required_external": [
+      {
+        "name": "sha2",
+        "version": "0.11.0",
+        "requirement": "=0.11.0",
+        "checksum": "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4",
+        "default_features": false,
+        "features": []
+      },
+      {
+        "name": "unicode-normalization",
+        "version": "0.1.25",
+        "requirement": "=0.1.25",
+        "checksum": "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8",
+        "default_features": true,
+        "features": []
+      }
+    ],
+    "public_api_additions": [
+      "M4D_UNICODE_VERSION",
+      "SCIENTIFIC_TILE_SHAPE_TZYX",
+      "ScientificDatasetHasher",
+      "ScientificHashError",
+      "ScientificLayerDescriptor",
+      "ScientificLayerHasher",
+      "ScientificLayerRoot",
+      "ScientificTemporalCalibration",
+      "ScientificTile",
+      "Sha256Hasher",
+      "WP10A_ARTIFACT_HAND_VECTOR_BODY",
+      "WP10A_ARTIFACT_HAND_VECTOR_ID",
+      "is_nfc",
+      "normalize_nfc",
+      "verify_wp10a_artifact_hand_vector"
+    ]
+  },
+  "dependencies": {
+    "workspace_by_kind": {
+      "normal": [
+        "mirante4d-dataset",
+        "mirante4d-domain",
+        "mirante4d-identity"
+      ],
+      "dev": [],
+      "build": []
+    },
+    "workspace_reachability_allowlist": [
+      "mirante4d-dataset",
+      "mirante4d-domain",
+      "mirante4d-identity",
+      "mirante4d-storage"
+    ],
+    "required_external": [
+      {
+        "name": "crc32c",
+        "version": "0.6.8",
+        "requirement": "=0.6.8",
+        "checksum": "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47",
+        "default_features": true,
+        "features": []
+      },
+      {
+        "name": "zarrs_metadata",
+        "version": "0.7.5",
+        "requirement": "=0.7.5",
+        "checksum": "d60c4c363a8a302d7babb3c29017850a7b4e0af6ca5f9ba2946263a185b62fea",
+        "default_features": true,
+        "features": []
+      },
+      {
+        "name": "zstd",
+        "version": "0.13.3",
+        "requirement": "=0.13.3",
+        "checksum": "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a",
+        "default_features": false,
+        "features": []
+      }
+    ],
+    "direct_external_by_kind": {
+      "normal": [
+        "crc32c",
+        "serde",
+        "serde_json",
+        "thiserror",
+        "zarrs_metadata",
+        "zstd"
+      ],
+      "dev": [],
+      "build": []
+    },
+    "production_closure_scope": "package-selected-all-features-all-target-normal-and-build",
+    "production_third_party_packages_max": 55,
+    "forbidden_transitive_packages": [
+      "paste",
+      "zarrs"
+    ],
+    "allowed_workspace_dependents": []
+  },
+  "source_policy": {
+    "roots": [
+      "crates/mirante4d-storage/src",
+      "crates/mirante4d-storage/tests"
+    ],
+    "optional_roots": [
+      "crates/mirante4d-storage/tests"
+    ],
+    "forbidden_import_roots": [
+      "eframe",
+      "egui",
+      "mirante4d_analysis",
+      "mirante4d_app",
+      "mirante4d_application",
+      "mirante4d_data",
+      "mirante4d_dataset_runtime",
+      "mirante4d_format",
+      "mirante4d_import",
+      "mirante4d_project_model",
+      "mirante4d_render_api",
+      "mirante4d_renderer",
+      "mirante4d_settings",
+      "wgpu",
+      "winit",
+      "xtask",
+      "zarrs"
+    ],
+    "unsafe_allowed": false,
+    "forbidden_paths": [
+      "crates/mirante4d-storage/build.rs",
+      "crates/mirante4d-storage/src/main.rs",
+      "crates/mirante4d-storage/src/bin"
+    ]
+  }
+}

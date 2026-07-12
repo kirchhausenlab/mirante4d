@@ -4308,6 +4308,254 @@
       "lane": "unit",
       "requirement_ids": ["D-022-unit", "D-022-policy", "WP-10A-dependency-prerequisite"],
       "reason": "WP-10A entry proves the temporary paste exception is limited to the exact reviewed dependency inclusion graph."
+    },
+    {
+      "id": "libtest:mirante4d-identity:artifact::tests::frozen_non_admissible_artifact_vector_matches_exactly",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:canonical::tests::dependency_tables_match_the_frozen_unicode_version",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:canonical::tests::f64_hex_uses_numeric_bit_order_and_normalizes_negative_zero",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:canonical::tests::nfc_normalization_is_canonical_and_idempotent",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:hash::tests::chunking_does_not_change_the_digest",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:hash::tests::incremental_and_one_shot_sha256_match_the_published_empty_vector",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:scientific::tests::canonical_validity_padding_and_invalid_sentinels_are_enforced",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:scientific::tests::dataset_rejects_noncanonical_layer_order_and_remains_failed",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:scientific::tests::exact_one_voxel_scientific_vector_matches",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:scientific::tests::merkle_boundaries_match_independent_fixed_vectors",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:scientific::tests::nondivisible_edge_tiles_are_required_in_canonical_order",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:scientific::tests::nonfinite_valid_float_rejects_but_signed_zero_and_subnormal_survive",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:scientific::tests::rejected_tile_poisoning_prevents_an_identity",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:scientific::tests::temporal_encodings_reject_ambiguous_or_noncanonical_values",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:limits::tests::accepted_boundary_counts_recompute_exactly",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:limits::tests::amplification_tables_match_the_accepted_absolute_and_ratio_limits",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:limits::tests::checked_arithmetic_rejects_zero_and_overflow",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:limits::tests::ds0_enforces_logical_s0_byte_ceiling",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:limits::tests::every_profile_rejects_one_object_above_its_ceiling",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:limits::tests::frozen_encoded_limits_recompute_exactly",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:limits::tests::package_counts_reject_inconsistent_totals_and_invalid_scale_contracts",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves package-wide object accounting and exact profile scale contracts cannot be underreported."
+    },
+    {
+      "id": "libtest:mirante4d-storage:paths::tests::accepts_frozen_paths_and_reports_depth",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:paths::tests::rejects_duplicate_paths",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:paths::tests::rejects_nonportable_and_overdeep_paths",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:profile::tests::capabilities_are_sorted_and_unique",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:profile::tests::profile_tuple_is_the_only_frozen_experimental_tuple",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp08a::tests::dependency_matrix_delegates_only_wp10a_storage_to_its_successor",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A enforces the off-product storage successor boundary and exact predecessor delegation."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp10a::tests::checked_in_contract_binds_freeze_and_predecessor",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A enforces the off-product storage successor boundary and exact predecessor delegation."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp10a::tests::cargo_tree_parser_counts_multiple_versions_as_distinct_packages",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A counts every selected third-party package version against the frozen dependency ceiling."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp10a::tests::reachability_distinguishes_production_from_dev_edges",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A enforces the off-product storage successor boundary and exact predecessor delegation."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp10a::tests::source_policy_rejects_forbidden_authority_and_unsafe",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A enforces the off-product storage successor boundary and exact predecessor delegation."
     }
   ],
   "expected_summary": {
@@ -4316,6 +4564,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 333
+    "current_additions": 364
   }
 }

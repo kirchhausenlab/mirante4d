@@ -57,11 +57,17 @@ lifecycle states, mandatory object-count and amplification proof, and an
 independent conformance corpus. WP-10C later activates it in the product and
 deletes the current reader and writer.
 
+The accepted WP-10A freeze now has a pure implementation core for its
+experimental compatibility tuple, storage geometry, bounded counts,
+amplification limits, portable paths, and scientific hashing. It does not yet
+read, write, or validate target packages.
+
 WP-10B separately installs immutable content-addressed project objects,
 complete generations, atomic head/recovery refs, leases, autosave/recovery,
 and conservative garbage collection.
 
-These are approved targets, not current readers or writers. Their authorities
-are the [data-format brief](plans/active/foundation-refactor/DATA_FORMAT_IDENTITY_BRIEF.md),
+The remaining target reader, writer, validator, corpus, and project-store work
+is approved but not implemented. Its authorities are the
+[data-format brief](plans/active/foundation-refactor/DATA_FORMAT_IDENTITY_BRIEF.md),
 [project-store brief](plans/active/foundation-refactor/PROJECT_STORE_DURABILITY_BRIEF.md),
 and their accepted work-package entries.

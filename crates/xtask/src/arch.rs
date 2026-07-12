@@ -9,6 +9,7 @@ use anyhow::{Context, bail};
 use syn::visit::Visit;
 
 mod wp08a;
+mod wp10a;
 
 const MAX_TRACKED_GENERATED_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024;
 const FORBIDDEN_DUMPING_GROUND_MODULE_NAMES: &[&str] =
@@ -65,6 +66,7 @@ pub(crate) fn architecture_self_check() -> anyhow::Result<()> {
         }
     }
     wp08a::check_wp08a_subsystem_contract(Path::new("."))?;
+    wp10a::check_wp10a_storage_contract(Path::new("."))?;
     check_source_architecture_policy()?;
     check_wp07a_contracts(Path::new("."))?;
     check_wp07b_boundary_contract(Path::new("."))?;
@@ -821,6 +823,7 @@ fn check_wp07b_live_cutover(
         ("mirante4d-dataset-runtime", "mirante4d-dataset"),
         ("mirante4d-render-api", "mirante4d-dataset"),
         ("mirante4d-renderer", "mirante4d-dataset"),
+        ("mirante4d-storage", "mirante4d-dataset"),
         ("xtask", "mirante4d-dataset"),
     ]);
     let live_expected_edges = expected_edges
@@ -1815,6 +1818,11 @@ fn check_wp07a_model_contract(
         let allowed_normal_dependencies = allowed_normal_dependencies
             .into_iter()
             .map(str::to_owned)
+            .chain(
+                wp08a::accepted_successor_normal_dependency_additions(name)
+                    .iter()
+                    .map(|dependency| (*dependency).to_owned()),
+            )
             .collect::<BTreeSet<_>>();
         if actual_normal_dependencies != allowed_normal_dependencies {
             bail!(
@@ -1859,13 +1867,24 @@ fn check_wp07a_model_contract(
         }
         let actual_public_api =
             public_root_api_names(&repo_root.join(crate_path).join("src/lib.rs"))?;
-        if actual_public_api != public_api_set {
-            let missing = public_api_set
+        let accepted_public_api = public_api_set
+            .iter()
+            .cloned()
+            .chain(
+                (name == "mirante4d-identity")
+                    .then_some(wp10a::accepted_identity_public_api_additions())
+                    .into_iter()
+                    .flatten()
+                    .map(|item| (*item).to_owned()),
+            )
+            .collect::<BTreeSet<_>>();
+        if actual_public_api != accepted_public_api {
+            let missing = accepted_public_api
                 .difference(&actual_public_api)
                 .cloned()
                 .collect::<Vec<_>>();
             let unexpected = actual_public_api
-                .difference(&public_api_set)
+                .difference(&accepted_public_api)
                 .cloned()
                 .collect::<Vec<_>>();
             bail!(

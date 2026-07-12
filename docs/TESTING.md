@@ -1,6 +1,6 @@
 # Testing And Evidence
 
-Last updated: 2026-07-11
+Last updated: 2026-07-12
 
 ## Claim Language
 
@@ -113,9 +113,12 @@ trusted-GPU, source-nonmutation, and real-display 1280x720 T2 product checks.
 Internal automation remains supporting evidence, not product-open proof.
 
 The checked independent report supports only the WP-03 source-TIFF archive.
-WP-10A entry work is active. Current schema-1 packages remain non-authoritative
-T2 support fixtures until WP-10A accepts the target profile with independent
-T1 conformance, negative cases, and storage/object-count evidence.
+WP-10A-B implementation is active. `mirante4d-storage` is assigned to the
+existing contract leaf, but its current tests prove only pure profile, path,
+and arithmetic contracts. They make no target-package, T1 conformance,
+independent-reader, lifecycle, or product-support claim. Current schema-1
+packages remain non-authoritative T2 support fixtures until WP-10A accepts the
+independent target evidence.
 
 The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).
