@@ -27,9 +27,9 @@ WP-10A library whose first slice owns frozen profile facts, portable package
 paths, checked package-count arithmetic, size/amplification ceilings, and
 bounded read-only local range I/O. It remains unreachable from the product.
 The new `mirante4d-render-wgpu` successor and unpublished
-`mirante4d-render-reference` oracle are also deliberately unreachable while
-WP-09A qualification is active; `mirante4d-renderer` remains the only product
-render route.
+`mirante4d-render-reference` oracle are accepted off-product and remain
+deliberately unreachable; `mirante4d-renderer` remains the only product render
+route until WP-09B.
 
 `mirante4d-core`, the application
 `AppState` god-state, `WorkbenchCommand`, project-v14 authority, and
@@ -119,8 +119,15 @@ Isolated 2,750/5,500/11,000-descriptor opens satisfy the linear metadata-work
 contract, and the largest stays inside its 10-second and 64-MiB post-open RSS
 ceilings. `cargo xtask verify-local format-lifecycle` is the real local gate.
 The profile remains EXPERIMENTAL and off-product; no stable-format,
-product-support, performance, or generic OME-Zarr claim follows. WP-09A entry
-work is active against the accepted WP-10A tag.
+product-support, performance, or generic OME-Zarr claim follows.
+
+WP-09A accepted the bounded off-product progressive Vulkan runtime and
+independent CPU reference at
+`1b1e7d5534f29b010cc346d434811a3906fb40e1`, tagged
+`foundation-wp-09a-exit-1`. Exact protected-main policy/Rust and trusted Vulkan
+evidence passed; product activation and product-open validation remain WP-09B
+work. WP-10B entry work is active.
+
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
 Current schema-1 packages remain transitional T2 fixtures and the sole product

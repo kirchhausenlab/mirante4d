@@ -123,6 +123,11 @@ trusted-GPU, source-nonmutation, and real-display 1280x720 T2 product checks.
 WP-10A is accepted at `foundation-wp-10a-exit-1`
 (`9b3a81d79a50027c0a8ddedc535021809a99d928`) after exact protected-main
 policy, Rust, and local format-lifecycle evidence.
+WP-09A is accepted at `foundation-wp-09a-exit-1`
+(`1b1e7d5534f29b010cc346d434811a3906fb40e1`) after exact protected-main
+policy/Rust and trusted-Vulkan evidence. Its owner-approved product-open
+deferral applies only to this deliberately unreachable successor; WP-09B still
+owns the real-viewer cutover gate.
 Internal automation remains supporting evidence, not product-open proof.
 
 The checked independent source report supports only the WP-03 source-TIFF
