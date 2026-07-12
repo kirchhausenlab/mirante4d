@@ -2361,6 +2361,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mirante4d-project-store"
+version = "0.1.0"
+dependencies = [
+ "mirante4d-domain",
+ "mirante4d-identity",
+ "mirante4d-project-model",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "mirante4d-render-api"
 version = "0.1.0"
 dependencies = [

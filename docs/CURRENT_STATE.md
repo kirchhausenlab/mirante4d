@@ -150,8 +150,10 @@ See [testing](TESTING.md) for commands and claim language.
   open, and save therefore reject at the typed identity gate before I/O.
 - Dataset schema 1 and the private project-v15 bridge are experimental, not
   target-format conformance claims.
-- The project-store wire contract is independently validated, but no successor
-  project-store crate or product path exists yet.
+- The successor project-store crate exists off-product with its frozen API,
+  control-record wire, and immutable publication primitive. Complete
+  transactions, refs, leases, actor execution, recovery, and every product path
+  remain unimplemented.
 - The package-capability lane remains pending until there is an honest
   unsupported-GPU package command.
 - Packaged runtime does not expose unsaved-autosave recovery.
