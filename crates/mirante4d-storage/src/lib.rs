@@ -16,6 +16,7 @@ mod directory_inventory;
 mod error;
 mod limits;
 mod ome_metadata;
+mod package_admission;
 mod package_catalog;
 // Staged behind the future full-SHA package-integrity capability.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -56,6 +57,7 @@ pub use limits::{
     count_3d_pyramid, encoded_inner_payload_limit, encoded_outer_shard_limit,
 };
 pub use ome_metadata::{OmeImageGroupMetadata, OmeLevelTransform};
+pub use package_admission::{DatasetProfileAdmission, PackageAdmissionError};
 pub use package_catalog::{LocalPackageCatalog, PackageOpenError};
 pub use packed_index::{
     PackedIndexCoordinates, PackedIndexError, PackedIndexRecord, PackedIndexStatistics,

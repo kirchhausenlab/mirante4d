@@ -75,7 +75,10 @@ an internal catalog path can then read only its packed-index, pixel, and
 validity ranges, verify their index/inner CRC32C and bounded zstd decoding,
 apply record-authorized fill elision, and report exact storage-boundary
 counters. It remains crate-private until full SHA-256 validation can gate
-PackageId-attributed reads. DS-specific admission, the writer,
+PackageId-attributed reads. Caller-selected DS admission now derives logical
+and addressed counts arithmetically, separates actual shard files, bounds every
+listed shard coordinate, and requires exact packed-index shard coverage. The
+writer,
 structural/full validation, the independent T1 corpus, and product activation
 remain incomplete.
 Current schema-1 packages remain transitional T2 fixtures and the sole product

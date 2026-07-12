@@ -167,6 +167,17 @@
     "cancellation": "the caller-supplied cancellation check is polled before and throughout enumeration",
     "profile_selection": "the inventory does not select or infer DS-0 through DS-4"
   },
+  "dataset_profile_admission": {
+    "selection": "the caller explicitly selects DS-0 through DS-4 for one validation or evidence scenario; the package does not store a DS label and the implementation never infers a smallest fitting profile",
+    "scale_rule": "scale limits apply independently to every image; the report records the maximum scales per image, while exact-profile admission requires every image to have the exact count",
+    "logical_counts": "derive logical S0 bytes from checked scientific-layer t,z,y,x and dtype facts and logical bricks from pixel-array shape divided by the frozen inner chunk grid without enumerating bricks",
+    "shard_counts": "derive addressed pixel, explicit-validity, and packed-index shards arithmetically; count actual shard descriptors separately from the exact directory inventory",
+    "descriptor_bounds": "every shard descriptor must belong to one profile-addressed array and have in-range outer coordinates; pixel and validity descriptors may be subsets, while packed-index descriptors require exact coverage",
+    "elision_boundary": "zero actual pixel shards may pass when addressed pixel shards are positive; admission only records provisional elision and does not authorize omitted payloads before packed-record structural validation",
+    "ceilings": "apply the selected profile to logical bytes/bricks, addressed shard counts, metadata/pages, actual physical objects, directories, depth, and fan-out with checked arithmetic",
+    "cancellation": "poll before and throughout the fresh inventory, image/level arithmetic, descriptor pass, and final admission",
+    "non_claims": "admission is a bounded count/address check, not DS fixture qualification, shard-byte integrity, structural/full validation, scientific identity, PackageId-attributed payload authority, or product support"
+  },
   "local_brick_address_plan": {
     "input": "one PackedIndexCoordinates value in image,scale,t,c,z,y,x logical-brick coordinates",
     "bounds": "image, scale, and every brick coordinate are checked against the catalog's cross-validated pixel shape before path construction",

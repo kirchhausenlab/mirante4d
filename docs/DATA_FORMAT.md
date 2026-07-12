@@ -90,8 +90,12 @@ payload ranges, validates index and inner CRC32C plus bounded zstd output, and
 uses the packed record to authorize pixel or validity fill elision. It exposes
 exact request/read/decode counters and enforces the frozen absolute ceilings.
 The path remains crate-private and its bytes cannot be attributed to a
-PackageId until whole-object manifest SHA-256 validation exists. DS-specific
-admission and complete-package validation remain incomplete.
+PackageId until whole-object manifest SHA-256 validation exists. Explicit
+caller-selected DS admission now distinguishes arithmetic addressed shards
+from actual files, validates every listed shard coordinate, requires complete
+packed-index shard coverage, and applies the selected count ceilings without
+enumerating logical bricks. It does not infer or persist a DS label. Structural
+and complete-package validation remain incomplete.
 
 WP-10B separately installs immutable content-addressed project objects,
 complete generations, atomic head/recovery refs, leases, autosave/recovery,

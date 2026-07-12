@@ -25,6 +25,14 @@ pub enum StorageProfileError {
     },
     #[error("{metric} must be positive")]
     ZeroCount { metric: &'static str },
+    #[error("actual {component} shard count {actual} exceeds addressed count {addressed}")]
+    ActualShardCountExceedsAddressed {
+        component: &'static str,
+        actual: u64,
+        addressed: u64,
+    },
+    #[error("packed-index shard coverage is incomplete: actual {actual}, addressed {addressed}")]
+    PackedIndexShardCoverageMismatch { actual: u64, addressed: u64 },
     #[error("inconsistent {metric}: reported {reported}, computed {computed}")]
     InconsistentCount {
         metric: &'static str,

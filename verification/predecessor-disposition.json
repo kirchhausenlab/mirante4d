@@ -4789,6 +4789,30 @@
       "reason": "WP-10A rejects unknown OME members, alternate paths/transforms, negative zero, mixed spatial modes, and oversized metadata."
     },
     {
+      "id": "libtest:mirante4d-storage:package_admission::tests::admission_arithmetic_reproduces_frozen_3d_boundaries",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A admission arithmetic directly reproduces every frozen 3D/multiscale logical-brick, addressed pixel/packed-shard, and logical-S0 boundary vector without materializing keys."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_admission::tests::scale_rules_apply_to_every_image_without_summing",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A applies DS scale rules independently to every image and never rejects a valid multi-image package by summing level counts."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::admits_explicit_dataset_profile_from_addressed_and_actual_facts",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A derives exact logical, addressed, and actual DS facts; permits zero-file all-fill pixels; requires packed coverage; rejects out-of-grid shards; and propagates cancellation."
+    },
+    {
       "id": "libtest:mirante4d-storage:package_catalog::tests::derives_descriptor_bound_brick_address_plan",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -4979,6 +5003,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 417
+    "current_additions": 420
   }
 }

@@ -150,6 +150,15 @@ focused boundary test accepts each exact absolute amplification ceiling and
 rejects one unit above it. These tests do not prove 3D, incompressible, whole-
 object SHA-256, DS-admission, complete-package, or PackageId-attributed reads.
 
+Dataset-profile admission tests prove explicit profile selection, exact
+logical/addressed/actual counts for tiny 2D pixel, all-fill, and explicit-
+validity fixtures, zero-file pixel elision, packed-index coverage, shard-grid
+rejection, cancellation, and per-image rather than summed scale rules. They do
+not materialize advertised keys; a pure admission-arithmetic test directly
+reproduces every frozen 3D/multiscale logical-brick, addressed-shard, and
+logical-S0 boundary vector. These tests do not qualify an exact DS fixture or
+validate packed records, payload digests, or scientific identity.
+
 The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).
 

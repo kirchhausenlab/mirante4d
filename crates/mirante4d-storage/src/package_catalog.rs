@@ -6,6 +6,7 @@ use thiserror::Error;
 
 use crate::brick_address::plan_local_brick_address;
 use crate::directory_inventory::{ExpectedFile, ExpectedFileRole, inspect_directory_closure};
+use crate::package_admission::{DatasetProfileAdmissionInput, admit_dataset_profile};
 use crate::package_read::{LocalBrickRead, PackageReadError, read_local_brick};
 use crate::{
     ControlError, DisplayDefaults, LocalPackageReader, MAX_PORTABLE_CONTROL_OBJECT_BYTES,
@@ -197,6 +198,27 @@ impl LocalPackageCatalog {
 
     pub const fn metadata_bytes_read(&self) -> u64 {
         self.metadata_bytes_read
+    }
+
+    /// Applies one caller-selected DS profile to exact addressing and
+    /// directory facts. This never infers a profile or validates payload SHA.
+    pub fn admit_dataset_profile(
+        &self,
+        requested: crate::ProfileKind,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<crate::DatasetProfileAdmission, crate::PackageAdmissionError> {
+        let inventory = self.inspect_directory_closure(&mut is_cancelled)?;
+        admit_dataset_profile(
+            DatasetProfileAdmissionInput {
+                profile: &self.profile,
+                science: &self.science,
+                arrays: &self.zarr_arrays,
+                descriptors: &self.descriptors,
+                inventory,
+            },
+            requested,
+            &mut is_cancelled,
+        )
     }
 
     /// Derives the sole bounded storage address plan for one logical brick.
@@ -815,6 +837,8 @@ mod tests {
         MissingPixelInner,
         PackedCoordinateMismatch,
         PackedValidityMismatch,
+        OutOfGridPixelShard,
+        MissingPackedShard,
     }
 
     struct TempRoot(PathBuf);
@@ -1085,15 +1109,23 @@ mod tests {
                         .unwrap(),
                 ),
             ),
-            (
-                "indexes/i00000000-s00/c/0/0".to_owned(),
-                (PackageObjectKind::PackedIndexShard, packed_shard),
-            ),
         ]);
         if let Some(pixel_shard) = pixel_shard {
+            if matches!(brick, BrickFixture::OutOfGridPixelShard) {
+                objects.insert(
+                    "images/i00000000/s00/c/0/0/0/0/1".to_owned(),
+                    (PackageObjectKind::PixelShard, pixel_shard.clone()),
+                );
+            }
             objects.insert(
                 "images/i00000000/s00/c/0/0/0/0/0".to_owned(),
                 (PackageObjectKind::PixelShard, pixel_shard),
+            );
+        }
+        if !matches!(brick, BrickFixture::MissingPackedShard) {
+            objects.insert(
+                "indexes/i00000000-s00/c/0/0".to_owned(),
+                (PackageObjectKind::PackedIndexShard, packed_shard),
             );
         }
         if explicit_validity {
@@ -1321,6 +1353,75 @@ mod tests {
             catalog.plan_brick_storage(coordinates),
             Err(crate::BrickAddressError::MissingPackedIndexShard { .. })
         ));
+    }
+
+    #[test]
+    fn admits_explicit_dataset_profile_from_addressed_and_actual_facts() {
+        let root = fixture(FixtureDrift::None);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        let admission = catalog
+            .admit_dataset_profile(crate::ProfileKind::Ds0, || false)
+            .unwrap();
+        assert_eq!(admission.profile(), crate::ProfileKind::Ds0);
+        let counts = admission.counts();
+        assert_eq!(counts.maximum_scales_per_image, 1);
+        assert_eq!(counts.logical_s0_bytes, 6);
+        assert_eq!(counts.logical_bricks, 1);
+        assert_eq!(counts.addressed_pixel_shards, 1);
+        assert_eq!(counts.actual_pixel_shards, 1);
+        assert_eq!(counts.addressed_validity_shards, 0);
+        assert_eq!(counts.actual_validity_shards, 0);
+        assert_eq!(counts.addressed_packed_index_shards, 1);
+        assert_eq!(counts.actual_packed_index_shards, 1);
+        assert_eq!(counts.total_physical_objects, 14);
+        assert_eq!(counts.maximum_directory_depth, 8);
+
+        let root = fixture_with_brick(FixtureDrift::None, BrickFixture::AllFill);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        let counts = catalog
+            .admit_dataset_profile(crate::ProfileKind::Ds0, || false)
+            .unwrap()
+            .counts();
+        assert_eq!(counts.addressed_pixel_shards, 1);
+        assert_eq!(counts.actual_pixel_shards, 0);
+        assert_eq!(counts.total_physical_objects, 13);
+
+        let root = fixture_with_brick(FixtureDrift::None, BrickFixture::ExplicitValidity);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        let counts = catalog
+            .admit_dataset_profile(crate::ProfileKind::Ds0, || false)
+            .unwrap()
+            .counts();
+        assert_eq!(counts.addressed_validity_shards, 1);
+        assert_eq!(counts.actual_validity_shards, 1);
+
+        let root = fixture_with_brick(FixtureDrift::None, BrickFixture::OutOfGridPixelShard);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        assert!(matches!(
+            catalog.admit_dataset_profile(crate::ProfileKind::Ds0, || false),
+            Err(crate::PackageAdmissionError::ShardCoordinateOutOfBounds { .. })
+        ));
+
+        let root = fixture_with_brick(FixtureDrift::None, BrickFixture::MissingPackedShard);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        assert_eq!(
+            catalog.admit_dataset_profile(crate::ProfileKind::Ds0, || false),
+            Err(crate::PackageAdmissionError::Profile(
+                crate::StorageProfileError::PackedIndexShardCoverageMismatch {
+                    actual: 0,
+                    addressed: 1,
+                }
+            ))
+        );
+
+        let root = fixture(FixtureDrift::None);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        assert_eq!(
+            catalog.admit_dataset_profile(crate::ProfileKind::Ds0, || true),
+            Err(crate::PackageAdmissionError::Inventory(
+                crate::DirectoryInventoryError::Cancelled
+            ))
+        );
     }
 
     #[test]

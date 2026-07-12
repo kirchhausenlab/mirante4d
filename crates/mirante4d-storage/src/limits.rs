@@ -134,31 +134,40 @@ impl ProfileLimits {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PackageCounts {
-    pub scales: u64,
+    pub maximum_scales_per_image: u64,
     pub logical_s0_bytes: u64,
     pub logical_bricks: u64,
-    pub pixel_shards: u64,
-    pub validity_shards: u64,
-    pub packed_index_shards: u64,
+    pub addressed_pixel_shards: u64,
+    pub actual_pixel_shards: u64,
+    pub addressed_validity_shards: u64,
+    pub actual_validity_shards: u64,
+    pub addressed_packed_index_shards: u64,
+    pub actual_packed_index_shards: u64,
     pub zarr_metadata_objects: u64,
     pub portable_provenance_records: u64,
     pub manifest_pages: u64,
     pub total_physical_objects: u64,
     pub directories: u64,
+    pub maximum_directory_depth: u64,
     pub maximum_directory_fan_out: u64,
 }
 
 impl PackageCounts {
     pub fn validate(self, profile: ProfileKind) -> Result<(), StorageProfileError> {
         let maximum = profile_limits(profile);
-        require_positive("scale count", self.scales)?;
+        require_positive("maximum scales per image", self.maximum_scales_per_image)?;
         match maximum.scales {
-            ScaleCountRule::Maximum(limit) => check(profile, "scales", self.scales, limit)?,
-            ScaleCountRule::Exact(expected) if self.scales != expected => {
+            ScaleCountRule::Maximum(limit) => check(
+                profile,
+                "scales per image",
+                self.maximum_scales_per_image,
+                limit,
+            )?,
+            ScaleCountRule::Exact(expected) if self.maximum_scales_per_image != expected => {
                 return Err(StorageProfileError::ExactCountMismatch {
                     profile: profile.name(),
-                    metric: "scales",
-                    actual: self.scales,
+                    metric: "scales per image",
+                    actual: self.maximum_scales_per_image,
                     expected,
                 });
             }
@@ -175,26 +184,49 @@ impl PackageCounts {
             self.logical_bricks,
             maximum.logical_bricks,
         )?;
-        require_positive("pixel shard count", self.pixel_shards)?;
+        require_positive("addressed pixel shard count", self.addressed_pixel_shards)?;
         check(
             profile,
-            "pixel shards",
-            self.pixel_shards,
+            "addressed pixel shards",
+            self.addressed_pixel_shards,
             maximum.pixel_shards,
         )?;
+        if self.actual_pixel_shards > self.addressed_pixel_shards {
+            return Err(StorageProfileError::ActualShardCountExceedsAddressed {
+                component: "pixel",
+                actual: self.actual_pixel_shards,
+                addressed: self.addressed_pixel_shards,
+            });
+        }
         check(
             profile,
-            "validity shards",
-            self.validity_shards,
+            "addressed validity shards",
+            self.addressed_validity_shards,
             maximum.validity_shards,
         )?;
-        require_positive("packed-index shard count", self.packed_index_shards)?;
+        if self.actual_validity_shards > self.addressed_validity_shards {
+            return Err(StorageProfileError::ActualShardCountExceedsAddressed {
+                component: "validity",
+                actual: self.actual_validity_shards,
+                addressed: self.addressed_validity_shards,
+            });
+        }
+        require_positive(
+            "addressed packed-index shard count",
+            self.addressed_packed_index_shards,
+        )?;
         check(
             profile,
-            "packed-index shards",
-            self.packed_index_shards,
+            "addressed packed-index shards",
+            self.addressed_packed_index_shards,
             maximum.packed_index_shards,
         )?;
+        if self.actual_packed_index_shards != self.addressed_packed_index_shards {
+            return Err(StorageProfileError::PackedIndexShardCoverageMismatch {
+                actual: self.actual_packed_index_shards,
+                addressed: self.addressed_packed_index_shards,
+            });
+        }
         require_positive("Zarr metadata object count", self.zarr_metadata_objects)?;
         check(
             profile,
@@ -236,6 +268,20 @@ impl PackageCounts {
             self.directories,
             maximum.directories,
         )?;
+        require_positive("maximum directory depth", self.maximum_directory_depth)?;
+        let directory_depth_max = u64::try_from(crate::MAX_DIRECTORY_DEPTH).map_err(|_| {
+            StorageProfileError::ArithmeticOverflow {
+                metric: "directory depth ceiling",
+            }
+        })?;
+        if self.maximum_directory_depth > directory_depth_max {
+            return Err(StorageProfileError::CeilingExceeded {
+                profile: profile.name(),
+                metric: "directory depth",
+                actual: self.maximum_directory_depth,
+                maximum: directory_depth_max,
+            });
+        }
         require_positive("directory fan-out", self.maximum_directory_fan_out)?;
         check(
             profile,
@@ -247,9 +293,9 @@ impl PackageCounts {
 
     pub fn recomputed_total_physical_objects(self) -> Result<u64, StorageProfileError> {
         [
-            self.pixel_shards,
-            self.validity_shards,
-            self.packed_index_shards,
+            self.actual_pixel_shards,
+            self.actual_validity_shards,
+            self.actual_packed_index_shards,
             self.zarr_metadata_objects,
             self.portable_provenance_records,
             self.manifest_pages,
@@ -426,17 +472,21 @@ mod tests {
             ScaleCountRule::Exact(value) => value,
         };
         let mut counts = PackageCounts {
-            scales,
+            maximum_scales_per_image: scales,
             logical_s0_bytes: 1,
             logical_bricks: 1,
-            pixel_shards: 1,
-            validity_shards: 0,
-            packed_index_shards: 1,
+            addressed_pixel_shards: 1,
+            actual_pixel_shards: 1,
+            addressed_validity_shards: 0,
+            actual_validity_shards: 0,
+            addressed_packed_index_shards: 1,
+            actual_packed_index_shards: 1,
             zarr_metadata_objects: 1,
             portable_provenance_records: 0,
             manifest_pages: 1,
             total_physical_objects: 0,
             directories: 1,
+            maximum_directory_depth: 1,
             maximum_directory_fan_out: 1,
         };
         counts.total_physical_objects = counts.recomputed_total_physical_objects().unwrap();
@@ -511,12 +561,12 @@ mod tests {
         ] {
             let limits = profile_limits(profile);
             let mut counts = minimal_package_counts(profile);
-            counts.pixel_shards = limits.pixel_shards + 1;
+            counts.addressed_pixel_shards = limits.pixel_shards + 1;
             counts.total_physical_objects = counts.recomputed_total_physical_objects().unwrap();
             assert!(matches!(
                 counts.validate(profile),
                 Err(StorageProfileError::CeilingExceeded {
-                    metric: "pixel shards",
+                    metric: "addressed pixel shards",
                     ..
                 })
             ));
@@ -543,21 +593,21 @@ mod tests {
         ));
 
         let mut wrong_exact_scale = minimal_package_counts(ProfileKind::Ds3);
-        wrong_exact_scale.scales = 1;
+        wrong_exact_scale.maximum_scales_per_image = 1;
         assert!(matches!(
             wrong_exact_scale.validate(ProfileKind::Ds3),
             Err(StorageProfileError::ExactCountMismatch {
-                metric: "scales",
+                metric: "scales per image",
                 ..
             })
         ));
 
         let mut zero_scale = minimal_package_counts(ProfileKind::Ds0);
-        zero_scale.scales = 0;
+        zero_scale.maximum_scales_per_image = 0;
         assert!(matches!(
             zero_scale.validate(ProfileKind::Ds0),
             Err(StorageProfileError::ZeroCount {
-                metric: "scale count"
+                metric: "maximum scales per image"
             })
         ));
     }

@@ -27,9 +27,9 @@ present. An authenticated local metadata catalog now opens the manifest and
 opening-critical metadata closure; a separate bounded operation checks the
 exact finalized file and directory inventory. CRC-checked bounded brick reads
 from the descriptor-derived address plan are now present behind a crate-private
-integrity boundary. Continue WP-10A-B with DS-specific admission and
-structural/full validation before exposing PackageId-attributed reads, then
-implement the writer.
+integrity boundary. Caller-selected DS admission is also present. Continue
+WP-10A-B with packed-record/shard structural reconciliation and full validation
+before exposing PackageId-attributed reads, then implement the writer.
 WP-10A-C then promotes the independent target-format authorities; WP-10A-D
 consumes them and closes the package evidence. Current schema 1 remains the
 sole product route until WP-10C.
