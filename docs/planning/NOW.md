@@ -5,12 +5,19 @@ Last updated: 2026-07-12
 ## Current Checkpoint
 
 WP-09A is accepted and immutable at `foundation-wp-09a-exit-1`
-(`1b1e7d5534f29b010cc346d434811a3906fb40e1`). WP-10B entry work is active.
+(`1b1e7d5534f29b010cc346d434811a3906fb40e1`). WP-10B's entry is accepted at
+`4d0e4853637a0466ca37548134822c5ec83a240f`; B1 contract and independent
+fixture work is active.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.
 
 ## WP-10B Entry Boundary
+
+The accepted entry's sole correction permits `mirante4d-project-store` to
+depend directly on the unchanged `mirante4d-domain` API so it can encode and
+reconstruct the domain-owned values in `ProjectGenerationProjection`. It does
+not authorize another persistence DTO owner or any other dependency change.
 
 The entry must bind to tag `foundation-wp-09a-exit-1`, commit
 `1b1e7d5534f29b010cc346d434811a3906fb40e1`, and tree

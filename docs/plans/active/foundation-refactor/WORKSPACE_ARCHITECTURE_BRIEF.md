@@ -81,7 +81,7 @@ dependencies. External dependencies receive equivalent owner restrictions.
 | `mirante4d-project-model` | Canonical durable `ProjectState`, `ProjectRevisionId` and revision invariants, dataset/artifact references, and persistence-neutral generation projections | `domain`, `identity` |
 | `mirante4d-settings` | Validated user preferences, versioned settings DTO/store, background atomic writes, and resource-reconfiguration intent | `domain` |
 | `mirante4d-storage` | Strict target M4D profile, bounded validation, lazy indexes, Zarr shards, and dataset readers/writers | `domain`, `identity`, `dataset` |
-| `mirante4d-project-store` | D-010 objects, generations, refs, leases, autosave, recovery, and GC | `project-model`, `identity` |
+| `mirante4d-project-store` | D-010 objects, generations, refs, leases, autosave, recovery, and GC | `domain`, `project-model`, `identity` |
 | `mirante4d-dataset-runtime` | One demand scheduler, decoded-buffer admission, CPU ledger, caches, deduplication, cancellation, and sole lease issuance/lifetime | `dataset` |
 | `mirante4d-render-api` | Backend-neutral render intent, requirements, frame identity, coverage, and presentation contracts | `domain`, `dataset` |
 | `mirante4d-render-wgpu` | Sole production GPU owner: device, pipelines, VRAM, staging, uploads, execution, and presentation | `render-api`, `dataset` |

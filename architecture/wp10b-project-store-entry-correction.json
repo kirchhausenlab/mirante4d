@@ -1,0 +1,52 @@
+{
+  "schema": "mirante4d-foundation-package-entry-correction",
+  "schema_version": 1,
+  "package": "WP-10B",
+  "status": "accepted",
+  "authorization": {
+    "approved_by": "Mirante4D repository owner",
+    "approved_on": "2026-07-12",
+    "reference": "WP10B-PREAUTH-2026-07-12",
+    "scope": "narrow project-store dependency correction discovered before B1 implementation"
+  },
+  "accepted_entry": {
+    "path": "architecture/wp10b-project-store-entry.json",
+    "sha256": "b5a189658d0f0d40f7ca0023bd3a688b3ca7926d28e028bb19acdc764920c793",
+    "protected_main_commit": "4d0e4853637a0466ca37548134822c5ec83a240f",
+    "protected_main_tree": "68078a91b0eadc8f1b8fa3b3b00fc97c56d9f266",
+    "hosted_run": "https://github.com/kirchhausenlab/mirante4d/actions/runs/29198840340",
+    "hosted_result": "success"
+  },
+  "discovered_gap": {
+    "fact": "ProjectGenerationProjection contains domain-owned camera, render, transfer, geometry, and layout values that the project store must encode and reconstruct.",
+    "why_the_entry_is_impossible_as_written": "Rust does not expose transitive dependencies for naming or constructing those domain types, while the accepted project-model intentionally owns neither serialization nor filesystem persistence.",
+    "rejected_workarounds": [
+      "change the accepted project-model API to duplicate persistence DTOs",
+      "map persistence bytes in application or app",
+      "use debug text, discriminants, unsafe layout access, or another hidden bridge"
+    ]
+  },
+  "correction": {
+    "add_normal_workspace_dependency": "mirante4d-project-store -> mirante4d-domain",
+    "remove_forbidden_workspace_dependency": "mirante4d-domain from mirante4d-project-store only",
+    "superseded_entry_fields": [
+      "dependency_contract.mirante4d-project-store.normal_workspace",
+      "dependency_contract.mirante4d-project-store.forbidden_workspace"
+    ],
+    "unchanged": "all other WP-10B outcomes, limits, paths, stop conditions, proof classes, deletion gates, and hard-cutover rules"
+  },
+  "invariants": [
+    "mirante4d-domain remains pure and unchanged; this correction permits dependency consumption, not domain edits.",
+    "mirante4d-project-store remains the sole persistence-byte and project-filesystem authority.",
+    "No application-owned DTO, compatibility bridge, alternate serializer, or additional dependency is authorized."
+  ],
+  "allowed_paths": [
+    "architecture/wp10b-project-store-entry-correction.json",
+    "docs/CURRENT_STATE.md",
+    "docs/planning/NOW.md",
+    "docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md",
+    "docs/plans/active/foundation-refactor/WORKSPACE_ARCHITECTURE_BRIEF.md"
+  ],
+  "stop_condition": "Any additional accepted dependency or lower-level API must change.",
+  "rollback": "revert this correction before project-store B1 implementation; no runtime authority changes in this checkpoint"
+}
