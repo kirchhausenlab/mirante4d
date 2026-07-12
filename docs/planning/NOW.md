@@ -11,9 +11,11 @@ independent fixture are frozen; B2 transactional store implementation is
 active off-product. Its first core checkpoint provides the exact crate/API
 boundary, control-record wire, and immutable object primitive. Its current
 checkpoint adds typed canonical generations, direct and deterministic paged
-closure, and generation-last immutable publication. Writer/maintenance leases
-and the first ref-backed manual transaction are next; product activation stays
-at B4.
+closure, generation-last immutable publication, process-held maintenance and
+writer leases, and an exact no-replace initial manual head in a prepared
+unpublished root. Before an established head can advance, the frozen recovery
+pair rule must explicitly accept the safe recovery-ahead crash window; then the
+recovery-before-head update is next. Product activation stays at B4.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.

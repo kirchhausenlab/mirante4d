@@ -557,6 +557,25 @@ pub struct ProjectStoreReceipt {
 }
 
 impl ProjectStoreReceipt {
+    pub(crate) fn initial_manual(
+        captured_revision: ProjectRevisionId,
+        captured_revision_high_water: ProjectRevisionHighWater,
+        generation_id: ProjectGenerationId,
+        published_objects: u64,
+        published_bytes: u64,
+    ) -> Self {
+        Self {
+            captured_revision,
+            captured_revision_high_water,
+            new_generation_id: generation_id,
+            current_generation_id: generation_id,
+            previous_generation_id: None,
+            autosave_base_generation_id: None,
+            published_objects,
+            published_bytes,
+        }
+    }
+
     pub const fn captured_revision(&self) -> ProjectRevisionId {
         self.captured_revision
     }

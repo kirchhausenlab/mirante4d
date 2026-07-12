@@ -146,5 +146,7 @@ deterministic 16 MiB paging only for large artifact payloads. Its promoted
 independent fixture covers manual/autosave recovery, divergence, object reuse,
 and corruption. B2 now implements typed canonical generation records, direct
 and deterministic 16 MiB paged closure, and generation-last immutable
-publication off-product. This is not yet a committed save or durability claim.
-B4 deletes project-v15 and makes the new store the sole product path.
+publication off-product. A prepared fresh store can publish the exact initial
+160-byte manual head once; it cannot yet replace an established head. This is
+not a public Create/Save or durability claim. B4 deletes project-v15 and makes
+the new store the sole product path.
