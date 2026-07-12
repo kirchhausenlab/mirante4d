@@ -130,6 +130,13 @@ deferral applies only to this deliberately unreachable successor; WP-09B still
 owns the real-viewer cutover gate.
 Internal automation remains supporting evidence, not product-open proof.
 
+WP-10B's independent project-store wire authority is checked in the public
+policy group with `python3 tools/project-fixtures/validate.py --manifest
+fixtures/project/manifest.json --self-test`. It proves exact canonical bytes,
+refs, object/page closure, recovery classification, and declared corruptions;
+it does not claim implemented transactions, filesystem durability, or product
+save/open support.
+
 The checked independent source report supports only the WP-03 source-TIFF
 archive. WP-10A is accepted off-product and its target authority is promoted.
 `mirante4d-storage` is assigned to the existing contract leaf. Its lower-level

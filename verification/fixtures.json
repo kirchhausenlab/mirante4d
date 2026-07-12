@@ -1,13 +1,14 @@
 {
   "schema": "mirante4d-verification-fixture-registry",
   "schema_version": 1,
-  "record_count": 10,
+  "record_count": 11,
   "rules": {
     "maximum_records": 64,
     "candidate_output_root": "target/mirante4d/fixture-candidates",
     "candidate_cannot_promote_itself": true,
     "one_promoted_authority_per_claim_scope": true,
-    "target_format_t1_available": true
+    "target_format_t1_available": true,
+    "project_store_t1_available": true
   },
   "promotions": [
     {
@@ -19,6 +20,12 @@
     {
       "fixture_id": "target-m4d-v1",
       "authority": "fixtures/target/manifest.json#/approvals",
+      "approved_on": "2026-07-12",
+      "changed_bytes_or_facts_require_new_version": true
+    },
+    {
+      "fixture_id": "project-store-v1",
+      "authority": "fixtures/project/manifest.json#/approvals/repository_owner",
       "approved_on": "2026-07-12",
       "changed_bytes_or_facts_require_new_version": true
     },
@@ -123,6 +130,27 @@
       "expiry": null,
       "deletion_gate": null,
       "target_format_conformance": true
+    },
+    {
+      "id": "project-store-v1",
+      "tier": "T1-project",
+      "claim_scope": "project-store-v1-independent-wire-and-recovery",
+      "authority_state": "promoted-project-store-wire",
+      "owner": "WP-10B project-store B1",
+      "capability": "public-cpu",
+      "publication": "public-safe-synthetic",
+      "license": "MIT",
+      "path": "fixtures/project/manifest.json",
+      "sha256": "f7509169e1557a46fcfebe14a0eb2c6a4622681b5c6682515b2a89440494a1d2",
+      "validation_command": "python3 tools/project-fixtures/validate.py --manifest fixtures/project/manifest.json --self-test",
+      "promotion": {
+        "authority": "fixtures/project/manifest.json#/approvals/repository_owner",
+        "approved_on": "2026-07-12",
+        "changed_authority_requires_new_version": true
+      },
+      "expiry": null,
+      "deletion_gate": null,
+      "target_format_conformance": false
     },
     {
       "id": "wp09a-semantic-small",

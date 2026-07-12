@@ -21,6 +21,7 @@ const PR_TEST_UNION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DOCTEST_PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
 const SOURCE_FIXTURE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(120);
 const TARGET_FIXTURE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(120);
+const PROJECT_FIXTURE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Leaf {
@@ -803,6 +804,20 @@ fn run_policy_phases(phases: &mut PhaseCollector) {
                 "--self-test",
             ]);
             run_command_with_timeout(&mut command, TARGET_FIXTURE_VALIDATION_TIMEOUT)
+        },
+    );
+    phases.run(
+        "project-fixture-validation",
+        "python3 tools/project-fixtures/validate.py --manifest fixtures/project/manifest.json --self-test",
+        || {
+            let mut command = Command::new("python3");
+            command.args([
+                "tools/project-fixtures/validate.py",
+                "--manifest",
+                "fixtures/project/manifest.json",
+                "--self-test",
+            ]);
+            run_command_with_timeout(&mut command, PROJECT_FIXTURE_VALIDATION_TIMEOUT)
         },
     );
     phases.run(

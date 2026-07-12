@@ -11,6 +11,7 @@ use syn::visit::Visit;
 mod wp08a;
 mod wp09a;
 mod wp10a;
+mod wp10b;
 
 const MAX_TRACKED_GENERATED_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024;
 const WP07A_MODEL_CONTRACT_PATH: &str = "architecture/model-contract.json";
@@ -72,6 +73,7 @@ pub(crate) fn architecture_self_check() -> anyhow::Result<()> {
     wp08a::check_wp08a_subsystem_contract(Path::new("."))?;
     wp09a::check_wp09a_render_contract(Path::new("."))?;
     wp10a::check_wp10a_storage_contract(Path::new("."))?;
+    wp10b::check_wp10b_project_store_contract(Path::new("."))?;
     check_source_architecture_policy()?;
     check_wp07a_contracts(Path::new("."))?;
     check_wp07b_boundary_contract(Path::new("."))?;

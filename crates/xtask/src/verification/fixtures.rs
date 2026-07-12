@@ -35,6 +35,7 @@ pub(crate) fn validate_fixture_registry() -> anyhow::Result<()> {
         match string(record, "tier")? {
             "T1-source" => validate_source_manifest_contract(record)?,
             "T1-target" => validate_target_manifest_contract(record)?,
+            "T1-project" => validate_project_manifest_contract(record)?,
             _ => {}
         }
     }
@@ -62,7 +63,8 @@ fn validate_registry_document(registry: &Value) -> anyhow::Result<Vec<FileRefere
     require_keys(
         rules,
         "maximum_records candidate_output_root candidate_cannot_promote_itself \
-         one_promoted_authority_per_claim_scope target_format_t1_available",
+         one_promoted_authority_per_claim_scope target_format_t1_available \
+         project_store_t1_available",
         "",
         "fixture registry rules",
     )?;
@@ -91,6 +93,7 @@ fn validate_registry_document(registry: &Value) -> anyhow::Result<Vec<FileRefere
     let mut references = Vec::new();
     let mut source_t1_count = 0;
     let mut target_t1_count = 0;
+    let mut project_t1_count = 0;
     for record in records {
         record
             .as_object()
@@ -118,6 +121,10 @@ fn validate_registry_document(registry: &Value) -> anyhow::Result<Vec<FileRefere
                 target_t1_count += 1;
                 validate_target_t1(record, &mut references)?;
             }
+            "T1-project" => {
+                project_t1_count += 1;
+                validate_project_t1(record, &mut references)?;
+            }
             "T2" => validate_t2(record, &mut references)?,
             "T5" => {
                 validate_t5(record)?;
@@ -135,6 +142,11 @@ fn validate_registry_document(registry: &Value) -> anyhow::Result<Vec<FileRefere
         || bool_field(rules, "target_format_t1_available")? != (target_t1_count == 1)
     {
         bail!("target-format T1 availability must match exactly one promoted target authority");
+    }
+    if project_t1_count > 1
+        || bool_field(rules, "project_store_t1_available")? != (project_t1_count == 1)
+    {
+        bail!("project-store T1 availability must match exactly one promoted authority");
     }
     validate_promotions(registry, records, candidate_root, &references)?;
     Ok(references)
@@ -236,6 +248,35 @@ fn validate_target_t1(record: &Value, references: &mut Vec<FileReference>) -> an
     null_field(record, "expiry", id)?;
     null_field(record, "deletion_gate", id)?;
     reference(record, "path", "sha256", id, "target manifest", references)?;
+    validate_record_promotion(record, id)?;
+    Ok(())
+}
+
+fn validate_project_t1(record: &Value, references: &mut Vec<FileReference>) -> anyhow::Result<()> {
+    let id = string(record, "id")?;
+    require_keys(
+        record,
+        "id tier claim_scope authority_state owner capability publication license path sha256 \
+         validation_command promotion expiry deletion_gate target_format_conformance",
+        "",
+        &format!("T1-project fixture {id:?}"),
+    )?;
+    if string(record, "authority_state")? != "promoted-project-store-wire"
+        || id != "project-store-v1"
+        || string(record, "claim_scope")? != "project-store-v1-independent-wire-and-recovery"
+        || string(record, "capability")? != "public-cpu"
+        || string(record, "publication")? != "public-safe-synthetic"
+        || string(record, "license")? != "MIT"
+        || string(record, "path")? != "fixtures/project/manifest.json"
+        || string(record, "validation_command")?
+            != "python3 tools/project-fixtures/validate.py --manifest fixtures/project/manifest.json --self-test"
+    {
+        bail!("fixture {id:?} project-store authority metadata is invalid");
+    }
+    false_field(record, "target_format_conformance", id)?;
+    null_field(record, "expiry", id)?;
+    null_field(record, "deletion_gate", id)?;
+    reference(record, "path", "sha256", id, "project manifest", references)?;
     validate_record_promotion(record, id)?;
     Ok(())
 }
@@ -529,6 +570,29 @@ fn validate_target_manifest_contract(record: &Value) -> anyhow::Result<()> {
         || pointer_string(&manifest, "/approvals/scientific_content/state")? != "approved"
     {
         bail!("fixture {id:?} target manifest identity or approval is invalid");
+    }
+    Ok(())
+}
+
+fn validate_project_manifest_contract(record: &Value) -> anyhow::Result<()> {
+    let id = string(record, "id")?;
+    let manifest = read_json(string(record, "path")?)?;
+    if string(&manifest, "schema")? != "mirante4d-foundation-project-fixture-manifest"
+        || u64_field(&manifest, "schema_version")? != 1
+        || string(&manifest, "status")? != "independently_validated"
+        || string(&manifest, "fixture_id")? != id
+        || pointer_string(&manifest, "/approvals/repository_owner/state")? != "approved"
+        || pointer_string(&manifest, "/contract/path")?
+            != "architecture/wp10b-project-store-contract.json"
+        || pointer_string(&manifest, "/archive/path")? != "fixtures/project/project-store-v1.tar.gz"
+    {
+        bail!("fixture {id:?} project manifest identity or approval is invalid");
+    }
+    let archive = repo_path(pointer_string(&manifest, "/archive/path")?);
+    if sha256_file(&archive)? != pointer_string(&manifest, "/archive/sha256")?
+        || fs::metadata(&archive)?.len() != pointer_u64(&manifest, "/archive/archive_bytes")?
+    {
+        bail!("fixture {id:?} project archive disagrees with its manifest");
     }
     Ok(())
 }
