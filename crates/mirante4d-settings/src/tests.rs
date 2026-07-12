@@ -575,6 +575,9 @@ fn temporary_names_are_unique_and_created_in_the_target_directory() {
 fn bounded_event_backpressure_cannot_deadlock_joined_shutdown() {
     let tempdir = tempfile::tempdir().unwrap();
     let path = tempdir.path().join("settings.json");
+    // Exercise channel backpressure without making the synchronization test's
+    // runtime depend on repeated filesystem flush latency.
+    fs::write(&path, "{invalid-settings").unwrap();
     let actor = SettingsActor::spawn(path, SettingsDocument::default()).unwrap();
     let document = SettingsDocument::default();
 
