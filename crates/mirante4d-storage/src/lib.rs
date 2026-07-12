@@ -5,8 +5,9 @@
 //! preflight arithmetic, portable package paths, packed-index records, the
 //! in-memory shard codec, strict Zarr/OME storage metadata, an authenticated
 //! local metadata catalog, a bounded exact directory inventory, and root-
-//! confined read-only range I/O with descriptor-derived brick address plans.
-//! It has no writer and makes no product target-package claim.
+//! confined read-only range I/O with descriptor-derived brick address plans,
+//! full SHA-256 closure, and an owning exact-package capability. It has no
+//! writer and makes no product target-package claim.
 
 #![forbid(unsafe_code)]
 
@@ -18,10 +19,9 @@ mod limits;
 mod ome_metadata;
 mod package_admission;
 mod package_catalog;
-mod package_structure;
-// Staged behind the future full-SHA package-integrity capability.
-#[cfg_attr(not(test), allow(dead_code))]
+mod package_integrity;
 mod package_read;
+mod package_structure;
 mod packed_index;
 mod paths;
 mod profile;
@@ -60,6 +60,9 @@ pub use limits::{
 pub use ome_metadata::{OmeImageGroupMetadata, OmeLevelTransform};
 pub use package_admission::{DatasetProfileAdmission, PackageAdmissionError};
 pub use package_catalog::{LocalPackageCatalog, PackageOpenError};
+pub use package_integrity::{ExactPackageCapability, PackageValidationError};
+pub use package_read::{LocalBrickRead, PackageReadError};
+pub use package_structure::PackageStructureError;
 pub use packed_index::{
     PackedIndexCoordinates, PackedIndexError, PackedIndexRecord, PackedIndexStatistics,
 };

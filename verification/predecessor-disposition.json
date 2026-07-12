@@ -4813,6 +4813,22 @@
       "reason": "WP-10A derives exact logical, addressed, and actual DS facts; permits zero-file all-fill pixels; requires packed coverage; rejects out-of-grid shards; and propagates cancellation."
     },
     {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::exact_capability_guards_consumed_and_complete_snapshot_freshness",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects replaced consumed shards on PackageId-attributed reads and exposes an explicit complete snapshot-freshness sweep without imposing that package-wide scan on every brick."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::full_sha_validation_rejects_closure_drift_and_issues_exact_capability",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A issues the owning exact-package capability only after structural coherence, full manifest SHA-256 closure, cancellation checks, fresh inventory, and a final mutation-detecting snapshot sweep."
+    },
+    {
       "id": "libtest:mirante4d-storage:package_catalog::tests::reconciles_every_packed_record_with_canonical_shard_slots",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -4907,6 +4923,14 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
       "reason": "WP-10A rejects symlink traversal, hardlinks, and non-regular objects at the local package boundary."
+    },
+    {
+      "id": "libtest:mirante4d-storage:range_io::tests::streams_full_object_digest_with_bounded_cancellation_and_snapshot",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves complete multi-buffer exact-object hashing, mid-stream cancellation, bounded retained memory, and same-length replacement detection."
     },
     {
       "id": "libtest:mirante4d-storage:shard::tests::deterministic_shard_tail_drives_present_and_missing_range_reads",
@@ -5019,6 +5043,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 422
+    "current_additions": 425
   }
 }

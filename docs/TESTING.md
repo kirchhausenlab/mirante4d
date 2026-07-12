@@ -130,11 +130,10 @@ authentication, exact opening-metadata bytes, and initial cross-object layer
 and storage-shape rejection. The directory-inventory test proves exact positive
 closure counts, cancellation, extra-directory rejection, and post-open length-
 drift rejection, including same-length manifest-authority drift. These tests
-make no DS-specific admission, shard-payload,
-official-schema, complete-package, T1 conformance, independent-reader,
-lifecycle, or product-support claim. Current schema-1 packages remain non-
-authoritative T2 support fixtures until WP-10A accepts the independent target
-evidence.
+alone make no DS-specific admission, shard-payload, official-schema, complete-
+package, T1 conformance, independent-reader, lifecycle, or product-support
+claim. Current schema-1 packages remain non-authoritative T2 support fixtures
+until WP-10A accepts the independent target evidence.
 
 Address-planning tests prove 2D/3D grid, C-order ordinal, inner-slot, and edge-
 extent arithmetic plus the exact baseline catalog-derived paths and packed-
@@ -142,13 +141,14 @@ record offset. They also prove coordinate/overflow rejection, mandatory packed-
 index descriptors, and optional fill-elided pixel descriptors. They read no
 shard bytes and make no payload-integrity claim.
 
-The crate-private one-brick read test covers 2D uint8 pixel-present, all-fill,
-and explicit-validity cases with exact two-, four-, and six-request accounting.
+The bounded brick-core test covers 2D uint8 pixel-present, all-fill, and
+explicit-validity cases with exact two-, four-, and six-request accounting.
 It also checks edge extent, required descriptor/inner failures, packed-record
 cross-checks, length drift, and selected packed-index/pixel corruption. A
 focused boundary test accepts each exact absolute amplification ceiling and
-rejects one unit above it. These tests do not prove 3D, incompressible, whole-
-object SHA-256, DS-admission, complete-package, or PackageId-attributed reads.
+rejects one unit above it. These core tests alone do not prove 3D,
+incompressible, whole-object SHA-256, DS admission, complete-package, or
+PackageId-attributed reads.
 
 Dataset-profile admission tests prove explicit profile selection, exact
 logical/addressed/actual counts for tiny 2D pixel, all-fill, and explicit-
@@ -167,10 +167,24 @@ objects, out-of-grid payload slots, packed-index digest drift, mid-pass/final-
 sweep cancellation, and same-length replacement before the last snapshot
 gate. A focused arithmetic test covers nondivisible edge capacities, C-order
 slot masks, and packed records 255/256 and 16383/16384. The pass reads packed-
-index shards completely and only pixel/validity shard tails, so it does not validate
-pixel/validity payload digests or values,
-prove the declared PackageId closure, recompute scientific identity, or
-qualify an exact DS fixture.
+index shards completely and only pixel/validity shard tails, so it does not
+validate pixel/validity payload digests or values, prove the declared PackageId
+closure, recompute scientific identity, or qualify an exact DS fixture.
+
+The exact-package validation test composes explicit DS admission and structural
+reconciliation with fixed-buffer streaming SHA-256 over the root, every page,
+and every descriptor object. It proves digest-drift rejection for opening and
+shard objects, phase-coherent snapshots, immediate and final-sweep
+cancellation, final inventory, mutation rejection before capability issuance,
+and PackageId-attributed pixel/validity reads. The range-I/O test separately
+proves multi-buffer hashing and mid-stream cancellation. Capability freshness
+tests reject replaced consumed shards and exercise the explicit complete-
+snapshot sweep without imposing an all-object scan on every brick. The sweep
+is deliberately a sequential mutation check, not an atomic snapshot of a
+concurrently writable directory. This is exact package-byte integrity only: it
+does not parse lazy portable-record semantics, recompute ScientificContentId,
+qualify IO-3 or independent T1, make a product/performance claim, or implement
+the writer.
 
 The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).

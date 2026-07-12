@@ -210,6 +210,17 @@
     "final_recheck": "repeat the exact directory and manifest-authority inspection after reconciliation, then revalidate every inspected shard snapshot as the last success gate; detected mutation or cancellation fails the attempt",
     "non_claims": "reconciliation does not hash pixel or validity shard payloads, recompute their scientific statistics, prove the declared PackageId closure, authorize PackageId-attributed reads, compute ScientificContentId, establish IO-3, qualify T1, activate the product, or freeze a stable format"
   },
+  "exact_package_validation": {
+    "entry": "consume one authenticated local metadata catalog after explicit caller-selected DS admission; no capability may be paired with another root or coexist with an unverified catalog read path",
+    "sequence": "complete package-wide structural reconciliation first, then hash the manifest root, every referenced manifest page, and every descriptor object in deterministic order, repeat the exact directory and manifest-authority inspection, and finish with one cancellable ordered snapshot sweep before capability issuance",
+    "hashing": "stream each object through raw SHA-256 using one open handle, exact declared length, one fixed 65536-byte buffer, cancellation before and throughout reads, and same-open identity checks; retain no payload bytes",
+    "phase_coherence": "every shard snapshot observed by structural reconciliation must exactly equal the corresponding full-hash snapshot, preventing structure from version A and digest from version B from being combined",
+    "capability": "issue one owning non-clone exact-package capability binding the proved PackageId, caller-selected DS admission, the complete closure observed by validation, manifest root/page snapshots, descriptor-aligned object snapshots, and checked object/byte counters",
+    "attributed_reads": "PackageId-attributed brick reads exist only on the exact-package capability; each read revalidates manifest authority and proves every actually consumed shard is the same object captured by full validation before returning CRC-checked bounded payloads",
+    "freshness": "the final sweep and explicit complete revalidation are sequential best-effort mutation checks, not an atomic filesystem snapshot; normal brick reads do not rescan unrelated objects and instead revalidate current authority and every consumed object before returning attributed bytes",
+    "bounds": "validation is O(total finalized object bytes plus structural work plus finalized objects times log finalized objects), retains O(finalized physical objects) bounded snapshots and paths plus one 65536-byte hash buffer, accumulates checked counters, and polls cancellation through every phase",
+    "non_claims": "exact package validation does not create an atomic filesystem snapshot or lock out concurrent writers, parse lazy portable-record semantics, recompute ScientificContentId or pixel statistics, establish official OME schema conformance or IO-3, qualify independent T1, implement a writer or publication, activate the product, prove post-issuance immutability of unrelated files on every brick read, make a product-open or performance claim, or freeze a stable format"
+  },
   "portable_records": {
     "scope": "initial package-contained version-1 portable records; adding another source or license literal is a hard schema change",
     "collection_items_max": 4096,

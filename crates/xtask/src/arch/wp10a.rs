@@ -28,7 +28,7 @@ const CONTROL_WIRE_PATH: &str = "architecture/wp10a-control-wire-specialization.
 const CONTROL_WIRE_SCHEMA: &str = "mirante4d-wp10a-control-wire-specialization";
 const CONTROL_WIRE_SCHEMA_VERSION: u64 = 1;
 const CONTROL_WIRE_SHA256: &str =
-    "a31a22f110d56da77cb9a1d170281d458a7e439a9e97d52f5f6f505fa5dfb062";
+    "9522f088bfe2fc9a7897a5fa595fec00ac954c69408c3448fd0eb5abf78e4654";
 const STORAGE_CRATE: &str = "mirante4d-storage";
 const STORAGE_PATH: &str = "crates/mirante4d-storage";
 const DEPENDENCY_KINDS: [&str; 3] = ["normal", "dev", "build"];
@@ -487,6 +487,7 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "Doi",
         "ELIDED_ALL_FILL_AMPLIFICATION",
         "ElidedAllFillAmplification",
+        "ExactPackageCapability",
         "F32Bits",
         "F64Bits",
         "FIXED_CONTROL_OBJECTS",
@@ -497,6 +498,7 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "INDEX_LOCATION",
         "INNER_CODECS",
         "LocalBrickAddressPlan",
+        "LocalBrickRead",
         "LocalObjectInfo",
         "LocalPackageCatalog",
         "LocalPackageReader",
@@ -533,6 +535,9 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "PackedIndexRecord",
         "PackedIndexStatistics",
         "PackageOpenError",
+        "PackageReadError",
+        "PackageStructureError",
+        "PackageValidationError",
         "PortableRecord",
         "PortableRecordKind",
         "PortableRecordPayload",

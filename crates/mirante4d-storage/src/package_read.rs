@@ -11,7 +11,7 @@ use crate::{
 
 /// CRC-checked storage payloads and packed facts for one logical brick.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LocalBrickRead {
+pub struct LocalBrickRead {
     record: PackedIndexRecord,
     logical_extent_zyx: [u64; 3],
     pixel_payload: Option<Vec<u8>>,
@@ -19,40 +19,45 @@ pub(crate) struct LocalBrickRead {
     range_requests: u8,
     encoded_bytes_read: u64,
     decoded_bytes: u64,
+    object_snapshots: Vec<LocalObjectSnapshot>,
 }
 
 impl LocalBrickRead {
-    pub(crate) const fn record(&self) -> PackedIndexRecord {
+    pub const fn record(&self) -> PackedIndexRecord {
         self.record
     }
 
-    pub(crate) const fn logical_extent_zyx(&self) -> [u64; 3] {
+    pub const fn logical_extent_zyx(&self) -> [u64; 3] {
         self.logical_extent_zyx
     }
 
-    pub(crate) fn pixel_payload(&self) -> Option<&[u8]> {
+    pub fn pixel_payload(&self) -> Option<&[u8]> {
         self.pixel_payload.as_deref()
     }
 
-    pub(crate) fn validity_payload(&self) -> Option<&[u8]> {
+    pub fn validity_payload(&self) -> Option<&[u8]> {
         self.validity_payload.as_deref()
     }
 
-    pub(crate) const fn range_requests(&self) -> u8 {
+    pub const fn range_requests(&self) -> u8 {
         self.range_requests
     }
 
-    pub(crate) const fn encoded_bytes_read(&self) -> u64 {
+    pub const fn encoded_bytes_read(&self) -> u64 {
         self.encoded_bytes_read
     }
 
-    pub(crate) const fn decoded_bytes(&self) -> u64 {
+    pub const fn decoded_bytes(&self) -> u64 {
         self.decoded_bytes
+    }
+
+    pub(crate) fn object_snapshots(&self) -> &[LocalObjectSnapshot] {
+        &self.object_snapshots
     }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
-pub(crate) enum PackageReadError {
+pub enum PackageReadError {
     #[error(transparent)]
     Address(#[from] BrickAddressError),
     #[error(transparent)]
@@ -61,6 +66,8 @@ pub(crate) enum PackageReadError {
     Shard(#[from] ShardCodecError),
     #[error(transparent)]
     PackedIndex(#[from] PackedIndexError),
+    #[error("exact-package brick read was cancelled")]
+    Cancelled,
     #[error("manifest object {path} has kind {actual:?}; expected {expected:?}")]
     DescriptorKindMismatch {
         path: String,
@@ -248,6 +255,7 @@ pub(crate) fn read_local_brick(
         range_requests: metrics.range_requests,
         encoded_bytes_read: metrics.encoded_bytes_read,
         decoded_bytes: metrics.decoded_bytes,
+        object_snapshots: used_objects,
     })
 }
 

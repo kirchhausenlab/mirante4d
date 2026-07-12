@@ -71,18 +71,21 @@ Unix range reads, and an authenticated local metadata catalog now exist. A
 separate cancellable inventory checks the exact finalized file/ancestor-
 directory closure, object types and lengths, counts, depth, and fan-out under
 global bounds. Descriptor-derived address plans validate one requested brick;
-an internal catalog path can then read only its packed-index, pixel, and
-validity ranges, verify their index/inner CRC32C and bounded zstd decoding,
-apply record-authorized fill elision, and report exact storage-boundary
-counters. It remains crate-private until full SHA-256 validation can gate
-PackageId-attributed reads. Caller-selected DS admission now derives logical
-and addressed counts arithmetically, separates actual shard files, bounds every
+the bounded brick core reads only its packed-index, pixel, and validity ranges,
+verifies their index/inner CRC32C and bounded zstd decoding, applies record-
+authorized fill elision, and reports exact storage-boundary counters. Caller-
+selected DS admission derives logical and addressed counts arithmetically,
+separates actual shard files, bounds every
 listed shard coordinate, and requires exact packed-index shard coverage. The
-crate-private structural pass now verifies every packed-index shard digest,
-record coordinate, edge capacity, canonical padding, and pixel/validity inner-
-slot presence, with a final identity/inventory sweep. It still issues no
-PackageId authority. The writer, full validation, independent T1 corpus, and
-product activation remain incomplete.
+structural pass verifies every packed-index shard digest, record coordinate,
+edge capacity, canonical padding, and pixel/validity inner-
+slot presence. Full validation then stream-hashes the manifest root, pages, and
+every descriptor object with fixed memory, requires structural/hash snapshot
+coherence, repeats inventory, and finishes with a cancellable identity sweep.
+Only its owning exact-package capability exposes PackageId-attributed brick
+reads, checking manifest authority and every consumed shard against the proved
+snapshot. The writer, independent T1 corpus, and product activation remain
+incomplete.
 Current schema-1 packages remain transitional T2 fixtures and the sole product
 route.
 

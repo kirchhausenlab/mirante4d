@@ -29,8 +29,8 @@ The workspace has sixteen crates:
 - `mirante4d-render-api`: backend-neutral intent, requirements, progressive
   frame status, opaque presentation lifecycle, and camera math.
 - `mirante4d-storage`: off-product target-profile facts, checked ceilings,
-  portable package paths, and a bounded local metadata/catalog reader;
-  currently no writer or product authority.
+  portable package paths, bounded local validation/reads, and an exact-package
+  capability; currently no writer or product authority.
 - `mirante4d-data`, `mirante4d-format`, `mirante4d-import`,
   `mirante4d-analysis`, and `mirante4d-renderer`: current storage/runtime,
   format, import, analysis, and rendering implementations.

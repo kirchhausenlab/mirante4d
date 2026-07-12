@@ -74,8 +74,8 @@ release DTOs are implemented. The fixed packed-index record and bounded
 zstd/CRC32C inner-payload and end-index codecs implement the selected binary
 layer in memory. Strict Zarr group/array metadata, closed OME image-group axes
 and transforms, and bounded root-confined Unix object-range reads are
-implemented. The complete target package reader, writer, and validator are not
-yet implemented. A bounded local catalog now authenticates the manifest
+implemented. The product reader, writer, and independent conformance validator
+are not yet implemented. A bounded local catalog authenticates the manifest
 root/pages, verifies opening-critical metadata bytes, parses the closed
 control/Zarr/OME objects, and checks their layer, time, geometry, dtype, shape,
 validity, and packed-index-count relationships. A separate cancellable
@@ -85,28 +85,33 @@ without reading payload bytes. It reports directory depth and reauthenticates
 manifest authority around the scan. One-brick address planning validates
 requested coordinates and derives exact pixel, validity, and packed-index
 shard paths, inner slots, packed-record offsets, and edge extents. From that
-plan, an internal read path fetches only the selected shard-index and inner-
+plan, the bounded brick core fetches only the selected shard-index and inner-
 payload ranges, validates index and inner CRC32C plus bounded zstd output, and
 uses the packed record to authorize pixel or validity fill elision. It exposes
 exact request/read/decode counters and enforces the frozen absolute ceilings.
-The path remains crate-private and its bytes cannot be attributed to a
-PackageId until whole-object manifest SHA-256 validation exists. Explicit
-caller-selected DS admission now distinguishes arithmetic addressed shards
+Explicit caller-selected DS admission distinguishes arithmetic addressed shards
 from actual files, validates every listed shard coordinate, requires complete
 packed-index shard coverage, and applies the selected count ceilings without
 enumerating logical bricks. It does not infer or persist a DS label. A crate-
 private structural pass then verifies packed-index object digests and every
 record's coordinates, edge capacity, validity mode, canonical padding, and
 pixel/validity inner-slot presence without reading those large payloads. The
-catalog exposes the root digest only as the declared PackageId. Full package-
-closure validation remains incomplete and no read is PackageId-authorized.
+catalog exposes the root digest only as the declared PackageId. Consuming full
+validation now stream-hashes the root, pages, and every descriptor object with
+a fixed 64 KiB buffer, requires the structural and digest observations to name
+the same shard versions, repeats inventory, and performs a final snapshot
+sweep. Its owning capability is the only PackageId-authorized brick-read path;
+it checks manifest authority and each consumed shard against that proof. Lazy
+portable-record semantics, atomic snapshotting of a concurrently mutable
+directory, scientific identity, the writer, independent T1, IO-3, and product
+support remain outside this claim.
 
 WP-10B separately installs immutable content-addressed project objects,
 complete generations, atomic head/recovery refs, leases, autosave/recovery,
 and conservative garbage collection.
 
-The remaining target reader, writer, validator, corpus, and project-store work
-is approved but not implemented. Its authorities are the
+The remaining target writer, independent validator/corpus, and project-store
+work is approved but not implemented. Its authorities are the
 [data-format brief](plans/active/foundation-refactor/DATA_FORMAT_IDENTITY_BRIEF.md),
 [project-store brief](plans/active/foundation-refactor/PROJECT_STORE_DURABILITY_BRIEF.md),
 and their accepted work-package entries.

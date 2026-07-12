@@ -43,16 +43,15 @@ pub(crate) struct PackageStructureReport {
 
 impl PackageStructureReport {
     pub(crate) fn revalidate_snapshots(
-        &mut self,
+        &self,
         reader: &LocalPackageReader,
         is_cancelled: &mut impl FnMut() -> bool,
     ) -> Result<(), PackageStructureError> {
-        while let Some(snapshot) = self.snapshots.pop() {
+        for snapshot in &self.snapshots {
             if is_cancelled() {
                 return Err(PackageStructureError::Cancelled);
             }
-            reader.revalidate_snapshot(&snapshot)?;
-            self.work_operations = checked_add("structural work count", self.work_operations, 1)?;
+            reader.revalidate_snapshot(snapshot)?;
         }
         if is_cancelled() {
             Err(PackageStructureError::Cancelled)
@@ -60,10 +59,14 @@ impl PackageStructureReport {
             Ok(())
         }
     }
+
+    pub(crate) fn snapshots(&self) -> &[LocalObjectSnapshot] {
+        &self.snapshots
+    }
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum PackageStructureError {
+pub enum PackageStructureError {
     #[error(transparent)]
     Admission(#[from] crate::PackageAdmissionError),
     #[error(transparent)]

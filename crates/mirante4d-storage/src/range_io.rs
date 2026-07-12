@@ -8,12 +8,15 @@ use std::{
 use std::os::unix::fs::MetadataExt;
 use thiserror::Error;
 
+use mirante4d_identity::{ExactBytesFacts, ExactBytesHasher, IdentityHashError};
+
 use crate::{
     GLOBAL_ENCODED_OUTER_SHARD_BYTES_MAX, PackagePath, ShardCodecError, ShardProfileKind,
     decode_shard_index_tail,
 };
 
 pub const SHARD_INDEX_RANGE_READ_BYTES_MAX: u64 = 4_096;
+pub(crate) const FULL_OBJECT_HASH_BUFFER_BYTES: usize = 64 * 1_024;
 
 /// Metadata for one checked regular object in a local target package.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,12 +34,32 @@ pub(crate) struct LocalShardChunkBytes {
     pub(crate) snapshot: LocalObjectSnapshot,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct LocalObjectSnapshot {
     path: PackagePath,
     bytes: u64,
     identity: FileIdentity,
+}
+
+impl LocalObjectSnapshot {
+    pub(crate) const fn path(&self) -> &PackagePath {
+        &self.path
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct LocalObjectHash {
+    pub(crate) facts: ExactBytesFacts,
+    pub(crate) snapshot: LocalObjectSnapshot,
+}
+
+#[derive(Debug)]
+pub(crate) enum LocalObjectHashError {
+    Range(RangeReadError),
+    Identity(IdentityHashError),
+    Cancelled,
+    DeclaredLengthMismatch { expected: u64, actual: u64 },
 }
 
 #[derive(Debug)]
@@ -134,6 +157,78 @@ impl LocalPackageReader {
             identity: checked.identity,
         };
         Ok((bytes, snapshot))
+    }
+
+    /// Streams one complete object through the exact-byte hasher.
+    ///
+    /// The object is opened once, no payload is retained, cancellation is
+    /// checked before every bounded read, and the same open file is
+    /// revalidated before its snapshot is returned.
+    pub(crate) fn hash_object_with_snapshot(
+        &self,
+        path: &PackagePath,
+        declared_bytes: u64,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<LocalObjectHash, LocalObjectHashError> {
+        if is_cancelled() {
+            return Err(LocalObjectHashError::Cancelled);
+        }
+        let mut checked = self
+            .open_object(path, GLOBAL_ENCODED_OUTER_SHARD_BYTES_MAX)
+            .map_err(LocalObjectHashError::Range)?;
+        if checked.bytes != declared_bytes {
+            return Err(LocalObjectHashError::DeclaredLengthMismatch {
+                expected: declared_bytes,
+                actual: checked.bytes,
+            });
+        }
+
+        let mut remaining = checked.bytes;
+        let mut buffer = vec![0_u8; FULL_OBJECT_HASH_BUFFER_BYTES];
+        let mut hasher = ExactBytesHasher::new();
+        while remaining != 0 {
+            if is_cancelled() {
+                return Err(LocalObjectHashError::Cancelled);
+            }
+            let requested = usize::try_from(remaining)
+                .unwrap_or(usize::MAX)
+                .min(buffer.len());
+            let read = checked
+                .file
+                .read(&mut buffer[..requested])
+                .map_err(|error| {
+                    LocalObjectHashError::Range(io_error(
+                        "stream package object",
+                        path.as_str(),
+                        error,
+                    ))
+                })?;
+            if read == 0 {
+                return Err(LocalObjectHashError::Range(RangeReadError::ShortRead {
+                    path: path.to_string(),
+                    expected: remaining,
+                }));
+            }
+            hasher
+                .update(&buffer[..read])
+                .map_err(LocalObjectHashError::Identity)?;
+            remaining -= u64::try_from(read)
+                .map_err(|_| LocalObjectHashError::Range(RangeReadError::LengthOverflow))?;
+        }
+        if is_cancelled() {
+            return Err(LocalObjectHashError::Cancelled);
+        }
+        let facts = hasher.finalize().map_err(LocalObjectHashError::Identity)?;
+        self.revalidate_open_object(path, &checked)
+            .map_err(LocalObjectHashError::Range)?;
+        Ok(LocalObjectHash {
+            facts,
+            snapshot: LocalObjectSnapshot {
+                path: path.clone(),
+                bytes: checked.bytes,
+                identity: checked.identity,
+            },
+        })
     }
 
     /// Reads one nonempty checked `(object, offset, length)` range.
@@ -676,6 +771,44 @@ mod tests {
         fs::rename(replacement, root.0.join(path.as_str())).unwrap();
         assert!(matches!(
             reader.revalidate_snapshot(&snapshot),
+            Err(RangeReadError::ObjectChanged { .. })
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn streams_full_object_digest_with_bounded_cancellation_and_snapshot() {
+        let root = TempRoot::new();
+        let bytes = (0..(FULL_OBJECT_HASH_BUFFER_BYTES * 2 + 17))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        root.write("objects/payload.bin", &bytes);
+        let reader = LocalPackageReader::open(&root.0).unwrap();
+        let path = PackagePath::parse("objects/payload.bin").unwrap();
+
+        let hashed = reader
+            .hash_object_with_snapshot(&path, bytes.len() as u64, || false)
+            .unwrap();
+        assert_eq!(hashed.facts, ExactBytesHasher::hash(&bytes).unwrap());
+        assert!(matches!(
+            reader.hash_object_with_snapshot(&path, bytes.len() as u64 - 1, || false),
+            Err(LocalObjectHashError::DeclaredLengthMismatch { .. })
+        ));
+
+        let mut polls = 0_u8;
+        assert!(matches!(
+            reader.hash_object_with_snapshot(&path, bytes.len() as u64, || {
+                polls += 1;
+                polls == 3
+            }),
+            Err(LocalObjectHashError::Cancelled)
+        ));
+
+        let replacement = root.0.join("replacement.bin");
+        fs::write(&replacement, &bytes).unwrap();
+        fs::rename(replacement, root.0.join(path.as_str())).unwrap();
+        assert!(matches!(
+            reader.revalidate_snapshot(&hashed.snapshot),
             Err(RangeReadError::ObjectChanged { .. })
         ));
     }
