@@ -4,12 +4,14 @@
 //! WP-10A-B owns immutable profile facts, strict control primitives, checked
 //! preflight arithmetic, portable package paths, packed-index records, the
 //! in-memory shard codec, strict Zarr/OME storage metadata, an authenticated
-//! local metadata catalog, and root-confined read-only range I/O. It has no
-//! writer and makes no product target-package claim.
+//! local metadata catalog, a bounded exact directory inventory, and root-
+//! confined read-only range I/O. It has no writer and makes no product target-
+//! package claim.
 
 #![forbid(unsafe_code)]
 
 mod control;
+mod directory_inventory;
 mod error;
 mod limits;
 mod ome_metadata;
@@ -37,6 +39,7 @@ pub use control::{
     ScienceTemporalKind, SourceIdentifier, SourceIdentifierScheme, SourcePayload, SpdxLicense,
     TypedId, U64Decimal, manifest_page_path, pack_manifest_pages, profile_compatibility_bytes,
 };
+pub use directory_inventory::{DirectoryInventory, DirectoryInventoryError};
 pub use error::StorageProfileError;
 pub use limits::{
     DatasetGeometry, ELIDED_ALL_FILL_AMPLIFICATION, ElidedAllFillAmplification,

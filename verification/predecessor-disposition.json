@@ -4773,6 +4773,14 @@
       "reason": "WP-10A rejects unknown OME members, alternate paths/transforms, negative zero, mixed spatial modes, and oversized metadata."
     },
     {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::inspects_exact_bounded_directory_closure",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the explicit directory inventory is cancellable and rejects extra directories, post-open length drift, or same-length manifest-authority drift while reporting exact closure counts and depth."
+    },
+    {
       "id": "libtest:mirante4d-storage:package_catalog::tests::opens_authenticated_metadata_catalog_without_reading_shards",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -4931,6 +4939,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 411
+    "current_additions": 412
   }
 }

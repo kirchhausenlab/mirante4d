@@ -78,8 +78,12 @@ implemented. The integrated package reader, writer, and validator are not yet
 implemented. A bounded local catalog now authenticates the manifest root/pages,
 verifies opening-critical metadata bytes, parses the closed control/Zarr/OME
 objects, and checks their layer, time, geometry, dtype, shape, validity, and
-packed-index-count relationships; it does not yet
-enumerate full directory closure or verify shard payloads.
+packed-index-count relationships. A separate cancellable inventory enforces
+the exact finalized file and ancestor-directory closure, safe object types,
+declared lengths, and globally bounded counts/fan-out without reading payload
+bytes. It reports directory depth and reauthenticates manifest authority around
+the scan. DS-specific admission and shard-payload verification remain
+incomplete.
 
 WP-10B separately installs immutable content-addressed project objects,
 complete generations, atomic head/recovery refs, leases, autosave/recovery,

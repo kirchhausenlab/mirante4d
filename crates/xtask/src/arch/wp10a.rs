@@ -28,7 +28,7 @@ const CONTROL_WIRE_PATH: &str = "architecture/wp10a-control-wire-specialization.
 const CONTROL_WIRE_SCHEMA: &str = "mirante4d-wp10a-control-wire-specialization";
 const CONTROL_WIRE_SCHEMA_VERSION: u64 = 1;
 const CONTROL_WIRE_SHA256: &str =
-    "141244a275ce3e17d09427b9af1269c62a024622dfa0667a069918f1924acde2";
+    "a16c3c44b54b887d960acf3a1119cb628040f7c348a2ff20bf41df3833cb4a45";
 const STORAGE_CRATE: &str = "mirante4d-storage";
 const STORAGE_PATH: &str = "crates/mirante4d-storage";
 const DEPENDENCY_KINDS: [&str; 3] = ["normal", "dev", "build"];
@@ -478,6 +478,8 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "DerivationScope",
         "DerivationSpaceBox",
         "DerivationTimeRange",
+        "DirectoryInventory",
+        "DirectoryInventoryError",
         "DisplayDefaults",
         "DisplayLayerDefaults",
         "Doi",

@@ -203,7 +203,7 @@ impl LocalPackageReader {
     }
 
     #[cfg(unix)]
-    fn validate_root_identity(&self) -> Result<(), RangeReadError> {
+    pub(crate) fn validate_root_identity(&self) -> Result<(), RangeReadError> {
         let metadata = symlink_metadata(&self.root, "reinspect package root", "<root>")?;
         if metadata.file_type().is_symlink()
             || !metadata.is_dir()
@@ -212,6 +212,15 @@ impl LocalPackageReader {
             return Err(RangeReadError::RootChanged);
         }
         Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn validate_root_identity(&self) -> Result<(), RangeReadError> {
+        Err(RangeReadError::UnsupportedPlatform)
+    }
+
+    pub(crate) fn root_path(&self) -> &Path {
+        &self.root
     }
 
     #[cfg(unix)]

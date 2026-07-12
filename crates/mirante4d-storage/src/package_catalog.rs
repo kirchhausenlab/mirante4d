@@ -4,6 +4,7 @@ use mirante4d_domain::IntensityDType;
 use mirante4d_identity::{ExactBytesHasher, IdentityHashError, PackageId};
 use thiserror::Error;
 
+use crate::directory_inventory::{ExpectedFile, ExpectedFileRole, inspect_directory_closure};
 use crate::{
     ControlError, DisplayDefaults, LocalPackageReader, MAX_PORTABLE_CONTROL_OBJECT_BYTES,
     MAX_PROFILE_HEADER_BYTES, MAX_ZARR_METADATA_BYTES, ManifestPage, ManifestRoot,
@@ -24,7 +25,10 @@ const MANIFEST_ROOT_PATH: &str = "m4d/manifest/root.json";
 /// explicit later validation modes.
 #[derive(Debug)]
 pub struct LocalPackageCatalog {
+    reader: LocalPackageReader,
     package_id: PackageId,
+    manifest_root: ManifestRoot,
+    manifest_root_bytes: u64,
     profile: ProfileHeader,
     science: ScienceDescriptor,
     display_defaults: DisplayDefaults,
@@ -45,6 +49,8 @@ impl LocalPackageCatalog {
         let root_bytes =
             reader.read_object(&root_path, MAX_PORTABLE_CONTROL_OBJECT_BYTES as u64)?;
         let manifest_root = ManifestRoot::parse_canonical(&root_bytes)?;
+        let manifest_root_bytes = u64::try_from(root_bytes.len())
+            .map_err(|_| PackageOpenError::MetadataByteCountOverflow)?;
         let package_id = manifest_root.package_id()?;
         let mut metadata_bytes_read = checked_add_bytes(0, profile_bytes.len())?;
         metadata_bytes_read = checked_add_bytes(metadata_bytes_read, root_bytes.len())?;
@@ -138,7 +144,10 @@ impl LocalPackageCatalog {
         validate_storage_metadata(&profile, &science, &ome_images, &zarr_arrays)?;
 
         Ok(Self {
+            reader,
             package_id,
+            manifest_root,
+            manifest_root_bytes,
             profile,
             science,
             display_defaults,
@@ -187,6 +196,107 @@ impl LocalPackageCatalog {
     pub const fn metadata_bytes_read(&self) -> u64 {
         self.metadata_bytes_read
     }
+
+    /// Inspects the exact finalized file and ancestor-directory closure.
+    ///
+    /// This operation opens no payload bytes, hashes no shards, and does not
+    /// select a DS-specific admission profile. It is globally bounded and
+    /// checks `is_cancelled` before and throughout filesystem enumeration.
+    pub fn inspect_directory_closure(
+        &self,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<crate::DirectoryInventory, crate::DirectoryInventoryError> {
+        self.reauthenticate_manifest_authority(&mut is_cancelled)?;
+        let mut expected = BTreeMap::new();
+        for descriptor in &self.descriptors {
+            insert_inventory_file(
+                &mut expected,
+                descriptor.path().clone(),
+                ExpectedFile {
+                    bytes: descriptor.raw().byte_length(),
+                    role: ExpectedFileRole::Descriptor(descriptor.kind()),
+                },
+            )?;
+        }
+        insert_inventory_file(
+            &mut expected,
+            PackagePath::parse(MANIFEST_ROOT_PATH)?,
+            ExpectedFile {
+                bytes: self.manifest_root_bytes,
+                role: ExpectedFileRole::ManifestRoot,
+            },
+        )?;
+        for page in self.manifest_root.pages() {
+            insert_inventory_file(
+                &mut expected,
+                page.path().clone(),
+                ExpectedFile {
+                    bytes: page.byte_length(),
+                    role: ExpectedFileRole::ManifestPage,
+                },
+            )?;
+        }
+        let inventory = inspect_directory_closure(&self.reader, expected, &mut is_cancelled)?;
+        self.reauthenticate_manifest_authority(&mut is_cancelled)?;
+        Ok(inventory)
+    }
+
+    fn reauthenticate_manifest_authority(
+        &self,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<(), crate::DirectoryInventoryError> {
+        self.reauthenticate_manifest_root(is_cancelled)?;
+        for page in self.manifest_root.pages() {
+            if is_cancelled() {
+                return Err(crate::DirectoryInventoryError::Cancelled);
+            }
+            let bytes = self
+                .reader
+                .read_object(page.path(), MAX_PORTABLE_CONTROL_OBJECT_BYTES as u64)?;
+            let length_matches = u64::try_from(bytes.len()).ok() == Some(page.byte_length());
+            let digest_matches = ExactBytesHasher::hash(&bytes)
+                .map(|facts| facts.digest() == page.digest())
+                .unwrap_or(false);
+            if !length_matches || !digest_matches {
+                return Err(crate::DirectoryInventoryError::ManifestAuthorityChanged);
+            }
+        }
+        self.reauthenticate_manifest_root(is_cancelled)
+    }
+
+    fn reauthenticate_manifest_root(
+        &self,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<(), crate::DirectoryInventoryError> {
+        if is_cancelled() {
+            return Err(crate::DirectoryInventoryError::Cancelled);
+        }
+        let path = PackagePath::parse(MANIFEST_ROOT_PATH)?;
+        let bytes = self
+            .reader
+            .read_object(&path, MAX_PORTABLE_CONTROL_OBJECT_BYTES as u64)?;
+        if u64::try_from(bytes.len()).ok() != Some(self.manifest_root_bytes)
+            || ManifestRoot::parse_canonical(&bytes).ok().as_ref() != Some(&self.manifest_root)
+        {
+            return Err(crate::DirectoryInventoryError::ManifestAuthorityChanged);
+        }
+        Ok(())
+    }
+}
+
+fn insert_inventory_file(
+    expected: &mut BTreeMap<PackagePath, ExpectedFile>,
+    path: PackagePath,
+    file: ExpectedFile,
+) -> Result<(), crate::DirectoryInventoryError> {
+    if expected.insert(path.clone(), file).is_some() {
+        return Err(crate::DirectoryInventoryError::Path(
+            StorageProfileError::DuplicatePath {
+                path: path.to_string(),
+            },
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -955,5 +1065,62 @@ mod tests {
                 Err(PackageOpenError::CrossObjectInconsistency { .. })
             ));
         }
+    }
+
+    #[test]
+    fn inspects_exact_bounded_directory_closure() {
+        let root = fixture(FixtureDrift::None);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        let inventory = catalog.inspect_directory_closure(|| false).unwrap();
+        assert_eq!(inventory.regular_files(), 12);
+        assert_eq!(inventory.directories(), 10);
+        assert_eq!(inventory.maximum_directory_depth(), 3);
+        assert_eq!(inventory.maximum_directory_fan_out(), 5);
+        assert_eq!(inventory.zarr_metadata_objects(), 7);
+        assert_eq!(inventory.manifest_pages(), 1);
+        assert_eq!(inventory.fixed_control_objects(), 4);
+        assert_eq!(inventory.pixel_shards(), 0);
+        assert_eq!(inventory.validity_shards(), 0);
+        assert_eq!(inventory.packed_index_shards(), 0);
+        assert_eq!(inventory.portable_records(), 0);
+
+        assert_eq!(
+            catalog.inspect_directory_closure(|| true),
+            Err(crate::DirectoryInventoryError::Cancelled)
+        );
+
+        fs::create_dir(root.0.join("extra")).unwrap();
+        assert!(matches!(
+            catalog.inspect_directory_closure(|| false),
+            Err(crate::DirectoryInventoryError::UnexpectedDirectory { .. })
+        ));
+
+        let root = fixture(FixtureDrift::None);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        let pixel = root.0.join("images/i00000000/s00/zarr.json");
+        let mut bytes = fs::read(&pixel).unwrap();
+        bytes.push(b' ');
+        fs::write(pixel, bytes).unwrap();
+        assert!(matches!(
+            catalog.inspect_directory_closure(|| false),
+            Err(crate::DirectoryInventoryError::ObjectLengthMismatch { .. })
+        ));
+
+        let root = fixture(FixtureDrift::None);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        let manifest = root.0.join(MANIFEST_ROOT_PATH);
+        let mut bytes = fs::read(&manifest).unwrap();
+        let marker = b"\"digest\":\"";
+        let start = bytes
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .unwrap()
+            + marker.len();
+        bytes[start] = if bytes[start] == b'0' { b'1' } else { b'0' };
+        fs::write(manifest, bytes).unwrap();
+        assert_eq!(
+            catalog.inspect_directory_closure(|| false),
+            Err(crate::DirectoryInventoryError::ManifestAuthorityChanged)
+        );
     }
 }

@@ -155,6 +155,18 @@
     "reported_metric": "exact metadata bytes read is retained for the later metadata-open evidence gate",
     "non_claims": "open does not enumerate directory closure, verify shard bytes, decode indexes, compute scientific identity, or imply full package validation"
   },
+  "local_directory_inventory": {
+    "invocation": "a separate explicit operation after metadata open; never implicit in open",
+    "file_set": "exactly all manifest descriptor paths, the manifest root, and every root-referenced manifest page",
+    "directory_set": "exactly the package root and the ancestor directories implied by the finalized file set; unlisted empty directories are rejected",
+    "filesystem_types": "do not follow links; reject symlinks, hardlinked regular files, non-regular objects, root escape, and directory identity drift",
+    "authority_stability": "manifest root and page authority bytes are reauthenticated before and after enumeration; files and directories receive a final identity/length sweep",
+    "lengths": "every regular file length must equal its authenticated descriptor or manifest-page/root fact; shard payload digests remain full-validation work",
+    "counting": "root counts as a directory; report maximum directory depth; fan-out counts direct child files plus direct child directories",
+    "bounds": "stop above the global DS-4 maxima of 11264 regular files, 14336 directories, or 512 direct children; DS-specific admission remains later validator work",
+    "cancellation": "the caller-supplied cancellation check is polled before and throughout enumeration",
+    "profile_selection": "the inventory does not select or infer DS-0 through DS-4"
+  },
   "portable_records": {
     "scope": "initial package-contained version-1 portable records; adding another source or license literal is a hard schema change",
     "collection_items_max": 4096,

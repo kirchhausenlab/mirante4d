@@ -127,10 +127,14 @@ closed Zarr rows, the closed OME axes/transform projection, semantic JSON
 validation, exact range bounds, and rejection of symlink, hardlink, and non-
 regular objects. Catalog tests additionally prove canonical manifest-page
 authentication, exact opening-metadata bytes, and initial cross-object layer
-and storage-shape rejection. They make no directory-closure, shard-payload, official-schema,
-complete-package, T1 conformance, independent-reader, lifecycle, or product-
-support claim. Current schema-1 packages remain non-authoritative T2 support
-fixtures until WP-10A accepts the independent target evidence.
+and storage-shape rejection. The directory-inventory test proves exact positive
+closure counts, cancellation, extra-directory rejection, and post-open length-
+drift rejection, including same-length manifest-authority drift. These tests
+make no DS-specific admission, shard-payload,
+official-schema, complete-package, T1 conformance, independent-reader,
+lifecycle, or product-support claim. Current schema-1 packages remain non-
+authoritative T2 support fixtures until WP-10A accepts the independent target
+evidence.
 
 The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).
