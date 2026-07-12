@@ -134,14 +134,18 @@ WP-10B's independent project-store wire authority is checked in the public
 policy group with `python3 tools/project-fixtures/validate.py --manifest
 fixtures/project/manifest.json --self-test`. It proves exact canonical bytes,
 refs, object/page closure, recovery classification, and declared corruptions;
-it does not claim implemented transactions, filesystem durability, or product
-save/open support.
+it does not independently conform repeated reuse of one physical page within a
+generation and does not claim filesystem durability or product save/open
+support.
 
 The unreachable `mirante4d-project-store` crate is assigned to the hosted
 contract lane. Its current tests cover the frozen API/limits, canonical
-envelope/ref/generation identities, held-descriptor traversal, bounded
-immutable publication, exact deduplication, collision rejection, and
-cancellation. They do not claim a complete transaction or writable durability.
+envelope/ref identities, typed canonical generations, direct and deterministic
+paged closure, held-descriptor traversal, bounded immutable object and
+generation-last publication, exact deduplication, collision rejection, and
+cancellation. They do not claim live ref mutation, leases, actor execution,
+recovery, garbage collection, a committed save, qualified writable durability,
+product reachability, or product-open validation.
 
 The checked independent source report supports only the WP-03 source-TIFF
 archive. WP-10A is accepted off-product and its target authority is promoted.

@@ -22,7 +22,8 @@ public release or public full microscopy dataset yet.
 - Linux release-directory, tarball, and AppImage build paths.
 - No segmentation or derived-label subsystem.
 
-The workspace has eighteen crates. `mirante4d-storage` is an off-product
+The workspace has nineteen packages: eighteen `mirante4d-*` crates plus
+`xtask`. `mirante4d-storage` is an off-product
 WP-10A library whose first slice owns frozen profile facts, portable package
 paths, checked package-count arithmetic, size/amplification ceilings, and
 bounded read-only local range I/O. It remains unreachable from the product.
@@ -128,7 +129,9 @@ independent CPU reference at
 evidence passed; product activation and product-open validation remain WP-09B
 work. WP-10B's entry is accepted. B1 freezes the successor project-store wire,
 limits, public boundary, transition inventory, and independent project fixture;
-B2 transactional implementation is active off-product.
+B2 transactional implementation is active off-product. Its current slice owns
+typed canonical generations, direct and deterministic paged object closure,
+and immutable generation-last publication.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
@@ -151,9 +154,10 @@ See [testing](TESTING.md) for commands and claim language.
 - Dataset schema 1 and the private project-v15 bridge are experimental, not
   target-format conformance claims.
 - The successor project-store crate exists off-product with its frozen API,
-  control-record wire, and immutable publication primitive. Complete
-  transactions, refs, leases, actor execution, recovery, and every product path
-  remain unimplemented.
+  control-record wire, typed generation/direct-and-paged closure, and
+  generation-last immutable publication. Live refs, leases, actor execution,
+  recovery, garbage collection, committed saves, durability qualification, and
+  every product path remain unimplemented.
 - The package-capability lane remains pending until there is an honest
   unsupported-GPU package command.
 - Packaged runtime does not expose unsaved-autosave recovery.

@@ -244,6 +244,15 @@ pub(crate) fn framed_generation_id(
 ) -> Result<ProjectGenerationId, WireError> {
     validate_generation_length(canonical_generation.len())?;
     validate_canonical_json(canonical_generation)?;
+    generation_id_from_validated_canonical(canonical_generation)
+}
+
+/// Frames canonical bytes after the closed generation codec has already
+/// validated and byte-for-byte re-encoded the complete record.
+pub(crate) fn generation_id_from_validated_canonical(
+    canonical_generation: &[u8],
+) -> Result<ProjectGenerationId, WireError> {
+    validate_generation_length(canonical_generation.len())?;
     let byte_length = u64::try_from(canonical_generation.len())
         .map_err(|_| WireError::GenerationLengthOverflow)?;
     let mut hasher = Sha256Hasher::new();
