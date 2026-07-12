@@ -22,8 +22,9 @@ exact recipe bodies and payloads, and exact compatibility tuple bytes are
 present. Exact object descriptors, greedy manifest pages, authenticated roots,
 PackageId derivation, portable records, derivation records, and detached
 release records are present. The fixed packed-index, inner-payload, and shard-
-tail codecs are present. Continue WP-10A-B with strict Zarr metadata and
-filesystem range I/O, then the reader, writer, and validator.
+tail codecs, strict storage-only Zarr metadata, and bounded local range reader
+are present. Continue WP-10A-B with OME image-group metadata, then the package
+reader, writer, and validator.
 WP-10A-C then promotes the independent target-format authorities; WP-10A-D
 consumes them and closes the package evidence. Current schema 1 remains the
 sole product route until WP-10C.

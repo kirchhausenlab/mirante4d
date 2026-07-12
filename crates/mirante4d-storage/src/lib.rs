@@ -2,9 +2,9 @@
 //!
 //! This crate is not reachable from the application before WP-10C. The first
 //! WP-10A-B owns immutable profile facts, strict control primitives, checked
-//! preflight arithmetic, portable package paths, packed-index records, and the
-//! in-memory shard codec. It performs no filesystem I/O and makes no
-//! target-package support claim.
+//! preflight arithmetic, portable package paths, packed-index records, the
+//! in-memory shard codec, strict storage metadata, and root-confined read-only
+//! range I/O. It has no writer and makes no product target-package claim.
 
 #![forbid(unsafe_code)]
 
@@ -14,7 +14,9 @@ mod limits;
 mod packed_index;
 mod paths;
 mod profile;
+mod range_io;
 mod shard;
+mod zarr_metadata;
 
 pub use control::{
     AsciiToken, CanonicalMapEntry, CanonicalValue, CanonicalValueKind, CitationPayload,
@@ -53,7 +55,13 @@ pub use profile::{
     CAPABILITIES, CHUNK_KEY_SEPARATOR, CompatibilityTuple, INDEX_CODECS, INDEX_LOCATION,
     INNER_CODECS, OUTER_CODEC, PROFILE, ProfileKind, ScaleCountRule, StorageShape, profile_limits,
 };
+pub use range_io::{
+    LocalObjectInfo, LocalPackageReader, RangeReadError, SHARD_INDEX_RANGE_READ_BYTES_MAX,
+};
 pub use shard::{
     ShardCodecError, ShardIndex, ShardIndexEntry, ShardProfileKind, decode_inner_payload,
     decode_shard_index_tail, encode_inner_payload,
+};
+pub use zarr_metadata::{
+    MAX_ZARR_METADATA_BYTES, ZarrArrayMetadata, ZarrGroupMetadata, ZarrMetadataError,
 };

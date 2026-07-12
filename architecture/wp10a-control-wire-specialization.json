@@ -34,6 +34,35 @@
     "validity_path": "validity/i########-s##",
     "packed_index_path": "indexes/i########-s##"
   },
+  "zarr_metadata": {
+    "metadata_object_bytes_max": 1048576,
+    "json_semantics": "not JCS; the writer emits deterministic compact JSON while the reader accepts semantic JSON key order and insignificant whitespace",
+    "empty_optional_members": "attributes and storage_transformers may be omitted or explicitly empty; the deterministic writer omits them",
+    "configuration_free_codec_spelling": "crc32c is exactly a name-only object as required by the pinned Zarr 3.0 metadata grammar; string shorthand is rejected",
+    "fill_values": {
+      "uint8_pixels": "JSON integer 0",
+      "uint16_pixels": "JSON integer 0",
+      "float32_pixels": "JSON numeric positive zero; the deterministic writer emits 0.0",
+      "validity": "JSON integer 0",
+      "packed_index": "JSON integer 0"
+    },
+    "pixel_dimension_names": [
+      "t",
+      "c",
+      "z",
+      "y",
+      "x"
+    ],
+    "validity_dimension_names": [
+      "t",
+      "c",
+      "z",
+      "y",
+      "x_byte"
+    ],
+    "packed_index_dimension_names": "the member is omitted and any present member is rejected",
+    "scope": "storage-only Zarr group and array metadata; OME image-group attributes remain a later DTO bound to the accepted OME wire contract"
+  },
   "normalization": {
     "transform_negative_zero": "normalize to positive zero before encoding; a stored negative-zero spelling is noncanonical"
   },

@@ -24,8 +24,8 @@ public release or public full microscopy dataset yet.
 
 The workspace has sixteen crates. `mirante4d-storage` is an off-product
 WP-10A library whose first slice owns frozen profile facts, portable package
-paths, checked package-count arithmetic, and size/amplification ceilings. It
-performs no filesystem I/O and is unreachable from the product.
+paths, checked package-count arithmetic, size/amplification ceilings, and
+bounded read-only local range I/O. It remains unreachable from the product.
 
 `mirante4d-core`, the application
 `AppState` god-state, `WorkbenchCommand`, project-v14 authority, and
@@ -65,10 +65,11 @@ manifest pages, authenticated roots, and PackageId derivation. Portable source,
 recipe, derivation, rights, and citation records have exact closed schemas;
 embedded recipe and derivation payloads and detached release records verify
 their typed identities. Exact 64-byte packed-index records and the bounded
-in-memory zstd/CRC32C shard and end-index codec also exist. Filesystem range
-I/O, Zarr metadata, reader, writer, validator, independent T1 corpus, and
-product activation remain incomplete. Current schema-1 packages remain
-transitional T2 fixtures and the sole product route.
+in-memory zstd/CRC32C shard and end-index codec also exist. Strict storage-only
+Zarr group/array metadata and root-confined bounded Unix range reads now exist.
+OME image-group metadata, the package reader, writer, validator, independent T1
+corpus, and product activation remain incomplete. Current schema-1 packages
+remain transitional T2 fixtures and the sole product route.
 
 ## Current Verification Boundary
 

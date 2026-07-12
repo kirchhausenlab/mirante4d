@@ -122,10 +122,12 @@ descriptor/page/root bytes. Closed portable-record tests prove structural
 canonical bytes; derivation and detached-release tests additionally prove typed
 identity verification. Packed-index and shard-codec tests prove the closed
 record layout, bounded zstd/CRC32C pipeline, exact end-index sizes, and strict
-structural rejection. They make no filesystem-package, T1 conformance,
-independent-reader, lifecycle, or product-support claim. Current schema-1
-packages remain non-authoritative T2 support fixtures until WP-10A accepts the
-independent target evidence.
+structural rejection. Storage-metadata and range-read tests prove the nine
+closed Zarr rows, semantic JSON validation, exact range bounds, and rejection of
+symlink, hardlink, and non-regular objects. They make no complete-package, T1
+conformance, independent-reader, lifecycle, or product-support claim. Current
+schema-1 packages remain non-authoritative T2 support fixtures until WP-10A
+accepts the independent target evidence.
 
 The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).

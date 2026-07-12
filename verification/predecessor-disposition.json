@@ -4749,6 +4749,30 @@
       "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
     },
     {
+      "id": "libtest:mirante4d-storage:range_io::tests::reads_only_the_requested_nonempty_range_and_index_tail",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves local reads fetch one exact nonempty range and at most the fixed shard-index tail."
+    },
+    {
+      "id": "libtest:mirante4d-storage:range_io::tests::rejects_empty_overflowing_out_of_bounds_and_oversized_reads",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects empty, overflowing, out-of-bounds, and profile-oversized local object reads before allocation."
+    },
+    {
+      "id": "libtest:mirante4d-storage:range_io::tests::rejects_symlink_hardlink_and_nonregular_objects",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects symlink traversal, hardlinks, and non-regular objects at the local package boundary."
+    },
+    {
       "id": "libtest:mirante4d-storage:shard::tests::deterministic_shard_tail_drives_present_and_missing_range_reads",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -4787,6 +4811,30 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
       "reason": "WP-10A rejects corrupt, oversized, inconsistent, out-of-bounds, and noncanonical shard indexes."
+    },
+    {
+      "id": "libtest:mirante4d-storage:zarr_metadata::tests::arrays_reject_unknown_alternate_and_oversized_metadata",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects unknown, alternate, malformed, and oversized Zarr array metadata outside the frozen profile."
+    },
+    {
+      "id": "libtest:mirante4d-storage:zarr_metadata::tests::empty_groups_emit_deterministic_bytes_and_accept_semantic_json",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A emits one deterministic empty group while accepting semantically equivalent strict Zarr JSON."
+    },
+    {
+      "id": "libtest:mirante4d-storage:zarr_metadata::tests::every_frozen_array_row_round_trips_the_exact_storage_pipeline",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves all nine array rows use the frozen grid, key, fill, dimension, sharding, codec, and end-index configuration."
     },
     {
       "id": "libtest:xtask::bin/xtask:arch::wp08a::tests::dependency_matrix_delegates_only_wp10a_storage_to_its_successor",
@@ -4835,6 +4883,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 399
+    "current_additions": 405
   }
 }

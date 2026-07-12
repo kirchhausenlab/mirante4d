@@ -28,7 +28,7 @@ const CONTROL_WIRE_PATH: &str = "architecture/wp10a-control-wire-specialization.
 const CONTROL_WIRE_SCHEMA: &str = "mirante4d-wp10a-control-wire-specialization";
 const CONTROL_WIRE_SCHEMA_VERSION: u64 = 1;
 const CONTROL_WIRE_SHA256: &str =
-    "0786aa150ea13476871c8e1e005528142026a26ff6fa62200d156f8c27309b3f";
+    "4c1440db68bd79e73a7646b2c8f19ab8b1d765261407aaa50c976e89dd789598";
 const STORAGE_CRATE: &str = "mirante4d-storage";
 const STORAGE_PATH: &str = "crates/mirante4d-storage";
 const DEPENDENCY_KINDS: [&str; 3] = ["normal", "dev", "build"];
@@ -492,6 +492,8 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "INDEX_CODECS",
         "INDEX_LOCATION",
         "INNER_CODECS",
+        "LocalObjectInfo",
+        "LocalPackageReader",
         "MANIFEST_DESCRIPTORS_PER_PAGE_GUARANTEED",
         "ManifestPage",
         "ManifestPageReference",
@@ -503,6 +505,7 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "MAX_PORTABLE_CONTROL_OBJECT_BYTES",
         "MAX_PROFILE_HEADER_BYTES",
         "MAX_RELATIVE_PATH_BYTES",
+        "MAX_ZARR_METADATA_BYTES",
         "NfcText",
         "OUTER_CODEC",
         "OmeInteroperabilityBase",
@@ -531,6 +534,7 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "ProfileLogicalLayer",
         "ProfileValidityMode",
         "PublishedAtUtc",
+        "RangeReadError",
         "RecipeBody",
         "RecipeDeterminism",
         "RecipeInput",
@@ -550,6 +554,7 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "ScienceLayer",
         "ScienceTemporalCalibration",
         "ScienceTemporalKind",
+        "SHARD_INDEX_RANGE_READ_BYTES_MAX",
         "ShardCodecError",
         "ShardIndex",
         "ShardIndexEntry",
@@ -562,6 +567,9 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "StorageShape",
         "TypedId",
         "U64Decimal",
+        "ZarrArrayMetadata",
+        "ZarrGroupMetadata",
+        "ZarrMetadataError",
         "amplification_2d",
         "amplification_3d",
         "checked_ceil_div",
