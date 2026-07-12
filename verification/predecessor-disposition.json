@@ -4421,6 +4421,22 @@
       "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
     },
     {
+      "id": "libtest:mirante4d-storage:control::display::tests::display_defaults_reject_malformed_noncanonical_and_invalid_layers",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects malformed, alternate, unordered, duplicate, oversized, and invalid display defaults."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::display::tests::display_defaults_roundtrip_exact_canonical_bytes",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the closed display-defaults DTO has one exact canonical encoding."
+    },
+    {
       "id": "libtest:mirante4d-storage:control::jcs::tests::number_depth_and_size_rejection",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -4627,6 +4643,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 373
+    "current_additions": 375
   }
 }

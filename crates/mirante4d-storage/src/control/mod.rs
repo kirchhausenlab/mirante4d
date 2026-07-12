@@ -1,14 +1,19 @@
+mod display;
 mod jcs;
 mod scalar;
 mod value;
 
 use thiserror::Error;
 
+pub use display::{DisplayDefaults, DisplayLayerDefaults};
 pub use scalar::{
     AsciiToken, F32Bits, F64Bits, I64Decimal, MAX_ASCII_TOKEN_BYTES, MAX_NFC_TEXT_BYTES, NfcText,
     Rgb24, TypedId, U64Decimal,
 };
-pub use value::{CanonicalMapEntry, CanonicalValue, CanonicalValueKind, MAX_CANONICAL_VALUE_BYTES};
+pub use value::{CanonicalMapEntry, CanonicalValue, CanonicalValueKind};
+
+/// Maximum canonical UTF-8 bytes in one portable version-1 control object.
+pub const MAX_PORTABLE_CONTROL_OBJECT_BYTES: usize = 1_048_576;
 
 /// A strict experimental-v1 control-wire validation failure.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]

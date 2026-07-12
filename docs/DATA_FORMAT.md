@@ -62,9 +62,9 @@ experimental compatibility tuple, storage geometry, bounded counts,
 amplification limits, sole portable package-path authority, scientific
 hashing, exact object/package hashing, and domain-framed recipe,
 derivation-record, and release hashing. Strict scalar grammars, restricted JCS,
-the closed canonical-value grammar, and the exact compatibility tuple are
-implemented, but the closed control DTOs are not yet complete. The core does
-not yet read, write, or validate target packages.
+the closed canonical-value and display-defaults grammars, and the exact
+compatibility tuple are implemented, but the remaining control DTOs are not
+yet complete. The core does not yet read, write, or validate target packages.
 
 WP-10B separately installs immutable content-addressed project objects,
 complete generations, atomic head/recovery refs, leases, autosave/recovery,

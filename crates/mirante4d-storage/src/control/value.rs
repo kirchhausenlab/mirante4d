@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AsciiToken, ControlError, F32Bits, F64Bits, I64Decimal, NfcText, TypedId, U64Decimal,
+    AsciiToken, ControlError, F32Bits, F64Bits, I64Decimal, MAX_PORTABLE_CONTROL_OBJECT_BYTES,
+    NfcText, TypedId, U64Decimal,
     jcs::{self, MAX_JCS_DEPTH},
 };
 
-pub const MAX_CANONICAL_VALUE_BYTES: usize = 1_048_576;
 const OBJECT: &str = "canonical value";
 
 /// The closed version-1 canonical-value variant set.
@@ -109,10 +109,10 @@ impl CanonicalValue {
     }
 
     pub fn parse_canonical(bytes: &[u8]) -> Result<Self, ControlError> {
-        if bytes.len() > MAX_CANONICAL_VALUE_BYTES {
+        if bytes.len() > MAX_PORTABLE_CONTROL_OBJECT_BYTES {
             return Err(ControlError::ControlObjectTooLarge {
                 object: OBJECT,
-                maximum: MAX_CANONICAL_VALUE_BYTES,
+                maximum: MAX_PORTABLE_CONTROL_OBJECT_BYTES,
             });
         }
         let wire: WireValue = serde_json::from_slice(bytes).map_err(|error| {
@@ -136,7 +136,7 @@ impl CanonicalValue {
                 object: OBJECT,
                 detail: error.to_string(),
             })?;
-        jcs::encode(&value, OBJECT, MAX_CANONICAL_VALUE_BYTES)
+        jcs::encode(&value, OBJECT, MAX_PORTABLE_CONTROL_OBJECT_BYTES)
     }
 
     pub const fn kind(&self) -> CanonicalValueKind {
@@ -473,7 +473,8 @@ mod tests {
         }
         assert!(CanonicalValue::list(vec![nested]).is_err());
         assert!(
-            CanonicalValue::parse_canonical(&vec![b' '; MAX_CANONICAL_VALUE_BYTES + 1]).is_err()
+            CanonicalValue::parse_canonical(&vec![b' '; MAX_PORTABLE_CONTROL_OBJECT_BYTES + 1])
+                .is_err()
         );
     }
 }
