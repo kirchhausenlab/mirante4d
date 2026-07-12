@@ -12,6 +12,12 @@
     "accepted_profile_freeze_sha256": "68266ce2c1cf782881824befc2df1c76712068fd445cecccfcd62156aa420807",
     "normative_decision_proposal_sha256": "a6edba8779e704664d56c872c62f8051e3b914cec27db460fab247568e7d4f6d"
   },
+  "control_wire_specialization": {
+    "path": "architecture/wp10a-control-wire-specialization.json",
+    "schema": "mirante4d-wp10a-control-wire-specialization",
+    "schema_version": 1,
+    "sha256": "d24596ee7c8d3cc2f8eca4ce391b7c942cfbc2b4613a4c0dbf4242954ad5f528"
+  },
   "activation": {
     "crate_name": "mirante4d-storage",
     "crate_path": "crates/mirante4d-storage",
@@ -67,6 +73,10 @@
       "Rgb24",
       "ScaleCountRule",
       "ScaleCounts",
+      "ScienceDescriptor",
+      "ScienceLayer",
+      "ScienceTemporalCalibration",
+      "ScienceTemporalKind",
       "StorageProfileError",
       "StorageShape",
       "TypedId",

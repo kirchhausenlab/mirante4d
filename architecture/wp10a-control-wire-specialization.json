@@ -1,0 +1,44 @@
+{
+  "schema": "mirante4d-wp10a-control-wire-specialization",
+  "schema_version": 1,
+  "status": "accepted-off-product",
+  "authorization": {
+    "accepted_profile_freeze_sha256": "68266ce2c1cf782881824befc2df1c76712068fd445cecccfcd62156aa420807",
+    "normative_decision_proposal_sha256": "a6edba8779e704664d56c872c62f8051e3b914cec27db460fab247568e7d4f6d"
+  },
+  "integer_wire": {
+    "image_ordinal": "u32 as u64_decimal JSON string",
+    "logical_layer_ordinal": "u32 as u64_decimal JSON string",
+    "physical_channel": "u32 as u64_decimal JSON string",
+    "scale_ordinal": "u32 as u64_decimal JSON string"
+  },
+  "science_temporal_calibration": {
+    "discriminator": "type",
+    "unknown": {
+      "keys": ["type"],
+      "type": "unknown"
+    },
+    "regular": {
+      "keys": ["type", "step_seconds_f64_bits"],
+      "type": "regular"
+    },
+    "explicit": {
+      "keys": ["type", "positions_seconds_f64_bits"],
+      "type": "explicit"
+    }
+  },
+  "indexed_paths": {
+    "stored_values_have_trailing_slash": false,
+    "image_group_path": "images/i########",
+    "pixel_path": "images/i########/s##",
+    "validity_path": "validity/i########-s##",
+    "packed_index_path": "indexes/i########-s##"
+  },
+  "normalization": {
+    "transform_negative_zero": "normalize to positive zero before encoding; a stored negative-zero spelling is noncanonical"
+  },
+  "cross_object_boundary": {
+    "display_object_local_rule": "layers are strictly increasing and unique",
+    "package_rule": "profile, science, and display must have the same nonempty contiguous logical-layer ordinals"
+  }
+}

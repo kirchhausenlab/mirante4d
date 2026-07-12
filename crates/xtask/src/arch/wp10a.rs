@@ -24,6 +24,11 @@ const ACCEPTED_FREEZE_SHA256: &str =
     "68266ce2c1cf782881824befc2df1c76712068fd445cecccfcd62156aa420807";
 const DECISION_PROPOSAL_SHA256: &str =
     "a6edba8779e704664d56c872c62f8051e3b914cec27db460fab247568e7d4f6d";
+const CONTROL_WIRE_PATH: &str = "architecture/wp10a-control-wire-specialization.json";
+const CONTROL_WIRE_SCHEMA: &str = "mirante4d-wp10a-control-wire-specialization";
+const CONTROL_WIRE_SCHEMA_VERSION: u64 = 1;
+const CONTROL_WIRE_SHA256: &str =
+    "d24596ee7c8d3cc2f8eca4ce391b7c942cfbc2b4613a4c0dbf4242954ad5f528";
 const STORAGE_CRATE: &str = "mirante4d-storage";
 const STORAGE_PATH: &str = "crates/mirante4d-storage";
 const DEPENDENCY_KINDS: [&str; 3] = ["normal", "dev", "build"];
@@ -36,6 +41,7 @@ struct StorageContract {
     status: String,
     predecessor: PredecessorBinding,
     authorization: AuthorizationBinding,
+    control_wire_specialization: PredecessorBinding,
     activation: ActivationContract,
     identity_successor: IdentitySuccessorContract,
     dependencies: DependencyContract,
@@ -138,6 +144,7 @@ pub(super) fn check_wp10a_storage_contract(repo_root: &Path) -> anyhow::Result<(
     let contract = read_contract(repo_root)?;
     validate_contract_header(&contract)?;
     validate_predecessor(repo_root, &contract.predecessor)?;
+    validate_control_wire_specialization(repo_root, &contract.control_wire_specialization)?;
     validate_forbidden_paths(repo_root, &contract.source_policy)?;
 
     let metadata = cargo_metadata(repo_root)?;
@@ -165,6 +172,10 @@ fn validate_contract_header(contract: &StorageContract) -> anyhow::Result<()> {
         || contract.predecessor.sha256 != PREDECESSOR_SHA256
         || contract.authorization.accepted_profile_freeze_sha256 != ACCEPTED_FREEZE_SHA256
         || contract.authorization.normative_decision_proposal_sha256 != DECISION_PROPOSAL_SHA256
+        || contract.control_wire_specialization.path != CONTROL_WIRE_PATH
+        || contract.control_wire_specialization.schema != CONTROL_WIRE_SCHEMA
+        || contract.control_wire_specialization.schema_version != CONTROL_WIRE_SCHEMA_VERSION
+        || contract.control_wire_specialization.sha256 != CONTROL_WIRE_SHA256
     {
         bail!("{CONTRACT_PATH} does not bind the accepted WP-10A freeze and WP-08A predecessor");
     }
@@ -367,6 +378,40 @@ fn validate_contract_header(contract: &StorageContract) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_control_wire_specialization(
+    repo_root: &Path,
+    binding: &PredecessorBinding,
+) -> anyhow::Result<()> {
+    let path = repo_root.join(&binding.path);
+    let digest = sha256_file(&path)?;
+    if digest != binding.sha256 {
+        bail!(
+            "immutable WP-10A control-wire specialization drifted: expected {}, found {digest}",
+            binding.sha256
+        );
+    }
+    let specialization: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    let authorization = specialization
+        .get("authorization")
+        .and_then(Value::as_object);
+    if specialization.get("schema").and_then(Value::as_str) != Some(binding.schema.as_str())
+        || specialization.get("schema_version").and_then(Value::as_u64)
+            != Some(binding.schema_version)
+        || specialization.get("status").and_then(Value::as_str) != Some(CONTRACT_STATUS)
+        || authorization
+            .and_then(|value| value.get("accepted_profile_freeze_sha256"))
+            .and_then(Value::as_str)
+            != Some(ACCEPTED_FREEZE_SHA256)
+        || authorization
+            .and_then(|value| value.get("normative_decision_proposal_sha256"))
+            .and_then(Value::as_str)
+            != Some(DECISION_PROPOSAL_SHA256)
+    {
+        bail!("WP-10A control-wire specialization is not the accepted off-product contract");
+    }
+    Ok(())
+}
+
 fn expected_identity_external() -> Vec<ExternalDependency> {
     vec![
         ExternalDependency {
@@ -457,6 +502,10 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "Rgb24",
         "ScaleCountRule",
         "ScaleCounts",
+        "ScienceDescriptor",
+        "ScienceLayer",
+        "ScienceTemporalCalibration",
+        "ScienceTemporalKind",
         "StorageProfileError",
         "StorageShape",
         "TypedId",
@@ -1317,6 +1366,11 @@ mod tests {
 
         validate_contract_header(&contract).unwrap();
         validate_predecessor(Path::new("../.."), &contract.predecessor).unwrap();
+        validate_control_wire_specialization(
+            Path::new("../.."),
+            &contract.control_wire_specialization,
+        )
+        .unwrap();
     }
 
     #[test]

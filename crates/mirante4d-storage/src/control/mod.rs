@@ -1,6 +1,7 @@
 mod display;
 mod jcs;
 mod scalar;
+mod science;
 mod value;
 
 use thiserror::Error;
@@ -9,6 +10,9 @@ pub use display::{DisplayDefaults, DisplayLayerDefaults};
 pub use scalar::{
     AsciiToken, F32Bits, F64Bits, I64Decimal, MAX_ASCII_TOKEN_BYTES, MAX_NFC_TEXT_BYTES, NfcText,
     Rgb24, TypedId, U64Decimal,
+};
+pub use science::{
+    ScienceDescriptor, ScienceLayer, ScienceTemporalCalibration, ScienceTemporalKind,
 };
 pub use value::{CanonicalMapEntry, CanonicalValue, CanonicalValueKind};
 

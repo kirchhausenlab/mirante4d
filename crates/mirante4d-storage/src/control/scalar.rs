@@ -210,6 +210,15 @@ impl F64Bits {
     pub const fn value(self) -> f64 {
         f64::from_bits(self.0)
     }
+
+    /// Canonicalizes either IEEE signed zero to positive zero.
+    pub const fn normalized_zero(self) -> Self {
+        if self.0 == (-0.0_f64).to_bits() {
+            Self(0)
+        } else {
+            self
+        }
+    }
 }
 
 impl fmt::Display for F64Bits {
@@ -394,6 +403,13 @@ mod tests {
         assert_eq!(subnormal.bits(), 1);
         assert!(subnormal.value().is_subnormal());
         assert!(F64Bits::parse("7ff0000000000000").is_err());
+        assert_eq!(
+            F64Bits::parse("8000000000000000")
+                .unwrap()
+                .normalized_zero()
+                .bits(),
+            0
+        );
 
         let color = Rgb24::parse("00ff7a").unwrap();
         assert_eq!(color.channels(), [0, 255, 122]);

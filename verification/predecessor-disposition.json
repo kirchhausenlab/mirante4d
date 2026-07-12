@@ -4477,6 +4477,22 @@
       "reason": "WP-10A proves control metadata accepts only the closed D-009 typed identity set."
     },
     {
+      "id": "libtest:mirante4d-storage:control::science::tests::science_descriptor_rejects_malformed_noncanonical_and_invalid_facts",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects malformed, alternate, noncontiguous, temporally invalid, and non-affine scientific descriptors."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::science::tests::science_descriptor_roundtrips_exact_bytes_and_temporal_variants",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the closed scientific descriptor and all temporal variants have exact canonical encodings."
+    },
+    {
       "id": "libtest:mirante4d-storage:control::tests::frozen_profile_compatibility_has_exact_canonical_bytes",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -4643,6 +4659,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 375
+    "current_additions": 377
   }
 }

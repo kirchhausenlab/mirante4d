@@ -16,7 +16,8 @@ mod profile;
 pub use control::{
     AsciiToken, CanonicalMapEntry, CanonicalValue, CanonicalValueKind, ControlError,
     DisplayDefaults, DisplayLayerDefaults, F32Bits, F64Bits, I64Decimal, MAX_ASCII_TOKEN_BYTES,
-    MAX_NFC_TEXT_BYTES, MAX_PORTABLE_CONTROL_OBJECT_BYTES, NfcText, Rgb24, TypedId, U64Decimal,
+    MAX_NFC_TEXT_BYTES, MAX_PORTABLE_CONTROL_OBJECT_BYTES, NfcText, Rgb24, ScienceDescriptor,
+    ScienceLayer, ScienceTemporalCalibration, ScienceTemporalKind, TypedId, U64Decimal,
     profile_compatibility_bytes,
 };
 pub use error::StorageProfileError;
