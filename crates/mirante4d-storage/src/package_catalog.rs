@@ -4,6 +4,7 @@ use mirante4d_domain::IntensityDType;
 use mirante4d_identity::{ExactBytesHasher, IdentityHashError, PackageId};
 use thiserror::Error;
 
+use crate::brick_address::plan_local_brick_address;
 use crate::directory_inventory::{ExpectedFile, ExpectedFileRole, inspect_directory_closure};
 use crate::{
     ControlError, DisplayDefaults, LocalPackageReader, MAX_PORTABLE_CONTROL_OBJECT_BYTES,
@@ -195,6 +196,19 @@ impl LocalPackageCatalog {
 
     pub const fn metadata_bytes_read(&self) -> u64 {
         self.metadata_bytes_read
+    }
+
+    /// Derives the sole bounded storage address plan for one logical brick.
+    pub fn plan_brick_storage(
+        &self,
+        coordinates: crate::PackedIndexCoordinates,
+    ) -> Result<crate::LocalBrickAddressPlan, crate::BrickAddressError> {
+        plan_local_brick_address(
+            &self.profile,
+            &self.zarr_arrays,
+            &self.descriptors,
+            coordinates,
+        )
     }
 
     /// Inspects the exact finalized file and ancestor-directory closure.
@@ -638,12 +652,20 @@ fn checked_record_count(
     } else {
         [1, 1, 64, 64, 64]
     };
-    pixel_shape
+    let counts = pixel_shape
         .into_iter()
         .zip(brick)
-        .try_fold(1_u64, |count, (dimension, chunk)| {
-            count.checked_mul(ceil_divide(dimension, chunk))
-        })
+        .map(|(dimension, chunk)| ceil_divide(dimension, chunk))
+        .collect::<Vec<_>>();
+    const MAX_COORDINATE_COUNT: u64 = u32::MAX as u64 + 1;
+    if counts.iter().any(|count| *count > MAX_COORDINATE_COUNT) {
+        return Err(PackageOpenError::CrossObjectInconsistency {
+            reason: "logical brick grid exceeds packed-index u32 coordinates",
+        });
+    }
+    counts
+        .into_iter()
+        .try_fold(1_u64, |count, dimension| count.checked_mul(dimension))
         .ok_or(PackageOpenError::CrossObjectInconsistency {
             reason: "logical brick count overflowed u64",
         })
@@ -964,6 +986,14 @@ mod tests {
                         .unwrap(),
                 ),
             ),
+            (
+                "images/i00000000/s00/c/0/0/0/0/0".to_owned(),
+                (PackageObjectKind::PixelShard, Vec::new()),
+            ),
+            (
+                "indexes/i00000000-s00/c/0/0".to_owned(),
+                (PackageObjectKind::PackedIndexShard, Vec::new()),
+            ),
         ]);
         if matches!(drift, FixtureDrift::ExtraMetadata) {
             objects.insert(
@@ -1072,16 +1102,16 @@ mod tests {
         let root = fixture(FixtureDrift::None);
         let catalog = LocalPackageCatalog::open(&root.0).unwrap();
         let inventory = catalog.inspect_directory_closure(|| false).unwrap();
-        assert_eq!(inventory.regular_files(), 12);
-        assert_eq!(inventory.directories(), 10);
-        assert_eq!(inventory.maximum_directory_depth(), 3);
+        assert_eq!(inventory.regular_files(), 14);
+        assert_eq!(inventory.directories(), 17);
+        assert_eq!(inventory.maximum_directory_depth(), 8);
         assert_eq!(inventory.maximum_directory_fan_out(), 5);
         assert_eq!(inventory.zarr_metadata_objects(), 7);
         assert_eq!(inventory.manifest_pages(), 1);
         assert_eq!(inventory.fixed_control_objects(), 4);
-        assert_eq!(inventory.pixel_shards(), 0);
+        assert_eq!(inventory.pixel_shards(), 1);
         assert_eq!(inventory.validity_shards(), 0);
-        assert_eq!(inventory.packed_index_shards(), 0);
+        assert_eq!(inventory.packed_index_shards(), 1);
         assert_eq!(inventory.portable_records(), 0);
 
         assert_eq!(
@@ -1122,5 +1152,54 @@ mod tests {
             catalog.inspect_directory_closure(|| false),
             Err(crate::DirectoryInventoryError::ManifestAuthorityChanged)
         );
+    }
+
+    #[test]
+    fn derives_descriptor_bound_brick_address_plan() {
+        let root = fixture(FixtureDrift::None);
+        let mut catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        let coordinates = crate::PackedIndexCoordinates::new(0, 0, 0, 0, 0, 0, 0);
+        let plan = catalog.plan_brick_storage(coordinates).unwrap();
+        assert_eq!(plan.coordinates(), coordinates);
+        assert_eq!(plan.record_ordinal(), 0);
+        assert_eq!(plan.logical_extent_zyx(), [1, 2, 3]);
+        assert_eq!(plan.pixel_kind(), ShardProfileKind::Pixel2dUint8);
+        assert_eq!(
+            plan.pixel_shard_path().as_str(),
+            "images/i00000000/s00/c/0/0/0/0/0"
+        );
+        assert_eq!(plan.pixel_inner_chunk(), 0);
+        assert!(plan.pixel_shard_listed());
+        assert_eq!(plan.validity_shard_path(), None);
+        assert_eq!(plan.validity_inner_chunk(), None);
+        assert_eq!(plan.validity_shard_listed(), None);
+        assert_eq!(
+            plan.packed_index_shard_path().as_str(),
+            "indexes/i00000000-s00/c/0/0"
+        );
+        assert_eq!(plan.packed_index_inner_chunk(), 0);
+        assert_eq!(plan.packed_index_record_byte_offset(), 0);
+
+        assert!(matches!(
+            catalog.plan_brick_storage(crate::PackedIndexCoordinates::new(0, 0, 0, 0, 0, 0, 1)),
+            Err(crate::BrickAddressError::CoordinateOutOfBounds { axis: "x", .. })
+        ));
+
+        catalog
+            .descriptors
+            .retain(|descriptor| descriptor.kind() != PackageObjectKind::PixelShard);
+        assert!(
+            !catalog
+                .plan_brick_storage(coordinates)
+                .unwrap()
+                .pixel_shard_listed()
+        );
+        catalog
+            .descriptors
+            .retain(|descriptor| descriptor.kind() != PackageObjectKind::PackedIndexShard);
+        assert!(matches!(
+            catalog.plan_brick_storage(coordinates),
+            Err(crate::BrickAddressError::MissingPackedIndexShard { .. })
+        ));
     }
 }

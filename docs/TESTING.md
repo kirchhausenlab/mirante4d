@@ -136,6 +136,12 @@ lifecycle, or product-support claim. Current schema-1 packages remain non-
 authoritative T2 support fixtures until WP-10A accepts the independent target
 evidence.
 
+Address-planning tests prove 2D/3D grid, C-order ordinal, inner-slot, and edge-
+extent arithmetic plus the exact baseline catalog-derived paths and packed-
+record offset. They also prove coordinate/overflow rejection, mandatory packed-
+index descriptors, and optional fill-elided pixel descriptors. They read no
+shard bytes and make no payload-integrity claim.
+
 The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).
 

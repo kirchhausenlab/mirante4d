@@ -4421,6 +4421,22 @@
       "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
     },
     {
+      "id": "libtest:mirante4d-storage:brick_address::tests::address_math_rejects_bounds_field_overflow_and_arithmetic_overflow",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects brick-address coordinate-field and checked-arithmetic overflow before path construction."
+    },
+    {
+      "id": "libtest:mirante4d-storage:brick_address::tests::derives_exact_2d_and_3d_storage_coordinates",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves exact 2D/3D brick grids, C-order record ordinals, x-fastest inner slots, and nondivisible edge extents."
+    },
+    {
       "id": "libtest:mirante4d-storage:control::display::tests::display_defaults_reject_malformed_noncanonical_and_invalid_layers",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -4773,6 +4789,14 @@
       "reason": "WP-10A rejects unknown OME members, alternate paths/transforms, negative zero, mixed spatial modes, and oversized metadata."
     },
     {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::derives_descriptor_bound_brick_address_plan",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A derives exact descriptor-bound shard paths and packed-record offsets, requires the packed-index shard, permits deferred pixel fill elision, and rejects out-of-grid requests."
+    },
+    {
       "id": "libtest:mirante4d-storage:package_catalog::tests::inspects_exact_bounded_directory_closure",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -4939,6 +4963,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 412
+    "current_additions": 415
   }
 }

@@ -26,8 +26,8 @@ tail codecs, strict Zarr/OME metadata, and bounded local range reader are
 present. An authenticated local metadata catalog now opens the manifest and
 opening-critical metadata closure; a separate bounded operation checks the
 exact finalized file and directory inventory. Continue WP-10A-B with
-descriptor-derived shard addressing and bounded brick reads, then DS-specific
-admission, the writer, and structural/full validation.
+CRC-checked bounded brick reads from the descriptor-derived address plan, then
+DS-specific admission, the writer, and structural/full validation.
 WP-10A-C then promotes the independent target-format authorities; WP-10A-D
 consumes them and closes the package evidence. Current schema 1 remains the
 sole product route until WP-10C.

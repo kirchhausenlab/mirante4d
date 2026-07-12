@@ -82,8 +82,10 @@ packed-index-count relationships. A separate cancellable inventory enforces
 the exact finalized file and ancestor-directory closure, safe object types,
 declared lengths, and globally bounded counts/fan-out without reading payload
 bytes. It reports directory depth and reauthenticates manifest authority around
-the scan. DS-specific admission and shard-payload verification remain
-incomplete.
+the scan. One-brick address planning validates requested coordinates and
+derives exact pixel, validity, and packed-index shard paths, inner slots,
+packed-record offsets, and edge extents without reading shard bytes. DS-
+specific admission and shard-payload verification remain incomplete.
 
 WP-10B separately installs immutable content-addressed project objects,
 complete generations, atomic head/recovery refs, leases, autosave/recovery,

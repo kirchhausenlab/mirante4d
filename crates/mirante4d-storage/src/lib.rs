@@ -5,11 +5,12 @@
 //! preflight arithmetic, portable package paths, packed-index records, the
 //! in-memory shard codec, strict Zarr/OME storage metadata, an authenticated
 //! local metadata catalog, a bounded exact directory inventory, and root-
-//! confined read-only range I/O. It has no writer and makes no product target-
-//! package claim.
+//! confined read-only range I/O with descriptor-derived brick address plans.
+//! It has no writer and makes no product target-package claim.
 
 #![forbid(unsafe_code)]
 
+mod brick_address;
 mod control;
 mod directory_inventory;
 mod error;
@@ -23,6 +24,7 @@ mod range_io;
 mod shard;
 mod zarr_metadata;
 
+pub use brick_address::{BrickAddressError, LocalBrickAddressPlan};
 pub use control::{
     AsciiToken, CanonicalMapEntry, CanonicalValue, CanonicalValueKind, CitationPayload,
     ControlError, DatasetSeriesUuid, DerivationBinding, DerivationBody, DerivationExactness,
