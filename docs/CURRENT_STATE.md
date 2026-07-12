@@ -85,10 +85,13 @@ every descriptor object with fixed memory, requires structural/hash snapshot
 coherence, repeats inventory, and finishes with a cancellable identity sweep.
 Only its owning exact-package capability exposes PackageId-attributed brick
 reads, checking manifest authority and every consumed shard against the proved
-snapshot. A deterministic off-product writer now derives encoded objects and
-manifest bytes from typed metadata and a lazy sequence of bounded decoded outer
-shards, hashes while writing, structurally validates a private sibling stage,
-and publishes a previously absent destination with Linux
+snapshot. Consuming that capability through the bounded, cancellable
+scientific scan recomputes base-scale layer roots and ScientificContentId and
+issues a stronger verified-scientific-package capability only after both
+package declarations match. A deterministic off-product writer now derives
+encoded objects and manifest bytes from typed metadata and a lazy sequence of
+bounded decoded outer shards, hashes while writing, structurally validates a
+private sibling stage, and publishes a previously absent destination with Linux
 `RENAME_NOREPLACE`. Cancellation and precommit failure remove only the owned
 stage during normal operation under the documented local threat model; a
 post-rename parent-sync failure is reported as durability-indeterminate without
@@ -101,12 +104,20 @@ evidence. The promoted `target-m4d-v1` authority tracks three bounded synthetic
 USTAR archives, independent expected facts and critical vectors, a full-array
 independent reader with pinned OME-schema results, 15 executed mutations, and
 byte-identical two-run reproduction. It is the registry's sole `T1-target`
-record and `target_format_t1_available` is true. This authority covers only the
-frozen EXPERIMENTAL profile; it does not establish IO-3, production package
-conformance, stable-format, product-support, performance, or generic OME-Zarr
-claims. Production consumption and package conformance remain WP-10A-D.
-Replacement, import/multiscale generation, production scientific-ID
-computation, and product activation remain incomplete.
+record and `target_format_t1_available` is true. The WP-10A-D candidate now
+consumes all three packages through the production exact and scientific path,
+matches every full-array and per-layer value/validity digest plus the exact
+counts and one-brick amplification facts, and rejects all 15 mutations.
+Production-writer outputs also pass the pinned schema and independent reader
+with the same scientific and image facts while exact PackageIds may differ.
+Isolated 2,750/5,500/11,000-descriptor opens satisfy the linear metadata-work
+contract, and the largest stays inside its 10-second and 64-MiB post-open RSS
+ceilings. `cargo xtask verify-local format-lifecycle` is the real local gate.
+WP-10A-D still requires clean-revision exit acceptance. The profile
+remains EXPERIMENTAL and off-product; no stable-format, product-support,
+performance, or generic OME-Zarr claim follows.
+Replacement, import/multiscale generation, and product activation remain
+incomplete.
 Current schema-1 packages remain transitional T2 fixtures and the sole product
 route.
 

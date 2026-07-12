@@ -982,6 +982,24 @@ pub(super) fn trusted_gpu_policy(registry: &Registry) -> anyhow::Result<(String,
     Ok((adapter_selector(adapter), lane.timeout_secs))
 }
 
+pub(super) fn format_lifecycle_timeout(registry: &Registry) -> anyhow::Result<u64> {
+    let lane = registry
+        .non_pr_lanes
+        .iter()
+        .find(|lane| lane.id == "format-lifecycle")
+        .context("verification registry is missing format-lifecycle lane")?;
+    if lane.command != "cargo xtask verify-local format-lifecycle"
+        || lane.fixture_tier != "T1-target"
+        || lane.capability != "standard-public-cpu"
+        || lane.timeout_secs != 900
+        || lane.evidence_level != "E0"
+        || lane.activation_state != "active-WP-10A"
+    {
+        bail!("format-lifecycle verification policy drifted");
+    }
+    Ok(lane.timeout_secs)
+}
+
 fn required_test_lanes(registry: &Registry) -> anyhow::Result<Vec<&Lane>> {
     ["unit", "contract", "ui"]
         .into_iter()
@@ -1296,6 +1314,12 @@ mod tests {
             ids,
             BTreeSet::from(["policy", "lint", "unit", "contract", "ui", "doctest"])
         );
+    }
+
+    #[test]
+    fn format_lifecycle_is_an_active_target_authority_consumer() {
+        let registry = read_registry().unwrap();
+        assert_eq!(format_lifecycle_timeout(&registry).unwrap(), 900);
     }
 
     #[test]

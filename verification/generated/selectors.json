@@ -9,6 +9,7 @@
     "unit": "package(mirante4d-analysis) | package(mirante4d-application) | package(mirante4d-data) | package(mirante4d-dataset) | package(mirante4d-dataset-runtime) | package(mirante4d-domain) | package(mirante4d-identity) | package(mirante4d-project-model) | package(mirante4d-render-api) | package(mirante4d-renderer) | package(mirante4d-settings) | package(xtask)"
   },
   "selector_adapters": {
-    "WP06-ADAPTER-TRUSTED-SPECIAL-SELECTOR": "package(mirante4d-renderer) & test(/^gpu::/)"
+    "WP06-ADAPTER-TRUSTED-SPECIAL-SELECTOR": "package(mirante4d-renderer) & test(/^gpu::/)",
+    "WP10A-ADAPTER-FORMAT-LIFECYCLE-SCALABILITY": "package(mirante4d-storage) & test(/^package_catalog::tests::representative_large_manifest_open_stays_inside_the_metadata_working_set/)"
   }
 }

@@ -30,6 +30,18 @@
     "schema_version": 1,
     "sha256": "0b2bad3c976b431d83cda1e24fae1ff50524a9865d7c5b260ccfc0a7d84e2321"
   },
+  "production_conformance": {
+    "test_targets": [
+      "crates/mirante4d-storage/tests/target_conformance.rs",
+      "crates/mirante4d-storage/tests/target_mutation_conformance.rs",
+      "crates/mirante4d-storage/tests/target_writer_conformance.rs"
+    ],
+    "command": "cargo xtask verify-local format-lifecycle",
+    "fixture_tier": "T1-target",
+    "target_manifest_sha256": "0b2bad3c976b431d83cda1e24fae1ff50524a9865d7c5b260ccfc0a7d84e2321",
+    "lifecycle": "EXPERIMENTAL",
+    "product_reachability": false
+  },
   "activation": {
     "crate_name": "mirante4d-storage",
     "crate_path": "crates/mirante4d-storage",
@@ -158,6 +170,8 @@
       "ScienceLayer",
       "ScienceTemporalCalibration",
       "ScienceTemporalKind",
+      "ScientificPackageValidationError",
+      "ScientificValidationReport",
       "SHARD_INDEX_RANGE_READ_BYTES_MAX",
       "ShardCodecError",
       "ShardIndex",
@@ -171,6 +185,7 @@
       "StorageShape",
       "TypedId",
       "U64Decimal",
+      "VerifiedScientificPackageCapability",
       "ZarrArrayMetadata",
       "ZarrGroupMetadata",
       "ZarrMetadataError",

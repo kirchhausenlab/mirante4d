@@ -22,6 +22,7 @@ mod package_admission;
 mod package_catalog;
 mod package_integrity;
 mod package_read;
+mod package_science;
 mod package_structure;
 mod package_write;
 mod packed_index;
@@ -64,6 +65,10 @@ pub use package_admission::{DatasetProfileAdmission, PackageAdmissionError};
 pub use package_catalog::{LocalPackageCatalog, PackageOpenError};
 pub use package_integrity::{ExactPackageCapability, PackageValidationError};
 pub use package_read::{LocalBrickRead, PackageReadError};
+pub use package_science::{
+    ScientificPackageValidationError, ScientificValidationReport,
+    VerifiedScientificPackageCapability,
+};
 pub use package_structure::PackageStructureError;
 pub use package_write::{
     LocalPackageWriter, PackageArrayInput, PackageShardInput, PackageWriteError, PackageWriteInput,

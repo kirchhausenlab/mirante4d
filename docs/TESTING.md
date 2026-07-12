@@ -187,6 +187,19 @@ does not parse lazy portable-record semantics, recompute ScientificContentId,
 qualify IO-3 or independent T1, make a product/performance claim, or implement
 an importer.
 
+The consuming scientific validator adds one bounded, cancellable base-scale
+scan after exact validation. Its stronger capability exposes the independently
+matched ScientificContentId and layer roots plus exact tile, brick, voxel,
+canonical-byte, and validity-byte work counters. The target integration reads
+every brick in all three promoted packages and matches every full-array and
+per-layer raw/canonical/validity digest, selected value, brick statistic,
+addressed/actual shard count, object/depth/fan-out count, and observed
+one-brick amplification maximum. The production mutation suite rejects all 15
+promoted cases at typed boundaries. A separate subprocess test opens
+2,750/5,500/11,000-descriptor catalogs and enforces fixed linear metadata-work
+bounds. The largest case also enforces 10-second and 64-MiB post-open RSS stop
+ceilings; these are contract limits, not product benchmark claims.
+
 Writer tests prove byte-identical package trees and PackageId values across
 different parents and reversed input order, then reopen output through full
 exact validation and PackageId-attributed brick reads. They cover pixel-
@@ -197,6 +210,10 @@ post-rename durability-indeterminate handling. A selected-profile limit-plus-
 one case proves that the writer stops consuming a lazy shard input and
 publishes nothing. This is a T2 writer/reader component proof, not independent
 T1 conformance, import, replacement, product support, or a performance claim.
+Separately, the production writer reconstructs all three T1 cases and the
+hash-locked zarr-python reader compares their complete semantic image and
+scientific facts with the promoted authority. Encoded shard bytes and exact
+PackageId may differ without weakening the semantic comparison.
 
 The WP-10A-C standards check verifies an exact 12-file, 162,831-byte offline
 mirror against immutable OME and Zarr revisions, lengths, and SHA-256 values.
@@ -216,10 +233,20 @@ python3 tools/target-fixtures/t1/validate.py \
 `target-m4d-v1` proves bounded archive safety and exact closure, independent
 lineage bindings and expected facts, full-array readback, pinned OME-schema
 results, critical identity vectors, exact rejection of 15 mutations, and
-byte-identical two-run reproduction for the frozen EXPERIMENTAL profile. It
-does not establish IO-3, production package conformance, stable-format,
-product-support, performance, or generic OME-Zarr claims. WP-10A-D remains the
-production package-conformance step.
+byte-identical two-run reproduction for the frozen EXPERIMENTAL profile.
+
+Run the complete WP-10A-D candidate evidence with:
+
+```bash
+cargo xtask verify-local format-lifecycle
+```
+
+That real local lane validates the promoted authority, runs the three positive
+and 15 negative production cases, and performs writer-to-pinned-reader
+readback. The candidate remains off-product and EXPERIMENTAL; it makes no
+stable-format, generic OME-Zarr, importer, product-support, product-open, or
+product-activation claim. Clean-revision WP-10A exit acceptance is still
+required.
 
 The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).

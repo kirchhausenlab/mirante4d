@@ -942,10 +942,11 @@ mod tests {
     use std::{
         cell::Cell,
         collections::BTreeMap,
-        fs,
+        env, fs,
         path::PathBuf,
+        process::Command,
         sync::atomic::{AtomicU64, Ordering},
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Instant, SystemTime, UNIX_EPOCH},
     };
 
     use mirante4d_domain::{IntensityDType, LogicalLayerKey, Shape4D};
@@ -1383,6 +1384,51 @@ mod tests {
         root
     }
 
+    fn expand_manifest_for_open_test(root: &TempRoot, descriptor_count: usize) {
+        let manifest =
+            ManifestRoot::parse_canonical(&fs::read(root.0.join(MANIFEST_ROOT_PATH)).unwrap())
+                .unwrap();
+        let mut descriptors = manifest
+            .pages()
+            .iter()
+            .flat_map(|reference| {
+                let bytes = fs::read(root.0.join(reference.path().as_str())).unwrap();
+                ManifestPage::parse_canonical(&bytes)
+                    .unwrap()
+                    .entries()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert!(descriptor_count > descriptors.len());
+        let dummy = ExactBytesHasher::hash(&[0]).unwrap();
+        for ordinal in 1..=(descriptor_count - descriptors.len()) {
+            descriptors.push(
+                PackageObjectDescriptor::new(
+                    PackagePath::parse(&format!(
+                        "images/i00000000/s00/c/0/0/0/{}/{}",
+                        ordinal / 1_000,
+                        ordinal % 1_000
+                    ))
+                    .unwrap(),
+                    PackageObjectKind::PixelShard,
+                    dummy.byte_length(),
+                    dummy.digest(),
+                )
+                .unwrap(),
+            );
+        }
+        let pages = crate::pack_manifest_pages(descriptors).unwrap();
+        let manifest = ManifestRoot::new(&pages).unwrap();
+        fs::remove_dir_all(root.0.join("m4d/manifest/pages")).unwrap();
+        for (ordinal, page) in pages.iter().enumerate() {
+            root.write(
+                &format!("m4d/manifest/pages/p{ordinal:08}.json"),
+                &page.canonical_bytes().unwrap(),
+            );
+        }
+        root.write(MANIFEST_ROOT_PATH, &manifest.canonical_bytes().unwrap());
+    }
+
     #[test]
     fn opens_authenticated_metadata_catalog_without_reading_shards() {
         let root = fixture(FixtureDrift::None);
@@ -1398,6 +1444,98 @@ mod tests {
         assert_eq!(catalog.science().layers().len(), 1);
         assert_eq!(catalog.zarr_arrays.len(), 2);
         assert!(catalog.metadata_bytes_read() > 0);
+    }
+
+    #[test]
+    #[ignore = "format-lifecycle subprocess scalability contract"]
+    fn representative_large_manifest_open_stays_inside_the_metadata_working_set() {
+        const COUNTS: [usize; 3] = [2_750, 5_500, 11_000];
+        const OPEN_METADATA_RSS_MAX: u64 = 64 * 1_024 * 1_024;
+        const OPEN_TIME_MAX_MILLIS: u128 = 10_000;
+        const LINEAR_BYTES_PER_DESCRIPTOR_MAX: u64 = 2_048;
+        const FIXED_METADATA_BYTES_MAX: u64 = 512 * 1_024;
+        const WORKER_ENV: &str = "MIRANTE4D_CATALOG_SCALABILITY_DESCRIPTORS";
+        const RESULT_PREFIX: &str = "MIRANTE4D_CATALOG_SCALABILITY ";
+
+        if let Some(value) = env::var_os(WORKER_ENV) {
+            let descriptors = value
+                .to_str()
+                .expect("descriptor count is UTF-8")
+                .parse::<usize>()
+                .expect("descriptor count is unsigned");
+            let root = fixture(FixtureDrift::None);
+            expand_manifest_for_open_test(&root, descriptors);
+            let started = Instant::now();
+            let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+            let elapsed_millis = started.elapsed().as_millis();
+            let resident_bytes = current_resident_bytes();
+            assert_eq!(catalog.descriptors().len(), descriptors);
+            println!(
+                "{RESULT_PREFIX}{descriptors} {} {elapsed_millis} {resident_bytes}",
+                catalog.metadata_bytes_read()
+            );
+            return;
+        }
+
+        let executable = env::current_exe().expect("resolve current test executable");
+        let mut previous_work = None;
+        for descriptors in COUNTS {
+            let output = Command::new(&executable)
+                .args([
+                    "--exact",
+                    "package_catalog::tests::representative_large_manifest_open_stays_inside_the_metadata_working_set",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(WORKER_ENV, descriptors.to_string())
+                .output()
+                .expect("run isolated catalog scalability worker");
+            assert!(
+                output.status.success(),
+                "catalog scalability worker failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).expect("worker output is UTF-8");
+            let result = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(RESULT_PREFIX))
+                .expect("worker emitted scalability result");
+            let fields = result
+                .split_ascii_whitespace()
+                .map(|field| field.parse::<u128>().expect("numeric worker result"))
+                .collect::<Vec<_>>();
+            assert_eq!(fields.len(), 4);
+            assert_eq!(fields[0], descriptors as u128);
+            let work = u64::try_from(fields[1]).expect("metadata work fits u64");
+            assert!(
+                work <= FIXED_METADATA_BYTES_MAX
+                    + u64::try_from(descriptors).unwrap() * LINEAR_BYTES_PER_DESCRIPTOR_MAX,
+                "metadata byte work exceeded the fixed linear bound"
+            );
+            if let Some(previous) = previous_work {
+                assert!(
+                    work <= previous * 2 + FIXED_METADATA_BYTES_MAX,
+                    "doubling descriptors exceeded the linear metadata-work bound"
+                );
+            }
+            previous_work = Some(work);
+            if descriptors == *COUNTS.last().unwrap() {
+                assert!(fields[2] <= OPEN_TIME_MAX_MILLIS);
+                assert!(fields[3] <= u128::from(OPEN_METADATA_RSS_MAX));
+            }
+        }
+    }
+
+    fn current_resident_bytes() -> u64 {
+        let status = fs::read_to_string("/proc/self/status").expect("read Linux process status");
+        let kibibytes = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))
+            .and_then(|value| value.split_ascii_whitespace().next())
+            .expect("process status contains VmRSS")
+            .parse::<u64>()
+            .expect("VmRSS is unsigned");
+        kibibytes.checked_mul(1_024).expect("VmRSS bytes fit u64")
     }
 
     #[test]
@@ -1936,6 +2074,29 @@ mod tests {
             Err(crate::PackageValidationError::Range(
                 crate::RangeReadError::ObjectChanged { .. }
             ))
+        ));
+    }
+
+    #[test]
+    fn scientific_capability_rejects_cancellation_and_a_declared_identity_mismatch() {
+        let root = fixture(FixtureDrift::None);
+        let exact = LocalPackageCatalog::open(&root.0)
+            .unwrap()
+            .validate_exact_package(crate::ProfileKind::Ds0, || false)
+            .unwrap();
+        assert!(matches!(
+            exact.validate_scientific_content(|| true),
+            Err(crate::ScientificPackageValidationError::Cancelled)
+        ));
+
+        let root = fixture(FixtureDrift::None);
+        let exact = LocalPackageCatalog::open(&root.0)
+            .unwrap()
+            .validate_exact_package(crate::ProfileKind::Ds0, || false)
+            .unwrap();
+        assert!(matches!(
+            exact.validate_scientific_content(|| false),
+            Err(crate::ScientificPackageValidationError::ScientificContentMismatch { .. })
         ));
     }
 
