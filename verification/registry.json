@@ -175,13 +175,13 @@
       "owner": "format-and-converter",
       "capability": "standard-public-cpu",
       "requirements": ["D-023-format-lifecycle"],
-      "fixture_tier": "T1-source-or-T2",
+      "fixture_tier": "T1-target",
       "timeout_secs": 900,
-      "evidence_level": "E2",
+      "evidence_level": "E0",
       "trigger": "target-format change or release candidate",
-      "command": "pending: WP-10 format-lifecycle command",
+      "command": "cargo xtask verify-local format-lifecycle",
       "hosted_required": false,
-      "activation_state": "planned-WP-10"
+      "activation_state": "active-WP-10A"
     },
     {
       "id": "trusted-gpu",
@@ -331,6 +331,23 @@
       "expected_ignored_cases": 34,
       "expiry": "WP-09B",
       "deletion_gate": "WP-09B-product-render-hard-cutover"
+    },
+    {
+      "id": "WP10A-ADAPTER-FORMAT-LIFECYCLE-SCALABILITY",
+      "lane": "format-lifecycle",
+      "owner": "mirante4d-storage",
+      "requirements": ["D-023-format-lifecycle", "WP-10A-off-product-storage-profile"],
+      "fixture_tier": "T1-target",
+      "capability": "standard-public-cpu",
+      "matches": [
+        {
+          "package": "mirante4d-storage",
+          "test_prefix": "package_catalog::tests::representative_large_manifest_open_stays_inside_the_metadata_working_set"
+        }
+      ],
+      "expected_ignored_cases": 1,
+      "expiry": "WP-14",
+      "deletion_gate": "WP-14-verification-hardening"
     }
   ]
 }

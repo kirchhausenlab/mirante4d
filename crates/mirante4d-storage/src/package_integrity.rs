@@ -112,6 +112,55 @@ impl ExactPackageCapability {
             .map_err(map_snapshot_read_error)?;
         Ok(read)
     }
+
+    pub(crate) fn begin_scientific_scan(
+        &self,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<(), PackageValidationError> {
+        self.proof
+            .revalidate_authority(self.catalog.reader(), is_cancelled)?;
+        Ok(())
+    }
+
+    /// Reads one brick during a package-wide scientific scan.
+    ///
+    /// The scan authenticates the manifest authority once around the whole
+    /// operation. Each consumed shard is still compared with the exact-object
+    /// snapshot captured by full package validation, avoiding an
+    /// `O(bricks * manifest_pages)` authority check.
+    pub(crate) fn read_brick_for_scientific_scan(
+        &self,
+        coordinates: PackedIndexCoordinates,
+    ) -> Result<LocalBrickRead, PackageReadError> {
+        let plan = self.catalog.plan_brick_storage(coordinates)?;
+        let read = read_local_brick(self.catalog.reader(), self.catalog.descriptors(), plan)?;
+        for snapshot in read.object_snapshots() {
+            let Some(expected) = self.proof.object_snapshots.get(snapshot.path()) else {
+                return Err(RangeReadError::ObjectChanged {
+                    path: snapshot.path().to_string(),
+                }
+                .into());
+            };
+            if snapshot != expected {
+                return Err(RangeReadError::ObjectChanged {
+                    path: snapshot.path().to_string(),
+                }
+                .into());
+            }
+            self.catalog.reader().revalidate_snapshot(snapshot)?;
+        }
+        Ok(read)
+    }
+
+    pub(crate) fn finish_scientific_scan(
+        &self,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<(), PackageValidationError> {
+        self.proof
+            .revalidate_authority(self.catalog.reader(), is_cancelled)?;
+        self.proof
+            .revalidate_all(self.catalog.reader(), is_cancelled)
+    }
 }
 
 /// A typed failure before an exact package capability can be issued.

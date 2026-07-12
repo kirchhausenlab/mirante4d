@@ -1,5 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::zarr_metadata::encode_sorted_wire;
 use crate::{
     F64Bits, MAX_ZARR_METADATA_BYTES, ProfileImage, ScienceTemporalCalibration, ZarrMetadataError,
 };
@@ -152,14 +153,7 @@ impl OmeImageGroupMetadata {
 
     pub fn deterministic_bytes(&self) -> Result<Vec<u8>, ZarrMetadataError> {
         validate_parts(self.regular_time_step_seconds, &self.level_transforms)?;
-        let bytes = serde_json::to_vec(&WireImageGroup::from(self)).map_err(|error| {
-            ZarrMetadataError::Encode {
-                object: OBJECT,
-                message: error.to_string(),
-            }
-        })?;
-        require_size(&bytes)?;
-        Ok(bytes)
+        encode_sorted_wire(&WireImageGroup::from(self), OBJECT)
     }
 
     pub const fn regular_time_step_seconds(&self) -> Option<F64Bits> {
@@ -518,7 +512,7 @@ mod tests {
         )
         .unwrap();
         let bytes = metadata.deterministic_bytes().unwrap();
-        let expected = br#"{"zarr_format":3,"node_type":"group","attributes":{"ome":{"version":"0.5","multiscales":[{"axes":[{"name":"t","type":"time","unit":"second"},{"name":"c","type":"channel"},{"name":"z","type":"space","unit":"micrometer"},{"name":"y","type":"space","unit":"micrometer"},{"name":"x","type":"space","unit":"micrometer"}],"datasets":[{"path":"s00","coordinateTransformations":[{"type":"scale","scale":[0.5,1.0,0.25,0.1,0.1]}]},{"path":"s01","coordinateTransformations":[{"type":"scale","scale":[0.5,1.0,0.5,0.2,0.2]},{"type":"translation","translation":[0.0,0.0,0.125,0.0,0.0]}]}]}]}}}"#;
+        let expected = br#"{"attributes":{"ome":{"multiscales":[{"axes":[{"name":"t","type":"time","unit":"second"},{"name":"c","type":"channel"},{"name":"z","type":"space","unit":"micrometer"},{"name":"y","type":"space","unit":"micrometer"},{"name":"x","type":"space","unit":"micrometer"}],"datasets":[{"coordinateTransformations":[{"scale":[0.5,1.0,0.25,0.1,0.1],"type":"scale"}],"path":"s00"},{"coordinateTransformations":[{"scale":[0.5,1.0,0.5,0.2,0.2],"type":"scale"},{"translation":[0.0,0.0,0.125,0.0,0.0],"type":"translation"}],"path":"s01"}]}],"version":"0.5"}},"node_type":"group","zarr_format":3}"#;
         assert_eq!(bytes, expected);
         assert_eq!(OmeImageGroupMetadata::parse(&bytes).unwrap(), metadata);
     }

@@ -52,8 +52,10 @@
     "crates/mirante4d-storage/src/**",
     "crates/mirante4d-storage/tests/**",
     "crates/xtask/src/arch/wp10a.rs",
+    "crates/xtask/src/main.rs",
     "crates/xtask/src/verification/**",
     "verification/registry.json",
+    "verification/generated/selectors.json",
     "verification/predecessor-disposition.json",
     "tools/target-fixtures/production-conformance/**",
     "docs/CURRENT_STATE.md",
@@ -95,6 +97,14 @@
     "D2: bounded scientific verification plus all positive and negative production-reader evidence",
     "D3: production-writer external readback, deterministic scalability evidence, format-lifecycle lane activation, and WP-10A closure"
   ],
+  "scalability_bounds": {
+    "manifest_descriptor_counts": [2750, 5500, 11000],
+    "catalog_open_time_max_seconds": 10,
+    "catalog_post_open_rss_bytes_max": 67108864,
+    "metadata_work": "authenticated bytes read stay below a fixed 512 KiB term plus 2,048 bytes per descriptor and each descriptor-count doubling stays below twice the prior work plus the fixed term",
+    "scientific_scan_work": "identity-tile count and brick-read count are reported and bounded by fixed tile/brick overlap; manifest authority is authenticated once around the scan, never once per brick",
+    "performance_claim": "the N/2N/4N metadata work is deterministic; only the largest isolated Linux subprocess is checked against post-open RSS and open-time stop ceilings, not treated as a benchmark or product first-frame claim"
+  },
   "non_goals": [
     "Product activation, viewer opening, schema-1 deletion, or product-open validation",
     "TIFF import, multiscale generation, replacement, migration, or conversion",
@@ -114,7 +124,7 @@
     "commands": [
       "python3 tools/target-fixtures/t1/validate.py --manifest fixtures/target/manifest.json --self-test",
       "cargo test -p mirante4d-storage --test target_conformance --frozen -- --nocapture",
-      "cargo xtask verify-leaf format-lifecycle",
+      "cargo xtask verify-local format-lifecycle",
       "cargo xtask verification-sync --check",
       "cargo xtask docs-check",
       "cargo xtask verify-pr policy",

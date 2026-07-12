@@ -81,7 +81,7 @@ impl ZarrArrayMetadata {
     }
 
     pub fn deterministic_bytes(&self) -> Result<Vec<u8>, ZarrMetadataError> {
-        encode_wire(&WireArray::from(self), "Zarr array metadata")
+        encode_sorted_wire(&WireArray::from(self), "Zarr array metadata")
     }
 }
 
@@ -520,6 +520,40 @@ fn encode_wire<T: Serialize>(wire: &T, object: &'static str) -> Result<Vec<u8>, 
     })?;
     require_size(&bytes, object)?;
     Ok(bytes)
+}
+
+pub(crate) fn encode_sorted_wire<T: Serialize>(
+    wire: &T,
+    object: &'static str,
+) -> Result<Vec<u8>, ZarrMetadataError> {
+    let value = serde_json::to_value(wire).map_err(|error| ZarrMetadataError::Encode {
+        object,
+        message: error.to_string(),
+    })?;
+    let bytes = serde_json::to_vec(&sort_object_keys(value)).map_err(|error| {
+        ZarrMetadataError::Encode {
+            object,
+            message: error.to_string(),
+        }
+    })?;
+    require_size(&bytes, object)?;
+    Ok(bytes)
+}
+
+fn sort_object_keys(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.into_iter().map(sort_object_keys).collect()),
+        Value::Object(entries) => {
+            let mut entries = entries.into_iter().collect::<Vec<_>>();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            let mut sorted = Map::new();
+            for (key, value) in entries {
+                sorted.insert(key, sort_object_keys(value));
+            }
+            Value::Object(sorted)
+        }
+        scalar => scalar,
+    }
 }
 
 fn invalid<T>(object: &'static str, reason: &'static str) -> Result<T, ZarrMetadataError> {

@@ -55,6 +55,7 @@ struct StorageContract {
     control_wire_specialization: PredecessorBinding,
     normative_standards: PredecessorBinding,
     target_corpus: PredecessorBinding,
+    production_conformance: ProductionConformanceContract,
     activation: ActivationContract,
     identity_successor: IdentitySuccessorContract,
     dependencies: DependencyContract,
@@ -75,6 +76,17 @@ struct PredecessorBinding {
 struct AuthorizationBinding {
     accepted_profile_freeze_sha256: String,
     normative_decision_proposal_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProductionConformanceContract {
+    test_targets: Vec<String>,
+    command: String,
+    fixture_tier: String,
+    target_manifest_sha256: String,
+    lifecycle: String,
+    product_reachability: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,6 +216,27 @@ fn validate_contract_header(contract: &StorageContract) -> anyhow::Result<()> {
     }
 
     let activation = &contract.activation;
+    let conformance = &contract.production_conformance;
+    if conformance.command != "cargo xtask verify-local format-lifecycle"
+        || conformance.fixture_tier != "T1-target"
+        || conformance.target_manifest_sha256 != TARGET_CORPUS_SHA256
+        || conformance.lifecycle != "EXPERIMENTAL"
+        || conformance.product_reachability
+    {
+        bail!(
+            "WP-10A production conformance must consume the exact promoted target authority off-product"
+        );
+    }
+    require_exact_set(
+        &conformance.test_targets,
+        &[
+            "crates/mirante4d-storage/tests/target_conformance.rs",
+            "crates/mirante4d-storage/tests/target_mutation_conformance.rs",
+            "crates/mirante4d-storage/tests/target_writer_conformance.rs",
+        ],
+        "production conformance test target",
+    )?;
+
     if activation.crate_name != STORAGE_CRATE
         || activation.crate_path != STORAGE_PATH
         || activation.lifecycle != "EXPERIMENTAL"
@@ -694,6 +727,8 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "ScienceLayer",
         "ScienceTemporalCalibration",
         "ScienceTemporalKind",
+        "ScientificPackageValidationError",
+        "ScientificValidationReport",
         "SHARD_INDEX_RANGE_READ_BYTES_MAX",
         "ShardCodecError",
         "ShardIndex",
@@ -707,6 +742,7 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "StorageShape",
         "TypedId",
         "U64Decimal",
+        "VerifiedScientificPackageCapability",
         "ZarrArrayMetadata",
         "ZarrGroupMetadata",
         "ZarrMetadataError",

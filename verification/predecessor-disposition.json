@@ -5131,6 +5131,78 @@
       "lane": "unit",
       "requirement_ids": ["D-022-unit", "WP-10A-off-product-storage-profile"],
       "reason": "WP-10A enforces the off-product storage successor boundary and exact predecessor delegation."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:verification::registry::tests::format_lifecycle_is_an_active_target_authority_consumer",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-023-format-lifecycle"],
+      "reason": "WP-10A-D keeps the format-lifecycle lane bound to its active T1-target command and public-CPU timeout."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:verification::runner::tests::format_lifecycle_targets_only_declared_conformance_work",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-023-format-lifecycle"],
+      "reason": "WP-10A-D proves the non-PR format-lifecycle command selects only the production reader/mutation targets, isolated scalability contract, and pinned writer-to-independent-reader runner."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::representative_large_manifest_open_stays_inside_the_metadata_working_set",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "format-lifecycle",
+      "requirement_ids": ["D-023-format-lifecycle", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A-D proves linear metadata-byte work at 2,750/5,500/11,000 descriptors and checks the largest isolated subprocess against its open-time and post-open RSS ceilings."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::scientific_capability_rejects_cancellation_and_a_declared_identity_mismatch",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "D-009-scientific-content-identity"],
+      "reason": "WP-10A-D issues no scientific capability after cancellation or a computed-versus-declared identity mismatch."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_science::tests::cancellation_and_checked_work_accounting_fail_closed",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "D-009-scientific-content-identity"],
+      "reason": "WP-10A-D scientific validation polls cancellation and rejects overflowing deterministic work accounting."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_science::tests::identity_hasher_rejects_valid_nonfinite_and_accepts_invalid_zero",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "D-009-scientific-content-identity"],
+      "reason": "WP-10A-D preserves finite-float and invalid-positive-zero canonical scientific sample rules."
+    },
+    {
+      "id": "libtest:mirante4d-storage::target_conformance:production_reader_consumes_all_positive_target_packages",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "D-023-format-lifecycle"],
+      "reason": "WP-10A-D proves the production reader consumes every promoted positive T1-target package and matches its independent package, layout, scientific, and brick facts."
+    },
+    {
+      "id": "libtest:mirante4d-storage::target_mutation_conformance:production_rejects_all_promoted_mutations_at_typed_stages",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "D-023-format-lifecycle"],
+      "reason": "WP-10A-D derives all fifteen promoted mutations and proves exact typed production rejection at metadata, closure, shard, or scientific validation."
+    },
+    {
+      "id": "libtest:mirante4d-storage::target_writer_conformance:production_writer_preserves_promoted_metadata_and_scientific_content",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "D-023-format-lifecycle"],
+      "reason": "WP-10A-D proves production output preserves promoted metadata and every scientific brick while exact package identity follows encoded bytes."
     }
   ],
   "expected_summary": {
@@ -5139,6 +5211,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 437
+    "current_additions": 446
   }
 }

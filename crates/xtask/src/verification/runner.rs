@@ -112,9 +112,16 @@ pub(crate) fn verify_pr(group: Option<&str>) -> anyhow::Result<()> {
 }
 
 pub(crate) fn verify_local(lane: &str) -> anyhow::Result<()> {
-    if lane != "trusted-gpu" {
-        bail!("unknown local verification lane {lane:?}; expected trusted-gpu");
+    match lane {
+        "format-lifecycle" => verify_format_lifecycle(),
+        "trusted-gpu" => verify_trusted_gpu(),
+        _ => {
+            bail!("unknown local verification lane {lane:?}; expected format-lifecycle|trusted-gpu")
+        }
     }
+}
+
+fn verify_trusted_gpu() -> anyhow::Result<()> {
     if env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
         bail!("trusted-gpu verification must not run in GitHub Actions");
     }
@@ -158,6 +165,118 @@ pub(crate) fn verify_local(lane: &str) -> anyhow::Result<()> {
     let report_path = verification_report_path("verify-local-trusted-gpu")?;
     let report_result = phases.write_report(&report_path, "trusted-gpu", &identity);
     phases.finish("trusted-gpu").and(report_result)
+}
+
+fn verify_format_lifecycle() -> anyhow::Result<()> {
+    let started = Instant::now();
+    ensure_nextest()?;
+    let registry = registry::read_registry()?;
+    let timeout_secs = registry::format_lifecycle_timeout(&registry)?;
+    let deadline = started
+        .checked_add(Duration::from_secs(timeout_secs))
+        .context("format-lifecycle aggregate deadline overflowed")?;
+    let identity = RunIdentity::gather()?;
+    let mut phases = PhaseCollector::default();
+    phases.record_identity(&identity);
+    phases.run(
+        "fixture-registry",
+        "in-process fixture registry validation",
+        || {
+            format_lifecycle_remaining(deadline)?;
+            fixtures::validate_fixture_registry()?;
+            format_lifecycle_remaining(deadline)?;
+            Ok(())
+        },
+    );
+    phases.run(
+        "target-fixture-validation",
+        "python3 tools/target-fixtures/t1/validate.py --manifest fixtures/target/manifest.json --self-test",
+        || {
+            let mut command = Command::new("python3");
+            command.args([
+                "tools/target-fixtures/t1/validate.py",
+                "--manifest",
+                "fixtures/target/manifest.json",
+                "--self-test",
+            ]);
+            run_command_with_timeout(
+                &mut command,
+                format_lifecycle_remaining(deadline)?.min(TARGET_FIXTURE_VALIDATION_TIMEOUT),
+            )
+        },
+    );
+    phases.run(
+        "target-conformance",
+        format_lifecycle_test_command(),
+        || {
+            let mut command = isolated_nextest_command();
+            command.args([
+                "nextest",
+                "run",
+                "--package",
+                "mirante4d-storage",
+                "--test",
+                "target_conformance",
+                "--test",
+                "target_mutation_conformance",
+                "--frozen",
+                "--profile",
+                "leaf",
+                "--no-fail-fast",
+                "--retries",
+                "0",
+                "--flaky-result",
+                "fail",
+                "--no-tests",
+                "fail",
+            ]);
+            run_command_with_timeout(&mut command, format_lifecycle_remaining(deadline)?)
+        },
+    );
+    phases.run(
+        "representative-metadata-scalability",
+        format_lifecycle_scalability_command(),
+        || {
+            let mut command = cargo_command();
+            command.args([
+                "test",
+                "-p",
+                "mirante4d-storage",
+                "--lib",
+                "package_catalog::tests::representative_large_manifest_open_stays_inside_the_metadata_working_set",
+                "--frozen",
+                "--",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ]);
+            run_command_with_timeout(&mut command, format_lifecycle_remaining(deadline)?)
+        },
+    );
+    phases.run(
+        "writer-independent-reader-conformance",
+        production_writer_conformance_command(),
+        || {
+            let mut command = Command::new("python3");
+            command.arg("tools/target-fixtures/production-conformance/run.py");
+            run_command_with_timeout(&mut command, format_lifecycle_remaining(deadline)?)
+        },
+    );
+    phases.run(
+        "aggregate-deadline",
+        "in-process 900-second aggregate deadline check",
+        || format_lifecycle_remaining(deadline).map(|_| ()),
+    );
+    let report_path = verification_report_path("verify-local-format-lifecycle")?;
+    let report_result = phases.write_report(&report_path, "format-lifecycle", &identity);
+    phases.finish("format-lifecycle").and(report_result)
+}
+
+fn format_lifecycle_remaining(deadline: Instant) -> anyhow::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .context("format-lifecycle exhausted its aggregate timeout")
 }
 
 fn verify_pr_policy() -> anyhow::Result<()> {
@@ -440,6 +559,18 @@ fn nextest_leaf_command(leaf: Leaf) -> String {
         "NEXTEST_USER_CONFIG_FILE=none cargo nextest run --workspace --frozen --profile leaf --no-fail-fast --retries 0 --flaky-result fail --no-tests fail -E 'group({})'",
         leaf.name()
     )
+}
+
+fn format_lifecycle_test_command() -> &'static str {
+    "NEXTEST_USER_CONFIG_FILE=none cargo nextest run --package mirante4d-storage --test target_conformance --test target_mutation_conformance --frozen --profile leaf --no-fail-fast --retries 0 --flaky-result fail --no-tests fail"
+}
+
+fn format_lifecycle_scalability_command() -> &'static str {
+    "cargo test -p mirante4d-storage --lib package_catalog::tests::representative_large_manifest_open_stays_inside_the_metadata_working_set --frozen -- --exact --ignored --nocapture"
+}
+
+fn production_writer_conformance_command() -> &'static str {
+    "python3 tools/target-fixtures/production-conformance/run.py"
 }
 
 fn isolated_nextest_command() -> Command {
@@ -983,5 +1114,24 @@ mod tests {
             .and_then(|(_, value)| value)
             .and_then(|value| value.to_str());
         assert_eq!(configured, Some("none"));
+    }
+
+    #[test]
+    fn format_lifecycle_targets_only_declared_conformance_work() {
+        let command = format_lifecycle_test_command();
+        assert!(command.contains("--package mirante4d-storage"));
+        assert!(command.contains("--test target_conformance"));
+        assert!(command.contains("--test target_mutation_conformance"));
+        assert!(!command.contains("--test target_writer_conformance"));
+        assert!(command.contains("--no-tests fail"));
+        assert!(!command.contains("--workspace"));
+        assert_eq!(
+            format_lifecycle_scalability_command(),
+            "cargo test -p mirante4d-storage --lib package_catalog::tests::representative_large_manifest_open_stays_inside_the_metadata_working_set --frozen -- --exact --ignored --nocapture"
+        );
+        assert_eq!(
+            production_writer_conformance_command(),
+            "python3 tools/target-fixtures/production-conformance/run.py"
+        );
     }
 }

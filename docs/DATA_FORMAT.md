@@ -102,18 +102,21 @@ validation now stream-hashes the root, pages, and every descriptor object with
 a fixed 64 KiB buffer, requires the structural and digest observations to name
 the same shard versions, repeats inventory, and performs a final snapshot
 sweep. Its owning capability is the only PackageId-authorized brick-read path;
-it checks manifest authority and each consumed shard against that proof. Lazy
-portable-record semantics, atomic snapshotting of a concurrently mutable
-directory, scientific identity, independent T1, IO-3, and product support
-remain outside this claim. A create-only off-product writer derives canonical
-metadata, shards, descriptors, pages, and root bytes from typed inputs; hashes
-objects while writing; performs DS admission, structural reconciliation,
+it checks manifest authority and each consumed shard against that proof. A
+separate consuming scan recomputes the base-scale scientific layer roots and
+ScientificContentId with bounded memory and cancellation, then returns the
+stronger verified-scientific-package capability. Lazy portable-record
+semantics, atomic snapshotting of a concurrently mutable directory, and
+product support remain outside these capabilities. A create-only off-product
+writer derives canonical metadata, shards, descriptors, pages, and root bytes
+from typed inputs; hashes objects while writing; performs DS admission,
+structural reconciliation,
 inventory, and snapshot checks in a private sibling stage; and publishes with
 Linux `RENAME_NOREPLACE` followed by parent-directory sync. It does not replace
-packages, compute scientific identity, generate multiscales, perform import,
-or activate the product. The exact official OME-NGFF 0.5.2 image artifacts,
-Zarr core 3.0 and selected codec specifications are now retained offline by
-immutable source revision, length, and SHA-256. A separately pinned
+packages, derive scientific identity from source data, generate multiscales,
+perform import, or activate the product. The exact official OME-NGFF 0.5.2
+image artifacts, Zarr core 3.0, and selected codec specifications are retained
+offline by immutable source revision, length, and SHA-256. A separately pinned
 zarr-python reader decodes one hand-built selected-subset shard. This is an
 interoperability stop/go result only; it is not T1, IO-3, official-schema,
 complete-package, or generic OME-Zarr evidence. The promoted
@@ -121,14 +124,24 @@ complete-package, or generic OME-Zarr evidence. The promoted
 independent expected facts, critical identity vectors, full-array independent
 readback with pinned OME-schema results, 15 executed rejection mutations, and
 byte-identical two-run reproduction. It covers only the frozen EXPERIMENTAL
-profile and makes no IO-3, production package-conformance, stable-format,
-product-support, performance, or generic OME-Zarr claim.
+profile.
+
+The WP-10A-D candidate consumes all three promoted packages through the
+production exact-to-scientific path, checks every full-array and per-layer
+value/validity digest plus exact shard/object/depth/fan-out and one-brick
+amplification facts, and rejects all 15 mutations. Production-writer outputs
+pass the pinned schema and independent reader with matching image and
+scientific facts; encoded bytes and PackageId may differ. Isolated
+2,750/5,500/11,000-descriptor opens prove the linear metadata-work contract,
+with the largest bounded to 10 seconds and 64 MiB of post-open RSS.
+`cargo xtask verify-local format-lifecycle` completes the candidate evidence.
+WP-10A exit acceptance remains pending. The format stays
+EXPERIMENTAL and off-product, with no stable, generic OME-Zarr, importer,
+product-support, or product-activation claim.
 
 WP-10B separately installs immutable content-addressed project objects,
 complete generations, atomic head/recovery refs, leases, autosave/recovery,
 and conservative garbage collection.
 
-The remaining WP-10A-D production package-conformance work is approved but not
-implemented. Its authority is the
-[data-format brief](plans/active/foundation-refactor/DATA_FORMAT_IDENTITY_BRIEF.md)
-and its accepted work-package entry.
+WP-09A may begin only after the WP-10A candidate receives clean-revision exit
+acceptance.
