@@ -61,8 +61,9 @@ The accepted WP-10A freeze now has a pure implementation core for its
 experimental compatibility tuple, storage geometry, bounded counts,
 amplification limits, sole portable package-path authority, scientific
 hashing, exact object/package hashing, and domain-framed recipe,
-derivation-record, and release hashing. Canonical control-schema validation is
-not yet complete, and the core does not yet read, write, or validate target
+derivation-record, and release hashing. Strict scalar grammars, restricted JCS,
+and the exact compatibility tuple are implemented, but the closed control DTOs
+are not yet complete. The core does not yet read, write, or validate target
 packages.
 
 WP-10B separately installs immutable content-addressed project objects,

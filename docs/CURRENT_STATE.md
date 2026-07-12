@@ -56,11 +56,12 @@ interactive demand; the predecessor app/data read pools, unbounded result
 channels, resident payload mirrors, and analysis execution worker are deleted.
 
 WP-10A entry, dependency disposition, and profile freeze are accepted.
-WP-10A-B implementation is active: the storage-profile, scientific identity,
-and exact object/package/recipe/derivation/release hashing primitives exist,
-while target metadata, shard/index I/O, reader, writer, validator, independent
-T1 corpus, and product activation remain incomplete. Current schema-1 packages
-remain transitional T2 fixtures and the sole product route.
+WP-10A-B implementation is active: the storage profile, scientific and exact
+identities, strict control scalars, restricted JCS, and exact compatibility
+tuple bytes exist. Closed target metadata DTOs, shard/index I/O, reader,
+writer, validator, independent T1 corpus, and product activation remain
+incomplete. Current schema-1 packages remain transitional T2 fixtures and the
+sole product route.
 
 ## Current Verification Boundary
 

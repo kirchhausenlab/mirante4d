@@ -16,8 +16,10 @@ authority. Analysis execution remains unavailable until WP-12.
 The pure profile/identity core and its product-nonreachability contract are
 present. Exact D-009 object, package, recipe, derivation-record, and release
 hash framing is implemented; strict control schemas must now validate the
-canonical bytes supplied to it. Continue WP-10A-B with those schemas,
-shard/index I/O, reader, writer, and validator.
+canonical bytes supplied to it. Their scalar grammars, restricted JCS encoder,
+and exact compatibility tuple bytes are present. Continue WP-10A-B with the
+closed profile/science/display/record/manifest/release DTOs, then shard/index
+I/O, reader, writer, and validator.
 WP-10A-C then promotes the independent target-format authorities; WP-10A-D
 consumes them and closes the package evidence. Current schema 1 remains the
 sole product route until WP-10C.

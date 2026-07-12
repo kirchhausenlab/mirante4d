@@ -1,16 +1,22 @@
 //! Strict off-product storage profile for Mirante4D datasets.
 //!
 //! This crate is not reachable from the application before WP-10C. The first
-//! WP-10A slice owns only immutable profile facts, checked preflight arithmetic,
-//! and portable package paths; it performs no filesystem I/O.
+//! WP-10A-B owns immutable profile facts, strict control primitives, checked
+//! preflight arithmetic, and portable package paths. It performs no filesystem
+//! I/O and makes no target-package support claim.
 
 #![forbid(unsafe_code)]
 
+mod control;
 mod error;
 mod limits;
 mod paths;
 mod profile;
 
+pub use control::{
+    AsciiToken, ControlError, F32Bits, F64Bits, I64Decimal, MAX_ASCII_TOKEN_BYTES,
+    MAX_NFC_TEXT_BYTES, NfcText, Rgb24, TypedId, U64Decimal, profile_compatibility_bytes,
+};
 pub use error::StorageProfileError;
 pub use limits::{
     DatasetGeometry, ELIDED_ALL_FILL_AMPLIFICATION, ElidedAllFillAmplification,

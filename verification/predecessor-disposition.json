@@ -4421,6 +4421,54 @@
       "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
     },
     {
+      "id": "libtest:mirante4d-storage:control::jcs::tests::number_depth_and_size_rejection",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves restricted control JCS rejects unfrozen numbers and enforces private depth and byte safety bounds."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::jcs::tests::utf16_ordering_and_minimal_escaping",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves restricted control JCS uses RFC 8785 UTF-16 key ordering and exact string escaping."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::scalar::tests::canonical_decimals_reject_alternate_and_out_of_range_forms",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves identity-bearing decimal strings have one bounded canonical form."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::scalar::tests::tokens_text_float_bits_and_rgb_use_the_frozen_wire_grammars",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the frozen ASCII, Unicode-17 NFC, finite bit-pattern, and RGB wire grammars."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::scalar::tests::typed_ids_roundtrip_every_frozen_prefix",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves control metadata accepts only the closed D-009 typed identity set."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::tests::frozen_profile_compatibility_has_exact_canonical_bytes",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A binds the one accepted compatibility tuple to exact canonical control bytes."
+    },
+    {
       "id": "libtest:mirante4d-storage:limits::tests::accepted_boundary_counts_recompute_exactly",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -4563,6 +4611,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 365
+    "current_additions": 371
   }
 }

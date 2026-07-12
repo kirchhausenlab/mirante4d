@@ -70,6 +70,7 @@ struct ActivationContract {
     product_activation_gate: String,
     product_reachability: bool,
     library_and_tests_only: bool,
+    public_api: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,6 +182,11 @@ fn validate_contract_header(contract: &StorageContract) -> anyhow::Result<()> {
     {
         bail!("WP-10A storage activation must remain experimental and off-product until WP-10C");
     }
+    require_exact_set(
+        &activation.public_api,
+        accepted_storage_public_api(),
+        "storage public API",
+    )?;
 
     if contract.identity_successor.crate_name != "mirante4d-identity" {
         bail!("WP-10A identity successor names the wrong crate");
@@ -405,6 +411,62 @@ pub(super) fn accepted_identity_public_api_additions() -> &'static [&'static str
     ]
 }
 
+fn accepted_storage_public_api() -> &'static [&'static str] {
+    &[
+        "AsciiToken",
+        "CAPABILITIES",
+        "CHUNK_KEY_SEPARATOR",
+        "CompatibilityTuple",
+        "ControlError",
+        "DatasetGeometry",
+        "ELIDED_ALL_FILL_AMPLIFICATION",
+        "ElidedAllFillAmplification",
+        "F32Bits",
+        "F64Bits",
+        "FIXED_CONTROL_OBJECTS",
+        "GLOBAL_ENCODED_OUTER_SHARD_BYTES_MAX",
+        "GLOBAL_UNCOMPRESSED_OUTER_SHARD_BYTES_MAX",
+        "I64Decimal",
+        "INDEX_CODECS",
+        "INDEX_LOCATION",
+        "INNER_CODECS",
+        "MANIFEST_DESCRIPTORS_PER_PAGE_GUARANTEED",
+        "MAX_ASCII_TOKEN_BYTES",
+        "MAX_DIRECTORY_DEPTH",
+        "MAX_FILE_PATH_COMPONENTS",
+        "MAX_NFC_TEXT_BYTES",
+        "MAX_RELATIVE_PATH_BYTES",
+        "NfcText",
+        "OUTER_CODEC",
+        "OneBrickAmplification",
+        "PACKED_INDEX_RECORD_BYTES",
+        "PACKED_INDEX_RECORDS_PER_INNER_CHUNK",
+        "PACKED_INDEX_RECORDS_PER_OUTER_SHARD",
+        "PORTABLE_PROVENANCE_RECORDS_MAX",
+        "PROFILE",
+        "PackageCounts",
+        "PackagePath",
+        "ProfileKind",
+        "ProfileLimits",
+        "Rgb24",
+        "ScaleCountRule",
+        "ScaleCounts",
+        "StorageProfileError",
+        "StorageShape",
+        "TypedId",
+        "U64Decimal",
+        "amplification_2d",
+        "amplification_3d",
+        "checked_ceil_div",
+        "count_3d_pyramid",
+        "encoded_inner_payload_limit",
+        "encoded_outer_shard_limit",
+        "profile_compatibility_bytes",
+        "profile_limits",
+        "validate_unique_paths",
+    ]
+}
+
 pub(super) fn accepted_identity_public_api_deletions() -> &'static [&'static str] {
     &[
         "MAX_OBJECT_PATH_BYTES",
@@ -543,11 +605,25 @@ fn validate_storage_package(
         bail!("WP-10A requires exactly one workspace package named mirante4d-identity");
     }
     validate_storage_manifest_path(repo_root, storage)?;
+    validate_storage_public_api(repo_root, contract)?;
     validate_storage_targets(storage)?;
     validate_direct_dependencies(storage, contract)?;
     validate_identity_dependencies(identity[0], contract)?;
     validate_locked_dependencies(repo_root, contract)?;
     validate_dependency_graph(repo_root, &package_by_id, &workspace_members, contract)
+}
+
+fn validate_storage_public_api(repo_root: &Path, contract: &StorageContract) -> anyhow::Result<()> {
+    let expected = unique_set(&contract.activation.public_api, "storage public API")?;
+    let actual = public_root_api_names(&repo_root.join(STORAGE_PATH).join("src/lib.rs"))?;
+    if actual != expected {
+        bail!(
+            "WP-10A storage public API drifted: missing={:?}, unexpected={:?}",
+            expected.difference(&actual).collect::<Vec<_>>(),
+            actual.difference(&expected).collect::<Vec<_>>()
+        );
+    }
+    Ok(())
 }
 
 fn validate_storage_manifest_path(repo_root: &Path, package: &Value) -> anyhow::Result<()> {
