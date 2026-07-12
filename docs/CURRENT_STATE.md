@@ -56,7 +56,8 @@ interactive demand; the predecessor app/data read pools, unbounded result
 channels, resident payload mirrors, and analysis execution worker are deleted.
 
 WP-10A entry, dependency disposition, and profile freeze are accepted.
-WP-10A-B implementation is active: the storage profile, scientific and exact
+WP-10A-B is implemented off-product and WP-10A-C evidence promotion is active:
+the storage profile, scientific and exact
 identities, strict control scalars, closed profile, canonical-value,
 scientific, and display-defaults grammars, restricted JCS, and exact
 compatibility tuple bytes exist. Exact recipe bodies and verified RecipeId
@@ -91,9 +92,14 @@ and publishes a previously absent destination with Linux
 `RENAME_NOREPLACE`. Cancellation and precommit failure remove only the owned
 stage during normal operation under the documented local threat model; a
 post-rename parent-sync failure is reported as durability-indeterminate without
-deleting the valid package. Replacement, import/multiscale generation,
-scientific-ID computation, the independent T1 corpus, and product activation
-remain incomplete.
+deleting the valid package. WP-10A-C now pins the exact OME-NGFF 0.5.2, Zarr
+core 3.0, bytes, CRC32C, indexed-sharding, and registered zstd source artifacts
+in a small offline digest-checked mirror. A hash-locked zarr-python 3.2.1 probe
+independently decodes one manually built array using the selected shard subset.
+That diagnostic is not T1, IO-3, OME semantic readback, or complete-package
+evidence. Replacement, import/multiscale generation, scientific-ID
+computation, the independent T1 corpus, and product activation remain
+incomplete.
 Current schema-1 packages remain transitional T2 fixtures and the sole product
 route.
 

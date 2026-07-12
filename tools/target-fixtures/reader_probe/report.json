@@ -1,0 +1,112 @@
+{
+  "case": "hand-built-2d-uint8-selected-zarr-shard-subset",
+  "entry_sha256": "040dc8c85524d77ee0660c4ae541df9bd5878508c3c1682d6d5158402aef046d",
+  "non_claims": [
+    "not a T1 fixture or authority promotion",
+    "not OME metadata or official-schema evidence",
+    "not a complete M4D package, IO-3, identity, product, or performance claim",
+    "not evidence for other data types, validity arrays, transforms, or multiple outer shards"
+  ],
+  "observed": {
+    "chunks": [
+      1,
+      1,
+      1,
+      256,
+      256
+    ],
+    "dtype": "uint8",
+    "numpy_version": "2.5.1",
+    "observed": [
+      [
+        0,
+        1,
+        2,
+        3
+      ],
+      [
+        4,
+        5,
+        6,
+        7
+      ],
+      [
+        8,
+        9,
+        10,
+        11
+      ],
+      [
+        12,
+        13,
+        14,
+        255
+      ]
+    ],
+    "result": "PASS",
+    "shape": [
+      1,
+      1,
+      1,
+      4,
+      4
+    ],
+    "shards": [
+      1,
+      1,
+      1,
+      1024,
+      1024
+    ],
+    "zarr_version": "3.2.1"
+  },
+  "producer": {
+    "metadata_bytes": 629,
+    "metadata_sha256": "cb28e21165ee80e5fdd9bed0f806837e97f4fe04babfcf7b7758f3fbbdd9b8c4",
+    "shard_bytes": 306,
+    "shard_sha256": "0afe3fd3c86fc01d25a755bfeec85e986fda2380ac3fc73b802fc4e092460f25",
+    "tree_sha256": "6a773ec88f1ea70ca30020bcbca6fa78855ce41ffde7a50cdaf84af7f3d9a4c0"
+  },
+  "reader": {
+    "name": "zarr-python",
+    "resolved_versions": [
+      "donfig 0.8.1.post1",
+      "google-crc32c 1.8.0",
+      "numcodecs 0.16.5",
+      "numpy 2.5.1",
+      "packaging 26.2",
+      "PyYAML 6.0.3",
+      "typing-extensions 4.16.0",
+      "zarr 3.2.1"
+    ],
+    "source_commit": "85890b3bb404fd1d401267c508a2694f5734559e",
+    "source_tag": "v3.2.1",
+    "version": "3.2.1"
+  },
+  "result": "PASS",
+  "schema": "mirante4d-wp10a-c-reader-probe",
+  "schema_version": 1,
+  "sources": {
+    "producer_sha256": "76d92b68b03ac353befa76f6fdd216352cf8a886cf734e0c048a33683559ceed",
+    "reader_sha256": "30da083dbc996d81f7a576779573c5550fa83c3e5c76c95e30aa30af54365212",
+    "reproducer_sha256": "aae3efda1c0fb42714595761d08c47ec47c0775dfab11cc9307e6636ce2ea662",
+    "requirements_lock_sha256": "20e3d7b96a8ed722bfb4cbb1e14028fc3cd33f825e566b7af5de8e565f1572ef"
+  },
+  "standards_manifest_sha256": "28021b100e855b86ad29c0f69e5249115de2a39ddc68e980ae7e5ea67bc65e4e",
+  "status": "diagnostic-pass",
+  "tools": {
+    "platform": "Linux x86_64",
+    "python": {
+      "sha256": "1643dacd9feaedc58f3cc581e4d22577dfe25c09b10282936186ccf0f2e61118",
+      "version": "Python 3.12.3"
+    },
+    "uv": {
+      "sha256": "13b335cfb84d5ec0a649ce071d6eb7c1e81496412caf9646f75434049da9d85c",
+      "version": "uv 0.9.27"
+    },
+    "zstd": {
+      "sha256": "7c5468b370f7c47eda07281e3437fafc568f95d10420051e3aa522709f9342c5",
+      "version": "*** Zstandard CLI (64-bit) v1.5.5, by Yann Collet ***"
+    }
+  }
+}

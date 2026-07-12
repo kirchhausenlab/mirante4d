@@ -1,0 +1,163 @@
+{
+  "schema": "mirante4d-wp10a-normative-standards",
+  "schema_version": 1,
+  "status": "accepted-off-product",
+  "entry": {
+    "path": "architecture/wp10a-c-authority-entry.json",
+    "sha256": "040dc8c85524d77ee0660c4ae541df9bd5878508c3c1682d6d5158402aef046d"
+  },
+  "validator": {
+    "path": "tools/target-fixtures/standards_check.py",
+    "sha256": "59e0167709346ff3be144e02ecebaefa2b1efca3408e832031dec39625f6a2d8"
+  },
+  "profile_scope": {
+    "storage_profile": "m4d-zarr3-local-1.0",
+    "ome_ngff_metadata": "0.5",
+    "ome_ngff_release": "0.5.2",
+    "zarr_format": 3,
+    "zarr_core": "3.0",
+    "zarr_subset": [
+      "regular chunk grid",
+      "default chunk-key encoding with slash separator",
+      "uint8, uint16, and float32 core data types",
+      "bytes 1.0",
+      "crc32c 1.0",
+      "sharding-indexed 1.0 with index at end",
+      "registered zstd extension at the pinned source revision"
+    ],
+    "claim": "only the exact closed Mirante4D profile subset"
+  },
+  "sources": [
+    {
+      "id": "ome-ngff-0.5.2",
+      "repository": "https://github.com/ome/ngff",
+      "release": "https://github.com/ome/ngff/releases/tag/0.5.2",
+      "tag": "0.5.2",
+      "tag_object": "764b18e662e46b1a13f89230c0749509ad30f489",
+      "commit": "5cdf83b6806b5e500477c7af69dae9ed2adcf77d",
+      "license_summary": "W3C Software and Document License for reports; Apache-2.0 for software and sample implementations",
+      "artifacts": [
+        {
+          "upstream_path": "LICENSE.md",
+          "local_path": "verification/standards/ome-ngff-0.5.2/LICENSE.md",
+          "url": "https://raw.githubusercontent.com/ome/ngff/5cdf83b6806b5e500477c7af69dae9ed2adcf77d/LICENSE.md",
+          "bytes": 439,
+          "sha256": "cad8da6404199f732387340029f0f91d55acb98092bf45089064b4a9b8bb0295",
+          "role": "license"
+        },
+        {
+          "upstream_path": "0.5/index.bs",
+          "local_path": "verification/standards/ome-ngff-0.5.2/0.5/index.bs",
+          "url": "https://raw.githubusercontent.com/ome/ngff/5cdf83b6806b5e500477c7af69dae9ed2adcf77d/0.5/index.bs",
+          "bytes": 37464,
+          "sha256": "eb007bba48e6b359906a1b5f289a4d6f5965a7fc0e8f50fd3bcfaeb765fef685",
+          "role": "normative OME-NGFF 0.5 prose"
+        },
+        {
+          "upstream_path": "0.5/schemas/_version.schema",
+          "local_path": "verification/standards/ome-ngff-0.5.2/0.5/schemas/_version.schema",
+          "url": "https://raw.githubusercontent.com/ome/ngff/5cdf83b6806b5e500477c7af69dae9ed2adcf77d/0.5/schemas/_version.schema",
+          "bytes": 280,
+          "sha256": "26c03746999987ae695a4d0efb2ae56503dd69b7b80320732f2a04a540ef91d5",
+          "role": "official OME-NGFF version schema"
+        },
+        {
+          "upstream_path": "0.5/schemas/image.schema",
+          "local_path": "verification/standards/ome-ngff-0.5.2/0.5/schemas/image.schema",
+          "url": "https://raw.githubusercontent.com/ome/ngff/5cdf83b6806b5e500477c7af69dae9ed2adcf77d/0.5/schemas/image.schema",
+          "bytes": 6114,
+          "sha256": "eb129f72fdd91e0da5c762b0214ac96a714a562c559fc60c6f688e28644c929d",
+          "role": "official OME-NGFF image-attributes schema"
+        }
+      ]
+    },
+    {
+      "id": "zarr-v3-3.0",
+      "repository": "https://github.com/zarr-developers/zarr-specs",
+      "revision_note": "upstream has no 3.0 release tag; this is the immutable GitHub-verified main-branch commit immediately preceding merge 1d0989e9d02ff7d6671e324f6bf17e3702181662, which changes the core specification from 3.0 to 3.1",
+      "commit": "52610ba402fab69e221e4b094213a36c1d658543",
+      "license_summary": "repository LICENSE is CC-BY-4.0; selected specification documents explicitly state CC-BY-3.0",
+      "artifacts": [
+        {
+          "upstream_path": "LICENSE",
+          "local_path": "verification/standards/zarr-v3-3.0/LICENSE",
+          "url": "https://raw.githubusercontent.com/zarr-developers/zarr-specs/52610ba402fab69e221e4b094213a36c1d658543/LICENSE",
+          "bytes": 18655,
+          "sha256": "fe7b4ce83b8381cc5b216bbb4af73c570688d1b819c73bbaed8ca401f4677cd6",
+          "role": "repository license"
+        },
+        {
+          "upstream_path": "docs/v3/core/v3.0.rst",
+          "local_path": "verification/standards/zarr-v3-3.0/docs/v3/core/v3.0.rst",
+          "url": "https://raw.githubusercontent.com/zarr-developers/zarr-specs/52610ba402fab69e221e4b094213a36c1d658543/docs/v3/core/v3.0.rst",
+          "bytes": 71256,
+          "sha256": "1b841a61a4a52e0fc2ef58f465ed7f88f82af54bf4d4e9b46992d1c080e1bf8f",
+          "role": "Zarr core 3.0 specification"
+        },
+        {
+          "upstream_path": "docs/v3/codecs/bytes/v1.0.rst",
+          "local_path": "verification/standards/zarr-v3-3.0/docs/v3/codecs/bytes/v1.0.rst",
+          "url": "https://raw.githubusercontent.com/zarr-developers/zarr-specs/52610ba402fab69e221e4b094213a36c1d658543/docs/v3/codecs/bytes/v1.0.rst",
+          "bytes": 4491,
+          "sha256": "b84922b92d059ca2d4fc4be6b73f1877a65f28bab40be1ab2c8aef47dc812575",
+          "role": "Zarr bytes codec 1.0 specification"
+        },
+        {
+          "upstream_path": "docs/v3/codecs/crc32c/v1.0.rst",
+          "local_path": "verification/standards/zarr-v3-3.0/docs/v3/codecs/crc32c/v1.0.rst",
+          "url": "https://raw.githubusercontent.com/zarr-developers/zarr-specs/52610ba402fab69e221e4b094213a36c1d658543/docs/v3/codecs/crc32c/v1.0.rst",
+          "bytes": 2917,
+          "sha256": "dfbbfc6eeed64fcc49bbc72c0248ef556802a0864cefc3c2431a697059f22fa2",
+          "role": "Zarr CRC32C codec 1.0 specification"
+        },
+        {
+          "upstream_path": "docs/v3/codecs/sharding-indexed/v1.0.rst",
+          "local_path": "verification/standards/zarr-v3-3.0/docs/v3/codecs/sharding-indexed/v1.0.rst",
+          "url": "https://raw.githubusercontent.com/zarr-developers/zarr-specs/52610ba402fab69e221e4b094213a36c1d658543/docs/v3/codecs/sharding-indexed/v1.0.rst",
+          "bytes": 13748,
+          "sha256": "a58551fc4206f33c14f7b08b1ec610492f8b4772a8a51789c4c551b9bcb89e5d",
+          "role": "Zarr indexed-sharding codec 1.0 specification"
+        }
+      ]
+    },
+    {
+      "id": "zarr-zstd-registered-extension",
+      "repository": "https://github.com/zarr-developers/zarr-extensions",
+      "revision_note": "upstream has no release tag or declared extension version; this is an immutable registered-extension commit",
+      "commit": "80d8a46665825908475871db65ef72cf9e13117c",
+      "license_summary": "CC-BY-3.0",
+      "artifacts": [
+        {
+          "upstream_path": "README.md",
+          "local_path": "verification/standards/zarr-zstd-80d8a466/README.md",
+          "url": "https://raw.githubusercontent.com/zarr-developers/zarr-extensions/80d8a46665825908475871db65ef72cf9e13117c/README.md",
+          "bytes": 5458,
+          "sha256": "3af38549319d1a69c3293328374016f42ddd80b1a0b39b4591f8e6fcb1287740",
+          "role": "registered-extension authority and license notice"
+        },
+        {
+          "upstream_path": "codecs/zstd/README.md",
+          "local_path": "verification/standards/zarr-zstd-80d8a466/codecs/zstd/README.md",
+          "url": "https://raw.githubusercontent.com/zarr-developers/zarr-extensions/80d8a46665825908475871db65ef72cf9e13117c/codecs/zstd/README.md",
+          "bytes": 1439,
+          "sha256": "8c2eee9524a4bef738990f2e926c2cd5745a2ce8373cf8ae11e910040bd21026",
+          "role": "registered Zarr zstd extension specification"
+        },
+        {
+          "upstream_path": "codecs/zstd/schema.json",
+          "local_path": "verification/standards/zarr-zstd-80d8a466/codecs/zstd/schema.json",
+          "url": "https://raw.githubusercontent.com/zarr-developers/zarr-extensions/80d8a46665825908475871db65ef72cf9e13117c/codecs/zstd/schema.json",
+          "bytes": 570,
+          "sha256": "5396ad5f91dcc261644549de916fa82e8ab364d55604d2342022423d264adb91",
+          "role": "registered Zarr zstd metadata schema"
+        }
+      ]
+    }
+  ],
+  "ome_schema_limit": "image.schema validates the OME attributes object but not the OME-NGFF 0.5.2 prose requirement that array dimension_names match the declared axes; independent conformance must check that rule explicitly",
+  "non_claims": [
+    "generic OME-Zarr or Zarr support",
+    "official schema conformance for any package",
+    "pixel, transform, identity, sharding, T1, IO-3, stable-format, or product evidence"
+  ]
+}
