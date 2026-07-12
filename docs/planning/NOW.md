@@ -1,26 +1,39 @@
 # Current Work
 
-Last updated: 2026-07-11
+Last updated: 2026-07-12
 
 ## Current Checkpoint
 
 WP-08B is accepted and immutable at `foundation-wp-08b-exit-1`
-(`0e3bdb0f5257c820841cee215cee38747efbda75`). WP-10A entry work is active.
+(`0e3bdb0f5257c820841cee215cee38747efbda75`). WP-10A-B off-product
+implementation is active against the accepted profile freeze.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.
 
-## WP-10A Entry Boundary
+## WP-10A Implementation Boundary
 
-1. Create and accept the package entry bound to `foundation-wp-08b-exit-1`,
-   commit `0e3bdb0f5257c820841cee215cee38747efbda75`, and tree
-   `5dc274503f9566d11816f52752c6c870a7c9d9fd`.
-2. Remove or explicitly replace the `paste` dependency exception that expires
-   at WP-10A entry; canonical storage implementation cannot begin first.
-3. Audit the current schema-1 path against the approved WP-10A target contract.
-4. Implement and prove the off-product target profile, independent corpus,
-   negative cases, object-count bounds, and source nonmutation. WP-10C owns the
-   later product hard cutover.
+The pure profile/identity core and its product-nonreachability contract are
+present. Exact D-009 object, package, recipe, derivation-record, and release
+hash framing is implemented; strict control schemas must now validate the
+canonical bytes supplied to it. Their scalar grammars, restricted JCS encoder,
+closed profile, canonical-value, scientific, and display-defaults grammars,
+exact recipe bodies and payloads, and exact compatibility tuple bytes are
+present. Exact object descriptors, greedy manifest pages, authenticated roots,
+PackageId derivation, portable records, derivation records, and detached
+release records are present. The fixed packed-index, inner-payload, and shard-
+tail codecs, strict Zarr/OME metadata, and bounded local range reader are
+present. An authenticated local metadata catalog now opens the manifest and
+opening-critical metadata closure; a separate bounded operation checks the
+exact finalized file and directory inventory. CRC-checked bounded brick reads
+from the descriptor-derived address plan are present. Caller-selected DS
+admission, package-wide structural reconciliation, fixed-buffer full SHA-256
+closure, final mutation checks, and the owning exact-package capability now
+gate PackageId-attributed reads. The deterministic create-only writer and its
+staged publication checks are present. Continue with WP-10A-C, which promotes
+the independent target-format authorities; WP-10A-D
+consumes them and closes the package evidence. Current schema 1 remains the
+sole product route until WP-10C.
 
 WP-09A is the next protected-branch checkpoint after WP-10A, following the
 approved integration order in the

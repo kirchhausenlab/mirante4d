@@ -38,8 +38,8 @@ is forbidden.
 
 - Import, validation, recovery, and maintenance never modify source microscopy
   data.
-- Writers stage output, validate it, and publish by an explicit replacement;
-  incomplete output must never appear complete.
+- Writers stage output, validate it, and publish atomically under an explicit
+  create or replacement policy; incomplete output must never appear complete.
 - Persisted identities are strict. There are no compatibility readers or
   in-application migrations during pre-alpha development.
 - Analysis results carry source and operation provenance. Preview,
@@ -57,11 +57,67 @@ lifecycle states, mandatory object-count and amplification proof, and an
 independent conformance corpus. WP-10C later activates it in the product and
 deletes the current reader and writer.
 
+The accepted WP-10A freeze now has a pure implementation core for its
+experimental compatibility tuple, storage geometry, bounded counts,
+amplification limits, sole portable package-path authority, scientific
+hashing, exact object/package hashing, and domain-framed recipe,
+derivation-record, and release hashing. Strict scalar grammars, restricted JCS,
+the closed profile, canonical-value, scientific, and display-defaults
+grammars, exact recipe bodies and verified RecipeId payloads, and the exact
+compatibility tuple are implemented. Exact path-bound object descriptors,
+canonical greedy manifest pages, authenticated manifest roots, and PackageId
+derivation are also implemented. A checked control-wire specialization fixes
+the ordinal, indexed-path, temporal, recipe-node, and manifest spellings
+omitted from the accepted freeze, plus the closed portable-record and detached-
+release scalar choices. Exact source, recipe, derivation, rights, citation, and
+release DTOs are implemented. The fixed packed-index record and bounded
+zstd/CRC32C inner-payload and end-index codecs implement the selected binary
+layer in memory. Strict Zarr group/array metadata, closed OME image-group axes
+and transforms, and bounded root-confined Unix object-range reads are
+implemented. The product reader and independent conformance validator are not
+yet implemented. A bounded local catalog authenticates the manifest
+root/pages, verifies opening-critical metadata bytes, parses the closed
+control/Zarr/OME objects, and checks their layer, time, geometry, dtype, shape,
+validity, and packed-index-count relationships. A separate cancellable
+inventory enforces the exact finalized file and ancestor-directory closure,
+safe object types, declared lengths, and globally bounded counts/fan-out
+without reading payload bytes. It reports directory depth and reauthenticates
+manifest authority around the scan. One-brick address planning validates
+requested coordinates and derives exact pixel, validity, and packed-index
+shard paths, inner slots, packed-record offsets, and edge extents. From that
+plan, the bounded brick core fetches only the selected shard-index and inner-
+payload ranges, validates index and inner CRC32C plus bounded zstd output, and
+uses the packed record to authorize pixel or validity fill elision. It exposes
+exact request/read/decode counters and enforces the frozen absolute ceilings.
+Explicit caller-selected DS admission distinguishes arithmetic addressed shards
+from actual files, validates every listed shard coordinate, requires complete
+packed-index shard coverage, and applies the selected count ceilings without
+enumerating logical bricks. It does not infer or persist a DS label. A crate-
+private structural pass then verifies packed-index object digests and every
+record's coordinates, edge capacity, validity mode, canonical padding, and
+pixel/validity inner-slot presence without reading those large payloads. The
+catalog exposes the root digest only as the declared PackageId. Consuming full
+validation now stream-hashes the root, pages, and every descriptor object with
+a fixed 64 KiB buffer, requires the structural and digest observations to name
+the same shard versions, repeats inventory, and performs a final snapshot
+sweep. Its owning capability is the only PackageId-authorized brick-read path;
+it checks manifest authority and each consumed shard against that proof. Lazy
+portable-record semantics, atomic snapshotting of a concurrently mutable
+directory, scientific identity, independent T1, IO-3, and product support
+remain outside this claim. A create-only off-product writer derives canonical
+metadata, shards, descriptors, pages, and root bytes from typed inputs; hashes
+objects while writing; performs DS admission, structural reconciliation,
+inventory, and snapshot checks in a private sibling stage; and publishes with
+Linux `RENAME_NOREPLACE` followed by parent-directory sync. It does not replace
+packages, compute scientific identity, generate multiscales, perform import,
+or activate the product.
+
 WP-10B separately installs immutable content-addressed project objects,
 complete generations, atomic head/recovery refs, leases, autosave/recovery,
 and conservative garbage collection.
 
-These are approved targets, not current readers or writers. Their authorities
-are the [data-format brief](plans/active/foundation-refactor/DATA_FORMAT_IDENTITY_BRIEF.md),
+The remaining independent validator/corpus and project-store work is approved
+but not implemented. Its authorities are the
+[data-format brief](plans/active/foundation-refactor/DATA_FORMAT_IDENTITY_BRIEF.md),
 [project-store brief](plans/active/foundation-refactor/PROJECT_STORE_DURABILITY_BRIEF.md),
 and their accepted work-package entries.

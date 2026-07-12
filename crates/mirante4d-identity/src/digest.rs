@@ -17,6 +17,11 @@ impl Sha256Digest {
         value.parse()
     }
 
+    /// Constructs a digest from its exact 32 raw bytes.
+    pub const fn from_bytes(bytes: [u8; SHA256_BYTE_LENGTH]) -> Self {
+        Self(bytes)
+    }
+
     pub const fn as_bytes(&self) -> &[u8; SHA256_BYTE_LENGTH] {
         &self.0
     }
@@ -84,6 +89,11 @@ macro_rules! typed_digest_id {
 
             pub fn parse(value: &str) -> Result<Self, IdentityError> {
                 value.parse()
+            }
+
+            /// Constructs the typed identifier from a computed SHA-256 digest.
+            pub const fn from_digest(digest: Sha256Digest) -> Self {
+                Self(digest)
             }
 
             pub const fn digest(&self) -> Sha256Digest {

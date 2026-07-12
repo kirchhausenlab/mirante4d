@@ -9,8 +9,12 @@ use anyhow::{Context, bail};
 use syn::visit::Visit;
 
 mod wp08a;
+mod wp10a;
 
 const MAX_TRACKED_GENERATED_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024;
+const WP07A_MODEL_CONTRACT_PATH: &str = "architecture/model-contract.json";
+const WP07A_MODEL_CONTRACT_SHA256: &str =
+    "095dc1c2b96ea70a893d385c3bf08ccd4c204c897156109c9e95b09ead7c5f0b";
 const FORBIDDEN_DUMPING_GROUND_MODULE_NAMES: &[&str] =
     &["common.rs", "helpers.rs", "misc.rs", "utils.rs"];
 const FORBIDDEN_AXIS_ALIGNED_2D_CHUNK_PATTERNS: &[&str] = &[
@@ -65,6 +69,7 @@ pub(crate) fn architecture_self_check() -> anyhow::Result<()> {
         }
     }
     wp08a::check_wp08a_subsystem_contract(Path::new("."))?;
+    wp10a::check_wp10a_storage_contract(Path::new("."))?;
     check_source_architecture_policy()?;
     check_wp07a_contracts(Path::new("."))?;
     check_wp07b_boundary_contract(Path::new("."))?;
@@ -821,6 +826,7 @@ fn check_wp07b_live_cutover(
         ("mirante4d-dataset-runtime", "mirante4d-dataset"),
         ("mirante4d-render-api", "mirante4d-dataset"),
         ("mirante4d-renderer", "mirante4d-dataset"),
+        ("mirante4d-storage", "mirante4d-dataset"),
         ("xtask", "mirante4d-dataset"),
     ]);
     let live_expected_edges = expected_edges
@@ -1706,7 +1712,13 @@ fn add_manifest_dependency_table(
 fn check_wp07a_model_contract(
     repo_root: &Path,
 ) -> anyhow::Result<(String, BTreeMap<String, BTreeSet<String>>)> {
-    let path = repo_root.join("architecture/model-contract.json");
+    let path = repo_root.join(WP07A_MODEL_CONTRACT_PATH);
+    let digest = sha256_file(&path)?;
+    if digest != WP07A_MODEL_CONTRACT_SHA256 {
+        bail!(
+            "immutable WP-07A model contract drifted: expected {WP07A_MODEL_CONTRACT_SHA256}, found {digest}"
+        );
+    }
     let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let contract: serde_json::Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse {}", path.display()))?;
@@ -1815,6 +1827,11 @@ fn check_wp07a_model_contract(
         let allowed_normal_dependencies = allowed_normal_dependencies
             .into_iter()
             .map(str::to_owned)
+            .chain(
+                wp08a::accepted_successor_normal_dependency_additions(name)
+                    .iter()
+                    .map(|dependency| (*dependency).to_owned()),
+            )
             .collect::<BTreeSet<_>>();
         if actual_normal_dependencies != allowed_normal_dependencies {
             bail!(
@@ -1859,13 +1876,33 @@ fn check_wp07a_model_contract(
         }
         let actual_public_api =
             public_root_api_names(&repo_root.join(crate_path).join("src/lib.rs"))?;
-        if actual_public_api != public_api_set {
-            let missing = public_api_set
+        let accepted_deletions = (name == "mirante4d-identity")
+            .then_some(wp10a::accepted_identity_public_api_deletions())
+            .into_iter()
+            .flatten()
+            .map(|item| (*item).to_owned())
+            .collect::<BTreeSet<_>>();
+        if !accepted_deletions.is_subset(&public_api_set) {
+            bail!("WP-10A identity API deletion is absent from the WP-07A predecessor");
+        }
+        let accepted_public_api = public_api_set
+            .difference(&accepted_deletions)
+            .cloned()
+            .chain(
+                (name == "mirante4d-identity")
+                    .then_some(wp10a::accepted_identity_public_api_additions())
+                    .into_iter()
+                    .flatten()
+                    .map(|item| (*item).to_owned()),
+            )
+            .collect::<BTreeSet<_>>();
+        if actual_public_api != accepted_public_api {
+            let missing = accepted_public_api
                 .difference(&actual_public_api)
                 .cloned()
                 .collect::<Vec<_>>();
             let unexpected = actual_public_api
-                .difference(&public_api_set)
+                .difference(&accepted_public_api)
                 .cloned()
                 .collect::<Vec<_>>();
             bail!(
@@ -1916,6 +1953,21 @@ fn check_wp07a_model_contract(
         })
         .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
     Ok((predecessor, mapping))
+}
+
+fn sha256_file(path: &Path) -> anyhow::Result<String> {
+    let output = Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .with_context(|| format!("failed to hash {}", path.display()))?;
+    if !output.status.success() {
+        bail!("sha256sum failed for {}", path.display());
+    }
+    String::from_utf8(output.stdout)?
+        .split_whitespace()
+        .next()
+        .map(str::to_owned)
+        .context("sha256sum returned no digest")
 }
 
 fn json_string_set(

@@ -1,6 +1,6 @@
 # Testing And Evidence
 
-Last updated: 2026-07-11
+Last updated: 2026-07-12
 
 ## Claim Language
 
@@ -113,9 +113,89 @@ trusted-GPU, source-nonmutation, and real-display 1280x720 T2 product checks.
 Internal automation remains supporting evidence, not product-open proof.
 
 The checked independent report supports only the WP-03 source-TIFF archive.
-WP-10A entry work is active. Current schema-1 packages remain non-authoritative
-T2 support fixtures until WP-10A accepts the target profile with independent
-T1 conformance, negative cases, and storage/object-count evidence.
+WP-10A-B implementation is active. `mirante4d-storage` is assigned to the
+existing contract leaf, but its current tests prove only pure profile, path,
+arithmetic, supporting exact-identity, scalar-wire, and restricted-JCS
+contracts, including the closed profile, canonical-value, scientific, and
+display-defaults grammars, verified recipe payloads, and exact manifest
+descriptor/page/root bytes. Closed portable-record tests prove structural
+canonical bytes; derivation and detached-release tests additionally prove typed
+identity verification. Packed-index and shard-codec tests prove the closed
+record layout, bounded zstd/CRC32C pipeline, exact end-index sizes, and strict
+structural rejection. Storage-metadata and range-read tests prove the nine
+closed Zarr rows, the closed OME axes/transform projection, semantic JSON
+validation, exact range bounds, and rejection of symlink, hardlink, and non-
+regular objects. Catalog tests additionally prove canonical manifest-page
+authentication, exact opening-metadata bytes, and initial cross-object layer
+and storage-shape rejection. The directory-inventory test proves exact positive
+closure counts, cancellation, extra-directory rejection, and post-open length-
+drift rejection, including same-length manifest-authority drift. These tests
+alone make no DS-specific admission, shard-payload, official-schema, complete-
+package, T1 conformance, independent-reader, lifecycle, or product-support
+claim. Current schema-1 packages remain non-authoritative T2 support fixtures
+until WP-10A accepts the independent target evidence.
+
+Address-planning tests prove 2D/3D grid, C-order ordinal, inner-slot, and edge-
+extent arithmetic plus the exact baseline catalog-derived paths and packed-
+record offset. They also prove coordinate/overflow rejection, mandatory packed-
+index descriptors, and optional fill-elided pixel descriptors. They read no
+shard bytes and make no payload-integrity claim.
+
+The bounded brick-core test covers 2D uint8 pixel-present, all-fill, and
+explicit-validity cases with exact two-, four-, and six-request accounting.
+It also checks edge extent, required descriptor/inner failures, packed-record
+cross-checks, length drift, and selected packed-index/pixel corruption. A
+focused boundary test accepts each exact absolute amplification ceiling and
+rejects one unit above it. These core tests alone do not prove 3D,
+incompressible, whole-object SHA-256, DS admission, complete-package, or
+PackageId-attributed reads.
+
+Dataset-profile admission tests prove explicit profile selection, exact
+logical/addressed/actual counts for tiny 2D pixel, all-fill, and explicit-
+validity fixtures, zero-file pixel elision, packed-index coverage, shard-grid
+rejection, cancellation, and per-image rather than summed scale rules. They do
+not materialize advertised keys; a pure admission-arithmetic test directly
+reproduces every frozen 3D/multiscale logical-brick, addressed-shard, and
+logical-S0 boundary vector. These tests do not qualify an exact DS fixture or
+validate packed records, payload digests, or scientific identity.
+
+The package-wide structural reconciliation test covers pixel-present, all-
+fill, explicit-validity, and explicit-all-invalid packages. It rejects record
+coordinate/validity drift, missing or extra packed slots, nonzero final packed
+padding, missing/extra pixel and validity payload slots, all-missing shard
+objects, out-of-grid payload slots, packed-index digest drift, mid-pass/final-
+sweep cancellation, and same-length replacement before the last snapshot
+gate. A focused arithmetic test covers nondivisible edge capacities, C-order
+slot masks, and packed records 255/256 and 16383/16384. The pass reads packed-
+index shards completely and only pixel/validity shard tails, so it does not
+validate pixel/validity payload digests or values, prove the declared PackageId
+closure, recompute scientific identity, or qualify an exact DS fixture.
+
+The exact-package validation test composes explicit DS admission and structural
+reconciliation with fixed-buffer streaming SHA-256 over the root, every page,
+and every descriptor object. It proves digest-drift rejection for opening and
+shard objects, phase-coherent snapshots, immediate and final-sweep
+cancellation, final inventory, mutation rejection before capability issuance,
+and PackageId-attributed pixel/validity reads. The range-I/O test separately
+proves multi-buffer hashing and mid-stream cancellation. Capability freshness
+tests reject replaced consumed shards and exercise the explicit complete-
+snapshot sweep without imposing an all-object scan on every brick. The sweep
+is deliberately a sequential mutation check, not an atomic snapshot of a
+concurrently writable directory. This is exact package-byte integrity only: it
+does not parse lazy portable-record semantics, recompute ScientificContentId,
+qualify IO-3 or independent T1, make a product/performance claim, or implement
+an importer.
+
+Writer tests prove byte-identical package trees and PackageId values across
+different parents and reversed input order, then reopen output through full
+exact validation and PackageId-attributed brick reads. They cover pixel-
+present, all-fill, explicit-validity, and explicit-all-invalid storage, plus
+cancellation cleanup, create-only collision safety, source nonmutation,
+private mode-0700 staging, no-replace symlink races, precommit cleanup, and
+post-rename durability-indeterminate handling. A selected-profile limit-plus-
+one case proves that the writer stops consuming a lazy shard input and
+publishes nothing. This is a T2 writer/reader component proof, not independent
+T1 conformance, import, replacement, product support, or a performance claim.
 
 The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).

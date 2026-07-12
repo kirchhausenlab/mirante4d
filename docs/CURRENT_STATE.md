@@ -1,6 +1,6 @@
 # Current State
 
-Last reviewed: 2026-07-11
+Last reviewed: 2026-07-12
 
 Mirante4D is public, pre-alpha academic research software. Persisted formats
 and APIs can change through explicit hard cutovers; there is no supported
@@ -22,7 +22,12 @@ public release or public full microscopy dataset yet.
 - Linux release-directory, tarball, and AppImage build paths.
 - No segmentation or derived-label subsystem.
 
-The workspace has fifteen crates. `mirante4d-core`, the application
+The workspace has sixteen crates. `mirante4d-storage` is an off-product
+WP-10A library whose first slice owns frozen profile facts, portable package
+paths, checked package-count arithmetic, size/amplification ceilings, and
+bounded read-only local range I/O. It remains unreachable from the product.
+
+`mirante4d-core`, the application
 `AppState` god-state, `WorkbenchCommand`, project-v14 authority, and
 preferences-v1 authority have been deleted. There is one live canonical
 application reducer and one canonical project model.
@@ -50,9 +55,47 @@ WP-08B accepted the unified dataset runtime at
 interactive demand; the predecessor app/data read pools, unbounded result
 channels, resident payload mirrors, and analysis execution worker are deleted.
 
-WP-10A entry work is active. Current schema-1 packages remain transitional T2
-fixtures; WP-10A owns the off-product target dataset schema, sharded storage,
-indexes, provenance, identity, independent corpus, and negative-case evidence.
+WP-10A entry, dependency disposition, and profile freeze are accepted.
+WP-10A-B implementation is active: the storage profile, scientific and exact
+identities, strict control scalars, closed profile, canonical-value,
+scientific, and display-defaults grammars, restricted JCS, and exact
+compatibility tuple bytes exist. Exact recipe bodies and verified RecipeId
+payloads also exist, together with exact object descriptors, canonical greedy
+manifest pages, authenticated roots, and PackageId derivation. Portable source,
+recipe, derivation, rights, and citation records have exact closed schemas;
+embedded recipe and derivation payloads and detached release records verify
+their typed identities. Exact 64-byte packed-index records and the bounded
+in-memory zstd/CRC32C shard and end-index codec also exist. Strict Zarr
+group/array metadata, closed OME image-group metadata, root-confined bounded
+Unix range reads, and an authenticated local metadata catalog now exist. A
+separate cancellable inventory checks the exact finalized file/ancestor-
+directory closure, object types and lengths, counts, depth, and fan-out under
+global bounds. Descriptor-derived address plans validate one requested brick;
+the bounded brick core reads only its packed-index, pixel, and validity ranges,
+verifies their index/inner CRC32C and bounded zstd decoding, applies record-
+authorized fill elision, and reports exact storage-boundary counters. Caller-
+selected DS admission derives logical and addressed counts arithmetically,
+separates actual shard files, bounds every
+listed shard coordinate, and requires exact packed-index shard coverage. The
+structural pass verifies every packed-index shard digest, record coordinate,
+edge capacity, canonical padding, and pixel/validity inner-
+slot presence. Full validation then stream-hashes the manifest root, pages, and
+every descriptor object with fixed memory, requires structural/hash snapshot
+coherence, repeats inventory, and finishes with a cancellable identity sweep.
+Only its owning exact-package capability exposes PackageId-attributed brick
+reads, checking manifest authority and every consumed shard against the proved
+snapshot. A deterministic off-product writer now derives encoded objects and
+manifest bytes from typed metadata and a lazy sequence of bounded decoded outer
+shards, hashes while writing, structurally validates a private sibling stage,
+and publishes a previously absent destination with Linux
+`RENAME_NOREPLACE`. Cancellation and precommit failure remove only the owned
+stage during normal operation under the documented local threat model; a
+post-rename parent-sync failure is reported as durability-indeterminate without
+deleting the valid package. Replacement, import/multiscale generation,
+scientific-ID computation, the independent T1 corpus, and product activation
+remain incomplete.
+Current schema-1 packages remain transitional T2 fixtures and the sole product
+route.
 
 ## Current Verification Boundary
 

@@ -2148,15 +2148,28 @@
       "reason": "WP-07A adds strict typed-identity and descriptor contract evidence."
     },
     {
-      "id": "libtest:mirante4d-identity:object::tests::descriptors_keep_raw_object_facts_separate_from_package_path",
+      "id": "libtest:mirante4d-identity:exact::tests::canonical_body_ids_use_the_frozen_domains_length_and_exact_bytes",
       "kind": "libtest",
       "owner": "mirante4d-identity",
       "lane": "unit",
-      "requirement_ids": [
-        "D-022-unit",
-        "WP-07A-canonical-model"
-      ],
-      "reason": "WP-07A adds strict typed-identity and descriptor contract evidence."
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen recipe, derivation-record, and release body framing with supporting T2 vectors."
+    },
+    {
+      "id": "libtest:mirante4d-identity:exact::tests::exact_byte_counting_is_chunk_invariant_and_failure_poisoned",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves exact-byte hashing uses checked length accounting and cannot finalize after overflow."
+    },
+    {
+      "id": "libtest:mirante4d-identity:exact::tests::exact_object_and_package_ids_hash_only_the_supplied_bytes",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves raw-object and package identities hash exact bytes without an added domain prefix."
     },
     {
       "id": "libtest:mirante4d-identity:object::tests::media_type_and_role_enforce_strict_ascii_grammars",
@@ -2170,26 +2183,12 @@
       "reason": "WP-07A adds strict typed-identity and descriptor contract evidence."
     },
     {
-      "id": "libtest:mirante4d-identity:object::tests::normalized_object_paths_roundtrip",
+      "id": "libtest:mirante4d-identity:object::tests::raw_object_descriptor_keeps_exact_typed_facts",
       "kind": "libtest",
       "owner": "mirante4d-identity",
       "lane": "unit",
-      "requirement_ids": [
-        "D-022-unit",
-        "WP-07A-canonical-model"
-      ],
-      "reason": "WP-07A adds strict typed-identity and descriptor contract evidence."
-    },
-    {
-      "id": "libtest:mirante4d-identity:object::tests::object_path_accepts_only_normalized_relative_lowercase_ascii",
-      "kind": "libtest",
-      "owner": "mirante4d-identity",
-      "lane": "unit",
-      "requirement_ids": [
-        "D-022-unit",
-        "WP-07A-canonical-model"
-      ],
-      "reason": "WP-07A adds strict typed-identity and descriptor contract evidence."
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A keeps exact typed object facts in identity while package paths have one storage-owned authority."
     },
     {
       "id": "libtest:mirante4d-project-model:tests::arbitrary_reorder_keeps_active_selection_by_identity",
@@ -4308,6 +4307,830 @@
       "lane": "unit",
       "requirement_ids": ["D-022-unit", "D-022-policy", "WP-10A-dependency-prerequisite"],
       "reason": "WP-10A entry proves the temporary paste exception is limited to the exact reviewed dependency inclusion graph."
+    },
+    {
+      "id": "libtest:mirante4d-identity:artifact::tests::frozen_non_admissible_artifact_vector_matches_exactly",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:canonical::tests::dependency_tables_match_the_frozen_unicode_version",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:canonical::tests::f64_hex_uses_numeric_bit_order_and_normalizes_negative_zero",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:canonical::tests::nfc_normalization_is_canonical_and_idempotent",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:hash::tests::chunking_does_not_change_the_digest",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:hash::tests::incremental_and_one_shot_sha256_match_the_published_empty_vector",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:scientific::tests::canonical_validity_padding_and_invalid_sentinels_are_enforced",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:scientific::tests::dataset_rejects_noncanonical_layer_order_and_remains_failed",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:scientific::tests::exact_one_voxel_scientific_vector_matches",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:scientific::tests::merkle_boundaries_match_independent_fixed_vectors",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:scientific::tests::nondivisible_edge_tiles_are_required_in_canonical_order",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:scientific::tests::nonfinite_valid_float_rejects_but_signed_zero_and_subnormal_survive",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:scientific::tests::rejected_tile_poisoning_prevents_an_identity",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-identity:scientific::tests::temporal_encodings_reject_ambiguous_or_noncanonical_values",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen D-009 canonicalization and scientific-identity contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:brick_address::tests::address_math_rejects_bounds_field_overflow_and_arithmetic_overflow",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects brick-address coordinate-field and checked-arithmetic overflow before path construction."
+    },
+    {
+      "id": "libtest:mirante4d-storage:brick_address::tests::derives_exact_2d_and_3d_storage_coordinates",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves exact 2D/3D brick grids, C-order record ordinals, x-fastest inner slots, and nondivisible edge extents."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::display::tests::display_defaults_reject_malformed_noncanonical_and_invalid_layers",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects malformed, alternate, unordered, duplicate, oversized, and invalid display defaults."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::display::tests::display_defaults_roundtrip_exact_canonical_bytes",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the closed display-defaults DTO has one exact canonical encoding."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::derivation::tests::derivation_payload_roundtrips_exact_scope_and_verified_identity",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves closed execution scope bytes and the domain-framed DerivationRecordId envelope."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::derivation::tests::derivation_rejects_bad_order_overlap_identity_and_encoding",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects malformed, overlapping, unordered, oversized, and identity-mismatched derivation records."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::header::tests::profile_header_rejects_malformed_noncanonical_and_inconsistent_mappings",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects malformed, alternate, inconsistent, overbound, and forbidden profile-header mappings."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::header::tests::profile_header_roundtrips_exact_frozen_bytes",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the bootstrap profile header carries the exact frozen compatibility, capabilities, paths, and mappings."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::jcs::tests::number_depth_and_size_rejection",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves restricted control JCS rejects unfrozen numbers and enforces private depth and byte safety bounds."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::jcs::tests::utf16_ordering_and_minimal_escaping",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves restricted control JCS uses RFC 8785 UTF-16 key ordering and exact string escaping."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::manifest::tests::manifest_pages_and_root_roundtrip_with_exact_package_identity",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves exact path-bound descriptors, canonical manifest pages, authenticated roots, and PackageId derivation."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::manifest::tests::manifest_rejects_registry_path_order_and_reference_drift",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects unregistered object facts, mismatched paths, alternate encodings, non-greedy pages, and unauthenticated page drift."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::manifest::tests::two_thousand_max_fact_descriptors_fit_one_linear_greedy_page",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the frozen two-thousand-descriptor page guarantee with linear exact-byte accounting."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::portable::tests::portable_records_reject_invalid_scalars_order_shapes_and_encoding",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects unsafe source identifiers, unfrozen licenses, bad ordering, alternate encodings, and malformed portable payloads."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::portable::tests::source_rights_and_citation_records_roundtrip_exact_bytes",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves an exact source encoding and structural roundtrips for closed source, rights, and citation portable records."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::recipe::tests::recipe_payload_rejects_malformed_noncanonical_and_invalid_graphs",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects malformed, alternate, unordered, forward-referencing, and identity-mismatched recipe payloads."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::recipe::tests::recipe_payload_roundtrips_exact_body_and_verified_identity",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the closed recipe graph has exact canonical body bytes and a verified domain-framed RecipeId."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::release::tests::release_rejects_malformed_unordered_oversized_and_self_superseding_values",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects malformed, unordered, oversized, self-referential, and identity-mismatched detached releases."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::release::tests::release_roundtrips_exact_body_and_verified_identity",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the exact detached release body and domain-framed ReleaseId envelope."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::release::tests::uuid_and_publication_time_use_one_strict_wire_form",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves dataset-series UUIDs and publication timestamps have one strict portable spelling."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::scalar::tests::canonical_decimals_reject_alternate_and_out_of_range_forms",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves identity-bearing decimal strings have one bounded canonical form."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::scalar::tests::tokens_text_float_bits_and_rgb_use_the_frozen_wire_grammars",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the frozen ASCII, Unicode-17 NFC, finite bit-pattern, and RGB wire grammars."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::scalar::tests::typed_ids_roundtrip_every_frozen_prefix",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves control metadata accepts only the closed D-009 typed identity set."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::science::tests::science_descriptor_rejects_malformed_noncanonical_and_invalid_facts",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects malformed, alternate, noncontiguous, temporally invalid, and non-affine scientific descriptors."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::science::tests::science_descriptor_roundtrips_exact_bytes_and_temporal_variants",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the closed scientific descriptor and all temporal variants have exact canonical encodings."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::tests::frozen_profile_compatibility_has_exact_canonical_bytes",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A binds the one accepted compatibility tuple to exact canonical control bytes."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::value::tests::every_canonical_value_variant_roundtrips_exact_bytes",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves every closed canonical-value variant has one exact tagged control encoding."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::value::tests::malformed_noncanonical_unordered_and_overdeep_values_reject",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects malformed, alternate, unordered, duplicate, oversized, and overdeep canonical values."
+    },
+    {
+      "id": "libtest:mirante4d-storage:limits::tests::accepted_boundary_counts_recompute_exactly",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:limits::tests::amplification_tables_match_the_accepted_absolute_and_ratio_limits",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:limits::tests::checked_arithmetic_rejects_zero_and_overflow",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:limits::tests::ds0_enforces_logical_s0_byte_ceiling",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:limits::tests::every_profile_rejects_one_object_above_its_ceiling",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:limits::tests::frozen_encoded_limits_recompute_exactly",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:limits::tests::package_counts_reject_inconsistent_totals_and_invalid_scale_contracts",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves package-wide object accounting and exact profile scale contracts cannot be underreported."
+    },
+    {
+      "id": "libtest:mirante4d-storage:packed_index::tests::accepts_fill_elision_and_preserves_finite_float_signed_zero_bits",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves packed-index fill elision and finite float32 statistics preserve the frozen semantics."
+    },
+    {
+      "id": "libtest:mirante4d-storage:packed_index::tests::exact_little_endian_record_round_trips_with_accessors",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the exact fixed 64-byte little-endian packed-index record layout."
+    },
+    {
+      "id": "libtest:mirante4d-storage:packed_index::tests::rejects_corrupt_flags_counts_payload_and_numeric_ranges",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects inconsistent packed-index flags, counts, payload claims, and numeric statistics."
+    },
+    {
+      "id": "libtest:mirante4d-storage:paths::tests::accepts_frozen_paths_and_reports_depth",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:paths::tests::rejects_duplicate_paths",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:paths::tests::rejects_nonportable_and_overdeep_paths",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:profile::tests::capabilities_are_sorted_and_unique",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:profile::tests::profile_tuple_is_the_only_frozen_experimental_tuple",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:ome_metadata::tests::ome_image_group_emits_exact_regular_diagonal_metadata",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A emits exact OME-NGFF 0.5 axes, contiguous datasets, and scale/translation metadata for regular diagonal geometry."
+    },
+    {
+      "id": "libtest:mirante4d-storage:ome_metadata::tests::ome_image_group_projects_nonregular_and_affine_semantics",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A projects nonregular time and arbitrary affine geometry only to the frozen unitless IO-1 OME representation."
+    },
+    {
+      "id": "libtest:mirante4d-storage:ome_metadata::tests::ome_image_group_rejects_alternate_unknown_and_oversized_metadata",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects unknown OME members, alternate paths/transforms, negative zero, mixed spatial modes, and oversized metadata."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_admission::tests::admission_arithmetic_reproduces_frozen_3d_boundaries",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A admission arithmetic directly reproduces every frozen 3D/multiscale logical-brick, addressed pixel/packed-shard, and logical-S0 boundary vector without materializing keys."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_admission::tests::scale_rules_apply_to_every_image_without_summing",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A applies DS scale rules independently to every image and never rejects a valid multi-image package by summing level counts."
+    },
+    {
+      "id": "libtest:mirante4d-storage:local_publication::tests::cleanup_does_not_remove_a_replacement_at_the_stage_name",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A cleanup works from the held stage descriptor and leaves a detected replacement name untouched under the documented local threat model."
+    },
+    {
+      "id": "libtest:mirante4d-storage:local_publication::tests::creates_fd_relative_tree_syncs_and_publishes_once",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A creates and synchronizes a private fd-relative package tree before create-only publication."
+    },
+    {
+      "id": "libtest:mirante4d-storage:local_publication::tests::destination_symlink_is_a_collision_and_owned_stage_is_removed",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A treats a destination symlink race as a no-replace collision without changing its target."
+    },
+    {
+      "id": "libtest:mirante4d-storage:local_publication::tests::postrename_failure_reports_indeterminate_and_never_rolls_back",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A reports post-rename durability failure as indeterminate and preserves the complete visible package."
+    },
+    {
+      "id": "libtest:mirante4d-storage:local_publication::tests::precommit_failure_removes_stage_without_publishing",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A precommit failure removes its private stage without exposing a destination."
+    },
+    {
+      "id": "libtest:mirante4d-storage:local_publication::tests::rename_capability_errors_are_typed_without_fallback",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A types no-replace capability failures and never falls back to an overwriting rename."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_write::tests::cancellation_and_collision_never_touch_destination_or_source",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A cancellation across early, middle, validation, and final gates cleans staging while collision and source bytes remain untouched."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_write::tests::lazy_shard_input_stops_at_the_selected_profile_bound",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A stops a lazy shard source exactly at the selected profile limit plus one and publishes nothing."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_write::tests::writer_outputs_cover_fill_and_explicit_validity_modes",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A writer output passes exact validation and readback for all-fill, explicit-validity, and explicit-all-invalid storage."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_write::tests::writes_byte_identical_exact_packages_independent_of_parent_and_input_order",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A derives byte-identical package trees and PackageId values across parent paths and reversed typed input order."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::admits_explicit_dataset_profile_from_addressed_and_actual_facts",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A derives exact logical, addressed, and actual DS facts; permits zero-file all-fill pixels; requires packed coverage; rejects out-of-grid shards; and propagates cancellation."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::exact_capability_guards_consumed_and_complete_snapshot_freshness",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects replaced consumed shards on PackageId-attributed reads and exposes an explicit complete snapshot-freshness sweep without imposing that package-wide scan on every brick."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::full_sha_validation_rejects_closure_drift_and_issues_exact_capability",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A issues the owning exact-package capability only after structural coherence, full manifest SHA-256 closure, cancellation checks, fresh inventory, and a final mutation-detecting snapshot sweep."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::reconciles_every_packed_record_with_canonical_shard_slots",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A reconciles every packed record with exact coordinates, edge capacity, validity mode, canonical padding, descriptor presence, and pixel/validity inner-slot state while preserving cancellation and rejecting packed-index digest drift."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::derives_descriptor_bound_brick_address_plan",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A derives exact descriptor-bound shard paths and packed-record offsets, requires the packed-index shard, permits deferred pixel fill elision, and rejects out-of-grid requests."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::inspects_exact_bounded_directory_closure",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the explicit directory inventory is cancellable and rejects extra directories, post-open length drift, or same-length manifest-authority drift while reporting exact closure counts and depth."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::opens_authenticated_metadata_catalog_without_reading_shards",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A authenticates canonical manifest pages and exact opening metadata without implicitly sweeping shard payloads."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::reads_one_crc_checked_brick_with_bounded_ranges",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves bounded 2D pixel-present, all-fill, and explicit-validity brick reads; exact storage-boundary accounting; packed-record cross-checks; required payload failures; and selected index/inner corruption rejection."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::rejects_cross_object_layer_drift_and_unexpected_metadata",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects unexpected metadata roles, mismatched profile/science/display layers, unitless OME under IO-2, and pixel storage-shape drift."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::rejects_manifest_page_and_metadata_byte_corruption",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects manifest-page and opening-metadata length or digest corruption before catalog admission."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_read::tests::amplification_checker_accepts_exact_limits_and_rejects_one_above",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A accepts exact regular and all-fill one-brick amplification limits and rejects each metric immediately above its ceiling."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_structure::tests::c_order_edges_slots_and_packed_boundaries_are_exact",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A fixes multi-record C-order inversion, nondivisible 2D edge capacities, sparse inner-slot masks, and the packed inner/outer boundaries at records 255/256 and 16383/16384."
+    },
+    {
+      "id": "libtest:mirante4d-storage:range_io::tests::reads_only_the_requested_nonempty_range_and_index_tail",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves local reads fetch one exact nonempty range and at most the fixed shard-index tail, while a retained object snapshot rejects same-length replacement."
+    },
+    {
+      "id": "libtest:mirante4d-storage:range_io::tests::rejects_empty_overflowing_out_of_bounds_and_oversized_reads",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects empty, overflowing, out-of-bounds, and profile-oversized local object reads before allocation."
+    },
+    {
+      "id": "libtest:mirante4d-storage:range_io::tests::rejects_symlink_hardlink_and_nonregular_objects",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects symlink traversal, hardlinks, and non-regular objects at the local package boundary."
+    },
+    {
+      "id": "libtest:mirante4d-storage:range_io::tests::streams_full_object_digest_with_bounded_cancellation_and_snapshot",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves complete multi-buffer exact-object hashing, mid-stream cancellation, bounded retained memory, and same-length replacement detection."
+    },
+    {
+      "id": "libtest:mirante4d-storage:shard::tests::canonical_tail_encoder_derives_offsets_missing_pairs_and_checksum",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A derives canonical zero-slack shard offsets, missing pairs, and the exact end-index checksum."
+    },
+    {
+      "id": "libtest:mirante4d-storage:shard::tests::canonical_tail_encoder_rejects_count_zero_and_oversized_entries",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A shard-tail encoding rejects slot-count, zero-length, and encoded-inner bound violations."
+    },
+    {
+      "id": "libtest:mirante4d-storage:shard::tests::deterministic_shard_tail_drives_present_and_missing_range_reads",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves deterministic zero-slack shards expose checked present ranges and raw missing sentinels."
+    },
+    {
+      "id": "libtest:mirante4d-storage:shard::tests::inner_decode_rejects_bombs_and_encoded_oversize_before_decompression",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A bounds encoded and decoded inner payloads before untrusted zstd data can exceed the frozen limits."
+    },
+    {
+      "id": "libtest:mirante4d-storage:shard::tests::inner_payload_round_trips_and_corruption_is_rejected",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the selected zstd-level-3 and little-endian CRC32C inner payload pipeline."
+    },
+    {
+      "id": "libtest:mirante4d-storage:shard::tests::profile_rows_fix_chunk_counts_and_tail_lengths",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A fixes all nine payload rows and their 1028-byte or 260-byte shard-index tails."
+    },
+    {
+      "id": "libtest:mirante4d-storage:shard::tests::tail_validation_rejects_checksum_pairs_bounds_and_slack",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects corrupt, oversized, inconsistent, out-of-bounds, and noncanonical shard indexes."
+    },
+    {
+      "id": "libtest:mirante4d-storage:zarr_metadata::tests::arrays_reject_unknown_alternate_and_oversized_metadata",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects unknown, alternate, malformed, and oversized Zarr array metadata outside the frozen profile."
+    },
+    {
+      "id": "libtest:mirante4d-storage:zarr_metadata::tests::empty_groups_emit_deterministic_bytes_and_accept_semantic_json",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A emits one deterministic empty group while accepting semantically equivalent strict Zarr JSON."
+    },
+    {
+      "id": "libtest:mirante4d-storage:zarr_metadata::tests::every_frozen_array_row_round_trips_the_exact_storage_pipeline",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves all nine array rows use the frozen grid, key, fill, dimension, sharding, codec, and end-index configuration."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp08a::tests::dependency_matrix_delegates_only_wp10a_storage_to_its_successor",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A enforces the off-product storage successor boundary and exact predecessor delegation."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp10a::tests::checked_in_contract_binds_freeze_and_predecessor",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A enforces the off-product storage successor boundary and exact predecessor delegation."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp10a::tests::cargo_tree_parser_counts_multiple_versions_as_distinct_packages",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A counts every selected third-party package version against the frozen dependency ceiling."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp10a::tests::declared_dependents_cover_all_dependency_kinds_and_targets",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves product nonreachability scans normal, dev, build, and target-specific workspace dependencies without resolving unrelated platforms."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp10a::tests::source_policy_rejects_forbidden_authority_and_unsafe",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A enforces the off-product storage successor boundary and exact predecessor delegation."
     }
   ],
   "expected_summary": {
@@ -4316,6 +5139,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 333
+    "current_additions": 437
   }
 }

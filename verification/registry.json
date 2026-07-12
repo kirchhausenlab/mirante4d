@@ -15,7 +15,6 @@
     { "id": "domain-shape", "owner": "mirante4d-domain", "seed": "0x4d34444f4d534850", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
     { "id": "domain-view", "owner": "mirante4d-domain", "seed": "0x4d34444f4d564945", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
     { "id": "identity-digest", "owner": "mirante4d-identity", "seed": "0x4d34494444494731", "cases": 128, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
-    { "id": "identity-object", "owner": "mirante4d-identity", "seed": "0x4d344f424a454354", "cases": 128, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
     { "id": "project-model", "owner": "mirante4d-project-model", "seed": "0x4d3450524f4a4d4f", "cases": 128, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" }
   ],
   "lint_exceptions": [],
@@ -78,13 +77,13 @@
     {
       "id": "contract",
       "kind": "nextest",
-      "owner": "format-import-contract-owners",
+      "owner": "format-import-storage-contract-owners",
       "requirements": ["D-022-contract"],
       "fixture_tier": "T1-source-or-T2",
       "capability": "hosted-cpu",
       "hosted_required": true,
-      "packages": ["mirante4d-format", "mirante4d-import"],
-      "selector": "package(mirante4d-format) | package(mirante4d-import)",
+      "packages": ["mirante4d-format", "mirante4d-import", "mirante4d-storage"],
+      "selector": "package(mirante4d-format) | package(mirante4d-import) | package(mirante4d-storage)",
       "warn_ms": 5000,
       "terminate_ms": 20000,
       "aggregate_timeout_secs": 720

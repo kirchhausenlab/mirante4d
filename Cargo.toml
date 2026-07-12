@@ -14,6 +14,7 @@ members = [
     "crates/mirante4d-render-api",
     "crates/mirante4d-renderer",
     "crates/mirante4d-settings",
+    "crates/mirante4d-storage",
     "crates/xtask",
 ]
 exclude = ["fuzz", "vendor/wayland-scanner"]
@@ -30,6 +31,7 @@ anyhow = "1.0.103"
 approx = "0.5.1"
 blake3 = "1.8.2"
 bytemuck = "1.25.0"
+crc32c = "=0.6.8"
 eframe = { version = "0.34.3", default-features = false, features = ["accesskit", "default_fonts", "wayland", "web_screen_reader", "wgpu", "x11"] }
 egui_kittest = { version = "0.34.3", default-features = false }
 glam = { version = "0.30.9", features = ["serde"] }
@@ -39,20 +41,25 @@ pollster = "0.4.0"
 proptest = "1.11.0"
 quick-xml = "0.41.0"
 rfd = "0.15.4"
+rustix = { version = "=1.1.4", features = ["fs"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
+serde_json = "=1.0.145"
+sha2 = { version = "=0.11.0", default-features = false }
 syn = { version = "2.0.117", features = ["full", "visit"] }
 tempfile = "3.23.0"
-thiserror = "2.0.17"
+thiserror = "=2.0.17"
 tiff = "0.11.3"
 toml = { version = "1.1.2", default-features = false, features = ["std", "serde", "parse"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+unicode-normalization = "=0.1.25"
 uuid = { version = "1.23.3", features = ["v4"] }
 wgpu = "29.0.3"
 winit = { version = "0.30.13", default-features = false, features = ["wayland-csd-adwaita-notitle", "wayland-dlopen"] }
 yaml-rust2 = "0.11.0"
 zarrs = { version = "0.23.13", default-features = false, features = ["crc32c", "filesystem", "ndarray", "sharding", "zstd"] }
+zarrs_metadata = "=0.7.5"
+zstd = { version = "=0.13.3", default-features = false }
 
 mirante4d-app = { path = "crates/mirante4d-app" }
 mirante4d-analysis = { path = "crates/mirante4d-analysis" }
@@ -68,6 +75,7 @@ mirante4d-project-model = { path = "crates/mirante4d-project-model" }
 mirante4d-render-api = { path = "crates/mirante4d-render-api" }
 mirante4d-renderer = { path = "crates/mirante4d-renderer" }
 mirante4d-settings = { path = "crates/mirante4d-settings" }
+mirante4d-storage = { path = "crates/mirante4d-storage" }
 
 [patch.crates-io]
 wayland-scanner = { path = "vendor/wayland-scanner" }

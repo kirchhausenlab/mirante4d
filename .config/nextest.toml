@@ -17,7 +17,7 @@ test-group = 'unit'
 slow-timeout = { period = "500ms", terminate-after = 4 }
 
 [[profile.default.overrides]]
-filter = 'package(mirante4d-format) | package(mirante4d-import)'
+filter = 'package(mirante4d-format) | package(mirante4d-import) | package(mirante4d-storage)'
 test-group = 'contract'
 slow-timeout = { period = "5s", terminate-after = 4 }
 

@@ -46,13 +46,18 @@ const TARGET_CRATES: [&str; 17] = [
     "mirante4d-storage",
     "mirante4d-ui-egui",
 ];
+const SUCCESSOR_OWNED_WORKSPACE_CRATES: [&str; 1] = ["mirante4d-storage"];
 
 // Keep the WP-08A JSON immutable while checking the small set of dependency
-// edges activated by its accepted WP-08B successor.
-fn wp08b_normal_dependency_additions(crate_name: &str) -> &'static [&'static str] {
+// edges activated by accepted successor packages. Each addition remains exact;
+// successor-owned crates themselves are delegated separately below.
+pub(super) fn accepted_successor_normal_dependency_additions(
+    crate_name: &str,
+) -> &'static [&'static str] {
     match crate_name {
         "mirante4d-app" => &["mirante4d-dataset-runtime"],
         "mirante4d-data" | "mirante4d-renderer" => &["mirante4d-dataset"],
+        "mirante4d-identity" => &["mirante4d-domain", "sha2", "unicode-normalization"],
         "xtask" => &["mirante4d-dataset", "mirante4d-dataset-runtime"],
         _ => &[],
     }
@@ -326,9 +331,13 @@ fn validate_dependency_matrix(
         }
     }
 
+    // The immutable WP-08A matrix remains authoritative for its exact
+    // predecessor workspace. A successor checker owns only the crates named
+    // here; every other addition still fails this closure check.
     let actual_crates = metadata
         .declared_dependency_kinds_by_name
         .keys()
+        .filter(|name| !SUCCESSOR_OWNED_WORKSPACE_CRATES.contains(&name.as_str()))
         .cloned()
         .collect::<BTreeSet<_>>();
     let expected_crates = declared.keys().cloned().collect::<BTreeSet<_>>();
@@ -379,7 +388,7 @@ fn validate_dependency_matrix(
                 unique_string_set(expected, &format!("WP-08A {name} {kind} dependency list"))?;
             if kind == "normal" {
                 expected.extend(
-                    wp08b_normal_dependency_additions(&name)
+                    accepted_successor_normal_dependency_additions(&name)
                         .iter()
                         .map(|dependency| (*dependency).to_owned()),
                 );
@@ -487,15 +496,16 @@ fn validate_normal_edge_closure(
                 .is_some_and(|dependencies| dependencies.contains(dependency));
             let explicitly_transitional =
                 transitional.contains(&(source.as_str(), dependency.as_str()));
-            let wp08b_cutover_edge = !target_permitted
-                && wp08b_normal_dependency_additions(source).contains(&dependency.as_str());
+            let accepted_successor_edge = !target_permitted
+                && accepted_successor_normal_dependency_additions(source)
+                    .contains(&dependency.as_str());
             let owners = usize::from(target_permitted)
                 + usize::from(explicitly_transitional)
-                + usize::from(wp08b_cutover_edge);
+                + usize::from(accepted_successor_edge);
             match owners {
                 1 => {}
                 0 => bail!(
-                    "live normal edge {source} -> {dependency} is not target-permitted, transitional, or part of the WP-08B cutover"
+                    "live normal edge {source} -> {dependency} is not target-permitted, transitional, or an accepted successor addition"
                 ),
                 _ => bail!(
                     "live normal edge {source} -> {dependency} has overlapping architecture classifications"
@@ -1817,6 +1827,55 @@ mod tests {
     }
 
     #[test]
+    fn dependency_matrix_delegates_only_wp10a_storage_to_its_successor() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["one", "two"] {
+            let crate_root = temp.path().join("crates").join(name);
+            fs::create_dir_all(&crate_root).unwrap();
+            fs::write(
+                crate_root.join("Cargo.toml"),
+                format!("[package]\nname = {name:?}\nversion = \"0.0.0\"\n"),
+            )
+            .unwrap();
+        }
+        let mut predecessor = contract();
+        predecessor.workspace_dependency_matrix = vec![
+            dependency_entry("one", &["two"], &[], &[]),
+            dependency_entry("two", &[], &[], &[]),
+        ];
+
+        let delegated = metadata(&[
+            ("one", &[("normal", &["two"])]),
+            ("two", &[]),
+            (
+                "mirante4d-storage",
+                &[(
+                    "normal",
+                    &[
+                        "mirante4d-dataset",
+                        "mirante4d-domain",
+                        "mirante4d-identity",
+                    ],
+                )],
+            ),
+        ]);
+        validate_dependency_matrix(temp.path(), &predecessor, &delegated).unwrap();
+
+        let unknown = metadata(&[
+            ("one", &[("normal", &["two"])]),
+            ("two", &[]),
+            ("mirante4d-storage", &[]),
+            ("unreviewed-successor", &[]),
+        ]);
+        assert!(
+            validate_dependency_matrix(temp.path(), &predecessor, &unknown)
+                .unwrap_err()
+                .to_string()
+                .contains("cover the workspace exactly")
+        );
+    }
+
+    #[test]
     fn target_dependency_matrix_rejects_missing_unknown_and_cycles() {
         let mut missing = contract();
         missing.target_dependency_matrix.pop();
@@ -1869,7 +1928,7 @@ mod tests {
             validate_normal_edge_closure(&contract, &metadata, &BTreeMap::new())
                 .unwrap_err()
                 .to_string()
-                .contains("not target-permitted, transitional, or part of the WP-08B cutover")
+                .contains("not target-permitted, transitional, or an accepted successor addition")
         );
     }
 
