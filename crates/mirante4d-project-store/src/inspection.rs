@@ -581,7 +581,11 @@ fn map_local_error(error: LocalPublicationError, stage: &'static str) -> Project
         LocalPublicationError::SourceDigest => ProjectStoreFault::DigestMismatch,
         LocalPublicationError::RefAlreadyPresent => ProjectStoreFault::StaleParent,
         LocalPublicationError::RefChanged => ProjectStoreFault::Corruption { stage },
-        LocalPublicationError::RefCommitIndeterminate => ProjectStoreFault::CommitIndeterminate,
+        LocalPublicationError::RefCommitIndeterminate
+        | LocalPublicationError::PackageCommitIndeterminate => {
+            ProjectStoreFault::CommitIndeterminate
+        }
+        LocalPublicationError::DestinationExists => ProjectStoreFault::DestinationExists,
         LocalPublicationError::AtomicPublishUnsupported => ProjectStoreFault::UnsupportedFilesystem,
         LocalPublicationError::InvalidPath
         | LocalPublicationError::ExistingMismatch

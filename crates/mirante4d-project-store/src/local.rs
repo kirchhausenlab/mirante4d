@@ -38,7 +38,7 @@ use thiserror::Error;
 use std::sync::atomic::AtomicUsize;
 
 use crate::{
-    ProjectGenerationId, ProjectStoreLimits,
+    ProjectGenerationId, ProjectStoreLimits, ProjectStorePath,
     generation::EncodedGeneration,
     wire::{
         ProjectEnvelope, REF_BYTES, RefKind, RefRecord, generation_id_from_validated_canonical,
@@ -57,6 +57,14 @@ const WRITABLE_SESSION_DESCRIPTORS: usize = 3;
 // private staging directory, and the separate parent/file pair used by the
 // final exact predecessor recheck.
 const REF_PUBLICATION_DESCRIPTORS: usize = WRITABLE_SESSION_DESCRIPTORS + 5;
+// Package installation additionally holds the destination parent, one
+// directory-enumeration descriptor, and one file descriptor at the walk peak.
+const PACKAGE_INSTALL_DESCRIPTORS: usize = WRITABLE_SESSION_DESCRIPTORS + 3;
+const PACKAGE_CLEANUP_DESCRIPTORS: usize = WRITABLE_SESSION_DESCRIPTORS + 2;
+// Beyond one file per bounded reachable object, the fixed envelope/ref/
+// generation tree, 256 digest fan-out directories, and one transient private
+// publication stage fit comfortably inside this reserve.
+const PACKAGE_CLEANUP_ENTRY_OVERHEAD: usize = 1_024;
 
 static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -79,10 +87,53 @@ const FILE_CREATE_FLAGS: OFlags = OFlags::WRONLY
 #[derive(Debug)]
 pub(crate) struct LocalStoreRoot {
     root: OwnedFd,
+    external_held_descriptors: usize,
     #[cfg(test)]
     ref_commit_directory_sync_count: AtomicUsize,
     #[cfg(test)]
     ref_commit_directory_sync_failure: AtomicUsize,
+}
+
+/// One destination-local sibling package which is invisible until its final
+/// no-replace rename. Drop removes only the still-owned staging tree.
+pub(crate) struct SiblingPackageStage {
+    parent: OwnedFd,
+    destination_name: OsString,
+    stage_name: OsString,
+    stage_identity: DirectoryIdentity,
+    root: Option<LocalStoreRoot>,
+    cleanup_limits: PackageCleanupLimits,
+    owns_stage: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PackageCleanupLimits {
+    directory_fanout_entries_max: usize,
+    physical_store_entries_max: usize,
+    open_file_descriptors_max: usize,
+}
+
+impl PackageCleanupLimits {
+    fn for_initial_package(limits: ProjectStoreLimits) -> Result<Self, LocalPublicationError> {
+        let self_authored_entries = limits
+            .reachable_objects_per_generation_max
+            .checked_add(PACKAGE_CLEANUP_ENTRY_OVERHEAD)
+            .ok_or_else(|| capacity_overflow(limits.physical_store_entries_max))?;
+        let defaults = ProjectStoreLimits::default();
+        Ok(Self {
+            directory_fanout_entries_max: limits
+                .directory_fanout_entries_max
+                .max(defaults.directory_fanout_entries_max)
+                .max(self_authored_entries),
+            physical_store_entries_max: limits
+                .physical_store_entries_max
+                .max(defaults.physical_store_entries_max)
+                .max(self_authored_entries),
+            open_file_descriptors_max: limits
+                .open_file_descriptors_max
+                .max(defaults.open_file_descriptors_max),
+        })
+    }
 }
 
 /// Whether immutable publication created a file or validated an identical one.
@@ -167,6 +218,8 @@ pub(crate) enum LocalPublicationError {
     SourceDigest,
     #[error("an existing immutable destination is not the declared exact file")]
     ExistingMismatch,
+    #[error("the package destination already exists")]
+    DestinationExists,
     #[error("the filesystem cannot publish an immutable file without replacement")]
     AtomicPublishUnsupported,
     #[error("an internally encoded generation has an invalid framed identity")]
@@ -179,6 +232,8 @@ pub(crate) enum LocalPublicationError {
     RefChanged,
     #[error("a replaced project ref may be visible but its directory durability is indeterminate")]
     RefCommitIndeterminate,
+    #[error("the installed package may be visible but parent durability is indeterminate")]
+    PackageCommitIndeterminate,
     #[error("project-store I/O failed while attempting to {operation}: {source}")]
     Io {
         operation: &'static str,
@@ -231,6 +286,7 @@ impl LocalStoreRoot {
         }
         Ok(Self {
             root: current,
+            external_held_descriptors: 0,
             #[cfg(test)]
             ref_commit_directory_sync_count: AtomicUsize::new(0),
             #[cfg(test)]
@@ -240,6 +296,48 @@ impl LocalStoreRoot {
 
     pub(crate) const fn descriptor(&self) -> &OwnedFd {
         &self.root
+    }
+
+    /// Creates the immutable project envelope in a private, unpublished
+    /// package root.
+    pub(crate) fn publish_project_envelope<C>(
+        &self,
+        envelope: ProjectEnvelope,
+        limits: ProjectStoreLimits,
+        mut is_cancelled: C,
+    ) -> Result<(), LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        let bytes = envelope
+            .encode()
+            .map_err(|_| LocalPublicationError::InvalidControl)?;
+        if bytes.len() > limits.project_envelope_bytes_max {
+            return Err(LocalPublicationError::Capacity {
+                declared: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                maximum: u64::try_from(limits.project_envelope_bytes_max).unwrap_or(u64::MAX),
+            });
+        }
+        check_cancelled(&mut is_cancelled)?;
+        let descriptor = openat(
+            &self.root,
+            OsStr::new("project.json"),
+            FILE_CREATE_FLAGS,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|error| match error {
+            Errno::EXIST => LocalPublicationError::ExistingMismatch,
+            other => io_error("create the project envelope", other),
+        })?;
+        let mut file = File::from(descriptor);
+        file.write_all(&bytes)
+            .map_err(|source| LocalPublicationError::Io {
+                operation: "write the project envelope",
+                source,
+            })?;
+        fsync(&file).map_err(|error| io_error("synchronize the project envelope", error))?;
+        check_cancelled(&mut is_cancelled)?;
+        fsync(&self.root).map_err(|error| io_error("synchronize the project root", error))
     }
 
     #[cfg(test)]
@@ -500,10 +598,10 @@ impl LocalStoreRoot {
         check_cancelled(&mut is_cancelled)?;
         let publishes_ref = pending_fixed_refs != 0 || replaces_fixed_ref;
         if publishes_ref {
-            enforce_count(
-                REF_PUBLICATION_DESCRIPTORS,
-                limits.open_file_descriptors_max,
-            )?;
+            let publication_descriptors = REF_PUBLICATION_DESCRIPTORS
+                .checked_add(self.external_held_descriptors)
+                .ok_or_else(|| capacity_overflow(limits.open_file_descriptors_max))?;
+            enforce_count(publication_descriptors, limits.open_file_descriptors_max)?;
         }
         let root = duplicate_directory(&self.root)?;
         let mut inventory = StoreInventory::default();
@@ -511,6 +609,7 @@ impl LocalStoreRoot {
             &root,
             InventoryDirectory::Root,
             0,
+            self.external_held_descriptors,
             limits,
             &mut inventory,
             &mut is_cancelled,
@@ -1167,10 +1266,201 @@ impl LocalStoreRoot {
     }
 }
 
+impl SiblingPackageStage {
+    pub(crate) fn begin(
+        destination: &ProjectStorePath,
+        limits: ProjectStoreLimits,
+    ) -> Result<Self, LocalPublicationError> {
+        let cleanup_limits = PackageCleanupLimits::for_initial_package(limits)?;
+        let path = destination.as_path();
+        let destination_name = path
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or(LocalPublicationError::InvalidPath)?
+            .to_os_string();
+        let parent_path = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent_root = LocalStoreRoot::open(parent_path)?;
+        let parent = duplicate_directory(parent_root.descriptor())?;
+        match statat(&parent, &destination_name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => return Err(LocalPublicationError::DestinationExists),
+            Err(Errno::NOENT) => {}
+            Err(error) => return Err(io_error("inspect the package destination", error)),
+        }
+
+        for attempt in 0..STAGE_CREATE_ATTEMPTS {
+            let stage_name = unique_package_stage_name(attempt);
+            match mkdirat(&parent, &stage_name, Mode::RWXU) {
+                Ok(()) => {
+                    let stage =
+                        match openat(&parent, &stage_name, DIRECTORY_OPEN_FLAGS, Mode::empty()) {
+                            Ok(stage) => stage,
+                            Err(error) => {
+                                let _ = unlinkat(&parent, &stage_name, AtFlags::REMOVEDIR);
+                                return Err(io_error("open the sibling package stage", error));
+                            }
+                        };
+                    let stage_identity = match fstat(&stage)
+                        .map_err(|error| io_error("identify the sibling package stage", error))
+                        .and_then(DirectoryIdentity::from_stat)
+                    {
+                        Ok(identity) => identity,
+                        Err(error) => {
+                            drop(stage);
+                            let _ = unlinkat(&parent, &stage_name, AtFlags::REMOVEDIR);
+                            return Err(error);
+                        }
+                    };
+                    let root = LocalStoreRoot {
+                        root: stage,
+                        external_held_descriptors: 1,
+                        #[cfg(test)]
+                        ref_commit_directory_sync_count: AtomicUsize::new(0),
+                        #[cfg(test)]
+                        ref_commit_directory_sync_failure: AtomicUsize::new(usize::MAX),
+                    };
+                    return Ok(Self {
+                        parent,
+                        destination_name,
+                        stage_name,
+                        stage_identity,
+                        root: Some(root),
+                        cleanup_limits,
+                        owns_stage: true,
+                    });
+                }
+                Err(Errno::EXIST) => continue,
+                Err(error) => {
+                    return Err(io_error("create the sibling package stage", error));
+                }
+            }
+        }
+        Err(LocalPublicationError::Io {
+            operation: "create a unique sibling package stage",
+            source: io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "all bounded package-stage names collided",
+            ),
+        })
+    }
+
+    pub(crate) fn root(&self) -> &LocalStoreRoot {
+        self.root
+            .as_ref()
+            .expect("the staged root exists until install")
+    }
+
+    pub(crate) fn sync_tree<C>(
+        &self,
+        limits: ProjectStoreLimits,
+        mut is_cancelled: C,
+    ) -> Result<(), LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        let mut entries = 0_usize;
+        sync_package_tree(
+            self.root().descriptor(),
+            0,
+            limits,
+            &mut entries,
+            &mut is_cancelled,
+        )
+    }
+
+    /// Installs the already-synchronized package. Cancellation is ignored
+    /// after the successful rename until destination-parent durability is
+    /// established.
+    pub(crate) fn install<C>(self, is_cancelled: C) -> Result<LocalStoreRoot, LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        self.install_inner(is_cancelled, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_with_parent_sync_failure<C>(
+        self,
+        is_cancelled: C,
+    ) -> Result<LocalStoreRoot, LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        self.install_inner(is_cancelled, true)
+    }
+
+    fn install_inner<C>(
+        mut self,
+        mut is_cancelled: C,
+        fail_parent_sync: bool,
+    ) -> Result<LocalStoreRoot, LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        check_cancelled(&mut is_cancelled)?;
+        if !self.stage_name_still_owned()? {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+        match renameat_with(
+            &self.parent,
+            &self.stage_name,
+            &self.parent,
+            &self.destination_name,
+            RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => self.owns_stage = false,
+            Err(Errno::EXIST) => return Err(LocalPublicationError::DestinationExists),
+            Err(error)
+                if error == Errno::NOSYS || error == Errno::INVAL || error == Errno::OPNOTSUPP =>
+            {
+                return Err(LocalPublicationError::AtomicPublishUnsupported);
+            }
+            Err(error) => return Err(io_error("install the staged project package", error)),
+        }
+        if fail_parent_sync || sync_with_retry(&self.parent).is_err() {
+            return Err(LocalPublicationError::PackageCommitIndeterminate);
+        }
+        let mut root = self
+            .root
+            .take()
+            .expect("the installed root remains descriptor-held");
+        root.external_held_descriptors = 0;
+        Ok(root)
+    }
+
+    fn stage_name_still_owned(&self) -> Result<bool, LocalPublicationError> {
+        match statat(&self.parent, &self.stage_name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => Ok(FileType::from_raw_mode(stat.st_mode) == FileType::Directory
+                && DirectoryIdentity::from_stat(stat)? == self.stage_identity),
+            Err(Errno::NOENT) => Ok(false),
+            Err(error) => Err(io_error("revalidate the sibling package stage", error)),
+        }
+    }
+}
+
+impl Drop for SiblingPackageStage {
+    fn drop(&mut self) {
+        if !self.owns_stage {
+            return;
+        }
+        if let Some(root) = &self.root {
+            let mut entries = 0_usize;
+            let _ =
+                remove_directory_contents(root.descriptor(), 0, self.cleanup_limits, &mut entries);
+        }
+        if self.stage_name_still_owned().unwrap_or(false) {
+            let _ = unlinkat(&self.parent, &self.stage_name, AtFlags::REMOVEDIR);
+        }
+    }
+}
+
 fn inspect_store_directory<C>(
     directory: &OwnedFd,
     role: InventoryDirectory,
     depth: usize,
+    external_held_descriptors: usize,
     limits: ProjectStoreLimits,
     inventory: &mut StoreInventory,
     is_cancelled: &mut C,
@@ -1180,7 +1470,8 @@ where
 {
     check_cancelled(is_cancelled)?;
     let held_descriptors = WRITABLE_SESSION_DESCRIPTORS
-        .checked_add(depth)
+        .checked_add(external_held_descriptors)
+        .and_then(|value| value.checked_add(depth))
         .and_then(|value| value.checked_add(2))
         .ok_or_else(|| capacity_overflow(limits.open_file_descriptors_max))?;
     enforce_count(held_descriptors, limits.open_file_descriptors_max)?;
@@ -1246,12 +1537,110 @@ where
             depth
                 .checked_add(1)
                 .ok_or_else(|| capacity_overflow(limits.open_file_descriptors_max))?,
+            external_held_descriptors,
             limits,
             inventory,
             is_cancelled,
         )?;
     }
     Ok(())
+}
+
+/// Synchronizes every regular file and directory in a private package before
+/// its name can become visible. The walk is descriptor-relative, bounded, and
+/// rejects links or namespace changes instead of following them.
+fn sync_package_tree<C>(
+    directory: &OwnedFd,
+    depth: usize,
+    limits: ProjectStoreLimits,
+    entries: &mut usize,
+    is_cancelled: &mut C,
+) -> Result<(), LocalPublicationError>
+where
+    C: FnMut() -> bool,
+{
+    check_cancelled(is_cancelled)?;
+    let held_descriptors = PACKAGE_INSTALL_DESCRIPTORS
+        .checked_add(depth)
+        .ok_or_else(|| capacity_overflow(limits.open_file_descriptors_max))?;
+    enforce_count(held_descriptors, limits.open_file_descriptors_max)?;
+
+    let mut fan_out = 0_usize;
+    let mut children = Vec::new();
+    for entry in Dir::read_from(directory).map_err(|_| LocalPublicationError::ExistingMismatch)? {
+        check_cancelled(is_cancelled)?;
+        let entry = entry.map_err(|_| LocalPublicationError::ExistingMismatch)?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        fan_out = checked_count_add(fan_out, 1, limits.directory_fanout_entries_max)?;
+        enforce_count(fan_out, limits.directory_fanout_entries_max)?;
+        *entries = checked_count_add(*entries, 1, limits.physical_store_entries_max)?;
+        enforce_count(*entries, limits.physical_store_entries_max)?;
+
+        let metadata = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| LocalPublicationError::ExistingMismatch)?;
+        match FileType::from_raw_mode(metadata.st_mode) {
+            FileType::Directory => {
+                children.push((name.to_owned(), DirectoryIdentity::from_stat(metadata)?))
+            }
+            FileType::RegularFile if metadata.st_nlink == 1 => {
+                let expected = FileIdentity::from_stat(metadata)?;
+                let file = openat(directory, name, FILE_READ_FLAGS, Mode::empty())
+                    .map_err(|_| LocalPublicationError::ExistingMismatch)?;
+                let before = FileIdentity::from_stat(
+                    fstat(&file).map_err(|_| LocalPublicationError::ExistingMismatch)?,
+                )?;
+                if before != expected {
+                    return Err(LocalPublicationError::ExistingMismatch);
+                }
+                fsync(&file).map_err(|error| io_error("synchronize a package file", error))?;
+                check_cancelled(is_cancelled)?;
+                let after = FileIdentity::from_stat(
+                    fstat(&file).map_err(|_| LocalPublicationError::ExistingMismatch)?,
+                )?;
+                let named = FileIdentity::from_stat(
+                    statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+                        .map_err(|_| LocalPublicationError::ExistingMismatch)?,
+                )?;
+                if before != after || before != named {
+                    return Err(LocalPublicationError::ExistingMismatch);
+                }
+            }
+            _ => return Err(LocalPublicationError::ExistingMismatch),
+        }
+    }
+    for (name, expected_identity) in children {
+        check_cancelled(is_cancelled)?;
+        let child = openat(directory, &name, DIRECTORY_OPEN_FLAGS, Mode::empty())
+            .map_err(|_| LocalPublicationError::ExistingMismatch)?;
+        let opened_identity = DirectoryIdentity::from_stat(
+            fstat(&child).map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        if opened_identity != expected_identity {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+        sync_package_tree(
+            &child,
+            depth
+                .checked_add(1)
+                .ok_or_else(|| capacity_overflow(limits.open_file_descriptors_max))?,
+            limits,
+            entries,
+            is_cancelled,
+        )?;
+        let named_identity = DirectoryIdentity::from_stat(
+            statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        if opened_identity != named_identity {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+    }
+
+    check_cancelled(is_cancelled)?;
+    fsync(directory).map_err(|error| io_error("synchronize a package directory", error))
 }
 
 fn checked_count_add(
@@ -1736,6 +2125,59 @@ fn duplicate_directory(directory: &OwnedFd) -> Result<OwnedFd, LocalPublicationE
     .map_err(|error| io_error("duplicate a held project-store directory", error))
 }
 
+fn remove_directory_contents(
+    directory: &OwnedFd,
+    depth: usize,
+    limits: PackageCleanupLimits,
+    entries: &mut usize,
+) -> Result<(), LocalPublicationError> {
+    let held_descriptors = PACKAGE_CLEANUP_DESCRIPTORS
+        .checked_add(depth)
+        .ok_or_else(|| capacity_overflow(limits.open_file_descriptors_max))?;
+    enforce_count(held_descriptors, limits.open_file_descriptors_max)?;
+
+    let mut fan_out = 0_usize;
+    let mut names = Vec::new();
+    for entry in Dir::read_from(directory).map_err(|_| LocalPublicationError::ExistingMismatch)? {
+        let entry = entry.map_err(|_| LocalPublicationError::ExistingMismatch)?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        fan_out = checked_count_add(fan_out, 1, limits.directory_fanout_entries_max)?;
+        enforce_count(fan_out, limits.directory_fanout_entries_max)?;
+        *entries = checked_count_add(*entries, 1, limits.physical_store_entries_max)?;
+        enforce_count(*entries, limits.physical_store_entries_max)?;
+        names.push(name.to_owned());
+    }
+
+    for name in names {
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let metadata = statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| LocalPublicationError::ExistingMismatch)?;
+        if FileType::from_raw_mode(metadata.st_mode) == FileType::Directory {
+            let child = openat(directory, &name, DIRECTORY_OPEN_FLAGS, Mode::empty())
+                .map_err(|_| LocalPublicationError::ExistingMismatch)?;
+            remove_directory_contents(
+                &child,
+                depth
+                    .checked_add(1)
+                    .ok_or_else(|| capacity_overflow(limits.open_file_descriptors_max))?,
+                limits,
+                entries,
+            )?;
+            unlinkat(directory, &name, AtFlags::REMOVEDIR)
+                .map_err(|error| io_error("remove an owned package-stage directory", error))?;
+        } else {
+            unlinkat(directory, &name, AtFlags::empty())
+                .map_err(|error| io_error("remove an owned package-stage file", error))?;
+        }
+    }
+    Ok(())
+}
+
 fn open_or_create_directory(
     parent: &OwnedFd,
     name: &OsStr,
@@ -1787,6 +2229,19 @@ fn unique_stage_name(attempt: u64) -> OsString {
         .as_nanos();
     format!(
         "tx-{}-{timestamp:032x}-{sequence:016x}-{attempt:02x}",
+        std::process::id()
+    )
+    .into()
+}
+
+fn unique_package_stage_name(attempt: u64) -> OsString {
+    let sequence = STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        ".mirante4d-project-stage-{}-{timestamp:032x}-{sequence:016x}-{attempt:02x}",
         std::process::id()
     )
     .into()
@@ -1914,6 +2369,29 @@ mod tests {
             LocalStoreRoot::open(Path::new("../outside")),
             Err(LocalPublicationError::InvalidPath)
         ));
+    }
+
+    #[test]
+    fn package_stage_loses_destination_race_without_clobber_or_leak() {
+        let parent = TestDirectory::new("package-race");
+        let destination = ProjectStorePath::new(parent.path().join("winner.m4dproj")).unwrap();
+        let stage =
+            SiblingPackageStage::begin(&destination, ProjectStoreLimits::default()).unwrap();
+        fs::write(destination.as_path(), b"racing winner").unwrap();
+
+        assert!(matches!(
+            stage.install(|| false),
+            Err(LocalPublicationError::DestinationExists)
+        ));
+        assert_eq!(fs::read(destination.as_path()).unwrap(), b"racing winner");
+        let remaining = fs::read_dir(parent.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            remaining,
+            vec![destination.as_path().file_name().unwrap().to_os_string()]
+        );
     }
 
     #[test]

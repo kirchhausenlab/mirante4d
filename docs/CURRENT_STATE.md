@@ -145,7 +145,10 @@ session through Close or shutdown. A shared private inspection core now opens
 and validates established stores for actor startup and transaction preflight,
 including exact ref/generation continuity, bounded physical metadata closure,
 autosave classification, and explicit read-only writer fallback without eager
-bulk-payload hashing. The frozen public actor remains non-constructible and the
+bulk-payload hashing. A crate-private destination-local installer now builds a
+complete initial Create or Save As package in a sibling stage, validates and
+synchronizes it, and installs it with a no-clobber rename while retaining the
+root and leases. The frozen public actor remains non-constructible and the
 crate remains off-product.
 
 Replacement, import/multiscale generation, and product activation remain
@@ -173,12 +176,15 @@ See [testing](TESTING.md) for commands and claim language.
   generation-last immutable publication. Its crate-private transaction core
   can create the initial manual head and advance an established manual head
   under held leases, and can create or advance an established-project autosave
-  head. Its private established-session actor executes and bounds those two
-  established save lanes only, using the same private established-store
-  inspection authority as transaction preflight. Public Create/Open/Save As
-  execution, provisional autosave, recovery selection/open, timers, garbage
-  collection, full verification, public actor construction, durability
-  qualification, and every product path remain unimplemented.
+  head. It can also install a new initial package privately with exact Create
+  facts or a caller-bound Save As fork tuple, without replacing an existing
+  destination. Source-session authentication remains with later actor wiring.
+  Its private established-session actor executes and bounds the two established
+  save lanes only, using the same private established-store inspection authority
+  as transaction preflight. Public Create/Open/Save As execution,
+  provisional autosave, recovery selection/open, timers, garbage collection,
+  full verification, public actor construction, durability qualification, and
+  every product path remain unimplemented.
 - The package-capability lane remains pending until there is an honest
   unsupported-GPU package command.
 - Packaged runtime does not expose unsaved-autosave recovery.

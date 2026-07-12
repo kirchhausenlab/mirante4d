@@ -1,10 +1,10 @@
 //! Generation-last publication and project-lane authority updates.
 //!
-//! This private B2 slice publishes an initial manual head into a prepared root
-//! and advances established manual and autosave heads through recovery-before-
-//! head atomic replacement under a held writer lease and bounded whole-store
-//! inventory. Actor execution, provisional autosave, recovery selection, Save
-//! As, and garbage collection remain outside this module.
+//! This private B2 slice installs a complete initial package and advances
+//! established manual and autosave heads through recovery-before-head atomic
+//! replacement under a held writer lease and bounded whole-store inventory.
+//! Public actor execution for Create and Save As, provisional autosave,
+//! recovery selection, and garbage collection remain outside this module.
 
 #![cfg(target_os = "linux")]
 #![cfg_attr(not(test), allow(dead_code))]
@@ -19,7 +19,7 @@ use thiserror::Error;
 
 use crate::{
     ProjectCommitCapture, ProjectGenerationId, ProjectStoreFault, ProjectStoreLimits,
-    ProjectStoreReceipt,
+    ProjectStorePath, ProjectStoreReceipt,
     api::CapturedObjectSource,
     generation::{
         ArtifactStorage, EncodedGeneration, GenerationCodecError, GenerationDocument,
@@ -29,8 +29,11 @@ use crate::{
         EstablishedStoreInspection, LaneSnapshot, inspect_established_store, read_lane_snapshot,
     },
     lease::{LeaseError, ProjectStoreLeases},
-    local::{ImmutablePublication, LocalPublicationError, LocalStoreRoot, PublicationDisposition},
-    wire::{RefKind, RefRecord},
+    local::{
+        ImmutablePublication, LocalPublicationError, LocalStoreRoot, PublicationDisposition,
+        SiblingPackageStage,
+    },
+    wire::{ProjectEnvelope, RefKind, RefRecord},
 };
 
 const STREAM_BUFFER_BYTES_MAX: usize = 1_048_576;
@@ -104,13 +107,182 @@ impl UnreferencedGenerationPublication {
     }
 }
 
+/// Why a new package receives its first manual generation.
+///
+/// Keeping this private prevents callers from installing arbitrary fork
+/// provenance while Create and Save As are still off-product.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InitialPackageMode {
+    Create,
+    SaveAs {
+        source_project_id: mirante4d_project_model::ProjectId,
+        source_generation_id: ProjectGenerationId,
+    },
+}
+
+impl InitialPackageMode {
+    const fn expected_fork(
+        self,
+    ) -> Option<(mirante4d_project_model::ProjectId, ProjectGenerationId)> {
+        match self {
+            Self::Create => None,
+            Self::SaveAs {
+                source_project_id,
+                source_generation_id,
+            } => Some((source_project_id, source_generation_id)),
+        }
+    }
+}
+
+/// A durably installed package together with the exact descriptor-held
+/// resources that crossed the no-replace rename.
+pub(crate) struct InstalledInitialPackage {
+    root: LocalStoreRoot,
+    leases: ProjectStoreLeases,
+    receipt: ProjectStoreReceipt,
+}
+
+impl InstalledInitialPackage {
+    pub(crate) fn receipt(&self) -> &ProjectStoreReceipt {
+        &self.receipt
+    }
+
+    pub(crate) fn into_parts(self) -> (LocalStoreRoot, ProjectStoreLeases, ProjectStoreReceipt) {
+        (self.root, self.leases, self.receipt)
+    }
+}
+
+/// Builds one complete private sibling package and installs it exactly once.
+/// No destination path becomes authoritative before the final no-replace
+/// rename, and the source project is represented only by immutable provenance
+/// plus read-only object streams.
+pub(crate) fn install_initial_manual_package<C>(
+    destination: &ProjectStorePath,
+    mode: InitialPackageMode,
+    capture: ProjectCommitCapture,
+    limits: ProjectStoreLimits,
+    mut is_cancelled: C,
+) -> Result<InstalledInitialPackage, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    let (stage, leases, receipt) =
+        prepare_initial_manual_package(destination, mode, capture, limits, &mut is_cancelled)?;
+    let root = stage
+        .install(&mut is_cancelled)
+        .map_err(|error| map_local_error(error, "package_install"))?;
+    Ok(InstalledInitialPackage {
+        root,
+        leases,
+        receipt,
+    })
+}
+
+#[cfg(test)]
+fn install_initial_manual_package_with_parent_sync_failure<C>(
+    destination: &ProjectStorePath,
+    mode: InitialPackageMode,
+    capture: ProjectCommitCapture,
+    limits: ProjectStoreLimits,
+    mut is_cancelled: C,
+) -> Result<InstalledInitialPackage, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    let (stage, leases, receipt) =
+        prepare_initial_manual_package(destination, mode, capture, limits, &mut is_cancelled)?;
+    let root = stage
+        .install_with_parent_sync_failure(&mut is_cancelled)
+        .map_err(|error| map_local_error(error, "package_install"))?;
+    Ok(InstalledInitialPackage {
+        root,
+        leases,
+        receipt,
+    })
+}
+
+fn prepare_initial_manual_package<C>(
+    destination: &ProjectStorePath,
+    mode: InitialPackageMode,
+    capture: ProjectCommitCapture,
+    limits: ProjectStoreLimits,
+    mut is_cancelled: C,
+) -> Result<(SiblingPackageStage, ProjectStoreLeases, ProjectStoreReceipt), ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    let limits = limits.validate()?;
+    let project_id = validate_initial_capture(mode, &capture)?;
+    check_cancelled(&mut is_cancelled).map_err(map_generation_error)?;
+
+    let stage = SiblingPackageStage::begin(destination, limits)
+        .map_err(|error| map_local_error(error, "package_stage_create"))?;
+    stage
+        .root()
+        .publish_project_envelope(ProjectEnvelope::new(project_id), limits, &mut is_cancelled)
+        .map_err(|error| map_local_error(error, "package_envelope"))?;
+    let leases = ProjectStoreLeases::acquire(stage.root(), crate::ProjectOpenMode::PreferWritable)
+        .map_err(map_lease_error)?;
+    if !leases.has_writer() {
+        return Err(ProjectStoreFault::WriterContended);
+    }
+    let receipt = publish_initial_manual_generation(
+        stage.root(),
+        &leases,
+        capture,
+        mode,
+        limits,
+        &mut is_cancelled,
+    )?;
+    let inspection = inspect_established_store(stage.root(), limits, &mut is_cancelled)?;
+    if inspection.project_id() != project_id
+        || inspection.manual().head.current() != receipt.current_generation_id()
+    {
+        return Err(ProjectStoreFault::Corruption {
+            stage: "installed_package_validation",
+        });
+    }
+    stage
+        .sync_tree(limits, &mut is_cancelled)
+        .map_err(|error| map_local_error(error, "package_tree_sync"))?;
+    Ok((stage, leases, receipt))
+}
+
+fn validate_initial_capture(
+    mode: InitialPackageMode,
+    capture: &ProjectCommitCapture,
+) -> Result<mirante4d_project_model::ProjectId, ProjectStoreFault> {
+    if capture.expected_parent().is_some() {
+        return Err(ProjectStoreFault::StaleParent);
+    }
+    if capture.autosave_base().is_some() || capture.forked_from() != mode.expected_fork() {
+        return Err(ProjectStoreFault::Corruption {
+            stage: "initial_manual_capture",
+        });
+    }
+    let project_id = capture.projection().state().project_id();
+    if matches!(
+        mode,
+        InitialPackageMode::SaveAs {
+            source_project_id,
+            ..
+        } if source_project_id == project_id
+    ) {
+        return Err(ProjectStoreFault::Corruption {
+            stage: "save_as_project_identity",
+        });
+    }
+    Ok(project_id)
+}
+
 /// Publishes the first manual head into an already prepared, unpublished store
-/// root. This is not the public Create command: envelope creation, package
-/// installation, and actor ownership are not implemented by this checkpoint.
+/// root. The package installer above supplies its envelope and final rename;
+/// this is still not the public Create command or actor execution path.
 pub(crate) fn publish_initial_manual_generation<C>(
     root: &LocalStoreRoot,
     leases: &ProjectStoreLeases,
     capture: ProjectCommitCapture,
+    mode: InitialPackageMode,
     limits: ProjectStoreLimits,
     mut is_cancelled: C,
 ) -> Result<ProjectStoreReceipt, ProjectStoreFault>
@@ -130,14 +302,7 @@ where
             stage: "project_envelope_identity",
         });
     }
-    if capture.expected_parent().is_some() {
-        return Err(ProjectStoreFault::StaleParent);
-    }
-    if capture.autosave_base().is_some() || capture.forked_from().is_some() {
-        return Err(ProjectStoreFault::Corruption {
-            stage: "initial_manual_capture",
-        });
-    }
+    validate_initial_capture(mode, &capture)?;
     require_fresh_lane_refs(root, project_id, limits, &mut is_cancelled)?;
 
     let captured_revision = capture.projection().revision();
@@ -636,9 +801,13 @@ fn map_local_error(error: LocalPublicationError, stage: &'static str) -> Project
         LocalPublicationError::Capacity { .. } => ProjectStoreFault::Capacity { stage },
         LocalPublicationError::SourceLength { .. } => ProjectStoreFault::SourceChanged,
         LocalPublicationError::SourceDigest => ProjectStoreFault::DigestMismatch,
+        LocalPublicationError::DestinationExists => ProjectStoreFault::DestinationExists,
         LocalPublicationError::RefAlreadyPresent => ProjectStoreFault::StaleParent,
         LocalPublicationError::RefChanged => ProjectStoreFault::Corruption { stage },
-        LocalPublicationError::RefCommitIndeterminate => ProjectStoreFault::CommitIndeterminate,
+        LocalPublicationError::RefCommitIndeterminate
+        | LocalPublicationError::PackageCommitIndeterminate => {
+            ProjectStoreFault::CommitIndeterminate
+        }
         LocalPublicationError::AtomicPublishUnsupported => ProjectStoreFault::UnsupportedFilesystem,
         LocalPublicationError::InvalidPath
         | LocalPublicationError::ExistingMismatch
@@ -1095,6 +1264,7 @@ mod tests {
     use std::{
         fs,
         io::Cursor,
+        os::unix::fs::symlink,
         path::{Path, PathBuf},
         process::Command,
         sync::{
@@ -1225,6 +1395,10 @@ mod tests {
     const DIVERGENT_MANUAL: &str = concat!(
         "m4d-project-generation-v1-sha256:",
         "6b91b33dbaa378598269005b027db7a0643e14babe4b7522a5a415a461f6a497"
+    );
+    const DIVERGENT_INITIAL: &str = concat!(
+        "m4d-project-generation-v1-sha256:",
+        "10011b8d7dce93c428e1d117b485746522b4ae1d4d8ee89e359739f2cffd3a10"
     );
     const DIVERGENT_AUTOSAVE: &str = concat!(
         "m4d-project-generation-v1-sha256:",
@@ -1507,6 +1681,7 @@ mod tests {
             &root,
             &leases,
             capture,
+            InitialPackageMode::Create,
             ProjectStoreLimits::default(),
             || false,
         )
@@ -1539,6 +1714,242 @@ mod tests {
     }
 
     #[test]
+    fn initial_package_install_supports_create_and_explicit_save_as_forks() {
+        let create_parent = TestDirectory::new("package-create");
+        let create_destination =
+            ProjectStorePath::new(create_parent.path().join("created.m4dproj")).unwrap();
+        let (create_id, create_generation, _) = frozen_stale_manual();
+        let (create_capture, _) = frozen_capture("stale.m4dproj", &create_generation);
+        let create_limits = ProjectStoreLimits {
+            open_file_descriptors_max: 9,
+            ..ProjectStoreLimits::default()
+        };
+        let created = install_initial_manual_package(
+            &create_destination,
+            InitialPackageMode::Create,
+            create_capture,
+            create_limits,
+            || false,
+        )
+        .unwrap();
+        assert_eq!(created.receipt().new_generation_id(), create_id);
+        let (created_root, created_leases, created_receipt) = created.into_parts();
+        assert!(created_leases.confirm_writer(&created_root).unwrap());
+        let created_inspection =
+            inspect_established_store(&created_root, ProjectStoreLimits::default(), || false)
+                .unwrap();
+        assert_eq!(
+            created_inspection.manual().head.current(),
+            created_receipt.current_generation_id()
+        );
+
+        let save_as_parent = TestDirectory::new("package-save-as");
+        let save_as_destination =
+            ProjectStorePath::new(save_as_parent.path().join("fork.m4dproj")).unwrap();
+        let fork_generation = frozen_generation("divergent.m4dproj", DIVERGENT_INITIAL);
+        let fork = fork_generation.forked_from().unwrap();
+        let (save_as_capture, _) = frozen_capture("divergent.m4dproj", &fork_generation);
+        let saved_as = install_initial_manual_package(
+            &save_as_destination,
+            InitialPackageMode::SaveAs {
+                source_project_id: fork.0,
+                source_generation_id: fork.1,
+            },
+            save_as_capture,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(
+            saved_as.receipt().new_generation_id(),
+            ProjectGenerationId::parse(DIVERGENT_INITIAL).unwrap()
+        );
+        let installed_generation = GenerationDocument::decode(
+            saved_as.receipt().new_generation_id(),
+            fork_generation.projection().state().project_id(),
+            &fs::read(generation_path(
+                save_as_destination.as_path(),
+                saved_as.receipt().new_generation_id(),
+            ))
+            .unwrap(),
+            ProjectStoreLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(installed_generation.forked_from(), Some(fork));
+    }
+
+    #[test]
+    fn package_collision_and_cancellation_leave_no_new_authority() {
+        let collision_parent = TestDirectory::new("package-collision");
+        let collision_destination =
+            ProjectStorePath::new(collision_parent.path().join("exists.m4dproj")).unwrap();
+        fs::create_dir(collision_destination.as_path()).unwrap();
+        fs::write(collision_destination.as_path().join("marker"), b"owned").unwrap();
+        let (_, frozen, _) = frozen_stale_manual();
+        let (collision_capture, opens) = frozen_capture("stale.m4dproj", &frozen);
+        assert!(matches!(
+            install_initial_manual_package(
+                &collision_destination,
+                InitialPackageMode::Create,
+                collision_capture,
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::DestinationExists)
+        ));
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fs::read(collision_destination.as_path().join("marker")).unwrap(),
+            b"owned"
+        );
+
+        let file_destination =
+            ProjectStorePath::new(collision_parent.path().join("file.m4dproj")).unwrap();
+        fs::write(file_destination.as_path(), b"unrelated").unwrap();
+        let (file_capture, file_opens) = frozen_capture("stale.m4dproj", &frozen);
+        assert!(matches!(
+            install_initial_manual_package(
+                &file_destination,
+                InitialPackageMode::Create,
+                file_capture,
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::DestinationExists)
+        ));
+        assert_eq!(file_opens.load(Ordering::SeqCst), 0);
+        assert_eq!(fs::read(file_destination.as_path()).unwrap(), b"unrelated");
+
+        let symlink_destination =
+            ProjectStorePath::new(collision_parent.path().join("link.m4dproj")).unwrap();
+        symlink(
+            collision_destination.as_path(),
+            symlink_destination.as_path(),
+        )
+        .unwrap();
+        let (symlink_capture, symlink_opens) = frozen_capture("stale.m4dproj", &frozen);
+        assert!(matches!(
+            install_initial_manual_package(
+                &symlink_destination,
+                InitialPackageMode::Create,
+                symlink_capture,
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::DestinationExists)
+        ));
+        assert_eq!(symlink_opens.load(Ordering::SeqCst), 0);
+        assert!(
+            fs::symlink_metadata(symlink_destination.as_path())
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let bounded_parent = TestDirectory::new("package-descriptor-bound");
+        let bounded_destination =
+            ProjectStorePath::new(bounded_parent.path().join("bounded.m4dproj")).unwrap();
+        let (bounded_capture, bounded_opens) = frozen_capture("stale.m4dproj", &frozen);
+        let bounded_limits = ProjectStoreLimits {
+            open_file_descriptors_max: 8,
+            ..ProjectStoreLimits::default()
+        };
+        assert!(matches!(
+            install_initial_manual_package(
+                &bounded_destination,
+                InitialPackageMode::Create,
+                bounded_capture,
+                bounded_limits,
+                || false,
+            ),
+            Err(ProjectStoreFault::Capacity {
+                stage: "store_inventory"
+            })
+        ));
+        assert!(bounded_opens.load(Ordering::SeqCst) > 0);
+        assert!(!bounded_destination.as_path().exists());
+        assert_eq!(fs::read_dir(bounded_parent.path()).unwrap().count(), 0);
+
+        let tiny_parent = TestDirectory::new("package-tiny-inventory");
+        let tiny_destination =
+            ProjectStorePath::new(tiny_parent.path().join("tiny.m4dproj")).unwrap();
+        let (tiny_capture, tiny_opens) = frozen_capture("stale.m4dproj", &frozen);
+        let tiny_limits = ProjectStoreLimits {
+            physical_store_entries_max: 1,
+            directory_fanout_entries_max: 1,
+            ..ProjectStoreLimits::default()
+        };
+        assert!(matches!(
+            install_initial_manual_package(
+                &tiny_destination,
+                InitialPackageMode::Create,
+                tiny_capture,
+                tiny_limits,
+                || false,
+            ),
+            Err(ProjectStoreFault::Capacity {
+                stage: "store_inventory"
+            })
+        ));
+        assert!(tiny_opens.load(Ordering::SeqCst) > 0);
+        assert!(!tiny_destination.as_path().exists());
+        assert_eq!(fs::read_dir(tiny_parent.path()).unwrap().count(), 0);
+
+        let cancel_parent = TestDirectory::new("package-cancel");
+        let cancel_destination =
+            ProjectStorePath::new(cancel_parent.path().join("cancelled.m4dproj")).unwrap();
+        let (cancel_capture, _) = frozen_capture("stale.m4dproj", &frozen);
+        let mut saw_populated_stage = false;
+        assert!(matches!(
+            install_initial_manual_package(
+                &cancel_destination,
+                InitialPackageMode::Create,
+                cancel_capture,
+                ProjectStoreLimits::default(),
+                || {
+                    let populated = fs::read_dir(cancel_parent.path()).unwrap().any(|entry| {
+                        let stage = entry.unwrap().path();
+                        stage
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with(".mirante4d-project-stage-"))
+                            && stage.join("refs/head").is_file()
+                    });
+                    saw_populated_stage |= populated;
+                    populated
+                },
+            ),
+            Err(ProjectStoreFault::Cancelled)
+        ));
+        assert!(saw_populated_stage);
+        assert!(!cancel_destination.as_path().exists());
+        assert_eq!(fs::read_dir(cancel_parent.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn post_install_parent_sync_failure_is_indeterminate_and_never_deleted() {
+        let parent = TestDirectory::new("package-indeterminate");
+        let destination = ProjectStorePath::new(parent.path().join("visible.m4dproj")).unwrap();
+        let (generation_id, frozen, _) = frozen_stale_manual();
+        let (capture, _) = frozen_capture("stale.m4dproj", &frozen);
+        assert!(matches!(
+            install_initial_manual_package_with_parent_sync_failure(
+                &destination,
+                InitialPackageMode::Create,
+                capture,
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::CommitIndeterminate)
+        ));
+        assert!(destination.as_path().is_dir());
+        let root = LocalStoreRoot::open(destination.as_path()).unwrap();
+        let inspection =
+            inspect_established_store(&root, ProjectStoreLimits::default(), || false).unwrap();
+        assert_eq!(inspection.manual().head.current(), generation_id);
+    }
+
+    #[test]
     fn first_manual_commit_rejects_stale_or_corrupt_head_before_publication() {
         let (_, frozen, _) = frozen_stale_manual();
 
@@ -1551,6 +1962,7 @@ mod tests {
                 &read_only_root,
                 &read_only_leases,
                 rejected_frozen_capture(&frozen),
+                InitialPackageMode::Create,
                 ProjectStoreLimits::default(),
                 || false,
             ),
@@ -1574,6 +1986,7 @@ mod tests {
                 &stale_root,
                 &stale_leases,
                 rejected_frozen_capture(&frozen),
+                InitialPackageMode::Create,
                 ProjectStoreLimits::default(),
                 || false,
             ),
@@ -1597,6 +2010,7 @@ mod tests {
                 &corrupt_root,
                 &corrupt_leases,
                 rejected_frozen_capture(&frozen),
+                InitialPackageMode::Create,
                 ProjectStoreLimits::default(),
                 || false,
             ),
@@ -1620,6 +2034,7 @@ mod tests {
                 &pinned_root,
                 &pinned_leases,
                 rejected_frozen_capture(&frozen),
+                InitialPackageMode::Create,
                 ProjectStoreLimits::default(),
                 || false,
             ),
@@ -1643,6 +2058,7 @@ mod tests {
                 &root,
                 &leases,
                 capture,
+                InitialPackageMode::Create,
                 ProjectStoreLimits::default(),
                 || generation.exists(),
             ),
@@ -1667,6 +2083,7 @@ mod tests {
             &root,
             &leases,
             initial,
+            InitialPackageMode::Create,
             ProjectStoreLimits::default(),
             || false,
         )
@@ -1807,6 +2224,7 @@ mod tests {
             &root,
             &leases,
             initial,
+            InitialPackageMode::Create,
             ProjectStoreLimits::default(),
             || false,
         )
@@ -1910,6 +2328,7 @@ mod tests {
             &capacity_root,
             &capacity_leases,
             initial,
+            InitialPackageMode::Create,
             ProjectStoreLimits::default(),
             || false,
         )
@@ -1953,6 +2372,7 @@ mod tests {
             &root,
             &leases,
             initial,
+            InitialPackageMode::Create,
             ProjectStoreLimits::default(),
             || false,
         )
@@ -2175,6 +2595,7 @@ mod tests {
             &root,
             &leases,
             initial,
+            InitialPackageMode::Create,
             ProjectStoreLimits::default(),
             || false,
         )

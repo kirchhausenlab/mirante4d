@@ -2563,6 +2563,14 @@
       "reason": "WP-10B B2 proves descriptor-relative immutable publication without path or replacement fallbacks."
     },
     {
+      "id": "libtest:mirante4d-project-store:local::tests::package_stage_loses_destination_race_without_clobber_or_leak",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves the final no-replace package rename preserves a racing destination and removes only the owned sibling stage."
+    },
+    {
       "id": "libtest:mirante4d-project-store:local::tests::consuming_publication_advances_the_source_across_a_noreplace_race",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -2729,6 +2737,30 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 proves read-only, stale-head, and corrupt-head failures consume no sources and publish no generation."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::initial_package_install_supports_create_and_explicit_save_as_forks",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves the shared private package installer creates exact initial and Save As generations, preserves the caller-bound fork tuple, and retains the installed root and leases."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::package_collision_and_cancellation_leave_no_new_authority",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 refuses existing directory, file, or symlink destinations before source reads and removes its owned sibling stage on cancellation."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::post_install_parent_sync_failure_is_indeterminate_and_never_deleted",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 reports post-rename parent-sync failure as indeterminate while preserving the complete visible package."
     },
     {
       "id": "libtest:mirante4d-project-store:transaction::tests::preflight_and_second_pass_drift_publish_no_generation",
@@ -5756,6 +5788,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 513
+    "current_additions": 517
   }
 }

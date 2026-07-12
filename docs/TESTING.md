@@ -164,11 +164,16 @@ joined or nonblocking shutdown. Five inspection cases cover the three promoted
 established-store states, exact heads and autosave classification, read-only and
 writer-contention modes, recovery-ahead without mutation, metadata-only payload
 validation, deferred payload digests, and fail-closed cancellation, capacity,
-symlink, hardlink, length, and control corruption. They do not claim public
-Create/Open/Save As execution, provisional autosave, recovery selection/open,
-timers, garbage collection, full verification, public actor wiring, the
-exhaustive fault matrix or power-cut durability, product reachability, or
-product-open validation.
+symlink, hardlink, length, and control corruption. Four initial-package cases
+cover exact Create facts and caller-bound Save As fork encoding, retained root/
+lease validity, exact descriptor admission, existing directory/file/symlink
+refusal before source reads, a final no-clobber race, populated-stage
+cancellation cleanup, and post-rename parent-sync indeterminacy without deleting
+the visible package. They do not authenticate the fork tuple against a source
+session or claim public Create/Open/Save As execution, provisional
+autosave, recovery selection/open, timers, garbage collection, full
+verification, public actor wiring, the exhaustive fault matrix or power-cut
+durability, product reachability, or product-open validation.
 
 The checked independent source report supports only the WP-03 source-TIFF
 archive. WP-10A is accepted off-product and its target authority is promoted.
