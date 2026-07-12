@@ -4469,6 +4469,22 @@
       "reason": "WP-10A binds the one accepted compatibility tuple to exact canonical control bytes."
     },
     {
+      "id": "libtest:mirante4d-storage:control::value::tests::every_canonical_value_variant_roundtrips_exact_bytes",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves every closed canonical-value variant has one exact tagged control encoding."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::value::tests::malformed_noncanonical_unordered_and_overdeep_values_reject",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects malformed, alternate, unordered, duplicate, oversized, and overdeep canonical values."
+    },
+    {
       "id": "libtest:mirante4d-storage:limits::tests::accepted_boundary_counts_recompute_exactly",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -4611,6 +4627,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 371
+    "current_additions": 373
   }
 }

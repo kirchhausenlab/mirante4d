@@ -1,5 +1,6 @@
 mod jcs;
 mod scalar;
+mod value;
 
 use thiserror::Error;
 
@@ -7,6 +8,7 @@ pub use scalar::{
     AsciiToken, F32Bits, F64Bits, I64Decimal, MAX_ASCII_TOKEN_BYTES, MAX_NFC_TEXT_BYTES, NfcText,
     Rgb24, TypedId, U64Decimal,
 };
+pub use value::{CanonicalMapEntry, CanonicalValue, CanonicalValueKind, MAX_CANONICAL_VALUE_BYTES};
 
 /// A strict experimental-v1 control-wire validation failure.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -24,6 +26,18 @@ pub enum ControlError {
     ControlObjectTooLarge {
         object: &'static str,
         maximum: usize,
+    },
+    #[error("malformed {object}: {detail}")]
+    MalformedControlObject {
+        object: &'static str,
+        detail: String,
+    },
+    #[error("{object} is not in its exact canonical encoding")]
+    NonCanonicalControlObject { object: &'static str },
+    #[error("invalid {object}: {reason}")]
+    InvalidControlObject {
+        object: &'static str,
+        reason: &'static str,
     },
 }
 
