@@ -2,42 +2,8 @@ use std::{fmt, str::FromStr};
 
 use crate::{ExactBytesDigest, IdentityError};
 
-pub const MAX_OBJECT_PATH_BYTES: usize = 4096;
 pub const MAX_MEDIA_TYPE_BYTES: usize = 255;
 pub const MAX_OBJECT_ROLE_BYTES: usize = 128;
-
-/// A normalized relative package-object path value.
-///
-/// This is deliberately not a filesystem path API. It accepts only nonempty
-/// lowercase-ASCII segments separated by `/`, with no absolute, empty, `.` or
-/// `..` segment.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ObjectPath(String);
-
-impl ObjectPath {
-    pub fn parse(value: &str) -> Result<Self, IdentityError> {
-        value.parse()
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl FromStr for ObjectPath {
-    type Err = IdentityError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        validate_object_path(value)?;
-        Ok(Self(value.to_owned()))
-    }
-}
-
-impl fmt::Display for ObjectPath {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
 
 /// A strict lowercase-ASCII media type without parameters.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -140,71 +106,6 @@ impl RawObjectDescriptor {
     }
 }
 
-/// A raw object descriptor bound to one normalized package path.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PackageObjectDescriptor {
-    path: ObjectPath,
-    object: RawObjectDescriptor,
-}
-
-impl PackageObjectDescriptor {
-    pub fn new(path: ObjectPath, object: RawObjectDescriptor) -> Self {
-        Self { path, object }
-    }
-
-    pub fn path(&self) -> &ObjectPath {
-        &self.path
-    }
-
-    pub fn object(&self) -> &RawObjectDescriptor {
-        &self.object
-    }
-}
-
-fn validate_object_path(value: &str) -> Result<(), IdentityError> {
-    if value.is_empty() {
-        return Err(IdentityError::InvalidObjectPath {
-            reason: "the value is empty",
-        });
-    }
-    if value.len() > MAX_OBJECT_PATH_BYTES {
-        return Err(IdentityError::InvalidObjectPath {
-            reason: "the value exceeds 4096 bytes",
-        });
-    }
-    if !value.is_ascii() {
-        return Err(IdentityError::InvalidObjectPath {
-            reason: "only ASCII is permitted",
-        });
-    }
-    if value.starts_with('/') {
-        return Err(IdentityError::InvalidObjectPath {
-            reason: "absolute paths are forbidden",
-        });
-    }
-
-    for segment in value.split('/') {
-        if segment.is_empty() {
-            return Err(IdentityError::InvalidObjectPath {
-                reason: "empty path segments are forbidden",
-            });
-        }
-        if matches!(segment, "." | "..") {
-            return Err(IdentityError::InvalidObjectPath {
-                reason: "dot path segments are forbidden",
-            });
-        }
-        if !segment.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
-        }) {
-            return Err(IdentityError::InvalidObjectPath {
-                reason: "segments may contain only lowercase letters, digits, '.', '_' and '-'",
-            });
-        }
-    }
-    Ok(())
-}
-
 fn validate_media_type(value: &str) -> Result<(), IdentityError> {
     if value.len() > MAX_MEDIA_TYPE_BYTES {
         return Err(IdentityError::InvalidMediaType {
@@ -268,37 +169,10 @@ fn validate_object_role(value: &str) -> Result<(), IdentityError> {
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
-    use proptest::test_runner::RngSeed;
-
     use super::*;
 
     const ZERO_EXACT_DIGEST: &str =
         "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-
-    #[test]
-    fn object_path_accepts_only_normalized_relative_lowercase_ascii() {
-        let path = ObjectPath::parse("layers/0/s0/c/0001-00.zarr-shard").unwrap();
-        assert_eq!(path.as_str(), "layers/0/s0/c/0001-00.zarr-shard");
-        assert_eq!(path.to_string(), path.as_str());
-
-        for invalid in [
-            "",
-            "/layers/0",
-            "layers//0",
-            "layers/./0",
-            "layers/../0",
-            "layers/0/",
-            "Layers/0",
-            "layers\\0",
-            "layers/space here",
-            "layers/café",
-        ] {
-            assert!(ObjectPath::parse(invalid).is_err(), "accepted {invalid:?}");
-        }
-        assert!(ObjectPath::parse(&"x".repeat(MAX_OBJECT_PATH_BYTES + 1)).is_err());
-        assert!(ObjectPath::parse(&"µ".repeat(MAX_OBJECT_PATH_BYTES)).is_err());
-    }
 
     #[test]
     fn media_type_and_role_enforce_strict_ascii_grammars() {
@@ -343,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn descriptors_keep_raw_object_facts_separate_from_package_path() {
+    fn raw_object_descriptor_keeps_exact_typed_facts() {
         let digest = ExactBytesDigest::parse(ZERO_EXACT_DIGEST).unwrap();
         let raw = RawObjectDescriptor::new(
             digest,
@@ -356,33 +230,5 @@ mod tests {
         assert_eq!(raw.byte_length(), 0);
         assert_eq!(raw.media_type().as_str(), "application/json");
         assert_eq!(raw.role().as_str(), "zarr.metadata");
-
-        let package = PackageObjectDescriptor::new(
-            ObjectPath::parse("layers/0/zarr.json").unwrap(),
-            raw.clone(),
-        );
-        assert_eq!(package.path().as_str(), "layers/0/zarr.json");
-        assert_eq!(package.object(), &raw);
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig {
-            cases: 128,
-            max_shrink_iters: 1_024,
-            failure_persistence: None,
-            rng_seed: RngSeed::Fixed(0x4d34_4f42_4a45_4354),
-            .. ProptestConfig::default()
-        })]
-
-        #[test]
-        fn normalized_object_paths_roundtrip(
-            segment in "[a-z][a-z0-9_-]{0,15}",
-            leaf in "[a-z][a-z0-9_-]{0,15}",
-        ) {
-            let encoded = format!("objects/{segment}/{leaf}.bin");
-            let path = ObjectPath::parse(&encoded).unwrap();
-            prop_assert_eq!(path.as_str(), encoded.as_str());
-            prop_assert_eq!(ObjectPath::parse(&path.to_string()).unwrap(), path);
-        }
     }
 }

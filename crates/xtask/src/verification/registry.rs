@@ -837,10 +837,6 @@ fn validate_property_groups(groups: &[PropertyGroup]) -> anyhow::Result<()> {
             ("mirante4d-identity", "0x4d34494444494731", 128),
         ),
         (
-            "identity-object",
-            ("mirante4d-identity", "0x4d344f424a454354", 128),
-        ),
-        (
             "project-model",
             ("mirante4d-project-model", "0x4d3450524f4a4d4f", 128),
         ),

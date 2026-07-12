@@ -13,9 +13,11 @@ authority. Analysis execution remains unavailable until WP-12.
 
 ## WP-10A Implementation Boundary
 
-The first pure profile/identity core and its product-nonreachability contract
-are present. Continue WP-10A-B with the strict control metadata, shard/index
-I/O, reader, writer, validator, and remaining D-009 canonical identities.
+The pure profile/identity core and its product-nonreachability contract are
+present. Exact D-009 object, package, recipe, derivation-record, and release
+hash framing is implemented; strict control schemas must now validate the
+canonical bytes supplied to it. Continue WP-10A-B with those schemas,
+shard/index I/O, reader, writer, and validator.
 WP-10A-C then promotes the independent target-format authorities; WP-10A-D
 consumes them and closes the package evidence. Current schema 1 remains the
 sole product route until WP-10C.

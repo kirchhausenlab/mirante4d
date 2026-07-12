@@ -9,6 +9,7 @@
 mod artifact;
 mod canonical;
 mod digest;
+mod exact;
 mod hash;
 mod object;
 mod scientific;
@@ -22,10 +23,10 @@ pub use digest::{
     ArtifactContentId, DerivationRecordId, ExactBytesDigest, PackageId, RecipeId, ReleaseId,
     ScientificContentId, Sha256Digest,
 };
+pub use exact::{ExactBytesFacts, ExactBytesHasher, IdentityHashError};
 pub use hash::Sha256Hasher;
 pub use object::{
-    MAX_MEDIA_TYPE_BYTES, MAX_OBJECT_PATH_BYTES, MAX_OBJECT_ROLE_BYTES, MediaType, ObjectPath,
-    ObjectRole, PackageObjectDescriptor, RawObjectDescriptor,
+    MAX_MEDIA_TYPE_BYTES, MAX_OBJECT_ROLE_BYTES, MediaType, ObjectRole, RawObjectDescriptor,
 };
 pub use scientific::{
     SCIENTIFIC_TILE_SHAPE_TZYX, ScientificDatasetHasher, ScientificHashError,
@@ -35,7 +36,7 @@ pub use scientific::{
 
 use thiserror::Error;
 
-/// A validation error for an identity or package-object descriptor value.
+/// A validation error for an identity or typed object value.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum IdentityError {
     #[error(
@@ -46,8 +47,6 @@ pub enum IdentityError {
     InvalidSha256Character { index: usize, byte: u8 },
     #[error("identity must start with {expected:?}")]
     InvalidIdentityPrefix { expected: &'static str },
-    #[error("invalid object path: {reason}")]
-    InvalidObjectPath { reason: &'static str },
     #[error("invalid media type: {reason}")]
     InvalidMediaType { reason: &'static str },
     #[error("invalid object role: {reason}")]

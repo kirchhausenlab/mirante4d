@@ -49,6 +49,9 @@
       }
     ],
     "public_api_additions": [
+      "ExactBytesFacts",
+      "ExactBytesHasher",
+      "IdentityHashError",
       "M4D_UNICODE_VERSION",
       "SCIENTIFIC_TILE_SHAPE_TZYX",
       "ScientificDatasetHasher",
@@ -64,7 +67,22 @@
       "is_nfc",
       "normalize_nfc",
       "verify_wp10a_artifact_hand_vector"
-    ]
+    ],
+    "public_api_deletions": [
+      "MAX_OBJECT_PATH_BYTES",
+      "ObjectPath",
+      "PackageObjectDescriptor"
+    ],
+    "forbidden_source_identifiers": [
+      "InvalidObjectPath",
+      "MAX_OBJECT_PATH_BYTES",
+      "ObjectPath",
+      "PackageObjectDescriptor"
+    ],
+    "package_path_authority": {
+      "crate_name": "mirante4d-storage",
+      "public_type": "PackagePath"
+    }
   },
   "dependencies": {
     "workspace_by_kind": {

@@ -2148,15 +2148,28 @@
       "reason": "WP-07A adds strict typed-identity and descriptor contract evidence."
     },
     {
-      "id": "libtest:mirante4d-identity:object::tests::descriptors_keep_raw_object_facts_separate_from_package_path",
+      "id": "libtest:mirante4d-identity:exact::tests::canonical_body_ids_use_the_frozen_domains_length_and_exact_bytes",
       "kind": "libtest",
       "owner": "mirante4d-identity",
       "lane": "unit",
-      "requirement_ids": [
-        "D-022-unit",
-        "WP-07A-canonical-model"
-      ],
-      "reason": "WP-07A adds strict typed-identity and descriptor contract evidence."
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves the frozen recipe, derivation-record, and release body framing with supporting T2 vectors."
+    },
+    {
+      "id": "libtest:mirante4d-identity:exact::tests::exact_byte_counting_is_chunk_invariant_and_failure_poisoned",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves exact-byte hashing uses checked length accounting and cannot finalize after overflow."
+    },
+    {
+      "id": "libtest:mirante4d-identity:exact::tests::exact_object_and_package_ids_hash_only_the_supplied_bytes",
+      "kind": "libtest",
+      "owner": "mirante4d-identity",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A proves raw-object and package identities hash exact bytes without an added domain prefix."
     },
     {
       "id": "libtest:mirante4d-identity:object::tests::media_type_and_role_enforce_strict_ascii_grammars",
@@ -2170,26 +2183,12 @@
       "reason": "WP-07A adds strict typed-identity and descriptor contract evidence."
     },
     {
-      "id": "libtest:mirante4d-identity:object::tests::normalized_object_paths_roundtrip",
+      "id": "libtest:mirante4d-identity:object::tests::raw_object_descriptor_keeps_exact_typed_facts",
       "kind": "libtest",
       "owner": "mirante4d-identity",
       "lane": "unit",
-      "requirement_ids": [
-        "D-022-unit",
-        "WP-07A-canonical-model"
-      ],
-      "reason": "WP-07A adds strict typed-identity and descriptor contract evidence."
-    },
-    {
-      "id": "libtest:mirante4d-identity:object::tests::object_path_accepts_only_normalized_relative_lowercase_ascii",
-      "kind": "libtest",
-      "owner": "mirante4d-identity",
-      "lane": "unit",
-      "requirement_ids": [
-        "D-022-unit",
-        "WP-07A-canonical-model"
-      ],
-      "reason": "WP-07A adds strict typed-identity and descriptor contract evidence."
+      "requirement_ids": ["D-022-unit", "WP-10A-D009-identity"],
+      "reason": "WP-10A keeps exact typed object facts in identity while package paths have one storage-owned authority."
     },
     {
       "id": "libtest:mirante4d-project-model:tests::arbitrary_reorder_keeps_active_selection_by_identity",
@@ -4564,6 +4563,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 364
+    "current_additions": 365
   }
 }

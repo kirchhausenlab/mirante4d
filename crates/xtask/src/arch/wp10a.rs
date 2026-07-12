@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use syn::visit::Visit;
 
-use super::{collect_rust_source_files, flatten_use_tree};
+use super::{collect_rust_source_files, flatten_use_tree, public_root_api_names, sha256_file};
 
 const CONTRACT_PATH: &str = "architecture/wp10a-storage-contract.json";
 const CONTRACT_SCHEMA: &str = "mirante4d-wp10a-storage-successor-contract";
@@ -79,6 +79,16 @@ struct IdentitySuccessorContract {
     normal_dependency_additions: Vec<String>,
     required_external: Vec<ExternalDependency>,
     public_api_additions: Vec<String>,
+    public_api_deletions: Vec<String>,
+    forbidden_source_identifiers: Vec<String>,
+    package_path_authority: PublicTypeAuthority,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicTypeAuthority {
+    crate_name: String,
+    public_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,6 +142,7 @@ pub(super) fn check_wp10a_storage_contract(repo_root: &Path) -> anyhow::Result<(
     let metadata = cargo_metadata(repo_root)?;
     validate_storage_package(repo_root, &contract, &metadata)?;
     validate_storage_sources(repo_root, &contract.source_policy)?;
+    validate_identity_hard_cut(repo_root, &contract.identity_successor)?;
     Ok(())
 }
 
@@ -184,6 +195,34 @@ fn validate_contract_header(contract: &StorageContract) -> anyhow::Result<()> {
         accepted_identity_public_api_additions(),
         "identity public API addition",
     )?;
+    require_exact_set(
+        &contract.identity_successor.public_api_deletions,
+        accepted_identity_public_api_deletions(),
+        "identity public API deletion",
+    )?;
+    require_exact_set(
+        &contract.identity_successor.forbidden_source_identifiers,
+        &[
+            "InvalidObjectPath",
+            "MAX_OBJECT_PATH_BYTES",
+            "ObjectPath",
+            "PackageObjectDescriptor",
+        ],
+        "identity forbidden source identifier",
+    )?;
+    if contract
+        .identity_successor
+        .package_path_authority
+        .crate_name
+        != STORAGE_CRATE
+        || contract
+            .identity_successor
+            .package_path_authority
+            .public_type
+            != "PackagePath"
+    {
+        bail!("WP-10A must keep mirante4d-storage::PackagePath as the sole path authority");
+    }
     if contract.identity_successor.required_external != expected_identity_external() {
         bail!("WP-10A frozen identity dependencies drifted");
     }
@@ -345,6 +384,9 @@ fn expected_identity_external() -> Vec<ExternalDependency> {
 
 pub(super) fn accepted_identity_public_api_additions() -> &'static [&'static str] {
     &[
+        "ExactBytesFacts",
+        "ExactBytesHasher",
+        "IdentityHashError",
         "M4D_UNICODE_VERSION",
         "SCIENTIFIC_TILE_SHAPE_TZYX",
         "ScientificDatasetHasher",
@@ -360,6 +402,14 @@ pub(super) fn accepted_identity_public_api_additions() -> &'static [&'static str
         "is_nfc",
         "normalize_nfc",
         "verify_wp10a_artifact_hand_vector",
+    ]
+}
+
+pub(super) fn accepted_identity_public_api_deletions() -> &'static [&'static str] {
+    &[
+        "MAX_OBJECT_PATH_BYTES",
+        "ObjectPath",
+        "PackageObjectDescriptor",
     ]
 }
 
@@ -414,21 +464,6 @@ fn validate_predecessor(repo_root: &Path, binding: &PredecessorBinding) -> anyho
         bail!("WP-10A predecessor is not the frozen WP-08A contract");
     }
     Ok(())
-}
-
-fn sha256_file(path: &Path) -> anyhow::Result<String> {
-    let output = Command::new("sha256sum")
-        .arg(path)
-        .output()
-        .with_context(|| format!("failed to hash {}", path.display()))?;
-    if !output.status.success() {
-        bail!("sha256sum failed for {}", path.display());
-    }
-    String::from_utf8(output.stdout)?
-        .split_whitespace()
-        .next()
-        .map(str::to_owned)
-        .context("sha256sum returned no digest")
 }
 
 fn validate_forbidden_paths(repo_root: &Path, policy: &SourcePolicy) -> anyhow::Result<()> {
@@ -938,6 +973,142 @@ fn validate_storage_sources(repo_root: &Path, policy: &SourcePolicy) -> anyhow::
         bail!("WP-10A storage contains no Rust source");
     }
     Ok(())
+}
+
+fn validate_identity_hard_cut(
+    repo_root: &Path,
+    successor: &IdentitySuccessorContract,
+) -> anyhow::Result<()> {
+    let forbidden = unique_set(
+        &successor.forbidden_source_identifiers,
+        "identity forbidden source identifier",
+    )?;
+    let source_root = repo_root.join("crates/mirante4d-identity/src");
+    let mut identifiers = BTreeSet::new();
+    for path in collect_rust_source_files(&source_root)? {
+        let source = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let file = syn::parse_file(&source)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        IdentifierCollector {
+            identifiers: &mut identifiers,
+        }
+        .visit_file(&file);
+    }
+    let remaining = forbidden.intersection(&identifiers).collect::<Vec<_>>();
+    if !remaining.is_empty() {
+        bail!("WP-10A removed identity path identifiers remain in source: {remaining:?}");
+    }
+
+    validate_no_other_package_path_authority(
+        repo_root,
+        &successor.package_path_authority.crate_name,
+    )?;
+    let storage_api = public_root_api_names(&repo_root.join(STORAGE_PATH).join("src/lib.rs"))?;
+    if !storage_api.contains(&successor.package_path_authority.public_type) {
+        bail!(
+            "WP-10A package path authority {:?} is not exported by {STORAGE_CRATE}",
+            successor.package_path_authority.public_type
+        );
+    }
+    Ok(())
+}
+
+fn validate_no_other_package_path_authority(
+    repo_root: &Path,
+    authority_crate: &str,
+) -> anyhow::Result<()> {
+    let crates_root = repo_root.join("crates");
+    let mut violations = Vec::new();
+    for entry in fs::read_dir(&crates_root)
+        .with_context(|| format!("failed to read {}", crates_root.display()))?
+    {
+        let entry = entry?;
+        let crate_root = entry.path();
+        if entry.file_name() == authority_crate
+            || !crate_root.join("Cargo.toml").is_file()
+            || !crate_root.join("src").is_dir()
+        {
+            continue;
+        }
+        for path in collect_rust_source_files(&crate_root.join("src"))? {
+            let source = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            let file = syn::parse_file(&source)
+                .with_context(|| format!("failed to parse {}", path.display()))?;
+            let mut visitor = PublicNamedTypeVisitor {
+                target: "PackagePath",
+                found: false,
+            };
+            visitor.visit_file(&file);
+            if visitor.found {
+                violations.push(format!(
+                    "{} exposes a public PackagePath definition or re-export",
+                    path.display()
+                ));
+            }
+        }
+    }
+    if !violations.is_empty() {
+        bail!(
+            "WP-10A found another public PackagePath authority:\n{}",
+            violations.join("\n")
+        );
+    }
+    Ok(())
+}
+
+struct PublicNamedTypeVisitor<'a> {
+    target: &'a str,
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for PublicNamedTypeVisitor<'_> {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        let named = match item {
+            syn::Item::Enum(item) => Some((&item.vis, &item.ident)),
+            syn::Item::Struct(item) => Some((&item.vis, &item.ident)),
+            syn::Item::Trait(item) => Some((&item.vis, &item.ident)),
+            syn::Item::TraitAlias(item) => Some((&item.vis, &item.ident)),
+            syn::Item::Type(item) => Some((&item.vis, &item.ident)),
+            syn::Item::Union(item) => Some((&item.vis, &item.ident)),
+            _ => None,
+        };
+        if let Some((visibility, identifier)) = named {
+            self.found |=
+                matches!(visibility, syn::Visibility::Public(_)) && identifier == self.target;
+        }
+        if let syn::Item::Use(item) = item
+            && matches!(item.vis, syn::Visibility::Public(_))
+            && use_tree_exports_name(&item.tree, self.target)
+        {
+            self.found = true;
+        }
+        syn::visit::visit_item(self, item);
+    }
+}
+
+fn use_tree_exports_name(tree: &syn::UseTree, target: &str) -> bool {
+    match tree {
+        syn::UseTree::Path(path) => use_tree_exports_name(&path.tree, target),
+        syn::UseTree::Name(name) => name.ident == target,
+        syn::UseTree::Rename(rename) => rename.rename == target,
+        syn::UseTree::Group(group) => group
+            .items
+            .iter()
+            .any(|tree| use_tree_exports_name(tree, target)),
+        syn::UseTree::Glob(_) => false,
+    }
+}
+
+struct IdentifierCollector<'a> {
+    identifiers: &'a mut BTreeSet<String>,
+}
+
+impl<'ast> Visit<'ast> for IdentifierCollector<'_> {
+    fn visit_ident(&mut self, identifier: &'ast syn::Ident) {
+        self.identifiers.insert(identifier.to_string());
+    }
 }
 
 struct StorageSourceVisitor<'a> {

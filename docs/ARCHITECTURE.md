@@ -126,6 +126,9 @@ The frozen subsystem boundary remains in
 [`architecture/wp08a-subsystem-contract.json`](../architecture/wp08a-subsystem-contract.json).
 The accepted off-product storage successor boundary is
 [`architecture/wp10a-storage-contract.json`](../architecture/wp10a-storage-contract.json).
+Within that successor, `mirante4d-storage::PackagePath` is the sole package-path
+authority. `mirante4d-identity` owns raw typed object facts and exact hashing,
+but no parallel path type.
 The concise live owner/deletion ledger is
 [`architecture/current-state-field-ledger.json`](../architecture/current-state-field-ledger.json).
 Later target ownership is defined by the
