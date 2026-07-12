@@ -279,13 +279,42 @@ pub trait ProjectObjectSource: Send + Sync {
     fn open(&self) -> io::Result<Box<dyn Read + Send>>;
 }
 
+/// One object source bound to the descriptor observed when the commit was
+/// captured. The actor must use this frozen descriptor as its expectation;
+/// asking the source for its descriptor again would reopen a TOCTOU gap.
+pub(crate) struct CapturedObjectSource {
+    descriptor: RawObjectDescriptor,
+    source: Box<dyn ProjectObjectSource>,
+}
+
+impl CapturedObjectSource {
+    pub(crate) fn descriptor(&self) -> &RawObjectDescriptor {
+        &self.descriptor
+    }
+
+    pub(crate) fn open(&self) -> io::Result<Box<dyn Read + Send>> {
+        self.source.open()
+    }
+}
+
+/// Private ownership transfer from the frozen public capture into the store
+/// actor. Keeping this as one value prevents individual commit facts from being
+/// silently dropped when transaction execution is added.
+pub(crate) struct ProjectCommitCaptureParts {
+    pub(crate) projection: ProjectGenerationProjection,
+    pub(crate) expected_parent: Option<ProjectGenerationId>,
+    pub(crate) autosave_base: Option<ProjectGenerationId>,
+    pub(crate) forked_from: Option<(ProjectId, ProjectGenerationId)>,
+    pub(crate) object_sources: Vec<CapturedObjectSource>,
+}
+
 /// One exact revision/projection capture and its complete logical-object input.
 pub struct ProjectCommitCapture {
     projection: ProjectGenerationProjection,
     expected_parent: Option<ProjectGenerationId>,
     autosave_base: Option<ProjectGenerationId>,
     forked_from: Option<(ProjectId, ProjectGenerationId)>,
-    object_sources: Vec<Box<dyn ProjectObjectSource>>,
+    object_sources: Vec<CapturedObjectSource>,
 }
 
 impl ProjectCommitCapture {
@@ -302,8 +331,11 @@ impl ProjectCommitCapture {
             insert_descriptor(&mut expected, artifact.object())?;
         }
         let mut actual = BTreeMap::<ExactBytesDigest, RawObjectDescriptor>::new();
-        for source in &object_sources {
-            insert_source_descriptor(&mut actual, source.descriptor())?;
+        let mut captured_sources = Vec::with_capacity(object_sources.len());
+        for source in object_sources {
+            let descriptor = source.descriptor().clone();
+            insert_source_descriptor(&mut actual, &descriptor)?;
+            captured_sources.push(CapturedObjectSource { descriptor, source });
         }
         if expected != actual {
             return Err(ProjectStoreFault::Corruption {
@@ -315,7 +347,7 @@ impl ProjectCommitCapture {
             expected_parent,
             autosave_base,
             forked_from,
-            object_sources,
+            object_sources: captured_sources,
         })
     }
 
@@ -337,6 +369,16 @@ impl ProjectCommitCapture {
 
     pub const fn forked_from(&self) -> Option<(ProjectId, ProjectGenerationId)> {
         self.forked_from
+    }
+
+    pub(crate) fn into_parts(self) -> ProjectCommitCaptureParts {
+        ProjectCommitCaptureParts {
+            projection: self.projection,
+            expected_parent: self.expected_parent,
+            autosave_base: self.autosave_base,
+            forked_from: self.forked_from,
+            object_sources: self.object_sources,
+        }
     }
 }
 

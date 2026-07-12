@@ -7,8 +7,11 @@
 #![forbid(unsafe_code)]
 
 mod api;
+mod generation;
 #[cfg(target_os = "linux")]
 mod local;
+#[cfg(target_os = "linux")]
+mod transaction;
 mod wire;
 
 pub use api::{

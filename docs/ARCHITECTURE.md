@@ -8,7 +8,8 @@ import/preprocessing workflows.
 
 ## Workspace Boundaries
 
-The workspace has eighteen crates:
+The workspace has nineteen packages (eighteen `mirante4d-*` crates plus
+`xtask`):
 
 - `mirante4d-domain`: validated framework-neutral geometry, view, transfer,
   render-intent, and tool values.
@@ -16,6 +17,8 @@ The workspace has eighteen crates:
   scientific-tree primitives; no filesystem I/O.
 - `mirante4d-project-model`: canonical durable project/view state and
   persistence-neutral generation projections.
+- `mirante4d-project-store`: private off-product successor project storage;
+  currently unreachable from the application.
 - `mirante4d-application`: the sole command reducer, revision/history owner,
   transient semantic state, operations, events, snapshots, and typed faults.
 - `mirante4d-settings`: closed settings document and bounded background I/O.
@@ -128,9 +131,10 @@ the future boundary; it is deleted by WP-10B.
 WP-10B B1 freezes the successor's canonical envelope, generation, ref, object,
 payload-paging, API, and failure-transition contract plus an independent
 project fixture. B2 now has an unreachable `mirante4d-project-store` crate with
-the frozen public boundary, canonical envelope/ref/generation identities, and
-descriptor-relative immutable publication. It still owns no live refs, leases,
-actor, or product path; those precede the B4 product hard cutover.
+the frozen public boundary, typed canonical generation records, deterministic
+direct and paged object closure, and descriptor-relative immutable object and
+generation-last publication. It still owns no live refs, leases, actor,
+recovery, garbage collection, or product path.
 
 Settings use `mirante4d-settings-v1` at the Linux XDG/HOME path. The UI submits
 validated changes; one background actor owns persistence. Legacy preferences

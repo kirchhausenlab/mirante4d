@@ -2435,12 +2435,68 @@
       "reason": "WP-10B B2 proves the off-product project-store boundary and frozen work limits."
     },
     {
+      "id": "libtest:mirante4d-project-store:generation::tests::commit_capture_builds_the_same_frozen_direct_generation",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves the closed typed generation mapping from the frozen capture boundary."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:generation::tests::every_frozen_generation_decodes_to_the_model_and_reencodes_exactly",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves exact typed decode and re-encode of every frozen generation vector."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:generation::tests::frozen_paged_binding_decodes_and_reencodes_exactly",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves the exact canonical large-object binding and deterministic page geometry."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:generation::tests::generation_decoder_rejects_noncanonical_wrong_identity_and_unbounded_arrays",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves fail-closed canonical, identity, nullable-field, and collection bounds."
+    },
+    {
       "id": "libtest:mirante4d-project-store:local::tests::opens_every_root_component_without_following_symlinks",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 proves descriptor-relative immutable publication without path or replacement fallbacks."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:local::tests::consuming_publication_advances_the_source_across_a_noreplace_race",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves exact source consumption across deduplication and no-replace publication races."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:local::tests::declared_and_consuming_publication_enforce_their_source_extents",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves complete-object and page-segment extent and digest enforcement."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:local::tests::descriptor_relative_object_read_is_bounded_exact_and_noncreating",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves bounded descriptor-relative closure validation without read-side mutation."
     },
     {
       "id": "libtest:mirante4d-project-store:local::tests::publishes_and_deduplicates_an_exact_object_with_bounded_staging",
@@ -2465,6 +2521,30 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 proves descriptor-relative immutable publication without path or replacement fallbacks."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::closure_union_reuses_identical_physical_objects",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves digest-keyed physical closure reuse for repeated exact pages."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::preflight_and_second_pass_drift_publish_no_generation",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves arithmetic preflight, mid-stream cancellation, and two-pass source drift fail before generation publication."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::two_pass_paging_publishes_the_exact_closure_before_the_generation",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves bounded direct/paged closure publication and generation-last ordering."
     },
     {
       "id": "libtest:mirante4d-project-store:wire::tests::all_ref_shapes_round_trip_and_forbidden_slots_are_rejected",
@@ -5476,6 +5556,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 478
+    "current_additions": 488
   }
 }
