@@ -126,22 +126,20 @@ readback with pinned OME-schema results, 15 executed rejection mutations, and
 byte-identical two-run reproduction. It covers only the frozen EXPERIMENTAL
 profile.
 
-The WP-10A-D candidate consumes all three promoted packages through the
-production exact-to-scientific path, checks every full-array and per-layer
-value/validity digest plus exact shard/object/depth/fan-out and one-brick
-amplification facts, and rejects all 15 mutations. Production-writer outputs
+The accepted WP-10A production path consumes all three promoted packages
+through the production exact-to-scientific path, checks every full-array and
+per-layer value/validity digest plus exact shard/object/depth/fan-out and
+one-brick amplification facts, and rejects all 15 mutations.
+Production-writer outputs
 pass the pinned schema and independent reader with matching image and
 scientific facts; encoded bytes and PackageId may differ. Isolated
 2,750/5,500/11,000-descriptor opens prove the linear metadata-work contract,
 with the largest bounded to 10 seconds and 64 MiB of post-open RSS.
-`cargo xtask verify-local format-lifecycle` completes the candidate evidence.
-WP-10A exit acceptance remains pending. The format stays
+`cargo xtask verify-local format-lifecycle` is the accepted lifecycle gate.
+WP-10A is immutable at `foundation-wp-10a-exit-1`. The format stays
 EXPERIMENTAL and off-product, with no stable, generic OME-Zarr, importer,
 product-support, or product-activation claim.
 
 WP-10B separately installs immutable content-addressed project objects,
 complete generations, atomic head/recovery refs, leases, autosave/recovery,
 and conservative garbage collection.
-
-WP-09A may begin only after the WP-10A candidate receives clean-revision exit
-acceptance.
