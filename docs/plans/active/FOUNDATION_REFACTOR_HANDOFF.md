@@ -1,13 +1,13 @@
 # Mirante4D Foundation Refactor Handoff
 
 Status: ACTIVE PUBLIC-EPOCH PROGRAM
-Last reviewed: 2026-07-11
-Current technical sequence: WP-10A, WP-09A, then the remaining packages below
+Last reviewed: 2026-07-12
+Current technical sequence: WP-09A, WP-10B, then the remaining packages below
 Public-data publication: deferred to a separate future handoff
-WP-10A predecessor: `foundation-wp-08b-exit-1`
-Completed through: WP-08B at `foundation-wp-08b-exit-1`
-Current checkpoint: WP-10A dataset schema and storage
-Next protected-branch checkpoint: WP-09A progressive render runtime
+WP-09A predecessor: `foundation-wp-10a-exit-1`
+Completed through: WP-10A at `foundation-wp-10a-exit-1`
+Current checkpoint: WP-09A progressive render runtime
+Next protected-branch checkpoint: WP-10B transactional project store
 
 ## Purpose
 
@@ -178,6 +178,9 @@ accepted at `f2e520da891134d1b3f65d8fcac7afb4140579a2`
 WP-08B accepted the unified runtime at
 `0e3bdb0f5257c820841cee215cee38747efbda75`
 (`foundation-wp-08b-exit-1`) before WP-10A entry work began.
+WP-10A accepted the off-product dataset schema, storage, index, identity, and
+target conformance package at `9b3a81d79a50027c0a8ddedc535021809a99d928`
+(`foundation-wp-10a-exit-1`) before WP-09A entry work began.
 
 ## Dataset And Fixture Boundary
 

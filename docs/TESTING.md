@@ -110,13 +110,16 @@ is accepted at `foundation-wp-08a-exit-2`
 `foundation-wp-08b-exit-1`
 (`0e3bdb0f5257c820841cee215cee38747efbda75`) after exact-main public,
 trusted-GPU, source-nonmutation, and real-display 1280x720 T2 product checks.
+WP-10A is accepted at `foundation-wp-10a-exit-1`
+(`9b3a81d79a50027c0a8ddedc535021809a99d928`) after exact protected-main
+policy, Rust, and local format-lifecycle evidence.
 Internal automation remains supporting evidence, not product-open proof.
 
 The checked independent source report supports only the WP-03 source-TIFF
-archive. WP-10A-B is implemented off-product and the WP-10A-C target authority
-is promoted. `mirante4d-storage` is assigned to the
-existing contract leaf, but its current tests prove only pure profile, path,
-arithmetic, supporting exact-identity, scalar-wire, and restricted-JCS
+archive. WP-10A is accepted off-product and its target authority is promoted.
+`mirante4d-storage` is assigned to the existing contract leaf. Its lower-level
+tests prove profile, path, arithmetic, supporting exact-identity, scalar-wire,
+and restricted-JCS
 contracts, including the closed profile, canonical-value, scientific, and
 display-defaults grammars, verified recipe payloads, and exact manifest
 descriptor/page/root bytes. Closed portable-record tests prove structural
@@ -130,11 +133,11 @@ regular objects. Catalog tests additionally prove canonical manifest-page
 authentication, exact opening-metadata bytes, and initial cross-object layer
 and storage-shape rejection. The directory-inventory test proves exact positive
 closure counts, cancellation, extra-directory rejection, and post-open length-
-drift rejection, including same-length manifest-authority drift. These tests
-alone make no DS-specific admission, shard-payload, official-schema, complete-
-package, T1 conformance, independent-reader, lifecycle, or product-support
-claim. Current schema-1 packages remain non-authoritative T2 support fixtures;
-the promoted target authority is separate and off-product.
+drift rejection, including same-length manifest-authority drift. These lower-
+level tests alone make no DS-specific admission, shard-payload, official-
+schema, complete-package, T1 conformance, independent-reader, lifecycle, or
+product-support claim. Current schema-1 packages remain non-authoritative T2
+support fixtures; the promoted target authority is separate and off-product.
 
 Address-planning tests prove 2D/3D grid, C-order ordinal, inner-slot, and edge-
 extent arithmetic plus the exact baseline catalog-derived paths and packed-
@@ -235,7 +238,7 @@ lineage bindings and expected facts, full-array readback, pinned OME-schema
 results, critical identity vectors, exact rejection of 15 mutations, and
 byte-identical two-run reproduction for the frozen EXPERIMENTAL profile.
 
-Run the complete WP-10A-D candidate evidence with:
+Re-run the accepted WP-10A evidence with:
 
 ```bash
 cargo xtask verify-local format-lifecycle
@@ -243,10 +246,9 @@ cargo xtask verify-local format-lifecycle
 
 That real local lane validates the promoted authority, runs the three positive
 and 15 negative production cases, and performs writer-to-pinned-reader
-readback. The candidate remains off-product and EXPERIMENTAL; it makes no
+readback. WP-10A remains off-product and EXPERIMENTAL; it makes no
 stable-format, generic OME-Zarr, importer, product-support, product-open, or
-product-activation claim. Clean-revision WP-10A exit acceptance is still
-required.
+product-activation claim.
 
 The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).

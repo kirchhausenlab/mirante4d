@@ -55,8 +55,9 @@ WP-08B accepted the unified dataset runtime at
 interactive demand; the predecessor app/data read pools, unbounded result
 channels, resident payload mirrors, and analysis execution worker are deleted.
 
-WP-10A entry, dependency disposition, and profile freeze are accepted.
-WP-10A-B is implemented off-product and WP-10A-C target evidence is promoted:
+WP-10A accepted the off-product dataset schema, storage, index, and identity
+package at `9b3a81d79a50027c0a8ddedc535021809a99d928`, tagged
+`foundation-wp-10a-exit-1`. Its profile and target evidence include:
 the storage profile, scientific and exact
 identities, strict control scalars, closed profile, canonical-value,
 scientific, and display-defaults grammars, restricted JCS, and exact
@@ -104,7 +105,7 @@ evidence. The promoted `target-m4d-v1` authority tracks three bounded synthetic
 USTAR archives, independent expected facts and critical vectors, a full-array
 independent reader with pinned OME-schema results, 15 executed mutations, and
 byte-identical two-run reproduction. It is the registry's sole `T1-target`
-record and `target_format_t1_available` is true. The WP-10A-D candidate now
+record and `target_format_t1_available` is true. The accepted production path
 consumes all three packages through the production exact and scientific path,
 matches every full-array and per-layer value/validity digest plus the exact
 counts and one-brick amplification facts, and rejects all 15 mutations.
@@ -113,9 +114,9 @@ with the same scientific and image facts while exact PackageIds may differ.
 Isolated 2,750/5,500/11,000-descriptor opens satisfy the linear metadata-work
 contract, and the largest stays inside its 10-second and 64-MiB post-open RSS
 ceilings. `cargo xtask verify-local format-lifecycle` is the real local gate.
-WP-10A-D still requires clean-revision exit acceptance. The profile
-remains EXPERIMENTAL and off-product; no stable-format, product-support,
-performance, or generic OME-Zarr claim follows.
+The profile remains EXPERIMENTAL and off-product; no stable-format,
+product-support, performance, or generic OME-Zarr claim follows. WP-09A entry
+work is active against the accepted WP-10A tag.
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
 Current schema-1 packages remain transitional T2 fixtures and the sole product

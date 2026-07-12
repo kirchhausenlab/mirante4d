@@ -5,7 +5,7 @@ contains unresolved work only.
 
 ## Foundation Program
 
-- Complete WP-10A, WP-09A, and the remaining storage, renderer, project,
+- Complete WP-09A and the remaining storage, renderer, project,
   import, analysis, UI, release, and final-deletion packages in the order stated
   by the [foundation handoff](plans/active/FOUNDATION_REFACTOR_HANDOFF.md).
 - Expose packaged unsaved-autosave recovery in its owning application package.
