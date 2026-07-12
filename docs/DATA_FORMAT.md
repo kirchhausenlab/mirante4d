@@ -150,7 +150,7 @@ pre-head commit, with the existing head still authoritative and no automatic
 repair. Any unrelated recovery target is corruption. B2 now implements typed
 canonical generation records, direct and deterministic 16 MiB paged closure,
 generation-last immutable publication, bounded physical-entry and directory-
-fan-out inventory before ref publication, and crate-private manual recovery-
-before-head replacement off-product. This is not a public Create/Save,
-autosave, recovery-open, or durability claim. B4 deletes project-v15 and makes
-the new store the sole product path.
+fan-out inventory before ref publication, and crate-private manual and
+established-project autosave recovery-before-head replacement off-product. This
+is not a public Create/Save, provisional-autosave, recovery-open, or durability
+claim. B4 deletes project-v15 and makes the new store the sole product path.

@@ -1,10 +1,10 @@
-//! Generation-last publication and manual-head authority updates.
+//! Generation-last publication and project-lane authority updates.
 //!
 //! This private B2 slice publishes an initial manual head into a prepared root
-//! and advances an established manual head through recovery-before-head atomic
-//! replacement under a held writer lease and bounded whole-store inventory.
-//! Actor execution, recovery selection, autosave commits, Save As, and garbage
-//! collection remain outside this module.
+//! and advances established manual and autosave heads through recovery-before-
+//! head atomic replacement under a held writer lease and bounded whole-store
+//! inventory. Actor execution, provisional autosave, recovery selection, Save
+//! As, and garbage collection remain outside this module.
 
 #![cfg(target_os = "linux")]
 #![cfg_attr(not(test), allow(dead_code))]
@@ -190,10 +190,67 @@ struct LaneSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct EstablishedManualSnapshot {
+struct EstablishedStoreSnapshot {
     manual: LaneSnapshot,
     autosave: Option<LaneSnapshot>,
     next_generation_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitLane {
+    Manual,
+    Autosave,
+}
+
+impl CommitLane {
+    const fn generation_kind(self) -> GenerationKind {
+        match self {
+            Self::Manual => GenerationKind::Manual,
+            Self::Autosave => GenerationKind::Autosave,
+        }
+    }
+
+    const fn head_kind(self) -> RefKind {
+        match self {
+            Self::Manual => RefKind::ManualHead,
+            Self::Autosave => RefKind::AutosaveHead,
+        }
+    }
+
+    const fn recovery_kind(self) -> RefKind {
+        match self {
+            Self::Manual => RefKind::ManualRecovery,
+            Self::Autosave => RefKind::AutosaveRecovery,
+        }
+    }
+
+    const fn target(self, snapshot: EstablishedStoreSnapshot) -> Option<LaneSnapshot> {
+        match self {
+            Self::Manual => Some(snapshot.manual),
+            Self::Autosave => snapshot.autosave,
+        }
+    }
+
+    const fn head_stage(self) -> &'static str {
+        match self {
+            Self::Manual => "manual_head",
+            Self::Autosave => "autosave_head",
+        }
+    }
+
+    const fn recovery_stage(self) -> &'static str {
+        match self {
+            Self::Manual => "manual_recovery",
+            Self::Autosave => "autosave_recovery",
+        }
+    }
+
+    const fn recovery_durability_stage(self) -> &'static str {
+        match self {
+            Self::Manual => "manual_recovery_durability",
+            Self::Autosave => "autosave_recovery_durability",
+        }
+    }
 }
 
 /// Advances one established manual lane through the frozen
@@ -203,6 +260,50 @@ pub(crate) fn publish_established_manual_generation<C>(
     root: &LocalStoreRoot,
     leases: &ProjectStoreLeases,
     capture: ProjectCommitCapture,
+    limits: ProjectStoreLimits,
+    is_cancelled: C,
+) -> Result<ProjectStoreReceipt, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    publish_established_lane_generation(
+        root,
+        leases,
+        capture,
+        CommitLane::Manual,
+        limits,
+        is_cancelled,
+    )
+}
+
+/// Publishes a first or advancing autosave for a project with an established
+/// manual head. Provisional autosave-only stores and actor coalescing remain
+/// later B2 work.
+pub(crate) fn publish_established_autosave_generation<C>(
+    root: &LocalStoreRoot,
+    leases: &ProjectStoreLeases,
+    capture: ProjectCommitCapture,
+    limits: ProjectStoreLimits,
+    is_cancelled: C,
+) -> Result<ProjectStoreReceipt, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    publish_established_lane_generation(
+        root,
+        leases,
+        capture,
+        CommitLane::Autosave,
+        limits,
+        is_cancelled,
+    )
+}
+
+fn publish_established_lane_generation<C>(
+    root: &LocalStoreRoot,
+    leases: &ProjectStoreLeases,
+    capture: ProjectCommitCapture,
+    lane: CommitLane,
     limits: ProjectStoreLimits,
     mut is_cancelled: C,
 ) -> Result<ProjectStoreReceipt, ProjectStoreFault>
@@ -222,96 +323,130 @@ where
             stage: "project_envelope_identity",
         });
     }
-    if capture.autosave_base().is_some() {
-        return Err(ProjectStoreFault::Corruption {
-            stage: "established_manual_capture",
-        });
-    }
     let snapshot =
-        inspect_established_manual(root, &capture, project_id, limits, &mut is_cancelled)?;
+        inspect_established_store(root, &capture, project_id, lane, limits, &mut is_cancelled)?;
 
     let captured_revision = capture.projection().revision();
     let captured_revision_high_water = capture.projection().revision_high_water().clone();
+    let autosave_base = capture.autosave_base();
     let publication = publish_unreferenced_generation(
         root,
         capture,
-        GenerationKind::Manual,
+        lane.generation_kind(),
         snapshot.next_generation_sequence,
         limits,
         &mut is_cancelled,
     )
     .map_err(map_generation_error)?;
 
-    let pending_recovery_ref = usize::from(snapshot.manual.recovery.is_none());
-    root.validate_store_inventory(limits, pending_recovery_ref, true, &mut is_cancelled)
-        .map_err(|error| map_local_error(error, "store_inventory"))?;
+    let target = lane.target(snapshot);
+    let (pending_fixed_refs, replaces_fixed_ref) = match target {
+        Some(target) => (usize::from(target.recovery.is_none()), true),
+        None => (1, false),
+    };
+    let previous = target.map(|target| target.head.current());
+    let receipt = match lane {
+        CommitLane::Manual => ProjectStoreReceipt::manual(
+            captured_revision,
+            captured_revision_high_water,
+            publication.generation_id(),
+            previous,
+            publication.created_objects(),
+            publication.created_object_bytes(),
+        ),
+        CommitLane::Autosave => ProjectStoreReceipt::autosave(
+            captured_revision,
+            captured_revision_high_water,
+            publication.generation_id(),
+            previous,
+            autosave_base.ok_or(ProjectStoreFault::StaleParent)?,
+            publication.created_objects(),
+            publication.created_object_bytes(),
+        ),
+    };
+    root.validate_store_inventory(
+        limits,
+        pending_fixed_refs,
+        replaces_fixed_ref,
+        &mut is_cancelled,
+    )
+    .map_err(|error| map_local_error(error, "store_inventory"))?;
     if !leases.confirm_writer(root).map_err(map_lease_error)? {
         return Err(ProjectStoreFault::ReadOnly);
     }
-    require_unchanged_established_refs(root, project_id, snapshot, limits, &mut is_cancelled)?;
-    check_cancelled(&mut is_cancelled).map_err(map_generation_error)?;
-
-    let old_current = snapshot.manual.head.current();
-    let recovery = RefRecord::new(RefKind::ManualRecovery, project_id, old_current, None, None)
-        .map_err(|_| ProjectStoreFault::Corruption {
-            stage: "manual_recovery",
-        })?;
-    replace_transaction_ref(
+    require_unchanged_established_refs(
         root,
-        leases,
-        snapshot.manual.recovery,
-        recovery,
+        project_id,
+        snapshot,
+        lane,
         limits,
         &mut is_cancelled,
-        "manual_recovery",
     )?;
-
-    // Cancellation here deliberately leaves the old head authoritative and
-    // the corrected recovery-ahead marker available for an exact retry.
     check_cancelled(&mut is_cancelled).map_err(map_generation_error)?;
+
+    if let Some(target) = target {
+        let recovery = RefRecord::new(
+            lane.recovery_kind(),
+            project_id,
+            target.head.current(),
+            None,
+            None,
+        )
+        .map_err(|_| ProjectStoreFault::Corruption {
+            stage: lane.recovery_stage(),
+        })?;
+        replace_transaction_ref(
+            root,
+            leases,
+            target.recovery,
+            recovery,
+            limits,
+            &mut is_cancelled,
+            lane.recovery_stage(),
+            TransactionRefPhase::Recovery {
+                durability_stage: lane.recovery_durability_stage(),
+            },
+        )?;
+
+        // Cancellation here deliberately leaves the old lane head
+        // authoritative and recovery-ahead available for an exact retry.
+        check_cancelled(&mut is_cancelled).map_err(map_generation_error)?;
+    }
     let head = RefRecord::new(
-        RefKind::ManualHead,
+        lane.head_kind(),
         project_id,
         publication.generation_id(),
-        Some(old_current),
-        None,
+        previous,
+        autosave_base,
     )
     .map_err(|_| ProjectStoreFault::Corruption {
-        stage: "manual_head",
+        stage: lane.head_stage(),
     })?;
     replace_transaction_ref(
         root,
         leases,
-        Some(snapshot.manual.head),
+        target.map(|target| target.head),
         head,
         limits,
         &mut is_cancelled,
-        "manual_head",
+        lane.head_stage(),
+        TransactionRefPhase::Head,
     )?;
 
-    Ok(ProjectStoreReceipt::manual(
-        captured_revision,
-        captured_revision_high_water,
-        publication.generation_id(),
-        Some(old_current),
-        publication.created_objects(),
-        publication.created_object_bytes(),
-    ))
+    Ok(receipt)
 }
 
-fn inspect_established_manual<C>(
+fn inspect_established_store<C>(
     root: &LocalStoreRoot,
     capture: &ProjectCommitCapture,
     project_id: mirante4d_project_model::ProjectId,
+    lane: CommitLane,
     limits: ProjectStoreLimits,
     is_cancelled: &mut C,
-) -> Result<EstablishedManualSnapshot, ProjectStoreFault>
+) -> Result<EstablishedStoreSnapshot, ProjectStoreFault>
 where
     C: FnMut() -> bool,
 {
-    let expected_parent = capture
-        .expected_parent()
-        .ok_or(ProjectStoreFault::StaleParent)?;
     let manual = read_lane_snapshot(
         root,
         project_id,
@@ -321,9 +456,38 @@ where
         &mut *is_cancelled,
     )?
     .ok_or(ProjectStoreFault::StaleParent)?;
-    if manual.head.current() != expected_parent {
+    match lane {
+        CommitLane::Manual => {
+            if capture.autosave_base().is_some() {
+                return Err(ProjectStoreFault::Corruption {
+                    stage: "established_manual_capture",
+                });
+            }
+            if capture.expected_parent() != Some(manual.head.current()) {
+                return Err(ProjectStoreFault::StaleParent);
+            }
+        }
+        CommitLane::Autosave => {
+            if capture.autosave_base() != Some(manual.head.current()) {
+                return Err(ProjectStoreFault::StaleParent);
+            }
+        }
+    }
+
+    let autosave = read_lane_snapshot(
+        root,
+        project_id,
+        RefKind::AutosaveHead,
+        RefKind::AutosaveRecovery,
+        limits,
+        &mut *is_cancelled,
+    )?;
+    if lane == CommitLane::Autosave
+        && capture.expected_parent() != autosave.map(|lane| lane.head.current())
+    {
         return Err(ProjectStoreFault::StaleParent);
     }
+
     let manual_generation = read_current_generation(
         root,
         project_id,
@@ -344,15 +508,6 @@ where
             stage: "manual_generation_continuity",
         });
     }
-
-    let autosave = read_lane_snapshot(
-        root,
-        project_id,
-        RefKind::AutosaveHead,
-        RefKind::AutosaveRecovery,
-        limits,
-        &mut *is_cancelled,
-    )?;
     let pins = root
         .read_pin_refs(limits, &mut *is_cancelled)
         .map_err(|error| map_local_error(error, "ref_namespace"))?;
@@ -422,7 +577,7 @@ where
             .ok_or(ProjectStoreFault::Capacity {
                 stage: "generation_sequence",
             })?;
-    Ok(EstablishedManualSnapshot {
+    Ok(EstablishedStoreSnapshot {
         manual,
         autosave,
         next_generation_sequence,
@@ -624,7 +779,8 @@ fn insert_expected_generation(
 fn require_unchanged_established_refs<C>(
     root: &LocalStoreRoot,
     project_id: mirante4d_project_model::ProjectId,
-    expected: EstablishedManualSnapshot,
+    expected: EstablishedStoreSnapshot,
+    lane: CommitLane,
     limits: ProjectStoreLimits,
     is_cancelled: &mut C,
 ) -> Result<(), ProjectStoreFault>
@@ -651,12 +807,24 @@ where
         limits,
         &mut *is_cancelled,
     )?;
+    if lane == CommitLane::Autosave
+        && autosave.map(|lane| lane.head.current())
+            != expected.autosave.map(|lane| lane.head.current())
+    {
+        return Err(ProjectStoreFault::StaleParent);
+    }
     if manual != expected.manual || autosave != expected.autosave {
         return Err(ProjectStoreFault::Corruption {
             stage: "lane_ref_drift",
         });
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransactionRefPhase {
+    Recovery { durability_stage: &'static str },
+    Head,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -668,22 +836,28 @@ fn replace_transaction_ref<C>(
     limits: ProjectStoreLimits,
     is_cancelled: &mut C,
     stage: &'static str,
+    phase: TransactionRefPhase,
 ) -> Result<(), ProjectStoreFault>
 where
     C: FnMut() -> bool,
 {
     if let Err(error) = root.replace_ref(expected, next, limits, &mut *is_cancelled) {
-        if matches!(error, LocalPublicationError::RefCommitIndeterminate) {
-            return if stage == "manual_head" {
+        return match (error, phase) {
+            (LocalPublicationError::RefCommitIndeterminate, TransactionRefPhase::Head) => {
                 leases.suspend_writes();
                 Err(ProjectStoreFault::CommitIndeterminate)
-            } else {
-                Err(ProjectStoreFault::Corruption {
-                    stage: "manual_recovery_durability",
-                })
-            };
-        }
-        return Err(map_local_error(error, stage));
+            }
+            (
+                LocalPublicationError::RefCommitIndeterminate,
+                TransactionRefPhase::Recovery { durability_stage },
+            ) => Err(ProjectStoreFault::Corruption {
+                stage: durability_stage,
+            }),
+            (LocalPublicationError::RefChanged, TransactionRefPhase::Head) => {
+                Err(ProjectStoreFault::StaleParent)
+            }
+            (error, _) => Err(map_local_error(error, stage)),
+        };
     }
     Ok(())
 }
@@ -758,9 +932,6 @@ fn map_local_error(error: LocalPublicationError, stage: &'static str) -> Project
         LocalPublicationError::SourceLength { .. } => ProjectStoreFault::SourceChanged,
         LocalPublicationError::SourceDigest => ProjectStoreFault::DigestMismatch,
         LocalPublicationError::RefAlreadyPresent => ProjectStoreFault::StaleParent,
-        LocalPublicationError::RefChanged if stage == "manual_head" => {
-            ProjectStoreFault::StaleParent
-        }
         LocalPublicationError::RefChanged => ProjectStoreFault::Corruption { stage },
         LocalPublicationError::RefCommitIndeterminate => ProjectStoreFault::CommitIndeterminate,
         LocalPublicationError::AtomicPublishUnsupported => ProjectStoreFault::UnsupportedFilesystem,
@@ -1322,6 +1493,10 @@ mod tests {
         "m4d-project-generation-v1-sha256:",
         "d5020fa3c69a493b34ffbbf3a67a249354e83e5a6d738479d46c7e301786d2ec"
     );
+    const STALE_AUTOSAVE: &str = concat!(
+        "m4d-project-generation-v1-sha256:",
+        "c357ffd5f7c051bf22877ffcd6680bdcd0f7db4068af93587e4a1f5bed0542a0"
+    );
     const RECOVERABLE_G1: &str = concat!(
         "m4d-project-generation-v1-sha256:",
         "9cf3985edc9a7de3702029a4b32fd3e4188796ee8459deddd0c6cd7babf57d81"
@@ -1333,6 +1508,22 @@ mod tests {
     const RECOVERABLE_ORPHAN: &str = concat!(
         "m4d-project-generation-v1-sha256:",
         "cfd67414728bb345edb7d5eabffac2530f04ed3b768d720782efe88e2d7ca370"
+    );
+    const RECOVERABLE_A1: &str = concat!(
+        "m4d-project-generation-v1-sha256:",
+        "dc1669b5773f1708b72114fb171e69c92d551e946de567ddd30d0a7c9a19d63c"
+    );
+    const RECOVERABLE_A2: &str = concat!(
+        "m4d-project-generation-v1-sha256:",
+        "d9504b896fd6a3fb21e52d227fcd284df654d4f063ea8ee0ca49fce0155e9b73"
+    );
+    const DIVERGENT_MANUAL: &str = concat!(
+        "m4d-project-generation-v1-sha256:",
+        "6b91b33dbaa378598269005b027db7a0643e14babe4b7522a5a415a461f6a497"
+    );
+    const DIVERGENT_AUTOSAVE: &str = concat!(
+        "m4d-project-generation-v1-sha256:",
+        "b9af2901b12b248533e53d2683fcf4db7d4b2eb33ef292413b8b5dc2cb8b951e"
     );
 
     impl ProjectObjectSource for RepeatedPageSource {
@@ -2219,6 +2410,606 @@ mod tests {
         }
     }
 
+    #[test]
+    fn first_established_autosave_matches_the_frozen_head() {
+        let directory = prepared_frozen_root("first-established-autosave");
+        let root = LocalStoreRoot::open(directory.path()).unwrap();
+        let leases = ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        let (_, manual, _) = frozen_stale_manual();
+        let autosave = frozen_generation("stale.m4dproj", STALE_AUTOSAVE);
+        let manual_id = ProjectGenerationId::parse(STALE_GENERATION).unwrap();
+        let autosave_id = ProjectGenerationId::parse(STALE_AUTOSAVE).unwrap();
+
+        let (initial, _) = frozen_capture("stale.m4dproj", &manual);
+        publish_initial_manual_generation(
+            &root,
+            &leases,
+            initial,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        let manual_head = fs::read(directory.path().join("refs/head")).unwrap();
+        let (capture, opens) = frozen_capture("stale.m4dproj", &autosave);
+        let receipt = publish_established_autosave_generation(
+            &root,
+            &leases,
+            capture,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+
+        assert_eq!(receipt.new_generation_id(), autosave_id);
+        assert_eq!(receipt.previous_generation_id(), None);
+        assert_eq!(receipt.autosave_base_generation_id(), Some(manual_id));
+        assert_eq!(receipt.published_objects(), 0);
+        assert_eq!(receipt.published_bytes(), 0);
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fs::read(generation_path(directory.path(), autosave_id)).unwrap(),
+            fixture_extract(&fixture_generation_member("stale.m4dproj", autosave_id))
+        );
+        assert_eq!(
+            fs::read(directory.path().join("refs/autosave-head")).unwrap(),
+            fixture_extract("stale.m4dproj/refs/autosave-head")
+        );
+        assert!(!directory.path().join("refs/autosave-recovery").exists());
+        assert_eq!(
+            fs::read(directory.path().join("refs/head")).unwrap(),
+            manual_head
+        );
+    }
+
+    #[test]
+    fn established_autosave_advances_clean_and_divergent_lanes() {
+        let directory = extracted_frozen_root("established-autosave-clean", "recoverable.m4dproj");
+        let root = LocalStoreRoot::open(directory.path()).unwrap();
+        let leases = ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        let a1 = ProjectGenerationId::parse(RECOVERABLE_A1).unwrap();
+        let a2 = ProjectGenerationId::parse(RECOVERABLE_A2).unwrap();
+        let manual = ProjectGenerationId::parse(RECOVERABLE_G2).unwrap();
+        let a2_document = frozen_generation("recoverable.m4dproj", RECOVERABLE_A2);
+        let a1_head = RefRecord::new(
+            RefKind::AutosaveHead,
+            a2_document.projection().state().project_id(),
+            a1,
+            None,
+            Some(manual),
+        )
+        .unwrap()
+        .encode();
+        fs::write(directory.path().join("refs/autosave-head"), a1_head).unwrap();
+        fs::remove_file(directory.path().join("refs/autosave-recovery")).unwrap();
+        let manual_head = fs::read(directory.path().join("refs/head")).unwrap();
+        let manual_recovery = fs::read(directory.path().join("refs/recovery")).unwrap();
+        let pin = fs::read(directory.path().join("refs/pins/checkpoint-a")).unwrap();
+
+        let (capture, _opens) = frozen_capture("recoverable.m4dproj", &a2_document);
+        let receipt = publish_established_autosave_generation(
+            &root,
+            &leases,
+            capture,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(receipt.new_generation_id(), a2);
+        assert_eq!(receipt.previous_generation_id(), Some(a1));
+        assert_eq!(receipt.autosave_base_generation_id(), Some(manual));
+        assert_eq!(receipt.published_objects(), 0);
+        assert_eq!(receipt.published_bytes(), 0);
+        assert_eq!(
+            fs::read(directory.path().join("refs/autosave-head")).unwrap(),
+            fixture_extract("recoverable.m4dproj/refs/autosave-head")
+        );
+        assert_eq!(
+            fs::read(directory.path().join("refs/autosave-recovery")).unwrap(),
+            fixture_extract("recoverable.m4dproj/refs/autosave-recovery")
+        );
+        assert_eq!(
+            fs::read(directory.path().join("refs/head")).unwrap(),
+            manual_head
+        );
+        assert_eq!(
+            fs::read(directory.path().join("refs/recovery")).unwrap(),
+            manual_recovery
+        );
+        assert_eq!(
+            fs::read(directory.path().join("refs/pins/checkpoint-a")).unwrap(),
+            pin
+        );
+
+        let divergent_directory =
+            extracted_frozen_root("established-autosave-divergent", "divergent.m4dproj");
+        let divergent_root = LocalStoreRoot::open(divergent_directory.path()).unwrap();
+        let divergent_leases =
+            ProjectStoreLeases::acquire(&divergent_root, ProjectOpenMode::PreferWritable).unwrap();
+        let old_autosave = frozen_generation("divergent.m4dproj", DIVERGENT_AUTOSAVE);
+        let old_autosave_id = ProjectGenerationId::parse(DIVERGENT_AUTOSAVE).unwrap();
+        let current_manual = ProjectGenerationId::parse(DIVERGENT_MANUAL).unwrap();
+        let manual_head = fs::read(divergent_directory.path().join("refs/head")).unwrap();
+        let manual_recovery = fs::read(divergent_directory.path().join("refs/recovery")).unwrap();
+        let projection = projection_with_revision(&old_autosave, 3, 4);
+        let (capture, _opens) = frozen_capture_with_facts(
+            "divergent.m4dproj",
+            &old_autosave,
+            projection,
+            Some(old_autosave_id),
+            Some(current_manual),
+        );
+        let receipt = publish_established_autosave_generation(
+            &divergent_root,
+            &divergent_leases,
+            capture,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(receipt.previous_generation_id(), Some(old_autosave_id));
+        assert_eq!(receipt.autosave_base_generation_id(), Some(current_manual));
+        assert_eq!(receipt.captured_revision().sequence(), 3);
+        assert_eq!(receipt.captured_revision_high_water().sequence(), 4);
+        assert_eq!(receipt.published_objects(), 0);
+        assert_eq!(receipt.published_bytes(), 0);
+        let generation_bytes = fs::read(generation_path(
+            divergent_directory.path(),
+            receipt.new_generation_id(),
+        ))
+        .unwrap();
+        let generation = GenerationDocument::decode(
+            receipt.new_generation_id(),
+            old_autosave.projection().state().project_id(),
+            &generation_bytes,
+            ProjectStoreLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(generation.kind(), GenerationKind::Autosave);
+        assert_eq!(generation.generation_sequence(), 4);
+        assert_eq!(generation.parent_generation_id(), Some(old_autosave_id));
+        assert_eq!(generation.base_manual_generation_id(), Some(current_manual));
+        assert_eq!(generation.projection().revision().sequence(), 3);
+        assert_eq!(generation.projection().revision_high_water().sequence(), 4);
+        let head = RefRecord::decode(
+            RefKind::AutosaveHead,
+            &fs::read(divergent_directory.path().join("refs/autosave-head")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(head.current(), receipt.new_generation_id());
+        assert_eq!(head.previous(), Some(old_autosave_id));
+        assert_eq!(head.base(), Some(current_manual));
+        let recovery = RefRecord::decode(
+            RefKind::AutosaveRecovery,
+            &fs::read(divergent_directory.path().join("refs/autosave-recovery")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(recovery.current(), old_autosave_id);
+        assert_eq!(
+            fs::read(divergent_directory.path().join("refs/head")).unwrap(),
+            manual_head
+        );
+        assert_eq!(
+            fs::read(divergent_directory.path().join("refs/recovery")).unwrap(),
+            manual_recovery
+        );
+    }
+
+    #[test]
+    fn established_autosave_rejects_invalid_state_and_capacity_without_ref_change() {
+        let directory = extracted_frozen_root("established-autosave-reject", "stale.m4dproj");
+        let root = LocalStoreRoot::open(directory.path()).unwrap();
+        let leases = ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        let autosave = frozen_generation("stale.m4dproj", STALE_AUTOSAVE);
+        let autosave_id = ProjectGenerationId::parse(STALE_AUTOSAVE).unwrap();
+        let manual_id = ProjectGenerationId::parse(STALE_GENERATION).unwrap();
+        let manual_head = fs::read(directory.path().join("refs/head")).unwrap();
+        let autosave_head = fs::read(directory.path().join("refs/autosave-head")).unwrap();
+
+        let (wrong_parent, opens) = frozen_capture_with_facts(
+            "stale.m4dproj",
+            &autosave,
+            autosave.projection().clone(),
+            None,
+            Some(manual_id),
+        );
+        assert!(matches!(
+            publish_established_autosave_generation(
+                &root,
+                &leases,
+                wrong_parent,
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::StaleParent)
+        ));
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+
+        let (wrong_base, opens) = frozen_capture_with_facts(
+            "stale.m4dproj",
+            &autosave,
+            autosave.projection().clone(),
+            Some(autosave_id),
+            None,
+        );
+        assert!(matches!(
+            publish_established_autosave_generation(
+                &root,
+                &leases,
+                wrong_base,
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::StaleParent)
+        ));
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+
+        let (regressed, opens) = frozen_capture_with_facts(
+            "stale.m4dproj",
+            &autosave,
+            projection_with_revision(&autosave, 4, 4),
+            Some(autosave_id),
+            Some(manual_id),
+        );
+        assert!(matches!(
+            publish_established_autosave_generation(
+                &root,
+                &leases,
+                regressed,
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::Corruption {
+                stage: "revision_high_water_regression"
+            })
+        ));
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fs::read(directory.path().join("refs/head")).unwrap(),
+            manual_head
+        );
+        assert_eq!(
+            fs::read(directory.path().join("refs/autosave-head")).unwrap(),
+            autosave_head
+        );
+        assert!(!directory.path().join("refs/autosave-recovery").exists());
+
+        let recovery_directory =
+            extracted_frozen_root("established-autosave-unrelated", "stale.m4dproj");
+        let recovery_root = LocalStoreRoot::open(recovery_directory.path()).unwrap();
+        let recovery_leases =
+            ProjectStoreLeases::acquire(&recovery_root, ProjectOpenMode::PreferWritable).unwrap();
+        let unrelated = RefRecord::new(
+            RefKind::AutosaveRecovery,
+            autosave.projection().state().project_id(),
+            manual_id,
+            None,
+            None,
+        )
+        .unwrap()
+        .encode();
+        fs::write(
+            recovery_directory.path().join("refs/autosave-recovery"),
+            unrelated,
+        )
+        .unwrap();
+        let recovery_head = fs::read(recovery_directory.path().join("refs/autosave-head")).unwrap();
+        let (capture, opens) = frozen_capture_with_facts(
+            "stale.m4dproj",
+            &autosave,
+            autosave.projection().clone(),
+            Some(autosave_id),
+            Some(manual_id),
+        );
+        assert!(matches!(
+            publish_established_autosave_generation(
+                &recovery_root,
+                &recovery_leases,
+                capture,
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::Corruption {
+                stage: "recovery_pair"
+            })
+        ));
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fs::read(recovery_directory.path().join("refs/autosave-head")).unwrap(),
+            recovery_head
+        );
+        assert_eq!(
+            fs::read(recovery_directory.path().join("refs/autosave-recovery")).unwrap(),
+            unrelated
+        );
+
+        let capacity_directory =
+            extracted_frozen_root("established-autosave-capacity", "stale.m4dproj");
+        let capacity_root = LocalStoreRoot::open(capacity_directory.path()).unwrap();
+        let capacity_leases =
+            ProjectStoreLeases::acquire(&capacity_root, ProjectOpenMode::PreferWritable).unwrap();
+        let old_manual_head = fs::read(capacity_directory.path().join("refs/head")).unwrap();
+        let old_autosave_head =
+            fs::read(capacity_directory.path().join("refs/autosave-head")).unwrap();
+        let limits = ProjectStoreLimits {
+            physical_store_entries_max: 1,
+            ..ProjectStoreLimits::default()
+        };
+        let (capture, _) = frozen_capture_with_facts(
+            "stale.m4dproj",
+            &autosave,
+            autosave.projection().clone(),
+            Some(autosave_id),
+            Some(manual_id),
+        );
+        assert!(matches!(
+            publish_established_autosave_generation(
+                &capacity_root,
+                &capacity_leases,
+                capture,
+                limits,
+                || false,
+            ),
+            Err(ProjectStoreFault::Capacity {
+                stage: "store_inventory"
+            })
+        ));
+        assert_eq!(
+            fs::read(capacity_directory.path().join("refs/head")).unwrap(),
+            old_manual_head
+        );
+        assert_eq!(
+            fs::read(capacity_directory.path().join("refs/autosave-head")).unwrap(),
+            old_autosave_head
+        );
+        assert!(
+            !capacity_directory
+                .path()
+                .join("refs/autosave-recovery")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn established_autosave_retries_after_cancelled_recovery_ahead() {
+        let directory = extracted_frozen_root("established-autosave-retry", "stale.m4dproj");
+        let root = LocalStoreRoot::open(directory.path()).unwrap();
+        let leases = ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        let autosave = frozen_generation("stale.m4dproj", STALE_AUTOSAVE);
+        let project_id = autosave.projection().state().project_id();
+        let autosave_id = ProjectGenerationId::parse(STALE_AUTOSAVE).unwrap();
+        let manual_id = ProjectGenerationId::parse(STALE_GENERATION).unwrap();
+        let old_head = fs::read(directory.path().join("refs/autosave-head")).unwrap();
+        let manual_head = fs::read(directory.path().join("refs/head")).unwrap();
+        let recovery_path = directory.path().join("refs/autosave-recovery");
+        let expected_generation = GenerationDocument::build_from_projection(
+            autosave.projection().clone(),
+            Some(autosave_id),
+            Some(manual_id),
+            autosave.forked_from(),
+            GenerationKind::Autosave,
+            2,
+            autosave.bindings().clone(),
+            autosave.reachable_objects().to_vec(),
+            ProjectStoreLimits::default(),
+        )
+        .unwrap()
+        .encode(ProjectStoreLimits::default())
+        .unwrap()
+        .id();
+
+        let (capture, _) = frozen_capture_with_facts(
+            "stale.m4dproj",
+            &autosave,
+            autosave.projection().clone(),
+            Some(autosave_id),
+            Some(manual_id),
+        );
+        assert!(matches!(
+            publish_established_autosave_generation(
+                &root,
+                &leases,
+                capture,
+                ProjectStoreLimits::default(),
+                || recovery_path.exists(),
+            ),
+            Err(ProjectStoreFault::Cancelled)
+        ));
+        let recovery_ahead = RefRecord::new(
+            RefKind::AutosaveRecovery,
+            project_id,
+            autosave_id,
+            None,
+            None,
+        )
+        .unwrap()
+        .encode();
+        assert_eq!(
+            fs::read(directory.path().join("refs/autosave-head")).unwrap(),
+            old_head
+        );
+        assert_eq!(fs::read(&recovery_path).unwrap(), recovery_ahead);
+        assert_eq!(
+            fs::read(directory.path().join("refs/head")).unwrap(),
+            manual_head
+        );
+        assert!(leases.confirm_writer(&root).unwrap());
+        assert!(generation_path(directory.path(), expected_generation).exists());
+
+        let (retry, _) = frozen_capture_with_facts(
+            "stale.m4dproj",
+            &autosave,
+            autosave.projection().clone(),
+            Some(autosave_id),
+            Some(manual_id),
+        );
+        let receipt = publish_established_autosave_generation(
+            &root,
+            &leases,
+            retry,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(receipt.new_generation_id(), expected_generation);
+        assert_eq!(receipt.previous_generation_id(), Some(autosave_id));
+        assert_eq!(receipt.autosave_base_generation_id(), Some(manual_id));
+        assert_eq!(receipt.published_objects(), 0);
+        assert_eq!(receipt.published_bytes(), 0);
+        let head = RefRecord::decode(
+            RefKind::AutosaveHead,
+            &fs::read(directory.path().join("refs/autosave-head")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(head.current(), receipt.new_generation_id());
+        assert_eq!(head.previous(), Some(autosave_id));
+        assert_eq!(head.base(), Some(manual_id));
+        assert_eq!(fs::read(&recovery_path).unwrap(), recovery_ahead);
+    }
+
+    #[test]
+    fn established_autosave_sync_failures_preserve_retry_and_head_indeterminacy() {
+        let autosave = frozen_generation("stale.m4dproj", STALE_AUTOSAVE);
+        let project_id = autosave.projection().state().project_id();
+        let autosave_id = ProjectGenerationId::parse(STALE_AUTOSAVE).unwrap();
+        let manual_id = ProjectGenerationId::parse(STALE_GENERATION).unwrap();
+        let expected_recovery = RefRecord::new(
+            RefKind::AutosaveRecovery,
+            project_id,
+            autosave_id,
+            None,
+            None,
+        )
+        .unwrap()
+        .encode();
+
+        for failed_sync in [0, 1] {
+            let directory = extracted_frozen_root(
+                &format!("established-autosave-recovery-sync-{failed_sync}"),
+                "stale.m4dproj",
+            );
+            let root = LocalStoreRoot::open(directory.path()).unwrap();
+            let leases =
+                ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+            let old_head = fs::read(directory.path().join("refs/autosave-head")).unwrap();
+            let manual_head = fs::read(directory.path().join("refs/head")).unwrap();
+            root.fail_ref_commit_directory_sync_at(failed_sync);
+            let (capture, _) = frozen_capture_with_facts(
+                "stale.m4dproj",
+                &autosave,
+                autosave.projection().clone(),
+                Some(autosave_id),
+                Some(manual_id),
+            );
+            assert!(matches!(
+                publish_established_autosave_generation(
+                    &root,
+                    &leases,
+                    capture,
+                    ProjectStoreLimits::default(),
+                    || false,
+                ),
+                Err(ProjectStoreFault::Corruption {
+                    stage: "autosave_recovery_durability"
+                })
+            ));
+            assert_eq!(root.ref_commit_directory_sync_attempts(), 2);
+            assert_eq!(
+                fs::read(directory.path().join("refs/autosave-head")).unwrap(),
+                old_head
+            );
+            assert_eq!(
+                fs::read(directory.path().join("refs/autosave-recovery")).unwrap(),
+                expected_recovery
+            );
+            assert_eq!(
+                fs::read(directory.path().join("refs/head")).unwrap(),
+                manual_head
+            );
+            assert!(leases.confirm_writer(&root).unwrap());
+
+            let (retry, _) = frozen_capture_with_facts(
+                "stale.m4dproj",
+                &autosave,
+                autosave.projection().clone(),
+                Some(autosave_id),
+                Some(manual_id),
+            );
+            let receipt = publish_established_autosave_generation(
+                &root,
+                &leases,
+                retry,
+                ProjectStoreLimits::default(),
+                || false,
+            )
+            .unwrap();
+            assert_eq!(receipt.published_objects(), 0);
+            assert_eq!(
+                fs::read(directory.path().join("refs/autosave-recovery")).unwrap(),
+                expected_recovery
+            );
+            let head = RefRecord::decode(
+                RefKind::AutosaveHead,
+                &fs::read(directory.path().join("refs/autosave-head")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(head.current(), receipt.new_generation_id());
+            assert_eq!(head.previous(), Some(autosave_id));
+            assert_eq!(head.base(), Some(manual_id));
+        }
+
+        for failed_sync in [2, 3] {
+            let directory = extracted_frozen_root(
+                &format!("established-autosave-head-sync-{failed_sync}"),
+                "stale.m4dproj",
+            );
+            let root = LocalStoreRoot::open(directory.path()).unwrap();
+            let leases =
+                ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+            let old_head = fs::read(directory.path().join("refs/autosave-head")).unwrap();
+            let manual_head = fs::read(directory.path().join("refs/head")).unwrap();
+            root.fail_ref_commit_directory_sync_at(failed_sync);
+            let (capture, _) = frozen_capture_with_facts(
+                "stale.m4dproj",
+                &autosave,
+                autosave.projection().clone(),
+                Some(autosave_id),
+                Some(manual_id),
+            );
+            assert!(matches!(
+                publish_established_autosave_generation(
+                    &root,
+                    &leases,
+                    capture,
+                    ProjectStoreLimits::default(),
+                    || fs::read(directory.path().join("refs/autosave-head"))
+                        .is_ok_and(|head| head != old_head),
+                ),
+                Err(ProjectStoreFault::CommitIndeterminate)
+            ));
+            assert_eq!(root.ref_commit_directory_sync_attempts(), 4);
+            assert_eq!(
+                fs::read(directory.path().join("refs/autosave-recovery")).unwrap(),
+                expected_recovery
+            );
+            let head = RefRecord::decode(
+                RefKind::AutosaveHead,
+                &fs::read(directory.path().join("refs/autosave-head")).unwrap(),
+            )
+            .unwrap();
+            assert_ne!(head.current(), autosave_id);
+            assert_eq!(head.previous(), Some(autosave_id));
+            assert_eq!(head.base(), Some(manual_id));
+            assert_eq!(
+                fs::read(directory.path().join("refs/head")).unwrap(),
+                manual_head
+            );
+            assert!(matches!(
+                leases.confirm_writer(&root),
+                Err(LeaseError::Indeterminate)
+            ));
+        }
+    }
+
     fn capture(
         artifacts: Vec<ArtifactReference>,
         sources: Vec<Box<dyn ProjectObjectSource>>,
@@ -2391,6 +3182,22 @@ mod tests {
         frozen: &GenerationDocument,
         expected_parent: Option<ProjectGenerationId>,
     ) -> (ProjectCommitCapture, Arc<AtomicUsize>) {
+        frozen_capture_with_facts(
+            store,
+            frozen,
+            frozen.projection().clone(),
+            expected_parent,
+            frozen.base_manual_generation_id(),
+        )
+    }
+
+    fn frozen_capture_with_facts(
+        store: &str,
+        frozen: &GenerationDocument,
+        projection: ProjectGenerationProjection,
+        expected_parent: Option<ProjectGenerationId>,
+        autosave_base: Option<ProjectGenerationId>,
+    ) -> (ProjectCommitCapture, Arc<AtomicUsize>) {
         let opens = Arc::new(AtomicUsize::new(0));
         let mut sources: Vec<Box<dyn ProjectObjectSource>> = Vec::new();
         for artifact in frozen.projection().state().artifacts() {
@@ -2429,14 +3236,28 @@ mod tests {
             }));
         }
         let capture = ProjectCommitCapture::new(
-            frozen.projection().clone(),
+            projection,
             expected_parent,
-            frozen.base_manual_generation_id(),
+            autosave_base,
             frozen.forked_from(),
             sources,
         )
         .unwrap();
         (capture, opens)
+    }
+
+    fn projection_with_revision(
+        frozen: &GenerationDocument,
+        revision_sequence: u64,
+        high_water_sequence: u64,
+    ) -> ProjectGenerationProjection {
+        let project_id = frozen.projection().state().project_id();
+        ProjectGenerationProjection::new(
+            ProjectRevisionId::new(project_id, revision_sequence),
+            ProjectRevisionHighWater::new(project_id, high_water_sequence),
+            frozen.projection().state().clone(),
+        )
+        .unwrap()
     }
 
     fn rejected_frozen_capture(frozen: &GenerationDocument) -> ProjectCommitCapture {

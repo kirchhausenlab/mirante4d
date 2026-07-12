@@ -137,10 +137,12 @@ generation-last publication. Its private lease core now enforces shared
 maintenance and one writer. A prepared fresh store can publish its initial
 manual head, and the private transaction core can advance an established
 manual head through bounded live-ref/closure validation, a descriptor-relative
-global-entry/fan-out inventory, and exact recovery-before-head replacement. It
-still owns no autosave commit, recovery
-selection, actor, garbage collection, public Create/Save, qualified durability,
-or product path.
+global-entry/fan-out inventory, and exact recovery-before-head replacement. The
+same crate-private transaction can create the first established-project
+autosave or advance its autosave lane, including changed-base divergence and
+recovery-ahead retry. It still owns no provisional autosave, recovery selection,
+actor, garbage collection, public Create/Save, qualified durability, or product
+path.
 
 Settings use `mirante4d-settings-v1` at the Linux XDG/HOME path. The UI submits
 validated changes; one background actor owns persistence. Legacy preferences

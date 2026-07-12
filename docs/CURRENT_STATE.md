@@ -133,10 +133,12 @@ B2 transactional implementation is active off-product. Its current slice owns
 typed canonical generations, direct and deterministic paged object closure,
 immutable generation-last publication, process-held maintenance/writer leases,
 exact initial manual-head publication, and crate-private established manual
-recovery-before-head replacement. Ref publication is preceded by a bounded
-descriptor-relative whole-store entry/fan-out inventory. The corrected
-recovery-ahead state keeps the old head authoritative and supports an exact
-retry without repair or promotion.
+recovery-before-head replacement. The same private transaction now creates and
+advances the established-project autosave lane while preserving the manual
+authority. Ref publication is preceded by a bounded descriptor-relative whole-
+store entry/fan-out inventory. The corrected recovery-ahead state keeps the old
+lane head authoritative and supports an exact retry without repair or
+promotion.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
@@ -162,9 +164,10 @@ See [testing](TESTING.md) for commands and claim language.
   control-record wire, typed generation/direct-and-paged closure, and
   generation-last immutable publication. Its crate-private transaction core
   can create the initial manual head and advance an established manual head
-  under held leases. Autosave commits, recovery selection/open, actor
-  execution, garbage collection, public Create/Save, durability qualification,
-  and every product path remain unimplemented.
+  under held leases, and can create or advance an established-project autosave
+  head. Provisional autosave, recovery selection/open, actor execution, garbage
+  collection, public Create/Save, durability qualification, and every product
+  path remain unimplemented.
 - The package-capability lane remains pending until there is an honest
   unsupported-GPU package command.
 - Packaged runtime does not expose unsaved-autosave recovery.
