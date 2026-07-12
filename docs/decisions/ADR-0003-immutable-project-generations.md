@@ -2,7 +2,7 @@
 
 Status: ACCEPTED TARGET DECISION
 Accepted: 2026-07-09
-Last reviewed: 2026-07-11
+Last reviewed: 2026-07-12
 Decision ID: D-010
 Implementation authorization: NONE INDEPENDENT; ACTIVE HANDOFF AND PACKAGE ENTRY ONLY
 
@@ -83,7 +83,7 @@ operations must be descriptor-relative and no-follow.
 
 Dataset bindings use verified D-009 scientific identity; package/release IDs
 and locator hints remain distinct. The WP-10B replacement of transitional
-project v14 is a hard cut: no v13/v14 core reader, in-place migration,
+project v15 is a hard cut: no v13/v14/v15 reader, in-place migration,
 fallback, or converter is included afterward.
 
 ## Consequences
@@ -96,7 +96,7 @@ fallback, or converter is included afterward.
   save appeared to work.
 - Content-addressed orphans are harmless before explicit compaction, so storage
   may grow until retention and GC run.
-- Existing experimental v13/v14 projects are regenerated unless a separately
+- Existing experimental v13/v14/v15 projects are regenerated unless a separately
   requested and authorized external converter is later approved.
 
 ## Enforcement
