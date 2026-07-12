@@ -2,12 +2,12 @@
 
 Status: ACTIVE PUBLIC-EPOCH PROGRAM
 Last reviewed: 2026-07-12
-Current technical sequence: WP-09A, WP-10B, then the remaining packages below
+Current technical sequence: WP-10B, WP-11, then the remaining packages below
 Public-data publication: deferred to a separate future handoff
-WP-09A predecessor: `foundation-wp-10a-exit-1`
-Completed through: WP-10A at `foundation-wp-10a-exit-1`
-Current checkpoint: WP-09A progressive render runtime
-Next protected-branch checkpoint: WP-10B transactional project store
+WP-10B predecessor: `foundation-wp-09a-exit-1`
+Completed through: WP-09A at `foundation-wp-09a-exit-1`
+Current checkpoint: WP-10B transactional project store
+Next protected-branch checkpoint: WP-11 import pipeline rebuild
 
 ## Purpose
 
@@ -181,6 +181,9 @@ WP-08B accepted the unified runtime at
 WP-10A accepted the off-product dataset schema, storage, index, identity, and
 target conformance package at `9b3a81d79a50027c0a8ddedc535021809a99d928`
 (`foundation-wp-10a-exit-1`) before WP-09A entry work began.
+WP-09A accepted the bounded off-product progressive Vulkan runtime and
+independent CPU reference at `1b1e7d5534f29b010cc346d434811a3906fb40e1`
+(`foundation-wp-09a-exit-1`) before WP-10B entry work began.
 
 ## Dataset And Fixture Boundary
 
