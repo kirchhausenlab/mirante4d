@@ -70,7 +70,9 @@ derivation are also implemented. A checked control-wire specialization fixes
 the ordinal, indexed-path, temporal, recipe-node, and manifest spellings
 omitted from the accepted freeze, plus the closed portable-record and detached-
 release scalar choices. Exact source, recipe, derivation, rights, citation, and
-release DTOs are implemented. The core does not yet read, write, or validate
+release DTOs are implemented. The fixed packed-index record and bounded
+zstd/CRC32C inner-payload and end-index codecs implement the selected binary
+layer in memory. The core does not yet read, write, or validate filesystem
 target packages.
 
 WP-10B separately installs immutable content-addressed project objects,

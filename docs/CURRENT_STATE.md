@@ -64,9 +64,11 @@ payloads also exist, together with exact object descriptors, canonical greedy
 manifest pages, authenticated roots, and PackageId derivation. Portable source,
 recipe, derivation, rights, and citation records have exact closed schemas;
 embedded recipe and derivation payloads and detached release records verify
-their typed identities. Shard/index I/O, reader, writer, validator, independent
-T1 corpus, and product activation remain incomplete. Current schema-1 packages
-remain transitional T2 fixtures and the sole product route.
+their typed identities. Exact 64-byte packed-index records and the bounded
+in-memory zstd/CRC32C shard and end-index codec also exist. Filesystem range
+I/O, Zarr metadata, reader, writer, validator, independent T1 corpus, and
+product activation remain incomplete. Current schema-1 packages remain
+transitional T2 fixtures and the sole product route.
 
 ## Current Verification Boundary
 

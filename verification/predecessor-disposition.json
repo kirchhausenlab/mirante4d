@@ -4685,6 +4685,30 @@
       "reason": "WP-10A proves package-wide object accounting and exact profile scale contracts cannot be underreported."
     },
     {
+      "id": "libtest:mirante4d-storage:packed_index::tests::accepts_fill_elision_and_preserves_finite_float_signed_zero_bits",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves packed-index fill elision and finite float32 statistics preserve the frozen semantics."
+    },
+    {
+      "id": "libtest:mirante4d-storage:packed_index::tests::exact_little_endian_record_round_trips_with_accessors",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the exact fixed 64-byte little-endian packed-index record layout."
+    },
+    {
+      "id": "libtest:mirante4d-storage:packed_index::tests::rejects_corrupt_flags_counts_payload_and_numeric_ranges",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects inconsistent packed-index flags, counts, payload claims, and numeric statistics."
+    },
+    {
       "id": "libtest:mirante4d-storage:paths::tests::accepts_frozen_paths_and_reports_depth",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -4723,6 +4747,46 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
       "reason": "WP-10A proves the strict off-product storage profile and its bounded path/count/amplification contract."
+    },
+    {
+      "id": "libtest:mirante4d-storage:shard::tests::deterministic_shard_tail_drives_present_and_missing_range_reads",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves deterministic zero-slack shards expose checked present ranges and raw missing sentinels."
+    },
+    {
+      "id": "libtest:mirante4d-storage:shard::tests::inner_decode_rejects_bombs_and_encoded_oversize_before_decompression",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A bounds encoded and decoded inner payloads before untrusted zstd data can exceed the frozen limits."
+    },
+    {
+      "id": "libtest:mirante4d-storage:shard::tests::inner_payload_round_trips_and_corruption_is_rejected",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the selected zstd-level-3 and little-endian CRC32C inner payload pipeline."
+    },
+    {
+      "id": "libtest:mirante4d-storage:shard::tests::profile_rows_fix_chunk_counts_and_tail_lengths",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A fixes all nine payload rows and their 1028-byte or 260-byte shard-index tails."
+    },
+    {
+      "id": "libtest:mirante4d-storage:shard::tests::tail_validation_rejects_checksum_pairs_bounds_and_slack",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects corrupt, oversized, inconsistent, out-of-bounds, and noncanonical shard indexes."
     },
     {
       "id": "libtest:xtask::bin/xtask:arch::wp08a::tests::dependency_matrix_delegates_only_wp10a_storage_to_its_successor",
@@ -4771,6 +4835,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 391
+    "current_additions": 399
   }
 }

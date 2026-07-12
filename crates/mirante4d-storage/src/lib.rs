@@ -2,16 +2,19 @@
 //!
 //! This crate is not reachable from the application before WP-10C. The first
 //! WP-10A-B owns immutable profile facts, strict control primitives, checked
-//! preflight arithmetic, and portable package paths. It performs no filesystem
-//! I/O and makes no target-package support claim.
+//! preflight arithmetic, portable package paths, packed-index records, and the
+//! in-memory shard codec. It performs no filesystem I/O and makes no
+//! target-package support claim.
 
 #![forbid(unsafe_code)]
 
 mod control;
 mod error;
 mod limits;
+mod packed_index;
 mod paths;
 mod profile;
+mod shard;
 
 pub use control::{
     AsciiToken, CanonicalMapEntry, CanonicalValue, CanonicalValueKind, CitationPayload,
@@ -39,6 +42,9 @@ pub use limits::{
     ProfileLimits, ScaleCounts, amplification_2d, amplification_3d, checked_ceil_div,
     count_3d_pyramid, encoded_inner_payload_limit, encoded_outer_shard_limit,
 };
+pub use packed_index::{
+    PackedIndexCoordinates, PackedIndexError, PackedIndexRecord, PackedIndexStatistics,
+};
 pub use paths::{
     MAX_DIRECTORY_DEPTH, MAX_FILE_PATH_COMPONENTS, MAX_RELATIVE_PATH_BYTES, PackagePath,
     validate_unique_paths,
@@ -46,4 +52,8 @@ pub use paths::{
 pub use profile::{
     CAPABILITIES, CHUNK_KEY_SEPARATOR, CompatibilityTuple, INDEX_CODECS, INDEX_LOCATION,
     INNER_CODECS, OUTER_CODEC, PROFILE, ProfileKind, ScaleCountRule, StorageShape, profile_limits,
+};
+pub use shard::{
+    ShardCodecError, ShardIndex, ShardIndexEntry, ShardProfileKind, decode_inner_payload,
+    decode_shard_index_tail, encode_inner_payload,
 };
