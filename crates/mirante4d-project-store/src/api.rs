@@ -676,7 +676,7 @@ pub enum ProjectStoreFault {
     Corruption { stage: &'static str },
     #[error("project-store work was cancelled before authority changed")]
     Cancelled,
-    #[error("the head replacement may be visible but durability is indeterminate")]
+    #[error("an authority update may be visible but durability is indeterminate")]
     CommitIndeterminate,
 }
 
