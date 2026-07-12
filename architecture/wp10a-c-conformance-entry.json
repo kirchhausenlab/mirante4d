@@ -20,14 +20,14 @@
     "worktree": "clean"
   },
   "outcome": [
-    "Promote one small public T1-target authority for the frozen experimental profile.",
+    "Promote one small public T1-target authority, carried by three case archives, for the frozen experimental profile.",
     "Cover the three required positive DS-0 cases, compact negative mutations, exact identity vectors, and an independent full-array read report.",
     "Replace the WP-06 false-only target-format fixture guard only when every authority component is complete and digest-bound."
   ],
   "invariants": [
     "Fixture-byte producer, scientific fact oracle, and independent reader are separate implementation lineages and import no Mirante production code.",
     "The producer treats oracle identities as opaque inputs and does not compute the logical digests or statistics that certify its bytes.",
-    "The corpus is one deterministic archive, not an exploded committed package tree, and remains inside the D-023 archive, file, directory, depth, fan-out, path, size, and compression ceilings.",
+    "The corpus uses one deterministic archive per positive package, not exploded committed package trees, and every archive plus the combined corpus remains inside the D-023 file, directory, depth, fan-out, path, size, and compression ceilings.",
     "The three positive cases cover 2D uint8 sparse data across multiple outer shards, 3D uint16 3t x 2c anisotropic non-divisible multiscale data, and 3D finite-float32 1t x 4c validity and bit-edge data.",
     "Promotion changes only evidence authority; no product reader, writer, importer, runtime, renderer, UI, or persisted lifecycle authority changes.",
     "The format remains EXPERIMENTAL and no compatibility or fallback path is added."
@@ -75,37 +75,39 @@
     ]
   },
   "corpus": {
-    "archive_count": 1,
+    "archive_count": 3,
     "positive_case_count": 3,
     "positive_cases": [
       {
         "id": "m4d-t1-u8-2d-sparse",
-        "shape_tczyx": [1, 1, 1, 1025, 1025],
+        "shape_tczyx": [1, 1, 1, 257, 1025],
         "dtype": "uint8",
         "levels": 1,
-        "required_edges": "valid zeros, sparse signal in multiple outer shards, implicit validity, IO-2-eligible diagonal geometry"
+        "required_edges": "valid zeros dominate, nonzero signal crosses both x outer shards and all ten logical bricks, implicit validity, IO-2-eligible diagonal geometry"
       },
       {
         "id": "m4d-t1-u16-3d-multiscale",
-        "shape_tczyx": [3, 2, 65, 257, 67],
+        "shape_tczyx": [3, 2, 65, 65, 65],
         "dtype": "uint16",
-        "levels": 3,
+        "levels": 2,
         "required_edges": "anisotropy, regular time, nonzero scale and translation, nondivisible boundaries, channel ordering, implicit validity, IO-2 eligibility"
       },
       {
         "id": "m4d-t1-f32-3d-validity",
-        "shape_tczyx": [1, 4, 17, 19, 23],
+        "shape_tczyx": [1, 4, 2, 3, 17],
         "dtype": "float32",
         "levels": 1,
-        "required_edges": "signed zeros, subnormals, finite normal extrema, rounding boundaries, explicit validity, arbitrary affine geometry, IO-1 classification"
+        "logical_to_physical_channels": [2, 0, 3, 1],
+        "required_edges": "signed zeros, signed subnormal and finite normal extrema, rounding boundaries, mixed and all-invalid regions, explicit validity, physical-channel permutation, arbitrary affine geometry, IO-1 classification"
       }
     ],
     "outer_limits": {
-      "archive_bytes": 33554432,
-      "unpacked_regular_file_bytes": 67108864,
-      "logical_voxel_bytes": 67108864,
-      "files": 192,
-      "directories": 48,
+      "combined_archive_bytes": 33554432,
+      "archive_bytes_each": 16777216,
+      "combined_unpacked_regular_file_bytes": 67108864,
+      "combined_logical_voxel_bytes": 67108864,
+      "files_each": 64,
+      "directories_each": 64,
       "depth": 8,
       "fan_out": 64,
       "path_bytes": 240,
@@ -114,7 +116,12 @@
     },
     "mutation_boundary": "recipes only; mutations are derived into ignored temporary directories and are not duplicated in the archive",
     "identity_boundary": "independent scientific, object, package, recipe, derivation-record, release, and artifact vectors plus the required equal-science and one-bit metamorphic pairs",
-    "candidate_boundary": "generation writes only beneath target/mirante4d/fixture-candidates; the reviewed promotion checkpoint alone writes tracked authority files"
+    "candidate_boundary": "generation writes only beneath target/mirante4d/fixture-candidates; the reviewed promotion checkpoint alone writes tracked authority files",
+    "implementation_checkpoints": [
+      "C2: declarative cases, zero-dependency oracle, and hand identity vectors without archives or promotion",
+      "C3: independent producer, three deterministic case archives, inventory facts, and mutation recipes without promotion",
+      "C4: independent reader and schema report, mutation execution, two-run reproduction, and one atomic manifest and registry promotion"
+    ]
   },
   "non_goals": [
     "Changing the frozen profile, codecs, control schemas, identity algorithms, or package writer",
@@ -157,8 +164,8 @@
     "product_open": "not applicable because this off-product evidence slice changes no reachable viewer, loading, interaction, rendering, or large-dataset path"
   },
   "rollback": {
-    "unit": "one WP-10A-C target-authority checkpoint",
-    "action": "revert the checkpoint, restoring the false target-format guard and removing the target authority as one unit",
+    "unit": "each pre-promotion C2/C3 checkpoint is independently revertible; C4 promotion is one atomic rollback unit",
+    "action": "delete ignored candidates or revert their pre-promotion checkpoint; if C4 was promoted, revert its tracked authority and affirmative registry flip together",
     "product_rollback": "none because no product authority flips"
   }
 }
