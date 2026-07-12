@@ -151,10 +151,15 @@ autosave head, zero immutable rewrites on full reuse, rejection before source
 reads, exact global-entry/fan-out capacity rejection without a ref change,
 cancellation/retry through recovery-ahead, retry after either recovery sync
 leg fails, and either final head sync-leg failure as write-suspending
-`CommitIndeterminate`. They do not claim actor execution,
-autosave commits, Save As, recovery selection/open, garbage collection, public
-Create/Save, the exhaustive fault matrix or power-cut durability, product
-reachability, or product-open validation.
+`CommitIndeterminate`. Established-autosave cases reproduce the independent
+first and advancing autosave generations and refs, replace a divergent lane
+against the current manual base, accept a lower revision with a non-regressing
+high-water mark, reject stale parent/base and invalid recovery/capacity state,
+retry an exact recovery-ahead cancellation, and distinguish recovery-sync
+failure from write-suspending head indeterminacy. They do not claim actor
+execution, provisional autosave, Save As, recovery selection/open, garbage
+collection, public Create/Save, the exhaustive fault matrix or power-cut
+durability, product reachability, or product-open validation.
 
 The checked independent source report supports only the WP-03 source-TIFF
 archive. WP-10A is accepted off-product and its target authority is promoted.

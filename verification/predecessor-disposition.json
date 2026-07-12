@@ -2547,6 +2547,38 @@
       "reason": "WP-10B B2 proves digest-keyed physical closure reuse for repeated exact pages."
     },
     {
+      "id": "libtest:mirante4d-project-store:transaction::tests::established_autosave_advances_clean_and_divergent_lanes",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 reproduces the independent advancing autosave refs, replaces a divergent lane against the current manual base, and permits a lower revision without high-water regression."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::established_autosave_rejects_invalid_state_and_capacity_without_ref_change",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 rejects stale autosave parents and manual bases, high-water regression, unrelated recovery, and over-capacity publication without changing authority refs."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::established_autosave_retries_after_cancelled_recovery_ahead",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 keeps the old autosave head authoritative after recovery-ahead cancellation and reuses the exact immutable generation on retry."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::established_autosave_sync_failures_preserve_retry_and_head_indeterminacy",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 preserves autosave retry after either recovery sync leg fails and suspends writes after either final head sync leg is indeterminate."
+    },
+    {
       "id": "libtest:mirante4d-project-store:transaction::tests::established_manual_commit_matches_the_frozen_recovery_and_head",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -2585,6 +2617,14 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 attempts both directory-sync legs, permits exact retry after pre-head recovery failure, and suspends writes only for final head indeterminacy."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::first_established_autosave_matches_the_frozen_head",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 reproduces the independent first established-project autosave generation and exact head while preserving the manual authority."
     },
     {
       "id": "libtest:mirante4d-project-store:transaction::tests::first_manual_commit_cancellation_after_generation_leaves_no_ref",
@@ -5636,6 +5676,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 498
+    "current_additions": 503
   }
 }
