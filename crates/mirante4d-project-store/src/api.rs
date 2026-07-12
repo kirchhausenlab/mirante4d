@@ -557,10 +557,11 @@ pub struct ProjectStoreReceipt {
 }
 
 impl ProjectStoreReceipt {
-    pub(crate) fn initial_manual(
+    pub(crate) fn manual(
         captured_revision: ProjectRevisionId,
         captured_revision_high_water: ProjectRevisionHighWater,
         generation_id: ProjectGenerationId,
+        previous_generation_id: Option<ProjectGenerationId>,
         published_objects: u64,
         published_bytes: u64,
     ) -> Self {
@@ -569,7 +570,7 @@ impl ProjectStoreReceipt {
             captured_revision_high_water,
             new_generation_id: generation_id,
             current_generation_id: generation_id,
-            previous_generation_id: None,
+            previous_generation_id,
             autosave_base_generation_id: None,
             published_objects,
             published_bytes,

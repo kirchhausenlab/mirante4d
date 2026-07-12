@@ -2531,12 +2531,60 @@
       "reason": "WP-10B B2 proves descriptor-relative immutable publication without path or replacement fallbacks."
     },
     {
+      "id": "libtest:mirante4d-project-store:local::tests::store_inventory_bounds_entries_fanout_and_ref_staging_reservations",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 enforces exact global-entry, nested fan-out, and descriptor caps, including pending refs and the two-stage recovery/head peak."
+    },
+    {
       "id": "libtest:mirante4d-project-store:transaction::tests::closure_union_reuses_identical_physical_objects",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 proves digest-keyed physical closure reuse for repeated exact pages."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::established_manual_commit_matches_the_frozen_recovery_and_head",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 reproduces the independent g1-to-g2 manual recovery-before-head transition and exact final refs."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::established_manual_commit_rejects_invalid_state_and_capacity_without_ref_change",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 rejects stale parents and invalid recovery/closure state before source reads, and publishes no ref when the bounded store inventory is over capacity."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::established_manual_commit_retries_after_cancelled_recovery_ahead",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 keeps the old head authoritative after recovery-ahead cancellation and retries to the exact final refs."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::established_manual_commit_uses_autosave_sequence_and_preserves_other_refs",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 derives the next sequence across both lanes, reuses immutable closure bytes, and preserves autosave and pin refs."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::established_manual_sync_failures_preserve_retry_and_head_indeterminacy",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 attempts both directory-sync legs, permits exact retry after pre-head recovery failure, and suspends writes only for final head indeterminacy."
     },
     {
       "id": "libtest:mirante4d-project-store:transaction::tests::first_manual_commit_cancellation_after_generation_leaves_no_ref",
@@ -5588,6 +5636,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 492
+    "current_additions": 498
   }
 }

@@ -12,11 +12,11 @@ active off-product. Its first core checkpoint provides the exact crate/API
 boundary, control-record wire, and immutable object primitive. Its current
 checkpoint adds typed canonical generations, direct and deterministic paged
 closure, generation-last immutable publication, process-held maintenance and
-writer leases, and an exact no-replace initial manual head in a prepared
-unpublished root. Before an established head can advance, the frozen recovery
-pair rule now explicitly accepts the safe recovery-ahead crash window. The
-recovery-before-head established-head update is next. Product activation stays
-at B4.
+writer leases, an exact no-replace initial manual head, and crate-private
+established manual recovery-before-head replacement with bounded store
+inventory and recovery-ahead retry.
+The next B2 slice extends the lane transaction beyond manual commits; actor and
+product activation stay later, with product activation at B4.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.

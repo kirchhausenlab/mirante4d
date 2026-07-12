@@ -3,8 +3,9 @@
 //! The caller supplies an already-open project root. Every operation below
 //! that root is relative to a held directory descriptor and rejects symlink
 //! traversal with `O_NOFOLLOW`. These primitives publish exact immutable
-//! objects and internally encoded complete generations. They own no refs,
-//! leases, actor, recovery, or GC behavior.
+//! objects, internally encoded complete generations, exact fixed-size refs,
+//! and bounded physical-store inventory. They own no ref policy, leases,
+//! actor, recovery selection, or GC behavior.
 //! The transaction caller must hold the writer lease; this primitive does not
 //! claim protection from an out-of-protocol same-user process reparenting the
 //! store namespace while its directory descriptors are open.
@@ -16,6 +17,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs::File,
     io::{self, Cursor, Read, Write},
+    os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -26,11 +28,14 @@ use rustix::{
     fd::OwnedFd,
     fs::{
         AtFlags, CWD, Dir, FileType, Mode, OFlags, RenameFlags, fstat, fsync, mkdirat, openat,
-        renameat_with, statat, unlinkat,
+        renameat, renameat_with, statat, unlinkat,
     },
     io::Errno,
 };
 use thiserror::Error;
+
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 
 use crate::{
     ProjectGenerationId, ProjectStoreLimits,
@@ -45,6 +50,13 @@ const STAGE_CREATE_ATTEMPTS: u64 = 128;
 const STAGING_DIRECTORY: &str = "staging";
 const STAGED_FILE: &str = "payload";
 const AUTHORITY_SYNC_ATTEMPTS: usize = 2;
+// LocalStoreRoot, maintenance lease, and writer-envelope lease remain held
+// throughout a writable transaction.
+const WRITABLE_SESSION_DESCRIPTORS: usize = 3;
+// The ref peak additionally holds its destination parent, staging parent,
+// private staging directory, and the separate parent/file pair used by the
+// final exact predecessor recheck.
+const REF_PUBLICATION_DESCRIPTORS: usize = WRITABLE_SESSION_DESCRIPTORS + 5;
 
 static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -66,6 +78,10 @@ const FILE_CREATE_FLAGS: OFlags = OFlags::WRONLY
 #[derive(Debug)]
 pub(crate) struct LocalStoreRoot {
     root: OwnedFd,
+    #[cfg(test)]
+    ref_commit_directory_sync_count: AtomicUsize,
+    #[cfg(test)]
+    ref_commit_directory_sync_failure: AtomicUsize,
 }
 
 /// Whether immutable publication created a file or validated an identical one.
@@ -120,6 +136,22 @@ enum SourceExtent {
     Segment,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StoreInventory {
+    entries: usize,
+    root_entries: usize,
+    refs_entries: Option<usize>,
+    staging_entries: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InventoryDirectory {
+    Root,
+    Refs,
+    Staging,
+    Other,
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum LocalPublicationError {
     #[error("immutable publication was cancelled")]
@@ -142,7 +174,9 @@ pub(crate) enum LocalPublicationError {
     InvalidControl,
     #[error("the initial manual head appeared after the empty-ref check")]
     RefAlreadyPresent,
-    #[error("the initial manual head may be visible but its directory durability is indeterminate")]
+    #[error("a project ref changed after transaction validation")]
+    RefChanged,
+    #[error("a replaced project ref may be visible but its directory durability is indeterminate")]
     RefCommitIndeterminate,
     #[error("project-store I/O failed while attempting to {operation}: {source}")]
     Io {
@@ -194,11 +228,28 @@ impl LocalStoreRoot {
                 }
             }
         }
-        Ok(Self { root: current })
+        Ok(Self {
+            root: current,
+            #[cfg(test)]
+            ref_commit_directory_sync_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            ref_commit_directory_sync_failure: AtomicUsize::new(usize::MAX),
+        })
     }
 
     pub(crate) const fn descriptor(&self) -> &OwnedFd {
         &self.root
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_ref_commit_directory_sync_at(&self, occurrence: usize) {
+        self.ref_commit_directory_sync_failure
+            .store(occurrence, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ref_commit_directory_sync_attempts(&self) -> usize {
+        self.ref_commit_directory_sync_count.load(Ordering::Acquire)
     }
 
     /// Reads the fixed project envelope without creating any path component.
@@ -248,6 +299,119 @@ impl LocalStoreRoot {
         RefRecord::decode(kind, &bytes)
             .map(Some)
             .map_err(|_| LocalPublicationError::InvalidControl)
+    }
+
+    /// Reads one immutable generation through its digest-derived path without
+    /// creating any component. Typed generation validation remains with the
+    /// transaction layer.
+    pub(crate) fn read_generation_bytes<C>(
+        &self,
+        id: ProjectGenerationId,
+        maximum_bytes: u64,
+        is_cancelled: C,
+    ) -> Result<Vec<u8>, LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        self.read_optional_small_file(&generation_relative_path(id), maximum_bytes, is_cancelled)?
+            .ok_or(LocalPublicationError::ExistingMismatch)
+    }
+
+    /// Validates the complete fixed-ref namespace and returns every bounded
+    /// pin record. Unknown entries and malformed checkpoint names fail closed.
+    pub(crate) fn read_pin_refs<C>(
+        &self,
+        limits: ProjectStoreLimits,
+        mut is_cancelled: C,
+    ) -> Result<Vec<RefRecord>, LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        check_cancelled(&mut is_cancelled)?;
+        let refs = match openat(
+            &self.root,
+            OsStr::new("refs"),
+            DIRECTORY_OPEN_FLAGS,
+            Mode::empty(),
+        ) {
+            Ok(refs) => refs,
+            Err(Errno::NOENT) => return Ok(Vec::new()),
+            Err(_) => return Err(LocalPublicationError::InvalidControl),
+        };
+        let mut entries = 0_usize;
+        let mut pins = Vec::new();
+        for entry in Dir::read_from(&refs).map_err(|_| LocalPublicationError::InvalidControl)? {
+            check_cancelled(&mut is_cancelled)?;
+            let entry = entry.map_err(|_| LocalPublicationError::InvalidControl)?;
+            let name = entry.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            entries = entries
+                .checked_add(1)
+                .ok_or(LocalPublicationError::InvalidControl)?;
+            if entries > limits.directory_fanout_entries_max {
+                return Err(LocalPublicationError::Capacity {
+                    declared: u64::try_from(entries).unwrap_or(u64::MAX),
+                    maximum: u64::try_from(limits.directory_fanout_entries_max).unwrap_or(u64::MAX),
+                });
+            }
+            if name == b"head"
+                || name == b"recovery"
+                || name == b"autosave-head"
+                || name == b"autosave-recovery"
+            {
+                continue;
+            }
+            if name != b"pins" {
+                return Err(LocalPublicationError::InvalidControl);
+            }
+            let pin_directory = openat(
+                &refs,
+                OsStr::new("pins"),
+                DIRECTORY_OPEN_FLAGS,
+                Mode::empty(),
+            )
+            .map_err(|_| LocalPublicationError::InvalidControl)?;
+            for pin in
+                Dir::read_from(&pin_directory).map_err(|_| LocalPublicationError::InvalidControl)?
+            {
+                check_cancelled(&mut is_cancelled)?;
+                let pin = pin.map_err(|_| LocalPublicationError::InvalidControl)?;
+                let pin_name = pin.file_name().to_bytes();
+                if pin_name == b"." || pin_name == b".." {
+                    continue;
+                }
+                if pins.len() >= limits.pin_refs_max {
+                    return Err(LocalPublicationError::Capacity {
+                        declared: u64::try_from(pins.len().saturating_add(1)).unwrap_or(u64::MAX),
+                        maximum: u64::try_from(limits.pin_refs_max).unwrap_or(u64::MAX),
+                    });
+                }
+                if !valid_checkpoint_name(pin_name) {
+                    return Err(LocalPublicationError::InvalidControl);
+                }
+                let path = PathBuf::from("refs")
+                    .join("pins")
+                    .join(OsStr::from_bytes(pin_name));
+                let bytes = self
+                    .read_optional_small_file(
+                        &path,
+                        u64::try_from(limits.ref_record_bytes_max)
+                            .map_err(|_| LocalPublicationError::InvalidControl)?,
+                        &mut is_cancelled,
+                    )?
+                    .ok_or(LocalPublicationError::InvalidControl)?;
+                if bytes.len() != limits.ref_record_bytes_exact || bytes.len() != REF_BYTES {
+                    return Err(LocalPublicationError::InvalidControl);
+                }
+                pins.push(
+                    RefRecord::decode(RefKind::Pin, &bytes)
+                        .map_err(|_| LocalPublicationError::InvalidControl)?,
+                );
+            }
+        }
+        Ok(pins)
     }
 
     /// Requires the prepared store's ref namespace to contain no fixed,
@@ -317,9 +481,105 @@ impl LocalStoreRoot {
         Ok(())
     }
 
+    /// Bounds every physical entry and every directory's immediate fan-out
+    /// through held descriptors. `pending_fixed_refs` reserves permanent ref
+    /// entries which the caller will create after this scan. When a ref will
+    /// be published, the projection also covers a missing persistent staging
+    /// directory and the peak private transaction entries.
+    pub(crate) fn validate_store_inventory<C>(
+        &self,
+        limits: ProjectStoreLimits,
+        pending_fixed_refs: usize,
+        replaces_fixed_ref: bool,
+        mut is_cancelled: C,
+    ) -> Result<(), LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        check_cancelled(&mut is_cancelled)?;
+        let publishes_ref = pending_fixed_refs != 0 || replaces_fixed_ref;
+        if publishes_ref {
+            enforce_count(
+                REF_PUBLICATION_DESCRIPTORS,
+                limits.open_file_descriptors_max,
+            )?;
+        }
+        let root = duplicate_directory(&self.root)?;
+        let mut inventory = StoreInventory::default();
+        inspect_store_directory(
+            &root,
+            InventoryDirectory::Root,
+            0,
+            limits,
+            &mut inventory,
+            &mut is_cancelled,
+        )?;
+
+        let creates_refs_directory =
+            usize::from(pending_fixed_refs != 0 && inventory.refs_entries.is_none());
+        let creates_staging_directory =
+            usize::from(publishes_ref && inventory.staging_entries.is_none());
+        let private_transaction_entries = if publishes_ref {
+            // One private transaction directory is always additional. A
+            // replacement also holds its staged payload beside the existing
+            // destination until rename, and its preceding recovery stage may
+            // remain after best-effort cleanup. A create's payload is already
+            // counted by `pending_fixed_refs`.
+            1_usize
+                .checked_add(usize::from(replaces_fixed_ref) * 2)
+                .ok_or_else(|| capacity_overflow(limits.physical_store_entries_max))?
+        } else {
+            0
+        };
+        let projected_additions = pending_fixed_refs
+            .checked_add(creates_refs_directory)
+            .and_then(|value| value.checked_add(creates_staging_directory))
+            .and_then(|value| value.checked_add(private_transaction_entries))
+            .ok_or_else(|| capacity_overflow(limits.physical_store_entries_max))?;
+        enforce_count(
+            checked_count_add(
+                inventory.entries,
+                projected_additions,
+                limits.physical_store_entries_max,
+            )?,
+            limits.physical_store_entries_max,
+        )?;
+        enforce_count(
+            checked_count_add(
+                inventory.root_entries,
+                creates_refs_directory
+                    .checked_add(creates_staging_directory)
+                    .ok_or_else(|| capacity_overflow(limits.directory_fanout_entries_max))?,
+                limits.directory_fanout_entries_max,
+            )?,
+            limits.directory_fanout_entries_max,
+        )?;
+        enforce_count(
+            checked_count_add(
+                inventory.refs_entries.unwrap_or(0),
+                pending_fixed_refs,
+                limits.directory_fanout_entries_max,
+            )?,
+            limits.directory_fanout_entries_max,
+        )?;
+        if publishes_ref {
+            enforce_count(
+                checked_count_add(
+                    inventory.staging_entries.unwrap_or(0),
+                    1_usize
+                        .checked_add(usize::from(replaces_fixed_ref))
+                        .ok_or_else(|| capacity_overflow(limits.directory_fanout_entries_max))?,
+                    limits.directory_fanout_entries_max,
+                )?,
+                limits.directory_fanout_entries_max,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Publishes the first manual head exactly once. There is deliberately no
-    /// replacement path here: established-head commits remain deferred until
-    /// the frozen recovery/head crash-state rule is corrected.
+    /// replacement path here; established commits use the separately checked
+    /// recovery-before-head transaction.
     pub(crate) fn publish_initial_manual_head<C>(
         &self,
         record: RefRecord,
@@ -371,9 +631,9 @@ impl LocalStoreRoot {
         ) {
             Ok(()) => {
                 stage.file_owned = false;
-                if sync_with_retry(&stage.directory).is_err()
-                    || sync_with_retry(&destination_parent).is_err()
-                {
+                let staging_result = sync_with_retry(&stage.directory);
+                let destination_result = sync_with_retry(&destination_parent);
+                if staging_result.is_err() || destination_result.is_err() {
                     return Err(LocalPublicationError::RefCommitIndeterminate);
                 }
                 Ok(())
@@ -386,6 +646,104 @@ impl LocalStoreRoot {
             }
             Err(error) => Err(io_error("publish the initial manual head", error)),
         }
+    }
+
+    /// Atomically replaces or creates one validated fixed ref after comparing
+    /// the exact visible predecessor. The caller owns lane policy and holds the
+    /// writer lease. Cancellation is ignored after rename until both affected
+    /// directories have been synchronized.
+    pub(crate) fn replace_ref<C>(
+        &self,
+        expected: Option<RefRecord>,
+        next: RefRecord,
+        limits: ProjectStoreLimits,
+        mut is_cancelled: C,
+    ) -> Result<(), LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        if next.kind() == RefKind::Pin
+            || limits.ref_record_bytes_exact != REF_BYTES
+            || expected.is_some_and(|record| {
+                record.kind() != next.kind() || record.project_id() != next.project_id()
+            })
+        {
+            return Err(LocalPublicationError::InvalidControl);
+        }
+        if self.read_ref(next.kind(), limits, &mut is_cancelled)? != expected {
+            return Err(LocalPublicationError::RefChanged);
+        }
+
+        let destination = ref_relative_path(next.kind())?;
+        let (destination_parent, destination_name) = self.open_or_create_parent(&destination)?;
+        let mut stage = Stage::begin(self)?;
+        let mut staged_file = stage.create_file()?;
+        staged_file
+            .write_all(&next.encode())
+            .map_err(|source| LocalPublicationError::Io {
+                operation: "write a staged project ref",
+                source,
+            })?;
+        fsync(&staged_file).map_err(|error| io_error("synchronize a staged project ref", error))?;
+        drop(staged_file);
+        check_cancelled(&mut is_cancelled)?;
+        if self.read_ref(next.kind(), limits, &mut is_cancelled)? != expected {
+            return Err(LocalPublicationError::RefChanged);
+        }
+
+        let replaced = if expected.is_some() {
+            renameat(
+                &stage.directory,
+                OsStr::new(STAGED_FILE),
+                &destination_parent,
+                &destination_name,
+            )
+        } else {
+            renameat_with(
+                &stage.directory,
+                OsStr::new(STAGED_FILE),
+                &destination_parent,
+                &destination_name,
+                RenameFlags::NOREPLACE,
+            )
+        };
+        match replaced {
+            Ok(()) => {
+                stage.file_owned = false;
+                let staging_result = self.sync_ref_commit_directory(&stage.directory);
+                // Always attempt the authoritative destination sync even when
+                // source-name removal could not be proven durable.
+                let destination_result = self.sync_ref_commit_directory(&destination_parent);
+                if staging_result.is_err() || destination_result.is_err() {
+                    return Err(LocalPublicationError::RefCommitIndeterminate);
+                }
+                Ok(())
+            }
+            Err(Errno::EXIST) => Err(LocalPublicationError::RefChanged),
+            Err(error)
+                if error == Errno::NOSYS || error == Errno::INVAL || error == Errno::OPNOTSUPP =>
+            {
+                Err(LocalPublicationError::AtomicPublishUnsupported)
+            }
+            Err(error) => Err(io_error("replace a project ref", error)),
+        }
+    }
+
+    fn sync_ref_commit_directory(&self, directory: &OwnedFd) -> Result<(), Errno> {
+        #[cfg(test)]
+        {
+            let occurrence = self
+                .ref_commit_directory_sync_count
+                .fetch_add(1, Ordering::AcqRel);
+            if occurrence
+                == self
+                    .ref_commit_directory_sync_failure
+                    .load(Ordering::Acquire)
+            {
+                return Err(Errno::IO);
+            }
+        }
+        sync_with_retry(directory)
     }
 
     pub(crate) fn publish_object<R, C>(
@@ -741,6 +1099,121 @@ impl LocalStoreRoot {
             return Err(LocalPublicationError::ExistingMismatch);
         }
         Ok(Some(bytes))
+    }
+}
+
+fn inspect_store_directory<C>(
+    directory: &OwnedFd,
+    role: InventoryDirectory,
+    depth: usize,
+    limits: ProjectStoreLimits,
+    inventory: &mut StoreInventory,
+    is_cancelled: &mut C,
+) -> Result<(), LocalPublicationError>
+where
+    C: FnMut() -> bool,
+{
+    check_cancelled(is_cancelled)?;
+    let held_descriptors = WRITABLE_SESSION_DESCRIPTORS
+        .checked_add(depth)
+        .and_then(|value| value.checked_add(2))
+        .ok_or_else(|| capacity_overflow(limits.open_file_descriptors_max))?;
+    enforce_count(held_descriptors, limits.open_file_descriptors_max)?;
+
+    let mut fan_out = 0_usize;
+    let mut child_directories = Vec::new();
+    for entry in Dir::read_from(directory).map_err(|_| LocalPublicationError::ExistingMismatch)? {
+        check_cancelled(is_cancelled)?;
+        let entry = entry.map_err(|_| LocalPublicationError::ExistingMismatch)?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        fan_out = checked_count_add(fan_out, 1, limits.directory_fanout_entries_max)?;
+        enforce_count(fan_out, limits.directory_fanout_entries_max)?;
+        inventory.entries =
+            checked_count_add(inventory.entries, 1, limits.physical_store_entries_max)?;
+        enforce_count(inventory.entries, limits.physical_store_entries_max)?;
+
+        let metadata = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| LocalPublicationError::ExistingMismatch)?;
+        match FileType::from_raw_mode(metadata.st_mode) {
+            FileType::Directory => {
+                let child_role = if role == InventoryDirectory::Root {
+                    match name.to_bytes() {
+                        b"refs" => InventoryDirectory::Refs,
+                        b"staging" => InventoryDirectory::Staging,
+                        _ => InventoryDirectory::Other,
+                    }
+                } else {
+                    InventoryDirectory::Other
+                };
+                child_directories.push((
+                    name.to_owned(),
+                    child_role,
+                    DirectoryIdentity::from_stat(metadata)?,
+                ));
+            }
+            FileType::RegularFile if metadata.st_nlink == 1 => {}
+            _ => return Err(LocalPublicationError::ExistingMismatch),
+        }
+    }
+    match role {
+        InventoryDirectory::Root => inventory.root_entries = fan_out,
+        InventoryDirectory::Refs => inventory.refs_entries = Some(fan_out),
+        InventoryDirectory::Staging => inventory.staging_entries = Some(fan_out),
+        InventoryDirectory::Other => {}
+    }
+
+    for (name, child_role, expected_identity) in child_directories {
+        check_cancelled(is_cancelled)?;
+        let child = openat(directory, &name, DIRECTORY_OPEN_FLAGS, Mode::empty())
+            .map_err(|_| LocalPublicationError::ExistingMismatch)?;
+        let opened_identity = DirectoryIdentity::from_stat(
+            fstat(&child).map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        if opened_identity != expected_identity {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+        inspect_store_directory(
+            &child,
+            child_role,
+            depth
+                .checked_add(1)
+                .ok_or_else(|| capacity_overflow(limits.open_file_descriptors_max))?,
+            limits,
+            inventory,
+            is_cancelled,
+        )?;
+    }
+    Ok(())
+}
+
+fn checked_count_add(
+    current: usize,
+    added: usize,
+    maximum: usize,
+) -> Result<usize, LocalPublicationError> {
+    current
+        .checked_add(added)
+        .ok_or_else(|| capacity_overflow(maximum))
+}
+
+fn enforce_count(actual: usize, maximum: usize) -> Result<(), LocalPublicationError> {
+    if actual > maximum {
+        Err(LocalPublicationError::Capacity {
+            declared: u64::try_from(actual).unwrap_or(u64::MAX),
+            maximum: u64::try_from(maximum).unwrap_or(u64::MAX),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn capacity_overflow(maximum: usize) -> LocalPublicationError {
+    LocalPublicationError::Capacity {
+        declared: u64::MAX,
+        maximum: u64::try_from(maximum).unwrap_or(u64::MAX),
     }
 }
 
@@ -1175,6 +1648,17 @@ fn ref_relative_path(kind: RefKind) -> Result<PathBuf, LocalPublicationError> {
         RefKind::Pin => return Err(LocalPublicationError::InvalidControl),
     };
     Ok(PathBuf::from("refs").join(name))
+}
+
+fn valid_checkpoint_name(name: &[u8]) -> bool {
+    let Some((&first, rest)) = name.split_first() else {
+        return false;
+    };
+    name.len() <= 64
+        && (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && rest.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_' || *byte == b'-'
+        })
 }
 
 fn duplicate_directory(directory: &OwnedFd) -> Result<OwnedFd, LocalPublicationError> {
@@ -1621,6 +2105,73 @@ mod tests {
                 false
             }),
             Err(LocalPublicationError::ExistingMismatch)
+        ));
+    }
+
+    #[test]
+    fn store_inventory_bounds_entries_fanout_and_ref_staging_reservations() {
+        let empty = TestDirectory::new("inventory-reservation");
+        let empty_root = LocalStoreRoot::open(empty.path()).unwrap();
+        let mut limits = ProjectStoreLimits {
+            physical_store_entries_max: 4,
+            directory_fanout_entries_max: 2,
+            ..ProjectStoreLimits::default()
+        };
+        empty_root
+            .validate_store_inventory(limits, 1, false, || false)
+            .unwrap();
+        limits.open_file_descriptors_max = REF_PUBLICATION_DESCRIPTORS;
+        empty_root
+            .validate_store_inventory(limits, 1, false, || false)
+            .unwrap();
+        limits.open_file_descriptors_max = REF_PUBLICATION_DESCRIPTORS - 1;
+        assert!(matches!(
+            empty_root.validate_store_inventory(limits, 1, false, || false),
+            Err(LocalPublicationError::Capacity { .. })
+        ));
+        limits.open_file_descriptors_max = ProjectStoreLimits::default().open_file_descriptors_max;
+        limits.physical_store_entries_max = 3;
+        assert!(matches!(
+            empty_root.validate_store_inventory(limits, 1, false, || false),
+            Err(LocalPublicationError::Capacity { .. })
+        ));
+        limits.physical_store_entries_max = 4;
+        limits.directory_fanout_entries_max = 1;
+        assert!(matches!(
+            empty_root.validate_store_inventory(limits, 1, false, || false),
+            Err(LocalPublicationError::Capacity { .. })
+        ));
+        limits.physical_store_entries_max = 6;
+        limits.directory_fanout_entries_max = 2;
+        empty_root
+            .validate_store_inventory(limits, 1, true, || false)
+            .unwrap();
+        limits.physical_store_entries_max = 5;
+        assert!(matches!(
+            empty_root.validate_store_inventory(limits, 1, true, || false),
+            Err(LocalPublicationError::Capacity { .. })
+        ));
+
+        let populated = TestDirectory::new("inventory-actual");
+        fs::create_dir(populated.path().join("branch")).unwrap();
+        fs::write(populated.path().join("branch/a"), b"a").unwrap();
+        fs::write(populated.path().join("branch/b"), b"b").unwrap();
+        let populated_root = LocalStoreRoot::open(populated.path()).unwrap();
+        limits.physical_store_entries_max = 3;
+        limits.directory_fanout_entries_max = 2;
+        populated_root
+            .validate_store_inventory(limits, 0, false, || false)
+            .unwrap();
+        limits.physical_store_entries_max = 2;
+        assert!(matches!(
+            populated_root.validate_store_inventory(limits, 0, false, || false),
+            Err(LocalPublicationError::Capacity { .. })
+        ));
+        limits.physical_store_entries_max = 3;
+        limits.directory_fanout_entries_max = 1;
+        assert!(matches!(
+            populated_root.validate_store_inventory(limits, 0, false, || false),
+            Err(LocalPublicationError::Capacity { .. })
         ));
     }
 

@@ -132,9 +132,11 @@ limits, public boundary, transition inventory, and independent project fixture;
 B2 transactional implementation is active off-product. Its current slice owns
 typed canonical generations, direct and deterministic paged object closure,
 immutable generation-last publication, process-held maintenance/writer leases,
-and exact initial manual-head publication in a prepared unpublished root. A
-narrow B1 correction recognizes a recovery ref equal to the still-authoritative
-head as an interrupted pre-head commit, without repairing or promoting it.
+exact initial manual-head publication, and crate-private established manual
+recovery-before-head replacement. Ref publication is preceded by a bounded
+descriptor-relative whole-store entry/fan-out inventory. The corrected
+recovery-ahead state keeps the old head authoritative and supports an exact
+retry without repair or promotion.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
@@ -158,11 +160,11 @@ See [testing](TESTING.md) for commands and claim language.
   target-format conformance claims.
 - The successor project-store crate exists off-product with its frozen API,
   control-record wire, typed generation/direct-and-paged closure, and
-  generation-last immutable publication. Its only live-ref mutation is a
-  no-replace initial manual head under held leases; established-head updates,
-  recovery-before-head writes, actor execution, garbage collection, public
-  Create/Save, durability qualification, and every product path remain
-  unimplemented.
+  generation-last immutable publication. Its crate-private transaction core
+  can create the initial manual head and advance an established manual head
+  under held leases. Autosave commits, recovery selection/open, actor
+  execution, garbage collection, public Create/Save, durability qualification,
+  and every product path remain unimplemented.
 - The package-capability lane remains pending until there is an honest
   unsupported-GPU package command.
 - Packaged runtime does not expose unsaved-autosave recovery.
