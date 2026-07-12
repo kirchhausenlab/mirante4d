@@ -138,7 +138,11 @@ advances the established-project autosave lane while preserving the manual
 authority. Ref publication is preceded by a bounded descriptor-relative whole-
 store entry/fan-out inventory. The corrected recovery-ahead state keeps the old
 lane head authoritative and supports an exact retry without repair or
-promotion.
+promotion. A crate-private established-session actor owns the root and leases,
+serializes those manual/autosave transactions, bounds requests and completions,
+coalesces queued autosaves, cancels active or queued work, and releases its
+session through Close or shutdown. The frozen public actor remains
+non-constructible and the crate remains off-product.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
@@ -165,9 +169,11 @@ See [testing](TESTING.md) for commands and claim language.
   generation-last immutable publication. Its crate-private transaction core
   can create the initial manual head and advance an established manual head
   under held leases, and can create or advance an established-project autosave
-  head. Provisional autosave, recovery selection/open, actor execution, garbage
-  collection, public Create/Save, durability qualification, and every product
-  path remain unimplemented.
+  head. Its private established-session actor executes and bounds those two
+  established save lanes only. Create/Open/Save As execution, provisional
+  autosave, recovery selection/open, timers, garbage collection, full
+  verification, public actor construction, durability qualification, and every
+  product path remain unimplemented.
 - The package-capability lane remains pending until there is an honest
   unsupported-GPU package command.
 - Packaged runtime does not expose unsaved-autosave recovery.

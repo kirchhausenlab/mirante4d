@@ -16,10 +16,12 @@ writer leases, an exact no-replace initial manual head, and crate-private
 established manual recovery-before-head replacement with bounded store
 inventory and recovery-ahead retry. The same transaction now creates and
 advances an established-project autosave lane, including divergent-base and
-lower-revision cases.
-The next B2 slice adds actor-owned execution around these private transaction
-primitives. Provisional autosave, recovery/open, garbage collection, and
-product activation stay later, with product activation at B4.
+lower-revision cases. A crate-private established-session actor now owns the
+root and leases, serializes those manual/autosave primitives, and enforces the
+frozen queue, coalescing, cancellation, close, and shutdown rules. B2 remains
+active off-product: Create/Open/Save As execution, provisional autosave,
+recovery/open, timers, garbage collection, full verification, and public actor
+wiring remain later work, with product activation at B4.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.

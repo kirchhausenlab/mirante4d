@@ -156,10 +156,14 @@ first and advancing autosave generations and refs, replace a divergent lane
 against the current manual base, accept a lower revision with a non-regressing
 high-water mark, reject stale parent/base and invalid recovery/capacity state,
 retry an exact recovery-ahead cancellation, and distinguish recovery-sync
-failure from write-suspending head indeterminacy. They do not claim actor
-execution, provisional autosave, Save As, recovery selection/open, garbage
-collection, public Create/Save, the exhaustive fault matrix or power-cut
-durability, product reachability, or product-open validation.
+failure from write-suspending head indeterminacy. Five actor cases exercise the
+real established manual/autosave primitives under one worker and prove exact
+request correlation, the request/completion bounds, queued-autosave coalescing,
+active and queued cancellation, close rejection, writer-lease lifetime, and
+joined or nonblocking shutdown. They do not claim Create/Open/Save As
+execution, provisional autosave, recovery selection/open, timers, garbage
+collection, full verification, public actor wiring, the exhaustive fault matrix
+or power-cut durability, product reachability, or product-open validation.
 
 The checked independent source report supports only the WP-03 source-TIFF
 archive. WP-10A is accepted off-product and its target authority is promoted.
