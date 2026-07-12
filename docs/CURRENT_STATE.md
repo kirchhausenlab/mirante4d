@@ -56,7 +56,7 @@ interactive demand; the predecessor app/data read pools, unbounded result
 channels, resident payload mirrors, and analysis execution worker are deleted.
 
 WP-10A entry, dependency disposition, and profile freeze are accepted.
-WP-10A-B is implemented off-product and WP-10A-C evidence promotion is active:
+WP-10A-B is implemented off-product and WP-10A-C target evidence is promoted:
 the storage profile, scientific and exact
 identities, strict control scalars, closed profile, canonical-value,
 scientific, and display-defaults grammars, restricted JCS, and exact
@@ -97,9 +97,16 @@ core 3.0, bytes, CRC32C, indexed-sharding, and registered zstd source artifacts
 in a small offline digest-checked mirror. A hash-locked zarr-python 3.2.1 probe
 independently decodes one manually built array using the selected shard subset.
 That diagnostic is not T1, IO-3, OME semantic readback, or complete-package
-evidence. Replacement, import/multiscale generation, scientific-ID
-computation, the independent T1 corpus, and product activation remain
-incomplete.
+evidence. The promoted `target-m4d-v1` authority tracks three bounded synthetic
+USTAR archives, independent expected facts and critical vectors, a full-array
+independent reader with pinned OME-schema results, 15 executed mutations, and
+byte-identical two-run reproduction. It is the registry's sole `T1-target`
+record and `target_format_t1_available` is true. This authority covers only the
+frozen EXPERIMENTAL profile; it does not establish IO-3, production package
+conformance, stable-format, product-support, performance, or generic OME-Zarr
+claims. Production consumption and package conformance remain WP-10A-D.
+Replacement, import/multiscale generation, production scientific-ID
+computation, and product activation remain incomplete.
 Current schema-1 packages remain transitional T2 fixtures and the sole product
 route.
 

@@ -35,11 +35,11 @@ const NORMATIVE_STANDARDS_SCHEMA_VERSION: u64 = 1;
 const NORMATIVE_STANDARDS_SHA256: &str =
     "28021b100e855b86ad29c0f69e5249115de2a39ddc68e980ae7e5ea67bc65e4e";
 const STANDARDS_CHECK_PATH: &str = "tools/target-fixtures/standards_check.py";
-const EXTERNAL_READER_PROBE_PATH: &str = "tools/target-fixtures/reader_probe/report.json";
-const EXTERNAL_READER_PROBE_SCHEMA: &str = "mirante4d-wp10a-c-reader-probe";
-const EXTERNAL_READER_PROBE_SCHEMA_VERSION: u64 = 1;
-const EXTERNAL_READER_PROBE_SHA256: &str =
-    "7ea3c9e71e696f0be37d5f10aadf53bb9775c4e5d0f9818b36f01a4d9da54c46";
+const TARGET_CORPUS_PATH: &str = "fixtures/target/manifest.json";
+const TARGET_CORPUS_SCHEMA: &str = "mirante4d-foundation-target-fixture-manifest";
+const TARGET_CORPUS_SCHEMA_VERSION: u64 = 1;
+const TARGET_CORPUS_SHA256: &str =
+    "0b2bad3c976b431d83cda1e24fae1ff50524a9865d7c5b260ccfc0a7d84e2321";
 const STORAGE_CRATE: &str = "mirante4d-storage";
 const STORAGE_PATH: &str = "crates/mirante4d-storage";
 const DEPENDENCY_KINDS: [&str; 3] = ["normal", "dev", "build"];
@@ -54,7 +54,7 @@ struct StorageContract {
     authorization: AuthorizationBinding,
     control_wire_specialization: PredecessorBinding,
     normative_standards: PredecessorBinding,
-    external_reader_probe: PredecessorBinding,
+    target_corpus: PredecessorBinding,
     activation: ActivationContract,
     identity_successor: IdentitySuccessorContract,
     dependencies: DependencyContract,
@@ -159,7 +159,7 @@ pub(super) fn check_wp10a_storage_contract(repo_root: &Path) -> anyhow::Result<(
     validate_predecessor(repo_root, &contract.predecessor)?;
     validate_control_wire_specialization(repo_root, &contract.control_wire_specialization)?;
     validate_normative_standards(repo_root, &contract.normative_standards)?;
-    validate_external_reader_probe(repo_root, &contract.external_reader_probe)?;
+    validate_target_corpus(repo_root, &contract.target_corpus)?;
     validate_forbidden_paths(repo_root, &contract.source_policy)?;
 
     let metadata = cargo_metadata(repo_root)?;
@@ -195,10 +195,10 @@ fn validate_contract_header(contract: &StorageContract) -> anyhow::Result<()> {
         || contract.normative_standards.schema != NORMATIVE_STANDARDS_SCHEMA
         || contract.normative_standards.schema_version != NORMATIVE_STANDARDS_SCHEMA_VERSION
         || contract.normative_standards.sha256 != NORMATIVE_STANDARDS_SHA256
-        || contract.external_reader_probe.path != EXTERNAL_READER_PROBE_PATH
-        || contract.external_reader_probe.schema != EXTERNAL_READER_PROBE_SCHEMA
-        || contract.external_reader_probe.schema_version != EXTERNAL_READER_PROBE_SCHEMA_VERSION
-        || contract.external_reader_probe.sha256 != EXTERNAL_READER_PROBE_SHA256
+        || contract.target_corpus.path != TARGET_CORPUS_PATH
+        || contract.target_corpus.schema != TARGET_CORPUS_SCHEMA
+        || contract.target_corpus.schema_version != TARGET_CORPUS_SCHEMA_VERSION
+        || contract.target_corpus.sha256 != TARGET_CORPUS_SHA256
     {
         bail!("{CONTRACT_PATH} does not bind the accepted WP-10A freeze and WP-08A predecessor");
     }
@@ -491,74 +491,42 @@ fn validate_normative_standards(
     Ok(())
 }
 
-fn validate_external_reader_probe(
-    repo_root: &Path,
-    binding: &PredecessorBinding,
-) -> anyhow::Result<()> {
+fn validate_target_corpus(repo_root: &Path, binding: &PredecessorBinding) -> anyhow::Result<()> {
     let path = repo_root.join(&binding.path);
     let digest = sha256_file(&path)?;
     if digest != binding.sha256 {
         bail!(
-            "immutable WP-10A external-reader probe drifted: expected {}, found {digest}",
+            "immutable WP-10A target corpus drifted: expected {}, found {digest}",
             binding.sha256
         );
     }
-    let report: Value = serde_json::from_slice(&fs::read(&path)?)?;
-    let reader = report.get("reader").and_then(Value::as_object);
-    if report.get("schema").and_then(Value::as_str) != Some(binding.schema.as_str())
-        || report.get("schema_version").and_then(Value::as_u64) != Some(binding.schema_version)
-        || report.get("status").and_then(Value::as_str) != Some("diagnostic-pass")
-        || report.get("result").and_then(Value::as_str) != Some("PASS")
-        || report
-            .get("standards_manifest_sha256")
+    let manifest: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    if manifest.get("schema").and_then(Value::as_str) != Some(binding.schema.as_str())
+        || manifest.get("schema_version").and_then(Value::as_u64) != Some(binding.schema_version)
+        || manifest.get("status").and_then(Value::as_str) != Some("independently_validated")
+        || manifest.get("fixture_id").and_then(Value::as_str) != Some("target-m4d-v1")
+        || manifest
+            .pointer("/profile/storage_profile")
+            .and_then(Value::as_str)
+            != Some("m4d-zarr3-local-1.0")
+        || manifest
+            .pointer("/profile/lifecycle")
+            .and_then(Value::as_str)
+            != Some("EXPERIMENTAL")
+        || manifest
+            .pointer("/profile/normative_standards_sha256")
             .and_then(Value::as_str)
             != Some(NORMATIVE_STANDARDS_SHA256)
-        || reader
-            .and_then(|value| value.get("name"))
+        || manifest
+            .pointer("/approvals/repository_owner/state")
             .and_then(Value::as_str)
-            != Some("zarr-python")
-        || reader
-            .and_then(|value| value.get("version"))
+            != Some("approved")
+        || manifest
+            .pointer("/approvals/scientific_content/state")
             .and_then(Value::as_str)
-            != Some("3.2.1")
-        || reader
-            .and_then(|value| value.get("source_commit"))
-            .and_then(Value::as_str)
-            != Some("85890b3bb404fd1d401267c508a2694f5734559e")
+            != Some("approved")
     {
-        bail!("WP-10A external-reader report is not the accepted diagnostic probe");
-    }
-
-    let sources = report
-        .get("sources")
-        .and_then(Value::as_object)
-        .context("WP-10A external-reader report lacks source digests")?;
-    for (field, relative) in [
-        (
-            "producer_sha256",
-            "tools/target-fixtures/reader_probe/producer.py",
-        ),
-        (
-            "reader_sha256",
-            "tools/target-fixtures/reader_probe/reader.py",
-        ),
-        (
-            "reproducer_sha256",
-            "tools/target-fixtures/reader_probe/reproduce.py",
-        ),
-        (
-            "requirements_lock_sha256",
-            "tools/target-fixtures/reader_probe/requirements-linux-x86_64-py312.lock",
-        ),
-    ] {
-        let expected = sources
-            .get(field)
-            .and_then(Value::as_str)
-            .with_context(|| format!("WP-10A external-reader report lacks {field}"))?;
-        let actual = sha256_file(&repo_root.join(relative))?;
-        if actual != expected {
-            bail!("WP-10A external-reader source drifted: {relative}");
-        }
+        bail!("WP-10A target corpus is not the accepted independent authority");
     }
     Ok(())
 }

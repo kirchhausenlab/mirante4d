@@ -32,8 +32,10 @@ pub(crate) fn validate_fixture_registry() -> anyhow::Result<()> {
         }
     }
     for record in array(&registry, "records")? {
-        if string(record, "tier")? == "T1-source" {
-            validate_source_manifest_contract(record)?;
+        match string(record, "tier")? {
+            "T1-source" => validate_source_manifest_contract(record)?,
+            "T1-target" => validate_target_manifest_contract(record)?,
+            _ => {}
         }
     }
     println!(
@@ -66,9 +68,8 @@ fn validate_registry_document(registry: &Value) -> anyhow::Result<Vec<FileRefere
     )?;
     if !bool_field(rules, "candidate_cannot_promote_itself")?
         || !bool_field(rules, "one_promoted_authority_per_claim_scope")?
-        || bool_field(rules, "target_format_t1_available")?
     {
-        bail!("fixture registry authority rules do not match the WP-06 boundary");
+        bail!("fixture registry authority rules are invalid");
     }
     let candidate_root = string(rules, "candidate_output_root")?;
     validate_relative_path(candidate_root, "fixture candidate root")?;
@@ -88,7 +89,8 @@ fn validate_registry_document(registry: &Value) -> anyhow::Result<Vec<FileRefere
     let mut ids = BTreeSet::new();
     let mut opaque_ids = BTreeSet::new();
     let mut references = Vec::new();
-    let mut t1_count = 0;
+    let mut source_t1_count = 0;
+    let mut target_t1_count = 0;
     for record in records {
         record
             .as_object()
@@ -109,8 +111,12 @@ fn validate_registry_document(registry: &Value) -> anyhow::Result<Vec<FileRefere
         }
         match string(record, "tier")? {
             "T1-source" => {
-                t1_count += 1;
-                validate_t1(record, &mut references)?;
+                source_t1_count += 1;
+                validate_source_t1(record, &mut references)?;
+            }
+            "T1-target" => {
+                target_t1_count += 1;
+                validate_target_t1(record, &mut references)?;
             }
             "T2" => validate_t2(record, &mut references)?,
             "T5" => {
@@ -122,14 +128,19 @@ fn validate_registry_document(registry: &Value) -> anyhow::Result<Vec<FileRefere
             tier => bail!("fixture {id:?} has unsupported tier {tier:?}"),
         }
     }
-    if t1_count == 0 {
+    if source_t1_count == 0 {
         bail!("fixture registry must retain independent source-only T1 evidence");
+    }
+    if target_t1_count > 1
+        || bool_field(rules, "target_format_t1_available")? != (target_t1_count == 1)
+    {
+        bail!("target-format T1 availability must match exactly one promoted target authority");
     }
     validate_promotions(registry, records, candidate_root, &references)?;
     Ok(references)
 }
 
-fn validate_t1(record: &Value, references: &mut Vec<FileReference>) -> anyhow::Result<()> {
+fn validate_source_t1(record: &Value, references: &mut Vec<FileReference>) -> anyhow::Result<()> {
     let id = string(record, "id")?;
     require_keys(
         record,
@@ -196,6 +207,35 @@ fn validate_t1(record: &Value, references: &mut Vec<FileReference>) -> anyhow::R
     if roles != required_roles || lineage_ids.len() != 3 || paths.len() != 3 || digests.len() != 3 {
         bail!("fixture {id:?} source lineages are not pairwise independent");
     }
+    validate_record_promotion(record, id)?;
+    Ok(())
+}
+
+fn validate_target_t1(record: &Value, references: &mut Vec<FileReference>) -> anyhow::Result<()> {
+    let id = string(record, "id")?;
+    require_keys(
+        record,
+        "id tier claim_scope authority_state owner capability publication license path sha256 \
+         validation_command promotion expiry deletion_gate target_format_conformance",
+        "",
+        &format!("T1-target fixture {id:?}"),
+    )?;
+    if string(record, "authority_state")? != "promoted-target-format"
+        || id != "target-m4d-v1"
+        || string(record, "claim_scope")? != "target-m4d-v1-independent-format-conformance"
+        || string(record, "capability")? != "public-cpu"
+        || string(record, "publication")? != "public-safe-synthetic"
+        || string(record, "license")? != "MIT"
+        || string(record, "path")? != "fixtures/target/manifest.json"
+        || string(record, "validation_command")?
+            != "python3 tools/target-fixtures/t1/validate.py --manifest fixtures/target/manifest.json --self-test"
+    {
+        bail!("fixture {id:?} target authority metadata is invalid");
+    }
+    true_field(record, "target_format_conformance", id)?;
+    null_field(record, "expiry", id)?;
+    null_field(record, "deletion_gate", id)?;
+    reference(record, "path", "sha256", id, "target manifest", references)?;
     validate_record_promotion(record, id)?;
     Ok(())
 }
@@ -478,6 +518,21 @@ fn validate_source_manifest_contract(record: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_target_manifest_contract(record: &Value) -> anyhow::Result<()> {
+    let id = string(record, "id")?;
+    let manifest = read_json(string(record, "path")?)?;
+    if string(&manifest, "schema")? != "mirante4d-foundation-target-fixture-manifest"
+        || u64_field(&manifest, "schema_version")? != 1
+        || string(&manifest, "status")? != "independently_validated"
+        || string(&manifest, "fixture_id")? != id
+        || pointer_string(&manifest, "/approvals/repository_owner/state")? != "approved"
+        || pointer_string(&manifest, "/approvals/scientific_content/state")? != "approved"
+    {
+        bail!("fixture {id:?} target manifest identity or approval is invalid");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct FixtureIdentity {
     id: String,
@@ -633,6 +688,13 @@ fn bool_field(value: &Value, field: &str) -> anyhow::Result<bool> {
 fn false_field(value: &Value, field: &str, id: &str) -> anyhow::Result<()> {
     if bool_field(value, field)? {
         bail!("fixture {id:?} cannot set {field} to true");
+    }
+    Ok(())
+}
+
+fn true_field(value: &Value, field: &str, id: &str) -> anyhow::Result<()> {
+    if !bool_field(value, field)? {
+        bail!("fixture {id:?} must set {field} to true");
     }
     Ok(())
 }

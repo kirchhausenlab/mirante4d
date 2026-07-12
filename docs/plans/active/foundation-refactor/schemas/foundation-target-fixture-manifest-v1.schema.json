@@ -1,0 +1,506 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:mirante4d:foundation:target-fixture-manifest:v1",
+  "title": "Mirante4D target T1 fixture authority manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema",
+    "schema_version",
+    "status",
+    "fixture_id",
+    "publication_class",
+    "license",
+    "profile",
+    "lineages",
+    "archives",
+    "authority_files",
+    "limits",
+    "reproduction",
+    "validator",
+    "approvals"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "../../docs/plans/active/foundation-refactor/schemas/foundation-target-fixture-manifest-v1.schema.json"
+    },
+    "schema": {
+      "const": "mirante4d-foundation-target-fixture-manifest"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "status": {
+      "const": "independently_validated"
+    },
+    "fixture_id": {
+      "const": "target-m4d-v1"
+    },
+    "publication_class": {
+      "const": "public_safe"
+    },
+    "license": {
+      "const": "MIT"
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "storage_profile",
+        "lifecycle",
+        "cases_path",
+        "cases_sha256",
+        "normative_standards_path",
+        "normative_standards_sha256"
+      ],
+      "properties": {
+        "storage_profile": {
+          "const": "m4d-zarr3-local-1.0"
+        },
+        "lifecycle": {
+          "const": "EXPERIMENTAL"
+        },
+        "cases_path": {
+          "const": "tools/target-fixtures/t1/cases-v1.tsv"
+        },
+        "cases_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "normative_standards_path": {
+          "const": "architecture/wp10a-normative-standards.json"
+        },
+        "normative_standards_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "lineages": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "producer",
+        "fact_oracle",
+        "independent_reader"
+      ],
+      "properties": {
+        "producer": {
+          "allOf": [
+            { "$ref": "#/$defs/lineage" },
+            {
+              "properties": {
+                "id": { "const": "TGT-PRODUCER-001" },
+                "class": { "const": "byte_producer" },
+                "source_path": { "const": "tools/target-fixtures/t1/producer/produce.py" },
+                "lock_path": { "const": "tools/target-fixtures/t1/producer/toolchain-lock.json" }
+              }
+            }
+          ]
+        },
+        "fact_oracle": {
+          "allOf": [
+            { "$ref": "#/$defs/lineage" },
+            {
+              "properties": {
+                "id": { "const": "TGT-FACT-001" },
+                "class": { "const": "fact_oracle" },
+                "source_path": { "const": "tools/target-fixtures/t1/fact_oracle/main.rs" },
+                "lock_path": { "const": "tools/target-fixtures/t1/fact_oracle/toolchain-lock.json" }
+              }
+            }
+          ]
+        },
+        "independent_reader": {
+          "allOf": [
+            { "$ref": "#/$defs/lineage" },
+            {
+              "properties": {
+                "id": { "const": "TGT-READER-001" },
+                "class": { "const": "independent_reader" },
+                "source_path": { "const": "tools/target-fixtures/t1/reader/reader.py" },
+                "lock_path": { "const": "tools/target-fixtures/t1/reader/requirements-linux-x86_64-py312.lock" }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "archives": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "$ref": "#/$defs/archive"
+      },
+      "allOf": [
+        {
+          "contains": {
+            "properties": { "case_id": { "const": "m4d-t1-u8-2d-sparse" } },
+            "required": ["case_id"]
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "properties": { "case_id": { "const": "m4d-t1-u16-3d-multiscale" } },
+            "required": ["case_id"]
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "properties": { "case_id": { "const": "m4d-t1-f32-3d-validity" } },
+            "required": ["case_id"]
+          },
+          "minContains": 1,
+          "maxContains": 1
+        }
+      ]
+    },
+    "authority_files": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "expected_facts",
+        "identity_vectors",
+        "mutations",
+        "independent_reader_report",
+        "reproduction_report"
+      ],
+      "properties": {
+        "expected_facts": {
+          "allOf": [
+            { "$ref": "#/$defs/authority_file" },
+            {
+              "properties": {
+                "path": { "const": "fixtures/target/expected-facts.json" },
+                "schema": { "const": "mirante4d-target-t1-independent-facts" }
+              }
+            }
+          ]
+        },
+        "identity_vectors": {
+          "allOf": [
+            { "$ref": "#/$defs/authority_file" },
+            {
+              "properties": {
+                "path": { "const": "fixtures/target/identity-vectors.json" },
+                "schema": { "const": "mirante4d-wp10a-c-hand-vectors" }
+              }
+            }
+          ]
+        },
+        "mutations": {
+          "allOf": [
+            { "$ref": "#/$defs/authority_file" },
+            {
+              "properties": {
+                "path": { "const": "fixtures/target/mutations.json" },
+                "schema": { "const": "mirante4d-target-t1-mutation-recipes" }
+              }
+            }
+          ]
+        },
+        "independent_reader_report": {
+          "allOf": [
+            { "$ref": "#/$defs/authority_file" },
+            {
+              "properties": {
+                "path": { "const": "fixtures/target/independent-reader-report.json" },
+                "schema": { "const": "mirante4d-target-t1-independent-reader-report" }
+              }
+            }
+          ]
+        },
+        "reproduction_report": {
+          "allOf": [
+            { "$ref": "#/$defs/authority_file" },
+            {
+              "properties": {
+                "path": { "const": "fixtures/target/reproduction-report.json" },
+                "schema": { "const": "mirante4d-target-t1-reproduction-report" }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "combined_archive_bytes",
+        "archive_bytes_each",
+        "combined_unpacked_regular_file_bytes",
+        "combined_logical_voxel_bytes",
+        "files_each",
+        "directories_each",
+        "depth",
+        "fan_out",
+        "path_bytes",
+        "individual_file_bytes",
+        "compression_ratio"
+      ],
+      "properties": {
+        "combined_archive_bytes": { "const": 33554432 },
+        "archive_bytes_each": { "const": 16777216 },
+        "combined_unpacked_regular_file_bytes": { "const": 67108864 },
+        "combined_logical_voxel_bytes": { "const": 67108864 },
+        "files_each": { "const": 64 },
+        "directories_each": { "const": 64 },
+        "depth": { "const": 8 },
+        "fan_out": { "const": 64 },
+        "path_bytes": { "const": 240 },
+        "individual_file_bytes": { "const": 33554432 },
+        "compression_ratio": { "const": 16 }
+      }
+    },
+    "reproduction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command",
+        "clean_runs",
+        "generated_tree_sha256",
+        "authority_binding_sha256"
+      ],
+      "properties": {
+        "command": {
+          "const": "python3 tools/target-fixtures/t1/reproduce.py"
+        },
+        "clean_runs": {
+          "const": 2
+        },
+        "generated_tree_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "authority_binding_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "validator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256",
+        "command",
+        "manifest_schema_path",
+        "manifest_schema_sha256",
+        "identity_vector_verifier_path",
+        "identity_vector_verifier_sha256"
+      ],
+      "properties": {
+        "path": {
+          "const": "tools/target-fixtures/t1/validate.py"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "command": {
+          "const": "python3 tools/target-fixtures/t1/validate.py --manifest fixtures/target/manifest.json --self-test"
+        },
+        "manifest_schema_path": {
+          "const": "docs/plans/active/foundation-refactor/schemas/foundation-target-fixture-manifest-v1.schema.json"
+        },
+        "manifest_schema_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "identity_vector_verifier_path": {
+          "const": "tools/target-fixtures/t1/hand_vectors/verify_hand_vectors.py"
+        },
+        "identity_vector_verifier_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "approvals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository_owner", "scientific_content"],
+      "properties": {
+        "repository_owner": {
+          "allOf": [
+            { "$ref": "#/$defs/approval" },
+            { "properties": { "role": { "const": "repository_owner" } } }
+          ]
+        },
+        "scientific_content": {
+          "allOf": [
+            { "$ref": "#/$defs/approval" },
+            { "properties": { "role": { "const": "scientific_content" } } }
+          ]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "repo_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*//)[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"
+    },
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "class",
+        "source_path",
+        "source_sha256",
+        "lock_path",
+        "lock_sha256"
+      ],
+      "properties": {
+        "id": {
+          "enum": ["TGT-PRODUCER-001", "TGT-FACT-001", "TGT-READER-001"]
+        },
+        "class": {
+          "enum": ["byte_producer", "fact_oracle", "independent_reader"]
+        },
+        "source_path": {
+          "$ref": "#/$defs/repo_path"
+        },
+        "source_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "lock_path": {
+          "$ref": "#/$defs/repo_path"
+        },
+        "lock_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "authority_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "schema"],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/repo_path"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "archive_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bytes", "sha256"],
+      "properties": {
+        "bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 33554432
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "inventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file_count",
+        "directory_count",
+        "regular_file_bytes",
+        "max_depth",
+        "max_fan_out",
+        "max_path_bytes",
+        "max_file_bytes",
+        "directories",
+        "files"
+      ],
+      "properties": {
+        "file_count": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "directory_count": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "regular_file_bytes": { "type": "integer", "minimum": 1, "maximum": 67108864 },
+        "max_depth": { "type": "integer", "minimum": 1, "maximum": 8 },
+        "max_fan_out": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "max_path_bytes": { "type": "integer", "minimum": 1, "maximum": 240 },
+        "max_file_bytes": { "type": "integer", "minimum": 1, "maximum": 33554432 },
+        "directories": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/repo_path" }
+        },
+        "files": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 64,
+          "propertyNames": { "$ref": "#/$defs/repo_path" },
+          "additionalProperties": { "$ref": "#/$defs/archive_file" }
+        }
+      }
+    },
+    "archive": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "path",
+        "format",
+        "compression",
+        "sha256",
+        "bytes",
+        "logical_voxel_bytes",
+        "package_id",
+        "tree_sha256",
+        "inventory"
+      ],
+      "properties": {
+        "case_id": {
+          "enum": [
+            "m4d-t1-u8-2d-sparse",
+            "m4d-t1-u16-3d-multiscale",
+            "m4d-t1-f32-3d-validity"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^fixtures/target/archives/m4d-t1-(u8-2d-sparse|u16-3d-multiscale|f32-3d-validity)\\.tar$"
+        },
+        "format": { "const": "ustar" },
+        "compression": { "const": "none" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "bytes": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+        "logical_voxel_bytes": { "type": "integer", "minimum": 1, "maximum": 67108864 },
+        "package_id": {
+          "type": "string",
+          "pattern": "^m4d-package-v1-sha256:[0-9a-f]{64}$"
+        },
+        "tree_sha256": { "$ref": "#/$defs/sha256" },
+        "inventory": { "$ref": "#/$defs/inventory" }
+      }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "role", "approved_by", "approved_on", "reference"],
+      "properties": {
+        "state": { "const": "approved" },
+        "role": { "type": "string", "minLength": 1 },
+        "approved_by": { "const": "Mirante4D repository owner" },
+        "approved_on": { "const": "2026-07-12" },
+        "reference": { "const": "WP10A-C-PREAUTH-2026-07-12" }
+      }
+    }
+  }
+}

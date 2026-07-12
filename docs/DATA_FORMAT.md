@@ -74,9 +74,10 @@ release DTOs are implemented. The fixed packed-index record and bounded
 zstd/CRC32C inner-payload and end-index codecs implement the selected binary
 layer in memory. Strict Zarr group/array metadata, closed OME image-group axes
 and transforms, and bounded root-confined Unix object-range reads are
-implemented. The product reader and independent conformance validator are not
-yet implemented. A bounded local catalog authenticates the manifest
-root/pages, verifies opening-critical metadata bytes, parses the closed
+implemented. The product reader is not yet implemented; the off-product
+independent conformance validator and corpus are promoted. A bounded local
+catalog authenticates the manifest root/pages, verifies opening-critical
+metadata bytes, parses the closed
 control/Zarr/OME objects, and checks their layer, time, geometry, dtype, shape,
 validity, and packed-index-count relationships. A separate cancellable
 inventory enforces the exact finalized file and ancestor-directory closure,
@@ -115,14 +116,19 @@ Zarr core 3.0 and selected codec specifications are now retained offline by
 immutable source revision, length, and SHA-256. A separately pinned
 zarr-python reader decodes one hand-built selected-subset shard. This is an
 interoperability stop/go result only; it is not T1, IO-3, official-schema,
-complete-package, or generic OME-Zarr evidence.
+complete-package, or generic OME-Zarr evidence. The promoted
+`target-m4d-v1` authority contains three bounded deterministic USTAR archives,
+independent expected facts, critical identity vectors, full-array independent
+readback with pinned OME-schema results, 15 executed rejection mutations, and
+byte-identical two-run reproduction. It covers only the frozen EXPERIMENTAL
+profile and makes no IO-3, production package-conformance, stable-format,
+product-support, performance, or generic OME-Zarr claim.
 
 WP-10B separately installs immutable content-addressed project objects,
 complete generations, atomic head/recovery refs, leases, autosave/recovery,
 and conservative garbage collection.
 
-The remaining independent validator/corpus and project-store work is approved
-but not implemented. Its authorities are the
-[data-format brief](plans/active/foundation-refactor/DATA_FORMAT_IDENTITY_BRIEF.md),
-[project-store brief](plans/active/foundation-refactor/PROJECT_STORE_DURABILITY_BRIEF.md),
-and their accepted work-package entries.
+The remaining WP-10A-D production package-conformance work is approved but not
+implemented. Its authority is the
+[data-format brief](plans/active/foundation-refactor/DATA_FORMAT_IDENTITY_BRIEF.md)
+and its accepted work-package entry.

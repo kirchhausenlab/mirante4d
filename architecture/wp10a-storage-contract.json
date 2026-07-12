@@ -24,11 +24,11 @@
     "schema_version": 1,
     "sha256": "28021b100e855b86ad29c0f69e5249115de2a39ddc68e980ae7e5ea67bc65e4e"
   },
-  "external_reader_probe": {
-    "path": "tools/target-fixtures/reader_probe/report.json",
-    "schema": "mirante4d-wp10a-c-reader-probe",
+  "target_corpus": {
+    "path": "fixtures/target/manifest.json",
+    "schema": "mirante4d-foundation-target-fixture-manifest",
     "schema_version": 1,
-    "sha256": "7ea3c9e71e696f0be37d5f10aadf53bb9775c4e5d0f9818b36f01a4d9da54c46"
+    "sha256": "0b2bad3c976b431d83cda1e24fae1ff50524a9865d7c5b260ccfc0a7d84e2321"
   },
   "activation": {
     "crate_name": "mirante4d-storage",
