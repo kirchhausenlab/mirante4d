@@ -14,15 +14,20 @@ mod paths;
 mod profile;
 
 pub use control::{
-    AsciiToken, CanonicalMapEntry, CanonicalValue, CanonicalValueKind, ControlError,
-    DisplayDefaults, DisplayLayerDefaults, F32Bits, F64Bits, I64Decimal, MAX_ASCII_TOKEN_BYTES,
-    MAX_NFC_TEXT_BYTES, MAX_PORTABLE_CONTROL_OBJECT_BYTES, MAX_PROFILE_HEADER_BYTES, ManifestPage,
+    AsciiToken, CanonicalMapEntry, CanonicalValue, CanonicalValueKind, CitationPayload,
+    ControlError, DatasetSeriesUuid, DerivationBinding, DerivationBody, DerivationExactness,
+    DerivationImplementation, DerivationOutcome, DerivationPayload, DerivationScope,
+    DerivationSpaceBox, DerivationTimeRange, DisplayDefaults, DisplayLayerDefaults, Doi, F32Bits,
+    F64Bits, I64Decimal, MAX_ASCII_TOKEN_BYTES, MAX_NFC_TEXT_BYTES,
+    MAX_PORTABLE_CONTROL_OBJECT_BYTES, MAX_PROFILE_HEADER_BYTES, ManifestPage,
     ManifestPageReference, ManifestRoot, NfcText, OmeInteroperabilityBase, PackageObjectDescriptor,
-    PackageObjectKind, ProfileHeader, ProfileImage, ProfileLevel, ProfileLogicalLayer,
-    ProfileValidityMode, RecipeBody, RecipeDeterminism, RecipeInput, RecipeNumericPolicy,
-    RecipeOperation, RecipePayload, RecipeRng, Rgb24, ScienceDescriptor, ScienceLayer,
-    ScienceTemporalCalibration, ScienceTemporalKind, TypedId, U64Decimal, manifest_page_path,
-    pack_manifest_pages, profile_compatibility_bytes,
+    PackageObjectKind, PortableRecord, PortableRecordKind, PortableRecordPayload, ProfileHeader,
+    ProfileImage, ProfileLevel, ProfileLogicalLayer, ProfileValidityMode, PublishedAtUtc,
+    RecipeBody, RecipeDeterminism, RecipeInput, RecipeNumericPolicy, RecipeOperation,
+    RecipePayload, RecipeRng, ReleaseBody, ReleaseCitation, ReleaseEvidence, ReleasePayload, Rgb24,
+    RightsPayload, ScienceDescriptor, ScienceLayer, ScienceTemporalCalibration,
+    ScienceTemporalKind, SourceIdentifier, SourceIdentifierScheme, SourcePayload, SpdxLicense,
+    TypedId, U64Decimal, manifest_page_path, pack_manifest_pages, profile_compatibility_bytes,
 };
 pub use error::StorageProfileError;
 pub use limits::{

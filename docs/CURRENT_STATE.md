@@ -61,11 +61,12 @@ identities, strict control scalars, closed profile, canonical-value,
 scientific, and display-defaults grammars, restricted JCS, and exact
 compatibility tuple bytes exist. Exact recipe bodies and verified RecipeId
 payloads also exist, together with exact object descriptors, canonical greedy
-manifest pages, authenticated roots, and PackageId derivation. The remaining
-record payloads and envelopes, release DTOs, shard/index I/O, reader, writer,
-validator, independent T1 corpus, and product activation remain incomplete.
-Current schema-1 packages remain transitional T2 fixtures and the sole product
-route.
+manifest pages, authenticated roots, and PackageId derivation. Portable source,
+recipe, derivation, rights, and citation records have exact closed schemas;
+embedded recipe and derivation payloads and detached release records verify
+their typed identities. Shard/index I/O, reader, writer, validator, independent
+T1 corpus, and product activation remain incomplete. Current schema-1 packages
+remain transitional T2 fixtures and the sole product route.
 
 ## Current Verification Boundary
 

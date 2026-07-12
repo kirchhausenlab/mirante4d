@@ -28,7 +28,7 @@ const CONTROL_WIRE_PATH: &str = "architecture/wp10a-control-wire-specialization.
 const CONTROL_WIRE_SCHEMA: &str = "mirante4d-wp10a-control-wire-specialization";
 const CONTROL_WIRE_SCHEMA_VERSION: u64 = 1;
 const CONTROL_WIRE_SHA256: &str =
-    "5920e798383febc358f253d539882508fd9cfefb6b7119e53bd5cd28add2b2fd";
+    "0786aa150ea13476871c8e1e005528142026a26ff6fa62200d156f8c27309b3f";
 const STORAGE_CRATE: &str = "mirante4d-storage";
 const STORAGE_PATH: &str = "crates/mirante4d-storage";
 const DEPENDENCY_KINDS: [&str; 3] = ["normal", "dev", "build"];
@@ -464,11 +464,23 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "CanonicalMapEntry",
         "CanonicalValue",
         "CanonicalValueKind",
+        "CitationPayload",
         "CompatibilityTuple",
         "ControlError",
+        "DatasetSeriesUuid",
         "DatasetGeometry",
+        "DerivationBinding",
+        "DerivationBody",
+        "DerivationExactness",
+        "DerivationImplementation",
+        "DerivationOutcome",
+        "DerivationPayload",
+        "DerivationScope",
+        "DerivationSpaceBox",
+        "DerivationTimeRange",
         "DisplayDefaults",
         "DisplayLayerDefaults",
+        "Doi",
         "ELIDED_ALL_FILL_AMPLIFICATION",
         "ElidedAllFillAmplification",
         "F32Bits",
@@ -504,6 +516,9 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "PackageObjectDescriptor",
         "PackageObjectKind",
         "PackagePath",
+        "PortableRecord",
+        "PortableRecordKind",
+        "PortableRecordPayload",
         "ProfileKind",
         "ProfileHeader",
         "ProfileImage",
@@ -511,6 +526,7 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "ProfileLimits",
         "ProfileLogicalLayer",
         "ProfileValidityMode",
+        "PublishedAtUtc",
         "RecipeBody",
         "RecipeDeterminism",
         "RecipeInput",
@@ -518,6 +534,11 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "RecipeOperation",
         "RecipePayload",
         "RecipeRng",
+        "ReleaseBody",
+        "ReleaseCitation",
+        "ReleaseEvidence",
+        "ReleasePayload",
+        "RightsPayload",
         "Rgb24",
         "ScaleCountRule",
         "ScaleCounts",
@@ -525,6 +546,10 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "ScienceLayer",
         "ScienceTemporalCalibration",
         "ScienceTemporalKind",
+        "SourceIdentifier",
+        "SourceIdentifierScheme",
+        "SourcePayload",
+        "SpdxLicense",
         "StorageProfileError",
         "StorageShape",
         "TypedId",

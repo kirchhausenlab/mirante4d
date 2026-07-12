@@ -118,10 +118,12 @@ existing contract leaf, but its current tests prove only pure profile, path,
 arithmetic, supporting exact-identity, scalar-wire, and restricted-JCS
 contracts, including the closed profile, canonical-value, scientific, and
 display-defaults grammars, verified recipe payloads, and exact manifest
-descriptor/page/root bytes. They make no complete-control-schema,
-filesystem-package, T1 conformance, independent-reader, lifecycle, or product-
-support claim. Current schema-1 packages remain non-authoritative T2 support
-fixtures until WP-10A accepts the independent target evidence.
+descriptor/page/root bytes. Closed portable-record tests prove structural
+canonical bytes; derivation and detached-release tests additionally prove typed
+identity verification. They make no filesystem-package, T1 conformance,
+independent-reader, lifecycle, or product-support claim. Current schema-1
+packages remain non-authoritative T2 support fixtures until WP-10A accepts the
+independent target evidence.
 
 The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).

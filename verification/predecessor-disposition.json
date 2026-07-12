@@ -4437,6 +4437,22 @@
       "reason": "WP-10A proves the closed display-defaults DTO has one exact canonical encoding."
     },
     {
+      "id": "libtest:mirante4d-storage:control::derivation::tests::derivation_payload_roundtrips_exact_scope_and_verified_identity",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves closed execution scope bytes and the domain-framed DerivationRecordId envelope."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::derivation::tests::derivation_rejects_bad_order_overlap_identity_and_encoding",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects malformed, overlapping, unordered, oversized, and identity-mismatched derivation records."
+    },
+    {
       "id": "libtest:mirante4d-storage:control::header::tests::profile_header_rejects_malformed_noncanonical_and_inconsistent_mappings",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -4493,6 +4509,22 @@
       "reason": "WP-10A proves the frozen two-thousand-descriptor page guarantee with linear exact-byte accounting."
     },
     {
+      "id": "libtest:mirante4d-storage:control::portable::tests::portable_records_reject_invalid_scalars_order_shapes_and_encoding",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects unsafe source identifiers, unfrozen licenses, bad ordering, alternate encodings, and malformed portable payloads."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::portable::tests::source_rights_and_citation_records_roundtrip_exact_bytes",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves an exact source encoding and structural roundtrips for closed source, rights, and citation portable records."
+    },
+    {
       "id": "libtest:mirante4d-storage:control::recipe::tests::recipe_payload_rejects_malformed_noncanonical_and_invalid_graphs",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -4507,6 +4539,30 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
       "reason": "WP-10A proves the closed recipe graph has exact canonical body bytes and a verified domain-framed RecipeId."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::release::tests::release_rejects_malformed_unordered_oversized_and_self_superseding_values",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects malformed, unordered, oversized, self-referential, and identity-mismatched detached releases."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::release::tests::release_roundtrips_exact_body_and_verified_identity",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the exact detached release body and domain-framed ReleaseId envelope."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::release::tests::uuid_and_publication_time_use_one_strict_wire_form",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves dataset-series UUIDs and publication timestamps have one strict portable spelling."
     },
     {
       "id": "libtest:mirante4d-storage:control::scalar::tests::canonical_decimals_reject_alternate_and_out_of_range_forms",
@@ -4715,6 +4771,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 384
+    "current_additions": 391
   }
 }

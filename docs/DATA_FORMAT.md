@@ -68,9 +68,10 @@ compatibility tuple are implemented. Exact path-bound object descriptors,
 canonical greedy manifest pages, authenticated manifest roots, and PackageId
 derivation are also implemented. A checked control-wire specialization fixes
 the ordinal, indexed-path, temporal, recipe-node, and manifest spellings
-omitted from the accepted freeze. The remaining record and release DTOs are not
-yet complete, and the core does not yet read, write, or validate target
-packages.
+omitted from the accepted freeze, plus the closed portable-record and detached-
+release scalar choices. Exact source, recipe, derivation, rights, citation, and
+release DTOs are implemented. The core does not yet read, write, or validate
+target packages.
 
 WP-10B separately installs immutable content-addressed project objects,
 complete generations, atomic head/recovery refs, leases, autosave/recovery,

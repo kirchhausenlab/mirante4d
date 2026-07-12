@@ -104,5 +104,61 @@
     "root_pages": "one through six contiguous p######## paths from zero, positive counts and byte lengths, and strictly increasing nonoverlapping path bounds",
     "cross_page_verification": "each reference matches exact count, bounds, bytes, and digest and flattening then repacking reproduces the identical greedy pages",
     "root_package_id": "SHA-256 of the exact canonical root bytes; package_id is not stored inside the root"
+  },
+  "portable_records": {
+    "scope": "initial package-contained version-1 portable records; adding another source or license literal is a hard schema change",
+    "collection_items_max": 4096,
+    "record_ordinals": "zero through thirteen and equal to the ordinal in m4d/records/r########.json",
+    "subject_id_order": "strictly sorted unique by exact ASCII typed-id spelling",
+    "nfc_set_order": "strictly sorted unique by normalized UTF-8 bytes",
+    "source_identifier_order": "strictly sorted unique by scheme ASCII bytes then value UTF-8 bytes",
+    "source_schemes": {
+      "sha256": "exactly 64 lowercase hexadecimal digits for the source object's raw bytes",
+      "doi": "the canonical DOI grammar below"
+    },
+    "doi": "lowercase ASCII, at most 255 bytes, 10. then 4 through 9 digits then / then one or more [a-z0-9._;()/:-] characters; no URL or doi: prefix",
+    "license_spdx_literals": ["CC-BY-4.0", "CC0-1.0", "MIT"],
+    "citation": "title and creators are nonempty NFC text; creators preserve semantic order and may repeat; year is null or 1000 through 9999; DOI is independently nullable"
+  },
+  "derivation_record": {
+    "scope_kind": "package-contained m4d-portable-record derivation payload; external packaging records are a separate future schema",
+    "bindings_layers_and_time_items_max": 4096,
+    "binding_keys": ["role", "id"],
+    "binding_order": "strictly sorted unique by role ASCII bytes then exact typed-id ASCII bytes",
+    "input_id_families": "all version-1 TypedId variants; later recipe and package validation owns semantic role compatibility",
+    "output_id_families": "all version-1 TypedId variants in the base derivation body",
+    "scope": "CanonicalValue map with exactly layers, space, and time entries in canonical key order",
+    "scope_layers": "nonempty sorted unique list of u64 values no greater than u32 maximum",
+    "scope_time": "nonempty list of maps with exactly end and start u64 entries; inclusive ranges require start no greater than end and are sorted by start then end and nonoverlapping",
+    "scope_space": "one through 256 maps with exactly extent_tzyx and origin_tzyx; each is four u64 values, extents are positive, checked exclusive ends fit u64, boxes are sorted by origin then extent, and every pair is nonoverlapping as half-open 4D boxes",
+    "implementation": "exactly name and version ASCII tokens plus build as the raw SHA-256 digest of the immutable implementation artifact named by the operation registry",
+    "outcome": "success, failed, or cancelled",
+    "exactness": "exact or approximate",
+    "coupling": "input and output arrays may be empty; outcome and exactness do not silently invent or discard bindings",
+    "package_cycle": "the m4d-portable-record wrapper rejects derivation outputs containing PackageId or ReleaseId; an external packaging record may use the base body to name its resulting PackageId without entering that package closure",
+    "bytes_max": 1048576
+  },
+  "release_record": {
+    "location": "detached from the package closure",
+    "collection_items_max": 4096,
+    "dataset_series_uuid": "lowercase hyphenated RFC 4122 UUID with version 4 and RFC 4122 variant bits",
+    "release_ordinal": "positive u64 decimal; a later catalog validator requires increasing ordinals within one dataset series",
+    "ascii_id_sets": "strictly sorted unique by exact ASCII spelling",
+    "nfc_sets": "strictly sorted unique by normalized UTF-8 bytes",
+    "recipe_ids": "sorted unique and possibly empty",
+    "derivation_record_ids": "sorted unique and possibly empty",
+    "portable_record_digests": "sorted unique and possibly empty exact-byte digests",
+    "schema_profiles": "nonempty sorted unique ASCII tokens",
+    "license_spdx": "one portable-record license_spdx literal",
+    "rights_holders": "nonempty NFC set",
+    "citation": "exactly title, year, and doi using the portable citation scalar rules",
+    "creators": "nonempty semantic-order NFC list; repeated equal names are permitted",
+    "institutions": "possibly empty NFC set",
+    "funders": "possibly empty NFC set",
+    "evidence": "possibly empty entries of exactly kind and digest, strictly sorted unique by kind then digest",
+    "published_at": "exact YYYY-MM-DDTHH:MM:SSZ UTC Gregorian timestamp, year 0001 through 9999, valid month/day and leap year, seconds 00 through 59",
+    "supersedes": "possibly empty sorted unique ReleaseId set; the envelope rejects its own ReleaseId",
+    "cross_release_validation": "a later catalog validator requires every superseded release to use the same dataset series and a lower ordinal",
+    "bytes_max": 1048576
   }
 }

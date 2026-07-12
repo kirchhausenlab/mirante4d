@@ -314,6 +314,14 @@ impl RecipePayload {
                 detail: error.to_string(),
             }
         })?;
+        let value = Self::try_from_wire(wire)?;
+        if value.canonical_bytes()?.as_slice() != bytes {
+            return Err(ControlError::NonCanonicalControlObject { object: OBJECT });
+        }
+        Ok(value)
+    }
+
+    pub(super) fn try_from_wire(wire: WireRecipePayload) -> Result<Self, ControlError> {
         let recipe_id =
             RecipeId::parse(&wire.recipe_id).map_err(|_| ControlError::InvalidControlObject {
                 object: OBJECT,
@@ -323,9 +331,6 @@ impl RecipePayload {
         let value = Self::new(body)?;
         if value.recipe_id != recipe_id {
             return invalid("recipe_id does not verify the canonical body");
-        }
-        if value.canonical_bytes()?.as_slice() != bytes {
-            return Err(ControlError::NonCanonicalControlObject { object: OBJECT });
         }
         Ok(value)
     }
@@ -381,7 +386,7 @@ fn invalid<T>(reason: &'static str) -> Result<T, ControlError> {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WireRecipePayload {
+pub(super) struct WireRecipePayload {
     recipe_id: String,
     body: WireRecipeBody,
 }

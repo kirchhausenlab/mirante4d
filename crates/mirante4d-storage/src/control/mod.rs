@@ -1,14 +1,21 @@
+mod derivation;
 mod display;
 mod header;
 mod jcs;
 mod manifest;
+mod portable;
 mod recipe;
+mod release;
 mod scalar;
 mod science;
 mod value;
 
 use thiserror::Error;
 
+pub use derivation::{
+    DerivationBinding, DerivationBody, DerivationExactness, DerivationImplementation,
+    DerivationOutcome, DerivationPayload, DerivationScope, DerivationSpaceBox, DerivationTimeRange,
+};
 pub use display::{DisplayDefaults, DisplayLayerDefaults};
 pub use header::{
     OmeInteroperabilityBase, ProfileHeader, ProfileImage, ProfileLevel, ProfileLogicalLayer,
@@ -18,9 +25,17 @@ pub use manifest::{
     ManifestPage, ManifestPageReference, ManifestRoot, PackageObjectDescriptor, PackageObjectKind,
     manifest_page_path, pack_manifest_pages,
 };
+pub use portable::{
+    CitationPayload, Doi, PortableRecord, PortableRecordKind, PortableRecordPayload, RightsPayload,
+    SourceIdentifier, SourceIdentifierScheme, SourcePayload, SpdxLicense,
+};
 pub use recipe::{
     RecipeBody, RecipeDeterminism, RecipeInput, RecipeNumericPolicy, RecipeOperation,
     RecipePayload, RecipeRng,
+};
+pub use release::{
+    DatasetSeriesUuid, PublishedAtUtc, ReleaseBody, ReleaseCitation, ReleaseEvidence,
+    ReleasePayload,
 };
 pub use scalar::{
     AsciiToken, F32Bits, F64Bits, I64Decimal, MAX_ASCII_TOKEN_BYTES, MAX_NFC_TEXT_BYTES, NfcText,
@@ -39,6 +54,7 @@ pub const MAX_PROFILE_HEADER_BYTES: usize = 4_194_304;
 pub(super) const IMAGE_COUNT_MAX: usize = 4;
 pub(super) const LEVEL_COUNT_MAX: usize = 7;
 pub(super) const PORTABLE_RECORD_COUNT_MAX: usize = 14;
+pub(super) const CONTROL_COLLECTION_ITEMS_MAX: usize = 4_096;
 
 /// A strict experimental-v1 control-wire validation failure.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
