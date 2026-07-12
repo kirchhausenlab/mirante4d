@@ -96,6 +96,9 @@ The commit protocol is:
 
 Before the head switch, the complete old generation remains authoritative.
 After the durable switch, the complete new generation is authoritative.
+If execution stops after recovery sync but before the head switch,
+`recovery.current == head.current` is a recognized interrupted state: the old
+head remains authoritative and no ref is repaired automatically.
 Staged or published-but-unreferenced objects/generations are harmless orphans;
 a ref never points into staging or at a partial closure.
 

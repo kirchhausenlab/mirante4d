@@ -40,8 +40,8 @@ EXPECTED_MUTATIONS = [
     ("head-truncated", "ref_length"),
     ("head-checksum-flip", "ref_checksum"),
     ("head-target-missing", "missing_generation"),
-    ("manual-recovery-not-previous", "recovery_mismatch"),
-    ("autosave-recovery-not-previous", "recovery_mismatch"),
+    ("manual-recovery-unrelated-generation", "recovery_mismatch"),
+    ("autosave-recovery-unrelated-generation", "recovery_mismatch"),
     ("generation-byte-flip", "generation_digest"),
     ("generation-unknown-field", "unknown_field"),
     ("generation-project-mismatch", "project_mismatch"),
@@ -515,17 +515,13 @@ def validate_recovery_pair(
         require(recovery is None, "recovery_mismatch", recovery_path)
         return
     previous = head["previous"]
-    require(
-        (recovery is None) == (previous is None),
-        "recovery_mismatch",
-        recovery_path,
-    )
-    if recovery is not None:
-        require(
-            recovery["current"] == previous,
-            "recovery_mismatch",
-            recovery_path,
-        )
+    if recovery is None:
+        require(previous is None, "recovery_mismatch", recovery_path)
+        return
+    allowed = {head["current"]}
+    if previous is not None:
+        allowed.add(previous)
+    require(recovery["current"] in allowed, "recovery_mismatch", recovery_path)
 
 
 def validate_store(store_files: dict[str, bytes], expected: dict[str, Any]) -> dict[str, Any]:
@@ -780,6 +776,31 @@ def reseal_ref_generation(encoded: bytes, generation: str) -> bytes:
     return bytes(value)
 
 
+def recovery_ref_from_head(encoded: bytes, recovery_kind: int) -> bytes:
+    value = bytearray(encoded)
+    value[10] = recovery_kind
+    value[11] = 0
+    value[64:128] = bytes(64)
+    value[128:160] = hashlib.sha256(REF_DOMAIN + value[:128]).digest()
+    return bytes(value)
+
+
+def validate_recovery_ahead_state(
+    base_files: dict[str, bytes],
+    expected: dict[str, Any],
+    head_path: str,
+    recovery_path: str,
+    recovery_kind: int,
+    head_fact: str,
+    recovery_fact: str,
+) -> None:
+    files = dict(base_files)
+    facts = copy.deepcopy(expected)
+    files[recovery_path] = recovery_ref_from_head(files[head_path], recovery_kind)
+    facts[recovery_fact] = facts[head_fact]
+    validate_store(files, facts)
+
+
 def reseal_orphan(files: dict[str, bytes], expected: dict[str, Any], mutate: Any) -> tuple[str, dict[str, Any]]:
     old = expected["recovery_candidates"][0]
     path = generation_path(old)
@@ -841,13 +862,21 @@ def run_mutation(base_files: dict[str, bytes], expected: dict[str, Any], mutatio
         files["refs/head"] = bytes(value)
     elif mutation == "head-target-missing":
         files["refs/head"] = reseal_ref_current(files["refs/head"], 0x11)
-    elif mutation == "manual-recovery-not-previous":
+    elif mutation == "manual-recovery-unrelated-generation":
         files["refs/recovery"] = reseal_ref_generation(
-            files["refs/recovery"], expected["head"]
+            files["refs/recovery"], expected["recovery_candidates"][0]
         )
-    elif mutation == "autosave-recovery-not-previous":
+    elif mutation == "autosave-recovery-unrelated-generation":
+        source = expected["autosave_head"]
+        generation = decode_json(
+            files[generation_path(source)], "invalid_json", "autosave head"
+        )
+        generation["generation_sequence"] = "5"
+        encoded = canonical_json(generation)
+        unrelated = generation_identity(encoded)
+        files[generation_path(unrelated)] = encoded
         files["refs/autosave-recovery"] = reseal_ref_generation(
-            files["refs/autosave-recovery"], expected["autosave_head"]
+            files["refs/autosave-recovery"], unrelated
         )
     elif mutation == "generation-byte-flip":
         path = generation_path(expected["head"])
@@ -896,9 +925,20 @@ def validate_path(manifest_path: Path, self_test: bool) -> dict[str, Any]:
     files, stores = validate_manifest_document(manifest, manifest_path, manifest_bytes)
     split_stores(files, stores)
     mutation_count = 0
+    recovery_ahead_count = 0
     if self_test:
         recoverable = store_subset(files, "recoverable.m4dproj")
         expected = stores[0]
+        stale = store_subset(files, "stale.m4dproj")
+        stale_expected = stores[2]
+        for case in [
+            (recoverable, expected, "refs/head", "refs/recovery", 2, "head", "manual_recovery"),
+            (recoverable, expected, "refs/autosave-head", "refs/autosave-recovery", 4, "autosave_head", "autosave_recovery"),
+            (stale, stale_expected, "refs/head", "refs/recovery", 2, "head", "manual_recovery"),
+            (stale, stale_expected, "refs/autosave-head", "refs/autosave-recovery", 4, "autosave_head", "autosave_recovery"),
+        ]:
+            validate_recovery_ahead_state(*case)
+            recovery_ahead_count += 1
         for mutation, expected_fault in EXPECTED_MUTATIONS:
             try:
                 run_mutation(recoverable, expected, mutation)
@@ -918,6 +958,7 @@ def validate_path(manifest_path: Path, self_test: bool) -> dict[str, Any]:
     return {
         "archive_sha256": manifest["archive"]["sha256"],
         "mutations": mutation_count,
+        "recovery_ahead_states": recovery_ahead_count,
         "result": "passed",
         "stores": len(stores),
     }

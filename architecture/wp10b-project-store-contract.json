@@ -15,6 +15,10 @@
       "path": "architecture/wp10b-project-store-quaternion-correction.json",
       "sha256": "f2ec1d537e90536e8e67212d663e49823edac5eee30d0d45fccd0fb8e5d6876f"
     },
+    "recovery_ahead_correction": {
+      "path": "architecture/wp10b-project-store-recovery-ahead-correction.json",
+      "sha256": "dcc908615da8ba94c937fa4ae6745651734caf56f7583ef2638f9e9cc90a6aa1"
+    },
     "protected_main": {
       "commit": "b6e0267802f8ac2d0d49a0f04302fd321ef2f617",
       "tree": "b20b598603b47fdbe7c85c3b6d1cba8c78fd433e",
@@ -147,7 +151,7 @@
         "established": "refs/head is present; refs/autosave-head, when present, has a required base equal to its current generation's base_manual_generation_id; comparison with refs/head.current classifies it as same-base or divergent",
         "provisional": "refs/head and refs/recovery are absent; refs/autosave-head is present with base absent, and its current autosave generation has base_manual_generation_id=null; every other combination without refs/head is corruption"
       },
-      "recovery_pair_rule": "independently for the manual and autosave lanes, the recovery ref is present if and only if the corresponding head ref has previous present, and recovery.current equals head.previous exactly; a recovery ref never selects an independent generation"
+      "recovery_pair_rule": "independently for the manual and autosave lanes: without a head, recovery is forbidden; with a head, recovery may be absent only when head.previous is absent, recovery.current may equal present head.previous for a clean pair, or recovery.current may equal head.current for an interrupted pre-head commit; the existing head.current remains authoritative and no ref is repaired automatically; any other recovery target is corruption"
     },
     "generation": {
       "schema": "mirante4d-project-generation",
@@ -583,11 +587,11 @@
     "schema": "mirante4d-foundation-project-fixture-manifest",
     "schema_version": 1,
     "tier": "T1-project",
-    "sha256": "f7509169e1557a46fcfebe14a0eb2c6a4622681b5c6682515b2a89440494a1d2",
+    "sha256": "2b7fa7c74dda59d41a5fdd32288d18ee9ef9ea28e5ea3449a488c164354037bb",
     "archive_bytes_max": 4194304,
     "producer": "independent Python producer",
     "validator": "dependency-isolated read-only Python validator",
-    "required_cases": "established newer autosave, stale same-base autosave, divergent autosave, provisional autosave-only project, and exact manual/autosave recovery-to-previous pairing"
+    "required_cases": "established newer autosave, stale same-base autosave, divergent autosave, provisional autosave-only project, exact manual/autosave recovery-to-previous pairing, positive recovery-ahead with and without head.previous, and unrelated same-lane recovery rejection"
   },
   "verification": {
     "trusted_lane": "cargo xtask verify-local project-store-lifecycle",

@@ -25,6 +25,10 @@ const QUATERNION_CORRECTION_PATH: &str =
     "architecture/wp10b-project-store-quaternion-correction.json";
 const QUATERNION_CORRECTION_SHA256: &str =
     "f2ec1d537e90536e8e67212d663e49823edac5eee30d0d45fccd0fb8e5d6876f";
+const RECOVERY_AHEAD_CORRECTION_PATH: &str =
+    "architecture/wp10b-project-store-recovery-ahead-correction.json";
+const RECOVERY_AHEAD_CORRECTION_SHA256: &str =
+    "dcc908615da8ba94c937fa4ae6745651734caf56f7583ef2638f9e9cc90a6aa1";
 const PROTECTED_MAIN_COMMIT: &str = "b6e0267802f8ac2d0d49a0f04302fd321ef2f617";
 const PROTECTED_MAIN_TREE: &str = "b20b598603b47fdbe7c85c3b6d1cba8c78fd433e";
 const PROTECTED_MAIN_RUN: &str =
@@ -39,7 +43,7 @@ const ZERO_SHA256: &str = "00000000000000000000000000000000000000000000000000000
 // wire, limit, API, and transition fact while allowing the independent fixture
 // producer to be bound after it has emitted its final manifest.
 const NORMALIZED_CONTRACT_SHA256: &str =
-    "708f471f451b1d21d23728c5b128c42203bb1de94c0080833fb1dc3d54d5fc64";
+    "b13dd04c37d816d4437ee9cfb564765eca60c10e2d04735db8baffbf8406148d";
 
 pub(super) fn check_wp10b_project_store_contract(repo_root: &Path) -> anyhow::Result<()> {
     let contract_path = repo_root.join(CONTRACT_PATH);
@@ -72,6 +76,11 @@ fn validate_header_and_bindings(repo_root: &Path, contract: &Value) -> anyhow::R
             "quaternion_correction",
             QUATERNION_CORRECTION_PATH,
             QUATERNION_CORRECTION_SHA256,
+        ),
+        (
+            "recovery_ahead_correction",
+            RECOVERY_AHEAD_CORRECTION_PATH,
+            RECOVERY_AHEAD_CORRECTION_SHA256,
         ),
     ] {
         expect_string(contract, &format!("/bindings/{name}/path"), path)?;
