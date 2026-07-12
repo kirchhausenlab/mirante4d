@@ -28,7 +28,7 @@ const CONTROL_WIRE_PATH: &str = "architecture/wp10a-control-wire-specialization.
 const CONTROL_WIRE_SCHEMA: &str = "mirante4d-wp10a-control-wire-specialization";
 const CONTROL_WIRE_SCHEMA_VERSION: u64 = 1;
 const CONTROL_WIRE_SHA256: &str =
-    "6275b9bd4e7b7fc8fe4c19785bc8cc6a9b3705a11cac5b4ad2cd57c160ac5202";
+    "4f58fd6949f501b33c91fca069b4c81b5d131f8021859d6130edee3834a14a50";
 const STORAGE_CRATE: &str = "mirante4d-storage";
 const STORAGE_PATH: &str = "crates/mirante4d-storage";
 const DEPENDENCY_KINDS: [&str; 3] = ["normal", "dev", "build"];

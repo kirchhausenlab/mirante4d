@@ -176,6 +176,18 @@
     "descriptor_policy": "the packed-index shard descriptor is mandatory; pixel and explicit-validity shard descriptors may be absent until the packed record proves fill elision",
     "non_claims": "planning reads no shard bytes and proves no payload CRC, shard digest, packed record, or scientific value"
   },
+  "local_brick_read": {
+    "input": "one descriptor-derived LocalBrickAddressPlan from an authenticated local metadata catalog",
+    "exposure": "crate-private precursor only until full manifest SHA-256 validation can issue an explicit package-integrity capability",
+    "range_io": "for each selected component, open the checked shard once, read and validate its exact fixed end-index tail, then read at most the selected encoded inner-payload range through the same file handle",
+    "selection_order": "read the mandatory packed-index component first; read pixels only when the validated packed record declares a pixel payload; read explicit validity only when the validated record has a positive valid-voxel count",
+    "integrity": "require exact manifest-declared object length, canonical zero-slack shard index structure, CRC32C for the index and each selected inner payload, bounded zstd output, requested packed-record coordinates, and profile-consistent validity mode",
+    "elision": "a missing pixel inner payload is accepted only when the packed record validates fill elision; a missing explicit-validity payload is accepted only for an all-invalid record; every selected required inner payload must be present",
+    "result": "return the validated packed record, exact nonpadded edge extent, optional fixed-capacity decoded pixel and validity payloads, and storage-boundary range/read/decode counters",
+    "amplification": "enforce the frozen absolute cold-request, encoded-read-byte, and decoded-byte ceilings for regular and fully elided one-brick reads",
+    "authority_stability": "file device, inode, length, mtime, and ctime are checked around each component read and every used shard receives one final bounded identity sweep",
+    "non_claims": "returned bytes cannot be attributed to the catalog PackageId; the operation does not verify whole-object manifest SHA-256, perform DS-specific admission or complete-package validation, compute scientific identity, or establish product support"
+  },
   "portable_records": {
     "scope": "initial package-contained version-1 portable records; adding another source or license literal is a hard schema change",
     "collection_items_max": 4096,

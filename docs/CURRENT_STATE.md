@@ -70,9 +70,12 @@ group/array metadata, closed OME image-group metadata, root-confined bounded
 Unix range reads, and an authenticated local metadata catalog now exist. A
 separate cancellable inventory checks the exact finalized file/ancestor-
 directory closure, object types and lengths, counts, depth, and fan-out under
-global bounds. Descriptor-derived address plans now validate one requested
-brick and derive its pixel, validity, and packed-index shard locations without
-reading payloads. DS-specific admission, shard reads, the writer,
+global bounds. Descriptor-derived address plans validate one requested brick;
+an internal catalog path can then read only its packed-index, pixel, and
+validity ranges, verify their index/inner CRC32C and bounded zstd decoding,
+apply record-authorized fill elision, and report exact storage-boundary
+counters. It remains crate-private until full SHA-256 validation can gate
+PackageId-attributed reads. DS-specific admission, the writer,
 structural/full validation, the independent T1 corpus, and product activation
 remain incomplete.
 Current schema-1 packages remain transitional T2 fixtures and the sole product

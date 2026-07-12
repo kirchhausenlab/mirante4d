@@ -6,6 +6,7 @@ use thiserror::Error;
 
 use crate::brick_address::plan_local_brick_address;
 use crate::directory_inventory::{ExpectedFile, ExpectedFileRole, inspect_directory_closure};
+use crate::package_read::{LocalBrickRead, PackageReadError, read_local_brick};
 use crate::{
     ControlError, DisplayDefaults, LocalPackageReader, MAX_PORTABLE_CONTROL_OBJECT_BYTES,
     MAX_PROFILE_HEADER_BYTES, MAX_ZARR_METADATA_BYTES, ManifestPage, ManifestRoot,
@@ -209,6 +210,21 @@ impl LocalPackageCatalog {
             &self.descriptors,
             coordinates,
         )
+    }
+
+    /// Reads CRC-checked ranges for one brick without establishing manifest
+    /// SHA-256 identity.
+    ///
+    /// This remains crate-private until the full validator can issue a
+    /// package-integrity capability. Callers must not attribute the returned
+    /// bytes to the catalog's claimed `PackageId` before that validation.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn read_crc_checked_brick_unverified(
+        &self,
+        coordinates: crate::PackedIndexCoordinates,
+    ) -> Result<LocalBrickRead, PackageReadError> {
+        let plan = self.plan_brick_storage(coordinates)?;
+        read_local_brick(&self.reader, &self.descriptors, plan)
     }
 
     /// Inspects the exact finalized file and ancestor-directory closure.
@@ -791,6 +807,16 @@ mod tests {
         UnitlessOme,
     }
 
+    #[derive(Clone, Copy)]
+    enum BrickFixture {
+        PixelPresent,
+        AllFill,
+        ExplicitValidity,
+        MissingPixelInner,
+        PackedCoordinateMismatch,
+        PackedValidityMismatch,
+    }
+
     struct TempRoot(PathBuf);
 
     impl TempRoot {
@@ -853,21 +879,94 @@ mod tests {
         .unwrap()
     }
 
+    fn fixture_shards(brick: BrickFixture) -> (Option<Vec<u8>>, Vec<u8>, Option<Vec<u8>>) {
+        let pixel_kind = ShardProfileKind::Pixel2dUint8;
+        let mut pixel_payload = vec![0; pixel_kind.decoded_inner_bytes()];
+        pixel_payload[..6].copy_from_slice(&[0, 1, 2, 0, 0, 0]);
+        let mut pixel_chunks = vec![None; pixel_kind.chunks_per_shard()];
+        if !matches!(
+            brick,
+            BrickFixture::AllFill | BrickFixture::MissingPixelInner
+        ) {
+            pixel_chunks[0] = Some(pixel_payload.as_slice());
+        }
+        let pixel_shard = (!matches!(brick, BrickFixture::AllFill))
+            .then(|| crate::shard::assemble_shard(pixel_kind, &pixel_chunks).unwrap());
+
+        let packed_kind = ShardProfileKind::PackedIndex;
+        let mut packed_payload = vec![0; packed_kind.decoded_inner_bytes()];
+        let coordinates = if matches!(brick, BrickFixture::PackedCoordinateMismatch) {
+            crate::PackedIndexCoordinates::new(0, 0, 0, 0, 0, 0, 1)
+        } else {
+            crate::PackedIndexCoordinates::new(0, 0, 0, 0, 0, 0, 0)
+        };
+        let explicit_validity = matches!(
+            brick,
+            BrickFixture::ExplicitValidity | BrickFixture::PackedValidityMismatch
+        );
+        let (statistics, pixel_present) = if matches!(brick, BrickFixture::AllFill) {
+            (crate::PackedIndexStatistics::new(6, 0, Some((0, 0))), false)
+        } else if matches!(brick, BrickFixture::ExplicitValidity) {
+            (crate::PackedIndexStatistics::new(3, 2, Some((0, 2))), true)
+        } else {
+            (crate::PackedIndexStatistics::new(6, 2, Some((0, 2))), true)
+        };
+        let record = crate::PackedIndexRecord::new(
+            coordinates,
+            statistics,
+            pixel_present,
+            explicit_validity,
+            IntensityDType::Uint8,
+            6,
+        )
+        .unwrap();
+        packed_payload[..crate::PACKED_INDEX_RECORD_BYTES as usize]
+            .copy_from_slice(&record.encode());
+        let mut packed_chunks = vec![None; packed_kind.chunks_per_shard()];
+        packed_chunks[0] = Some(packed_payload.as_slice());
+        let packed_shard = crate::shard::assemble_shard(packed_kind, &packed_chunks).unwrap();
+
+        let validity_shard = matches!(brick, BrickFixture::ExplicitValidity).then(|| {
+            let kind = ShardProfileKind::Validity2d;
+            let mut payload = vec![0; kind.decoded_inner_bytes()];
+            payload[0] = 0b0000_0111;
+            let mut chunks = vec![None; kind.chunks_per_shard()];
+            chunks[0] = Some(payload.as_slice());
+            crate::shard::assemble_shard(kind, &chunks).unwrap()
+        });
+        (pixel_shard, packed_shard, validity_shard)
+    }
+
     fn fixture(drift: FixtureDrift) -> TempRoot {
+        fixture_with_brick(drift, BrickFixture::PixelPresent)
+    }
+
+    fn fixture_with_brick(drift: FixtureDrift, brick: BrickFixture) -> TempRoot {
         let root = TempRoot::new();
         let temporal = ScienceTemporalCalibration::regular(bits64("3ff0000000000000")).unwrap();
-        let profile_level = ProfileLevel::new(0, 0, ProfileValidityMode::AllValid).unwrap();
+        let explicit_validity = matches!(brick, BrickFixture::ExplicitValidity);
+        let validity_mode = if explicit_validity {
+            ProfileValidityMode::Explicit
+        } else {
+            ProfileValidityMode::AllValid
+        };
+        let profile_level = ProfileLevel::new(0, 0, validity_mode).unwrap();
         let image = crate::ProfileImage::new(
             0,
             vec![ProfileLogicalLayer::new(LogicalLayerKey::new(0), 0)],
             vec![profile_level],
         )
         .unwrap();
+        let (pixel_shard, packed_shard, validity_shard) = fixture_shards(brick);
         let profile = ProfileHeader::new(
             scientific_id(),
             vec![image.clone()],
             0,
-            OmeInteroperabilityBase::Io2,
+            if explicit_validity {
+                OmeInteroperabilityBase::Io1
+            } else {
+                OmeInteroperabilityBase::Io2
+            },
         )
         .unwrap();
         let science = ScienceDescriptor::new(
@@ -987,14 +1086,35 @@ mod tests {
                 ),
             ),
             (
-                "images/i00000000/s00/c/0/0/0/0/0".to_owned(),
-                (PackageObjectKind::PixelShard, Vec::new()),
-            ),
-            (
                 "indexes/i00000000-s00/c/0/0".to_owned(),
-                (PackageObjectKind::PackedIndexShard, Vec::new()),
+                (PackageObjectKind::PackedIndexShard, packed_shard),
             ),
         ]);
+        if let Some(pixel_shard) = pixel_shard {
+            objects.insert(
+                "images/i00000000/s00/c/0/0/0/0/0".to_owned(),
+                (PackageObjectKind::PixelShard, pixel_shard),
+            );
+        }
+        if explicit_validity {
+            objects.insert(
+                "validity/i00000000-s00/zarr.json".to_owned(),
+                (
+                    PackageObjectKind::ZarrValidityArray,
+                    ZarrArrayMetadata::new(ShardProfileKind::Validity2d, vec![1, 1, 1, 2, 1])
+                        .unwrap()
+                        .deterministic_bytes()
+                        .unwrap(),
+                ),
+            );
+            objects.insert(
+                "validity/i00000000-s00/c/0/0/0/0/0".to_owned(),
+                (
+                    PackageObjectKind::ValidityShard,
+                    validity_shard.expect("explicit fixture has validity shard"),
+                ),
+            );
+        }
         if matches!(drift, FixtureDrift::ExtraMetadata) {
             objects.insert(
                 "images/i00000001/zarr.json".to_owned(),
@@ -1200,6 +1320,148 @@ mod tests {
         assert!(matches!(
             catalog.plan_brick_storage(coordinates),
             Err(crate::BrickAddressError::MissingPackedIndexShard { .. })
+        ));
+    }
+
+    #[test]
+    fn reads_one_crc_checked_brick_with_bounded_ranges() {
+        let root = fixture(FixtureDrift::None);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        let coordinates = crate::PackedIndexCoordinates::new(0, 0, 0, 0, 0, 0, 0);
+        let brick = catalog
+            .read_crc_checked_brick_unverified(coordinates)
+            .unwrap();
+        assert_eq!(brick.record().coordinates(), coordinates);
+        assert_eq!(brick.logical_extent_zyx(), [1, 2, 3]);
+        assert_eq!(&brick.pixel_payload().unwrap()[..6], &[0, 1, 2, 0, 0, 0]);
+        assert_eq!(brick.pixel_payload().unwrap().len(), 65_536);
+        assert_eq!(brick.validity_payload(), None);
+        assert_eq!(brick.range_requests(), 4);
+        assert_eq!(
+            brick.encoded_bytes_read(),
+            fs::metadata(root.0.join("images/i00000000/s00/c/0/0/0/0/0"))
+                .unwrap()
+                .len()
+                + fs::metadata(root.0.join("indexes/i00000000-s00/c/0/0"))
+                    .unwrap()
+                    .len()
+        );
+        assert!(
+            brick.encoded_bytes_read()
+                <= crate::amplification_2d(IntensityDType::Uint8).read_bytes_max
+        );
+        assert_eq!(brick.decoded_bytes(), 83_200);
+
+        let root = fixture_with_brick(FixtureDrift::None, BrickFixture::AllFill);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        let brick = catalog
+            .read_crc_checked_brick_unverified(coordinates)
+            .unwrap();
+        assert_eq!(brick.pixel_payload(), None);
+        assert_eq!(brick.validity_payload(), None);
+        assert_eq!(brick.range_requests(), 2);
+        assert_eq!(brick.decoded_bytes(), 17_408);
+        assert_eq!(
+            brick.encoded_bytes_read(),
+            fs::metadata(root.0.join("indexes/i00000000-s00/c/0/0"))
+                .unwrap()
+                .len()
+        );
+
+        let root = fixture_with_brick(FixtureDrift::None, BrickFixture::ExplicitValidity);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        let brick = catalog
+            .read_crc_checked_brick_unverified(coordinates)
+            .unwrap();
+        assert!(brick.pixel_payload().is_some());
+        assert_eq!(brick.validity_payload().unwrap()[0], 0b0000_0111);
+        assert_eq!(brick.range_requests(), 6);
+        assert_eq!(brick.decoded_bytes(), 91_648);
+        assert_eq!(
+            brick.encoded_bytes_read(),
+            [
+                "images/i00000000/s00/c/0/0/0/0/0",
+                "validity/i00000000-s00/c/0/0/0/0/0",
+                "indexes/i00000000-s00/c/0/0",
+            ]
+            .into_iter()
+            .map(|path| fs::metadata(root.0.join(path)).unwrap().len())
+            .sum::<u64>()
+        );
+        let limits = crate::amplification_2d(IntensityDType::Uint8);
+        assert!(brick.encoded_bytes_read() <= limits.read_bytes_max);
+        assert_eq!(brick.decoded_bytes(), limits.decoded_bytes_max);
+
+        let root = fixture(FixtureDrift::None);
+        let mut catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        catalog
+            .descriptors
+            .retain(|descriptor| descriptor.kind() != PackageObjectKind::PixelShard);
+        assert!(matches!(
+            catalog.read_crc_checked_brick_unverified(coordinates),
+            Err(PackageReadError::MissingRequiredShardDescriptor {
+                component: "pixel",
+                ..
+            })
+        ));
+
+        let root = fixture_with_brick(FixtureDrift::None, BrickFixture::MissingPixelInner);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        assert!(matches!(
+            catalog.read_crc_checked_brick_unverified(coordinates),
+            Err(PackageReadError::MissingRequiredInnerPayload {
+                component: "pixel",
+                ..
+            })
+        ));
+
+        let root = fixture_with_brick(FixtureDrift::None, BrickFixture::PackedCoordinateMismatch);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        assert_eq!(
+            catalog.read_crc_checked_brick_unverified(coordinates),
+            Err(PackageReadError::PackedRecordCoordinateMismatch)
+        );
+
+        let root = fixture_with_brick(FixtureDrift::None, BrickFixture::PackedValidityMismatch);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        assert_eq!(
+            catalog.read_crc_checked_brick_unverified(coordinates),
+            Err(PackageReadError::PackedRecordValidityMismatch)
+        );
+
+        let root = fixture(FixtureDrift::None);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        let packed = root.0.join("indexes/i00000000-s00/c/0/0");
+        let mut bytes = fs::read(&packed).unwrap();
+        bytes.push(0);
+        fs::write(packed, bytes).unwrap();
+        assert!(matches!(
+            catalog.read_crc_checked_brick_unverified(coordinates),
+            Err(PackageReadError::ObjectLengthMismatch { .. })
+        ));
+
+        let root = fixture(FixtureDrift::None);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        let packed = root.0.join("indexes/i00000000-s00/c/0/0");
+        let mut bytes = fs::read(&packed).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        fs::write(packed, bytes).unwrap();
+        assert!(matches!(
+            catalog.read_crc_checked_brick_unverified(coordinates),
+            Err(PackageReadError::Shard(
+                crate::ShardCodecError::IndexChecksumMismatch
+            ))
+        ));
+
+        let root = fixture(FixtureDrift::None);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        let pixel = root.0.join("images/i00000000/s00/c/0/0/0/0/0");
+        let mut bytes = fs::read(&pixel).unwrap();
+        bytes[0] ^= 1;
+        fs::write(pixel, bytes).unwrap();
+        assert!(matches!(
+            catalog.read_crc_checked_brick_unverified(coordinates),
+            Err(PackageReadError::Shard(_))
         ));
     }
 }

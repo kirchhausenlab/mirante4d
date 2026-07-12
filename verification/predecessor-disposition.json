@@ -4813,6 +4813,14 @@
       "reason": "WP-10A authenticates canonical manifest pages and exact opening metadata without implicitly sweeping shard payloads."
     },
     {
+      "id": "libtest:mirante4d-storage:package_catalog::tests::reads_one_crc_checked_brick_with_bounded_ranges",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves bounded 2D pixel-present, all-fill, and explicit-validity brick reads; exact storage-boundary accounting; packed-record cross-checks; required payload failures; and selected index/inner corruption rejection."
+    },
+    {
       "id": "libtest:mirante4d-storage:package_catalog::tests::rejects_cross_object_layer_drift_and_unexpected_metadata",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -4827,6 +4835,14 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
       "reason": "WP-10A rejects manifest-page and opening-metadata length or digest corruption before catalog admission."
+    },
+    {
+      "id": "libtest:mirante4d-storage:package_read::tests::amplification_checker_accepts_exact_limits_and_rejects_one_above",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A accepts exact regular and all-fill one-brick amplification limits and rejects each metric immediately above its ceiling."
     },
     {
       "id": "libtest:mirante4d-storage:range_io::tests::reads_only_the_requested_nonempty_range_and_index_tail",
@@ -4963,6 +4979,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 415
+    "current_additions": 417
   }
 }

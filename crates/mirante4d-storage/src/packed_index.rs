@@ -301,6 +301,13 @@ pub enum PackedIndexError {
     ImplicitValidityNotAllValid,
     #[error("pixel payload is absent despite {nonfill} valid nonfill voxels")]
     MissingOccupiedPixelPayload { nonfill: u64 },
+    #[error(
+        "pixel payload is absent, but numeric range bits {minimum_bits:#018x} through {maximum_bits:#018x} do not prove the positive-zero profile fill"
+    )]
+    FillElisionRangeMismatch {
+        minimum_bits: u64,
+        maximum_bits: u64,
+    },
     #[error("numeric range bits must both be zero when the range-present flag is clear")]
     UnexpectedNumericRangeBits,
     #[error("{field} bits {bits:#018x} are not a zero-extended {dtype:?} value")]
@@ -389,7 +396,14 @@ fn validate(
         return Ok(());
     }
 
-    validate_numeric_range(dtype, minimum_bits, maximum_bits)
+    validate_numeric_range(dtype, minimum_bits, maximum_bits)?;
+    if !flag(flags, FLAG_PIXEL_PAYLOAD_PRESENT) && (minimum_bits != 0 || maximum_bits != 0) {
+        return Err(PackedIndexError::FillElisionRangeMismatch {
+            minimum_bits,
+            maximum_bits,
+        });
+    }
+    Ok(())
 }
 
 fn validate_numeric_range(
@@ -558,6 +572,28 @@ mod tests {
             fill.flags_bits(),
             FLAG_ALL_VALID | FLAG_NUMERIC_RANGE_PRESENT
         );
+        assert!(matches!(
+            PackedIndexRecord::new(
+                coordinates(),
+                PackedIndexStatistics::new(64, 0, Some((5, 5))),
+                false,
+                false,
+                IntensityDType::Uint8,
+                64,
+            ),
+            Err(PackedIndexError::FillElisionRangeMismatch { .. })
+        ));
+        assert!(matches!(
+            PackedIndexRecord::new(
+                coordinates(),
+                PackedIndexStatistics::new(64, 0, Some((0x8000_0000, 0))),
+                false,
+                false,
+                IntensityDType::Float32,
+                64,
+            ),
+            Err(PackedIndexError::FillElisionRangeMismatch { .. })
+        ));
 
         let signed_zero = PackedIndexRecord::new(
             coordinates(),

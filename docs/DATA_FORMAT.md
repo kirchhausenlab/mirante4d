@@ -74,18 +74,24 @@ release DTOs are implemented. The fixed packed-index record and bounded
 zstd/CRC32C inner-payload and end-index codecs implement the selected binary
 layer in memory. Strict Zarr group/array metadata, closed OME image-group axes
 and transforms, and bounded root-confined Unix object-range reads are
-implemented. The integrated package reader, writer, and validator are not yet
-implemented. A bounded local catalog now authenticates the manifest root/pages,
-verifies opening-critical metadata bytes, parses the closed control/Zarr/OME
-objects, and checks their layer, time, geometry, dtype, shape, validity, and
-packed-index-count relationships. A separate cancellable inventory enforces
-the exact finalized file and ancestor-directory closure, safe object types,
-declared lengths, and globally bounded counts/fan-out without reading payload
-bytes. It reports directory depth and reauthenticates manifest authority around
-the scan. One-brick address planning validates requested coordinates and
-derives exact pixel, validity, and packed-index shard paths, inner slots,
-packed-record offsets, and edge extents without reading shard bytes. DS-
-specific admission and shard-payload verification remain incomplete.
+implemented. The complete target package reader, writer, and validator are not
+yet implemented. A bounded local catalog now authenticates the manifest
+root/pages, verifies opening-critical metadata bytes, parses the closed
+control/Zarr/OME objects, and checks their layer, time, geometry, dtype, shape,
+validity, and packed-index-count relationships. A separate cancellable
+inventory enforces the exact finalized file and ancestor-directory closure,
+safe object types, declared lengths, and globally bounded counts/fan-out
+without reading payload bytes. It reports directory depth and reauthenticates
+manifest authority around the scan. One-brick address planning validates
+requested coordinates and derives exact pixel, validity, and packed-index
+shard paths, inner slots, packed-record offsets, and edge extents. From that
+plan, an internal read path fetches only the selected shard-index and inner-
+payload ranges, validates index and inner CRC32C plus bounded zstd output, and
+uses the packed record to authorize pixel or validity fill elision. It exposes
+exact request/read/decode counters and enforces the frozen absolute ceilings.
+The path remains crate-private and its bytes cannot be attributed to a
+PackageId until whole-object manifest SHA-256 validation exists. DS-specific
+admission and complete-package validation remain incomplete.
 
 WP-10B separately installs immutable content-addressed project objects,
 complete generations, atomic head/recovery refs, leases, autosave/recovery,

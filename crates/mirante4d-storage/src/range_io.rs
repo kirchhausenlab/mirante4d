@@ -8,7 +8,10 @@ use std::{
 use std::os::unix::fs::MetadataExt;
 use thiserror::Error;
 
-use crate::{GLOBAL_ENCODED_OUTER_SHARD_BYTES_MAX, PackagePath};
+use crate::{
+    GLOBAL_ENCODED_OUTER_SHARD_BYTES_MAX, PackagePath, ShardCodecError, ShardProfileKind,
+    decode_shard_index_tail,
+};
 
 pub const SHARD_INDEX_RANGE_READ_BYTES_MAX: u64 = 4_096;
 
@@ -16,6 +19,32 @@ pub const SHARD_INDEX_RANGE_READ_BYTES_MAX: u64 = 4_096;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LocalObjectInfo {
     bytes: u64,
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct LocalShardChunkBytes {
+    pub(crate) encoded: Option<Vec<u8>>,
+    pub(crate) range_requests: u8,
+    pub(crate) encoded_bytes_read: u64,
+    pub(crate) decoded_index_bytes: u64,
+    pub(crate) snapshot: LocalObjectSnapshot,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct LocalObjectSnapshot {
+    path: PackagePath,
+    bytes: u64,
+    identity: FileIdentity,
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum LocalShardChunkReadError {
+    Range(RangeReadError),
+    Shard(ShardCodecError),
+    DeclaredLengthMismatch { expected: u64, actual: u64 },
 }
 
 impl LocalObjectInfo {
@@ -145,6 +174,94 @@ impl LocalPackageReader {
         Ok((bytes, payload_bytes))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn read_shard_chunk(
+        &self,
+        path: &PackagePath,
+        kind: ShardProfileKind,
+        chunk_index: usize,
+        declared_bytes: u64,
+    ) -> Result<LocalShardChunkBytes, LocalShardChunkReadError> {
+        let mut checked = self
+            .open_object(
+                path,
+                u64::try_from(kind.encoded_shard_bytes_max()).map_err(|_| {
+                    LocalShardChunkReadError::Shard(ShardCodecError::LengthOverflow)
+                })?,
+            )
+            .map_err(LocalShardChunkReadError::Range)?;
+        let result = (|| {
+            if checked.bytes != declared_bytes {
+                return Err(LocalShardChunkReadError::DeclaredLengthMismatch {
+                    expected: declared_bytes,
+                    actual: checked.bytes,
+                });
+            }
+            let tail_bytes = u64::try_from(kind.index_tail_bytes())
+                .map_err(|_| LocalShardChunkReadError::Shard(ShardCodecError::LengthOverflow))?;
+            if tail_bytes > checked.bytes {
+                return Err(LocalShardChunkReadError::Range(
+                    RangeReadError::RangeOutOfBounds {
+                        offset: 0,
+                        length: tail_bytes,
+                        object_bytes: checked.bytes,
+                    },
+                ));
+            }
+            let payload_bytes = checked.bytes - tail_bytes;
+            let tail = read_exact_at(&mut checked.file, path, payload_bytes, tail_bytes)
+                .map_err(LocalShardChunkReadError::Range)?;
+            let index = decode_shard_index_tail(kind, &tail, payload_bytes)
+                .map_err(LocalShardChunkReadError::Shard)?;
+            let entry = index
+                .entry(chunk_index)
+                .map_err(LocalShardChunkReadError::Shard)?;
+            let encoded = entry
+                .map(|entry| {
+                    read_exact_at(&mut checked.file, path, entry.offset(), entry.nbytes())
+                        .map_err(LocalShardChunkReadError::Range)
+                })
+                .transpose()?;
+            let encoded_payload_bytes = entry.map_or(0, |entry| entry.nbytes());
+            let encoded_bytes_read = tail_bytes.checked_add(encoded_payload_bytes).ok_or(
+                LocalShardChunkReadError::Shard(ShardCodecError::LengthOverflow),
+            )?;
+            let decoded_index_bytes = u64::try_from(kind.index_tail_bytes() - 4)
+                .map_err(|_| LocalShardChunkReadError::Shard(ShardCodecError::LengthOverflow))?;
+            Ok(LocalShardChunkBytes {
+                encoded,
+                range_requests: if entry.is_some() { 2 } else { 1 },
+                encoded_bytes_read,
+                decoded_index_bytes,
+                snapshot: LocalObjectSnapshot {
+                    path: path.clone(),
+                    bytes: checked.bytes,
+                    identity: checked.identity,
+                },
+            })
+        })();
+        self.revalidate_open_object(path, &checked)
+            .map_err(LocalShardChunkReadError::Range)?;
+        result
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn revalidate_snapshots(
+        &self,
+        snapshots: &[LocalObjectSnapshot],
+    ) -> Result<(), RangeReadError> {
+        for snapshot in snapshots {
+            let checked = self.open_object(&snapshot.path, snapshot.bytes)?;
+            if checked.bytes != snapshot.bytes || checked.identity != snapshot.identity {
+                return Err(RangeReadError::ObjectChanged {
+                    path: snapshot.path.to_string(),
+                });
+            }
+            self.revalidate_open_object(&snapshot.path, &checked)?;
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     fn open_object(
         &self,
@@ -207,7 +324,7 @@ impl LocalPackageReader {
         let metadata = symlink_metadata(&self.root, "reinspect package root", "<root>")?;
         if metadata.file_type().is_symlink()
             || !metadata.is_dir()
-            || FileIdentity::from_metadata(&metadata) != self.root_identity
+            || !FileIdentity::from_metadata(&metadata).same_node(self.root_identity)
         {
             return Err(RangeReadError::RootChanged);
         }
@@ -351,14 +468,26 @@ struct CheckedObject {
 struct FileIdentity {
     device: u64,
     inode: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
 }
 
 impl FileIdentity {
+    const fn same_node(self, other: Self) -> bool {
+        self.device == other.device && self.inode == other.inode
+    }
+
     #[cfg(unix)]
     fn from_metadata(metadata: &Metadata) -> Self {
         Self {
             device: metadata.dev(),
             inode: metadata.ino(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
         }
     }
 }

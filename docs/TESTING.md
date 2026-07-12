@@ -142,6 +142,14 @@ record offset. They also prove coordinate/overflow rejection, mandatory packed-
 index descriptors, and optional fill-elided pixel descriptors. They read no
 shard bytes and make no payload-integrity claim.
 
+The crate-private one-brick read test covers 2D uint8 pixel-present, all-fill,
+and explicit-validity cases with exact two-, four-, and six-request accounting.
+It also checks edge extent, required descriptor/inner failures, packed-record
+cross-checks, length drift, and selected packed-index/pixel corruption. A
+focused boundary test accepts each exact absolute amplification ceiling and
+rejects one unit above it. These tests do not prove 3D, incompressible, whole-
+object SHA-256, DS-admission, complete-package, or PackageId-attributed reads.
+
 The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).
 

@@ -395,7 +395,7 @@ pub fn decode_shard_index_tail(
 /// Internal deterministic assembler. The package writer will supply missing
 /// slots only after semantic fill-elision validation exists.
 #[cfg(test)]
-fn assemble_shard(
+pub(crate) fn assemble_shard(
     kind: ShardProfileKind,
     decoded_chunks: &[Option<&[u8]>],
 ) -> Result<Vec<u8>, ShardCodecError> {
