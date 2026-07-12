@@ -10,19 +10,36 @@ native-checker-only dev/test exceptions are documented here and enforced by
 
 ## Active Exceptions
 
-### `paste`
+### `EXC-PASTE-WP10A-1` — `paste`
 
 Allowed advisory exception:
 
 - `RUSTSEC-2024-0436`
 
-Reason: `paste` is currently pulled transitively by `zarrs` and related `zarrs_*` crates. The RustSec advisory marks it unmaintained, but reports no safe upgrade. Mirante4D keeps this exception narrow and must remove it once the upstream Zarr dependency graph no longer requires `paste`, or replace the storage dependency if the exception becomes a practical maintenance risk.
+Exact reviewed inclusion graph:
+
+- `paste 1.0.15`
+- `zarrs 0.23.13`
+- `zarrs_data_type 0.9.0`
+- `zarrs_plugin 0.4.1`
+
+The dependency gate checks the all-features metadata graph, including every
+target-conditioned edge. It rejects workspace paths that bypass
+`mirante4d-data` or `mirante4d-format`, and rejects any path from
+`mirante4d-storage` to this exception.
+
+Reason: the current schema-1 bridge in `mirante4d-format` and `mirante4d-data`
+still needs this released Zarr graph. RustSec classifies the advisory as
+unmaintained information and provides no patched `paste` release. This is not
+authorization for target storage to inherit the exception; WP-10A must choose
+that implementation dependency separately in its profile-freeze supplement.
 
 Owner: Mirante4D maintainers.
 
-Expiry: WP-10A entry. The data-format package must either remove this
-transitive dependency or explicitly replace this exception before beginning
-the canonical storage implementation.
+Review: on every Zarr dependency update.
+
+Expiry: when the current schema-1 path is deleted at WP-10C, or earlier if an
+upstream release removes `paste`.
 
 ### `epaint_default_fonts`
 
