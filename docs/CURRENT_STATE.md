@@ -97,12 +97,15 @@ core 3.0, bytes, CRC32C, indexed-sharding, and registered zstd source artifacts
 in a small offline digest-checked mirror. A hash-locked zarr-python 3.2.1 probe
 independently decodes one manually built array using the selected shard subset.
 That diagnostic is not T1, IO-3, OME semantic readback, or complete-package
-evidence. The next WP-10A-C checkpoint has frozen the three required synthetic
-DS-0 case specifications, a zero-dependency fact oracle that reads only those
-specifications, and separate static hand vectors for critical scientific,
-Merkle, packed-index, manifest, and identity frames. Their outputs remain
-ignored candidates: no target archives or T1 promotion exist yet, and
-`target_format_t1_available` remains false. Replacement, import/multiscale generation, scientific-ID
+evidence. WP-10A-C has frozen the three required synthetic DS-0 case
+specifications, a zero-dependency fact oracle, separate static critical hand
+vectors, compact mutation recipes, and an independent stdlib-only byte
+producer. The producer consumes oracle ScientificContentIds only as opaque
+inputs and deterministically emits three bounded candidate package archives
+with operational package and inventory facts beneath ignored target storage.
+No archive is tracked or promoted; no independent reader/schema report or
+registry flip exists, and `target_format_t1_available` remains false.
+Replacement, import/multiscale generation, production scientific-ID
 computation, the independent T1 corpus, and product activation remain
 incomplete.
 Current schema-1 packages remain transitional T2 fixtures and the sole product

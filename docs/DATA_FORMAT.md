@@ -117,9 +117,12 @@ zarr-python reader decodes one hand-built selected-subset shard. This is an
 interoperability stop/go result only; it is not T1, IO-3, official-schema,
 complete-package, or generic OME-Zarr evidence. The three required target T1
 case specifications, an independent zero-dependency scientific fact oracle,
-and static hand-derived critical byte/hash vectors now exist off-product. They
-are unpromoted inputs only; package archives, the full external-reader report,
-mutation evidence, and registry authority remain incomplete.
+static hand-derived critical byte/hash vectors, and compact mutation recipes
+now exist off-product. The independent producer emits the three exact
+candidate packages and deterministic USTAR archives, including package IDs and
+bounded inventory facts. These ignored outputs cannot certify themselves. No
+tracked or promoted target archive, independent reader/schema report, executed
+mutation evidence, or registry authority exists.
 
 WP-10B separately installs immutable content-addressed project objects,
 complete generations, atomic head/recovery refs, leases, autosave/recovery,

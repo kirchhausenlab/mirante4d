@@ -6,10 +6,12 @@ tooling. It never imports Mirante4D production crates.
 - `cases-v1.tsv` is the shared declarative value input.
 - `fact_oracle/` computes scientific facts without opening package bytes.
 - `producer/` writes candidate package bytes but cannot certify them.
-- `reader/` observes candidate bytes through the pinned external reader.
+- `mutations-v1.json` defines compact negative derivations without copying
+  package trees into the repository.
 - `hand_vectors/` verifies separately frozen critical byte/hash vectors.
-- `validate.py` performs offline manifest and bounded-archive validation.
-- `reproduce.py` creates two ignored candidates and requires byte equality.
+
+C4 adds the independent reader, offline validator, and two-run reproducer
+before any authority is promoted.
 
 Generation writes only below `target/mirante4d/fixture-candidates`. Tracked
 files under `fixtures/target` appear only in the separately reviewed promotion

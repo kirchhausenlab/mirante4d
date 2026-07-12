@@ -35,10 +35,12 @@ staged publication checks are present. Continue with WP-10A-C, which promotes
 the independent target-format authorities. Its exact standards mirror and
 external-reader codec probe are present. The three-case declarative corpus
 input, zero-dependency scientific oracle, and static critical hand vectors are
-also present but unpromoted; exact archives, mutations, the full independent
-reader/schema report, and the atomic registry promotion remain. WP-10A-D then
-consumes those authorities and closes the package evidence. Current schema 1
-remains the sole product route until WP-10C.
+also present. The independent producer, compact mutation recipes, and three
+bounded deterministic candidate archives are present but unpromoted.
+Independent reader/schema validation, mutation execution, two-run authority
+assembly, and the atomic registry promotion remain. WP-10A-D then consumes
+those authorities and closes the package evidence. Current schema 1 remains
+the sole product route until WP-10C.
 
 WP-09A is the next protected-branch checkpoint after WP-10A, following the
 approved integration order in the

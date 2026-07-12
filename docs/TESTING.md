@@ -211,8 +211,11 @@ Their zero-dependency Rust oracle reads only the declarative TSV and passes
 independent SHA-256, one-voxel scientific, and Merkle 1/1023/1024/1025 checks.
 A separate stdlib-only verifier checks the frozen packed-index, manifest,
 package, recipe, derivation, release, artifact, and scientific hand vectors.
-These are candidate inputs, not target T1 authority; they create no archive,
-reader report, registry flip, production conformance, or product claim.
+The C3 producer imports no Mirante, NumPy, or zarr-python code and uses oracle
+ScientificContentIds only as opaque inputs. Its three deterministic candidate
+archives, operational reports, and compact unexecuted mutation recipes are
+producer evidence only: they supply no independent readback, T1 authority,
+registry promotion, IO-3, production conformance, or product claim.
 
 The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).
