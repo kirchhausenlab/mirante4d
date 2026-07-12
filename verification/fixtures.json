@@ -1,7 +1,7 @@
 {
   "schema": "mirante4d-verification-fixture-registry",
   "schema_version": 1,
-  "record_count": 7,
+  "record_count": 10,
   "rules": {
     "maximum_records": 64,
     "candidate_output_root": "target/mirante4d/fixture-candidates",
@@ -123,6 +123,97 @@
       "expiry": null,
       "deletion_gate": null,
       "target_format_conformance": true
+    },
+    {
+      "id": "wp09a-semantic-small",
+      "tier": "T2",
+      "claim_scope": "wp09a-semantic-render-reference-and-vulkan-support",
+      "authority_state": "non-authoritative-generated",
+      "owner": "mirante4d-render-wgpu",
+      "capability": "trusted-hw2-vulkan",
+      "publication": "public-safe-generated",
+      "license": "MIT",
+      "path": "crates/mirante4d-render-wgpu/src/gpu_tests.rs",
+      "sha256": "898386623eeeaed5faecd36df5490a84d2b01f7de5d303dc91001d58ac35feda",
+      "generator": {
+        "command": "MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 cargo xtask verify-local trusted-gpu",
+        "source": "crates/mirante4d-render-wgpu/src/gpu_tests.rs",
+        "sha256": "898386623eeeaed5faecd36df5490a84d2b01f7de5d303dc91001d58ac35feda",
+        "production_writer_used": false
+      },
+      "lineages": [],
+      "limits": {
+        "resources": 24,
+        "decoded_bytes_with_validity": 241664,
+        "qualification_extent_pixels": [96, 96]
+      },
+      "validation_command": "MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 cargo xtask verify-local trusted-gpu",
+      "promotion": null,
+      "expiry": "WP-14 review",
+      "deletion_gate": "WP-14 verification hardening",
+      "target_format_conformance": false
+    },
+    {
+      "id": "wp09a-upload-boundary",
+      "tier": "T2",
+      "claim_scope": "wp09a-exact-per-frame-upload-boundary-support",
+      "authority_state": "non-authoritative-generated",
+      "owner": "mirante4d-render-wgpu",
+      "capability": "trusted-hw2-vulkan",
+      "publication": "public-safe-generated",
+      "license": "MIT",
+      "path": "crates/mirante4d-render-wgpu/src/gpu_tests.rs",
+      "sha256": "898386623eeeaed5faecd36df5490a84d2b01f7de5d303dc91001d58ac35feda",
+      "generator": {
+        "command": "MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 cargo xtask verify-local trusted-gpu",
+        "source": "crates/mirante4d-render-wgpu/src/gpu_tests.rs",
+        "sha256": "898386623eeeaed5faecd36df5490a84d2b01f7de5d303dc91001d58ac35feda",
+        "production_writer_used": false
+      },
+      "lineages": [],
+      "limits": {
+        "resources": 9,
+        "payload_bytes": 9437184,
+        "first_frame_resources": 8,
+        "first_frame_payload_bytes": 8388608,
+        "second_frame_resources": 1,
+        "second_frame_payload_bytes": 1048576
+      },
+      "validation_command": "MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 cargo xtask verify-local trusted-gpu",
+      "promotion": null,
+      "expiry": "WP-14 review",
+      "deletion_gate": "WP-14 verification hardening",
+      "target_format_conformance": false
+    },
+    {
+      "id": "wp09a-work-boundary",
+      "tier": "T2",
+      "claim_scope": "wp09a-exact-per-frame-resource-visit-boundary-support",
+      "authority_state": "non-authoritative-generated",
+      "owner": "mirante4d-render-wgpu",
+      "capability": "trusted-hw2-vulkan",
+      "publication": "public-safe-generated",
+      "license": "MIT",
+      "path": "crates/mirante4d-render-wgpu/src/gpu_tests.rs",
+      "sha256": "898386623eeeaed5faecd36df5490a84d2b01f7de5d303dc91001d58ac35feda",
+      "generator": {
+        "command": "MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 cargo xtask verify-local trusted-gpu",
+        "source": "crates/mirante4d-render-wgpu/src/gpu_tests.rs",
+        "sha256": "898386623eeeaed5faecd36df5490a84d2b01f7de5d303dc91001d58ac35feda",
+        "production_writer_used": false
+      },
+      "lineages": [],
+      "limits": {
+        "resources": 129,
+        "payload_bytes": 129,
+        "first_frame_resources": 128,
+        "second_frame_resources": 1
+      },
+      "validation_command": "MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 cargo xtask verify-local trusted-gpu",
+      "promotion": null,
+      "expiry": "WP-14 review",
+      "deletion_gate": "WP-14 verification hardening",
+      "target_format_conformance": false
     },
     {
       "id": "bootstrap-m4d-schema1",

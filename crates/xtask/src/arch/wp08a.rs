@@ -46,7 +46,11 @@ const TARGET_CRATES: [&str; 17] = [
     "mirante4d-storage",
     "mirante4d-ui-egui",
 ];
-const SUCCESSOR_OWNED_WORKSPACE_CRATES: [&str; 1] = ["mirante4d-storage"];
+const SUCCESSOR_OWNED_WORKSPACE_CRATES: [&str; 3] = [
+    "mirante4d-render-reference",
+    "mirante4d-render-wgpu",
+    "mirante4d-storage",
+];
 
 // Keep the WP-08A JSON immutable while checking the small set of dependency
 // edges activated by accepted successor packages. Each addition remains exact;
@@ -974,7 +978,7 @@ fn validate_frozen_public_api(
     Ok(())
 }
 
-fn public_api_violations(
+pub(super) fn public_api_violations(
     path: &Path,
     source: &str,
     forbidden: &BTreeSet<String>,
@@ -1537,7 +1541,7 @@ fn validate_frozen_source_rules(
     Ok(())
 }
 
-fn forbidden_import_violations(
+pub(super) fn forbidden_import_violations(
     path: &Path,
     source: &str,
     forbidden: &BTreeSet<String>,
@@ -1827,7 +1831,7 @@ mod tests {
     }
 
     #[test]
-    fn dependency_matrix_delegates_only_wp10a_storage_to_its_successor() {
+    fn dependency_matrix_delegates_only_accepted_successors() {
         let temp = tempfile::tempdir().unwrap();
         for name in ["one", "two"] {
             let crate_root = temp.path().join("crates").join(name);
@@ -1858,6 +1862,8 @@ mod tests {
                     ],
                 )],
             ),
+            ("mirante4d-render-reference", &[]),
+            ("mirante4d-render-wgpu", &[]),
         ]);
         validate_dependency_matrix(temp.path(), &predecessor, &delegated).unwrap();
 
@@ -1865,6 +1871,8 @@ mod tests {
             ("one", &[("normal", &["two"])]),
             ("two", &[]),
             ("mirante4d-storage", &[]),
+            ("mirante4d-render-reference", &[]),
+            ("mirante4d-render-wgpu", &[]),
             ("unreviewed-successor", &[]),
         ]);
         assert!(

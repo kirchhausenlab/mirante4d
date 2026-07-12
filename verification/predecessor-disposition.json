@@ -5093,12 +5093,12 @@
       "reason": "WP-10A proves all nine array rows use the frozen grid, key, fill, dimension, sharding, codec, and end-index configuration."
     },
     {
-      "id": "libtest:xtask::bin/xtask:arch::wp08a::tests::dependency_matrix_delegates_only_wp10a_storage_to_its_successor",
+      "id": "libtest:xtask::bin/xtask:arch::wp08a::tests::dependency_matrix_delegates_only_accepted_successors",
       "kind": "libtest",
       "owner": "xtask",
       "lane": "unit",
       "requirement_ids": ["D-022-unit", "WP-10A-off-product-storage-profile"],
-      "reason": "WP-10A enforces the off-product storage successor boundary and exact predecessor delegation."
+      "reason": "WP-09A extends exact predecessor delegation to the accepted off-product storage and render successor crates; unknown workspace additions still fail closed."
     },
     {
       "id": "libtest:xtask::bin/xtask:arch::wp10a::tests::checked_in_contract_binds_freeze_and_predecessor",
@@ -5203,6 +5203,134 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "D-023-format-lifecycle"],
       "reason": "WP-10A-D proves production output preserves promoted metadata and every scientific brick while exact package identity follows encoded bytes."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp09a::tests::checked_in_contract_binds_off_product_successors",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-09A-off-product-progressive-render"],
+      "reason": "WP-09A enforces the exact off-product successor crates, dependencies, public roots, source boundaries, budgets, and reachability."
+    },
+    {
+      "id": "libtest:mirante4d-render-reference:tests::mip_distinguishes_valid_zero_invalidity_and_missing_coverage",
+      "kind": "libtest",
+      "owner": "mirante4d-render-reference",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-09A-off-product-progressive-render"],
+      "reason": "WP-09A adds bounded public CPU-oracle coverage for semantic MIP, DVR, ISO, cross-section, dtype, validity, missing coverage, and frame access."
+    },
+    {
+      "id": "libtest:mirante4d-render-reference:tests::dvr_and_iso_have_fixed_small_ray_hand_facts",
+      "kind": "libtest",
+      "owner": "mirante4d-render-reference",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-09A-off-product-progressive-render"],
+      "reason": "WP-09A adds bounded public CPU-oracle coverage for semantic MIP, DVR, ISO, cross-section, dtype, validity, missing coverage, and frame access."
+    },
+    {
+      "id": "libtest:mirante4d-render-reference:tests::cross_section_samples_the_pixel_center_without_a_volume_projection",
+      "kind": "libtest",
+      "owner": "mirante4d-render-reference",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-09A-off-product-progressive-render"],
+      "reason": "WP-09A adds bounded public CPU-oracle coverage for semantic MIP, DVR, ISO, cross-section, dtype, validity, missing coverage, and frame access."
+    },
+    {
+      "id": "libtest:mirante4d-render-reference:tests::dtype_decoding_uses_canonical_little_endian_values",
+      "kind": "libtest",
+      "owner": "mirante4d-render-reference",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-09A-off-product-progressive-render"],
+      "reason": "WP-09A adds bounded public CPU-oracle coverage for semantic MIP, DVR, ISO, cross-section, dtype, validity, missing coverage, and frame access."
+    },
+    {
+      "id": "libtest:mirante4d-render-reference:tests::frame_accessors_are_bounded_at_the_declared_extent",
+      "kind": "libtest",
+      "owner": "mirante4d-render-reference",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-09A-off-product-progressive-render"],
+      "reason": "WP-09A adds bounded public CPU-oracle coverage for semantic MIP, DVR, ISO, cross-section, dtype, validity, missing coverage, and frame access."
+    },
+    {
+      "id": "libtest:mirante4d-render-wgpu:tests::accepted_frame_budget_is_exact",
+      "kind": "libtest",
+      "owner": "mirante4d-render-wgpu",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-09A-off-product-progressive-render"],
+      "reason": "WP-09A adds hosted CPU checks for the successor frame budget, configuration floor, and aligned upload arithmetic without initializing a GPU."
+    },
+    {
+      "id": "libtest:mirante4d-render-wgpu:tests::config_rejects_a_ledger_smaller_than_one_mebibyte",
+      "kind": "libtest",
+      "owner": "mirante4d-render-wgpu",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-09A-off-product-progressive-render"],
+      "reason": "WP-09A adds hosted CPU checks for the successor frame budget, configuration floor, and aligned upload arithmetic without initializing a GPU."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:verification::runner::tests::wp09a_evidence_line_is_exact_and_sanitized",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-09A-off-product-progressive-render"],
+      "reason": "WP-09A trusted-GPU evidence requires exactly one closed, path-sanitized adapter, ledger, counter, and readback record from the aggregate GPU case."
+    },
+    {
+      "id": "libtest:mirante4d-render-wgpu:runtime::tests::lease_preflight_enforces_the_exact_frame_visit_ceiling",
+      "kind": "libtest",
+      "owner": "mirante4d-render-wgpu",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-09A-off-product-progressive-render"],
+      "reason": "WP-09A proves lease metadata admission stops at the exact 128-resource per-frame visit ceiling without inspecting an unbounded lease tail."
+    },
+    {
+      "id": "libtest:mirante4d-render-wgpu:runtime::tests::requirement_preflight_has_a_fixed_metadata_ceiling",
+      "kind": "libtest",
+      "owner": "mirante4d-render-wgpu",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-09A-off-product-progressive-render"],
+      "reason": "WP-09A proves requirement preflight metadata work has a fixed ceiling independent of the unvisited requirement tail."
+    },
+    {
+      "id": "libtest:mirante4d-render-wgpu:runtime::tests::requirement_preflight_preserves_the_129_resource_cursor_fixture",
+      "kind": "libtest",
+      "owner": "mirante4d-render-wgpu",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-09A-off-product-progressive-render"],
+      "reason": "WP-09A preserves the accepted 128-then-1 deterministic cursor boundary for the 129-resource work fixture."
+    },
+    {
+      "id": "libtest:mirante4d-render-wgpu:runtime::tests::requirement_preflight_rejects_ambiguous_multiscale_and_overlap",
+      "kind": "libtest",
+      "owner": "mirante4d-render-wgpu",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-09A-off-product-progressive-render"],
+      "reason": "WP-09A rejects ambiguous multiscale and overlapping requirements before GPU work can be submitted."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp09a::tests::public_guard_rejects_wgpu_in_any_signature_path_segment",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-09A-off-product-progressive-render"],
+      "reason": "WP-09A architecture enforcement rejects any public successor signature that exposes a WGPU path, including unlisted backend type names."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:verification::runner::tests::wp09a_evidence_rejects_budget_and_case_incoherence",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-09A-off-product-progressive-render"],
+      "reason": "WP-09A rejects trusted evidence with ledger, per-frame budget, aggregate-counter, accepted-case, shared-capacity, or readback-count drift."
+    },
+    {
+      "id": "libtest:mirante4d-render-wgpu:gpu_tests::qualification",
+      "kind": "libtest",
+      "owner": "mirante4d-render-wgpu",
+      "lane": "trusted-gpu",
+      "requirement_ids": ["D-022-trusted-gpu-separation", "WP-09A-off-product-progressive-render"],
+      "reason": "WP-09A runs one ignored aggregate real-Vulkan case so device creation, three generated fixtures, lifecycle/capacity checks, asynchronous readback, and closed evidence emission occur once."
     }
   ],
   "expected_summary": {
@@ -5211,6 +5339,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 446
+    "current_additions": 462
   }
 }

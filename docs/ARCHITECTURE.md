@@ -8,7 +8,7 @@ import/preprocessing workflows.
 
 ## Workspace Boundaries
 
-The workspace has sixteen crates:
+The workspace has eighteen crates:
 
 - `mirante4d-domain`: validated framework-neutral geometry, view, transfer,
   render-intent, and tool values.
@@ -28,6 +28,11 @@ The workspace has sixteen crates:
   scheduler and worker owner.
 - `mirante4d-render-api`: backend-neutral intent, requirements, progressive
   frame status, opaque presentation lifecycle, and camera math.
+- `mirante4d-render-reference`: unpublished, bounded CPU oracle for renderer
+  correctness; it owns no product route or GPU authority.
+- `mirante4d-render-wgpu`: off-product progressive GPU successor built only
+  against dataset leases and render contracts; WP-09B owns its future product
+  activation.
 - `mirante4d-storage`: off-product target-profile facts, checked ceilings,
   portable package paths, bounded local validation/reads, an exact-package
   capability, and a deterministic create-only local writer; currently no
@@ -41,8 +46,9 @@ The workspace has sixteen crates:
 `mirante4d-core` and the predecessor application/session/preferences models
 do not exist. Lower crates do not depend on the app/UI layer; the renderer
 does not read files; format code does not own viewer state.
-No product crate depends on `mirante4d-storage`; WP-10C owns that future hard
-cutover.
+No product crate depends on `mirante4d-storage`, `mirante4d-render-reference`,
+or `mirante4d-render-wgpu`. WP-10C owns the storage cutover and WP-09B owns the
+render cutover.
 
 ## Application Composition
 
@@ -101,6 +107,17 @@ architecture. Missing occupied data is loading/incomplete, never empty.
 An explicit zero-resource plan means the view is outside selected data (or no
 layer is visible); it is terminal and distinct from missing occupied data.
 
+The WP-09A successor is deliberately outside this product flow. It owns one
+bounded WGPU arena, progressive residency, current-frame suppression, and
+asynchronous validation capture; the independent CPU oracle owns expected
+RGBA, coverage, and validity facts. The current `mirante4d-renderer` remains
+the only reachable product renderer until WP-09B. WP-09A qualification covers
+voxel-exact sampling, flat ISO shading, and one semantic scale per layer; other
+intent variants are rejected explicitly rather than silently approximated.
+Its fixed input ceilings are 256 requirement records and 128 supplied leases
+per call. Resident-resource metadata is capped at 256; GPU control and reported
+coverage include at most 128 resources.
+
 ## Persistence And Settings
 
 Unverified sources are unbound workspaces. Project attach/open/save rejects at
@@ -127,6 +144,8 @@ The frozen subsystem boundary remains in
 [`architecture/wp08a-subsystem-contract.json`](../architecture/wp08a-subsystem-contract.json).
 The accepted off-product storage successor boundary is
 [`architecture/wp10a-storage-contract.json`](../architecture/wp10a-storage-contract.json).
+The accepted off-product render successor boundary is
+[`architecture/wp09a-render-contract.json`](../architecture/wp09a-render-contract.json).
 Within that successor, `mirante4d-storage::PackagePath` is the sole package-path
 authority. `mirante4d-identity` owns raw typed object facts and exact hashing,
 but no parallel path type.

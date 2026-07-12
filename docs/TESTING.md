@@ -85,6 +85,16 @@ stay in local resolvers and never enter the public tree or hosted logs. The
 package-capability lane is registered as pending; WP-06 does not invent a
 passing package claim before an honest unsupported-GPU command exists.
 
+WP-09A adds one ignored aggregate successor case to this lane while retaining
+the 34 predecessor GPU cases. It starts the real Vulkan runtime once per
+logical ledger, consumes only dataset-runtime-issued leases, and covers the
+semantic-small, 8-MiB upload, and 128-resource work boundaries. The verifier
+refuses dirty revisions and requires exactly one sanitized
+`wp09a-evidence-json` record. That record keeps the main and small-capacity
+ledgers separate, validates the exact case facts and per-frame maxima, and
+includes a render after every dataset lease is released. This is off-product
+component evidence, not viewer or performance validation.
+
 No benchmark baseline is currently authoritative. The temporary tool-owned
 [baseline directory](benchmarks/baselines/README.md) remains diagnostic until
 WP-14 owns its final disposition.

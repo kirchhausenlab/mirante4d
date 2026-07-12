@@ -947,12 +947,7 @@ fn generated_nextest(registry: &Registry) -> anyhow::Result<String> {
          store-success-output = false\n\
          store-failure-output = true\n",
     );
-    let trusted_adapter = registry
-        .selector_adapters
-        .iter()
-        .find(|adapter| adapter.lane == "trusted-gpu")
-        .context("verification registry is missing trusted-gpu adapter")?;
-    let trusted_selector = adapter_selector(trusted_adapter);
+    let trusted_selector = lane_adapter_selector(registry, "trusted-gpu")?;
     if trusted_selector.contains('\'') {
         bail!("trusted-gpu selector cannot contain a TOML literal quote");
     }
@@ -974,12 +969,10 @@ pub(super) fn trusted_gpu_policy(registry: &Registry) -> anyhow::Result<(String,
         .iter()
         .find(|lane| lane.id == "trusted-gpu")
         .context("verification registry is missing trusted-gpu lane")?;
-    let adapter = registry
-        .selector_adapters
-        .iter()
-        .find(|adapter| adapter.lane == "trusted-gpu")
-        .context("verification registry is missing trusted-gpu adapter")?;
-    Ok((adapter_selector(adapter), lane.timeout_secs))
+    Ok((
+        lane_adapter_selector(registry, "trusted-gpu")?,
+        lane.timeout_secs,
+    ))
 }
 
 pub(super) fn format_lifecycle_timeout(registry: &Registry) -> anyhow::Result<u64> {
@@ -1036,6 +1029,23 @@ fn adapter_selector(adapter: &SelectorAdapter) -> String {
     }
 }
 
+fn lane_adapter_selector(registry: &Registry, lane: &str) -> anyhow::Result<String> {
+    let selectors = registry
+        .selector_adapters
+        .iter()
+        .filter(|adapter| adapter.lane == lane)
+        .map(adapter_selector)
+        .collect::<Vec<_>>();
+    if selectors.is_empty() {
+        bail!("verification registry is missing {lane} adapter");
+    }
+    Ok(selectors
+        .into_iter()
+        .map(|selector| format!("({selector})"))
+        .collect::<Vec<_>>()
+        .join(" | "))
+}
+
 fn regex_prefix(prefix: &str) -> String {
     let mut escaped = String::from("^");
     for character in prefix.chars() {
@@ -1084,6 +1094,7 @@ pub(super) fn audit_discovery(
         .context("Nextest discovery is missing rust-suites")?;
     let test_lanes = required_test_lanes(registry)?;
     let mut counts = BTreeMap::<String, u64>::new();
+    let mut adapter_counts = BTreeMap::<String, u64>::new();
 
     for suite in suites.values() {
         let package = suite
@@ -1112,6 +1123,7 @@ pub(super) fn audit_discovery(
                     );
                 }
                 *counts.entry(matched[0].lane.clone()).or_default() += 1;
+                *adapter_counts.entry(matched[0].id.clone()).or_default() += 1;
             } else {
                 let matched = test_lanes
                     .iter()
@@ -1129,7 +1141,7 @@ pub(super) fn audit_discovery(
     }
 
     for adapter in &registry.selector_adapters {
-        let actual = counts.get(&adapter.lane).copied().unwrap_or(0);
+        let actual = adapter_counts.get(&adapter.id).copied().unwrap_or(0);
         if actual != adapter.expected_ignored_cases {
             bail!(
                 "selector adapter {:?} expected {} ignored cases, discovered {actual}",

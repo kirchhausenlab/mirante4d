@@ -22,10 +22,14 @@ public release or public full microscopy dataset yet.
 - Linux release-directory, tarball, and AppImage build paths.
 - No segmentation or derived-label subsystem.
 
-The workspace has sixteen crates. `mirante4d-storage` is an off-product
+The workspace has eighteen crates. `mirante4d-storage` is an off-product
 WP-10A library whose first slice owns frozen profile facts, portable package
 paths, checked package-count arithmetic, size/amplification ceilings, and
 bounded read-only local range I/O. It remains unreachable from the product.
+The new `mirante4d-render-wgpu` successor and unpublished
+`mirante4d-render-reference` oracle are also deliberately unreachable while
+WP-09A qualification is active; `mirante4d-renderer` remains the only product
+render route.
 
 `mirante4d-core`, the application
 `AppState` god-state, `WorkbenchCommand`, project-v14 authority, and
@@ -147,6 +151,10 @@ See [testing](TESTING.md) for commands and claim language.
 - Frame intensity statistics remain unavailable until a real lease-backed
   computation exists; loading placeholders are never reported as scientific
   zeros.
+- The off-product WP-09A successor qualification is limited to voxel-exact
+  sampling, flat ISO shading, one semantic scale per layer, 256 requirement
+  records, and 128 supplied leases per call. Unsupported cases fail explicitly.
+  Product support remains a WP-09B decision.
 - Windows and macOS are not qualified targets. 4K is intentionally out of
   scope.
 - Current persisted formats have no compatibility promise.
