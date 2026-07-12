@@ -1,0 +1,282 @@
+{
+  "schema": "mirante4d-foundation-package-entry",
+  "schema_version": 1,
+  "package": "WP-10B",
+  "slice": "transactional-project-store-and-product-cutover",
+  "status": "accepted",
+  "authorization": {
+    "approved_by": "Mirante4D repository owner",
+    "approved_on": "2026-07-12",
+    "reference": "WP10B-PREAUTH-2026-07-12",
+    "scope": "WP-10B entry and implementation, current-source D-009 verification, trusted local filesystem and rootless-VM durability work, product cutover, predecessor deletion, and product-open validation"
+  },
+  "predecessor": {
+    "foundation_tag": "foundation-wp-09a-exit-1",
+    "tag_object": "f4ee84bcb2a1b5069943fa32bf3c28f9a497921f",
+    "foundation_commit": "1b1e7d5534f29b010cc346d434811a3906fb40e1",
+    "foundation_tree": "42846232a04ec7548a3bb9b1b6598e79be29e72b",
+    "immediate_branch": "main",
+    "immediate_commit": "bf44814197c7b76c6abdc9ff620c38195736e3ca",
+    "immediate_tree": "ddf7caddb8ab12c267514e14f0d71808e242e785",
+    "hosted_run": "https://github.com/kirchhausenlab/mirante4d/actions/runs/29197925397",
+    "hosted_result": "success"
+  },
+  "entry_state": {
+    "branch": "wp10b-project-store-entry",
+    "commit": "bf44814197c7b76c6abdc9ff620c38195736e3ca",
+    "tree": "ddf7caddb8ab12c267514e14f0d71808e242e785",
+    "worktree": "clean"
+  },
+  "inherited_contracts": [
+    {
+      "path": "architecture/model-contract.json",
+      "sha256": "095dc1c2b96ea70a893d385c3bf08ccd4c204c897156109c9e95b09ead7c5f0b",
+      "rule": "canonical project state, revision, high-water, and scientific identity remain authoritative"
+    },
+    {
+      "path": "architecture/wp08a-subsystem-contract.json",
+      "sha256": "0500c27c9c4e13ce2eb0d833534a865c01efb0eabfea34df30015cf9af416cd3",
+      "rule": "WP-10B consumes the frozen subsystem APIs and removes the project-v15 bridge at its expiry gate"
+    },
+    {
+      "path": "architecture/wp10a-storage-contract.json",
+      "sha256": "494294eaca48f129e2cfc10e4c74616c2f4bb814d232f69380c6ffbb310543b7",
+      "rule": "D-009 identity primitives may be consumed, but target storage remains off-product until WP-10C"
+    }
+  ],
+  "outcome": [
+    "Implement one mirante4d-project-store authority for immutable objects, complete generations, refs, leases, autosave, recovery, Save As, and conservative compaction.",
+    "Add a bounded current-source scientific verification operation and cache, then promote the whole live source session to a verified catalog before project attach, open, or save.",
+    "Switch the product atomically to the new store and delete the private project-v15 bridge, CurrentProjectRuntime, their tests, and every legacy project reader or alternate path.",
+    "Prove canonical bytes independently, hostile process/filesystem behavior locally, and the real viewer save/edit/recover/reopen workflow on the accepted Linux display targets."
+  ],
+  "authority": {
+    "durable_state_owner": "mirante4d-project-model",
+    "live_revision_owner": "mirante4d-application",
+    "successor_store_owner": "mirante4d-project-store",
+    "composition_owner": "mirante4d-app",
+    "current_source_verification_bridge": "mirante4d-data",
+    "predecessor_until_checkpoint_b4": "mirante4d-app::current_project_persistence_bridge plus CurrentProjectRuntime",
+    "final_product_authority_flip": true,
+    "product_activation_checkpoint": "B4"
+  },
+  "entry_audit_facts": [
+    "The current source catalog is always unverified and production has no D-009 verification completion; a test-only admission helper is not a product seam.",
+    "Identity promotion must replace or restart the source runtime with a verified catalog because verified and unverified semantic resource keys are intentionally different.",
+    "The project-v15 bridge is the only current project I/O path and has no autosave, Save As, OS lease, expected-parent conflict, object store, recovery refs, or compaction.",
+    "The canonical project model already owns the required dataset-reference split, project revision, revision high-water, and generation projection."
+  ],
+  "dependency_contract": {
+    "mirante4d-project-store": {
+      "normal_workspace": ["mirante4d-identity", "mirante4d-project-model"],
+      "normal_external": ["rustix", "serde", "serde_json", "thiserror"],
+      "forbidden_workspace": ["mirante4d-app", "mirante4d-application", "mirante4d-data", "mirante4d-dataset-runtime", "mirante4d-domain", "mirante4d-format", "mirante4d-render-wgpu", "mirante4d-renderer", "mirante4d-settings", "mirante4d-storage"]
+    },
+    "product_edges_at_b4": [
+      "mirante4d-application -> mirante4d-project-store",
+      "mirante4d-app -> mirante4d-project-store"
+    ],
+    "temporary_identity_edge": "mirante4d-data may add mirante4d-identity only for the approved current-source verification bridge",
+    "rule": "a required change to identity, dataset, dataset-runtime, current format, or WP-10A storage APIs stops the package for corrective review"
+  },
+  "public_api_boundary": {
+    "checkpoint_b1": "freeze at most sixteen cohesive root exports covering path, limits/configuration, generation/object identity, open mode/session, actor command/completion, recovery candidate, diagnostics, and typed fault",
+    "forbidden": "renderer, GPU, UI, worker-thread handle, current-format DTO, storage DTO, arbitrary internal path, owning unbounded byte vector, or segmentation type",
+    "persistence_projection": "project-model remains serialization-free; project-store owns the closed wire DTO and maps only the accepted ProjectGenerationProjection"
+  },
+  "store_limits": {
+    "project_envelope_bytes_max": 16384,
+    "ref_record_bytes_max": 4096,
+    "generation_bytes_max": 67108864,
+    "object_or_page_bytes_max": 16777216,
+    "stream_buffer_bytes_max": 1048576,
+    "artifact_records_per_generation_max": 16384,
+    "reachable_objects_per_generation_max": 65536,
+    "generations_scanned_max": 4096,
+    "directory_fanout_entries_max": 4096,
+    "physical_store_entries_max": 131072,
+    "pin_refs_max": 64,
+    "recovery_candidates_max": 64,
+    "actor_request_queue_max": 8,
+    "actor_completion_queue_max": 8,
+    "open_file_descriptors_max": 64,
+    "autosave_queued_requests_max": 1,
+    "autosave_idle_delay_seconds": 30,
+    "autosave_max_delay_seconds": 120,
+    "gc_batch_entries_max": 1024,
+    "gc_batch_bytes_max": 268435456,
+    "digest_fanout_hex_bytes": 1,
+    "rule": "limit exhaustion is typed and publishes no ref; large artifacts stream in fixed buffers and never create one object per row, timepoint, voxel, or dataset brick"
+  },
+  "persistence_contract": {
+    "profile": "experimental mirante4d-project-store-v1",
+    "records": "closed canonical project envelope, binary checksummed refs, canonical JSON generations, artifact page manifests, and exact-byte objects",
+    "commit_order": "lease and expected-parent check; immutable objects; complete generation; independent recovery ref; atomic head replacement; refs-directory sync",
+    "indeterminate_rule": "failed final durability keeps the revision dirty, suspends writes, and requires close/reopen recovery",
+    "locking": "shared whole-session maintenance flock followed by writable-session writer flock; lock-file presence is never authority",
+    "autosave": "same generation format, separate head/recovery refs, explicit base manual generation, one coalesced queued request",
+    "compaction": "unknown files, corrupt graphs, active leases, or an over-cap recovery review block deletion; unreachable content moves to synced trash before separate purge",
+    "filesystem_policy": "write support only for an evidence-qualified Linux filesystem and exact mount-option tuple; every other filesystem is read-only"
+  },
+  "current_source_identity_contract": {
+    "algorithm": "stream canonical base-scale values and validity through existing D-009 ScientificDatasetHasher primitives while validating the full current encoded-object checksum inventory",
+    "bounds": "at most two runtime-accounted resource leases, one 1-MiB streaming buffer, and a 64-MiB checksum-inventory cache; bounded progress/completion queues; cancellation checked between resources and stream blocks",
+    "cache": "machine-local and non-portable; reuse requires an exact manifest/checksum inventory, normalized object closure, sizes, and encoded-object digests; any drift invalidates it",
+    "promotion": "typed application completion replaces the current source/runtime generation with a verified catalog before attaching or restoring a project",
+    "failure": "cancel, mismatch, mutation, or unverifiable cache leaves the workspace unbound and project I/O unavailable",
+    "source_nonmutation": true
+  },
+  "fixtures": [
+    {
+      "id": "project-store-v1",
+      "tier": "T1-project",
+      "authority": "independent Python producer and dependency-isolated read-only validator",
+      "scope": "canonical envelope/ref/generation/page/object bytes and digests, two manual generations with object reuse, autosave/recovery/divergence, exact recovery candidates, and typed corrupt mutations",
+      "maximum_archive_bytes": 4194304
+    },
+    {
+      "id": "wp10b-hostile-lifecycle",
+      "tier": "T2",
+      "scope": "named before/after failpoints, short writes, ENOSPC, permissions, corruption, symlink races, concurrent writers, stale parents, interrupted compaction, relocation, and cross-device Save As"
+    },
+    {
+      "id": "bootstrap-m4d-schema1",
+      "tier": "T2",
+      "scope": "real product current-source verification plus save, edit-during-save, autosave recovery, reopen, and Save As without source mutation"
+    }
+  ],
+  "durability_harness": {
+    "command": "cargo xtask verify-local project-store-lifecycle",
+    "rootless": true,
+    "qemu_package": "qemu-system-x86 1:8.2.2+ds-0ubuntu1.17",
+    "kvm": "/dev/kvm is writable by the designated user",
+    "guest_kernel_package": "linux-image-6.17.0-35-generic 6.17.0-35.35~24.04.1 amd64",
+    "guest_kernel_deb_sha256": "d5502a5dfa01203e16f6430e10236efe9e007cd29bd93bbed65ddf20ee6e9cfa",
+    "guest_busybox_package": "busybox-static 1:1.36.1-6ubuntu3.1",
+    "guest_busybox_sha256": "dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14",
+    "guest_memory_bytes": 268435456,
+    "sparse_ext4_disks": 2,
+    "sparse_disk_bytes_each": 134217728,
+    "nbdkit_package": "nbdkit 1.36.3-1ubuntu10 amd64",
+    "nbdkit_deb_sha256": "02ae094a32267be68516e1dedd26a2b83334a1a20303055ce765e2e9cf8580e2",
+    "working_disk_bytes_max": 671088640,
+    "filesystem": "ext4 created by e2fsprogs 1.47.0; exact observed features and mount options are recorded in evidence",
+    "power_cut": "attach each ext4 image through rootless nbdkit cache=writeback, kill QEMU and nbdkit at every authoritative transition in the frozen inventory, then restart from the durable backing images and validate in a fresh guest process; explicit guest flushes must reach the backing image",
+    "cross_device": "the two independent ext4 virtio disks provide the positive copy-and-rehash Save As case",
+    "no_large_dataset": "all large-size boundaries use checked arithmetic or bounded streams; no TiB dataset is allocated or simulated on disk"
+  },
+  "implementation_checkpoints": [
+    "B1: accepted entry, exact project-store contract, crate boundary, canonical wire schemas, promoted T1-project fixture, independent validator, and architecture/verification ownership",
+    "B2: descriptor-relative transactional core, immutable objects/generations/refs, leases, manual save/Save As, autosave/recovery, compaction/trash, actor, exhaustive failpoints, fresh-process kills, and rootless-VM durability evidence; still off-product",
+    "B3: bounded current-source D-009 verification/cache, typed application completion, atomic verified-catalog runtime replacement, and project-store application service integration; project-v15 remains the sole product route until B4",
+    "B4: atomic product save/open/autosave/recovery cutover, complete project-v15 and CurrentProjectRuntime deletion, real viewer validation, clean protected-main evidence, and WP-10B exit"
+  ],
+  "verification": {
+    "public": [
+      "cargo fmt --all --check",
+      "cargo xtask verification-sync --check",
+      "cargo xtask docs-check",
+      "cargo xtask verify-pr policy",
+      "cargo xtask verify-pr rust"
+    ],
+    "trusted": "cargo xtask verify-local project-store-lifecycle",
+    "trusted_lane_timeout_seconds": 900,
+    "product": "real mapped viewer on the public T2 current package at 1280x720 and 1920x1080: verify identity, save, edit while saving, autosave, kill, recover, reopen, Save As, and source nonmutation",
+    "performance": {
+      "ui_enqueue_and_poll_p99_milliseconds_max": 5,
+      "samples_min": 1000,
+      "incremental_unchanged_artifact_bytes_rewritten_max": 0,
+      "post_open_or_save_metadata_rss_bytes_max": 100663296,
+      "retries": 0
+    },
+    "report": "bind commit/tree/clean state, fixture and executable digests, filesystem/kernel/mount/QEMU facts, transition and kill matrix, byte/object/work counters, product display facts, source digests, results, and all failures without private paths"
+  },
+  "allowed_paths": [
+    "architecture/wp10b-project-store-entry.json",
+    "architecture/wp10b-project-store-contract.json",
+    "architecture/current-state-field-ledger.json",
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/mirante4d-project-store/**",
+    "crates/mirante4d-project-model/**",
+    "crates/mirante4d-application/**",
+    "crates/mirante4d-data/**",
+    "crates/mirante4d-app/**",
+    "crates/xtask/src/arch.rs",
+    "crates/xtask/src/arch/wp10b.rs",
+    "crates/xtask/src/verification/**",
+    "crates/xtask/src/product_validate.rs",
+    "crates/xtask/src/product_validate/**",
+    "verification/fixtures.json",
+    "verification/registry.json",
+    "verification/generated/selectors.json",
+    "verification/predecessor-disposition.json",
+    ".config/nextest.toml",
+    "fixtures/project/**",
+    "tools/project-fixtures/**",
+    "tools/project-store-vm/**",
+    "docs/ARCHITECTURE.md",
+    "docs/CURRENT_STATE.md",
+    "docs/DATA_FORMAT.md",
+    "docs/TESTING.md",
+    "docs/DEVELOPMENT.md",
+    "docs/BACKLOG.md",
+    "docs/planning/NOW.md",
+    "docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md",
+    "docs/decisions/ADR-0003-immutable-project-generations.md"
+  ],
+  "mandatory_deletions_at_b4": [
+    "crates/mirante4d-app/src/current_project_persistence_bridge.rs",
+    "crates/mirante4d-app/src/current_runtime/project.rs",
+    "CurrentProjectRuntime and direct current_project_path ownership",
+    "every mirante4d-project-v15 DTO, reader, writer, fixture, test, selector, and runtime string outside immutable historical contracts",
+    "all sixteen predecessor bridge tests and their live verification dispositions"
+  ],
+  "forbidden_paths": [
+    "architecture/model-contract.json",
+    "architecture/wp08a-subsystem-contract.json",
+    "architecture/wp10a-storage-contract.json",
+    "crates/mirante4d-domain/**",
+    "crates/mirante4d-identity/**",
+    "crates/mirante4d-dataset/**",
+    "crates/mirante4d-dataset-runtime/**",
+    "crates/mirante4d-format/**",
+    "crates/mirante4d-storage/**",
+    "crates/mirante4d-import/**",
+    "crates/mirante4d-analysis/**",
+    "crates/mirante4d-render-api/**",
+    "crates/mirante4d-render-reference/**",
+    "crates/mirante4d-render-wgpu/**",
+    "crates/mirante4d-renderer/**",
+    "crates/mirante4d-settings/**",
+    ".github/**"
+  ],
+  "invariants": [
+    "Only project-store owns project paths, canonical persistence bytes, filesystem mutation, OS leases, refs, generations, objects, autosave/recovery, and compaction.",
+    "Only application owns live revision/history movement and decides whether an exact completed revision becomes saved.",
+    "A ref never names staging or an incomplete object closure; before the durable head switch the old generation remains authoritative.",
+    "No v13, v14, or v15 reader, converter, migration shim, feature flag, fallback, or alternate product project path survives B4.",
+    "Dataset locators remain hints; only a verified D-009 scientific identity may bind a project, and source bytes are never mutated.",
+    "Unknown filesystems, unknown files, corrupt graphs, active maintenance leases, and unreviewable recovery sets fail closed.",
+    "All large bytes, queues, scans, files, descriptors, processes, and VM artifacts remain inside the declared limits and are cancellable where publication safety permits.",
+    "Both new store code and bridge additions forbid unsafe code."
+  ],
+  "non_goals": [
+    "WP-10A target-storage product activation, current dataset-format deletion, import, analysis, rendering, settings, segmentation, public-data publication, or release hardening",
+    "Stable project-format compatibility, a generic project reader, cloud/network/FUSE write support, automatic project merge, silent recovery, or automatic deletion of non-regenerable data",
+    "Large real microscopy data, TiB disk images, 4K display qualification, paid CI, or a public self-hosted runner"
+  ],
+  "stop_conditions": [
+    "Any inherited model, identity, dataset, dataset-runtime, format, or WP-10A storage API must change rather than being consumed through the accepted bridge boundaries.",
+    "Current-source verification cannot validate the full checksum inventory, remain bounded/cancellable, or atomically replace the live runtime with a verified catalog.",
+    "Canonical fixture facts depend on the production serializer/reader, or the independent validator cannot reject the declared corruptions.",
+    "Any ref can expose a partial closure, an existing digest can be accepted without exact validation, or a capacity/failure path changes authority.",
+    "The rootless VM cannot discard guest-unpersisted writes, positive cross-device Save As cannot use two filesystems, or the 900-second/640-MiB harness ceilings are exceeded.",
+    "A product cutover requires retaining project-v15, adding a compatibility route, mutating source data, or skipping real mapped-viewer save/recovery/reopen validation."
+  ],
+  "rollback": {
+    "b1_b2_b3": "revert the failed checkpoint while the project-v15 product route remains sole and delete non-authoritative generated output; never add a fallback",
+    "b4": "the authority flip and predecessor deletion are one atomic protected-main checkpoint; preserve verified backups of test projects before merge and fix forward afterward",
+    "format": "the new project store remains experimental and disposable development projects are regenerated; no converter is implied"
+  }
+}
