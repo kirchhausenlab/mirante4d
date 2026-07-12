@@ -271,7 +271,7 @@ fn require_map_order(entries: &[CanonicalMapEntry]) -> Result<(), ControlError> 
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
-enum WireValue {
+pub(super) enum WireValue {
     #[serde(rename = "bool")]
     Bool { value: bool },
     #[serde(rename = "u64")]
@@ -296,7 +296,7 @@ enum WireValue {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WireMapEntry {
+pub(super) struct WireMapEntry {
     key: String,
     value: WireValue,
 }

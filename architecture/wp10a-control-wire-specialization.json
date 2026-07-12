@@ -40,5 +40,9 @@
   "cross_object_boundary": {
     "display_object_local_rule": "layers are strictly increasing and unique",
     "package_rule": "profile, science, and display must have the same nonempty contiguous logical-layer ordinals"
+  },
+  "recipe_graph": {
+    "node_origin": "zero",
+    "input_uniqueness": "unique by the ordered pair role then node"
   }
 }

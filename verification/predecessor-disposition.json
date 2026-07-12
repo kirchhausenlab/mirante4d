@@ -4469,6 +4469,22 @@
       "reason": "WP-10A proves restricted control JCS uses RFC 8785 UTF-16 key ordering and exact string escaping."
     },
     {
+      "id": "libtest:mirante4d-storage:control::recipe::tests::recipe_payload_rejects_malformed_noncanonical_and_invalid_graphs",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects malformed, alternate, unordered, forward-referencing, and identity-mismatched recipe payloads."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::recipe::tests::recipe_payload_roundtrips_exact_body_and_verified_identity",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the closed recipe graph has exact canonical body bytes and a verified domain-framed RecipeId."
+    },
+    {
       "id": "libtest:mirante4d-storage:control::scalar::tests::canonical_decimals_reject_alternate_and_out_of_range_forms",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -4675,6 +4691,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 379
+    "current_additions": 381
   }
 }

@@ -18,8 +18,10 @@ pub use control::{
     DisplayDefaults, DisplayLayerDefaults, F32Bits, F64Bits, I64Decimal, MAX_ASCII_TOKEN_BYTES,
     MAX_NFC_TEXT_BYTES, MAX_PORTABLE_CONTROL_OBJECT_BYTES, MAX_PROFILE_HEADER_BYTES, NfcText,
     OmeInteroperabilityBase, ProfileHeader, ProfileImage, ProfileLevel, ProfileLogicalLayer,
-    ProfileValidityMode, Rgb24, ScienceDescriptor, ScienceLayer, ScienceTemporalCalibration,
-    ScienceTemporalKind, TypedId, U64Decimal, profile_compatibility_bytes,
+    ProfileValidityMode, RecipeBody, RecipeDeterminism, RecipeInput, RecipeNumericPolicy,
+    RecipeOperation, RecipePayload, RecipeRng, Rgb24, ScienceDescriptor, ScienceLayer,
+    ScienceTemporalCalibration, ScienceTemporalKind, TypedId, U64Decimal,
+    profile_compatibility_bytes,
 };
 pub use error::StorageProfileError;
 pub use limits::{

@@ -117,10 +117,11 @@ WP-10A-B implementation is active. `mirante4d-storage` is assigned to the
 existing contract leaf, but its current tests prove only pure profile, path,
 arithmetic, supporting exact-identity, scalar-wire, and restricted-JCS
 contracts, including the closed profile, canonical-value, scientific, and
-display-defaults grammars. They make no complete-control-schema,
-target-package, T1 conformance, independent-reader, lifecycle, or
-product-support claim. Current schema-1 packages remain non-authoritative T2
-support fixtures until WP-10A accepts the independent target evidence.
+display-defaults grammars and verified recipe payloads. They make no
+complete-control-schema, target-package, T1 conformance, independent-reader,
+lifecycle, or product-support claim. Current schema-1 packages remain
+non-authoritative T2 support fixtures until WP-10A accepts the independent
+target evidence.
 
 The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).

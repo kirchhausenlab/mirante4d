@@ -16,7 +16,7 @@
     "path": "architecture/wp10a-control-wire-specialization.json",
     "schema": "mirante4d-wp10a-control-wire-specialization",
     "schema_version": 1,
-    "sha256": "d24596ee7c8d3cc2f8eca4ce391b7c942cfbc2b4613a4c0dbf4242954ad5f528"
+    "sha256": "e2225af70a120cdc313cc370041d457750e0be5337925c5bfa427aa558cc06b8"
   },
   "activation": {
     "crate_name": "mirante4d-storage",
@@ -77,6 +77,13 @@
       "ProfileLimits",
       "ProfileLogicalLayer",
       "ProfileValidityMode",
+      "RecipeBody",
+      "RecipeDeterminism",
+      "RecipeInput",
+      "RecipeNumericPolicy",
+      "RecipeOperation",
+      "RecipePayload",
+      "RecipeRng",
       "Rgb24",
       "ScaleCountRule",
       "ScaleCounts",

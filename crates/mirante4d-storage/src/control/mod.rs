@@ -1,6 +1,7 @@
 mod display;
 mod header;
 mod jcs;
+mod recipe;
 mod scalar;
 mod science;
 mod value;
@@ -11,6 +12,10 @@ pub use display::{DisplayDefaults, DisplayLayerDefaults};
 pub use header::{
     OmeInteroperabilityBase, ProfileHeader, ProfileImage, ProfileLevel, ProfileLogicalLayer,
     ProfileValidityMode,
+};
+pub use recipe::{
+    RecipeBody, RecipeDeterminism, RecipeInput, RecipeNumericPolicy, RecipeOperation,
+    RecipePayload, RecipeRng,
 };
 pub use scalar::{
     AsciiToken, F32Bits, F64Bits, I64Decimal, MAX_ASCII_TOKEN_BYTES, MAX_NFC_TEXT_BYTES, NfcText,

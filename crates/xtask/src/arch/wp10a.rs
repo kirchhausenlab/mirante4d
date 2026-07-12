@@ -28,7 +28,7 @@ const CONTROL_WIRE_PATH: &str = "architecture/wp10a-control-wire-specialization.
 const CONTROL_WIRE_SCHEMA: &str = "mirante4d-wp10a-control-wire-specialization";
 const CONTROL_WIRE_SCHEMA_VERSION: u64 = 1;
 const CONTROL_WIRE_SHA256: &str =
-    "d24596ee7c8d3cc2f8eca4ce391b7c942cfbc2b4613a4c0dbf4242954ad5f528";
+    "e2225af70a120cdc313cc370041d457750e0be5337925c5bfa427aa558cc06b8";
 const STORAGE_CRATE: &str = "mirante4d-storage";
 const STORAGE_PATH: &str = "crates/mirante4d-storage";
 const DEPENDENCY_KINDS: [&str; 3] = ["normal", "dev", "build"];
@@ -506,6 +506,13 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "ProfileLimits",
         "ProfileLogicalLayer",
         "ProfileValidityMode",
+        "RecipeBody",
+        "RecipeDeterminism",
+        "RecipeInput",
+        "RecipeNumericPolicy",
+        "RecipeOperation",
+        "RecipePayload",
+        "RecipeRng",
         "Rgb24",
         "ScaleCountRule",
         "ScaleCounts",
