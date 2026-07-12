@@ -2370,6 +2370,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "mirante4d-render-reference"
+version = "0.1.0"
+dependencies = [
+ "mirante4d-dataset",
+ "mirante4d-domain",
+ "mirante4d-render-api",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "mirante4d-render-wgpu"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "mirante4d-dataset",
+ "mirante4d-dataset-runtime",
+ "mirante4d-domain",
+ "mirante4d-render-api",
+ "mirante4d-render-reference",
+ "pollster",
+ "thiserror 2.0.17",
+ "wgpu",
+]
+
+[[package]]
 name = "mirante4d-renderer"
 version = "0.1.0"
 dependencies = [

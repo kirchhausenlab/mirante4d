@@ -9,6 +9,7 @@ use anyhow::{Context, bail};
 use syn::visit::Visit;
 
 mod wp08a;
+mod wp09a;
 mod wp10a;
 
 const MAX_TRACKED_GENERATED_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024;
@@ -69,6 +70,7 @@ pub(crate) fn architecture_self_check() -> anyhow::Result<()> {
         }
     }
     wp08a::check_wp08a_subsystem_contract(Path::new("."))?;
+    wp09a::check_wp09a_render_contract(Path::new("."))?;
     wp10a::check_wp10a_storage_contract(Path::new("."))?;
     check_source_architecture_policy()?;
     check_wp07a_contracts(Path::new("."))?;
@@ -825,6 +827,10 @@ fn check_wp07b_live_cutover(
         ("mirante4d-data", "mirante4d-dataset"),
         ("mirante4d-dataset-runtime", "mirante4d-dataset"),
         ("mirante4d-render-api", "mirante4d-dataset"),
+        ("mirante4d-render-reference", "mirante4d-dataset"),
+        ("mirante4d-render-reference", "mirante4d-render-api"),
+        ("mirante4d-render-wgpu", "mirante4d-dataset"),
+        ("mirante4d-render-wgpu", "mirante4d-render-api"),
         ("mirante4d-renderer", "mirante4d-dataset"),
         ("mirante4d-storage", "mirante4d-dataset"),
         ("xtask", "mirante4d-dataset"),
@@ -1989,13 +1995,16 @@ fn json_string_set(
 }
 
 #[derive(Debug)]
-struct WorkspaceDependencyMetadata {
-    declared_dependency_kinds_by_name: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
-    workspace_package_ids_by_name: BTreeMap<String, String>,
-    custom_build_package_ids: BTreeSet<String>,
+pub(super) struct WorkspaceDependencyMetadata {
+    pub(super) declared_dependency_kinds_by_name:
+        BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+    pub(super) workspace_package_ids_by_name: BTreeMap<String, String>,
+    pub(super) custom_build_package_ids: BTreeSet<String>,
 }
 
-fn workspace_dependency_metadata(repo_root: &Path) -> anyhow::Result<WorkspaceDependencyMetadata> {
+pub(super) fn workspace_dependency_metadata(
+    repo_root: &Path,
+) -> anyhow::Result<WorkspaceDependencyMetadata> {
     validate_local_cargo_overrides(repo_root)?;
     let output = Command::new("cargo")
         .args([
