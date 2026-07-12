@@ -151,7 +151,7 @@
     "verified_objects": "verify exact bytes and parse the profile, science, display, empty Zarr groups, image-group OME metadata, and every profile-addressed Zarr array metadata object",
     "portable_record_policy": "profile paths and manifest descriptor roles are checked during open; portable record bytes remain lazy",
     "descriptor_set": "every non-shard descriptor must be exactly one profile-derived required metadata/control path; shard descriptors remain authenticated claims but their files are not read",
-    "cross_object_checks": "profile/science/display identity and layer sets match; OME image level counts and time calibration match; layers sharing one physical image have equal science dtype, shape, time, and transform",
+    "cross_object_checks": "profile/science/display identity and layer sets match; physical channels exactly cover c; OME level/time/base geometry and IO-2 eligibility match science; co-grouped layers share science grids; per-level pixel dtype and ceil-divided shapes, validity t,c,z,y,ceil(x/8), and packed-index logical-brick counts match",
     "reported_metric": "exact metadata bytes read is retained for the later metadata-open evidence gate",
     "non_claims": "open does not enumerate directory closure, verify shard bytes, decode indexes, compute scientific identity, or imply full package validation"
   },

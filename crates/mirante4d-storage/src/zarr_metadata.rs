@@ -551,6 +551,8 @@ mod tests {
     const VALIDITY_NAMES: &[&str] = &["t", "c", "z", "y", "x_byte"];
     const SHAPE_3D: &[u64] = &[2, 3, 65, 513, 1_025];
     const SHAPE_2D: &[u64] = &[2, 3, 1, 513, 1_025];
+    const SHAPE_VALIDITY_3D: &[u64] = &[2, 3, 65, 513, 129];
+    const SHAPE_VALIDITY_2D: &[u64] = &[2, 3, 1, 513, 129];
     const SHAPE_INDEX: &[u64] = &[1_025, 64];
     const OUTER_PIXEL_3D: &[u64] = &[1, 1, 256, 256, 256];
     const INNER_PIXEL_3D: &[u64] = &[1, 1, 64, 64, 64];
@@ -620,7 +622,7 @@ mod tests {
         },
         ExpectedRow {
             kind: ShardProfileKind::Validity3d,
-            shape: SHAPE_3D,
+            shape: SHAPE_VALIDITY_3D,
             data_type: "uint8",
             outer_chunk_shape: OUTER_VALIDITY_3D,
             inner_chunk_shape: INNER_VALIDITY_3D,
@@ -629,7 +631,7 @@ mod tests {
         },
         ExpectedRow {
             kind: ShardProfileKind::Validity2d,
-            shape: SHAPE_2D,
+            shape: SHAPE_VALIDITY_2D,
             data_type: "uint8",
             outer_chunk_shape: OUTER_VALIDITY_2D,
             inner_chunk_shape: INNER_VALIDITY_2D,

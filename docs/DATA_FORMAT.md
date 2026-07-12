@@ -77,7 +77,8 @@ and transforms, and bounded root-confined Unix object-range reads are
 implemented. The integrated package reader, writer, and validator are not yet
 implemented. A bounded local catalog now authenticates the manifest root/pages,
 verifies opening-critical metadata bytes, parses the closed control/Zarr/OME
-objects, and checks their initial layer/time relationships; it does not yet
+objects, and checks their layer, time, geometry, dtype, shape, validity, and
+packed-index-count relationships; it does not yet
 enumerate full directory closure or verify shard payloads.
 
 WP-10B separately installs immutable content-addressed project objects,

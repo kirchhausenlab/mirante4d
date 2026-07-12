@@ -1,14 +1,16 @@
 use std::{collections::BTreeMap, path::Path};
 
+use mirante4d_domain::IntensityDType;
 use mirante4d_identity::{ExactBytesHasher, IdentityHashError, PackageId};
 use thiserror::Error;
 
 use crate::{
     ControlError, DisplayDefaults, LocalPackageReader, MAX_PORTABLE_CONTROL_OBJECT_BYTES,
     MAX_PROFILE_HEADER_BYTES, MAX_ZARR_METADATA_BYTES, ManifestPage, ManifestRoot,
-    OmeImageGroupMetadata, PackageObjectDescriptor, PackageObjectKind, PackagePath, ProfileHeader,
-    RangeReadError, ScienceDescriptor, StorageProfileError, ZarrArrayMetadata, ZarrGroupMetadata,
-    ZarrMetadataError,
+    OmeImageGroupMetadata, OmeInteroperabilityBase, OmeLevelTransform, PackageObjectDescriptor,
+    PackageObjectKind, PackagePath, ProfileHeader, ProfileValidityMode, RangeReadError,
+    ScienceDescriptor, ScienceLayer, ScienceTemporalKind, ShardProfileKind, StorageProfileError,
+    ZarrArrayMetadata, ZarrGroupMetadata, ZarrMetadataError,
 };
 
 const PROFILE_PATH: &str = "m4d/profile.json";
@@ -133,6 +135,7 @@ impl LocalPackageCatalog {
                 path: profile.display_defaults_path().to_string(),
             })?;
         validate_cross_object_metadata(&profile, &science, &display_defaults, &ome_images)?;
+        validate_storage_metadata(&profile, &science, &ome_images, &zarr_arrays)?;
 
         Ok(Self {
             package_id,
@@ -380,6 +383,170 @@ fn validate_cross_object_metadata(
     Ok(())
 }
 
+fn validate_storage_metadata(
+    profile: &ProfileHeader,
+    science: &ScienceDescriptor,
+    ome_images: &BTreeMap<PackagePath, OmeImageGroupMetadata>,
+    zarr_arrays: &BTreeMap<PackagePath, ZarrArrayMetadata>,
+) -> Result<(), PackageOpenError> {
+    for image in profile.images() {
+        let first = image.logical_layers()[0].logical_layer().ordinal() as usize;
+        let science_layer = &science.layers()[first];
+        let base_shape = science_layer.base_shape();
+        let two_dimensional = base_shape.z() == 1;
+        let channel_count = u64::try_from(image.logical_layers().len()).map_err(|_| {
+            PackageOpenError::CrossObjectInconsistency {
+                reason: "physical channel count exceeds u64",
+            }
+        })?;
+        let mut physical_channels = image
+            .logical_layers()
+            .iter()
+            .map(|layer| layer.physical_channel())
+            .collect::<Vec<_>>();
+        physical_channels.sort_unstable();
+        if !physical_channels
+            .iter()
+            .enumerate()
+            .all(|(expected, channel)| usize::try_from(*channel).ok() == Some(expected))
+        {
+            return cross_object("physical channels must exactly cover zero through c-1");
+        }
+
+        let ome_path = metadata_path(image.image_group_path())?;
+        let ome = &ome_images[&ome_path];
+        let expected_base_transform = ome_base_transform(science_layer);
+        if ome.level_transforms()[0] != expected_base_transform {
+            return cross_object("base OME and science spatial transforms differ");
+        }
+        if profile.ome_interoperability_base() == OmeInteroperabilityBase::Io2
+            && (science_layer.temporal_calibration().kind() != ScienceTemporalKind::Regular
+                || expected_base_transform == OmeLevelTransform::UnitlessIdentity)
+        {
+            return cross_object("IO-2 requires regular time and diagonal micrometer geometry");
+        }
+
+        let mut spatial = [base_shape.z(), base_shape.y(), base_shape.x()];
+        for level in image.levels() {
+            let pixel_shape = [
+                base_shape.t(),
+                channel_count,
+                spatial[0],
+                spatial[1],
+                spatial[2],
+            ];
+            let pixel_path = metadata_path(level.pixel_path())?;
+            let pixel = required_array(zarr_arrays, &pixel_path)?;
+            if pixel.kind() != pixel_kind(science_layer.dtype(), two_dimensional)
+                || pixel.shape() != pixel_shape
+            {
+                return cross_object("pixel Zarr dtype or shape differs from science metadata");
+            }
+
+            if level.validity_mode() == ProfileValidityMode::Explicit {
+                let validity_path = metadata_path(level.validity_path().ok_or(
+                    PackageOpenError::CrossObjectInconsistency {
+                        reason: "explicit validity has no profile path",
+                    },
+                )?)?;
+                let validity = required_array(zarr_arrays, &validity_path)?;
+                let validity_shape = [
+                    base_shape.t(),
+                    channel_count,
+                    spatial[0],
+                    spatial[1],
+                    ceil_divide(spatial[2], 8),
+                ];
+                let expected_kind = if two_dimensional {
+                    ShardProfileKind::Validity2d
+                } else {
+                    ShardProfileKind::Validity3d
+                };
+                if validity.kind() != expected_kind || validity.shape() != validity_shape {
+                    return cross_object("validity Zarr shape is not t,c,z,y,ceil(x/8)");
+                }
+            }
+
+            let record_count = checked_record_count(pixel_shape, two_dimensional)?;
+            let packed_path = metadata_path(level.packed_index_path())?;
+            let packed = required_array(zarr_arrays, &packed_path)?;
+            if packed.kind() != ShardProfileKind::PackedIndex
+                || packed.shape() != [record_count, 64]
+            {
+                return cross_object("packed-index record count differs from logical bricks");
+            }
+
+            spatial = spatial.map(ceil_divide_by_two);
+        }
+    }
+    Ok(())
+}
+
+fn required_array<'a>(
+    arrays: &'a BTreeMap<PackagePath, ZarrArrayMetadata>,
+    path: &PackagePath,
+) -> Result<&'a ZarrArrayMetadata, PackageOpenError> {
+    arrays
+        .get(path)
+        .ok_or_else(|| PackageOpenError::MissingMetadataObject {
+            path: path.to_string(),
+        })
+}
+
+fn pixel_kind(dtype: IntensityDType, two_dimensional: bool) -> ShardProfileKind {
+    match (dtype, two_dimensional) {
+        (IntensityDType::Uint8, false) => ShardProfileKind::Pixel3dUint8,
+        (IntensityDType::Uint16, false) => ShardProfileKind::Pixel3dUint16,
+        (IntensityDType::Float32, false) => ShardProfileKind::Pixel3dFloat32,
+        (IntensityDType::Uint8, true) => ShardProfileKind::Pixel2dUint8,
+        (IntensityDType::Uint16, true) => ShardProfileKind::Pixel2dUint16,
+        (IntensityDType::Float32, true) => ShardProfileKind::Pixel2dFloat32,
+    }
+}
+
+fn ome_base_transform(layer: &ScienceLayer) -> OmeLevelTransform {
+    let matrix = layer.grid_to_world_micrometer_f64_bits();
+    if [1, 2, 4, 6, 8, 9]
+        .into_iter()
+        .all(|index| matrix[index].bits() == 0)
+    {
+        OmeLevelTransform::DiagonalMicrometer {
+            scale_zyx: [matrix[10], matrix[5], matrix[0]],
+            translation_zyx: [matrix[11], matrix[7], matrix[3]],
+        }
+    } else {
+        OmeLevelTransform::UnitlessIdentity
+    }
+}
+
+fn checked_record_count(
+    pixel_shape: [u64; 5],
+    two_dimensional: bool,
+) -> Result<u64, PackageOpenError> {
+    let brick = if two_dimensional {
+        [1, 1, 1, 256, 256]
+    } else {
+        [1, 1, 64, 64, 64]
+    };
+    pixel_shape
+        .into_iter()
+        .zip(brick)
+        .try_fold(1_u64, |count, (dimension, chunk)| {
+            count.checked_mul(ceil_divide(dimension, chunk))
+        })
+        .ok_or(PackageOpenError::CrossObjectInconsistency {
+            reason: "logical brick count overflowed u64",
+        })
+}
+
+const fn ceil_divide(value: u64, divisor: u64) -> u64 {
+    value / divisor + if value.is_multiple_of(divisor) { 0 } else { 1 }
+}
+
+const fn ceil_divide_by_two(value: u64) -> u64 {
+    value / 2 + value % 2
+}
+
 fn read_verified_metadata(
     reader: &LocalPackageReader,
     descriptor: &PackageObjectDescriptor,
@@ -483,6 +650,15 @@ mod tests {
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
+    #[derive(Clone, Copy)]
+    enum FixtureDrift {
+        None,
+        EmptyDisplay,
+        ExtraMetadata,
+        WrongPixelShape,
+        UnitlessOme,
+    }
+
     struct TempRoot(PathBuf);
 
     impl TempRoot {
@@ -545,7 +721,7 @@ mod tests {
         .unwrap()
     }
 
-    fn fixture(empty_display: bool, extra_metadata: bool) -> TempRoot {
+    fn fixture(drift: FixtureDrift) -> TempRoot {
         let root = TempRoot::new();
         let temporal = ScienceTemporalCalibration::regular(bits64("3ff0000000000000")).unwrap();
         let profile_level = ProfileLevel::new(0, 0, ProfileValidityMode::AllValid).unwrap();
@@ -576,7 +752,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let display = DisplayDefaults::new(if empty_display {
+        let display = DisplayDefaults::new(if matches!(drift, FixtureDrift::EmptyDisplay) {
             Vec::new()
         } else {
             vec![
@@ -594,9 +770,13 @@ mod tests {
         let ome = OmeImageGroupMetadata::new(
             &image,
             &temporal,
-            vec![OmeLevelTransform::DiagonalMicrometer {
-                scale_zyx: [bits64("3ff0000000000000"); 3],
-                translation_zyx: [bits64("0000000000000000"); 3],
+            vec![if matches!(drift, FixtureDrift::UnitlessOme) {
+                OmeLevelTransform::UnitlessIdentity
+            } else {
+                OmeLevelTransform::DiagonalMicrometer {
+                    scale_zyx: [bits64("3ff0000000000000"); 3],
+                    translation_zyx: [bits64("0000000000000000"); 3],
+                }
             }],
         )
         .unwrap();
@@ -651,10 +831,17 @@ mod tests {
                 "images/i00000000/s00/zarr.json".to_owned(),
                 (
                     PackageObjectKind::ZarrPixelArray,
-                    ZarrArrayMetadata::new(ShardProfileKind::Pixel2dUint8, vec![1, 1, 1, 2, 3])
-                        .unwrap()
-                        .deterministic_bytes()
-                        .unwrap(),
+                    ZarrArrayMetadata::new(
+                        ShardProfileKind::Pixel2dUint8,
+                        if matches!(drift, FixtureDrift::WrongPixelShape) {
+                            vec![1, 1, 1, 2, 4]
+                        } else {
+                            vec![1, 1, 1, 2, 3]
+                        },
+                    )
+                    .unwrap()
+                    .deterministic_bytes()
+                    .unwrap(),
                 ),
             ),
             (
@@ -668,7 +855,7 @@ mod tests {
                 ),
             ),
         ]);
-        if extra_metadata {
+        if matches!(drift, FixtureDrift::ExtraMetadata) {
             objects.insert(
                 "images/i00000001/zarr.json".to_owned(),
                 (
@@ -711,7 +898,7 @@ mod tests {
 
     #[test]
     fn opens_authenticated_metadata_catalog_without_reading_shards() {
-        let root = fixture(false, false);
+        let root = fixture(FixtureDrift::None);
         let catalog = LocalPackageCatalog::open(&root.0).unwrap();
         assert_eq!(
             catalog.package_id(),
@@ -728,7 +915,7 @@ mod tests {
 
     #[test]
     fn rejects_manifest_page_and_metadata_byte_corruption() {
-        let root = fixture(false, false);
+        let root = fixture(FixtureDrift::None);
         let page = root.0.join("m4d/manifest/pages/p00000000.json");
         let mut bytes = fs::read(&page).unwrap();
         bytes.push(b' ');
@@ -738,7 +925,7 @@ mod tests {
             Err(PackageOpenError::ManifestPageLengthMismatch { .. })
         ));
 
-        let root = fixture(false, false);
+        let root = fixture(FixtureDrift::None);
         let science = root.0.join("m4d/science.json");
         let mut bytes = fs::read(&science).unwrap();
         bytes.push(b' ');
@@ -751,15 +938,22 @@ mod tests {
 
     #[test]
     fn rejects_cross_object_layer_drift_and_unexpected_metadata() {
-        let root = fixture(true, false);
+        let root = fixture(FixtureDrift::EmptyDisplay);
         assert!(matches!(
             LocalPackageCatalog::open(&root.0),
             Err(PackageOpenError::CrossObjectInconsistency { .. })
         ));
-        let root = fixture(false, true);
+        let root = fixture(FixtureDrift::ExtraMetadata);
         assert!(matches!(
             LocalPackageCatalog::open(&root.0),
             Err(PackageOpenError::UnexpectedMetadataObject { .. })
         ));
+        for drift in [FixtureDrift::WrongPixelShape, FixtureDrift::UnitlessOme] {
+            let root = fixture(drift);
+            assert!(matches!(
+                LocalPackageCatalog::open(&root.0),
+                Err(PackageOpenError::CrossObjectInconsistency { .. })
+            ));
+        }
     }
 }

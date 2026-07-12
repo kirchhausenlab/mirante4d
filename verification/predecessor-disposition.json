@@ -4786,7 +4786,7 @@
       "owner": "mirante4d-storage",
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
-      "reason": "WP-10A rejects unexpected metadata roles and inconsistent profile, science, display, OME, or physical-image layer facts."
+      "reason": "WP-10A rejects unexpected metadata roles, mismatched profile/science/display layers, unitless OME under IO-2, and pixel storage-shape drift."
     },
     {
       "id": "libtest:mirante4d-storage:package_catalog::tests::rejects_manifest_page_and_metadata_byte_corruption",
