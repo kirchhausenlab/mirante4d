@@ -60,10 +60,12 @@ WP-10A-B implementation is active: the storage profile, scientific and exact
 identities, strict control scalars, closed profile, canonical-value,
 scientific, and display-defaults grammars, restricted JCS, and exact
 compatibility tuple bytes exist. Exact recipe bodies and verified RecipeId
-payloads also exist. The remaining record payloads and envelopes, manifest and
-release DTOs, shard/index I/O, reader, writer, validator, independent T1
-corpus, and product activation remain incomplete. Current schema-1 packages
-remain transitional T2 fixtures and the sole product route.
+payloads also exist, together with exact object descriptors, canonical greedy
+manifest pages, authenticated roots, and PackageId derivation. The remaining
+record payloads and envelopes, release DTOs, shard/index I/O, reader, writer,
+validator, independent T1 corpus, and product activation remain incomplete.
+Current schema-1 packages remain transitional T2 fixtures and the sole product
+route.
 
 ## Current Verification Boundary
 

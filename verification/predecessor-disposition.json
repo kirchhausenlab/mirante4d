@@ -4469,6 +4469,30 @@
       "reason": "WP-10A proves restricted control JCS uses RFC 8785 UTF-16 key ordering and exact string escaping."
     },
     {
+      "id": "libtest:mirante4d-storage:control::manifest::tests::manifest_pages_and_root_roundtrip_with_exact_package_identity",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves exact path-bound descriptors, canonical manifest pages, authenticated roots, and PackageId derivation."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::manifest::tests::manifest_rejects_registry_path_order_and_reference_drift",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A rejects unregistered object facts, mismatched paths, alternate encodings, non-greedy pages, and unauthenticated page drift."
+    },
+    {
+      "id": "libtest:mirante4d-storage:control::manifest::tests::two_thousand_max_fact_descriptors_fit_one_linear_greedy_page",
+      "kind": "libtest",
+      "owner": "mirante4d-storage",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10A-off-product-storage-profile"],
+      "reason": "WP-10A proves the frozen two-thousand-descriptor page guarantee with linear exact-byte accounting."
+    },
+    {
       "id": "libtest:mirante4d-storage:control::recipe::tests::recipe_payload_rejects_malformed_noncanonical_and_invalid_graphs",
       "kind": "libtest",
       "owner": "mirante4d-storage",
@@ -4691,6 +4715,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 381
+    "current_additions": 384
   }
 }

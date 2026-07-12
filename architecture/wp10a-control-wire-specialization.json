@@ -44,5 +44,65 @@
   "recipe_graph": {
     "node_origin": "zero",
     "input_uniqueness": "unique by the ordered pair role then node"
+  },
+  "package_manifest": {
+    "descriptor_keys": ["path", "media_type", "logical_role", "bytes", "digest"],
+    "descriptor_bytes_max": 512,
+    "media_types": [
+      "application/vnd.mirante4d.display-defaults+json",
+      "application/vnd.mirante4d.portable-record+json",
+      "application/vnd.mirante4d.profile+json",
+      "application/vnd.mirante4d.science+json",
+      "application/vnd.zarr+json",
+      "application/vnd.zarr.shard"
+    ],
+    "logical_roles": [
+      "m4d.display-defaults",
+      "m4d.portable-record",
+      "m4d.profile",
+      "m4d.science",
+      "packed-index.shard",
+      "pixel.shard",
+      "validity.shard",
+      "zarr.image-group",
+      "zarr.images-group",
+      "zarr.indexes-group",
+      "zarr.packed-index-array",
+      "zarr.pixel-array",
+      "zarr.root",
+      "zarr.validity-array",
+      "zarr.validity-group"
+    ],
+    "path_role_pairing": {
+      "zarr.root": "zarr.json",
+      "zarr.images-group": "images/zarr.json",
+      "zarr.validity-group": "validity/zarr.json",
+      "zarr.indexes-group": "indexes/zarr.json",
+      "zarr.image-group": "images/i########/zarr.json",
+      "zarr.pixel-array": "images/i########/s##/zarr.json",
+      "zarr.validity-array": "validity/i########-s##/zarr.json",
+      "zarr.packed-index-array": "indexes/i########-s##/zarr.json",
+      "pixel.shard": "images/i########/s##/c/<u64>/<u64>/<u64>/<u64>/<u64>",
+      "validity.shard": "validity/i########-s##/c/<u64>/<u64>/<u64>/<u64>/<u64>",
+      "packed-index.shard": "indexes/i########-s##/c/<u64>/0",
+      "m4d.profile": "m4d/profile.json",
+      "m4d.science": "m4d/science.json",
+      "m4d.display-defaults": "m4d/display.json",
+      "m4d.portable-record": "m4d/records/r########.json with ordinal 0 through 13"
+    },
+    "path_ordinals": "image 0 through 3 and scale 0 through 6; shard coordinates use canonical unsigned decimal components",
+    "page_schema": "m4d-manifest-page",
+    "page_keys": ["schema", "schema_version", "entries"],
+    "page_path": "m4d/manifest/pages/p########.json",
+    "page_bytes_max": 1048576,
+    "page_entries": "nonempty and strictly sorted unique by ASCII package path",
+    "page_packing": "path-sort descriptors, then greedily append the next descriptor iff the exact canonical page remains within the byte limit",
+    "root_schema": "m4d-manifest-root",
+    "root_keys": ["schema", "schema_version", "pages"],
+    "page_reference_keys": ["path", "first_path", "last_path", "entry_count", "bytes", "digest"],
+    "root_bytes_max": 1048576,
+    "root_pages": "one through six contiguous p######## paths from zero, positive counts and byte lengths, and strictly increasing nonoverlapping path bounds",
+    "cross_page_verification": "each reference matches exact count, bounds, bytes, and digest and flattening then repacking reproduces the identical greedy pages",
+    "root_package_id": "SHA-256 of the exact canonical root bytes; package_id is not stored inside the root"
   }
 }

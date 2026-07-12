@@ -4,7 +4,10 @@ use mirante4d_domain::LogicalLayerKey;
 use mirante4d_identity::ScientificContentId;
 use serde::{Deserialize, Serialize};
 
-use super::{ControlError, MAX_PROFILE_HEADER_BYTES, U64Decimal, jcs};
+use super::{
+    ControlError, IMAGE_COUNT_MAX, LEVEL_COUNT_MAX, MAX_PROFILE_HEADER_BYTES,
+    PORTABLE_RECORD_COUNT_MAX, U64Decimal, jcs,
+};
 use crate::{CAPABILITIES, PROFILE, PackagePath};
 
 const OBJECT: &str = "profile header";
@@ -12,9 +15,6 @@ const SCHEMA: &str = "m4d-profile";
 const SCIENCE_PATH: &str = "m4d/science.json";
 const DISPLAY_PATH: &str = "m4d/display.json";
 const MANIFEST_ROOT_PATH: &str = "m4d/manifest/root.json";
-const IMAGE_COUNT_MAX: usize = 4;
-const LEVEL_COUNT_MAX: usize = 7;
-const PORTABLE_RECORD_COUNT_MAX: usize = 14;
 
 /// The maximum OME interoperability claim stored in a version-1 profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,6 +1,7 @@
 mod display;
 mod header;
 mod jcs;
+mod manifest;
 mod recipe;
 mod scalar;
 mod science;
@@ -12,6 +13,10 @@ pub use display::{DisplayDefaults, DisplayLayerDefaults};
 pub use header::{
     OmeInteroperabilityBase, ProfileHeader, ProfileImage, ProfileLevel, ProfileLogicalLayer,
     ProfileValidityMode,
+};
+pub use manifest::{
+    ManifestPage, ManifestPageReference, ManifestRoot, PackageObjectDescriptor, PackageObjectKind,
+    manifest_page_path, pack_manifest_pages,
 };
 pub use recipe::{
     RecipeBody, RecipeDeterminism, RecipeInput, RecipeNumericPolicy, RecipeOperation,
@@ -30,6 +35,10 @@ pub use value::{CanonicalMapEntry, CanonicalValue, CanonicalValueKind};
 pub const MAX_PORTABLE_CONTROL_OBJECT_BYTES: usize = 1_048_576;
 /// Maximum canonical UTF-8 bytes in the version-1 bootstrap profile header.
 pub const MAX_PROFILE_HEADER_BYTES: usize = 4_194_304;
+
+pub(super) const IMAGE_COUNT_MAX: usize = 4;
+pub(super) const LEVEL_COUNT_MAX: usize = 7;
+pub(super) const PORTABLE_RECORD_COUNT_MAX: usize = 14;
 
 /// A strict experimental-v1 control-wire validation failure.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]

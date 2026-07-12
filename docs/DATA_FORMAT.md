@@ -64,10 +64,13 @@ hashing, exact object/package hashing, and domain-framed recipe,
 derivation-record, and release hashing. Strict scalar grammars, restricted JCS,
 the closed profile, canonical-value, scientific, and display-defaults
 grammars, exact recipe bodies and verified RecipeId payloads, and the exact
-compatibility tuple are implemented. A checked control-wire specialization
-fixes the ordinal, indexed-path, temporal, and recipe-node spellings omitted
-from the accepted freeze. The remaining control DTOs are not yet complete, and
-the core does not yet read, write, or validate target packages.
+compatibility tuple are implemented. Exact path-bound object descriptors,
+canonical greedy manifest pages, authenticated manifest roots, and PackageId
+derivation are also implemented. A checked control-wire specialization fixes
+the ordinal, indexed-path, temporal, recipe-node, and manifest spellings
+omitted from the accepted freeze. The remaining record and release DTOs are not
+yet complete, and the core does not yet read, write, or validate target
+packages.
 
 WP-10B separately installs immutable content-addressed project objects,
 complete generations, atomic head/recovery refs, leases, autosave/recovery,

@@ -28,7 +28,7 @@ const CONTROL_WIRE_PATH: &str = "architecture/wp10a-control-wire-specialization.
 const CONTROL_WIRE_SCHEMA: &str = "mirante4d-wp10a-control-wire-specialization";
 const CONTROL_WIRE_SCHEMA_VERSION: u64 = 1;
 const CONTROL_WIRE_SHA256: &str =
-    "e2225af70a120cdc313cc370041d457750e0be5337925c5bfa427aa558cc06b8";
+    "5920e798383febc358f253d539882508fd9cfefb6b7119e53bd5cd28add2b2fd";
 const STORAGE_CRATE: &str = "mirante4d-storage";
 const STORAGE_PATH: &str = "crates/mirante4d-storage";
 const DEPENDENCY_KINDS: [&str; 3] = ["normal", "dev", "build"];
@@ -481,6 +481,9 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "INDEX_LOCATION",
         "INNER_CODECS",
         "MANIFEST_DESCRIPTORS_PER_PAGE_GUARANTEED",
+        "ManifestPage",
+        "ManifestPageReference",
+        "ManifestRoot",
         "MAX_ASCII_TOKEN_BYTES",
         "MAX_DIRECTORY_DEPTH",
         "MAX_FILE_PATH_COMPONENTS",
@@ -498,6 +501,8 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "PORTABLE_PROVENANCE_RECORDS_MAX",
         "PROFILE",
         "PackageCounts",
+        "PackageObjectDescriptor",
+        "PackageObjectKind",
         "PackagePath",
         "ProfileKind",
         "ProfileHeader",
@@ -530,6 +535,8 @@ fn accepted_storage_public_api() -> &'static [&'static str] {
         "count_3d_pyramid",
         "encoded_inner_payload_limit",
         "encoded_outer_shard_limit",
+        "manifest_page_path",
+        "pack_manifest_pages",
         "profile_compatibility_bytes",
         "profile_limits",
         "validate_unique_paths",
