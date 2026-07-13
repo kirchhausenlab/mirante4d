@@ -174,7 +174,7 @@
           "role": "rootless-power-cut-runner",
           "id": "WP10B-VM-RUNNER-001",
           "path": "tools/project-store-vm/run.py",
-          "sha256": "96f354a3e15c90e7229f6b5289aebd2282e70378833742531125d98e6a2d5f58"
+          "sha256": "71ef11a8c1eedadb24431e784b5e13a7d0b14dde96a739bcba674e8360730a50"
         },
         {
           "role": "guest-init-boundary",

@@ -6238,6 +6238,14 @@
       "reason": "WP-10B B2 accepts exactly one sanitized lifecycle record and rejects tool, cut-matrix, or performance drift before trusted-local evidence can be recorded."
     },
     {
+      "id": "libtest:xtask::bin/xtask:verification::runner::tests::project_store_hosted_aggregate_is_exact_and_scope_bounded",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B2 accepts the exact hosted, inherited process, hostile, and runtime-gate matrices while keeping B3 source and B4 product claims out of durability qualification."
+    },
+    {
       "id": "libtest:xtask::bin/xtask:verification::registry::tests::project_store_lifecycle_is_an_active_trusted_local_lane",
       "kind": "libtest",
       "owner": "xtask",
@@ -6356,6 +6364,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 588
+    "current_additions": 589
   }
 }

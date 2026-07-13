@@ -135,6 +135,10 @@ class HarnessFailure(RuntimeError):
     """A sanitized, user-actionable harness failure."""
 
 
+def deadline_expired(_signum: int, _frame: Any) -> None:
+    raise HarnessFailure("VM aggregate timeout expired")
+
+
 def exact_object(value: Any, keys: set[str], context: str) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != keys:
         raise HarnessFailure(f"{context} fields drifted")
@@ -1468,7 +1472,11 @@ def aggregate_counters(target: dict[str, int | float], current: dict[str, int | 
 
 
 def success_evidence(
-    manifest: dict[str, Any], repo: Path, work: Path, deadline: float
+    manifest: dict[str, Any],
+    repo: Path,
+    work: Path,
+    started: float,
+    deadline: float,
 ) -> dict[str, Any]:
     constraints = manifest["constraints"]
     if sys.platform != "linux" or os.uname().machine != "x86_64":
@@ -1734,7 +1742,7 @@ def success_evidence(
         raise HarnessFailure("project-store performance boundary failed")
     if working_peak > constraints["working_bytes_max"]:
         raise HarnessFailure("VM working allocation exceeded 640 MiB")
-    elapsed_ms = int((constraints["timeout_seconds"] - (deadline - time.monotonic())) * 1000)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
     if elapsed_ms > constraints["timeout_seconds"] * 1000:
         raise HarnessFailure("VM aggregate timeout exceeded 900 seconds")
     counters.update(
@@ -2068,6 +2076,7 @@ def self_test(manifest: dict[str, Any], repo: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--deadline-seconds", type=int)
     args = parser.parse_args()
     script = Path(__file__).resolve()
     repo = script.parents[2]
@@ -2090,13 +2099,31 @@ def main() -> int:
 
     constraints = manifest.get("constraints", {})
     timeout = constraints.get("timeout_seconds", 900)
-    deadline = time.monotonic() + (timeout if isinstance(timeout, int) else 900)
-    target = repo / "target/mirante4d/project-store-vm"
-    target.mkdir(parents=True, exist_ok=True)
+    maximum_timeout = timeout if isinstance(timeout, int) else 900
+    effective_timeout = (
+        args.deadline_seconds
+        if args.deadline_seconds is not None
+        else maximum_timeout
+    )
     try:
         validate_manifest(manifest)
+        if effective_timeout <= 0 or effective_timeout > maximum_timeout:
+            raise HarnessFailure("VM cooperative deadline is outside the frozen maximum")
+    except HarnessFailure as error:
+        evidence = failed_evidence(str(error))
+        print(EVIDENCE_PREFIX + json.dumps(evidence, sort_keys=True, separators=(",", ":")))
+        return 1
+    started = time.monotonic()
+    deadline = started + effective_timeout
+    target = repo / "target/mirante4d/project-store-vm"
+    target.mkdir(parents=True, exist_ok=True)
+    previous_alarm = signal.signal(signal.SIGALRM, deadline_expired)
+    signal.setitimer(signal.ITIMER_REAL, effective_timeout)
+    try:
         with tempfile.TemporaryDirectory(prefix="run-", dir=target) as encoded:
-            evidence = success_evidence(manifest, repo, Path(encoded), deadline)
+            evidence = success_evidence(
+                manifest, repo, Path(encoded), started, deadline
+            )
         validate_success_evidence(evidence, manifest)
         require_same_git_identity(evidence["identity"], git_identity(repo))
     except HarnessFailure as error:
@@ -2107,6 +2134,9 @@ def main() -> int:
         evidence = failed_evidence("unexpected project-store lifecycle harness failure")
         print(EVIDENCE_PREFIX + json.dumps(evidence, sort_keys=True, separators=(",", ":")))
         return 1
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_alarm)
     print(EVIDENCE_PREFIX + json.dumps(evidence, sort_keys=True, separators=(",", ":")))
     return 0
 
