@@ -10,8 +10,12 @@
 mod actor;
 mod api;
 #[cfg(target_os = "linux")]
+mod filesystem;
+#[cfg(target_os = "linux")]
 mod full_verify;
 mod generation;
+#[cfg(all(test, target_os = "linux"))]
+mod hostile_tests;
 #[cfg(target_os = "linux")]
 mod inspection;
 #[cfg(target_os = "linux")]
@@ -22,6 +26,8 @@ mod local;
 mod pin;
 #[cfg(target_os = "linux")]
 mod transaction;
+#[cfg(target_os = "linux")]
+mod transition;
 #[cfg(target_os = "linux")]
 mod trash;
 mod wire;

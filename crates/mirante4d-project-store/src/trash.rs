@@ -1776,8 +1776,13 @@ where
 fn map_local_error(error: LocalPublicationError, stage: &'static str) -> ProjectStoreFault {
     match error {
         LocalPublicationError::Cancelled => ProjectStoreFault::Cancelled,
-        LocalPublicationError::Capacity { .. } => ProjectStoreFault::Capacity { stage },
-        LocalPublicationError::SourceLength { .. } => ProjectStoreFault::SourceChanged,
+        LocalPublicationError::Capacity { .. } | LocalPublicationError::StorageFull { .. } => {
+            ProjectStoreFault::Capacity { stage }
+        }
+        LocalPublicationError::ReadOnly { .. } => ProjectStoreFault::ReadOnly,
+        LocalPublicationError::SourceIo { .. } | LocalPublicationError::SourceLength { .. } => {
+            ProjectStoreFault::SourceChanged
+        }
         LocalPublicationError::SourceDigest => ProjectStoreFault::DigestMismatch,
         LocalPublicationError::RefCommitIndeterminate
         | LocalPublicationError::PackageCommitIndeterminate => {
@@ -3283,7 +3288,14 @@ pub(crate) mod tests {
         fs::rename(active, trash).unwrap();
     }
 
-    fn install_unique_regenerable_orphan(root: &Path) -> (ProjectGenerationId, PathBuf) {
+    pub(crate) fn install_unique_regenerable_orphan(root: &Path) -> (ProjectGenerationId, PathBuf) {
+        install_unique_regenerable_orphan_inner(root, true)
+    }
+
+    fn install_unique_regenerable_orphan_inner(
+        root: &Path,
+        remove_source: bool,
+    ) -> (ProjectGenerationId, PathBuf) {
         let old = generation_id(RECOVERABLE_ORPHAN);
         let old_path = root.join(active_generation_path(old));
         let mut document = serde_json::from_slice::<Value>(&fs::read(&old_path).unwrap()).unwrap();
@@ -3314,11 +3326,20 @@ pub(crate) mod tests {
         let selected_path = root.join(active_generation_path(selected));
         fs::create_dir_all(selected_path.parent().unwrap()).unwrap();
         fs::write(&selected_path, canonical).unwrap();
-        fs::remove_file(old_path).unwrap();
+        if remove_source {
+            fs::remove_file(old_path).unwrap();
+        }
         let object_path = root.join(active_object_path(digest));
         fs::create_dir_all(object_path.parent().unwrap()).unwrap();
         fs::write(&object_path, object_bytes).unwrap();
         (selected, object_path)
+    }
+
+    pub(crate) fn install_two_safe_orphans(root: &Path) -> [ProjectGenerationId; 2] {
+        let (normal, _) = install_unique_regenerable_orphan_inner(root, false);
+        let collision = install_zero_non_regenerable_orphan(root);
+        assert_ne!(normal, collision);
+        [normal, collision]
     }
 
     pub(crate) fn install_zero_non_regenerable_orphan(root: &Path) -> ProjectGenerationId {

@@ -1,7 +1,7 @@
 {
   "schema": "mirante4d-verification-fixture-registry",
   "schema_version": 1,
-  "record_count": 11,
+  "record_count": 12,
   "rules": {
     "maximum_records": 64,
     "candidate_output_root": "target/mirante4d/fixture-candidates",
@@ -150,6 +150,55 @@
       },
       "expiry": null,
       "deletion_gate": null,
+      "target_format_conformance": false
+    },
+    {
+      "id": "wp10b-hostile-lifecycle",
+      "tier": "T2",
+      "claim_scope": "wp10b-rootless-ext4-power-cut-and-cross-device-support",
+      "authority_state": "non-authoritative-generated",
+      "owner": "mirante4d-project-store",
+      "capability": "trusted-local-kvm-ext4",
+      "publication": "public-safe-synthetic",
+      "license": "MIT",
+      "path": "tools/project-store-vm/manifest.json",
+      "sha256": "b972473d7c5e3c51df91727aa3e96887ac207619e848ab3eb8f6ae303e37e848",
+      "generator": {
+        "command": "python3 tools/project-store-vm/run.py --self-test",
+        "source": "tools/project-store-vm/manifest.json",
+        "sha256": "b972473d7c5e3c51df91727aa3e96887ac207619e848ab3eb8f6ae303e37e848",
+        "production_writer_used": false
+      },
+      "lineages": [
+        {
+          "role": "rootless-power-cut-runner",
+          "id": "WP10B-VM-RUNNER-001",
+          "path": "tools/project-store-vm/run.py",
+          "sha256": "71ef11a8c1eedadb24431e784b5e13a7d0b14dde96a739bcba674e8360730a50"
+        },
+        {
+          "role": "guest-init-boundary",
+          "id": "WP10B-VM-GUEST-001",
+          "path": "tools/project-store-vm/guest-init.sh",
+          "sha256": "e9435d1d84339e5cab51e2ff8d1c6202e3bc4b115a2d22ee836c10a914a2c627"
+        }
+      ],
+      "limits": {
+        "flows": 11,
+        "transition_names": 28,
+        "power_cut_cases": 60,
+        "guest_memory_bytes": 268435456,
+        "sparse_disks": 2,
+        "sparse_disk_bytes_each": 134217728,
+        "working_bytes_max": 671088640,
+        "timeout_seconds": 900,
+        "retries": 0,
+        "large_dataset_bytes": 0
+      },
+      "validation_command": "python3 tools/project-store-vm/run.py --self-test",
+      "promotion": null,
+      "expiry": "WP-14 review",
+      "deletion_gate": "WP-14 verification hardening",
       "target_format_conformance": false
     },
     {

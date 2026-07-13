@@ -33,9 +33,10 @@ use crate::{
     local::{LocalStoreRoot, valid_checkpoint_id},
     pin::{publish_pin, remove_pin},
     transaction::{
-        InitialPackageMode, InstalledInitialPackage, install_initial_manual_package,
-        install_initial_provisional_autosave_package, publish_established_autosave_generation,
-        publish_established_manual_generation, publish_provisional_autosave_generation,
+        InitialPackageMode, InstalledInitialPackage, ensure_writable_destination,
+        install_initial_manual_package, install_initial_provisional_autosave_package,
+        publish_established_autosave_generation, publish_established_manual_generation,
+        publish_provisional_autosave_generation,
     },
     trash::{purge_trash, trash_generations},
 };
@@ -287,6 +288,7 @@ impl SessionResources {
     where
         C: FnMut() -> bool,
     {
+        ensure_writable_destination(&destination)?;
         match self.leases.confirm_writer(&self.root) {
             Ok(true) => {}
             Ok(false) => return Err(ProjectStoreFault::ReadOnly),
@@ -352,6 +354,7 @@ impl SessionResources {
     where
         C: FnMut() -> bool,
     {
+        ensure_writable_destination(&destination)?;
         match self.leases.confirm_writer(&self.root) {
             Ok(true) => {}
             Ok(false) => return Err(ProjectStoreFault::ReadOnly),
@@ -418,6 +421,7 @@ impl SessionResources {
     where
         C: FnMut() -> bool,
     {
+        ensure_writable_destination(&destination)?;
         if source_generation != selected_generation {
             return Err(ProjectStoreFault::StaleParent);
         }
@@ -1577,6 +1581,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[path = "durability_tests.rs"]
+    mod durability_tests;
+    #[path = "hosted_durability_tests.rs"]
+    mod hosted_durability_tests;
+
     use std::{
         collections::BTreeMap,
         env, fs,
@@ -1606,12 +1615,14 @@ mod tests {
     use super::*;
     use crate::{
         ProjectGenerationId, ProjectObjectSource, ProjectStoreActor, ProjectStoreLimits,
+        filesystem::TEST_REAL_POLICY_ENV,
         generation::{ArtifactStorage, GenerationDocument, LogicalObjectBinding},
         lease::{GcTransition, GcTransitionTarget, TransitionEdge},
         wire::ProjectEnvelope,
     };
 
     const TIMEOUT: Duration = Duration::from_secs(5);
+    const HOSTED_ACTOR_TIMEOUT_ENV: &str = "MIRANTE4D_PROJECT_STORE_HOSTED_ACTOR_TIMEOUT_MS";
     const TRASH_PROCESS_ROLE: &str = "MIRANTE4D_TRASH_PROCESS_ROLE";
     const TRASH_PROCESS_ROOT: &str = "MIRANTE4D_TRASH_PROCESS_ROOT";
     const TRASH_PROCESS_GENERATION: &str = "MIRANTE4D_TRASH_PROCESS_GENERATION";
@@ -1643,6 +1654,10 @@ mod tests {
     const PIN_UNPIN_PROCESS_TEST: &str = concat!(
         "actor::tests::",
         "pin_and_unpin_fresh_process_kill_and_retry_matrix"
+    );
+    const UNQUALIFIED_COMMAND_DESTINATIONS_TEST: &str = concat!(
+        "actor::tests::",
+        "create_and_save_as_report_unqualified_destinations_before_source_reads"
     );
     const STALE_MANUAL: &str = concat!(
         "m4d-project-generation-v1-sha256:",
@@ -1974,6 +1989,113 @@ mod tests {
                 })),
             }
         }
+    }
+
+    #[test]
+    fn create_and_save_as_report_unqualified_destinations_before_source_reads() {
+        if env::var_os(TEST_REAL_POLICY_ENV).is_none() {
+            let status = Command::new(env::current_exe().unwrap())
+                .arg(UNQUALIFIED_COMMAND_DESTINATIONS_TEST)
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(TEST_REAL_POLICY_ENV, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let destination = |label: &str| {
+            ProjectStorePath::new(format!(
+                "/dev/shm/mirante4d-actor-unqualified-{label}-{}.m4dproj",
+                std::process::id()
+            ))
+            .unwrap()
+        };
+
+        let create_destination = destination("create");
+        let create_generation = frozen_generation(STALE_MANUAL);
+        let (create_capture, create_opens) = controlled_fixture_capture(
+            "stale.m4dproj",
+            &create_generation,
+            create_generation.projection().clone(),
+            None,
+            None,
+            None,
+            ControlledRead::Normal,
+        );
+        let creator = ProjectStoreActor::start(Default::default()).unwrap();
+        creator
+            .try_submit(ProjectStoreCommand::Create {
+                request_id: request_id(1),
+                destination: create_destination.clone(),
+                capture: create_capture,
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&creator),
+            ProjectStoreCompletion::Created {
+                request_id: actual,
+                result: Err(ProjectStoreFault::UnsupportedFilesystem),
+            } if actual == request_id(1)
+        ));
+        assert_eq!(create_opens.load(Ordering::SeqCst), 0);
+        assert!(!create_destination.as_path().exists());
+        creator.try_submit(close_command(2)).unwrap();
+        assert!(matches!(
+            public_recv_timeout(&creator),
+            ProjectStoreCompletion::Closed {
+                request_id: actual,
+                result: Ok(()),
+            } if actual == request_id(2)
+        ));
+        creator.join().unwrap();
+
+        let source =
+            TestProject::extracted_store("unqualified-save-as-source", "recoverable.m4dproj");
+        let save_as_destination = destination("save-as");
+        let save_as_generation = frozen_generation_in("divergent.m4dproj", DIVERGENT_INITIAL);
+        let expected_fork = Some((
+            save_as_generation.forked_from().unwrap().0,
+            generation_id(RECOVERABLE_G2),
+        ));
+        let (save_as_capture, save_as_opens) = controlled_fixture_capture(
+            "divergent.m4dproj",
+            &save_as_generation,
+            save_as_generation.projection().clone(),
+            None,
+            None,
+            expected_fork,
+            ControlledRead::Normal,
+        );
+        let saver =
+            EstablishedProjectActor::start(&source.store_path(), Default::default()).unwrap();
+        saver
+            .try_submit(ProjectStoreCommand::SaveAs {
+                request_id: request_id(1),
+                destination: save_as_destination.clone(),
+                source_generation: generation_id(RECOVERABLE_G2),
+                capture: save_as_capture,
+            })
+            .unwrap();
+        assert!(matches!(
+            saver.recv_timeout(TIMEOUT),
+            Some(ProjectStoreCompletion::SavedAs {
+                request_id: actual,
+                result: Err(ProjectStoreFault::UnsupportedFilesystem),
+            }) if actual == request_id(1)
+        ));
+        assert_eq!(save_as_opens.load(Ordering::SeqCst), 0);
+        assert!(!save_as_destination.as_path().exists());
+        saver.try_submit(close_command(2)).unwrap();
+        assert!(matches!(
+            saver.recv_timeout(TIMEOUT),
+            Some(ProjectStoreCompletion::Closed {
+                request_id: actual,
+                result: Ok(()),
+            }) if actual == request_id(2)
+        ));
+        saver.join().unwrap();
     }
 
     #[test]
@@ -5011,7 +5133,15 @@ mod tests {
     }
 
     fn public_recv_timeout(actor: &ProjectStoreActor) -> ProjectStoreCompletion {
-        let deadline = Instant::now() + TIMEOUT;
+        let timeout = match env::var(HOSTED_ACTOR_TIMEOUT_ENV) {
+            Ok(value) => {
+                assert_eq!(value, "15000", "invalid hosted actor timeout");
+                Duration::from_secs(15)
+            }
+            Err(env::VarError::NotPresent) => TIMEOUT,
+            Err(error) => panic!("invalid hosted actor timeout: {error}"),
+        };
+        let deadline = Instant::now() + timeout;
         loop {
             if let Some(completion) = actor.try_recv() {
                 return completion;
@@ -5409,7 +5539,7 @@ mod tests {
 
     fn fixture_extract(member: &str) -> Vec<u8> {
         let output = Command::new("tar")
-            .arg("-xOf")
+            .arg("-xzOf")
             .arg(fixture_archive())
             .arg(member)
             .output()
@@ -5419,8 +5549,12 @@ mod tests {
     }
 
     fn fixture_archive() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/project/project-store-v1.tar.gz")
+        env::var_os("MIRANTE4D_PROJECT_STORE_VM_FIXTURE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../fixtures/project/project-store-v1.tar.gz")
+            })
     }
 
     fn fixture_generation_member_in(store: &str, id: ProjectGenerationId) -> String {

@@ -22,6 +22,40 @@ const DOCTEST_PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
 const SOURCE_FIXTURE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(120);
 const TARGET_FIXTURE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(120);
 const PROJECT_FIXTURE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(120);
+const PROJECT_STORE_VM_SELF_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+const PROJECT_STORE_HOSTED_MATRIX_TIMEOUT_MS: u64 = 100_000;
+
+const PROJECT_STORE_PROCESS_MATRIX_CASES: [(&str, u64); 3] = [
+    (
+        "actor::tests::pin_and_unpin_fresh_process_kill_and_retry_matrix",
+        16,
+    ),
+    (
+        "actor::tests::trash_fresh_process_kill_and_retry_matrix",
+        34,
+    ),
+    (
+        "actor::tests::purge_fresh_process_kill_and_retry_matrix",
+        16,
+    ),
+];
+
+const PROJECT_STORE_HOSTILE_CASES: [&str; 5] = [
+    "hostile_tests::cross_device_save_as_read_failure_preserves_source_and_destination_absence",
+    "hostile_tests::partial_writes_complete_exactly_and_zero_progress_fails_closed",
+    "hostile_tests::permission_denial_is_read_only_and_publishes_nothing",
+    "hostile_tests::storage_full_is_capacity_and_leaves_no_authority_or_residue",
+    "hostile_tests::whole_package_relocation_survives_a_read_only_cross_device_copy",
+];
+
+const PROJECT_STORE_RUNTIME_GATE_CASES: [&str; 6] = [
+    "filesystem::tests::parser_accepts_only_the_exact_ext4_mount_tuple",
+    "filesystem::tests::real_policy_rejects_dev_shm_and_downgrades_writes",
+    "actor::tests::create_and_save_as_report_unqualified_destinations_before_source_reads",
+    "transaction::tests::unqualified_initial_destinations_fail_before_source_reads_or_mutation",
+    "lease::tests::writer_confirmation_suspends_after_filesystem_qualification_changes",
+    "inspection::tests::writable_open_cleans_staging_while_read_only_and_fallback_leave_it_untouched",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Leaf {
@@ -115,11 +149,1101 @@ pub(crate) fn verify_pr(group: Option<&str>) -> anyhow::Result<()> {
 pub(crate) fn verify_local(lane: &str) -> anyhow::Result<()> {
     match lane {
         "format-lifecycle" => verify_format_lifecycle(),
+        "project-store-lifecycle" => verify_project_store_lifecycle(),
         "trusted-gpu" => verify_trusted_gpu(),
-        _ => {
-            bail!("unknown local verification lane {lane:?}; expected format-lifecycle|trusted-gpu")
+        _ => bail!(
+            "unknown local verification lane {lane:?}; expected format-lifecycle|project-store-lifecycle|trusted-gpu"
+        ),
+    }
+}
+
+fn verify_project_store_lifecycle() -> anyhow::Result<()> {
+    if env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
+        bail!("project-store-lifecycle verification must not run in GitHub Actions");
+    }
+    if env::var("MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL").as_deref() != Ok("1") {
+        bail!(
+            "project-store-lifecycle verification requires MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 on the trusted machine"
+        );
+    }
+    ensure_nextest()?;
+    let started = Instant::now();
+    let registry = registry::read_registry()?;
+    let timeout_secs = registry::project_store_lifecycle_timeout(&registry)?;
+    let deadline = started
+        .checked_add(Duration::from_secs(timeout_secs))
+        .context("project-store lifecycle aggregate deadline overflowed")?;
+    let identity = RunIdentity::gather()?;
+    if !identity.qualifying {
+        bail!(
+            "project-store-lifecycle verification requires a qualifying clean revision: {}",
+            identity.qualification_issues.join("; ")
+        );
+    }
+
+    let report_path = verification_report_path("verify-local-project-store-lifecycle")?;
+    let output_path = report_path
+        .parent()
+        .context("project-store lifecycle report path has no parent")?
+        .join("project-store-lifecycle-output.log");
+    let hosted_output_path = report_path
+        .parent()
+        .context("project-store lifecycle report path has no parent")?
+        .join("project-store-hosted-output.log");
+    let mut phases = PhaseCollector::default();
+    phases.record_identity(&identity);
+
+    let mut hosted_evidence = None;
+    let hosted_passed = phases.run(
+        "hosted-process-hostile-runtime",
+        "NEXTEST_USER_CONFIG_FILE=none cargo nextest run --color never --package mirante4d-project-store --frozen --no-fail-fast --retries 0 --flaky-result fail --no-tests fail --success-output immediate --no-output-indent",
+        || {
+            let mut command = isolated_nextest_command();
+            command.args([
+                "nextest",
+                "run",
+                "--color",
+                "never",
+                "--package",
+                "mirante4d-project-store",
+                "--frozen",
+                "--no-fail-fast",
+                "--retries",
+                "0",
+                "--flaky-result",
+                "fail",
+                "--no-tests",
+                "fail",
+                "--success-output",
+                "immediate",
+                "--no-output-indent",
+            ]);
+            let output = fs::File::create(&hosted_output_path)
+                .with_context(|| format!("failed to create {}", hosted_output_path.display()))?;
+            command.stdout(Stdio::from(output.try_clone()?));
+            command.stderr(Stdio::from(output));
+            let command_result = run_command_with_timeout(
+                &mut command,
+                project_store_lifecycle_remaining(deadline)?,
+            );
+            let encoded = fs::read_to_string(&hosted_output_path)
+                .with_context(|| format!("failed to read {}", hosted_output_path.display()))?;
+            print!("{encoded}");
+            let parsed = parse_project_store_hosted_suite_evidence(&encoded);
+            if let Ok(evidence) = &parsed {
+                hosted_evidence = Some(evidence.clone());
+            }
+            command_result?;
+            project_store_lifecycle_remaining(deadline)?;
+            parsed?;
+            Ok(())
+        },
+    );
+    if let Some(evidence) = &hosted_evidence {
+        phases.record_evidence("wp10b_hosted_suite", evidence.clone());
+    }
+
+    let mut lifecycle_evidence = None;
+    let vm_passed = if hosted_passed {
+        phases.run(
+            "power-cut-lifecycle",
+            "python3 tools/project-store-vm/run.py --deadline-seconds <remaining aggregate seconds>",
+            || {
+                let remaining = project_store_lifecycle_remaining(deadline)?;
+                let cooperative_seconds = remaining.as_secs();
+                if cooperative_seconds == 0 {
+                    bail!("project-store lifecycle has no time left for the VM phase");
+                }
+                let mut command = Command::new("python3");
+                command
+                    .arg("tools/project-store-vm/run.py")
+                    .arg("--deadline-seconds")
+                    .arg(cooperative_seconds.to_string());
+                let output = fs::File::create(&output_path)
+                    .with_context(|| format!("failed to create {}", output_path.display()))?;
+                command.stdout(Stdio::from(output.try_clone()?));
+                command.stderr(Stdio::from(output));
+                let status = command.status().context(
+                    "failed to start the cooperative project-store VM harness",
+                )?;
+                let encoded = fs::read_to_string(&output_path)
+                    .with_context(|| format!("failed to read {}", output_path.display()))?;
+                print!("{encoded}");
+                let extracted = extract_project_store_lifecycle_evidence(&encoded);
+                if let Ok(evidence) = &extracted {
+                    lifecycle_evidence = Some(evidence.clone());
+                }
+                if !status.success() {
+                    bail!("cooperative project-store VM harness failed with {status}");
+                }
+                project_store_lifecycle_remaining(deadline)?;
+                let evidence = extracted?;
+                validate_project_store_lifecycle_evidence(&evidence)?;
+                validate_project_store_lifecycle_identity(&evidence, &identity)?;
+                lifecycle_evidence = Some(evidence);
+                Ok(())
+            },
+        )
+    } else {
+        phases.block(
+            "power-cut-lifecycle",
+            "hosted project-store evidence did not pass",
+        );
+        false
+    };
+    if let Some(evidence) = lifecycle_evidence {
+        phases.record_evidence("wp10b_project_store_lifecycle", evidence);
+    }
+    let deadline_passed = if vm_passed {
+        phases.run(
+            "aggregate-deadline",
+            "in-process 900-second aggregate deadline check",
+            || project_store_lifecycle_remaining(deadline).map(|_| ()),
+        )
+    } else {
+        phases.block(
+            "aggregate-deadline",
+            "power-cut lifecycle evidence did not pass",
+        );
+        false
+    };
+    if deadline_passed {
+        phases.record_evidence(
+            "wp10b_b2_aggregate",
+            project_store_b2_aggregate_evidence(
+                hosted_evidence
+                    .context("hosted evidence was not captured after a passing phase")?,
+            ),
+        );
+    }
+    let report_result = phases.write_report(&report_path, "project-store-lifecycle", &identity);
+    phases.finish("project-store-lifecycle").and(report_result)
+}
+
+fn project_store_lifecycle_remaining(deadline: Instant) -> anyhow::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .context("project-store lifecycle exhausted its 900-second aggregate timeout")
+}
+
+fn project_store_marker_fields(
+    output: &str,
+    prefix: &str,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let lines = output
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(prefix))
+        .collect::<Vec<_>>();
+    if lines.len() != 1 {
+        bail!(
+            "project-store output must contain exactly one {prefix:?} line; found {}",
+            lines.len()
+        );
+    }
+    let mut fields = BTreeMap::new();
+    for token in lines[0].split_whitespace() {
+        let (key, value) = token
+            .split_once('=')
+            .with_context(|| format!("project-store marker token is invalid: {token}"))?;
+        if fields.insert(key.to_owned(), value.to_owned()).is_some() {
+            bail!("project-store marker repeats field {key}");
         }
     }
+    Ok(fields)
+}
+
+fn project_store_marker_u64(fields: &BTreeMap<String, String>, field: &str) -> anyhow::Result<u64> {
+    fields
+        .get(field)
+        .with_context(|| format!("project-store marker lacks {field}"))?
+        .parse::<u64>()
+        .with_context(|| format!("project-store marker {field} is not unsigned"))
+}
+
+fn parse_project_store_hosted_suite_evidence(output: &str) -> anyhow::Result<Value> {
+    const PREFIX: &str = "M4D_HOSTED_TRANSITION_MATRIX_V1";
+    let fields = project_store_marker_fields(output, PREFIX)?;
+    let expected_keys = BTreeSet::from([
+        "discovered_edge_rows",
+        "durability_claim",
+        "inherited_exact_fail_rows",
+        "inherited_process_matrices",
+        "newly_fail_injected",
+        "newly_sigkill_reopen_retry",
+        "power_loss_simulated",
+        "pure_before_after_trees",
+        "wall_milliseconds",
+        "workers",
+    ]);
+    if fields.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_keys {
+        bail!("hosted project-store marker fields drifted");
+    }
+    let discovered_edge_rows = project_store_marker_u64(&fields, "discovered_edge_rows")?;
+    let newly_fail_injected = project_store_marker_u64(&fields, "newly_fail_injected")?;
+    let inherited_exact_fail_rows = project_store_marker_u64(&fields, "inherited_exact_fail_rows")?;
+    let pure_before_after_trees = project_store_marker_u64(&fields, "pure_before_after_trees")?;
+    let newly_sigkill_reopen_retry =
+        project_store_marker_u64(&fields, "newly_sigkill_reopen_retry")?;
+    let workers = project_store_marker_u64(&fields, "workers")?;
+    let wall_milliseconds = project_store_marker_u64(&fields, "wall_milliseconds")?;
+    if discovered_edge_rows != 424
+        || newly_fail_injected != 338
+        || inherited_exact_fail_rows != 86
+        || pure_before_after_trees != 120
+        || newly_sigkill_reopen_retry != 102
+        || workers != 8
+        || wall_milliseconds > PROJECT_STORE_HOSTED_MATRIX_TIMEOUT_MS
+        || fields.get("inherited_process_matrices").map(String::as_str)
+            != Some("pin_unpin_trash_purge")
+        || fields.get("power_loss_simulated").map(String::as_str) != Some("false")
+        || fields.get("durability_claim").map(String::as_str) != Some("false")
+    {
+        bail!("hosted project-store matrix facts drifted");
+    }
+    for case in PROJECT_STORE_PROCESS_MATRIX_CASES
+        .iter()
+        .map(|(case, _)| *case)
+        .chain(PROJECT_STORE_HOSTILE_CASES)
+        .chain(PROJECT_STORE_RUNTIME_GATE_CASES)
+    {
+        let suffix = format!("mirante4d-project-store {case}");
+        if !output
+            .lines()
+            .any(|line| line.contains("PASS") && line.trim_end().ends_with(&suffix))
+        {
+            bail!("hosted project-store output lacks a passing result for {case}");
+        }
+    }
+    let process_matrices = [
+        parse_project_store_process_matrix(
+            output,
+            "M4D_PIN_UNPIN_PROCESS_MATRIX_V1",
+            PROJECT_STORE_PROCESS_MATRIX_CASES[0].0,
+            16,
+            &[
+                ("idempotent_second_retries", 16),
+                ("recovery_sync_required_cases", 8),
+                ("staging_cleanup_cases", 11),
+                ("staging_residue_after_reopen", 0),
+            ],
+        )?,
+        parse_project_store_process_matrix(
+            output,
+            "M4D_TRASH_PROCESS_MATRIX_V1",
+            PROJECT_STORE_PROCESS_MATRIX_CASES[1].0,
+            34,
+            &[("zero_mutation_sync_retries", 34)],
+        )?,
+        parse_project_store_process_matrix(
+            output,
+            "M4D_PURGE_PROCESS_MATRIX_V1",
+            PROJECT_STORE_PROCESS_MATRIX_CASES[2].0,
+            16,
+            &[("zero_removal_sync_retries", 16)],
+        )?,
+    ];
+    Ok(serde_json::json!({
+        "schema": "mirante4d-wp10b-hosted-suite-evidence",
+        "schema_version": 1,
+        "result": "passed",
+        "transition_matrix": {
+            "discovered_edge_rows": discovered_edge_rows,
+            "newly_fail_injected": newly_fail_injected,
+            "inherited_exact_fail_rows": inherited_exact_fail_rows,
+            "pure_before_after_trees": pure_before_after_trees,
+            "newly_sigkill_reopen_retry": newly_sigkill_reopen_retry,
+            "inherited_process_matrices": ["pin", "unpin", "trash", "purge"],
+            "workers": workers,
+            "wall_milliseconds": wall_milliseconds,
+            "power_loss_simulated": false,
+            "durability_claim": false
+        },
+        "process_matrices": process_matrices
+    }))
+}
+
+fn parse_project_store_process_matrix(
+    output: &str,
+    prefix: &str,
+    test: &str,
+    cases: u64,
+    extra_counts: &[(&str, u64)],
+) -> anyhow::Result<Value> {
+    let fields = project_store_marker_fields(output, prefix)?;
+    let mut expected_keys = BTreeSet::from([
+        "cases",
+        "durability_claim",
+        "fresh_reopens",
+        "killed",
+        "power_loss_simulated",
+        "process_crash_only",
+        "retry_completed",
+    ]);
+    expected_keys.extend(extra_counts.iter().map(|(field, _)| *field));
+    if fields.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_keys
+        || project_store_marker_u64(&fields, "cases")? != cases
+        || project_store_marker_u64(&fields, "killed")? != cases
+        || project_store_marker_u64(&fields, "fresh_reopens")? != cases
+        || project_store_marker_u64(&fields, "retry_completed")? != cases
+        || fields.get("process_crash_only").map(String::as_str) != Some("true")
+        || fields.get("power_loss_simulated").map(String::as_str) != Some("false")
+        || fields.get("durability_claim").map(String::as_str) != Some("false")
+        || extra_counts.iter().any(|(field, expected)| {
+            project_store_marker_u64(&fields, field).ok() != Some(*expected)
+        })
+    {
+        bail!("project-store process matrix facts drifted for {test}");
+    }
+    let mut facts = serde_json::Map::new();
+    for (field, value) in fields {
+        let value =
+            match value.as_str() {
+                "true" => Value::Bool(true),
+                "false" => Value::Bool(false),
+                _ => Value::from(value.parse::<u64>().with_context(|| {
+                    format!("project-store process matrix {field} is not typed")
+                })?),
+            };
+        facts.insert(field, value);
+    }
+    Ok(serde_json::json!({
+        "test": test,
+        "result": "passed",
+        "facts": facts
+    }))
+}
+
+fn project_store_b2_aggregate_evidence(hosted: Value) -> Value {
+    let passed_cases = |cases: &[&str]| {
+        cases
+            .iter()
+            .map(|case| serde_json::json!({"test": case, "result": "passed"}))
+            .collect::<Vec<_>>()
+    };
+    serde_json::json!({
+        "schema": "mirante4d-wp10b-b2-durability-qualification-evidence",
+        "schema_version": 1,
+        "result": "passed",
+        "failures": [],
+        "hosted_suite": hosted,
+        "hostile_cases": passed_cases(&PROJECT_STORE_HOSTILE_CASES),
+        "runtime_gate_cases": passed_cases(&PROJECT_STORE_RUNTIME_GATE_CASES),
+        "power_cut_evidence_key": "wp10b_project_store_lifecycle",
+        "qualification_scope": {
+            "checkpoint": "B2",
+            "public_ci_and_protected_main": "pending_external_acceptance",
+            "store_product_reachability": "declared_off_product_and_enforced_by_the_separate_policy_gate",
+            "source_identity_verification": "not_applicable_until_b3",
+            "product_display_validation": "not_applicable_until_b4",
+            "product_durability_claim": false
+        }
+    })
+}
+
+#[cfg(test)]
+fn parse_project_store_lifecycle_evidence(output: &str) -> anyhow::Result<Value> {
+    let evidence = extract_project_store_lifecycle_evidence(output)?;
+    validate_project_store_lifecycle_evidence(&evidence)?;
+    Ok(evidence)
+}
+
+fn extract_project_store_lifecycle_evidence(output: &str) -> anyhow::Result<Value> {
+    const PREFIX: &str = "mirante4d-project-store-vm-evidence:";
+    let lines = output
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(PREFIX))
+        .collect::<Vec<_>>();
+    if lines.len() != 1 {
+        bail!(
+            "project-store lifecycle output must contain exactly one {PREFIX:?} line; found {}",
+            lines.len()
+        );
+    }
+    let evidence: Value = serde_json::from_str(lines[0])
+        .context("project-store lifecycle evidence line is not valid JSON")?;
+    Ok(evidence)
+}
+
+fn validate_project_store_lifecycle_identity(
+    evidence: &Value,
+    identity: &RunIdentity,
+) -> anyhow::Result<()> {
+    let root = evidence
+        .as_object()
+        .context("project-store lifecycle evidence must be an object")?;
+    let evidence_identity = root
+        .get("identity")
+        .and_then(Value::as_object)
+        .context("project-store lifecycle identity must be an object")?;
+    if require_string(
+        evidence_identity,
+        "commit",
+        "project-store lifecycle identity",
+    )? != identity.commit
+        || require_string(
+            evidence_identity,
+            "tree",
+            "project-store lifecycle identity",
+        )? != identity.tree
+        || !identity.clean
+    {
+        bail!("project-store lifecycle evidence does not bind the xtask run identity");
+    }
+    Ok(())
+}
+
+fn validate_project_store_lifecycle_evidence(evidence: &Value) -> anyhow::Result<()> {
+    const CONTEXT: &str = "project-store lifecycle evidence";
+    let root = exact_object(
+        evidence,
+        &[
+            "counters",
+            "failures",
+            "filesystem",
+            "harness",
+            "identity",
+            "matrix",
+            "result",
+            "schema",
+            "schema_version",
+            "tools",
+        ],
+        CONTEXT,
+    )?;
+    if require_string(root, "schema", CONTEXT)?
+        != "mirante4d-wp10b-project-store-lifecycle-evidence"
+        || require_u64(root, "schema_version", CONTEXT)? != 1
+        || require_string(root, "result", CONTEXT)? != "passed"
+        || !root
+            .get("failures")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+    {
+        bail!("project-store lifecycle evidence result identity drifted");
+    }
+
+    let identity = exact_object(
+        root.get("identity")
+            .context("project-store lifecycle evidence lacks identity")?,
+        &[
+            "clean",
+            "commit",
+            "fixture_sha256",
+            "guest_test_sha256",
+            "manifest_sha256",
+            "tree",
+        ],
+        "project-store lifecycle identity",
+    )?;
+    require_lower_hex(identity, "commit", 40, "project-store lifecycle identity")?;
+    require_lower_hex(identity, "tree", 40, "project-store lifecycle identity")?;
+    for field in ["fixture_sha256", "guest_test_sha256", "manifest_sha256"] {
+        require_lower_hex(identity, field, 64, "project-store lifecycle identity")?;
+    }
+    if !require_bool(identity, "clean", "project-store lifecycle identity")? {
+        bail!("project-store lifecycle evidence must bind a clean revision");
+    }
+    let manifest_digest =
+        registry::sha256_file(&registry::repo_path("tools/project-store-vm/manifest.json"))?;
+    let fixture_digest = registry::sha256_file(&registry::repo_path(
+        "fixtures/project/project-store-v1.tar.gz",
+    ))?;
+    if require_string(
+        identity,
+        "manifest_sha256",
+        "project-store lifecycle identity",
+    )? != manifest_digest
+        || require_string(
+            identity,
+            "fixture_sha256",
+            "project-store lifecycle identity",
+        )? != fixture_digest
+    {
+        bail!("project-store lifecycle evidence source digests drifted");
+    }
+
+    validate_project_store_lifecycle_tools(
+        root.get("tools")
+            .context("project-store lifecycle evidence lacks tools")?,
+    )?;
+    validate_project_store_lifecycle_filesystem(
+        root.get("filesystem")
+            .context("project-store lifecycle evidence lacks filesystem")?,
+    )?;
+    validate_project_store_lifecycle_harness(
+        root.get("harness")
+            .context("project-store lifecycle evidence lacks harness")?,
+    )?;
+
+    let expected_rows = expected_project_store_vm_rows()?;
+    validate_project_store_lifecycle_matrix(
+        root.get("matrix")
+            .context("project-store lifecycle evidence lacks matrix")?,
+        &expected_rows,
+    )?;
+    validate_project_store_lifecycle_counters(
+        root.get("counters")
+            .context("project-store lifecycle evidence lacks counters")?,
+        expected_rows.len() as u64,
+    )?;
+    Ok(())
+}
+
+fn validate_project_store_lifecycle_tools(value: &Value) -> anyhow::Result<()> {
+    let tools = exact_object(
+        value,
+        &["busybox", "e2fsprogs", "kernel", "nbdkit", "qemu"],
+        "project-store lifecycle tools",
+    )?;
+    let qemu = exact_object(
+        tools.get("qemu").context("VM evidence lacks qemu")?,
+        &["binary_sha256", "package_version"],
+        "project-store lifecycle qemu",
+    )?;
+    require_lower_hex(qemu, "binary_sha256", 64, "project-store lifecycle qemu")?;
+    if require_string(qemu, "package_version", "project-store lifecycle qemu")?
+        != "1:8.2.2+ds-0ubuntu1.17"
+    {
+        bail!("project-store lifecycle QEMU version drifted");
+    }
+
+    let kernel = exact_object(
+        tools.get("kernel").context("VM evidence lacks kernel")?,
+        &["image_sha256", "package_archive_sha256", "package_version"],
+        "project-store lifecycle kernel",
+    )?;
+    require_lower_hex(kernel, "image_sha256", 64, "project-store lifecycle kernel")?;
+    if require_string(
+        kernel,
+        "package_archive_sha256",
+        "project-store lifecycle kernel",
+    )? != "d5502a5dfa01203e16f6430e10236efe9e007cd29bd93bbed65ddf20ee6e9cfa"
+        || require_string(kernel, "package_version", "project-store lifecycle kernel")?
+            != "6.17.0-35.35~24.04.1"
+    {
+        bail!("project-store lifecycle kernel identity drifted");
+    }
+
+    let busybox = exact_object(
+        tools.get("busybox").context("VM evidence lacks busybox")?,
+        &["binary_sha256", "package_version"],
+        "project-store lifecycle busybox",
+    )?;
+    if require_string(busybox, "binary_sha256", "project-store lifecycle busybox")?
+        != "dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14"
+        || require_string(
+            busybox,
+            "package_version",
+            "project-store lifecycle busybox",
+        )? != "1:1.36.1-6ubuntu3.1"
+    {
+        bail!("project-store lifecycle BusyBox identity drifted");
+    }
+
+    let nbdkit = exact_object(
+        tools.get("nbdkit").context("VM evidence lacks nbdkit")?,
+        &["binary_sha256", "package_archive_sha256", "package_version"],
+        "project-store lifecycle nbdkit",
+    )?;
+    require_lower_hex(
+        nbdkit,
+        "binary_sha256",
+        64,
+        "project-store lifecycle nbdkit",
+    )?;
+    if require_string(
+        nbdkit,
+        "package_archive_sha256",
+        "project-store lifecycle nbdkit",
+    )? != "02ae094a32267be68516e1dedd26a2b83334a1a20303055ce765e2e9cf8580e2"
+        || require_string(nbdkit, "package_version", "project-store lifecycle nbdkit")?
+            != "1.36.3-1ubuntu10"
+    {
+        bail!("project-store lifecycle nbdkit identity drifted");
+    }
+
+    let e2fsprogs = exact_object(
+        tools
+            .get("e2fsprogs")
+            .context("VM evidence lacks e2fsprogs")?,
+        &["version"],
+        "project-store lifecycle e2fsprogs",
+    )?;
+    if require_string(e2fsprogs, "version", "project-store lifecycle e2fsprogs")? != "1.47.0" {
+        bail!("project-store lifecycle e2fsprogs version drifted");
+    }
+    Ok(())
+}
+
+fn validate_project_store_lifecycle_filesystem(value: &Value) -> anyhow::Result<()> {
+    let filesystem = exact_object(
+        value,
+        &[
+            "device_count",
+            "features",
+            "independent_devices",
+            "statfs_magic_hex",
+            "super_options",
+            "type",
+            "vfs_options",
+        ],
+        "project-store lifecycle filesystem",
+    )?;
+    if require_string(filesystem, "type", "project-store lifecycle filesystem")? != "ext4"
+        || require_string(
+            filesystem,
+            "statfs_magic_hex",
+            "project-store lifecycle filesystem",
+        )? != "0xef53"
+        || require_u64(
+            filesystem,
+            "device_count",
+            "project-store lifecycle filesystem",
+        )? != 2
+        || !require_bool(
+            filesystem,
+            "independent_devices",
+            "project-store lifecycle filesystem",
+        )?
+        || string_array(
+            filesystem,
+            "vfs_options",
+            "project-store lifecycle filesystem",
+        )? != ["relatime", "rw"]
+        || string_array(
+            filesystem,
+            "super_options",
+            "project-store lifecycle filesystem",
+        )? != ["rw"]
+    {
+        bail!("project-store lifecycle filesystem tuple drifted");
+    }
+    let features = string_array(filesystem, "features", "project-store lifecycle filesystem")?;
+    if features.is_empty()
+        || features.windows(2).any(|pair| pair[0] >= pair[1])
+        || features.iter().any(|feature| {
+            feature.is_empty()
+                || feature.len() > 64
+                || feature
+                    .bytes()
+                    .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'))
+        })
+    {
+        bail!("project-store lifecycle ext4 feature inventory is invalid");
+    }
+    Ok(())
+}
+
+fn validate_project_store_lifecycle_harness(value: &Value) -> anyhow::Result<()> {
+    let harness = exact_object(
+        value,
+        &[
+            "cross_device_save_as",
+            "disk_bytes_each",
+            "disk_count",
+            "guest_memory_bytes",
+            "kvm",
+            "power_cut",
+            "retries",
+            "rootless",
+            "timeout_seconds",
+            "working_bytes_max",
+        ],
+        "project-store lifecycle harness",
+    )?;
+    if !require_bool(harness, "rootless", "project-store lifecycle harness")?
+        || !require_bool(harness, "kvm", "project-store lifecycle harness")?
+        || !require_bool(
+            harness,
+            "cross_device_save_as",
+            "project-store lifecycle harness",
+        )?
+        || require_string(harness, "power_cut", "project-store lifecycle harness")?
+            != "qemu-and-nbdkit-sigkill"
+        || require_u64(
+            harness,
+            "guest_memory_bytes",
+            "project-store lifecycle harness",
+        )? != 268_435_456
+        || require_u64(harness, "disk_count", "project-store lifecycle harness")? != 2
+        || require_u64(
+            harness,
+            "disk_bytes_each",
+            "project-store lifecycle harness",
+        )? != 134_217_728
+        || require_u64(
+            harness,
+            "working_bytes_max",
+            "project-store lifecycle harness",
+        )? != 671_088_640
+        || require_u64(
+            harness,
+            "timeout_seconds",
+            "project-store lifecycle harness",
+        )? != 900
+        || require_u64(harness, "retries", "project-store lifecycle harness")? != 0
+    {
+        bail!("project-store lifecycle harness limits drifted");
+    }
+    Ok(())
+}
+
+fn validate_project_store_lifecycle_matrix(
+    value: &Value,
+    expected_rows: &[Value],
+) -> anyhow::Result<()> {
+    let matrix = exact_object(
+        value,
+        &[
+            "cut_cases",
+            "fresh_validations",
+            "nbdkit_kills",
+            "passed_cut_cases",
+            "pre_sequence_cut",
+            "qemu_kills",
+            "rows",
+            "scenario_baselines",
+            "trace_rows",
+        ],
+        "project-store lifecycle matrix",
+    )?;
+    let transition_cut_cases = expected_rows.len() as u64;
+    let cut_cases = transition_cut_cases + 1;
+    if require_u64(
+        matrix,
+        "scenario_baselines",
+        "project-store lifecycle matrix",
+    )? != 11
+        || require_u64(matrix, "trace_rows", "project-store lifecycle matrix")?
+            != transition_cut_cases * 2
+        || require_u64(matrix, "cut_cases", "project-store lifecycle matrix")? != cut_cases
+        || require_u64(matrix, "passed_cut_cases", "project-store lifecycle matrix")? != cut_cases
+        || require_u64(
+            matrix,
+            "fresh_validations",
+            "project-store lifecycle matrix",
+        )? != cut_cases
+        || require_u64(matrix, "qemu_kills", "project-store lifecycle matrix")? != cut_cases
+        || require_u64(matrix, "nbdkit_kills", "project-store lifecycle matrix")? != cut_cases * 2
+    {
+        bail!("project-store lifecycle matrix counts drifted");
+    }
+    let pre_sequence = exact_object(
+        matrix
+            .get("pre_sequence_cut")
+            .context("project-store lifecycle matrix lacks its pre-sequence cut")?,
+        &["case", "lane", "status"],
+        "project-store lifecycle pre-sequence cut",
+    )?;
+    if require_string(
+        pre_sequence,
+        "case",
+        "project-store lifecycle pre-sequence cut",
+    )? != "save-as"
+        || require_string(
+            pre_sequence,
+            "lane",
+            "project-store lifecycle pre-sequence cut",
+        )? != "none"
+        || require_string(
+            pre_sequence,
+            "status",
+            "project-store lifecycle pre-sequence cut",
+        )? != "passed"
+    {
+        bail!("project-store lifecycle pre-sequence cut drifted");
+    }
+    let rows = matrix
+        .get("rows")
+        .and_then(Value::as_array)
+        .context("project-store lifecycle matrix.rows must be an array")?;
+    for row in rows {
+        exact_object(
+            row,
+            &["case", "edge", "lane", "occurrence", "status", "transition"],
+            "project-store lifecycle matrix row",
+        )?;
+    }
+    if rows != expected_rows {
+        bail!("project-store lifecycle matrix rows drifted from the hostile manifest");
+    }
+    Ok(())
+}
+
+fn validate_project_store_lifecycle_counters(
+    value: &Value,
+    transition_cut_cases: u64,
+) -> anyhow::Result<()> {
+    let counters = exact_object(
+        value,
+        &[
+            "elapsed_ms",
+            "enqueue_poll_p99_ms",
+            "enqueue_poll_samples",
+            "incremental_unchanged_artifact_bytes_rewritten",
+            "exact_retry_attempts",
+            "post_open_or_save_metadata_rss_bytes",
+            "pre_sequence_power_cuts",
+            "qemu_boots",
+            "validated_power_cuts",
+            "working_bytes_peak",
+        ],
+        "project-store lifecycle counters",
+    )?;
+    let p99 = counters
+        .get("enqueue_poll_p99_ms")
+        .and_then(Value::as_f64)
+        .context("project-store lifecycle counters.enqueue_poll_p99_ms must be numeric")?;
+    let cut_cases = transition_cut_cases + 1;
+    if !(0.0..=5.0).contains(&p99)
+        || require_u64(
+            counters,
+            "enqueue_poll_samples",
+            "project-store lifecycle counters",
+        )? < 1_000
+        || require_u64(
+            counters,
+            "incremental_unchanged_artifact_bytes_rewritten",
+            "project-store lifecycle counters",
+        )? != 0
+        || require_u64(
+            counters,
+            "post_open_or_save_metadata_rss_bytes",
+            "project-store lifecycle counters",
+        )? > 100_663_296
+        || require_u64(counters, "elapsed_ms", "project-store lifecycle counters")? > 900_000
+        || require_u64(
+            counters,
+            "working_bytes_peak",
+            "project-store lifecycle counters",
+        )? > 671_088_640
+        || require_u64(counters, "qemu_boots", "project-store lifecycle counters")?
+            != 11 + cut_cases * 2 + 1
+        || require_u64(
+            counters,
+            "pre_sequence_power_cuts",
+            "project-store lifecycle counters",
+        )? != 1
+        || require_u64(
+            counters,
+            "exact_retry_attempts",
+            "project-store lifecycle counters",
+        )? != cut_cases
+        || require_u64(
+            counters,
+            "validated_power_cuts",
+            "project-store lifecycle counters",
+        )? != cut_cases
+    {
+        bail!("project-store lifecycle resource or performance counters drifted");
+    }
+    Ok(())
+}
+
+fn expected_project_store_vm_rows() -> anyhow::Result<Vec<Value>> {
+    let path = registry::repo_path("tools/project-store-vm/manifest.json");
+    let encoded = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let manifest: Value =
+        serde_json::from_slice(&encoded).context("project-store VM manifest is not valid JSON")?;
+    let root = exact_object(
+        &manifest,
+        &[
+            "constraints",
+            "fixture_id",
+            "flows",
+            "guest_driver",
+            "performance",
+            "pre_sequence",
+            "schema",
+            "schema_version",
+        ],
+        "project-store VM manifest",
+    )?;
+    if require_string(root, "schema", "project-store VM manifest")?
+        != "mirante4d-wp10b-project-store-vm-manifest"
+        || require_u64(root, "schema_version", "project-store VM manifest")? != 1
+        || require_string(root, "fixture_id", "project-store VM manifest")?
+            != "wp10b-hostile-lifecycle"
+    {
+        bail!("project-store VM manifest identity drifted");
+    }
+    let pre_sequence = exact_object(
+        root.get("pre_sequence")
+            .context("project-store VM manifest lacks pre_sequence")?,
+        &["case", "lane"],
+        "project-store VM pre-sequence cut",
+    )?;
+    if require_string(pre_sequence, "case", "project-store VM pre-sequence cut")? != "save-as"
+        || require_string(pre_sequence, "lane", "project-store VM pre-sequence cut")? != "none"
+    {
+        bail!("project-store VM pre-sequence cut drifted");
+    }
+    let flows = root
+        .get("flows")
+        .and_then(Value::as_array)
+        .context("project-store VM manifest.flows must be an array")?;
+    if flows.len() != 11 {
+        bail!("project-store VM manifest must contain eleven flows");
+    }
+    let mut rows = Vec::new();
+    let mut transitions = BTreeSet::new();
+    for flow in flows {
+        let flow = exact_object(
+            flow,
+            &["case", "id", "lane", "transitions"],
+            "project-store VM flow",
+        )?;
+        let case = require_safe_token(flow, "case", "project-store VM flow")?;
+        require_safe_token(flow, "id", "project-store VM flow")?;
+        let lane = require_string(flow, "lane", "project-store VM flow")?;
+        if !matches!(lane, "none" | "manual" | "autosave") {
+            bail!("project-store VM flow lane is invalid");
+        }
+        let mut flow_occurrences = BTreeMap::<&str, BTreeSet<u64>>::new();
+        let flow_transitions = flow
+            .get("transitions")
+            .and_then(Value::as_array)
+            .context("project-store VM flow.transitions must be an array")?;
+        for transition in flow_transitions {
+            let transition = exact_object(
+                transition,
+                &["name", "occurrences"],
+                "project-store VM transition",
+            )?;
+            let name = require_safe_token(transition, "name", "project-store VM transition")?;
+            transitions.insert(name);
+            let occurrences = transition
+                .get("occurrences")
+                .and_then(Value::as_array)
+                .context("project-store VM transition.occurrences must be an array")?;
+            if occurrences.is_empty() {
+                bail!("project-store VM transition occurrences must be nonempty");
+            }
+            let parsed = occurrences
+                .iter()
+                .map(|occurrence| {
+                    occurrence
+                        .as_u64()
+                        .context("project-store VM transition occurrence must be unsigned")
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let start = parsed[0];
+            if parsed
+                .iter()
+                .enumerate()
+                .any(|(index, occurrence)| start.checked_add(index as u64) != Some(*occurrence))
+            {
+                bail!("project-store VM transition occurrence segment must be contiguous");
+            }
+            for occurrence in parsed {
+                if !flow_occurrences.entry(name).or_default().insert(occurrence) {
+                    bail!("project-store VM flow contains a duplicate transition occurrence");
+                }
+                rows.push(serde_json::json!({
+                    "case": case,
+                    "transition": name,
+                    "lane": lane,
+                    "edge": "after",
+                    "occurrence": occurrence,
+                    "status": "passed",
+                }));
+            }
+        }
+        if flow_occurrences
+            .values()
+            .any(|occurrences| occurrences.iter().copied().ne(0..occurrences.len() as u64))
+        {
+            bail!("project-store VM transition occurrences must be contiguous from zero");
+        }
+    }
+    let expected_transitions = BTreeSet::from([
+        "destination_parent_sync",
+        "gc_active_deduplicate_remove",
+        "gc_source_directory_sync",
+        "gc_trash_collision_file_sync",
+        "gc_trash_directory_create",
+        "gc_trash_directory_sync",
+        "gc_trash_move",
+        "generation_directory_sync",
+        "generation_file_sync",
+        "generation_publish_noreplace",
+        "head_directory_sync",
+        "head_file_sync",
+        "head_replace",
+        "object_directory_sync",
+        "object_file_sync",
+        "object_publish_noreplace",
+        "package_install_noreplace",
+        "package_tree_sync",
+        "pin_directory_sync",
+        "pin_file_sync",
+        "pin_replace",
+        "purge_directory_sync",
+        "purge_remove",
+        "recovery_directory_sync",
+        "recovery_file_sync",
+        "recovery_replace",
+        "unpin_directory_sync",
+        "unpin_remove",
+    ]);
+    if transitions != expected_transitions || rows.len() != 59 {
+        bail!("project-store VM transition inventory drifted");
+    }
+    Ok(rows)
+}
+
+fn require_lower_hex(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    length: usize,
+    context: &str,
+) -> anyhow::Result<()> {
+    let value = require_string(object, field, context)?;
+    if value.len() != length
+        || value
+            .bytes()
+            .any(|byte| !(byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    {
+        bail!("{context}.{field} must be a lowercase hexadecimal digest");
+    }
+    Ok(())
+}
+
+fn require_safe_token<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+    context: &str,
+) -> anyhow::Result<&'a str> {
+    let value = require_string(object, field, context)?;
+    if value.is_empty()
+        || value.len() > 64
+        || !value.as_bytes()[0].is_ascii_lowercase()
+        || value.bytes().any(|byte| {
+            !(byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-')
+        })
+    {
+        bail!("{context}.{field} must be a safe token");
+    }
+    Ok(value)
+}
+
+fn string_array<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+    context: &str,
+) -> anyhow::Result<Vec<&'a str>> {
+    object
+        .get(field)
+        .and_then(Value::as_array)
+        .with_context(|| format!("{context}.{field} must be an array"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .with_context(|| format!("{context}.{field} entries must be strings"))
+        })
+        .collect()
 }
 
 fn verify_trusted_gpu() -> anyhow::Result<()> {
@@ -818,6 +1942,15 @@ fn run_policy_phases(phases: &mut PhaseCollector) {
                 "--self-test",
             ]);
             run_command_with_timeout(&mut command, PROJECT_FIXTURE_VALIDATION_TIMEOUT)
+        },
+    );
+    phases.run(
+        "project-store-vm-self-test",
+        "python3 tools/project-store-vm/run.py --self-test",
+        || {
+            let mut command = Command::new("python3");
+            command.args(["tools/project-store-vm/run.py", "--self-test"]);
+            run_command_with_timeout(&mut command, PROJECT_STORE_VM_SELF_TEST_TIMEOUT)
         },
     );
     phases.run(
@@ -1538,6 +2671,233 @@ mod tests {
             assert_eq!(Leaf::parse(name).unwrap().name(), name);
         }
         assert!(Leaf::parse("fast").is_err());
+    }
+
+    fn valid_project_store_lifecycle_evidence() -> Value {
+        let rows = expected_project_store_vm_rows().unwrap();
+        let transition_cut_cases = rows.len() as u64;
+        let cut_cases = transition_cut_cases + 1;
+        let manifest_sha256 =
+            registry::sha256_file(&registry::repo_path("tools/project-store-vm/manifest.json"))
+                .unwrap();
+        let fixture_sha256 = registry::sha256_file(&registry::repo_path(
+            "fixtures/project/project-store-v1.tar.gz",
+        ))
+        .unwrap();
+        json!({
+            "schema": "mirante4d-wp10b-project-store-lifecycle-evidence",
+            "schema_version": 1,
+            "result": "passed",
+            "failures": [],
+            "identity": {
+                "commit": "a".repeat(40),
+                "tree": "b".repeat(40),
+                "clean": true,
+                "manifest_sha256": manifest_sha256,
+                "fixture_sha256": fixture_sha256,
+                "guest_test_sha256": "c".repeat(64)
+            },
+            "tools": {
+                "qemu": {
+                    "package_version": "1:8.2.2+ds-0ubuntu1.17",
+                    "binary_sha256": "d".repeat(64)
+                },
+                "kernel": {
+                    "package_version": "6.17.0-35.35~24.04.1",
+                    "package_archive_sha256": "d5502a5dfa01203e16f6430e10236efe9e007cd29bd93bbed65ddf20ee6e9cfa",
+                    "image_sha256": "e".repeat(64)
+                },
+                "busybox": {
+                    "package_version": "1:1.36.1-6ubuntu3.1",
+                    "binary_sha256": "dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14"
+                },
+                "nbdkit": {
+                    "package_version": "1.36.3-1ubuntu10",
+                    "package_archive_sha256": "02ae094a32267be68516e1dedd26a2b83334a1a20303055ce765e2e9cf8580e2",
+                    "binary_sha256": "f".repeat(64)
+                },
+                "e2fsprogs": {"version": "1.47.0"}
+            },
+            "filesystem": {
+                "type": "ext4",
+                "statfs_magic_hex": "0xef53",
+                "vfs_options": ["relatime", "rw"],
+                "super_options": ["rw"],
+                "device_count": 2,
+                "independent_devices": true,
+                "features": ["64bit", "ext_attr"]
+            },
+            "harness": {
+                "rootless": true,
+                "kvm": true,
+                "guest_memory_bytes": 268435456,
+                "disk_count": 2,
+                "disk_bytes_each": 134217728,
+                "working_bytes_max": 671088640,
+                "timeout_seconds": 900,
+                "retries": 0,
+                "power_cut": "qemu-and-nbdkit-sigkill",
+                "cross_device_save_as": true
+            },
+            "matrix": {
+                "scenario_baselines": 11,
+                "trace_rows": transition_cut_cases * 2,
+                "pre_sequence_cut": {
+                    "case": "save-as",
+                    "lane": "none",
+                    "status": "passed"
+                },
+                "cut_cases": cut_cases,
+                "passed_cut_cases": cut_cases,
+                "qemu_kills": cut_cases,
+                "nbdkit_kills": cut_cases * 2,
+                "fresh_validations": cut_cases,
+                "rows": rows
+            },
+            "counters": {
+                "exact_retry_attempts": cut_cases,
+                "pre_sequence_power_cuts": 1,
+                "validated_power_cuts": cut_cases,
+                "enqueue_poll_samples": 1000,
+                "enqueue_poll_p99_ms": 5.0,
+                "incremental_unchanged_artifact_bytes_rewritten": 0,
+                "post_open_or_save_metadata_rss_bytes": 100663296,
+                "elapsed_ms": 900000,
+                "working_bytes_peak": 671088640,
+                "qemu_boots": 11 + cut_cases * 2 + 1
+            }
+        })
+    }
+
+    #[test]
+    fn project_store_lifecycle_evidence_is_exact_and_fail_closed() {
+        let evidence = valid_project_store_lifecycle_evidence();
+        let output = format!(
+            "guest noise\nmirante4d-project-store-vm-evidence:{}\n",
+            serde_json::to_string(&evidence).unwrap()
+        );
+        assert_eq!(
+            parse_project_store_lifecycle_evidence(&output).unwrap(),
+            evidence
+        );
+        assert!(parse_project_store_lifecycle_evidence("no evidence").is_err());
+        assert!(parse_project_store_lifecycle_evidence(&format!("{output}{output}")).is_err());
+        let failed = json!({
+            "schema": "mirante4d-wp10b-project-store-lifecycle-evidence",
+            "schema_version": 1,
+            "result": "failed",
+            "failures": ["bounded failure"],
+            "identity": {},
+            "tools": {},
+            "filesystem": {},
+            "harness": {},
+            "matrix": {},
+            "counters": {}
+        });
+        let failed_output = format!(
+            "mirante4d-project-store-vm-evidence:{}\n",
+            serde_json::to_string(&failed).unwrap()
+        );
+        assert_eq!(
+            extract_project_store_lifecycle_evidence(&failed_output).unwrap(),
+            failed
+        );
+        assert!(parse_project_store_lifecycle_evidence(&failed_output).is_err());
+
+        let mut tool_drift = evidence.clone();
+        tool_drift["tools"]["qemu"]["package_version"] = json!("8.2.2");
+        assert!(validate_project_store_lifecycle_evidence(&tool_drift).is_err());
+
+        let mut cut_drift = evidence.clone();
+        cut_drift["matrix"]["rows"][0]["edge"] = json!("before");
+        assert!(validate_project_store_lifecycle_evidence(&cut_drift).is_err());
+
+        let mut pre_sequence_drift = evidence.clone();
+        pre_sequence_drift["matrix"]["pre_sequence_cut"]["status"] = json!("skipped");
+        assert!(validate_project_store_lifecycle_evidence(&pre_sequence_drift).is_err());
+
+        let mut performance_drift = evidence;
+        performance_drift["counters"]["enqueue_poll_p99_ms"] = json!(5.01);
+        assert!(validate_project_store_lifecycle_evidence(&performance_drift).is_err());
+    }
+
+    #[test]
+    fn project_store_hosted_aggregate_is_exact_and_scope_bounded() {
+        let marker = "noise\nM4D_HOSTED_TRANSITION_MATRIX_V1 discovered_edge_rows=424 newly_fail_injected=338 inherited_exact_fail_rows=86 pure_before_after_trees=120 newly_sigkill_reopen_retry=102 inherited_process_matrices=pin_unpin_trash_purge workers=8 wall_milliseconds=77071 power_loss_simulated=false durability_claim=false\nM4D_PIN_UNPIN_PROCESS_MATRIX_V1 cases=16 killed=16 fresh_reopens=16 retry_completed=16 idempotent_second_retries=16 recovery_sync_required_cases=8 staging_cleanup_cases=11 staging_residue_after_reopen=0 process_crash_only=true power_loss_simulated=false durability_claim=false\nM4D_TRASH_PROCESS_MATRIX_V1 cases=34 killed=34 fresh_reopens=34 retry_completed=34 zero_mutation_sync_retries=34 process_crash_only=true power_loss_simulated=false durability_claim=false\nM4D_PURGE_PROCESS_MATRIX_V1 cases=16 killed=16 fresh_reopens=16 retry_completed=16 zero_removal_sync_retries=16 process_crash_only=true power_loss_simulated=false durability_claim=false\n";
+        let passing_cases = PROJECT_STORE_PROCESS_MATRIX_CASES
+            .iter()
+            .map(|(case, _)| *case)
+            .chain(PROJECT_STORE_HOSTILE_CASES)
+            .chain(PROJECT_STORE_RUNTIME_GATE_CASES)
+            .map(|case| format!("PASS mirante4d-project-store {case}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output = format!("{marker}{passing_cases}\n");
+        let hosted = parse_project_store_hosted_suite_evidence(&output).unwrap();
+        assert_eq!(hosted["result"], "passed");
+        assert_eq!(hosted["transition_matrix"]["discovered_edge_rows"], 424);
+        assert_eq!(hosted["process_matrices"][1]["facts"]["fresh_reopens"], 34);
+
+        let aggregate = project_store_b2_aggregate_evidence(hosted);
+        assert_eq!(aggregate["result"], "passed");
+        assert_eq!(
+            aggregate["hosted_suite"]["process_matrices"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(aggregate["hostile_cases"].as_array().unwrap().len(), 5);
+        assert_eq!(aggregate["runtime_gate_cases"].as_array().unwrap().len(), 6);
+        assert_eq!(
+            aggregate["qualification_scope"]["source_identity_verification"],
+            "not_applicable_until_b3"
+        );
+        assert_eq!(
+            aggregate["qualification_scope"]["product_display_validation"],
+            "not_applicable_until_b4"
+        );
+        assert_eq!(
+            aggregate["qualification_scope"]["product_durability_claim"],
+            false
+        );
+
+        assert!(parse_project_store_hosted_suite_evidence("no marker").is_err());
+        assert!(
+            parse_project_store_hosted_suite_evidence(&format!(
+                "{marker}{marker}{passing_cases}\n"
+            ))
+            .is_err()
+        );
+        assert!(
+            parse_project_store_hosted_suite_evidence(
+                &output.replace("discovered_edge_rows=424", "discovered_edge_rows=423")
+            )
+            .is_err()
+        );
+        assert!(
+            parse_project_store_hosted_suite_evidence(
+                &output.replace("durability_claim=false", "durability_claim=true")
+            )
+            .is_err()
+        );
+        assert!(
+            parse_project_store_hosted_suite_evidence(&output.replacen(
+                "cases=34 killed=34",
+                "cases=34 killed=33",
+                1
+            ))
+            .is_err()
+        );
+        assert!(
+            parse_project_store_hosted_suite_evidence(
+                &output.replace(
+                    "PASS mirante4d-project-store hostile_tests::storage_full_is_capacity_and_leaves_no_authority_or_residue",
+                    "FAIL mirante4d-project-store hostile_tests::storage_full_is_capacity_and_leaves_no_authority_or_residue"
+                )
+            )
+            .is_err()
+        );
     }
 
     fn valid_wp09a_evidence() -> Value {

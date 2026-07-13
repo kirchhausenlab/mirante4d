@@ -57,6 +57,10 @@ const PUBLIC_ACTOR_LIFECYCLE_CORRECTION_PATH: &str =
     "architecture/wp10b-project-store-public-actor-lifecycle-correction.json";
 const PUBLIC_ACTOR_LIFECYCLE_CORRECTION_SHA256: &str =
     "ac1a7804655af4dab8110f7a584a7bf990ac25a9b03799da9d03638e3d787bbc";
+const DURABILITY_QUALIFICATION_CORRECTION_PATH: &str =
+    "architecture/wp10b-project-store-durability-qualification-correction.json";
+const DURABILITY_QUALIFICATION_CORRECTION_SHA256: &str =
+    "6b4bbc23115115e36a449209810764cbce2738ca693a985275f5e6513d4252e6";
 const PROTECTED_MAIN_COMMIT: &str = "b6e0267802f8ac2d0d49a0f04302fd321ef2f617";
 const PROTECTED_MAIN_TREE: &str = "b20b598603b47fdbe7c85c3b6d1cba8c78fd433e";
 const PROTECTED_MAIN_RUN: &str =
@@ -71,7 +75,7 @@ const ZERO_SHA256: &str = "00000000000000000000000000000000000000000000000000000
 // contract plus bound corrections while allowing the independent fixture
 // producer to remain bound to its final manifest.
 const NORMALIZED_CONTRACT_SHA256: &str =
-    "859c6500c63c51da0a53dd9dfcb9380430502ea10966e41df101d40787e651dd";
+    "2af1ee0435e7ff516c659ed5e3fce5b8e751f57534563b691d8f19c46faa8497";
 
 pub(super) fn check_wp10b_project_store_contract(repo_root: &Path) -> anyhow::Result<()> {
     let contract_path = repo_root.join(CONTRACT_PATH);
@@ -144,6 +148,11 @@ fn validate_header_and_bindings(repo_root: &Path, contract: &Value) -> anyhow::R
             "public_actor_lifecycle_correction",
             PUBLIC_ACTOR_LIFECYCLE_CORRECTION_PATH,
             PUBLIC_ACTOR_LIFECYCLE_CORRECTION_SHA256,
+        ),
+        (
+            "durability_qualification_correction",
+            DURABILITY_QUALIFICATION_CORRECTION_PATH,
+            DURABILITY_QUALIFICATION_CORRECTION_SHA256,
         ),
     ] {
         expect_string(contract, &format!("/bindings/{name}/path"), path)?;

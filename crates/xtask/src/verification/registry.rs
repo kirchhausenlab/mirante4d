@@ -54,6 +54,7 @@ struct TestTimeoutOverride {
     selector: String,
     warn_ms: u64,
     terminate_ms: u64,
+    threads_required: Option<String>,
     reason: String,
 }
 
@@ -673,6 +674,7 @@ fn validate_registry(registry: &Registry) -> anyhow::Result<()> {
         "format-lifecycle",
         "main-package-capability",
         "performance",
+        "project-store-lifecycle",
         "product-e1",
         "product-e2",
         "product-e3",
@@ -726,6 +728,10 @@ fn validate_test_timeout_overrides(overrides: &[TestTimeoutOverride]) -> anyhow:
             || timeout.warn_ms == 0
             || timeout.terminate_ms < timeout.warn_ms
             || timeout.terminate_ms % timeout.warn_ms != 0
+            || timeout
+                .threads_required
+                .as_deref()
+                .is_some_and(|value| value != "num-test-threads")
             || timeout.reason.trim().is_empty()
         {
             bail!("per-test timeout override has incomplete policy metadata");
@@ -936,8 +942,14 @@ fn generated_nextest(registry: &Registry) -> anyhow::Result<String> {
     );
     for timeout in &registry.test_timeout_overrides {
         text.push_str(&format!(
-            "\n[[profile.default.overrides]]\nfilter = '{}'\nslow-timeout = {{ period = \"{}\", terminate-after = {} }}\n",
+            "\n[[profile.default.overrides]]\nfilter = '{}'\n",
             timeout.selector,
+        ));
+        if let Some(threads_required) = &timeout.threads_required {
+            text.push_str(&format!("threads-required = \"{threads_required}\"\n"));
+        }
+        text.push_str(&format!(
+            "slow-timeout = {{ period = \"{}\", terminate-after = {} }}\n",
             duration_text(timeout.warn_ms),
             timeout.terminate_ms / timeout.warn_ms,
         ));
@@ -1026,6 +1038,27 @@ pub(super) fn format_lifecycle_timeout(registry: &Registry) -> anyhow::Result<u6
         || lane.activation_state != "active-WP-10A"
     {
         bail!("format-lifecycle verification policy drifted");
+    }
+    Ok(lane.timeout_secs)
+}
+
+pub(super) fn project_store_lifecycle_timeout(registry: &Registry) -> anyhow::Result<u64> {
+    let lane = registry
+        .non_pr_lanes
+        .iter()
+        .find(|lane| lane.id == "project-store-lifecycle")
+        .context("verification registry is missing project-store-lifecycle lane")?;
+    if lane.command != "cargo xtask verify-local project-store-lifecycle"
+        || lane.owner != "project-store"
+        || lane.fixture_tier != "T1-project-or-T2"
+        || lane.capability != "trusted-local-kvm-ext4"
+        || lane.requirements != ["WP-10B-project-store"]
+        || lane.timeout_secs != 900
+        || lane.evidence_level != "E0"
+        || lane.hosted_required
+        || lane.activation_state != "active-WP-10B-B2"
+    {
+        bail!("project-store-lifecycle verification policy drifted");
     }
     Ok(lane.timeout_secs)
 }
@@ -1369,6 +1402,12 @@ mod tests {
     fn format_lifecycle_is_an_active_target_authority_consumer() {
         let registry = read_registry().unwrap();
         assert_eq!(format_lifecycle_timeout(&registry).unwrap(), 900);
+    }
+
+    #[test]
+    fn project_store_lifecycle_is_an_active_trusted_local_lane() {
+        let registry = read_registry().unwrap();
+        assert_eq!(project_store_lifecycle_timeout(&registry).unwrap(), 900);
     }
 
     #[test]

@@ -39,7 +39,9 @@ use std::sync::atomic::AtomicUsize;
 
 use crate::{
     ProjectGenerationId, ProjectStoreLimits, ProjectStorePath,
+    filesystem::{WritableFilesystemQualification, writable_filesystem_qualification},
     generation::EncodedGeneration,
+    transition::{self, StoreTransition, TransitionLane, TransitionOccurrence, TransitionPoint},
     wire::{
         ProjectEnvelope, REF_BYTES, RefKind, RefRecord, generation_id_from_validated_canonical,
     },
@@ -104,6 +106,7 @@ pub(crate) struct LocalStoreRoot {
 /// no-replace rename. Drop removes only the still-owned staging tree.
 pub(crate) struct SiblingPackageStage {
     parent: OwnedFd,
+    filesystem: WritableFilesystemQualification,
     destination_name: OsString,
     stage_name: OsString,
     stage_identity: DirectoryIdentity,
@@ -194,6 +197,99 @@ enum SourceExtent {
     Segment,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImmutableWriteMode {
+    Normal,
+    #[cfg(test)]
+    InjectStorageFull,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImmutableKind {
+    Object,
+    Generation,
+}
+
+impl ImmutableKind {
+    const fn stage_create(self) -> StoreTransition {
+        match self {
+            Self::Object => StoreTransition::ObjectStageCreate,
+            Self::Generation => StoreTransition::GenerationStageCreate,
+        }
+    }
+
+    const fn write(self) -> StoreTransition {
+        match self {
+            Self::Object => StoreTransition::ObjectWrite,
+            Self::Generation => StoreTransition::GenerationWrite,
+        }
+    }
+
+    const fn file_sync(self) -> StoreTransition {
+        match self {
+            Self::Object => StoreTransition::ObjectFileSync,
+            Self::Generation => StoreTransition::GenerationFileSync,
+        }
+    }
+
+    const fn publish(self) -> StoreTransition {
+        match self {
+            Self::Object => StoreTransition::ObjectPublishNoreplace,
+            Self::Generation => StoreTransition::GenerationPublishNoreplace,
+        }
+    }
+
+    const fn directory_sync(self) -> StoreTransition {
+        match self {
+            Self::Object => StoreTransition::ObjectDirectorySync,
+            Self::Generation => StoreTransition::GenerationDirectorySync,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RefTransitionPoints {
+    stage_create: TransitionPoint,
+    write: TransitionPoint,
+    file_sync: TransitionPoint,
+    replace: TransitionPoint,
+    directory_sync: TransitionPoint,
+}
+
+impl RefTransitionPoints {
+    fn for_kind(kind: RefKind) -> Result<Self, LocalPublicationError> {
+        let (lane, recovery) = match kind {
+            RefKind::ManualHead => (TransitionLane::Manual, false),
+            RefKind::ManualRecovery => (TransitionLane::Manual, true),
+            RefKind::AutosaveHead => (TransitionLane::Autosave, false),
+            RefKind::AutosaveRecovery => (TransitionLane::Autosave, true),
+            RefKind::Pin => return Err(LocalPublicationError::InvalidControl),
+        };
+        let point = |head, recovery_point| {
+            TransitionPoint::in_lane(if recovery { recovery_point } else { head }, lane)
+        };
+        Ok(Self {
+            stage_create: point(
+                StoreTransition::HeadStageCreate,
+                StoreTransition::RecoveryStageCreate,
+            ),
+            write: point(StoreTransition::HeadWrite, StoreTransition::RecoveryWrite),
+            file_sync: point(
+                StoreTransition::HeadFileSync,
+                StoreTransition::RecoveryFileSync,
+            ),
+            replace: point(
+                StoreTransition::HeadReplace,
+                StoreTransition::RecoveryReplace,
+            ),
+            directory_sync: point(
+                StoreTransition::HeadDirectorySync,
+                StoreTransition::RecoveryDirectorySync,
+            ),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct StoreInventory {
     entries: usize,
@@ -256,6 +352,15 @@ pub(crate) enum LocalPublicationError {
     InvalidPath,
     #[error("the declared file length {declared} exceeds the {maximum}-byte limit")]
     Capacity { declared: u64, maximum: u64 },
+    #[error("project-store storage is full while attempting to {operation}")]
+    StorageFull { operation: &'static str },
+    #[error("project-store storage is read-only while attempting to {operation}")]
+    ReadOnly { operation: &'static str },
+    #[error("an immutable source could not be read")]
+    SourceIo {
+        #[source]
+        source: io::Error,
+    },
     #[error("the source length differs from its declared {expected} bytes")]
     SourceLength { expected: u64 },
     #[error("the source exact-byte digest differs from its declared identity")]
@@ -363,6 +468,37 @@ fn generation_relative_path(id: ProjectGenerationId) -> PathBuf {
         .join(format!("{}.json", &digest[2..]))
 }
 
+/// Validates a prospective package destination without inspecting or
+/// mutating the destination name.
+pub(crate) fn ensure_writable_destination(
+    destination: &ProjectStorePath,
+) -> Result<(), LocalPublicationError> {
+    open_writable_destination_parent(destination).map(|_| ())
+}
+
+fn open_writable_destination_parent(
+    destination: &ProjectStorePath,
+) -> Result<(OwnedFd, WritableFilesystemQualification, OsString), LocalPublicationError> {
+    let path = destination.as_path();
+    let destination_name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or(LocalPublicationError::InvalidPath)?
+        .to_os_string();
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent_root = LocalStoreRoot::open(parent_path)?;
+    let filesystem = writable_filesystem_qualification(parent_root.descriptor())
+        .ok_or(LocalPublicationError::AtomicPublishUnsupported)?;
+    let parent = duplicate_directory(parent_root.descriptor())?;
+    if writable_filesystem_qualification(&parent) != Some(filesystem) {
+        return Err(LocalPublicationError::AtomicPublishUnsupported);
+    }
+    Ok((parent, filesystem, destination_name))
+}
+
 impl LocalStoreRoot {
     /// Opens every component of an existing root through the previously held
     /// directory descriptor. `..` and platform prefixes are rejected.
@@ -428,6 +564,11 @@ impl LocalStoreRoot {
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let parent = LocalStoreRoot::open(parent_path)?;
+        let filesystem = writable_filesystem_qualification(parent.descriptor())
+            .ok_or(LocalPublicationError::AtomicPublishUnsupported)?;
+        if writable_filesystem_qualification(&self.root) != Some(filesystem) {
+            return Err(LocalPublicationError::AtomicPublishUnsupported);
+        }
         let held = DirectoryIdentity::from_stat(
             fstat(&self.root).map_err(|_| LocalPublicationError::ExistingMismatch)?,
         )?;
@@ -442,8 +583,13 @@ impl LocalStoreRoot {
         if named != held {
             return Err(LocalPublicationError::ExistingMismatch);
         }
+        let parent_sync = lifecycle_before(
+            TransitionPoint::new(StoreTransition::DestinationParentSync),
+            "synchronize the package destination parent",
+        )?;
         sync_with_retry(parent.descriptor())
             .map_err(|_| LocalPublicationError::PackageCommitIndeterminate)?;
+        lifecycle_after(parent_sync, "synchronize the package destination parent")?;
         let named_after = DirectoryIdentity::from_stat(
             statat(
                 parent.descriptor(),
@@ -505,11 +651,7 @@ impl LocalStoreRoot {
             other => io_error("create the project envelope", other),
         })?;
         let mut file = File::from(descriptor);
-        file.write_all(&bytes)
-            .map_err(|source| LocalPublicationError::Io {
-                operation: "write the project envelope",
-                source,
-            })?;
+        write_all_classified(&mut file, &bytes, "write the project envelope")?;
         fsync(&file).map_err(|error| io_error("synchronize the project envelope", error))?;
         check_cancelled(&mut is_cancelled)?;
         fsync(&self.root).map_err(|error| io_error("synchronize the project root", error))
@@ -535,6 +677,10 @@ impl LocalStoreRoot {
     where
         C: FnMut() -> bool,
     {
+        let transition = lifecycle_before(
+            TransitionPoint::new(StoreTransition::EnvelopeRead),
+            "read the project envelope",
+        )?;
         let bytes = self
             .read_optional_small_file(
                 Path::new("project.json"),
@@ -543,7 +689,10 @@ impl LocalStoreRoot {
                 is_cancelled,
             )?
             .ok_or(LocalPublicationError::InvalidControl)?;
-        ProjectEnvelope::decode(&bytes).map_err(|_| LocalPublicationError::InvalidControl)
+        let envelope =
+            ProjectEnvelope::decode(&bytes).map_err(|_| LocalPublicationError::InvalidControl)?;
+        lifecycle_after(transition, "read the project envelope")?;
+        Ok(envelope)
     }
 
     /// Reads one exact lane ref through held descriptors. Missing refs remain
@@ -557,6 +706,10 @@ impl LocalStoreRoot {
     where
         C: FnMut() -> bool,
     {
+        let transition = lifecycle_before(
+            TransitionPoint::new(StoreTransition::RefRead),
+            "read a project ref",
+        )?;
         let path = ref_relative_path(kind)?;
         let Some(bytes) = self.read_optional_small_file(
             &path,
@@ -565,14 +718,16 @@ impl LocalStoreRoot {
             is_cancelled,
         )?
         else {
+            lifecycle_after(transition, "read a project ref")?;
             return Ok(None);
         };
         if bytes.len() != limits.ref_record_bytes_exact || bytes.len() != REF_BYTES {
             return Err(LocalPublicationError::InvalidControl);
         }
-        RefRecord::decode(kind, &bytes)
-            .map(Some)
-            .map_err(|_| LocalPublicationError::InvalidControl)
+        let record =
+            RefRecord::decode(kind, &bytes).map_err(|_| LocalPublicationError::InvalidControl)?;
+        lifecycle_after(transition, "read a project ref")?;
+        Ok(Some(record))
     }
 
     /// Reads one immutable generation through its digest-derived path without
@@ -823,6 +978,10 @@ impl LocalStoreRoot {
         C: FnMut() -> bool,
     {
         check_cancelled(&mut is_cancelled)?;
+        let ref_read = lifecycle_before(
+            TransitionPoint::new(StoreTransition::RefRead),
+            "read the project pin refs",
+        )?;
         let refs = match openat(
             &self.root,
             OsStr::new("refs"),
@@ -830,7 +989,10 @@ impl LocalStoreRoot {
             Mode::empty(),
         ) {
             Ok(refs) => refs,
-            Err(Errno::NOENT) => return Ok(Vec::new()),
+            Err(Errno::NOENT) => {
+                lifecycle_after(ref_read, "read the project pin refs")?;
+                return Ok(Vec::new());
+            }
             Err(_) => return Err(LocalPublicationError::InvalidControl),
         };
         let mut entries = 0_usize;
@@ -908,6 +1070,7 @@ impl LocalStoreRoot {
                 pins.push((checkpoint_id, record));
             }
         }
+        lifecycle_after(ref_read, "read the project pin refs")?;
         Ok(pins)
     }
 
@@ -1315,6 +1478,10 @@ impl LocalStoreRoot {
         C: FnMut() -> bool,
     {
         check_cancelled(&mut is_cancelled)?;
+        let object_inventory = lifecycle_before(
+            TransitionPoint::new(StoreTransition::ObjectInventory),
+            "validate the project-store inventory",
+        )?;
         let publishes_ref = pending_fixed_refs != 0 || pending_pin_refs != 0 || replaces_fixed_ref;
         if publishes_ref {
             let publication_descriptors = REF_PUBLICATION_DESCRIPTORS
@@ -1419,7 +1586,7 @@ impl LocalStoreRoot {
                 limits.directory_fanout_entries_max,
             )?;
         }
-        Ok(())
+        lifecycle_after(object_inventory, "validate the project-store inventory")
     }
 
     /// Publishes the first manual head exactly once. There is deliberately no
@@ -1454,30 +1621,47 @@ impl LocalStoreRoot {
             Err(_) => return Err(LocalPublicationError::ExistingMismatch),
         }
 
+        let point = RefTransitionPoints::for_kind(RefKind::ManualHead)?;
+        let stage_create = lifecycle_before(point.stage_create, "create a staged manual head")?;
         let mut stage = Stage::begin(self)?;
         let mut staged_file = stage.create_file()?;
-        staged_file
-            .write_all(&record.encode())
-            .map_err(|source| LocalPublicationError::Io {
-                operation: "write the initial manual head",
-                source,
-            })?;
+        lifecycle_after(stage_create, "create a staged manual head")?;
+        let write = lifecycle_before(point.write, "write the initial manual head")?;
+        write_all_classified(
+            &mut staged_file,
+            &record.encode(),
+            "write the initial manual head",
+        )?;
+        lifecycle_after(write, "write the initial manual head")?;
+        let file_sync = lifecycle_before(point.file_sync, "synchronize the initial manual head")?;
         fsync(&staged_file)
             .map_err(|error| io_error("synchronize the staged initial manual head", error))?;
+        lifecycle_after(file_sync, "synchronize the initial manual head")?;
         drop(staged_file);
         check_cancelled(&mut is_cancelled)?;
 
-        match renameat_with(
+        let replace = lifecycle_before(point.replace, "publish the initial manual head")?;
+        let replace_result = renameat_with(
             &stage.directory,
             OsStr::new(STAGED_FILE),
             &destination_parent,
             &destination_name,
             RenameFlags::NOREPLACE,
-        ) {
+        );
+        lifecycle_after(replace, "publish the initial manual head")?;
+        match replace_result {
             Ok(()) => {
                 stage.file_owned = false;
-                let staging_result = sync_with_retry(&stage.directory);
-                let destination_result = sync_with_retry(&destination_parent);
+                let staging_result = sync_lifecycle_directory(
+                    &stage.directory,
+                    point.directory_sync,
+                    "synchronize manual-head staging",
+                );
+                let destination_result = sync_lifecycle_directory(
+                    &destination_parent,
+                    point.directory_sync,
+                    "synchronize manual-head authority",
+                );
                 if staging_result.is_err() || destination_result.is_err() {
                     return Err(LocalPublicationError::RefCommitIndeterminate);
                 }
@@ -1521,21 +1705,28 @@ impl LocalStoreRoot {
 
         let destination = ref_relative_path(next.kind())?;
         let (destination_parent, destination_name) = self.open_or_create_parent(&destination)?;
+        let point = RefTransitionPoints::for_kind(next.kind())?;
+        let stage_create = lifecycle_before(point.stage_create, "create a staged project ref")?;
         let mut stage = Stage::begin(self)?;
         let mut staged_file = stage.create_file()?;
-        staged_file
-            .write_all(&next.encode())
-            .map_err(|source| LocalPublicationError::Io {
-                operation: "write a staged project ref",
-                source,
-            })?;
+        lifecycle_after(stage_create, "create a staged project ref")?;
+        let write = lifecycle_before(point.write, "write a staged project ref")?;
+        write_all_classified(
+            &mut staged_file,
+            &next.encode(),
+            "write a staged project ref",
+        )?;
+        lifecycle_after(write, "write a staged project ref")?;
+        let file_sync = lifecycle_before(point.file_sync, "synchronize a staged project ref")?;
         fsync(&staged_file).map_err(|error| io_error("synchronize a staged project ref", error))?;
+        lifecycle_after(file_sync, "synchronize a staged project ref")?;
         drop(staged_file);
         check_cancelled(&mut is_cancelled)?;
         if self.read_ref(next.kind(), limits, &mut is_cancelled)? != expected {
             return Err(LocalPublicationError::RefChanged);
         }
 
+        let replace = lifecycle_before(point.replace, "replace a project ref")?;
         let replaced = if expected.is_some() {
             renameat(
                 &stage.directory,
@@ -1555,10 +1746,27 @@ impl LocalStoreRoot {
         match replaced {
             Ok(()) => {
                 stage.file_owned = false;
-                let staging_result = self.sync_ref_commit_directory(&stage.directory);
+                if lifecycle_after(replace, "replace a project ref").is_err() {
+                    return Err(LocalPublicationError::RefCommitIndeterminate);
+                }
+                let staging_sync =
+                    lifecycle_before(point.directory_sync, "synchronize project-ref staging")?;
+                let staging_result = self
+                    .sync_ref_commit_directory(&stage.directory)
+                    .map_err(|_| LocalPublicationError::RefCommitIndeterminate)
+                    .and_then(|()| {
+                        lifecycle_after(staging_sync, "synchronize project-ref staging")
+                    });
                 // Always attempt the authoritative destination sync even when
                 // source-name removal could not be proven durable.
-                let destination_result = self.sync_ref_commit_directory(&destination_parent);
+                let destination_sync =
+                    lifecycle_before(point.directory_sync, "synchronize project-ref authority")?;
+                let destination_result = self
+                    .sync_ref_commit_directory(&destination_parent)
+                    .map_err(|_| LocalPublicationError::RefCommitIndeterminate)
+                    .and_then(|()| {
+                        lifecycle_after(destination_sync, "synchronize project-ref authority")
+                    });
                 if staging_result.is_err() || destination_result.is_err() {
                     return Err(LocalPublicationError::RefCommitIndeterminate);
                 }
@@ -1612,12 +1820,11 @@ impl LocalStoreRoot {
         let write = observer
             .before(PinTransition::Write)
             .map_err(|()| injected_pin_transition("write a staged project pin"))?;
-        staged_file
-            .write_all(&next.encode())
-            .map_err(|source| LocalPublicationError::Io {
-                operation: "write a staged project pin",
-                source,
-            })?;
+        write_all_classified(
+            &mut staged_file,
+            &next.encode(),
+            "write a staged project pin",
+        )?;
         observer
             .after(write)
             .map_err(|()| injected_pin_transition("write a staged project pin"))?;
@@ -1863,6 +2070,7 @@ impl LocalStoreRoot {
         let facts = ExactBytesHasher::hash(generation.bytes())
             .map_err(|_| LocalPublicationError::InvalidGeneration)?;
         self.publish(
+            ImmutableKind::Generation,
             generation_relative_path(id),
             &mut Cursor::new(generation.bytes()),
             DeclaredExactFile::from_facts(facts),
@@ -1888,11 +2096,37 @@ impl LocalStoreRoot {
         C: FnMut() -> bool,
     {
         self.publish(
+            ImmutableKind::Object,
             object_relative_path(digest),
             source,
             DeclaredExactFile::new(digest, byte_length),
             maximum_bytes,
             SourceExtent::Complete,
+            is_cancelled,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_declared_object_with_storage_full<R, C>(
+        &self,
+        source: &mut R,
+        digest: ExactBytesDigest,
+        byte_length: u64,
+        maximum_bytes: u64,
+        is_cancelled: C,
+    ) -> Result<ImmutablePublication, LocalPublicationError>
+    where
+        R: Read + ?Sized,
+        C: FnMut() -> bool,
+    {
+        self.publish_with_write_mode(
+            ImmutableKind::Object,
+            object_relative_path(digest),
+            source,
+            DeclaredExactFile::new(digest, byte_length),
+            maximum_bytes,
+            SourceExtent::Complete,
+            ImmutableWriteMode::InjectStorageFull,
             is_cancelled,
         )
     }
@@ -1914,6 +2148,7 @@ impl LocalStoreRoot {
         C: FnMut() -> bool,
     {
         self.publish(
+            ImmutableKind::Object,
             object_relative_path(digest),
             source,
             DeclaredExactFile::new(digest, byte_length),
@@ -2139,13 +2374,43 @@ impl LocalStoreRoot {
         Ok(bytes)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn publish<R, C>(
         &self,
+        kind: ImmutableKind,
         destination: PathBuf,
         source: &mut R,
         expected: DeclaredExactFile,
         maximum_bytes: u64,
         source_extent: SourceExtent,
+        is_cancelled: C,
+    ) -> Result<ImmutablePublication, LocalPublicationError>
+    where
+        R: Read + ?Sized,
+        C: FnMut() -> bool,
+    {
+        self.publish_with_write_mode(
+            kind,
+            destination,
+            source,
+            expected,
+            maximum_bytes,
+            source_extent,
+            ImmutableWriteMode::Normal,
+            is_cancelled,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_with_write_mode<R, C>(
+        &self,
+        kind: ImmutableKind,
+        destination: PathBuf,
+        source: &mut R,
+        expected: DeclaredExactFile,
+        maximum_bytes: u64,
+        source_extent: SourceExtent,
+        write_mode: ImmutableWriteMode,
         mut is_cancelled: C,
     ) -> Result<ImmutablePublication, LocalPublicationError>
     where
@@ -2172,43 +2437,79 @@ impl LocalStoreRoot {
                 disposition: PublicationDisposition::AlreadyPresent,
             });
         }
+        let stage_create = lifecycle_before(
+            TransitionPoint::new(kind.stage_create()),
+            "create an immutable publication stage",
+        )?;
         let mut stage = Stage::begin(self)?;
         let mut staged_file = stage.create_file()?;
-        let facts = match source_extent {
-            SourceExtent::Complete => write_exact_source(
-                &mut staged_file,
-                source,
-                expected.byte_length,
-                &mut is_cancelled,
-            )?,
-            SourceExtent::Segment => write_exact_segment(
-                &mut staged_file,
-                source,
-                expected.byte_length,
-                &mut is_cancelled,
-            )?,
+        lifecycle_after(stage_create, "create an immutable publication stage")?;
+        let write = lifecycle_before(
+            TransitionPoint::new(kind.write()),
+            "write a staged immutable file",
+        )?;
+        let facts = match write_mode {
+            ImmutableWriteMode::Normal => match source_extent {
+                SourceExtent::Complete => write_exact_source(
+                    &mut staged_file,
+                    source,
+                    expected.byte_length,
+                    &mut is_cancelled,
+                )?,
+                SourceExtent::Segment => write_exact_segment(
+                    &mut staged_file,
+                    source,
+                    expected.byte_length,
+                    &mut is_cancelled,
+                )?,
+            },
+            #[cfg(test)]
+            ImmutableWriteMode::InjectStorageFull => {
+                return Err(io_error("write a staged immutable file", Errno::NOSPC));
+            }
         };
+        lifecycle_after(write, "write a staged immutable file")?;
         validate_source_facts(facts, expected)?;
         check_cancelled(&mut is_cancelled)?;
+        let file_sync = lifecycle_before(
+            TransitionPoint::new(kind.file_sync()),
+            "synchronize a staged immutable file",
+        )?;
         fsync(&staged_file)
             .map_err(|error| io_error("synchronize a staged immutable file", error))?;
+        lifecycle_after(file_sync, "synchronize a staged immutable file")?;
         drop(staged_file);
         check_cancelled(&mut is_cancelled)?;
 
-        match renameat_with(
+        let publish = lifecycle_before(
+            TransitionPoint::new(kind.publish()),
+            "publish an immutable file without replacement",
+        )?;
+        let publish_result = renameat_with(
             &stage.directory,
             OsStr::new(STAGED_FILE),
             &destination_parent,
             &destination_name,
             RenameFlags::NOREPLACE,
-        ) {
+        );
+        lifecycle_after(publish, "publish an immutable file without replacement")?;
+        match publish_result {
             Ok(()) => {
                 stage.file_owned = false;
                 // A cross-directory rename is not durably complete until both
                 // the source-name removal and destination-name addition have
                 // been synchronized. Cancellation is deliberately not polled
                 // in this post-rename critical section.
-                sync_published_rename(&stage.directory, &destination_parent)?;
+                sync_lifecycle_directory(
+                    &stage.directory,
+                    TransitionPoint::new(kind.directory_sync()),
+                    "synchronize immutable publication staging",
+                )?;
+                sync_lifecycle_directory(
+                    &destination_parent,
+                    TransitionPoint::new(kind.directory_sync()),
+                    "synchronize immutable publication destination",
+                )?;
                 Ok(ImmutablePublication {
                     facts,
                     disposition: PublicationDisposition::Created,
@@ -2349,18 +2650,7 @@ impl SiblingPackageStage {
         limits: ProjectStoreLimits,
     ) -> Result<Self, LocalPublicationError> {
         let cleanup_limits = PackageCleanupLimits::for_initial_package(limits)?;
-        let path = destination.as_path();
-        let destination_name = path
-            .file_name()
-            .filter(|name| !name.is_empty())
-            .ok_or(LocalPublicationError::InvalidPath)?
-            .to_os_string();
-        let parent_path = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let parent_root = LocalStoreRoot::open(parent_path)?;
-        let parent = duplicate_directory(parent_root.descriptor())?;
+        let (parent, filesystem, destination_name) = open_writable_destination_parent(destination)?;
         match statat(&parent, &destination_name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(_) => return Err(LocalPublicationError::DestinationExists),
             Err(Errno::NOENT) => {}
@@ -2369,6 +2659,10 @@ impl SiblingPackageStage {
 
         for attempt in 0..STAGE_CREATE_ATTEMPTS {
             let stage_name = unique_package_stage_name(attempt);
+            let stage_create = lifecycle_before(
+                TransitionPoint::new(StoreTransition::PackageStageCreate),
+                "create a sibling package stage",
+            )?;
             match mkdirat(&parent, &stage_name, Mode::RWXU) {
                 Ok(()) => {
                     let stage =
@@ -2398,8 +2692,10 @@ impl SiblingPackageStage {
                         #[cfg(test)]
                         ref_commit_directory_sync_failure: AtomicUsize::new(usize::MAX),
                     };
+                    lifecycle_after(stage_create, "create a sibling package stage")?;
                     return Ok(Self {
                         parent,
+                        filesystem,
                         destination_name,
                         stage_name,
                         stage_identity,
@@ -2408,7 +2704,10 @@ impl SiblingPackageStage {
                         owns_stage: true,
                     });
                 }
-                Err(Errno::EXIST) => continue,
+                Err(Errno::EXIST) => {
+                    lifecycle_after(stage_create, "create a sibling package stage")?;
+                    continue;
+                }
                 Err(error) => {
                     return Err(io_error("create the sibling package stage", error));
                 }
@@ -2437,6 +2736,10 @@ impl SiblingPackageStage {
     where
         C: FnMut() -> bool,
     {
+        let transition = lifecycle_before(
+            TransitionPoint::new(StoreTransition::PackageTreeSync),
+            "synchronize the sibling package tree",
+        )?;
         let mut entries = 0_usize;
         sync_package_tree(
             self.root().descriptor(),
@@ -2444,7 +2747,8 @@ impl SiblingPackageStage {
             limits,
             &mut entries,
             &mut is_cancelled,
-        )
+        )?;
+        lifecycle_after(transition, "synchronize the sibling package tree")
     }
 
     /// Installs the already-synchronized package. Cancellation is ignored
@@ -2477,17 +2781,30 @@ impl SiblingPackageStage {
         C: FnMut() -> bool,
     {
         check_cancelled(&mut is_cancelled)?;
+        if writable_filesystem_qualification(&self.parent) != Some(self.filesystem) {
+            return Err(LocalPublicationError::AtomicPublishUnsupported);
+        }
         if !self.stage_name_still_owned()? {
             return Err(LocalPublicationError::ExistingMismatch);
         }
-        match renameat_with(
+        let install = lifecycle_before(
+            TransitionPoint::new(StoreTransition::PackageInstallNoreplace),
+            "install the staged project package",
+        )?;
+        let install_result = renameat_with(
             &self.parent,
             &self.stage_name,
             &self.parent,
             &self.destination_name,
             RenameFlags::NOREPLACE,
-        ) {
-            Ok(()) => self.owns_stage = false,
+        );
+        match install_result {
+            Ok(()) => {
+                self.owns_stage = false;
+                if lifecycle_after(install, "install the staged project package").is_err() {
+                    return Err(LocalPublicationError::PackageCommitIndeterminate);
+                }
+            }
             Err(Errno::EXIST) => return Err(LocalPublicationError::DestinationExists),
             Err(error)
                 if error == Errno::NOSYS || error == Errno::INVAL || error == Errno::OPNOTSUPP =>
@@ -2496,9 +2813,14 @@ impl SiblingPackageStage {
             }
             Err(error) => return Err(io_error("install the staged project package", error)),
         }
+        let parent_sync = lifecycle_before(
+            TransitionPoint::new(StoreTransition::DestinationParentSync),
+            "synchronize the package destination parent",
+        )?;
         if fail_parent_sync || sync_with_retry(&self.parent).is_err() {
             return Err(LocalPublicationError::PackageCommitIndeterminate);
         }
+        lifecycle_after(parent_sync, "synchronize the package destination parent")?;
         let mut root = self
             .root
             .take()
@@ -2756,8 +3078,12 @@ fn capacity_overflow(maximum: usize) -> LocalPublicationError {
 fn map_staging_preflight_error(error: LocalPublicationError) -> StagingCleanupError {
     match error {
         LocalPublicationError::Cancelled => StagingCleanupError::Cancelled,
-        LocalPublicationError::Capacity { .. } => StagingCleanupError::Capacity,
+        LocalPublicationError::Capacity { .. } | LocalPublicationError::StorageFull { .. } => {
+            StagingCleanupError::Capacity
+        }
+        LocalPublicationError::ReadOnly { .. } => StagingCleanupError::ReadOnly,
         LocalPublicationError::InvalidPath
+        | LocalPublicationError::SourceIo { .. }
         | LocalPublicationError::SourceLength { .. }
         | LocalPublicationError::SourceDigest
         | LocalPublicationError::ExistingMismatch
@@ -3174,12 +3500,7 @@ where
         let read = match source.read(&mut buffer) {
             Ok(read) => read,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(source) => {
-                return Err(LocalPublicationError::Io {
-                    operation: "read an immutable source",
-                    source,
-                });
-            }
+            Err(source) => return Err(LocalPublicationError::SourceIo { source }),
         };
         if read == 0 {
             break;
@@ -3197,11 +3518,7 @@ where
                 expected: expected_bytes,
             });
         }
-        file.write_all(&buffer[..read])
-            .map_err(|source| LocalPublicationError::Io {
-                operation: "write a staged immutable file",
-                source,
-            })?;
+        write_all_classified(file, &buffer[..read], "write a staged immutable file")?;
         hasher
             .update(&buffer[..read])
             .map_err(|_| LocalPublicationError::SourceLength {
@@ -3231,12 +3548,21 @@ where
     C: FnMut() -> bool,
 {
     consume_declared_segment(source, expected_bytes, is_cancelled, |bytes| {
-        file.write_all(bytes)
-            .map_err(|source| LocalPublicationError::Io {
-                operation: "write a staged immutable file segment",
-                source,
-            })
+        write_all_classified(file, bytes, "write a staged immutable file segment")
     })
+}
+
+pub(crate) fn write_all_classified<W>(
+    writer: &mut W,
+    bytes: &[u8],
+    operation: &'static str,
+) -> Result<(), LocalPublicationError>
+where
+    W: Write + ?Sized,
+{
+    writer
+        .write_all(bytes)
+        .map_err(|source| classify_io_error(operation, source))
 }
 
 fn consume_exact_segment<R, C>(
@@ -3277,12 +3603,7 @@ where
             }
             Ok(read) => read,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(source) => {
-                return Err(LocalPublicationError::Io {
-                    operation: "read an immutable source segment",
-                    source,
-                });
-            }
+            Err(source) => return Err(LocalPublicationError::SourceIo { source }),
         };
         on_chunk(&buffer[..read])?;
         hasher
@@ -3432,14 +3753,34 @@ fn validate_source_facts(
     }
 }
 
-fn sync_published_rename(
-    source_directory: &OwnedFd,
-    destination_directory: &OwnedFd,
+fn lifecycle_before(
+    point: TransitionPoint,
+    operation: &'static str,
+) -> Result<TransitionOccurrence, LocalPublicationError> {
+    transition::before(point).map_err(|error| LocalPublicationError::Io {
+        operation,
+        source: io::Error::other(error),
+    })
+}
+
+fn lifecycle_after(
+    occurrence: TransitionOccurrence,
+    operation: &'static str,
 ) -> Result<(), LocalPublicationError> {
-    fsync(source_directory)
-        .map_err(|error| io_error("synchronize an immutable staging directory", error))?;
-    fsync(destination_directory)
-        .map_err(|error| io_error("synchronize an immutable destination directory", error))
+    transition::after(occurrence).map_err(|error| LocalPublicationError::Io {
+        operation,
+        source: io::Error::other(error),
+    })
+}
+
+fn sync_lifecycle_directory(
+    directory: &OwnedFd,
+    point: TransitionPoint,
+    operation: &'static str,
+) -> Result<(), LocalPublicationError> {
+    let occurrence = lifecycle_before(point, operation)?;
+    sync_with_retry(directory).map_err(|error| io_error(operation, error))?;
+    lifecycle_after(occurrence, operation)
 }
 
 fn sync_with_retry(directory: &OwnedFd) -> Result<(), Errno> {
@@ -3702,9 +4043,18 @@ fn check_cancelled(is_cancelled: &mut impl FnMut() -> bool) -> Result<(), LocalP
 }
 
 fn io_error(operation: &'static str, error: Errno) -> LocalPublicationError {
-    LocalPublicationError::Io {
-        operation,
-        source: io::Error::from(error),
+    classify_io_error(operation, io::Error::from(error))
+}
+
+fn classify_io_error(operation: &'static str, source: io::Error) -> LocalPublicationError {
+    match source.kind() {
+        io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded => {
+            LocalPublicationError::StorageFull { operation }
+        }
+        io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem => {
+            LocalPublicationError::ReadOnly { operation }
+        }
+        _ => LocalPublicationError::Io { operation, source },
     }
 }
 

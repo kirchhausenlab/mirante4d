@@ -71,6 +71,17 @@ MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
   cargo xtask verify-local trusted-gpu
 ```
 
+Run the WP-10B project-store power-cut qualification only on the trusted Linux
+machine, from a clean revision with the pinned KVM/QEMU environment. The lane
+downloads, verifies, and extracts its exact nbdkit package without root access:
+
+```bash
+MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
+  cargo xtask verify-local project-store-lifecycle
+```
+
+This lane is local-only and is not a GitHub Actions requirement.
+
 ## Working Rules
 
 - Keep generated packages, private microscopy data, logs, and evidence under

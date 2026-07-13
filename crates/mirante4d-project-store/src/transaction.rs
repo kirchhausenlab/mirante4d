@@ -33,8 +33,9 @@ use crate::{
     lease::{LeaseError, ProjectStoreLeases},
     local::{
         ImmutablePublication, LocalPublicationError, LocalStoreRoot, PublicationDisposition,
-        SiblingPackageStage,
+        SiblingPackageStage, ensure_writable_destination as ensure_local_writable_destination,
     },
+    transition::{self, StoreTransition, TransitionPoint},
     wire::{ProjectEnvelope, RefKind, RefRecord},
 };
 
@@ -53,6 +54,8 @@ pub(crate) enum GenerationTransactionError {
     Capacity { stage: &'static str },
     #[error("the physical object closure is invalid")]
     Closure,
+    #[error("an injected project-store transition failed at {stage}")]
+    Transition { stage: &'static str },
     #[error(transparent)]
     Codec(#[from] GenerationCodecError),
     #[error(transparent)]
@@ -63,12 +66,14 @@ impl From<LocalPublicationError> for GenerationTransactionError {
     fn from(error: LocalPublicationError) -> Self {
         match error {
             LocalPublicationError::Cancelled => Self::Cancelled,
-            LocalPublicationError::SourceLength { .. } | LocalPublicationError::SourceDigest => {
-                Self::SourceChanged
+            LocalPublicationError::SourceIo { .. }
+            | LocalPublicationError::SourceLength { .. }
+            | LocalPublicationError::SourceDigest => Self::SourceChanged,
+            LocalPublicationError::Capacity { .. } | LocalPublicationError::StorageFull { .. } => {
+                Self::Capacity {
+                    stage: "physical object",
+                }
             }
-            LocalPublicationError::Capacity { .. } => Self::Capacity {
-                stage: "physical object",
-            },
             other => Self::Local(other),
         }
     }
@@ -154,6 +159,23 @@ impl InstalledInitialPackage {
     }
 }
 
+/// Applies the destination filesystem policy before Create or Save As reads
+/// from its source session.
+pub(crate) fn ensure_writable_destination(
+    destination: &ProjectStorePath,
+) -> Result<(), ProjectStoreFault> {
+    ensure_local_writable_destination(destination)
+        .map_err(|error| map_local_error(error, "destination_filesystem"))
+}
+
+fn missing_initial_writer_fault(leases: &ProjectStoreLeases) -> ProjectStoreFault {
+    if leases.writable_filesystem_qualified() {
+        ProjectStoreFault::WriterContended
+    } else {
+        ProjectStoreFault::UnsupportedFilesystem
+    }
+}
+
 /// Builds one complete private sibling package and installs it exactly once.
 /// No destination path becomes authoritative before the final no-replace
 /// rename, and the source project is represented only by immutable provenance
@@ -168,6 +190,7 @@ pub(crate) fn install_initial_manual_package<C>(
 where
     C: FnMut() -> bool,
 {
+    ensure_writable_destination(destination)?;
     let (stage, leases, receipt) =
         prepare_initial_manual_package(destination, mode, capture, limits, &mut is_cancelled)?;
     let root = stage
@@ -231,8 +254,14 @@ fn install_initial_provisional_autosave_package_inner<C>(
 where
     C: FnMut() -> bool,
 {
+    ensure_writable_destination(destination)?;
     let limits = limits.validate()?;
+    let expected_parent = before_transaction_transition(
+        StoreTransition::ExpectedParentCheck,
+        "expected_parent_check",
+    )?;
     let project_id = validate_initial_provisional_capture(&capture)?;
+    after_transaction_transition(expected_parent, "expected_parent_check")?;
     check_cancelled(&mut *is_cancelled).map_err(map_generation_error)?;
     let stage = match SiblingPackageStage::begin(destination, limits) {
         Ok(stage) => stage,
@@ -253,7 +282,7 @@ where
     let leases = ProjectStoreLeases::acquire(stage.root(), crate::ProjectOpenMode::PreferWritable)
         .map_err(map_lease_error)?;
     if !leases.has_writer() {
-        return Err(ProjectStoreFault::WriterContended);
+        return Err(missing_initial_writer_fault(&leases));
     }
     let receipt = publish_initial_provisional_autosave_generation(
         stage.root(),
@@ -316,7 +345,7 @@ where
     let leases = ProjectStoreLeases::acquire(&root, crate::ProjectOpenMode::PreferWritable)
         .map_err(map_lease_error)?;
     if !leases.has_writer() {
-        return Err(ProjectStoreFault::WriterContended);
+        return Err(missing_initial_writer_fault(&leases));
     }
     root.validate_store_inventory(limits, 0, false, &mut *is_cancelled)
         .map_err(|error| map_local_error(error, "store_inventory"))?;
@@ -362,7 +391,11 @@ where
     }
     check_cancelled(&mut *is_cancelled).map_err(map_generation_error)?;
     if let Err(error) = root.sync_existing_package_parent(destination, limits) {
-        if matches!(error, LocalPublicationError::PackageCommitIndeterminate) {
+        if matches!(
+            error,
+            LocalPublicationError::AtomicPublishUnsupported
+                | LocalPublicationError::PackageCommitIndeterminate
+        ) {
             leases.suspend_writes();
         }
         return Err(map_local_error(error, "destination_parent_sync"));
@@ -394,6 +427,7 @@ fn install_initial_manual_package_with_parent_sync_failure<C>(
 where
     C: FnMut() -> bool,
 {
+    ensure_writable_destination(destination)?;
     let (stage, leases, receipt) =
         prepare_initial_manual_package(destination, mode, capture, limits, &mut is_cancelled)?;
     let root = stage
@@ -417,7 +451,12 @@ where
     C: FnMut() -> bool,
 {
     let limits = limits.validate()?;
+    let expected_parent = before_transaction_transition(
+        StoreTransition::ExpectedParentCheck,
+        "expected_parent_check",
+    )?;
     let project_id = validate_initial_capture(mode, &capture)?;
+    after_transaction_transition(expected_parent, "expected_parent_check")?;
     check_cancelled(&mut is_cancelled).map_err(map_generation_error)?;
 
     let stage = SiblingPackageStage::begin(destination, limits)
@@ -429,7 +468,7 @@ where
     let leases = ProjectStoreLeases::acquire(stage.root(), crate::ProjectOpenMode::PreferWritable)
         .map_err(map_lease_error)?;
     if !leases.has_writer() {
-        return Err(ProjectStoreFault::WriterContended);
+        return Err(missing_initial_writer_fault(&leases));
     }
     let receipt = publish_initial_manual_generation(
         stage.root(),
@@ -523,17 +562,23 @@ where
             stage: "project_envelope_identity",
         });
     }
+    let expected_parent = before_transaction_transition(
+        StoreTransition::ExpectedParentCheck,
+        "expected_parent_check",
+    )?;
     validate_initial_capture(mode, &capture)?;
+    after_transaction_transition(expected_parent, "expected_parent_check")?;
     require_fresh_lane_refs(root, project_id, limits, &mut is_cancelled)?;
 
     let captured_revision = capture.projection().revision();
     let captured_revision_high_water = capture.projection().revision_high_water().clone();
-    let publication = publish_unreferenced_generation(
+    let publication = publish_unreferenced_generation_with_copy_transition(
         root,
         capture,
         GenerationKind::Manual,
         0,
         limits,
+        matches!(mode, InitialPackageMode::SaveAs { .. }),
         &mut is_cancelled,
     )
     .map_err(map_generation_error)?;
@@ -590,7 +635,12 @@ where
     }
     root.validate_store_inventory(limits, 0, false, &mut is_cancelled)
         .map_err(|error| map_local_error(error, "store_inventory"))?;
+    let expected_parent = before_transaction_transition(
+        StoreTransition::ExpectedParentCheck,
+        "expected_parent_check",
+    )?;
     let project_id = validate_initial_provisional_capture(&capture)?;
+    after_transaction_transition(expected_parent, "expected_parent_check")?;
     let envelope = root
         .read_project_envelope(limits, &mut is_cancelled)
         .map_err(|error| map_local_error(error, "project_envelope"))?;
@@ -785,7 +835,12 @@ where
     if is_exact_visible_provisional_commit(&state, &capture) {
         return adopt_visible_provisional_commit(root, leases, capture, limits, &mut is_cancelled);
     }
+    let expected_parent = before_transaction_transition(
+        StoreTransition::ExpectedParentCheck,
+        "expected_parent_check",
+    )?;
     let target = validate_provisional_capture(&capture, &state)?;
+    after_transaction_transition(expected_parent, "expected_parent_check")?;
     let current_generation = state
         .autosave_generation()
         .expect("a validated provisional store has an autosave generation");
@@ -1126,7 +1181,12 @@ where
             stage: "project_envelope_identity",
         });
     }
+    let expected_parent = before_transaction_transition(
+        StoreTransition::ExpectedParentCheck,
+        "expected_parent_check",
+    )?;
     validate_established_capture(&capture, lane, &inspection)?;
+    after_transaction_transition(expected_parent, "expected_parent_check")?;
     let next_generation_sequence = inspection.next_generation_sequence()?;
     let expected_manual = inspection.manual();
     let expected_autosave = inspection.autosave();
@@ -1441,15 +1501,24 @@ fn map_generation_error(error: GenerationTransactionError) -> ProjectStoreFault 
                 stage: "generation_closure",
             }
         }
+        GenerationTransactionError::Transition { stage } => ProjectStoreFault::Corruption { stage },
         GenerationTransactionError::Local(error) => map_local_error(error, "generation_io"),
     }
 }
 
-fn map_local_error(error: LocalPublicationError, stage: &'static str) -> ProjectStoreFault {
+pub(crate) fn map_local_error(
+    error: LocalPublicationError,
+    stage: &'static str,
+) -> ProjectStoreFault {
     match error {
         LocalPublicationError::Cancelled => ProjectStoreFault::Cancelled,
-        LocalPublicationError::Capacity { .. } => ProjectStoreFault::Capacity { stage },
-        LocalPublicationError::SourceLength { .. } => ProjectStoreFault::SourceChanged,
+        LocalPublicationError::Capacity { .. } | LocalPublicationError::StorageFull { .. } => {
+            ProjectStoreFault::Capacity { stage }
+        }
+        LocalPublicationError::ReadOnly { .. } => ProjectStoreFault::ReadOnly,
+        LocalPublicationError::SourceIo { .. } | LocalPublicationError::SourceLength { .. } => {
+            ProjectStoreFault::SourceChanged
+        }
         LocalPublicationError::SourceDigest => ProjectStoreFault::DigestMismatch,
         LocalPublicationError::DestinationExists => ProjectStoreFault::DestinationExists,
         LocalPublicationError::RefAlreadyPresent => ProjectStoreFault::StaleParent,
@@ -1473,6 +1542,29 @@ pub(crate) fn publish_unreferenced_generation<C>(
     kind: GenerationKind,
     generation_sequence: u64,
     limits: ProjectStoreLimits,
+    mut is_cancelled: C,
+) -> Result<UnreferencedGenerationPublication, GenerationTransactionError>
+where
+    C: FnMut() -> bool,
+{
+    publish_unreferenced_generation_with_copy_transition(
+        root,
+        capture,
+        kind,
+        generation_sequence,
+        limits,
+        false,
+        &mut is_cancelled,
+    )
+}
+
+fn publish_unreferenced_generation_with_copy_transition<C>(
+    root: &LocalStoreRoot,
+    capture: ProjectCommitCapture,
+    kind: GenerationKind,
+    generation_sequence: u64,
+    limits: ProjectStoreLimits,
+    trace_closure_copy_rehash: bool,
     mut is_cancelled: C,
 ) -> Result<UnreferencedGenerationPublication, GenerationTransactionError>
 where
@@ -1516,6 +1608,7 @@ where
                 limits.object_or_page_bytes_max,
                 &mut is_cancelled,
             )? {
+                let copy = before_copy_rehash(trace_closure_copy_rehash)?;
                 let mut reader = source
                     .open()
                     .map_err(|_| GenerationTransactionError::SourceIo)?;
@@ -1527,9 +1620,11 @@ where
                     &mut is_cancelled,
                 )?;
                 record_created(publication, &mut created_objects, &mut created_object_bytes)?;
+                after_copy_rehash(copy)?;
             }
             ArtifactStorage::direct(&descriptor)?
         } else {
+            let copy = before_copy_rehash(trace_closure_copy_rehash)?;
             let pages = derive_page_plan(&source, &descriptor, limits, &mut is_cancelled)?;
             let binding = LogicalObjectBinding::new(descriptor.clone(), pages, limits)?;
             let encoded_binding = binding.encode(limits)?;
@@ -1558,6 +1653,7 @@ where
                 record_created(publication, &mut created_objects, &mut created_object_bytes)?;
             }
             require_eof(&mut reader)?;
+            after_copy_rehash(copy)?;
 
             let mut binding_reader = Cursor::new(encoded_binding.bytes());
             let publication = root.publish_declared_object(
@@ -1887,6 +1983,45 @@ fn check_cancelled(
     }
 }
 
+fn before_transaction_transition(
+    transition: StoreTransition,
+    stage: &'static str,
+) -> Result<crate::transition::TransitionOccurrence, ProjectStoreFault> {
+    transition::before(TransitionPoint::new(transition))
+        .map_err(|_| ProjectStoreFault::Corruption { stage })
+}
+
+fn after_transaction_transition(
+    occurrence: crate::transition::TransitionOccurrence,
+    stage: &'static str,
+) -> Result<(), ProjectStoreFault> {
+    transition::after(occurrence).map_err(|_| ProjectStoreFault::Corruption { stage })
+}
+
+fn before_copy_rehash(
+    enabled: bool,
+) -> Result<Option<crate::transition::TransitionOccurrence>, GenerationTransactionError> {
+    enabled
+        .then(|| {
+            transition::before(TransitionPoint::new(StoreTransition::ClosureCopyRehash)).map_err(
+                |_| GenerationTransactionError::Transition {
+                    stage: "closure_copy_rehash",
+                },
+            )
+        })
+        .transpose()
+}
+
+fn after_copy_rehash(
+    occurrence: Option<crate::transition::TransitionOccurrence>,
+) -> Result<(), GenerationTransactionError> {
+    occurrence.map_or(Ok(()), |occurrence| {
+        transition::after(occurrence).map_err(|_| GenerationTransactionError::Transition {
+            stage: "closure_copy_rehash",
+        })
+    })
+}
+
 fn read_some(
     reader: &mut dyn Read,
     buffer: &mut [u8],
@@ -1939,9 +2074,16 @@ mod tests {
     };
 
     use super::*;
-    use crate::{ProjectObjectSource, ProjectOpenMode, wire::ProjectEnvelope};
+    use crate::{
+        ProjectObjectSource, ProjectOpenMode, filesystem::TEST_REAL_POLICY_ENV,
+        wire::ProjectEnvelope,
+    };
 
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+    const UNQUALIFIED_INITIAL_DESTINATIONS_TEST: &str = concat!(
+        "transaction::tests::",
+        "unqualified_initial_destinations_fail_before_source_reads_or_mutation"
+    );
 
     struct TestDirectory(PathBuf);
 
@@ -2365,6 +2507,82 @@ mod tests {
         assert!(!directory.path().join("refs/autosave-head").exists());
         assert!(!directory.path().join("refs/autosave-recovery").exists());
         assert!(opens.load(Ordering::SeqCst) >= frozen.projection().state().artifacts().len());
+    }
+
+    #[test]
+    fn unqualified_initial_destinations_fail_before_source_reads_or_mutation() {
+        if std::env::var_os(TEST_REAL_POLICY_ENV).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg(UNQUALIFIED_INITIAL_DESTINATIONS_TEST)
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(TEST_REAL_POLICY_ENV, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let destination = |label: &str| {
+            ProjectStorePath::new(format!(
+                "/dev/shm/mirante4d-unqualified-{label}-{}.m4dproj",
+                std::process::id()
+            ))
+            .unwrap()
+        };
+
+        let create_destination = destination("create");
+        let (_, create_generation, _) = frozen_stale_manual();
+        let (create_capture, create_opens) = frozen_capture("stale.m4dproj", &create_generation);
+        assert!(matches!(
+            install_initial_manual_package(
+                &create_destination,
+                InitialPackageMode::Create,
+                create_capture,
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::UnsupportedFilesystem)
+        ));
+        assert_eq!(create_opens.load(Ordering::SeqCst), 0);
+        assert!(!create_destination.as_path().exists());
+
+        let save_as_destination = destination("save-as");
+        let save_as_generation = frozen_generation("divergent.m4dproj", DIVERGENT_INITIAL);
+        let fork = save_as_generation.forked_from().unwrap();
+        let (save_as_capture, save_as_opens) =
+            frozen_capture("divergent.m4dproj", &save_as_generation);
+        assert!(matches!(
+            install_initial_manual_package(
+                &save_as_destination,
+                InitialPackageMode::SaveAs {
+                    source_project_id: fork.0,
+                    source_generation_id: fork.1,
+                },
+                save_as_capture,
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::UnsupportedFilesystem)
+        ));
+        assert_eq!(save_as_opens.load(Ordering::SeqCst), 0);
+        assert!(!save_as_destination.as_path().exists());
+
+        let provisional_destination = destination("provisional");
+        let provisional_generation = frozen_generation("provisional.m4dproj", PROVISIONAL_AUTOSAVE);
+        let (provisional_capture, provisional_opens) =
+            frozen_capture("provisional.m4dproj", &provisional_generation);
+        assert!(matches!(
+            install_initial_provisional_autosave_package(
+                &provisional_destination,
+                provisional_capture,
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::UnsupportedFilesystem)
+        ));
+        assert_eq!(provisional_opens.load(Ordering::SeqCst), 0);
+        assert!(!provisional_destination.as_path().exists());
     }
 
     #[test]
@@ -4813,7 +5031,7 @@ mod tests {
 
     fn fixture_extract(member: &str) -> Vec<u8> {
         let output = Command::new("tar")
-            .arg("-xOf")
+            .arg("-xzOf")
             .arg(fixture_archive())
             .arg(member)
             .output()

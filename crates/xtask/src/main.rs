@@ -84,9 +84,11 @@ fn main() -> anyhow::Result<()> {
         "verify-local" => {
             let lane = args
                 .next()
-                .context("usage: cargo xtask verify-local <format-lifecycle|trusted-gpu>")?;
+                .context("usage: cargo xtask verify-local <format-lifecycle|project-store-lifecycle|trusted-gpu>")?;
             if args.next().is_some() {
-                bail!("usage: cargo xtask verify-local <format-lifecycle|trusted-gpu>");
+                bail!(
+                    "usage: cargo xtask verify-local <format-lifecycle|project-store-lifecycle|trusted-gpu>"
+                );
             }
             verification::verify_local(&lane)
         }
@@ -411,8 +413,8 @@ Commands:
       runs one non-recursive verification leaf with its declared timeout and selector
   cargo xtask verify-pr [policy|rust]
       runs the pull-request policy and/or Rust group without recursively invoking xtask
-  cargo xtask verify-local <format-lifecycle|trusted-gpu>
-      runs the registry-owned ignored GPU union on an explicitly trusted local machine
+  cargo xtask verify-local <format-lifecycle|project-store-lifecycle|trusted-gpu>
+      runs one registry-owned local qualification lane on an explicitly trusted machine
       env: MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 acknowledges trusted-machine execution
   cargo xtask verification-sync [--check]
       generates or verifies the registry-derived Nextest configuration and selectors

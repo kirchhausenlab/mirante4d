@@ -32,7 +32,12 @@ use rustix::{
 };
 use thiserror::Error;
 
-use crate::{ProjectOpenMode, local::LocalStoreRoot};
+use crate::{
+    ProjectOpenMode,
+    filesystem::{WritableFilesystemQualification, writable_filesystem_qualification},
+    local::LocalStoreRoot,
+    transition::{self, StoreTransition, TransitionOccurrence, TransitionPoint},
+};
 
 const DIRECTORY_OPEN_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
@@ -206,6 +211,7 @@ impl TransitionEdge {
 pub(crate) struct GcTransitionOccurrence {
     transition: GcTransition,
     occurrence: usize,
+    lifecycle: Option<TransitionOccurrence>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -282,6 +288,7 @@ impl GcTransitionInjector {
         let occurrence = GcTransitionOccurrence {
             transition,
             occurrence,
+            lifecycle: None,
         };
         self.hit(occurrence, TransitionEdge::Before)?;
         Ok(occurrence)
@@ -420,6 +427,7 @@ impl AnchorIdentity {
 struct WriterLease {
     anchor: OwnedFd,
     identity: AnchorIdentity,
+    filesystem: WritableFilesystemQualification,
 }
 
 impl WriterLease {
@@ -449,6 +457,7 @@ impl WriterLease {
 pub(crate) struct ProjectStoreLeases {
     maintenance: OwnedFd,
     writer: Option<WriterLease>,
+    writable_filesystem: Option<WritableFilesystemQualification>,
     writes_suspended: AtomicBool,
     maintenance_lost: AtomicBool,
     #[cfg(test)]
@@ -460,14 +469,28 @@ impl ProjectStoreLeases {
         root: &LocalStoreRoot,
         requested: ProjectOpenMode,
     ) -> Result<Self, LeaseError> {
+        let maintenance_transition = transition::before(TransitionPoint::new(
+            StoreTransition::MaintenanceLeaseAcquire,
+        ))
+        .map_err(|_| injected_lease_io("inject failure before maintenance lease acquisition"))?;
         let maintenance = duplicate_root(root)?;
         lock_blocking(
             &maintenance,
             FlockOperation::LockShared,
             "acquire maintenance lease",
         )?;
+        transition::after(maintenance_transition)
+            .map_err(|_| injected_lease_io("inject failure after maintenance lease acquisition"))?;
 
-        let writer = if requested == ProjectOpenMode::PreferWritable {
+        let mut writable_filesystem = (requested == ProjectOpenMode::PreferWritable)
+            .then(|| writable_filesystem_qualification(root.descriptor()))
+            .flatten();
+        let writer = if let Some(filesystem) = writable_filesystem {
+            let writer_transition =
+                transition::before(TransitionPoint::new(StoreTransition::WriterLeaseTryAcquire))
+                    .map_err(|_| {
+                        injected_lease_io("inject failure before writer lease acquisition")
+                    })?;
             let anchor = openat(
                 root.descriptor(),
                 OsStr::new("project.json"),
@@ -478,11 +501,23 @@ impl ProjectStoreLeases {
             let identity = AnchorIdentity::from_stat(
                 fstat(&anchor).map_err(|error| lease_io("identify writer lease anchor", error))?,
             )?;
-            match flock(&anchor, FlockOperation::NonBlockingLockExclusive) {
+            let lock_result = flock(&anchor, FlockOperation::NonBlockingLockExclusive);
+            transition::after(writer_transition)
+                .map_err(|_| injected_lease_io("inject failure after writer lease acquisition"))?;
+            match lock_result {
                 Ok(()) => {
-                    let writer = WriterLease { anchor, identity };
-                    writer.confirm(root)?;
-                    Some(writer)
+                    let writer = WriterLease {
+                        anchor,
+                        identity,
+                        filesystem,
+                    };
+                    if writable_filesystem_qualification(root.descriptor()) != Some(filesystem) {
+                        writable_filesystem = None;
+                        None
+                    } else {
+                        writer.confirm(root)?;
+                        Some(writer)
+                    }
                 }
                 Err(error) if error == Errno::AGAIN => None,
                 Err(error) => return Err(lease_io("try to acquire writer lease", error)),
@@ -494,6 +529,7 @@ impl ProjectStoreLeases {
         Ok(Self {
             maintenance,
             writer,
+            writable_filesystem,
             writes_suspended: AtomicBool::new(false),
             maintenance_lost: AtomicBool::new(false),
             #[cfg(test)]
@@ -513,13 +549,27 @@ impl ProjectStoreLeases {
         self.writer.is_some()
     }
 
+    pub(crate) const fn writable_filesystem_qualified(&self) -> bool {
+        self.writable_filesystem.is_some()
+    }
+
     pub(crate) fn confirm_writer(&self, root: &LocalStoreRoot) -> Result<bool, LeaseError> {
         if self.writes_suspended.load(Ordering::Acquire) {
             return Err(LeaseError::Indeterminate);
         }
         match &self.writer {
             Some(writer) => {
+                let transition = transition::before(TransitionPoint::new(
+                    StoreTransition::WriterLeaseConfirm,
+                ))
+                .map_err(|_| injected_lease_io("inject failure before writer confirmation"))?;
+                if writable_filesystem_qualification(root.descriptor()) != Some(writer.filesystem) {
+                    self.suspend_writes();
+                    return Err(LeaseError::Indeterminate);
+                }
                 writer.confirm(root)?;
+                transition::after(transition)
+                    .map_err(|_| injected_lease_io("inject failure after writer confirmation"))?;
                 Ok(true)
             }
             None => Ok(false),
@@ -528,6 +578,12 @@ impl ProjectStoreLeases {
 
     pub(crate) fn suspend_writes(&self) {
         self.writes_suspended.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn change_writer_filesystem_qualification_for_test(&mut self) {
+        let writer = self.writer.as_mut().expect("the test holds a writer lease");
+        writer.filesystem = writer.filesystem.different_for_test();
     }
 
     pub(crate) fn maintenance_lost(&self) -> bool {
@@ -548,13 +604,19 @@ impl ProjectStoreLeases {
         &self,
         transition: GcTransition,
     ) -> Result<GcTransitionOccurrence, InjectedGcTransition> {
+        let lifecycle =
+            crate::transition::before(TransitionPoint::new(gc_store_transition(transition)))
+                .map_err(|_| InjectedGcTransition)?;
         #[cfg(test)]
         if let Some(injector) = &self.gc_transition_injector {
-            return injector.before(transition);
+            let mut occurrence = injector.before(transition)?;
+            occurrence.lifecycle = Some(lifecycle);
+            return Ok(occurrence);
         }
         Ok(GcTransitionOccurrence {
             transition,
             occurrence: 0,
+            lifecycle: Some(lifecycle),
         })
     }
 
@@ -562,6 +624,9 @@ impl ProjectStoreLeases {
         &self,
         occurrence: GcTransitionOccurrence,
     ) -> Result<(), InjectedGcTransition> {
+        if let Some(lifecycle) = occurrence.lifecycle {
+            crate::transition::after(lifecycle).map_err(|_| InjectedGcTransition)?;
+        }
         #[cfg(test)]
         if let Some(injector) = &self.gc_transition_injector {
             return injector.after(occurrence);
@@ -695,6 +760,35 @@ impl ProjectStoreLeases {
                 self.mark_maintenance_lost();
                 Err(MaintenanceTransitionError::MaintenanceLost { source })
             }
+        }
+    }
+}
+
+const fn gc_store_transition(transition: GcTransition) -> StoreTransition {
+    match transition {
+        GcTransition::MaintenanceUpgrade => StoreTransition::GcMaintenanceUpgrade,
+        GcTransition::RootScan => StoreTransition::GcRootScan,
+        GcTransition::CandidateListing => StoreTransition::GcCandidateListing,
+        GcTransition::TrashDirectoryCreate => StoreTransition::GcTrashDirectoryCreate,
+        GcTransition::TrashCollisionFileSync => StoreTransition::GcTrashCollisionFileSync,
+        GcTransition::TrashMove => StoreTransition::GcTrashMove,
+        GcTransition::ActiveDeduplicateRemove => StoreTransition::GcActiveDeduplicateRemove,
+        GcTransition::SourceDirectorySync => StoreTransition::GcSourceDirectorySync,
+        GcTransition::TrashDirectorySync => StoreTransition::GcTrashDirectorySync,
+        GcTransition::MaintenanceRestore => StoreTransition::GcMaintenanceRestore,
+        GcTransition::PurgeRemove => StoreTransition::PurgeRemove,
+        GcTransition::PurgeDirectorySync => StoreTransition::PurgeDirectorySync,
+        GcTransition::PinStageCreate => StoreTransition::PinStageCreate,
+        GcTransition::PinWrite => StoreTransition::PinWrite,
+        GcTransition::PinFileSync => StoreTransition::PinFileSync,
+        GcTransition::PinReplace => StoreTransition::PinReplace,
+        GcTransition::PinDirectorySync => StoreTransition::PinDirectorySync,
+        GcTransition::UnpinRemove => StoreTransition::UnpinRemove,
+        GcTransition::UnpinDirectorySync => StoreTransition::UnpinDirectorySync,
+        GcTransition::StagingCleanupPayloadRemove => StoreTransition::StagingCleanupPayloadRemove,
+        GcTransition::StagingCleanupDirectorySync => StoreTransition::StagingCleanupDirectorySync,
+        GcTransition::StagingCleanupTransactionRemove => {
+            StoreTransition::StagingCleanupTransactionRemove
         }
     }
 }
@@ -1041,5 +1135,24 @@ mod tests {
         assert!(!independent_exclusive_available(&root));
         drop(read_only);
         assert!(independent_exclusive_available(&root));
+    }
+
+    #[test]
+    fn writer_confirmation_suspends_after_filesystem_qualification_changes() {
+        let directory = TestDirectory::new();
+        let root = LocalStoreRoot::open(directory.path()).unwrap();
+        let mut leases =
+            ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        assert!(leases.confirm_writer(&root).unwrap());
+
+        leases.change_writer_filesystem_qualification_for_test();
+        assert!(matches!(
+            leases.confirm_writer(&root),
+            Err(LeaseError::Indeterminate)
+        ));
+        assert!(matches!(
+            leases.confirm_writer(&root),
+            Err(LeaseError::Indeterminate)
+        ));
     }
 }

@@ -73,7 +73,8 @@ object batches, a revalidated sync barrier, generation-last removal,
 cancellation, read-only rejection, and indeterminate-session handling. Sixteen
 exact callback cases and 16 actual `SIGKILL` cases prove fresh-process retry
 for every observed Purge transition occurrence. This is process-crash evidence,
-not power-loss durability. The remaining B2 lifecycle/durability work is next.
+not power-loss durability. The separate aggregate B2 lifecycle/durability proof
+is described below.
 Its first bound correction resolves provisional autosave publication: the
 already-frozen autosave-only state has no manual base, starts at one
 caller-supplied no-clobber package path, and advances through the existing lane
@@ -83,7 +84,16 @@ retry with four focused transaction cases. The public actor now starts unbound
 and owns fresh Create, healthy Open, provisional publication and manual
 handoff, normal session commands, and recovery-selected Save As while retaining
 the damaged source unchanged. Its focused lifecycle cases cover those routes;
-the remaining B2 durability qualification is next.
+the aggregate B2 durability qualification covers their separate durability
+claim. Its accepted narrow
+correction freezes one exact ext4 tuple, fail-closed read-only/new-destination
+semantics, exhaustive hosted injection, mutation/residue process kills, and VM
+cuts only at distinct persistence/authority boundaries. The implementation and
+clean aggregate qualification pass at
+`0f24f255b45e1ce274f5ae527e02ef7fe5906285`: 120 hosted tests and all 60 VM
+cut cases passed with zero harness retries. The sanitized report SHA-256 is
+`ba7c41bbea543e4e576ad9188e99a77611e01479d7a3ea5b928166203ad10b0e`.
+Public-CI/protected-main B2 acceptance remains; B3 follows immediately.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.
