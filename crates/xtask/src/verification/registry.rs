@@ -946,9 +946,7 @@ fn generated_nextest(registry: &Registry) -> anyhow::Result<String> {
             timeout.selector,
         ));
         if let Some(threads_required) = &timeout.threads_required {
-            text.push_str(&format!(
-                "threads-required = \"{threads_required}\"\n"
-            ));
+            text.push_str(&format!("threads-required = \"{threads_required}\"\n"));
         }
         text.push_str(&format!(
             "slow-timeout = {{ period = \"{}\", terminate-after = {} }}\n",
