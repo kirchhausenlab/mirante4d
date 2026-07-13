@@ -2443,6 +2443,14 @@
       "reason": "WP-10B B2 proves collision, source failure, and cancellation leave the established source session authoritative and usable."
     },
     {
+      "id": "libtest:mirante4d-project-store:actor::tests::full_verify_is_correlated_cancellable_and_available_read_only",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves private FullVerify request correlation, cancellation, and writer-contended read-only availability without changing session authority."
+    },
+    {
       "id": "libtest:mirante4d-project-store:actor::tests::queued_autosaves_coalesce_and_completion_obligations_stay_bounded",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -2521,6 +2529,22 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 freezes loaded Open/OpenRecovery success payloads and distinguishes manual recovery branches from autosave divergence."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:full_verify::tests::corruption_cancellation_and_snapshot_drift_fail_without_mutation",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves exact payload corruption and cancellation add no mutation, while injected active-namespace drift is rejected without FullVerify adding any further mutation."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:full_verify::tests::healthy_store_verifies_every_physical_and_paged_logical_byte_without_mutation",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves bounded stable-snapshot FullVerify hashes every active physical object, reconstructs paged logical objects, and changes no store bytes."
     },
     {
       "id": "libtest:mirante4d-project-store:generation::tests::commit_capture_builds_the_same_frozen_direct_generation",
@@ -5948,6 +5972,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 537
+    "current_additions": 540
   }
 }

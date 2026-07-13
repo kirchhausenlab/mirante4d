@@ -145,7 +145,7 @@ stores, holds their maintenance/writer leases, validates the bounded envelope,
 ref, generation, continuity, and physical-object metadata graph, and reports
 writable contention as an explicit read-only mode. Transactions and actor
 startup consume that same authority. Bulk payload digests remain streaming or
-full-verification work. A bounded graph extension recognizes healthy
+explicit verification work. A bounded graph extension recognizes healthy
 provisional stores and strictly enumerates the immutable generation/object
 namespaces, validates every generation metadata closure, and reports exact
 ref/pin roots plus capped orphan generations. Parent and autosave-base IDs are
@@ -167,11 +167,16 @@ coalescing, cancellation, close, and shutdown. Private Pin/Unpin commands now
 atomically create, replace, or remove exact checkpoint roots after fresh graph
 validation, and suspend writes if post-mutation durability is indeterminate.
 The accepted transition inventory now names pin, unpin, and purge mutation
-phases; exhaustive injection evidence remains later B2 work. The frozen public
-actor remains non-constructible and unwired. The crate still owns no public Create/Open/Save
-As execution, provisional autosave publication, product recovery workflow,
-timers, garbage collection, full verification, qualified durability, or product
-path.
+phases; exhaustive injection evidence remains later B2 work. Private
+FullVerify now takes a bounded stable snapshot of every active generation and
+object outside staging and trash, hashes every physical object, reconstructs
+paged logical objects, and repeats the snapshot before success. It is
+cancellable, available to read-only sessions, and changes no store authority.
+It does not validate artifact scientific semantics, repair data, verify trash,
+or prove durability. The frozen public actor remains non-constructible and
+unwired. The crate still owns no public Create/Open/Save As execution,
+provisional autosave publication, product recovery workflow, timers, garbage
+collection, qualified durability, or product path.
 
 Settings use `mirante4d-settings-v1` at the Linux XDG/HOME path. The UI submits
 validated changes; one background actor owns persistence. Legacy preferences

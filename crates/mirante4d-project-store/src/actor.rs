@@ -96,6 +96,9 @@ enum Work {
         request_id: ProjectStoreRequestId,
         checkpoint_id: String,
     },
+    FullVerify {
+        request_id: ProjectStoreRequestId,
+    },
 }
 
 impl Work {
@@ -107,7 +110,8 @@ impl Work {
             | Self::InspectRecovery { request_id }
             | Self::OpenRecovery { request_id, .. }
             | Self::Pin { request_id, .. }
-            | Self::Unpin { request_id, .. } => *request_id,
+            | Self::Unpin { request_id, .. }
+            | Self::FullVerify { request_id } => *request_id,
         }
     }
 
@@ -142,6 +146,10 @@ impl Work {
                 result: Err(ProjectStoreFault::Cancelled),
             },
             Self::Unpin { request_id, .. } => ProjectStoreCompletion::Unpinned {
+                request_id,
+                result: Err(ProjectStoreFault::Cancelled),
+            },
+            Self::FullVerify { request_id } => ProjectStoreCompletion::Verified {
                 request_id,
                 result: Err(ProjectStoreFault::Cancelled),
             },
@@ -393,6 +401,9 @@ impl EstablishedProjectActor {
             ProjectStoreCommand::Unpin { .. } => Err(ProjectStoreFault::Corruption {
                 stage: "checkpoint_id",
             }),
+            ProjectStoreCommand::FullVerify { request_id } => {
+                self.submit_work(Work::FullVerify { request_id })
+            }
             ProjectStoreCommand::Cancel {
                 request_id,
                 target_request_id,
@@ -783,6 +794,21 @@ fn worker_main(
                     || cancelled.load(Ordering::Acquire),
                 ),
             },
+            Work::FullVerify { request_id } => {
+                let result = crate::full_verify::full_verify(&session.root, limits, || {
+                    cancelled.load(Ordering::Acquire)
+                })
+                .map(|mut diagnostics| {
+                    let state = shared.lock();
+                    diagnostics.queued_requests = state.requests.len();
+                    diagnostics.queued_completions = state.completions.len();
+                    diagnostics.active_transactions = usize::from(state.active.is_some());
+                    diagnostics.open_file_descriptors =
+                        2 + usize::from(session.leases.has_writer());
+                    diagnostics
+                });
+                ProjectStoreCompletion::Verified { request_id, result }
+            }
         };
         let mut state = shared.lock();
         state.active = None;
@@ -1896,6 +1922,84 @@ mod tests {
     }
 
     #[test]
+    fn full_verify_is_correlated_cancellable_and_available_read_only() {
+        let writable = TestProject::extracted("actor-full-verify");
+        let actor =
+            EstablishedProjectActor::start(&writable.store_path(), Default::default()).unwrap();
+        actor
+            .try_submit(ProjectStoreCommand::FullVerify {
+                request_id: request_id(1),
+            })
+            .unwrap();
+        let writable_diagnostics = match actor.recv_timeout(TIMEOUT) {
+            Some(ProjectStoreCompletion::Verified {
+                request_id: actual,
+                result: Ok(diagnostics),
+            }) if actual == request_id(1) => diagnostics,
+            other => panic!("unexpected writable FullVerify completion: {other:?}"),
+        };
+        assert_eq!(writable_diagnostics.active_transactions, 1);
+        assert_eq!(writable_diagnostics.open_file_descriptors, 3);
+        assert_eq!(writable_diagnostics.published_objects, 0);
+        actor.try_submit(close_command(2)).unwrap();
+        actor.recv_timeout(TIMEOUT).unwrap();
+        actor.join().unwrap();
+
+        let contended = TestProject::extracted("actor-full-verify-read-only");
+        let held_root = LocalStoreRoot::open(contended.path()).unwrap();
+        let held_writer =
+            ProjectStoreLeases::acquire(&held_root, ProjectOpenMode::PreferWritable).unwrap();
+        assert!(held_writer.has_writer());
+        let read_only =
+            EstablishedProjectActor::start(&contended.store_path(), Default::default()).unwrap();
+        read_only
+            .try_submit(ProjectStoreCommand::FullVerify {
+                request_id: request_id(1),
+            })
+            .unwrap();
+        let read_only_diagnostics = match read_only.recv_timeout(TIMEOUT) {
+            Some(ProjectStoreCompletion::Verified {
+                request_id: actual,
+                result: Ok(diagnostics),
+            }) if actual == request_id(1) => diagnostics,
+            other => panic!("unexpected read-only FullVerify completion: {other:?}"),
+        };
+        assert_eq!(read_only_diagnostics.active_transactions, 1);
+        assert_eq!(read_only_diagnostics.open_file_descriptors, 2);
+        assert_eq!(read_only_diagnostics.published_objects, 0);
+        read_only.try_submit(close_command(2)).unwrap();
+        read_only.recv_timeout(TIMEOUT).unwrap();
+        read_only.join().unwrap();
+
+        let cancelled = TestProject::extracted("actor-full-verify-cancelled");
+        let actor =
+            EstablishedProjectActor::start(&cancelled.store_path(), Default::default()).unwrap();
+        let (capture, gate) = gated_manual_capture();
+        actor
+            .try_submit(ProjectStoreCommand::ManualSave {
+                request_id: request_id(1),
+                capture,
+            })
+            .unwrap();
+        gate.wait_started();
+        actor
+            .try_submit(ProjectStoreCommand::FullVerify {
+                request_id: request_id(2),
+            })
+            .unwrap();
+        actor.try_submit(cancel_command(3, 2)).unwrap();
+        assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 2);
+        assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 3);
+        actor.try_submit(cancel_command(4, 1)).unwrap();
+        assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 4);
+        gate.release();
+        assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 1);
+        actor.try_submit(close_command(5)).unwrap();
+        actor.recv_timeout(TIMEOUT).unwrap();
+        actor.join().unwrap();
+    }
+
+    #[test]
     fn queued_autosaves_coalesce_and_completion_obligations_stay_bounded() {
         let project = TestProject::extracted("coalesce-bound");
         let actor =
@@ -2209,6 +2313,9 @@ mod tests {
                 request_id: actual_id,
                 result: Err(ProjectStoreFault::Cancelled)
             } | ProjectStoreCompletion::Unpinned {
+                request_id: actual_id,
+                result: Err(ProjectStoreFault::Cancelled)
+            } | ProjectStoreCompletion::Verified {
                 request_id: actual_id,
                 result: Err(ProjectStoreFault::Cancelled)
             } if actual_id == request_id(expected)

@@ -678,12 +678,13 @@ impl LocalStoreRoot {
     }
 
     /// Validates the complete fixed-ref namespace and returns every bounded
-    /// pin record. Unknown entries and malformed checkpoint names fail closed.
+    /// named pin record. Unknown entries and malformed checkpoint names fail
+    /// closed.
     pub(crate) fn read_pin_refs<C>(
         &self,
         limits: ProjectStoreLimits,
         mut is_cancelled: C,
-    ) -> Result<Vec<RefRecord>, LocalPublicationError>
+    ) -> Result<Vec<(String, RefRecord)>, LocalPublicationError>
     where
         C: FnMut() -> bool,
     {
@@ -765,10 +766,12 @@ impl LocalStoreRoot {
                 if bytes.len() != limits.ref_record_bytes_exact || bytes.len() != REF_BYTES {
                     return Err(LocalPublicationError::InvalidControl);
                 }
-                pins.push(
-                    RefRecord::decode(RefKind::Pin, &bytes)
-                        .map_err(|_| LocalPublicationError::InvalidControl)?,
-                );
+                let checkpoint_id = str::from_utf8(pin_name)
+                    .map_err(|_| LocalPublicationError::InvalidControl)?
+                    .to_owned();
+                let record = RefRecord::decode(RefKind::Pin, &bytes)
+                    .map_err(|_| LocalPublicationError::InvalidControl)?;
+                pins.push((checkpoint_id, record));
             }
         }
         Ok(pins)
@@ -1473,6 +1476,127 @@ impl LocalStoreRoot {
             &mut on_chunk,
         )?
         .ok_or(LocalPublicationError::ExistingMismatch)
+    }
+
+    /// Streams and verifies one exact object without synchronizing or
+    /// otherwise mutating the store. Every path component is opened relative
+    /// to the held root, and the opened file must remain the same named,
+    /// single-link regular file across the complete read.
+    pub(crate) fn verify_exact_object<C, F>(
+        &self,
+        digest: ExactBytesDigest,
+        byte_length: u64,
+        maximum_bytes: u64,
+        stream_buffer_bytes: usize,
+        mut is_cancelled: C,
+        mut on_chunk: F,
+    ) -> Result<ExactBytesFacts, LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+        F: FnMut(&[u8]),
+    {
+        let expected = DeclaredExactFile::new(digest, byte_length);
+        validate_capacity(expected, maximum_bytes)?;
+        if stream_buffer_bytes == 0 {
+            return Err(LocalPublicationError::Capacity {
+                declared: 0,
+                maximum: u64::try_from(STREAM_BUFFER_BYTES).expect("the stream limit fits u64"),
+            });
+        }
+        let stream_buffer_bytes = stream_buffer_bytes.min(STREAM_BUFFER_BYTES);
+        check_cancelled(&mut is_cancelled)?;
+
+        let (parent, name) = self.open_existing_parent(&object_relative_path(digest))?;
+        let named_before = FileIdentity::from_stat(
+            statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        let descriptor = openat(&parent, &name, FILE_READ_FLAGS, Mode::empty())
+            .map_err(|_| LocalPublicationError::ExistingMismatch)?;
+        let opened_before = FileIdentity::from_stat(
+            fstat(&descriptor).map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        if named_before != opened_before {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+        if opened_before.bytes != byte_length {
+            return Err(LocalPublicationError::SourceLength {
+                expected: byte_length,
+            });
+        }
+
+        let mut file = File::from(descriptor);
+        let mut hasher = ExactBytesHasher::new();
+        let mut observed = 0_u64;
+        let mut buffer = vec![0_u8; stream_buffer_bytes];
+        loop {
+            check_cancelled(&mut is_cancelled)?;
+            let read = match file.read(&mut buffer) {
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(source) => {
+                    return Err(LocalPublicationError::Io {
+                        operation: "stream an exact project object",
+                        source,
+                    });
+                }
+            };
+            if read == 0 {
+                break;
+            }
+            observed = observed
+                .checked_add(u64::try_from(read).map_err(|_| {
+                    LocalPublicationError::SourceLength {
+                        expected: byte_length,
+                    }
+                })?)
+                .ok_or(LocalPublicationError::SourceLength {
+                    expected: byte_length,
+                })?;
+            if observed > byte_length {
+                return Err(LocalPublicationError::SourceLength {
+                    expected: byte_length,
+                });
+            }
+            on_chunk(&buffer[..read]);
+            hasher
+                .update(&buffer[..read])
+                .map_err(|_| LocalPublicationError::SourceLength {
+                    expected: byte_length,
+                })?;
+        }
+        if observed != byte_length {
+            return Err(LocalPublicationError::SourceLength {
+                expected: byte_length,
+            });
+        }
+        let facts = hasher
+            .finalize()
+            .map_err(|_| LocalPublicationError::SourceLength {
+                expected: byte_length,
+            })?;
+        check_cancelled(&mut is_cancelled)?;
+
+        let opened_after = FileIdentity::from_stat(
+            fstat(&file).map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        let named_after = FileIdentity::from_stat(
+            statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        if opened_before != opened_after || opened_before != named_after {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+        if facts.byte_length() != byte_length {
+            return Err(LocalPublicationError::SourceLength {
+                expected: byte_length,
+            });
+        }
+        if facts.digest() != digest {
+            return Err(LocalPublicationError::SourceDigest);
+        }
+        check_cancelled(&mut is_cancelled)?;
+        Ok(facts)
     }
 
     /// Validates only the immutable object's descriptor-relative file

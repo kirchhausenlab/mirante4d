@@ -46,7 +46,7 @@ pub(crate) struct StoreStateInspection {
     autosave: Option<LaneSnapshot>,
     manual_generation: Option<GenerationDocument>,
     autosave_generation: Option<GenerationDocument>,
-    pins: Vec<RefRecord>,
+    pins: Vec<(String, RefRecord)>,
     maximum_generation_sequence: u64,
     maximum_revision_high_water: u64,
 }
@@ -85,7 +85,7 @@ impl StoreStateInspection {
 
     fn root_generation_ids(&self) -> BTreeSet<ProjectGenerationId> {
         let mut roots = self.lane_root_generation_ids();
-        roots.extend(self.pins.iter().map(|pin| pin.current()));
+        roots.extend(self.pins.iter().map(|(_, pin)| pin.current()));
         roots
     }
 
@@ -104,6 +104,22 @@ impl StoreStateInspection {
 /// payload bytes are not hashed by this read-side snapshot.
 pub(crate) struct StoreGraphInspection {
     state: StoreStateInspection,
+    generation_ids: Vec<ProjectGenerationId>,
+    root_generation_ids: Vec<ProjectGenerationId>,
+    orphan_generation_ids: Vec<ProjectGenerationId>,
+    object_facts: Vec<PhysicalObject>,
+    live_object_facts: Vec<PhysicalObject>,
+    unrooted_object_facts: Vec<PhysicalObject>,
+}
+
+/// Compact exact authority and namespace facts used to reject a verification
+/// result if the active store changes while bulk bytes are being streamed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoreGraphSnapshot {
+    project_id: ProjectId,
+    manual: Option<LaneSnapshot>,
+    autosave: Option<LaneSnapshot>,
+    pins: Vec<(String, RefRecord)>,
     generation_ids: Vec<ProjectGenerationId>,
     root_generation_ids: Vec<ProjectGenerationId>,
     orphan_generation_ids: Vec<ProjectGenerationId>,
@@ -234,7 +250,7 @@ impl StoreGraphInspection {
         next: Option<ProjectGenerationId>,
     ) -> usize {
         let mut pin_counts = BTreeMap::<ProjectGenerationId, usize>::new();
-        for pin in &self.state.pins {
+        for (_, pin) in &self.state.pins {
             *pin_counts.entry(pin.current()).or_default() += 1;
         }
         if let Some(prior) = prior
@@ -270,6 +286,23 @@ impl StoreGraphInspection {
     /// may still be shared by an unselected recovery candidate.
     pub(crate) fn unrooted_object_facts(&self) -> &[PhysicalObject] {
         &self.unrooted_object_facts
+    }
+
+    pub(crate) fn snapshot(&self) -> StoreGraphSnapshot {
+        let mut pins = self.state.pins.clone();
+        pins.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        StoreGraphSnapshot {
+            project_id: self.state.project_id,
+            manual: self.state.manual,
+            autosave: self.state.autosave,
+            pins,
+            generation_ids: self.generation_ids.clone(),
+            root_generation_ids: self.root_generation_ids.clone(),
+            orphan_generation_ids: self.orphan_generation_ids.clone(),
+            object_facts: self.object_facts.clone(),
+            live_object_facts: self.live_object_facts.clone(),
+            unrooted_object_facts: self.unrooted_object_facts.clone(),
+        }
     }
 }
 
@@ -429,7 +462,7 @@ where
     let pins = root
         .read_pin_refs(limits, &mut is_cancelled)
         .map_err(|error| map_local_error(error, "ref_namespace"))?;
-    if pins.iter().any(|pin| pin.project_id() != project_id) {
+    if pins.iter().any(|(_, pin)| pin.project_id() != project_id) {
         return Err(ProjectStoreFault::Corruption {
             stage: "pin_identity",
         });
@@ -717,7 +750,7 @@ where
     let pins = root
         .read_pin_refs(limits, &mut is_cancelled)
         .map_err(|error| map_local_error(error, "recovery_pins"))?;
-    if pins.iter().any(|pin| pin.project_id() != project_id) {
+    if pins.iter().any(|(_, pin)| pin.project_id() != project_id) {
         return Err(ProjectStoreFault::Corruption {
             stage: "recovery_pin_identity",
         });
@@ -743,7 +776,7 @@ where
         autosave,
         GenerationKind::Autosave,
     )?;
-    for pin in &pins {
+    for (_, pin) in &pins {
         mentioned.insert(pin.current());
         insert_expected_generation(&mut expected, pin.current(), None)?;
     }
@@ -1214,7 +1247,7 @@ fn recovery_lineage_authority<'a>(
     manual: RecoveryLaneObservation,
     valid_autosave_current: Option<ProjectGenerationId>,
     autosave: RecoveryLaneObservation,
-    pins: &[RefRecord],
+    pins: &[(String, RefRecord)],
     sources: &[RecoverySource],
     summaries: &'a BTreeMap<ProjectGenerationId, RecoveryGenerationSummary>,
 ) -> Result<Option<&'a RecoveryGenerationSummary>, ProjectStoreFault> {
@@ -1228,7 +1261,7 @@ fn recovery_lineage_authority<'a>(
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
-    trusted_ids.extend(pins.iter().map(|pin| pin.current()));
+    trusted_ids.extend(pins.iter().map(|(_, pin)| pin.current()));
     let trusted = trusted_ids
         .into_iter()
         .filter_map(|generation_id| summaries.get(&generation_id))
@@ -1429,7 +1462,7 @@ fn validate_referenced_generations<C>(
     project_id: ProjectId,
     manual: Option<LaneSnapshot>,
     autosave: Option<LaneSnapshot>,
-    pins: &[RefRecord],
+    pins: &[(String, RefRecord)],
     manual_current: Option<&GenerationDocument>,
     autosave_current: Option<&GenerationDocument>,
     limits: ProjectStoreLimits,
@@ -1463,7 +1496,7 @@ where
             insert_expected_generation(&mut targets, id, Some(GenerationKind::Autosave))?;
         }
     }
-    for pin in pins {
+    for (_, pin) in pins {
         insert_expected_generation(&mut targets, pin.current(), None)?;
     }
 
@@ -1609,7 +1642,7 @@ where
     Ok(())
 }
 
-fn unique_logical_descriptors(
+pub(crate) fn unique_logical_descriptors(
     document: &GenerationDocument,
 ) -> Result<BTreeMap<ExactBytesDigest, RawObjectDescriptor>, ProjectStoreFault> {
     let mut descriptors = BTreeMap::new();
