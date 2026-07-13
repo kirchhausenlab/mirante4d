@@ -20,6 +20,137 @@ use mirante4d_dataset_runtime::{DatasetRuntimeConfig, DatasetRuntimeDiagnostics}
 use mirante4d_renderer::gpu::{AdapterDiagnostics, GpuLimitDiagnostics};
 
 #[test]
+fn automation_script_parses_the_b4_project_store_contract() {
+    let raw = r#"
+        {
+          "schema": "mirante4d-product-automation-script",
+          "schema_version": 2,
+          "scenario": "b4_project_store",
+          "commands": [
+            { "command": "set_mapped_client_pixels", "width": 1280, "height": 720 },
+            { "command": "new_project" },
+            { "command": "initial_save_with_edit", "path": "/tmp/original.m4dproj" },
+            { "command": "wait_for", "condition": "project_store_idle", "timeout_ms": 1000 },
+            { "command": "wait_for", "condition": "project_autosaved", "timeout_ms": 31000 },
+            { "command": "open_project", "path": "/tmp/original.m4dproj" },
+            { "command": "wait_for", "condition": "recovery_review_required", "timeout_ms": 1000 },
+            { "command": "recover_automatic_autosave" },
+            { "command": "save_project_as", "path": "/tmp/recovered.m4dproj" },
+            { "command": "close_project_store" },
+            { "command": "wait_for", "condition": "project_store_closed", "timeout_ms": 1000 },
+            { "command": "write_external_kill_checkpoint", "path": "/tmp/checkpoint.json", "stage": "autosaved" },
+            { "command": "assert", "condition": { "project_state": {
+              "bound": true,
+              "dirty": true,
+              "lifecycle": "established",
+              "can_save": true,
+              "can_save_as": true,
+              "manual": true,
+              "autosave": true
+            } } },
+            { "command": "hold_for_external_kill" },
+            { "command": "quit" }
+          ]
+        }"#;
+
+    let script: ProductAutomationScript = serde_json::from_str(raw).unwrap();
+    script.validate().unwrap();
+
+    assert_eq!(script.commands.len(), 15);
+    assert_eq!(script.commands[0].name(), "set_mapped_client_pixels");
+    assert_eq!(script.commands[1].name(), "new_project");
+    assert_eq!(script.commands[2].name(), "initial_save_with_edit");
+    assert_eq!(script.commands[5].name(), "open_project");
+    assert_eq!(script.commands[7].name(), "recover_automatic_autosave");
+    assert_eq!(script.commands[8].name(), "save_project_as");
+    assert_eq!(script.commands[9].name(), "close_project_store");
+    assert_eq!(script.commands[11].name(), "write_external_kill_checkpoint");
+    assert_eq!(script.commands[13].name(), "hold_for_external_kill");
+    for index in [3, 4, 6, 10] {
+        let ProductAutomationCommand::WaitFor { condition, .. } = script.commands[index] else {
+            panic!("command {index} is not a wait");
+        };
+        assert!(condition.is_passive());
+    }
+    let ProductAutomationCommand::Assert {
+        condition:
+            ProductAutomationAssertCondition::ProjectState {
+                bound,
+                dirty,
+                lifecycle,
+                can_save,
+                can_save_as,
+                manual,
+                autosave,
+            },
+    } = script.commands[12]
+    else {
+        panic!("expected the structured project-state assertion");
+    };
+    assert!(bound && dirty && can_save && can_save_as && manual && autosave);
+    assert_eq!(
+        lifecycle,
+        ProductAutomationProjectStoreLifecycle::Established
+    );
+}
+
+#[test]
+fn b4_project_evidence_helpers_keep_exact_typed_facts() {
+    let project_id = mirante4d_project_model::ProjectId::from_bytes([7; 16]);
+    let revision = ProjectRevisionId::new(project_id, 42);
+    assert_eq!(
+        project_revision_json(Some(revision))["project_id"],
+        project_id.to_string()
+    );
+    assert_eq!(project_revision_json(Some(revision))["sequence"], 42);
+    assert_eq!(project_revision_json(None), Value::Null);
+
+    assert_eq!(
+        project_store_lifecycle(ProductAutomationProjectStoreLifecycle::RecoverySelected),
+        ProjectStoreLifecycle::RecoverySelected
+    );
+    assert_eq!(
+        project_store_lifecycle_name(ProjectStoreLifecycle::RecoveryOnly),
+        "recovery_only"
+    );
+
+    let close = recorded_result_json(Some(&crate::ProjectStoreRecordedResult::Succeeded), "fault");
+    assert_eq!(close["status"], "succeeded");
+    assert_eq!(close["fault"], Value::Null);
+    let join = recorded_result_json(
+        Some(&crate::ProjectStoreRecordedResult::Failed(
+            "join failed".to_owned(),
+        )),
+        "error",
+    );
+    assert_eq!(join["status"], "failed");
+    assert_eq!(join["error"], "join failed");
+    assert!(join.get("failure_key").is_none());
+}
+
+#[test]
+fn external_kill_checkpoint_writer_syncs_once_without_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("checkpoint.json");
+    let checkpoint = json!({
+        "schema": "mirante4d-product-external-kill-checkpoint",
+        "schema_version": 1,
+        "stage": "autosaved",
+    });
+
+    write_synced_json_no_replace(&path, &checkpoint).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+        checkpoint
+    );
+    assert!(
+        write_synced_json_no_replace(&path, &json!({ "stage": "replacement" }))
+            .unwrap_err()
+            .contains("already exists")
+    );
+}
+
+#[test]
 fn cross_section_hover_readout_json_records_generation_semantics() {
     let readout = CrossSectionHoverReadout {
         text: "XY ch0 t0 s0 stale".to_owned(),

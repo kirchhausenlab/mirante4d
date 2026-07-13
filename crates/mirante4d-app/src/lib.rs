@@ -123,7 +123,9 @@ use mirante4d_import::{
     ImportCancellationToken, ImportError, TiffDirectoryImportReport, TiffImportSource,
     TiffSourceImportOptions, import_tiff_source_with_progress,
 };
-use mirante4d_project_model::{ChannelPreset, LayerViewState, ProjectId, ViewState};
+use mirante4d_project_model::{
+    ChannelPreset, LayerViewState, ProjectId, ProjectRevisionId, ViewState,
+};
 use mirante4d_project_store::{
     ProjectGenerationId, ProjectOpenMode, ProjectRecoveryCandidate, ProjectStoreConfig,
     ProjectStoreFault, ProjectStorePath,
@@ -291,21 +293,79 @@ struct PendingSourceInstall {
     completion: OperationCompletion,
 }
 
-fn initialize_project_recovery_root() -> Option<PathBuf> {
-    let state_root = std::env::var_os("XDG_STATE_HOME")
+#[derive(Default)]
+struct ProjectStoreNoninteractivePaths {
+    open: Option<PathBuf>,
+    initial_save: Option<PathBuf>,
+    save_as: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+enum ProjectStoreRecordedResult {
+    Succeeded,
+    Failed(String),
+}
+
+#[derive(Default)]
+struct ProjectStoreProductEvidence {
+    initial_save_captured_revision: Option<ProjectRevisionId>,
+    latest_autosave_captured_revision: Option<ProjectRevisionId>,
+    durable_edit_started_at: Option<Instant>,
+    autosave_elapsed_from_durable_edit_ms: Option<u64>,
+    close_result: Option<ProjectStoreRecordedResult>,
+    actor_join: Option<ProjectStoreRecordedResult>,
+}
+
+fn initialize_project_recovery_root(source: &Path) -> (Option<PathBuf>, Option<String>) {
+    let Some(state_root) = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .map(|home| home.join(".local").join("state"))
-        })?;
-    let recovery_root = state_root.join("mirante4d").join("recovery");
+        })
+    else {
+        return (
+            None,
+            Some("Project recovery is unavailable; provisional autosave is disabled.".to_owned()),
+        );
+    };
+    let recovery_root = match project_recovery_root_path(&state_root, source) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(kind = ?error.kind(), "project recovery area overlaps the source or cannot be validated");
+            return (
+                None,
+                Some(
+                    "Project recovery is unavailable for this source; provisional autosave is disabled."
+                        .to_owned(),
+                ),
+            );
+        }
+    };
     match fs::create_dir_all(&recovery_root) {
-        Ok(()) => Some(recovery_root),
+        Ok(()) => (Some(recovery_root), None),
         Err(error) => {
             tracing::warn!(kind = ?error.kind(), "project recovery area is unavailable");
-            None
+            (
+                None,
+                Some(
+                    "Project recovery is unavailable; provisional autosave is disabled.".to_owned(),
+                ),
+            )
         }
+    }
+}
+
+fn project_recovery_root_path(state_root: &Path, source: &Path) -> io::Result<PathBuf> {
+    let recovery_root = state_root.join("mirante4d").join("recovery");
+    if project_destination_is_outside_source_closure(source, &recovery_root)? {
+        Ok(recovery_root)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "project recovery root overlaps the microscopy source",
+        ))
     }
 }
 
@@ -356,6 +416,47 @@ fn discover_project_recovery_locators(
     Ok(locators)
 }
 
+fn project_destination_is_outside_source_closure(
+    source: &Path,
+    destination: &Path,
+) -> io::Result<bool> {
+    let source = fs::canonicalize(source)?;
+    let destination = canonicalize_from_existing_parent(destination)?;
+    Ok(destination != source
+        && !destination.starts_with(&source)
+        && !source.starts_with(&destination))
+}
+
+fn canonicalize_from_existing_parent(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut existing = absolute.as_path();
+    let mut missing = Vec::new();
+    while !existing.try_exists()? {
+        let name = existing.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "destination has no existing ancestor",
+            )
+        })?;
+        missing.push(name.to_os_string());
+        existing = existing.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "destination has no existing parent",
+            )
+        })?;
+    }
+    let mut canonical = fs::canonicalize(existing)?;
+    for component in missing.iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
+}
+
 fn start_project_store_service(
     recovery_root: Option<&Path>,
     provisional_project_id: ProjectId,
@@ -366,21 +467,25 @@ fn start_project_store_service(
     ),
     ProjectStoreFault,
 > {
-    let provisional_destination = recovery_root
+    let discovered_provisional_destination = recovery_root
         .map(|root| root.join(format!("{provisional_project_id}.m4dproj")))
         .map(ProjectStorePath::new)
         .transpose()?;
-    let (recovery_store_locators, warning) =
+    let (recovery_store_locators, warning, recovery_discovery_succeeded) =
         match discover_project_recovery_locators(recovery_root, provisional_project_id) {
-            Ok(locators) => (locators, None),
+            Ok(locators) => (locators, None, true),
             Err(error) => {
                 tracing::warn!(%error, "project recovery discovery failed");
                 (
                     Vec::new(),
                     Some(format!("Project recovery discovery failed: {error}")),
+                    false,
                 )
             }
         };
+    let provisional_destination = recovery_discovery_succeeded
+        .then_some(discovered_provisional_destination)
+        .flatten();
     let service = ProjectStoreApplicationService::start_with_recovery_locators(
         ProjectStoreConfig::default(),
         SystemMonotonicClock::new(),
@@ -412,6 +517,8 @@ pub struct MiranteWorkbenchApp {
     project_recovery_panel_open: bool,
     pending_recovery_selection: Option<ProjectGenerationId>,
     pending_project_open_locator: Option<ProjectId>,
+    project_store_noninteractive_paths: ProjectStoreNoninteractivePaths,
+    project_store_product_evidence: ProjectStoreProductEvidence,
     pending_dataset_open_path: Option<PathBuf>,
     project_status_message: Option<String>,
     close_after_project_save: bool,
@@ -487,9 +594,11 @@ impl MiranteWorkbenchApp {
         render_runtime.gpu_renderer = Some(Arc::clone(&gpu_renderer));
         let ui_runtime =
             current_runtime::ui::CurrentUiRuntime::new(resource_policy, wgpu_texture_renderer);
-        let project_recovery_root = initialize_project_recovery_root();
-        let (project_store, project_status_message) =
+        let (project_recovery_root, recovery_root_warning) =
+            initialize_project_recovery_root(dataset.selected_path());
+        let (project_store, discovery_warning) =
             start_project_store_service(project_recovery_root.as_deref(), provisional_project_id)?;
+        let project_status_message = recovery_root_warning.or(discovery_warning);
         let project_store = Some(project_store);
         let mut app = Self {
             application,
@@ -508,6 +617,8 @@ impl MiranteWorkbenchApp {
             project_recovery_panel_open: false,
             pending_recovery_selection: None,
             pending_project_open_locator: None,
+            project_store_noninteractive_paths: ProjectStoreNoninteractivePaths::default(),
+            project_store_product_evidence: ProjectStoreProductEvidence::default(),
             pending_dataset_open_path: None,
             project_status_message,
             close_after_project_save: false,
@@ -693,15 +804,21 @@ impl MiranteWorkbenchApp {
                                 .map_err(project_service_error_fault)
                         })
                 } else {
-                    let Some(path) = rfd::FileDialog::new()
-                        .set_title("Open Mirante4D project package")
-                        .pick_folder()
-                    else {
-                        self.complete_project_operation(
-                            token.clone(),
-                            OperationCompletion::Cancelled,
-                        );
-                        return;
+                    let path = match self.project_store_noninteractive_paths.open.take() {
+                        Some(path) => path,
+                        None => {
+                            let Some(path) = rfd::FileDialog::new()
+                                .set_title("Open Mirante4D project package")
+                                .pick_folder()
+                            else {
+                                self.complete_project_operation(
+                                    token.clone(),
+                                    OperationCompletion::Cancelled,
+                                );
+                                return;
+                            };
+                            path
+                        }
                     };
                     let path = match ProjectStorePath::new(path) {
                         Ok(path) => path,
@@ -710,6 +827,20 @@ impl MiranteWorkbenchApp {
                             return;
                         }
                     };
+                    if !project_destination_is_outside_source_closure(
+                        self.dataset.selected_path(),
+                        path.as_path(),
+                    )
+                    .unwrap_or(false)
+                    {
+                        self.complete_project_fault(
+                            token.clone(),
+                            ProjectStoreFault::Corruption {
+                                stage: "project_destination_source_overlap",
+                            },
+                        );
+                        return;
+                    }
                     self.project_store
                         .as_mut()
                         .ok_or(ProjectStoreFault::Corruption {
@@ -733,20 +864,43 @@ impl MiranteWorkbenchApp {
                     )
                 });
                 let initial_destination = if needs_destination {
-                    let Some(path) = rfd::FileDialog::new()
-                        .set_title("Save Mirante4D project package")
-                        .add_filter("Mirante4D project", &["m4dproj"])
-                        .set_file_name("project.m4dproj")
-                        .save_file()
-                    else {
-                        self.complete_project_operation(
-                            token.clone(),
-                            OperationCompletion::Cancelled,
-                        );
-                        return;
+                    let path = match self.project_store_noninteractive_paths.initial_save.take() {
+                        Some(path) => path,
+                        None => {
+                            let Some(path) = rfd::FileDialog::new()
+                                .set_title("Save Mirante4D project package")
+                                .add_filter("Mirante4D project", &["m4dproj"])
+                                .set_file_name("project.m4dproj")
+                                .save_file()
+                            else {
+                                self.complete_project_operation(
+                                    token.clone(),
+                                    OperationCompletion::Cancelled,
+                                );
+                                return;
+                            };
+                            path
+                        }
                     };
                     match ProjectStorePath::new(path) {
-                        Ok(path) => Some(path),
+                        Ok(path)
+                            if project_destination_is_outside_source_closure(
+                                self.dataset.selected_path(),
+                                path.as_path(),
+                            )
+                            .unwrap_or(false) =>
+                        {
+                            Some(path)
+                        }
+                        Ok(_) => {
+                            self.complete_project_fault(
+                                token.clone(),
+                                ProjectStoreFault::Corruption {
+                                    stage: "project_destination_source_overlap",
+                                },
+                            );
+                            return;
+                        }
                         Err(fault) => {
                             self.complete_project_fault(token.clone(), fault);
                             return;
@@ -771,22 +925,53 @@ impl MiranteWorkbenchApp {
                             )
                             .map_err(project_service_error_fault)
                     });
-                if let Err(fault) = request {
-                    self.complete_project_fault(token.clone(), fault);
+                match request {
+                    Ok(_) if needs_destination => {
+                        self.project_store_product_evidence
+                            .initial_save_captured_revision = Some(projection.revision());
+                    }
+                    Ok(_) => {}
+                    Err(fault) => self.complete_project_fault(token.clone(), fault),
                 }
             }
             ApplicationEvent::ProjectSaveAsRequested { token, projection } => {
-                let Some(path) = rfd::FileDialog::new()
-                    .set_title("Save Mirante4D project package as")
-                    .add_filter("Mirante4D project", &["m4dproj"])
-                    .set_file_name("project.m4dproj")
-                    .save_file()
-                else {
-                    self.complete_project_operation(token.clone(), OperationCompletion::Cancelled);
-                    return;
+                let path = match self.project_store_noninteractive_paths.save_as.take() {
+                    Some(path) => path,
+                    None => {
+                        let Some(path) = rfd::FileDialog::new()
+                            .set_title("Save Mirante4D project package as")
+                            .add_filter("Mirante4D project", &["m4dproj"])
+                            .set_file_name("project.m4dproj")
+                            .save_file()
+                        else {
+                            self.complete_project_operation(
+                                token.clone(),
+                                OperationCompletion::Cancelled,
+                            );
+                            return;
+                        };
+                        path
+                    }
                 };
                 let path = match ProjectStorePath::new(path) {
-                    Ok(path) => path,
+                    Ok(path)
+                        if project_destination_is_outside_source_closure(
+                            self.dataset.selected_path(),
+                            path.as_path(),
+                        )
+                        .unwrap_or(false) =>
+                    {
+                        path
+                    }
+                    Ok(_) => {
+                        self.complete_project_fault(
+                            token.clone(),
+                            ProjectStoreFault::Corruption {
+                                stage: "project_destination_source_overlap",
+                            },
+                        );
+                        return;
+                    }
                     Err(fault) => {
                         self.complete_project_fault(token.clone(), fault);
                         return;
@@ -907,8 +1092,14 @@ impl MiranteWorkbenchApp {
                 self.project_recovery_panel_open = false;
                 self.pending_recovery_selection = None;
                 self.pending_project_open_locator = None;
+                self.project_store_noninteractive_paths =
+                    ProjectStoreNoninteractivePaths::default();
+                self.project_store_product_evidence = ProjectStoreProductEvidence::default();
                 self.pending_dataset_open_path = None;
-                self.project_status_message = None;
+                self.project_status_message = self.project_recovery_root.is_none().then(|| {
+                    "Project recovery is unavailable for this source; provisional autosave is disabled."
+                        .to_owned()
+                });
             }
             _ => {}
         }
@@ -1236,6 +1427,8 @@ impl MiranteWorkbenchApp {
                 ) {
                     return;
                 }
+                self.project_store_product_evidence
+                    .initial_save_captured_revision = Some(saved_revision);
                 self.project_recovery_candidates.clear();
                 self.project_recovery_panel_open = false;
                 self.project_status_message = Some("Project saved.".to_owned());
@@ -1307,7 +1500,16 @@ impl MiranteWorkbenchApp {
                 self.project_status_message = Some("Autosaving project…".to_owned());
             }
             ProjectStoreServiceEvent::AutosaveFinished { result, .. } => match result {
-                Ok(_) => {
+                Ok(receipt) => {
+                    self.project_store_product_evidence
+                        .latest_autosave_captured_revision = Some(receipt.captured_revision());
+                    self.project_store_product_evidence
+                        .autosave_elapsed_from_durable_edit_ms = self
+                        .project_store_product_evidence
+                        .durable_edit_started_at
+                        .map(|started| {
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+                        });
                     self.project_status_message = Some("Project autosaved.".to_owned());
                 }
                 Err(fault) => {
@@ -1317,14 +1519,26 @@ impl MiranteWorkbenchApp {
             ProjectStoreServiceEvent::CancellationAcknowledged { .. } => {}
             ProjectStoreServiceEvent::Closed { result, .. } => {
                 let close_succeeded = result.is_ok();
-                if let Err(fault) = result {
-                    tracing::warn!(%fault, "project-store close reported a failure");
-                }
-                if let Some(service) = self.project_store.take()
-                    && let Err(error) = service.join()
-                {
-                    tracing::warn!(?error, "project-store actor join failed");
-                }
+                self.project_store_product_evidence.close_result = Some(match result {
+                    Ok(()) => ProjectStoreRecordedResult::Succeeded,
+                    Err(fault) => {
+                        tracing::warn!(%fault, "project-store close reported a failure");
+                        ProjectStoreRecordedResult::Failed(fault.to_string())
+                    }
+                });
+                self.project_store_product_evidence.actor_join =
+                    Some(match self.project_store.take() {
+                        Some(service) => match service.join() {
+                            Ok(()) => ProjectStoreRecordedResult::Succeeded,
+                            Err(error) => {
+                                tracing::warn!(?error, "project-store actor join failed");
+                                ProjectStoreRecordedResult::Failed(format!("{error:?}"))
+                            }
+                        },
+                        None => ProjectStoreRecordedResult::Failed(
+                            "project-store actor was unavailable at close completion".to_owned(),
+                        ),
+                    });
                 if self.exit_after_project_close {
                     self.exit_after_project_close = false;
                     self.restart_project_store_after_close = false;
@@ -2009,12 +2223,16 @@ impl MiranteWorkbenchApp {
                 tracing::error!("new source did not produce an unbound project workspace");
                 return;
             };
+            let (project_recovery_root, recovery_root_warning) =
+                initialize_project_recovery_root(self.dataset.selected_path());
+            self.project_recovery_root = project_recovery_root;
             match start_project_store_service(
                 self.project_recovery_root.as_deref(),
                 workspace.provisional_project_id(),
             ) {
-                Ok((service, warning)) => {
+                Ok((service, discovery_warning)) => {
                     self.project_store = Some(service);
+                    let warning = recovery_root_warning.or(discovery_warning);
                     if warning.is_some() {
                         self.project_status_message = warning;
                     }

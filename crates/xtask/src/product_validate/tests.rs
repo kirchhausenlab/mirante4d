@@ -63,6 +63,122 @@ fn b3_exact_capture_report(second_width: u64) -> Value {
     })
 }
 
+fn b4_valid_checkpoint() -> Value {
+    json!({
+        "schema": B4_CHECKPOINT_SCHEMA,
+        "schema_version": 1,
+        "stage": B4_CHECKPOINT_STAGE,
+        "written_at_epoch_ms": 1,
+        "viewport_evidence": {
+            "requested_mapped_client_pixels": {
+                "width": B4_PRIMARY_CLIENT_WIDTH,
+                "height": B4_PRIMARY_CLIENT_HEIGHT
+            }
+        },
+        "project_state": {
+            "bound": true,
+            "dirty": true,
+            "current_revision": {"project_id": "project", "sequence": 3},
+            "saved_revision": {"project_id": "project", "sequence": 2},
+            "lifecycle": "established",
+            "can_save": true,
+            "can_save_as": true,
+            "manual": true,
+            "autosave": true,
+            "current_manual": "manual-generation",
+            "current_autosave": "autosave-generation"
+        },
+        "project_evidence": {
+            "initial_save_captured_revision": {"project_id": "project", "sequence": 2},
+            "latest_autosave_captured_revision": {"project_id": "project", "sequence": 3},
+            "autosave_elapsed_from_durable_edit_ms": B4_AUTOSAVE_MIN_ELAPSED_MS,
+            "autosave_wait_mode": "scheduled_deadline_no_busy_poll",
+            "close_result": null,
+            "actor_join": null
+        }
+    })
+}
+
+fn b4_normal_automation_report(width: u32, height: u32) -> Value {
+    json!({
+        "status": "passed",
+        "viewport_evidence": {
+            "requested_mapped_client_pixels": {"width": width, "height": height},
+            "observed_client_area_pixels": null
+        },
+        "project_store_evidence": {
+            "close_result": {"status": "succeeded", "fault": null},
+            "actor_join": {"status": "succeeded", "error": null}
+        },
+        "artifacts": [{
+            "kind": "viewport_capture",
+            "capture_source": "gpu_display_frame_readback",
+            "path": "capture.ppm",
+            "width": 16,
+            "height": 16,
+            "pixel_stats": {
+                "pixel_count": 256,
+                "nonzero_rgb_pixels": 1,
+                "max_rgb": 255
+            }
+        }]
+    })
+}
+
+fn b4_valid_attempt(number: u64) -> Value {
+    let (width, height) = if number == 1 {
+        (B4_PRIMARY_CLIENT_WIDTH, B4_PRIMARY_CLIENT_HEIGHT)
+    } else {
+        (B4_SECONDARY_CLIENT_WIDTH, B4_SECONDARY_CLIENT_HEIGHT)
+    };
+    let (signal, exit_success, external_sigkill_sent, checkpoint, automation_report) =
+        if number == 1 {
+            (
+                json!(9),
+                json!(false),
+                true,
+                b4_valid_checkpoint(),
+                Value::Null,
+            )
+        } else {
+            (
+                Value::Null,
+                json!(true),
+                false,
+                Value::Null,
+                b4_normal_automation_report(width, height),
+            )
+        };
+    json!({
+        "attempt": number,
+        "phase": format!("launch-{number}"),
+        "retry_index": 0,
+        "status": "passed",
+        "failure_reason": null,
+        "requested_client_area_pixels": {"width": width, "height": height},
+        "process": {
+            "timed_out": false,
+            "exit_status": if number == 1 { "signal: 9" } else { "exit status: 0" },
+            "exit_success": exit_success,
+            "signal": signal,
+            "external_sigkill_sent": external_sigkill_sent,
+            "checkpoint": checkpoint,
+            "observed_client_area_pixels": {
+                "width": width,
+                "height": height,
+                "window_id": "0x1",
+                "map_state": "is_viewable",
+                "observation": "xdotool_pid_search_plus_xwininfo_client_geometry"
+            },
+            "fullscreen_action": null,
+            "control_failure": null
+        },
+        "automation_report": automation_report,
+        "source_closure_evidence": {"byte_identical": true},
+        "project_package_evidence": {"exists": true, "is_directory": true}
+    })
+}
+
 #[test]
 fn generated_fixture_product_automation_script_uses_semantic_commands() {
     let script = generated_fixture_camera_smoke_script(Path::new("/tmp/demo.m4d"));
@@ -293,6 +409,211 @@ fn b3_source_closure_evidence_compares_exact_entries_and_bytes() {
         before.compare_json(temp.path()).unwrap()["byte_identical"],
         false
     );
+}
+
+#[test]
+fn b4_scripts_lock_the_fixed_three_launch_cutover() {
+    let package = Path::new("/tmp/source.m4d");
+    let original = Path::new("/tmp/original.m4dproj");
+    let save_as = Path::new("/tmp/save-as.m4dproj");
+    let checkpoint = Path::new("/tmp/checkpoint.json");
+    let first = b4_launch_one_script(package, original, checkpoint);
+    let second = b4_launch_two_script(package, original, save_as);
+    let third = b4_launch_three_script(package, save_as);
+    for script in [&first, &second, &third] {
+        validate_product_automation_script(script).unwrap();
+        assert!(
+            script["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|command| {
+                    command.get("command").and_then(Value::as_str) != Some("sleep_or_frames")
+                })
+        );
+    }
+
+    let first_commands = first["commands"].as_array().unwrap();
+    let initial_save = first_commands
+        .iter()
+        .position(|command| command["command"] == "initial_save_with_edit")
+        .unwrap();
+    let autosave = first_commands
+        .iter()
+        .position(|command| {
+            command["command"] == "wait_for" && command["condition"] == "project_autosaved"
+        })
+        .unwrap();
+    let checkpoint_command = first_commands
+        .iter()
+        .position(|command| command["command"] == "write_external_kill_checkpoint")
+        .unwrap();
+    assert!(initial_save < autosave && autosave < checkpoint_command);
+    assert_eq!(first_commands[autosave]["timeout_ms"], 45_000);
+    assert_eq!(
+        first_commands.last().unwrap()["command"],
+        "hold_for_external_kill"
+    );
+    assert_eq!(
+        first_commands[checkpoint_command]["stage"],
+        B4_CHECKPOINT_STAGE
+    );
+    assert!(first_commands.iter().any(|command| {
+        command["condition"]["project_state"]["dirty"] == true
+            && command["condition"]["project_state"]["manual"] == true
+            && command["condition"]["project_state"]["autosave"] == true
+    }));
+
+    let second_commands = second["commands"].as_array().unwrap();
+    assert!(second_commands.iter().any(|command| {
+        command["command"] == "wait_for" && command["condition"] == "recovery_review_required"
+    }));
+    assert!(second_commands.iter().any(|command| {
+        command["condition"]["project_state"]["lifecycle"] == "recovery_selected"
+            && command["condition"]["project_state"]["dirty"] == true
+            && command["condition"]["project_state"]["can_save"] == false
+            && command["condition"]["project_state"]["can_save_as"] == true
+    }));
+    assert!(second_commands.iter().any(|command| {
+        command["command"] == "save_project_as" && command["path"].as_str() == save_as.to_str()
+    }));
+    assert_eq!(second_commands.last().unwrap()["command"], "quit");
+
+    let third_commands = third["commands"].as_array().unwrap();
+    assert!(third_commands.iter().any(|command| {
+        command["condition"]["project_state"]["lifecycle"] == "established"
+            && command["condition"]["project_state"]["dirty"] == false
+    }));
+    for commands in [second_commands, third_commands] {
+        let close = commands
+            .iter()
+            .position(|command| command["command"] == "close_project_store")
+            .unwrap();
+        let joined = commands
+            .iter()
+            .position(|command| {
+                command["command"] == "wait_for" && command["condition"] == "project_store_closed"
+            })
+            .unwrap();
+        assert!(close < joined);
+    }
+}
+
+#[test]
+fn b4_checkpoint_requires_real_passive_autosave_and_revision_order() {
+    let checkpoint = b4_valid_checkpoint();
+    validate_b4_checkpoint(&checkpoint, B4_CHECKPOINT_STAGE).unwrap();
+
+    let mut too_early = checkpoint.clone();
+    too_early["project_evidence"]["autosave_elapsed_from_durable_edit_ms"] = json!(29_999);
+    assert!(validate_b4_checkpoint(&too_early, B4_CHECKPOINT_STAGE).is_err());
+
+    let mut wrong_capture = checkpoint.clone();
+    wrong_capture["project_evidence"]["latest_autosave_captured_revision"]["sequence"] = json!(2);
+    assert!(validate_b4_checkpoint(&wrong_capture, B4_CHECKPOINT_STAGE).is_err());
+
+    let mut missing_pixels = checkpoint;
+    missing_pixels["viewport_evidence"] = json!({});
+    assert!(validate_b4_checkpoint(&missing_pixels, B4_CHECKPOINT_STAGE).is_err());
+}
+
+#[test]
+fn b4_xwininfo_parser_requires_exact_viewable_client_facts() {
+    let output = "\
+xwininfo: Window id: 0x123 \"Mirante4D\"\n\
+  Width: 1920\n\
+  Height: 1080\n\
+  Map State: IsViewable\n";
+    assert_eq!(
+        parse_xwininfo_client_geometry(output),
+        Some((1920, 1080, true))
+    );
+    assert_eq!(
+        parse_xwininfo_client_geometry(&output.replace("IsViewable", "IsUnMapped")),
+        Some((1920, 1080, false))
+    );
+    assert!(parse_xwininfo_client_geometry("Width: 1920\n").is_none());
+}
+
+#[test]
+fn b4_aggregate_requires_signal_nine_normal_joins_and_zero_retries() {
+    let attempts = vec![
+        b4_valid_attempt(1),
+        b4_valid_attempt(2),
+        b4_valid_attempt(3),
+    ];
+    validate_b4_aggregate_attempts(&attempts).unwrap();
+
+    let mut wrong_signal = attempts.clone();
+    wrong_signal[0]["process"]["signal"] = json!(15);
+    assert!(validate_b4_aggregate_attempts(&wrong_signal).is_err());
+
+    let mut missing_join = attempts.clone();
+    missing_join[1]["automation_report"]["project_store_evidence"]["actor_join"]["status"] =
+        json!("failed");
+    assert!(validate_b4_aggregate_attempts(&missing_join).is_err());
+
+    let mut retried = attempts;
+    retried[2]["retry_index"] = json!(1);
+    assert!(validate_b4_aggregate_attempts(&retried).is_err());
+}
+
+#[test]
+fn b4_trusted_report_must_match_revision_and_actor_thresholds() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("trusted.json");
+    let commit = "a".repeat(40);
+    let tree = "b".repeat(40);
+    let identity = json!({
+        "commit": commit,
+        "tree": tree,
+        "clean": true,
+    });
+    let lifecycle = json!({
+        "schema": "mirante4d-wp10b-project-store-lifecycle-evidence",
+        "schema_version": 1,
+        "result": "passed",
+        "failures": [],
+        "identity": {"commit": commit, "tree": tree, "clean": true},
+        "harness": {"retries": 0},
+        "counters": {
+            "enqueue_poll_p99_ms": 5.0,
+            "enqueue_poll_samples": 1000,
+            "incremental_unchanged_artifact_bytes_rewritten": 0,
+            "post_open_or_save_metadata_rss_bytes": 100663296
+        }
+    });
+    let report = json!({
+        "schema": "mirante4d-verification-run",
+        "schema_version": 1,
+        "group": "project-store-lifecycle",
+        "native_status": "passed",
+        "identity": {
+            "commit": commit,
+            "tree": tree,
+            "clean": true,
+            "qualifying": true
+        },
+        "phases": [
+            {"status": "passed"},
+            {"status": "passed"},
+            {"status": "passed"}
+        ],
+        "evidence": {"wp10b_project_store_lifecycle": lifecycle}
+    });
+    write_json_file(&path, &report).unwrap();
+    let accepted = load_b4_trusted_project_store_evidence(&path, &identity).unwrap();
+    assert_eq!(accepted["performance_result"], "passed");
+    assert_eq!(
+        accepted["lifecycle_evidence"]["counters"]["enqueue_poll_samples"],
+        1000
+    );
+
+    let mut failed = report;
+    failed["evidence"]["wp10b_project_store_lifecycle"]["counters"]["enqueue_poll_p99_ms"] =
+        json!(5.01);
+    write_json_file(&path, &failed).unwrap();
+    assert!(load_b4_trusted_project_store_evidence(&path, &identity).is_err());
 }
 
 #[test]
@@ -936,6 +1257,10 @@ fn product_validation_scenario_resolution_is_strict() {
         ProductValidationScenario::GeneratedFixtureRenderModes
     );
     assert_eq!(
+        ProductValidationScenario::resolve(Some("b4-project-persistence"), None, None).unwrap(),
+        ProductValidationScenario::B4ProjectPersistence
+    );
+    assert_eq!(
         ProductValidationScenario::resolve(Some("t5-qual-001-render-modes"), None, None).unwrap(),
         ProductValidationScenario::T5Qual001InteractionRenderModes
     );
@@ -991,6 +1316,10 @@ fn product_validation_output_dirs_are_scenario_scoped() {
     assert_eq!(
         product_validation_output_dir(&ProductValidationScenario::GeneratedFixtureRenderModes),
         Path::new(OUTPUT_DIR).join(GENERATED_RENDER_MODES_SCENARIO)
+    );
+    assert_eq!(
+        product_validation_output_dir(&ProductValidationScenario::B4ProjectPersistence),
+        Path::new(OUTPUT_DIR).join(B4_PROJECT_PERSISTENCE_SCENARIO)
     );
     assert_eq!(
         product_validation_output_dir(&ProductValidationScenario::T5Qual001InteractionMip),

@@ -24,7 +24,7 @@ use crate::workflow_audit::workflow_audit;
 use anyhow::{Context, bail};
 
 const PRODUCT_VALIDATE_USAGE: &str = "usage: cargo xtask product-validate [native-package.m4d] \
-     [generated_fixture_camera_smoke|generated_fixture_render_modes|\
+     [generated_fixture_camera_smoke|generated_fixture_render_modes|b3_source_verification|b4_project_persistence|\
       t5_qual_001_interaction_mip|t5_qual_001_interaction_render_modes|t5_qual_001_interaction_continuous|\
       t5_qual_001_four_panel_cross_section|t5_qual_001_four_panel_fine_scale|\
       t5_qual_001_four_panel_continuous_cross_section|t5_qual_002_four_panel_timepoint|t5_qual_002_four_panel_autoplay|custom_script]";
@@ -379,6 +379,8 @@ target/mirante4d/product-validation/<scenario>/.
 Scenarios:
   generated_fixture_camera_smoke     bounded generated-fixture camera workflow
   generated_fixture_render_modes     generated-fixture MIP/DVR/ISO workflow
+  b3_source_verification             current-source verification support workflow
+  b4_project_persistence             fixed three-launch save/autosave/recovery workflow; real X11 display and same-revision trusted report required
   t5_qual_001_interaction_mip               heavy T5Qual001 MIP workflow; requires package and heavy opt-in
   t5_qual_001_interaction_render_modes      heavy T5Qual001 MIP/DVR/ISO workflow; requires package and heavy opt-in
   t5_qual_001_interaction_continuous        heavy T5Qual001 continuous MIP/DVR/ISO workflow; requires package and heavy opt-in
@@ -393,6 +395,8 @@ Scenarios:
 Controls:
   MIRANTE4D_PRODUCT_VALIDATE_TIMEOUT_SECS=<seconds>
   MIRANTE4D_PRODUCT_VALIDATE_SCENARIO=<scenario>
+  MIRANTE4D_PRODUCT_VALIDATE_PROJECT_STORE_LIFECYCLE_REPORT=<report.json>
+                                      exact-revision trusted report required by b4_project_persistence
   MIRANTE4D_PRODUCT_VALIDATE_SCRIPT=<script.json>
   MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display|virtual_display
   MIRANTE4D_PRODUCT_VALIDATE_PREFLIGHT_ONLY=1
@@ -486,11 +490,13 @@ Commands:
       env: MIRANTE4D_PHASE11_MAXIMIZED_VIEWPORT_WIDTH/HEIGHT=<pixels> (optional local maximized scenario)
   cargo xtask app-smoke <native-package.m4d>
       developer release-app open smoke using MIRANTE4D_APP_SMOKE; writes JSON and log reports
-  cargo xtask product-validate [native-package.m4d] [generated_fixture_camera_smoke|generated_fixture_render_modes|t5_qual_001_interaction_mip|t5_qual_001_interaction_render_modes|t5_qual_001_interaction_continuous|t5_qual_001_four_panel_cross_section|t5_qual_001_four_panel_fine_scale|t5_qual_001_four_panel_continuous_cross_section|t5_qual_002_four_panel_timepoint|t5_qual_002_four_panel_autoplay|custom_script]
+  cargo xtask product-validate [native-package.m4d] [generated_fixture_camera_smoke|generated_fixture_render_modes|b3_source_verification|b4_project_persistence|t5_qual_001_interaction_mip|t5_qual_001_interaction_render_modes|t5_qual_001_interaction_continuous|t5_qual_001_four_panel_cross_section|t5_qual_001_four_panel_fine_scale|t5_qual_001_four_panel_continuous_cross_section|t5_qual_002_four_panel_timepoint|t5_qual_002_four_panel_autoplay|custom_script]
       launches the real native app with env-gated semantic automation and writes product-validation artifacts
       help: cargo xtask product-validate --help
       no argument uses the generated basic-u16-16cube fixture; explicit paths target real native packages
       generated_fixture_render_modes switches MIP, DVR, and ISO on a bounded generated fixture
+      b3_source_verification exercises current-source verification on a bounded fixture
+      b4_project_persistence runs the fixed three-launch save/autosave/SIGKILL/recovery/Save-As/final-reopen scenario
       t5_qual_001_interaction_mip requires <native-package.m4d> and MIRANTE4D_XTASK_ALLOW_HEAVY_BENCHMARK=1
       t5_qual_001_interaction_render_modes requires <native-package.m4d> and MIRANTE4D_XTASK_ALLOW_HEAVY_BENCHMARK=1
       t5_qual_001_interaction_continuous requires <native-package.m4d> and MIRANTE4D_XTASK_ALLOW_HEAVY_BENCHMARK=1
@@ -508,6 +514,7 @@ Commands:
       env: MIRANTE4D_PRODUCT_VALIDATE_SKIP_RELEASE_BUILD=1 reuses target/release/mirante4d-app
       env: MIRANTE4D_PRODUCT_VALIDATE_MAX_RSS_BYTES=<bytes> kills the launched app if it exceeds the wrapper RSS guard
       env: MIRANTE4D_PRODUCT_VALIDATE_GPU_TIMESTAMPS=1 requests renderer timestamp-query samples when supported
+      env: MIRANTE4D_PRODUCT_VALIDATE_PROJECT_STORE_LIFECYCLE_REPORT=<report.json> binds same-revision trusted actor evidence for b4_project_persistence
   cargo xtask bench-runtime-stress
       env: MIRANTE4D_BENCH_HARDWARE_NAME=<name> (default local-dev-machine)
       env: MIRANTE4D_BENCH_HARDWARE_CLASS=<class> (default hardware name)
@@ -624,6 +631,13 @@ mod tests {
             ProductValidateArgs::Run {
                 package: None,
                 scenario: Some("generated_fixture_render_modes".to_owned())
+            }
+        );
+        assert_eq!(
+            product_validate_args(args(&["b4_project_persistence"])).unwrap(),
+            ProductValidateArgs::Run {
+                package: None,
+                scenario: Some("b4_project_persistence".to_owned())
             }
         );
         assert_eq!(

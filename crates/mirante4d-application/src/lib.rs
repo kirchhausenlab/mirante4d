@@ -2019,6 +2019,9 @@ impl ApplicationState {
         let Workspace::Bound(bound) = &self.workspace else {
             return Err(ApplicationFaultCode::IdentityVerificationRequired);
         };
+        if !bound.dirty() {
+            return Ok(CommandEffect::NoChange);
+        }
         let projection = ProjectGenerationProjection::new(
             bound.current_revision(),
             bound.high_water.clone(),

@@ -897,6 +897,38 @@ fn exact_current_save_completion_marks_the_project_clean() {
 }
 
 #[test]
+fn initial_unsaved_save_is_requested_but_a_clean_save_is_a_noop() {
+    let mut application = bound_application();
+    application.drain_events(MAX_PENDING_EVENTS);
+
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::RequestProjectSave)
+            .unwrap(),
+        CommandEffect::Changed
+    );
+    let (token, revision) = save_request(&mut application);
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::ProjectSaved(revision),
+        })
+        .unwrap();
+    application.drain_events(MAX_PENDING_EVENTS);
+
+    let before = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::RequestProjectSave)
+            .unwrap(),
+        CommandEffect::NoChange
+    );
+    assert_eq!(application, before);
+    assert!(application.snapshot().active_operations().is_empty());
+    assert_eq!(application.snapshot().pending_event_count(), 0);
+}
+
+#[test]
 fn a_second_save_is_rejected_until_the_active_save_finishes() {
     let mut application = bound_application();
     application.drain_events(MAX_PENDING_EVENTS);

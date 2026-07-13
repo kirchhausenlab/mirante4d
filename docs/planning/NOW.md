@@ -4,27 +4,21 @@ Last updated: 2026-07-13
 
 ## Current Checkpoint
 
-WP-10B B1 and B2 are complete. B2 is accepted on protected main at
-`4a246a1bb7bfe099673ef10d6cb5951729b3ff37` (tree
-`af5531d8ffbda0c13b342a0b4df47a894e7f99fb`). Its clean aggregate passed all
-120 hosted tests and 60 rootless-VM cuts with zero retries; protected-main
-policy and Rust checks passed in
-[run 29273392030](https://github.com/kirchhausenlab/mirante4d/actions/runs/29273392030).
+WP-10B B1 through B3 are complete. B3 is accepted on protected main at
+`8fdd94dc9c60406e8de8a96749d7148d38b1dc7a`.
 
-B3 is the current checkpoint, and its implementation candidate is under
-validation. It implements bounded current-source D-009 verification,
-source-generation-aware completion and invalidation, atomic verified-catalog/
-runtime replacement, authenticated capture reuse and Save As copying, exact
-revision-based autosave scheduling, and an application service over the
-accepted project-store actor. The remaining B3 work is final public-gate
-evidence, real-display validation at both accepted resolutions, and protected-
-main acceptance. The new project-store service remains
-unreachable from the product during B3: the private project-v15 bridge and
-`CurrentProjectRuntime` stay the sole product route until B4.
+B4 is the current implementation candidate. The product now constructs and
+polls `ProjectStoreApplicationService` as its sole project-persistence route;
+New, Open, Save, Save As, revision-aware autosave, recovery, dirty close, and
+actor join use the accepted project-store actor. The project-v15 bridge and
+`CurrentProjectRuntime` files are deleted, with architecture and predecessor
+guards enforcing their absence.
 
-B4 will switch product save/open/autosave/recovery atomically to the successor,
-delete the complete project-v15 path, and run the required real-viewer checks at
-1280x720 and 1920x1080. WP-10B does not exit before that deletion and evidence.
+The fixed `b4_project_persistence` automation implements the required bounded
+three-launch save/autosave/external-kill/recovery/Save-As/final-reopen
+scenario. B4 and WP-10B remain unaccepted until one exact clean revision passes
+the public, trusted project-store-lifecycle, and required real-display evidence
+at 1280x720 and 1920x1080, then lands on protected main.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.
@@ -45,8 +39,8 @@ revision/autosave/recovery behavior, bounded object growth, and the declared
 Linux durability/fault-injection matrix. Project binding remains gated on a
 verified D-009 scientific identity.
 
-WP-10B is a product persistence hard cutover: the private project-v15 bridge
-must be deleted in the same accepted package, no legacy reader or converter may
-remain, and real product-open validation is required. WP-11 is the next
-protected-branch checkpoint, following the
+WP-10B is a product persistence hard cutover. The B4 candidate deletes the
+private project-v15 bridge without a legacy reader or converter; acceptance
+still requires the clean-revision evidence above. WP-11 is the next protected-
+branch checkpoint, following the
 [foundation handoff](../plans/active/FOUNDATION_REFACTOR_HANDOFF.md).

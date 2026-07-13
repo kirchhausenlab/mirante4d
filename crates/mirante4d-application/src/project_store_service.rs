@@ -9,6 +9,7 @@
 
 use std::time::{Duration, Instant};
 
+use mirante4d_identity::ScientificContentId;
 use mirante4d_project_model::{
     ProjectGenerationProjection, ProjectId, ProjectRevisionHighWater, ProjectRevisionId,
     ProjectState,
@@ -482,11 +483,13 @@ struct AutosaveCaptureFacts {
 struct ActiveAutosave {
     request_id: ProjectStoreRequestId,
     project_id: ProjectId,
+    source_identity: ScientificContentId,
     revision: ProjectRevisionId,
     revision_high_water: ProjectRevisionHighWater,
     expected_parent: Option<ProjectGenerationId>,
     autosave_base: Option<ProjectGenerationId>,
     cancellation_request: Option<ProjectStoreRequestId>,
+    stale_source_observed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1219,6 +1222,8 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
             return Ok(events);
         }
 
+        self.cancel_stale_autosave_if_needed(snapshot)?;
+
         let commit_active = self.active_foreground.is_some()
             || self.active_autosave.is_some()
             || self.pending_normal_open.is_some()
@@ -1239,6 +1244,7 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
             }
             let facts = self.binding.autosave_capture_facts(due.project_id)?;
             let sources = source_factory(&projection)?;
+            let source_identity = *projection.state().dataset().scientific_content_id();
             let revision_high_water = projection.revision_high_water().clone();
             let capture = ProjectCommitCapture::new(
                 projection,
@@ -1256,11 +1262,13 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
             self.active_autosave = Some(ActiveAutosave {
                 request_id,
                 project_id: due.project_id,
+                source_identity,
                 revision: due.revision,
                 revision_high_water,
                 expected_parent: facts.expected_parent,
                 autosave_base: facts.autosave_base,
                 cancellation_request: None,
+                stale_source_observed: false,
             });
             events.push(ProjectStoreServiceEvent::AutosaveSubmitted {
                 request_id,
@@ -1342,6 +1350,25 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
         } else {
             Ok(())
         }
+    }
+
+    fn cancel_stale_autosave_if_needed(
+        &mut self,
+        snapshot: &ApplicationSnapshot,
+    ) -> Result<(), ProjectStoreServiceError> {
+        let should_cancel = self.active_autosave.as_ref().is_some_and(|active| {
+            !active.stale_source_observed
+                && active.cancellation_request.is_none()
+                && !active_autosave_source_is_current(active, snapshot)
+        });
+        if should_cancel {
+            self.cancel_active_autosave()?;
+            self.active_autosave
+                .as_mut()
+                .expect("the active autosave accepted cancellation")
+                .stale_source_observed = true;
+        }
+        Ok(())
     }
 
     fn submit_inspection(
@@ -1824,6 +1851,22 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
             .ok_or(ProjectStoreServiceError::RequestIdOverflow)?;
         Ok(request_id)
     }
+}
+
+fn active_autosave_source_is_current(
+    active: &ActiveAutosave,
+    snapshot: &ApplicationSnapshot,
+) -> bool {
+    let SourceVerificationSnapshot::Verified(source) = snapshot.source() else {
+        return false;
+    };
+    let WorkspaceSnapshot::Bound { project, .. } = snapshot.workspace() else {
+        return false;
+    };
+    project.project_id() == active.project_id
+        && project.dataset().scientific_content_id() == &active.source_identity
+        && source.scientific_content_id() == &active.source_identity
+        && project.dataset().has_same_scientific_content(source)
 }
 
 fn projection_from_snapshot(

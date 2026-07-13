@@ -1,18 +1,23 @@
 use std::{
     collections::BTreeSet,
     env, fs,
-    path::PathBuf,
+    fs::OpenOptions,
+    io::Write,
+    path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use eframe::egui;
-use mirante4d_application::{ApplicationCommand, CrossSectionPanelId, SourceVerificationSnapshot};
+use mirante4d_application::{
+    ApplicationCommand, ApplicationEvent, CommandEffect, CrossSectionPanelId,
+    ProjectStoreLifecycle, SourceVerificationSnapshot, WorkspaceSnapshot,
+};
 use mirante4d_domain::{
     CrossSectionView as CanonicalCrossSectionView, DisplayWindow, DvrOpacityTransfer,
     IsoShadingPolicy, LayerTransfer, Opacity, RenderMode, RenderState, TimeIndex, UnitQuaternion,
     ViewerLayout, WorldPoint3,
 };
-use mirante4d_project_model::LayerViewState;
+use mirante4d_project_model::{LayerViewState, ProjectRevisionId};
 use mirante4d_render_api::PresentationViewport;
 use mirante4d_renderer::{
     CurrentLeaseCohortStatus, RenderViewport,
@@ -205,6 +210,7 @@ pub(crate) struct ProductAutomationController {
     pending_cross_section_latency_samples: Vec<PendingCrossSectionLatencySample>,
     limit_observations: ProductAutomationLimitObservations,
     render_target_override: Option<RenderViewport>,
+    requested_mapped_client_pixels: Option<(u32, u32)>,
     report_written: bool,
 }
 
@@ -320,13 +326,15 @@ impl ProductAutomationController {
                 );
                 ctx.request_repaint();
             }
-            AutomationStatus::Waiting => {
+            AutomationStatus::Waiting { repaint_after } => {
                 automation.record_app_update_sample(
                     app,
                     update_timing,
                     duration_ms(automation_started.elapsed()),
                 );
-                ctx.request_repaint_after(Duration::from_millis(16));
+                if let Some(delay) = repaint_after {
+                    ctx.request_repaint_after(delay);
+                }
             }
             AutomationStatus::Finished => {
                 automation.record_app_update_sample(
@@ -384,6 +392,7 @@ impl ProductAutomationController {
             pending_cross_section_latency_samples: Vec::new(),
             limit_observations: ProductAutomationLimitObservations::default(),
             render_target_override: None,
+            requested_mapped_client_pixels: None,
             report_written: false,
         }
     }
@@ -415,7 +424,9 @@ impl ProductAutomationController {
 
     fn step(&mut self, app: &mut MiranteWorkbenchApp, ctx: &egui::Context) -> AutomationStatus {
         if self.report_written {
-            return AutomationStatus::Waiting;
+            return AutomationStatus::Waiting {
+                repaint_after: None,
+            };
         }
         self.observe_cross_section_latency_samples(app);
         if self.command_index >= self.script.commands.len() {
@@ -485,7 +496,12 @@ impl ProductAutomationController {
                 }
                 AutomationStatus::Continue
             }
-            Ok(CommandProgress::Waiting) => AutomationStatus::Waiting,
+            Ok(CommandProgress::Waiting) => AutomationStatus::Waiting {
+                repaint_after: Some(Duration::from_millis(16)),
+            },
+            Ok(CommandProgress::PassiveWaiting(repaint_after)) => {
+                AutomationStatus::Waiting { repaint_after }
+            }
             Err(reason) => {
                 self.events.push(ProductAutomationEvent::failed(
                     command_index,
@@ -520,6 +536,113 @@ impl ProductAutomationController {
                     "mode": "opened_by_product_startup",
                     "path": app.dataset.selected_path().display().to_string(),
                 })))
+            }
+            ProductAutomationCommand::NewProject => {
+                dispatch_application_command(app, ctx, ApplicationCommand::AttachVerifiedDataset)?;
+                if !current_egui_shell_bridge::snapshot(&app.application).is_bound() {
+                    return Err("new_project did not establish a bound workspace".to_owned());
+                }
+                Ok(CommandProgress::Done(project_state_json(app)))
+            }
+            ProductAutomationCommand::InitialSaveWithEdit { path } => {
+                initial_save_with_durable_edit(app, ctx, path)
+            }
+            ProductAutomationCommand::OpenProject { path } => {
+                if app.project_store_noninteractive_paths.open.is_some() {
+                    return Err("a noninteractive project-open path is already pending".to_owned());
+                }
+                app.project_store_noninteractive_paths.open = Some(path.clone());
+                if let Err(reason) =
+                    dispatch_application_command(app, ctx, ApplicationCommand::RequestProjectOpen)
+                {
+                    app.project_store_noninteractive_paths.open = None;
+                    return Err(reason);
+                }
+                if app.project_store_noninteractive_paths.open.is_some() {
+                    return Err(
+                        "open_project path was not consumed by the project event route".to_owned(),
+                    );
+                }
+                Ok(CommandProgress::Done(json!({
+                    "path": path.display().to_string(),
+                    "normal_reducer_service_path": true,
+                })))
+            }
+            ProductAutomationCommand::RecoverAutomaticAutosave => {
+                let (generation_id, token) = app
+                    .project_recovery_review
+                    .as_ref()
+                    .map(|review| (review.automatic_newer, review.token.clone()))
+                    .ok_or_else(|| {
+                        "no automatic autosave recovery is awaiting review".to_owned()
+                    })?;
+                app.project_store
+                    .as_mut()
+                    .ok_or_else(|| "project-store service is unavailable".to_owned())?
+                    .submit_open_recovery(token, generation_id)
+                    .map_err(|error| {
+                        format!("automatic autosave recovery was rejected: {error:?}")
+                    })?;
+                Ok(CommandProgress::Done(json!({
+                    "generation_id": generation_id.to_string(),
+                    "foreground_active": true,
+                })))
+            }
+            ProductAutomationCommand::SaveProjectAs { path } => {
+                if app.project_store_noninteractive_paths.save_as.is_some() {
+                    return Err("a noninteractive Save As path is already pending".to_owned());
+                }
+                let new_project_id = mirante4d_project_model::ProjectId::from_bytes(
+                    *uuid::Uuid::new_v4().as_bytes(),
+                );
+                app.project_store_noninteractive_paths.save_as = Some(path.clone());
+                if let Err(reason) = dispatch_application_command(
+                    app,
+                    ctx,
+                    ApplicationCommand::RequestProjectSaveAs { new_project_id },
+                ) {
+                    app.project_store_noninteractive_paths.save_as = None;
+                    return Err(reason);
+                }
+                if app.project_store_noninteractive_paths.save_as.is_some() {
+                    return Err(
+                        "save_project_as path was not consumed by the project event route"
+                            .to_owned(),
+                    );
+                }
+                Ok(CommandProgress::Done(json!({
+                    "path": path.display().to_string(),
+                    "new_project_id": new_project_id.to_string(),
+                    "normal_reducer_service_path": true,
+                })))
+            }
+            ProductAutomationCommand::CloseProjectStore => {
+                app.project_store_product_evidence.close_result = None;
+                app.project_store_product_evidence.actor_join = None;
+                let request_id = app
+                    .project_store
+                    .as_mut()
+                    .ok_or_else(|| "project-store service is unavailable".to_owned())?
+                    .close()
+                    .map_err(|error| format!("project-store close was rejected: {error:?}"))?;
+                Ok(CommandProgress::Done(json!({
+                    "request_id": request_id.get(),
+                    "normal_actor_close": true,
+                })))
+            }
+            ProductAutomationCommand::WriteExternalKillCheckpoint { path, stage } => {
+                let checkpoint =
+                    external_kill_checkpoint_json(app, stage, self.requested_mapped_client_pixels);
+                write_synced_json_no_replace(path, &checkpoint)?;
+                Ok(CommandProgress::Done(json!({
+                    "path": path.display().to_string(),
+                    "stage": stage,
+                    "synced": true,
+                    "project_evidence": project_store_evidence_json(app),
+                })))
+            }
+            ProductAutomationCommand::HoldForExternalKill => {
+                Ok(CommandProgress::PassiveWaiting(None))
             }
             ProductAutomationCommand::CancelSourceVerification => {
                 let service = app
@@ -602,7 +725,13 @@ impl ProductAutomationController {
                         condition.name()
                     ))
                 } else {
-                    Ok(CommandProgress::Waiting)
+                    Ok(if condition.is_passive() {
+                        CommandProgress::PassiveWaiting(Some(
+                            Duration::from_millis(*timeout_ms).saturating_sub(started.elapsed()),
+                        ))
+                    } else {
+                        CommandProgress::Waiting
+                    })
                 }
             }
             ProductAutomationCommand::SetViewportSize { width, height } => {
@@ -618,6 +747,33 @@ impl ProductAutomationController {
                         "width": width,
                         "height": height,
                     },
+                })))
+            }
+            ProductAutomationCommand::SetMappedClientPixels { width, height } => {
+                if *width == 0 || *height == 0 {
+                    return Err("requested mapped client pixels must be nonzero".to_owned());
+                }
+                let pixels_per_point = ctx
+                    .input(|input| input.viewport().native_pixels_per_point)
+                    .unwrap_or_else(|| ctx.pixels_per_point());
+                if !pixels_per_point.is_finite() || pixels_per_point <= 0.0 {
+                    return Err("native pixels-per-point is unavailable".to_owned());
+                }
+                let fullscreen = *width == 1920 && *height == 1080;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                    *width as f32 / pixels_per_point,
+                    *height as f32 / pixels_per_point,
+                )));
+                self.requested_mapped_client_pixels = Some((*width, *height));
+                Ok(CommandProgress::Done(json!({
+                    "requested_mapped_client_pixels": {
+                        "width": width,
+                        "height": height,
+                    },
+                    "pixels_per_point": pixels_per_point,
+                    "fullscreen_requested": fullscreen,
+                    "external_geometry_observation_required": true,
                 })))
             }
             ProductAutomationCommand::SetRenderTargetSize { width, height } => {
@@ -1089,7 +1245,7 @@ impl ProductAutomationController {
                         probe.expected_schedule_generation,
                     )? {
                         CommandProgress::Done(details) => Some(details),
-                        CommandProgress::Waiting => {
+                        CommandProgress::Waiting | CommandProgress::PassiveWaiting(_) => {
                             return Err(
                                 "cross_section_pan probe_after unexpectedly waited".to_owned()
                             );
@@ -1544,6 +1700,35 @@ impl ProductAutomationController {
                         .as_ref()
                         .is_some_and(|service| service.active_token().is_none())
             }
+            ProductAutomationWaitCondition::ProjectStoreIdle => {
+                app.project_store.as_ref().is_some_and(|service| {
+                    let status = service.status();
+                    !status.foreground_active()
+                        && !status.autosave_active()
+                        && !matches!(
+                            status.lifecycle(),
+                            ProjectStoreLifecycle::Closing | ProjectStoreLifecycle::Closed
+                        )
+                })
+            }
+            ProductAutomationWaitCondition::ProjectAutosaved => app
+                .project_store_product_evidence
+                .latest_autosave_captured_revision
+                .is_some(),
+            ProductAutomationWaitCondition::RecoveryReviewRequired => {
+                app.project_recovery_review.is_some()
+            }
+            ProductAutomationWaitCondition::ProjectStoreClosed => {
+                app.project_store.is_none()
+                    && matches!(
+                        app.project_store_product_evidence.close_result,
+                        Some(crate::ProjectStoreRecordedResult::Succeeded)
+                    )
+                    && matches!(
+                        app.project_store_product_evidence.actor_join,
+                        Some(crate::ProjectStoreRecordedResult::Succeeded)
+                    )
+            }
         }
     }
 
@@ -1859,6 +2044,34 @@ impl ProductAutomationController {
                     ))
                 }
             }
+            ProductAutomationAssertCondition::ProjectState {
+                bound,
+                dirty,
+                lifecycle,
+                can_save,
+                can_save_as,
+                manual,
+                autosave,
+            } => {
+                let facts = project_state_facts(app);
+                let expected_lifecycle = project_store_lifecycle(*lifecycle);
+                if facts.bound == *bound
+                    && facts.dirty == *dirty
+                    && facts.lifecycle == Some(expected_lifecycle)
+                    && facts.can_save == *can_save
+                    && facts.can_save_as == *can_save_as
+                    && facts.manual == *manual
+                    && facts.autosave == *autosave
+                {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "project state does not match the assertion; expected lifecycle={}, observed={}",
+                        lifecycle.name(),
+                        project_state_json(app)
+                    ))
+                }
+            }
         }
     }
 
@@ -1948,6 +2161,8 @@ impl ProductAutomationController {
                     "height": app.render_runtime.render_viewport.height,
                 },
             },
+            "project_state": project_state_json(app),
+            "project_store_evidence": project_store_evidence_json(app),
         })
     }
 
@@ -1994,6 +2209,10 @@ impl ProductAutomationController {
             })
             .unwrap_or(Value::Null);
         let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+        let requested_mapped_client_pixels = self
+            .requested_mapped_client_pixels
+            .map(|(width, height)| json!({ "width": width, "height": height }))
+            .unwrap_or(Value::Null);
         let report = json!({
             "schema": AUTOMATION_REPORT_SCHEMA,
             "schema_version": AUTOMATION_SCHEMA_VERSION,
@@ -2008,6 +2227,7 @@ impl ProductAutomationController {
             },
             "viewport_evidence": {
                 "requested_window_inner_size_points": requested_window_inner_size_points,
+                "requested_mapped_client_pixels": requested_mapped_client_pixels,
                 "pixels_per_point": ctx.pixels_per_point(),
                 "observed_client_area_pixels": Value::Null,
                 "render_target_pixels": render_target_pixels,
@@ -2029,6 +2249,8 @@ impl ProductAutomationController {
                 "path": app.dataset.selected_path().display().to_string(),
                 "name": snapshot.catalog().label(),
             },
+            "project_state": project_state_json(app),
+            "project_store_evidence": project_store_evidence_json(app),
             "events": &self.events,
             "app_update_timing_samples": self
                 .app_update_samples
@@ -2218,10 +2440,19 @@ impl ProductAutomationController {
                 }
             }
             ProductAutomationCommand::OpenDataset { .. }
+            | ProductAutomationCommand::NewProject
+            | ProductAutomationCommand::InitialSaveWithEdit { .. }
+            | ProductAutomationCommand::OpenProject { .. }
+            | ProductAutomationCommand::RecoverAutomaticAutosave
+            | ProductAutomationCommand::SaveProjectAs { .. }
+            | ProductAutomationCommand::CloseProjectStore
+            | ProductAutomationCommand::WriteExternalKillCheckpoint { .. }
+            | ProductAutomationCommand::HoldForExternalKill
             | ProductAutomationCommand::CancelSourceVerification
             | ProductAutomationCommand::RequestSourceVerification
             | ProductAutomationCommand::WaitFor { .. }
             | ProductAutomationCommand::SetViewportSize { .. }
+            | ProductAutomationCommand::SetMappedClientPixels { .. }
             | ProductAutomationCommand::SetRenderTargetSize { .. }
             | ProductAutomationCommand::SetViewerLayout { .. }
             | ProductAutomationCommand::SetPlayback { .. }
@@ -2899,13 +3130,343 @@ impl ProductAutomationEvent {
 enum CommandProgress {
     Done(Value),
     Waiting,
+    PassiveWaiting(Option<Duration>),
 }
 
 enum AutomationStatus {
     Continue,
-    Waiting,
+    Waiting { repaint_after: Option<Duration> },
     Finished,
     Failed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProductAutomationProjectStateFacts {
+    bound: bool,
+    dirty: bool,
+    lifecycle: Option<ProjectStoreLifecycle>,
+    can_save: bool,
+    can_save_as: bool,
+    manual: bool,
+    autosave: bool,
+}
+
+fn initial_save_with_durable_edit(
+    app: &mut MiranteWorkbenchApp,
+    ctx: &egui::Context,
+    path: &Path,
+) -> Result<CommandProgress, String> {
+    if app
+        .project_store_noninteractive_paths
+        .initial_save
+        .is_some()
+    {
+        return Err("a noninteractive initial-Save path is already pending".to_owned());
+    }
+    let service = app
+        .project_store
+        .as_ref()
+        .ok_or_else(|| "project-store service is unavailable".to_owned())?;
+    if !service.can_save()
+        || !matches!(
+            service.status().lifecycle(),
+            ProjectStoreLifecycle::Unbound | ProjectStoreLifecycle::Provisional
+        )
+    {
+        return Err("initial_save_with_edit requires a saveable unestablished store".to_owned());
+    }
+
+    app.project_store_noninteractive_paths.initial_save = Some(path.to_path_buf());
+    if let Err(fault) = current_egui_shell_bridge::dispatch(
+        &mut app.application,
+        ApplicationCommand::RequestProjectSave,
+    ) {
+        app.project_store_noninteractive_paths.initial_save = None;
+        return Err(format!("initial project Save was rejected: {fault:?}"));
+    }
+    let events = current_egui_shell_bridge::drain_events(&mut app.application, 256);
+    let captured_revision = events
+        .iter()
+        .find_map(|event| match event {
+            ApplicationEvent::ProjectSaveRequested { projection, .. } => {
+                Some(projection.revision())
+            }
+            _ => None,
+        })
+        .ok_or_else(|| "initial project Save emitted no capture event".to_owned())?;
+    for event in &events {
+        app.observe_source_application_event(event);
+        app.observe_project_application_event(event);
+    }
+    if app
+        .project_store_noninteractive_paths
+        .initial_save
+        .is_some()
+    {
+        return Err("initial Save path was not consumed by the project event route".to_owned());
+    }
+    if !app
+        .project_store
+        .as_ref()
+        .is_some_and(|service| service.status().foreground_active())
+    {
+        return Err("initial Save was not active before the durable edit".to_owned());
+    }
+
+    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let mut camera = *application_view(&snapshot).camera();
+    crate::viewport::apply_camera_pan(&mut camera, egui::vec2(8.0, -4.0));
+    let durable_edit_started_at = Instant::now();
+    app.project_store_product_evidence.durable_edit_started_at = Some(durable_edit_started_at);
+    let effect = app
+        .apply_application_command(ApplicationCommand::SetCamera(camera), ctx)
+        .map_err(|fault| format!("durable edit after initial Save was rejected: {fault:?}"))?;
+    if effect != CommandEffect::Changed {
+        app.project_store_product_evidence.durable_edit_started_at = None;
+        return Err("durable camera edit after initial Save changed no state".to_owned());
+    }
+    let current_revision = match current_egui_shell_bridge::snapshot(&app.application).workspace() {
+        WorkspaceSnapshot::Bound { revision, .. } => *revision,
+        WorkspaceSnapshot::Unbound { .. } => {
+            return Err("durable edit left the project workspace unbound".to_owned());
+        }
+    };
+    if current_revision == captured_revision {
+        return Err("durable edit did not advance beyond the captured revision".to_owned());
+    }
+    Ok(CommandProgress::Done(json!({
+        "path": path.display().to_string(),
+        "captured_revision": project_revision_json(Some(captured_revision)),
+        "current_revision_after_edit": project_revision_json(Some(current_revision)),
+        "foreground_was_active_before_edit": true,
+        "normal_reducer_service_path": true,
+        "completion_polling_resumed_only_after_edit": true,
+    })))
+}
+
+fn project_state_facts(app: &MiranteWorkbenchApp) -> ProductAutomationProjectStateFacts {
+    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let (bound, dirty) = match snapshot.workspace() {
+        WorkspaceSnapshot::Bound { dirty, .. } => (true, *dirty),
+        WorkspaceSnapshot::Unbound { .. } => (false, false),
+    };
+    let status = app.project_store.as_ref().map(|service| service.status());
+    let lifecycle = status
+        .as_ref()
+        .map(|status| status.lifecycle())
+        .or_else(|| {
+            app.project_store_product_evidence
+                .close_result
+                .as_ref()
+                .map(|_| ProjectStoreLifecycle::Closed)
+        });
+    ProductAutomationProjectStateFacts {
+        bound,
+        dirty,
+        lifecycle,
+        can_save: app
+            .project_store
+            .as_ref()
+            .is_some_and(|service| service.can_save()),
+        can_save_as: app
+            .project_store
+            .as_ref()
+            .is_some_and(|service| service.can_save_as()),
+        manual: status
+            .as_ref()
+            .is_some_and(|status| status.current_manual().is_some()),
+        autosave: status
+            .as_ref()
+            .is_some_and(|status| status.current_autosave().is_some()),
+    }
+}
+
+fn project_state_json(app: &MiranteWorkbenchApp) -> Value {
+    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let (current_revision, saved_revision) = match snapshot.workspace() {
+        WorkspaceSnapshot::Bound {
+            revision,
+            saved_revision,
+            ..
+        } => (Some(*revision), *saved_revision),
+        WorkspaceSnapshot::Unbound { .. } => (None, None),
+    };
+    let status = app.project_store.as_ref().map(|service| service.status());
+    let facts = project_state_facts(app);
+    json!({
+        "bound": facts.bound,
+        "dirty": facts.dirty,
+        "current_revision": project_revision_json(current_revision),
+        "saved_revision": project_revision_json(saved_revision),
+        "lifecycle": facts.lifecycle.map(project_store_lifecycle_name),
+        "can_save": facts.can_save,
+        "can_save_as": facts.can_save_as,
+        "manual": facts.manual,
+        "autosave": facts.autosave,
+        "current_manual": status
+            .as_ref()
+            .and_then(|status| status.current_manual())
+            .map(|generation| generation.to_string()),
+        "current_autosave": status
+            .as_ref()
+            .and_then(|status| status.current_autosave())
+            .map(|generation| generation.to_string()),
+    })
+}
+
+fn project_store_evidence_json(app: &MiranteWorkbenchApp) -> Value {
+    let evidence = &app.project_store_product_evidence;
+    json!({
+        "initial_save_captured_revision": project_revision_json(
+            evidence.initial_save_captured_revision,
+        ),
+        "latest_autosave_captured_revision": project_revision_json(
+            evidence.latest_autosave_captured_revision,
+        ),
+        "autosave_elapsed_from_durable_edit_ms":
+            evidence.autosave_elapsed_from_durable_edit_ms,
+        "autosave_wait_mode": "scheduled_deadline_no_busy_poll",
+        "close_result": recorded_result_json(evidence.close_result.as_ref(), "fault"),
+        "actor_join": recorded_result_json(evidence.actor_join.as_ref(), "error"),
+    })
+}
+
+fn external_kill_checkpoint_json(
+    app: &MiranteWorkbenchApp,
+    stage: &str,
+    requested_mapped_client_pixels: Option<(u32, u32)>,
+) -> Value {
+    json!({
+        "schema": "mirante4d-product-external-kill-checkpoint",
+        "schema_version": 1,
+        "stage": stage,
+        "written_at_epoch_ms": epoch_ms(),
+        "viewport_evidence": {
+            "requested_mapped_client_pixels": requested_mapped_client_pixels
+                .map(|(width, height)| json!({ "width": width, "height": height })),
+        },
+        "project_state": project_state_json(app),
+        "project_evidence": project_store_evidence_json(app),
+    })
+}
+
+fn recorded_result_json(
+    result: Option<&crate::ProjectStoreRecordedResult>,
+    failure_key: &'static str,
+) -> Value {
+    let Some(result) = result else {
+        return Value::Null;
+    };
+    let (status, failure) = match result {
+        crate::ProjectStoreRecordedResult::Succeeded => ("succeeded", Value::Null),
+        crate::ProjectStoreRecordedResult::Failed(reason) => {
+            ("failed", Value::String(reason.clone()))
+        }
+    };
+    let mut object = serde_json::Map::new();
+    object.insert("status".to_owned(), Value::String(status.to_owned()));
+    object.insert(failure_key.to_owned(), failure);
+    Value::Object(object)
+}
+
+fn project_revision_json(revision: Option<ProjectRevisionId>) -> Value {
+    revision.map_or(Value::Null, |revision| {
+        json!({
+            "project_id": revision.project_id().to_string(),
+            "sequence": revision.sequence(),
+        })
+    })
+}
+
+fn project_store_lifecycle(
+    lifecycle: ProductAutomationProjectStoreLifecycle,
+) -> ProjectStoreLifecycle {
+    match lifecycle {
+        ProductAutomationProjectStoreLifecycle::Unbound => ProjectStoreLifecycle::Unbound,
+        ProductAutomationProjectStoreLifecycle::Provisional => ProjectStoreLifecycle::Provisional,
+        ProductAutomationProjectStoreLifecycle::Established => ProjectStoreLifecycle::Established,
+        ProductAutomationProjectStoreLifecycle::RecoveryOnly => ProjectStoreLifecycle::RecoveryOnly,
+        ProductAutomationProjectStoreLifecycle::RecoverySelected => {
+            ProjectStoreLifecycle::RecoverySelected
+        }
+        ProductAutomationProjectStoreLifecycle::Closing => ProjectStoreLifecycle::Closing,
+        ProductAutomationProjectStoreLifecycle::Closed => ProjectStoreLifecycle::Closed,
+    }
+}
+
+fn project_store_lifecycle_name(lifecycle: ProjectStoreLifecycle) -> &'static str {
+    match lifecycle {
+        ProjectStoreLifecycle::Unbound => "unbound",
+        ProjectStoreLifecycle::Provisional => "provisional",
+        ProjectStoreLifecycle::Established => "established",
+        ProjectStoreLifecycle::RecoveryOnly => "recovery_only",
+        ProjectStoreLifecycle::RecoverySelected => "recovery_selected",
+        ProjectStoreLifecycle::Closing => "closing",
+        ProjectStoreLifecycle::Closed => "closed",
+    }
+}
+
+fn write_synced_json_no_replace(path: &Path, value: &Value) -> Result<(), String> {
+    if path.exists() {
+        return Err(format!(
+            "external-kill checkpoint already exists: {}",
+            path.display()
+        ));
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "failed to create checkpoint directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "checkpoint path has no UTF-8 file name".to_owned())?;
+    let stage_path = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    let mut bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| format!("failed to serialize external-kill checkpoint: {error}"))?;
+    bytes.push(b'\n');
+    let write_result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&stage_path)
+            .map_err(|error| {
+                format!(
+                    "failed to create checkpoint stage {}: {error}",
+                    stage_path.display()
+                )
+            })?;
+        file.write_all(&bytes).map_err(|error| {
+            format!(
+                "failed to write checkpoint stage {}: {error}",
+                stage_path.display()
+            )
+        })?;
+        file.sync_all().map_err(|error| {
+            format!(
+                "failed to sync checkpoint stage {}: {error}",
+                stage_path.display()
+            )
+        })?;
+        drop(file);
+        fs::rename(&stage_path, path)
+            .map_err(|error| format!("failed to publish checkpoint {}: {error}", path.display()))?;
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                format!(
+                    "failed to sync checkpoint directory {}: {error}",
+                    parent.display()
+                )
+            })
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&stage_path);
+    }
+    write_result
 }
 
 fn normalize_path(path: &std::path::Path) -> PathBuf {

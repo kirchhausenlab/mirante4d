@@ -17,8 +17,8 @@ The workspace has nineteen packages (eighteen `mirante4d-*` crates plus
   scientific-tree primitives; no filesystem I/O.
 - `mirante4d-project-model`: canonical durable project/view state and
   persistence-neutral generation projections.
-- `mirante4d-project-store`: private successor project storage; B3 compiles its
-  application service, but the product does not construct or poll it until B4.
+- `mirante4d-project-store`: experimental product project storage, reached only
+  through the application-owned project-store service.
 - `mirante4d-application`: the sole command reducer, revision/history owner,
   transient semantic state, operations, events, snapshots, and typed faults.
 - `mirante4d-settings`: closed settings document and bounded background I/O.
@@ -56,8 +56,8 @@ render cutover.
 ## Application Composition
 
 `MiranteWorkbenchApp` holds `ApplicationState`, payload-free
-`DatasetDemandState`, process diagnostics, six remaining temporary runtime
-owners, and narrow persistence/settings/source-open handles. It is a
+`DatasetDemandState`, process diagnostics, five remaining temporary runtime
+owners, and narrow project-store/settings/source-open handles. It is a
 composition root, not a second model.
 
 The temporary owners and deletion gates are:
@@ -66,15 +66,15 @@ The temporary owners and deletion gates are:
 |---|---|---|
 | `CurrentRenderRuntime` | render status, frames, GPU and presentation resources | WP-09B |
 | `CurrentUiRuntime` | egui-local drafts and interaction facts | WP-09C |
-| `CurrentProjectRuntime` | current project package path only | WP-10B |
 | `CurrentImportRuntime` | current import execution | WP-10C |
 | `CurrentAnalysisRuntime` | passive tables, plots, artifacts, and exports | WP-12 |
 | `CurrentValidationRuntime` | product-validation harness only | WP-14 |
 
 The private egui bridge translates UI input to `ApplicationCommand` and reads
-snapshots/events. The private project-v15 bridge is the sole temporary project
-I/O route and has no compatibility reader. Both are mandatory-deletion
-bridges, not permanent public APIs.
+snapshots/events. `ProjectStoreApplicationService` is the sole product project
+I/O route; its actor owns project roots, sessions, leases, refs, recovery, and
+filesystem mutation. The project-v15 bridge and `CurrentProjectRuntime` are
+deleted, with no compatibility reader or fallback.
 
 `DatasetRequestDispatcher` is the sole application poll owner. It keeps only
 bounded request correlation and cancellation generations; decoded allocations
@@ -123,7 +123,7 @@ coverage include at most 128 resources.
 
 ## Persistence And Settings
 
-Current schema-1 sources open as unverified workspaces. B3 runs a background,
+Current schema-1 sources open as unverified workspaces. B3 added a background,
 cancellable D-009 scan over the base scale between complete source-tree
 inventories, then prepares and atomically promotes a structurally identical
 verified catalog/runtime for the exact source generation. Progress,
@@ -131,8 +131,7 @@ cancellation, success, and source-drift invalidation use the canonical
 application operation path; unrelated view changes do not make a verification
 completion stale. Project attach/open/save remains identity-gated until
 verification succeeds, and observed drift clears interactive demand and blocks
-new project I/O until reverification. The private project-v15 bridge remains
-the sole product persistence path until B4.
+new project I/O until reverification.
 
 WP-10B B1 freezes the successor's canonical envelope, generation, ref, object,
 payload-paging, API, and failure-transition contract plus an independent
@@ -225,17 +224,18 @@ selection, after which Save As installs a new project with exact fork
 provenance while leaving the damaged package untouched. B2's exact ext4
 durability qualification is accepted on protected main.
 
-B3 adds only the data-to-identity/hash and app/application-to-project-store
+B3 added only the data-to-identity/hash and app/application-to-project-store
 edges required by its accepted correction. Project captures now require caller
 sources only for genuinely new logical objects; unchanged direct or paged
 objects may be reused only from the actor-authenticated held generation and
 lane. Save As copies and rehashes that authenticated closure into destination-
-local staging. A private application service implements the injected-monotonic-
+local staging. The application service implements the injected-monotonic-
 clock 30-second-idle/120-second-maximum autosave schedule over the real actor,
 including edit-during-capture, failure, cancellation, and indeterminate-write
-semantics. The service has no product composition field or start/poll path;
-the project-v15 bridge and `CurrentProjectRuntime` remain the sole product
-project route until B4.
+semantics. The B4 candidate constructs and polls it as the sole product project
+route and deletes the project-v15 bridge and `CurrentProjectRuntime`. New,
+Open, Save, Save As, recovery selection, dirty close, source replacement, and
+application exit all pass through the service and joined actor lifecycle.
 
 Settings use `mirante4d-settings-v1` at the Linux XDG/HOME path. The UI submits
 validated changes; one background actor owns persistence. Legacy preferences

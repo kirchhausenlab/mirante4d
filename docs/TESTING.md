@@ -140,8 +140,8 @@ does not independently conform repeated reuse of one physical page within a
 generation and does not claim filesystem durability or product save/open
 support.
 
-The unreachable `mirante4d-project-store` crate is assigned to the hosted
-contract lane. Its current tests cover the frozen API/limits, corrected loaded
+The `mirante4d-project-store` crate is assigned to the hosted contract lane.
+Its current tests cover the frozen API/limits, corrected loaded
 Open/OpenRecovery result shape, distinct manual-branch classification, canonical
 envelope/ref identities, typed canonical generations, direct and deterministic
 paged closure, held-descriptor traversal, bounded immutable object and
@@ -300,12 +300,12 @@ VM cuts with zero harness retries. Its sanitized report has SHA-256
 `ced8c82c75c480810e7ebf81e2c032e579f89bbb28c1f854d1681a3ddad1f9e5`.
 Protected-main policy and Rust checks also passed in
 [run 29273392030](https://github.com/kirchhausenlab/mirante4d/actions/runs/29273392030).
-This qualifies only the exact B2 off-product ext4 tuple and revision. The B3
-candidate adds focused coverage for bounded pre/scan/post source verification,
-source-generation currentness and invalidation, authenticated direct/paged
-reuse and Save As copying, and injected-clock autosave scheduling. That code is
-implemented but B3 is not accepted until the public gates and required real-
-display run pass; B4 product persistence validation remains pending.
+This qualifies only the exact B2 off-product ext4 tuple and revision. B3 is
+accepted on protected main at
+`8fdd94dc9c60406e8de8a96749d7148d38b1dc7a`. The B4 candidate adds focused
+coverage for the sole product service route, predecessor absence, project
+lifecycle semantics, and the fixed three-launch native scenario. Its final
+clean-revision evidence and protected-main acceptance remain pending.
 
 Run the supporting B3 product scenario on the real display with:
 
@@ -313,13 +313,26 @@ Run the supporting B3 product scenario on the real display with:
 cargo xtask product-validate b3_source_verification
 ```
 
-The scenario uses a small generated T2 package, exercises verification
-progress, cancellation, successful reverification, continued nonblank
-rendering, exact internal 1280x720 and 1920x1080 GPU captures, and byte-
-identical source closure. Its report is E1 support only. B3 validation still
-requires external observation of the mapped physical client area at both
-sizes; the command does not claim E4 or exercise the B4 save/autosave/recovery
-cutover.
+The accepted B3 scenario uses a small generated T2 package and remains
+supporting E1 evidence.
+
+On one exact clean committed revision, first produce the trusted project-store
+report, then run the B4 candidate on a real X11 display:
+
+```bash
+MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
+  cargo xtask verify-local project-store-lifecycle
+
+MIRANTE4D_PRODUCT_VALIDATE_PROJECT_STORE_LIFECYCLE_REPORT=<report.json> \
+  cargo xtask product-validate b4_project_persistence
+```
+
+The second command requires the first report to name the same clean commit and
+tree. It retains three zero-retry launches: initial Save, edit-during-save,
+real 30-second autosave and external `SIGKILL`; relaunch, recovery and Save As;
+then clean final reopen and joined close. It externally observes exact mapped
+client sizes of 1280x720 and 1920x1080 and compares the source closure around
+every launch. The automation exists, but no qualifying B4 run is claimed here.
 
 The checked independent source report supports only the WP-03 source-TIFF
 archive. WP-10A is accepted off-product and its target authority is promoted.
