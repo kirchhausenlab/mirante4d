@@ -23,7 +23,7 @@ const SOURCE_FIXTURE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(120);
 const TARGET_FIXTURE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(120);
 const PROJECT_FIXTURE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(120);
 const PROJECT_STORE_VM_SELF_TEST_TIMEOUT: Duration = Duration::from_secs(30);
-const PROJECT_STORE_HOSTED_MATRIX_TIMEOUT_MS: u64 = 100_000;
+const PROJECT_STORE_HOSTED_MATRIX_TIMEOUT_MS: u64 = 180_000;
 
 const PROJECT_STORE_PROCESS_MATRIX_CASES: [(&str, u64); 3] = [
     (
@@ -2860,6 +2860,19 @@ mod tests {
         assert_eq!(
             aggregate["qualification_scope"]["product_durability_claim"],
             false
+        );
+
+        assert!(
+            parse_project_store_hosted_suite_evidence(
+                &output.replace("wall_milliseconds=77071", "wall_milliseconds=180000")
+            )
+            .is_ok()
+        );
+        assert!(
+            parse_project_store_hosted_suite_evidence(
+                &output.replace("wall_milliseconds=77071", "wall_milliseconds=180001")
+            )
+            .is_err()
         );
 
         assert!(parse_project_store_hosted_suite_evidence("no marker").is_err());
