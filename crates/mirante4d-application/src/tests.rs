@@ -303,6 +303,10 @@ fn all_project_io_and_attachment_are_identity_gated_before_verification() {
         ApplicationCommand::AttachVerifiedDataset,
         ApplicationCommand::RequestProjectOpen,
         ApplicationCommand::RequestProjectSave,
+        ApplicationCommand::RequestProjectSaveAs {
+            new_project_id: project_id(5),
+        },
+        ApplicationCommand::RequestProjectRecovery,
     ] {
         let before = application.fork_for_dispatch();
         assert_eq!(
@@ -912,6 +916,346 @@ fn a_second_save_is_rejected_until_the_active_save_finishes() {
 }
 
 #[test]
+fn save_as_retains_an_initial_new_id_projection_and_switches_only_on_exact_completion() {
+    let mut application = bound_application();
+    application.drain_events(MAX_PENDING_EVENTS);
+    application
+        .dispatch(ApplicationCommand::SetTimepoint(TimeIndex::new(3)))
+        .unwrap();
+    application.drain_events(MAX_PENDING_EVENTS);
+
+    let old_project_id = project_id(4);
+    let new_project_id = project_id(5);
+    application
+        .dispatch(ApplicationCommand::RequestProjectSaveAs { new_project_id })
+        .unwrap();
+    let (token, retained) = save_as_request(&mut application);
+    assert_eq!(token.kind(), OperationKind::ProjectSaveAs);
+    assert_eq!(token.project_id(), Some(old_project_id));
+    assert_eq!(
+        token.project_revision().map(ProjectRevisionId::sequence),
+        Some(1)
+    );
+    assert_eq!(retained.state().project_id(), new_project_id);
+    assert_eq!(
+        retained.revision(),
+        ProjectRevisionId::initial(new_project_id)
+    );
+    assert_eq!(
+        retained.revision_high_water(),
+        &ProjectRevisionHighWater::initial(new_project_id)
+    );
+    assert_eq!(retained.state().view().timepoint(), TimeIndex::new(3));
+
+    let before_edit = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::SetTimepoint(TimeIndex::new(4)))
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::OperationConflict
+    );
+    assert_eq!(application, before_edit);
+
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::ProjectSavedAs(Box::new(retained.as_ref().clone())),
+        })
+        .unwrap();
+    let WorkspaceSnapshot::Bound {
+        project,
+        revision,
+        revision_high_water,
+        saved_revision,
+        dirty,
+        retained_history_entries,
+        ..
+    } = application.snapshot().workspace().clone()
+    else {
+        panic!("workspace was not bound");
+    };
+    assert_eq!(project.project_id(), new_project_id);
+    assert_eq!(revision, ProjectRevisionId::initial(new_project_id));
+    assert_eq!(
+        revision_high_water,
+        ProjectRevisionHighWater::initial(new_project_id)
+    );
+    assert_eq!(saved_revision, Some(revision));
+    assert!(!dirty);
+    assert_eq!(retained_history_entries, 1);
+}
+
+#[test]
+fn save_as_rejects_a_nonexact_completion_and_failure_retains_the_old_project() {
+    let mut application = bound_application();
+    application.drain_events(MAX_PENDING_EVENTS);
+    let new_project_id = project_id(5);
+    application
+        .dispatch(ApplicationCommand::RequestProjectSaveAs { new_project_id })
+        .unwrap();
+    let (token, _retained) = save_as_request(&mut application);
+    let mismatched = projection(new_project_id, dataset_reference('1'), 1, 1);
+
+    let before_mismatch = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token: token.clone(),
+                completion: OperationCompletion::ProjectSavedAs(Box::new(mismatched)),
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::InvalidOperationCompletion
+    );
+    assert_eq!(application, before_mismatch);
+
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::Failed(OperationFailureCode::ProjectWriteFailed),
+        })
+        .unwrap();
+    let WorkspaceSnapshot::Bound { project, .. } = application.snapshot().workspace().clone()
+    else {
+        panic!("workspace was not bound");
+    };
+    assert_eq!(project.project_id(), project_id(4));
+    assert!(application.snapshot().active_operations().is_empty());
+}
+
+#[test]
+fn recovery_blocks_mutation_and_is_dirty_even_with_the_exact_verified_locator() {
+    let mut application = bound_application();
+    application.drain_events(MAX_PENDING_EVENTS);
+    application
+        .dispatch(ApplicationCommand::RequestProjectRecovery)
+        .unwrap();
+    let token = recovery_request(&mut application);
+    assert_eq!(token.kind(), OperationKind::ProjectRecovery);
+
+    let before_mutation = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::SetTimepoint(TimeIndex::new(2)))
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::OperationConflict
+    );
+    assert_eq!(application, before_mutation);
+
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::ProjectRecovered(Box::new(projection(
+                project_id(4),
+                dataset_reference('1'),
+                5,
+                7,
+            ))),
+        })
+        .unwrap();
+    let WorkspaceSnapshot::Bound {
+        project,
+        revision,
+        revision_high_water,
+        saved_revision,
+        dirty,
+        ..
+    } = application.snapshot().workspace().clone()
+    else {
+        panic!("workspace was not bound");
+    };
+    assert_eq!(project.dataset(), &dataset_reference('1'));
+    assert_eq!(revision.sequence(), 5);
+    assert_eq!(revision_high_water.sequence(), 7);
+    assert_eq!(saved_revision, None);
+    assert!(dirty);
+}
+
+#[test]
+fn recovery_rebinds_a_same_science_locator_and_rejects_other_science_atomically() {
+    let mut application = bound_application();
+    application.drain_events(MAX_PENDING_EVENTS);
+    application
+        .dispatch(ApplicationCommand::RequestProjectRecovery)
+        .unwrap();
+    let token = recovery_request(&mut application);
+
+    let before_mismatch = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token: token.clone(),
+                completion: OperationCompletion::ProjectRecovered(Box::new(projection(
+                    project_id(4),
+                    dataset_reference('2'),
+                    5,
+                    7,
+                ))),
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::DatasetIdentityMismatch
+    );
+    assert_eq!(application, before_mismatch);
+
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token: token.clone(),
+                completion: OperationCompletion::ProjectRecovered(Box::new(projection(
+                    project_id(8),
+                    dataset_reference('1'),
+                    5,
+                    7,
+                ))),
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::InvalidProjectTransition
+    );
+    assert_eq!(application, before_mismatch);
+
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::ProjectRecovered(Box::new(projection(
+                project_id(4),
+                dataset_reference_at('1', "recovered-location.m4d"),
+                5,
+                7,
+            ))),
+        })
+        .unwrap();
+    let WorkspaceSnapshot::Bound {
+        project,
+        revision,
+        revision_high_water,
+        saved_revision,
+        dirty,
+        ..
+    } = application.snapshot().workspace().clone()
+    else {
+        panic!("workspace was not bound");
+    };
+    assert_eq!(project.dataset(), &dataset_reference('1'));
+    assert_eq!(revision.sequence(), 8);
+    assert_eq!(revision_high_water.sequence(), 8);
+    assert_eq!(saved_revision, None);
+    assert!(dirty);
+}
+
+#[test]
+fn verified_unbound_workspace_can_request_and_admit_a_dirty_recovery() {
+    let mut application = application();
+    verify(&mut application, dataset_reference('1'));
+    application.drain_events(MAX_PENDING_EVENTS);
+    application
+        .dispatch(ApplicationCommand::RequestProjectRecovery)
+        .unwrap();
+    let token = recovery_request(&mut application);
+    assert_eq!(token.project_id(), None);
+
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::ProjectRecovered(Box::new(projection(
+                project_id(9),
+                dataset_reference('1'),
+                4,
+                6,
+            ))),
+        })
+        .unwrap();
+    let WorkspaceSnapshot::Bound {
+        project,
+        revision,
+        saved_revision,
+        dirty,
+        ..
+    } = application.snapshot().workspace().clone()
+    else {
+        panic!("workspace was not bound");
+    };
+    assert_eq!(project.project_id(), project_id(9));
+    assert_eq!(revision.sequence(), 4);
+    assert_eq!(saved_revision, None);
+    assert!(dirty);
+}
+
+#[test]
+fn project_open_can_complete_directly_with_a_dirty_recovery_projection() {
+    let mut application = application_for_project_open('1');
+    let token = project_open_token(&mut application);
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::ProjectRecovered(Box::new(projection(
+                project_id(9),
+                dataset_reference('1'),
+                3,
+                5,
+            ))),
+        })
+        .unwrap();
+
+    let WorkspaceSnapshot::Bound {
+        project,
+        revision,
+        saved_revision,
+        dirty,
+        ..
+    } = application.snapshot().workspace().clone()
+    else {
+        panic!("workspace was not bound");
+    };
+    assert_eq!(project.project_id(), project_id(9));
+    assert_eq!(revision.sequence(), 3);
+    assert_eq!(saved_revision, None);
+    assert!(dirty);
+}
+
+#[test]
+fn source_invalidation_cancels_save_as_and_recovery_operations() {
+    for save_as in [true, false] {
+        let mut application = bound_application();
+        application.drain_events(MAX_PENDING_EVENTS);
+        let expected_kind = if save_as {
+            application
+                .dispatch(ApplicationCommand::RequestProjectSaveAs {
+                    new_project_id: project_id(5),
+                })
+                .unwrap();
+            OperationKind::ProjectSaveAs
+        } else {
+            application
+                .dispatch(ApplicationCommand::RequestProjectRecovery)
+                .unwrap();
+            OperationKind::ProjectRecovery
+        };
+        application.drain_events(MAX_PENDING_EVENTS);
+
+        application
+            .dispatch(ApplicationCommand::InvalidateSourceVerification {
+                source_generation: SourceSessionGeneration::new(1),
+            })
+            .unwrap();
+        assert!(application.snapshot().active_operations().is_empty());
+        assert!(
+            application
+                .drain_events(MAX_PENDING_EVENTS)
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    ApplicationEvent::OperationCancellationRequested { token }
+                        if token.kind() == expected_kind
+                ))
+        );
+    }
+}
+
+#[test]
 fn verified_project_open_restores_revision_and_rejects_another_scientific_identity() {
     let mut application = application();
     let verified = dataset_reference('1');
@@ -1129,6 +1473,16 @@ fn operation_failure_codes_are_closed_over_their_operation_kind() {
             OperationFailureCode::ProjectNotFound,
         ),
         (
+            OperationKind::ProjectSaveAs,
+            OperationFailureCode::ProjectCommitIndeterminate,
+            OperationFailureCode::ProjectNotFound,
+        ),
+        (
+            OperationKind::ProjectRecovery,
+            OperationFailureCode::ProjectReadFailed,
+            OperationFailureCode::ProjectWriteFailed,
+        ),
+        (
             OperationKind::Analysis,
             OperationFailureCode::AnalysisCapacityExceeded,
             OperationFailureCode::ImportCapacityExceeded,
@@ -1149,6 +1503,49 @@ fn operation_failure_codes_are_closed_over_their_operation_kind() {
             kind,
             &OperationCompletion::Failed(rejected)
         ));
+    }
+}
+
+#[test]
+fn typed_project_store_faults_are_admitted_only_by_read_or_mutation_operations() {
+    let mutation_codes = [
+        OperationFailureCode::ProjectReadOnly,
+        OperationFailureCode::ProjectWriterContended,
+        OperationFailureCode::ProjectStaleParent,
+        OperationFailureCode::ProjectDestinationExists,
+        OperationFailureCode::ProjectUnsupportedFilesystem,
+        OperationFailureCode::ProjectCapacityExceeded,
+        OperationFailureCode::ProjectSourceChanged,
+        OperationFailureCode::ProjectDigestMismatch,
+        OperationFailureCode::ProjectCorrupt,
+        OperationFailureCode::ProjectBusy,
+    ];
+    for kind in [OperationKind::ProjectSave, OperationKind::ProjectSaveAs] {
+        for code in mutation_codes {
+            assert!(failure_code_matches_kind(kind, code));
+        }
+    }
+
+    let read_codes = [
+        OperationFailureCode::ProjectCapacityExceeded,
+        OperationFailureCode::ProjectDigestMismatch,
+        OperationFailureCode::ProjectCorrupt,
+        OperationFailureCode::ProjectBusy,
+    ];
+    for kind in [OperationKind::ProjectOpen, OperationKind::ProjectRecovery] {
+        for code in read_codes {
+            assert!(failure_code_matches_kind(kind, code));
+        }
+        for code in [
+            OperationFailureCode::ProjectReadOnly,
+            OperationFailureCode::ProjectWriterContended,
+            OperationFailureCode::ProjectStaleParent,
+            OperationFailureCode::ProjectDestinationExists,
+            OperationFailureCode::ProjectUnsupportedFilesystem,
+            OperationFailureCode::ProjectSourceChanged,
+        ] {
+            assert!(!failure_code_matches_kind(kind, code));
+        }
     }
 }
 
@@ -2189,6 +2586,32 @@ fn save_request(application: &mut ApplicationState) -> (OperationToken, ProjectR
             _ => None,
         })
         .expect("project-save event")
+}
+
+fn save_as_request(
+    application: &mut ApplicationState,
+) -> (OperationToken, Arc<ProjectGenerationProjection>) {
+    application
+        .drain_events(MAX_PENDING_EVENTS)
+        .into_iter()
+        .find_map(|event| match event {
+            ApplicationEvent::ProjectSaveAsRequested { token, projection } => {
+                Some((token, projection))
+            }
+            _ => None,
+        })
+        .expect("project-save-as event")
+}
+
+fn recovery_request(application: &mut ApplicationState) -> OperationToken {
+    application
+        .drain_events(MAX_PENDING_EVENTS)
+        .into_iter()
+        .find_map(|event| match event {
+            ApplicationEvent::ProjectRecoveryRequested { token } => Some(token),
+            _ => None,
+        })
+        .expect("project-recovery event")
 }
 
 fn bound_project_arc(snapshot: &ApplicationSnapshot) -> Arc<ProjectState> {
