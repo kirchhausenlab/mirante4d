@@ -8,6 +8,63 @@ const TEST_INITIAL_RENDER_VIEWPORT_SIDE: u64 = 32;
 
 use super::*;
 
+#[test]
+fn recovery_locator_discovery_is_canonical_bounded_and_content_blind() {
+    let root = tempfile::tempdir().unwrap();
+    let current = ProjectId::from_bytes([1; 16]);
+    let older_a = ProjectId::from_bytes([2; 16]);
+    let older_b = ProjectId::from_bytes([3; 16]);
+    fs::create_dir(root.path().join(format!("{current}.m4dproj"))).unwrap();
+    fs::create_dir(root.path().join(format!("{older_b}.m4dproj"))).unwrap();
+    fs::create_dir(root.path().join(format!("{older_a}.m4dproj"))).unwrap();
+    fs::create_dir(root.path().join("not-a-project.m4dproj")).unwrap();
+    fs::write(
+        root.path()
+            .join(format!("{}.m4dproj", ProjectId::from_bytes([4; 16]))),
+        b"not a directory",
+    )
+    .unwrap();
+
+    let locators = discover_project_recovery_locators(Some(root.path()), current).unwrap();
+    assert_eq!(
+        locators
+            .iter()
+            .map(ProjectRecoveryStoreLocator::project_id)
+            .collect::<Vec<_>>(),
+        vec![older_a, older_b]
+    );
+}
+
+#[test]
+fn recovery_locator_discovery_fails_closed_at_its_exact_capacity() {
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..=PROJECT_RECOVERY_ROOT_ENTRIES_MAX {
+        let mut bytes = [0; 16];
+        bytes[8..].copy_from_slice(&u64::try_from(index + 1).unwrap().to_be_bytes());
+        fs::create_dir(
+            root.path()
+                .join(format!("{}.m4dproj", ProjectId::from_bytes(bytes))),
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        discover_project_recovery_locators(Some(root.path()), ProjectId::from_bytes([0; 16])),
+        Err(ProjectRecoveryDiscoveryError::Capacity)
+    ));
+}
+
+#[test]
+fn recovery_locator_discovery_bounds_noncanonical_root_entries() {
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..=PROJECT_RECOVERY_ROOT_ENTRIES_MAX {
+        fs::write(root.path().join(format!("junk-{index}")), b"junk").unwrap();
+    }
+    assert!(matches!(
+        discover_project_recovery_locators(Some(root.path()), ProjectId::from_bytes([0; 16])),
+        Err(ProjectRecoveryDiscoveryError::Capacity)
+    ));
+}
+
 fn open_dataset_and_render_first_frame(
     path: impl AsRef<std::path::Path>,
 ) -> anyhow::Result<unified_source_open::UnifiedOpenedSource> {
@@ -52,14 +109,26 @@ fn test_workbench_app_without_background_runtime(
         dataset,
         render_runtime,
         ui_runtime,
-        project_runtime: current_runtime::project::CurrentProjectRuntime::unbound(),
         import_runtime: current_runtime::import::CurrentImportRuntime::idle(),
         analysis_runtime,
         validation_runtime: current_runtime::validation::CurrentValidationRuntime {
             product_automation: None,
             test_render_viewport_max_side: None,
         },
-        project_persistence: None,
+        project_store: None,
+        project_recovery_root: None,
+        project_recovery_candidates: Vec::new(),
+        project_recovery_review: None,
+        project_recovery_panel_open: false,
+        pending_recovery_selection: None,
+        pending_project_open_locator: None,
+        pending_dataset_open_path: None,
+        project_status_message: None,
+        close_after_project_save: false,
+        exit_after_project_close: false,
+        restart_project_store_after_close: false,
+        pending_viewport_close: false,
+        pending_source_install: None,
         settings_connection,
         source_open_service: None,
         source_verification_service: None,

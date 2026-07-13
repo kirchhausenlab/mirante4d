@@ -9,9 +9,9 @@
 mod project_store_service;
 
 pub use project_store_service::{
-    MonotonicClock, ProjectStoreApplicationService, ProjectStoreLifecycle,
-    ProjectStoreServiceError, ProjectStoreServiceEvent, ProjectStoreServiceStatus,
-    SystemMonotonicClock,
+    MonotonicClock, ProjectRecoveryStoreLocator, ProjectStoreApplicationService,
+    ProjectStoreLifecycle, ProjectStoreServiceError, ProjectStoreServiceEvent,
+    ProjectStoreServiceStatus, SystemMonotonicClock,
 };
 
 use std::{
@@ -288,6 +288,7 @@ pub struct OperationToken {
     source_session_generation: SourceSessionGeneration,
     project_id: Option<ProjectId>,
     project_revision: Option<ProjectRevisionId>,
+    target_project_id: Option<ProjectId>,
     currentness_generation: CurrentnessGeneration,
 }
 
@@ -318,6 +319,10 @@ impl OperationToken {
 
     pub const fn project_revision(&self) -> Option<ProjectRevisionId> {
         self.project_revision
+    }
+
+    pub const fn target_project_id(&self) -> Option<ProjectId> {
+        self.target_project_id
     }
 
     pub const fn currentness_generation(&self) -> CurrentnessGeneration {
@@ -1256,13 +1261,15 @@ impl ApplicationState {
         command: ApplicationCommand,
         command_kind: ApplicationCommandKind,
     ) -> Result<CommandEffect, ApplicationFaultCode> {
-        let project_replacement_active = self.operations.values().any(|operation| {
+        let durable_project_freeze_active = self.operations.values().any(|operation| {
             matches!(
                 operation.token.kind,
-                OperationKind::ProjectSaveAs | OperationKind::ProjectRecovery
+                OperationKind::DatasetOpen
+                    | OperationKind::ProjectSaveAs
+                    | OperationKind::ProjectRecovery
             )
         });
-        if project_replacement_active && command.mutates_durable_project() {
+        if durable_project_freeze_active && command.mutates_durable_project() {
             return Err(ApplicationFaultCode::OperationConflict);
         }
         match command {
@@ -1467,7 +1474,8 @@ impl ApplicationState {
             .filter_map(|(operation_id, operation)| {
                 matches!(
                     operation.token.kind,
-                    OperationKind::SourceVerification
+                    OperationKind::DatasetOpen
+                        | OperationKind::SourceVerification
                         | OperationKind::ProjectOpen
                         | OperationKind::ProjectSave
                         | OperationKind::ProjectSaveAs
@@ -2068,7 +2076,9 @@ impl ApplicationState {
             .operations
             .get_mut(&token.operation_id)
             .ok_or(ApplicationFaultCode::OperationNotFound)?;
+        operation.token.target_project_id = Some(new_project_id);
         operation.retained_projection = Some(Arc::clone(&projection));
+        let token = operation.token.clone();
         self.push_event(ApplicationEvent::ProjectSaveAsRequested { token, projection })?;
         Ok(CommandEffect::Changed)
     }
@@ -2140,6 +2150,7 @@ impl ApplicationState {
             source_session_generation: self.source_generation,
             project_id,
             project_revision,
+            target_project_id: None,
             currentness_generation: self.currentness,
         };
         self.operations.insert(

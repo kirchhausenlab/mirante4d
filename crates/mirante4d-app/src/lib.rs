@@ -1,6 +1,7 @@
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::{
+    fs, io,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -15,7 +16,6 @@ mod cross_section_readout;
 mod cross_section_runtime;
 mod cross_section_scheduler;
 mod current_egui_shell_bridge;
-mod current_project_persistence_bridge;
 mod current_runtime;
 mod current_settings_connection;
 mod current_source_open_service;
@@ -106,8 +106,9 @@ use mirante4d_application::{AnalysisTableDescriptor, AnalysisTableId};
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, ApplicationFault, ApplicationFaultCode,
     ApplicationSnapshot, ApplicationState, CommandEffect, OperationCompletion,
-    OperationFailureCode, OperationKind, OperationToken, SourceSessionGeneration,
-    SourceVerificationSnapshot, WorkspaceSnapshot,
+    OperationFailureCode, OperationKind, OperationToken, ProjectRecoveryStoreLocator,
+    ProjectStoreApplicationService, ProjectStoreLifecycle, ProjectStoreServiceEvent,
+    SourceSessionGeneration, SourceVerificationSnapshot, SystemMonotonicClock, WorkspaceSnapshot,
 };
 use mirante4d_dataset::DatasetSourceId;
 use mirante4d_domain::{
@@ -122,7 +123,11 @@ use mirante4d_import::{
     ImportCancellationToken, ImportError, TiffDirectoryImportReport, TiffImportSource,
     TiffSourceImportOptions, import_tiff_source_with_progress,
 };
-use mirante4d_project_model::{ChannelPreset, LayerViewState, ViewState};
+use mirante4d_project_model::{ChannelPreset, LayerViewState, ProjectId, ViewState};
+use mirante4d_project_store::{
+    ProjectGenerationId, ProjectOpenMode, ProjectRecoveryCandidate, ProjectStoreConfig,
+    ProjectStoreFault, ProjectStorePath,
+};
 use mirante4d_render_api::PresentationViewport;
 use mirante4d_renderer::gpu::{GpuDisplayFrame, GpuRenderer};
 #[cfg(test)]
@@ -173,6 +178,7 @@ const DEFAULT_DVR_OPACITY_GAMMA: f32 = 0.25;
 const CROSS_SECTION_FAST_SLICE_MULTIPLIER: f64 = 10.0;
 const CROSS_SECTION_ROTATE_RADIANS_PER_POINT: f64 = 0.005;
 const MIB: u64 = 1024 * 1024;
+const PROJECT_RECOVERY_ROOT_ENTRIES_MAX: usize = 64;
 
 fn bytes_to_mib_rounded(bytes: u64) -> u64 {
     (bytes.saturating_add(MIB / 2) / MIB).max(1)
@@ -191,39 +197,203 @@ fn application_view(snapshot: &ApplicationSnapshot) -> &ViewState {
 
 fn project_failure_code(
     operation: OperationKind,
-    error: &current_project_persistence_bridge::ProjectPersistenceError,
+    fault: &ProjectStoreFault,
 ) -> OperationFailureCode {
-    use current_project_persistence_bridge::ProjectPersistenceError as Error;
-    match error {
-        Error::UnsupportedSchema | Error::UnsupportedSchemaVersion => {
-            OperationFailureCode::ProjectUnsupportedSchema
+    match fault {
+        ProjectStoreFault::ReadOnly => OperationFailureCode::ProjectReadOnly,
+        ProjectStoreFault::WriterContended => OperationFailureCode::ProjectWriterContended,
+        ProjectStoreFault::StaleParent => OperationFailureCode::ProjectStaleParent,
+        ProjectStoreFault::DestinationExists => OperationFailureCode::ProjectDestinationExists,
+        ProjectStoreFault::UnsupportedFilesystem => {
+            OperationFailureCode::ProjectUnsupportedFilesystem
         }
-        Error::InvalidDocument { .. }
-        | Error::InvalidValue { .. }
-        | Error::ExistingTargetRejected { .. }
-        | Error::ReadbackMismatch
-        | Error::UnsafeSymlink
-        | Error::DocumentTooLarge { .. } => OperationFailureCode::ProjectInvalidDocument,
-        Error::CommitIndeterminate { .. } => OperationFailureCode::ProjectCommitIndeterminate,
-        Error::PreCommitIo { kind, .. } if *kind == std::io::ErrorKind::PermissionDenied => {
-            OperationFailureCode::ProjectPermissionDenied
+        ProjectStoreFault::Capacity { .. } => OperationFailureCode::ProjectCapacityExceeded,
+        ProjectStoreFault::SourceChanged => OperationFailureCode::ProjectSourceChanged,
+        ProjectStoreFault::DigestMismatch => OperationFailureCode::ProjectDigestMismatch,
+        ProjectStoreFault::Corruption { .. } | ProjectStoreFault::ConfirmationRequired => {
+            OperationFailureCode::ProjectCorrupt
         }
-        Error::PreCommitIo { kind, .. }
-            if *kind == std::io::ErrorKind::NotFound && operation == OperationKind::ProjectOpen =>
-        {
-            OperationFailureCode::ProjectNotFound
-        }
-        Error::PreCommitIo { .. }
-        | Error::ActorQueueFull
-        | Error::ActorUnavailable
-        | Error::ActorThreadPanicked
-        | Error::DuplicateOperationToken
-        | Error::UnknownOperationToken
-        | Error::ProjectPathUnavailable => match operation {
-            OperationKind::ProjectOpen => OperationFailureCode::ProjectReadFailed,
+        ProjectStoreFault::QueueFull { .. } => OperationFailureCode::ProjectBusy,
+        ProjectStoreFault::Cancelled => match operation {
+            OperationKind::ProjectOpen | OperationKind::ProjectRecovery => {
+                OperationFailureCode::ProjectReadFailed
+            }
             _ => OperationFailureCode::ProjectWriteFailed,
         },
+        ProjectStoreFault::CommitIndeterminate => OperationFailureCode::ProjectCommitIndeterminate,
     }
+}
+
+fn project_service_error_fault(
+    error: mirante4d_application::ProjectStoreServiceError,
+) -> ProjectStoreFault {
+    match error {
+        mirante4d_application::ProjectStoreServiceError::Store(fault) => fault,
+        mirante4d_application::ProjectStoreServiceError::ReadOnly => ProjectStoreFault::ReadOnly,
+        mirante4d_application::ProjectStoreServiceError::WritesSuspended => {
+            ProjectStoreFault::CommitIndeterminate
+        }
+        mirante4d_application::ProjectStoreServiceError::RecoveryCandidateUnavailable
+        | mirante4d_application::ProjectStoreServiceError::InvalidProjection
+        | mirante4d_application::ProjectStoreServiceError::InvalidApplicationSnapshot
+        | mirante4d_application::ProjectStoreServiceError::InvalidOperationToken
+        | mirante4d_application::ProjectStoreServiceError::ProjectMismatch
+        | mirante4d_application::ProjectStoreServiceError::UnexpectedCompletion => {
+            ProjectStoreFault::Corruption {
+                stage: "application_service",
+            }
+        }
+        mirante4d_application::ProjectStoreServiceError::OperationConflict
+        | mirante4d_application::ProjectStoreServiceError::Closing => {
+            ProjectStoreFault::QueueFull {
+                queue: "application_service",
+            }
+        }
+        mirante4d_application::ProjectStoreServiceError::SaveAsRequired => {
+            ProjectStoreFault::ReadOnly
+        }
+        mirante4d_application::ProjectStoreServiceError::ClockRegressed { .. }
+        | mirante4d_application::ProjectStoreServiceError::ClockOverflow
+        | mirante4d_application::ProjectStoreServiceError::RequestIdOverflow
+        | mirante4d_application::ProjectStoreServiceError::ActorPanicked => {
+            ProjectStoreFault::Corruption {
+                stage: "application_service_runtime",
+            }
+        }
+    }
+}
+
+struct ProjectRecoveryReview {
+    token: OperationToken,
+    automatic_newer: ProjectGenerationId,
+}
+
+#[derive(Debug)]
+enum ProjectRecoveryDiscoveryError {
+    Io(io::ErrorKind),
+    Capacity,
+    InvalidPath(ProjectStoreFault),
+}
+
+impl std::fmt::Display for ProjectRecoveryDiscoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(kind) => write!(formatter, "recovery directory I/O failed: {kind:?}"),
+            Self::Capacity => formatter.write_str("too many recovery-root entries"),
+            Self::InvalidPath(fault) => write!(formatter, "invalid recovery path: {fault}"),
+        }
+    }
+}
+
+struct PendingSourceInstall {
+    token: OperationToken,
+    runtime: current_source_open_service::CurrentSourceRuntimeTransfer,
+    completion: OperationCompletion,
+}
+
+fn initialize_project_recovery_root() -> Option<PathBuf> {
+    let state_root = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".local").join("state"))
+        })?;
+    let recovery_root = state_root.join("mirante4d").join("recovery");
+    match fs::create_dir_all(&recovery_root) {
+        Ok(()) => Some(recovery_root),
+        Err(error) => {
+            tracing::warn!(kind = ?error.kind(), "project recovery area is unavailable");
+            None
+        }
+    }
+}
+
+fn discover_project_recovery_locators(
+    recovery_root: Option<&Path>,
+    current_project_id: ProjectId,
+) -> Result<Vec<ProjectRecoveryStoreLocator>, ProjectRecoveryDiscoveryError> {
+    let Some(recovery_root) = recovery_root else {
+        return Ok(Vec::new());
+    };
+    let entries = fs::read_dir(recovery_root)
+        .map_err(|error| ProjectRecoveryDiscoveryError::Io(error.kind()))?;
+    let mut locators = Vec::new();
+    for (entry_index, entry) in entries.enumerate() {
+        if entry_index >= PROJECT_RECOVERY_ROOT_ENTRIES_MAX {
+            return Err(ProjectRecoveryDiscoveryError::Capacity);
+        }
+        let entry = entry.map_err(|error| ProjectRecoveryDiscoveryError::Io(error.kind()))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| ProjectRecoveryDiscoveryError::Io(error.kind()))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(project_id) = name
+            .strip_suffix(".m4dproj")
+            .and_then(|value| ProjectId::parse(value).ok())
+        else {
+            continue;
+        };
+        if project_id == current_project_id {
+            continue;
+        }
+        let path = ProjectStorePath::new(entry.path())
+            .map_err(ProjectRecoveryDiscoveryError::InvalidPath)?;
+        let locator = ProjectRecoveryStoreLocator::new(project_id, path).map_err(|_| {
+            ProjectRecoveryDiscoveryError::InvalidPath(ProjectStoreFault::Corruption {
+                stage: "recovery_locator",
+            })
+        })?;
+        locators.push(locator);
+    }
+    locators.sort_by_key(ProjectRecoveryStoreLocator::project_id);
+    Ok(locators)
+}
+
+fn start_project_store_service(
+    recovery_root: Option<&Path>,
+    provisional_project_id: ProjectId,
+) -> Result<
+    (
+        ProjectStoreApplicationService<SystemMonotonicClock>,
+        Option<String>,
+    ),
+    ProjectStoreFault,
+> {
+    let provisional_destination = recovery_root
+        .map(|root| root.join(format!("{provisional_project_id}.m4dproj")))
+        .map(ProjectStorePath::new)
+        .transpose()?;
+    let (recovery_store_locators, warning) =
+        match discover_project_recovery_locators(recovery_root, provisional_project_id) {
+            Ok(locators) => (locators, None),
+            Err(error) => {
+                tracing::warn!(%error, "project recovery discovery failed");
+                (
+                    Vec::new(),
+                    Some(format!("Project recovery discovery failed: {error}")),
+                )
+            }
+        };
+    let service = ProjectStoreApplicationService::start_with_recovery_locators(
+        ProjectStoreConfig::default(),
+        SystemMonotonicClock::new(),
+        provisional_destination,
+        recovery_store_locators,
+    )
+    .map_err(|error| match error {
+        mirante4d_application::ProjectStoreServiceError::Store(fault) => fault,
+        _ => ProjectStoreFault::Corruption {
+            stage: "application_service_start",
+        },
+    })?;
+    Ok((service, warning))
 }
 
 pub struct MiranteWorkbenchApp {
@@ -232,12 +402,23 @@ pub struct MiranteWorkbenchApp {
     dataset: dataset_requests::DatasetDemandState,
     render_runtime: current_runtime::render::CurrentRenderRuntime,
     ui_runtime: current_runtime::ui::CurrentUiRuntime,
-    project_runtime: current_runtime::project::CurrentProjectRuntime,
     import_runtime: current_runtime::import::CurrentImportRuntime,
     analysis_runtime: current_runtime::analysis::CurrentAnalysisRuntime,
     validation_runtime: current_runtime::validation::CurrentValidationRuntime,
-    project_persistence:
-        Option<current_project_persistence_bridge::CurrentProjectPersistenceBridge>,
+    project_store: Option<ProjectStoreApplicationService<SystemMonotonicClock>>,
+    project_recovery_root: Option<PathBuf>,
+    project_recovery_candidates: Vec<ProjectRecoveryCandidate>,
+    project_recovery_review: Option<ProjectRecoveryReview>,
+    project_recovery_panel_open: bool,
+    pending_recovery_selection: Option<ProjectGenerationId>,
+    pending_project_open_locator: Option<ProjectId>,
+    pending_dataset_open_path: Option<PathBuf>,
+    project_status_message: Option<String>,
+    close_after_project_save: bool,
+    exit_after_project_close: bool,
+    restart_project_store_after_close: bool,
+    pending_viewport_close: bool,
+    pending_source_install: Option<PendingSourceInstall>,
     settings_connection: current_settings_connection::CurrentSettingsConnection,
     source_open_service: Option<current_source_open_service::CurrentSourceOpenService>,
     source_verification_service:
@@ -277,6 +458,7 @@ impl MiranteWorkbenchApp {
             mut render_runtime,
             analysis_runtime,
         } = opened;
+        let provisional_project_id = workspace.provisional_project_id();
         let application = ApplicationState::new_unbound(
             SourceSessionGeneration::new(1),
             catalog.as_ref().clone(),
@@ -305,20 +487,34 @@ impl MiranteWorkbenchApp {
         render_runtime.gpu_renderer = Some(Arc::clone(&gpu_renderer));
         let ui_runtime =
             current_runtime::ui::CurrentUiRuntime::new(resource_policy, wgpu_texture_renderer);
+        let project_recovery_root = initialize_project_recovery_root();
+        let (project_store, project_status_message) =
+            start_project_store_service(project_recovery_root.as_deref(), provisional_project_id)?;
+        let project_store = Some(project_store);
         let mut app = Self {
             application,
             startup_diagnostics,
             dataset,
             render_runtime,
             ui_runtime,
-            project_runtime: current_runtime::project::CurrentProjectRuntime::unbound(),
             import_runtime: current_runtime::import::CurrentImportRuntime::idle(),
             analysis_runtime,
             validation_runtime:
                 current_runtime::validation::CurrentValidationRuntime::from_environment(),
-            project_persistence: Some(
-                current_project_persistence_bridge::CurrentProjectPersistenceBridge::spawn()?,
-            ),
+            project_store,
+            project_recovery_root,
+            project_recovery_candidates: Vec::new(),
+            project_recovery_review: None,
+            project_recovery_panel_open: false,
+            pending_recovery_selection: None,
+            pending_project_open_locator: None,
+            pending_dataset_open_path: None,
+            project_status_message,
+            close_after_project_save: false,
+            exit_after_project_close: false,
+            restart_project_store_after_close: false,
+            pending_viewport_close: false,
+            pending_source_install: None,
             settings_connection,
             source_open_service: Some(current_source_open_service::CurrentSourceOpenService::new()),
             source_verification_service: Some(
@@ -467,7 +663,7 @@ impl MiranteWorkbenchApp {
             // terminal actor result from retiring its operation.
             self.poll_source_open_service();
             self.poll_source_verification_service();
-            self.poll_project_persistence();
+            self.poll_project_store();
             self.try_start_pending_automatic_source_verification();
             if events.is_empty()
                 && !had_completion_commands
@@ -481,76 +677,238 @@ impl MiranteWorkbenchApp {
     fn observe_project_application_event(&mut self, event: &ApplicationEvent) {
         match event {
             ApplicationEvent::ProjectOpenRequested { token } => {
+                let request = if let Some(project_id) = self.pending_project_open_locator.take() {
+                    self.project_store
+                        .as_mut()
+                        .ok_or(ProjectStoreFault::Corruption {
+                            stage: "application_service_unavailable",
+                        })
+                        .and_then(|service| {
+                            service
+                                .submit_open_recovery_store(
+                                    token.clone(),
+                                    project_id,
+                                    ProjectOpenMode::PreferWritable,
+                                )
+                                .map_err(project_service_error_fault)
+                        })
+                } else {
+                    let Some(path) = rfd::FileDialog::new()
+                        .set_title("Open Mirante4D project package")
+                        .pick_folder()
+                    else {
+                        self.complete_project_operation(
+                            token.clone(),
+                            OperationCompletion::Cancelled,
+                        );
+                        return;
+                    };
+                    let path = match ProjectStorePath::new(path) {
+                        Ok(path) => path,
+                        Err(fault) => {
+                            self.complete_project_fault(token.clone(), fault);
+                            return;
+                        }
+                    };
+                    self.project_store
+                        .as_mut()
+                        .ok_or(ProjectStoreFault::Corruption {
+                            stage: "application_service_unavailable",
+                        })
+                        .and_then(|service| {
+                            service
+                                .submit_open(token.clone(), path, ProjectOpenMode::PreferWritable)
+                                .map_err(project_service_error_fault)
+                        })
+                };
+                if let Err(fault) = request {
+                    self.complete_project_fault(token.clone(), fault);
+                }
+            }
+            ApplicationEvent::ProjectSaveRequested { token, projection } => {
+                let needs_destination = self.project_store.as_ref().is_some_and(|service| {
+                    matches!(
+                        service.status().lifecycle(),
+                        ProjectStoreLifecycle::Unbound | ProjectStoreLifecycle::Provisional
+                    )
+                });
+                let initial_destination = if needs_destination {
+                    let Some(path) = rfd::FileDialog::new()
+                        .set_title("Save Mirante4D project package")
+                        .add_filter("Mirante4D project", &["m4dproj"])
+                        .set_file_name("project.m4dproj")
+                        .save_file()
+                    else {
+                        self.complete_project_operation(
+                            token.clone(),
+                            OperationCompletion::Cancelled,
+                        );
+                        return;
+                    };
+                    match ProjectStorePath::new(path) {
+                        Ok(path) => Some(path),
+                        Err(fault) => {
+                            self.complete_project_fault(token.clone(), fault);
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let request = self
+                    .project_store
+                    .as_mut()
+                    .ok_or(ProjectStoreFault::Corruption {
+                        stage: "application_service_unavailable",
+                    })
+                    .and_then(|service| {
+                        service
+                            .submit_save(
+                                token.clone(),
+                                projection.as_ref().clone(),
+                                initial_destination,
+                                Vec::new(),
+                            )
+                            .map_err(project_service_error_fault)
+                    });
+                if let Err(fault) = request {
+                    self.complete_project_fault(token.clone(), fault);
+                }
+            }
+            ApplicationEvent::ProjectSaveAsRequested { token, projection } => {
                 let Some(path) = rfd::FileDialog::new()
-                    .set_title("Open Mirante4D project package")
-                    .pick_folder()
+                    .set_title("Save Mirante4D project package as")
+                    .add_filter("Mirante4D project", &["m4dproj"])
+                    .set_file_name("project.m4dproj")
+                    .save_file()
                 else {
                     self.complete_project_operation(token.clone(), OperationCompletion::Cancelled);
                     return;
                 };
+                let path = match ProjectStorePath::new(path) {
+                    Ok(path) => path,
+                    Err(fault) => {
+                        self.complete_project_fault(token.clone(), fault);
+                        return;
+                    }
+                };
                 let request = self
-                    .project_persistence
-                    .as_ref()
-                    .ok_or(
-                        current_project_persistence_bridge::ProjectPersistenceError::ActorUnavailable,
-                    )
-                    .and_then(|bridge| bridge.request_open(token.clone(), path));
-                if let Err(error) = request {
-                    self.complete_project_operation(
-                        token.clone(),
-                        OperationCompletion::Failed(project_failure_code(token.kind(), &error)),
-                    );
+                    .project_store
+                    .as_mut()
+                    .ok_or(ProjectStoreFault::Corruption {
+                        stage: "application_service_unavailable",
+                    })
+                    .and_then(|service| {
+                        service
+                            .submit_save_as(
+                                &current_egui_shell_bridge::snapshot(&self.application),
+                                token.clone(),
+                                path,
+                                projection.as_ref().clone(),
+                                Vec::new(),
+                            )
+                            .map_err(project_service_error_fault)
+                    });
+                if let Err(fault) = request {
+                    self.complete_project_fault(token.clone(), fault);
                 }
             }
-            ApplicationEvent::ProjectSaveRequested { token, projection } => {
-                let path = self
-                    .project_runtime
-                    .current_project_path
-                    .clone()
-                    .or_else(|| {
-                        rfd::FileDialog::new()
-                            .set_title("Save Mirante4D project package")
-                            .add_filter("Mirante4D project", &["m4dproj"])
-                            .set_file_name("project.m4dproj")
-                            .save_file()
-                    });
-                let Some(path) = path else {
+            ApplicationEvent::ProjectRecoveryRequested { token } => {
+                let Some(generation_id) = self.pending_recovery_selection.take() else {
                     self.complete_project_operation(token.clone(), OperationCompletion::Cancelled);
                     return;
                 };
                 let request = self
-                    .project_persistence
-                    .as_ref()
-                    .ok_or(
-                        current_project_persistence_bridge::ProjectPersistenceError::ActorUnavailable,
-                    )
-                    .and_then(|bridge| {
-                        bridge.request_save(token.clone(), path, Arc::clone(projection))
+                    .project_store
+                    .as_mut()
+                    .ok_or(ProjectStoreFault::Corruption {
+                        stage: "application_service_unavailable",
+                    })
+                    .and_then(|service| {
+                        service
+                            .submit_open_recovery(token.clone(), generation_id)
+                            .map_err(project_service_error_fault)
                     });
-                if let Err(error) = request {
-                    self.complete_project_operation(
-                        token.clone(),
-                        OperationCompletion::Failed(project_failure_code(token.kind(), &error)),
-                    );
+                if let Err(fault) = request {
+                    self.complete_project_fault(token.clone(), fault);
                 }
             }
             ApplicationEvent::OperationCancellationRequested { token }
                 if matches!(
                     token.kind(),
-                    OperationKind::ProjectOpen | OperationKind::ProjectSave
+                    OperationKind::ProjectOpen
+                        | OperationKind::ProjectSave
+                        | OperationKind::ProjectSaveAs
+                        | OperationKind::ProjectRecovery
                 ) =>
             {
-                if let Some(bridge) = self.project_persistence.as_ref() {
-                    match bridge.cancel(token.clone()) {
-                        Ok(())
-                        | Err(
-                            current_project_persistence_bridge::ProjectPersistenceError::UnknownOperationToken,
-                        ) => {}
-                        Err(error) => {
-                            tracing::warn!(%error, "project cancellation request failed");
+                let pending_cancel = self.project_store.as_mut().and_then(|service| match service
+                    .cancel_operation(token.operation_id())
+                {
+                    Ok(_) => None,
+                    Err(mirante4d_application::ProjectStoreServiceError::OperationConflict) => {
+                        match service.cancel_pending_open(token.operation_id()) {
+                            Ok(event) => Some(Ok(event)),
+                            Err(error) => Some(Err(error)),
                         }
                     }
+                    Err(error) => Some(Err(error)),
+                });
+                match pending_cancel {
+                    Some(Ok(event)) => {
+                        self.restart_project_store_after_close = true;
+                        self.handle_project_store_event(event);
+                    }
+                    Some(Err(error)) => {
+                        tracing::warn!(?error, "project cancellation request failed");
+                    }
+                    None => {}
                 }
+            }
+            ApplicationEvent::ProjectSaved { .. } | ApplicationEvent::ProjectSavedAs { .. }
+                if self.close_after_project_save =>
+            {
+                if self.project_dirty() {
+                    self.close_after_project_save = false;
+                    self.ui_runtime.close_prompt_open = true;
+                    self.project_status_message =
+                        Some("Project changed while saving; save again before closing.".to_owned());
+                } else {
+                    self.close_after_project_save = false;
+                    if let Some(path) = self.pending_dataset_open_path.take() {
+                        self.ui_runtime.close_prompt_open = false;
+                        if let Err(error) = self.replace_state_from_dataset_path(path, None) {
+                            self.project_status_message =
+                                Some(format!("Dataset open could not start: {error}"));
+                        }
+                    } else {
+                        self.request_project_store_close_for_exit();
+                    }
+                }
+            }
+            ApplicationEvent::OperationCompleted { token, outcome }
+                if self.close_after_project_save
+                    && matches!(
+                        token.kind(),
+                        OperationKind::ProjectSave | OperationKind::ProjectSaveAs
+                    )
+                    && matches!(
+                        outcome,
+                        mirante4d_application::OperationOutcome::Cancelled
+                            | mirante4d_application::OperationOutcome::Failed(_)
+                    ) =>
+            {
+                self.close_after_project_save = false;
+                self.ui_runtime.close_prompt_open = true;
+            }
+            ApplicationEvent::CurrentSourceReplaced { .. } => {
+                self.project_recovery_candidates.clear();
+                self.project_recovery_review = None;
+                self.project_recovery_panel_open = false;
+                self.pending_recovery_selection = None;
+                self.pending_project_open_locator = None;
+                self.pending_dataset_open_path = None;
+                self.project_status_message = None;
             }
             _ => {}
         }
@@ -693,6 +1051,57 @@ impl MiranteWorkbenchApp {
         }
     }
 
+    fn complete_project_store_operation(
+        &mut self,
+        token: OperationToken,
+        completion: OperationCompletion,
+    ) -> bool {
+        if self.complete_project_operation(token, completion) {
+            return true;
+        }
+        self.project_status_message = Some(
+            "Project storage completed after its application request became stale. Further project I/O is disabled until the application is reopened."
+                .to_owned(),
+        );
+        if matches!(
+            current_egui_shell_bridge::snapshot(&self.application).workspace(),
+            WorkspaceSnapshot::Unbound { .. }
+        ) {
+            self.request_project_store_restart();
+            return false;
+        }
+        let close_error = self.project_store.as_mut().and_then(|service| {
+            (!matches!(
+                service.status().lifecycle(),
+                ProjectStoreLifecycle::Closing | ProjectStoreLifecycle::Closed
+            ))
+            .then(|| service.close().err())
+            .flatten()
+        });
+        if let Some(error) = close_error {
+            tracing::error!(?error, "failed to close incoherent project-store service");
+        }
+        false
+    }
+
+    fn complete_project_store_fault(
+        &mut self,
+        token: OperationToken,
+        fault: ProjectStoreFault,
+    ) -> bool {
+        let completion = if fault == ProjectStoreFault::Cancelled {
+            OperationCompletion::Cancelled
+        } else {
+            OperationCompletion::Failed(project_failure_code(token.kind(), &fault))
+        };
+        if self.complete_project_store_operation(token, completion) {
+            self.project_status_message = Some(format!("Project operation failed: {fault}"));
+            true
+        } else {
+            false
+        }
+    }
+
     fn begin_background_operation(&mut self, kind: OperationKind) -> Option<OperationToken> {
         let before = current_egui_shell_bridge::snapshot(&self.application)
             .active_operations()
@@ -744,88 +1153,210 @@ impl MiranteWorkbenchApp {
         }
     }
 
-    fn poll_project_persistence(&mut self) {
-        loop {
-            let event = match self
-                .project_persistence
-                .as_ref()
-                .map(|bridge| bridge.try_recv())
-            {
-                None | Some(Ok(None)) => break,
-                Some(Ok(Some(event))) => event,
-                Some(Err(error)) => {
-                    tracing::error!(%error, "project persistence actor failed");
-                    let tokens = current_egui_shell_bridge::snapshot(&self.application)
-                        .active_operations()
-                        .iter()
-                        .filter(|token| {
-                            matches!(
-                                token.kind(),
-                                OperationKind::ProjectOpen | OperationKind::ProjectSave
-                            )
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    for token in tokens {
-                        let code = project_failure_code(token.kind(), &error);
-                        self.complete_project_operation(token, OperationCompletion::Failed(code));
-                    }
-                    if let Some(bridge) = self.project_persistence.take()
-                        && let Err(shutdown_error) = bridge.shutdown()
-                    {
-                        tracing::warn!(%shutdown_error, "failed to join unavailable project actor");
-                    }
-                    break;
+    fn poll_project_store(&mut self) {
+        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let result = self
+            .project_store
+            .as_mut()
+            .map(|service| service.drive(&snapshot, |_| Ok(Vec::new())));
+        let events = match result {
+            None => return,
+            Some(Ok(events)) => events,
+            Some(Err(error)) => {
+                tracing::error!(?error, "project-store service failed");
+                self.project_status_message = Some(format!("Project storage failed: {error:?}"));
+                return;
+            }
+        };
+        for event in events {
+            self.handle_project_store_event(event);
+        }
+    }
+
+    fn handle_project_store_event(&mut self, event: ProjectStoreServiceEvent) {
+        match event {
+            ProjectStoreServiceEvent::Opened {
+                token,
+                projection,
+                candidates,
+                opens_dirty,
+            } => {
+                let completion = if opens_dirty {
+                    OperationCompletion::ProjectRecovered(projection)
+                } else {
+                    OperationCompletion::ProjectOpened(projection)
+                };
+                if !self.complete_project_store_operation(token, completion) {
+                    return;
                 }
-            };
-            match event {
-                current_project_persistence_bridge::ProjectPersistenceEvent::OpenCompleted {
+                self.project_recovery_candidates = candidates;
+                self.project_recovery_review = None;
+                self.project_status_message = Some(if opens_dirty {
+                    "Opened provisional recovery as an unsaved project.".to_owned()
+                } else {
+                    "Project opened.".to_owned()
+                });
+            }
+            ProjectStoreServiceEvent::RecoveryReviewRequired {
+                token,
+                candidates,
+                automatic_newer,
+            } => {
+                self.project_recovery_candidates = candidates;
+                self.project_recovery_review = Some(ProjectRecoveryReview {
                     token,
-                    path,
-                    result,
-                } => match result {
-                    Ok(projection) => {
-                        if self.complete_project_operation(
-                            token,
-                            OperationCompletion::ProjectOpened(projection),
-                        ) {
-                            self.project_runtime.current_project_path = Some(path);
+                    automatic_newer,
+                });
+                self.project_status_message =
+                    Some("A newer same-project autosave is available.".to_owned());
+            }
+            ProjectStoreServiceEvent::OpenFailed {
+                token,
+                fault,
+                candidates,
+            } => {
+                let restart_needed = candidates.is_empty()
+                    && self
+                        .project_store
+                        .as_ref()
+                        .is_some_and(|service| !service.can_open());
+                self.project_recovery_candidates = candidates;
+                self.project_recovery_panel_open = !self.project_recovery_candidates.is_empty();
+                if self.complete_project_store_fault(token, fault) && restart_needed {
+                    self.request_project_store_restart();
+                }
+            }
+            ProjectStoreServiceEvent::Created {
+                token,
+                saved_revision,
+            } => {
+                if !self.complete_project_store_operation(
+                    token,
+                    OperationCompletion::ProjectSaved(saved_revision),
+                ) {
+                    return;
+                }
+                self.project_recovery_candidates.clear();
+                self.project_recovery_panel_open = false;
+                self.project_status_message = Some("Project saved.".to_owned());
+            }
+            ProjectStoreServiceEvent::ManualSaved { token, receipt } => {
+                if !self.complete_project_store_operation(
+                    token,
+                    OperationCompletion::ProjectSaved(receipt.captured_revision()),
+                ) {
+                    return;
+                }
+                self.project_recovery_candidates.clear();
+                self.project_recovery_panel_open = false;
+                self.project_status_message = Some("Project saved.".to_owned());
+            }
+            ProjectStoreServiceEvent::SavedAs {
+                token,
+                projection,
+                receipt: _,
+            } => {
+                if !self.complete_project_store_operation(
+                    token,
+                    OperationCompletion::ProjectSavedAs(projection),
+                ) {
+                    return;
+                }
+                self.project_recovery_candidates.clear();
+                self.project_recovery_panel_open = false;
+                self.project_status_message = Some("Project saved as a new project.".to_owned());
+            }
+            ProjectStoreServiceEvent::RecoveryCandidatesListed { candidates } => {
+                self.project_recovery_candidates = candidates;
+            }
+            ProjectStoreServiceEvent::RecoveryInspectionFailed { fault } => {
+                self.project_status_message = Some(format!("Recovery inspection failed: {fault}"));
+            }
+            ProjectStoreServiceEvent::RecoveryOpened {
+                token,
+                generation_id: _,
+                projection,
+            } => {
+                if !self.complete_project_store_operation(
+                    token,
+                    OperationCompletion::ProjectRecovered(projection),
+                ) {
+                    return;
+                }
+                self.project_recovery_review = None;
+                self.project_recovery_panel_open = false;
+                self.project_status_message =
+                    Some("Recovery opened as an unsaved Save-As-only project.".to_owned());
+            }
+            ProjectStoreServiceEvent::RecoverySelectionFailed {
+                token,
+                fault,
+                normal_open_still_available,
+            } => {
+                if normal_open_still_available {
+                    self.project_status_message =
+                        Some(format!("Recovery selection failed: {fault}"));
+                } else {
+                    self.complete_project_store_fault(token, fault);
+                }
+            }
+            ProjectStoreServiceEvent::OperationFailed { token, fault } => {
+                self.complete_project_store_fault(token, fault);
+            }
+            ProjectStoreServiceEvent::AutosaveSubmitted { .. } => {
+                self.project_status_message = Some("Autosaving project…".to_owned());
+            }
+            ProjectStoreServiceEvent::AutosaveFinished { result, .. } => match result {
+                Ok(_) => {
+                    self.project_status_message = Some("Project autosaved.".to_owned());
+                }
+                Err(fault) => {
+                    self.project_status_message = Some(format!("Autosave failed: {fault}"));
+                }
+            },
+            ProjectStoreServiceEvent::CancellationAcknowledged { .. } => {}
+            ProjectStoreServiceEvent::Closed { result, .. } => {
+                let close_succeeded = result.is_ok();
+                if let Err(fault) = result {
+                    tracing::warn!(%fault, "project-store close reported a failure");
+                }
+                if let Some(service) = self.project_store.take()
+                    && let Err(error) = service.join()
+                {
+                    tracing::warn!(?error, "project-store actor join failed");
+                }
+                if self.exit_after_project_close {
+                    self.exit_after_project_close = false;
+                    self.restart_project_store_after_close = false;
+                    if let Some(pending) = self.pending_source_install.take() {
+                        if let Err(error) = pending.runtime.dataset.request_shutdown() {
+                            tracing::warn!(%error, "prepared dataset shutdown before exit failed");
                         }
+                        std::thread::spawn(move || drop(pending.runtime));
                     }
-                    Err(error) => {
-                        self.complete_project_operation(
-                            token.clone(),
-                            OperationCompletion::Failed(project_failure_code(token.kind(), &error)),
-                        );
-                    }
-                },
-                current_project_persistence_bridge::ProjectPersistenceEvent::SaveCompleted {
-                    token,
-                    path,
-                    result,
-                } => match result {
-                    Ok(revision) => {
-                        if self.complete_project_operation(
-                            token,
-                            OperationCompletion::ProjectSaved(revision),
-                        ) {
-                            self.project_runtime.current_project_path = Some(path);
-                        }
-                    }
-                    Err(error) => {
-                        self.complete_project_operation(
-                            token.clone(),
-                            OperationCompletion::Failed(project_failure_code(token.kind(), &error)),
-                        );
-                    }
-                },
-                current_project_persistence_bridge::ProjectPersistenceEvent::Cancelled {
-                    token,
-                } => {
-                    self.complete_project_operation(token, OperationCompletion::Cancelled);
+                    self.pending_viewport_close = true;
+                } else if self.pending_source_install.is_some() && close_succeeded {
+                    self.finish_pending_source_install();
+                } else if self.pending_source_install.is_some() {
+                    self.abort_pending_source_install(
+                        "The current project could not close; the new dataset was not installed.",
+                    );
+                } else if self.restart_project_store_after_close {
+                    self.restart_project_store_after_close = false;
+                    self.restart_unbound_project_store();
                 }
             }
         }
+    }
+
+    fn complete_project_fault(&mut self, token: OperationToken, fault: ProjectStoreFault) {
+        let completion = if fault == ProjectStoreFault::Cancelled {
+            OperationCompletion::Cancelled
+        } else {
+            OperationCompletion::Failed(project_failure_code(token.kind(), &fault))
+        };
+        self.project_status_message = Some(format!("Project operation failed: {fault}"));
+        self.complete_project_operation(token, completion);
     }
 
     fn project_dirty(&self) -> bool {
@@ -835,14 +1366,24 @@ impl MiranteWorkbenchApp {
     }
 
     fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if self.pending_viewport_close {
+            self.pending_viewport_close = false;
+            self.ui_runtime.allow_close_without_prompt = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
         if !ctx.input(|input| input.viewport().close_requested()) {
             return;
         }
-        if self.ui_runtime.allow_close_without_prompt || !self.project_dirty() {
+        if self.ui_runtime.allow_close_without_prompt {
             return;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        self.ui_runtime.close_prompt_open = true;
+        if self.project_dirty() {
+            self.ui_runtime.close_prompt_open = true;
+        } else {
+            self.request_project_store_close_for_exit();
+        }
     }
 
     fn show_dirty_project_close_prompt(&mut self, ctx: &egui::Context) {
@@ -854,23 +1395,305 @@ impl MiranteWorkbenchApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.label("Project changes have not been saved.");
+                ui.label(if self.pending_dataset_open_path.is_some() {
+                    "Project changes have not been saved. Save or discard them before opening another dataset."
+                } else {
+                    "Project changes have not been saved."
+                });
                 ui.horizontal(|ui| {
-                    if ui_kit::toolbar_button(ui, "Save", true).clicked() {
-                        self.save_current_project();
+                    let (save_available, save_as_required) = self
+                        .project_store
+                        .as_ref()
+                        .map(|service| {
+                            let can_save = service.can_save();
+                            let can_save_as = service.can_save_as();
+                            (can_save || can_save_as, !can_save && can_save_as)
+                        })
+                        .unwrap_or((false, false));
+                    let save_label = if save_as_required { "Save As" } else { "Save" };
+                    if ui_kit::toolbar_button(ui, save_label, save_available).clicked() {
+                        self.close_after_project_save = true;
+                        let started = if save_as_required {
+                            self.save_current_project_as()
+                        } else {
+                            self.save_current_project()
+                        };
+                        if started && self.close_after_project_save {
+                            self.ui_runtime.close_prompt_open = false;
+                        } else if !started {
+                            self.close_after_project_save = false;
+                        }
                     }
                     if ui_kit::toolbar_button(ui, "Discard", true).clicked() {
-                        self.ui_runtime.allow_close_without_prompt = true;
                         self.ui_runtime.close_prompt_open = false;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        self.close_after_project_save = false;
+                        if let Some(path) = self.pending_dataset_open_path.take() {
+                            if let Err(error) = self.replace_state_from_dataset_path(path, None) {
+                                self.project_status_message =
+                                    Some(format!("Dataset open could not start: {error}"));
+                            }
+                        } else {
+                            self.request_project_store_close_for_exit();
+                        }
                     }
                     if ui_kit::toolbar_button(ui, "Cancel", true).clicked() {
                         self.ui_runtime.close_prompt_open = false;
                         self.ui_runtime.allow_close_without_prompt = false;
+                        self.close_after_project_save = false;
+                        self.pending_dataset_open_path = None;
                         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                     }
                 });
             });
+    }
+
+    fn show_project_recovery_ui(&mut self, ctx: &egui::Context) {
+        #[derive(Clone, Copy)]
+        enum ReviewAction {
+            Recover(ProjectGenerationId),
+            OpenSaved,
+        }
+
+        let review = self
+            .project_recovery_review
+            .as_ref()
+            .map(|review| review.automatic_newer);
+        let mut review_action = None;
+        if let Some(automatic_newer) = review {
+            egui::Window::new("Recover autosaved project?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label(
+                        "A newer autosave was found for the saved project. Recovery opens it as an unsaved branch that must be saved with Save As.",
+                    );
+                    ui.horizontal(|ui| {
+                        if ui_kit::toolbar_button(ui, "Recover Autosave", true).clicked() {
+                            review_action = Some(ReviewAction::Recover(automatic_newer));
+                        }
+                        if ui_kit::toolbar_button(ui, "Open Saved Project", true).clicked() {
+                            review_action = Some(ReviewAction::OpenSaved);
+                        }
+                    });
+                });
+        }
+        match review_action {
+            Some(ReviewAction::Recover(generation_id)) => {
+                self.recover_project_candidate(generation_id);
+            }
+            Some(ReviewAction::OpenSaved) => self.accept_saved_project_after_recovery_review(),
+            None => {}
+        }
+
+        if !self.project_recovery_panel_open {
+            return;
+        }
+        let candidates = self.project_recovery_candidates.clone();
+        let locators = self
+            .project_store
+            .as_ref()
+            .map(|service| service.recovery_store_project_ids().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let can_open_locator = self
+            .project_store
+            .as_ref()
+            .is_some_and(ProjectStoreApplicationService::can_open);
+        let mut panel_open = true;
+        let mut selected = None;
+        let mut selected_locator = None;
+        egui::Window::new("Project Recovery")
+            .open(&mut panel_open)
+            .resizable(true)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                if candidates.is_empty() && locators.is_empty() {
+                    ui.label("No validated recovery branches are available.");
+                    return;
+                }
+                ui.label(
+                    "Recovery never changes the stored project. A selected branch opens dirty and must be saved with Save As.",
+                );
+                ui.separator();
+                if !locators.is_empty() {
+                    ui.heading("Unsaved projects from earlier launches");
+                    for project_id in &locators {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!("Project {project_id}"));
+                            if ui_kit::toolbar_button(
+                                ui,
+                                "Inspect and Recover",
+                                can_open_locator,
+                            )
+                            .on_hover_text("Validated by the project-store actor before opening")
+                            .clicked()
+                            {
+                                selected_locator = Some(*project_id);
+                            }
+                        });
+                    }
+                    if !candidates.is_empty() {
+                        ui.separator();
+                    }
+                }
+                if !candidates.is_empty() {
+                    ui.heading("Branches in the selected project");
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        for candidate in &candidates {
+                            ui.group(|ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(format!(
+                                        "{} · {} · revision {}",
+                                        candidate.classification(),
+                                        candidate.origin(),
+                                        candidate.revision_sequence()
+                                    ));
+                                    if ui_kit::toolbar_button(ui, "Open Recovery", true).clicked()
+                                    {
+                                        selected = Some(candidate.generation_id());
+                                    }
+                                });
+                                ui_kit::muted_label(
+                                    ui,
+                                    format!(
+                                        "generation {} · artifacts {} ({} non-regenerable)",
+                                        candidate.generation_sequence(),
+                                        candidate.artifact_count(),
+                                        candidate.non_regenerable_artifact_count()
+                                    ),
+                                );
+                            });
+                        }
+                    });
+            });
+        self.project_recovery_panel_open = panel_open;
+        if let Some(generation_id) = selected {
+            self.project_recovery_panel_open = false;
+            self.recover_project_candidate(generation_id);
+        } else if let Some(project_id) = selected_locator {
+            self.project_recovery_panel_open = false;
+            self.open_recovery_locator(project_id);
+        }
+    }
+
+    fn open_project_recovery_panel(&mut self) {
+        self.project_recovery_panel_open = true;
+        let can_inspect = self.project_store.as_ref().is_some_and(|service| {
+            let status = service.status();
+            !status.foreground_active()
+                && !status.autosave_active()
+                && matches!(
+                    status.lifecycle(),
+                    ProjectStoreLifecycle::Provisional
+                        | ProjectStoreLifecycle::Established
+                        | ProjectStoreLifecycle::RecoveryOnly
+                        | ProjectStoreLifecycle::RecoverySelected
+                )
+        });
+        if !can_inspect {
+            return;
+        }
+        match self
+            .project_store
+            .as_mut()
+            .expect("inspection eligibility requires a project-store service")
+            .submit_inspect_recovery()
+        {
+            Ok(_) => {
+                self.project_recovery_candidates.clear();
+                self.project_status_message = Some("Inspecting project recovery…".to_owned());
+            }
+            Err(error) => {
+                self.project_status_message =
+                    Some(format!("Recovery inspection could not start: {error:?}"));
+            }
+        }
+    }
+
+    fn request_project_store_close_for_exit(&mut self) {
+        self.exit_after_project_close = true;
+        self.ui_runtime.close_prompt_open = false;
+        match self.project_store.as_mut() {
+            Some(service) if service.status().lifecycle() != ProjectStoreLifecycle::Closed => {
+                if let Err(error) = service.close()
+                    && !matches!(
+                        error,
+                        mirante4d_application::ProjectStoreServiceError::Closing
+                    )
+                {
+                    self.exit_after_project_close = false;
+                    self.project_status_message =
+                        Some(format!("Could not close project storage: {error:?}"));
+                }
+            }
+            Some(_) => {
+                if let Some(service) = self.project_store.take()
+                    && let Err(error) = service.join()
+                {
+                    tracing::warn!(?error, "project-store actor join failed");
+                }
+                self.exit_after_project_close = false;
+                self.pending_viewport_close = true;
+            }
+            None => {
+                self.exit_after_project_close = false;
+                self.pending_viewport_close = true;
+            }
+        }
+    }
+
+    fn request_project_store_restart(&mut self) {
+        self.restart_project_store_after_close = true;
+        let close_result = match self.project_store.as_mut() {
+            Some(service)
+                if !matches!(
+                    service.status().lifecycle(),
+                    ProjectStoreLifecycle::Closing | ProjectStoreLifecycle::Closed
+                ) =>
+            {
+                service.close().map(|_| ())
+            }
+            Some(_) => Ok(()),
+            None => {
+                self.restart_project_store_after_close = false;
+                self.restart_unbound_project_store();
+                return;
+            }
+        };
+        if let Err(error) = close_result {
+            self.restart_project_store_after_close = false;
+            self.project_status_message =
+                Some(format!("Project storage could not restart: {error:?}"));
+        }
+    }
+
+    fn restart_unbound_project_store(&mut self) {
+        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let WorkspaceSnapshot::Unbound { workspace } = snapshot.workspace() else {
+            self.project_status_message = Some(
+                "Project storage is unavailable for the bound project; reopen the application before saving again."
+                    .to_owned(),
+            );
+            return;
+        };
+        match start_project_store_service(
+            self.project_recovery_root.as_deref(),
+            workspace.provisional_project_id(),
+        ) {
+            Ok((service, warning)) => {
+                self.project_store = Some(service);
+                if warning.is_some() {
+                    self.project_status_message = warning;
+                }
+            }
+            Err(fault) => {
+                self.project_status_message =
+                    Some(format!("Project storage could not restart: {fault}"));
+            }
+        }
     }
 
     fn open_session_from_dialog(&mut self, _ctx: &egui::Context) {
@@ -883,6 +1706,21 @@ impl MiranteWorkbenchApp {
         self.pump_application_services();
     }
 
+    fn open_recovery_locator(&mut self, project_id: ProjectId) {
+        self.pending_project_open_locator = Some(project_id);
+        if let Err(fault) = current_egui_shell_bridge::dispatch(
+            &mut self.application,
+            ApplicationCommand::RequestProjectOpen,
+        ) {
+            self.pending_project_open_locator = None;
+            self.project_status_message = Some(format!(
+                "Recovery cannot open for the current dataset: {fault:?}"
+            ));
+            return;
+        }
+        self.pump_application_services();
+    }
+
     fn open_native_from_dialog(&mut self, ctx: &egui::Context) {
         let Some(path) = rfd::FileDialog::new()
             .set_title("Open Mirante4D dataset package")
@@ -890,7 +1728,10 @@ impl MiranteWorkbenchApp {
         else {
             return;
         };
-        if let Err(error) = self.replace_state_from_dataset_path(path, Some(ctx)) {
+        if self.project_dirty() {
+            self.pending_dataset_open_path = Some(path);
+            self.ui_runtime.close_prompt_open = true;
+        } else if let Err(error) = self.replace_state_from_dataset_path(path, Some(ctx)) {
             tracing::warn!(%error, "dataset open request was rejected");
         }
     }
@@ -940,12 +1781,86 @@ impl MiranteWorkbenchApp {
         Ok(())
     }
 
-    fn save_current_project(&mut self) {
+    fn save_current_project(&mut self) -> bool {
         if let Err(fault) = current_egui_shell_bridge::dispatch(
             &mut self.application,
             ApplicationCommand::RequestProjectSave,
         ) {
             tracing::info!(?fault, "project save is unavailable for the current source");
+            return false;
+        }
+        self.pump_application_services();
+        true
+    }
+
+    fn save_current_project_as(&mut self) -> bool {
+        let new_project_id = ProjectId::from_bytes(*uuid::Uuid::new_v4().as_bytes());
+        if let Err(fault) = current_egui_shell_bridge::dispatch(
+            &mut self.application,
+            ApplicationCommand::RequestProjectSaveAs { new_project_id },
+        ) {
+            tracing::info!(
+                ?fault,
+                "project Save As is unavailable for the current source"
+            );
+            return false;
+        }
+        self.pump_application_services();
+        true
+    }
+
+    fn new_current_project(&mut self) {
+        if let Err(fault) = current_egui_shell_bridge::dispatch(
+            &mut self.application,
+            ApplicationCommand::AttachVerifiedDataset,
+        ) {
+            tracing::info!(?fault, "new project is unavailable for the current source");
+        }
+        self.pump_application_services();
+    }
+
+    fn accept_saved_project_after_recovery_review(&mut self) {
+        let Some(review) = self.project_recovery_review.as_ref() else {
+            return;
+        };
+        let event = self
+            .project_store
+            .as_mut()
+            .and_then(|service| service.accept_normal_open(review.token.operation_id()).ok());
+        match event {
+            Some(event) => self.handle_project_store_event(event),
+            None => {
+                self.project_status_message =
+                    Some("Could not accept the saved project state.".to_owned());
+            }
+        }
+    }
+
+    fn recover_project_candidate(&mut self, generation_id: ProjectGenerationId) {
+        if let Some(review) = self.project_recovery_review.as_ref() {
+            let result = self
+                .project_store
+                .as_mut()
+                .ok_or(ProjectStoreFault::Corruption {
+                    stage: "application_service_unavailable",
+                })
+                .and_then(|service| {
+                    service
+                        .submit_open_recovery(review.token.clone(), generation_id)
+                        .map_err(project_service_error_fault)
+                });
+            if let Err(fault) = result {
+                self.project_status_message = Some(format!("Could not open recovery: {fault}"));
+            }
+            return;
+        }
+        self.pending_recovery_selection = Some(generation_id);
+        if let Err(fault) = current_egui_shell_bridge::dispatch(
+            &mut self.application,
+            ApplicationCommand::RequestProjectRecovery,
+        ) {
+            self.pending_recovery_selection = None;
+            tracing::info!(?fault, "project recovery is unavailable");
         }
         self.pump_application_services();
     }
@@ -1029,14 +1944,44 @@ impl MiranteWorkbenchApp {
         match result.outcome {
             current_source_open_service::CurrentSourceOpenOutcome::Prepared(prepared) => {
                 let (runtime, completion) = prepared.into_runtime_and_completion();
-                if self.complete_source_operation(token, completion) {
-                    self.install_current_source_runtime(runtime);
-                } else {
-                    tracing::warn!("stale dataset open result was suppressed");
+                let token_is_current = current_egui_shell_bridge::snapshot(&self.application)
+                    .active_operations()
+                    .iter()
+                    .any(|active| active == &token);
+                if !token_is_current {
+                    tracing::warn!("stale prepared dataset was suppressed before project close");
                     if let Err(error) = runtime.dataset.request_shutdown() {
                         tracing::warn!(%error, "stale dataset runtime shutdown request failed");
                     }
                     std::thread::spawn(move || drop(runtime));
+                    return;
+                }
+                let pending = PendingSourceInstall {
+                    token,
+                    runtime,
+                    completion,
+                };
+                let store_is_closed = self.project_store.as_ref().is_none_or(|service| {
+                    service.status().lifecycle() == ProjectStoreLifecycle::Closed
+                });
+                if store_is_closed {
+                    self.pending_source_install = Some(pending);
+                    self.finish_pending_source_install();
+                } else {
+                    self.pending_source_install = Some(pending);
+                    let close_error = if let Some(service) = self.project_store.as_mut()
+                        && service.status().lifecycle() != ProjectStoreLifecycle::Closing
+                    {
+                        service.close().err()
+                    } else {
+                        None
+                    };
+                    if let Some(error) = close_error {
+                        tracing::warn!(?error, "current project close request failed");
+                        self.abort_pending_source_install(
+                            "The current project could not close; the new dataset was not installed.",
+                        );
+                    }
                 }
             }
             current_source_open_service::CurrentSourceOpenOutcome::Cancelled => {
@@ -1046,6 +1991,65 @@ impl MiranteWorkbenchApp {
                 self.complete_source_operation(token, OperationCompletion::Failed(code));
             }
         }
+    }
+
+    fn finish_pending_source_install(&mut self) {
+        if let Some(service) = self.project_store.take()
+            && let Err(error) = service.join()
+        {
+            tracing::warn!(?error, "replaced project-store actor join failed");
+        }
+        let Some(pending) = self.pending_source_install.take() else {
+            return;
+        };
+        if self.complete_source_operation(pending.token, pending.completion) {
+            self.install_current_source_runtime(pending.runtime);
+            let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+            let WorkspaceSnapshot::Unbound { workspace } = snapshot.workspace() else {
+                tracing::error!("new source did not produce an unbound project workspace");
+                return;
+            };
+            match start_project_store_service(
+                self.project_recovery_root.as_deref(),
+                workspace.provisional_project_id(),
+            ) {
+                Ok((service, warning)) => {
+                    self.project_store = Some(service);
+                    if warning.is_some() {
+                        self.project_status_message = warning;
+                    }
+                }
+                Err(fault) => {
+                    self.project_status_message =
+                        Some(format!("Project storage could not start: {fault}"));
+                }
+            }
+        } else {
+            tracing::warn!("stale dataset open result was suppressed");
+            self.project_status_message = Some(
+                "The prepared dataset became stale; the current project remains closed and the application must be reopened before saving again."
+                    .to_owned(),
+            );
+            if let Err(error) = pending.runtime.dataset.request_shutdown() {
+                tracing::warn!(%error, "stale dataset runtime shutdown request failed");
+            }
+            std::thread::spawn(move || drop(pending.runtime));
+        }
+    }
+
+    fn abort_pending_source_install(&mut self, message: &str) {
+        let Some(pending) = self.pending_source_install.take() else {
+            return;
+        };
+        self.project_status_message = Some(message.to_owned());
+        self.complete_source_operation(
+            pending.token,
+            OperationCompletion::Failed(OperationFailureCode::DatasetReadFailed),
+        );
+        if let Err(error) = pending.runtime.dataset.request_shutdown() {
+            tracing::warn!(%error, "rejected dataset runtime shutdown request failed");
+        }
+        std::thread::spawn(move || drop(pending.runtime));
     }
 
     fn poll_source_verification_service(&mut self) {
@@ -1162,7 +2166,6 @@ impl MiranteWorkbenchApp {
             &mut self.import_runtime,
             current_runtime::import::CurrentImportRuntime::idle(),
         );
-        self.project_runtime.current_project_path = None;
         self.ui_runtime.viewer_tools = ViewerToolState::default();
         self.ui_runtime.analysis_plot_view = None;
         self.ui_runtime.analysis_filter.clear();

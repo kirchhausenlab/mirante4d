@@ -884,7 +884,11 @@ impl eframe::App for MiranteWorkbenchApp {
         let import_active = self.import_runtime.import_task.is_some();
         let import_setup_active = self.import_runtime.tiff_import_setup_task.is_some()
             || self.import_runtime.pending_tiff_import.is_some();
-        let workflow_busy = import_active || import_setup_active;
+        let dataset_open_active = application_snapshot
+            .active_operations()
+            .iter()
+            .any(|token| token.kind() == OperationKind::DatasetOpen);
+        let workflow_busy = import_active || import_setup_active || dataset_open_active;
         let mut start_pending_tiff_import = false;
         let mut cancel_pending_tiff_import = false;
         let mut dismiss_tiff_import_setup_error = false;
@@ -907,6 +911,51 @@ impl eframe::App for MiranteWorkbenchApp {
             application_snapshot.source(),
             SourceVerificationSnapshot::Verified(_)
         );
+        let project_is_bound = application_snapshot.is_bound();
+        let project_store_status = self.project_store.as_ref().map(|service| service.status());
+        let project_store_idle = project_store_status.as_ref().is_some_and(|status| {
+            !status.foreground_active()
+                && !status.autosave_active()
+                && !matches!(
+                    status.lifecycle(),
+                    ProjectStoreLifecycle::Closing | ProjectStoreLifecycle::Closed
+                )
+        });
+        let can_inspect_project_recovery = project_store_status.as_ref().is_some_and(|status| {
+            !status.foreground_active()
+                && !status.autosave_active()
+                && matches!(
+                    status.lifecycle(),
+                    ProjectStoreLifecycle::Provisional
+                        | ProjectStoreLifecycle::Established
+                        | ProjectStoreLifecycle::RecoveryOnly
+                        | ProjectStoreLifecycle::RecoverySelected
+                )
+        });
+        let can_new_project = project_actions_available
+            && !project_is_bound
+            && self
+                .project_store
+                .as_ref()
+                .is_some_and(ProjectStoreApplicationService::can_open);
+        let can_open_project = project_actions_available
+            && !project_is_bound
+            && self
+                .project_store
+                .as_ref()
+                .is_some_and(ProjectStoreApplicationService::can_open);
+        let can_save_project = project_actions_available
+            && project_is_bound
+            && self
+                .project_store
+                .as_ref()
+                .is_some_and(ProjectStoreApplicationService::can_save);
+        let can_save_project_as = project_actions_available
+            && project_is_bound
+            && self
+                .project_store
+                .as_ref()
+                .is_some_and(ProjectStoreApplicationService::can_save_as);
         let active_layer = view
             .layer(view.active_layer())
             .expect("application view contains its active layer");
@@ -922,13 +971,27 @@ impl eframe::App for MiranteWorkbenchApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.heading("Mirante4D");
                     ui.separator();
-                    if ui_kit::toolbar_button(ui, "Open", !workflow_busy).clicked() {
+                    if ui_kit::toolbar_button(
+                        ui,
+                        "Open",
+                        !workflow_busy
+                            && project_store_idle
+                            && self.pending_dataset_open_path.is_none(),
+                    )
+                    .clicked()
+                    {
                         self.open_native_from_dialog(ui.ctx());
+                    }
+                    if ui_kit::toolbar_button(ui, "New Project", !workflow_busy && can_new_project)
+                        .on_hover_text("Start an unsaved project for the verified dataset")
+                        .clicked()
+                    {
+                        self.new_current_project();
                     }
                     if ui_kit::toolbar_button(
                         ui,
                         "Open Project",
-                        !workflow_busy && project_actions_available,
+                        !workflow_busy && can_open_project,
                     )
                     .on_hover_text("Requires a verified scientific dataset identity")
                     .clicked()
@@ -938,12 +1001,37 @@ impl eframe::App for MiranteWorkbenchApp {
                     if ui_kit::toolbar_button(
                         ui,
                         "Save Project",
-                        !workflow_busy && project_actions_available,
+                        !workflow_busy && can_save_project,
                     )
                     .on_hover_text("Requires a verified scientific dataset identity")
                     .clicked()
                     {
                         self.save_current_project();
+                    }
+                    if ui_kit::toolbar_button(
+                        ui,
+                        "Save Project As",
+                        !workflow_busy && can_save_project_as,
+                    )
+                    .on_hover_text("Save a new project identity with exact fork provenance")
+                    .clicked()
+                    {
+                        self.save_current_project_as();
+                    }
+                    if ui_kit::toolbar_button(
+                        ui,
+                        "Recovery",
+                        !workflow_busy
+                            && (can_inspect_project_recovery
+                                || !self.project_recovery_candidates.is_empty()
+                                || self.project_store.as_ref().is_some_and(|service| {
+                                    service.recovery_store_project_ids().next().is_some()
+                                })),
+                    )
+                    .on_hover_text("List validated autosave and manual recovery branches")
+                    .clicked()
+                    {
+                        self.open_project_recovery_panel();
                     }
                     if ui_kit::toolbar_button(ui, "Import Dir", !workflow_busy)
                         .on_hover_text("Import TIFF directory")
@@ -964,6 +1052,9 @@ impl eframe::App for MiranteWorkbenchApp {
                     ui.separator();
                     ui_kit::elided_label(ui, application_snapshot.catalog().label(), 42);
                 });
+                if let Some(message) = self.project_status_message.as_deref() {
+                    ui_kit::muted_label(ui, message);
+                }
                 ui.horizontal_wrapped(|ui| {
                     layout_selector(
                         ui,
@@ -2179,6 +2270,7 @@ impl eframe::App for MiranteWorkbenchApp {
             &mut cancel_pending_tiff_import,
             &mut dismiss_tiff_import_setup_error,
         );
+        self.show_project_recovery_ui(ui.ctx());
         self.show_dirty_project_close_prompt(ui.ctx());
         let ui_build_ms = duration_ms(ui_build_started.elapsed());
 
@@ -2222,6 +2314,10 @@ impl eframe::App for MiranteWorkbenchApp {
 
         let background_repaint_started = Instant::now();
         let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let project_store_pending = self
+            .project_store
+            .as_ref()
+            .is_some_and(ProjectStoreApplicationService::has_pending_work);
         if workbench_playback_runtime::background_work_active(
             &snapshot,
             &self.import_runtime,
@@ -2233,8 +2329,16 @@ impl eframe::App for MiranteWorkbenchApp {
             self.source_verification_service
                 .as_ref()
                 .is_some_and(|service| service.active_token().is_some()),
-        ) {
+        ) || project_store_pending
+        {
             request_background_work_repaint_after(ui.ctx());
+        }
+        if let Some(delay) = self
+            .project_store
+            .as_ref()
+            .and_then(ProjectStoreApplicationService::repaint_after)
+        {
+            ui.ctx().request_repaint_after(delay);
         }
         let background_repaint_request_ms = duration_ms(background_repaint_started.elapsed());
 
@@ -2274,10 +2378,18 @@ impl eframe::App for MiranteWorkbenchApp {
         if let Err(error) = self.settings_connection.shutdown() {
             tracing::warn!(%error, "settings actor shutdown failed");
         }
-        if let Some(project_persistence) = self.project_persistence.take()
-            && let Err(error) = project_persistence.shutdown()
-        {
-            tracing::warn!(%error, "project persistence actor shutdown failed");
+        if let Some(mut project_store) = self.project_store.take() {
+            if let Err(error) = project_store.close()
+                && !matches!(
+                    error,
+                    mirante4d_application::ProjectStoreServiceError::Closing
+                )
+            {
+                tracing::warn!(?error, "project-store close request failed during exit");
+            }
+            if let Err(error) = project_store.join() {
+                tracing::warn!(?error, "project-store actor join failed during exit");
+            }
         }
     }
 }

@@ -1418,34 +1418,31 @@ fn stale_and_mismatched_completions_are_rejected_with_operation_context() {
 }
 
 #[test]
-fn stale_dataset_open_completion_can_be_explicitly_retired_after_atomic_rejection() {
+fn dataset_open_failure_remains_exact_after_a_rejected_durable_edit() {
     let mut application = application();
     application
         .dispatch(ApplicationCommand::RequestDatasetOpen)
         .unwrap();
     let token = dataset_open_token(&mut application);
-    application
-        .dispatch(ApplicationCommand::SetTimepoint(TimeIndex::new(1)))
-        .unwrap();
+    let before_edit = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::SetTimepoint(TimeIndex::new(1)))
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::OperationConflict
+    );
+    assert_eq!(application, before_edit);
 
     assert_eq!(
         application
             .dispatch(ApplicationCommand::CompleteOperation {
-                token: token.clone(),
-                completion: OperationCompletion::Failed(OperationFailureCode::DatasetReadFailed,),
+                token,
+                completion: OperationCompletion::Failed(OperationFailureCode::DatasetReadFailed),
             })
-            .unwrap_err()
-            .code(),
-        ApplicationFaultCode::StaleOperationCompletion
+            .unwrap(),
+        CommandEffect::Changed
     );
-    assert_eq!(
-        application.snapshot().active_operations(),
-        std::slice::from_ref(&token)
-    );
-
-    application
-        .dispatch(ApplicationCommand::CancelOperation(token.operation_id()))
-        .unwrap();
     assert!(application.snapshot().active_operations().is_empty());
 }
 
@@ -2079,6 +2076,134 @@ fn source_replacement_is_central_generation_guarded_and_resets_bound_transients(
         ApplicationFaultCode::SourceGenerationNotAdvanced
     );
     assert_eq!(application, before);
+}
+
+#[test]
+fn dataset_open_freezes_durable_edits_but_allows_transient_state_and_exact_completion() {
+    let mut application = application();
+    verify(&mut application, dataset_reference('1'));
+    application.drain_events(MAX_PENDING_EVENTS);
+    application
+        .dispatch(ApplicationCommand::RequestDatasetOpen)
+        .unwrap();
+    let token = dataset_open_token(&mut application);
+
+    for command in [
+        ApplicationCommand::AttachVerifiedDataset,
+        ApplicationCommand::SetTimepoint(TimeIndex::new(1)),
+    ] {
+        let before = application.fork_for_dispatch();
+        assert_eq!(
+            application.dispatch(command).unwrap_err().code(),
+            ApplicationFaultCode::OperationConflict
+        );
+        assert_eq!(application, before);
+    }
+
+    let currentness = application.snapshot().currentness();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::SetActiveTool(ToolKind::Inspect))
+            .unwrap(),
+        CommandEffect::Changed
+    );
+    assert_eq!(application.snapshot().currentness(), currentness);
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token,
+                completion: OperationCompletion::DatasetOpened {
+                    catalog: Arc::new(catalog_for_source(4, 2)),
+                    workspace: Box::new(unbound_workspace(project_id(9))),
+                    source_generation: SourceSessionGeneration::new(2),
+                },
+            })
+            .unwrap(),
+        CommandEffect::Changed
+    );
+    let snapshot = application.snapshot();
+    assert_eq!(
+        snapshot.source_generation(),
+        SourceSessionGeneration::new(2)
+    );
+    assert!(!snapshot.is_bound());
+    assert!(snapshot.active_operations().is_empty());
+}
+
+#[test]
+fn dataset_open_can_still_be_cancelled_while_the_durable_freeze_is_active() {
+    let mut application = application();
+    application
+        .dispatch(ApplicationCommand::RequestDatasetOpen)
+        .unwrap();
+    let token = dataset_open_token(&mut application);
+
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CancelOperation(token.operation_id()))
+            .unwrap(),
+        CommandEffect::Changed
+    );
+    assert!(application.snapshot().active_operations().is_empty());
+    assert!(
+        application
+            .drain_events(MAX_PENDING_EVENTS)
+            .iter()
+            .any(|event| matches!(
+                event,
+                ApplicationEvent::OperationCancellationRequested { token: cancelled }
+                    if cancelled == &token
+            ))
+    );
+}
+
+#[test]
+fn source_invalidation_cancels_dataset_open_before_advancing_currentness() {
+    let mut application = application();
+    verify(&mut application, dataset_reference('1'));
+    application.drain_events(MAX_PENDING_EVENTS);
+    application
+        .dispatch(ApplicationCommand::RequestDatasetOpen)
+        .unwrap();
+    let token = dataset_open_token(&mut application);
+
+    application
+        .dispatch(ApplicationCommand::InvalidateSourceVerification {
+            source_generation: SourceSessionGeneration::new(1),
+        })
+        .unwrap();
+    assert!(application.snapshot().active_operations().is_empty());
+    assert_ne!(
+        application.snapshot().currentness(),
+        token.currentness_generation()
+    );
+    assert!(
+        application
+            .drain_events(MAX_PENDING_EVENTS)
+            .iter()
+            .any(|event| matches!(
+                event,
+                ApplicationEvent::OperationCancellationRequested { token: cancelled }
+                    if cancelled == &token
+            ))
+    );
+
+    let before_late = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token,
+                completion: OperationCompletion::DatasetOpened {
+                    catalog: Arc::new(catalog_for_source(4, 2)),
+                    workspace: Box::new(unbound_workspace(project_id(9))),
+                    source_generation: SourceSessionGeneration::new(2),
+                },
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::OperationNotFound
+    );
+    assert_eq!(application, before_late);
 }
 
 #[test]
