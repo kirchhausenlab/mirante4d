@@ -1,5 +1,6 @@
 use std::{
     env, fs,
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -36,6 +37,7 @@ const PRODUCT_VALIDATE_MAX_RSS_BYTES_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_MAX
 const APP_GPU_TIMESTAMPS_ENV: &str = "MIRANTE4D_GPU_TIMESTAMPS";
 const GENERATED_FIXTURE_SCENARIO: &str = "generated_fixture_camera_smoke";
 const GENERATED_RENDER_MODES_SCENARIO: &str = "generated_fixture_render_modes";
+const B3_SOURCE_VERIFICATION_SCENARIO: &str = "b3_source_verification";
 const T5_QUAL_001_INTERACTION_MIP_SCENARIO: &str = "t5_qual_001_interaction_mip";
 const T5_QUAL_001_INTERACTION_RENDER_MODES_SCENARIO: &str = "t5_qual_001_interaction_render_modes";
 const T5_QUAL_001_INTERACTION_CONTINUOUS_SCENARIO: &str = "t5_qual_001_interaction_continuous";
@@ -48,6 +50,12 @@ const T5_QUAL_002_FOUR_PANEL_AUTOPLAY_SCENARIO: &str = "t5_qual_002_four_panel_a
 const CUSTOM_SCRIPT_SCENARIO: &str = "custom_script";
 const GENERATED_VIEWPORT_WIDTH: u32 = 960;
 const GENERATED_VIEWPORT_HEIGHT: u32 = 720;
+const B3_VIEWPORT_WIDTH: u32 = 1280;
+const B3_VIEWPORT_HEIGHT: u32 = 720;
+const B3_SECOND_VIEWPORT_WIDTH: u32 = 1920;
+const B3_SECOND_VIEWPORT_HEIGHT: u32 = 1080;
+const B3_PRIMARY_E1_CAPTURE: &str = "b3-after-success-1280x720";
+const B3_SECONDARY_E1_CAPTURE: &str = "b3-after-success-1920x1080";
 const T5_QUAL_001_VIEWPORT_WIDTH: u32 = 1280;
 const T5_QUAL_001_VIEWPORT_HEIGHT: u32 = 720;
 const T5_QUAL_002_VIEWPORT_WIDTH: u32 = 1280;
@@ -62,6 +70,174 @@ const LEGACY_ROOT_PRODUCT_VALIDATION_ARTIFACTS: &[&str] = &[
     "mirante4d-app.stdout.log",
     "mirante4d-app.stderr.log",
 ];
+const SOURCE_CLOSURE_EVIDENCE_ENTRY_MAX: usize = 131_072;
+const SOURCE_CLOSURE_EVIDENCE_BYTES_MAX: u64 = 256 * MIB;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceClosureSnapshot {
+    entries: Vec<SourceClosureEntry>,
+    regular_files: u64,
+    source_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SourceClosureEntry {
+    Directory(Vec<u8>),
+    File {
+        relative_path: Vec<u8>,
+        bytes: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceFileStamp {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl SourceClosureSnapshot {
+    fn capture(root: &Path) -> anyhow::Result<Self> {
+        let root_metadata = fs::symlink_metadata(root)
+            .with_context(|| format!("failed to inspect source closure root {}", root.display()))?;
+        if !root_metadata.file_type().is_dir() {
+            bail!("source closure root is not a directory");
+        }
+
+        let mut entries = Vec::new();
+        let mut stack = vec![(root.to_path_buf(), Vec::<u8>::new())];
+        let mut regular_files = 0_u64;
+        let mut source_bytes = 0_u64;
+        while let Some((directory, relative)) = stack.pop() {
+            let mut children = fs::read_dir(&directory)
+                .context("failed to traverse source closure directory")?
+                .collect::<Result<Vec<_>, _>>()
+                .context("failed to enumerate source closure")?;
+            children.sort_by(|left, right| {
+                left.file_name()
+                    .as_bytes()
+                    .cmp(right.file_name().as_bytes())
+            });
+            for child in children.into_iter().rev() {
+                if entries.len() >= SOURCE_CLOSURE_EVIDENCE_ENTRY_MAX {
+                    bail!("source closure exceeds the evidence entry bound");
+                }
+                let name = child.file_name();
+                let name = name.as_bytes();
+                if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
+                    bail!("source closure contains an invalid relative name");
+                }
+                let mut child_relative = relative.clone();
+                if !child_relative.is_empty() {
+                    child_relative.push(b'/');
+                }
+                child_relative.extend_from_slice(name);
+                let child_path = child.path();
+                let before = fs::symlink_metadata(&child_path)
+                    .context("failed to inspect source closure entry")?;
+                if before.file_type().is_dir() {
+                    entries.push(SourceClosureEntry::Directory(child_relative.clone()));
+                    stack.push((child_path, child_relative));
+                } else if before.file_type().is_file() {
+                    let stamp = source_file_stamp(&before);
+                    source_bytes = source_bytes
+                        .checked_add(stamp.length)
+                        .context("source closure byte count overflowed")?;
+                    if source_bytes > SOURCE_CLOSURE_EVIDENCE_BYTES_MAX {
+                        bail!("source closure exceeds the evidence byte bound");
+                    }
+                    let bytes = fs::read(&child_path)
+                        .context("failed to read source closure evidence bytes")?;
+                    let after = fs::symlink_metadata(&child_path)
+                        .context("failed to re-inspect source closure entry")?;
+                    if source_file_stamp(&after) != stamp
+                        || u64::try_from(bytes.len()).ok() != Some(stamp.length)
+                    {
+                        bail!("source closure changed while evidence was captured");
+                    }
+                    regular_files = regular_files
+                        .checked_add(1)
+                        .context("source closure file count overflowed")?;
+                    entries.push(SourceClosureEntry::File {
+                        relative_path: child_relative,
+                        bytes,
+                    });
+                } else {
+                    bail!("source closure contains a symlink or special entry");
+                }
+            }
+        }
+        entries.sort_by(|left, right| {
+            source_closure_entry_path(left).cmp(source_closure_entry_path(right))
+        });
+        Ok(Self {
+            entries,
+            regular_files,
+            source_bytes,
+        })
+    }
+
+    fn pending_json(&self) -> Value {
+        json!({
+            "required": true,
+            "comparison": "exact_relative_entry_and_regular_file_bytes",
+            "byte_identical": Value::Null,
+            "before": {
+                "entries": self.entries.len(),
+                "regular_files": self.regular_files,
+                "source_bytes": self.source_bytes,
+            },
+            "after": Value::Null,
+        })
+    }
+
+    fn compare_json(&self, root: &Path) -> anyhow::Result<Value> {
+        let after = Self::capture(root)?;
+        Ok(json!({
+            "required": true,
+            "comparison": "exact_relative_entry_and_regular_file_bytes",
+            "byte_identical": self == &after,
+            "before": {
+                "entries": self.entries.len(),
+                "regular_files": self.regular_files,
+                "source_bytes": self.source_bytes,
+            },
+            "after": {
+                "entries": after.entries.len(),
+                "regular_files": after.regular_files,
+                "source_bytes": after.source_bytes,
+            },
+            "bounds": {
+                "maximum_entries": SOURCE_CLOSURE_EVIDENCE_ENTRY_MAX,
+                "maximum_source_bytes": SOURCE_CLOSURE_EVIDENCE_BYTES_MAX,
+            },
+            "paths_or_source_bytes_reported": false,
+        }))
+    }
+}
+
+fn source_file_stamp(metadata: &fs::Metadata) -> SourceFileStamp {
+    SourceFileStamp {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        length: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    }
+}
+
+fn source_closure_entry_path(entry: &SourceClosureEntry) -> &[u8] {
+    match entry {
+        SourceClosureEntry::Directory(path) => path,
+        SourceClosureEntry::File { relative_path, .. } => relative_path,
+    }
+}
 
 pub(crate) fn product_validate(
     package: Option<&Path>,
@@ -118,6 +294,12 @@ fn product_validate_report_inner(
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
 
     let (package, script) = product_validation_package_and_script(package, scenario)?;
+    let source_closure_before = matches!(scenario, ProductValidationScenario::B3SourceVerification)
+        .then(|| SourceClosureSnapshot::capture(&package))
+        .transpose()?;
+    let pending_source_closure_evidence = source_closure_before
+        .as_ref()
+        .map_or(Value::Null, SourceClosureSnapshot::pending_json);
     let script_path = output_dir.join("product-automation-script.json");
     let automation_report_path = output_dir.join("product-automation-report.json");
     let wrapper_report_path = output_dir.join("product-validation-report.json");
@@ -165,6 +347,7 @@ fn product_validate_report_inner(
             process_rss_limit_bytes,
             process_peak_rss_bytes: None,
             process_rss_limit_exceeded: false,
+            source_closure_evidence: pending_source_closure_evidence.clone(),
             automation_status: None,
             exit_status: None,
             exit_success: None,
@@ -202,6 +385,7 @@ fn product_validate_report_inner(
             process_rss_limit_bytes,
             process_peak_rss_bytes: None,
             process_rss_limit_exceeded: false,
+            source_closure_evidence: pending_source_closure_evidence.clone(),
             automation_status: None,
             exit_status: None,
             exit_success: None,
@@ -236,6 +420,7 @@ fn product_validate_report_inner(
             process_rss_limit_bytes,
             process_peak_rss_bytes: None,
             process_rss_limit_exceeded: false,
+            source_closure_evidence: pending_source_closure_evidence.clone(),
             automation_status: None,
             exit_status: None,
             exit_success: None,
@@ -262,6 +447,15 @@ fn product_validate_report_inner(
         gpu_timestamps_requested,
         max_rss_bytes: process_rss_limit_bytes,
     })?;
+    let source_closure_evidence = source_closure_before
+        .as_ref()
+        .map(|before| before.compare_json(&package))
+        .transpose()?
+        .unwrap_or(Value::Null);
+    let source_closure_changed = source_closure_evidence
+        .get("byte_identical")
+        .and_then(Value::as_bool)
+        == Some(false);
 
     if status.timed_out {
         write_wrapper_report(WrapperReport {
@@ -288,6 +482,7 @@ fn product_validate_report_inner(
             process_rss_limit_bytes,
             process_peak_rss_bytes: status.peak_rss_bytes,
             process_rss_limit_exceeded: status.rss_limit_exceeded,
+            source_closure_evidence: source_closure_evidence.clone(),
             automation_status: None,
             exit_status: status.exit_status,
             exit_success: status.exit_success,
@@ -327,6 +522,7 @@ fn product_validate_report_inner(
             process_rss_limit_bytes,
             process_peak_rss_bytes: status.peak_rss_bytes,
             process_rss_limit_exceeded: status.rss_limit_exceeded,
+            source_closure_evidence: source_closure_evidence.clone(),
             automation_status: None,
             exit_status: status.exit_status,
             exit_success: status.exit_success,
@@ -353,12 +549,26 @@ fn product_validate_report_inner(
         .and_then(Value::as_str)
         .map(str::to_owned);
     let app_exited_successfully = status.exit_success.unwrap_or(false);
-    let (validation_status, failure_reason) = completed_product_validation_outcome(
+    let (mut validation_status, mut failure_reason) = completed_product_validation_outcome(
         app_exited_successfully,
         automation_status.as_deref(),
         automation_failure.as_deref(),
         automation_report.as_ref(),
     );
+    if validation_status == ProductValidationStatus::Passed
+        && matches!(scenario, ProductValidationScenario::B3SourceVerification)
+        && let Err(reason) = b3_exact_e1_capture_evidence(automation_report.as_ref())
+    {
+        validation_status = ProductValidationStatus::Failed;
+        failure_reason = Some(reason);
+    }
+    if source_closure_changed {
+        validation_status = ProductValidationStatus::Failed;
+        failure_reason = Some(
+            "source closure changed during B3 product validation; source bytes must remain identical"
+                .to_owned(),
+        );
+    }
     write_wrapper_report(WrapperReport {
         path: &wrapper_report_path,
         scenario_name: scenario.name(),
@@ -380,6 +590,7 @@ fn product_validate_report_inner(
         process_rss_limit_bytes,
         process_peak_rss_bytes: status.peak_rss_bytes,
         process_rss_limit_exceeded: status.rss_limit_exceeded,
+        source_closure_evidence,
         automation_status,
         exit_status: status.exit_status,
         exit_success: status.exit_success,
@@ -395,6 +606,7 @@ fn product_validate_report_inner(
 enum ProductValidationScenario {
     GeneratedFixtureCameraSmoke,
     GeneratedFixtureRenderModes,
+    B3SourceVerification,
     T5Qual001InteractionMip,
     T5Qual001InteractionRenderModes,
     T5Qual001InteractionContinuous,
@@ -411,6 +623,7 @@ impl ProductValidationScenario {
         match self {
             Self::GeneratedFixtureCameraSmoke => GENERATED_FIXTURE_SCENARIO,
             Self::GeneratedFixtureRenderModes => GENERATED_RENDER_MODES_SCENARIO,
+            Self::B3SourceVerification => B3_SOURCE_VERIFICATION_SCENARIO,
             Self::T5Qual001InteractionMip => T5_QUAL_001_INTERACTION_MIP_SCENARIO,
             Self::T5Qual001InteractionRenderModes => T5_QUAL_001_INTERACTION_RENDER_MODES_SCENARIO,
             Self::T5Qual001InteractionContinuous => T5_QUAL_001_INTERACTION_CONTINUOUS_SCENARIO,
@@ -447,6 +660,9 @@ impl ProductValidationScenario {
             GENERATED_RENDER_MODES_SCENARIO | "generated-fixture-render-modes" | "render-modes" => {
                 Ok(Self::GeneratedFixtureRenderModes)
             }
+            B3_SOURCE_VERIFICATION_SCENARIO | "b3-source-verification" => {
+                Ok(Self::B3SourceVerification)
+            }
             T5_QUAL_001_INTERACTION_MIP_SCENARIO
             | "t5-qual-001-interaction-mip"
             | "T5-QUAL-001" => Ok(Self::T5Qual001InteractionMip),
@@ -480,6 +696,7 @@ impl ProductValidationScenario {
             other => bail!(
                 "unknown product validation scenario {other:?}; expected \
                  {GENERATED_FIXTURE_SCENARIO}, {GENERATED_RENDER_MODES_SCENARIO}, \
+                 {B3_SOURCE_VERIFICATION_SCENARIO}, \
                  {T5_QUAL_001_INTERACTION_MIP_SCENARIO}, {T5_QUAL_001_INTERACTION_RENDER_MODES_SCENARIO}, \
                  {T5_QUAL_001_INTERACTION_CONTINUOUS_SCENARIO}, {T5_QUAL_001_FOUR_PANEL_CROSS_SECTION_SCENARIO}, \
                  {T5_QUAL_001_FOUR_PANEL_FINE_SCALE_SCENARIO}, \
@@ -500,6 +717,8 @@ impl ProductValidationScenario {
                 | GENERATED_RENDER_MODES_SCENARIO
                 | "generated-fixture-render-modes"
                 | "render-modes"
+                | B3_SOURCE_VERIFICATION_SCENARIO
+                | "b3-source-verification"
                 | T5_QUAL_001_INTERACTION_MIP_SCENARIO
                 | "t5-qual-001-interaction-mip"
                 | "T5-QUAL-001"
@@ -537,6 +756,7 @@ impl ProductValidationScenario {
         match self {
             Self::GeneratedFixtureCameraSmoke
             | Self::GeneratedFixtureRenderModes
+            | Self::B3SourceVerification
             | Self::CustomScript(_) => 60,
             Self::T5Qual001InteractionMip => 180,
             Self::T5Qual001InteractionRenderModes => 240,
@@ -671,46 +891,127 @@ fn qualifying_nonblank_viewport_capture(
 
     artifacts
         .iter()
-        .find(|artifact| {
-            if artifact.get("kind").and_then(Value::as_str) != Some("viewport_capture") {
-                return false;
-            }
-            if artifact.get("capture_source").and_then(Value::as_str)
-                != Some("gpu_display_frame_readback")
-            {
-                return false;
-            }
-            let Some(width) = artifact.get("width").and_then(Value::as_u64) else {
-                return false;
-            };
-            let Some(height) = artifact.get("height").and_then(Value::as_u64) else {
-                return false;
-            };
-            let Some(path) = artifact.get("path").and_then(Value::as_str) else {
-                return false;
-            };
-            let pixel_stats = artifact.get("pixel_stats");
-            let pixel_count = pixel_stats
-                .and_then(|stats| stats.get("pixel_count"))
-                .and_then(Value::as_u64);
-            let nonzero_rgb_pixels = pixel_stats
-                .and_then(|stats| stats.get("nonzero_rgb_pixels"))
-                .and_then(Value::as_u64);
-            let max_rgb = pixel_stats
-                .and_then(|stats| stats.get("max_rgb"))
-                .and_then(Value::as_u64);
-
-            width > 0
-                && height > 0
-                && !path.trim().is_empty()
-                && width.checked_mul(height) == pixel_count
-                && nonzero_rgb_pixels.is_some_and(|count| count > 0 && Some(count) <= pixel_count)
-                && max_rgb.is_some_and(|value| value > 0)
-        })
+        .find(|artifact| nonblank_gpu_viewport_capture(artifact))
         .ok_or_else(|| {
             "same-run automation report is missing a nonblank GPU viewport_capture artifact"
                 .to_owned()
         })
+}
+
+fn nonblank_gpu_viewport_capture(artifact: &Value) -> bool {
+    if artifact.get("kind").and_then(Value::as_str) != Some("viewport_capture")
+        || artifact.get("capture_source").and_then(Value::as_str)
+            != Some("gpu_display_frame_readback")
+    {
+        return false;
+    }
+    let Some(width) = artifact.get("width").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(height) = artifact.get("height").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(path) = artifact.get("path").and_then(Value::as_str) else {
+        return false;
+    };
+    let pixel_stats = artifact.get("pixel_stats");
+    let pixel_count = pixel_stats
+        .and_then(|stats| stats.get("pixel_count"))
+        .and_then(Value::as_u64);
+    let nonzero_rgb_pixels = pixel_stats
+        .and_then(|stats| stats.get("nonzero_rgb_pixels"))
+        .and_then(Value::as_u64);
+    let max_rgb = pixel_stats
+        .and_then(|stats| stats.get("max_rgb"))
+        .and_then(Value::as_u64);
+
+    width > 0
+        && height > 0
+        && !path.trim().is_empty()
+        && width.checked_mul(height) == pixel_count
+        && nonzero_rgb_pixels.is_some_and(|count| count > 0 && Some(count) <= pixel_count)
+        && max_rgb.is_some_and(|value| value > 0)
+}
+
+fn b3_exact_e1_capture_evidence(automation_report: Option<&Value>) -> Result<Value, String> {
+    let artifacts = automation_report
+        .and_then(|report| report.get("artifacts"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "B3 E1 report is missing its exact-size GPU captures".to_owned())?;
+    let requirements = [
+        (
+            B3_PRIMARY_E1_CAPTURE,
+            u64::from(B3_VIEWPORT_WIDTH),
+            u64::from(B3_VIEWPORT_HEIGHT),
+        ),
+        (
+            B3_SECONDARY_E1_CAPTURE,
+            u64::from(B3_SECOND_VIEWPORT_WIDTH),
+            u64::from(B3_SECOND_VIEWPORT_HEIGHT),
+        ),
+    ];
+    let mut accepted = Vec::with_capacity(requirements.len());
+    for (label, expected_width, expected_height) in requirements {
+        let artifact = artifacts
+            .iter()
+            .find(|artifact| {
+                artifact
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .and_then(|path| Path::new(path).file_stem())
+                    .and_then(|stem| stem.to_str())
+                    == Some(label)
+            })
+            .ok_or_else(|| format!("B3 E1 report is missing capture {label}.ppm"))?;
+        if !nonblank_gpu_viewport_capture(artifact) {
+            return Err(format!(
+                "B3 E1 capture {label}.ppm is not a valid nonblank GPU readback"
+            ));
+        }
+        let width = artifact
+            .get("width")
+            .and_then(Value::as_u64)
+            .expect("qualifying viewport capture has a width");
+        let height = artifact
+            .get("height")
+            .and_then(Value::as_u64)
+            .expect("qualifying viewport capture has a height");
+        if width != expected_width || height != expected_height {
+            return Err(format!(
+                "B3 E1 capture {label}.ppm is {width}x{height}, expected exact {expected_width}x{expected_height} render-target pixels"
+            ));
+        }
+        let command_index = artifact
+            .get("command_index")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("B3 E1 capture {label}.ppm is missing command_index"))?;
+        accepted.push(json!({
+            "label": label,
+            "width": expected_width,
+            "height": expected_height,
+            "path": artifact.get("path").and_then(Value::as_str),
+            "command_index": command_index,
+            "capture_source": "gpu_display_frame_readback",
+        }));
+    }
+
+    let distinct_paths = accepted[0].get("path") != accepted[1].get("path");
+    let distinct_commands = accepted[0].get("command_index") != accepted[1].get("command_index");
+    if !distinct_paths || !distinct_commands {
+        return Err(
+            "B3 E1 exact-size captures must be distinct artifacts from distinct commands"
+                .to_owned(),
+        );
+    }
+
+    Ok(json!({
+        "required": true,
+        "accepted": true,
+        "evidence_level": "E1",
+        "evidence_scope": "automation_only_internal_gpu_render_target_readback",
+        "e4_product_open_satisfied": false,
+        "captures": accepted,
+    }))
 }
 
 fn product_validation_package_and_script(
@@ -732,6 +1033,14 @@ fn product_validation_package_and_script(
                 None => generate_fixture(RENDER_MODES_FIXTURE)?,
             };
             let script = generated_fixture_render_modes_script(&package);
+            Ok((package, script))
+        }
+        ProductValidationScenario::B3SourceVerification => {
+            let package = match package {
+                Some(package) => package.to_path_buf(),
+                None => generate_fixture(DEFAULT_FIXTURE)?,
+            };
+            let script = b3_source_verification_script(&package);
             Ok((package, script))
         }
         ProductValidationScenario::T5Qual001InteractionMip => {
@@ -901,6 +1210,60 @@ fn generated_fixture_render_modes_script(package: &Path) -> Value {
             { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
             { "command": "copy_diagnostics" },
             { "command": "capture_screenshot", "name": "generated-iso" },
+            { "command": "copy_diagnostics" },
+            { "command": "quit" }
+        ]
+    })
+}
+
+fn b3_source_verification_script(package: &Path) -> Value {
+    json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "scenario": B3_SOURCE_VERIFICATION_SCENARIO,
+        "limits": dataset_runtime_limits(128 * MIB, 128),
+        "commands": [
+            { "command": "open_dataset", "path": package },
+            { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
+            { "command": "set_viewport_size", "width": B3_VIEWPORT_WIDTH, "height": B3_VIEWPORT_HEIGHT },
+            { "command": "set_render_target_size", "width": B3_VIEWPORT_WIDTH, "height": B3_VIEWPORT_HEIGHT },
+            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30000 },
+            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "render_target_pixels": { "width": B3_VIEWPORT_WIDTH, "height": B3_VIEWPORT_HEIGHT } } },
+            { "command": "capture_screenshot", "name": "b3-before-cancel-1280x720" },
+            { "command": "cancel_source_verification" },
+            { "command": "wait_for", "condition": "source_verification_required", "timeout_ms": 30000 },
+            { "command": "assert", "condition": {
+                "source_verification_evidence": {
+                    "min_accepted_progress_updates": 0,
+                    "min_cancelled_runs": 1,
+                    "min_accepted_successes": 0
+                }
+            } },
+            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "render_target_pixels": { "width": B3_VIEWPORT_WIDTH, "height": B3_VIEWPORT_HEIGHT } } },
+            { "command": "capture_screenshot", "name": "b3-after-cancel-1280x720" },
+            { "command": "request_source_verification" },
+            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30000 },
+            { "command": "assert", "condition": {
+                "source_verification_evidence": {
+                    "min_accepted_progress_updates": 1,
+                    "min_cancelled_runs": 1,
+                    "min_accepted_successes": 1
+                }
+            } },
+            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "render_target_pixels": { "width": B3_VIEWPORT_WIDTH, "height": B3_VIEWPORT_HEIGHT } } },
+            { "command": "capture_screenshot", "name": "b3-after-success-1280x720" },
+            { "command": "set_viewport_size", "width": B3_SECOND_VIEWPORT_WIDTH, "height": B3_SECOND_VIEWPORT_HEIGHT },
+            { "command": "set_render_target_size", "width": B3_SECOND_VIEWPORT_WIDTH, "height": B3_SECOND_VIEWPORT_HEIGHT },
+            { "command": "sleep_or_frames", "frames": 3 },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "render_target_pixels": { "width": B3_SECOND_VIEWPORT_WIDTH, "height": B3_SECOND_VIEWPORT_HEIGHT } } },
+            { "command": "capture_screenshot", "name": "b3-after-success-1920x1080" },
             { "command": "copy_diagnostics" },
             { "command": "quit" }
         ]
@@ -1868,6 +2231,7 @@ struct WrapperReport<'a> {
     process_rss_limit_bytes: Option<u64>,
     process_peak_rss_bytes: Option<u64>,
     process_rss_limit_exceeded: bool,
+    source_closure_evidence: Value,
     automation_status: Option<String>,
     exit_status: Option<String>,
     exit_success: Option<bool>,
@@ -1950,6 +2314,22 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     let scenario_name = report.scenario_name;
+    let b3_e1_capture_evidence = if scenario_name == B3_SOURCE_VERIFICATION_SCENARIO {
+        match b3_exact_e1_capture_evidence(report.automation_report_value) {
+            Ok(evidence) => evidence,
+            Err(reason) => json!({
+                "required": true,
+                "accepted": false,
+                "evidence_level": "E1",
+                "evidence_scope": "automation_only_internal_gpu_render_target_readback",
+                "e4_product_open_satisfied": false,
+                "failure_reason": reason,
+                "captures": [],
+            }),
+        }
+    } else {
+        Value::Null
+    };
     let command_count = report
         .script_value
         .get("commands")
@@ -2060,6 +2440,7 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
             "pixels_per_point": pixels_per_point,
             "observed_client_area_pixels": Value::Null,
             "render_target_pixels": render_target_pixels,
+            "b3_exact_e1_capture_evidence": b3_e1_capture_evidence,
             "render_modes": render_modes.clone(),
             "frame_wait_count": frame_wait_count,
             "millis_wait_count": millis_wait_count,
@@ -2126,6 +2507,7 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
             "peak_rss_bytes": report.process_peak_rss_bytes,
             "rss_limit_exceeded": report.process_rss_limit_exceeded,
         },
+        "source_closure_evidence": report.source_closure_evidence,
     })
 }
 

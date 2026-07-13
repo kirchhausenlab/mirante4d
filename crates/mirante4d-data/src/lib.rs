@@ -13,6 +13,7 @@ use mirante4d_format::{
 use zarrs::array::ArrayShardedReadableExtCache;
 
 mod current_source_bridge;
+mod current_source_verification;
 mod error;
 mod payloads;
 mod regions;
@@ -21,6 +22,10 @@ mod runtime_support;
 mod sharded_bricks;
 mod types;
 pub use current_source_bridge::{CurrentDatasetSource, CurrentDatasetSourceOpenError};
+pub use current_source_verification::{
+    CurrentSourceVerification, CurrentSourceVerificationError, CurrentSourceVerificationPhase,
+    CurrentSourceVerificationProgress, CurrentSourceVerificationReport,
+};
 pub use error::DataError;
 use payloads::*;
 pub use regions::translated_region_grid_to_world;

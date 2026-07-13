@@ -98,6 +98,48 @@ fn automation_script_parses_semantic_camera_commands() {
 }
 
 #[test]
+fn automation_script_parses_source_verification_evidence_workflow() {
+    let raw = r#"
+        {
+          "schema": "mirante4d-product-automation-script",
+          "schema_version": 2,
+          "scenario": "b3_source_verification",
+          "commands": [
+            { "command": "set_render_target_size", "width": 1280, "height": 720 },
+            { "command": "cancel_source_verification" },
+            { "command": "wait_for", "condition": "source_verification_required", "timeout_ms": 1000 },
+            { "command": "request_source_verification" },
+            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 1000 },
+            { "command": "assert", "condition": { "source_verification_evidence": {
+              "min_accepted_progress_updates": 1,
+              "min_cancelled_runs": 1,
+              "min_accepted_successes": 1
+            } } },
+            { "command": "assert", "condition": { "render_target_pixels": {
+              "width": 1280,
+              "height": 720
+            } } },
+            { "command": "quit" }
+          ]
+        }"#;
+
+    let script: ProductAutomationScript = serde_json::from_str(raw).unwrap();
+
+    script.validate().unwrap();
+    assert_eq!(script.commands[0].name(), "set_render_target_size");
+    assert_eq!(script.commands[1].name(), "cancel_source_verification");
+    assert_eq!(script.commands[3].name(), "request_source_verification");
+    let ProductAutomationCommand::Assert { condition } = &script.commands[5] else {
+        panic!("expected source-verification evidence assertion");
+    };
+    assert_eq!(condition.name(), "source_verification_evidence");
+    let ProductAutomationCommand::Assert { condition } = &script.commands[6] else {
+        panic!("expected render-target assertion");
+    };
+    assert_eq!(condition.name(), "render_target_pixels");
+}
+
+#[test]
 fn automation_script_parses_four_panel_cross_section_commands_and_assertions() {
     let raw = r#"
         {

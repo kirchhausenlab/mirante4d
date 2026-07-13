@@ -6,7 +6,7 @@ use std::{
 };
 
 use eframe::egui;
-use mirante4d_application::{ApplicationCommand, CrossSectionPanelId};
+use mirante4d_application::{ApplicationCommand, CrossSectionPanelId, SourceVerificationSnapshot};
 use mirante4d_domain::{
     CrossSectionView as CanonicalCrossSectionView, DisplayWindow, DvrOpacityTransfer,
     IsoShadingPolicy, LayerTransfer, Opacity, RenderMode, RenderState, TimeIndex, UnitQuaternion,
@@ -15,7 +15,7 @@ use mirante4d_domain::{
 use mirante4d_project_model::LayerViewState;
 use mirante4d_render_api::PresentationViewport;
 use mirante4d_renderer::{
-    CurrentLeaseCohortStatus,
+    CurrentLeaseCohortStatus, RenderViewport,
     gpu::{GpuDisplayFrame, GpuRenderer},
 };
 use serde::Serialize;
@@ -28,7 +28,7 @@ use crate::cross_section_readout::{
 use crate::display_refresh::DisplayRefreshTiming;
 use crate::{
     DVR_DENSITY_SCALE_MAX, DVR_DENSITY_SCALE_MIN, DisplayedFrameFreshness, FrameCompleteness,
-    MiranteWorkbenchApp, application_view, current_egui_shell_bridge,
+    MiranteWorkbenchApp, application_view, current_egui_shell_bridge, set_render_viewport,
     viewer_layout::{PanelId, render_cross_section_view_state},
 };
 
@@ -204,6 +204,7 @@ pub(crate) struct ProductAutomationController {
     cross_section_latency_samples: Vec<ProductAutomationCrossSectionLatencySample>,
     pending_cross_section_latency_samples: Vec<PendingCrossSectionLatencySample>,
     limit_observations: ProductAutomationLimitObservations,
+    render_target_override: Option<RenderViewport>,
     report_written: bool,
 }
 
@@ -382,8 +383,13 @@ impl ProductAutomationController {
             cross_section_latency_samples: Vec::new(),
             pending_cross_section_latency_samples: Vec::new(),
             limit_observations: ProductAutomationLimitObservations::default(),
+            render_target_override: None,
             report_written: false,
         }
+    }
+
+    pub(crate) const fn render_target_override(&self) -> Option<RenderViewport> {
+        self.render_target_override
     }
 
     fn failed_to_initialize(reason: String) -> Self {
@@ -515,6 +521,71 @@ impl ProductAutomationController {
                     "path": app.dataset.selected_path().display().to_string(),
                 })))
             }
+            ProductAutomationCommand::CancelSourceVerification => {
+                let service = app
+                    .source_verification_service
+                    .as_mut()
+                    .ok_or_else(|| "source-verification service is unavailable".to_owned())?;
+                service
+                    .reset_diagnostics()
+                    .map_err(|error| error.to_string())?;
+
+                let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+                match snapshot.source() {
+                    SourceVerificationSnapshot::Verified(_) => {
+                        current_egui_shell_bridge::dispatch(
+                            &mut app.application,
+                            ApplicationCommand::InvalidateSourceVerification {
+                                source_generation: snapshot.source_generation(),
+                            },
+                        )
+                        .map_err(|fault| {
+                            format!("source-verification invalidation was rejected: {fault:?}")
+                        })?;
+                    }
+                    SourceVerificationSnapshot::Required => {}
+                    SourceVerificationSnapshot::Verifying { .. } => {
+                        return Err(
+                            "cancel_source_verification requires an idle source state".to_owned()
+                        );
+                    }
+                }
+                current_egui_shell_bridge::dispatch(
+                    &mut app.application,
+                    ApplicationCommand::RequestSourceVerification,
+                )
+                .map_err(|fault| format!("source-verification request was rejected: {fault:?}"))?;
+                let operation_id =
+                    match current_egui_shell_bridge::snapshot(&app.application).source() {
+                        SourceVerificationSnapshot::Verifying { operation_id, .. } => *operation_id,
+                        _ => {
+                            return Err("source-verification request did not create an operation"
+                                .to_owned());
+                        }
+                    };
+                current_egui_shell_bridge::dispatch(
+                    &mut app.application,
+                    ApplicationCommand::CancelOperation(operation_id),
+                )
+                .map_err(|fault| {
+                    format!("source-verification cancellation was rejected: {fault:?}")
+                })?;
+                app.pump_application_services();
+                Ok(CommandProgress::Done(json!({
+                    "operation_id": operation_id.get(),
+                    "cancellation_requested_before_worker_poll": true,
+                })))
+            }
+            ProductAutomationCommand::RequestSourceVerification => {
+                dispatch_application_command(
+                    app,
+                    ctx,
+                    ApplicationCommand::RequestSourceVerification,
+                )?;
+                Ok(CommandProgress::Done(json!({
+                    "requested": true,
+                })))
+            }
             ProductAutomationCommand::WaitFor {
                 condition,
                 timeout_ms,
@@ -547,6 +618,39 @@ impl ProductAutomationController {
                         "width": width,
                         "height": height,
                     },
+                })))
+            }
+            ProductAutomationCommand::SetRenderTargetSize { width, height } => {
+                let viewport = RenderViewport::new(u64::from(*width), u64::from(*height))
+                    .map_err(|error| format!("invalid automation render target: {error}"))?;
+                let context_max = ctx.input(|input| input.max_texture_side);
+                let maximum = app
+                    .validation_runtime
+                    .test_render_viewport_max_side
+                    .map_or(context_max, |test_max| context_max.min(test_max));
+                if usize::try_from(viewport.width)
+                    .ok()
+                    .is_none_or(|width| width > maximum)
+                    || usize::try_from(viewport.height)
+                        .ok()
+                        .is_none_or(|height| height > maximum)
+                {
+                    return Err(format!(
+                        "automation render target {}x{} exceeds maximum texture side {maximum}",
+                        viewport.width, viewport.height
+                    ));
+                }
+                self.render_target_override = Some(viewport);
+                if set_render_viewport(&mut app.render_runtime, viewport) {
+                    app.render_runtime.lod_replan_pending = true;
+                    ctx.request_repaint();
+                }
+                Ok(CommandProgress::Done(json!({
+                    "requested_render_target_pixels": {
+                        "width": viewport.width,
+                        "height": viewport.height,
+                    },
+                    "evidence_scope": "automation_only_internal_gpu_render_target",
                 })))
             }
             ProductAutomationCommand::SetViewerLayout { layout } => {
@@ -1426,6 +1530,20 @@ impl ProductAutomationController {
             ProductAutomationWaitCondition::GpuFramePresented => {
                 app.render_runtime.gpu_display_frame.is_some()
             }
+            ProductAutomationWaitCondition::SourceVerificationRequired => {
+                matches!(snapshot.source(), SourceVerificationSnapshot::Required)
+                    && app
+                        .source_verification_service
+                        .as_ref()
+                        .is_some_and(|service| service.active_token().is_none())
+            }
+            ProductAutomationWaitCondition::SourceVerificationVerified => {
+                matches!(snapshot.source(), SourceVerificationSnapshot::Verified(_))
+                    && app
+                        .source_verification_service
+                        .as_ref()
+                        .is_some_and(|service| service.active_token().is_none())
+            }
         }
     }
 
@@ -1699,6 +1817,47 @@ impl ProductAutomationController {
             } => assert_four_panel_images_distinct(app, min_different_pixels.unwrap_or(1)),
             ProductAutomationAssertCondition::CrossSectionRetired => {
                 assert_cross_section_retired(app)
+            }
+            ProductAutomationAssertCondition::SourceVerificationEvidence {
+                min_accepted_progress_updates,
+                min_cancelled_runs,
+                min_accepted_successes,
+            } => {
+                let diagnostics = app
+                    .source_verification_service
+                    .as_ref()
+                    .ok_or_else(|| "source-verification service is unavailable".to_owned())?
+                    .diagnostics();
+                if diagnostics.accepted_progress_updates < *min_accepted_progress_updates
+                    || diagnostics.cancelled_runs < *min_cancelled_runs
+                    || diagnostics.accepted_successes < *min_accepted_successes
+                {
+                    Err(format!(
+                        "source-verification evidence is incomplete: progress={}, cancelled={}, successes={}",
+                        diagnostics.accepted_progress_updates,
+                        diagnostics.cancelled_runs,
+                        diagnostics.accepted_successes,
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            ProductAutomationAssertCondition::RenderTargetPixels { width, height } => {
+                let frame = app
+                    .render_runtime
+                    .gpu_display_frame
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "no GPU display frame exists for exact-size assertion".to_owned()
+                    })?;
+                if frame.viewport.width == *width && frame.viewport.height == *height {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "GPU render target is {}x{}, expected exact {}x{} pixels",
+                        frame.viewport.width, frame.viewport.height, width, height
+                    ))
+                }
             }
         }
     }
@@ -2059,8 +2218,11 @@ impl ProductAutomationController {
                 }
             }
             ProductAutomationCommand::OpenDataset { .. }
+            | ProductAutomationCommand::CancelSourceVerification
+            | ProductAutomationCommand::RequestSourceVerification
             | ProductAutomationCommand::WaitFor { .. }
             | ProductAutomationCommand::SetViewportSize { .. }
+            | ProductAutomationCommand::SetRenderTargetSize { .. }
             | ProductAutomationCommand::SetViewerLayout { .. }
             | ProductAutomationCommand::SetPlayback { .. }
             | ProductAutomationCommand::SetRenderMode { .. }

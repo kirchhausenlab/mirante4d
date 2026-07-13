@@ -33,10 +33,10 @@ use crate::{
     local::{LocalStoreRoot, valid_checkpoint_id},
     pin::{publish_pin, remove_pin},
     transaction::{
-        InitialPackageMode, InstalledInitialPackage, ensure_writable_destination,
-        install_initial_manual_package, install_initial_provisional_autosave_package,
-        publish_established_autosave_generation, publish_established_manual_generation,
-        publish_provisional_autosave_generation,
+        InitialPackageMode, InstalledInitialPackage, ensure_authenticated_copy_destination,
+        install_initial_manual_package, install_initial_manual_package_from_generation,
+        install_initial_provisional_autosave_package, publish_established_autosave_generation,
+        publish_established_manual_generation, publish_provisional_autosave_generation,
     },
     trash::{purge_trash, trash_generations},
 };
@@ -288,7 +288,7 @@ impl SessionResources {
     where
         C: FnMut() -> bool,
     {
-        ensure_writable_destination(&destination)?;
+        ensure_authenticated_copy_destination(&destination, &self.root, limits)?;
         match self.leases.confirm_writer(&self.root) {
             Ok(true) => {}
             Ok(false) => return Err(ProjectStoreFault::ReadOnly),
@@ -322,10 +322,12 @@ impl SessionResources {
             });
         }
         let project_id = projection.state().project_id();
-        let installed = install_initial_manual_package(
+        let installed = install_initial_manual_package_from_generation(
             &destination,
             InitialPackageMode::Create,
             capture,
+            &self.root,
+            source,
             limits,
             &mut is_cancelled,
         )?;
@@ -354,7 +356,7 @@ impl SessionResources {
     where
         C: FnMut() -> bool,
     {
-        ensure_writable_destination(&destination)?;
+        ensure_authenticated_copy_destination(&destination, &self.root, limits)?;
         match self.leases.confirm_writer(&self.root) {
             Ok(true) => {}
             Ok(false) => return Err(ProjectStoreFault::ReadOnly),
@@ -386,13 +388,15 @@ impl SessionResources {
             });
         }
         let source_project_id = inspection.project_id();
-        let installed = install_initial_manual_package(
+        let installed = install_initial_manual_package_from_generation(
             &destination,
             InitialPackageMode::SaveAs {
                 source_project_id,
                 source_generation_id: source_generation,
             },
             capture,
+            &self.root,
+            inspection.manual_generation(),
             limits,
             &mut is_cancelled,
         )?;
@@ -421,32 +425,34 @@ impl SessionResources {
     where
         C: FnMut() -> bool,
     {
-        ensure_writable_destination(&destination)?;
+        ensure_authenticated_copy_destination(&destination, &self.root, limits)?;
         if source_generation != selected_generation {
             return Err(ProjectStoreFault::StaleParent);
         }
         let opened = open_recovery(&self.root, selected_generation, limits, &mut is_cancelled)?;
-        let (inspection, selected) = opened.into_parts();
+        let (inspection, selected) = opened.into_document_parts();
         let source_project_id = inspection.project_id();
         if !capture
             .projection()
             .state()
             .dataset()
-            .has_same_scientific_content(selected.state().dataset())
+            .has_same_scientific_content(selected.projection().state().dataset())
             || capture.projection().revision_high_water().sequence()
-                < selected.revision_high_water().sequence()
+                < selected.projection().revision_high_water().sequence()
         {
             return Err(ProjectStoreFault::Corruption {
                 stage: "save_as_recovery_selection",
             });
         }
-        let installed = install_initial_manual_package(
+        let installed = install_initial_manual_package_from_generation(
             &destination,
             InitialPackageMode::SaveAs {
                 source_project_id,
                 source_generation_id: selected_generation,
             },
             capture,
+            &self.root,
+            &selected,
             limits,
             &mut is_cancelled,
         )?;
@@ -1962,8 +1968,6 @@ mod tests {
     #[derive(Clone)]
     enum ControlledRead {
         Normal,
-        Fail,
-        Gate(Arc<Gate>),
     }
 
     struct ControlledSource {
@@ -1982,11 +1986,6 @@ mod tests {
             self.opens.fetch_add(1, Ordering::SeqCst);
             match &self.behavior {
                 ControlledRead::Normal => Ok(Box::new(Cursor::new(Arc::clone(&self.bytes)))),
-                ControlledRead::Fail => Err(io::Error::other("injected source failure")),
-                ControlledRead::Gate(gate) => Ok(Box::new(GatedReader {
-                    bytes: Cursor::new(Arc::clone(&self.bytes)),
-                    gate: Arc::clone(gate),
-                })),
             }
         }
     }
@@ -2341,15 +2340,9 @@ mod tests {
         assert_ne!(advanced_id, first_id);
 
         let provisional_before = file_tree(provisional_path.as_path());
-        let (manual, _) = controlled_fixture_capture(
-            "provisional.m4dproj",
-            &frozen,
-            next_projection.clone(),
-            None,
-            None,
-            None,
-            ControlledRead::Normal,
-        );
+        let manual =
+            ProjectCommitCapture::new(next_projection.clone(), None, None, None, Vec::new())
+                .unwrap();
         actor
             .try_submit(ProjectStoreCommand::Create {
                 request_id: request_id(3),
@@ -2475,6 +2468,34 @@ mod tests {
             selected_projection.state().dataset().clone(),
         );
         let source_project_id = selected_projection.state().project_id();
+        let rejected_destination =
+            ProjectStorePath::new(source.path().join("rejected-recovery-save-as.m4dproj")).unwrap();
+        let rejected_capture = ProjectCommitCapture::new(
+            recovered_projection.clone(),
+            None,
+            None,
+            Some((source_project_id, selected_id)),
+            Vec::new(),
+        )
+        .unwrap();
+        actor
+            .try_submit(ProjectStoreCommand::SaveAs {
+                request_id: request_id(5),
+                destination: rejected_destination.clone(),
+                source_generation: selected_id,
+                capture: rejected_capture,
+            })
+            .unwrap();
+        assert_saved_as_fault(
+            public_recv_timeout(&actor),
+            5,
+            ProjectStoreFault::Corruption {
+                stage: "destination_source_overlap",
+            },
+        );
+        assert!(!rejected_destination.as_path().exists());
+        assert_eq!(file_tree(source.path()), source_before);
+
         let (capture, _) = controlled_fixture_capture(
             "recoverable.m4dproj",
             &selected,
@@ -2486,7 +2507,7 @@ mod tests {
         );
         actor
             .try_submit(ProjectStoreCommand::SaveAs {
-                request_id: request_id(5),
+                request_id: request_id(6),
                 destination: destination.clone(),
                 source_generation: selected_id,
                 capture,
@@ -2496,7 +2517,7 @@ mod tests {
             ProjectStoreCompletion::SavedAs {
                 request_id: actual,
                 result: Ok(receipt),
-            } if actual == request_id(5) => receipt.current_generation_id(),
+            } if actual == request_id(6) => receipt.current_generation_id(),
             other => panic!("unexpected recovery Save As: {other:?}"),
         };
         assert_eq!(file_tree(source.path()), source_before);
@@ -2510,7 +2531,7 @@ mod tests {
             Some((source_project_id, selected_id))
         );
 
-        actor.try_submit(close_command(6)).unwrap();
+        actor.try_submit(close_command(7)).unwrap();
         public_recv_timeout(&actor);
         actor.join().unwrap();
     }
@@ -3066,7 +3087,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_and_cancelled_save_as_keep_the_source_session_authoritative() {
+    fn rejected_save_as_keeps_the_source_session_authoritative() {
         let source = TestProject::extracted_store("save-as-failure", "recoverable.m4dproj");
         let destinations = TestDirectory::new("save-as-failure-targets");
         let actor =
@@ -3106,60 +3127,91 @@ mod tests {
             b"unrelated"
         );
 
-        let failed = destinations.destination("source-failure.m4dproj");
-        let (failed_capture, failed_opens) = controlled_fixture_capture(
-            "divergent.m4dproj",
-            &target,
+        let rejected = destinations.destination("redundant-source.m4dproj");
+        let artifact = target.projection().state().artifacts().first().unwrap();
+        let ArtifactStorage::Direct { object } =
+            target.bindings().get(&artifact.object().digest()).unwrap()
+        else {
+            panic!("the tiny Save As fixture must remain direct");
+        };
+        let redundant_opens = Arc::new(AtomicUsize::new(0));
+        let redundant_source: Box<dyn ProjectObjectSource> = Box::new(ControlledSource {
+            descriptor: artifact.object().clone(),
+            bytes: Arc::from(fixture_extract(&fixture_object_member_in(
+                "divergent.m4dproj",
+                object.digest(),
+            ))),
+            opens: Arc::clone(&redundant_opens),
+            behavior: ControlledRead::Normal,
+        });
+        let rejected_capture = ProjectCommitCapture::new(
             target.projection().clone(),
             None,
             None,
             target.forked_from(),
-            ControlledRead::Fail,
-        );
+            vec![redundant_source],
+        )
+        .unwrap();
         actor
             .try_submit(ProjectStoreCommand::SaveAs {
                 request_id: request_id(2),
-                destination: failed.clone(),
+                destination: rejected.clone(),
                 source_generation,
-                capture: failed_capture,
+                capture: rejected_capture,
             })
             .unwrap();
         assert_saved_as_fault(
             actor.recv_timeout(TIMEOUT).unwrap(),
             2,
-            ProjectStoreFault::SourceChanged,
+            ProjectStoreFault::Corruption {
+                stage: "generation_closure",
+            },
         );
-        assert_eq!(failed_opens.load(Ordering::SeqCst), 1);
-        assert!(!failed.as_path().exists());
+        assert_eq!(redundant_opens.load(Ordering::SeqCst), 0);
+        assert!(!rejected.as_path().exists());
         assert_eq!(stage_count(destinations.path()), 0);
 
-        let cancelled = destinations.destination("cancelled.m4dproj");
-        let gate = Arc::new(Gate::default());
-        let (cancelled_capture, cancelled_opens) = controlled_fixture_capture(
-            "divergent.m4dproj",
-            &target,
-            target.projection().clone(),
-            None,
-            None,
-            target.forked_from(),
-            ControlledRead::Gate(Arc::clone(&gate)),
-        );
-        actor
-            .try_submit(ProjectStoreCommand::SaveAs {
-                request_id: request_id(3),
-                destination: cancelled.clone(),
-                source_generation,
-                capture: cancelled_capture,
-            })
+        for (request, destination) in [
+            (
+                3,
+                ProjectStorePath::new(source.path().join("nested-save-as.m4dproj")).unwrap(),
+            ),
+            (
+                4,
+                ProjectStorePath::new(
+                    source
+                        .path()
+                        .join("objects/sha256/deeply-nested-save-as.m4dproj"),
+                )
+                .unwrap(),
+            ),
+        ] {
+            let capture = ProjectCommitCapture::new(
+                target.projection().clone(),
+                None,
+                None,
+                target.forked_from(),
+                Vec::new(),
+            )
             .unwrap();
-        gate.wait_started();
-        actor.try_submit(cancel_command(4, 3)).unwrap();
-        assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 4);
-        gate.release();
-        assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 3);
-        assert_eq!(cancelled_opens.load(Ordering::SeqCst), 1);
-        assert!(!cancelled.as_path().exists());
-        assert_eq!(stage_count(destinations.path()), 0);
+            actor
+                .try_submit(ProjectStoreCommand::SaveAs {
+                    request_id: request_id(request),
+                    destination: destination.clone(),
+                    source_generation,
+                    capture,
+                })
+                .unwrap();
+            assert_saved_as_fault(
+                actor.recv_timeout(TIMEOUT).unwrap(),
+                request,
+                ProjectStoreFault::Corruption {
+                    stage: "destination_source_overlap",
+                },
+            );
+            assert!(!destination.as_path().exists());
+            assert_eq!(file_tree(source.path()), source_before);
+        }
         assert_eq!(file_tree(source.path()), source_before);
 
         let source_root = LocalStoreRoot::open(source.path()).unwrap();
@@ -5314,6 +5366,12 @@ mod tests {
         gated: Option<(RawObjectDescriptor, Arc<[u8]>, Arc<Gate>)>,
     ) -> ProjectCommitCapture {
         let mut sources: Vec<Box<dyn ProjectObjectSource>> = Vec::new();
+        let authority = expected_parent
+            .or(autosave_base)
+            .or_else(|| frozen.forked_from().map(|(_, generation_id)| generation_id));
+        let reusable = authority
+            .map(|generation_id| fixture_authority_descriptors(frozen, generation_id))
+            .unwrap_or_default();
         for artifact in projection.state().artifacts() {
             if let Some((descriptor, bytes, gate)) = &gated
                 && artifact.object() == descriptor
@@ -5323,6 +5381,9 @@ mod tests {
                     bytes: Arc::clone(bytes),
                     gate: Arc::clone(gate),
                 }));
+                continue;
+            }
+            if reusable.get(&artifact.object().digest()) == Some(artifact.object()) {
                 continue;
             }
             let storage = frozen.bindings().get(&artifact.object().digest()).unwrap();
@@ -5355,7 +5416,16 @@ mod tests {
     ) -> (ProjectCommitCapture, Arc<AtomicUsize>) {
         let opens = Arc::new(AtomicUsize::new(0));
         let mut sources: Vec<Box<dyn ProjectObjectSource>> = Vec::new();
+        let authority = expected_parent
+            .or(autosave_base)
+            .or_else(|| forked_from.map(|(_, generation_id)| generation_id));
+        let reusable = authority
+            .map(|generation_id| fixture_authority_descriptors(frozen, generation_id))
+            .unwrap_or_default();
         for artifact in projection.state().artifacts() {
+            if reusable.get(&artifact.object().digest()) == Some(artifact.object()) {
+                continue;
+            }
             let storage = frozen.bindings().get(&artifact.object().digest()).unwrap();
             let bytes = match storage {
                 ArtifactStorage::Direct { object } => {
@@ -5401,6 +5471,45 @@ mod tests {
             .unwrap(),
             opens,
         )
+    }
+
+    fn fixture_authority_descriptors(
+        fallback: &GenerationDocument,
+        generation_id: ProjectGenerationId,
+    ) -> BTreeMap<ExactBytesDigest, RawObjectDescriptor> {
+        let authority = match generation_id {
+            id if id == self::generation_id(STALE_MANUAL) => frozen_generation(STALE_MANUAL),
+            id if id == self::generation_id(STALE_AUTOSAVE) => frozen_generation(STALE_AUTOSAVE),
+            id if id == self::generation_id(PROVISIONAL_AUTOSAVE) => {
+                frozen_generation_in("provisional.m4dproj", PROVISIONAL_AUTOSAVE)
+            }
+            id if id == self::generation_id(RECOVERABLE_G1) => {
+                frozen_generation_in("recoverable.m4dproj", RECOVERABLE_G1)
+            }
+            id if id == self::generation_id(RECOVERABLE_G2) => {
+                frozen_generation_in("recoverable.m4dproj", RECOVERABLE_G2)
+            }
+            id if id == self::generation_id(RECOVERABLE_AUTOSAVE) => {
+                frozen_generation_in("recoverable.m4dproj", RECOVERABLE_AUTOSAVE)
+            }
+            id if id == self::generation_id(RECOVERABLE_ORPHAN) => {
+                frozen_generation_in("recoverable.m4dproj", RECOVERABLE_ORPHAN)
+            }
+            id if id == self::generation_id(DIVERGENT_INITIAL) => {
+                frozen_generation_in("divergent.m4dproj", DIVERGENT_INITIAL)
+            }
+            id if id == self::generation_id(DIVERGENT_NEXT) => {
+                frozen_generation_in("divergent.m4dproj", DIVERGENT_NEXT)
+            }
+            _ => fallback.clone(),
+        };
+        let mut descriptors = BTreeMap::new();
+        for artifact in authority.projection().state().artifacts() {
+            descriptors
+                .entry(artifact.object().digest())
+                .or_insert_with(|| artifact.object().clone());
+        }
+        descriptors
     }
 
     fn retarget_projection(

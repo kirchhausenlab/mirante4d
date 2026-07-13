@@ -2,12 +2,18 @@
 
 use std::{
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use mirante4d_application::UnboundWorkspace;
-use mirante4d_data::CurrentDatasetSource;
-use mirante4d_dataset::{DatasetCatalog, DatasetSource, DatasetSourceId};
+use mirante4d_data::{
+    CurrentDatasetSource, CurrentSourceVerification, CurrentSourceVerificationError,
+    CurrentSourceVerificationProgress,
+};
+use mirante4d_dataset::{CpuByteLedger, DatasetCatalog, DatasetSource, DatasetSourceId};
 use mirante4d_dataset_runtime::{
     DatasetRuntime, DatasetRuntimeConfig, RuntimeFault, RuntimeFaultCode,
 };
@@ -43,23 +49,32 @@ pub(crate) struct UnifiedOpenedSource {
     pub(crate) startup_diagnostics: StartupDiagnostics,
 }
 
+pub(crate) struct UnifiedVerifiedSource {
+    pub(crate) dataset: DatasetDemandState,
+    pub(crate) catalog: Arc<DatasetCatalog>,
+}
+
+#[derive(Debug)]
+pub(crate) enum UnifiedVerifiedSourceOpenError {
+    RuntimeConfiguration(RuntimeFaultCode),
+    Verification(CurrentSourceVerificationError),
+    Runtime(RuntimeFault),
+    MissingCpuLedger,
+}
+
+pub(crate) enum UnifiedCurrentSourceVerificationError {
+    Open(mirante4d_data::CurrentDatasetSourceOpenError),
+    Verification(CurrentSourceVerificationError),
+}
+
 pub(crate) fn open(
     path: impl AsRef<Path>,
     resource_policy: ResourcePolicy,
     source_id: DatasetSourceId,
 ) -> anyhow::Result<UnifiedOpenedSource> {
     let selected_path = path.as_ref().to_path_buf();
-    let worker_limit = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1)
-        .clamp(1, MAX_DATASET_WORKERS);
-    let config = DatasetRuntimeConfig::new(
-        resource_policy.cpu_dataset_budget_bytes(),
-        worker_limit,
-        REQUEST_QUEUE_LIMIT,
-        COMPLETION_QUEUE_LIMIT,
-    )
-    .map_err(|code| anyhow::anyhow!("unified dataset runtime configuration failed: {code}"))?;
+    let config = runtime_config(resource_policy)
+        .map_err(|code| anyhow::anyhow!("unified dataset runtime configuration failed: {code}"))?;
 
     let source_error = Arc::new(Mutex::new(None));
     let worker_error = Arc::clone(&source_error);
@@ -70,7 +85,7 @@ pub(crate) fn open(
         *worker_ledger
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(&ledger));
-        match CurrentDatasetSource::open(source_path, source_id, ledger) {
+        match open_current_source(source_path, source_id, ledger) {
             Ok(source) => {
                 let source: Arc<dyn DatasetSource> = source;
                 Ok(source)
@@ -99,7 +114,8 @@ pub(crate) fn open(
 
     let workspace = workspace_from_catalog(catalog.as_ref())?;
     let (render_runtime, analysis_runtime) = initial_runtime_state(catalog.as_ref(), &workspace)?;
-    let dataset = DatasetDemandState::new(runtime, cpu_ledger, selected_path);
+    let resource_identity = catalog.scientific_identity().resource_identity();
+    let dataset = DatasetDemandState::new(runtime, cpu_ledger, resource_identity, selected_path);
     Ok(UnifiedOpenedSource {
         dataset,
         catalog,
@@ -108,6 +124,99 @@ pub(crate) fn open(
         analysis_runtime,
         startup_diagnostics: collect_startup_diagnostics(),
     })
+}
+
+pub(crate) fn verify_current_source(
+    path: impl AsRef<Path>,
+    source_id: DatasetSourceId,
+    scan_ledger: Arc<dyn CpuByteLedger>,
+    is_cancelled: impl Fn() -> bool,
+    report_progress: impl FnMut(CurrentSourceVerificationProgress),
+) -> Result<CurrentSourceVerification, UnifiedCurrentSourceVerificationError> {
+    let source = open_current_source(path, source_id, scan_ledger)
+        .map_err(UnifiedCurrentSourceVerificationError::Open)?;
+    source
+        .verify_scientific_content(is_cancelled, report_progress)
+        .map_err(UnifiedCurrentSourceVerificationError::Verification)
+}
+
+fn open_current_source(
+    path: impl AsRef<Path>,
+    source_id: DatasetSourceId,
+    ledger: Arc<dyn CpuByteLedger>,
+) -> Result<Arc<CurrentDatasetSource>, mirante4d_data::CurrentDatasetSourceOpenError> {
+    CurrentDatasetSource::open(path, source_id, ledger)
+}
+
+pub(crate) fn open_verified(
+    path: impl AsRef<Path>,
+    resource_policy: ResourcePolicy,
+    verification: CurrentSourceVerification,
+    cancellation: &AtomicBool,
+    report_progress: impl Fn(CurrentSourceVerificationProgress) + Send + Sync + 'static,
+) -> Result<UnifiedVerifiedSource, UnifiedVerifiedSourceOpenError> {
+    let selected_path = path.as_ref().to_path_buf();
+    let config = runtime_config(resource_policy)
+        .map_err(UnifiedVerifiedSourceOpenError::RuntimeConfiguration)?;
+    let source_error = Arc::new(Mutex::new(None));
+    let worker_error = Arc::clone(&source_error);
+    let captured_ledger = Arc::new(Mutex::new(None));
+    let worker_ledger = Arc::clone(&captured_ledger);
+    let source_path = selected_path.clone();
+    let (runtime, catalog) = <dyn DatasetRuntime>::start(config, move |ledger| {
+        *worker_ledger
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(&ledger));
+        match CurrentDatasetSource::open_verified(
+            source_path,
+            &verification,
+            ledger,
+            || cancellation.load(Ordering::Acquire),
+            report_progress,
+        ) {
+            Ok(source) => {
+                let source: Arc<dyn DatasetSource> = source;
+                Ok(source)
+            }
+            Err(error) => {
+                *worker_error
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = Some(error);
+                Err(RuntimeFault::new(RuntimeFaultCode::SourceRejected))
+            }
+        }
+    })
+    .map_err(|runtime_error| {
+        source_error
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+            .map(UnifiedVerifiedSourceOpenError::Verification)
+            .unwrap_or(UnifiedVerifiedSourceOpenError::Runtime(runtime_error))
+    })?;
+    let cpu_ledger = captured_ledger
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take()
+        .ok_or(UnifiedVerifiedSourceOpenError::MissingCpuLedger)?;
+    let resource_identity = catalog.scientific_identity().resource_identity();
+    let dataset = DatasetDemandState::new(runtime, cpu_ledger, resource_identity, selected_path);
+    Ok(UnifiedVerifiedSource { dataset, catalog })
+}
+
+fn runtime_config(
+    resource_policy: ResourcePolicy,
+) -> Result<DatasetRuntimeConfig, RuntimeFaultCode> {
+    let worker_limit = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .clamp(1, MAX_DATASET_WORKERS);
+    DatasetRuntimeConfig::new(
+        resource_policy.cpu_dataset_budget_bytes(),
+        worker_limit,
+        REQUEST_QUEUE_LIMIT,
+        COMPLETION_QUEUE_LIMIT,
+    )
 }
 
 fn initial_runtime_state(

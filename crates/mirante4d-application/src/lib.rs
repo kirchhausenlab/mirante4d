@@ -6,12 +6,14 @@
 
 #![forbid(unsafe_code)]
 
+mod project_store_service;
+
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
 };
 
-use mirante4d_dataset::{DatasetCatalog, ScientificIdentityStatus};
+use mirante4d_dataset::{DatasetCatalog, DatasetSourceId, ScientificIdentityStatus};
 use mirante4d_domain::{
     CameraView, CrossSectionView, IsoLightState, LogicalLayerKey, TimeIndex, ToolKind, ViewerLayout,
 };
@@ -262,6 +264,7 @@ impl SettingsChangeToken {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OperationKind {
     DatasetOpen,
+    SourceVerification,
     ProjectOpen,
     ProjectSave,
     Analysis,
@@ -343,6 +346,10 @@ pub enum OperationFailureCode {
     DatasetUnsupported,
     DatasetCapacityExceeded,
     DatasetReadFailed,
+    SourceChanged,
+    SourceVerificationInvalid,
+    SourceVerificationCapacityExceeded,
+    SourceVerificationReadFailed,
     ProjectNotFound,
     ProjectPermissionDenied,
     ProjectInvalidDocument,
@@ -367,6 +374,11 @@ pub enum OperationCompletion {
         source_generation: SourceSessionGeneration,
         catalog: Arc<DatasetCatalog>,
         workspace: Box<UnboundWorkspace>,
+    },
+    SourceVerified {
+        source_generation: SourceSessionGeneration,
+        catalog: Arc<DatasetCatalog>,
+        dataset: DatasetReference,
     },
     AnalysisReady {
         tables: Vec<AnalysisTableDescriptor>,
@@ -472,6 +484,15 @@ impl TransientApplicationState {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApplicationCommand {
     RequestDatasetOpen,
+    RequestSourceVerification,
+    UpdateSourceVerificationProgress {
+        token: OperationToken,
+        completed_work: u64,
+        total_work: u64,
+    },
+    InvalidateSourceVerification {
+        source_generation: SourceSessionGeneration,
+    },
     AttachVerifiedDataset,
     SetActiveLayer(LogicalLayerKey),
     SetTimepoint(TimeIndex),
@@ -523,6 +544,9 @@ pub enum ApplicationCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplicationCommandKind {
     RequestDatasetOpen,
+    RequestSourceVerification,
+    UpdateSourceVerificationProgress,
+    InvalidateSourceVerification,
     AttachVerifiedDataset,
     SetActiveLayer,
     SetTimepoint,
@@ -561,6 +585,13 @@ impl ApplicationCommand {
     pub const fn kind(&self) -> ApplicationCommandKind {
         match self {
             Self::RequestDatasetOpen => ApplicationCommandKind::RequestDatasetOpen,
+            Self::RequestSourceVerification => ApplicationCommandKind::RequestSourceVerification,
+            Self::UpdateSourceVerificationProgress { .. } => {
+                ApplicationCommandKind::UpdateSourceVerificationProgress
+            }
+            Self::InvalidateSourceVerification { .. } => {
+                ApplicationCommandKind::InvalidateSourceVerification
+            }
             Self::AttachVerifiedDataset => ApplicationCommandKind::AttachVerifiedDataset,
             Self::SetActiveLayer(_) => ApplicationCommandKind::SetActiveLayer,
             Self::SetTimepoint(_) => ApplicationCommandKind::SetTimepoint,
@@ -629,6 +660,7 @@ pub enum ApplicationFaultCode {
     OperationTokenMismatch,
     StaleOperationCompletion,
     InvalidOperationCompletion,
+    InvalidOperationProgress,
     OperationConflict,
     ResourcePolicyChangePending,
     ResourcePolicyCompletionMismatch,
@@ -686,9 +718,20 @@ pub enum ApplicationEvent {
         source_generation: SourceSessionGeneration,
         provisional_project_id: ProjectId,
     },
+    SourceVerificationRequested {
+        token: OperationToken,
+    },
+    SourceVerificationProgress {
+        token: OperationToken,
+        completed_work: u64,
+        total_work: u64,
+    },
     SourceVerified {
         source_generation: SourceSessionGeneration,
         scientific_content_id: ScientificContentId,
+    },
+    SourceVerificationInvalidated {
+        source_generation: SourceSessionGeneration,
     },
     WorkspaceChanged {
         currentness: CurrentnessGeneration,
@@ -742,6 +785,7 @@ pub enum OperationOutcome {
     Cancelled,
     Failed(OperationFailureCode),
     DatasetOpened,
+    SourceVerified,
     AnalysisReady,
     ArtifactAdmitted,
     ProjectOpened,
@@ -921,11 +965,19 @@ struct ActiveOperation {
     token: OperationToken,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceVerificationProgressState {
+    operation_id: OperationId,
+    completed_work: u64,
+    total_work: u64,
+}
+
 #[derive(Debug, PartialEq)]
 pub struct ApplicationState {
     source_generation: SourceSessionGeneration,
     catalog: Arc<DatasetCatalog>,
     verified_source: Option<DatasetReference>,
+    source_verification_progress: Option<SourceVerificationProgressState>,
     workspace: Workspace,
     transient: TransientApplicationState,
     currentness: CurrentnessGeneration,
@@ -952,6 +1004,7 @@ impl ApplicationState {
             source_generation,
             catalog: Arc::new(catalog),
             verified_source: None,
+            source_verification_progress: None,
             workspace: Workspace::Unbound(Arc::new(workspace)),
             transient: TransientApplicationState::default(),
             currentness: CurrentnessGeneration::initial(),
@@ -971,6 +1024,7 @@ impl ApplicationState {
             source_generation: self.source_generation,
             catalog: Arc::clone(&self.catalog),
             verified_source: self.verified_source.clone(),
+            source_verification_progress: self.source_verification_progress,
             workspace: self.workspace.clone(),
             transient: self.transient.clone(),
             currentness: self.currentness,
@@ -985,48 +1039,6 @@ impl ApplicationState {
         }
     }
 
-    #[cfg(test)]
-    fn admit_verified_source_for_test(
-        &mut self,
-        source_generation: SourceSessionGeneration,
-        dataset: DatasetReference,
-    ) -> Result<CommandEffect, ApplicationFaultCode> {
-        if source_generation != self.source_generation {
-            return Err(ApplicationFaultCode::SourceSessionMismatch);
-        }
-        if let Workspace::Bound(bound) = &self.workspace
-            && bound.current_state().dataset() != &dataset
-        {
-            return Err(ApplicationFaultCode::DatasetIdentityMismatch);
-        }
-        if self.verified_source.as_ref() == Some(&dataset) {
-            return Ok(CommandEffect::NoChange);
-        }
-        match self.catalog.scientific_identity() {
-            ScientificIdentityStatus::Unverified(_) => {
-                self.catalog = Arc::new(
-                    DatasetCatalog::new(
-                        self.catalog.label(),
-                        ScientificIdentityStatus::Verified(*dataset.scientific_content_id()),
-                        self.catalog.layers().cloned().collect(),
-                    )
-                    .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)?,
-                );
-            }
-            ScientificIdentityStatus::Verified(identity)
-                if identity == dataset.scientific_content_id() => {}
-            ScientificIdentityStatus::Verified(_) => {
-                return Err(ApplicationFaultCode::DatasetIdentityMismatch);
-            }
-        }
-        self.push_event(ApplicationEvent::SourceVerified {
-            source_generation,
-            scientific_content_id: *dataset.scientific_content_id(),
-        })?;
-        self.verified_source = Some(dataset);
-        Ok(CommandEffect::Changed)
-    }
-
     /// Applies one command atomically. Rejected commands leave every field,
     /// including queues, counters, and revision high-water, unchanged.
     pub fn dispatch(
@@ -1035,7 +1047,10 @@ impl ApplicationState {
     ) -> Result<CommandEffect, ApplicationFault> {
         let command_kind = command.kind();
         let fault_token = match &command {
-            ApplicationCommand::CompleteOperation { token, .. } => Some(token.clone()),
+            ApplicationCommand::CompleteOperation { token, .. }
+            | ApplicationCommand::UpdateSourceVerificationProgress { token, .. } => {
+                Some(token.clone())
+            }
             _ => None,
         };
         let mut candidate = self.fork_for_dispatch();
@@ -1065,9 +1080,16 @@ impl ApplicationState {
                 retained_history_entries: workspace.history.len(),
             },
         };
-        let source = match &self.verified_source {
-            Some(dataset) => SourceVerificationSnapshot::Verified(dataset.clone()),
-            None => SourceVerificationSnapshot::Required,
+        let source = match self.source_verification_progress {
+            Some(progress) => SourceVerificationSnapshot::Verifying {
+                operation_id: progress.operation_id,
+                completed_work: progress.completed_work,
+                total_work: progress.total_work,
+            },
+            None => match &self.verified_source {
+                Some(dataset) => SourceVerificationSnapshot::Verified(dataset.clone()),
+                None => SourceVerificationSnapshot::Required,
+            },
         };
         let operations = self
             .operations
@@ -1102,6 +1124,15 @@ impl ApplicationState {
     ) -> Result<CommandEffect, ApplicationFaultCode> {
         match command {
             ApplicationCommand::RequestDatasetOpen => self.request_dataset_open(),
+            ApplicationCommand::RequestSourceVerification => self.request_source_verification(),
+            ApplicationCommand::UpdateSourceVerificationProgress {
+                token,
+                completed_work,
+                total_work,
+            } => self.update_source_verification_progress(token, completed_work, total_work),
+            ApplicationCommand::InvalidateSourceVerification { source_generation } => {
+                self.invalidate_source_verification(source_generation)
+            }
             ApplicationCommand::AttachVerifiedDataset => self.attach_verified_dataset(),
             ApplicationCommand::SetActiveLayer(layer) => self.update_view(command_kind, |view| {
                 rebuild_view(view, ViewUpdate::Active(layer))
@@ -1165,6 +1196,7 @@ impl ApplicationState {
                 if matches!(
                     kind,
                     OperationKind::DatasetOpen
+                        | OperationKind::SourceVerification
                         | OperationKind::ProjectOpen
                         | OperationKind::ProjectSave
                 ) {
@@ -1201,6 +1233,7 @@ impl ApplicationState {
         self.source_generation = source_generation;
         self.catalog = catalog;
         self.verified_source = None;
+        self.source_verification_progress = None;
         self.workspace = Workspace::Unbound(Arc::new(workspace));
         self.transient = TransientApplicationState::default();
         self.advance_currentness()?;
@@ -1217,6 +1250,102 @@ impl ApplicationState {
         }
         let token = self.create_operation(OperationKind::DatasetOpen)?;
         self.push_event(ApplicationEvent::DatasetOpenRequested { token })?;
+        Ok(CommandEffect::Changed)
+    }
+
+    fn request_source_verification(&mut self) -> Result<CommandEffect, ApplicationFaultCode> {
+        if self.verified_source.is_some() {
+            return Ok(CommandEffect::NoChange);
+        }
+        if self.source_verification_progress.is_some() || !self.operations.is_empty() {
+            return Err(ApplicationFaultCode::OperationConflict);
+        }
+        require_unverified_catalog(&self.catalog, self.source_generation)?;
+        let token = self.create_operation(OperationKind::SourceVerification)?;
+        self.source_verification_progress = Some(SourceVerificationProgressState {
+            operation_id: token.operation_id,
+            completed_work: 0,
+            total_work: 0,
+        });
+        self.push_event(ApplicationEvent::SourceVerificationRequested { token })?;
+        Ok(CommandEffect::Changed)
+    }
+
+    fn update_source_verification_progress(
+        &mut self,
+        token: OperationToken,
+        completed_work: u64,
+        total_work: u64,
+    ) -> Result<CommandEffect, ApplicationFaultCode> {
+        self.validate_source_verification_token_current(&token)?;
+        if total_work == 0 || completed_work > total_work {
+            return Err(ApplicationFaultCode::InvalidOperationProgress);
+        }
+        let progress = self
+            .source_verification_progress
+            .as_mut()
+            .ok_or(ApplicationFaultCode::InvalidOperationProgress)?;
+        if progress.operation_id != token.operation_id
+            || completed_work < progress.completed_work
+            || (progress.total_work != 0 && progress.total_work != total_work)
+        {
+            return Err(ApplicationFaultCode::InvalidOperationProgress);
+        }
+        if progress.completed_work == completed_work && progress.total_work == total_work {
+            return Ok(CommandEffect::NoChange);
+        }
+        progress.completed_work = completed_work;
+        progress.total_work = total_work;
+        self.push_event(ApplicationEvent::SourceVerificationProgress {
+            token,
+            completed_work,
+            total_work,
+        })?;
+        Ok(CommandEffect::Changed)
+    }
+
+    fn invalidate_source_verification(
+        &mut self,
+        source_generation: SourceSessionGeneration,
+    ) -> Result<CommandEffect, ApplicationFaultCode> {
+        if source_generation != self.source_generation {
+            return Err(ApplicationFaultCode::SourceSessionMismatch);
+        }
+
+        let cancelled_ids = self
+            .operations
+            .iter()
+            .filter_map(|(operation_id, operation)| {
+                matches!(
+                    operation.token.kind,
+                    OperationKind::SourceVerification
+                        | OperationKind::ProjectOpen
+                        | OperationKind::ProjectSave
+                )
+                .then_some(*operation_id)
+            })
+            .collect::<Vec<_>>();
+        let cancelled_operations = cancelled_ids
+            .into_iter()
+            .filter_map(|operation_id| self.operations.remove(&operation_id))
+            .collect::<Vec<_>>();
+        let was_verified = self.verified_source.take().is_some();
+        if cancelled_operations.is_empty() && !was_verified {
+            return Ok(CommandEffect::NoChange);
+        }
+
+        self.catalog = Arc::new(catalog_with_identity(
+            &self.catalog,
+            ScientificIdentityStatus::Unverified(DatasetSourceId::new(source_generation.get())),
+        )?);
+        self.source_verification_progress = None;
+        for operation in cancelled_operations {
+            self.push_event(ApplicationEvent::OperationCancellationRequested {
+                token: operation.token,
+            })?;
+        }
+        self.advance_currentness()?;
+        self.push_event(ApplicationEvent::SourceVerificationInvalidated { source_generation })?;
         Ok(CommandEffect::Changed)
     }
 
@@ -1715,6 +1844,9 @@ impl ApplicationState {
     }
 
     fn request_project_save(&mut self) -> Result<CommandEffect, ApplicationFaultCode> {
+        if self.verified_source.is_none() {
+            return Err(ApplicationFaultCode::IdentityVerificationRequired);
+        }
         if self
             .operations
             .values()
@@ -1808,7 +1940,9 @@ impl ApplicationState {
         if active.token != token {
             return Err(ApplicationFaultCode::OperationTokenMismatch);
         }
-        if token.kind == OperationKind::ProjectSave {
+        if token.kind == OperationKind::SourceVerification {
+            self.validate_source_verification_token_current(&token)?;
+        } else if token.kind == OperationKind::ProjectSave {
             self.validate_save_token_current(&token)?;
         } else {
             self.validate_token_current(&token)?;
@@ -1818,8 +1952,34 @@ impl ApplicationState {
         }
         let outcome = match completion {
             OperationCompletion::Succeeded => OperationOutcome::Succeeded,
-            OperationCompletion::Cancelled => OperationOutcome::Cancelled,
-            OperationCompletion::Failed(code) => OperationOutcome::Failed(code),
+            OperationCompletion::Cancelled => {
+                if token.kind == OperationKind::SourceVerification {
+                    self.source_verification_progress = None;
+                }
+                OperationOutcome::Cancelled
+            }
+            OperationCompletion::Failed(code) => {
+                if token.kind == OperationKind::SourceVerification {
+                    self.source_verification_progress = None;
+                    if code == OperationFailureCode::SourceChanged {
+                        let binding_changed = self.verified_source.take().is_some()
+                            || self.catalog.scientific_identity().is_verified();
+                        self.catalog = Arc::new(catalog_with_identity(
+                            &self.catalog,
+                            ScientificIdentityStatus::Unverified(DatasetSourceId::new(
+                                self.source_generation.get(),
+                            )),
+                        )?);
+                        if binding_changed {
+                            self.advance_currentness()?;
+                        }
+                        self.push_event(ApplicationEvent::SourceVerificationInvalidated {
+                            source_generation: self.source_generation,
+                        })?;
+                    }
+                }
+                OperationOutcome::Failed(code)
+            }
             OperationCompletion::DatasetOpened {
                 source_generation,
                 catalog,
@@ -1830,6 +1990,14 @@ impl ApplicationState {
                 }
                 self.admit_opened_source(source_generation, catalog, *workspace)?;
                 OperationOutcome::DatasetOpened
+            }
+            OperationCompletion::SourceVerified {
+                source_generation,
+                catalog,
+                dataset,
+            } => {
+                self.admit_verified_source(source_generation, catalog, dataset)?;
+                OperationOutcome::SourceVerified
             }
             OperationCompletion::AnalysisReady { tables, plots } => {
                 if token.kind != OperationKind::Analysis {
@@ -1902,6 +2070,44 @@ impl ApplicationState {
         Ok(CommandEffect::Changed)
     }
 
+    fn admit_verified_source(
+        &mut self,
+        source_generation: SourceSessionGeneration,
+        catalog: Arc<DatasetCatalog>,
+        dataset: DatasetReference,
+    ) -> Result<(), ApplicationFaultCode> {
+        if source_generation != self.source_generation {
+            return Err(ApplicationFaultCode::SourceSessionMismatch);
+        }
+        let identity = *dataset.scientific_content_id();
+        if catalog.scientific_identity().verified_id() != Some(&identity) {
+            return Err(ApplicationFaultCode::DatasetIdentityMismatch);
+        }
+        let expected =
+            catalog_with_identity(&self.catalog, ScientificIdentityStatus::Verified(identity))?;
+        if catalog.as_ref() != &expected {
+            return Err(ApplicationFaultCode::DatasetIdentityMismatch);
+        }
+        if let Workspace::Bound(bound) = &self.workspace
+            && !bound
+                .current_state()
+                .dataset()
+                .has_same_scientific_content(&dataset)
+        {
+            return Err(ApplicationFaultCode::DatasetIdentityMismatch);
+        }
+
+        self.catalog = catalog;
+        self.verified_source = Some(dataset);
+        self.source_verification_progress = None;
+        self.advance_currentness()?;
+        self.push_event(ApplicationEvent::SourceVerified {
+            source_generation,
+            scientific_content_id: identity,
+        })?;
+        Ok(())
+    }
+
     fn admit_analysis_descriptors(
         &mut self,
         operation_id: OperationId,
@@ -1968,10 +2174,31 @@ impl ApplicationState {
             .operations
             .remove(&operation_id)
             .ok_or(ApplicationFaultCode::OperationNotFound)?;
+        if operation.token.kind == OperationKind::SourceVerification {
+            self.source_verification_progress = None;
+        }
         self.push_event(ApplicationEvent::OperationCancellationRequested {
             token: operation.token,
         })?;
         Ok(CommandEffect::Changed)
+    }
+
+    fn validate_source_verification_token_current(
+        &self,
+        token: &OperationToken,
+    ) -> Result<(), ApplicationFaultCode> {
+        let Some(active) = self.operations.get(&token.operation_id) else {
+            return Err(ApplicationFaultCode::OperationNotFound);
+        };
+        if active.token != *token {
+            return Err(ApplicationFaultCode::OperationTokenMismatch);
+        }
+        if token.kind != OperationKind::SourceVerification
+            || token.source_session_generation != self.source_generation
+        {
+            return Err(ApplicationFaultCode::StaleOperationCompletion);
+        }
+        Ok(())
     }
 
     fn validate_token_current(&self, token: &OperationToken) -> Result<(), ApplicationFaultCode> {
@@ -2096,6 +2323,7 @@ impl ApplicationState {
             }
             ApplicationEvent::OperationStarted { .. }
             | ApplicationEvent::DatasetOpenRequested { .. }
+            | ApplicationEvent::SourceVerificationRequested { .. }
             | ApplicationEvent::ProjectOpenRequested { .. }
             | ApplicationEvent::ProjectSaveRequested { .. }
             | ApplicationEvent::ResourcePolicyChangePending { .. } => {
@@ -2130,6 +2358,11 @@ impl ApplicationState {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceVerificationSnapshot {
     Required,
+    Verifying {
+        operation_id: OperationId,
+        completed_work: u64,
+        total_work: u64,
+    },
     Verified(DatasetReference),
 }
 
@@ -2353,6 +2586,18 @@ fn require_unverified_catalog(
     }
 }
 
+fn catalog_with_identity(
+    catalog: &DatasetCatalog,
+    scientific_identity: ScientificIdentityStatus,
+) -> Result<DatasetCatalog, ApplicationFaultCode> {
+    DatasetCatalog::new(
+        catalog.label(),
+        scientific_identity,
+        catalog.layers().cloned().collect(),
+    )
+    .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)
+}
+
 fn catalog_timepoint_count(catalog: &DatasetCatalog) -> u64 {
     catalog
         .layers()
@@ -2468,6 +2713,10 @@ fn completion_matches_kind(kind: OperationKind, completion: &OperationCompletion
             completion,
             OperationCompletion::DatasetOpened { .. } | OperationCompletion::Cancelled
         ),
+        OperationKind::SourceVerification => matches!(
+            completion,
+            OperationCompletion::SourceVerified { .. } | OperationCompletion::Cancelled
+        ),
         OperationKind::ProjectOpen => matches!(
             completion,
             OperationCompletion::ProjectOpened(_) | OperationCompletion::Cancelled
@@ -2500,6 +2749,13 @@ const fn failure_code_matches_kind(kind: OperationKind, code: OperationFailureCo
                 | OperationFailureCode::DatasetUnsupported
                 | OperationFailureCode::DatasetCapacityExceeded
                 | OperationFailureCode::DatasetReadFailed
+        ),
+        OperationKind::SourceVerification => matches!(
+            code,
+            OperationFailureCode::SourceChanged
+                | OperationFailureCode::SourceVerificationInvalid
+                | OperationFailureCode::SourceVerificationCapacityExceeded
+                | OperationFailureCode::SourceVerificationReadFailed
         ),
         OperationKind::ProjectOpen => matches!(
             code,

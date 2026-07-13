@@ -16,7 +16,7 @@
 use std::{
     ffi::{OsStr, OsString},
     fs::File,
-    io::{self, Cursor, Read, Write},
+    io::{self, Cursor, Read, Seek, SeekFrom, Write},
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -49,6 +49,10 @@ use crate::{
 
 const STREAM_BUFFER_BYTES: usize = 1024 * 1024;
 const STAGE_CREATE_ATTEMPTS: u64 = 128;
+// Linux directory ancestry is finite. This defensive bound keeps a hostile
+// mount namespace from turning a destination-containment check into an
+// unbounded descriptor-relative walk.
+const DIRECTORY_ANCESTRY_STEPS_MAX: usize = 4_096;
 const STAGING_DIRECTORY: &str = "staging";
 const STAGED_FILE: &str = "payload";
 const AUTHORITY_SYNC_ATTEMPTS: usize = 2;
@@ -476,6 +480,17 @@ pub(crate) fn ensure_writable_destination(
     open_writable_destination_parent(destination).map(|_| ())
 }
 
+/// Applies the writable-filesystem policy and rejects a destination whose
+/// exact held parent is the authenticated source root or one of its
+/// descendants. No destination name is inspected or mutated.
+pub(crate) fn ensure_writable_destination_outside_source(
+    destination: &ProjectStorePath,
+    source: &LocalStoreRoot,
+) -> Result<(), LocalPublicationError> {
+    let (parent, _, _) = open_writable_destination_parent(destination)?;
+    ensure_directory_outside_source(&parent, source)
+}
+
 fn open_writable_destination_parent(
     destination: &ProjectStorePath,
 ) -> Result<(OwnedFd, WritableFilesystemQualification, OsString), LocalPublicationError> {
@@ -497,6 +512,39 @@ fn open_writable_destination_parent(
         return Err(LocalPublicationError::AtomicPublishUnsupported);
     }
     Ok((parent, filesystem, destination_name))
+}
+
+fn ensure_directory_outside_source(
+    directory: &OwnedFd,
+    source: &LocalStoreRoot,
+) -> Result<(), LocalPublicationError> {
+    let source_identity = DirectoryIdentity::from_stat(
+        fstat(source.descriptor()).map_err(|_| LocalPublicationError::ExistingMismatch)?,
+    )?;
+    let mut current = duplicate_directory(directory)?;
+    for _ in 0..DIRECTORY_ANCESTRY_STEPS_MAX {
+        let current_identity = DirectoryIdentity::from_stat(
+            fstat(&current).map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        if current_identity == source_identity {
+            return Err(LocalPublicationError::InvalidPath);
+        }
+        let parent = openat(
+            &current,
+            OsStr::new(".."),
+            DIRECTORY_OPEN_FLAGS,
+            Mode::empty(),
+        )
+        .map_err(|_| LocalPublicationError::ExistingMismatch)?;
+        let parent_identity = DirectoryIdentity::from_stat(
+            fstat(&parent).map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        if parent_identity == current_identity {
+            return Ok(());
+        }
+        current = parent;
+    }
+    Err(LocalPublicationError::ExistingMismatch)
 }
 
 impl LocalStoreRoot {
@@ -2189,6 +2237,76 @@ impl LocalStoreRoot {
         .ok_or(LocalPublicationError::ExistingMismatch)
     }
 
+    /// Copies one descriptor-held immutable object from another authenticated
+    /// store root while rehashing every source byte. The source name and
+    /// opened descriptor must remain identical through the complete copy.
+    pub(crate) fn copy_exact_object_from<C>(
+        &self,
+        source: &Self,
+        digest: ExactBytesDigest,
+        byte_length: u64,
+        maximum_bytes: u64,
+        mut is_cancelled: C,
+    ) -> Result<ImmutablePublication, LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        let expected = DeclaredExactFile::new(digest, byte_length);
+        validate_capacity(expected, maximum_bytes)?;
+        check_cancelled(&mut is_cancelled)?;
+
+        let (parent, name) = source.open_existing_parent(&object_relative_path(digest))?;
+        let named_before = FileIdentity::from_stat(
+            statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        let descriptor = openat(&parent, &name, FILE_READ_FLAGS, Mode::empty())
+            .map_err(|_| LocalPublicationError::ExistingMismatch)?;
+        let opened_before = FileIdentity::from_stat(
+            fstat(&descriptor).map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        if named_before != opened_before || opened_before.bytes != byte_length {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+
+        let mut file = File::from(descriptor);
+        let publication = self.publish_declared_object(
+            &mut file,
+            digest,
+            byte_length,
+            maximum_bytes,
+            &mut is_cancelled,
+        )?;
+
+        // An already-present destination can be discovered before the source
+        // is consumed. Rehash it explicitly in that case; a created file (or
+        // no-replace race) was already hashed by immutable publication.
+        let consumed = file
+            .stream_position()
+            .map_err(|source| LocalPublicationError::SourceIo { source })?;
+        if consumed != byte_length || byte_length == 0 {
+            file.seek(SeekFrom::Start(0))
+                .map_err(|source| LocalPublicationError::SourceIo { source })?;
+            let facts = hash_exact_file(&mut file, byte_length, &mut is_cancelled, &mut |_| {})?;
+            if facts.digest() != digest || facts.byte_length() != byte_length {
+                return Err(LocalPublicationError::SourceDigest);
+            }
+        }
+
+        check_cancelled(&mut is_cancelled)?;
+        let opened_after = FileIdentity::from_stat(
+            fstat(&file).map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        let named_after = FileIdentity::from_stat(
+            statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        if opened_before != opened_after || opened_before != named_after {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+        Ok(publication)
+    }
+
     /// Streams and verifies one exact object without synchronizing or
     /// otherwise mutating the store. Every path component is opened relative
     /// to the held root, and the opened file must remain the same named,
@@ -2649,8 +2767,30 @@ impl SiblingPackageStage {
         destination: &ProjectStorePath,
         limits: ProjectStoreLimits,
     ) -> Result<Self, LocalPublicationError> {
+        Self::begin_inner(destination, None, limits)
+    }
+
+    /// Begins a package copied from an authenticated source only after the
+    /// exact destination-parent descriptor has passed the source-containment
+    /// check. The same descriptor is retained for staging and installation.
+    pub(crate) fn begin_copy_from(
+        destination: &ProjectStorePath,
+        source: &LocalStoreRoot,
+        limits: ProjectStoreLimits,
+    ) -> Result<Self, LocalPublicationError> {
+        Self::begin_inner(destination, Some(source), limits)
+    }
+
+    fn begin_inner(
+        destination: &ProjectStorePath,
+        source: Option<&LocalStoreRoot>,
+        limits: ProjectStoreLimits,
+    ) -> Result<Self, LocalPublicationError> {
         let cleanup_limits = PackageCleanupLimits::for_initial_package(limits)?;
         let (parent, filesystem, destination_name) = open_writable_destination_parent(destination)?;
+        if let Some(source) = source {
+            ensure_directory_outside_source(&parent, source)?;
+        }
         match statat(&parent, &destination_name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(_) => return Err(LocalPublicationError::DestinationExists),
             Err(Errno::NOENT) => {}

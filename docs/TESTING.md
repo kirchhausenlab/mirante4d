@@ -300,8 +300,26 @@ VM cuts with zero harness retries. Its sanitized report has SHA-256
 `ced8c82c75c480810e7ebf81e2c032e579f89bbb28c1f854d1681a3ddad1f9e5`.
 Protected-main policy and Rust checks also passed in
 [run 29273392030](https://github.com/kirchhausenlab/mirante4d/actions/runs/29273392030).
-This qualifies only the exact B2 off-product ext4 tuple and revision; B3/B4
-integration and B4 product validation remain pending.
+This qualifies only the exact B2 off-product ext4 tuple and revision. The B3
+candidate adds focused coverage for bounded pre/scan/post source verification,
+source-generation currentness and invalidation, authenticated direct/paged
+reuse and Save As copying, and injected-clock autosave scheduling. That code is
+implemented but B3 is not accepted until the public gates and required real-
+display run pass; B4 product persistence validation remains pending.
+
+Run the supporting B3 product scenario on the real display with:
+
+```bash
+cargo xtask product-validate b3_source_verification
+```
+
+The scenario uses a small generated T2 package, exercises verification
+progress, cancellation, successful reverification, continued nonblank
+rendering, exact internal 1280x720 and 1920x1080 GPU captures, and byte-
+identical source closure. Its report is E1 support only. B3 validation still
+requires external observation of the mapped physical client area at both
+sizes; the command does not claim E4 or exercise the B4 save/autosave/recovery
+cutover.
 
 The checked independent source report supports only the WP-03 source-TIFF
 archive. WP-10A is accepted off-product and its target authority is promoted.

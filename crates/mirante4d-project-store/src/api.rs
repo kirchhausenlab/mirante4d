@@ -310,7 +310,9 @@ pub(crate) struct ProjectCommitCaptureParts {
     pub(crate) object_sources: Vec<CapturedObjectSource>,
 }
 
-/// One exact revision/projection capture and its complete logical-object input.
+/// One exact revision/projection capture and its genuinely new logical-object
+/// input. Unchanged objects may be omitted only when the actor authenticates
+/// their storage binding against its held source generation.
 pub struct ProjectCommitCapture {
     projection: ProjectGenerationProjection,
     expected_parent: Option<ProjectGenerationId>,
@@ -339,10 +341,12 @@ impl ProjectCommitCapture {
             insert_source_descriptor(&mut actual, &descriptor)?;
             captured_sources.push(CapturedObjectSource { descriptor, source });
         }
-        if expected != actual {
-            return Err(ProjectStoreFault::Corruption {
-                stage: "object_source_closure",
-            });
+        for (digest, descriptor) in &actual {
+            if expected.get(digest) != Some(descriptor) {
+                return Err(ProjectStoreFault::Corruption {
+                    stage: "object_source_subset",
+                });
+            }
         }
         Ok(Self {
             projection,

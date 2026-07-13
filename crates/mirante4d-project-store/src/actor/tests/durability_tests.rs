@@ -139,54 +139,13 @@ fn validate_and_retry(scenario: VmScenario, root_a: &Path, root_b: &Path) {
     result.unwrap_or_else(|fault| panic!("fresh VM validation/retry failed: {fault:?}"));
 }
 
-struct StoreObjectSource {
-    descriptor: RawObjectDescriptor,
-    path: PathBuf,
-}
-
-impl ProjectObjectSource for StoreObjectSource {
-    fn descriptor(&self) -> &RawObjectDescriptor {
-        &self.descriptor
-    }
-
-    fn open(&self) -> std::io::Result<Box<dyn std::io::Read + Send>> {
-        fs::File::open(&self.path).map(|file| Box::new(file) as Box<dyn std::io::Read + Send>)
-    }
-}
-
-fn store_backed_save_as_capture(
-    source: &Path,
-    target: &GenerationDocument,
-) -> ProjectCommitCapture {
-    let mut sources: Vec<Box<dyn ProjectObjectSource>> = Vec::new();
-    for artifact in target.projection().state().artifacts() {
-        let storage = target.bindings().get(&artifact.object().digest()).unwrap();
-        let ArtifactStorage::Direct { object } = storage else {
-            panic!("the cross-device Save As fixture must remain directly stored");
-        };
-        assert_eq!(object.digest(), artifact.object().digest());
-        assert_eq!(object.byte_length(), artifact.object().byte_length());
-        let digest = object.digest().digest().to_string();
-        let path = source
-            .join("objects")
-            .join("sha256")
-            .join(&digest[..2])
-            .join(&digest[2..]);
-        assert!(
-            path.is_file(),
-            "Save As source object is absent from root A"
-        );
-        sources.push(Box::new(StoreObjectSource {
-            descriptor: artifact.object().clone(),
-            path,
-        }));
-    }
+fn store_backed_save_as_capture(target: &GenerationDocument) -> ProjectCommitCapture {
     ProjectCommitCapture::new(
         target.projection().clone(),
         None,
         None,
         target.forked_from(),
-        sources,
+        Vec::new(),
     )
     .unwrap()
 }
@@ -201,7 +160,7 @@ fn run_save_as(root_a: &Path, root_b: &Path, validating: bool) -> Result<(), Pro
     let (actor, _) = open_actor(&source)?;
     let target = frozen_generation_in("divergent.m4dproj", DIVERGENT_INITIAL);
     let source_generation = generation_id(RECOVERABLE_G2);
-    let capture = store_backed_save_as_capture(&source, &target);
+    let capture = store_backed_save_as_capture(&target);
     actor.try_submit(ProjectStoreCommand::SaveAs {
         request_id: request_id(2),
         destination: ProjectStorePath::new(destination.clone()).unwrap(),

@@ -316,16 +316,41 @@ fn all_project_io_and_attachment_are_identity_gated_before_verification() {
 #[test]
 fn source_verification_requires_the_exact_current_session_generation() {
     let mut application = application();
+    let token = request_source_verification(&mut application);
+    application
+        .dispatch(ApplicationCommand::UpdateSourceVerificationProgress {
+            token: token.clone(),
+            completed_work: 1,
+            total_work: 1,
+        })
+        .unwrap();
     let before = application.fork_for_dispatch();
+    let dataset = dataset_reference('1');
+    let catalog = verified_catalog(application.snapshot().catalog(), &dataset);
     let fault = application
-        .admit_verified_source_for_test(SourceSessionGeneration::new(2), dataset_reference('1'))
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token: token.clone(),
+            completion: OperationCompletion::SourceVerified {
+                source_generation: SourceSessionGeneration::new(2),
+                catalog: Arc::clone(&catalog),
+                dataset: dataset.clone(),
+            },
+        })
         .unwrap_err();
-    assert_eq!(fault, ApplicationFaultCode::SourceSessionMismatch);
+    assert_eq!(fault.code(), ApplicationFaultCode::SourceSessionMismatch);
     assert_eq!(application, before);
 
-    let reference = dataset_reference('1');
-    let identity = *reference.scientific_content_id();
-    verify(&mut application, reference);
+    let identity = *dataset.scientific_content_id();
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::SourceVerified {
+                source_generation: SourceSessionGeneration::new(1),
+                catalog,
+                dataset,
+            },
+        })
+        .unwrap();
     assert!(matches!(
         application.snapshot().source(),
         SourceVerificationSnapshot::Verified(_)
@@ -355,6 +380,354 @@ fn source_verification_requires_the_exact_current_session_generation() {
         .unwrap_err(),
         ApplicationFaultCode::DatasetIdentityMismatch
     );
+}
+
+#[test]
+fn source_verification_progress_is_one_bounded_monotonic_observation() {
+    let mut application = application();
+    let token = request_source_verification(&mut application);
+    assert!(matches!(
+        application.snapshot().source(),
+        SourceVerificationSnapshot::Verifying {
+            operation_id,
+            completed_work: 0,
+            total_work: 0,
+        } if *operation_id == token.operation_id()
+    ));
+
+    application
+        .dispatch(ApplicationCommand::UpdateSourceVerificationProgress {
+            token: token.clone(),
+            completed_work: 4,
+            total_work: 10,
+        })
+        .unwrap();
+    assert!(matches!(
+        application.snapshot().source(),
+        SourceVerificationSnapshot::Verifying {
+            completed_work: 4,
+            total_work: 10,
+            ..
+        }
+    ));
+
+    for (completed_work, total_work) in [(3, 10), (4, 11), (11, 10), (0, 0)] {
+        let before = application.fork_for_dispatch();
+        assert_eq!(
+            application
+                .dispatch(ApplicationCommand::UpdateSourceVerificationProgress {
+                    token: token.clone(),
+                    completed_work,
+                    total_work,
+                })
+                .unwrap_err()
+                .code(),
+            ApplicationFaultCode::InvalidOperationProgress
+        );
+        assert_eq!(application, before);
+    }
+
+    let dataset = dataset_reference('1');
+    let catalog = verified_catalog(application.snapshot().catalog(), &dataset);
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::SourceVerified {
+                source_generation: SourceSessionGeneration::new(1),
+                catalog,
+                dataset,
+            },
+        })
+        .unwrap();
+    assert!(matches!(
+        application.snapshot().source(),
+        SourceVerificationSnapshot::Verified(_)
+    ));
+}
+
+#[test]
+fn source_verification_completion_ignores_view_currentness_but_not_source_generation() {
+    let mut application = application();
+    let token = request_source_verification(&mut application);
+    application
+        .dispatch(ApplicationCommand::UpdateSourceVerificationProgress {
+            token: token.clone(),
+            completed_work: 7,
+            total_work: 7,
+        })
+        .unwrap();
+    let request_currentness = token.currentness_generation();
+    application
+        .dispatch(ApplicationCommand::SetTimepoint(TimeIndex::new(1)))
+        .unwrap();
+    assert_ne!(application.snapshot().currentness(), request_currentness);
+
+    let dataset = dataset_reference('1');
+    let catalog = verified_catalog(application.snapshot().catalog(), &dataset);
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::SourceVerified {
+                source_generation: SourceSessionGeneration::new(1),
+                catalog,
+                dataset,
+            },
+        })
+        .unwrap();
+    assert!(matches!(
+        application.snapshot().source(),
+        SourceVerificationSnapshot::Verified(_)
+    ));
+    assert_eq!(unbound_view(&application.snapshot()).timepoint().get(), 1);
+}
+
+#[test]
+fn source_verification_rejects_catalog_or_reference_drift_atomically() {
+    let mut application = application();
+    let token = request_source_verification(&mut application);
+    application
+        .dispatch(ApplicationCommand::UpdateSourceVerificationProgress {
+            token: token.clone(),
+            completed_work: 1,
+            total_work: 1,
+        })
+        .unwrap();
+    let dataset = dataset_reference('1');
+    let wrong_catalog = Arc::new(
+        DatasetCatalog::new(
+            "changed-label",
+            ScientificIdentityStatus::Verified(*dataset.scientific_content_id()),
+            application.snapshot().catalog().layers().cloned().collect(),
+        )
+        .unwrap(),
+    );
+    let before = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token: token.clone(),
+                completion: OperationCompletion::SourceVerified {
+                    source_generation: SourceSessionGeneration::new(1),
+                    catalog: wrong_catalog,
+                    dataset: dataset.clone(),
+                },
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::DatasetIdentityMismatch
+    );
+    assert_eq!(application, before);
+
+    let mismatched_catalog = verified_catalog(application.snapshot().catalog(), &dataset);
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token,
+                completion: OperationCompletion::SourceVerified {
+                    source_generation: SourceSessionGeneration::new(1),
+                    catalog: mismatched_catalog,
+                    dataset: dataset_reference('2'),
+                },
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::DatasetIdentityMismatch
+    );
+    assert_eq!(application, before);
+}
+
+#[test]
+fn cancelled_source_verification_suppresses_its_late_prepared_completion() {
+    let mut application = application();
+    let token = request_source_verification(&mut application);
+    application
+        .dispatch(ApplicationCommand::CancelOperation(token.operation_id()))
+        .unwrap();
+    assert!(matches!(
+        application.snapshot().source(),
+        SourceVerificationSnapshot::Required
+    ));
+
+    let dataset = dataset_reference('1');
+    let catalog = verified_catalog(application.snapshot().catalog(), &dataset);
+    let before = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token,
+                completion: OperationCompletion::SourceVerified {
+                    source_generation: SourceSessionGeneration::new(1),
+                    catalog,
+                    dataset,
+                },
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::OperationNotFound
+    );
+    assert_eq!(application, before);
+}
+
+#[test]
+fn invalidated_source_verification_cannot_displace_its_successor() {
+    let mut application = application();
+    let superseded = request_source_verification(&mut application);
+    let dataset = dataset_reference('1');
+    let catalog = verified_catalog(application.snapshot().catalog(), &dataset);
+
+    application
+        .dispatch(ApplicationCommand::InvalidateSourceVerification {
+            source_generation: SourceSessionGeneration::new(1),
+        })
+        .unwrap();
+    let events = application.drain_events(MAX_PENDING_EVENTS);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ApplicationEvent::OperationCancellationRequested { token }
+            if token == &superseded
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ApplicationEvent::SourceVerificationInvalidated {
+            source_generation
+        } if *source_generation == SourceSessionGeneration::new(1)
+    )));
+
+    let successor = request_source_verification(&mut application);
+    let before_late = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token: superseded,
+                completion: OperationCompletion::SourceVerified {
+                    source_generation: SourceSessionGeneration::new(1),
+                    catalog: Arc::clone(&catalog),
+                    dataset: dataset.clone(),
+                },
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::OperationNotFound
+    );
+    assert_eq!(application, before_late);
+
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token: successor,
+            completion: OperationCompletion::SourceVerified {
+                source_generation: SourceSessionGeneration::new(1),
+                catalog,
+                dataset,
+            },
+        })
+        .unwrap();
+    assert!(matches!(
+        application.snapshot().source(),
+        SourceVerificationSnapshot::Verified(_)
+    ));
+}
+
+#[test]
+fn failed_source_verification_never_admits_a_late_prepared_binding() {
+    let mut application = application();
+    let token = request_source_verification(&mut application);
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token: token.clone(),
+            completion: OperationCompletion::Failed(OperationFailureCode::SourceChanged),
+        })
+        .unwrap();
+    assert!(matches!(
+        application.snapshot().source(),
+        SourceVerificationSnapshot::Required
+    ));
+    assert!(
+        application
+            .drain_events(MAX_PENDING_EVENTS)
+            .iter()
+            .any(|event| matches!(
+                event,
+                ApplicationEvent::SourceVerificationInvalidated {
+                    source_generation
+                } if *source_generation == SourceSessionGeneration::new(1)
+            ))
+    );
+
+    let dataset = dataset_reference('1');
+    let catalog = verified_catalog(application.snapshot().catalog(), &dataset);
+    let before = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token,
+                completion: OperationCompletion::SourceVerified {
+                    source_generation: SourceSessionGeneration::new(1),
+                    catalog,
+                    dataset,
+                },
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::OperationNotFound
+    );
+    assert_eq!(application, before);
+}
+
+#[test]
+fn observed_source_drift_invalidates_identity_and_cancels_project_persistence() {
+    let mut application = bound_application();
+    application.drain_events(MAX_PENDING_EVENTS);
+    application
+        .dispatch(ApplicationCommand::RequestProjectSave)
+        .unwrap();
+    let (save_token, captured_revision) = save_request(&mut application);
+
+    application
+        .dispatch(ApplicationCommand::InvalidateSourceVerification {
+            source_generation: SourceSessionGeneration::new(1),
+        })
+        .unwrap();
+    let snapshot = application.snapshot();
+    assert!(matches!(
+        snapshot.source(),
+        SourceVerificationSnapshot::Required
+    ));
+    assert_eq!(
+        snapshot.catalog().scientific_identity(),
+        &ScientificIdentityStatus::Unverified(DatasetSourceId::new(1))
+    );
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::RequestProjectSave)
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::IdentityVerificationRequired
+    );
+
+    let before_late = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token: save_token,
+                completion: OperationCompletion::ProjectSaved(captured_revision),
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::OperationNotFound
+    );
+    assert_eq!(application, before_late);
+
+    let before_wrong_generation = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::InvalidateSourceVerification {
+                source_generation: SourceSessionGeneration::new(2),
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::SourceSessionMismatch
+    );
+    assert_eq!(application, before_wrong_generation);
 }
 
 #[test]
@@ -739,6 +1112,11 @@ fn operation_failure_codes_are_closed_over_their_operation_kind() {
             OperationKind::DatasetOpen,
             OperationFailureCode::DatasetReadFailed,
             OperationFailureCode::AnalysisExecutionFailed,
+        ),
+        (
+            OperationKind::SourceVerification,
+            OperationFailureCode::SourceChanged,
+            OperationFailureCode::DatasetReadFailed,
         ),
         (
             OperationKind::ProjectOpen,
@@ -1503,9 +1881,50 @@ fn application_for_project_open(identity_digit: char) -> ApplicationState {
 }
 
 fn verify(application: &mut ApplicationState, dataset: DatasetReference) {
+    let token = request_source_verification(application);
     application
-        .admit_verified_source_for_test(SourceSessionGeneration::new(1), dataset)
+        .dispatch(ApplicationCommand::UpdateSourceVerificationProgress {
+            token: token.clone(),
+            completed_work: 1,
+            total_work: 1,
+        })
         .unwrap();
+    let catalog = verified_catalog(application.snapshot().catalog(), &dataset);
+    let source_generation = application.snapshot().source_generation();
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::SourceVerified {
+                source_generation,
+                catalog,
+                dataset,
+            },
+        })
+        .unwrap();
+}
+
+fn request_source_verification(application: &mut ApplicationState) -> OperationToken {
+    application
+        .dispatch(ApplicationCommand::RequestSourceVerification)
+        .unwrap();
+    application
+        .drain_events(MAX_PENDING_EVENTS)
+        .into_iter()
+        .find_map(|event| match event {
+            ApplicationEvent::SourceVerificationRequested { token } => Some(token),
+            _ => None,
+        })
+        .expect("source-verification request event")
+}
+
+fn verified_catalog(catalog: &DatasetCatalog, dataset: &DatasetReference) -> Arc<DatasetCatalog> {
+    Arc::new(
+        catalog_with_identity(
+            catalog,
+            ScientificIdentityStatus::Verified(*dataset.scientific_content_id()),
+        )
+        .unwrap(),
+    )
 }
 
 fn unbound_workspace(id: ProjectId) -> UnboundWorkspace {
