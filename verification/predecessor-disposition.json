@@ -2496,7 +2496,7 @@
       "owner": "mirante4d-project-store",
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
-      "reason": "WP-10B B2 kills actor-routed Pin/Unpin mutators before and after every observed occurrence of the seven frozen transitions, then proves fresh-process reopen, exact retry, idempotent second retry, lease release, and unchanged unrelated authority without claiming staging cleanup or power-loss durability."
+      "reason": "WP-10B B2 kills actor-routed Pin/Unpin mutators before and after every observed occurrence of the seven frozen transitions, then proves fresh-process reopen, cleanup of all 11 writer-private staging residues, exact retry, idempotent second retry, lease release, and unchanged unrelated authority without claiming power-loss durability."
     },
     {
       "id": "libtest:mirante4d-project-store:actor::tests::save_as_authentication_rejects_stale_fork_target_and_science_before_reads",
@@ -2659,6 +2659,14 @@
       "reason": "WP-10B B2 proves eager inspection validates descriptor-relative object metadata while deferring bulk payload digests."
     },
     {
+      "id": "libtest:mirante4d-project-store:inspection::tests::empty_staging_sync_failure_suspends_writes_and_fresh_retry_succeeds",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves an existing empty staging directory is synced, sync uncertainty suspends writes, and a fresh zero-removal retry succeeds."
+    },
+    {
       "id": "libtest:mirante4d-project-store:inspection::tests::established_fixtures_report_exact_heads_and_autosave_classification",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -2707,6 +2715,14 @@
       "reason": "WP-10B B2 proves established open holds session leases and reports writable contention as an explicit read-only fallback."
     },
     {
+      "id": "libtest:mirante4d-project-store:inspection::tests::staging_cleanup_transition_failures_require_exact_fresh_retry",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 injects all eight before/after cleanup transition occurrences, distinguishes pre-removal failure from indeterminacy, suspends writes when required, and proves fresh plus idempotent retry."
+    },
+    {
       "id": "libtest:mirante4d-project-store:inspection::tests::store_graph_rejects_corrupt_or_excess_orphans_without_affecting_normal_open",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -2721,6 +2737,22 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 reports the independent fixtures' exact declared live roots and orphan generations, plus a disjoint read-only live/unrooted object partition."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:inspection::tests::writable_open_cleans_staging_while_read_only_and_fallback_leave_it_untouched",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves writable open cleans exact dead staging while explicit and writer-contended read-only sessions leave it untouched."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:inspection::tests::writable_open_validates_store_before_touching_staging",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves writable open completes bounded store validation before staging cleanup and leaves residue untouched when validation fails."
     },
     {
       "id": "libtest:mirante4d-project-store:lease::tests::process_contention_preserves_shared_maintenance_and_single_writer_ownership",
@@ -2825,6 +2857,54 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 proves descriptor-relative immutable publication without path or replacement fallbacks."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:local::tests::staging_cleanup_cancellation_and_invalid_entry_leave_everything_untouched",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves cancellation and malformed transaction names fail during whole-staging preflight without selective mutation."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:local::tests::staging_cleanup_capacity_failure_removes_nothing",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves cleanup fan-out capacity failure removes no valid transaction or payload."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:local::tests::staging_cleanup_final_reinventory_fails_indeterminate_on_namespace_drift",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves final staging re-inventory rejects post-removal namespace drift indeterminately and fresh retry closes the residue."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:local::tests::staging_cleanup_is_sorted_bounded_and_idempotent",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves bytewise transaction order, exact remove/sync sequence, deferred cancellation, sibling-stage isolation, empty retry sync, idempotence, and absent-staging non-creation."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:local::tests::staging_cleanup_rejects_every_foreign_entry_without_selective_scavenging",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 rejects malformed, linked, non-directory, extra-child, non-regular, and oversized staging entries while preserving every valid peer and outside sentinel."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:local::tests::staging_transaction_name_grammar_is_exact",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves the exact nonzero canonical-u32 PID, lowercase fixed-width nonce/sequence, and 00-through-7f attempt grammar."
     },
     {
       "id": "libtest:mirante4d-project-store:local::tests::store_inventory_bounds_entries_fanout_and_ref_staging_reservations",
@@ -6116,6 +6196,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 558
+    "current_additions": 568
   }
 }

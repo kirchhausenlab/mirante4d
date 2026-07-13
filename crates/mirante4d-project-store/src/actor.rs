@@ -29,7 +29,10 @@ use crate::{
     ProjectCommitCapture, ProjectGenerationId, ProjectOpenMode, ProjectStoreCommand,
     ProjectStoreCompletion, ProjectStoreConfig, ProjectStoreDiagnostics, ProjectStoreFault,
     ProjectStorePath, ProjectStoreReceipt, ProjectStoreRequestId, ProjectStoreSession,
-    inspection::{RecoveryInspection, inspect_established_store, inspect_recovery, open_recovery},
+    inspection::{
+        RecoveryInspection, cleanup_dead_writer_staging, inspect_established_store,
+        inspect_recovery, open_recovery,
+    },
     lease::{LeaseError, ProjectStoreLeases},
     local::{LocalStoreRoot, valid_checkpoint_id},
     pin::{publish_pin, remove_pin},
@@ -1025,6 +1028,9 @@ fn open_resources(
             }
         })?;
     inspect_recovery(&root, limits, || false)?;
+    if leases.has_writer() {
+        cleanup_dead_writer_staging(&root, &leases, limits, || false)?;
+    }
     Ok(SessionResources {
         path: path.clone(),
         root,
@@ -3008,7 +3014,7 @@ mod tests {
         let mut recovered = 0_usize;
         let mut idempotent_second_retries = 0_usize;
         let mut recovery_sync_required_cases = 0_usize;
-        let mut staging_residue_cases = 0_usize;
+        let mut staging_cleanup_cases = 0_usize;
         for (case, (operation, transition, edge, occurrence)) in cases.into_iter().enumerate() {
             let project = TestProject::extracted_store(
                 &format!("pin-unpin-kill-{case}"),
@@ -3073,6 +3079,15 @@ mod tests {
             assert_eq!(killed_status.signal(), Some(9));
             killed += 1;
 
+            let expected_staging_residue = operation == PinProcessOperation::Pin
+                && !(transition == GcTransition::PinStageCreate && edge == TransitionEdge::Before);
+            let staging_residue_before_reopen = private_pin_staging_residue(project.path());
+            assert_eq!(
+                staging_residue_before_reopen,
+                usize::from(expected_staging_residue)
+            );
+            staging_cleanup_cases += staging_residue_before_reopen;
+
             let mut recovery = ChildGuard::new(
                 Command::new(env::current_exe().unwrap())
                     .arg(PIN_UNPIN_PROCESS_TEST)
@@ -3107,11 +3122,7 @@ mod tests {
             };
             recovery_sync_required_cases += usize::from(recovery_synced_existing_state);
 
-            let expected_staging_residue = operation == PinProcessOperation::Pin
-                && !(transition == GcTransition::PinStageCreate && edge == TransitionEdge::Before);
-            let staging_residue = private_pin_staging_residue(project.path());
-            assert_eq!(staging_residue, usize::from(expected_staging_residue));
-            staging_residue_cases += staging_residue;
+            assert_eq!(private_pin_staging_residue(project.path()), 0);
 
             let root = LocalStoreRoot::open(project.path()).unwrap();
             let final_pin = root.read_pin_ref("checkpoint-a", limits, || false).unwrap();
@@ -3143,9 +3154,9 @@ mod tests {
         assert_eq!(recovered, 16);
         assert_eq!(idempotent_second_retries, 16);
         assert_eq!(recovery_sync_required_cases, 8);
-        assert_eq!(staging_residue_cases, 11);
+        assert_eq!(staging_cleanup_cases, 11);
         eprintln!(
-            "M4D_PIN_UNPIN_PROCESS_MATRIX_V1 cases=16 killed=16 fresh_reopens=16 retry_completed=16 idempotent_second_retries=16 recovery_sync_required_cases=8 staging_residue_cases=11 staging_cleanup_deferred=true process_crash_only=true power_loss_simulated=false durability_claim=false"
+            "M4D_PIN_UNPIN_PROCESS_MATRIX_V1 cases=16 killed=16 fresh_reopens=16 retry_completed=16 idempotent_second_retries=16 recovery_sync_required_cases=8 staging_cleanup_cases=11 staging_residue_after_reopen=0 process_crash_only=true power_loss_simulated=false durability_claim=false"
         );
     }
 

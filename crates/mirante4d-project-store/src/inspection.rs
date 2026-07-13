@@ -17,8 +17,11 @@ use crate::{
     generation::{
         ArtifactStorage, GenerationDocument, GenerationKind, LogicalObjectBinding, PhysicalObject,
     },
-    lease::{LeaseError, ProjectStoreLeases},
-    local::{LocalPublicationError, LocalStoreRoot},
+    lease::{GcTransition, GcTransitionOccurrence, LeaseError, ProjectStoreLeases},
+    local::{
+        LocalPublicationError, LocalStoreRoot, StagingCleanupError, StagingCleanupTransition,
+        StagingCleanupTransitionObserver,
+    },
     wire::{RefKind, RefRecord},
 };
 
@@ -372,6 +375,32 @@ pub(crate) struct OpenedEstablishedStore {
     inspection: EstablishedStoreInspection,
 }
 
+struct LeaseStagingCleanupObserver<'a>(&'a ProjectStoreLeases);
+
+impl StagingCleanupTransitionObserver for LeaseStagingCleanupObserver<'_> {
+    type Occurrence = GcTransitionOccurrence;
+
+    fn before(&self, transition: StagingCleanupTransition) -> Result<Self::Occurrence, ()> {
+        self.0
+            .gc_transition_before(staging_cleanup_transition(transition))
+            .map_err(|_| ())
+    }
+
+    fn after(&self, occurrence: Self::Occurrence) -> Result<(), ()> {
+        self.0.gc_transition_after(occurrence).map_err(|_| ())
+    }
+}
+
+const fn staging_cleanup_transition(transition: StagingCleanupTransition) -> GcTransition {
+    match transition {
+        StagingCleanupTransition::PayloadRemove => GcTransition::StagingCleanupPayloadRemove,
+        StagingCleanupTransition::DirectorySync => GcTransition::StagingCleanupDirectorySync,
+        StagingCleanupTransition::TransactionRemove => {
+            GcTransition::StagingCleanupTransactionRemove
+        }
+    }
+}
+
 impl OpenedEstablishedStore {
     pub(crate) const fn effective_mode(&self) -> ProjectOpenMode {
         self.leases.effective_mode()
@@ -397,11 +426,57 @@ where
         LocalStoreRoot::open(path.as_path()).map_err(|error| map_local_error(error, "open"))?;
     let leases = ProjectStoreLeases::acquire(&root, requested_mode).map_err(map_lease_error)?;
     let inspection = inspect_established_store(&root, limits, &mut is_cancelled)?;
+    if leases.has_writer() {
+        cleanup_dead_writer_staging(&root, &leases, limits, &mut is_cancelled)?;
+    }
     Ok(OpenedEstablishedStore {
         _root: root,
         leases,
         inspection,
     })
+}
+
+pub(crate) fn cleanup_dead_writer_staging<C>(
+    root: &LocalStoreRoot,
+    leases: &ProjectStoreLeases,
+    limits: ProjectStoreLimits,
+    is_cancelled: C,
+) -> Result<(), ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    let plan = root
+        .preflight_staging_cleanup(limits, is_cancelled)
+        .map_err(map_staging_cleanup_error)?;
+    let observer = LeaseStagingCleanupObserver(leases);
+    match root.execute_staging_cleanup(plan, &observer, || match leases.confirm_writer(root) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(StagingCleanupError::ReadOnly),
+        Err(LeaseError::Indeterminate) => Err(StagingCleanupError::CommitIndeterminate),
+        Err(LeaseError::InvalidAnchor | LeaseError::Io { .. }) => {
+            Err(StagingCleanupError::Corruption)
+        }
+    }) {
+        Err(StagingCleanupError::CommitIndeterminate) => {
+            leases.suspend_writes();
+            Err(ProjectStoreFault::CommitIndeterminate)
+        }
+        result => result.map_err(map_staging_cleanup_error),
+    }
+}
+
+fn map_staging_cleanup_error(error: StagingCleanupError) -> ProjectStoreFault {
+    match error {
+        StagingCleanupError::Cancelled => ProjectStoreFault::Cancelled,
+        StagingCleanupError::ReadOnly => ProjectStoreFault::ReadOnly,
+        StagingCleanupError::Capacity => ProjectStoreFault::Capacity {
+            stage: "staging_cleanup",
+        },
+        StagingCleanupError::Corruption => ProjectStoreFault::Corruption {
+            stage: "staging_cleanup",
+        },
+        StagingCleanupError::CommitIndeterminate => ProjectStoreFault::CommitIndeterminate,
+    }
 }
 
 pub(crate) fn inspect_established_store<C>(
@@ -1794,6 +1869,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::lease::{GcTransitionInjector, GcTransitionTarget, TransitionEdge};
 
     const RECOVERABLE_MANUAL: &str = concat!(
         "m4d-project-generation-v1-sha256:",
@@ -1885,6 +1961,21 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn install_staging_residue(project: &TestProject, payload: bool) -> PathBuf {
+        let name = format!(
+            "tx-{}-{:032x}-{:016x}-00",
+            std::process::id(),
+            0_u128,
+            TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let transaction = project.path().join("staging").join(name);
+        fs::create_dir_all(&transaction).unwrap();
+        if payload {
+            fs::write(transaction.join("payload"), b"interrupted stage").unwrap();
+        }
+        transaction
     }
 
     #[test]
@@ -2725,6 +2816,264 @@ mod tests {
         )
         .unwrap();
         assert_eq!(next.effective_mode(), ProjectOpenMode::PreferWritable);
+    }
+
+    #[test]
+    fn writable_open_cleans_staging_while_read_only_and_fallback_leave_it_untouched() {
+        let project = TestProject::extracted("staging-open", "stale.m4dproj");
+        let first = install_staging_residue(&project, true);
+        let read_only = open_established_store(
+            &project.store_path(),
+            ProjectOpenMode::ReadOnly,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(read_only.effective_mode(), ProjectOpenMode::ReadOnly);
+        assert!(first.join("payload").exists());
+        drop(read_only);
+
+        let writer = open_established_store(
+            &project.store_path(),
+            ProjectOpenMode::PreferWritable,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(writer.effective_mode(), ProjectOpenMode::PreferWritable);
+        assert_eq!(
+            fs::read_dir(project.path().join("staging"))
+                .unwrap()
+                .count(),
+            0
+        );
+        let second = install_staging_residue(&project, true);
+
+        let fallback = open_established_store(
+            &project.store_path(),
+            ProjectOpenMode::PreferWritable,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(fallback.effective_mode(), ProjectOpenMode::ReadOnly);
+        assert!(second.join("payload").exists());
+        drop(fallback);
+        drop(writer);
+
+        let retry = open_established_store(
+            &project.store_path(),
+            ProjectOpenMode::PreferWritable,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(retry.effective_mode(), ProjectOpenMode::PreferWritable);
+        assert_eq!(
+            fs::read_dir(project.path().join("staging"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn writable_open_validates_store_before_touching_staging() {
+        let project = TestProject::extracted("staging-validation-order", "stale.m4dproj");
+        let transaction = install_staging_residue(&project, true);
+        fs::write(project.path().join("refs/head"), b"corrupt head").unwrap();
+
+        assert!(matches!(
+            open_established_store(
+                &project.store_path(),
+                ProjectOpenMode::PreferWritable,
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::Corruption { .. })
+        ));
+        assert_eq!(
+            fs::read(transaction.join("payload")).unwrap(),
+            b"interrupted stage"
+        );
+    }
+
+    #[test]
+    fn empty_staging_sync_failure_suspends_writes_and_fresh_retry_succeeds() {
+        let project = TestProject::extracted("staging-empty-sync", "stale.m4dproj");
+        fs::create_dir_all(project.path().join("staging")).unwrap();
+        assert_eq!(
+            fs::read_dir(project.path().join("staging"))
+                .unwrap()
+                .count(),
+            0
+        );
+        let root = LocalStoreRoot::open(project.path()).unwrap();
+        inspect_established_store(&root, ProjectStoreLimits::default(), || false).unwrap();
+        let mut leases =
+            ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        let injector = GcTransitionInjector::failing(GcTransitionTarget {
+            transition: GcTransition::StagingCleanupDirectorySync,
+            edge: TransitionEdge::Before,
+            occurrence: 0,
+        });
+        leases.set_gc_transition_injector(injector.clone());
+
+        assert_eq!(
+            cleanup_dead_writer_staging(&root, &leases, ProjectStoreLimits::default(), || false,),
+            Err(ProjectStoreFault::CommitIndeterminate)
+        );
+        assert_eq!(injector.fired(), 1);
+        assert!(matches!(
+            leases.confirm_writer(&root),
+            Err(LeaseError::Indeterminate)
+        ));
+        drop(leases);
+        drop(root);
+
+        let retry = open_established_store(
+            &project.store_path(),
+            ProjectOpenMode::PreferWritable,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(retry.effective_mode(), ProjectOpenMode::PreferWritable);
+        assert_eq!(
+            fs::read_dir(project.path().join("staging"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn staging_cleanup_transition_failures_require_exact_fresh_retry() {
+        assert_eq!(
+            GcTransition::STAGING_CLEANUP.map(GcTransition::name),
+            [
+                "staging_cleanup_payload_remove",
+                "staging_cleanup_directory_sync",
+                "staging_cleanup_transaction_remove",
+            ]
+        );
+        for transition in GcTransition::STAGING_CLEANUP {
+            assert_eq!(GcTransition::parse(transition.name()), Some(transition));
+        }
+
+        let cases = [
+            (
+                GcTransition::StagingCleanupPayloadRemove,
+                TransitionEdge::Before,
+                0,
+                false,
+            ),
+            (
+                GcTransition::StagingCleanupPayloadRemove,
+                TransitionEdge::After,
+                0,
+                true,
+            ),
+            (
+                GcTransition::StagingCleanupDirectorySync,
+                TransitionEdge::Before,
+                0,
+                true,
+            ),
+            (
+                GcTransition::StagingCleanupDirectorySync,
+                TransitionEdge::After,
+                0,
+                true,
+            ),
+            (
+                GcTransition::StagingCleanupTransactionRemove,
+                TransitionEdge::Before,
+                0,
+                true,
+            ),
+            (
+                GcTransition::StagingCleanupTransactionRemove,
+                TransitionEdge::After,
+                0,
+                true,
+            ),
+            (
+                GcTransition::StagingCleanupDirectorySync,
+                TransitionEdge::Before,
+                1,
+                true,
+            ),
+            (
+                GcTransition::StagingCleanupDirectorySync,
+                TransitionEdge::After,
+                1,
+                true,
+            ),
+        ];
+
+        for (case, (transition, edge, occurrence, indeterminate)) in cases.into_iter().enumerate() {
+            let project =
+                TestProject::extracted(&format!("staging-transition-{case}"), "stale.m4dproj");
+            install_staging_residue(&project, true);
+            let root = LocalStoreRoot::open(project.path()).unwrap();
+            inspect_established_store(&root, ProjectStoreLimits::default(), || false).unwrap();
+            let mut leases =
+                ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+            let injector = GcTransitionInjector::failing(GcTransitionTarget {
+                transition,
+                edge,
+                occurrence,
+            });
+            leases.set_gc_transition_injector(injector.clone());
+            let result =
+                cleanup_dead_writer_staging(&root, &leases, ProjectStoreLimits::default(), || {
+                    false
+                });
+            assert_eq!(injector.fired(), 1);
+            if indeterminate {
+                assert_eq!(result, Err(ProjectStoreFault::CommitIndeterminate));
+                assert!(matches!(
+                    leases.confirm_writer(&root),
+                    Err(LeaseError::Indeterminate)
+                ));
+            } else {
+                assert_eq!(
+                    result,
+                    Err(ProjectStoreFault::Corruption {
+                        stage: "staging_cleanup"
+                    })
+                );
+                assert!(leases.confirm_writer(&root).unwrap());
+            }
+            drop(leases);
+            drop(root);
+
+            let retry = open_established_store(
+                &project.store_path(),
+                ProjectOpenMode::PreferWritable,
+                ProjectStoreLimits::default(),
+                || false,
+            )
+            .unwrap();
+            assert_eq!(retry.effective_mode(), ProjectOpenMode::PreferWritable);
+            assert_eq!(
+                fs::read_dir(project.path().join("staging"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+            drop(retry);
+
+            let idempotent = open_established_store(
+                &project.store_path(),
+                ProjectOpenMode::PreferWritable,
+                ProjectStoreLimits::default(),
+                || false,
+            )
+            .unwrap();
+            assert_eq!(idempotent.effective_mode(), ProjectOpenMode::PreferWritable);
+        }
     }
 
     #[test]
