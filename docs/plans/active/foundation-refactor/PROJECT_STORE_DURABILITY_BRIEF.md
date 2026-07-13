@@ -2,7 +2,7 @@
 
 Status: HANDOFF_READY SUBORDINATE
 Program version: 0.21
-Last updated: 2026-07-11
+Last updated: 2026-07-13
 Implementation authorization: INHERITED ONLY THROUGH THE ACTIVATED HANDOFF AND PACKAGE ENTRY GATES
 Parent authority: `docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md`
 Authority scope: D-010 project transactions, commit protocol, concurrency, recovery, autosave, garbage collection, and durability evidence
@@ -165,7 +165,15 @@ device rename.
   and any analysis output without a complete verified deterministic recipe are
   non-regenerable by default. They are never age-pruned or provenance-guessed
   away. Trashing or purging a non-regenerable candidate requires an itemized
-  confirmation and the approved verified-backup policy.
+  confirmation and the approved verified-backup policy. The current Trash API
+  cannot carry that proof, so its implementation must reject such candidates
+  with `ConfirmationRequired`; a future proof-bearing API must be approved
+  separately.
+- Trash uses mirrored generation/object namespaces under `trash`, fresh
+  exclusive-maintenance preflight, retained-generation closure subtraction,
+  no-replace moves, and bounded durable batches. It never sweeps anonymous
+  unrooted objects. Cancellation may stop only between synced batches; any
+  other post-mutation failure is write-suspending and indeterminate.
 - Writable durability is initially claimed only on tested local Linux
   filesystem and mount-option tuples with same-filesystem staging, no-replace
   publication, atomic ref replacement, file sync, and directory sync. Unknown,
@@ -217,7 +225,9 @@ D-010/WP-10B must inject failures before and after every write, flush, publish,
 directory sync, generation publication, ref replacement, and ref-directory
 sync. The accepted maintenance-transition correction explicitly adds pin stage,
 write, file-sync, replace, and directory-sync phases; unpin remove and
-directory-sync phases; and separate purge remove and directory-sync phases.
+directory-sync phases; Trash maintenance upgrade/restore, directory-create,
+collision-sync, move, duplicate-remove, source-sync, and trash-sync phases;
+and separate purge remove and directory-sync phases.
 It must also kill child processes at every transition and reopen in a
 fresh process; exercise `ENOSPC`, short writes, permissions/read-only errors,
 corrupt/truncated refs/generations/objects, concurrent writers, stale-parent

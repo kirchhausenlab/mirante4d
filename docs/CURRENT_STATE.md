@@ -1,6 +1,6 @@
 # Current State
 
-Last reviewed: 2026-07-12
+Last reviewed: 2026-07-13
 
 Mirante4D is public, pre-alpha academic research software. Persisted formats
 and APIs can change through explicit hard cutovers; there is no supported
@@ -174,7 +174,10 @@ bounded stable active-store snapshot, reconstructs paged logical objects,
 supports cancellation and read-only sessions, and changes no store bytes.
 Private PlanCompaction now returns a bounded stable-snapshot recovery-review
 candidate for every orphan generation without mutation and remains available
-read-only.
+read-only. A bound safety correction freezes the later Trash subset for
+generations declaring no non-regenerable artifacts, its lease transition,
+retained-closure subtraction, bounded batch/retry, and `ConfirmationRequired`
+fault; it implements no deletion.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
@@ -214,6 +217,10 @@ See [testing](TESTING.md) for commands and claim language.
   estimate, or prove backup approval. Private FullVerify does not validate
   artifact scientific semantics, repair data, inspect trash, or establish a
   durability claim.
+- Trash and Purge do not mutate storage yet. The current Trash API cannot
+  authorize removal of non-regenerable artifacts; supporting that later needs
+  separately approved snapshot-bound itemized confirmation and verified-
+  backup proof.
 - The package-capability lane remains pending until there is an honest
   unsupported-GPU package command.
 - Packaged runtime does not expose unsaved-autosave recovery.

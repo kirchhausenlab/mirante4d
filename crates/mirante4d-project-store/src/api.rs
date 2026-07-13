@@ -741,7 +741,9 @@ pub enum ProjectStoreFault {
     DigestMismatch,
     #[error("project-store data is corrupt during {stage}")]
     Corruption { stage: &'static str },
-    #[error("project-store work was cancelled before authority changed")]
+    #[error("itemized confirmation and verified-backup authorization are required")]
+    ConfirmationRequired,
+    #[error("project-store work was cancelled at a safe boundary")]
     Cancelled,
     #[error("an authority update may be visible but durability is indeterminate")]
     CommitIndeterminate,
