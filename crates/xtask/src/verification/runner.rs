@@ -733,6 +733,7 @@ fn expected_project_store_vm_rows() -> anyhow::Result<Vec<Value>> {
         if !matches!(lane, "none" | "manual" | "autosave") {
             bail!("project-store VM flow lane is invalid");
         }
+        let mut flow_occurrences = BTreeMap::<&str, BTreeSet<u64>>::new();
         let flow_transitions = flow
             .get("transitions")
             .and_then(Value::as_array)
@@ -752,19 +753,41 @@ fn expected_project_store_vm_rows() -> anyhow::Result<Vec<Value>> {
             if occurrences.is_empty() {
                 bail!("project-store VM transition occurrences must be nonempty");
             }
-            for (index, occurrence) in occurrences.iter().enumerate() {
-                if occurrence.as_u64() != Some(index as u64) {
-                    bail!("project-store VM transition occurrences must be contiguous from zero");
+            let parsed = occurrences
+                .iter()
+                .map(|occurrence| {
+                    occurrence
+                        .as_u64()
+                        .context("project-store VM transition occurrence must be unsigned")
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let start = parsed[0];
+            if parsed
+                .iter()
+                .enumerate()
+                .any(|(index, occurrence)| start.checked_add(index as u64) != Some(*occurrence))
+            {
+                bail!("project-store VM transition occurrence segment must be contiguous");
+            }
+            for occurrence in parsed {
+                if !flow_occurrences.entry(name).or_default().insert(occurrence) {
+                    bail!("project-store VM flow contains a duplicate transition occurrence");
                 }
                 rows.push(serde_json::json!({
                     "case": case,
                     "transition": name,
                     "lane": lane,
                     "edge": "after",
-                    "occurrence": index as u64,
+                    "occurrence": occurrence,
                     "status": "passed",
                 }));
             }
+        }
+        if flow_occurrences
+            .values()
+            .any(|occurrences| occurrences.iter().copied().ne(0..occurrences.len() as u64))
+        {
+            bail!("project-store VM transition occurrences must be contiguous from zero");
         }
     }
     let expected_transitions = BTreeSet::from([
