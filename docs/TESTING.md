@@ -157,7 +157,7 @@ first and advancing autosave generations and refs, replace a divergent lane
 against the current manual base, accept a lower revision with a non-regressing
 high-water mark, reject stale parent/base and invalid recovery/capacity state,
 retry an exact recovery-ahead cancellation, and distinguish recovery-sync
-failure from write-suspending head indeterminacy. Ten actor cases exercise the
+failure from write-suspending head indeterminacy. Eleven actor cases exercise the
 real established manual/autosave primitives under one worker and prove exact
 request correlation, the request/completion bounds, queued-autosave coalescing,
 active and queued cancellation, close rejection, writer-lease lifetime, and
@@ -187,6 +187,14 @@ effects and read-only faults, while the shared cancellation case covers both
 queued completion variants. The maintenance-transition correction is bound by
 the architecture gate; it is not yet exhaustive failpoint, process-kill, or
 power-cut evidence.
+Two FullVerify cases prove a bounded stable snapshot of every active generation
+and object outside staging and trash, exact physical-object hashing, paged
+logical reconstruction, cancellation, snapshot-drift rejection, and
+byte-identical no-mutation behavior. One actor case proves correlated and
+cancellable execution remains available in a writer-contended read-only
+session. This evidence does not validate artifact scientific semantics, repair
+data, verify trash, establish durability, construct the public actor, or wire a
+product path.
 Four initial-package cases
 cover exact Create facts and caller-bound Save As fork encoding, retained root/
 lease validity, exact descriptor admission, existing directory/file/symlink

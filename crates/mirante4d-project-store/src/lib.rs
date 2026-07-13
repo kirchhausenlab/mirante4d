@@ -9,6 +9,8 @@
 #[cfg(target_os = "linux")]
 mod actor;
 mod api;
+#[cfg(target_os = "linux")]
+mod full_verify;
 mod generation;
 #[cfg(target_os = "linux")]
 mod inspection;
