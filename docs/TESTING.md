@@ -191,8 +191,11 @@ read-only faults, while the shared cancellation case covers both queued
 completion variants. A second actor case performs the same 16 points with
 actual `SIGKILL`, fresh-process reopen, exact retry, and an idempotent second
 retry while unrelated authority remains unchanged. This is process-crash
-evidence only: it does not clean dead-writer staging, simulate power loss, or
-establish filesystem durability.
+evidence only: it does not simulate power loss or establish filesystem
+durability. The accepted staging-cleanup correction now freezes the exact
+writer-private grammar, complete preflight, three named transitions, ordered
+sync, cancellation, indeterminacy, and retry rules. Implementation evidence for
+that cleanup is still pending.
 Two FullVerify cases prove a bounded stable snapshot of every active generation
 and object outside staging and trash, exact physical-object hashing, paged
 logical reconstruction, cancellation, snapshot-drift rejection, and

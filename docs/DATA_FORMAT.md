@@ -158,4 +158,7 @@ no-clobber publication and advance rules. The private publisher now implements
 those rules with exact uncertain-install adoption and fresh retry. This remains
 off-product and is not a public Create/Save, actor/timer, recovery-open, or
 durability claim. B4 deletes project-v15 and makes the new store the sole
-product path.
+product path. A separate accepted correction now fixes the exact internal
+`staging/tx-*` name and payload grammar plus writer-only cleanup rules. Staging
+remains non-authoritative; cleanup implementation and durability evidence are
+still pending.

@@ -39,6 +39,10 @@
       "path": "architecture/wp10b-project-store-provisional-autosave-correction.json",
       "sha256": "2eb9df2cd56472dba37ed9d321b680b2a2a76274210dd7e57aca10be31466e9a"
     },
+    "staging_cleanup_correction": {
+      "path": "architecture/wp10b-project-store-staging-cleanup-correction.json",
+      "sha256": "890f405df832e895da229ba26515efb734fcbe0ccc098f61c7674798a4222324"
+    },
     "protected_main": {
       "commit": "b6e0267802f8ac2d0d49a0f04302fd321ef2f617",
       "tree": "b20b598603b47fdbe7c85c3b6d1cba8c78fd433e",
@@ -79,7 +83,9 @@
     "checkpoint_id": "1 through 64 lowercase ASCII bytes matching [a-z0-9][a-z0-9_-]*",
     "generation": "generations/sha256/<first-two-digest-hex>/<remaining-sixty-two-digest-hex>.json",
     "object": "objects/sha256/<first-two-digest-hex>/<remaining-sixty-two-digest-hex>",
-    "staging": "staging/<transaction-id>",
+    "staging": "staging/<staging-transaction-id>",
+    "staging_transaction_id": "tx-<canonical-minimal-nonzero-u32-pid>-<32-lowercase-hex-nonce>-<16-lowercase-hex-sequence>-<2-lowercase-hex-attempt-00-through-7f>",
+    "staging_payload": "optional sole child named payload; same-filesystem single-link regular file no larger than generation_bytes_max",
     "locks": "locks",
     "trash": "trash",
     "trash_generation": "trash/generations/sha256/<first-two-digest-hex>/<remaining-sixty-two-digest-hex>.json",
@@ -498,6 +504,19 @@
     "transitions": "first publication composes the existing commit_prefix, object, and generation sets, the autosave-parameterized head_ref set, package_stage_create, package_tree_sync, package_install_noreplace, and destination_parent_sync; advance composes the existing commit_prefix, object, and generation sets plus the autosave-parameterized recovery_ref and head_ref sets",
     "timers": "B2 publishes and coalesces explicitly submitted captures only; B3 application integration owns the 30-second idle and 120-second maximum scheduling because application owns live revision and capture creation; exact trigger, reset, and monotonic-clock semantics remain unfrozen and this correction authorizes no timer implementation"
   },
+  "staging_cleanup_contract": {
+    "trigger": "after existing-store open acquires the writer lease, completes bounded read-side store/recovery validation, and reconfirms the writer against the same held root immediately before removal; cleanup finishes before writable use or another mutation; read-only requests and writer-contended read-only fallbacks never clean staging; shared maintenance remains sufficient",
+    "selection": "every direct staging child must match the exact transaction grammar; PID is syntax only and process liveness, age, hostname, and lock text are never consulted",
+    "contents": "staging, each transaction directory, and each payload stay on the held store root's filesystem; a transaction is empty or contains only one single-link regular payload no larger than generation_bytes_max; payload bytes are not hashed, decoded, or interpreted",
+    "preflight": "completely and boundedly validate every staging child and record its identity before the first removal; one unknown, malformed, linked, cross-device, oversized, changed, or over-cap entry rejects the whole cleanup without mutation",
+    "order": "process transaction IDs in unsigned bytewise order; revalidate identities; remove payload if present and sync that transaction directory; remove the empty transaction directory and sync top-level staging; when staging exists but is already empty, sync it once; never create missing staging; retain staging itself and finally prove every existing staging directory empty",
+    "transitions": "compose staging_cleanup_payload_remove, staging_cleanup_directory_sync, and staging_cleanup_transaction_remove; staging_cleanup_directory_sync repeats for transaction and top-level staging directories and uses before/after plus zero-based occurrence injection",
+    "cancellation": "observe cancellation only during complete preflight, where it changes no bytes; after preflight defer cancellation through the full ordered remove, sync, and re-inventory sweep",
+    "indeterminate": "any required sync failure or any failure after the first successful removal returns commit_indeterminate, suspends writes, performs no rollback, and requires close/reopen plus fresh retry",
+    "retry": "fresh retry accepts a now-empty transaction or an already-absent transaction, re-preflights the visible namespace, syncs an existing empty staging directory even with zero removals, never creates missing staging, is idempotent, and introduces no marker or ownership record",
+    "scope": "touch only canonical direct children of internal staging; never remove sibling package stages, published immutable orphans, refs, locks, trash, generations, objects, or staging itself",
+    "claim_boundary": "focused callback and process-crash evidence does not prove hostile-writer safety, power-loss durability, or filesystem qualification"
+  },
   "limits": {
     "project_envelope_bytes_max": 16384,
     "ref_record_bytes_exact": 160,
@@ -586,6 +605,11 @@
     "unpin": [
       "unpin_remove",
       "unpin_directory_sync"
+    ],
+    "staging_cleanup": [
+      "staging_cleanup_payload_remove",
+      "staging_cleanup_directory_sync",
+      "staging_cleanup_transaction_remove"
     ],
     "gc": [
       "gc_maintenance_upgrade",
