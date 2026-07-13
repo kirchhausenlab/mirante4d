@@ -6,10 +6,10 @@ Current technical sequence: WP-10B, WP-11, then the remaining packages below
 Public-data publication: deferred to a separate future handoff
 WP-10B predecessor: `foundation-wp-09a-exit-1`
 Completed through: WP-09A at `foundation-wp-09a-exit-1`
-Current checkpoint: WP-10B transactional project store; Purge safety contract
-following private actor-routed Trash and its exact process-crash evidence
-Next protected-branch checkpoint: WP-10B private actor-routed Purge execution
-and recovery evidence
+Current checkpoint: WP-10B transactional project store; private actor-routed
+safe Purge and its exact process-crash evidence
+Next protected-branch checkpoint: WP-10B remaining B2 lifecycle/durability
+work
 
 ## Purpose
 

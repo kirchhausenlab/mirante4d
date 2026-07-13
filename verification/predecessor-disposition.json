@@ -2531,6 +2531,22 @@
       "reason": "WP-10B B2 kills an actor-routed Trash mutator before and after every observed occurrence of the ten frozen transitions, then proves fresh-process reopen, exact retry, zero-mutation sync retry, lease release, and unchanged refs/retained objects without claiming power-loss durability."
     },
     {
+      "id": "libtest:mirante4d-project-store:actor::tests::purge_is_correlated_cancellable_read_only_and_indeterminate",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves private Purge request correlation, active and queued cancellation, writer-contended read-only rejection, successful bounded diagnostics, and write-suspending indeterminate-session behavior."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:actor::tests::purge_fresh_process_kill_and_retry_matrix",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 kills an actor-routed Purge mutator in 16 actual transition cases, then proves fresh-process reopen, exact retry, zero-removal sync retry, lease release, and unchanged active authority without claiming power-loss durability."
+    },
+    {
       "id": "libtest:mirante4d-project-store:api::tests::accepted_defaults_match_the_frozen_b2_work_bounds",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -3001,6 +3017,22 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 proves bounded direct/paged closure publication and generation-last ordering."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:trash::tests::purge_object_first_bounded_recovery_and_strict_preflight_are_exact",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves strict complete-trash and zero-non-regenerable preflight, object-first bounded deletion, the synced empty-object barrier, generation-last removal, cancellation, exact retry, and zero-removal sync retry while active authority remains unchanged."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:trash::tests::purge_transition_failures_and_sync_retries_are_exact",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves 16 exact before/after cases across the four-transition Purge execution, including maintenance upgrade/restore and every observed remove and directory-sync occurrence, pre-unlink immutability, post-unlink indeterminacy, and bounded sync recovery."
     },
     {
       "id": "libtest:mirante4d-project-store:trash::tests::selected_zero_non_regenerable_orphan_preserves_shared_objects_and_retries_exactly",
@@ -6036,6 +6068,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 548
+    "current_additions": 552
   }
 }

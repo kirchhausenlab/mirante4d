@@ -56,6 +56,8 @@ pub(crate) enum GcTransition {
     SourceDirectorySync,
     TrashDirectorySync,
     MaintenanceRestore,
+    PurgeRemove,
+    PurgeDirectorySync,
 }
 
 impl GcTransition {
@@ -73,6 +75,14 @@ impl GcTransition {
         Self::MaintenanceRestore,
     ];
 
+    #[cfg(test)]
+    pub(crate) const PURGE: [Self; 4] = [
+        Self::MaintenanceUpgrade,
+        Self::PurgeRemove,
+        Self::PurgeDirectorySync,
+        Self::MaintenanceRestore,
+    ];
+
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::MaintenanceUpgrade => "gc_maintenance_upgrade",
@@ -85,6 +95,8 @@ impl GcTransition {
             Self::SourceDirectorySync => "gc_source_directory_sync",
             Self::TrashDirectorySync => "gc_trash_directory_sync",
             Self::MaintenanceRestore => "gc_maintenance_restore",
+            Self::PurgeRemove => "purge_remove",
+            Self::PurgeDirectorySync => "purge_directory_sync",
         }
     }
 
@@ -92,6 +104,7 @@ impl GcTransition {
     pub(crate) fn parse(name: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
+            .chain([Self::PurgeRemove, Self::PurgeDirectorySync])
             .find(|transition| transition.name() == name)
     }
 
@@ -107,6 +120,8 @@ impl GcTransition {
             Self::SourceDirectorySync => 7,
             Self::TrashDirectorySync => 8,
             Self::MaintenanceRestore => 9,
+            Self::PurgeRemove => 10,
+            Self::PurgeDirectorySync => 11,
         }
     }
 }
@@ -164,7 +179,7 @@ pub(crate) struct GcTransitionTarget {
 pub(crate) struct GcTransitionInjector {
     target: Option<GcTransitionTarget>,
     action: GcTransitionAction,
-    attempts: [AtomicUsize; 10],
+    attempts: [AtomicUsize; 12],
     fired: AtomicUsize,
     release: AtomicBool,
     parked_thread: Mutex<Option<thread::Thread>>,

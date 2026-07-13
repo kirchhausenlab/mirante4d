@@ -157,9 +157,10 @@ first and advancing autosave generations and refs, replace a divergent lane
 against the current manual base, accept a lower revision with a non-regressing
 high-water mark, reject stale parent/base and invalid recovery/capacity state,
 retry an exact recovery-ahead cancellation, and distinguish recovery-sync
-failure from write-suspending head indeterminacy. Fifteen actor cases exercise the
-real established manual/autosave primitives under one worker and prove exact
-request correlation, the request/completion bounds, queued-autosave coalescing,
+failure from write-suspending head indeterminacy. Seventeen actor cases
+exercise the real established manual/autosave primitives under one worker and
+prove exact request correlation, the request/completion bounds, queued-autosave
+coalescing,
 active and queued cancellation, close rejection, writer-lease lifetime, and
 joined or nonblocking shutdown. They also prove authenticated Save As session
 and lease transfer, rejection before source reads, and preservation of the old
@@ -185,8 +186,8 @@ read-only rejection, linked-file rejection, idempotence, and write-suspending
 directory-sync uncertainty. One actor case proves correlated Pin/Unpin graph
 effects and read-only faults, while the shared cancellation case covers both
 queued completion variants. The maintenance-transition correction is bound by
-the architecture gate. The non-Trash transition inventory is not yet an
-exhaustive failpoint, process-kill, or power-cut matrix.
+the architecture gate. Pin and unpin still lack an exhaustive failpoint,
+process-kill, or power-cut matrix.
 Two FullVerify cases prove a bounded stable snapshot of every active generation
 and object outside staging and trash, exact physical-object hashing, paged
 logical reconstruction, cancellation, snapshot-drift rejection, and
@@ -223,10 +224,20 @@ including repeated observed occurrences, then reopens in a fresh process and
 proves exact retry plus a zero-mutation sync retry. This is process-crash
 evidence only: it does not simulate power loss or establish filesystem
 durability.
-The accepted Purge safety correction requires separate evidence for strict
-whole-trash preflight, object-first deletion with generation records retained,
-synced cancellation/retry prefixes, actor behavior, and exact failpoint and
-fresh-process matrices. None of that Purge execution evidence exists yet.
+The accepted Purge subset now has four focused cases. One proves strict whole-
+trash and zero-non-regenerable preflight, object-first bounded deletion while
+generation records remain, the synced empty-object barrier, generation-last
+removal, retained active copies and directories, cancellation/retry, and a
+zero-removal sync retry. A second supplies 16 exact before/after callback cases
+across the four-transition Purge execution, including maintenance upgrade/
+restore and every observed remove and directory-sync occurrence, pre-unlink
+immutability, post-unlink indeterminacy, and sync recovery. One actor case
+proves exact correlation, active and queued cancellation, writer-contended
+read-only rejection, successful diagnostics, and indeterminate-session
+handling. A 16-case actor subprocess matrix performs actual `SIGKILL`, fresh-
+process reopen, exact retry, and zero-removal sync retry. This proves logic and
+process-crash recovery only; it does not simulate power loss, qualify a
+filesystem, establish durability, or expose public/product Purge.
 The existing process-lease case now also proves failed in-place maintenance
 upgrade restoration, contended exclusive acquisition, explicit and drop-based
 downgrade, cancellation, writer retention, and read-only rejection. It does

@@ -168,7 +168,7 @@ remains off-product. Private Pin/Unpin execution now validates the complete
 graph and prospective recovery-candidate cap, preserves duplicate-pin liveness,
 rejects read-only sessions, and makes directory-sync uncertainty
 write-suspending. The accepted transition authority names pin, unpin, and purge
-phases, but their exhaustive failpoint/kill matrix is not yet implemented. A
+phases. Pin and unpin do not yet have their exhaustive failpoint/kill matrix. A
 private read-only FullVerify path now hashes every physical object in one
 bounded stable active-store snapshot, reconstructs paged logical objects,
 supports cancellation and read-only sessions, and changes no store bytes.
@@ -184,9 +184,13 @@ sync, and fail-closed inventory. All ten frozen Trash transitions now support
 exact before/after and zero-based occurrence injection. A 34-case actor kill
 matrix proves fresh-process reopen and idempotent retry, while explicitly
 making no power-loss durability claim. A bound Purge safety correction now
-freezes complete-snapshot selection, strict zero-non-regenerable preflight,
-object-first synced batches, generation-last deletion, and idempotent reopen/
-retry. Purge execution remains absent.
+owns the implemented private actor-routed safe subset: complete-snapshot and
+strict zero-non-regenerable preflight, object-first bounded synced deletion, a
+revalidated empty-object barrier, generation-last removal, retained directory
+hierarchies, and idempotent reopen/retry. Sixteen exact callback cases and 16
+actual `SIGKILL` cases cover every observed Purge maintenance, remove, and
+directory-sync occurrence. This is process-crash evidence only, with no power-loss,
+filesystem-durability, public, or product claim.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
@@ -220,8 +224,9 @@ See [testing](TESTING.md) for commands and claim language.
   established-store inspection authority as transaction preflight. Public
   Create/Open/Save As execution,
   provisional autosave publication, public/product recovery workflow, timers,
-  public/product garbage collection, Purge, public actor construction,
-  durability qualification, and every product path remain unimplemented.
+  public/product garbage collection and Purge wiring, public actor
+  construction, durability qualification, and every product path remain
+  unimplemented.
   PlanCompaction
   does not authorize Trash, expose a physical object/byte plan or reclaim
   estimate, or prove backup approval. Private FullVerify does not validate
@@ -229,8 +234,10 @@ See [testing](TESTING.md) for commands and claim language.
   durability claim.
 - Private actor-routed Trash is covered only for its bounded authorized subset;
   its callback and process-crash matrix does not simulate power loss or qualify
-  filesystem durability. Purge now has a frozen safe subset but no execution
-  evidence. The current API cannot authorize removal of non-regenerable
+  filesystem durability. Private actor-routed Purge is likewise limited to its
+  strict zero-non-regenerable subset; its callback and process-crash matrices
+  do not simulate power loss, qualify a filesystem, or expose public/product
+  execution. The current API cannot authorize removal of non-regenerable
   artifacts; supporting that later needs separately approved snapshot-bound
   itemized confirmation and verified-backup proof.
 - The package-capability lane remains pending until there is an honest

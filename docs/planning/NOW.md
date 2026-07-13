@@ -37,12 +37,12 @@ A bounded private recovery reader and actor path now classify all four fixtures,
 fall back across corrupt heads/targets, scan only after exhausted lane fallback,
 and load a freshly selected projection without repair or promotion. B2 remains
 active off-product: public Create/Open/Save As execution, provisional autosave
-publication, timers, public/product garbage collection, Purge, and public actor
-wiring remain later work, with product activation at B4.
+publication, timers, public/product garbage collection and Purge wiring, and
+public actor wiring remain later work, with product activation at B4.
 Private Pin/Unpin now supplies durable checkpoint roots with fresh graph,
 capacity, cancellation, and read-only enforcement. The accepted maintenance
-transition correction names pin, unpin, and purge phases for the later
-exhaustive failure matrix.
+transition correction names pin and unpin phases whose exhaustive failure
+matrix remains later B2 work.
 A private bounded FullVerify path now hashes every physical object in one
 stable active-store snapshot, reconstructs paged logical objects, remains
 cancellable and available read-only, and changes no store authority. Artifact
@@ -64,9 +64,13 @@ before/after and zero-based occurrence injection plus a 34-case fresh-process
 kill/retry matrix. This is process-crash evidence, not power-loss durability.
 The accepted Purge safety correction now freezes a strict complete-trash,
 zero-non-regenerable subset with object-first synced deletion and generation
-metadata retained until the object namespace is durably empty. Implementing
-that private actor path and its exact recovery evidence comes next; the
-remaining B2 lifecycle/durability work follows.
+metadata retained until the object namespace is synced and revalidated empty. The private
+actor now routes that exact subset with strict fail-closed preflight, bounded
+object batches, a revalidated sync barrier, generation-last removal,
+cancellation, read-only rejection, and indeterminate-session handling. Sixteen
+exact callback cases and 16 actual `SIGKILL` cases prove fresh-process retry
+for every observed Purge transition occurrence. This is process-crash evidence,
+not power-loss durability. The remaining B2 lifecycle/durability work is next.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.
