@@ -18,6 +18,14 @@
     { "id": "project-model", "owner": "mirante4d-project-model", "seed": "0x4d3450524f4a4d4f", "cases": 128, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" }
   ],
   "lint_exceptions": [],
+  "test_timeout_overrides": [
+    {
+      "selector": "package(mirante4d-project-store) & test(=actor::tests::purge_fresh_process_kill_and_retry_matrix)",
+      "warn_ms": 5000,
+      "terminate_ms": 40000,
+      "reason": "The real-process Purge crash matrix spawns 32 child processes and performs filesystem syncs; public hosted runners can exceed the 20-second contract-lane default, so only its termination ceiling is 40 seconds."
+    }
+  ],
   "lanes": [
     {
       "id": "policy",
