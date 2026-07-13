@@ -2979,6 +2979,22 @@
       "reason": "WP-10B B2 proves bounded direct/paged closure publication and generation-last ordering."
     },
     {
+      "id": "libtest:mirante4d-project-store:trash::tests::selected_zero_non_regenerable_orphan_preserves_shared_objects_and_retries_exactly",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves explicit zero-non-regenerable Trash preserves retained shared and anonymous objects, cancels after a synced batch prefix, publishes mirrored generation quarantine, retries exactly, and deduplicates without replacement."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:trash::tests::unsafe_selection_and_symlinked_inventory_do_not_mutate",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 rejects empty, duplicate, non-regenerable, symlinked-inventory, and foreign-lineage retry selections before Trash adds any mutation."
+    },
+    {
       "id": "libtest:mirante4d-project-store:wire::tests::all_ref_shapes_round_trip_and_forbidden_slots_are_rejected",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -5988,6 +6004,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 542
+    "current_additions": 544
   }
 }

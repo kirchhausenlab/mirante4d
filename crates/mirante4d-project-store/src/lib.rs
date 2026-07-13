@@ -22,6 +22,8 @@ mod local;
 mod pin;
 #[cfg(target_os = "linux")]
 mod transaction;
+#[cfg(target_os = "linux")]
+mod trash;
 mod wire;
 
 pub use api::{
