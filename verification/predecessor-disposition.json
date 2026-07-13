@@ -2555,6 +2555,14 @@
       "reason": "WP-10B B2 proves one shared inspection authority accepts the exact newer, divergent, and stale established fixtures."
     },
     {
+      "id": "libtest:mirante4d-project-store:inspection::tests::provisional_fixture_has_one_healthy_autosave_authority_without_a_manual_head",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 recognizes the exact healthy provisional autosave-only state without inventing a manual authority or mutating refs."
+    },
+    {
       "id": "libtest:mirante4d-project-store:inspection::tests::recovery_ahead_is_accepted_without_changing_head_authority_or_bytes",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -2571,12 +2579,52 @@
       "reason": "WP-10B B2 proves established open holds session leases and reports writable contention as an explicit read-only fallback."
     },
     {
+      "id": "libtest:mirante4d-project-store:inspection::tests::store_graph_rejects_corrupt_or_excess_orphans_without_affecting_normal_open",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 keeps normal open independent from orphan review while the graph pass rejects corrupt generations, wrong-lane provenance, scan overflow, and over-cap recovery candidates without mutation."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:inspection::tests::store_graph_reports_exact_fixture_roots_orphans_and_object_partition",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 reports the independent fixtures' exact declared live roots and orphan generations, plus a disjoint read-only live/unrooted object partition."
+    },
+    {
       "id": "libtest:mirante4d-project-store:lease::tests::process_contention_preserves_shared_maintenance_and_single_writer_ownership",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 proves process-held shared maintenance exclusion, one writer, read-only contention fallback, and lease release."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:local::tests::canonical_fixture_namespaces_enumerate_exact_sorted_facts",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 descriptor-relatively enumerates exact canonical generation identities and object length facts in deterministic order."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:local::tests::namespace_enumeration_enforces_all_work_bounds_and_cancellation",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 bounds immutable namespace generation count, object bytes, entries, fan-out, descriptors, and cancellation."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:local::tests::namespace_enumeration_rejects_unknown_malformed_and_linked_entries",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 rejects noncanonical digest namespace names, unknown entries, symlinks, and hardlinks through held descriptors."
     },
     {
       "id": "libtest:mirante4d-project-store:local::tests::opens_every_root_component_without_following_symlinks",
@@ -5812,6 +5860,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 520
+    "current_additions": 526
   }
 }

@@ -6,7 +6,7 @@ Current technical sequence: WP-10B, WP-11, then the remaining packages below
 Public-data publication: deferred to a separate future handoff
 WP-10B predecessor: `foundation-wp-09a-exit-1`
 Completed through: WP-09A at `foundation-wp-09a-exit-1`
-Current checkpoint: WP-10B transactional project store; B2 package-install core
+Current checkpoint: WP-10B transactional project store; B2 bounded store graph
 Next protected-branch checkpoint: WP-11 import pipeline rebuild
 
 ## Purpose

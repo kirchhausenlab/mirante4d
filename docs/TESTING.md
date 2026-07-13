@@ -162,12 +162,16 @@ request correlation, the request/completion bounds, queued-autosave coalescing,
 active and queued cancellation, close rejection, writer-lease lifetime, and
 joined or nonblocking shutdown. They also prove authenticated Save As session
 and lease transfer, rejection before source reads, and preservation of the old
-session across collision, source failure, and cancellation. Five inspection
+session across collision, source failure, and cancellation. Eight inspection
 cases cover the three promoted
 established-store states, exact heads and autosave classification, read-only and
 writer-contention modes, recovery-ahead without mutation, metadata-only payload
-validation, deferred payload digests, and fail-closed cancellation, capacity,
-symlink, hardlink, length, and control corruption. Four initial-package cases
+validation, deferred payload digests, the exact provisional state, canonical
+generation/object namespace enumeration, exact live-root/orphan partitioning,
+candidate caps, and fail-closed cancellation, capacity, symlink, hardlink,
+length, provenance, and control corruption. The graph is read-only preparation
+for recovery/compaction; it is not recovery selection, full verification, or a
+trash plan. Four initial-package cases
 cover exact Create facts and caller-bound Save As fork encoding, retained root/
 lease validity, exact descriptor admission, existing directory/file/symlink
 refusal before source reads, a final no-clobber race, populated-stage

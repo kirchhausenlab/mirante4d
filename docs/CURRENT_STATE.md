@@ -148,7 +148,12 @@ only after durable success. A shared private inspection core now opens
 and validates established stores for actor startup and transaction preflight,
 including exact ref/generation continuity, bounded physical metadata closure,
 autosave classification, and explicit read-only writer fallback without eager
-bulk-payload hashing. A crate-private destination-local installer now builds a
+bulk-payload hashing. A bounded read-only graph pass now also recognizes the
+exact provisional autosave-only state, enumerates canonical generation/object
+namespaces, validates every generation metadata closure, and separates the
+declared live roots from capped orphan recovery candidates without treating
+parent or autosave-base provenance as liveness. A crate-private destination-
+local installer now builds a
 complete initial Create or Save As package in a sibling stage, validates and
 synchronizes it, and installs it with a no-clobber rename while retaining the
 root and leases. The frozen public actor remains non-constructible and the
@@ -185,9 +190,9 @@ See [testing](TESTING.md) for commands and claim language.
   save, autosave, and authenticated Save As work, using the same private
   established-store inspection authority as transaction preflight. Public
   Create/Open/Save As execution,
-  provisional autosave, recovery selection/open, timers, garbage collection,
-  full verification, public actor construction, durability qualification, and
-  every product path remain unimplemented.
+  provisional autosave publication, recovery selection/open, timers, garbage
+  collection, full verification, public actor construction, durability
+  qualification, and every product path remain unimplemented.
 - The package-capability lane remains pending until there is an honest
   unsupported-GPU package command.
 - Packaged runtime does not expose unsaved-autosave recovery.
