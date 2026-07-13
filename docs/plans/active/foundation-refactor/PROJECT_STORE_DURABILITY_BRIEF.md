@@ -125,12 +125,18 @@ device rename.
 - Every commit also compares the expected parent; a mismatch returns a typed
   conflict. There is no automatic project merge.
 - Autosave uses the same object/generation format but switches only
-  `autosave-head` through the same autosave-recovery-before-head protocol,
-  records its base manual generation and captured revision, and coalesces
-  queued requests in the store actor. A manual save may clear/advance autosave
-  refs only after the manual head is durable. A crash before that cleanup leaves
-  a harmless stale autosave suppressed by base/revision comparison rather than
-  prompting the user or becoming a permanent live root.
+  `autosave-head` through the same autosave-recovery-before-head protocol and
+  coalesces queued requests in the store actor. An established autosave records
+  its current manual base; a provisional autosave has no manual base. Its first
+  private publication installs a complete caller-located sibling-staged package
+  with only a base-less autosave head, and later provisional autosaves advance
+  that lane without becoming established. A manual save may clear/advance
+  autosave refs only after the manual head is durable. A crash before that
+  cleanup leaves a harmless stale autosave suppressed by base/revision
+  comparison rather than prompting the user or becoming a permanent live root.
+  The application integration owns the 30-second idle and 120-second maximum
+  scheduling because it owns live revisions and capture creation; the store
+  actor publishes and coalesces submitted captures.
 - The normal recovery prompt is offered only for a newer same-base autosave.
   A changed-base autosave is labeled divergent. Manual previous, manual
   recovery, and manual generations found by bounded scan are labeled manual

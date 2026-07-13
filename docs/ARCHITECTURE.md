@@ -203,8 +203,12 @@ and exact retry includes required empty-fan-out sync sweeps. All observed Purge
 maintenance, remove, and directory-sync occurrences have exact before/after
 callback and fresh-process kill/reopen/retry coverage: 16 cases in each matrix.
 This proves logic and process-crash recovery only, not power-loss durability or
-filesystem qualification. The frozen public actor remains non-constructible. The crate
-still owns no public Create/Open/
+filesystem qualification. The frozen public actor remains non-constructible. A
+bound correction now resolves the already-frozen provisional wire: a
+provisional autosave has no manual base, its first private publication uses one
+caller-located no-clobber package, and later provisional autosaves advance that
+lane through the existing protocol. The publisher is not implemented yet. The
+crate still owns no public Create/Open/
 Save As execution, provisional autosave publication, product recovery workflow,
 timers, public/product garbage-collection wiring, qualified durability, or
 product path.

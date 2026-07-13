@@ -35,6 +35,10 @@
       "path": "architecture/wp10b-project-store-purge-safety-correction.json",
       "sha256": "7e7a0e47ae085c2684b9ae9c465eb5568e3555882c7540ef581cce594fff0278"
     },
+    "provisional_autosave_correction": {
+      "path": "architecture/wp10b-project-store-provisional-autosave-correction.json",
+      "sha256": "2eb9df2cd56472dba37ed9d321b680b2a2a76274210dd7e57aca10be31466e9a"
+    },
     "protected_main": {
       "commit": "b6e0267802f8ac2d0d49a0f04302fd321ef2f617",
       "tree": "b20b598603b47fdbe7c85c3b6d1cba8c78fd433e",
@@ -454,7 +458,7 @@
     ],
     "save_as": "caller supplies a projection with the new ProjectId and explicit source generation; the actor changes session only after durable destination installation and retains the old session on failure",
     "completion": "every accepted request produces exactly one terminal completion carrying its ProjectStoreRequestId, including cancellation and an autosave superseded by coalescing; successful Opened and RecoveryOpened completions carry (ProjectStoreSession, ProjectGenerationProjection) in that order, while Created remains session-only because its caller supplied the created projection",
-    "receipt": "opaque operation-specific anti-TOCTOU token; durable commits carry captured revision/high-water and new/current/previous generation IDs; autosave receipts also carry base manual generation and cannot mark a project saved",
+    "receipt": "opaque operation-specific anti-TOCTOU token; durable commits carry captured revision/high-water and new/current/previous generation IDs; established autosave receipts carry their required base manual generation, provisional autosave receipts carry no base, and neither can mark a project saved",
     "recovery_candidate": "bounded metadata only with generation, captured revision, origin, base/current relation, recovery classification, and recoverability summary; inspection may decode projection state internally for bounded validation but never returns or exposes it, and only successful explicit OpenRecovery returns the selected projection",
     "recovery_classification": {
       "provisional": "the candidate is an autosave, no manual head exists, and its base is absent",
@@ -482,6 +486,17 @@
       "commit_indeterminate"
     ],
     "config": "contains no filesystem-qualification bypass, hard-limit bypass, retry, compatibility, or alternate-path switch"
+  },
+  "provisional_autosave_contract": {
+    "base": "an established-project autosave requires the current manual generation as its base; a provisional autosave has no manual base in its capture, generation, head ref, or receipt",
+    "destination": "the first private provisional publication takes one caller-supplied validated ProjectStorePath and never chooses the application recovery directory or invents another ProjectId",
+    "first_capture": "expected_parent, autosave_base, and forked_from are absent; the projection ProjectId equals the envelope ProjectId",
+    "first_publication": "create autosave generation sequence zero with no base, publish its complete immutable closure and generation, publish only a base-less refs/autosave-head, validate and sync the sibling package, install it by no-clobber rename, and sync the destination parent",
+    "advance": "require expected_parent equal to the current autosave head, no autosave base, matching project/scientific identity and fork facts, and non-regressing revision high-water; use the autosave recovery-before-head protocol and remain provisional",
+    "retry": "never overwrite; a fresh retry may adopt only an exact fully validated destination created by the same first capture and completes the required destination-parent sync; every unrelated or mismatched destination fails closed",
+    "cancellation": "first-publication cancellation before package install removes only the owned sibling stage and changes no destination; during advance, cancellation before recovery-ref publication may leave validated immutable orphans, while cancellation after durable recovery-ref publication may leave only the accepted recovery-ahead state with the old autosave head authoritative; defer cancellation across package install and each ref replacement through required syncs; post-authority uncertainty is commit_indeterminate and requires fresh reopen/retry",
+    "transitions": "first publication composes the existing commit_prefix, object, and generation sets, the autosave-parameterized head_ref set, package_stage_create, package_tree_sync, package_install_noreplace, and destination_parent_sync; advance composes the existing commit_prefix, object, and generation sets plus the autosave-parameterized recovery_ref and head_ref sets",
+    "timers": "B2 publishes and coalesces explicitly submitted captures only; B3 application integration owns the 30-second idle and 120-second maximum scheduling because application owns live revision and capture creation; exact trigger, reset, and monotonic-clock semantics remain unfrozen and this correction authorizes no timer implementation"
   },
   "limits": {
     "project_envelope_bytes_max": 16384,
