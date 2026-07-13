@@ -24,7 +24,9 @@ startup and transaction preflight, with bounded object-metadata checks and no
 eager bulk-payload hashing. A shared crate-private initial-package transaction
 now gives future Create and Save As one destination-local sibling-stage,
 full-tree-sync, no-clobber install path with a caller-bound fork tuple and
-retained leases. Source-session authentication remains with actor wiring. B2
+retained leases. The private established-session actor now authenticates Save
+As against the live manual head and scientific identity, then changes its owned
+root and leases only after that transaction durably installs the fork. B2
 remains active off-product: public Create/Open/Save As execution,
 provisional autosave, recovery/open, timers, garbage collection, full
 verification, and public actor wiring remain later work, with product

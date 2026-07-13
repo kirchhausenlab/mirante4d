@@ -2435,12 +2435,36 @@
       "reason": "WP-10B B2 proves one worker serializes established manual/autosave commits and releases its writer lease before Close completes."
     },
     {
+      "id": "libtest:mirante4d-project-store:actor::tests::failed_and_cancelled_save_as_keep_the_source_session_authoritative",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves collision, source failure, and cancellation leave the established source session authoritative and usable."
+    },
+    {
       "id": "libtest:mirante4d-project-store:actor::tests::queued_autosaves_coalesce_and_completion_obligations_stay_bounded",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 proves queued autosaves coalesce with terminal supersession while all completion obligations remain bounded."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:actor::tests::save_as_authentication_rejects_stale_fork_target_and_science_before_reads",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 authenticates Save As against the execution-time manual head, source project, fork tuple, target identity, and scientific identity before object reads."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:actor::tests::save_as_switches_the_owned_session_and_transfers_writer_lease",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves durable Save As transfers actor ownership and the writer lease to the installed fork before later saves."
     },
     {
       "id": "libtest:mirante4d-project-store:actor::tests::the_eight_request_queue_rejects_a_ninth_queued_save",
@@ -5788,6 +5812,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 517
+    "current_additions": 520
   }
 }

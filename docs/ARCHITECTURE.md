@@ -146,10 +146,12 @@ ref, generation, continuity, and physical-object metadata graph, and reports
 writable contention as an explicit read-only mode. Transactions and actor
 startup consume that same authority. Bulk payload digests remain streaming or
 full-verification work. The established-session actor solely owns its opened
-root and leases, serializes manual/autosave transactions, and enforces bounded
-requests, completions, autosave coalescing, cancellation, close, and shutdown.
-The frozen public actor remains non-constructible and unwired. The crate still
-owns no public Create/Open/Save As execution, provisional autosave, recovery
+root and leases, serializes manual/autosave transactions, authenticates Save As
+against the live session, and transfers ownership to the durably installed fork
+only on success. It also enforces bounded requests, completions, autosave
+coalescing, cancellation, close, and shutdown. The frozen public actor remains
+non-constructible and unwired. The crate still owns no public Create/Open/Save
+As execution, provisional autosave, recovery
 selection, timers, garbage collection, full verification, qualified durability,
 or product path.
 
