@@ -27,9 +27,12 @@ full-tree-sync, no-clobber install path with a caller-bound fork tuple and
 retained leases. The private established-session actor now authenticates Save
 As against the live manual head and scientific identity, then changes its owned
 root and leases only after that transaction durably installs the fork. B2
-remains active off-product: public Create/Open/Save As execution,
-provisional autosave, recovery/open, timers, garbage collection, full
-verification, and public actor wiring remain later work, with product
+now also has one bounded metadata graph over established or provisional store
+state, canonical generation/object namespace enumeration, exact ref/pin roots,
+and capped orphan candidates. It performs no repair, payload hashing, or
+deletion. B2 remains active off-product: public Create/Open/Save As execution,
+provisional autosave publication, recovery/open, timers, garbage collection,
+full verification, and public actor wiring remain later work, with product
 activation at B4.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte

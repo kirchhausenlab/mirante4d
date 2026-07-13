@@ -17,13 +17,13 @@ use std::{
     ffi::{OsStr, OsString},
     fs::File,
     io::{self, Cursor, Read, Write},
-    os::unix::ffi::OsStrExt,
+    os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use mirante4d_identity::{ExactBytesDigest, ExactBytesFacts, ExactBytesHasher};
+use mirante4d_identity::{ExactBytesDigest, ExactBytesFacts, ExactBytesHasher, Sha256Digest};
 use rustix::{
     fd::OwnedFd,
     fs::{
@@ -61,6 +61,9 @@ const REF_PUBLICATION_DESCRIPTORS: usize = WRITABLE_SESSION_DESCRIPTORS + 5;
 // directory-enumeration descriptor, and one file descriptor at the walk peak.
 const PACKAGE_INSTALL_DESCRIPTORS: usize = WRITABLE_SESSION_DESCRIPTORS + 3;
 const PACKAGE_CLEANUP_DESCRIPTORS: usize = WRITABLE_SESSION_DESCRIPTORS + 2;
+// A digest-namespace scan additionally holds the namespace, `sha256`, fanout,
+// directory iterator, and one metadata descriptor at its peak.
+const DIGEST_ENUMERATION_DESCRIPTORS: usize = WRITABLE_SESSION_DESCRIPTORS + 5;
 // Beyond one file per bounded reachable object, the fixed envelope/ref/
 // generation tree, 256 digest fan-out directories, and one transient private
 // publication stage fit comfortably inside this reserve.
@@ -202,6 +205,41 @@ enum InventoryDirectory {
     Refs,
     Staging,
     Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DigestNamespace {
+    Generations,
+    Objects,
+}
+
+impl DigestNamespace {
+    const fn directory(self) -> &'static str {
+        match self {
+            Self::Generations => "generations",
+            Self::Objects => "objects",
+        }
+    }
+
+    const fn suffix(self) -> &'static [u8] {
+        match self {
+            Self::Generations => b".json",
+            Self::Objects => b"",
+        }
+    }
+
+    const fn maximum_file_bytes(self, limits: ProjectStoreLimits) -> u64 {
+        match self {
+            Self::Generations => limits.generation_bytes_max,
+            Self::Objects => limits.object_or_page_bytes_max,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EnumeratedDigestFile {
+    digest: Sha256Digest,
+    byte_length: u64,
 }
 
 #[derive(Debug, Error)]
@@ -414,6 +452,226 @@ impl LocalStoreRoot {
     {
         self.read_optional_small_file(&generation_relative_path(id), maximum_bytes, is_cancelled)?
             .ok_or(LocalPublicationError::ExistingMismatch)
+    }
+
+    /// Enumerates every canonical immutable generation name without reading
+    /// generation payload bytes or creating any namespace component.
+    pub(crate) fn enumerate_generation_ids<C>(
+        &self,
+        limits: ProjectStoreLimits,
+        is_cancelled: C,
+    ) -> Result<Vec<ProjectGenerationId>, LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        self.enumerate_digest_namespace(
+            DigestNamespace::Generations,
+            limits.generations_scanned_max,
+            limits,
+            is_cancelled,
+        )
+        .map(|files| {
+            files
+                .into_iter()
+                .map(|file| ProjectGenerationId::from_digest(file.digest))
+                .collect()
+        })
+    }
+
+    /// Enumerates every canonical exact-object name and observed byte length
+    /// without reading object bytes or creating any namespace component.
+    pub(crate) fn enumerate_object_facts<C>(
+        &self,
+        limits: ProjectStoreLimits,
+        is_cancelled: C,
+    ) -> Result<Vec<(ExactBytesDigest, u64)>, LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        self.enumerate_digest_namespace(
+            DigestNamespace::Objects,
+            limits.physical_store_entries_max,
+            limits,
+            is_cancelled,
+        )
+        .map(|files| {
+            files
+                .into_iter()
+                .map(|file| (ExactBytesDigest::from_digest(file.digest), file.byte_length))
+                .collect()
+        })
+    }
+
+    fn enumerate_digest_namespace<C>(
+        &self,
+        namespace: DigestNamespace,
+        item_limit: usize,
+        limits: ProjectStoreLimits,
+        mut is_cancelled: C,
+    ) -> Result<Vec<EnumeratedDigestFile>, LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        check_cancelled(&mut is_cancelled)?;
+        let held_descriptors = DIGEST_ENUMERATION_DESCRIPTORS
+            .checked_add(self.external_held_descriptors)
+            .ok_or_else(|| capacity_overflow(limits.open_file_descriptors_max))?;
+        enforce_count(held_descriptors, limits.open_file_descriptors_max)?;
+
+        let Some((namespace_directory, namespace_identity)) =
+            open_stable_directory_if_present(&self.root, OsStr::new(namespace.directory()))?
+        else {
+            return Ok(Vec::new());
+        };
+        let mut physical_entries = 1_usize;
+
+        let mut namespace_fanout = 0_usize;
+        let mut sha256_identity = None;
+        for entry in Dir::read_from(&namespace_directory)
+            .map_err(|_| LocalPublicationError::ExistingMismatch)?
+        {
+            check_cancelled(&mut is_cancelled)?;
+            let entry = entry.map_err(|_| LocalPublicationError::ExistingMismatch)?;
+            let name = entry.file_name();
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            namespace_fanout =
+                checked_count_add(namespace_fanout, 1, limits.directory_fanout_entries_max)?;
+            enforce_count(namespace_fanout, limits.directory_fanout_entries_max)?;
+            physical_entries =
+                checked_count_add(physical_entries, 1, limits.physical_store_entries_max)?;
+            enforce_count(physical_entries, limits.physical_store_entries_max)?;
+            if name.to_bytes() != b"sha256" || sha256_identity.is_some() {
+                return Err(LocalPublicationError::ExistingMismatch);
+            }
+            sha256_identity = Some(DirectoryIdentity::from_stat(
+                statat(&namespace_directory, name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(|_| LocalPublicationError::ExistingMismatch)?,
+            )?);
+        }
+
+        let Some(expected_sha256_identity) = sha256_identity else {
+            confirm_named_directory(
+                &self.root,
+                OsStr::new(namespace.directory()),
+                namespace_identity,
+            )?;
+            return Ok(Vec::new());
+        };
+        let sha256_directory = open_stable_directory(
+            &namespace_directory,
+            OsStr::new("sha256"),
+            expected_sha256_identity,
+        )?;
+
+        let mut sha256_fanout = 0_usize;
+        let mut fanouts = Vec::new();
+        for entry in Dir::read_from(&sha256_directory)
+            .map_err(|_| LocalPublicationError::ExistingMismatch)?
+        {
+            check_cancelled(&mut is_cancelled)?;
+            let entry = entry.map_err(|_| LocalPublicationError::ExistingMismatch)?;
+            let name = entry.file_name();
+            let bytes = name.to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            sha256_fanout =
+                checked_count_add(sha256_fanout, 1, limits.directory_fanout_entries_max)?;
+            enforce_count(sha256_fanout, limits.directory_fanout_entries_max)?;
+            physical_entries =
+                checked_count_add(physical_entries, 1, limits.physical_store_entries_max)?;
+            enforce_count(physical_entries, limits.physical_store_entries_max)?;
+            if !is_exact_lower_hex(bytes, 2) {
+                return Err(LocalPublicationError::ExistingMismatch);
+            }
+            fanouts.push((
+                OsString::from_vec(bytes.to_vec()),
+                DirectoryIdentity::from_stat(
+                    statat(&sha256_directory, name, AtFlags::SYMLINK_NOFOLLOW)
+                        .map_err(|_| LocalPublicationError::ExistingMismatch)?,
+                )?,
+            ));
+        }
+        fanouts.sort_unstable_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+
+        let mut files = Vec::new();
+        for (fanout_name, expected_fanout_identity) in fanouts {
+            check_cancelled(&mut is_cancelled)?;
+            let fanout_directory =
+                open_stable_directory(&sha256_directory, &fanout_name, expected_fanout_identity)?;
+            let mut fanout_entries = 0_usize;
+            for entry in Dir::read_from(&fanout_directory)
+                .map_err(|_| LocalPublicationError::ExistingMismatch)?
+            {
+                check_cancelled(&mut is_cancelled)?;
+                let entry = entry.map_err(|_| LocalPublicationError::ExistingMismatch)?;
+                let name = entry.file_name();
+                let name_bytes = name.to_bytes();
+                if name_bytes == b"." || name_bytes == b".." {
+                    continue;
+                }
+                fanout_entries =
+                    checked_count_add(fanout_entries, 1, limits.directory_fanout_entries_max)?;
+                enforce_count(fanout_entries, limits.directory_fanout_entries_max)?;
+                physical_entries =
+                    checked_count_add(physical_entries, 1, limits.physical_store_entries_max)?;
+                enforce_count(physical_entries, limits.physical_store_entries_max)?;
+                if files.len() >= item_limit {
+                    return Err(LocalPublicationError::Capacity {
+                        declared: u64::try_from(files.len().saturating_add(1)).unwrap_or(u64::MAX),
+                        maximum: u64::try_from(item_limit).unwrap_or(u64::MAX),
+                    });
+                }
+                let digest = parse_digest_namespace_name(
+                    fanout_name.as_bytes(),
+                    name_bytes,
+                    namespace.suffix(),
+                )?;
+                let before = FileIdentity::from_stat(
+                    statat(&fanout_directory, name, AtFlags::SYMLINK_NOFOLLOW)
+                        .map_err(|_| LocalPublicationError::ExistingMismatch)?,
+                )?;
+                if before.bytes > namespace.maximum_file_bytes(limits) {
+                    return Err(LocalPublicationError::Capacity {
+                        declared: before.bytes,
+                        maximum: namespace.maximum_file_bytes(limits),
+                    });
+                }
+                let descriptor =
+                    openat(&fanout_directory, name, FILE_METADATA_FLAGS, Mode::empty())
+                        .map_err(|_| LocalPublicationError::ExistingMismatch)?;
+                let opened = FileIdentity::from_stat(
+                    fstat(&descriptor).map_err(|_| LocalPublicationError::ExistingMismatch)?,
+                )?;
+                check_cancelled(&mut is_cancelled)?;
+                let named = FileIdentity::from_stat(
+                    statat(&fanout_directory, name, AtFlags::SYMLINK_NOFOLLOW)
+                        .map_err(|_| LocalPublicationError::ExistingMismatch)?,
+                )?;
+                if before != opened || before != named {
+                    return Err(LocalPublicationError::ExistingMismatch);
+                }
+                files.push(EnumeratedDigestFile {
+                    digest,
+                    byte_length: before.bytes,
+                });
+            }
+            confirm_named_directory(&sha256_directory, &fanout_name, expected_fanout_identity)?;
+        }
+        confirm_named_directory(
+            &namespace_directory,
+            OsStr::new("sha256"),
+            expected_sha256_identity,
+        )?;
+        confirm_named_directory(
+            &self.root,
+            OsStr::new(namespace.directory()),
+            namespace_identity,
+        )?;
+        files.sort_unstable_by_key(|file| file.digest);
+        Ok(files)
     }
 
     /// Validates the complete fixed-ref namespace and returns every bounded
@@ -2115,6 +2373,80 @@ fn valid_checkpoint_name(name: &[u8]) -> bool {
         })
 }
 
+fn open_stable_directory_if_present(
+    parent: &OwnedFd,
+    name: &OsStr,
+) -> Result<Option<(OwnedFd, DirectoryIdentity)>, LocalPublicationError> {
+    let expected = match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(metadata) => DirectoryIdentity::from_stat(metadata)?,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(_) => return Err(LocalPublicationError::ExistingMismatch),
+    };
+    open_stable_directory(parent, name, expected).map(|directory| Some((directory, expected)))
+}
+
+fn open_stable_directory(
+    parent: &OwnedFd,
+    name: &OsStr,
+    expected: DirectoryIdentity,
+) -> Result<OwnedFd, LocalPublicationError> {
+    let directory = openat(parent, name, DIRECTORY_OPEN_FLAGS, Mode::empty())
+        .map_err(|_| LocalPublicationError::ExistingMismatch)?;
+    let opened = DirectoryIdentity::from_stat(
+        fstat(&directory).map_err(|_| LocalPublicationError::ExistingMismatch)?,
+    )?;
+    if opened != expected {
+        return Err(LocalPublicationError::ExistingMismatch);
+    }
+    confirm_named_directory(parent, name, expected)?;
+    Ok(directory)
+}
+
+fn confirm_named_directory(
+    parent: &OwnedFd,
+    name: &OsStr,
+    expected: DirectoryIdentity,
+) -> Result<(), LocalPublicationError> {
+    let named = DirectoryIdentity::from_stat(
+        statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| LocalPublicationError::ExistingMismatch)?,
+    )?;
+    if named == expected {
+        Ok(())
+    } else {
+        Err(LocalPublicationError::ExistingMismatch)
+    }
+}
+
+fn is_exact_lower_hex(value: &[u8], length: usize) -> bool {
+    value.len() == length
+        && value
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn parse_digest_namespace_name(
+    fanout: &[u8],
+    name: &[u8],
+    suffix: &[u8],
+) -> Result<Sha256Digest, LocalPublicationError> {
+    if !is_exact_lower_hex(fanout, 2) {
+        return Err(LocalPublicationError::ExistingMismatch);
+    }
+    let stem = name
+        .strip_suffix(suffix)
+        .ok_or(LocalPublicationError::ExistingMismatch)?;
+    if !is_exact_lower_hex(stem, 62) {
+        return Err(LocalPublicationError::ExistingMismatch);
+    }
+    let mut digest = [0_u8; 64];
+    digest[..2].copy_from_slice(fanout);
+    digest[2..].copy_from_slice(stem);
+    let digest =
+        std::str::from_utf8(&digest).map_err(|_| LocalPublicationError::ExistingMismatch)?;
+    Sha256Digest::parse(digest).map_err(|_| LocalPublicationError::ExistingMismatch)
+}
+
 fn duplicate_directory(directory: &OwnedFd) -> Result<OwnedFd, LocalPublicationError> {
     openat(
         directory,
@@ -2348,6 +2680,178 @@ mod tests {
 
     fn object_path(root: &Path, digest: ExactBytesDigest) -> PathBuf {
         root.join(object_relative_path(digest))
+    }
+
+    fn extracted_fixture_store(label: &str, store: &str) -> (TestDirectory, PathBuf) {
+        let directory = TestDirectory::new(label);
+        let status = Command::new("tar")
+            .args(["-xzf"])
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../fixtures/project/project-store-v1.tar.gz"),
+            )
+            .args(["-C"])
+            .arg(directory.path())
+            .arg(store)
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to extract {store}");
+        let path = directory.path().join(store);
+        (directory, path)
+    }
+
+    #[test]
+    fn canonical_fixture_namespaces_enumerate_exact_sorted_facts() {
+        let (_directory, path) = extracted_fixture_store("enumerate-valid", "divergent.m4dproj");
+        let root = LocalStoreRoot::open(&path).unwrap();
+
+        let generations = root
+            .enumerate_generation_ids(ProjectStoreLimits::default(), || false)
+            .unwrap()
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            generations,
+            [
+                "10011b8d7dce93c428e1d117b485746522b4ae1d4d8ee89e359739f2cffd3a10",
+                "10447a78680ee73dcc5572d71d81f1ad99079fb1374979a8a7937453a149ae1c",
+                "6b91b33dbaa378598269005b027db7a0643e14babe4b7522a5a415a461f6a497",
+                "b9af2901b12b248533e53d2683fcf4db7d4b2eb33ef292413b8b5dc2cb8b951e",
+            ]
+            .map(|digest| format!("{}{}", ProjectGenerationId::PREFIX, digest))
+        );
+        assert_eq!(
+            root.enumerate_object_facts(ProjectStoreLimits::default(), || false)
+                .unwrap(),
+            vec![(
+                ExactBytesDigest::parse(concat!(
+                    "sha256:",
+                    "f317b2208b90efc088e10edda67cef73f8cedda059cb53538183fa94e12df94d"
+                ))
+                .unwrap(),
+                50,
+            )]
+        );
+    }
+
+    #[test]
+    fn namespace_enumeration_rejects_unknown_malformed_and_linked_entries() {
+        let (_unknown_directory, unknown_path) =
+            extracted_fixture_store("enumerate-unknown", "divergent.m4dproj");
+        fs::write(
+            unknown_path.join("objects/sha256/README"),
+            b"unknown namespace entry",
+        )
+        .unwrap();
+        let unknown_root = LocalStoreRoot::open(&unknown_path).unwrap();
+        assert!(matches!(
+            unknown_root.enumerate_object_facts(ProjectStoreLimits::default(), || false),
+            Err(LocalPublicationError::ExistingMismatch)
+        ));
+
+        let (_malformed_directory, malformed_path) =
+            extracted_fixture_store("enumerate-malformed", "divergent.m4dproj");
+        fs::write(
+            malformed_path.join("generations/sha256/10/not-a-generation.json"),
+            b"malformed",
+        )
+        .unwrap();
+        let malformed_root = LocalStoreRoot::open(&malformed_path).unwrap();
+        assert!(matches!(
+            malformed_root.enumerate_generation_ids(ProjectStoreLimits::default(), || false),
+            Err(LocalPublicationError::ExistingMismatch)
+        ));
+
+        let (_symlink_directory, symlink_path) =
+            extracted_fixture_store("enumerate-symlink", "divergent.m4dproj");
+        let generation = symlink_path.join(concat!(
+            "generations/sha256/10/",
+            "011b8d7dce93c428e1d117b485746522b4ae1d4d8ee89e359739f2cffd3a10.json"
+        ));
+        let outside = symlink_path.join("outside-generation");
+        fs::write(&outside, b"outside").unwrap();
+        fs::remove_file(&generation).unwrap();
+        symlink(&outside, &generation).unwrap();
+        let symlink_root = LocalStoreRoot::open(&symlink_path).unwrap();
+        assert!(matches!(
+            symlink_root.enumerate_generation_ids(ProjectStoreLimits::default(), || false),
+            Err(LocalPublicationError::ExistingMismatch)
+        ));
+
+        let (_hardlink_directory, hardlink_path) =
+            extracted_fixture_store("enumerate-hardlink", "divergent.m4dproj");
+        let object = hardlink_path.join(concat!(
+            "objects/sha256/f3/",
+            "17b2208b90efc088e10edda67cef73f8cedda059cb53538183fa94e12df94d"
+        ));
+        fs::hard_link(&object, hardlink_path.join("object-hardlink")).unwrap();
+        let hardlink_root = LocalStoreRoot::open(&hardlink_path).unwrap();
+        assert!(matches!(
+            hardlink_root.enumerate_object_facts(ProjectStoreLimits::default(), || false),
+            Err(LocalPublicationError::ExistingMismatch)
+        ));
+    }
+
+    #[test]
+    fn namespace_enumeration_enforces_all_work_bounds_and_cancellation() {
+        let (_directory, path) = extracted_fixture_store("enumerate-bounds", "divergent.m4dproj");
+        let root = LocalStoreRoot::open(&path).unwrap();
+
+        let generation_limit = ProjectStoreLimits {
+            generations_scanned_max: 3,
+            ..ProjectStoreLimits::default()
+        };
+        assert!(matches!(
+            root.enumerate_generation_ids(generation_limit, || false),
+            Err(LocalPublicationError::Capacity { .. })
+        ));
+        let fanout_limit = ProjectStoreLimits {
+            directory_fanout_entries_max: 2,
+            ..ProjectStoreLimits::default()
+        };
+        assert!(matches!(
+            root.enumerate_generation_ids(fanout_limit, || false),
+            Err(LocalPublicationError::Capacity { .. })
+        ));
+        let descriptor_limit = ProjectStoreLimits {
+            open_file_descriptors_max: DIGEST_ENUMERATION_DESCRIPTORS - 1,
+            ..ProjectStoreLimits::default()
+        };
+        assert!(matches!(
+            root.enumerate_object_facts(descriptor_limit, || false),
+            Err(LocalPublicationError::Capacity { .. })
+        ));
+        let physical_limit = ProjectStoreLimits {
+            physical_store_entries_max: 3,
+            ..ProjectStoreLimits::default()
+        };
+        assert!(matches!(
+            root.enumerate_object_facts(physical_limit, || false),
+            Err(LocalPublicationError::Capacity { .. })
+        ));
+        assert!(matches!(
+            root.enumerate_generation_ids(ProjectStoreLimits::default(), || true),
+            Err(LocalPublicationError::Cancelled)
+        ));
+        assert!(matches!(
+            root.enumerate_object_facts(ProjectStoreLimits::default(), || true),
+            Err(LocalPublicationError::Cancelled)
+        ));
+        let object = path.join(concat!(
+            "objects/sha256/f3/",
+            "17b2208b90efc088e10edda67cef73f8cedda059cb53538183fa94e12df94d"
+        ));
+        fs::OpenOptions::new()
+            .write(true)
+            .open(object)
+            .unwrap()
+            .set_len(ProjectStoreLimits::default().object_or_page_bytes_max + 1)
+            .unwrap();
+        assert!(matches!(
+            root.enumerate_object_facts(ProjectStoreLimits::default(), || false),
+            Err(LocalPublicationError::Capacity { .. })
+        ));
     }
 
     #[test]
