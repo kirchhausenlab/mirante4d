@@ -293,6 +293,8 @@ where
     if !leases.confirm_writer(root).map_err(map_lease_error)? {
         return Err(ProjectStoreFault::ReadOnly);
     }
+    root.validate_store_inventory(limits, 0, false, &mut is_cancelled)
+        .map_err(|error| map_local_error(error, "store_inventory"))?;
     let project_id = capture.projection().state().project_id();
     let envelope = root
         .read_project_envelope(limits, &mut is_cancelled)
@@ -469,6 +471,8 @@ where
     if !leases.confirm_writer(root).map_err(map_lease_error)? {
         return Err(ProjectStoreFault::ReadOnly);
     }
+    root.validate_store_inventory(limits, 0, false, &mut is_cancelled)
+        .map_err(|error| map_local_error(error, "store_inventory"))?;
     let project_id = capture.projection().state().project_id();
     let inspection = inspect_established_store(root, limits, &mut is_cancelled)?;
     if inspection.project_id() != project_id {
@@ -2315,6 +2319,33 @@ mod tests {
                 || false,
             ),
             Err(ProjectStoreFault::Corruption { .. })
+        ));
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+
+        let staging_directory =
+            extracted_frozen_root("established-staging-preflight", "recoverable.m4dproj");
+        let staging_root = LocalStoreRoot::open(staging_directory.path()).unwrap();
+        let staging_leases =
+            ProjectStoreLeases::acquire(&staging_root, ProjectOpenMode::PreferWritable).unwrap();
+        let private_stage = staging_directory.path().join("staging/stale-transaction");
+        fs::create_dir_all(&private_stage).unwrap();
+        symlink(
+            staging_directory.path().join("project.json"),
+            private_stage.join("invalid-link"),
+        )
+        .unwrap();
+        let (capture, opens) = frozen_capture("recoverable.m4dproj", &orphan);
+        assert!(matches!(
+            publish_established_manual_generation(
+                &staging_root,
+                &staging_leases,
+                capture,
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::Corruption {
+                stage: "store_inventory"
+            })
         ));
         assert_eq!(opens.load(Ordering::SeqCst), 0);
 

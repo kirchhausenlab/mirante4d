@@ -1,4 +1,4 @@
-//! Crate-private execution core for one established writable project session.
+//! Crate-private execution core for one recovery-capable project session.
 //!
 //! The public actor remains deliberately non-constructible until open/create,
 //! recovery, and product wiring can establish the complete session contract.
@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 use crate::{
     ProjectCommitCapture, ProjectGenerationId, ProjectOpenMode, ProjectStoreCommand,
     ProjectStoreCompletion, ProjectStoreConfig, ProjectStoreFault, ProjectStorePath,
-    ProjectStoreReceipt, ProjectStoreRequestId,
-    inspection::{inspect_established_store, open_established_store},
+    ProjectStoreReceipt, ProjectStoreRequestId, ProjectStoreSession,
+    inspection::{RecoveryInspection, inspect_established_store, inspect_recovery, open_recovery},
     lease::{LeaseError, ProjectStoreLeases},
     local::LocalStoreRoot,
     transaction::{
@@ -32,7 +32,7 @@ use crate::{
     },
 };
 
-/// One private worker which owns the store root, leases, and all write work.
+/// One private worker which owns the store root, leases, and all session work.
 pub(crate) struct EstablishedProjectActor {
     shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
@@ -79,6 +79,13 @@ enum Work {
         source_generation: ProjectGenerationId,
         capture: ProjectCommitCapture,
     },
+    InspectRecovery {
+        request_id: ProjectStoreRequestId,
+    },
+    OpenRecovery {
+        request_id: ProjectStoreRequestId,
+        generation_id: ProjectGenerationId,
+    },
 }
 
 impl Work {
@@ -86,7 +93,9 @@ impl Work {
         match self {
             Self::ManualSave { request_id, .. }
             | Self::Autosave { request_id, .. }
-            | Self::SaveAs { request_id, .. } => *request_id,
+            | Self::SaveAs { request_id, .. }
+            | Self::InspectRecovery { request_id }
+            | Self::OpenRecovery { request_id, .. } => *request_id,
         }
     }
 
@@ -108,13 +117,22 @@ impl Work {
                 request_id,
                 result: Err(ProjectStoreFault::Cancelled),
             },
+            Self::InspectRecovery { request_id } => ProjectStoreCompletion::RecoveryInspected {
+                request_id,
+                result: Err(ProjectStoreFault::Cancelled),
+            },
+            Self::OpenRecovery { request_id, .. } => ProjectStoreCompletion::RecoveryOpened {
+                request_id,
+                result: Err(ProjectStoreFault::Cancelled),
+            },
         }
     }
 }
 
-/// The worker's sole ownership of one writable established session. Mutable
+/// The worker's sole ownership of one recovery-capable session. Mutable
 /// authority facts are always reinspected from `root` rather than shadowed.
 struct SessionResources {
+    path: ProjectStorePath,
     root: LocalStoreRoot,
     leases: ProjectStoreLeases,
 }
@@ -173,9 +191,58 @@ impl SessionResources {
             &mut is_cancelled,
         )?;
         let (root, leases, receipt) = installed.into_parts();
-        let old = std::mem::replace(self, Self { root, leases });
+        let old = std::mem::replace(
+            self,
+            Self {
+                path: destination,
+                root,
+                leases,
+            },
+        );
         drop(old);
         Ok(receipt)
+    }
+
+    fn inspect_recovery<C>(
+        &self,
+        limits: crate::ProjectStoreLimits,
+        is_cancelled: C,
+    ) -> Result<Vec<crate::ProjectRecoveryCandidate>, ProjectStoreFault>
+    where
+        C: FnMut() -> bool,
+    {
+        inspect_recovery(&self.root, limits, is_cancelled)
+            .map(|inspection| inspection.candidates().to_vec())
+    }
+
+    fn open_recovery<C>(
+        &self,
+        generation_id: ProjectGenerationId,
+        limits: crate::ProjectStoreLimits,
+        is_cancelled: C,
+    ) -> Result<
+        (
+            ProjectStoreSession,
+            mirante4d_project_model::ProjectGenerationProjection,
+        ),
+        ProjectStoreFault,
+    >
+    where
+        C: FnMut() -> bool,
+    {
+        let opened = open_recovery(&self.root, generation_id, limits, is_cancelled)?;
+        let (inspection, projection) = opened.into_parts();
+        Ok((self.session(&inspection), projection))
+    }
+
+    fn session(&self, inspection: &RecoveryInspection) -> ProjectStoreSession {
+        ProjectStoreSession::new(
+            self.path.clone(),
+            inspection.project_id(),
+            self.leases.effective_mode(),
+            inspection.current_manual_generation(),
+            inspection.current_autosave_generation(),
+        )
     }
 }
 
@@ -273,6 +340,16 @@ impl EstablishedProjectActor {
                 destination,
                 source_generation,
                 capture,
+            }),
+            ProjectStoreCommand::InspectRecovery { request_id } => {
+                self.submit_work(Work::InspectRecovery { request_id })
+            }
+            ProjectStoreCommand::OpenRecovery {
+                request_id,
+                generation_id,
+            } => self.submit_work(Work::OpenRecovery {
+                request_id,
+                generation_id,
             }),
             ProjectStoreCommand::Cancel {
                 request_id,
@@ -624,6 +701,18 @@ fn worker_main(
                     cancelled.load(Ordering::Acquire)
                 }),
             },
+            Work::InspectRecovery { request_id } => ProjectStoreCompletion::RecoveryInspected {
+                request_id,
+                result: session.inspect_recovery(limits, || cancelled.load(Ordering::Acquire)),
+            },
+            Work::OpenRecovery {
+                request_id,
+                generation_id,
+            } => ProjectStoreCompletion::RecoveryOpened {
+                request_id,
+                result: session
+                    .open_recovery(generation_id, limits, || cancelled.load(Ordering::Acquire)),
+            },
         };
         let mut state = shared.lock();
         state.active = None;
@@ -645,12 +734,26 @@ fn open_resources(
     path: &ProjectStorePath,
     limits: crate::ProjectStoreLimits,
 ) -> Result<SessionResources, ProjectStoreFault> {
-    let opened = open_established_store(path, ProjectOpenMode::PreferWritable, limits, || false)?;
-    if opened.effective_mode() != ProjectOpenMode::PreferWritable {
-        return Err(ProjectStoreFault::WriterContended);
-    }
-    let (root, leases) = opened.into_resources();
-    Ok(SessionResources { root, leases })
+    let root = LocalStoreRoot::open(path.as_path()).map_err(|_| ProjectStoreFault::Corruption {
+        stage: "actor_startup_open",
+    })?;
+    let leases =
+        ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).map_err(|error| {
+            match error {
+                LeaseError::Indeterminate => ProjectStoreFault::CommitIndeterminate,
+                LeaseError::InvalidAnchor | LeaseError::Io { .. } => {
+                    ProjectStoreFault::Corruption {
+                        stage: "actor_startup_lease",
+                    }
+                }
+            }
+        })?;
+    inspect_recovery(&root, limits, || false)?;
+    Ok(SessionResources {
+        path: path.clone(),
+        root,
+        leases,
+    })
 }
 
 #[cfg(test)]
@@ -703,6 +806,10 @@ mod tests {
     const RECOVERABLE_G2: &str = concat!(
         "m4d-project-generation-v1-sha256:",
         "50fc92ea0e67a54336658f1638596642f17177ceb72c3afbc364c941e6a9b854"
+    );
+    const RECOVERABLE_AUTOSAVE: &str = concat!(
+        "m4d-project-generation-v1-sha256:",
+        "d9504b896fd6a3fb21e52d227fcd284df654d4f063ea8ee0ca49fce0155e9b73"
     );
     const RECOVERABLE_ORPHAN: &str = concat!(
         "m4d-project-generation-v1-sha256:",
@@ -957,6 +1064,209 @@ mod tests {
         drop(contender);
 
         let _next = acquire_writer_eventually(&contender_root);
+    }
+
+    #[test]
+    fn recovery_inspection_and_open_are_read_only_and_keep_current_save_authority() {
+        let project = TestProject::extracted_store("recovery", "recoverable.m4dproj");
+        let path = project.store_path();
+        let before = file_tree(project.path());
+        let actor = EstablishedProjectActor::start(&path, Default::default()).unwrap();
+
+        actor
+            .try_submit(ProjectStoreCommand::InspectRecovery {
+                request_id: request_id(1),
+            })
+            .unwrap();
+        let candidate = match actor.recv_timeout(TIMEOUT).unwrap() {
+            ProjectStoreCompletion::RecoveryInspected {
+                request_id: actual,
+                result: Ok(candidates),
+            } if actual == request_id(1) && candidates.len() == 1 => {
+                candidates.into_iter().next().unwrap()
+            }
+            other => panic!("unexpected recovery inspection: {other:?}"),
+        };
+        assert_eq!(
+            candidate.generation_id(),
+            generation_id(RECOVERABLE_AUTOSAVE)
+        );
+        assert_eq!(candidate.origin(), "autosave_head");
+        assert!(candidate.is_newer());
+        assert_eq!(
+            candidate.current_manual_generation_id(),
+            Some(generation_id(RECOVERABLE_G2))
+        );
+
+        actor
+            .try_submit(ProjectStoreCommand::OpenRecovery {
+                request_id: request_id(2),
+                generation_id: candidate.generation_id(),
+            })
+            .unwrap();
+        let (session, projection) = match actor.recv_timeout(TIMEOUT).unwrap() {
+            ProjectStoreCompletion::RecoveryOpened {
+                request_id: actual,
+                result: Ok(opened),
+            } if actual == request_id(2) => opened,
+            other => panic!("unexpected recovery open: {other:?}"),
+        };
+        assert_eq!(session.path(), &path);
+        assert_eq!(session.project_id(), projection.state().project_id());
+        assert_eq!(session.mode(), ProjectOpenMode::PreferWritable);
+        assert_eq!(
+            session.current_manual_generation(),
+            Some(generation_id(RECOVERABLE_G2))
+        );
+        assert_eq!(
+            session.current_autosave_generation(),
+            Some(generation_id(RECOVERABLE_AUTOSAVE))
+        );
+        assert_eq!(
+            projection.revision().sequence(),
+            candidate.revision_sequence()
+        );
+        assert_eq!(file_tree(project.path()), before);
+
+        actor
+            .try_submit(ProjectStoreCommand::OpenRecovery {
+                request_id: request_id(3),
+                generation_id: generation_id(RECOVERABLE_ORPHAN),
+            })
+            .unwrap();
+        assert!(matches!(
+            actor.recv_timeout(TIMEOUT),
+            Some(ProjectStoreCompletion::RecoveryOpened {
+                request_id: actual,
+                result: Err(ProjectStoreFault::Corruption {
+                    stage: "recovery_selection"
+                }),
+            }) if actual == request_id(3)
+        ));
+        assert_eq!(file_tree(project.path()), before);
+
+        let orphan = frozen_generation_in("recoverable.m4dproj", RECOVERABLE_ORPHAN);
+        let (capture, _) = controlled_fixture_capture(
+            "recoverable.m4dproj",
+            &orphan,
+            orphan.projection().clone(),
+            orphan.parent_generation_id(),
+            orphan.base_manual_generation_id(),
+            orphan.forked_from(),
+            ControlledRead::Normal,
+        );
+        actor
+            .try_submit(ProjectStoreCommand::ManualSave {
+                request_id: request_id(4),
+                capture,
+            })
+            .unwrap();
+        assert!(matches!(
+            actor.recv_timeout(TIMEOUT),
+            Some(ProjectStoreCompletion::ManualSaved {
+                request_id: actual,
+                result: Ok(receipt),
+            }) if actual == request_id(4)
+                && receipt.current_generation_id() == generation_id(RECOVERABLE_ORPHAN)
+        ));
+
+        actor.try_submit(close_command(5)).unwrap();
+        assert!(matches!(
+            actor.recv_timeout(TIMEOUT),
+            Some(ProjectStoreCompletion::Closed {
+                request_id: actual,
+                result: Ok(()),
+            }) if actual == request_id(5)
+        ));
+        actor.join().unwrap();
+
+        let corrupt = TestProject::extracted_store("recovery-corrupt", "recoverable.m4dproj");
+        let head = corrupt.path().join("refs/head");
+        let mut head_bytes = fs::read(&head).unwrap();
+        head_bytes[0] ^= 1;
+        fs::write(&head, &head_bytes).unwrap();
+        let corrupt_actor =
+            EstablishedProjectActor::start(&corrupt.store_path(), Default::default()).unwrap();
+        corrupt_actor
+            .try_submit(ProjectStoreCommand::InspectRecovery {
+                request_id: request_id(1),
+            })
+            .unwrap();
+        match corrupt_actor.recv_timeout(TIMEOUT).unwrap() {
+            ProjectStoreCompletion::RecoveryInspected {
+                request_id: actual,
+                result: Ok(candidates),
+            } if actual == request_id(1) => {
+                assert_eq!(candidates.len(), 2);
+                assert!(
+                    candidates
+                        .iter()
+                        .any(|candidate| candidate.origin() == "manual_recovery")
+                );
+            }
+            other => panic!("unexpected corrupt-head recovery inspection: {other:?}"),
+        }
+        assert_eq!(fs::read(&head).unwrap(), head_bytes);
+        corrupt_actor.try_submit(close_command(2)).unwrap();
+        corrupt_actor.recv_timeout(TIMEOUT).unwrap();
+        corrupt_actor.join().unwrap();
+
+        let contended = TestProject::extracted("recovery-read-only");
+        let contended_path = contended.store_path();
+        let contended_before = file_tree(contended.path());
+        let writer = EstablishedProjectActor::start(&contended_path, Default::default()).unwrap();
+        let reader = EstablishedProjectActor::start(&contended_path, Default::default()).unwrap();
+        reader
+            .try_submit(ProjectStoreCommand::InspectRecovery {
+                request_id: request_id(1),
+            })
+            .unwrap();
+        let recovery_id = match reader.recv_timeout(TIMEOUT).unwrap() {
+            ProjectStoreCompletion::RecoveryInspected {
+                request_id: actual,
+                result: Ok(candidates),
+            } if actual == request_id(1) && candidates.len() == 1 => candidates[0].generation_id(),
+            other => panic!("unexpected read-only recovery inspection: {other:?}"),
+        };
+        reader
+            .try_submit(ProjectStoreCommand::OpenRecovery {
+                request_id: request_id(2),
+                generation_id: recovery_id,
+            })
+            .unwrap();
+        match reader.recv_timeout(TIMEOUT).unwrap() {
+            ProjectStoreCompletion::RecoveryOpened {
+                request_id: actual,
+                result: Ok((session, _)),
+            } if actual == request_id(2) => {
+                assert_eq!(session.path(), &contended_path);
+                assert_eq!(session.mode(), ProjectOpenMode::ReadOnly);
+                assert_eq!(
+                    session.current_manual_generation(),
+                    Some(generation_id(STALE_MANUAL))
+                );
+                assert_eq!(
+                    session.current_autosave_generation(),
+                    Some(generation_id(STALE_AUTOSAVE))
+                );
+            }
+            other => panic!("unexpected read-only recovery open: {other:?}"),
+        }
+        reader.try_submit(manual_command(3)).unwrap();
+        assert!(matches!(
+            reader.recv_timeout(TIMEOUT),
+            Some(ProjectStoreCompletion::ManualSaved {
+                request_id: actual,
+                result: Err(ProjectStoreFault::ReadOnly),
+            }) if actual == request_id(3)
+        ));
+        assert_eq!(file_tree(contended.path()), contended_before);
+        reader.try_submit(close_command(4)).unwrap();
+        reader.recv_timeout(TIMEOUT).unwrap();
+        reader.join().unwrap();
+        writer.try_submit(close_command(1)).unwrap();
+        writer.recv_timeout(TIMEOUT).unwrap();
+        writer.join().unwrap();
     }
 
     #[test]
@@ -1476,17 +1786,31 @@ mod tests {
             })
             .unwrap();
         gate.wait_started();
-        actor.try_submit(autosave_command(2)).unwrap();
+        actor
+            .try_submit(ProjectStoreCommand::InspectRecovery {
+                request_id: request_id(2),
+            })
+            .unwrap();
         actor.try_submit(cancel_command(3, 2)).unwrap();
         assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 2);
         assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 3);
 
-        actor.try_submit(cancel_command(4, 1)).unwrap();
-        assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 4);
+        actor
+            .try_submit(ProjectStoreCommand::OpenRecovery {
+                request_id: request_id(4),
+                generation_id: generation_id(STALE_AUTOSAVE),
+            })
+            .unwrap();
+        actor.try_submit(cancel_command(5, 4)).unwrap();
+        assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 4);
+        assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 5);
+
+        actor.try_submit(cancel_command(6, 1)).unwrap();
+        assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 6);
         gate.release();
         assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 1);
 
-        actor.try_submit(close_command(5)).unwrap();
+        actor.try_submit(close_command(7)).unwrap();
         assert!(matches!(
             actor.recv_timeout(TIMEOUT),
             Some(ProjectStoreCompletion::Closed { result: Ok(()), .. })
@@ -1644,6 +1968,12 @@ mod tests {
                 request_id: actual_id,
                 result: Err(ProjectStoreFault::Cancelled)
             } | ProjectStoreCompletion::SavedAs {
+                request_id: actual_id,
+                result: Err(ProjectStoreFault::Cancelled)
+            } | ProjectStoreCompletion::RecoveryInspected {
+                request_id: actual_id,
+                result: Err(ProjectStoreFault::Cancelled)
+            } | ProjectStoreCompletion::RecoveryOpened {
                 request_id: actual_id,
                 result: Err(ProjectStoreFault::Cancelled)
             } if actual_id == request_id(expected)

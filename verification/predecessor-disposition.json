@@ -2451,6 +2451,14 @@
       "reason": "WP-10B B2 proves queued autosaves coalesce with terminal supersession while all completion obligations remain bounded."
     },
     {
+      "id": "libtest:mirante4d-project-store:actor::tests::recovery_inspection_and_open_are_read_only_and_keep_current_save_authority",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves private recovery inspection/open preserve actual session heads and bytes across normal, corrupt-head, and writer-contended read-only sessions."
+    },
+    {
       "id": "libtest:mirante4d-project-store:actor::tests::save_as_authentication_rejects_stale_fork_target_and_science_before_reads",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -2579,6 +2587,22 @@
       "reason": "WP-10B B2 proves established recovery-ahead remains valid read-only state and never replaces head authority."
     },
     {
+      "id": "libtest:mirante4d-project-store:inspection::tests::recovery_discovery_classifies_every_fixture_and_opens_only_a_fresh_candidate",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 classifies the four frozen recovery states and loads only one freshly revalidated explicit selection without mutation."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:inspection::tests::recovery_falls_back_then_scans_without_repair_and_obeys_bounds",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves bounded fail-soft manual/autosave fallback, corrupt-head orphan scan, lineage/provenance rejection, cancellation, and no ref repair."
+    },
+    {
       "id": "libtest:mirante4d-project-store:inspection::tests::requested_mode_and_writer_contention_are_reported_without_losing_leases",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -2681,6 +2705,14 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 proves descriptor-relative immutable publication without path or replacement fallbacks."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:local::tests::read_inventory_does_not_follow_writer_private_staging",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves read-side startup never follows volatile writer-private staging while write-side inventory remains strict."
     },
     {
       "id": "libtest:mirante4d-project-store:local::tests::refuses_changed_hardlinked_and_symlinked_existing_destinations",
@@ -5868,6 +5900,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 527
+    "current_additions": 531
   }
 }

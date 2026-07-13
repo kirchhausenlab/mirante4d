@@ -6,10 +6,14 @@
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 use mirante4d_identity::{ExactBytesDigest, RawObjectDescriptor};
-use mirante4d_project_model::ProjectId;
+use mirante4d_project_model::{
+    ArtifactRecoverability, DatasetReference, ProjectGenerationProjection, ProjectId,
+};
 
 use crate::{
-    ProjectGenerationId, ProjectOpenMode, ProjectStoreFault, ProjectStoreLimits, ProjectStorePath,
+    ProjectGenerationId, ProjectOpenMode, ProjectRecoveryCandidate, ProjectStoreFault,
+    ProjectStoreLimits, ProjectStorePath,
+    api::{RecoveryCandidateFacts, RecoveryClassification, RecoveryOrigin},
     generation::{
         ArtifactStorage, GenerationDocument, GenerationKind, LogicalObjectBinding, PhysicalObject,
     },
@@ -103,6 +107,105 @@ pub(crate) struct StoreGraphInspection {
     unrooted_object_facts: Vec<PhysicalObject>,
 }
 
+/// One bounded recovery view. Invalid generation targets are omitted rather
+/// than allowed to block an independent validated fallback. No ref is repaired.
+pub(crate) struct RecoveryInspection {
+    project_id: ProjectId,
+    current_manual_generation: Option<ProjectGenerationId>,
+    current_autosave_generation: Option<ProjectGenerationId>,
+    candidates: Vec<ProjectRecoveryCandidate>,
+}
+
+impl RecoveryInspection {
+    pub(crate) const fn project_id(&self) -> ProjectId {
+        self.project_id
+    }
+
+    pub(crate) const fn current_manual_generation(&self) -> Option<ProjectGenerationId> {
+        self.current_manual_generation
+    }
+
+    pub(crate) const fn current_autosave_generation(&self) -> Option<ProjectGenerationId> {
+        self.current_autosave_generation
+    }
+
+    pub(crate) fn candidates(&self) -> &[ProjectRecoveryCandidate] {
+        &self.candidates
+    }
+}
+
+pub(crate) struct RecoveryOpen {
+    inspection: RecoveryInspection,
+    projection: ProjectGenerationProjection,
+}
+
+impl RecoveryOpen {
+    pub(crate) fn into_parts(self) -> (RecoveryInspection, ProjectGenerationProjection) {
+        (self.inspection, self.projection)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefObservation {
+    Missing,
+    Valid(RefRecord),
+    InvalidBytes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecoveryLaneObservation {
+    head: RefObservation,
+    recovery: RefObservation,
+}
+
+#[derive(Clone, Copy)]
+struct RecoverySource {
+    generation_id: ProjectGenerationId,
+    origin: RecoveryOrigin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecoveryGenerationSummary {
+    facts: RecoveryCandidateFacts,
+    parent_generation_id: Option<ProjectGenerationId>,
+    forked_from: Option<(ProjectId, ProjectGenerationId)>,
+    dataset: DatasetReference,
+}
+
+impl RecoveryGenerationSummary {
+    fn from_document(document: &GenerationDocument) -> Result<Self, ProjectStoreFault> {
+        let artifacts = document.projection().state().artifacts();
+        let artifact_count =
+            u32::try_from(artifacts.len()).map_err(|_| ProjectStoreFault::Capacity {
+                stage: "recovery_candidate_artifacts",
+            })?;
+        let non_regenerable_artifact_count = u32::try_from(
+            artifacts
+                .iter()
+                .filter(|artifact| {
+                    artifact.recoverability() == ArtifactRecoverability::NonRegenerable
+                })
+                .count(),
+        )
+        .map_err(|_| ProjectStoreFault::Capacity {
+            stage: "recovery_candidate_artifacts",
+        })?;
+        Ok(Self {
+            facts: RecoveryCandidateFacts {
+                kind: document.kind(),
+                generation_sequence: document.generation_sequence(),
+                revision_sequence: document.projection().revision().sequence(),
+                base_manual_generation_id: document.base_manual_generation_id(),
+                artifact_count,
+                non_regenerable_artifact_count,
+            },
+            parent_generation_id: document.parent_generation_id(),
+            forked_from: document.forked_from(),
+            dataset: document.projection().state().dataset().clone(),
+        })
+    }
+}
+
 impl StoreGraphInspection {
     pub(crate) const fn state(&self) -> &StoreStateInspection {
         &self.state
@@ -191,7 +294,7 @@ impl EstablishedStoreInspection {
 }
 
 pub(crate) struct OpenedEstablishedStore {
-    root: LocalStoreRoot,
+    _root: LocalStoreRoot,
     leases: ProjectStoreLeases,
     inspection: EstablishedStoreInspection,
 }
@@ -203,10 +306,6 @@ impl OpenedEstablishedStore {
 
     pub(crate) const fn inspection(&self) -> &EstablishedStoreInspection {
         &self.inspection
-    }
-
-    pub(crate) fn into_resources(self) -> (LocalStoreRoot, ProjectStoreLeases) {
-        (self.root, self.leases)
     }
 }
 
@@ -226,7 +325,7 @@ where
     let leases = ProjectStoreLeases::acquire(&root, requested_mode).map_err(map_lease_error)?;
     let inspection = inspect_established_store(&root, limits, &mut is_cancelled)?;
     Ok(OpenedEstablishedStore {
-        root,
+        _root: root,
         leases,
         inspection,
     })
@@ -270,7 +369,7 @@ where
 {
     let limits = limits.validate()?;
     check_cancelled(&mut is_cancelled)?;
-    root.validate_store_inventory(limits, 0, false, &mut is_cancelled)
+    root.validate_read_inventory(limits, &mut is_cancelled)
         .map_err(|error| map_local_error(error, "store_inventory"))?;
     let envelope = root
         .read_project_envelope(limits, &mut is_cancelled)
@@ -513,6 +612,702 @@ where
         live_object_facts,
         unrooted_object_facts,
     })
+}
+
+pub(crate) fn inspect_recovery<C>(
+    root: &LocalStoreRoot,
+    limits: ProjectStoreLimits,
+    is_cancelled: C,
+) -> Result<RecoveryInspection, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    discover_recovery(root, limits, None, is_cancelled).map(|(inspection, _)| inspection)
+}
+
+pub(crate) fn open_recovery<C>(
+    root: &LocalStoreRoot,
+    generation_id: ProjectGenerationId,
+    limits: ProjectStoreLimits,
+    is_cancelled: C,
+) -> Result<RecoveryOpen, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    let (inspection, projection) =
+        discover_recovery(root, limits, Some(generation_id), is_cancelled)?;
+    Ok(RecoveryOpen {
+        inspection,
+        projection: projection.ok_or(ProjectStoreFault::Corruption {
+            stage: "recovery_selection",
+        })?,
+    })
+}
+
+fn discover_recovery<C>(
+    root: &LocalStoreRoot,
+    limits: ProjectStoreLimits,
+    selected: Option<ProjectGenerationId>,
+    mut is_cancelled: C,
+) -> Result<(RecoveryInspection, Option<ProjectGenerationProjection>), ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    let limits = limits.validate()?;
+    check_cancelled(&mut is_cancelled)?;
+    root.validate_read_inventory(limits, &mut is_cancelled)
+        .map_err(|error| map_local_error(error, "recovery_inventory"))?;
+    let envelope = root
+        .read_project_envelope(limits, &mut is_cancelled)
+        .map_err(|error| map_local_error(error, "recovery_envelope"))?;
+    let project_id = envelope.project_id();
+    let manual = observe_recovery_lane(
+        root,
+        project_id,
+        RefKind::ManualHead,
+        RefKind::ManualRecovery,
+        limits,
+        &mut is_cancelled,
+    )?;
+    let autosave = observe_recovery_lane(
+        root,
+        project_id,
+        RefKind::AutosaveHead,
+        RefKind::AutosaveRecovery,
+        limits,
+        &mut is_cancelled,
+    )?;
+    validate_recovery_store_shape(manual, autosave)?;
+
+    let pins = root
+        .read_pin_refs(limits, &mut is_cancelled)
+        .map_err(|error| map_local_error(error, "recovery_pins"))?;
+    if pins.iter().any(|pin| pin.project_id() != project_id) {
+        return Err(ProjectStoreFault::Corruption {
+            stage: "recovery_pin_identity",
+        });
+    }
+    let generation_ids = root
+        .enumerate_generation_ids(limits, &mut is_cancelled)
+        .map_err(|error| map_local_error(error, "recovery_generation_namespace"))?;
+    let generation_set = generation_ids.iter().copied().collect::<BTreeSet<_>>();
+    root.enumerate_object_facts(limits, &mut is_cancelled)
+        .map_err(|error| map_local_error(error, "recovery_object_namespace"))?;
+
+    let mut expected = BTreeMap::<ProjectGenerationId, Option<GenerationKind>>::new();
+    let mut mentioned = BTreeSet::new();
+    record_recovery_lane_ids(
+        &mut expected,
+        &mut mentioned,
+        manual,
+        GenerationKind::Manual,
+    )?;
+    record_recovery_lane_ids(
+        &mut expected,
+        &mut mentioned,
+        autosave,
+        GenerationKind::Autosave,
+    )?;
+    for pin in &pins {
+        mentioned.insert(pin.current());
+        insert_expected_generation(&mut expected, pin.current(), None)?;
+    }
+
+    let mut summaries = BTreeMap::new();
+    for (generation_id, expected_kind) in &expected {
+        if let Some(document) = read_recovery_document(
+            root,
+            project_id,
+            *generation_id,
+            *expected_kind,
+            &generation_set,
+            limits,
+            &mut is_cancelled,
+        )? {
+            summaries.insert(
+                *generation_id,
+                RecoveryGenerationSummary::from_document(&document)?,
+            );
+        }
+    }
+
+    let manual_head = valid_head(manual.head);
+    let autosave_head = valid_head(autosave.head);
+    let valid_manual_current =
+        current_recovery_summary(manual_head, &summaries, GenerationKind::Manual).map(|_| {
+            manual_head
+                .expect("a current document requires its head")
+                .current()
+        });
+    let valid_autosave_current =
+        current_recovery_summary(autosave_head, &summaries, GenerationKind::Autosave).map(|_| {
+            autosave_head
+                .expect("a current document requires its head")
+                .current()
+        });
+    let current_manual_generation = manual_head.map(RefRecord::current);
+    let current_autosave_generation = autosave_head.map(RefRecord::current);
+
+    let mut sources = Vec::new();
+    let mut inserted = BTreeSet::new();
+    if let (Some(head), Some(_)) = (autosave_head, valid_autosave_current) {
+        push_recovery_source(
+            &mut sources,
+            &mut inserted,
+            head.current(),
+            RecoveryOrigin::AutosaveHead,
+            limits.recovery_candidates_max,
+        )?;
+    } else {
+        // `AutosaveRecovery` names the autosave-lane fallback origin. The
+        // validated previous slot wins when recovery bytes are unavailable;
+        // a clean recovery ref then deduplicates to the same generation.
+        if let Some(previous) = autosave_head.and_then(RefRecord::previous)
+            && summaries.contains_key(&previous)
+        {
+            push_recovery_source(
+                &mut sources,
+                &mut inserted,
+                previous,
+                RecoveryOrigin::AutosaveRecovery,
+                limits.recovery_candidates_max,
+            )?;
+        }
+        if let Some(recovery) = valid_recovery(autosave.recovery)
+            && summaries.contains_key(&recovery.current())
+        {
+            push_recovery_source(
+                &mut sources,
+                &mut inserted,
+                recovery.current(),
+                RecoveryOrigin::AutosaveRecovery,
+                limits.recovery_candidates_max,
+            )?;
+        }
+    }
+    if valid_manual_current.is_none() {
+        if let Some(previous) = manual_head.and_then(RefRecord::previous)
+            && summaries.contains_key(&previous)
+        {
+            push_recovery_source(
+                &mut sources,
+                &mut inserted,
+                previous,
+                RecoveryOrigin::ManualPrevious,
+                limits.recovery_candidates_max,
+            )?;
+        }
+        if let Some(recovery) = valid_recovery(manual.recovery)
+            && summaries.contains_key(&recovery.current())
+        {
+            push_recovery_source(
+                &mut sources,
+                &mut inserted,
+                recovery.current(),
+                RecoveryOrigin::ManualRecovery,
+                limits.recovery_candidates_max,
+            )?;
+        }
+    }
+
+    let manual_damaged = match manual.head {
+        RefObservation::Missing => false,
+        RefObservation::Valid(_) => valid_manual_current.is_none(),
+        RefObservation::InvalidBytes => true,
+    };
+    let autosave_damaged = match autosave.head {
+        RefObservation::Missing => false,
+        RefObservation::Valid(_) => valid_autosave_current.is_none(),
+        RefObservation::InvalidBytes => true,
+    };
+    let manual_has_fallback = sources.iter().any(|source| {
+        matches!(
+            source.origin,
+            RecoveryOrigin::ManualPrevious | RecoveryOrigin::ManualRecovery
+        )
+    });
+    let autosave_has_fallback = sources
+        .iter()
+        .any(|source| matches!(source.origin, RecoveryOrigin::AutosaveRecovery));
+    if (manual_damaged && !manual_has_fallback) || (autosave_damaged && !autosave_has_fallback) {
+        let scan_ids = generation_ids
+            .iter()
+            .copied()
+            .filter(|generation_id| !mentioned.contains(generation_id))
+            .collect::<Vec<_>>();
+        for generation_id in scan_ids {
+            if let Some(document) = read_recovery_document(
+                root,
+                project_id,
+                generation_id,
+                None,
+                &generation_set,
+                limits,
+                &mut is_cancelled,
+            )? {
+                summaries.insert(
+                    generation_id,
+                    RecoveryGenerationSummary::from_document(&document)?,
+                );
+                push_recovery_source(
+                    &mut sources,
+                    &mut inserted,
+                    generation_id,
+                    RecoveryOrigin::OrphanScan,
+                    limits.recovery_candidates_max,
+                )?;
+            }
+        }
+    }
+
+    load_recovery_provenance_summaries(
+        root,
+        project_id,
+        &sources,
+        &mut summaries,
+        &generation_set,
+        limits,
+        &mut is_cancelled,
+    )?;
+    let lineage = recovery_lineage_authority(
+        valid_manual_current,
+        manual,
+        valid_autosave_current,
+        autosave,
+        &pins,
+        &sources,
+        &summaries,
+    )?;
+    let mut candidates = Vec::new();
+    let manual_current_summary =
+        valid_manual_current.and_then(|generation_id| summaries.get(&generation_id));
+    for source in sources {
+        let Some(summary) = summaries.get(&source.generation_id) else {
+            continue;
+        };
+        if lineage.is_some_and(|authority| !same_recovery_lineage(summary, authority)) {
+            return Err(ProjectStoreFault::Corruption {
+                stage: "recovery_lineage",
+            });
+        }
+        if !valid_recovery_provenance(summary, &summaries, &generation_set) {
+            return Err(ProjectStoreFault::Corruption {
+                stage: "recovery_provenance",
+            });
+        }
+        let classification = classify_recovery_summary(
+            summary,
+            manual.head,
+            current_manual_generation,
+            manual_current_summary,
+        );
+        candidates.push(ProjectRecoveryCandidate::from_facts(
+            source.generation_id,
+            summary.facts,
+            source.origin,
+            classification,
+            current_manual_generation,
+        )?);
+    }
+    if candidates.len() > limits.recovery_candidates_max {
+        return Err(ProjectStoreFault::Capacity {
+            stage: "recovery_candidates",
+        });
+    }
+
+    let selected_projection = if let Some(selected) = selected {
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.generation_id() == selected)
+        {
+            return Err(ProjectStoreFault::Corruption {
+                stage: "recovery_selection",
+            });
+        }
+        let expected_summary = summaries
+            .get(&selected)
+            .expect("every candidate retains its validated summary");
+        let selected_document = read_recovery_document(
+            root,
+            project_id,
+            selected,
+            Some(expected_summary.facts.kind),
+            &generation_set,
+            limits,
+            &mut is_cancelled,
+        )?
+        .ok_or(ProjectStoreFault::Corruption {
+            stage: "recovery_selection",
+        })?;
+        if RecoveryGenerationSummary::from_document(&selected_document)? != *expected_summary {
+            return Err(ProjectStoreFault::Corruption {
+                stage: "recovery_selection",
+            });
+        }
+        Some(selected_document.into_projection())
+    } else {
+        None
+    };
+    Ok((
+        RecoveryInspection {
+            project_id,
+            current_manual_generation,
+            current_autosave_generation,
+            candidates,
+        },
+        selected_projection,
+    ))
+}
+
+fn observe_recovery_lane<C>(
+    root: &LocalStoreRoot,
+    project_id: ProjectId,
+    head_kind: RefKind,
+    recovery_kind: RefKind,
+    limits: ProjectStoreLimits,
+    is_cancelled: &mut C,
+) -> Result<RecoveryLaneObservation, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    let head = observe_ref(root, head_kind, limits, &mut *is_cancelled)?;
+    let recovery = observe_ref(root, recovery_kind, limits, &mut *is_cancelled)?;
+    for record in [head, recovery].into_iter().filter_map(valid_observation) {
+        if record.project_id() != project_id {
+            return Err(ProjectStoreFault::Corruption {
+                stage: "recovery_ref_identity",
+            });
+        }
+    }
+    if let RefObservation::Valid(head_record) = head {
+        if head_record.previous() == Some(head_record.current()) {
+            return Err(ProjectStoreFault::Corruption {
+                stage: "recovery_ref_identity",
+            });
+        }
+        match recovery {
+            RefObservation::Missing if head_record.previous().is_some() => {
+                return Err(ProjectStoreFault::Corruption {
+                    stage: "recovery_pair",
+                });
+            }
+            RefObservation::Valid(recovery_record)
+                if recovery_record.current() != head_record.current()
+                    && Some(recovery_record.current()) != head_record.previous() =>
+            {
+                return Err(ProjectStoreFault::Corruption {
+                    stage: "recovery_pair",
+                });
+            }
+            _ => {}
+        }
+    } else if matches!(head, RefObservation::Missing)
+        && !matches!(recovery, RefObservation::Missing)
+    {
+        return Err(ProjectStoreFault::Corruption {
+            stage: "recovery_without_head",
+        });
+    }
+    Ok(RecoveryLaneObservation { head, recovery })
+}
+
+fn observe_ref<C>(
+    root: &LocalStoreRoot,
+    kind: RefKind,
+    limits: ProjectStoreLimits,
+    is_cancelled: C,
+) -> Result<RefObservation, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    match root.read_ref(kind, limits, is_cancelled) {
+        Ok(Some(record)) => Ok(RefObservation::Valid(record)),
+        Ok(None) => Ok(RefObservation::Missing),
+        Err(LocalPublicationError::InvalidControl) => Ok(RefObservation::InvalidBytes),
+        Err(error) => Err(map_local_error(error, "recovery_ref")),
+    }
+}
+
+fn validate_recovery_store_shape(
+    manual: RecoveryLaneObservation,
+    autosave: RecoveryLaneObservation,
+) -> Result<(), ProjectStoreFault> {
+    if matches!(manual.head, RefObservation::Missing)
+        && matches!(autosave.head, RefObservation::Missing)
+    {
+        return Err(ProjectStoreFault::Corruption {
+            stage: "recovery_store_state",
+        });
+    }
+    if matches!(manual.head, RefObservation::Missing) {
+        match autosave.head {
+            RefObservation::Valid(head) if head.base().is_none() => {}
+            RefObservation::InvalidBytes => {}
+            _ => {
+                return Err(ProjectStoreFault::Corruption {
+                    stage: "recovery_provisional_state",
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn record_recovery_lane_ids(
+    expected: &mut BTreeMap<ProjectGenerationId, Option<GenerationKind>>,
+    mentioned: &mut BTreeSet<ProjectGenerationId>,
+    lane: RecoveryLaneObservation,
+    kind: GenerationKind,
+) -> Result<(), ProjectStoreFault> {
+    for generation_id in [
+        valid_head(lane.head).map(RefRecord::current),
+        valid_head(lane.head).and_then(RefRecord::previous),
+        valid_recovery(lane.recovery).map(RefRecord::current),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        mentioned.insert(generation_id);
+        insert_expected_generation(expected, generation_id, Some(kind))?;
+    }
+    Ok(())
+}
+
+fn read_recovery_document<C>(
+    root: &LocalStoreRoot,
+    project_id: ProjectId,
+    generation_id: ProjectGenerationId,
+    expected_kind: Option<GenerationKind>,
+    generation_set: &BTreeSet<ProjectGenerationId>,
+    limits: ProjectStoreLimits,
+    is_cancelled: &mut C,
+) -> Result<Option<GenerationDocument>, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    if !generation_set.contains(&generation_id) {
+        return Ok(None);
+    }
+    let bytes = root
+        .read_generation_bytes(
+            generation_id,
+            limits.generation_bytes_max,
+            &mut *is_cancelled,
+        )
+        .map_err(|error| map_local_error(error, "recovery_generation"))?;
+    let Ok(document) = GenerationDocument::decode(generation_id, project_id, &bytes, limits) else {
+        return Ok(None);
+    };
+    if expected_kind.is_some_and(|kind| document.kind() != kind) {
+        return Ok(None);
+    }
+    match validate_physical_closure_metadata(root, &document, limits, &mut *is_cancelled) {
+        Ok(()) => Ok(Some(document)),
+        Err(error @ (ProjectStoreFault::Cancelled | ProjectStoreFault::Capacity { .. })) => {
+            Err(error)
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+fn load_recovery_provenance_summaries<C>(
+    root: &LocalStoreRoot,
+    project_id: ProjectId,
+    sources: &[RecoverySource],
+    summaries: &mut BTreeMap<ProjectGenerationId, RecoveryGenerationSummary>,
+    generation_set: &BTreeSet<ProjectGenerationId>,
+    limits: ProjectStoreLimits,
+    is_cancelled: &mut C,
+) -> Result<(), ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    let targets = sources
+        .iter()
+        .filter_map(|source| summaries.get(&source.generation_id))
+        .flat_map(|summary| {
+            [
+                summary.parent_generation_id,
+                summary.facts.base_manual_generation_id,
+            ]
+            .into_iter()
+            .flatten()
+        })
+        .filter(|generation_id| {
+            generation_set.contains(generation_id) && !summaries.contains_key(generation_id)
+        })
+        .collect::<BTreeSet<_>>();
+    for generation_id in targets {
+        let Some(document) = read_recovery_document(
+            root,
+            project_id,
+            generation_id,
+            None,
+            generation_set,
+            limits,
+            &mut *is_cancelled,
+        )?
+        else {
+            // Recovery accepts dangling provenance because GC does not retain
+            // parent/base relations. An unreadable target is equally unable
+            // to supply contradictory kind or lineage facts.
+            continue;
+        };
+        summaries.insert(
+            generation_id,
+            RecoveryGenerationSummary::from_document(&document)?,
+        );
+    }
+    Ok(())
+}
+
+fn current_recovery_summary(
+    head: Option<RefRecord>,
+    summaries: &BTreeMap<ProjectGenerationId, RecoveryGenerationSummary>,
+    kind: GenerationKind,
+) -> Option<&RecoveryGenerationSummary> {
+    let head = head?;
+    let summary = summaries.get(&head.current())?;
+    (summary.facts.kind == kind
+        && summary.parent_generation_id == head.previous()
+        && summary.facts.base_manual_generation_id == head.base())
+    .then_some(summary)
+}
+
+fn recovery_lineage_authority<'a>(
+    valid_manual_current: Option<ProjectGenerationId>,
+    manual: RecoveryLaneObservation,
+    valid_autosave_current: Option<ProjectGenerationId>,
+    autosave: RecoveryLaneObservation,
+    pins: &[RefRecord],
+    sources: &[RecoverySource],
+    summaries: &'a BTreeMap<ProjectGenerationId, RecoveryGenerationSummary>,
+) -> Result<Option<&'a RecoveryGenerationSummary>, ProjectStoreFault> {
+    let mut trusted_ids = [
+        valid_manual_current,
+        valid_head(manual.head).and_then(RefRecord::previous),
+        valid_recovery(manual.recovery).map(RefRecord::current),
+        valid_autosave_current,
+        valid_recovery(autosave.recovery).map(RefRecord::current),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    trusted_ids.extend(pins.iter().map(|pin| pin.current()));
+    let trusted = trusted_ids
+        .into_iter()
+        .filter_map(|generation_id| summaries.get(&generation_id))
+        .collect::<Vec<_>>();
+    let candidates = sources
+        .iter()
+        .filter_map(|source| summaries.get(&source.generation_id))
+        .collect::<Vec<_>>();
+    let authority = trusted
+        .first()
+        .copied()
+        .or_else(|| candidates.first().copied());
+    if authority.is_some_and(|authority| {
+        trusted
+            .iter()
+            .chain(&candidates)
+            .any(|summary| !same_recovery_lineage(summary, authority))
+    }) {
+        return Err(ProjectStoreFault::Corruption {
+            stage: "recovery_lineage",
+        });
+    }
+    Ok(authority)
+}
+
+fn same_recovery_lineage(
+    summary: &RecoveryGenerationSummary,
+    authority: &RecoveryGenerationSummary,
+) -> bool {
+    summary.forked_from == authority.forked_from
+        && summary
+            .dataset
+            .has_same_scientific_content(&authority.dataset)
+}
+
+fn valid_recovery_provenance(
+    summary: &RecoveryGenerationSummary,
+    summaries: &BTreeMap<ProjectGenerationId, RecoveryGenerationSummary>,
+    generation_set: &BTreeSet<ProjectGenerationId>,
+) -> bool {
+    !summary.parent_generation_id.is_some_and(|parent| {
+        generation_set.contains(&parent)
+            && summaries.get(&parent).is_some_and(|parent| {
+                parent.facts.kind != summary.facts.kind || !same_recovery_lineage(parent, summary)
+            })
+    }) && !summary.facts.base_manual_generation_id.is_some_and(|base| {
+        generation_set.contains(&base)
+            && summaries.get(&base).is_some_and(|base| {
+                base.facts.kind != GenerationKind::Manual || !same_recovery_lineage(base, summary)
+            })
+    })
+}
+
+fn classify_recovery_summary(
+    summary: &RecoveryGenerationSummary,
+    manual_observation: RefObservation,
+    current_manual_generation: Option<ProjectGenerationId>,
+    current_manual_summary: Option<&RecoveryGenerationSummary>,
+) -> RecoveryClassification {
+    if summary.facts.kind == GenerationKind::Manual {
+        return RecoveryClassification::ManualBranch;
+    }
+    if matches!(manual_observation, RefObservation::Missing)
+        && summary.facts.base_manual_generation_id.is_none()
+    {
+        return RecoveryClassification::Provisional;
+    }
+    if let (Some(current_manual), Some(current_summary)) =
+        (current_manual_generation, current_manual_summary)
+        && summary.facts.base_manual_generation_id == Some(current_manual)
+    {
+        return if summary.facts.revision_sequence == current_summary.facts.revision_sequence {
+            RecoveryClassification::Stale
+        } else {
+            RecoveryClassification::Newer
+        };
+    }
+    RecoveryClassification::Divergent
+}
+
+fn push_recovery_source(
+    sources: &mut Vec<RecoverySource>,
+    inserted: &mut BTreeSet<ProjectGenerationId>,
+    generation_id: ProjectGenerationId,
+    origin: RecoveryOrigin,
+    candidates_max: usize,
+) -> Result<(), ProjectStoreFault> {
+    if inserted.insert(generation_id) {
+        if sources.len() >= candidates_max {
+            return Err(ProjectStoreFault::Capacity {
+                stage: "recovery_candidates",
+            });
+        }
+        sources.push(RecoverySource {
+            generation_id,
+            origin,
+        });
+    }
+    Ok(())
+}
+
+const fn valid_observation(observation: RefObservation) -> Option<RefRecord> {
+    match observation {
+        RefObservation::Valid(record) => Some(record),
+        RefObservation::Missing | RefObservation::InvalidBytes => None,
+    }
+}
+
+const fn valid_head(observation: RefObservation) -> Option<RefRecord> {
+    valid_observation(observation)
+}
+
+const fn valid_recovery(observation: RefObservation) -> Option<RefRecord> {
+    valid_observation(observation)
 }
 
 pub(crate) fn read_lane_snapshot<C>(
@@ -1143,6 +1938,415 @@ mod tests {
     }
 
     #[test]
+    fn recovery_discovery_classifies_every_fixture_and_opens_only_a_fresh_candidate() {
+        for (store, autosave_id, classification, manual_id, artifacts, non_regenerable) in [
+            (
+                "recoverable.m4dproj",
+                RECOVERABLE_AUTOSAVE,
+                "newer",
+                Some(RECOVERABLE_MANUAL),
+                2,
+                1,
+            ),
+            (
+                "divergent.m4dproj",
+                DIVERGENT_AUTOSAVE,
+                "divergent",
+                Some(DIVERGENT_MANUAL),
+                1,
+                1,
+            ),
+            (
+                "stale.m4dproj",
+                STALE_AUTOSAVE,
+                "stale",
+                Some(STALE_MANUAL),
+                1,
+                1,
+            ),
+            (
+                "provisional.m4dproj",
+                PROVISIONAL_AUTOSAVE,
+                "provisional",
+                None,
+                1,
+                1,
+            ),
+        ] {
+            let project = TestProject::extracted("recovery", store);
+            let before = all_file_bytes(project.path());
+            let root = LocalStoreRoot::open(project.path()).unwrap();
+            let inspection =
+                inspect_recovery(&root, ProjectStoreLimits::default(), || false).unwrap();
+            let candidate = inspection.candidates().first().unwrap();
+            assert_eq!(inspection.candidates().len(), 1);
+            assert_eq!(candidate.generation_id(), generation_id(autosave_id));
+            assert_eq!(candidate.origin(), "autosave_head");
+            assert_eq!(candidate.classification(), classification);
+            assert_eq!(candidate.artifact_count(), artifacts);
+            assert_eq!(candidate.non_regenerable_artifact_count(), non_regenerable);
+            assert_eq!(
+                inspection.current_manual_generation(),
+                manual_id.map(generation_id)
+            );
+            assert_eq!(
+                inspection.current_autosave_generation(),
+                Some(generation_id(autosave_id))
+            );
+
+            let opened = open_recovery(
+                &root,
+                candidate.generation_id(),
+                ProjectStoreLimits::default(),
+                || false,
+            )
+            .unwrap();
+            let (opened_inspection, projection) = opened.into_parts();
+            assert_eq!(
+                projection.revision().sequence(),
+                candidate.revision_sequence()
+            );
+            assert_eq!(projection.state().project_id(), inspection.project_id());
+            assert_eq!(
+                opened_inspection.current_manual_generation(),
+                inspection.current_manual_generation()
+            );
+            assert_eq!(all_file_bytes(project.path()), before);
+            assert!(matches!(
+                open_recovery(
+                    &root,
+                    generation_id(RECOVERABLE_ORPHAN),
+                    ProjectStoreLimits::default(),
+                    || false,
+                ),
+                Err(ProjectStoreFault::Corruption {
+                    stage: "recovery_selection"
+                })
+            ));
+            assert_eq!(all_file_bytes(project.path()), before);
+        }
+    }
+
+    #[test]
+    fn recovery_falls_back_then_scans_without_repair_and_obeys_bounds() {
+        for corrupt_head_ref in [true, false] {
+            let autosave = TestProject::extracted(
+                if corrupt_head_ref {
+                    "recovery-autosave-ref"
+                } else {
+                    "recovery-autosave-generation"
+                },
+                "recoverable.m4dproj",
+            );
+            if corrupt_head_ref {
+                let path = autosave.path().join("refs/autosave-head");
+                let mut bytes = fs::read(&path).unwrap();
+                bytes[0] ^= 1;
+                fs::write(path, bytes).unwrap();
+            } else {
+                corrupt_generation(autosave.path(), generation_id(RECOVERABLE_AUTOSAVE));
+            }
+            let before = all_file_bytes(autosave.path());
+            let root = LocalStoreRoot::open(autosave.path()).unwrap();
+            let inspection =
+                inspect_recovery(&root, ProjectStoreLimits::default(), || false).unwrap();
+            assert_eq!(inspection.candidates().len(), 1);
+            let candidate = &inspection.candidates()[0];
+            assert_eq!(candidate.origin(), "autosave_recovery");
+            assert_eq!(candidate.classification(), "newer");
+            assert_eq!(
+                candidate.generation_id(),
+                generation_id(RECOVERABLE_AUTOSAVE_PREVIOUS)
+            );
+            let (_, projection) = open_recovery(
+                &root,
+                candidate.generation_id(),
+                ProjectStoreLimits::default(),
+                || false,
+            )
+            .unwrap()
+            .into_parts();
+            assert_eq!(
+                projection.revision().sequence(),
+                candidate.revision_sequence()
+            );
+            assert_eq!(all_file_bytes(autosave.path()), before);
+        }
+
+        let invalid_head = TestProject::extracted("recovery-invalid-head", "recoverable.m4dproj");
+        let head_path = invalid_head.path().join("refs/head");
+        let mut head_bytes = fs::read(&head_path).unwrap();
+        head_bytes[0] ^= 1;
+        fs::write(&head_path, head_bytes).unwrap();
+        let before = all_file_bytes(invalid_head.path());
+        let root = LocalStoreRoot::open(invalid_head.path()).unwrap();
+        let inspection = inspect_recovery(&root, ProjectStoreLimits::default(), || false).unwrap();
+        assert_eq!(inspection.current_manual_generation(), None);
+        assert_eq!(inspection.candidates().len(), 2);
+        assert_eq!(inspection.candidates()[0].origin(), "autosave_head");
+        assert_eq!(inspection.candidates()[0].classification(), "divergent");
+        assert_eq!(inspection.candidates()[1].origin(), "manual_recovery");
+        assert_eq!(inspection.candidates()[1].classification(), "manual_branch");
+        assert_eq!(all_file_bytes(invalid_head.path()), before);
+
+        let fallback = TestProject::extracted("recovery-fallback", "recoverable.m4dproj");
+        corrupt_generation(fallback.path(), generation_id(RECOVERABLE_MANUAL));
+        let before = all_file_bytes(fallback.path());
+        let root = LocalStoreRoot::open(fallback.path()).unwrap();
+        let inspection = inspect_recovery(&root, ProjectStoreLimits::default(), || false).unwrap();
+        assert_eq!(inspection.candidates().len(), 2);
+        assert_eq!(inspection.candidates()[0].origin(), "autosave_head");
+        assert_eq!(inspection.candidates()[0].classification(), "divergent");
+        assert_eq!(inspection.candidates()[1].origin(), "manual_previous");
+        assert_eq!(inspection.candidates()[1].classification(), "manual_branch");
+        assert_eq!(
+            inspection.candidates()[1].generation_id(),
+            generation_id(RECOVERABLE_MANUAL_PREVIOUS)
+        );
+        assert_eq!(all_file_bytes(fallback.path()), before);
+
+        let bounded = ProjectStoreLimits {
+            recovery_candidates_max: 1,
+            ..ProjectStoreLimits::default()
+        };
+        assert!(matches!(
+            inspect_recovery(&root, bounded, || false),
+            Err(ProjectStoreFault::Capacity {
+                stage: "recovery_candidates"
+            })
+        ));
+        assert!(matches!(
+            inspect_recovery(&root, ProjectStoreLimits::default(), || true),
+            Err(ProjectStoreFault::Cancelled)
+        ));
+        let polls = AtomicUsize::new(0);
+        assert!(matches!(
+            inspect_recovery(&root, ProjectStoreLimits::default(), || {
+                polls.fetch_add(1, Ordering::SeqCst) >= 4
+            }),
+            Err(ProjectStoreFault::Cancelled)
+        ));
+        assert!(polls.load(Ordering::SeqCst) > 4);
+        assert_eq!(all_file_bytes(fallback.path()), before);
+
+        let provenance = TestProject::extracted("recovery-provenance", "recoverable.m4dproj");
+        let project_id = crate::wire::ProjectEnvelope::decode(
+            &fs::read(provenance.path().join("project.json")).unwrap(),
+        )
+        .unwrap()
+        .project_id();
+        let old_id = generation_id(RECOVERABLE_ORPHAN);
+        let old = GenerationDocument::decode(
+            old_id,
+            project_id,
+            &fs::read(generation_path(provenance.path(), old_id)).unwrap(),
+            ProjectStoreLimits::default(),
+        )
+        .unwrap();
+        let wrong_parent = GenerationDocument::build_from_projection(
+            old.projection().clone(),
+            None,
+            Some(generation_id(RECOVERABLE_MANUAL_PREVIOUS)),
+            old.forked_from(),
+            GenerationKind::Autosave,
+            old.generation_sequence().checked_add(10).unwrap(),
+            old.bindings().clone(),
+            old.reachable_objects().to_vec(),
+            ProjectStoreLimits::default(),
+        )
+        .unwrap()
+        .encode(ProjectStoreLimits::default())
+        .unwrap();
+        let branch = GenerationDocument::build_from_projection(
+            old.projection().clone(),
+            Some(wrong_parent.id()),
+            None,
+            old.forked_from(),
+            GenerationKind::Manual,
+            old.generation_sequence().checked_add(11).unwrap(),
+            old.bindings().clone(),
+            old.reachable_objects().to_vec(),
+            ProjectStoreLimits::default(),
+        )
+        .unwrap()
+        .encode(ProjectStoreLimits::default())
+        .unwrap();
+        for generation in [&wrong_parent, &branch] {
+            let path = generation_path(provenance.path(), generation.id());
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, generation.bytes()).unwrap();
+        }
+        fs::write(
+            provenance.path().join("refs/recovery"),
+            RefRecord::new(RefKind::ManualRecovery, project_id, branch.id(), None, None)
+                .unwrap()
+                .encode(),
+        )
+        .unwrap();
+        fs::write(
+            provenance.path().join("refs/head"),
+            RefRecord::new(
+                RefKind::ManualHead,
+                project_id,
+                generation_id(RECOVERABLE_MANUAL),
+                Some(branch.id()),
+                None,
+            )
+            .unwrap()
+            .encode(),
+        )
+        .unwrap();
+        corrupt_generation(provenance.path(), generation_id(RECOVERABLE_MANUAL));
+        let before = all_file_bytes(provenance.path());
+        let root = LocalStoreRoot::open(provenance.path()).unwrap();
+        match inspect_recovery(&root, ProjectStoreLimits::default(), || false) {
+            Err(ProjectStoreFault::Corruption {
+                stage: "recovery_provenance",
+            }) => {}
+            Err(error) => panic!("expected recovery provenance failure, got {error:?}"),
+            Ok(_) => panic!("expected recovery provenance failure"),
+        }
+        assert_eq!(all_file_bytes(provenance.path()), before);
+
+        let lane_scan = TestProject::extracted("recovery-lane-scan", "recoverable.m4dproj");
+        for generation in [RECOVERABLE_MANUAL, RECOVERABLE_MANUAL_PREVIOUS] {
+            corrupt_generation(lane_scan.path(), generation_id(generation));
+        }
+        let before = all_file_bytes(lane_scan.path());
+        let root = LocalStoreRoot::open(lane_scan.path()).unwrap();
+        let inspection = inspect_recovery(&root, ProjectStoreLimits::default(), || false).unwrap();
+        assert_eq!(inspection.candidates().len(), 2);
+        assert_eq!(inspection.candidates()[0].origin(), "autosave_head");
+        assert_eq!(inspection.candidates()[1].origin(), "orphan_scan");
+        assert_eq!(
+            inspection.candidates()[1].generation_id(),
+            generation_id(RECOVERABLE_ORPHAN)
+        );
+        assert_eq!(all_file_bytes(lane_scan.path()), before);
+
+        let scanned = TestProject::extracted("recovery-scan", "recoverable.m4dproj");
+        for reference in [
+            "refs/head",
+            "refs/recovery",
+            "refs/autosave-head",
+            "refs/autosave-recovery",
+        ] {
+            let path = scanned.path().join(reference);
+            let mut bytes = fs::read(&path).unwrap();
+            bytes[0] ^= 1;
+            fs::write(path, bytes).unwrap();
+        }
+        for generation in [
+            RECOVERABLE_MANUAL,
+            RECOVERABLE_MANUAL_PREVIOUS,
+            RECOVERABLE_AUTOSAVE,
+            RECOVERABLE_AUTOSAVE_PREVIOUS,
+        ] {
+            corrupt_generation(scanned.path(), generation_id(generation));
+        }
+        let before = all_file_bytes(scanned.path());
+        let root = LocalStoreRoot::open(scanned.path()).unwrap();
+        let inspection = inspect_recovery(
+            &root,
+            ProjectStoreLimits {
+                recovery_candidates_max: 1,
+                ..ProjectStoreLimits::default()
+            },
+            || false,
+        )
+        .unwrap();
+        assert_eq!(inspection.current_manual_generation(), None);
+        assert_eq!(inspection.current_autosave_generation(), None);
+        assert_eq!(inspection.candidates().len(), 1);
+        let orphan = &inspection.candidates()[0];
+        assert_eq!(orphan.generation_id(), generation_id(RECOVERABLE_ORPHAN));
+        assert_eq!(orphan.origin(), "orphan_scan");
+        assert_eq!(orphan.classification(), "manual_branch");
+        let (_, projection) = open_recovery(
+            &root,
+            orphan.generation_id(),
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap()
+        .into_parts();
+        assert_eq!(projection.revision().sequence(), orphan.revision_sequence());
+        assert_eq!(all_file_bytes(scanned.path()), before);
+
+        let orphan_autosave =
+            TestProject::extracted("recovery-orphan-autosave", "recoverable.m4dproj");
+        for reference in [
+            "refs/head",
+            "refs/recovery",
+            "refs/autosave-head",
+            "refs/autosave-recovery",
+        ] {
+            let path = orphan_autosave.path().join(reference);
+            let mut bytes = fs::read(&path).unwrap();
+            bytes[0] ^= 1;
+            fs::write(path, bytes).unwrap();
+        }
+        for generation in [
+            RECOVERABLE_MANUAL,
+            RECOVERABLE_MANUAL_PREVIOUS,
+            RECOVERABLE_AUTOSAVE,
+        ] {
+            corrupt_generation(orphan_autosave.path(), generation_id(generation));
+        }
+        let before = all_file_bytes(orphan_autosave.path());
+        let root = LocalStoreRoot::open(orphan_autosave.path()).unwrap();
+        let inspection = inspect_recovery(&root, ProjectStoreLimits::default(), || false).unwrap();
+        let autosave_orphan = inspection
+            .candidates()
+            .iter()
+            .find(|candidate| {
+                candidate.generation_id() == generation_id(RECOVERABLE_AUTOSAVE_PREVIOUS)
+            })
+            .unwrap();
+        assert_eq!(autosave_orphan.origin(), "orphan_scan");
+        assert_eq!(autosave_orphan.classification(), "divergent");
+        assert!(!autosave_orphan.is_manual_branch());
+        assert_eq!(all_file_bytes(orphan_autosave.path()), before);
+
+        let old_id = generation_id(RECOVERABLE_ORPHAN);
+        let old = GenerationDocument::decode(
+            old_id,
+            inspection.project_id(),
+            &fs::read(generation_path(orphan_autosave.path(), old_id)).unwrap(),
+            ProjectStoreLimits::default(),
+        )
+        .unwrap();
+        let foreign = GenerationDocument::build_from_projection(
+            old.projection().clone(),
+            old.parent_generation_id(),
+            old.base_manual_generation_id(),
+            Some((
+                ProjectId::from_bytes([0x77; 16]),
+                generation_id(RECOVERABLE_MANUAL),
+            )),
+            old.kind(),
+            old.generation_sequence().checked_add(10).unwrap(),
+            old.bindings().clone(),
+            old.reachable_objects().to_vec(),
+            ProjectStoreLimits::default(),
+        )
+        .unwrap()
+        .encode(ProjectStoreLimits::default())
+        .unwrap();
+        let foreign_path = generation_path(orphan_autosave.path(), foreign.id());
+        fs::create_dir_all(foreign_path.parent().unwrap()).unwrap();
+        fs::write(foreign_path, foreign.bytes()).unwrap();
+        let before = all_file_bytes(orphan_autosave.path());
+        assert!(matches!(
+            inspect_recovery(&root, ProjectStoreLimits::default(), || false),
+            Err(ProjectStoreFault::Corruption {
+                stage: "recovery_lineage"
+            })
+        ));
+        assert_eq!(all_file_bytes(orphan_autosave.path()), before);
+    }
+
+    #[test]
     fn store_graph_rejects_corrupt_or_excess_orphans_without_affecting_normal_open() {
         let corrupt = TestProject::extracted("graph-corrupt", "recoverable.m4dproj");
         let root = LocalStoreRoot::open(corrupt.path()).unwrap();
@@ -1455,6 +2659,13 @@ mod tests {
             .join("sha256")
             .join(&digest[..2])
             .join(format!("{}.json", &digest[2..]))
+    }
+
+    fn corrupt_generation(root: &Path, id: ProjectGenerationId) {
+        let path = generation_path(root, id);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[0] ^= 1;
+        fs::write(path, bytes).unwrap();
     }
 
     fn generation_id(value: &str) -> ProjectGenerationId {

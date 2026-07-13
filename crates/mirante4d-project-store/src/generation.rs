@@ -1011,6 +1011,10 @@ impl GenerationDocument {
         &self.projection
     }
 
+    pub(crate) fn into_projection(self) -> ProjectGenerationProjection {
+        self.projection
+    }
+
     pub(crate) fn bindings(&self) -> &BTreeMap<ExactBytesDigest, ArtifactStorage> {
         &self.bindings
     }

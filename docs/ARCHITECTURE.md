@@ -153,16 +153,21 @@ relations, not liveness edges. The result is recovery/compaction input, not a
 trash authorization. The corrected public contract makes successful Open and
 OpenRecovery return the held session together with the validated loaded
 projection. Recovery inspection remains metadata-only; manual fallback uses a
-distinct manual-branch classification, and selection never rewrites refs. The
-established-session actor solely owns its opened
-root and leases, serializes manual/autosave transactions, authenticates Save As
+distinct manual-branch classification, and selection never rewrites refs. A
+separate bounded recovery reader tolerates invalid head bytes or generation
+targets while keeping malformed namespaces, mixed lineage, capacity, and
+provenance fail-closed. The private actor can retain a corrupt-head or
+writer-contended read-only session for InspectRecovery/OpenRecovery and returns
+the actual ref facts with an explicitly selected projection without changing
+authority. It otherwise solely owns its opened root and leases, serializes
+manual/autosave transactions, authenticates Save As
 against the live session, and transfers ownership to the durably installed fork
 only on success. It also enforces bounded requests, completions, autosave
 coalescing, cancellation, close, and shutdown. The frozen public actor remains
 non-constructible and unwired. The crate still owns no public Create/Open/Save
-As execution, provisional autosave publication, recovery
-selection, timers, garbage collection, full verification, qualified durability,
-or product path.
+As execution, provisional autosave publication, product recovery workflow,
+timers, garbage collection, full verification, qualified durability, or product
+path.
 
 Settings use `mirante4d-settings-v1` at the Linux XDG/HOME path. The UI submits
 validated changes; one background actor owns persistence. Legacy preferences

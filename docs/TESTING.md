@@ -157,29 +157,36 @@ first and advancing autosave generations and refs, replace a divergent lane
 against the current manual base, accept a lower revision with a non-regressing
 high-water mark, reject stale parent/base and invalid recovery/capacity state,
 retry an exact recovery-ahead cancellation, and distinguish recovery-sync
-failure from write-suspending head indeterminacy. Eight actor cases exercise the
+failure from write-suspending head indeterminacy. Nine actor cases exercise the
 real established manual/autosave primitives under one worker and prove exact
 request correlation, the request/completion bounds, queued-autosave coalescing,
 active and queued cancellation, close rejection, writer-lease lifetime, and
 joined or nonblocking shutdown. They also prove authenticated Save As session
 and lease transfer, rejection before source reads, and preservation of the old
-session across collision, source failure, and cancellation. Eight inspection
-cases cover the three promoted
+session across collision, source failure, and cancellation. Private recovery
+cases cover exact InspectRecovery/OpenRecovery correlation, corrupt-head
+startup, read-only writer contention, actual session heads, fresh explicit
+selection, and unchanged refs/resources before a later ordinary save. Ten
+inspection cases cover the three promoted
 established-store states, exact heads and autosave classification, read-only and
 writer-contention modes, recovery-ahead without mutation, metadata-only payload
 validation, deferred payload digests, the exact provisional state, canonical
 generation/object namespace enumeration, exact live-root/orphan partitioning,
 candidate caps, and fail-closed cancellation, capacity, symlink, hardlink,
-length, provenance, and control corruption. The graph is read-only preparation
-for recovery/compaction; it is not recovery selection, full verification, or a
-trash plan. Four initial-package cases
+length, provenance, and control corruption. Recovery-specific inspection also
+proves all four fixture classifications, manual/autosave fallback, corrupt-head
+and corrupt-target scan, per-lane exhaustion, valid-candidate caps, mixed-lineage
+and wrong-provenance rejection, delayed cancellation, orphan-autosave
+classification, fresh selection, and byte-identical no-repair behavior. The
+graph remains read-only preparation for recovery/compaction, not a trash plan.
+Four initial-package cases
 cover exact Create facts and caller-bound Save As fork encoding, retained root/
 lease validity, exact descriptor admission, existing directory/file/symlink
 refusal before source reads, a final no-clobber race, populated-stage
 cancellation cleanup, and post-rename parent-sync indeterminacy without deleting
 the visible package. They do not claim public Create/Open/Save As execution,
-provisional autosave, recovery selection/open, timers, garbage collection, full
-verification, public actor wiring, the exhaustive fault matrix or power-cut
+provisional autosave, public recovery/open wiring, timers, garbage collection,
+full verification, public actor construction, the exhaustive fault matrix or power-cut
 durability, product reachability, or product-open validation.
 
 The checked independent source report supports only the WP-03 source-TIFF
