@@ -334,12 +334,12 @@ fn validate_project_store_crate(repo_root: &Path, contract: &Value) -> anyhow::R
             continue;
         }
         for (kind, dependencies) in kinds {
-            if dependencies.contains(PROJECT_STORE_CRATE) {
-                if !allowed_b3_consumers.contains(&(source.as_str(), kind.as_str())) {
-                    bail!(
-                        "off-product WP-10B B3 project store has unauthorized consumer {source} ({kind})"
-                    );
-                }
+            if dependencies.contains(PROJECT_STORE_CRATE)
+                && !allowed_b3_consumers.contains(&(source.as_str(), kind.as_str()))
+            {
+                bail!(
+                    "off-product WP-10B B3 project store has unauthorized consumer {source} ({kind})"
+                );
             }
         }
     }
