@@ -58,6 +58,9 @@ freshly revalidated orphans declaring zero non-regenerable artifacts may enter
 the mirrored quarantine. Shared objects stay active, work proceeds in synced
 bounded batches, and every other selection fails with `ConfirmationRequired`.
 The correction does not itself move or delete a file.
+The private lease core now replaces its self-conflicting separate-descriptor
+helper with the required cancellable same-descriptor transition and fallible
+restoration. Trash routing and mutation remain the next slice.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.

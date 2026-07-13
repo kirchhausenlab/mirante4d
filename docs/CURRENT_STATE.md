@@ -177,7 +177,8 @@ candidate for every orphan generation without mutation and remains available
 read-only. A bound safety correction freezes the later Trash subset for
 generations declaring no non-regenerable artifacts, its lease transition,
 retained-closure subtraction, bounded batch/retry, and `ConfirmationRequired`
-fault; it implements no deletion.
+fault. The private lease core implements that same-descriptor transition and
+fallible restoration, but Trash remains unwired and implements no deletion.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
