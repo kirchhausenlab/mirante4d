@@ -2,9 +2,10 @@
 //!
 //! This private B2 slice installs a complete initial package and advances
 //! established manual and autosave heads through recovery-before-head atomic
-//! replacement under a held writer lease and bounded whole-store inventory.
-//! Public actor execution for Create and Save As, provisional autosave,
-//! recovery selection, and garbage collection remain outside this module.
+//! replacement under a held writer lease and bounded whole-store inventory. It
+//! also installs and advances the private provisional autosave-only lane.
+//! Public actor execution for Create and Save As, recovery selection, timers,
+//! and garbage collection remain outside this module.
 
 #![cfg(target_os = "linux")]
 #![cfg_attr(not(test), allow(dead_code))]
@@ -26,7 +27,8 @@ use crate::{
         GenerationKind, LogicalObjectBinding, LogicalObjectPage, PAGE_BYTES, PhysicalObject,
     },
     inspection::{
-        EstablishedStoreInspection, LaneSnapshot, inspect_established_store, read_lane_snapshot,
+        EstablishedStoreInspection, LaneSnapshot, inspect_established_store, inspect_store_graph,
+        inspect_store_state, read_lane_snapshot,
     },
     lease::{LeaseError, ProjectStoreLeases},
     local::{
@@ -178,6 +180,209 @@ where
     })
 }
 
+/// Installs the first private autosave-only package at the caller's exact
+/// destination. A visible destination is never overwritten: it may be adopted
+/// only when a bounded stable full verification proves that it is the exact
+/// package produced by this first capture.
+pub(crate) fn install_initial_provisional_autosave_package<C>(
+    destination: &ProjectStorePath,
+    capture: ProjectCommitCapture,
+    limits: ProjectStoreLimits,
+    mut is_cancelled: C,
+) -> Result<InstalledInitialPackage, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    install_initial_provisional_autosave_package_inner(
+        destination,
+        capture,
+        limits,
+        &mut is_cancelled,
+        false,
+    )
+}
+
+#[cfg(test)]
+fn install_initial_provisional_autosave_package_with_parent_sync_failure<C>(
+    destination: &ProjectStorePath,
+    capture: ProjectCommitCapture,
+    limits: ProjectStoreLimits,
+    mut is_cancelled: C,
+) -> Result<InstalledInitialPackage, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    install_initial_provisional_autosave_package_inner(
+        destination,
+        capture,
+        limits,
+        &mut is_cancelled,
+        true,
+    )
+}
+
+fn install_initial_provisional_autosave_package_inner<C>(
+    destination: &ProjectStorePath,
+    capture: ProjectCommitCapture,
+    limits: ProjectStoreLimits,
+    is_cancelled: &mut C,
+    fail_parent_sync: bool,
+) -> Result<InstalledInitialPackage, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    let limits = limits.validate()?;
+    let project_id = validate_initial_provisional_capture(&capture)?;
+    check_cancelled(&mut *is_cancelled).map_err(map_generation_error)?;
+    let stage = match SiblingPackageStage::begin(destination, limits) {
+        Ok(stage) => stage,
+        Err(LocalPublicationError::DestinationExists) => {
+            return adopt_initial_provisional_autosave_package(
+                destination,
+                &capture,
+                limits,
+                is_cancelled,
+            );
+        }
+        Err(error) => return Err(map_local_error(error, "package_stage_create")),
+    };
+    stage
+        .root()
+        .publish_project_envelope(ProjectEnvelope::new(project_id), limits, &mut *is_cancelled)
+        .map_err(|error| map_local_error(error, "package_envelope"))?;
+    let leases = ProjectStoreLeases::acquire(stage.root(), crate::ProjectOpenMode::PreferWritable)
+        .map_err(map_lease_error)?;
+    if !leases.has_writer() {
+        return Err(ProjectStoreFault::WriterContended);
+    }
+    let receipt = publish_initial_provisional_autosave_generation(
+        stage.root(),
+        &leases,
+        capture,
+        limits,
+        &mut *is_cancelled,
+    )?;
+    let state = inspect_store_state(stage.root(), limits, &mut *is_cancelled)?;
+    if !state.is_provisional()
+        || state.project_id() != project_id
+        || state.autosave().map(|lane| lane.head.current()) != Some(receipt.current_generation_id())
+    {
+        return Err(ProjectStoreFault::Corruption {
+            stage: "installed_provisional_validation",
+        });
+    }
+    stage
+        .sync_tree(limits, &mut *is_cancelled)
+        .map_err(|error| map_local_error(error, "package_tree_sync"))?;
+    #[cfg(test)]
+    let installed = if fail_parent_sync {
+        stage.install_with_parent_sync_failure(&mut *is_cancelled)
+    } else {
+        stage.install(&mut *is_cancelled)
+    };
+    #[cfg(not(test))]
+    let installed = {
+        debug_assert!(!fail_parent_sync);
+        stage.install(&mut *is_cancelled)
+    };
+    let root = match installed {
+        Ok(root) => root,
+        Err(error) => {
+            if matches!(error, LocalPublicationError::PackageCommitIndeterminate) {
+                leases.suspend_writes();
+            }
+            return Err(map_local_error(error, "package_install"));
+        }
+    };
+    Ok(InstalledInitialPackage {
+        root,
+        leases,
+        receipt,
+    })
+}
+
+fn adopt_initial_provisional_autosave_package<C>(
+    destination: &ProjectStorePath,
+    capture: &ProjectCommitCapture,
+    limits: ProjectStoreLimits,
+    is_cancelled: &mut C,
+) -> Result<InstalledInitialPackage, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    check_cancelled(&mut *is_cancelled).map_err(map_generation_error)?;
+    let root = LocalStoreRoot::open(destination.as_path())
+        .map_err(|_| ProjectStoreFault::DestinationExists)?;
+    let leases = ProjectStoreLeases::acquire(&root, crate::ProjectOpenMode::PreferWritable)
+        .map_err(map_lease_error)?;
+    if !leases.has_writer() {
+        return Err(ProjectStoreFault::WriterContended);
+    }
+    root.validate_store_inventory(limits, 0, false, &mut *is_cancelled)
+        .map_err(|error| map_local_error(error, "store_inventory"))?;
+    root.validate_initial_package_namespace(limits, &mut *is_cancelled)
+        .map_err(|error| map_local_error(error, "initial_package_namespace"))?;
+    let graph = inspect_store_graph(&root, limits, &mut *is_cancelled)?;
+    let snapshot = graph.snapshot();
+    let state = graph.state();
+    let Some(lane) = state.autosave() else {
+        return Err(ProjectStoreFault::DestinationExists);
+    };
+    let Some(document) = state.autosave_generation() else {
+        return Err(ProjectStoreFault::DestinationExists);
+    };
+    let generation_id = lane.head.current();
+    let exact_first_capture = state.is_provisional()
+        && state.project_id() == capture.projection().state().project_id()
+        && lane.head.previous().is_none()
+        && lane.head.base().is_none()
+        && lane.recovery.is_none()
+        && document.kind() == GenerationKind::Autosave
+        && document.generation_sequence() == 0
+        && document.parent_generation_id().is_none()
+        && document.base_manual_generation_id().is_none()
+        && document.forked_from().is_none()
+        && document.projection() == capture.projection()
+        && graph.pin_count() == 0
+        && graph.generation_ids() == [generation_id]
+        && graph.root_generation_ids() == [generation_id]
+        && graph.orphan_generation_ids().is_empty()
+        && graph.unrooted_object_facts().is_empty()
+        && graph.object_facts() == document.reachable_objects();
+    if !exact_first_capture {
+        return Err(ProjectStoreFault::DestinationExists);
+    }
+    crate::full_verify::full_verify(&root, limits, &mut *is_cancelled)?;
+    let after = inspect_store_graph(&root, limits, &mut *is_cancelled)?;
+    if after.snapshot() != snapshot {
+        return Err(ProjectStoreFault::SourceChanged);
+    }
+    if !leases.confirm_writer(&root).map_err(map_lease_error)? {
+        return Err(ProjectStoreFault::ReadOnly);
+    }
+    check_cancelled(&mut *is_cancelled).map_err(map_generation_error)?;
+    if let Err(error) = root.sync_existing_package_parent(destination, limits) {
+        if matches!(error, LocalPublicationError::PackageCommitIndeterminate) {
+            leases.suspend_writes();
+        }
+        return Err(map_local_error(error, "destination_parent_sync"));
+    }
+    let receipt = ProjectStoreReceipt::autosave(
+        capture.projection().revision(),
+        capture.projection().revision_high_water().clone(),
+        generation_id,
+        None,
+        None,
+        0,
+        0,
+    );
+    Ok(InstalledInitialPackage {
+        root,
+        leases,
+        receipt,
+    })
+}
+
 #[cfg(test)]
 fn install_initial_manual_package_with_parent_sync_failure<C>(
     destination: &ProjectStorePath,
@@ -275,6 +480,20 @@ fn validate_initial_capture(
     Ok(project_id)
 }
 
+fn validate_initial_provisional_capture(
+    capture: &ProjectCommitCapture,
+) -> Result<mirante4d_project_model::ProjectId, ProjectStoreFault> {
+    if capture.expected_parent().is_some() {
+        return Err(ProjectStoreFault::StaleParent);
+    }
+    if capture.autosave_base().is_some() || capture.forked_from().is_some() {
+        return Err(ProjectStoreFault::Corruption {
+            stage: "initial_provisional_capture",
+        });
+    }
+    Ok(capture.projection().state().project_id())
+}
+
 /// Publishes the first manual head into an already prepared, unpublished store
 /// root. The package installer above supplies its envelope and final rename;
 /// this is still not the public Create command or actor execution path.
@@ -347,6 +566,86 @@ where
         captured_revision,
         captured_revision_high_water,
         publication.generation_id(),
+        None,
+        publication.created_objects(),
+        publication.created_object_bytes(),
+    ))
+}
+
+/// Publishes the sole base-less autosave head into a prepared unpublished
+/// package. The caller owns the sibling-stage install and no-clobber rename.
+fn publish_initial_provisional_autosave_generation<C>(
+    root: &LocalStoreRoot,
+    leases: &ProjectStoreLeases,
+    capture: ProjectCommitCapture,
+    limits: ProjectStoreLimits,
+    mut is_cancelled: C,
+) -> Result<ProjectStoreReceipt, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    let limits = limits.validate()?;
+    if !leases.confirm_writer(root).map_err(map_lease_error)? {
+        return Err(ProjectStoreFault::ReadOnly);
+    }
+    root.validate_store_inventory(limits, 0, false, &mut is_cancelled)
+        .map_err(|error| map_local_error(error, "store_inventory"))?;
+    let project_id = validate_initial_provisional_capture(&capture)?;
+    let envelope = root
+        .read_project_envelope(limits, &mut is_cancelled)
+        .map_err(|error| map_local_error(error, "project_envelope"))?;
+    if envelope.project_id() != project_id {
+        return Err(ProjectStoreFault::Corruption {
+            stage: "project_envelope_identity",
+        });
+    }
+    require_fresh_lane_refs(root, project_id, limits, &mut is_cancelled)?;
+
+    let captured_revision = capture.projection().revision();
+    let captured_revision_high_water = capture.projection().revision_high_water().clone();
+    let publication = publish_unreferenced_generation(
+        root,
+        capture,
+        GenerationKind::Autosave,
+        0,
+        limits,
+        &mut is_cancelled,
+    )
+    .map_err(map_generation_error)?;
+
+    root.validate_store_inventory(limits, 1, false, &mut is_cancelled)
+        .map_err(|error| map_local_error(error, "store_inventory"))?;
+    if !leases.confirm_writer(root).map_err(map_lease_error)? {
+        return Err(ProjectStoreFault::ReadOnly);
+    }
+    require_fresh_lane_refs(root, project_id, limits, &mut is_cancelled)?;
+    check_cancelled(&mut is_cancelled).map_err(map_generation_error)?;
+    let head = RefRecord::new(
+        RefKind::AutosaveHead,
+        project_id,
+        publication.generation_id(),
+        None,
+        None,
+    )
+    .map_err(|_| ProjectStoreFault::Corruption {
+        stage: "initial_provisional_head",
+    })?;
+    replace_transaction_ref(
+        root,
+        leases,
+        None,
+        head,
+        limits,
+        &mut is_cancelled,
+        "initial_provisional_head",
+        TransactionRefPhase::Head,
+    )?;
+
+    Ok(ProjectStoreReceipt::autosave(
+        captured_revision,
+        captured_revision_high_water,
+        publication.generation_id(),
+        None,
         None,
         publication.created_objects(),
         publication.created_object_bytes(),
@@ -456,6 +755,353 @@ where
     )
 }
 
+/// Advances an autosave-only provisional store without creating a manual
+/// authority. It uses the same autosave recovery-before-head protocol as an
+/// established project, but every capture, generation, ref, and receipt keeps
+/// the manual base absent.
+pub(crate) fn publish_provisional_autosave_generation<C>(
+    root: &LocalStoreRoot,
+    leases: &ProjectStoreLeases,
+    capture: ProjectCommitCapture,
+    limits: ProjectStoreLimits,
+    mut is_cancelled: C,
+) -> Result<ProjectStoreReceipt, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    let limits = limits.validate()?;
+    if !leases.confirm_writer(root).map_err(map_lease_error)? {
+        return Err(ProjectStoreFault::ReadOnly);
+    }
+    root.validate_store_inventory(limits, 0, false, &mut is_cancelled)
+        .map_err(|error| map_local_error(error, "store_inventory"))?;
+    let project_id = capture.projection().state().project_id();
+    let state = inspect_store_state(root, limits, &mut is_cancelled)?;
+    if state.project_id() != project_id {
+        return Err(ProjectStoreFault::Corruption {
+            stage: "project_envelope_identity",
+        });
+    }
+    if is_exact_visible_provisional_commit(&state, &capture) {
+        return adopt_visible_provisional_commit(root, leases, capture, limits, &mut is_cancelled);
+    }
+    let target = validate_provisional_capture(&capture, &state)?;
+    let current_generation = state
+        .autosave_generation()
+        .expect("a validated provisional store has an autosave generation");
+    let next_generation_sequence = current_generation
+        .generation_sequence()
+        .checked_add(1)
+        .ok_or(ProjectStoreFault::Capacity {
+            stage: "generation_sequence",
+        })?;
+    let captured_revision = capture.projection().revision();
+    let captured_revision_high_water = capture.projection().revision_high_water().clone();
+    let expected_autosave = state.autosave();
+
+    let publication = publish_unreferenced_generation(
+        root,
+        capture,
+        GenerationKind::Autosave,
+        next_generation_sequence,
+        limits,
+        &mut is_cancelled,
+    )
+    .map_err(map_generation_error)?;
+    let pending_fixed_refs = usize::from(target.recovery.is_none());
+    root.validate_store_inventory(limits, pending_fixed_refs, true, &mut is_cancelled)
+        .map_err(|error| map_local_error(error, "store_inventory"))?;
+    if !leases.confirm_writer(root).map_err(map_lease_error)? {
+        return Err(ProjectStoreFault::ReadOnly);
+    }
+    require_unchanged_provisional_refs(
+        root,
+        project_id,
+        expected_autosave.expect("a validated provisional store has an autosave lane"),
+        limits,
+        &mut is_cancelled,
+    )?;
+    check_cancelled(&mut is_cancelled).map_err(map_generation_error)?;
+
+    let recovery = RefRecord::new(
+        RefKind::AutosaveRecovery,
+        project_id,
+        target.head.current(),
+        None,
+        None,
+    )
+    .map_err(|_| ProjectStoreFault::Corruption {
+        stage: "autosave_recovery",
+    })?;
+    replace_transaction_ref(
+        root,
+        leases,
+        target.recovery,
+        recovery,
+        limits,
+        &mut is_cancelled,
+        "autosave_recovery",
+        TransactionRefPhase::Recovery {
+            durability_stage: "autosave_recovery_durability",
+        },
+    )?;
+
+    // Cancellation here leaves the old autosave head authoritative and the
+    // accepted recovery-ahead pair available for an exact fresh retry.
+    check_cancelled(&mut is_cancelled).map_err(map_generation_error)?;
+    let head = RefRecord::new(
+        RefKind::AutosaveHead,
+        project_id,
+        publication.generation_id(),
+        Some(target.head.current()),
+        None,
+    )
+    .map_err(|_| ProjectStoreFault::Corruption {
+        stage: "autosave_head",
+    })?;
+    replace_transaction_ref(
+        root,
+        leases,
+        Some(target.head),
+        head,
+        limits,
+        &mut is_cancelled,
+        "autosave_head",
+        TransactionRefPhase::Head,
+    )?;
+
+    Ok(ProjectStoreReceipt::autosave(
+        captured_revision,
+        captured_revision_high_water,
+        publication.generation_id(),
+        Some(target.head.current()),
+        None,
+        publication.created_objects(),
+        publication.created_object_bytes(),
+    ))
+}
+
+fn is_exact_visible_provisional_commit(
+    state: &crate::inspection::StoreStateInspection,
+    capture: &ProjectCommitCapture,
+) -> bool {
+    let Some(expected_parent) = capture.expected_parent() else {
+        return false;
+    };
+    let Some(lane) = state.autosave() else {
+        return false;
+    };
+    let Some(generation) = state.autosave_generation() else {
+        return false;
+    };
+    state.is_provisional()
+        && state.manual().is_none()
+        && capture.autosave_base().is_none()
+        && capture.forked_from().is_none()
+        && lane.head.previous() == Some(expected_parent)
+        && lane.head.base().is_none()
+        && lane.recovery.is_some_and(|recovery| {
+            recovery.current() == expected_parent
+                && recovery.previous().is_none()
+                && recovery.base().is_none()
+        })
+        && generation.kind() == GenerationKind::Autosave
+        && generation.parent_generation_id() == Some(expected_parent)
+        && generation.base_manual_generation_id().is_none()
+        && generation.forked_from().is_none()
+        && generation.projection() == capture.projection()
+}
+
+fn adopt_visible_provisional_commit<C>(
+    root: &LocalStoreRoot,
+    leases: &ProjectStoreLeases,
+    capture: ProjectCommitCapture,
+    limits: ProjectStoreLimits,
+    is_cancelled: &mut C,
+) -> Result<ProjectStoreReceipt, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    let expected_parent = capture
+        .expected_parent()
+        .expect("visible retry requires its prior autosave head");
+    let graph = inspect_store_graph(root, limits, &mut *is_cancelled)?;
+    if !is_exact_visible_provisional_commit(graph.state(), &capture) {
+        return Err(ProjectStoreFault::SourceChanged);
+    }
+    let snapshot = graph.snapshot();
+    let generation = graph
+        .state()
+        .autosave_generation()
+        .expect("an exact visible retry has one current autosave");
+    let parent_bytes = root
+        .read_generation_bytes(
+            expected_parent,
+            limits.generation_bytes_max,
+            &mut *is_cancelled,
+        )
+        .map_err(|error| map_local_error(error, "provisional_retry_parent"))?;
+    let parent = GenerationDocument::decode(
+        expected_parent,
+        graph.state().project_id(),
+        &parent_bytes,
+        limits,
+    )
+    .map_err(|_| ProjectStoreFault::Corruption {
+        stage: "provisional_retry_parent",
+    })?;
+    if parent.kind() != GenerationKind::Autosave
+        || parent.base_manual_generation_id().is_some()
+        || parent.forked_from().is_some()
+        || generation.generation_sequence()
+            != parent
+                .generation_sequence()
+                .checked_add(1)
+                .ok_or(ProjectStoreFault::Capacity {
+                    stage: "generation_sequence",
+                })?
+        || generation.projection().revision_high_water().sequence()
+            < parent.projection().revision_high_water().sequence()
+        || !generation
+            .projection()
+            .state()
+            .dataset()
+            .has_same_scientific_content(parent.projection().state().dataset())
+    {
+        return Err(ProjectStoreFault::Corruption {
+            stage: "provisional_retry_continuity",
+        });
+    }
+    crate::full_verify::full_verify(root, limits, &mut *is_cancelled)?;
+    let verified = inspect_store_graph(root, limits, &mut *is_cancelled)?;
+    if verified.snapshot() != snapshot
+        || !is_exact_visible_provisional_commit(verified.state(), &capture)
+    {
+        return Err(ProjectStoreFault::SourceChanged);
+    }
+    if !leases.confirm_writer(root).map_err(map_lease_error)? {
+        return Err(ProjectStoreFault::ReadOnly);
+    }
+    check_cancelled(&mut *is_cancelled).map_err(map_generation_error)?;
+    if let Err(error) = root.sync_existing_ref_directory() {
+        if matches!(error, LocalPublicationError::RefCommitIndeterminate) {
+            leases.suspend_writes();
+        }
+        return Err(map_local_error(error, "autosave_head"));
+    }
+    let after_sync = inspect_store_graph(root, limits, || false)?;
+    if after_sync.snapshot() != snapshot
+        || !is_exact_visible_provisional_commit(after_sync.state(), &capture)
+    {
+        return Err(ProjectStoreFault::SourceChanged);
+    }
+    let generation_id = after_sync
+        .state()
+        .autosave()
+        .expect("an exact visible retry has one autosave lane")
+        .head
+        .current();
+    Ok(ProjectStoreReceipt::autosave(
+        capture.projection().revision(),
+        capture.projection().revision_high_water().clone(),
+        generation_id,
+        Some(expected_parent),
+        None,
+        0,
+        0,
+    ))
+}
+
+fn validate_provisional_capture(
+    capture: &ProjectCommitCapture,
+    state: &crate::inspection::StoreStateInspection,
+) -> Result<LaneSnapshot, ProjectStoreFault> {
+    if !state.is_provisional() || state.manual().is_some() {
+        return Err(ProjectStoreFault::Corruption {
+            stage: "provisional_state",
+        });
+    }
+    let autosave = state.autosave().ok_or(ProjectStoreFault::Corruption {
+        stage: "autosave_head",
+    })?;
+    let generation = state
+        .autosave_generation()
+        .ok_or(ProjectStoreFault::Corruption {
+            stage: "autosave_generation",
+        })?;
+    if capture.expected_parent() != Some(autosave.head.current()) {
+        return Err(ProjectStoreFault::StaleParent);
+    }
+    if capture.autosave_base().is_some()
+        || capture.forked_from().is_some()
+        || generation.forked_from().is_some()
+    {
+        return Err(ProjectStoreFault::Corruption {
+            stage: "provisional_capture",
+        });
+    }
+    if !capture
+        .projection()
+        .state()
+        .dataset()
+        .has_same_scientific_content(generation.projection().state().dataset())
+    {
+        return Err(ProjectStoreFault::Corruption {
+            stage: "provisional_generation_continuity",
+        });
+    }
+    if capture.projection().revision_high_water().sequence()
+        < generation.projection().revision_high_water().sequence()
+    {
+        return Err(ProjectStoreFault::Corruption {
+            stage: "revision_high_water_regression",
+        });
+    }
+    Ok(autosave)
+}
+
+fn require_unchanged_provisional_refs<C>(
+    root: &LocalStoreRoot,
+    project_id: mirante4d_project_model::ProjectId,
+    expected_autosave: LaneSnapshot,
+    limits: ProjectStoreLimits,
+    is_cancelled: &mut C,
+) -> Result<(), ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    let manual = read_lane_snapshot(
+        root,
+        project_id,
+        RefKind::ManualHead,
+        RefKind::ManualRecovery,
+        limits,
+        &mut *is_cancelled,
+    )?;
+    if manual.is_some() {
+        return Err(ProjectStoreFault::Corruption {
+            stage: "manual_ref_drift",
+        });
+    }
+    let autosave = read_lane_snapshot(
+        root,
+        project_id,
+        RefKind::AutosaveHead,
+        RefKind::AutosaveRecovery,
+        limits,
+        &mut *is_cancelled,
+    )?;
+    if autosave.map(|lane| lane.head.current()) != Some(expected_autosave.head.current()) {
+        return Err(ProjectStoreFault::StaleParent);
+    }
+    if autosave != Some(expected_autosave) {
+        return Err(ProjectStoreFault::Corruption {
+            stage: "lane_ref_drift",
+        });
+    }
+    Ok(())
+}
+
 fn publish_established_lane_generation<C>(
     root: &LocalStoreRoot,
     leases: &ProjectStoreLeases,
@@ -518,7 +1164,7 @@ where
             captured_revision_high_water,
             publication.generation_id(),
             previous,
-            autosave_base.ok_or(ProjectStoreFault::StaleParent)?,
+            autosave_base,
             publication.created_objects(),
             publication.created_object_bytes(),
         ),
@@ -1408,6 +2054,10 @@ mod tests {
         "m4d-project-generation-v1-sha256:",
         "b9af2901b12b248533e53d2683fcf4db7d4b2eb33ef292413b8b5dc2cb8b951e"
     );
+    const PROVISIONAL_AUTOSAVE: &str = concat!(
+        "m4d-project-generation-v1-sha256:",
+        "a1a84e1b98686c1d9eda416177988e691695baed74244ff5b99136e839ab0cea"
+    );
 
     impl ProjectObjectSource for RepeatedPageSource {
         fn descriptor(&self) -> &RawObjectDescriptor {
@@ -1951,6 +2601,658 @@ mod tests {
         let inspection =
             inspect_established_store(&root, ProjectStoreLimits::default(), || false).unwrap();
         assert_eq!(inspection.manual().head.current(), generation_id);
+    }
+
+    #[test]
+    fn first_provisional_autosave_installs_the_exact_base_less_fixture() {
+        let parent = TestDirectory::new("provisional-first");
+        let destination = ProjectStorePath::new(parent.path().join("unsaved.m4dproj")).unwrap();
+        let frozen = frozen_generation("provisional.m4dproj", PROVISIONAL_AUTOSAVE);
+        let generation_id = ProjectGenerationId::parse(PROVISIONAL_AUTOSAVE).unwrap();
+        let (capture, opens) = frozen_capture("provisional.m4dproj", &frozen);
+
+        let installed = install_initial_provisional_autosave_package(
+            &destination,
+            capture,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(installed.receipt().new_generation_id(), generation_id);
+        assert_eq!(installed.receipt().current_generation_id(), generation_id);
+        assert_eq!(installed.receipt().previous_generation_id(), None);
+        assert_eq!(installed.receipt().autosave_base_generation_id(), None);
+        assert!(opens.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            fs::read(destination.as_path().join("refs/autosave-head")).unwrap(),
+            fixture_extract("provisional.m4dproj/refs/autosave-head")
+        );
+        assert_eq!(
+            fs::read(generation_path(destination.as_path(), generation_id)).unwrap(),
+            fixture_extract(&fixture_generation_member(
+                "provisional.m4dproj",
+                generation_id,
+            ))
+        );
+        assert!(!destination.as_path().join("refs/head").exists());
+        assert!(!destination.as_path().join("refs/recovery").exists());
+        assert!(
+            !destination
+                .as_path()
+                .join("refs/autosave-recovery")
+                .exists()
+        );
+
+        let (root, leases, _) = installed.into_parts();
+        assert!(leases.confirm_writer(&root).unwrap());
+        let graph = inspect_store_graph(&root, ProjectStoreLimits::default(), || false).unwrap();
+        assert!(graph.state().is_provisional());
+        assert_eq!(graph.generation_ids(), [generation_id]);
+        assert_eq!(graph.root_generation_ids(), [generation_id]);
+        assert!(graph.orphan_generation_ids().is_empty());
+    }
+
+    #[test]
+    fn provisional_first_publication_cancels_cleans_and_exactly_adopts_uncertain_install() {
+        let frozen = frozen_generation("provisional.m4dproj", PROVISIONAL_AUTOSAVE);
+
+        let cancel_parent = TestDirectory::new("provisional-first-cancel");
+        let cancel_destination =
+            ProjectStorePath::new(cancel_parent.path().join("cancelled.m4dproj")).unwrap();
+        let (cancel_capture, _) = frozen_capture("provisional.m4dproj", &frozen);
+        let mut saw_complete_stage = false;
+        assert!(matches!(
+            install_initial_provisional_autosave_package(
+                &cancel_destination,
+                cancel_capture,
+                ProjectStoreLimits::default(),
+                || {
+                    let complete = fs::read_dir(cancel_parent.path()).unwrap().any(|entry| {
+                        let stage = entry.unwrap().path();
+                        stage
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with(".mirante4d-project-stage-"))
+                            && stage.join("refs/autosave-head").is_file()
+                    });
+                    saw_complete_stage |= complete;
+                    complete
+                },
+            ),
+            Err(ProjectStoreFault::Cancelled)
+        ));
+        assert!(saw_complete_stage);
+        assert!(!cancel_destination.as_path().exists());
+        assert_eq!(fs::read_dir(cancel_parent.path()).unwrap().count(), 0);
+
+        let retry_parent = TestDirectory::new("provisional-first-retry");
+        let retry_destination =
+            ProjectStorePath::new(retry_parent.path().join("visible.m4dproj")).unwrap();
+        let (uncertain_capture, _) = frozen_capture("provisional.m4dproj", &frozen);
+        assert!(matches!(
+            install_initial_provisional_autosave_package_with_parent_sync_failure(
+                &retry_destination,
+                uncertain_capture,
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::CommitIndeterminate)
+        ));
+        assert!(retry_destination.as_path().is_dir());
+
+        let (retry_capture, retry_opens) = frozen_capture("provisional.m4dproj", &frozen);
+        let adopted = install_initial_provisional_autosave_package(
+            &retry_destination,
+            retry_capture,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(retry_opens.load(Ordering::SeqCst), 0);
+        assert_eq!(adopted.receipt().published_objects(), 0);
+        assert_eq!(adopted.receipt().published_bytes(), 0);
+        assert_eq!(adopted.receipt().autosave_base_generation_id(), None);
+        let (_, adopted_leases, _) = adopted.into_parts();
+        drop(adopted_leases);
+
+        let head_before_foreign =
+            fs::read(retry_destination.as_path().join("refs/autosave-head")).unwrap();
+        fs::write(
+            retry_destination.as_path().join("foreign-entry"),
+            b"foreign",
+        )
+        .unwrap();
+        let (foreign_retry, foreign_opens) = frozen_capture("provisional.m4dproj", &frozen);
+        assert!(matches!(
+            install_initial_provisional_autosave_package(
+                &retry_destination,
+                foreign_retry,
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::Corruption {
+                stage: "initial_package_namespace"
+            })
+        ));
+        assert_eq!(foreign_opens.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fs::read(retry_destination.as_path().join("foreign-entry")).unwrap(),
+            b"foreign"
+        );
+        assert_eq!(
+            fs::read(retry_destination.as_path().join("refs/autosave-head")).unwrap(),
+            head_before_foreign
+        );
+        fs::remove_file(retry_destination.as_path().join("foreign-entry")).unwrap();
+
+        let next_revision = frozen.projection().revision().sequence() + 1;
+        let next_high_water = frozen.projection().revision_high_water().sequence() + 1;
+        let mismatched_projection =
+            projection_with_revision(&frozen, next_revision, next_high_water);
+        let (mismatched, mismatched_opens) = frozen_capture_with_facts(
+            "provisional.m4dproj",
+            &frozen,
+            mismatched_projection,
+            None,
+            None,
+        );
+        assert!(matches!(
+            install_initial_provisional_autosave_package(
+                &retry_destination,
+                mismatched,
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::DestinationExists)
+        ));
+        assert_eq!(mismatched_opens.load(Ordering::SeqCst), 0);
+
+        let race_parent = TestDirectory::new("provisional-first-race");
+        let race_destination =
+            ProjectStorePath::new(race_parent.path().join("raced.m4dproj")).unwrap();
+        let (race_capture, race_opens) = frozen_capture("provisional.m4dproj", &frozen);
+        let mut injected_race = false;
+        assert!(matches!(
+            install_initial_provisional_autosave_package(
+                &race_destination,
+                race_capture,
+                ProjectStoreLimits::default(),
+                || {
+                    if !injected_race
+                        && fs::read_dir(race_parent.path()).unwrap().any(|entry| {
+                            let stage = entry.unwrap().path();
+                            stage
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(|name| name.starts_with(".mirante4d-project-stage-"))
+                                && stage.join("refs/autosave-head").is_file()
+                        })
+                    {
+                        fs::create_dir(race_destination.as_path()).unwrap();
+                        fs::write(race_destination.as_path().join("marker"), b"racer").unwrap();
+                        injected_race = true;
+                    }
+                    false
+                },
+            ),
+            Err(ProjectStoreFault::DestinationExists)
+        ));
+        assert!(injected_race);
+        assert!(race_opens.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            fs::read(race_destination.as_path().join("marker")).unwrap(),
+            b"racer"
+        );
+        assert_eq!(fs::read_dir(race_parent.path()).unwrap().count(), 1);
+
+        let object = frozen.reachable_objects()[0];
+        let path = object_path(retry_destination.as_path(), object.digest());
+        let mut corrupt = fs::read(&path).unwrap();
+        corrupt[0] ^= 1;
+        fs::write(&path, corrupt).unwrap();
+        let (corrupt_retry, corrupt_opens) = frozen_capture("provisional.m4dproj", &frozen);
+        assert!(matches!(
+            install_initial_provisional_autosave_package(
+                &retry_destination,
+                corrupt_retry,
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::Corruption { .. } | ProjectStoreFault::DigestMismatch)
+        ));
+        assert_eq!(corrupt_opens.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn provisional_advance_rejects_invalid_captures_and_allows_lower_revision() {
+        let frozen = frozen_generation("provisional.m4dproj", PROVISIONAL_AUTOSAVE);
+        let first_id = ProjectGenerationId::parse(PROVISIONAL_AUTOSAVE).unwrap();
+        let parent = TestDirectory::new("provisional-advance-validation");
+        let destination = ProjectStorePath::new(parent.path().join("validation.m4dproj")).unwrap();
+        let (initial, _) = frozen_capture("provisional.m4dproj", &frozen);
+        let installed = install_initial_provisional_autosave_package(
+            &destination,
+            initial,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        let (root, leases, _) = installed.into_parts();
+        let initial_head = fs::read(destination.as_path().join("refs/autosave-head")).unwrap();
+
+        let cases = [
+            (
+                projection_with_revision(&frozen, 1, 1),
+                None,
+                None,
+                "stale parent",
+            ),
+            (
+                projection_with_revision(&frozen, 1, 1),
+                Some(first_id),
+                Some(first_id),
+                "unexpected manual base",
+            ),
+            (
+                projection_with_revision(&frozen, 0, 0),
+                Some(first_id),
+                None,
+                "regressed high water",
+            ),
+        ];
+        for (projection, expected_parent, base, label) in cases {
+            let (capture, opens) = frozen_capture_with_facts(
+                "provisional.m4dproj",
+                &frozen,
+                projection,
+                expected_parent,
+                base,
+            );
+            let result = publish_provisional_autosave_generation(
+                &root,
+                &leases,
+                capture,
+                ProjectStoreLimits::default(),
+                || false,
+            );
+            assert!(result.is_err(), "{label} was accepted");
+            assert_eq!(opens.load(Ordering::SeqCst), 0, "{label} read a source");
+            assert_eq!(
+                fs::read(destination.as_path().join("refs/autosave-head")).unwrap(),
+                initial_head,
+                "{label} changed the head"
+            );
+            assert!(
+                !destination
+                    .as_path()
+                    .join("refs/autosave-recovery")
+                    .exists()
+            );
+        }
+
+        let source_state = frozen.projection().state();
+        let foreign_project = ProjectId::parse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").unwrap();
+        let foreign_state = ProjectState::new(
+            foreign_project,
+            source_state.dataset().clone(),
+            source_state.view().clone(),
+            source_state.channel_presets().to_vec(),
+            source_state.artifacts().to_vec(),
+        )
+        .unwrap();
+        let foreign_projection = ProjectGenerationProjection::new(
+            ProjectRevisionId::new(foreign_project, 1),
+            ProjectRevisionHighWater::new(foreign_project, 1),
+            foreign_state,
+        )
+        .unwrap();
+        let foreign_scientific_id = ScientificContentId::parse(&format!(
+            "{}{}",
+            ScientificContentId::PREFIX,
+            "99".repeat(32)
+        ))
+        .unwrap();
+        let foreign_dataset = DatasetReference::new(
+            foreign_scientific_id,
+            source_state.dataset().package_id().cloned(),
+            source_state.dataset().release_id().cloned(),
+            source_state.dataset().locator_hint().cloned(),
+        );
+        let scientific_state = ProjectState::new(
+            source_state.project_id(),
+            foreign_dataset,
+            source_state.view().clone(),
+            source_state.channel_presets().to_vec(),
+            source_state.artifacts().to_vec(),
+        )
+        .unwrap();
+        let scientific_projection = ProjectGenerationProjection::new(
+            ProjectRevisionId::new(source_state.project_id(), 1),
+            ProjectRevisionHighWater::new(source_state.project_id(), 1),
+            scientific_state,
+        )
+        .unwrap();
+        let (fork_capture, fork_opens) = frozen_capture_with_all_facts(
+            "provisional.m4dproj",
+            &frozen,
+            frozen.projection().clone(),
+            Some(first_id),
+            None,
+            Some((
+                ProjectId::parse(STALE_PROJECT).unwrap(),
+                ProjectGenerationId::parse(STALE_GENERATION).unwrap(),
+            )),
+        );
+        let (project_capture, project_opens) = frozen_capture_with_facts(
+            "provisional.m4dproj",
+            &frozen,
+            foreign_projection,
+            Some(first_id),
+            None,
+        );
+        let (scientific_capture, scientific_opens) = frozen_capture_with_facts(
+            "provisional.m4dproj",
+            &frozen,
+            scientific_projection,
+            Some(first_id),
+            None,
+        );
+        for (label, capture, opens) in [
+            ("fork provenance", fork_capture, fork_opens),
+            ("project identity", project_capture, project_opens),
+            ("scientific identity", scientific_capture, scientific_opens),
+        ] {
+            assert!(
+                publish_provisional_autosave_generation(
+                    &root,
+                    &leases,
+                    capture,
+                    ProjectStoreLimits::default(),
+                    || false,
+                )
+                .is_err(),
+                "{label} was accepted"
+            );
+            assert_eq!(opens.load(Ordering::SeqCst), 0, "{label} read a source");
+            assert_eq!(
+                fs::read(destination.as_path().join("refs/autosave-head")).unwrap(),
+                initial_head,
+                "{label} changed the head"
+            );
+            assert!(
+                !destination
+                    .as_path()
+                    .join("refs/autosave-recovery")
+                    .exists()
+            );
+        }
+
+        let lower_revision = projection_with_revision(&frozen, 0, 1);
+        let (capture, _) = frozen_capture_with_facts(
+            "provisional.m4dproj",
+            &frozen,
+            lower_revision,
+            Some(first_id),
+            None,
+        );
+        let receipt = publish_provisional_autosave_generation(
+            &root,
+            &leases,
+            capture,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(receipt.captured_revision().sequence(), 0);
+        assert_eq!(receipt.captured_revision_high_water().sequence(), 1);
+        assert_eq!(receipt.previous_generation_id(), Some(first_id));
+        assert_eq!(receipt.autosave_base_generation_id(), None);
+        let head = RefRecord::decode(
+            RefKind::AutosaveHead,
+            &fs::read(destination.as_path().join("refs/autosave-head")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(head.current(), receipt.new_generation_id());
+        assert_eq!(head.previous(), Some(first_id));
+        assert_eq!(head.base(), None);
+        assert!(!destination.as_path().join("refs/head").exists());
+    }
+
+    #[test]
+    fn provisional_advance_retries_recovery_ahead_and_suspends_on_head_uncertainty() {
+        let frozen = frozen_generation("provisional.m4dproj", PROVISIONAL_AUTOSAVE);
+        let first_id = ProjectGenerationId::parse(PROVISIONAL_AUTOSAVE).unwrap();
+        let next_revision = frozen.projection().revision().sequence() + 1;
+        let next_high_water = frozen.projection().revision_high_water().sequence() + 1;
+        let projection = projection_with_revision(&frozen, next_revision, next_high_water);
+        let expected = GenerationDocument::build_from_projection(
+            projection.clone(),
+            Some(first_id),
+            None,
+            None,
+            GenerationKind::Autosave,
+            1,
+            frozen.bindings().clone(),
+            frozen.reachable_objects().to_vec(),
+            ProjectStoreLimits::default(),
+        )
+        .unwrap()
+        .encode(ProjectStoreLimits::default())
+        .unwrap()
+        .id();
+
+        let parent = TestDirectory::new("provisional-advance");
+        let destination = ProjectStorePath::new(parent.path().join("advance.m4dproj")).unwrap();
+        let (initial, _) = frozen_capture("provisional.m4dproj", &frozen);
+        let installed = install_initial_provisional_autosave_package(
+            &destination,
+            initial,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        let (root, leases, _) = installed.into_parts();
+        let (cancelled_before_recovery, _) = frozen_capture_with_facts(
+            "provisional.m4dproj",
+            &frozen,
+            projection.clone(),
+            Some(first_id),
+            None,
+        );
+        assert!(matches!(
+            publish_provisional_autosave_generation(
+                &root,
+                &leases,
+                cancelled_before_recovery,
+                ProjectStoreLimits::default(),
+                || generation_path(destination.as_path(), expected).is_file()
+                    && !destination
+                        .as_path()
+                        .join("refs/autosave-recovery")
+                        .exists(),
+            ),
+            Err(ProjectStoreFault::Cancelled)
+        ));
+        assert!(
+            !destination
+                .as_path()
+                .join("refs/autosave-recovery")
+                .exists()
+        );
+        let unchanged = RefRecord::decode(
+            RefKind::AutosaveHead,
+            &fs::read(destination.as_path().join("refs/autosave-head")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unchanged.current(), first_id);
+
+        let (cancelled_after_recovery, _) = frozen_capture_with_facts(
+            "provisional.m4dproj",
+            &frozen,
+            projection.clone(),
+            Some(first_id),
+            None,
+        );
+        assert!(matches!(
+            publish_provisional_autosave_generation(
+                &root,
+                &leases,
+                cancelled_after_recovery,
+                ProjectStoreLimits::default(),
+                || destination
+                    .as_path()
+                    .join("refs/autosave-recovery")
+                    .exists()
+                    && RefRecord::decode(
+                        RefKind::AutosaveHead,
+                        &fs::read(destination.as_path().join("refs/autosave-head")).unwrap(),
+                    )
+                    .is_ok_and(|head| head.current() == first_id),
+            ),
+            Err(ProjectStoreFault::Cancelled)
+        ));
+        let recovery = RefRecord::decode(
+            RefKind::AutosaveRecovery,
+            &fs::read(destination.as_path().join("refs/autosave-recovery")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(recovery.current(), first_id);
+        let old_head = RefRecord::decode(
+            RefKind::AutosaveHead,
+            &fs::read(destination.as_path().join("refs/autosave-head")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(old_head.current(), first_id);
+        assert_eq!(old_head.previous(), None);
+        assert_eq!(old_head.base(), None);
+        assert!(leases.confirm_writer(&root).unwrap());
+
+        let (retry, _) = frozen_capture_with_facts(
+            "provisional.m4dproj",
+            &frozen,
+            projection.clone(),
+            Some(first_id),
+            None,
+        );
+        let receipt = publish_provisional_autosave_generation(
+            &root,
+            &leases,
+            retry,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(receipt.new_generation_id(), expected);
+        assert_eq!(receipt.previous_generation_id(), Some(first_id));
+        assert_eq!(receipt.autosave_base_generation_id(), None);
+        assert_eq!(receipt.published_objects(), 0);
+        assert_eq!(receipt.published_bytes(), 0);
+        let head = RefRecord::decode(
+            RefKind::AutosaveHead,
+            &fs::read(destination.as_path().join("refs/autosave-head")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(head.current(), expected);
+        assert_eq!(head.previous(), Some(first_id));
+        assert_eq!(head.base(), None);
+        assert!(!destination.as_path().join("refs/head").exists());
+        assert!(!destination.as_path().join("refs/recovery").exists());
+
+        let indeterminate_parent = TestDirectory::new("provisional-head-indeterminate");
+        let indeterminate_destination =
+            ProjectStorePath::new(indeterminate_parent.path().join("indeterminate.m4dproj"))
+                .unwrap();
+        let (indeterminate_initial, _) = frozen_capture("provisional.m4dproj", &frozen);
+        let indeterminate = install_initial_provisional_autosave_package(
+            &indeterminate_destination,
+            indeterminate_initial,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        let (indeterminate_root, indeterminate_leases, _) = indeterminate.into_parts();
+        indeterminate_root.fail_ref_commit_directory_sync_at(
+            indeterminate_root.ref_commit_directory_sync_attempts() + 2,
+        );
+        let (capture, _) = frozen_capture_with_facts(
+            "provisional.m4dproj",
+            &frozen,
+            projection.clone(),
+            Some(first_id),
+            None,
+        );
+        assert!(matches!(
+            publish_provisional_autosave_generation(
+                &indeterminate_root,
+                &indeterminate_leases,
+                capture,
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::CommitIndeterminate)
+        ));
+        assert!(matches!(
+            indeterminate_leases.confirm_writer(&indeterminate_root),
+            Err(LeaseError::Indeterminate)
+        ));
+        let visible = RefRecord::decode(
+            RefKind::AutosaveHead,
+            &fs::read(
+                indeterminate_destination
+                    .as_path()
+                    .join("refs/autosave-head"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(visible.current(), expected);
+        assert_eq!(visible.previous(), Some(first_id));
+        assert_eq!(visible.base(), None);
+
+        drop(indeterminate_leases);
+        drop(indeterminate_root);
+        let retry_root = LocalStoreRoot::open(indeterminate_destination.as_path()).unwrap();
+        let retry_leases =
+            ProjectStoreLeases::acquire(&retry_root, ProjectOpenMode::PreferWritable).unwrap();
+        let (fresh_retry, fresh_retry_opens) = frozen_capture_with_facts(
+            "provisional.m4dproj",
+            &frozen,
+            projection.clone(),
+            Some(first_id),
+            None,
+        );
+        let recovered = publish_provisional_autosave_generation(
+            &retry_root,
+            &retry_leases,
+            fresh_retry,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(fresh_retry_opens.load(Ordering::SeqCst), 0);
+        assert_eq!(recovered.new_generation_id(), expected);
+        assert_eq!(recovered.previous_generation_id(), Some(first_id));
+        assert_eq!(recovered.autosave_base_generation_id(), None);
+        assert_eq!(recovered.published_objects(), 0);
+        assert_eq!(recovered.published_bytes(), 0);
+
+        let (second_retry, second_retry_opens) = frozen_capture_with_facts(
+            "provisional.m4dproj",
+            &frozen,
+            projection,
+            Some(first_id),
+            None,
+        );
+        let idempotent = publish_provisional_autosave_generation(
+            &retry_root,
+            &retry_leases,
+            second_retry,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(second_retry_opens.load(Ordering::SeqCst), 0);
+        assert_eq!(idempotent, recovered);
     }
 
     #[test]
@@ -3318,6 +4620,14 @@ mod tests {
             .join(format!("{}.json", &digest[2..]))
     }
 
+    fn object_path(root: &Path, digest: ExactBytesDigest) -> PathBuf {
+        let digest = digest.digest().to_string();
+        root.join("objects")
+            .join("sha256")
+            .join(&digest[..2])
+            .join(&digest[2..])
+    }
+
     fn prepared_frozen_root(label: &str) -> TestDirectory {
         prepared_frozen_root_from_store(label, "stale.m4dproj")
     }
@@ -3400,6 +4710,24 @@ mod tests {
         expected_parent: Option<ProjectGenerationId>,
         autosave_base: Option<ProjectGenerationId>,
     ) -> (ProjectCommitCapture, Arc<AtomicUsize>) {
+        frozen_capture_with_all_facts(
+            store,
+            frozen,
+            projection,
+            expected_parent,
+            autosave_base,
+            frozen.forked_from(),
+        )
+    }
+
+    fn frozen_capture_with_all_facts(
+        store: &str,
+        frozen: &GenerationDocument,
+        projection: ProjectGenerationProjection,
+        expected_parent: Option<ProjectGenerationId>,
+        autosave_base: Option<ProjectGenerationId>,
+        forked_from: Option<(ProjectId, ProjectGenerationId)>,
+    ) -> (ProjectCommitCapture, Arc<AtomicUsize>) {
         let opens = Arc::new(AtomicUsize::new(0));
         let mut sources: Vec<Box<dyn ProjectObjectSource>> = Vec::new();
         for artifact in frozen.projection().state().artifacts() {
@@ -3441,7 +4769,7 @@ mod tests {
             projection,
             expected_parent,
             autosave_base,
-            frozen.forked_from(),
+            forked_from,
             sources,
         )
         .unwrap();

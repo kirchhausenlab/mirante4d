@@ -154,7 +154,8 @@ fan-out inventory before ref publication, and crate-private manual and
 established-project autosave recovery-before-head replacement off-product. This
 now has a bound correction specifying that provisional autosave generations,
 heads, captures, and receipts have no manual base, including exact first
-no-clobber publication and advance rules. The provisional publisher is not yet
-implemented, so this is not a public Create/Save, provisional-autosave,
-recovery-open, or durability claim. B4 deletes project-v15 and makes the new
-store the sole product path.
+no-clobber publication and advance rules. The private publisher now implements
+those rules with exact uncertain-install adoption and fresh retry. This remains
+off-product and is not a public Create/Save, actor/timer, recovery-open, or
+durability claim. B4 deletes project-v15 and makes the new store the sole
+product path.

@@ -648,7 +648,7 @@ impl ProjectStoreReceipt {
         captured_revision_high_water: ProjectRevisionHighWater,
         generation_id: ProjectGenerationId,
         previous_generation_id: Option<ProjectGenerationId>,
-        autosave_base_generation_id: ProjectGenerationId,
+        autosave_base_generation_id: Option<ProjectGenerationId>,
         published_objects: u64,
         published_bytes: u64,
     ) -> Self {
@@ -657,7 +657,7 @@ impl ProjectStoreReceipt {
             captured_revision_high_water,
             generation_id,
             previous_generation_id,
-            Some(autosave_base_generation_id),
+            autosave_base_generation_id,
             published_objects,
             published_bytes,
         )

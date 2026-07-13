@@ -250,9 +250,15 @@ not by itself establish power-loss durability.
 
 The accepted provisional-autosave correction now fixes the base-less first and
 advancing publication, receipt, cancellation, collision, and fresh-retry
-requirements. Implementation evidence for that publisher is still pending; the
-existing provisional fixture and inspection tests prove only the frozen wire
-and read-only recognition.
+requirements. Four focused private-transaction cases now reproduce the exact
+first provisional fixture, clean a cancelled sibling stage, preserve a racing
+destination, adopt only an exact fully verified uncertain install, reject
+invalid advance facts before source reads, allow lower revision with a
+non-regressing high-water mark, preserve the base-less lane, and retry exactly
+across pre-recovery cancellation, recovery-ahead cancellation, and final-head
+sync uncertainty. This is not exhaustive transition or process-kill evidence,
+dead-writer staging cleanup, power-loss/filesystem qualification, public actor
+construction, timer scheduling, or product wiring.
 
 Four initial-package cases
 cover exact Create facts and caller-bound Save As fork encoding, retained root/
@@ -260,7 +266,8 @@ lease validity, exact descriptor admission, existing directory/file/symlink
 refusal before source reads, a final no-clobber race, populated-stage
 cancellation cleanup, and post-rename parent-sync indeterminacy without deleting
 the visible package. They do not claim public Create/Open/Save As execution,
-provisional autosave, public recovery/open wiring, timers, garbage collection,
+public provisional-autosave execution, public recovery/open wiring, timers,
+garbage collection,
 full verification, public actor construction, the exhaustive fault matrix or power-cut
 durability, product reachability, or product-open validation.
 

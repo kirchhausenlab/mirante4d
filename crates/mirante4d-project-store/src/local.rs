@@ -357,6 +357,76 @@ impl LocalStoreRoot {
         &self.root
     }
 
+    /// Re-establishes destination-parent durability for an already visible
+    /// package, but only while the named directory is still this held root.
+    /// This is the narrow recovery operation used after an indeterminate
+    /// no-clobber package install; it never creates or replaces a name.
+    pub(crate) fn sync_existing_package_parent(
+        &self,
+        destination: &ProjectStorePath,
+        limits: ProjectStoreLimits,
+    ) -> Result<(), LocalPublicationError> {
+        enforce_count(
+            WRITABLE_SESSION_DESCRIPTORS
+                .checked_add(1)
+                .ok_or_else(|| capacity_overflow(limits.open_file_descriptors_max))?,
+            limits.open_file_descriptors_max,
+        )?;
+        let path = destination.as_path();
+        let destination_name = path
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or(LocalPublicationError::InvalidPath)?;
+        let parent_path = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent = LocalStoreRoot::open(parent_path)?;
+        let held = DirectoryIdentity::from_stat(
+            fstat(&self.root).map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        let named = DirectoryIdentity::from_stat(
+            statat(
+                parent.descriptor(),
+                destination_name,
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        if named != held {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+        sync_with_retry(parent.descriptor())
+            .map_err(|_| LocalPublicationError::PackageCommitIndeterminate)?;
+        let named_after = DirectoryIdentity::from_stat(
+            statat(
+                parent.descriptor(),
+                destination_name,
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        if named_after != held {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+        Ok(())
+    }
+
+    /// Repeats the existing ref-directory durability step without replacing a
+    /// ref. Callers must validate the exact visible authority before and after
+    /// this recovery sync.
+    pub(crate) fn sync_existing_ref_directory(&self) -> Result<(), LocalPublicationError> {
+        let refs = openat(
+            &self.root,
+            OsStr::new("refs"),
+            DIRECTORY_OPEN_FLAGS,
+            Mode::empty(),
+        )
+        .map_err(|_| LocalPublicationError::ExistingMismatch)?;
+        self.sync_ref_commit_directory(&refs)
+            .map_err(|_| LocalPublicationError::RefCommitIndeterminate)
+    }
+
     /// Creates the immutable project envelope in a private, unpublished
     /// package root.
     pub(crate) fn publish_project_envelope<C>(
@@ -926,6 +996,84 @@ impl LocalStoreRoot {
         C: FnMut() -> bool,
     {
         self.validate_store_inventory_mode(limits, 0, 0, false, false, is_cancelled)
+    }
+
+    /// Requires the exact root namespace produced by one initial package
+    /// publication. Generation, object, and ref contents are validated by the
+    /// transaction graph; this closes the remaining gap for foreign root
+    /// entries and requires the writer-private staging directory to be empty.
+    pub(crate) fn validate_initial_package_namespace<C>(
+        &self,
+        limits: ProjectStoreLimits,
+        mut is_cancelled: C,
+    ) -> Result<(), LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        check_cancelled(&mut is_cancelled)?;
+        let mut seen = [false; 5];
+        let mut entries = 0_usize;
+        for entry in
+            Dir::read_from(&self.root).map_err(|_| LocalPublicationError::ExistingMismatch)?
+        {
+            check_cancelled(&mut is_cancelled)?;
+            let entry = entry.map_err(|_| LocalPublicationError::ExistingMismatch)?;
+            let name = entry.file_name();
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            entries = checked_count_add(entries, 1, limits.directory_fanout_entries_max)?;
+            let slot = match name.to_bytes() {
+                b"project.json" => 0,
+                b"refs" => 1,
+                b"generations" => 2,
+                b"objects" => 3,
+                b"staging" => 4,
+                _ => return Err(LocalPublicationError::ExistingMismatch),
+            };
+            if seen[slot] {
+                return Err(LocalPublicationError::ExistingMismatch);
+            }
+            seen[slot] = true;
+            let stat = statat(&self.root, name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| LocalPublicationError::ExistingMismatch)?;
+            if slot == 0 {
+                FileIdentity::from_stat(stat)?;
+                continue;
+            }
+            let expected = DirectoryIdentity::from_stat(stat)?;
+            let directory = openat(&self.root, name, DIRECTORY_OPEN_FLAGS, Mode::empty())
+                .map_err(|_| LocalPublicationError::ExistingMismatch)?;
+            let opened = DirectoryIdentity::from_stat(
+                fstat(&directory).map_err(|_| LocalPublicationError::ExistingMismatch)?,
+            )?;
+            if opened != expected {
+                return Err(LocalPublicationError::ExistingMismatch);
+            }
+            if slot == 4 {
+                for staged in Dir::read_from(&directory)
+                    .map_err(|_| LocalPublicationError::ExistingMismatch)?
+                {
+                    check_cancelled(&mut is_cancelled)?;
+                    let staged = staged.map_err(|_| LocalPublicationError::ExistingMismatch)?;
+                    let staged_name = staged.file_name().to_bytes();
+                    if staged_name != b"." && staged_name != b".." {
+                        return Err(LocalPublicationError::ExistingMismatch);
+                    }
+                }
+            }
+            let named = DirectoryIdentity::from_stat(
+                statat(&self.root, name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(|_| LocalPublicationError::ExistingMismatch)?,
+            )?;
+            if named != opened {
+                return Err(LocalPublicationError::ExistingMismatch);
+            }
+        }
+        if entries != seen.len() || seen.into_iter().any(|present| !present) {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_pin_inventory<C>(
