@@ -13,6 +13,7 @@ ui = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'package(mirante4d-project-store) & test(=actor::tests::hosted_durability_tests::exhaustive_hosted_and_process_transition_matrix)'
+threads-required = "num-test-threads"
 slow-timeout = { period = "20s", terminate-after = 5 }
 
 [[profile.default.overrides]]

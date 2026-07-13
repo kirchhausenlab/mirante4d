@@ -54,6 +54,7 @@ struct TestTimeoutOverride {
     selector: String,
     warn_ms: u64,
     terminate_ms: u64,
+    threads_required: Option<String>,
     reason: String,
 }
 
@@ -727,6 +728,10 @@ fn validate_test_timeout_overrides(overrides: &[TestTimeoutOverride]) -> anyhow:
             || timeout.warn_ms == 0
             || timeout.terminate_ms < timeout.warn_ms
             || timeout.terminate_ms % timeout.warn_ms != 0
+            || timeout
+                .threads_required
+                .as_deref()
+                .is_some_and(|value| value != "num-test-threads")
             || timeout.reason.trim().is_empty()
         {
             bail!("per-test timeout override has incomplete policy metadata");
@@ -937,8 +942,16 @@ fn generated_nextest(registry: &Registry) -> anyhow::Result<String> {
     );
     for timeout in &registry.test_timeout_overrides {
         text.push_str(&format!(
-            "\n[[profile.default.overrides]]\nfilter = '{}'\nslow-timeout = {{ period = \"{}\", terminate-after = {} }}\n",
+            "\n[[profile.default.overrides]]\nfilter = '{}'\n",
             timeout.selector,
+        ));
+        if let Some(threads_required) = &timeout.threads_required {
+            text.push_str(&format!(
+                "threads-required = \"{threads_required}\"\n"
+            ));
+        }
+        text.push_str(&format!(
+            "slow-timeout = {{ period = \"{}\", terminate-after = {} }}\n",
             duration_text(timeout.warn_ms),
             timeout.terminate_ms / timeout.warn_ms,
         ));
