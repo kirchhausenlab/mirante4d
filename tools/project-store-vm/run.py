@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,13 @@ HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 HEX_40 = re.compile(r"^[0-9a-f]{40}$")
 SAFE_TOKEN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 SAFE_TEXT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:+~=/()-]{0,255}$")
+
+
+@dataclass(frozen=True)
+class NbdkitBundle:
+    binary: Path
+    cache_filter: Path
+    file_plugin: Path
 
 EXPECTED_TRANSITIONS = {
     "object_file_sync",
@@ -620,7 +628,7 @@ def validate_unix_socket_path(path: Path) -> None:
 
 
 def start_nbdkit(
-    nbdkit: Path, image: Path, directory: Path, deadline: float
+    nbdkit: NbdkitBundle, image: Path, directory: Path, deadline: float
 ) -> tuple[subprocess.Popen[str], Path, Path]:
     directory.mkdir(parents=True)
     socket_root = Path(tempfile.mkdtemp(prefix=NBD_SOCKET_PREFIX, dir="/tmp"))
@@ -635,12 +643,12 @@ def start_nbdkit(
     try:
         process = subprocess.Popen(
             [
-                str(nbdkit),
+                str(nbdkit.binary),
                 "--foreground",
                 "--unix",
                 str(socket),
-                "--filter=cache",
-                "file",
+                f"--filter={nbdkit.cache_filter}",
+                str(nbdkit.file_plugin),
                 str(image),
                 "cache=writeback",
                 "cache-on-read=false",
@@ -1172,7 +1180,7 @@ def run_complete_guest(
     occurrence: int,
     case_dir: Path,
     qemu: Path,
-    nbdkit: Path,
+    nbdkit: NbdkitBundle,
     kernel: Path,
     initramfs: Path,
     constraints: dict[str, Any],
@@ -1225,7 +1233,7 @@ def run_pre_sequence_cut(
     *,
     case_dir: Path,
     qemu: Path,
-    nbdkit: Path,
+    nbdkit: NbdkitBundle,
     kernel: Path,
     initramfs: Path,
     constraints: dict[str, Any],
@@ -1330,7 +1338,7 @@ def run_power_cut(
     *,
     case_dir: Path,
     qemu: Path,
-    nbdkit: Path,
+    nbdkit: NbdkitBundle,
     kernel: Path,
     initramfs: Path,
     constraints: dict[str, Any],
@@ -1468,7 +1476,6 @@ def success_evidence(
     )
 
     qemu = command_path("qemu-system-x86_64")
-    nbdkit = command_path("nbdkit")
     busybox = command_path("busybox")
     command_path("mkfs.ext4")
     command_path("tune2fs")
@@ -1476,7 +1483,6 @@ def success_evidence(
     command_path("gzip")
     package_version(constraints["kernel_package"], constraints["kernel_version"])
     package_version(constraints["busybox_package"], constraints["busybox_version"])
-    package_version(constraints["nbdkit_package"], constraints["nbdkit_version"])
     qemu_package_version(constraints["qemu_version"])
     e2fsprogs_version(constraints["e2fsprogs_version"])
     if sha256_file(busybox) != constraints["busybox_sha256"]:
@@ -1490,7 +1496,7 @@ def success_evidence(
         packages / "kernel",
         deadline,
     )
-    download_deb(
+    nbdkit_deb = download_deb(
         constraints["nbdkit_package"],
         constraints["nbdkit_version"],
         constraints["nbdkit_deb_sha256"],
@@ -1505,6 +1511,24 @@ def success_evidence(
     kernel = kernel_root / "boot/vmlinuz-6.17.0-35-generic"
     if not kernel.is_file():
         raise HarnessFailure("frozen guest kernel was absent from its verified package")
+
+    nbdkit_root = work / "nbdkit-package"
+    nbdkit_root.mkdir()
+    run_checked(
+        ["dpkg-deb", "--extract", str(nbdkit_deb), str(nbdkit_root)], timeout=60
+    )
+    nbdkit = NbdkitBundle(
+        binary=nbdkit_root / "usr/bin/nbdkit",
+        cache_filter=nbdkit_root
+        / "usr/lib/x86_64-linux-gnu/nbdkit/filters/nbdkit-cache-filter.so",
+        file_plugin=nbdkit_root
+        / "usr/lib/x86_64-linux-gnu/nbdkit/plugins/nbdkit-file-plugin.so",
+    )
+    if not all(
+        path.is_file()
+        for path in [nbdkit.binary, nbdkit.cache_filter, nbdkit.file_plugin]
+    ):
+        raise HarnessFailure("frozen nbdkit runtime was absent from its verified package")
 
     test_binary = build_guest_test(repo, deadline)
     identity["guest_test_sha256"] = sha256_file(test_binary)
@@ -1527,7 +1551,7 @@ def success_evidence(
         "nbdkit": {
             "package_version": constraints["nbdkit_version"],
             "package_archive_sha256": constraints["nbdkit_deb_sha256"],
-            "binary_sha256": sha256_file(nbdkit),
+            "binary_sha256": sha256_file(nbdkit.binary),
         },
         "e2fsprogs": {"version": constraints["e2fsprogs_version"]},
     }

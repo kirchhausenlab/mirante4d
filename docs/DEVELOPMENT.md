@@ -72,7 +72,8 @@ MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
 ```
 
 Run the WP-10B project-store power-cut qualification only on the trusted Linux
-machine, from a clean revision with the pinned KVM/QEMU/nbdkit environment:
+machine, from a clean revision with the pinned KVM/QEMU environment. The lane
+downloads, verifies, and extracts its exact nbdkit package without root access:
 
 ```bash
 MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
