@@ -2507,6 +2507,14 @@
       "reason": "WP-10B B2 proves the frozen eight-request queue bound while allowing in-place queued-autosave replacement."
     },
     {
+      "id": "libtest:mirante4d-project-store:actor::tests::trash_is_correlated_cancellable_bounded_and_rejects_read_only",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves private Trash selection admission, exact request correlation, active cancellation without mutation, writer-contended read-only rejection, and successful authorized quarantine diagnostics; shared actor cancellation evidence covers queued Trash."
+    },
+    {
       "id": "libtest:mirante4d-project-store:api::tests::accepted_defaults_match_the_frozen_b2_work_bounds",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -6004,6 +6012,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 544
+    "current_additions": 545
   }
 }

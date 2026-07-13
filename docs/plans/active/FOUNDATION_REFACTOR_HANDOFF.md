@@ -6,10 +6,10 @@ Current technical sequence: WP-10B, WP-11, then the remaining packages below
 Public-data publication: deferred to a separate future handoff
 WP-10B predecessor: `foundation-wp-09a-exit-1`
 Completed through: WP-09A at `foundation-wp-09a-exit-1`
-Current checkpoint: WP-10B transactional project store; actor-unwired B2 Trash
-core
-Next protected-branch checkpoint: WP-10B Trash actor routing and transition
-evidence
+Current checkpoint: WP-10B transactional project store; private actor-routed B2
+Trash subset
+Next protected-branch checkpoint: WP-10B exact Trash transition and
+fresh-process evidence
 
 ## Purpose
 

@@ -37,8 +37,8 @@ A bounded private recovery reader and actor path now classify all four fixtures,
 fall back across corrupt heads/targets, scan only after exhausted lane fallback,
 and load a freshly selected projection without repair or promotion. B2 remains
 active off-product: public Create/Open/Save As execution, provisional autosave
-publication, timers, garbage collection, and public actor wiring remain later
-work, with product activation at B4.
+publication, timers, public/product garbage collection, Purge, and public actor
+wiring remain later work, with product activation at B4.
 Private Pin/Unpin now supplies durable checkpoint roots with fresh graph,
 capacity, cancellation, and read-only enforcement. The accepted maintenance
 transition correction names pin, unpin, and purge phases for the later
@@ -57,10 +57,10 @@ The next B2 checkpoint is bound by a narrow Trash safety correction: only
 freshly revalidated orphans declaring zero non-regenerable artifacts may enter
 the mirrored quarantine. Shared objects stay active, work proceeds in synced
 bounded batches, and every other selection fails with `ConfirmationRequired`.
-The private actor-unwired core now implements that subset using the corrected
-cancellable same-descriptor transition, exact retry, and fail-closed inventory.
-Actor routing plus transition/fresh-process evidence are the next slice; Purge
-remains later B2 work.
+The private actor now routes that subset using bounded admission, correlated
+completion and cancellation, the corrected same-descriptor transition, exact
+retry, and fail-closed inventory. Exact transition/fresh-process evidence is
+the next slice; Purge remains later B2 work.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.

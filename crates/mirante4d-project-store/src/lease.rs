@@ -119,6 +119,7 @@ pub(crate) struct ProjectStoreLeases {
     maintenance: OwnedFd,
     writer: Option<WriterLease>,
     writes_suspended: AtomicBool,
+    maintenance_lost: AtomicBool,
 }
 
 impl ProjectStoreLeases {
@@ -161,6 +162,7 @@ impl ProjectStoreLeases {
             maintenance,
             writer,
             writes_suspended: AtomicBool::new(false),
+            maintenance_lost: AtomicBool::new(false),
         })
     }
 
@@ -191,6 +193,15 @@ impl ProjectStoreLeases {
 
     pub(crate) fn suspend_writes(&self) {
         self.writes_suspended.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn maintenance_lost(&self) -> bool {
+        self.maintenance_lost.load(Ordering::Acquire)
+    }
+
+    fn mark_maintenance_lost(&self) {
+        self.maintenance_lost.store(true, Ordering::Release);
+        self.suspend_writes();
     }
 
     pub(crate) fn with_exclusive_maintenance<C, F, T, E>(
@@ -279,7 +290,7 @@ impl ProjectStoreLeases {
 
     fn restore_shared_or_suspend(&self) -> Result<(), MaintenanceTransitionError> {
         self.restore_shared().map_err(|source| {
-            self.suspend_writes();
+            self.mark_maintenance_lost();
             MaintenanceTransitionError::MaintenanceLost { source }
         })
     }
@@ -310,7 +321,7 @@ impl Drop for ExclusiveMaintenanceGuard<'_> {
     fn drop(&mut self) {
         if self.exclusive {
             if self.leases.restore_shared().is_err() {
-                self.leases.suspend_writes();
+                self.leases.mark_maintenance_lost();
             }
             self.exclusive = false;
         }

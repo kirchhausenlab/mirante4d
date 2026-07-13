@@ -1523,7 +1523,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         collections::BTreeMap,
         fs,
@@ -1710,7 +1710,7 @@ mod tests {
         assert_eq!(all_file_bytes(project.path()), foreign_before);
     }
 
-    fn install_zero_non_regenerable_orphan(root: &Path) -> ProjectGenerationId {
+    pub(crate) fn install_zero_non_regenerable_orphan(root: &Path) -> ProjectGenerationId {
         let old = generation_id(RECOVERABLE_ORPHAN);
         let old_path = root.join(active_generation_path(old));
         let mut document = serde_json::from_slice::<Value>(&fs::read(&old_path).unwrap()).unwrap();
