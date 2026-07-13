@@ -156,11 +156,14 @@ first and advancing autosave generations and refs, replace a divergent lane
 against the current manual base, accept a lower revision with a non-regressing
 high-water mark, reject stale parent/base and invalid recovery/capacity state,
 retry an exact recovery-ahead cancellation, and distinguish recovery-sync
-failure from write-suspending head indeterminacy. Five actor cases exercise the
+failure from write-suspending head indeterminacy. Eight actor cases exercise the
 real established manual/autosave primitives under one worker and prove exact
 request correlation, the request/completion bounds, queued-autosave coalescing,
 active and queued cancellation, close rejection, writer-lease lifetime, and
-joined or nonblocking shutdown. Five inspection cases cover the three promoted
+joined or nonblocking shutdown. They also prove authenticated Save As session
+and lease transfer, rejection before source reads, and preservation of the old
+session across collision, source failure, and cancellation. Five inspection
+cases cover the three promoted
 established-store states, exact heads and autosave classification, read-only and
 writer-contention modes, recovery-ahead without mutation, metadata-only payload
 validation, deferred payload digests, and fail-closed cancellation, capacity,
@@ -169,9 +172,8 @@ cover exact Create facts and caller-bound Save As fork encoding, retained root/
 lease validity, exact descriptor admission, existing directory/file/symlink
 refusal before source reads, a final no-clobber race, populated-stage
 cancellation cleanup, and post-rename parent-sync indeterminacy without deleting
-the visible package. They do not authenticate the fork tuple against a source
-session or claim public Create/Open/Save As execution, provisional
-autosave, recovery selection/open, timers, garbage collection, full
+the visible package. They do not claim public Create/Open/Save As execution,
+provisional autosave, recovery selection/open, timers, garbage collection, full
 verification, public actor wiring, the exhaustive fault matrix or power-cut
 durability, product reachability, or product-open validation.
 

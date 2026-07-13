@@ -141,7 +141,10 @@ lane head authoritative and supports an exact retry without repair or
 promotion. A crate-private established-session actor owns the root and leases,
 serializes those manual/autosave transactions, bounds requests and completions,
 coalesces queued autosaves, cancels active or queued work, and releases its
-session through Close or shutdown. A shared private inspection core now opens
+session through Close or shutdown. The same actor authenticates Save As against
+the live manual head and scientific identity, installs the fork through the
+shared no-clobber package transaction, and changes its owned root and leases
+only after durable success. A shared private inspection core now opens
 and validates established stores for actor startup and transaction preflight,
 including exact ref/generation continuity, bounded physical metadata closure,
 autosave classification, and explicit read-only writer fallback without eager
@@ -178,10 +181,10 @@ See [testing](TESTING.md) for commands and claim language.
   under held leases, and can create or advance an established-project autosave
   head. It can also install a new initial package privately with exact Create
   facts or a caller-bound Save As fork tuple, without replacing an existing
-  destination. Source-session authentication remains with later actor wiring.
-  Its private established-session actor executes and bounds the two established
-  save lanes only, using the same private established-store inspection authority
-  as transaction preflight. Public Create/Open/Save As execution,
+  destination. Its private established-session actor executes and bounds manual
+  save, autosave, and authenticated Save As work, using the same private
+  established-store inspection authority as transaction preflight. Public
+  Create/Open/Save As execution,
   provisional autosave, recovery selection/open, timers, garbage collection,
   full verification, public actor construction, durability qualification, and
   every product path remain unimplemented.
