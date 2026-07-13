@@ -3910,14 +3910,6 @@
       "reason": "WP-07B-B closes typed worker failures over the operation kind admitted by the canonical reducer."
     },
     {
-      "id": "libtest:mirante4d-application:tests::stale_dataset_open_completion_can_be_explicitly_retired_after_atomic_rejection",
-      "kind": "libtest",
-      "owner": "mirante4d-application",
-      "lane": "unit",
-      "requirement_ids": ["D-022-unit", "WP-07B-B-live-cutover"],
-      "reason": "WP-07B-B proves stale source-open suppression cannot orphan the canonical operation registry."
-    },
-    {
       "id": "libtest:mirante4d-app:workbench_playback_runtime::tests::pending_settings_keep_application_services_polling_without_an_operation",
       "kind": "libtest",
       "owner": "mirante4d-app",
@@ -5870,38 +5862,6 @@
       "reason": "WP-10A enforces the off-product storage successor boundary and exact predecessor delegation."
     },
     {
-      "id": "libtest:xtask::bin/xtask:arch::wp10b::tests::b3_isolation_allows_only_the_private_service_module_declaration",
-      "kind": "libtest",
-      "owner": "xtask",
-      "lane": "unit",
-      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
-      "reason": "WP-10B B3 permits the private compile/test-only project-store service declaration without making it product reachable."
-    },
-    {
-      "id": "libtest:xtask::bin/xtask:arch::wp10b::tests::b3_isolation_detects_indirect_application_state_wiring",
-      "kind": "libtest",
-      "owner": "xtask",
-      "lane": "unit",
-      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
-      "reason": "WP-10B B3 rejects direct and indirect production wiring of the compile/test-only project-store service."
-    },
-    {
-      "id": "libtest:xtask::bin/xtask:arch::wp10b::tests::b3_isolation_rejects_a_renamed_project_store_dependency",
-      "kind": "libtest",
-      "owner": "xtask",
-      "lane": "unit",
-      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
-      "reason": "WP-10B B3 rejects normal or target-specific Cargo aliases that could bypass the product-isolation source guard."
-    },
-    {
-      "id": "libtest:xtask::bin/xtask:arch::wp10b::tests::b3_isolation_rejects_service_side_application_state_extension",
-      "kind": "libtest",
-      "owner": "xtask",
-      "lane": "unit",
-      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
-      "reason": "WP-10B B3 prevents the private service module from extending or aliasing product-owned application state."
-    },
-    {
       "id": "libtest:xtask::bin/xtask:verification::registry::tests::format_lifecycle_is_an_active_target_authority_consumer",
       "kind": "libtest",
       "owner": "xtask",
@@ -6636,6 +6596,366 @@
       "lane": "unit",
       "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
       "reason": "WP-10B B3 builds the supporting product script for progress, cancellation, retry success, nonblank rendering, and both accepted sizes."
+    },
+    {
+      "id": "libtest:mirante4d-app:product_automation::tests::automation_script_parses_the_b4_project_store_contract",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-10B-project-store"],
+      "reason": "WP-10B B4 parses the fixed project-persistence product workflow."
+    },
+    {
+      "id": "libtest:mirante4d-app:product_automation::tests::b4_project_evidence_helpers_keep_exact_typed_facts",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-10B-project-store"],
+      "reason": "WP-10B B4 keeps product evidence typed and exact."
+    },
+    {
+      "id": "libtest:mirante4d-app:product_automation::tests::external_kill_checkpoint_writer_syncs_once_without_replacement",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-10B-project-store"],
+      "reason": "WP-10B B4 synchronizes the external-kill checkpoint exactly once."
+    },
+    {
+      "id": "libtest:mirante4d-app:tests::noninteractive_project_paths_are_consumed_once",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-10B-project-store"],
+      "reason": "WP-10B B4 consumes automation paths through the normal product route exactly once."
+    },
+    {
+      "id": "libtest:mirante4d-app:tests::project_destination_check_resolves_a_symlinked_existing_parent",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-10B-project-store"],
+      "reason": "WP-10B B4 resolves existing destination parents before overlap checks."
+    },
+    {
+      "id": "libtest:mirante4d-app:tests::project_destinations_cannot_overlap_the_canonical_source_closure",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-10B-project-store"],
+      "reason": "WP-10B B4 rejects project destinations inside the microscopy source closure."
+    },
+    {
+      "id": "libtest:mirante4d-app:tests::recovery_discovery_failure_disables_only_provisional_autosave",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-10B-project-store"],
+      "reason": "WP-10B B4 confines recovery-discovery failure to provisional autosave."
+    },
+    {
+      "id": "libtest:mirante4d-app:tests::recovery_locator_discovery_bounds_noncanonical_root_entries",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-10B-project-store"],
+      "reason": "WP-10B B4 bounds noncanonical recovery-root discovery."
+    },
+    {
+      "id": "libtest:mirante4d-app:tests::recovery_locator_discovery_fails_closed_at_its_exact_capacity",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-10B-project-store"],
+      "reason": "WP-10B B4 fails recovery discovery closed at its exact capacity."
+    },
+    {
+      "id": "libtest:mirante4d-app:tests::recovery_locator_discovery_is_canonical_bounded_and_content_blind",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-10B-project-store"],
+      "reason": "WP-10B B4 keeps recovery discovery canonical, bounded, and content blind."
+    },
+    {
+      "id": "libtest:mirante4d-app:tests::recovery_root_overlap_is_rejected_before_directory_creation",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-10B-project-store"],
+      "reason": "WP-10B B4 rejects recovery-root overlap before mutation."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::automatic_recovery_review_selects_only_newer_and_leaves_branches_explicit",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 auto-prompts only a newer same-base recovery and leaves branches explicit."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::foreground_completion_at_autosave_deadline_does_not_capture_the_stale_snapshot",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 excludes stale autosave capture at a foreground completion boundary."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::initial_save_preserves_the_reducer_token_on_qualified_or_unsupported_filesystems",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 preserves initial-save identity across filesystem outcomes."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::missing_recovery_destination_disables_only_provisional_autosave",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 confines a missing recovery destination to provisional autosave."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::opening_a_provisional_store_is_dirty_until_recovery_is_selected",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 keeps provisional open dirty until explicit recovery selection."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::pending_recovery_review_cancellation_is_terminal_and_closes_the_session",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 makes recovery-review cancellation terminal."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::pending_repaint_deadline_and_busy_status_are_exact_without_polling",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 exposes exact passive repaint and busy state."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::real_open_recovery_inspection_failure_enters_recovery_only",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 enters recovery-only mode after real inspection failure."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::real_recovery_selected_save_as_establishes_the_new_project",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 establishes recovered authority only through Save As."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::save_as_rejects_a_projection_not_retained_by_its_exact_token",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 rejects Save As projection-token drift."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::source_invalidation_cancels_an_active_autosave_and_suppresses_its_stale_result",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 cancels autosave after source invalidation and suppresses stale completion."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::status_and_action_availability_follow_the_private_lifecycle",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 derives status and available actions from the persistence lifecycle."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::dataset_open_can_still_be_cancelled_while_the_durable_freeze_is_active",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 permits cancellation while durable edits are frozen."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::dataset_open_failure_remains_exact_after_a_rejected_durable_edit",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 retains exact dataset-open failure across a rejected durable edit."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::dataset_open_freezes_durable_edits_but_allows_transient_state_and_exact_completion",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 freezes durable edits without freezing transient state."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::initial_unsaved_save_is_requested_but_a_clean_save_is_a_noop",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 permits initial Save and makes repeated clean Save a no-op."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::project_open_can_complete_directly_with_a_dirty_recovery_projection",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 admits a typed dirty recovery projection from Open."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::recovery_blocks_mutation_and_is_dirty_even_with_the_exact_verified_locator",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 keeps recovery dirty and mutation-blocked."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::recovery_rebinds_a_same_science_locator_and_rejects_other_science_atomically",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 rebinds only the same verified scientific source."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::save_as_rejects_a_nonexact_completion_and_failure_retains_the_old_project",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 rejects nonexact Save As completion without losing old authority."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::save_as_retains_an_initial_new_id_projection_and_switches_only_on_exact_completion",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 switches Save As authority only on exact completion."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::source_invalidation_cancels_dataset_open_before_advancing_currentness",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 cancels dataset Open before source currentness advances."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::source_invalidation_cancels_save_as_and_recovery_operations",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 cancels Save As and recovery work after source invalidation."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::typed_project_store_faults_are_admitted_only_by_read_or_mutation_operations",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 admits typed store faults only through matching operations."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::verified_unbound_workspace_can_request_and_admit_a_dirty_recovery",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 admits dirty recovery from a verified unbound workspace."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp10b::tests::b4_activation_rejects_a_renamed_project_store_dependency",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 rejects dependency aliases that bypass the activated boundary."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp10b::tests::b4_application_root_requires_the_service_module_and_public_route",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 requires the successor service and public product route."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp10b::tests::b4_predecessor_identifier_detection_is_token_exact",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 detects predecessor identifiers token-exactly."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp10b::tests::b4_service_rejects_application_state_extension",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 keeps application state owned outside the service."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:product_validate::tests::b4_aggregate_requires_signal_nine_normal_joins_and_zero_retries",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 requires SIGKILL, normal joins, and zero retries."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:product_validate::tests::b4_checkpoint_requires_real_passive_autosave_and_revision_order",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 requires a real passive autosave and exact revision ordering."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:product_validate::tests::b4_scripts_lock_the_fixed_three_launch_cutover",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 locks the fixed three-launch product cutover."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:product_validate::tests::b4_trusted_report_must_match_revision_and_actor_thresholds",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 binds trusted evidence to the exact revision and actor thresholds."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:product_validate::tests::b4_xwininfo_parser_requires_exact_viewable_client_facts",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B4 requires exact externally observed client geometry."
     }
   ],
   "expected_summary": {
@@ -6644,6 +6964,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 624
+    "current_additions": 664
   }
 }
