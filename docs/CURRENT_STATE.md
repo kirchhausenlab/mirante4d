@@ -183,7 +183,10 @@ mirrored quarantine, shared-object retention, exact retry, bounded directory
 sync, and fail-closed inventory. All ten frozen Trash transitions now support
 exact before/after and zero-based occurrence injection. A 34-case actor kill
 matrix proves fresh-process reopen and idempotent retry, while explicitly
-making no power-loss durability claim. Purge remains absent.
+making no power-loss durability claim. A bound Purge safety correction now
+freezes complete-snapshot selection, strict zero-non-regenerable preflight,
+object-first synced batches, generation-last deletion, and idempotent reopen/
+retry. Purge execution remains absent.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
@@ -226,10 +229,10 @@ See [testing](TESTING.md) for commands and claim language.
   durability claim.
 - Private actor-routed Trash is covered only for its bounded authorized subset;
   its callback and process-crash matrix does not simulate power loss or qualify
-  filesystem durability, and Purge is not implemented. The current API cannot
-  authorize removal of non-regenerable artifacts; supporting that later needs
-  separately approved snapshot-bound itemized confirmation and verified-backup
-  proof.
+  filesystem durability. Purge now has a frozen safe subset but no execution
+  evidence. The current API cannot authorize removal of non-regenerable
+  artifacts; supporting that later needs separately approved snapshot-bound
+  itemized confirmation and verified-backup proof.
 - The package-capability lane remains pending until there is an honest
   unsupported-GPU package command.
 - Packaged runtime does not expose unsaved-autosave recovery.

@@ -174,6 +174,14 @@ device rename.
   no-replace moves, and bounded durable batches. It never sweeps anonymous
   unrooted objects. Cancellation may stop only between synced batches; any
   other post-mutation failure is write-suspending and indeterminate.
+- Purge selects the complete canonical trash snapshot only after strict active-
+  plus-trash validation proves every generation regenerable. It removes
+  objects in synced bounded batches while retaining their generation records,
+  crosses a revalidated empty-object barrier, then removes generation records.
+  It retains the directory hierarchy. Cancellation between batches leaves a
+  synced idempotent prefix; a post-unlink failure or process kill is
+  indeterminate and requires reopen. Object-phase retry recognizes the ordered
+  removal prefix; generation-phase retry revalidates each surviving record.
 - Writable durability is initially claimed only on tested local Linux
   filesystem and mount-option tuples with same-filesystem staging, no-replace
   publication, atomic ref replacement, file sync, and directory sync. Unknown,

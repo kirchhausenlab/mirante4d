@@ -223,6 +223,10 @@ including repeated observed occurrences, then reopens in a fresh process and
 proves exact retry plus a zero-mutation sync retry. This is process-crash
 evidence only: it does not simulate power loss or establish filesystem
 durability.
+The accepted Purge safety correction requires separate evidence for strict
+whole-trash preflight, object-first deletion with generation records retained,
+synced cancellation/retry prefixes, actor behavior, and exact failpoint and
+fresh-process matrices. None of that Purge execution evidence exists yet.
 The existing process-lease case now also proves failed in-place maintenance
 upgrade restoration, contended exclusive acquisition, explicit and drop-based
 downgrade, cancellation, writer retention, and read-only rejection. It does

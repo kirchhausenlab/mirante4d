@@ -1,0 +1,85 @@
+{
+  "schema": "mirante4d-foundation-package-entry-correction",
+  "schema_version": 1,
+  "package": "WP-10B",
+  "status": "accepted",
+  "authorization": {
+    "approved_by": "Mirante4D repository owner",
+    "approved_on": "2026-07-13",
+    "reference": "WP10B-PREAUTH-2026-07-12",
+    "scope": "narrow Purge safety correction required by the accepted Trash stop condition before any purge deletion"
+  },
+  "accepted_boundary": {
+    "contract_path": "architecture/wp10b-project-store-contract.json",
+    "pre_correction_contract_sha256": "9c4f174577f915be94a92de8eeea3ab9521b5842235c6976bbdce7ba575622ef",
+    "trash_correction_path": "architecture/wp10b-project-store-trash-safety-correction.json",
+    "trash_correction_sha256": "1eb60a85cdaf13f458826dace05ba548559b4fe30bd70616fe97af21f2ed7ee5",
+    "protected_main_commit": "ffacfe8981cd8bc0b0e0acda9c182124207a17b5",
+    "protected_main_tree": "5b787cdda61f839775368e5b3829685cd7879c65",
+    "hosted_run": "https://github.com/kirchhausenlab/mirante4d/actions/runs/29230820606",
+    "hosted_result": "success"
+  },
+  "discovered_gaps": {
+    "selection": "The parameterless Purge command did not define which trash content it selects or what empty success means.",
+    "authorization": "The current API cannot carry proof for non-regenerable deletion, and deleting generation records before objects would destroy the persisted authorization needed by a fresh retry.",
+    "recovery": "Cancellation, partial deletion, directory-sync recovery, retry recognition, retained directories, and diagnostic meanings were not frozen.",
+    "risk": "A direct recursive delete could erase non-regenerable, malformed, foreign, anonymous, or incompletely quarantined content and leave an unauthorizable crash state."
+  },
+  "correction": {
+    "selection": "Purge selects the complete freshly inventoried canonical trash snapshot. An empty snapshot is successful zero-namespace-mutation work. There is no age, caller-selected, automatic, or active-store deletion mode.",
+    "non_regenerable": "Every remaining trash generation must declare zero non-regenerable artifacts. Otherwise reject before unlink with ConfirmationRequired. Supporting proof-bearing deletion requires a separate public API correction.",
+    "maintenance": "Require a confirmed writer and cancellably upgrade the actor's own shared maintenance descriptor to exclusive. Preflight and deletion occur only while exclusive; every exit restores shared ownership. Maintenance loss suspends the session and fails indeterminately under the accepted Trash semantics.",
+    "preflight": "Before unlink, completely and boundedly validate the active graph and active-plus-trash namespaces, canonical single-link regular generation and object files, project identity, declared closures and lengths, fan-out and capacity, and exact present trash-object digests. Missing generation parent or base IDs remain permitted provenance rather than liveness edges. Unknown, malformed, foreign, linked, mismatched, or unreferenced trash content fails closed.",
+    "incomplete_trash": "Every trash generation must be absent from active storage. A closure object present only in active storage is allowed only when retained by an active generation; an unretained active-only closure object returns SourceChanged so Trash can finish first. Every present trash object must be referenced by at least one accepted trash generation. When the same digest exists in active and trash, Purge removes only the validated trash file when an active generation retains the active copy; an unretained active duplicate returns SourceChanged.",
+    "object_phase": "Delete trash objects first in digest order while retaining every trash generation as authorization. After every object batch, sync each affected containing directory. On every invocation, also sync every existing canonical trash-object fan-out directory, including empty directories, then re-inventory and prove the trash-object namespace empty before generation deletion may begin.",
+    "object_retry": "While all authorizing generation records remain, exclude only active-only closure objects retained by active generations. An absent trash-owned object is accepted as already purged only when absent entries form an exact digest-ordered prefix and present entries form the remaining suffix. Any other absence pattern fails closed. This exact prefix rule applies only to the object phase.",
+    "generation_phase": "Only after the synced empty-object phase barrier, independently revalidate and delete each remaining trash generation file in generation-ID order and sync each affected containing directory. A retry syncs every existing canonical trash-generation fan-out directory, including empty directories. Absent generation records are not claimed as a runtime-verifiable ordered prefix, and surviving records may name already-purged provenance parents or bases. Keep the bounded trash directory hierarchy; Purge removes regular files only.",
+    "preunlink_identity": "Hold the validated file and no-follow parent descriptors. Immediately before each unlink, revalidate the path's regular single-link type, device and inode, length, and expected generation identity or object digest against the held fact; any mismatch fails closed. Exclusive maintenance excludes compliant store writers. Linux cannot make unlink conditional on inode identity, so hostile external replacement between the final check and unlink is outside the supported writer model; descriptor-relative no-follow traversal still prevents symlink escape.",
+    "batches": "Each durable batch contains at most gc_batch_entries_max unlinks and gc_batch_bytes_max validated file bytes. It holds descriptor-relative no-follow parent directories through unlink and sync and never follows or removes a directory.",
+    "cancellation": "Lease waiting and initial inventory may cancel before maintenance progress, leaving any preexisting state unchanged. Once a retry prefix is recognized or a recovery-sync sweep begins, defer cancellation through the complete sweep and re-inventory. From a batch's first unlink through all required directory syncs, also defer cancellation. Between synced batches Cancelled may leave only current-invocation progress as an idempotent prefix; generation records remain until the object phase barrier.",
+    "indeterminate": "Any required recovery-sync failure or any non-cancellation failure after the operation's first successful unlink returns CommitIndeterminate, suspends writes, performs no rollback, and requires close/reopen plus fresh inspection. A failure before unlink changes no namespace bytes.",
+    "diagnostics": "On success, published_objects counts regular files newly removed from trash by this invocation, including generation JSON and object files; streamed_bytes counts exact bytes read from those present trash files for identity and integrity validation. Neither field is a reclaim estimate. A zero-removal retry reports zero published_objects even when it performs required directory syncs.",
+    "transitions": "Purge composes gc_maintenance_upgrade and gc_maintenance_restore with the already frozen purge_remove and purge_directory_sync transitions. Each observed occurrence requires exact before and after injection and fresh-process kill/reopen/retry evidence.",
+    "claim_boundary": "Callback and SIGKILL evidence proves logic and process-crash recovery only. It does not simulate power loss, qualify a filesystem, or establish durability."
+  },
+  "supplemented_contract_paths": [
+    "bindings.purge_safety_correction",
+    "public_api_contract.cancellation",
+    "purge_contract",
+    "purge_contract.transitions"
+  ],
+  "superseded_prior_claims": [
+    "trash-safety-correction deferred Purge behavior; this correction now freezes the safe Purge subset",
+    "trash-safety-correction stop condition: Purge implementation; this separate accepted review satisfies that condition only within this correction"
+  ],
+  "unchanged": [
+    "the sixteen public root exports and every command, completion, fault, and limit",
+    "every persisted path and byte; no purge marker or directory removal is introduced",
+    "active-store bytes, dependencies, fixtures, and product reachability",
+    "no proof-bearing non-regenerable, backup, reclaim, durability, public, or product claim"
+  ],
+  "allowed_paths": [
+    "architecture/wp10b-project-store-purge-safety-correction.json",
+    "architecture/wp10b-project-store-contract.json",
+    "crates/mirante4d-project-store/src/actor.rs",
+    "crates/mirante4d-project-store/src/lease.rs",
+    "crates/mirante4d-project-store/src/trash.rs",
+    "crates/xtask/src/arch/wp10b.rs",
+    "verification/predecessor-disposition.json",
+    "docs/ARCHITECTURE.md",
+    "docs/CURRENT_STATE.md",
+    "docs/TESTING.md",
+    "docs/planning/NOW.md",
+    "docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md",
+    "docs/plans/active/foundation-refactor/PROJECT_STORE_DURABILITY_BRIEF.md"
+  ],
+  "evidence": [
+    "exact architecture binding and normalized-contract checks",
+    "bounded object-first success, cancellation, strict rejection, reopen, and zero-removal sync-retry tests",
+    "exact transition injection and fresh-process kill/reopen/retry matrices",
+    "private actor correlation, cancellation, read-only, and indeterminate-session tests",
+    "unchanged public root, dependency, fixture, active-wire, and product-reachability guards"
+  ],
+  "stop_condition": "Any public API, export, fault, or limit change; persisted path, byte, marker, or directory removal; dependency, fixture, product wiring, active-store deletion, proof-bearing non-regenerable support, or durability claim must stop for separate review.",
+  "rollback": "revert this correction before Purge implementation; Trash remains quarantined and Purge remains off-product"
+}
