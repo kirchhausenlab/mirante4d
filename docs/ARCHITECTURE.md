@@ -173,10 +173,15 @@ object outside staging and trash, hashes every physical object, reconstructs
 paged logical objects, and repeats the snapshot before success. It is
 cancellable, available to read-only sessions, and changes no store authority.
 It does not validate artifact scientific semantics, repair data, verify trash,
-or prove durability. The frozen public actor remains non-constructible and
-unwired. The crate still owns no public Create/Open/Save As execution,
-provisional autosave publication, product recovery workflow, timers, garbage
-collection, qualified durability, or product path.
+or prove durability. Private PlanCompaction now repeats the bounded graph
+snapshot and returns deterministic metadata-only recovery-review candidates
+for every orphan generation. It is cancellable, available read-only, and
+changes no authority. Its result is not Trash authorization, a physical
+object/byte plan, a reclaim estimate, or backup approval. The frozen public
+actor remains non-constructible and unwired. The crate still owns no public
+Create/Open/Save As execution, provisional autosave publication, product
+recovery workflow, timers, garbage-collection mutation, qualified durability,
+or product path.
 
 Settings use `mirante4d-settings-v1` at the Linux XDG/HOME path. The UI submits
 validated changes; one background actor owns persistence. Legacy preferences
