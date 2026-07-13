@@ -159,8 +159,23 @@ device rename.
   with the validated ProjectGenerationProjection. Candidate inspection remains
   metadata-only at its public boundary: it may decode projection state for
   validation but does not return or expose it before explicit selection.
-- Automatic cleanup removes only dead-writer staging. Explicit compaction
-  roots only the current/previous manual head, manual recovery, current/
+- Automatic cleanup removes only exact writer-private transaction directories
+  after an existing-store opener has acquired the writer lease, completed
+  bounded store/recovery validation, and reconfirmed the writer against the
+  same root. Read-only sessions never clean. Every staging child must match the
+  canonical
+  `tx-<nonzero-minimal-u32-pid>-<32-hex>-<16-hex>-<00..7f>` grammar and be
+  empty or contain only one bounded, same-filesystem, single-link regular
+  `payload`; PID, age, hostname, and lock text never establish ownership.
+  Cleanup preflights the whole bounded namespace before mutation, removes in
+  bytewise order, syncs the transaction and staging directories, and is
+  retryable without markers. An existing empty `staging/` is synced on a
+  zero-removal retry; a missing one is not created.
+  Cancellation is preflight-only; any failure after removal begins is
+  write-suspending and indeterminate. This does not cover sibling package
+  stages, immutable orphans, hostile external writers, power loss, or
+  filesystem qualification. Explicit compaction roots only the current/
+  previous manual head, manual recovery, current/
   previous autosave head, autosave recovery, and pins. `generation.parent` is
   provenance, not a liveness edge, so complete history requires pins. Before
   moving anything, compaction lists orphan generations as recovery candidates.

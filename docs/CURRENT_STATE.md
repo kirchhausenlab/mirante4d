@@ -170,7 +170,10 @@ rejects read-only sessions, and makes directory-sync uncertainty
 write-suspending. All seven frozen Pin/Unpin transitions now have exact before/
 after occurrence injection plus a 16-case actual `SIGKILL`, fresh-process
 reopen, and retry matrix. This proves logic and process-crash recovery only;
-dead-writer staging cleanup and power-loss/filesystem durability remain later. A
+power-loss/filesystem durability remains later. A bound staging-cleanup
+correction now freezes exact writer-only selection, whole-namespace preflight,
+ordered synced removal, cancellation, indeterminacy, and fresh retry. Its
+implementation evidence remains pending. A
 bound correction now resolves the provisional-autosave base contradiction and
 freezes first no-clobber publication, advance, receipt, cancellation, and retry
 semantics. The private publisher now installs the first exact base-less package,

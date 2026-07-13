@@ -43,8 +43,11 @@ Private Pin/Unpin now supplies durable checkpoint roots with fresh graph,
 capacity, cancellation, and read-only enforcement. All seven frozen phases now
 have exact before/after occurrence injection plus a 16-case actual `SIGKILL`,
 fresh-process reopen, and retry matrix. This is process-crash evidence only;
-dead-writer staging cleanup and power-loss/filesystem durability remain later
-B2 work.
+power-loss/filesystem durability remain later B2 work. The next narrow
+correction now freezes writer-only dead-staging selection, complete bounded
+preflight, ordered synced removal, three transition names, cancellation,
+indeterminacy, and exact retry. Its private implementation and focused evidence
+are next.
 A private bounded FullVerify path now hashes every physical object in one
 stable active-store snapshot, reconstructs paged logical objects, remains
 cancellable and available read-only, and changes no store authority. Artifact
@@ -80,8 +83,8 @@ protocol. The private publisher now implements first publication, exact-only
 uncertain-install adoption, base-less advance, cancellation, and exact fresh
 retry with four focused transaction cases. Exhaustive transition/process-kill
 evidence remains later. The next narrow B2 checkpoint is the already-audited
-dead-writer staging-cleanup correction and implementation; public actor/session
-lifecycle follows it.
+dead-writer staging-cleanup implementation; public actor/session lifecycle
+follows it.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.
