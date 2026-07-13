@@ -2995,6 +2995,14 @@
       "reason": "WP-10B B2 proves read-only, stale-head, and corrupt-head failures consume no sources and publish no generation."
     },
     {
+      "id": "libtest:mirante4d-project-store:transaction::tests::first_provisional_autosave_installs_the_exact_base_less_fixture",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 privately installs the independent first provisional autosave with exact base-less generation and ref authority."
+    },
+    {
       "id": "libtest:mirante4d-project-store:transaction::tests::initial_package_install_supports_create_and_explicit_save_as_forks",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -3025,6 +3033,30 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 proves arithmetic preflight, mid-stream cancellation, and two-pass source drift fail before generation publication."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::provisional_advance_rejects_invalid_captures_and_allows_lower_revision",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 rejects invalid provisional parent, base, fork, identity, and high-water facts before source reads while permitting a lower revision without high-water regression."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::provisional_advance_retries_recovery_ahead_and_suspends_on_head_uncertainty",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 preserves old authority across provisional cancellation and performs exact sync-only fresh retry after visible final-head uncertainty."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::provisional_first_publication_cancels_cleans_and_exactly_adopts_uncertain_install",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 cleans a cancelled provisional sibling stage, preserves a no-clobber race, and adopts only the exact fully verified uncertain install."
     },
     {
       "id": "libtest:mirante4d-project-store:transaction::tests::two_pass_paging_publishes_the_exact_closure_before_the_generation",
@@ -6084,6 +6116,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 554
+    "current_additions": 558
   }
 }

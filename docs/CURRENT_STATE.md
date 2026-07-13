@@ -173,7 +173,11 @@ reopen, and retry matrix. This proves logic and process-crash recovery only;
 dead-writer staging cleanup and power-loss/filesystem durability remain later. A
 bound correction now resolves the provisional-autosave base contradiction and
 freezes first no-clobber publication, advance, receipt, cancellation, and retry
-semantics. That publisher remains unimplemented. A
+semantics. The private publisher now installs the first exact base-less package,
+adopts only an exact fully verified uncertain install, advances the provisional
+lane, and supports cancellation plus exact fresh retry. Its focused evidence
+does not supply exhaustive transition, process-kill, staging-cleanup, or
+power-loss coverage. A
 private read-only FullVerify path now hashes every physical object in one
 bounded stable active-store snapshot, reconstructs paged logical objects,
 supports cancellation and read-only sessions, and changes no store bytes.
@@ -227,8 +231,8 @@ See [testing](TESTING.md) for commands and claim language.
   destination. Its private established-session actor executes and bounds manual
   save, autosave, and authenticated Save As work, using the same private
   established-store inspection authority as transaction preflight. Public
-  Create/Open/Save As execution,
-  provisional autosave publication, public/product recovery workflow, timers,
+  Create/Open/Save As execution, provisional-autosave actor/timer wiring,
+  public/product recovery workflow,
   public/product garbage collection and Purge wiring, public actor
   construction, durability qualification, and every product path remain
   unimplemented.

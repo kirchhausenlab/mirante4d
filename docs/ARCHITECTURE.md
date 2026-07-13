@@ -207,10 +207,13 @@ filesystem qualification. The frozen public actor remains non-constructible. A
 bound correction now resolves the already-frozen provisional wire: a
 provisional autosave has no manual base, its first private publication uses one
 caller-located no-clobber package, and later provisional autosaves advance that
-lane through the existing protocol. The publisher is not implemented yet. The
-crate still owns no public Create/Open/
-Save As execution, provisional autosave publication, product recovery workflow,
-timers, public/product garbage-collection wiring, qualified durability, or
+lane through the existing protocol. The private publisher now installs that
+first exact package, adopts only an exact fully verified uncertain install,
+and advances the base-less lane with cancellation and exact fresh-retry
+handling. Its focused evidence is not the exhaustive transition, process-kill,
+or power-loss matrix. The crate still owns no public Create/Open/Save As
+execution, provisional-autosave actor or timer wiring, product recovery
+workflow, public/product garbage-collection wiring, qualified durability, or
 product path.
 
 Settings use `mirante4d-settings-v1` at the Linux XDG/HOME path. The UI submits
