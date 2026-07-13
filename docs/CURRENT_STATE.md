@@ -164,7 +164,11 @@ now discover validated manual/autosave fallbacks or capped scan candidates,
 load only an explicit fresh selection, preserve actual head facts, and support
 corrupt-head and writer-contended read-only sessions without repair or
 promotion. The frozen public actor remains non-constructible and the crate
-remains off-product.
+remains off-product. Private Pin/Unpin execution now validates the complete
+graph and prospective recovery-candidate cap, preserves duplicate-pin liveness,
+rejects read-only sessions, and makes directory-sync uncertainty
+write-suspending. The accepted transition authority names pin, unpin, and purge
+phases, but the exhaustive failpoint/kill matrix is not yet implemented.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
@@ -197,8 +201,8 @@ See [testing](TESTING.md) for commands and claim language.
   save, autosave, and authenticated Save As work, using the same private
   established-store inspection authority as transaction preflight. Public
   Create/Open/Save As execution,
-  provisional autosave publication, recovery selection/open, timers, garbage
-  collection, full verification, public actor construction, durability
+  provisional autosave publication, public/product recovery workflow, timers,
+  garbage collection, full verification, public actor construction, durability
   qualification, and every product path remain unimplemented.
 - The package-capability lane remains pending until there is an honest
   unsupported-GPU package command.

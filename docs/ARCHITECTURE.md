@@ -163,8 +163,12 @@ authority. It otherwise solely owns its opened root and leases, serializes
 manual/autosave transactions, authenticates Save As
 against the live session, and transfers ownership to the durably installed fork
 only on success. It also enforces bounded requests, completions, autosave
-coalescing, cancellation, close, and shutdown. The frozen public actor remains
-non-constructible and unwired. The crate still owns no public Create/Open/Save
+coalescing, cancellation, close, and shutdown. Private Pin/Unpin commands now
+atomically create, replace, or remove exact checkpoint roots after fresh graph
+validation, and suspend writes if post-mutation durability is indeterminate.
+The accepted transition inventory now names pin, unpin, and purge mutation
+phases; exhaustive injection evidence remains later B2 work. The frozen public
+actor remains non-constructible and unwired. The crate still owns no public Create/Open/Save
 As execution, provisional autosave publication, product recovery workflow,
 timers, garbage collection, full verification, qualified durability, or product
 path.

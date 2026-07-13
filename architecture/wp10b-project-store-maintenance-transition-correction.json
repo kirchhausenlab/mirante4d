@@ -1,0 +1,75 @@
+{
+  "schema": "mirante4d-foundation-package-entry-correction",
+  "schema_version": 1,
+  "package": "WP-10B",
+  "status": "accepted",
+  "authorization": {
+    "approved_by": "Mirante4D repository owner",
+    "approved_on": "2026-07-13",
+    "reference": "WP10B-PREAUTH-2026-07-12",
+    "scope": "narrow maintenance-transition correction discovered before pin, unpin, and purge implementation"
+  },
+  "accepted_boundary": {
+    "contract_path": "architecture/wp10b-project-store-contract.json",
+    "pre_correction_contract_sha256": "18648115c209bdd3acdc3a64cd96b410e973f00bcc188c5cd1674c7e72a0126c",
+    "protected_main_commit": "31633543db14b0f40c9c6c41fd9edbff55ddd254",
+    "protected_main_tree": "bc2d9ce45f1ce1481479ee01a25d27e33b4d55bd",
+    "hosted_run": "https://github.com/kirchhausenlab/mirante4d/actions/runs/29219006351",
+    "hosted_result": "success"
+  },
+  "discovered_gap": {
+    "transition_inventory": "The accepted commands include pin, unpin, and purge, but the exhaustive mutation inventory names no injectable write, remove, or directory-sync transitions for them.",
+    "risk": "Those commands could be implemented without the named failure and process-kill evidence required for every authority mutation."
+  },
+  "correction": {
+    "pin": [
+      "pin_stage_create",
+      "pin_write",
+      "pin_file_sync",
+      "pin_replace",
+      "pin_directory_sync"
+    ],
+    "unpin": [
+      "unpin_remove",
+      "unpin_directory_sync"
+    ],
+    "purge": [
+      "purge_remove",
+      "purge_directory_sync"
+    ],
+    "supplemented_contract_field": "transition_inventory",
+    "added_contract_paths": [
+      "transition_inventory.pin",
+      "transition_inventory.unpin",
+      "transition_inventory.purge"
+    ],
+    "superseded_contract_path": "transition_inventory.injection",
+    "replacement_injection_rule": "each named transition supports before and after injection plus a zero-based occurrence for every repeated transition"
+  },
+  "unchanged": [
+    "the sixteen public root exports",
+    "commands, completions, faults, and limits",
+    "persisted paths and bytes",
+    "lease, compaction, and purge policy",
+    "fixtures, dependencies, and product reachability"
+  ],
+  "allowed_paths": [
+    "architecture/wp10b-project-store-maintenance-transition-correction.json",
+    "architecture/wp10b-project-store-contract.json",
+    "crates/xtask/src/arch/wp10b.rs",
+    "verification/predecessor-disposition.json",
+    "docs/ARCHITECTURE.md",
+    "docs/CURRENT_STATE.md",
+    "docs/TESTING.md",
+    "docs/planning/NOW.md",
+    "docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md",
+    "docs/plans/active/foundation-refactor/PROJECT_STORE_DURABILITY_BRIEF.md"
+  ],
+  "evidence": [
+    "exact architecture binding and normalized-contract checks",
+    "named before/after transition hooks with occurrence selection when each command is implemented",
+    "unchanged public root, dependency, fixture, and wire guards"
+  ],
+  "stop_condition": "Any command shape, public export, persisted byte, ref shape, path, fault, dependency, product wiring, or deletion policy must change.",
+  "rollback": "revert this correction before maintenance-command implementation; the project store remains off-product"
+}

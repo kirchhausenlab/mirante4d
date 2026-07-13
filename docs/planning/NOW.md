@@ -39,6 +39,10 @@ and load a freshly selected projection without repair or promotion. B2 remains
 active off-product: public Create/Open/Save As execution, provisional autosave
 publication, timers, garbage collection, full verification, and public actor
 wiring remain later work, with product activation at B4.
+Private Pin/Unpin now supplies durable checkpoint roots with fresh graph,
+capacity, cancellation, and read-only enforcement. The accepted maintenance
+transition correction names pin, unpin, and purge phases for the later
+exhaustive failure matrix.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.

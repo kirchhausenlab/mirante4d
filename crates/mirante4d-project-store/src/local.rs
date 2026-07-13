@@ -196,6 +196,7 @@ struct StoreInventory {
     entries: usize,
     root_entries: usize,
     refs_entries: Option<usize>,
+    pins_entries: Option<usize>,
     staging_entries: Option<usize>,
     inspect_staging: bool,
 }
@@ -204,6 +205,7 @@ struct StoreInventory {
 enum InventoryDirectory {
     Root,
     Refs,
+    Pins,
     Staging,
     Other,
 }
@@ -772,6 +774,33 @@ impl LocalStoreRoot {
         Ok(pins)
     }
 
+    pub(crate) fn read_pin_ref<C>(
+        &self,
+        checkpoint_id: &str,
+        limits: ProjectStoreLimits,
+        is_cancelled: C,
+    ) -> Result<Option<RefRecord>, LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        let path = pin_relative_path(checkpoint_id)?;
+        let Some(bytes) = self.read_optional_small_file(
+            &path,
+            u64::try_from(limits.ref_record_bytes_max)
+                .map_err(|_| LocalPublicationError::InvalidControl)?,
+            is_cancelled,
+        )?
+        else {
+            return Ok(None);
+        };
+        if bytes.len() != limits.ref_record_bytes_exact || bytes.len() != REF_BYTES {
+            return Err(LocalPublicationError::InvalidControl);
+        }
+        RefRecord::decode(RefKind::Pin, &bytes)
+            .map(Some)
+            .map_err(|_| LocalPublicationError::InvalidControl)
+    }
+
     /// Requires the prepared store's ref namespace to contain no fixed,
     /// pinned, or unknown ref. An empty `refs/pins` directory is harmless;
     /// every visible entry is bounded and checked through held descriptors.
@@ -857,6 +886,7 @@ impl LocalStoreRoot {
         self.validate_store_inventory_mode(
             limits,
             pending_fixed_refs,
+            0,
             replaces_fixed_ref,
             true,
             is_cancelled,
@@ -874,13 +904,33 @@ impl LocalStoreRoot {
     where
         C: FnMut() -> bool,
     {
-        self.validate_store_inventory_mode(limits, 0, false, false, is_cancelled)
+        self.validate_store_inventory_mode(limits, 0, 0, false, false, is_cancelled)
+    }
+
+    pub(crate) fn validate_pin_inventory<C>(
+        &self,
+        limits: ProjectStoreLimits,
+        creates_pin: bool,
+        is_cancelled: C,
+    ) -> Result<(), LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        self.validate_store_inventory_mode(
+            limits,
+            0,
+            usize::from(creates_pin),
+            !creates_pin,
+            true,
+            is_cancelled,
+        )
     }
 
     fn validate_store_inventory_mode<C>(
         &self,
         limits: ProjectStoreLimits,
         pending_fixed_refs: usize,
+        pending_pin_refs: usize,
         replaces_fixed_ref: bool,
         inspect_staging: bool,
         mut is_cancelled: C,
@@ -889,7 +939,7 @@ impl LocalStoreRoot {
         C: FnMut() -> bool,
     {
         check_cancelled(&mut is_cancelled)?;
-        let publishes_ref = pending_fixed_refs != 0 || replaces_fixed_ref;
+        let publishes_ref = pending_fixed_refs != 0 || pending_pin_refs != 0 || replaces_fixed_ref;
         if publishes_ref {
             let publication_descriptors = REF_PUBLICATION_DESCRIPTORS
                 .checked_add(self.external_held_descriptors)
@@ -911,8 +961,11 @@ impl LocalStoreRoot {
             &mut is_cancelled,
         )?;
 
-        let creates_refs_directory =
-            usize::from(pending_fixed_refs != 0 && inventory.refs_entries.is_none());
+        let creates_refs_directory = usize::from(
+            (pending_fixed_refs != 0 || pending_pin_refs != 0) && inventory.refs_entries.is_none(),
+        );
+        let creates_pins_directory =
+            usize::from(pending_pin_refs != 0 && inventory.pins_entries.is_none());
         let creates_staging_directory =
             usize::from(publishes_ref && inventory.staging_entries.is_none());
         let private_transaction_entries = if publishes_ref {
@@ -920,7 +973,7 @@ impl LocalStoreRoot {
             // replacement also holds its staged payload beside the existing
             // destination until rename, and its preceding recovery stage may
             // remain after best-effort cleanup. A create's payload is already
-            // counted by `pending_fixed_refs`.
+            // counted by its pending persistent ref.
             1_usize
                 .checked_add(usize::from(replaces_fixed_ref) * 2)
                 .ok_or_else(|| capacity_overflow(limits.physical_store_entries_max))?
@@ -928,7 +981,9 @@ impl LocalStoreRoot {
             0
         };
         let projected_additions = pending_fixed_refs
-            .checked_add(creates_refs_directory)
+            .checked_add(pending_pin_refs)
+            .and_then(|value| value.checked_add(creates_refs_directory))
+            .and_then(|value| value.checked_add(creates_pins_directory))
             .and_then(|value| value.checked_add(creates_staging_directory))
             .and_then(|value| value.checked_add(private_transaction_entries))
             .ok_or_else(|| capacity_overflow(limits.physical_store_entries_max))?;
@@ -953,10 +1008,28 @@ impl LocalStoreRoot {
         enforce_count(
             checked_count_add(
                 inventory.refs_entries.unwrap_or(0),
-                pending_fixed_refs,
+                pending_fixed_refs
+                    .checked_add(creates_pins_directory)
+                    .ok_or_else(|| capacity_overflow(limits.directory_fanout_entries_max))?,
                 limits.directory_fanout_entries_max,
             )?,
             limits.directory_fanout_entries_max,
+        )?;
+        enforce_count(
+            checked_count_add(
+                inventory.pins_entries.unwrap_or(0),
+                pending_pin_refs,
+                limits.directory_fanout_entries_max,
+            )?,
+            limits.directory_fanout_entries_max,
+        )?;
+        enforce_count(
+            checked_count_add(
+                inventory.pins_entries.unwrap_or(0),
+                pending_pin_refs,
+                limits.pin_refs_max,
+            )?,
+            limits.pin_refs_max,
         )?;
         if publishes_ref {
             enforce_count(
@@ -1122,6 +1195,114 @@ impl LocalStoreRoot {
                 Err(LocalPublicationError::AtomicPublishUnsupported)
             }
             Err(error) => Err(io_error("replace a project ref", error)),
+        }
+    }
+
+    pub(crate) fn replace_pin<C>(
+        &self,
+        checkpoint_id: &str,
+        expected: Option<RefRecord>,
+        next: RefRecord,
+        limits: ProjectStoreLimits,
+        mut is_cancelled: C,
+    ) -> Result<(), LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        let destination = pin_relative_path(checkpoint_id)?;
+        if next.kind() != RefKind::Pin
+            || limits.ref_record_bytes_exact != REF_BYTES
+            || expected.is_some_and(|record| {
+                record.kind() != RefKind::Pin || record.project_id() != next.project_id()
+            })
+        {
+            return Err(LocalPublicationError::InvalidControl);
+        }
+        if self.read_pin_ref(checkpoint_id, limits, &mut is_cancelled)? != expected {
+            return Err(LocalPublicationError::RefChanged);
+        }
+
+        let (destination_parent, destination_name) = self.open_or_create_parent(&destination)?;
+        let mut stage = Stage::begin(self)?;
+        let mut staged_file = stage.create_file()?;
+        staged_file
+            .write_all(&next.encode())
+            .map_err(|source| LocalPublicationError::Io {
+                operation: "write a staged project pin",
+                source,
+            })?;
+        fsync(&staged_file).map_err(|error| io_error("synchronize a staged project pin", error))?;
+        drop(staged_file);
+        check_cancelled(&mut is_cancelled)?;
+        if self.read_pin_ref(checkpoint_id, limits, &mut is_cancelled)? != expected {
+            return Err(LocalPublicationError::RefChanged);
+        }
+
+        let replaced = if expected.is_some() {
+            renameat(
+                &stage.directory,
+                OsStr::new(STAGED_FILE),
+                &destination_parent,
+                &destination_name,
+            )
+        } else {
+            renameat_with(
+                &stage.directory,
+                OsStr::new(STAGED_FILE),
+                &destination_parent,
+                &destination_name,
+                RenameFlags::NOREPLACE,
+            )
+        };
+        match replaced {
+            Ok(()) => {
+                stage.file_owned = false;
+                let staging_result = self.sync_ref_commit_directory(&stage.directory);
+                let destination_result = self.sync_ref_commit_directory(&destination_parent);
+                if staging_result.is_err() || destination_result.is_err() {
+                    return Err(LocalPublicationError::RefCommitIndeterminate);
+                }
+                Ok(())
+            }
+            Err(Errno::EXIST) => Err(LocalPublicationError::RefChanged),
+            Err(error)
+                if error == Errno::NOSYS || error == Errno::INVAL || error == Errno::OPNOTSUPP =>
+            {
+                Err(LocalPublicationError::AtomicPublishUnsupported)
+            }
+            Err(error) => Err(io_error("replace a project pin", error)),
+        }
+    }
+
+    pub(crate) fn remove_pin<C>(
+        &self,
+        checkpoint_id: &str,
+        expected: RefRecord,
+        limits: ProjectStoreLimits,
+        mut is_cancelled: C,
+    ) -> Result<(), LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        let path = pin_relative_path(checkpoint_id)?;
+        if expected.kind() != RefKind::Pin
+            || self.read_pin_ref(checkpoint_id, limits, &mut is_cancelled)? != Some(expected)
+        {
+            return Err(LocalPublicationError::RefChanged);
+        }
+        let Some((parent, name)) = self.open_existing_parent_if_present(&path)? else {
+            return Err(LocalPublicationError::RefChanged);
+        };
+        check_cancelled(&mut is_cancelled)?;
+        if self.read_pin_ref(checkpoint_id, limits, &mut is_cancelled)? != Some(expected) {
+            return Err(LocalPublicationError::RefChanged);
+        }
+        match unlinkat(&parent, &name, AtFlags::empty()) {
+            Ok(()) => self
+                .sync_ref_commit_directory(&parent)
+                .map_err(|_| LocalPublicationError::RefCommitIndeterminate),
+            Err(Errno::NOENT) => Err(LocalPublicationError::RefChanged),
+            Err(error) => Err(io_error("remove a project pin", error)),
         }
     }
 
@@ -1797,6 +1978,8 @@ where
                         b"staging" => InventoryDirectory::Staging,
                         _ => InventoryDirectory::Other,
                     }
+                } else if role == InventoryDirectory::Refs && name.to_bytes() == b"pins" {
+                    InventoryDirectory::Pins
                 } else {
                     InventoryDirectory::Other
                 };
@@ -1815,6 +1998,7 @@ where
     match role {
         InventoryDirectory::Root => inventory.root_entries = fan_out,
         InventoryDirectory::Refs => inventory.refs_entries = Some(fan_out),
+        InventoryDirectory::Pins => inventory.pins_entries = Some(fan_out),
         InventoryDirectory::Staging => inventory.staging_entries = Some(fan_out),
         InventoryDirectory::Other => {}
     }
@@ -2402,6 +2586,13 @@ fn ref_relative_path(kind: RefKind) -> Result<PathBuf, LocalPublicationError> {
     Ok(PathBuf::from("refs").join(name))
 }
 
+fn pin_relative_path(checkpoint_id: &str) -> Result<PathBuf, LocalPublicationError> {
+    if !valid_checkpoint_id(checkpoint_id) {
+        return Err(LocalPublicationError::InvalidControl);
+    }
+    Ok(PathBuf::from("refs").join("pins").join(checkpoint_id))
+}
+
 fn valid_checkpoint_name(name: &[u8]) -> bool {
     let Some((&first, rest)) = name.split_first() else {
         return false;
@@ -2411,6 +2602,10 @@ fn valid_checkpoint_name(name: &[u8]) -> bool {
         && rest.iter().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_' || *byte == b'-'
         })
+}
+
+pub(crate) fn valid_checkpoint_id(checkpoint_id: &str) -> bool {
+    valid_checkpoint_name(checkpoint_id.as_bytes())
 }
 
 fn open_stable_directory_if_present(

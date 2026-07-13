@@ -2459,6 +2459,14 @@
       "reason": "WP-10B B2 proves private recovery inspection/open preserve actual session heads and bytes across normal, corrupt-head, and writer-contended read-only sessions."
     },
     {
+      "id": "libtest:mirante4d-project-store:actor::tests::pin_and_unpin_are_correlated_graph_safe_and_reject_read_only_sessions",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves bounded checkpoint admission plus correlated private Pin/Unpin graph effects, typed target faults, and writer-contended read-only rejection."
+    },
+    {
       "id": "libtest:mirante4d-project-store:actor::tests::save_as_authentication_rejects_stale_fork_target_and_science_before_reads",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -2737,6 +2745,46 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 enforces exact global-entry, nested fan-out, and descriptor caps, including pending refs and the two-stage recovery/head peak."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:pin::tests::pin_and_unpin_sync_failure_is_indeterminate_and_suspends_writes",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves post-Pin/Unpin directory-sync uncertainty is indeterminate and suspends further writes."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:pin::tests::pin_create_replace_and_unpin_change_only_the_named_root",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves durable pin create, replace, and idempotent unpin change only the named liveness root."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:pin::tests::pin_rejects_invalid_capacity_read_only_and_cancelled_work_without_mutation",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves checkpoint grammar, target, pin-cap, cancellation, and read-only failures publish no pin."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:pin::tests::pin_rejects_linked_checkpoint_files_without_touching_outside_data",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 rejects symlinked and hardlinked checkpoint refs without following or changing outside data."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:pin::tests::unpin_rejects_a_post_state_above_the_recovery_candidate_cap",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 rejects Pin/Unpin post-states that would exceed the bounded recovery-candidate review set."
     },
     {
       "id": "libtest:mirante4d-project-store:transaction::tests::closure_union_reuses_identical_physical_objects",
@@ -5900,6 +5948,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 531
+    "current_additions": 537
   }
 }
