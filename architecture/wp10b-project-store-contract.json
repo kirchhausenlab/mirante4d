@@ -43,6 +43,10 @@
       "path": "architecture/wp10b-project-store-staging-cleanup-correction.json",
       "sha256": "890f405df832e895da229ba26515efb734fcbe0ccc098f61c7674798a4222324"
     },
+    "public_actor_lifecycle_correction": {
+      "path": "architecture/wp10b-project-store-public-actor-lifecycle-correction.json",
+      "sha256": "ac1a7804655af4dab8110f7a584a7bf990ac25a9b03799da9d03638e3d787bbc"
+    },
     "protected_main": {
       "commit": "b6e0267802f8ac2d0d49a0f04302fd321ef2f617",
       "tree": "b20b598603b47fdbe7c85c3b6d1cba8c78fd433e",
@@ -436,7 +440,7 @@
     "ProjectStoreSession"
   ],
   "public_api_contract": {
-    "actor": "owns exactly one live session, every OS lease, the bounded request/completion queues, and the sole active filesystem transaction",
+    "actor": "starts unbound, then owns at most one live normal or recovery-only session, every OS lease, the bounded request/completion queues, and the sole active filesystem transaction",
     "session": "immutable safe metadata only: project ID, current manual/autosave generation IDs, effective open mode, and a display-safe package root; no lock or internal object paths",
     "open_modes": [
       "read_only",
@@ -492,6 +496,19 @@
       "commit_indeterminate"
     ],
     "config": "contains no filesystem-qualification bypass, hard-limit bypass, retry, compatibility, or alternate-path switch"
+  },
+  "public_actor_lifecycle_contract": {
+    "methods": "ProjectStoreActor::start(config), nonblocking try_submit, nonblocking try_recv, has_exited, and joined cancellation shutdown through join; Drop requests cancellation and does not block",
+    "ownership": "one worker is unbound or owns exactly one held root and its leases; filesystem work never runs on the caller thread and an installed package crosses directly into actor ownership without close/reopen",
+    "autosave_destination": "Autosave carries destination as Option<ProjectStorePath>; unbound first provisional publication requires Some, while bound provisional or established advance requires None; every other combination fails before mutation",
+    "create": "unbound Create installs a fresh initial manual package; Create from a healthy provisional session performs a same-project, same-science, fork-absent, non-regressing-high-water initial-manual handoff to an absent destination and transfers ownership only after durable success",
+    "old_unsaved_package": "a successful first-manual handoff does not mutate, delete, repair, or retain authority over the old provisional package; bounded application recovery-area pruning remains later work",
+    "open": "unbound Open honors the requested mode and returns the actual held session plus authoritative projection for a healthy established or provisional store; failure before bounded recovery validation leaves the actor unbound",
+    "recovery_only": "when bounded recovery validation succeeds but normal authority loading fails, Open returns the normal fault while retaining a recovery-only session; it accepts InspectRecovery, OpenRecovery, FullVerify, Cancel, and Close, rejects every mutation, and after successful explicit selection additionally permits only SaveAs with that exact selected generation, a new ProjectId, and fork provenance as a new authority",
+    "normal_bound": "normal sessions retain the accepted session commands; ManualSave is established-only, a provisional first manual project uses Create, and a recovery-selected project uses only the corrected SaveAs flow",
+    "binding_conflict": "Create or Open against an incompatible bound session completes with a typed corruption fault and changes no session",
+    "completion": "every accepted request still produces exactly one existing terminal correlated completion; first provisional publication uses Autosaved and no new completion or fault variant is added",
+    "close": "Close is valid unbound or bound, cancels queued and active work at accepted safe boundaries, releases the held session, emits Closed, and terminates the worker; joined shutdown creates no new completion obligation"
   },
   "provisional_autosave_contract": {
     "base": "an established-project autosave requires the current manual generation as its base; a provisional autosave has no manual base in its capture, generation, head ref, or receipt",

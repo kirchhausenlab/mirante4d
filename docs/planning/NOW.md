@@ -36,9 +36,7 @@ honest manual-branch recovery classification without changing persisted bytes.
 A bounded private recovery reader and actor path now classify all four fixtures,
 fall back across corrupt heads/targets, scan only after exhausted lane fallback,
 and load a freshly selected projection without repair or promotion. B2 remains
-active off-product: public Create/Open/Save As execution, provisional-autosave
-actor and timer wiring, public/product garbage collection and Purge wiring, and
-public actor wiring remain later work, with product activation at B4.
+active off-product, with product activation at B4.
 Private Pin/Unpin now supplies durable checkpoint roots with fresh graph,
 capacity, cancellation, and read-only enforcement. All seven frozen phases now
 have exact before/after occurrence injection plus a 16-case actual `SIGKILL`,
@@ -81,9 +79,11 @@ already-frozen autosave-only state has no manual base, starts at one
 caller-supplied no-clobber package path, and advances through the existing lane
 protocol. The private publisher now implements first publication, exact-only
 uncertain-install adoption, base-less advance, cancellation, and exact fresh
-retry with four focused transaction cases. Exhaustive transition/process-kill
-evidence remains later. The next narrow B2 checkpoint is public actor/session
-lifecycle, followed by the remaining durability qualification.
+retry with four focused transaction cases. The public actor now starts unbound
+and owns fresh Create, healthy Open, provisional publication and manual
+handoff, normal session commands, and recovery-selected Save As while retaining
+the damaged source unchanged. Its focused lifecycle cases cover those routes;
+the remaining B2 durability qualification is next.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.

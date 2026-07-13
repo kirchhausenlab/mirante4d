@@ -1,7 +1,4 @@
-//! Crate-private execution core for one recovery-capable project session.
-//!
-//! The public actor remains deliberately non-constructible until open/create,
-//! recovery, and product wiring can establish the complete session contract.
+//! Execution core for one public unbound-or-session project-store actor.
 
 #![cfg(target_os = "linux")]
 #![cfg_attr(not(test), allow(dead_code))]
@@ -11,7 +8,6 @@ use std::{
     sync::{
         Arc, Condvar, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
-        mpsc,
     },
     thread::{self, JoinHandle},
 };
@@ -30,15 +26,16 @@ use crate::{
     ProjectStoreCompletion, ProjectStoreConfig, ProjectStoreDiagnostics, ProjectStoreFault,
     ProjectStorePath, ProjectStoreReceipt, ProjectStoreRequestId, ProjectStoreSession,
     inspection::{
-        RecoveryInspection, cleanup_dead_writer_staging, inspect_established_store,
-        inspect_recovery, open_recovery,
+        RecoveryInspection, StoreStateInspection, cleanup_dead_writer_staging,
+        inspect_established_store, inspect_recovery, inspect_store_state, open_recovery,
     },
     lease::{LeaseError, ProjectStoreLeases},
     local::{LocalStoreRoot, valid_checkpoint_id},
     pin::{publish_pin, remove_pin},
     transaction::{
-        InitialPackageMode, install_initial_manual_package,
-        publish_established_autosave_generation, publish_established_manual_generation,
+        InitialPackageMode, InstalledInitialPackage, install_initial_manual_package,
+        install_initial_provisional_autosave_package, publish_established_autosave_generation,
+        publish_established_manual_generation, publish_provisional_autosave_generation,
     },
     trash::{purge_trash, trash_generations},
 };
@@ -79,12 +76,23 @@ struct Active {
 }
 
 enum Work {
+    Create {
+        request_id: ProjectStoreRequestId,
+        destination: ProjectStorePath,
+        capture: ProjectCommitCapture,
+    },
+    Open {
+        request_id: ProjectStoreRequestId,
+        path: ProjectStorePath,
+        mode: ProjectOpenMode,
+    },
     ManualSave {
         request_id: ProjectStoreRequestId,
         capture: ProjectCommitCapture,
     },
     Autosave {
         request_id: ProjectStoreRequestId,
+        destination: Option<ProjectStorePath>,
         capture: ProjectCommitCapture,
     },
     SaveAs {
@@ -127,7 +135,9 @@ enum Work {
 impl Work {
     const fn request_id(&self) -> ProjectStoreRequestId {
         match self {
-            Self::ManualSave { request_id, .. }
+            Self::Create { request_id, .. }
+            | Self::Open { request_id, .. }
+            | Self::ManualSave { request_id, .. }
             | Self::Autosave { request_id, .. }
             | Self::SaveAs { request_id, .. }
             | Self::InspectRecovery { request_id }
@@ -147,6 +157,14 @@ impl Work {
 
     fn cancelled_completion(self) -> ProjectStoreCompletion {
         match self {
+            Self::Create { request_id, .. } => ProjectStoreCompletion::Created {
+                request_id,
+                result: Err(ProjectStoreFault::Cancelled),
+            },
+            Self::Open { request_id, .. } => ProjectStoreCompletion::Opened {
+                request_id,
+                result: Err(ProjectStoreFault::Cancelled),
+            },
             Self::ManualSave { request_id, .. } => ProjectStoreCompletion::ManualSaved {
                 request_id,
                 result: Err(ProjectStoreFault::Cancelled),
@@ -203,7 +221,126 @@ struct SessionResources {
     leases: ProjectStoreLeases,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NormalSessionKind {
+    Established,
+    Provisional,
+}
+
+enum ActorSession {
+    Normal {
+        resources: SessionResources,
+        kind: NormalSessionKind,
+    },
+    RecoveryOnly {
+        resources: SessionResources,
+        selected_generation: Option<ProjectGenerationId>,
+    },
+}
+
+impl ActorSession {
+    fn resources(&self) -> &SessionResources {
+        match self {
+            Self::Normal { resources, .. } | Self::RecoveryOnly { resources, .. } => resources,
+        }
+    }
+
+    fn resources_mut(&mut self) -> &mut SessionResources {
+        match self {
+            Self::Normal { resources, .. } | Self::RecoveryOnly { resources, .. } => resources,
+        }
+    }
+}
+
 impl SessionResources {
+    fn from_installed(
+        path: ProjectStorePath,
+        project_id: mirante4d_project_model::ProjectId,
+        installed: InstalledInitialPackage,
+        kind: NormalSessionKind,
+    ) -> (ActorSession, ProjectStoreReceipt, ProjectStoreSession) {
+        let (root, leases, receipt) = installed.into_parts();
+        let session = ProjectStoreSession::new(
+            path.clone(),
+            project_id,
+            leases.effective_mode(),
+            (kind == NormalSessionKind::Established).then_some(receipt.current_generation_id()),
+            (kind == NormalSessionKind::Provisional).then_some(receipt.current_generation_id()),
+        );
+        (
+            ActorSession::Normal {
+                resources: Self { path, root, leases },
+                kind,
+            },
+            receipt,
+            session,
+        )
+    }
+
+    fn create_from_provisional<C>(
+        &mut self,
+        destination: ProjectStorePath,
+        capture: ProjectCommitCapture,
+        limits: crate::ProjectStoreLimits,
+        mut is_cancelled: C,
+    ) -> Result<ProjectStoreSession, ProjectStoreFault>
+    where
+        C: FnMut() -> bool,
+    {
+        match self.leases.confirm_writer(&self.root) {
+            Ok(true) => {}
+            Ok(false) => return Err(ProjectStoreFault::ReadOnly),
+            Err(LeaseError::Indeterminate) => return Err(ProjectStoreFault::CommitIndeterminate),
+            Err(LeaseError::InvalidAnchor | LeaseError::Io { .. }) => {
+                return Err(ProjectStoreFault::Corruption {
+                    stage: "actor_session_lease",
+                });
+            }
+        }
+        let state = inspect_store_state(&self.root, limits, &mut is_cancelled)?;
+        if !state.is_provisional() {
+            return Err(ProjectStoreFault::Corruption {
+                stage: "create_session_kind",
+            });
+        }
+        let source = state.authority_generation();
+        let projection = capture.projection();
+        if projection.state().project_id() != state.project_id()
+            || !projection
+                .state()
+                .dataset()
+                .has_same_scientific_content(source.projection().state().dataset())
+            || capture.forked_from().is_some()
+            || source.forked_from().is_some()
+            || projection.revision_high_water().sequence()
+                < source.projection().revision_high_water().sequence()
+        {
+            return Err(ProjectStoreFault::Corruption {
+                stage: "create_from_provisional",
+            });
+        }
+        let project_id = projection.state().project_id();
+        let installed = install_initial_manual_package(
+            &destination,
+            InitialPackageMode::Create,
+            capture,
+            limits,
+            &mut is_cancelled,
+        )?;
+        let (next, _receipt, session) = Self::from_installed(
+            destination,
+            project_id,
+            installed,
+            NormalSessionKind::Established,
+        );
+        let ActorSession::Normal { resources, .. } = next else {
+            unreachable!("an installed manual package is a normal session")
+        };
+        let old = std::mem::replace(self, resources);
+        drop(old);
+        Ok(session)
+    }
+
     fn save_as<C>(
         &mut self,
         destination: ProjectStorePath,
@@ -269,6 +406,59 @@ impl SessionResources {
         Ok(receipt)
     }
 
+    fn save_as_selected_recovery<C>(
+        &mut self,
+        selected_generation: ProjectGenerationId,
+        destination: ProjectStorePath,
+        source_generation: ProjectGenerationId,
+        capture: ProjectCommitCapture,
+        limits: crate::ProjectStoreLimits,
+        mut is_cancelled: C,
+    ) -> Result<ProjectStoreReceipt, ProjectStoreFault>
+    where
+        C: FnMut() -> bool,
+    {
+        if source_generation != selected_generation {
+            return Err(ProjectStoreFault::StaleParent);
+        }
+        let opened = open_recovery(&self.root, selected_generation, limits, &mut is_cancelled)?;
+        let (inspection, selected) = opened.into_parts();
+        let source_project_id = inspection.project_id();
+        if !capture
+            .projection()
+            .state()
+            .dataset()
+            .has_same_scientific_content(selected.state().dataset())
+            || capture.projection().revision_high_water().sequence()
+                < selected.revision_high_water().sequence()
+        {
+            return Err(ProjectStoreFault::Corruption {
+                stage: "save_as_recovery_selection",
+            });
+        }
+        let installed = install_initial_manual_package(
+            &destination,
+            InitialPackageMode::SaveAs {
+                source_project_id,
+                source_generation_id: selected_generation,
+            },
+            capture,
+            limits,
+            &mut is_cancelled,
+        )?;
+        let (root, leases, receipt) = installed.into_parts();
+        let old = std::mem::replace(
+            self,
+            Self {
+                path: destination,
+                root,
+                leases,
+            },
+        );
+        drop(old);
+        Ok(receipt)
+    }
+
     fn inspect_recovery<C>(
         &self,
         limits: crate::ProjectStoreLimits,
@@ -310,12 +500,26 @@ impl SessionResources {
             inspection.current_autosave_generation(),
         )
     }
+
+    fn session_from_state(&self, state: &StoreStateInspection) -> ProjectStoreSession {
+        ProjectStoreSession::new(
+            self.path.clone(),
+            state.project_id(),
+            self.leases.effective_mode(),
+            state.manual().map(|lane| lane.head.current()),
+            state.autosave().map(|lane| lane.head.current()),
+        )
+    }
 }
 
 impl EstablishedProjectActor {
-    pub(crate) fn start(
-        path: &ProjectStorePath,
+    pub(crate) fn start_unbound(config: ProjectStoreConfig) -> Result<Self, ProjectStoreFault> {
+        Self::start_inner(config, None)
+    }
+
+    fn start_inner(
         config: ProjectStoreConfig,
+        initial_session: Option<ActorSession>,
     ) -> Result<Self, ProjectStoreFault> {
         let limits = config.limits().validate()?;
         let shared = Arc::new(Shared {
@@ -340,43 +544,43 @@ impl EstablishedProjectActor {
             gc_transition_injector: OnceLock::new(),
         });
         let worker_shared = Arc::clone(&shared);
-        let worker_path = path.clone();
-        let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name(String::from("mirante4d-project-store"))
-            .spawn(move || match open_resources(&worker_path, limits) {
-                Ok(resources) => {
-                    if startup_sender.send(Ok(())).is_ok() {
-                        worker_main(worker_shared, resources, limits);
-                    }
-                }
-                Err(error) => {
-                    let _ = startup_sender.send(Err(error));
-                    let mut state = worker_shared.lock();
-                    state.worker_exited = true;
-                    worker_shared.wake.notify_all();
-                }
-            })
+            .spawn(move || worker_main(worker_shared, initial_session, limits))
             .map_err(|_| ProjectStoreFault::Corruption {
                 stage: "actor_spawn",
             })?;
-        match startup_receiver.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                let _ = worker.join();
-                return Err(error);
-            }
-            Err(_) => {
-                let _ = worker.join();
-                return Err(ProjectStoreFault::Corruption {
-                    stage: "actor_startup",
-                });
-            }
-        }
         Ok(Self {
             shared,
             worker: Some(worker),
         })
+    }
+
+    #[cfg(test)]
+    fn start_bound(
+        path: &ProjectStorePath,
+        config: ProjectStoreConfig,
+    ) -> Result<Self, ProjectStoreFault> {
+        let limits = config.limits().validate()?;
+        let outcome = open_resources(path, ProjectOpenMode::PreferWritable, limits, || false)?;
+        let session = match outcome {
+            OpenResources::Normal {
+                resources, kind, ..
+            } => ActorSession::Normal { resources, kind },
+            OpenResources::RecoveryOnly { resources, .. } => ActorSession::RecoveryOnly {
+                resources,
+                selected_generation: None,
+            },
+        };
+        Self::start_inner(config, Some(session))
+    }
+
+    #[cfg(test)]
+    fn start(
+        path: &ProjectStorePath,
+        config: ProjectStoreConfig,
+    ) -> Result<Self, ProjectStoreFault> {
+        Self::start_bound(path, config)
     }
 
     #[cfg(test)]
@@ -385,7 +589,7 @@ impl EstablishedProjectActor {
         config: ProjectStoreConfig,
         injector: Arc<GcTransitionInjector>,
     ) -> Result<Self, ProjectStoreFault> {
-        let actor = Self::start(path, config)?;
+        let actor = Self::start_bound(path, config)?;
         actor
             .shared
             .gc_transition_injector
@@ -394,9 +598,26 @@ impl EstablishedProjectActor {
         Ok(actor)
     }
 
-    /// Accepts only the established-session commands implemented by this core.
     pub(crate) fn try_submit(&self, command: ProjectStoreCommand) -> Result<(), ProjectStoreFault> {
         match command {
+            ProjectStoreCommand::Create {
+                request_id,
+                destination,
+                capture,
+            } => self.submit_work(Work::Create {
+                request_id,
+                destination,
+                capture,
+            }),
+            ProjectStoreCommand::Open {
+                request_id,
+                path,
+                mode,
+            } => self.submit_work(Work::Open {
+                request_id,
+                path,
+                mode,
+            }),
             ProjectStoreCommand::ManualSave {
                 request_id,
                 capture,
@@ -406,9 +627,11 @@ impl EstablishedProjectActor {
             }),
             ProjectStoreCommand::Autosave {
                 request_id,
+                destination,
                 capture,
             } if self.shared.autosave_enabled => self.submit_work(Work::Autosave {
                 request_id,
+                destination,
                 capture,
             }),
             ProjectStoreCommand::Autosave { .. } => Err(ProjectStoreFault::Corruption {
@@ -493,9 +716,6 @@ impl EstablishedProjectActor {
                 target_request_id,
             } => self.submit_cancel(request_id, target_request_id),
             ProjectStoreCommand::Close { request_id } => self.submit_close(request_id),
-            _ => Err(ProjectStoreFault::Corruption {
-                stage: "actor_command_unimplemented",
-            }),
         }
     }
 
@@ -754,12 +974,246 @@ fn actor_diagnostics(
     diagnostics
 }
 
+fn lifecycle_fault(stage: &'static str) -> ProjectStoreFault {
+    ProjectStoreFault::Corruption { stage }
+}
+
+fn normal_session_mut(
+    session: &mut Option<ActorSession>,
+) -> Result<(&mut SessionResources, NormalSessionKind), ProjectStoreFault> {
+    match session {
+        Some(ActorSession::Normal { resources, kind }) => Ok((resources, *kind)),
+        Some(ActorSession::RecoveryOnly { .. }) => Err(lifecycle_fault("actor_recovery_only")),
+        None => Err(lifecycle_fault("actor_unbound")),
+    }
+}
+
+fn any_session_mut(
+    session: &mut Option<ActorSession>,
+) -> Result<&mut SessionResources, ProjectStoreFault> {
+    session
+        .as_mut()
+        .map(ActorSession::resources_mut)
+        .ok_or_else(|| lifecycle_fault("actor_unbound"))
+}
+
+fn execute_create<C>(
+    session: &mut Option<ActorSession>,
+    destination: ProjectStorePath,
+    capture: ProjectCommitCapture,
+    limits: crate::ProjectStoreLimits,
+    mut is_cancelled: C,
+) -> Result<ProjectStoreSession, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    match session.take() {
+        None => {
+            let project_id = capture.projection().state().project_id();
+            let installed = install_initial_manual_package(
+                &destination,
+                InitialPackageMode::Create,
+                capture,
+                limits,
+                &mut is_cancelled,
+            )?;
+            let (next, _receipt, opened) = SessionResources::from_installed(
+                destination,
+                project_id,
+                installed,
+                NormalSessionKind::Established,
+            );
+            *session = Some(next);
+            Ok(opened)
+        }
+        Some(ActorSession::Normal {
+            mut resources,
+            kind: NormalSessionKind::Provisional,
+        }) => {
+            let result =
+                resources.create_from_provisional(destination, capture, limits, &mut is_cancelled);
+            let kind = if result.is_ok() {
+                NormalSessionKind::Established
+            } else {
+                NormalSessionKind::Provisional
+            };
+            *session = Some(ActorSession::Normal { resources, kind });
+            result
+        }
+        Some(other) => {
+            *session = Some(other);
+            Err(lifecycle_fault("create_session_bound"))
+        }
+    }
+}
+
+fn execute_open<C>(
+    session: &mut Option<ActorSession>,
+    path: ProjectStorePath,
+    mode: ProjectOpenMode,
+    limits: crate::ProjectStoreLimits,
+    is_cancelled: C,
+) -> Result<
+    (
+        ProjectStoreSession,
+        mirante4d_project_model::ProjectGenerationProjection,
+    ),
+    ProjectStoreFault,
+>
+where
+    C: FnMut() -> bool,
+{
+    if session.is_some() {
+        return Err(lifecycle_fault("open_session_bound"));
+    }
+    match open_resources(&path, mode, limits, is_cancelled)? {
+        OpenResources::Normal {
+            resources,
+            kind,
+            opened,
+            projection,
+        } => {
+            *session = Some(ActorSession::Normal { resources, kind });
+            Ok((opened, *projection))
+        }
+        OpenResources::RecoveryOnly {
+            resources,
+            normal_fault,
+        } => {
+            *session = Some(ActorSession::RecoveryOnly {
+                resources,
+                selected_generation: None,
+            });
+            Err(normal_fault)
+        }
+    }
+}
+
+fn execute_autosave<C>(
+    session: &mut Option<ActorSession>,
+    destination: Option<ProjectStorePath>,
+    capture: ProjectCommitCapture,
+    limits: crate::ProjectStoreLimits,
+    mut is_cancelled: C,
+) -> Result<ProjectStoreReceipt, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    match (session.take(), destination) {
+        (None, Some(destination)) => {
+            let project_id = capture.projection().state().project_id();
+            let installed = install_initial_provisional_autosave_package(
+                &destination,
+                capture,
+                limits,
+                &mut is_cancelled,
+            )?;
+            let (next, receipt, _opened) = SessionResources::from_installed(
+                destination,
+                project_id,
+                installed,
+                NormalSessionKind::Provisional,
+            );
+            *session = Some(next);
+            Ok(receipt)
+        }
+        (None, None) => Err(lifecycle_fault("autosave_destination")),
+        (Some(ActorSession::Normal { resources, kind }), None) => {
+            let result = match kind {
+                NormalSessionKind::Established => publish_established_autosave_generation(
+                    &resources.root,
+                    &resources.leases,
+                    capture,
+                    limits,
+                    &mut is_cancelled,
+                ),
+                NormalSessionKind::Provisional => publish_provisional_autosave_generation(
+                    &resources.root,
+                    &resources.leases,
+                    capture,
+                    limits,
+                    &mut is_cancelled,
+                ),
+            };
+            *session = Some(ActorSession::Normal { resources, kind });
+            result
+        }
+        (Some(other), _) => {
+            *session = Some(other);
+            Err(lifecycle_fault("autosave_destination"))
+        }
+    }
+}
+
+fn execute_save_as<C>(
+    session: &mut Option<ActorSession>,
+    destination: ProjectStorePath,
+    source_generation: ProjectGenerationId,
+    capture: ProjectCommitCapture,
+    limits: crate::ProjectStoreLimits,
+    mut is_cancelled: C,
+) -> Result<ProjectStoreReceipt, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    match session.take() {
+        Some(ActorSession::Normal {
+            mut resources,
+            kind: NormalSessionKind::Established,
+        }) => {
+            let result = resources.save_as(
+                destination,
+                source_generation,
+                capture,
+                limits,
+                &mut is_cancelled,
+            );
+            *session = Some(ActorSession::Normal {
+                resources,
+                kind: NormalSessionKind::Established,
+            });
+            result
+        }
+        Some(ActorSession::RecoveryOnly {
+            mut resources,
+            selected_generation: Some(selected_generation),
+        }) => {
+            let result = resources.save_as_selected_recovery(
+                selected_generation,
+                destination,
+                source_generation,
+                capture,
+                limits,
+                &mut is_cancelled,
+            );
+            let next = if result.is_ok() {
+                ActorSession::Normal {
+                    resources,
+                    kind: NormalSessionKind::Established,
+                }
+            } else {
+                ActorSession::RecoveryOnly {
+                    resources,
+                    selected_generation: Some(selected_generation),
+                }
+            };
+            *session = Some(next);
+            result
+        }
+        Some(other) => {
+            *session = Some(other);
+            Err(lifecycle_fault("save_as_session_kind"))
+        }
+        None => Err(lifecycle_fault("actor_unbound")),
+    }
+}
+
 fn worker_main(
     shared: Arc<Shared>,
-    resources: SessionResources,
+    initial_session: Option<ActorSession>,
     limits: crate::ProjectStoreLimits,
 ) {
-    let mut resources = Some(resources);
+    let mut session = initial_session;
     loop {
         let (work, cancelled) = {
             let mut state = shared.lock();
@@ -802,7 +1256,7 @@ fn worker_main(
                 .close_request
                 .take()
                 .expect("an idle worker wakes only for close or shutdown");
-            drop(resources.take());
+            drop(session.take());
             state.finish_reserved(ProjectStoreCompletion::Closed {
                 request_id,
                 result: Ok(()),
@@ -812,33 +1266,54 @@ fn worker_main(
             return;
         };
 
-        let session = resources.as_mut().expect("resources live until close");
         let completion = match work {
+            Work::Create {
+                request_id,
+                destination,
+                capture,
+            } => ProjectStoreCompletion::Created {
+                request_id,
+                result: execute_create(&mut session, destination, capture, limits, || {
+                    cancelled.load(Ordering::Acquire)
+                }),
+            },
+            Work::Open {
+                request_id,
+                path,
+                mode,
+            } => ProjectStoreCompletion::Opened {
+                request_id,
+                result: execute_open(&mut session, path, mode, limits, || {
+                    cancelled.load(Ordering::Acquire)
+                }),
+            },
             Work::ManualSave {
                 request_id,
                 capture,
             } => ProjectStoreCompletion::ManualSaved {
                 request_id,
-                result: publish_established_manual_generation(
-                    &session.root,
-                    &session.leases,
-                    capture,
-                    limits,
-                    || cancelled.load(Ordering::Acquire),
-                ),
+                result: normal_session_mut(&mut session).and_then(|(resources, kind)| {
+                    if kind != NormalSessionKind::Established {
+                        return Err(lifecycle_fault("manual_save_requires_create"));
+                    }
+                    publish_established_manual_generation(
+                        &resources.root,
+                        &resources.leases,
+                        capture,
+                        limits,
+                        || cancelled.load(Ordering::Acquire),
+                    )
+                }),
             },
             Work::Autosave {
                 request_id,
+                destination,
                 capture,
             } => ProjectStoreCompletion::Autosaved {
                 request_id,
-                result: publish_established_autosave_generation(
-                    &session.root,
-                    &session.leases,
-                    capture,
-                    limits,
-                    || cancelled.load(Ordering::Acquire),
-                ),
+                result: execute_autosave(&mut session, destination, capture, limits, || {
+                    cancelled.load(Ordering::Acquire)
+                }),
             },
             Work::SaveAs {
                 request_id,
@@ -847,126 +1322,153 @@ fn worker_main(
                 capture,
             } => ProjectStoreCompletion::SavedAs {
                 request_id,
-                result: session.save_as(destination, source_generation, capture, limits, || {
-                    cancelled.load(Ordering::Acquire)
-                }),
+                result: execute_save_as(
+                    &mut session,
+                    destination,
+                    source_generation,
+                    capture,
+                    limits,
+                    || cancelled.load(Ordering::Acquire),
+                ),
             },
             Work::InspectRecovery { request_id } => ProjectStoreCompletion::RecoveryInspected {
                 request_id,
-                result: session.inspect_recovery(limits, || cancelled.load(Ordering::Acquire)),
+                result: any_session_mut(&mut session).and_then(|resources| {
+                    resources.inspect_recovery(limits, || cancelled.load(Ordering::Acquire))
+                }),
             },
             Work::OpenRecovery {
                 request_id,
                 generation_id,
-            } => ProjectStoreCompletion::RecoveryOpened {
-                request_id,
-                result: session
-                    .open_recovery(generation_id, limits, || cancelled.load(Ordering::Acquire)),
-            },
+            } => {
+                let result = any_session_mut(&mut session).and_then(|resources| {
+                    resources
+                        .open_recovery(generation_id, limits, || cancelled.load(Ordering::Acquire))
+                });
+                if result.is_ok()
+                    && let Some(ActorSession::RecoveryOnly {
+                        selected_generation,
+                        ..
+                    }) = &mut session
+                {
+                    *selected_generation = Some(generation_id);
+                }
+                ProjectStoreCompletion::RecoveryOpened { request_id, result }
+            }
             Work::Pin {
                 request_id,
                 checkpoint_id,
                 generation_id,
             } => {
-                #[cfg(test)]
-                if let Some(injector) = shared.gc_transition_injector.get() {
-                    session
-                        .leases
-                        .set_gc_transition_injector(Arc::clone(injector));
-                }
-                ProjectStoreCompletion::Pinned {
-                    request_id,
-                    result: publish_pin(
-                        &session.root,
-                        &session.leases,
+                let result = normal_session_mut(&mut session).and_then(|(resources, _)| {
+                    #[cfg(test)]
+                    if let Some(injector) = shared.gc_transition_injector.get() {
+                        resources
+                            .leases
+                            .set_gc_transition_injector(Arc::clone(injector));
+                    }
+                    publish_pin(
+                        &resources.root,
+                        &resources.leases,
                         &checkpoint_id,
                         generation_id,
                         limits,
                         || cancelled.load(Ordering::Acquire),
-                    ),
-                }
+                    )
+                });
+                ProjectStoreCompletion::Pinned { request_id, result }
             }
             Work::Unpin {
                 request_id,
                 checkpoint_id,
             } => {
-                #[cfg(test)]
-                if let Some(injector) = shared.gc_transition_injector.get() {
-                    session
-                        .leases
-                        .set_gc_transition_injector(Arc::clone(injector));
-                }
-                ProjectStoreCompletion::Unpinned {
-                    request_id,
-                    result: remove_pin(
-                        &session.root,
-                        &session.leases,
+                let result = normal_session_mut(&mut session).and_then(|(resources, _)| {
+                    #[cfg(test)]
+                    if let Some(injector) = shared.gc_transition_injector.get() {
+                        resources
+                            .leases
+                            .set_gc_transition_injector(Arc::clone(injector));
+                    }
+                    remove_pin(
+                        &resources.root,
+                        &resources.leases,
                         &checkpoint_id,
                         limits,
                         || cancelled.load(Ordering::Acquire),
-                    ),
-                }
+                    )
+                });
+                ProjectStoreCompletion::Unpinned { request_id, result }
             }
             Work::PlanCompaction { request_id } => ProjectStoreCompletion::CompactionPlanned {
                 request_id,
-                result: crate::inspection::plan_compaction(&session.root, limits, || {
-                    cancelled.load(Ordering::Acquire)
+                result: normal_session_mut(&mut session).and_then(|(resources, _)| {
+                    crate::inspection::plan_compaction(&resources.root, limits, || {
+                        cancelled.load(Ordering::Acquire)
+                    })
                 }),
             },
             Work::Trash {
                 request_id,
                 generations,
             } => {
-                #[cfg(test)]
-                if let Some(injector) = shared.gc_transition_injector.get() {
-                    session
-                        .leases
-                        .set_gc_transition_injector(Arc::clone(injector));
-                }
-                let result = trash_generations(
-                    &session.root,
-                    &mut session.leases,
-                    &generations,
-                    limits,
-                    || cancelled.load(Ordering::Acquire),
-                )
-                .map(|diagnostics| actor_diagnostics(&shared, &session.leases, diagnostics));
+                let result = normal_session_mut(&mut session).and_then(|(resources, _)| {
+                    #[cfg(test)]
+                    if let Some(injector) = shared.gc_transition_injector.get() {
+                        resources
+                            .leases
+                            .set_gc_transition_injector(Arc::clone(injector));
+                    }
+                    trash_generations(
+                        &resources.root,
+                        &mut resources.leases,
+                        &generations,
+                        limits,
+                        || cancelled.load(Ordering::Acquire),
+                    )
+                    .map(|diagnostics| actor_diagnostics(&shared, &resources.leases, diagnostics))
+                });
                 ProjectStoreCompletion::Trashed { request_id, result }
             }
             Work::Purge { request_id } => {
-                #[cfg(test)]
-                if let Some(injector) = shared.gc_transition_injector.get() {
-                    session
-                        .leases
-                        .set_gc_transition_injector(Arc::clone(injector));
-                }
-                let result = purge_trash(&session.root, &mut session.leases, limits, || {
-                    cancelled.load(Ordering::Acquire)
-                })
-                .map(|diagnostics| actor_diagnostics(&shared, &session.leases, diagnostics));
+                let result = normal_session_mut(&mut session).and_then(|(resources, _)| {
+                    #[cfg(test)]
+                    if let Some(injector) = shared.gc_transition_injector.get() {
+                        resources
+                            .leases
+                            .set_gc_transition_injector(Arc::clone(injector));
+                    }
+                    purge_trash(&resources.root, &mut resources.leases, limits, || {
+                        cancelled.load(Ordering::Acquire)
+                    })
+                    .map(|diagnostics| actor_diagnostics(&shared, &resources.leases, diagnostics))
+                });
                 ProjectStoreCompletion::Purged { request_id, result }
             }
             Work::FullVerify { request_id } => {
-                let result = crate::full_verify::full_verify(&session.root, limits, || {
-                    cancelled.load(Ordering::Acquire)
-                })
-                .map(|diagnostics| actor_diagnostics(&shared, &session.leases, diagnostics));
+                let result = any_session_mut(&mut session).and_then(|resources| {
+                    crate::full_verify::full_verify(&resources.root, limits, || {
+                        cancelled.load(Ordering::Acquire)
+                    })
+                    .map(|diagnostics| actor_diagnostics(&shared, &resources.leases, diagnostics))
+                });
                 ProjectStoreCompletion::Verified { request_id, result }
             }
         };
-        let maintenance_lost = session.leases.maintenance_lost();
+        let maintenance_lost = session
+            .as_ref()
+            .is_some_and(|session| session.resources().leases.maintenance_lost());
         if maintenance_lost {
             let mut state = shared.lock();
             state.active = None;
             if state.shutdown {
                 state.completion_reservations = 0;
-                drop(resources.take());
+                drop(session.take());
                 state.worker_exited = true;
                 shared.wake.notify_all();
                 return;
             }
             state.accepting = false;
-            drop(resources.take());
+            drop(session.take());
             state.finish_reserved(completion);
             while !state.requests.is_empty() {
                 while !state.can_reserve_completion(shared.completion_limit) {
@@ -1003,39 +1505,74 @@ fn worker_main(
         shared.wake.notify_all();
     }
 
-    drop(resources.take());
+    drop(session.take());
     let mut state = shared.lock();
     state.worker_exited = true;
     shared.wake.notify_all();
 }
 
-fn open_resources(
+enum OpenResources {
+    Normal {
+        resources: SessionResources,
+        kind: NormalSessionKind,
+        opened: ProjectStoreSession,
+        projection: Box<mirante4d_project_model::ProjectGenerationProjection>,
+    },
+    RecoveryOnly {
+        resources: SessionResources,
+        normal_fault: ProjectStoreFault,
+    },
+}
+
+fn open_resources<C>(
     path: &ProjectStorePath,
+    mode: ProjectOpenMode,
     limits: crate::ProjectStoreLimits,
-) -> Result<SessionResources, ProjectStoreFault> {
+    mut is_cancelled: C,
+) -> Result<OpenResources, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
     let root = LocalStoreRoot::open(path.as_path()).map_err(|_| ProjectStoreFault::Corruption {
-        stage: "actor_startup_open",
+        stage: "actor_open",
     })?;
-    let leases =
-        ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).map_err(|error| {
-            match error {
-                LeaseError::Indeterminate => ProjectStoreFault::CommitIndeterminate,
-                LeaseError::InvalidAnchor | LeaseError::Io { .. } => {
-                    ProjectStoreFault::Corruption {
-                        stage: "actor_startup_lease",
-                    }
-                }
-            }
-        })?;
-    inspect_recovery(&root, limits, || false)?;
+    let leases = ProjectStoreLeases::acquire(&root, mode).map_err(|error| match error {
+        LeaseError::Indeterminate => ProjectStoreFault::CommitIndeterminate,
+        LeaseError::InvalidAnchor | LeaseError::Io { .. } => ProjectStoreFault::Corruption {
+            stage: "actor_open_lease",
+        },
+    })?;
+    inspect_recovery(&root, limits, &mut is_cancelled)?;
     if leases.has_writer() {
-        cleanup_dead_writer_staging(&root, &leases, limits, || false)?;
+        cleanup_dead_writer_staging(&root, &leases, limits, &mut is_cancelled)?;
     }
-    Ok(SessionResources {
+    let resources = SessionResources {
         path: path.clone(),
         root,
         leases,
-    })
+    };
+    match inspect_store_state(&resources.root, limits, &mut is_cancelled) {
+        Ok(state) => {
+            let kind = if state.is_provisional() {
+                NormalSessionKind::Provisional
+            } else {
+                NormalSessionKind::Established
+            };
+            let opened = resources.session_from_state(&state);
+            let projection = Box::new(state.authority_generation().projection().clone());
+            Ok(OpenResources::Normal {
+                resources,
+                kind,
+                opened,
+                projection,
+            })
+        }
+        Err(ProjectStoreFault::Cancelled) => Err(ProjectStoreFault::Cancelled),
+        Err(normal_fault) => Ok(OpenResources::RecoveryOnly {
+            resources,
+            normal_fault,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -1068,7 +1605,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        ProjectGenerationId, ProjectObjectSource, ProjectStoreLimits,
+        ProjectGenerationId, ProjectObjectSource, ProjectStoreActor, ProjectStoreLimits,
         generation::{ArtifactStorage, GenerationDocument, LogicalObjectBinding},
         lease::{GcTransition, GcTransitionTarget, TransitionEdge},
         wire::ProjectEnvelope,
@@ -1114,6 +1651,10 @@ mod tests {
     const STALE_AUTOSAVE: &str = concat!(
         "m4d-project-generation-v1-sha256:",
         "c357ffd5f7c051bf22877ffcd6680bdcd0f7db4068af93587e4a1f5bed0542a0"
+    );
+    const PROVISIONAL_AUTOSAVE: &str = concat!(
+        "m4d-project-generation-v1-sha256:",
+        "a1a84e1b98686c1d9eda416177988e691695baed74244ff5b99136e839ab0cea"
     );
     const RECOVERABLE_G1: &str = concat!(
         "m4d-project-generation-v1-sha256:",
@@ -1436,10 +1977,427 @@ mod tests {
     }
 
     #[test]
+    fn public_actor_fresh_create_binds_exact_resources_and_rejects_incompatible_commands() {
+        let parent = TestDirectory::new("public-create");
+        let destination = parent.destination("created.m4dproj");
+        let frozen = frozen_generation(STALE_MANUAL);
+        let actor = ProjectStoreActor::start(Default::default()).unwrap();
+        assert!(actor.try_recv().is_none());
+
+        let provisional = frozen_generation_in("provisional.m4dproj", PROVISIONAL_AUTOSAVE);
+        let (invalid_autosave, _) = controlled_fixture_capture(
+            "provisional.m4dproj",
+            &provisional,
+            provisional.projection().clone(),
+            None,
+            None,
+            None,
+            ControlledRead::Normal,
+        );
+        actor
+            .try_submit(ProjectStoreCommand::Autosave {
+                request_id: request_id(1),
+                destination: None,
+                capture: invalid_autosave,
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&actor),
+            ProjectStoreCompletion::Autosaved {
+                request_id: actual,
+                result: Err(ProjectStoreFault::Corruption {
+                    stage: "autosave_destination"
+                }),
+            } if actual == request_id(1)
+        ));
+
+        let (capture, _) = controlled_fixture_capture(
+            "stale.m4dproj",
+            &frozen,
+            frozen.projection().clone(),
+            None,
+            None,
+            None,
+            ControlledRead::Normal,
+        );
+        actor
+            .try_submit(ProjectStoreCommand::Create {
+                request_id: request_id(2),
+                destination: destination.clone(),
+                capture,
+            })
+            .unwrap();
+        let opened = match public_recv_timeout(&actor) {
+            ProjectStoreCompletion::Created {
+                request_id: actual,
+                result: Ok(opened),
+            } if actual == request_id(2) => opened,
+            other => panic!("unexpected Create completion: {other:?}"),
+        };
+        assert_eq!(opened.path(), &destination);
+        assert_eq!(
+            opened.project_id(),
+            frozen.projection().state().project_id()
+        );
+        assert_eq!(opened.mode(), ProjectOpenMode::PreferWritable);
+        assert_eq!(
+            opened.current_manual_generation(),
+            Some(generation_id(STALE_MANUAL))
+        );
+        assert_eq!(opened.current_autosave_generation(), None);
+
+        let root = LocalStoreRoot::open(destination.as_path()).unwrap();
+        let contender =
+            ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        assert!(
+            !contender.has_writer(),
+            "Create must hand its held lease directly to the actor"
+        );
+
+        actor
+            .try_submit(ProjectStoreCommand::Open {
+                request_id: request_id(3),
+                path: destination.clone(),
+                mode: ProjectOpenMode::ReadOnly,
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&actor),
+            ProjectStoreCompletion::Opened {
+                request_id: actual,
+                result: Err(ProjectStoreFault::Corruption {
+                    stage: "open_session_bound"
+                }),
+            } if actual == request_id(3)
+        ));
+
+        actor.try_submit(close_command(4)).unwrap();
+        assert!(matches!(
+            public_recv_timeout(&actor),
+            ProjectStoreCompletion::Closed {
+                request_id: actual,
+                result: Ok(()),
+            } if actual == request_id(4)
+        ));
+        assert!(actor.has_exited());
+        actor.join().unwrap();
+        drop(contender);
+        let _writer = acquire_writer_eventually(&root);
+    }
+
+    #[test]
+    fn public_actor_opens_healthy_established_and_provisional_authority() {
+        let established = TestProject::extracted("public-open-established");
+        let actor = ProjectStoreActor::start(Default::default()).unwrap();
+        actor
+            .try_submit(ProjectStoreCommand::Open {
+                request_id: request_id(1),
+                path: established.store_path(),
+                mode: ProjectOpenMode::ReadOnly,
+            })
+            .unwrap();
+        match public_recv_timeout(&actor) {
+            ProjectStoreCompletion::Opened {
+                request_id: actual,
+                result: Ok((session, projection)),
+            } if actual == request_id(1) => {
+                assert_eq!(session.mode(), ProjectOpenMode::ReadOnly);
+                assert_eq!(
+                    session.current_manual_generation(),
+                    Some(generation_id(STALE_MANUAL))
+                );
+                assert_eq!(
+                    session.current_autosave_generation(),
+                    Some(generation_id(STALE_AUTOSAVE))
+                );
+                assert_eq!(projection, *frozen_generation(STALE_MANUAL).projection());
+            }
+            other => panic!("unexpected established Open completion: {other:?}"),
+        }
+        actor.try_submit(close_command(2)).unwrap();
+        public_recv_timeout(&actor);
+        actor.join().unwrap();
+
+        let provisional =
+            TestProject::extracted_store("public-open-provisional", "provisional.m4dproj");
+        let actor = ProjectStoreActor::start(Default::default()).unwrap();
+        actor
+            .try_submit(ProjectStoreCommand::Open {
+                request_id: request_id(1),
+                path: provisional.store_path(),
+                mode: ProjectOpenMode::PreferWritable,
+            })
+            .unwrap();
+        match public_recv_timeout(&actor) {
+            ProjectStoreCompletion::Opened {
+                request_id: actual,
+                result: Ok((session, projection)),
+            } if actual == request_id(1) => {
+                assert_eq!(session.mode(), ProjectOpenMode::PreferWritable);
+                assert_eq!(session.current_manual_generation(), None);
+                assert_eq!(
+                    session.current_autosave_generation(),
+                    Some(generation_id(PROVISIONAL_AUTOSAVE))
+                );
+                assert_eq!(
+                    projection,
+                    *frozen_generation_in("provisional.m4dproj", PROVISIONAL_AUTOSAVE).projection()
+                );
+            }
+            other => panic!("unexpected provisional Open completion: {other:?}"),
+        }
+        actor.try_submit(close_command(2)).unwrap();
+        public_recv_timeout(&actor);
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn public_actor_first_and_advancing_provisional_autosave_then_manual_handoff() {
+        let recovery_parent = TestDirectory::new("public-provisional");
+        let provisional_path = recovery_parent.destination("unsaved.m4dproj");
+        let manual_parent = TestDirectory::new("public-provisional-manual");
+        let manual_path = manual_parent.destination("saved.m4dproj");
+        let frozen = frozen_generation_in("provisional.m4dproj", PROVISIONAL_AUTOSAVE);
+        let first_id = generation_id(PROVISIONAL_AUTOSAVE);
+        let actor = ProjectStoreActor::start(Default::default()).unwrap();
+
+        let (first, _) = controlled_fixture_capture(
+            "provisional.m4dproj",
+            &frozen,
+            frozen.projection().clone(),
+            None,
+            None,
+            None,
+            ControlledRead::Normal,
+        );
+        actor
+            .try_submit(ProjectStoreCommand::Autosave {
+                request_id: request_id(1),
+                destination: Some(provisional_path.clone()),
+                capture: first,
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&actor),
+            ProjectStoreCompletion::Autosaved {
+                request_id: actual,
+                result: Ok(receipt),
+            } if actual == request_id(1)
+                && receipt.current_generation_id() == first_id
+                && receipt.previous_generation_id().is_none()
+                && receipt.autosave_base_generation_id().is_none()
+        ));
+
+        let next_projection = next_revision_projection(&frozen);
+        let (advance, _) = controlled_fixture_capture(
+            "provisional.m4dproj",
+            &frozen,
+            next_projection.clone(),
+            Some(first_id),
+            None,
+            None,
+            ControlledRead::Normal,
+        );
+        actor
+            .try_submit(ProjectStoreCommand::Autosave {
+                request_id: request_id(2),
+                destination: None,
+                capture: advance,
+            })
+            .unwrap();
+        let advanced_id = match public_recv_timeout(&actor) {
+            ProjectStoreCompletion::Autosaved {
+                request_id: actual,
+                result: Ok(receipt),
+            } if actual == request_id(2) => {
+                assert_eq!(receipt.previous_generation_id(), Some(first_id));
+                assert_eq!(receipt.autosave_base_generation_id(), None);
+                receipt.current_generation_id()
+            }
+            other => panic!("unexpected advancing provisional Autosave: {other:?}"),
+        };
+        assert_ne!(advanced_id, first_id);
+
+        let provisional_before = file_tree(provisional_path.as_path());
+        let (manual, _) = controlled_fixture_capture(
+            "provisional.m4dproj",
+            &frozen,
+            next_projection.clone(),
+            None,
+            None,
+            None,
+            ControlledRead::Normal,
+        );
+        actor
+            .try_submit(ProjectStoreCommand::Create {
+                request_id: request_id(3),
+                destination: manual_path.clone(),
+                capture: manual,
+            })
+            .unwrap();
+        match public_recv_timeout(&actor) {
+            ProjectStoreCompletion::Created {
+                request_id: actual,
+                result: Ok(session),
+            } if actual == request_id(3) => {
+                assert_eq!(session.path(), &manual_path);
+                assert_eq!(session.project_id(), next_projection.state().project_id());
+                assert!(session.current_manual_generation().is_some());
+                assert_eq!(session.current_autosave_generation(), None);
+            }
+            other => panic!("unexpected provisional Create handoff: {other:?}"),
+        }
+        assert_eq!(file_tree(provisional_path.as_path()), provisional_before);
+        let old_root = LocalStoreRoot::open(provisional_path.as_path()).unwrap();
+        let _old_writer = acquire_writer_eventually(&old_root);
+        let new_root = LocalStoreRoot::open(manual_path.as_path()).unwrap();
+        let new_contender =
+            ProjectStoreLeases::acquire(&new_root, ProjectOpenMode::PreferWritable).unwrap();
+        assert!(!new_contender.has_writer());
+
+        actor.try_submit(close_command(4)).unwrap();
+        public_recv_timeout(&actor);
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn public_actor_corrupt_open_is_recovery_only_until_selected_save_as() {
+        let source = TestProject::extracted_store("public-recovery-only", "recoverable.m4dproj");
+        let head = source.path().join("refs/head");
+        let mut corrupt_head = fs::read(&head).unwrap();
+        corrupt_head[0] ^= 1;
+        fs::write(&head, &corrupt_head).unwrap();
+        let actor = ProjectStoreActor::start(Default::default()).unwrap();
+        actor
+            .try_submit(ProjectStoreCommand::Open {
+                request_id: request_id(1),
+                path: source.store_path(),
+                mode: ProjectOpenMode::PreferWritable,
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&actor),
+            ProjectStoreCompletion::Opened {
+                request_id: actual,
+                result: Err(ProjectStoreFault::Corruption { .. }),
+            } if actual == request_id(1)
+        ));
+
+        let selected_id = generation_id(RECOVERABLE_G1);
+        let selected = frozen_generation_in("recoverable.m4dproj", RECOVERABLE_G1);
+        let (blocked, blocked_opens) = controlled_fixture_capture(
+            "recoverable.m4dproj",
+            &selected,
+            selected.projection().clone(),
+            Some(selected_id),
+            None,
+            selected.forked_from(),
+            ControlledRead::Normal,
+        );
+        actor
+            .try_submit(ProjectStoreCommand::ManualSave {
+                request_id: request_id(2),
+                capture: blocked,
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&actor),
+            ProjectStoreCompletion::ManualSaved {
+                request_id: actual,
+                result: Err(ProjectStoreFault::Corruption {
+                    stage: "actor_recovery_only"
+                }),
+            } if actual == request_id(2)
+        ));
+        assert_eq!(blocked_opens.load(Ordering::SeqCst), 0);
+
+        actor
+            .try_submit(ProjectStoreCommand::InspectRecovery {
+                request_id: request_id(3),
+            })
+            .unwrap();
+        match public_recv_timeout(&actor) {
+            ProjectStoreCompletion::RecoveryInspected {
+                request_id: actual,
+                result: Ok(candidates),
+            } if actual == request_id(3) => {
+                assert!(
+                    candidates
+                        .iter()
+                        .any(|candidate| candidate.generation_id() == selected_id)
+                );
+            }
+            other => panic!("unexpected recovery inspection: {other:?}"),
+        }
+        actor
+            .try_submit(ProjectStoreCommand::OpenRecovery {
+                request_id: request_id(4),
+                generation_id: selected_id,
+            })
+            .unwrap();
+        let selected_projection = match public_recv_timeout(&actor) {
+            ProjectStoreCompletion::RecoveryOpened {
+                request_id: actual,
+                result: Ok((_session, projection)),
+            } if actual == request_id(4) => projection,
+            other => panic!("unexpected recovery selection: {other:?}"),
+        };
+
+        let source_before = file_tree(source.path());
+        let destination_parent = TestDirectory::new("public-recovery-save-as");
+        let destination = destination_parent.destination("recovered.m4dproj");
+        let new_project_id = ProjectId::from_bytes([0x42; 16]);
+        let recovered_projection = retarget_projection(
+            &selected,
+            new_project_id,
+            selected_projection.state().dataset().clone(),
+        );
+        let source_project_id = selected_projection.state().project_id();
+        let (capture, _) = controlled_fixture_capture(
+            "recoverable.m4dproj",
+            &selected,
+            recovered_projection,
+            None,
+            None,
+            Some((source_project_id, selected_id)),
+            ControlledRead::Normal,
+        );
+        actor
+            .try_submit(ProjectStoreCommand::SaveAs {
+                request_id: request_id(5),
+                destination: destination.clone(),
+                source_generation: selected_id,
+                capture,
+            })
+            .unwrap();
+        let recovered_id = match public_recv_timeout(&actor) {
+            ProjectStoreCompletion::SavedAs {
+                request_id: actual,
+                result: Ok(receipt),
+            } if actual == request_id(5) => receipt.current_generation_id(),
+            other => panic!("unexpected recovery Save As: {other:?}"),
+        };
+        assert_eq!(file_tree(source.path()), source_before);
+        let destination_root = LocalStoreRoot::open(destination.as_path()).unwrap();
+        let recovered =
+            inspect_established_store(&destination_root, ProjectStoreLimits::default(), || false)
+                .unwrap();
+        assert_eq!(recovered.manual().head.current(), recovered_id);
+        assert_eq!(
+            recovered.manual_generation().forked_from(),
+            Some((source_project_id, selected_id))
+        );
+
+        actor.try_submit(close_command(6)).unwrap();
+        public_recv_timeout(&actor);
+        actor.join().unwrap();
+    }
+
+    #[test]
     fn established_commands_are_serialized_and_close_releases_the_writer_lease() {
         let project = TestProject::extracted("serial-close");
-        let actor =
-            EstablishedProjectActor::start(&project.store_path(), Default::default()).unwrap();
+        let actor = EstablishedProjectActor::start_bound(&project.store_path(), Default::default())
+            .unwrap();
         assert!(actor.try_recv().is_none());
 
         let contender_root = LocalStoreRoot::open(project.path()).unwrap();
@@ -3958,6 +4916,7 @@ mod tests {
         let frozen = frozen_generation(STALE_AUTOSAVE);
         ProjectStoreCommand::Autosave {
             request_id: request_id(id),
+            destination: None,
             capture: frozen_capture(
                 &frozen,
                 frozen.projection().clone(),
@@ -4049,6 +5008,20 @@ mod tests {
 
     fn request_id(id: u64) -> ProjectStoreRequestId {
         ProjectStoreRequestId::new(id).unwrap()
+    }
+
+    fn public_recv_timeout(actor: &ProjectStoreActor) -> ProjectStoreCompletion {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if let Some(completion) = actor.try_recv() {
+                return completion;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "public actor completion timed out"
+            );
+            thread::yield_now();
+        }
     }
 
     fn wait_until_active(actor: &EstablishedProjectActor, expected: u64) {
@@ -4318,6 +5291,19 @@ mod tests {
             ProjectRevisionId::new(project_id, old.revision().sequence()),
             ProjectRevisionHighWater::new(project_id, old.revision_high_water().sequence()),
             state,
+        )
+        .unwrap()
+    }
+
+    fn next_revision_projection(frozen: &GenerationDocument) -> ProjectGenerationProjection {
+        let old = frozen.projection();
+        let project_id = old.state().project_id();
+        let revision = old.revision().sequence().checked_add(1).unwrap();
+        let high_water = old.revision_high_water().sequence().checked_add(1).unwrap();
+        ProjectGenerationProjection::new(
+            ProjectRevisionId::new(project_id, revision),
+            ProjectRevisionHighWater::new(project_id, high_water),
+            old.state().clone(),
         )
         .unwrap()
     }

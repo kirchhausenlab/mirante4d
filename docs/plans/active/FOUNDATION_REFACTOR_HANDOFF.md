@@ -7,9 +7,8 @@ Public-data publication: deferred to a separate future handoff
 WP-10B predecessor: `foundation-wp-09a-exit-1`
 Completed through: WP-09A at `foundation-wp-09a-exit-1`
 Current checkpoint: WP-10B transactional project store; public actor/session
-lifecycle after implemented dead-writer staging cleanup
-Next protected-branch checkpoint: WP-10B remaining B2 lifecycle/durability
-work
+lifecycle implemented after dead-writer staging cleanup
+Next protected-branch checkpoint: WP-10B remaining B2 durability work
 
 ## Purpose
 

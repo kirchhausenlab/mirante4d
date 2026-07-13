@@ -1,0 +1,90 @@
+{
+  "schema": "mirante4d-foundation-package-entry-correction",
+  "schema_version": 1,
+  "package": "WP-10B",
+  "status": "accepted",
+  "authorization": {
+    "approved_by": "Mirante4D repository owner",
+    "approved_on": "2026-07-13",
+    "reference": "WP10B-PREAUTH-2026-07-12",
+    "scope": "narrow public actor and session lifecycle correction discovered before B2 public lifecycle implementation"
+  },
+  "accepted_boundary": {
+    "contract_path": "architecture/wp10b-project-store-contract.json",
+    "pre_correction_contract_sha256": "787cbb299e4b25d9a904ec819de355359d5d68d7715af82373e004ce1990974d",
+    "protected_main_commit": "9a1a76c89461f2973efa1973e656cc50e36a2039",
+    "protected_main_tree": "58f46e21335f882c99956a3f6d4f2c3cf6591a38",
+    "hosted_run": "https://github.com/kirchhausenlab/mirante4d/actions/runs/29249253635",
+    "hosted_result": "success"
+  },
+  "discovered_gaps": {
+    "provisional_destination": "The accepted first provisional autosave requires one caller-supplied ProjectStorePath, but the frozen Autosave command, actor placeholder, and config cannot carry it.",
+    "initial_manual_handoff": "The accepted provisional store and initial manual installer exist, but the lifecycle does not say how a provisional or explicitly recovered unsaved branch becomes a durable manual project without mutating or promoting its old refs.",
+    "recoverable_open": "InspectRecovery and OpenRecovery carry no path, so tearing down every failed Open would make the accepted corrupt-head recovery workflow unreachable.",
+    "public_methods": "ProjectStoreActor is one of the frozen sixteen public exports but has no constructor, submission, completion, exit, or joined-shutdown methods."
+  },
+  "correction": {
+    "methods": "ProjectStoreActor::start(config) creates one unbound background actor; try_submit is nonblocking and bounded; try_recv is nonblocking; has_exited reports terminal worker state; join performs cancellation shutdown and joins the worker. Drop requests cancellation and remains nonblocking.",
+    "ownership": "One actor is unbound or owns exactly one held root and its leases. It never owns two live sessions, reopens a just-installed package, exposes a worker handle, or performs filesystem work on the caller thread.",
+    "autosave_command": "Autosave adds destination: Option<ProjectStorePath>. Unbound plus Some(destination) performs first provisional publication and binds that installed session on durable success. A bound provisional or established session requires destination absent and advances the applicable autosave lane. Every other state/destination combination fails before mutation. The existing Autosaved receipt remains the completion and a provisional receipt has no manual base.",
+    "create_unbound": "Create on an unbound actor installs the accepted initial manual package and binds the exact returned root and leases without close/reopen. Created returns the resulting ProjectStoreSession.",
+    "create_from_provisional": "Create on a healthy provisional session is the first-manual handoff. The capture must preserve the held project ID and scientific identity, keep fork provenance absent, and carry a non-regressing revision high-water. It installs an absent destination as a new initial-manual package and transfers actor ownership only after durable success. Failure retains the provisional root, leases, and lifecycle state unchanged.",
+    "normal_open": "Open on an unbound actor honors ReadOnly or PreferWritable. A healthy established or provisional store returns the actual held session and its authoritative projection. If root/lease establishment or bounded recovery validation fails, Open returns its fault and the actor remains unbound.",
+    "recovery_only_open": "If bounded recovery validation succeeds but normal authority loading fails, Open returns that normal-open fault while retaining the root and leases in a recovery-only state. That state accepts InspectRecovery, OpenRecovery, FullVerify, Cancel, and Close; all other commands fail before mutation. Successful OpenRecovery returns the selected projection without ref repair and additionally permits SaveAs using that exact selected generation as source. The SaveAs capture uses a new ProjectId and forked_from=(held ProjectId, selected generation), and ownership transfers only after durable success. A later failed Open, OpenRecovery, or SaveAs never silently replaces or repairs authority.",
+    "bound_commands": "Normal bound sessions retain the accepted ManualSave, SaveAs, Autosave, recovery, Pin, Unpin, PlanCompaction, Trash, Purge, FullVerify, Cancel, and Close behavior. ManualSave remains established-only; a provisional first manual project uses Create, while a recovery-selected project uses only the corrected SaveAs flow.",
+    "binding_conflicts": "Create and Open submitted while an incompatible session is already bound complete with a typed corruption fault and change no session. Every accepted request still produces exactly one terminal correlated completion.",
+    "close_and_shutdown": "Close is valid while unbound or bound, cancels queued/active work at accepted safe boundaries, releases any held session, emits the existing Closed completion, and terminates the worker. Joined shutdown emits no new public completion obligation."
+  },
+  "superseded_fields": [
+    "wp10b-project-store-contract.json public_api_contract.actor",
+    "wp10b-project-store-recovery-ahead-correction.json correction.unchanged public-API promise, only for the Autosave destination field",
+    "wp10b-project-store-recovery-api-correction.json unchanged commands promise, only for the Autosave destination field",
+    "wp10b-project-store-maintenance-transition-correction.json unchanged command-shape promise and matching stop condition, only for the Autosave destination field",
+    "wp10b-project-store-trash-safety-correction.json unchanged command-shape promise, only for the Autosave destination field",
+    "wp10b-project-store-purge-safety-correction.json unchanged command promise, only for the Autosave destination field",
+    "wp10b-project-store-provisional-autosave-correction.json unchanged promise that every command remains unchanged",
+    "wp10b-project-store-provisional-autosave-correction.json destination transport left to later public lifecycle work",
+    "wp10b-project-store-staging-cleanup-correction.json unchanged command promise, only for the Autosave destination field"
+  ],
+  "supplemented_contract_paths": [
+    "bindings.public_actor_lifecycle_correction",
+    "public_api_contract.actor",
+    "public_actor_lifecycle_contract"
+  ],
+  "invariants": [
+    "The public root remains exactly sixteen types and the store remains off-product through B3.",
+    "No persisted byte, path, generation/ref rule, transition name, fault variant, completion variant, limit, dependency, or product edge changes.",
+    "Only the worker performs project filesystem I/O and it owns every held root and lease until Close, shutdown, or an atomic successful destination transfer.",
+    "A failed destination operation retains the old session exactly; a failed unbound bind retains no session; recovery inspection and selection never repair refs.",
+    "The first-manual handoff never deletes or mutates the old provisional package, and recovery SaveAs never deletes, mutates, or repairs the damaged package."
+  ],
+  "allowed_paths": [
+    "architecture/wp10b-project-store-public-actor-lifecycle-correction.json",
+    "architecture/wp10b-project-store-contract.json",
+    "crates/mirante4d-project-store/src/api.rs",
+    "crates/mirante4d-project-store/src/actor.rs",
+    "crates/mirante4d-project-store/src/inspection.rs",
+    "crates/mirante4d-project-store/src/transaction.rs",
+    "crates/xtask/src/arch/wp10b.rs",
+    "verification/predecessor-disposition.json",
+    "docs/ARCHITECTURE.md",
+    "docs/CURRENT_STATE.md",
+    "docs/DATA_FORMAT.md",
+    "docs/TESTING.md",
+    "docs/planning/NOW.md",
+    "docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md",
+    "docs/plans/active/foundation-refactor/PROJECT_STORE_DURABILITY_BRIEF.md"
+  ],
+  "evidence": [
+    "exact correction binding, normalized-contract check, and unchanged public-root/dependency/wire/limit guards",
+    "public unbound, Create, Open, provisional autosave, first-manual handoff, recovery-only, Close, Drop, and joined-shutdown lifecycle tests",
+    "existing queue, correlation, coalescing, cancellation, Save As, recovery, maintenance, and process-crash tests remain green"
+  ],
+  "non_goals": [
+    "B3 current-source verification, application service or autosave timers",
+    "B4 product wiring, predecessor deletion, recovery-area pruning, or product validation",
+    "power-loss simulation, filesystem qualification, or a new durability claim"
+  ],
+  "stop_condition": "Any persisted byte/path, root export, completion/fault variant, transition, limit, dependency, product edge, timer, recovery-area deletion, or durability claim must change.",
+  "rollback": "revert this correction and its public lifecycle implementation together while the project-v15 product route remains sole"
+}
