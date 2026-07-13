@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use crate::{
     ProjectCommitCapture, ProjectGenerationId, ProjectOpenMode, ProjectStoreCommand,
-    ProjectStoreCompletion, ProjectStoreConfig, ProjectStoreFault, ProjectStorePath,
-    ProjectStoreReceipt, ProjectStoreRequestId, ProjectStoreSession,
+    ProjectStoreCompletion, ProjectStoreConfig, ProjectStoreDiagnostics, ProjectStoreFault,
+    ProjectStorePath, ProjectStoreReceipt, ProjectStoreRequestId, ProjectStoreSession,
     inspection::{RecoveryInspection, inspect_established_store, inspect_recovery, open_recovery},
     lease::{LeaseError, ProjectStoreLeases},
     local::{LocalStoreRoot, valid_checkpoint_id},
@@ -31,6 +31,7 @@ use crate::{
         InitialPackageMode, install_initial_manual_package,
         publish_established_autosave_generation, publish_established_manual_generation,
     },
+    trash::trash_generations,
 };
 
 /// One private worker which owns the store root, leases, and all session work.
@@ -44,6 +45,7 @@ struct Shared {
     wake: Condvar,
     request_limit: usize,
     completion_limit: usize,
+    trash_selection_limit: usize,
     autosave_enabled: bool,
 }
 
@@ -99,6 +101,10 @@ enum Work {
     PlanCompaction {
         request_id: ProjectStoreRequestId,
     },
+    Trash {
+        request_id: ProjectStoreRequestId,
+        generations: Vec<ProjectGenerationId>,
+    },
     FullVerify {
         request_id: ProjectStoreRequestId,
     },
@@ -115,6 +121,7 @@ impl Work {
             | Self::Pin { request_id, .. }
             | Self::Unpin { request_id, .. }
             | Self::PlanCompaction { request_id }
+            | Self::Trash { request_id, .. }
             | Self::FullVerify { request_id } => *request_id,
         }
     }
@@ -154,6 +161,10 @@ impl Work {
                 result: Err(ProjectStoreFault::Cancelled),
             },
             Self::PlanCompaction { request_id } => ProjectStoreCompletion::CompactionPlanned {
+                request_id,
+                result: Err(ProjectStoreFault::Cancelled),
+            },
+            Self::Trash { request_id, .. } => ProjectStoreCompletion::Trashed {
                 request_id,
                 result: Err(ProjectStoreFault::Cancelled),
             },
@@ -304,6 +315,7 @@ impl EstablishedProjectActor {
             wake: Condvar::new(),
             request_limit: limits.actor_request_queue_max(),
             completion_limit: limits.actor_completion_queue_max(),
+            trash_selection_limit: limits.recovery_candidates_max,
             autosave_enabled: config.autosave_enabled(),
         });
         let worker_shared = Arc::clone(&shared);
@@ -411,6 +423,28 @@ impl EstablishedProjectActor {
             }),
             ProjectStoreCommand::PlanCompaction { request_id } => {
                 self.submit_work(Work::PlanCompaction { request_id })
+            }
+            ProjectStoreCommand::Trash {
+                request_id,
+                generations,
+            } => {
+                if generations.len() > self.shared.trash_selection_limit {
+                    return Err(ProjectStoreFault::Capacity {
+                        stage: "trash_selection",
+                    });
+                }
+                if generations.is_empty()
+                    || generations.iter().copied().collect::<BTreeSet<_>>().len()
+                        != generations.len()
+                {
+                    return Err(ProjectStoreFault::Corruption {
+                        stage: "trash_selection",
+                    });
+                }
+                self.submit_work(Work::Trash {
+                    request_id,
+                    generations,
+                })
             }
             ProjectStoreCommand::FullVerify { request_id } => {
                 self.submit_work(Work::FullVerify { request_id })
@@ -668,6 +702,19 @@ impl State {
     }
 }
 
+fn actor_diagnostics(
+    shared: &Shared,
+    leases: &ProjectStoreLeases,
+    mut diagnostics: ProjectStoreDiagnostics,
+) -> ProjectStoreDiagnostics {
+    let state = shared.lock();
+    diagnostics.queued_requests = state.requests.len();
+    diagnostics.queued_completions = state.completions.len();
+    diagnostics.active_transactions = usize::from(state.active.is_some());
+    diagnostics.open_file_descriptors = 2 + usize::from(leases.has_writer());
+    diagnostics
+}
+
 fn worker_main(
     shared: Arc<Shared>,
     resources: SessionResources,
@@ -811,22 +858,67 @@ fn worker_main(
                     cancelled.load(Ordering::Acquire)
                 }),
             },
+            Work::Trash {
+                request_id,
+                generations,
+            } => {
+                let result = trash_generations(
+                    &session.root,
+                    &mut session.leases,
+                    &generations,
+                    limits,
+                    || cancelled.load(Ordering::Acquire),
+                )
+                .map(|diagnostics| actor_diagnostics(&shared, &session.leases, diagnostics));
+                ProjectStoreCompletion::Trashed { request_id, result }
+            }
             Work::FullVerify { request_id } => {
                 let result = crate::full_verify::full_verify(&session.root, limits, || {
                     cancelled.load(Ordering::Acquire)
                 })
-                .map(|mut diagnostics| {
-                    let state = shared.lock();
-                    diagnostics.queued_requests = state.requests.len();
-                    diagnostics.queued_completions = state.completions.len();
-                    diagnostics.active_transactions = usize::from(state.active.is_some());
-                    diagnostics.open_file_descriptors =
-                        2 + usize::from(session.leases.has_writer());
-                    diagnostics
-                });
+                .map(|diagnostics| actor_diagnostics(&shared, &session.leases, diagnostics));
                 ProjectStoreCompletion::Verified { request_id, result }
             }
         };
+        let maintenance_lost = session.leases.maintenance_lost();
+        if maintenance_lost {
+            let mut state = shared.lock();
+            state.active = None;
+            if state.shutdown {
+                state.completion_reservations = 0;
+                drop(resources.take());
+                state.worker_exited = true;
+                shared.wake.notify_all();
+                return;
+            }
+            state.accepting = false;
+            drop(resources.take());
+            state.finish_reserved(completion);
+            while !state.requests.is_empty() {
+                while !state.can_reserve_completion(shared.completion_limit) {
+                    state = shared
+                        .wake
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                let cancelled = state
+                    .requests
+                    .pop_front()
+                    .expect("a terminal session drains one queued request");
+                state.push_unreserved(cancelled.cancelled_completion(), shared.completion_limit);
+                shared.wake.notify_all();
+            }
+            if let Some(request_id) = state.close_request.take() {
+                state.finish_reserved(ProjectStoreCompletion::Closed {
+                    request_id,
+                    result: Ok(()),
+                });
+            }
+            state.worker_exited = true;
+            shared.wake.notify_all();
+            return;
+        }
+
         let mut state = shared.lock();
         state.active = None;
         if state.shutdown {
@@ -2010,6 +2102,126 @@ mod tests {
     }
 
     #[test]
+    fn trash_is_correlated_cancellable_bounded_and_rejects_read_only() {
+        let writable = TestProject::extracted_store("actor-trash", "recoverable.m4dproj");
+        let selected = crate::trash::tests::install_zero_non_regenerable_orphan(writable.path());
+        let blocker_root = LocalStoreRoot::open(writable.path()).unwrap();
+        let blocker =
+            ProjectStoreLeases::acquire(&blocker_root, ProjectOpenMode::ReadOnly).unwrap();
+        let actor =
+            EstablishedProjectActor::start(&writable.store_path(), Default::default()).unwrap();
+        let before = file_tree(writable.path());
+
+        assert_eq!(
+            actor.try_submit(ProjectStoreCommand::Trash {
+                request_id: request_id(1),
+                generations: Vec::new(),
+            }),
+            Err(ProjectStoreFault::Corruption {
+                stage: "trash_selection"
+            })
+        );
+        assert_eq!(
+            actor.try_submit(ProjectStoreCommand::Trash {
+                request_id: request_id(1),
+                generations: vec![selected, selected],
+            }),
+            Err(ProjectStoreFault::Corruption {
+                stage: "trash_selection"
+            })
+        );
+        assert_eq!(
+            actor.try_submit(ProjectStoreCommand::Trash {
+                request_id: request_id(1),
+                generations: vec![selected; 65],
+            }),
+            Err(ProjectStoreFault::Capacity {
+                stage: "trash_selection"
+            })
+        );
+
+        actor
+            .try_submit(ProjectStoreCommand::Trash {
+                request_id: request_id(1),
+                generations: vec![selected],
+            })
+            .unwrap();
+        wait_until_active(&actor, 1);
+        actor.try_submit(cancel_command(2, 1)).unwrap();
+        assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 2);
+        assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 1);
+        assert_eq!(file_tree(writable.path()), before);
+
+        drop(blocker);
+        actor
+            .try_submit(ProjectStoreCommand::Trash {
+                request_id: request_id(3),
+                generations: vec![selected],
+            })
+            .unwrap();
+        let diagnostics = match actor.recv_timeout(TIMEOUT) {
+            Some(ProjectStoreCompletion::Trashed {
+                request_id: actual,
+                result: Ok(diagnostics),
+            }) if actual == request_id(3) => diagnostics,
+            other => panic!("unexpected Trash completion: {other:?}"),
+        };
+        assert_eq!(diagnostics.queued_requests, 0);
+        assert_eq!(diagnostics.queued_completions, 0);
+        assert_eq!(diagnostics.active_transactions, 1);
+        assert_eq!(diagnostics.open_file_descriptors, 3);
+        assert_eq!(diagnostics.streamed_bytes, 0);
+        assert_eq!(diagnostics.published_objects, 1);
+        assert!(
+            !crate::inspection::inspect_store_graph(
+                &blocker_root,
+                ProjectStoreLimits::default(),
+                || false,
+            )
+            .unwrap()
+            .generation_ids()
+            .contains(&selected)
+        );
+        actor.try_submit(close_command(4)).unwrap();
+        assert!(matches!(
+            actor.recv_timeout(TIMEOUT),
+            Some(ProjectStoreCompletion::Closed {
+                request_id: actual,
+                result: Ok(()),
+            }) if actual == request_id(4)
+        ));
+        actor.join().unwrap();
+
+        let contended =
+            TestProject::extracted_store("actor-trash-read-only", "recoverable.m4dproj");
+        let selected = crate::trash::tests::install_zero_non_regenerable_orphan(contended.path());
+        let held_root = LocalStoreRoot::open(contended.path()).unwrap();
+        let held_writer =
+            ProjectStoreLeases::acquire(&held_root, ProjectOpenMode::PreferWritable).unwrap();
+        assert!(held_writer.has_writer());
+        let read_only =
+            EstablishedProjectActor::start(&contended.store_path(), Default::default()).unwrap();
+        let before = file_tree(contended.path());
+        read_only
+            .try_submit(ProjectStoreCommand::Trash {
+                request_id: request_id(1),
+                generations: vec![selected],
+            })
+            .unwrap();
+        assert!(matches!(
+            read_only.recv_timeout(TIMEOUT),
+            Some(ProjectStoreCompletion::Trashed {
+                request_id: actual,
+                result: Err(ProjectStoreFault::ReadOnly),
+            }) if actual == request_id(1)
+        ));
+        assert_eq!(file_tree(contended.path()), before);
+        read_only.try_submit(close_command(2)).unwrap();
+        read_only.recv_timeout(TIMEOUT).unwrap();
+        read_only.join().unwrap();
+    }
+
+    #[test]
     fn full_verify_is_correlated_cancellable_and_available_read_only() {
         let writable = TestProject::extracted("actor-full-verify");
         let actor =
@@ -2235,12 +2447,22 @@ mod tests {
         assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 10);
         assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 11);
 
-        actor.try_submit(cancel_command(12, 1)).unwrap();
-        assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 12);
+        actor
+            .try_submit(ProjectStoreCommand::Trash {
+                request_id: request_id(12),
+                generations: vec![generation_id(STALE_MANUAL)],
+            })
+            .unwrap();
+        actor.try_submit(cancel_command(13, 12)).unwrap();
+        assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 12);
+        assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 13);
+
+        actor.try_submit(cancel_command(14, 1)).unwrap();
+        assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 14);
         gate.release();
         assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 1);
 
-        actor.try_submit(close_command(13)).unwrap();
+        actor.try_submit(close_command(15)).unwrap();
         assert!(matches!(
             actor.recv_timeout(TIMEOUT),
             Some(ProjectStoreCompletion::Closed { result: Ok(()), .. })
@@ -2374,6 +2596,30 @@ mod tests {
         ProjectStoreRequestId::new(id).unwrap()
     }
 
+    fn wait_until_active(actor: &EstablishedProjectActor, expected: u64) {
+        let deadline = Instant::now() + TIMEOUT;
+        let mut state = actor.shared.lock();
+        loop {
+            if state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.request_id == request_id(expected))
+            {
+                return;
+            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .expect("request did not become active before the timeout");
+            let (next, wait) = actor
+                .shared
+                .wake
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+            assert!(!wait.timed_out(), "request did not become active");
+        }
+    }
+
     fn generation_id(id: &str) -> ProjectGenerationId {
         ProjectGenerationId::parse(id).unwrap()
     }
@@ -2413,6 +2659,9 @@ mod tests {
                 request_id: actual_id,
                 result: Err(ProjectStoreFault::Cancelled)
             } | ProjectStoreCompletion::CompactionPlanned {
+                request_id: actual_id,
+                result: Err(ProjectStoreFault::Cancelled)
+            } | ProjectStoreCompletion::Trashed {
                 request_id: actual_id,
                 result: Err(ProjectStoreFault::Cancelled)
             } | ProjectStoreCompletion::Verified {
