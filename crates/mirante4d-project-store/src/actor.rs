@@ -5530,7 +5530,7 @@ mod tests {
 
     fn fixture_extract(member: &str) -> Vec<u8> {
         let output = Command::new("tar")
-            .arg("-xOf")
+            .arg("-xzOf")
             .arg(fixture_archive())
             .arg(member)
             .output()
@@ -5540,8 +5540,12 @@ mod tests {
     }
 
     fn fixture_archive() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/project/project-store-v1.tar.gz")
+        env::var_os("MIRANTE4D_PROJECT_STORE_VM_FIXTURE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../fixtures/project/project-store-v1.tar.gz")
+            })
     }
 
     fn fixture_generation_member_in(store: &str, id: ProjectGenerationId) -> String {

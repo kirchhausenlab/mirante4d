@@ -58,7 +58,7 @@ export MIRANTE4D_PROJECT_STORE_TEST_REAL_FILESYSTEM_POLICY=1
 
 /mirante4d-project-store-tests \
   actor::tests::durability_tests::project_store_vm_guest_driver \
-  --exact --nocapture
+  --exact --ignored --nocapture
 status=$?
 echo "mirante4d-project-store-vm-driver-exit:$status"
 poweroff -f

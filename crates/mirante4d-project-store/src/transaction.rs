@@ -5031,7 +5031,7 @@ mod tests {
 
     fn fixture_extract(member: &str) -> Vec<u8> {
         let output = Command::new("tar")
-            .arg("-xOf")
+            .arg("-xzOf")
             .arg(fixture_archive())
             .arg(member)
             .output()

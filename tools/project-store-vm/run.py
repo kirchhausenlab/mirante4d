@@ -197,6 +197,11 @@ def validate_guest_init_text(text: str) -> None:
         raise HarnessFailure(
             "VM guest init does not force the real filesystem qualification detector"
         )
+    ignored_flags = [
+        index for index, line in enumerate(lines) if "--ignored" in line.split()
+    ]
+    if len(ignored_flags) != 1 or ignored_flags[0] <= invocations[0]:
+        raise HarnessFailure("VM guest init does not execute the ignored driver")
 
 
 def validate_guest_init(repo: Path) -> Path:
@@ -285,6 +290,7 @@ def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(transitions, list) or not transitions:
             raise HarnessFailure("VM flow must contain transitions")
         flow_rows: set[tuple[str, int]] = set()
+        flow_occurrences: dict[str, set[int]] = {}
         for transition in transitions:
             transition = exact_object(
                 transition, {"name", "occurrences"}, "VM transition"
@@ -294,9 +300,10 @@ def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
             if not isinstance(occurrences, list) or not occurrences:
                 raise HarnessFailure("VM transition occurrences must be nonempty")
             parsed = [unsigned(item, "VM transition occurrence") for item in occurrences]
-            if parsed != list(range(len(parsed))):
-                raise HarnessFailure("VM transition occurrences must be contiguous from zero")
+            if parsed != list(range(parsed[0], parsed[0] + len(parsed))):
+                raise HarnessFailure("VM transition occurrence segment must be contiguous")
             observed_names.add(name)
+            flow_occurrences.setdefault(name, set()).update(parsed)
             for occurrence in parsed:
                 key = (name, occurrence)
                 if key in flow_rows:
@@ -312,6 +319,11 @@ def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
                         "occurrence": occurrence,
                     }
                 )
+        if any(
+            sorted(occurrences) != list(range(len(occurrences)))
+            for occurrences in flow_occurrences.values()
+        ):
+            raise HarnessFailure("VM transition occurrences must be contiguous from zero")
         if case_name in {"recovery-ref", "head-ref"}:
             manual_ref_flows += int(lane == "manual")
             autosave_ref_flows += int(lane == "autosave")
@@ -472,6 +484,7 @@ def build_guest_test(repo: Path, deadline: float) -> Path:
         [
             "cargo",
             "test",
+            "--release",
             "--package",
             "mirante4d-project-store",
             "--lib",
@@ -481,6 +494,7 @@ def build_guest_test(repo: Path, deadline: float) -> Path:
         ],
         cwd=repo,
         timeout=min(300.0, remaining),
+        env={**os.environ, "CARGO_PROFILE_RELEASE_STRIP": "symbols"},
     )
     executables: list[Path] = []
     for line in output.splitlines():
@@ -1919,6 +1933,7 @@ def self_test(manifest: dict[str, Any], repo: Path) -> None:
             REAL_FILESYSTEM_POLICY_EXPORT,
             f"{REAL_FILESYSTEM_POLICY_EXPORT}\nunset {REAL_FILESYSTEM_POLICY_ENV}",
         ),
+        init.replace("--ignored", ""),
     ]:
         try:
             validate_guest_init_text(drifted)

@@ -162,11 +162,11 @@
       "publication": "public-safe-synthetic",
       "license": "MIT",
       "path": "tools/project-store-vm/manifest.json",
-      "sha256": "92d574e07393d65cb71801ee198f2e59b7c0f93c6ebd2d3fb3ae52e3a467d8ff",
+      "sha256": "b972473d7c5e3c51df91727aa3e96887ac207619e848ab3eb8f6ae303e37e848",
       "generator": {
         "command": "python3 tools/project-store-vm/run.py --self-test",
         "source": "tools/project-store-vm/manifest.json",
-        "sha256": "92d574e07393d65cb71801ee198f2e59b7c0f93c6ebd2d3fb3ae52e3a467d8ff",
+        "sha256": "b972473d7c5e3c51df91727aa3e96887ac207619e848ab3eb8f6ae303e37e848",
         "production_writer_used": false
       },
       "lineages": [
@@ -174,13 +174,13 @@
           "role": "rootless-power-cut-runner",
           "id": "WP10B-VM-RUNNER-001",
           "path": "tools/project-store-vm/run.py",
-          "sha256": "d86dc9625a5279941047eff851576b3ecf05b8abf60725a8ca1ab37fa30d58df"
+          "sha256": "fdc07189c65d2b718f5d1c3ebe665119d80d894e0324bc8d3b946cee29fa64dc"
         },
         {
           "role": "guest-init-boundary",
           "id": "WP10B-VM-GUEST-001",
           "path": "tools/project-store-vm/guest-init.sh",
-          "sha256": "a5d22ef36c8dddc07c77b12a88fd135cdc8da403650b2914016615204bc9ac3b"
+          "sha256": "e9435d1d84339e5cab51e2ff8d1c6202e3bc4b115a2d22ee836c10a914a2c627"
         }
       ],
       "limits": {

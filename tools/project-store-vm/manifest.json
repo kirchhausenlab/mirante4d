@@ -135,10 +135,11 @@
       "transitions": [
         { "name": "gc_trash_directory_create", "occurrences": [0, 1, 2, 3] },
         { "name": "gc_trash_collision_file_sync", "occurrences": [0] },
-        { "name": "gc_trash_move", "occurrences": [0, 1] },
         { "name": "gc_active_deduplicate_remove", "occurrences": [0] },
+        { "name": "gc_trash_move", "occurrences": [0, 1] },
+        { "name": "gc_trash_directory_sync", "occurrences": [0] },
         { "name": "gc_source_directory_sync", "occurrences": [0, 1, 2] },
-        { "name": "gc_trash_directory_sync", "occurrences": [0, 1, 2, 3, 4, 5, 6, 7, 8] }
+        { "name": "gc_trash_directory_sync", "occurrences": [1, 2, 3, 4, 5, 6, 7, 8] }
       ]
     },
     {
@@ -146,8 +147,10 @@
       "case": "purge",
       "lane": "none",
       "transitions": [
-        { "name": "purge_remove", "occurrences": [0, 1] },
-        { "name": "purge_directory_sync", "occurrences": [0, 1, 2, 3] }
+        { "name": "purge_remove", "occurrences": [0] },
+        { "name": "purge_directory_sync", "occurrences": [0, 1, 2] },
+        { "name": "purge_remove", "occurrences": [1] },
+        { "name": "purge_directory_sync", "occurrences": [3] }
       ]
     }
   ],
