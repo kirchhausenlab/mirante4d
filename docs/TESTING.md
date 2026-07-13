@@ -248,6 +248,12 @@ upgrade restoration, contended exclusive acquisition, explicit and drop-based
 downgrade, cancellation, writer retention, and read-only rejection. It does
 not by itself establish power-loss durability.
 
+The accepted provisional-autosave correction now fixes the base-less first and
+advancing publication, receipt, cancellation, collision, and fresh-retry
+requirements. Implementation evidence for that publisher is still pending; the
+existing provisional fixture and inspection tests prove only the frozen wire
+and read-only recognition.
+
 Four initial-package cases
 cover exact Create facts and caller-bound Save As fork encoding, retained root/
 lease validity, exact descriptor admission, existing directory/file/symlink

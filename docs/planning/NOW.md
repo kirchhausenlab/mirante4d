@@ -73,6 +73,10 @@ cancellation, read-only rejection, and indeterminate-session handling. Sixteen
 exact callback cases and 16 actual `SIGKILL` cases prove fresh-process retry
 for every observed Purge transition occurrence. This is process-crash evidence,
 not power-loss durability. The remaining B2 lifecycle/durability work is next.
+Its first bound correction resolves provisional autosave publication: the
+already-frozen autosave-only state has no manual base, starts at one
+caller-supplied no-clobber package path, and advances through the existing lane
+protocol. The private publisher and its focused evidence are next.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.

@@ -171,6 +171,9 @@ write-suspending. All seven frozen Pin/Unpin transitions now have exact before/
 after occurrence injection plus a 16-case actual `SIGKILL`, fresh-process
 reopen, and retry matrix. This proves logic and process-crash recovery only;
 dead-writer staging cleanup and power-loss/filesystem durability remain later. A
+bound correction now resolves the provisional-autosave base contradiction and
+freezes first no-clobber publication, advance, receipt, cancellation, and retry
+semantics. That publisher remains unimplemented. A
 private read-only FullVerify path now hashes every physical object in one
 bounded stable active-store snapshot, reconstructs paged logical objects,
 supports cancellation and read-only sessions, and changes no store bytes.
