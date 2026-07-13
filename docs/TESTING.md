@@ -157,7 +157,7 @@ first and advancing autosave generations and refs, replace a divergent lane
 against the current manual base, accept a lower revision with a non-regressing
 high-water mark, reject stale parent/base and invalid recovery/capacity state,
 retry an exact recovery-ahead cancellation, and distinguish recovery-sync
-failure from write-suspending head indeterminacy. Nine actor cases exercise the
+failure from write-suspending head indeterminacy. Ten actor cases exercise the
 real established manual/autosave primitives under one worker and prove exact
 request correlation, the request/completion bounds, queued-autosave coalescing,
 active and queued cancellation, close rejection, writer-lease lifetime, and
@@ -179,6 +179,14 @@ and corrupt-target scan, per-lane exhaustion, valid-candidate caps, mixed-lineag
 and wrong-provenance rejection, delayed cancellation, orphan-autosave
 classification, fresh selection, and byte-identical no-repair behavior. The
 graph remains read-only preparation for recovery/compaction, not a trash plan.
+Five pin cases prove create/replace/unpin, exact checkpoint grammar, target and
+pin caps, prospective orphan caps with duplicate-root semantics, cancellation,
+read-only rejection, linked-file rejection, idempotence, and write-suspending
+directory-sync uncertainty. One actor case proves correlated Pin/Unpin graph
+effects and read-only faults, while the shared cancellation case covers both
+queued completion variants. The maintenance-transition correction is bound by
+the architecture gate; it is not yet exhaustive failpoint, process-kill, or
+power-cut evidence.
 Four initial-package cases
 cover exact Create facts and caller-bound Save As fork encoding, retained root/
 lease validity, exact descriptor admission, existing directory/file/symlink

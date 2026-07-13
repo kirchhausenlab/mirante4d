@@ -84,13 +84,18 @@ impl StoreStateInspection {
     }
 
     fn root_generation_ids(&self) -> BTreeSet<ProjectGenerationId> {
+        let mut roots = self.lane_root_generation_ids();
+        roots.extend(self.pins.iter().map(|pin| pin.current()));
+        roots
+    }
+
+    fn lane_root_generation_ids(&self) -> BTreeSet<ProjectGenerationId> {
         let mut roots = BTreeSet::new();
         for lane in [self.manual, self.autosave].into_iter().flatten() {
             roots.insert(lane.head.current());
             roots.extend(lane.head.previous());
             roots.extend(lane.recovery.map(RefRecord::current));
         }
-        roots.extend(self.pins.iter().map(|pin| pin.current()));
         roots
     }
 }
@@ -217,6 +222,36 @@ impl StoreGraphInspection {
 
     pub(crate) fn root_generation_ids(&self) -> &[ProjectGenerationId] {
         &self.root_generation_ids
+    }
+
+    pub(crate) fn pin_count(&self) -> usize {
+        self.state.pins.len()
+    }
+
+    pub(crate) fn prospective_orphan_count_after_pin_change(
+        &self,
+        prior: Option<ProjectGenerationId>,
+        next: Option<ProjectGenerationId>,
+    ) -> usize {
+        let mut pin_counts = BTreeMap::<ProjectGenerationId, usize>::new();
+        for pin in &self.state.pins {
+            *pin_counts.entry(pin.current()).or_default() += 1;
+        }
+        if let Some(prior) = prior
+            && let Some(count) = pin_counts.get_mut(&prior)
+        {
+            *count = count.saturating_sub(1);
+        }
+        if let Some(next) = next {
+            *pin_counts.entry(next).or_default() += 1;
+        }
+        let mut roots = self.state.lane_root_generation_ids();
+        roots.extend(
+            pin_counts
+                .into_iter()
+                .filter_map(|(generation_id, count)| (count != 0).then_some(generation_id)),
+        );
+        self.generation_ids.len().saturating_sub(roots.len())
     }
 
     pub(crate) fn orphan_generation_ids(&self) -> &[ProjectGenerationId] {

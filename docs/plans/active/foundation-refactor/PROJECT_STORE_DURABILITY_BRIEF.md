@@ -215,7 +215,10 @@ scientific ID for nonexistent voxel payloads.
 
 D-010/WP-10B must inject failures before and after every write, flush, publish,
 directory sync, generation publication, ref replacement, and ref-directory
-sync. It must also kill child processes at every transition and reopen in a
+sync. The accepted maintenance-transition correction explicitly adds pin stage,
+write, file-sync, replace, and directory-sync phases; unpin remove and
+directory-sync phases; and separate purge remove and directory-sync phases.
+It must also kill child processes at every transition and reopen in a
 fresh process; exercise `ENOSPC`, short writes, permissions/read-only errors,
 corrupt/truncated refs/generations/objects, concurrent writers, stale-parent
 conflicts, crash-released locks, autosave races/divergence, GC interruption,

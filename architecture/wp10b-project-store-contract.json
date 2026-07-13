@@ -23,6 +23,10 @@
       "path": "architecture/wp10b-project-store-recovery-api-correction.json",
       "sha256": "48957fd7c36a34cd916f659cd3becaf8b54c497ab55ad2ed120af8ac2e384e73"
     },
+    "maintenance_transition_correction": {
+      "path": "architecture/wp10b-project-store-maintenance-transition-correction.json",
+      "sha256": "778ac85e7c40c1327f6ce6f1854cf7f2cc3a1d631df2da007d0906d819eafac1"
+    },
     "protected_main": {
       "commit": "b6e0267802f8ac2d0d49a0f04302fd321ef2f617",
       "tree": "b20b598603b47fdbe7c85c3b6d1cba8c78fd433e",
@@ -492,7 +496,7 @@
     "gc_batch_bytes_max": 268435456
   },
   "transition_inventory": {
-    "injection": "each named transition supports before and after injection plus a zero-based occurrence for repeated writes, objects, pages, generations, refs, and GC moves",
+    "injection": "each named transition supports before and after injection plus a zero-based occurrence for every repeated transition",
     "open": [
       "maintenance_lease_acquire",
       "writer_lease_try_acquire",
@@ -545,12 +549,27 @@
       "package_install_noreplace",
       "destination_parent_sync"
     ],
+    "pin": [
+      "pin_stage_create",
+      "pin_write",
+      "pin_file_sync",
+      "pin_replace",
+      "pin_directory_sync"
+    ],
+    "unpin": [
+      "unpin_remove",
+      "unpin_directory_sync"
+    ],
     "gc": [
       "gc_root_scan",
       "gc_candidate_listing",
       "gc_trash_move",
       "gc_source_directory_sync",
       "gc_trash_directory_sync"
+    ],
+    "purge": [
+      "purge_remove",
+      "purge_directory_sync"
     ],
     "purge_is_separate": true,
     "commit_indeterminate": "failure to establish final ref-directory durability after retry suspends writes, keeps the revision dirty, and requires close/reopen",

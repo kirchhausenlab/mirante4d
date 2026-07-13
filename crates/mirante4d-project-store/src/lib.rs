@@ -17,6 +17,8 @@ mod lease;
 #[cfg(target_os = "linux")]
 mod local;
 #[cfg(target_os = "linux")]
+mod pin;
+#[cfg(target_os = "linux")]
 mod transaction;
 mod wire;
 

@@ -25,7 +25,8 @@ use crate::{
     ProjectStoreReceipt, ProjectStoreRequestId, ProjectStoreSession,
     inspection::{RecoveryInspection, inspect_established_store, inspect_recovery, open_recovery},
     lease::{LeaseError, ProjectStoreLeases},
-    local::LocalStoreRoot,
+    local::{LocalStoreRoot, valid_checkpoint_id},
+    pin::{publish_pin, remove_pin},
     transaction::{
         InitialPackageMode, install_initial_manual_package,
         publish_established_autosave_generation, publish_established_manual_generation,
@@ -86,6 +87,15 @@ enum Work {
         request_id: ProjectStoreRequestId,
         generation_id: ProjectGenerationId,
     },
+    Pin {
+        request_id: ProjectStoreRequestId,
+        checkpoint_id: String,
+        generation_id: ProjectGenerationId,
+    },
+    Unpin {
+        request_id: ProjectStoreRequestId,
+        checkpoint_id: String,
+    },
 }
 
 impl Work {
@@ -95,7 +105,9 @@ impl Work {
             | Self::Autosave { request_id, .. }
             | Self::SaveAs { request_id, .. }
             | Self::InspectRecovery { request_id }
-            | Self::OpenRecovery { request_id, .. } => *request_id,
+            | Self::OpenRecovery { request_id, .. }
+            | Self::Pin { request_id, .. }
+            | Self::Unpin { request_id, .. } => *request_id,
         }
     }
 
@@ -122,6 +134,14 @@ impl Work {
                 result: Err(ProjectStoreFault::Cancelled),
             },
             Self::OpenRecovery { request_id, .. } => ProjectStoreCompletion::RecoveryOpened {
+                request_id,
+                result: Err(ProjectStoreFault::Cancelled),
+            },
+            Self::Pin { request_id, .. } => ProjectStoreCompletion::Pinned {
+                request_id,
+                result: Err(ProjectStoreFault::Cancelled),
+            },
+            Self::Unpin { request_id, .. } => ProjectStoreCompletion::Unpinned {
                 request_id,
                 result: Err(ProjectStoreFault::Cancelled),
             },
@@ -350,6 +370,28 @@ impl EstablishedProjectActor {
             } => self.submit_work(Work::OpenRecovery {
                 request_id,
                 generation_id,
+            }),
+            ProjectStoreCommand::Pin {
+                request_id,
+                checkpoint_id,
+                generation_id,
+            } if valid_checkpoint_id(&checkpoint_id) => self.submit_work(Work::Pin {
+                request_id,
+                checkpoint_id,
+                generation_id,
+            }),
+            ProjectStoreCommand::Pin { .. } => Err(ProjectStoreFault::Corruption {
+                stage: "checkpoint_id",
+            }),
+            ProjectStoreCommand::Unpin {
+                request_id,
+                checkpoint_id,
+            } if valid_checkpoint_id(&checkpoint_id) => self.submit_work(Work::Unpin {
+                request_id,
+                checkpoint_id,
+            }),
+            ProjectStoreCommand::Unpin { .. } => Err(ProjectStoreFault::Corruption {
+                stage: "checkpoint_id",
             }),
             ProjectStoreCommand::Cancel {
                 request_id,
@@ -712,6 +754,34 @@ fn worker_main(
                 request_id,
                 result: session
                     .open_recovery(generation_id, limits, || cancelled.load(Ordering::Acquire)),
+            },
+            Work::Pin {
+                request_id,
+                checkpoint_id,
+                generation_id,
+            } => ProjectStoreCompletion::Pinned {
+                request_id,
+                result: publish_pin(
+                    &session.root,
+                    &session.leases,
+                    &checkpoint_id,
+                    generation_id,
+                    limits,
+                    || cancelled.load(Ordering::Acquire),
+                ),
+            },
+            Work::Unpin {
+                request_id,
+                checkpoint_id,
+            } => ProjectStoreCompletion::Unpinned {
+                request_id,
+                result: remove_pin(
+                    &session.root,
+                    &session.leases,
+                    &checkpoint_id,
+                    limits,
+                    || cancelled.load(Ordering::Acquire),
+                ),
             },
         };
         let mut state = shared.lock();
@@ -1707,6 +1777,125 @@ mod tests {
     }
 
     #[test]
+    fn pin_and_unpin_are_correlated_graph_safe_and_reject_read_only_sessions() {
+        let project = TestProject::extracted_store("actor-pins", "recoverable.m4dproj");
+        let actor =
+            EstablishedProjectActor::start(&project.store_path(), Default::default()).unwrap();
+        let orphan = generation_id(RECOVERABLE_ORPHAN);
+        actor
+            .try_submit(ProjectStoreCommand::Pin {
+                request_id: request_id(1),
+                checkpoint_id: "review".to_owned(),
+                generation_id: orphan,
+            })
+            .unwrap();
+        assert!(matches!(
+            actor.recv_timeout(TIMEOUT),
+            Some(ProjectStoreCompletion::Pinned {
+                request_id: actual,
+                result: Ok(()),
+            }) if actual == request_id(1)
+        ));
+        let root = LocalStoreRoot::open(project.path()).unwrap();
+        assert!(
+            crate::inspection::inspect_store_graph(&root, ProjectStoreLimits::default(), || false)
+                .unwrap()
+                .orphan_generation_ids()
+                .is_empty()
+        );
+
+        actor
+            .try_submit(ProjectStoreCommand::Unpin {
+                request_id: request_id(2),
+                checkpoint_id: "review".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            actor.recv_timeout(TIMEOUT),
+            Some(ProjectStoreCompletion::Unpinned {
+                request_id: actual,
+                result: Ok(()),
+            }) if actual == request_id(2)
+        ));
+        assert_eq!(
+            crate::inspection::inspect_store_graph(&root, ProjectStoreLimits::default(), || false)
+                .unwrap()
+                .orphan_generation_ids(),
+            [orphan]
+        );
+
+        assert_eq!(
+            actor.try_submit(ProjectStoreCommand::Pin {
+                request_id: request_id(3),
+                checkpoint_id: "Invalid".to_owned(),
+                generation_id: orphan,
+            }),
+            Err(ProjectStoreFault::Corruption {
+                stage: "checkpoint_id"
+            })
+        );
+        actor
+            .try_submit(ProjectStoreCommand::Pin {
+                request_id: request_id(4),
+                checkpoint_id: "missing".to_owned(),
+                generation_id: ProjectGenerationId::from_digest(
+                    mirante4d_identity::Sha256Digest::from_bytes([0x77; 32]),
+                ),
+            })
+            .unwrap();
+        assert!(matches!(
+            actor.recv_timeout(TIMEOUT),
+            Some(ProjectStoreCompletion::Pinned {
+                request_id: actual,
+                result: Err(ProjectStoreFault::Corruption {
+                    stage: "pin_generation"
+                }),
+            }) if actual == request_id(4)
+        ));
+        actor.try_submit(close_command(5)).unwrap();
+        actor.recv_timeout(TIMEOUT).unwrap();
+        actor.join().unwrap();
+
+        let contended = TestProject::extracted_store("actor-pins-read-only", "recoverable.m4dproj");
+        let held_root = LocalStoreRoot::open(contended.path()).unwrap();
+        let held_writer =
+            ProjectStoreLeases::acquire(&held_root, ProjectOpenMode::PreferWritable).unwrap();
+        assert!(held_writer.has_writer());
+        let read_only =
+            EstablishedProjectActor::start(&contended.store_path(), Default::default()).unwrap();
+        read_only
+            .try_submit(ProjectStoreCommand::Pin {
+                request_id: request_id(1),
+                checkpoint_id: "review".to_owned(),
+                generation_id: orphan,
+            })
+            .unwrap();
+        assert!(matches!(
+            read_only.recv_timeout(TIMEOUT),
+            Some(ProjectStoreCompletion::Pinned {
+                result: Err(ProjectStoreFault::ReadOnly),
+                ..
+            })
+        ));
+        read_only
+            .try_submit(ProjectStoreCommand::Unpin {
+                request_id: request_id(2),
+                checkpoint_id: "checkpoint-a".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            read_only.recv_timeout(TIMEOUT),
+            Some(ProjectStoreCompletion::Unpinned {
+                result: Err(ProjectStoreFault::ReadOnly),
+                ..
+            })
+        ));
+        read_only.try_submit(close_command(3)).unwrap();
+        read_only.recv_timeout(TIMEOUT).unwrap();
+        read_only.join().unwrap();
+    }
+
+    #[test]
     fn queued_autosaves_coalesce_and_completion_obligations_stay_bounded() {
         let project = TestProject::extracted("coalesce-bound");
         let actor =
@@ -1727,8 +1916,19 @@ mod tests {
         actor.try_submit(cancel_command(6, 5)).unwrap();
         actor.try_submit(autosave_command(7)).unwrap();
         actor.try_submit(cancel_command(8, 7)).unwrap();
-        actor.try_submit(manual_command(9)).unwrap();
-        actor.try_submit(manual_command(10)).unwrap();
+        actor
+            .try_submit(ProjectStoreCommand::Pin {
+                request_id: request_id(9),
+                checkpoint_id: "closing-pin".to_owned(),
+                generation_id: generation_id(STALE_MANUAL),
+            })
+            .unwrap();
+        actor
+            .try_submit(ProjectStoreCommand::Unpin {
+                request_id: request_id(10),
+                checkpoint_id: "checkpoint-a".to_owned(),
+            })
+            .unwrap();
         assert_eq!(
             actor.try_submit(close_command(11)),
             Err(ProjectStoreFault::QueueFull {
@@ -1762,6 +1962,14 @@ mod tests {
                     result: Err(ProjectStoreFault::Cancelled),
                     ..
                 }
+                | ProjectStoreCompletion::Pinned {
+                    result: Err(ProjectStoreFault::Cancelled),
+                    ..
+                }
+                | ProjectStoreCompletion::Unpinned {
+                    result: Err(ProjectStoreFault::Cancelled),
+                    ..
+                }
                 | ProjectStoreCompletion::Closed { result: Ok(()), .. } => {}
                 other => panic!("unexpected close-barrier completion: {other:?}"),
             }
@@ -1787,8 +1995,10 @@ mod tests {
             .unwrap();
         gate.wait_started();
         actor
-            .try_submit(ProjectStoreCommand::InspectRecovery {
+            .try_submit(ProjectStoreCommand::Pin {
                 request_id: request_id(2),
+                checkpoint_id: "queued-pin".to_owned(),
+                generation_id: generation_id(STALE_MANUAL),
             })
             .unwrap();
         actor.try_submit(cancel_command(3, 2)).unwrap();
@@ -1796,21 +2006,40 @@ mod tests {
         assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 3);
 
         actor
-            .try_submit(ProjectStoreCommand::OpenRecovery {
+            .try_submit(ProjectStoreCommand::Unpin {
                 request_id: request_id(4),
-                generation_id: generation_id(STALE_AUTOSAVE),
+                checkpoint_id: "checkpoint-a".to_owned(),
             })
             .unwrap();
         actor.try_submit(cancel_command(5, 4)).unwrap();
         assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 4);
         assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 5);
 
-        actor.try_submit(cancel_command(6, 1)).unwrap();
-        assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 6);
+        actor
+            .try_submit(ProjectStoreCommand::InspectRecovery {
+                request_id: request_id(6),
+            })
+            .unwrap();
+        actor.try_submit(cancel_command(7, 6)).unwrap();
+        assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 6);
+        assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 7);
+
+        actor
+            .try_submit(ProjectStoreCommand::OpenRecovery {
+                request_id: request_id(8),
+                generation_id: generation_id(STALE_AUTOSAVE),
+            })
+            .unwrap();
+        actor.try_submit(cancel_command(9, 8)).unwrap();
+        assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 8);
+        assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 9);
+
+        actor.try_submit(cancel_command(10, 1)).unwrap();
+        assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 10);
         gate.release();
         assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 1);
 
-        actor.try_submit(close_command(7)).unwrap();
+        actor.try_submit(close_command(11)).unwrap();
         assert!(matches!(
             actor.recv_timeout(TIMEOUT),
             Some(ProjectStoreCompletion::Closed { result: Ok(()), .. })
@@ -1974,6 +2203,12 @@ mod tests {
                 request_id: actual_id,
                 result: Err(ProjectStoreFault::Cancelled)
             } | ProjectStoreCompletion::RecoveryOpened {
+                request_id: actual_id,
+                result: Err(ProjectStoreFault::Cancelled)
+            } | ProjectStoreCompletion::Pinned {
+                request_id: actual_id,
+                result: Err(ProjectStoreFault::Cancelled)
+            } | ProjectStoreCompletion::Unpinned {
                 request_id: actual_id,
                 result: Err(ProjectStoreFault::Cancelled)
             } if actual_id == request_id(expected)

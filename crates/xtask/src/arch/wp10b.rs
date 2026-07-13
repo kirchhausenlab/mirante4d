@@ -33,6 +33,10 @@ const RECOVERY_API_CORRECTION_PATH: &str =
     "architecture/wp10b-project-store-recovery-api-correction.json";
 const RECOVERY_API_CORRECTION_SHA256: &str =
     "48957fd7c36a34cd916f659cd3becaf8b54c497ab55ad2ed120af8ac2e384e73";
+const MAINTENANCE_TRANSITION_CORRECTION_PATH: &str =
+    "architecture/wp10b-project-store-maintenance-transition-correction.json";
+const MAINTENANCE_TRANSITION_CORRECTION_SHA256: &str =
+    "778ac85e7c40c1327f6ce6f1854cf7f2cc3a1d631df2da007d0906d819eafac1";
 const PROTECTED_MAIN_COMMIT: &str = "b6e0267802f8ac2d0d49a0f04302fd321ef2f617";
 const PROTECTED_MAIN_TREE: &str = "b20b598603b47fdbe7c85c3b6d1cba8c78fd433e";
 const PROTECTED_MAIN_RUN: &str =
@@ -47,7 +51,7 @@ const ZERO_SHA256: &str = "00000000000000000000000000000000000000000000000000000
 // contract plus bound corrections while allowing the independent fixture
 // producer to remain bound to its final manifest.
 const NORMALIZED_CONTRACT_SHA256: &str =
-    "8cb08e614c619097d14a95b5634d21a180d431b3fed8a4e155da115def9533a8";
+    "e46578894dac50ad612bbd525ae1bc7c716cd76e9381f181387f19659232a08e";
 
 pub(super) fn check_wp10b_project_store_contract(repo_root: &Path) -> anyhow::Result<()> {
     let contract_path = repo_root.join(CONTRACT_PATH);
@@ -90,6 +94,11 @@ fn validate_header_and_bindings(repo_root: &Path, contract: &Value) -> anyhow::R
             "recovery_api_correction",
             RECOVERY_API_CORRECTION_PATH,
             RECOVERY_API_CORRECTION_SHA256,
+        ),
+        (
+            "maintenance_transition_correction",
+            MAINTENANCE_TRANSITION_CORRECTION_PATH,
+            MAINTENANCE_TRANSITION_CORRECTION_SHA256,
         ),
     ] {
         expect_string(contract, &format!("/bindings/{name}/path"), path)?;
