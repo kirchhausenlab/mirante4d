@@ -214,11 +214,17 @@ pub(super) enum ProductAutomationCommand {
     OpenDataset {
         path: PathBuf,
     },
+    CancelSourceVerification,
+    RequestSourceVerification,
     WaitFor {
         condition: ProductAutomationWaitCondition,
         timeout_ms: u64,
     },
     SetViewportSize {
+        width: u32,
+        height: u32,
+    },
+    SetRenderTargetSize {
         width: u32,
         height: u32,
     },
@@ -332,8 +338,11 @@ impl ProductAutomationCommand {
     pub(super) fn name(&self) -> &'static str {
         match self {
             Self::OpenDataset { .. } => "open_dataset",
+            Self::CancelSourceVerification => "cancel_source_verification",
+            Self::RequestSourceVerification => "request_source_verification",
             Self::WaitFor { .. } => "wait_for",
             Self::SetViewportSize { .. } => "set_viewport_size",
+            Self::SetRenderTargetSize { .. } => "set_render_target_size",
             Self::SetViewerLayout { .. } => "set_viewer_layout",
             Self::SetTimepoint { .. } => "set_timepoint",
             Self::StepTimepoint { .. } => "step_timepoint",
@@ -374,6 +383,8 @@ pub(super) enum ProductAutomationWaitCondition {
     FrameFreshnessCurrent,
     NoRenderError,
     GpuFramePresented,
+    SourceVerificationRequired,
+    SourceVerificationVerified,
 }
 
 impl ProductAutomationWaitCondition {
@@ -385,6 +396,8 @@ impl ProductAutomationWaitCondition {
             Self::FrameFreshnessCurrent => "frame_freshness_current",
             Self::NoRenderError => "no_render_error",
             Self::GpuFramePresented => "gpu_frame_presented",
+            Self::SourceVerificationRequired => "source_verification_required",
+            Self::SourceVerificationVerified => "source_verification_verified",
         }
     }
 }
@@ -441,6 +454,15 @@ pub(super) enum ProductAutomationAssertCondition {
         min_different_pixels: Option<usize>,
     },
     CrossSectionRetired,
+    SourceVerificationEvidence {
+        min_accepted_progress_updates: u64,
+        min_cancelled_runs: u64,
+        min_accepted_successes: u64,
+    },
+    RenderTargetPixels {
+        width: u64,
+        height: u64,
+    },
 }
 
 impl ProductAutomationAssertCondition {
@@ -462,6 +484,8 @@ impl ProductAutomationAssertCondition {
             Self::CrossSectionPanelImagesDistinct { .. } => "cross_section_panel_images_distinct",
             Self::FourPanelImagesDistinct { .. } => "four_panel_images_distinct",
             Self::CrossSectionRetired => "cross_section_retired",
+            Self::SourceVerificationEvidence { .. } => "source_verification_evidence",
+            Self::RenderTargetPixels { .. } => "render_target_pixels",
         }
     }
 

@@ -136,7 +136,11 @@ device rename.
   comparison rather than prompting the user or becoming a permanent live root.
   The application integration owns the 30-second idle and 120-second maximum
   scheduling because it owns live revisions and capture creation; the store
-  actor publishes and coalesces submitted captures.
+  actor publishes and coalesces submitted captures. The B3 candidate implements
+  that exact deadline with an injected monotonic clock in a private application
+  service, including edit-during-capture, failure/cancellation, and
+  `CommitIndeterminate` handling. The service remains product-unreachable until
+  B4.
 - The normal recovery prompt is offered only for a newer same-base autosave.
   A changed-base autosave is labeled divergent. Manual previous, manual
   recovery, and manual generations found by bounded scan are labeled manual
@@ -293,8 +297,11 @@ commit `4a246a1bb7bfe099673ef10d6cb5951729b3ff37` (tree
 cut cases passed with zero harness retries. The sanitized report SHA-256 is
 `ced8c82c75c480810e7ebf81e2c032e579f89bbb28c1f854d1681a3ddad1f9e5`, and
 protected-main policy/Rust checks passed in GitHub Actions run 29273392030.
-This qualifies only that exact off-product B2 revision and ext4 tuple; B3/B4
-integration and B4 product validation remain pending.
+This qualifies only that exact off-product B2 revision and ext4 tuple. The B3
+candidate adds actor-authenticated direct/paged reuse, destination-local Save As
+copy-and-rehash, and the private autosave service described above, but its
+public and real-display evidence is not yet accepted. B4 product activation,
+predecessor deletion, and product persistence validation remain pending.
 
 ### Identity And Project Resolution
 

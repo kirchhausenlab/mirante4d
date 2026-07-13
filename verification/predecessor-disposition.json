@@ -2435,12 +2435,12 @@
       "reason": "WP-10B B2 proves one worker serializes established manual/autosave commits and releases its writer lease before Close completes."
     },
     {
-      "id": "libtest:mirante4d-project-store:actor::tests::failed_and_cancelled_save_as_keep_the_source_session_authoritative",
+      "id": "libtest:mirante4d-project-store:actor::tests::rejected_save_as_keeps_the_source_session_authoritative",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
-      "reason": "WP-10B B2 proves collision, source failure, and cancellation leave the established source session authoritative and usable."
+      "reason": "WP-10B B3 proves collision and a redundant authenticated-object source are rejected before reads while the established source session remains authoritative and usable."
     },
     {
       "id": "libtest:mirante4d-project-store:actor::tests::full_verify_is_correlated_cancellable_and_available_read_only",
@@ -6388,6 +6388,366 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 keeps all frozen transition names unique and exactly parseable."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_source_verification_service::tests::cancellation_before_receive_wins_over_an_already_published_success",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 proves a cancellation accepted before result receipt suppresses an already-published verification success."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_source_verification_service::tests::coalescing_never_regresses_progress",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 proves worker progress is bounded, coalesced, and monotonically observed by the product service."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_source_verification_service::tests::evidence_diagnostics_reset_only_while_idle",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 keeps source-verification evidence counters correlated and resettable only while no worker is active."
+    },
+    {
+      "id": "libtest:mirante4d-app:current_source_verification_service::tests::phase_progress_maps_to_one_fixed_monotonic_scalar",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 maps verification and runtime-preparation phases onto one fixed monotonic product progress range."
+    },
+    {
+      "id": "libtest:mirante4d-app:product_automation::tests::automation_script_parses_source_verification_evidence_workflow",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "WP-10B-project-store"],
+      "reason": "WP-10B B3 parses the exact supporting product-automation commands for verification, cancellation, retry, and evidence assertions."
+    },
+    {
+      "id": "libtest:mirante4d-app:tests::automatic_source_verification_waits_for_the_previous_worker_to_retire",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 defers automatic successor verification until the cancelled predecessor worker has retired."
+    },
+    {
+      "id": "libtest:mirante4d-app:tests::observed_source_fault_invalidates_then_retry_restores_runtime_identity_coherence",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 invalidates a drifted verified runtime and restores catalog/runtime identity coherence only after successful retry."
+    },
+    {
+      "id": "libtest:mirante4d-app:workbench_brick_runtime::tests::only_observed_source_integrity_faults_invalidate_a_verified_binding",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 confines verified-binding invalidation to observed source-integrity fault classes."
+    },
+    {
+      "id": "libtest:mirante4d-app:workbench_playback_runtime::tests::deferred_or_retiring_source_verification_keeps_ui_polling",
+      "kind": "libtest",
+      "owner": "mirante4d-app",
+      "lane": "ui",
+      "requirement_ids": ["D-022-ui", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 keeps the UI event loop polling while source verification is deferred or its worker is retiring."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::cancelled_completion_does_not_rearm_the_captured_revision",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B3 proves a cancelled autosave completion does not automatically retry the captured revision."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::commit_indeterminate_suspends_writes_until_service_reopen",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B3 suspends project writes only after CommitIndeterminate and requires service reopen to resume."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::decreasing_tick_is_rejected_atomically",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B3 atomically rejects regression of the injected monotonic autosave clock."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::edits_during_capture_keep_their_own_deadlines_and_failures_do_not_retry",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B3 preserves edit deadlines that arise during an immutable capture and does not rearm a failed captured revision."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::every_eligibility_fact_blocks_capture_without_consuming_the_deadline",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B3 enforces every verified, bound, dirty, writable, and no-active-commit autosave eligibility fact without consuming its deadline."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::failed_capture_is_not_retried_until_a_later_durable_edit",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B3 rearms a failed autosave only after a later durable edit."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::idle_and_maximum_deadlines_are_exact",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B3 proves the exact 30-second idle and 120-second maximum autosave deadlines without sleeping."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::inactive_cancellation_uses_the_service_path",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B3 returns the typed inactive-cancellation outcome through the project-store service boundary."
+    },
+    {
+      "id": "libtest:mirante4d-application:project_store_service::tests::real_actor_autosave_obeys_filesystem_policy_without_advancing_manual_saved_revision",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B3 routes an exact immutable capture through the real actor: qualified ext4 proves chained autosaves, an unqualified host proves typed non-mutating rejection, and neither advances the manual saved revision."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::cancelled_source_verification_suppresses_its_late_prepared_completion",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 suppresses and disposes a prepared source runtime after its verification is cancelled."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::failed_source_verification_never_admits_a_late_prepared_binding",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 prevents failed verification from later admitting a prepared binding."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::invalidated_source_verification_cannot_displace_its_successor",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 rejects a stale invalidated completion before it can displace the current source generation."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::observed_source_drift_invalidates_identity_and_cancels_project_persistence",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 invalidates verified identity and cancels project persistence after observed source drift."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::source_verification_completion_ignores_view_currentness_but_not_source_generation",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 keys verification completion to source generation rather than transient view currentness."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::source_verification_progress_is_one_bounded_monotonic_observation",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 exposes one bounded monotonic source-verification progress observation."
+    },
+    {
+      "id": "libtest:mirante4d-application:tests::source_verification_rejects_catalog_or_reference_drift_atomically",
+      "kind": "libtest",
+      "owner": "mirante4d-application",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 rejects catalog or source-reference drift before atomically promoting a verified binding."
+    },
+    {
+      "id": "libtest:mirante4d-data:current_source_verification::tests::bridge_traversal_matches_manual_multi_layer_time_and_tile_edge_assembly",
+      "kind": "libtest",
+      "owner": "mirante4d-data",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 matches an independent D-009 assembly across layers, time, tiles, and edge extents."
+    },
+    {
+      "id": "libtest:mirante4d-data:current_source_verification::tests::cancellation_and_capacity_release_every_verification_charge",
+      "kind": "libtest",
+      "owner": "mirante4d-data",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 proves cancellation and capacity failure release every admitted verification byte."
+    },
+    {
+      "id": "libtest:mirante4d-data:current_source_verification::tests::drift_links_and_changed_verified_reopen_fail_closed_without_source_writes",
+      "kind": "libtest",
+      "owner": "mirante4d-data",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 rejects closure drift, links, and changed verified reopen without mutating source bytes."
+    },
+    {
+      "id": "libtest:mirante4d-data:current_source_verification::tests::exact_four_dtype_pairs_are_admitted_and_u8_storage_is_identity_invariant",
+      "kind": "libtest",
+      "owner": "mirante4d-data",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 admits exactly the four frozen source/stored dtype pairs and proves lossless u8 storage invariance."
+    },
+    {
+      "id": "libtest:mirante4d-data:current_source_verification::tests::inventory_bounds_reject_limit_plus_one_without_allocating_a_tree",
+      "kind": "libtest",
+      "owner": "mirante4d-data",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 rejects source-inventory limit plus one with bounded streaming work."
+    },
+    {
+      "id": "libtest:mirante4d-data:current_source_verification::tests::one_voxel_package_matches_the_independent_d009_vector_and_reopens_verified",
+      "kind": "libtest",
+      "owner": "mirante4d-data",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 matches the independent one-voxel D-009 vector and reopens through the verified bridge."
+    },
+    {
+      "id": "libtest:mirante4d-data:current_source_verification::tests::validity_canonicalization_is_lsb_exact_and_float_rules_are_closed",
+      "kind": "libtest",
+      "owner": "mirante4d-data",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 proves least-significant-bit validity and the closed finite-float canonicalization rules."
+    },
+    {
+      "id": "libtest:mirante4d-data:current_source_verification::tests::verification_rebinds_open_metadata_to_the_preinventory_closure",
+      "kind": "libtest",
+      "owner": "mirante4d-data",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "D-009-scientific-content-identity", "WP-10B-project-store"],
+      "reason": "WP-10B B3 binds reopened metadata to the exact verified pre-inventory closure before capability issuance."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::authenticated_copy_cancellation_cleans_the_private_destination_stage",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B3 removes only its private destination stage when authenticated Save As copying is cancelled."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::authenticated_copy_rejects_source_descendants_and_enforces_the_true_fd_peak",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B3 rejects a Save As destination inside its source and enforces the complete held-descriptor peak."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::authenticated_source_namespace_and_content_drift_are_source_changed",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B3 reports authenticated source namespace or byte drift as SourceChanged before destination authority publication."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::omitted_new_logical_object_is_rejected_before_ref_publication",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B3 rejects a genuinely new logical object without exactly one source before publishing a ref."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::reopened_unchanged_paged_manual_save_needs_no_object_sources",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B3 saves a reopened unchanged paged artifact through authenticated reuse with zero caller sources."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::same_digest_with_a_different_descriptor_requires_and_consumes_a_new_source",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B3 treats a changed logical descriptor as new even when its content digest matches and consumes its exact supplied source."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::save_as_copies_the_authenticated_paged_closure_without_sources",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B3 copies and rehashes an authenticated paged closure into destination-local Save As storage without caller sources."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::unreferenced_store_content_cannot_authorize_held_lane_reuse",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B3 permits source-free reuse only for content authenticated by the held source generation and lane."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:product_validate::tests::b3_e1_acceptance_rejects_a_mislabeled_second_render_target",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B3 rejects supporting E1 evidence that mislabels the second exact GPU render target."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:product_validate::tests::b3_e1_acceptance_requires_two_distinct_exact_gpu_render_targets",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B3 requires distinct exact GPU render targets at both accepted product-validation resolutions."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:product_validate::tests::b3_source_closure_evidence_compares_exact_entries_and_bytes",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B3 supporting product evidence compares the exact source closure and bytes before and after validation."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:product_validate::tests::b3_source_verification_script_proves_cancel_progress_success_and_both_sizes",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B3 builds the supporting product script for progress, cancellation, retry success, nonblank rendering, and both accepted sizes."
     }
   ],
   "expected_summary": {
@@ -6396,6 +6756,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 593
+    "current_additions": 638
   }
 }

@@ -82,6 +82,16 @@ MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
 
 This lane is local-only and is not a GitHub Actions requirement.
 
+Run the B3 current-source verification scenario on a real mapped display with:
+
+```bash
+cargo xtask product-validate b3_source_verification
+```
+
+This produces supporting E1 evidence. B3 validation also observes the mapped
+physical client area externally at 1280x720 and 1920x1080; successor project
+save, autosave, and recovery remain B4 work.
+
 ## Working Rules
 
 - Keep generated packages, private microscopy data, logs, and evidence under

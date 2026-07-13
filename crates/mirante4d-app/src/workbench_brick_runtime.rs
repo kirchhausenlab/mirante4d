@@ -3,8 +3,9 @@
 use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
 use eframe::egui;
+use mirante4d_application::ApplicationCommand;
 use mirante4d_dataset::{CpuLedgerCategory, DatasetCatalog, DatasetResourceKey, ResourceLease};
-use mirante4d_dataset_runtime::{RequestPriority, RuntimeFault};
+use mirante4d_dataset_runtime::{RequestPriority, RuntimeFault, RuntimeFaultCode};
 use mirante4d_domain::{TimeIndex, ViewerLayout};
 use mirante4d_render_api::MAX_RENDER_REQUIREMENTS;
 
@@ -49,6 +50,14 @@ struct AggregateDemandSeed<'a> {
 impl MiranteWorkbenchApp {
     pub(crate) fn request_visible_bricks(&mut self) -> VisibleBrickRequestOutcome {
         let snapshot = self.application.snapshot();
+        if self.dataset.resource_identity()
+            != snapshot.catalog().scientific_identity().resource_identity()
+        {
+            self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Loading;
+            self.render_runtime.frame_fidelity.reason = LodDecisionReason::LoadingTargetScale;
+            self.render_runtime.frame_fidelity.backend = RenderBackend::Loading;
+            return VisibleBrickRequestOutcome::default();
+        }
         let view = application_view(&snapshot);
         let four_panel = view.layout() == ViewerLayout::FourPanel;
         let diagnostics = match self.dataset.dispatcher().diagnostics() {
@@ -204,6 +213,25 @@ impl MiranteWorkbenchApp {
 
     pub(crate) fn drain_brick_results(&mut self, ctx: &egui::Context) {
         let started = Instant::now();
+        let snapshot = self.application.snapshot();
+        if self.dataset.resource_identity()
+            != snapshot.catalog().scientific_identity().resource_identity()
+        {
+            match self
+                .dataset
+                .dispatcher_mut()
+                .drain(RESULT_DRAIN_LIMIT, |_ticket, _lease| {})
+            {
+                Ok(drained) => {
+                    let _ = self.dataset.dispatcher_mut().take_last_fault();
+                    if drained > 0 || self.dataset.dispatcher().has_pending_work() {
+                        ctx.request_repaint();
+                    }
+                }
+                Err(fault) => self.dataset.record_plan_error(fault.to_string()),
+            }
+            return;
+        }
         let (dataset, render) = (&mut self.dataset, &mut self.render_runtime);
         let bridge = &mut render.lease_bridge;
         let mut installed = false;
@@ -398,7 +426,23 @@ impl MiranteWorkbenchApp {
         }
     }
 
-    fn record_dataset_fault(&mut self, fault: &RuntimeFault) {
+    pub(crate) fn record_dataset_fault(&mut self, fault: &RuntimeFault) {
+        if runtime_fault_invalidates_verified_source(fault.code()) {
+            let snapshot = self.application.snapshot();
+            if snapshot.catalog().scientific_identity().is_verified()
+                && let Err(application_fault) = crate::current_egui_shell_bridge::dispatch(
+                    &mut self.application,
+                    ApplicationCommand::InvalidateSourceVerification {
+                        source_generation: snapshot.source_generation(),
+                    },
+                )
+            {
+                tracing::warn!(
+                    ?application_fault,
+                    "observed source fault could not invalidate the verified binding"
+                );
+            }
+        }
         let message = fault.to_string();
         self.dataset.record_plan_error(message.clone());
         self.render_runtime.visible_brick_plan_error = Some(message.clone());
@@ -430,6 +474,16 @@ impl MiranteWorkbenchApp {
             LodDecisionReason::BackendLimit
         };
     }
+}
+
+const fn runtime_fault_invalidates_verified_source(code: RuntimeFaultCode) -> bool {
+    matches!(
+        code,
+        RuntimeFaultCode::SourceRejected
+            | RuntimeFaultCode::CorruptResource
+            | RuntimeFaultCode::UnsupportedResource
+            | RuntimeFaultCode::DecodeFailed
+    )
 }
 
 fn budget_share_usize(total: usize, numerator: usize, denominator: usize) -> usize {
@@ -500,12 +554,34 @@ fn resource_at_timepoint(key: DatasetResourceKey, timepoint: TimeIndex) -> Datas
 
 #[cfg(test)]
 mod tests {
-    use super::completion_drain_needs_replan;
+    use mirante4d_dataset_runtime::RuntimeFaultCode;
+
+    use super::{completion_drain_needs_replan, runtime_fault_invalidates_verified_source};
 
     #[test]
     fn draining_cancelled_backlog_retries_queue_blocked_demand() {
         assert!(completion_drain_needs_replan(false, 1, true));
         assert!(!completion_drain_needs_replan(false, 1, false));
         assert!(completion_drain_needs_replan(true, 1, false));
+    }
+
+    #[test]
+    fn only_observed_source_integrity_faults_invalidate_a_verified_binding() {
+        for code in [
+            RuntimeFaultCode::SourceRejected,
+            RuntimeFaultCode::CorruptResource,
+            RuntimeFaultCode::UnsupportedResource,
+            RuntimeFaultCode::DecodeFailed,
+        ] {
+            assert!(runtime_fault_invalidates_verified_source(code));
+        }
+        for code in [
+            RuntimeFaultCode::QueueFull,
+            RuntimeFaultCode::Cancelled,
+            RuntimeFaultCode::ShuttingDown,
+            RuntimeFaultCode::InvariantViolation,
+        ] {
+            assert!(!runtime_fault_invalidates_verified_source(code));
+        }
     }
 }

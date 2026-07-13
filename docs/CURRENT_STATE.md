@@ -143,9 +143,15 @@ all 120 hosted tests and 60 rootless-VM cuts passed with zero harness retries.
 The exhaustive hosted matrix took 85,683 ms and the VM evidence phase took
 340,235 ms. Protected-main policy and Rust checks also passed in
 [run 29273392030](https://github.com/kirchhausenlab/mirante4d/actions/runs/29273392030).
-This qualifies only the exact off-product B2 ext4 tuple and revision. B3 source
-verification/application integration and B4 product cutover remain pending;
-no product persistence claim is made.
+This qualifies only the exact off-product B2 ext4 tuple and revision. The B3
+implementation candidate now adds bounded current-source D-009 verification,
+source-generation-aware promotion and invalidation, authenticated project-
+object reuse and Save As closure copying, and an injected-clock autosave
+service over the project-store actor. Source verification is product-reachable;
+the project-store service remains compile/test-only, and the private
+project-v15 route remains the sole product persistence path until B4. B3
+acceptance evidence and the B4 product cutover are still pending, so no
+successor product-persistence claim is made.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
@@ -163,8 +169,10 @@ See [testing](TESTING.md) for commands and claim language.
 
 ## Known Limitations
 
-- Current sources have no verified `ScientificContentId`; project attach,
-  open, and save therefore reject at the typed identity gate before I/O.
+- Current schema-1 sources begin unverified and can derive a verified
+  `ScientificContentId` through the bounded B3 source scan. Project attach,
+  open, and save reject at the typed identity gate until that scan succeeds,
+  and observed source drift returns the source to the unverified state.
 - Dataset schema 1 and the private project-v15 bridge are experimental, not
   target-format conformance claims.
 - The successor project-store crate exists off-product with its frozen API,
@@ -178,9 +186,11 @@ See [testing](TESTING.md) for commands and claim language.
   provisional Autosave and manual handoff, established-session work, explicit
   recovery selection, and authenticated Save As while retaining exact roots and
   leases. B2 durability qualification now passes for its exact off-product
-  revision. Source-identity integration, autosave timer scheduling, product
-  recovery workflow, public/product garbage collection and Purge wiring, and
-  every product path remain unimplemented.
+  revision. B3 adds actor-authenticated unchanged-object reuse, destination-
+  local Save As closure copying, and exact autosave scheduling in a private
+  application service. That service is not constructed or polled by the
+  product; product recovery, public/product garbage collection and Purge
+  wiring, and every successor product-persistence path remain unimplemented.
   PlanCompaction
   does not authorize Trash, expose a physical object/byte plan or reclaim
   estimate, or prove backup approval. Private FullVerify does not validate

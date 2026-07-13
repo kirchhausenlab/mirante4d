@@ -29,6 +29,40 @@ fn active_lease_cohort_assertions(commands: &[Value]) -> usize {
         .count()
 }
 
+fn b3_exact_capture_report(second_width: u64) -> Value {
+    json!({
+        "status": "passed",
+        "artifacts": [
+            {
+                "kind": "viewport_capture",
+                "capture_source": "gpu_display_frame_readback",
+                "path": format!("artifacts/{B3_PRIMARY_E1_CAPTURE}.ppm"),
+                "width": B3_VIEWPORT_WIDTH,
+                "height": B3_VIEWPORT_HEIGHT,
+                "command_index": 20,
+                "pixel_stats": {
+                    "pixel_count": u64::from(B3_VIEWPORT_WIDTH) * u64::from(B3_VIEWPORT_HEIGHT),
+                    "nonzero_rgb_pixels": 1,
+                    "max_rgb": 255
+                }
+            },
+            {
+                "kind": "viewport_capture",
+                "capture_source": "gpu_display_frame_readback",
+                "path": format!("artifacts/{B3_SECONDARY_E1_CAPTURE}.ppm"),
+                "width": second_width,
+                "height": B3_SECOND_VIEWPORT_HEIGHT,
+                "command_index": 30,
+                "pixel_stats": {
+                    "pixel_count": second_width * u64::from(B3_SECOND_VIEWPORT_HEIGHT),
+                    "nonzero_rgb_pixels": 1,
+                    "max_rgb": 255
+                }
+            }
+        ]
+    })
+}
+
 #[test]
 fn generated_fixture_product_automation_script_uses_semantic_commands() {
     let script = generated_fixture_camera_smoke_script(Path::new("/tmp/demo.m4d"));
@@ -168,6 +202,97 @@ fn generated_fixture_render_modes_script_switches_supported_modes() {
             .any(|command| { command["condition"]["render_mode"]["mode"].as_str() == Some("iso") })
     );
     assert_eq!(commands.last().unwrap()["command"], "quit");
+}
+
+#[test]
+fn b3_source_verification_script_proves_cancel_progress_success_and_both_sizes() {
+    let script = b3_source_verification_script(Path::new("/tmp/demo.m4d"));
+    let commands = script["commands"].as_array().unwrap();
+
+    assert_eq!(script["scenario"], B3_SOURCE_VERIFICATION_SCENARIO);
+    assert_eq!(commands[0]["command"], "open_dataset");
+    let initial_verified_wait = commands
+        .iter()
+        .position(|command| {
+            command["command"] == "wait_for"
+                && command["condition"] == "source_verification_verified"
+        })
+        .unwrap();
+    let cancellation = commands
+        .iter()
+        .position(|command| command["command"] == "cancel_source_verification")
+        .unwrap();
+    assert!(initial_verified_wait < cancellation);
+    assert!(
+        commands
+            .iter()
+            .any(|command| command["command"] == "cancel_source_verification")
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|command| command["command"] == "request_source_verification")
+    );
+    assert!(commands.iter().any(|command| {
+        command["condition"]["source_verification_evidence"]["min_accepted_progress_updates"] == 1
+            && command["condition"]["source_verification_evidence"]["min_cancelled_runs"] == 1
+            && command["condition"]["source_verification_evidence"]["min_accepted_successes"] == 1
+    }));
+    assert!(commands.iter().any(|command| {
+        command["command"] == "set_viewport_size"
+            && command["width"] == B3_VIEWPORT_WIDTH
+            && command["height"] == B3_VIEWPORT_HEIGHT
+    }));
+    assert!(commands.iter().any(|command| {
+        command["command"] == "set_render_target_size"
+            && command["width"] == B3_VIEWPORT_WIDTH
+            && command["height"] == B3_VIEWPORT_HEIGHT
+    }));
+    assert!(commands.iter().any(|command| {
+        command["command"] == "set_render_target_size"
+            && command["width"] == B3_SECOND_VIEWPORT_WIDTH
+            && command["height"] == B3_SECOND_VIEWPORT_HEIGHT
+    }));
+    assert!(commands.iter().any(|command| {
+        command["condition"]["render_target_pixels"]["width"] == B3_VIEWPORT_WIDTH
+            && command["condition"]["render_target_pixels"]["height"] == B3_VIEWPORT_HEIGHT
+    }));
+    assert!(commands.iter().any(|command| {
+        command["condition"]["render_target_pixels"]["width"] == B3_SECOND_VIEWPORT_WIDTH
+            && command["condition"]["render_target_pixels"]["height"] == B3_SECOND_VIEWPORT_HEIGHT
+    }));
+    assert!(commands.iter().any(|command| {
+        command["command"] == "set_viewport_size"
+            && command["width"] == B3_SECOND_VIEWPORT_WIDTH
+            && command["height"] == B3_SECOND_VIEWPORT_HEIGHT
+    }));
+    assert!(commands.iter().any(|command| {
+        command["command"] == "capture_screenshot" && command["name"] == "b3-after-cancel-1280x720"
+    }));
+    assert!(commands.iter().any(|command| {
+        command["command"] == "capture_screenshot"
+            && command["name"] == "b3-after-success-1920x1080"
+    }));
+    assert_eq!(commands.last().unwrap()["command"], "quit");
+    validate_product_automation_script(&script).unwrap();
+}
+
+#[test]
+fn b3_source_closure_evidence_compares_exact_entries_and_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("empty")).unwrap();
+    fs::write(temp.path().join("payload"), b"before").unwrap();
+    let before = SourceClosureSnapshot::capture(temp.path()).unwrap();
+    assert_eq!(
+        before.compare_json(temp.path()).unwrap()["byte_identical"],
+        true
+    );
+
+    fs::write(temp.path().join("payload"), b"after!").unwrap();
+    assert_eq!(
+        before.compare_json(temp.path()).unwrap()["byte_identical"],
+        false
+    );
 }
 
 #[test]
@@ -1259,6 +1384,29 @@ fn completed_product_validation_rejects_nonblank_loading_reference_capture() {
 }
 
 #[test]
+fn b3_e1_acceptance_requires_two_distinct_exact_gpu_render_targets() {
+    let automation_report = b3_exact_capture_report(u64::from(B3_SECOND_VIEWPORT_WIDTH));
+
+    let evidence = b3_exact_e1_capture_evidence(Some(&automation_report)).unwrap();
+
+    assert_eq!(evidence["accepted"], true);
+    assert_eq!(evidence["evidence_level"], "E1");
+    assert_eq!(evidence["e4_product_open_satisfied"], false);
+    assert_eq!(evidence["captures"].as_array().unwrap().len(), 2);
+    assert_eq!(evidence["captures"][0]["width"], B3_VIEWPORT_WIDTH);
+    assert_eq!(evidence["captures"][1]["width"], B3_SECOND_VIEWPORT_WIDTH);
+}
+
+#[test]
+fn b3_e1_acceptance_rejects_a_mislabeled_second_render_target() {
+    let automation_report = b3_exact_capture_report(1280);
+
+    let error = b3_exact_e1_capture_evidence(Some(&automation_report)).unwrap_err();
+
+    assert!(error.contains("expected exact 1920x1080 render-target pixels"));
+}
+
+#[test]
 fn unix_epoch_ms_to_utc_rfc3339_formats_report_timestamps() {
     assert_eq!(unix_epoch_ms_to_utc_rfc3339(0), "1970-01-01T00:00:00.000Z");
     assert_eq!(
@@ -1509,6 +1657,7 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
         process_rss_limit_bytes: Some(8 * GIB),
         process_peak_rss_bytes: Some(64 * MIB),
         process_rss_limit_exceeded: false,
+        source_closure_evidence: Value::Null,
         automation_status: Some("passed".to_owned()),
         exit_status: Some("0".to_owned()),
         exit_success: Some(true),
@@ -1712,6 +1861,7 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
         process_rss_limit_bytes: None,
         process_peak_rss_bytes: None,
         process_rss_limit_exceeded: false,
+        source_closure_evidence: Value::Null,
         automation_status: Some("passed".to_owned()),
         exit_status: Some("0".to_owned()),
         exit_success: Some(true),
@@ -1762,6 +1912,7 @@ fn wrapper_report_marks_preflight_as_non_launch_unsupported_evidence() {
         process_rss_limit_bytes: Some(8 * GIB),
         process_peak_rss_bytes: None,
         process_rss_limit_exceeded: false,
+        source_closure_evidence: Value::Null,
         automation_status: None,
         exit_status: None,
         exit_success: None,

@@ -182,11 +182,18 @@ impl MiranteWorkbenchApp {
             viewport_changed |=
                 set_presentation_viewport(&mut self.render_runtime, presentation_viewport);
         }
-        if let Some(render_viewport) = render_viewport_for_display_size(
-            display_size_points,
-            ctx.pixels_per_point(),
-            max_texture_side,
-        ) {
+        let automation_render_target = self
+            .validation_runtime
+            .product_automation
+            .as_ref()
+            .and_then(ProductAutomationController::render_target_override);
+        if let Some(render_viewport) = automation_render_target.or_else(|| {
+            render_viewport_for_display_size(
+                display_size_points,
+                ctx.pixels_per_point(),
+                max_texture_side,
+            )
+        }) {
             viewport_changed |= set_render_viewport(&mut self.render_runtime, render_viewport);
         }
         if viewport_changed {
@@ -1022,10 +1029,44 @@ impl eframe::App for MiranteWorkbenchApp {
                             match application_snapshot.source() {
                                 SourceVerificationSnapshot::Required => {
                                     "verification required; project open/save unavailable"
+                                        .to_owned()
                                 }
-                                SourceVerificationSnapshot::Verified(_) => "verified",
+                                SourceVerificationSnapshot::Verifying {
+                                    completed_work,
+                                    total_work,
+                                    ..
+                                } => (*completed_work)
+                                    .saturating_mul(100)
+                                    .checked_div(*total_work)
+                                    .map_or_else(
+                                        || "verifying".to_owned(),
+                                        |percent| format!("verifying ({percent}%)"),
+                                    ),
+                                SourceVerificationSnapshot::Verified(_) => "verified".to_owned(),
                             },
                         );
+                        if let SourceVerificationSnapshot::Verifying { operation_id, .. } =
+                            application_snapshot.source()
+                            && ui_kit::toolbar_button(ui, "Cancel Verification", true).clicked()
+                        {
+                            application_commands
+                                .push(ApplicationCommand::CancelOperation(*operation_id));
+                        }
+                        if matches!(
+                            application_snapshot.source(),
+                            SourceVerificationSnapshot::Required
+                        ) && ui_kit::toolbar_button(
+                            ui,
+                            "Verify Source",
+                            self.source_verification_service
+                                .as_ref()
+                                .is_some_and(|service| service.active_token().is_none()),
+                        )
+                        .clicked()
+                        {
+                            application_commands
+                                .push(ApplicationCommand::RequestSourceVerification);
+                        }
                     });
                     ui_kit::section(ui, "Status", |ui| {
                         if let Some(task) = &self.import_runtime.import_task {
@@ -2187,6 +2228,11 @@ impl eframe::App for MiranteWorkbenchApp {
             &self.analysis_runtime,
             &self.dataset,
             &self.render_runtime,
+        ) || workbench_playback_runtime::source_verification_polling_required(
+            self.pending_automatic_source_verification.is_some(),
+            self.source_verification_service
+                .as_ref()
+                .is_some_and(|service| service.active_token().is_some()),
         ) {
             request_background_work_repaint_after(ui.ctx());
         }
@@ -2219,6 +2265,11 @@ impl eframe::App for MiranteWorkbenchApp {
             && let Err(error) = source_open_service.shutdown()
         {
             tracing::warn!(%error, "dataset open service shutdown failed");
+        }
+        if let Some(source_verification_service) = self.source_verification_service.take()
+            && let Err(error) = source_verification_service.shutdown()
+        {
+            tracing::warn!(%error, "source-verification service shutdown failed");
         }
         if let Err(error) = self.settings_connection.shutdown() {
             tracing::warn!(%error, "settings actor shutdown failed");

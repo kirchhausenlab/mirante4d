@@ -8,7 +8,8 @@ WP-10B predecessor: `foundation-wp-09a-exit-1`
 Completed through: WP-09A at `foundation-wp-09a-exit-1`
 Current checkpoint: WP-10B B2 is accepted on protected main at
 `4a246a1bb7bfe099673ef10d6cb5951729b3ff37`
-Next protected-branch checkpoint: WP-10B B3 source verification and application integration
+Next protected-branch checkpoint: WP-10B B3 source verification and application
+integration; its implementation candidate is under validation, not yet accepted
 
 ## Purpose
 

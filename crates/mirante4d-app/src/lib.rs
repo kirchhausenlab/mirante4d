@@ -19,6 +19,7 @@ mod current_project_persistence_bridge;
 mod current_runtime;
 mod current_settings_connection;
 mod current_source_open_service;
+mod current_source_verification_service;
 mod dataset_demand_plan;
 mod dataset_requests;
 mod diagnostics;
@@ -239,6 +240,9 @@ pub struct MiranteWorkbenchApp {
         Option<current_project_persistence_bridge::CurrentProjectPersistenceBridge>,
     settings_connection: current_settings_connection::CurrentSettingsConnection,
     source_open_service: Option<current_source_open_service::CurrentSourceOpenService>,
+    source_verification_service:
+        Option<current_source_verification_service::CurrentSourceVerificationService>,
+    pending_automatic_source_verification: Option<SourceSessionGeneration>,
 }
 
 struct CrossSectionPanelGpuDisplayFrame {
@@ -317,7 +321,13 @@ impl MiranteWorkbenchApp {
             ),
             settings_connection,
             source_open_service: Some(current_source_open_service::CurrentSourceOpenService::new()),
+            source_verification_service: Some(
+                current_source_verification_service::CurrentSourceVerificationService::new(),
+            ),
+            pending_automatic_source_verification: None,
         };
+        app.request_current_source_verification();
+        app.pump_application_services();
         app.request_opened_state_visible_work(Some(&cc.egui_ctx));
         Ok(app)
     }
@@ -456,7 +466,9 @@ impl MiranteWorkbenchApp {
             // Drain first so a full bounded event queue cannot prevent a
             // terminal actor result from retiring its operation.
             self.poll_source_open_service();
+            self.poll_source_verification_service();
             self.poll_project_persistence();
+            self.try_start_pending_automatic_source_verification();
             if events.is_empty()
                 && !had_completion_commands
                 && current_egui_shell_bridge::snapshot(&self.application).pending_event_count() == 0
@@ -545,26 +557,80 @@ impl MiranteWorkbenchApp {
     }
 
     fn observe_source_application_event(&mut self, event: &ApplicationEvent) {
-        let ApplicationEvent::OperationCancellationRequested { token } = event else {
-            return;
-        };
-        if token.kind() != OperationKind::DatasetOpen {
-            return;
-        }
-        if let Some(service) = self.source_open_service.as_ref() {
-            match service.cancel(token) {
-                Ok(())
-                | Err(
-                    current_source_open_service::CurrentSourceOpenServiceError::NoActiveOperation,
-                ) => {}
-                Err(error) => {
-                    tracing::warn!(%error, "dataset cancellation request failed");
+        match event {
+            ApplicationEvent::SourceVerificationRequested { token } => {
+                let path = self.dataset.selected_path().to_path_buf();
+                let resource_policy =
+                    current_egui_shell_bridge::snapshot(&self.application).resource_policy();
+                let scan_ledger = self.dataset.cpu_ledger_arc();
+                let request = self
+                    .source_verification_service
+                    .as_mut()
+                    .ok_or(
+                        current_source_verification_service::CurrentSourceVerificationServiceError::NoActiveOperation,
+                    )
+                    .and_then(|service| {
+                        service.request_verification(
+                            token.clone(),
+                            path,
+                            resource_policy,
+                            scan_ledger,
+                        )
+                    });
+                if let Err(error) = request {
+                    tracing::warn!(%error, "source-verification request failed");
+                    self.complete_source_operation(
+                        token.clone(),
+                        OperationCompletion::Failed(
+                            OperationFailureCode::SourceVerificationReadFailed,
+                        ),
+                    );
                 }
             }
+            ApplicationEvent::SourceVerificationInvalidated { source_generation } => {
+                let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+                if *source_generation == snapshot.source_generation()
+                    && self.dataset.resource_identity()
+                        != snapshot.catalog().scientific_identity().resource_identity()
+                {
+                    self.retire_invalidated_source_runtime();
+                }
+            }
+            ApplicationEvent::OperationCancellationRequested { token }
+                if token.kind() == OperationKind::DatasetOpen =>
+            {
+                if let Some(service) = self.source_open_service.as_ref() {
+                    match service.cancel(token) {
+                        Ok(())
+                        | Err(
+                            current_source_open_service::CurrentSourceOpenServiceError::NoActiveOperation,
+                        ) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "dataset cancellation request failed");
+                        }
+                    }
+                }
+            }
+            ApplicationEvent::OperationCancellationRequested { token }
+                if token.kind() == OperationKind::SourceVerification =>
+            {
+                if let Some(service) = self.source_verification_service.as_ref() {
+                    match service.cancel(token) {
+                        Ok(())
+                        | Err(
+                            current_source_verification_service::CurrentSourceVerificationServiceError::NoActiveOperation,
+                        ) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "source-verification cancellation failed");
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
-    fn complete_source_open_operation(
+    fn complete_source_operation(
         &mut self,
         token: OperationToken,
         completion: OperationCompletion,
@@ -577,7 +643,7 @@ impl MiranteWorkbenchApp {
             Ok(_) => true,
             Err(fault) if fault.code() == ApplicationFaultCode::OperationNotFound => false,
             Err(fault) => {
-                tracing::warn!(?fault, "dataset open completion was rejected");
+                tracing::warn!(?fault, "source operation completion was rejected");
                 match current_egui_shell_bridge::dispatch(
                     &mut self.application,
                     ApplicationCommand::CancelOperation(operation_id),
@@ -588,7 +654,7 @@ impl MiranteWorkbenchApp {
                     Err(cancel_fault) => {
                         tracing::warn!(
                             ?cancel_fault,
-                            "rejected dataset open operation could not be retired"
+                            "rejected source operation could not be retired"
                         );
                     }
                 }
@@ -850,14 +916,14 @@ impl MiranteWorkbenchApp {
         let resource_policy =
             current_egui_shell_bridge::snapshot(&self.application).resource_policy();
         let Some(service) = self.source_open_service.as_mut() else {
-            self.complete_source_open_operation(
+            self.complete_source_operation(
                 token,
                 OperationCompletion::Failed(OperationFailureCode::DatasetReadFailed),
             );
             anyhow::bail!("dataset open service is unavailable");
         };
         if let Err(error) = service.request_open(token.clone(), path, resource_policy) {
-            self.complete_source_open_operation(
+            self.complete_source_operation(
                 token,
                 OperationCompletion::Failed(OperationFailureCode::DatasetReadFailed),
             );
@@ -884,6 +950,58 @@ impl MiranteWorkbenchApp {
         self.pump_application_services();
     }
 
+    fn request_current_source_verification(&mut self) {
+        if let Err(fault) = current_egui_shell_bridge::dispatch(
+            &mut self.application,
+            ApplicationCommand::RequestSourceVerification,
+        ) {
+            tracing::warn!(?fault, "source verification request was rejected");
+        }
+    }
+
+    fn try_start_pending_automatic_source_verification(&mut self) {
+        let Some(pending_generation) = self.pending_automatic_source_verification else {
+            return;
+        };
+        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        if snapshot.source_generation() != pending_generation
+            || !matches!(snapshot.source(), SourceVerificationSnapshot::Required)
+        {
+            self.pending_automatic_source_verification = None;
+            return;
+        }
+        if self
+            .source_verification_service
+            .as_ref()
+            .is_none_or(|service| service.active_token().is_some())
+        {
+            return;
+        }
+
+        match current_egui_shell_bridge::dispatch(
+            &mut self.application,
+            ApplicationCommand::RequestSourceVerification,
+        ) {
+            Ok(_) => self.pending_automatic_source_verification = None,
+            Err(fault) if fault.code() == ApplicationFaultCode::OperationConflict => {}
+            Err(fault) => {
+                self.pending_automatic_source_verification = None;
+                tracing::warn!(?fault, "automatic source verification request was rejected");
+            }
+        }
+    }
+
+    fn retire_invalidated_source_runtime(&mut self) {
+        if let Err(error) = self.dataset.cancel_and_clear_interactive_demand() {
+            tracing::warn!(%error, "invalidated dataset demand cancellation failed");
+        }
+        let retired_leases = std::mem::take(&mut self.render_runtime.lease_bridge);
+        self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Loading;
+        self.render_runtime.frame_fidelity.reason = LodDecisionReason::LoadingTargetScale;
+        self.render_runtime.frame_fidelity.backend = RenderBackend::Loading;
+        std::thread::spawn(move || drop(retired_leases));
+    }
+
     fn request_opened_state_visible_work(&mut self, _ctx: Option<&egui::Context>) {
         self.request_visible_bricks();
     }
@@ -899,7 +1017,7 @@ impl MiranteWorkbenchApp {
             Err(error) => {
                 tracing::error!(%error, "dataset open worker failed");
                 if let Some(token) = active_token {
-                    self.complete_source_open_operation(
+                    self.complete_source_operation(
                         token,
                         OperationCompletion::Failed(OperationFailureCode::DatasetReadFailed),
                     );
@@ -911,7 +1029,7 @@ impl MiranteWorkbenchApp {
         match result.outcome {
             current_source_open_service::CurrentSourceOpenOutcome::Prepared(prepared) => {
                 let (runtime, completion) = prepared.into_runtime_and_completion();
-                if self.complete_source_open_operation(token, completion) {
+                if self.complete_source_operation(token, completion) {
                     self.install_current_source_runtime(runtime);
                 } else {
                     tracing::warn!("stale dataset open result was suppressed");
@@ -922,12 +1040,106 @@ impl MiranteWorkbenchApp {
                 }
             }
             current_source_open_service::CurrentSourceOpenOutcome::Cancelled => {
-                self.complete_source_open_operation(token, OperationCompletion::Cancelled);
+                self.complete_source_operation(token, OperationCompletion::Cancelled);
             }
             current_source_open_service::CurrentSourceOpenOutcome::Failed(code) => {
-                self.complete_source_open_operation(token, OperationCompletion::Failed(code));
+                self.complete_source_operation(token, OperationCompletion::Failed(code));
             }
         }
+    }
+
+    fn poll_source_verification_service(&mut self) {
+        let (active_token, progress, result) = match self.source_verification_service.as_mut() {
+            Some(service) => (
+                service.active_token().cloned(),
+                service.take_progress(),
+                service.try_recv(),
+            ),
+            None => return,
+        };
+
+        match progress {
+            Ok(Some(progress)) => {
+                match current_egui_shell_bridge::dispatch(
+                    &mut self.application,
+                    ApplicationCommand::UpdateSourceVerificationProgress {
+                        token: progress.token,
+                        completed_work: progress.completed_work,
+                        total_work: progress.total_work,
+                    },
+                ) {
+                    Ok(_) => {
+                        if let Some(service) = self.source_verification_service.as_mut() {
+                            service.note_accepted_progress();
+                        }
+                    }
+                    Err(fault) if fault.code() == ApplicationFaultCode::OperationNotFound => {}
+                    Err(fault) => tracing::warn!(?fault, "source-verification progress rejected"),
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "source-verification progress failed"),
+        }
+
+        let result = match result {
+            Ok(Some(result)) => result,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::error!(%error, "source-verification worker failed");
+                if let Some(token) = active_token {
+                    self.complete_source_operation(
+                        token,
+                        OperationCompletion::Failed(
+                            OperationFailureCode::SourceVerificationReadFailed,
+                        ),
+                    );
+                }
+                return;
+            }
+        };
+
+        let token = result.token;
+        match result.outcome {
+            current_source_verification_service::CurrentSourceVerificationOutcome::Prepared(
+                prepared,
+            ) => {
+                let (runtime, completion) = prepared.into_runtime_and_completion();
+                if self.complete_source_operation(token, completion) {
+                    if let Some(service) = self.source_verification_service.as_mut() {
+                        service.note_accepted_success();
+                    }
+                    self.install_verified_source_runtime(runtime);
+                } else {
+                    tracing::warn!("stale source-verification result was suppressed");
+                    if let Err(error) = runtime.dataset.request_shutdown() {
+                        tracing::warn!(%error, "stale verified runtime shutdown request failed");
+                    }
+                    std::thread::spawn(move || drop(runtime));
+                }
+            }
+            current_source_verification_service::CurrentSourceVerificationOutcome::Cancelled => {
+                if let Some(service) = self.source_verification_service.as_mut() {
+                    service.note_cancelled_run();
+                }
+                self.complete_source_operation(token, OperationCompletion::Cancelled);
+            }
+            current_source_verification_service::CurrentSourceVerificationOutcome::Failed(code) => {
+                self.complete_source_operation(token, OperationCompletion::Failed(code));
+            }
+        }
+    }
+
+    fn install_verified_source_runtime(
+        &mut self,
+        transfer: current_source_verification_service::CurrentSourceVerificationRuntimeTransfer,
+    ) {
+        let retired_leases = std::mem::take(&mut self.render_runtime.lease_bridge);
+        let old_dataset = std::mem::replace(&mut self.dataset, transfer.dataset);
+        if let Err(error) = old_dataset.request_shutdown() {
+            tracing::warn!(%error, "unverified dataset runtime shutdown request failed");
+        }
+        self.request_opened_state_visible_work(None);
+        std::thread::spawn(move || drop((old_dataset, retired_leases)));
     }
 
     fn install_current_source_runtime(
@@ -960,6 +1172,9 @@ impl MiranteWorkbenchApp {
         if let Err(error) = old_dataset.request_shutdown() {
             tracing::warn!(%error, "replaced dataset runtime shutdown request failed");
         }
+        self.pending_automatic_source_verification =
+            Some(current_egui_shell_bridge::snapshot(&self.application).source_generation());
+        self.try_start_pending_automatic_source_verification();
         self.request_opened_state_visible_work(None);
 
         std::thread::spawn(move || {

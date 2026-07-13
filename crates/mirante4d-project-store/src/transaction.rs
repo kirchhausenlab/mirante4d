@@ -34,6 +34,7 @@ use crate::{
     local::{
         ImmutablePublication, LocalPublicationError, LocalStoreRoot, PublicationDisposition,
         SiblingPackageStage, ensure_writable_destination as ensure_local_writable_destination,
+        ensure_writable_destination_outside_source,
     },
     transition::{self, StoreTransition, TransitionPoint},
     wire::{ProjectEnvelope, RefKind, RefRecord},
@@ -41,6 +42,10 @@ use crate::{
 
 const STREAM_BUFFER_BYTES_MAX: usize = 1_048_576;
 const PAGE_RECORDS_MAX: u64 = 65_536;
+// Source session (root + two leases): 3. Destination package (held parent,
+// root + two leases): 4. Source object parent/file: 2. Destination immutable
+// publication (object parent + staging parent/directory/payload): 4.
+const AUTHENTICATED_COPY_DESCRIPTORS_MAX: usize = 13;
 
 #[derive(Debug, Error)]
 pub(crate) enum GenerationTransactionError {
@@ -76,6 +81,22 @@ impl From<LocalPublicationError> for GenerationTransactionError {
             }
             other => Self::Local(other),
         }
+    }
+}
+
+fn map_authenticated_source_error(error: LocalPublicationError) -> GenerationTransactionError {
+    match error {
+        LocalPublicationError::Cancelled => GenerationTransactionError::Cancelled,
+        LocalPublicationError::SourceIo { .. }
+        | LocalPublicationError::SourceLength { .. }
+        | LocalPublicationError::SourceDigest
+        | LocalPublicationError::ExistingMismatch => GenerationTransactionError::SourceChanged,
+        LocalPublicationError::Capacity { .. } | LocalPublicationError::StorageFull { .. } => {
+            GenerationTransactionError::Capacity {
+                stage: "physical object",
+            }
+        }
+        other => GenerationTransactionError::Local(other),
     }
 }
 
@@ -141,6 +162,67 @@ impl InitialPackageMode {
     }
 }
 
+/// One exact generation authenticated by the actor against its held session
+/// and operation lane. It authorizes reuse only for unchanged logical
+/// descriptors present in this generation; it is never inferred from object
+/// names or from unrooted store content.
+#[derive(Clone, Copy)]
+struct AuthenticatedGenerationSource<'a> {
+    root: &'a LocalStoreRoot,
+    document: &'a GenerationDocument,
+    copy_to_destination: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ObjectPublicationContext<'a> {
+    source_generation: Option<AuthenticatedGenerationSource<'a>>,
+    trace_closure_copy_rehash: bool,
+}
+
+impl ObjectPublicationContext<'_> {
+    const CAPTURED_ONLY: Self = Self {
+        source_generation: None,
+        trace_closure_copy_rehash: false,
+    };
+}
+
+impl<'a> AuthenticatedGenerationSource<'a> {
+    const fn in_place(root: &'a LocalStoreRoot, document: &'a GenerationDocument) -> Self {
+        Self {
+            root,
+            document,
+            copy_to_destination: false,
+        }
+    }
+
+    const fn copy_from(root: &'a LocalStoreRoot, document: &'a GenerationDocument) -> Self {
+        Self {
+            root,
+            document,
+            copy_to_destination: true,
+        }
+    }
+}
+
+/// One rematerialized authenticated binding. This value is deliberately
+/// short-lived: preflight retains only `storage`, and publication reconstructs
+/// at most one binding's physical-object list at a time.
+struct AuthenticatedReuse {
+    storage: ArtifactStorage,
+    objects: Vec<PhysicalObject>,
+}
+
+enum PreparedLogicalInput {
+    New(CapturedObjectSource),
+    Reused(ArtifactStorage),
+}
+
+struct PreparedLogicalObject {
+    digest: ExactBytesDigest,
+    descriptor: RawObjectDescriptor,
+    input: PreparedLogicalInput,
+}
+
 /// A durably installed package together with the exact descriptor-held
 /// resources that crossed the no-replace rename.
 pub(crate) struct InstalledInitialPackage {
@@ -168,6 +250,23 @@ pub(crate) fn ensure_writable_destination(
         .map_err(|error| map_local_error(error, "destination_filesystem"))
 }
 
+/// Applies every admission check which must precede authenticated source
+/// inspection for Create-from-provisional and Save As.
+pub(crate) fn ensure_authenticated_copy_destination(
+    destination: &ProjectStorePath,
+    source: &LocalStoreRoot,
+    limits: ProjectStoreLimits,
+) -> Result<(), ProjectStoreFault> {
+    let limits = limits.validate()?;
+    if limits.open_file_descriptors_max < AUTHENTICATED_COPY_DESCRIPTORS_MAX {
+        return Err(ProjectStoreFault::Capacity {
+            stage: "save_as_file_descriptors",
+        });
+    }
+    ensure_writable_destination_outside_source(destination, source)
+        .map_err(|error| map_local_error(error, "destination_source_overlap"))
+}
+
 fn missing_initial_writer_fault(leases: &ProjectStoreLeases) -> ProjectStoreFault {
     if leases.writable_filesystem_qualified() {
         ProjectStoreFault::WriterContended
@@ -190,9 +289,68 @@ pub(crate) fn install_initial_manual_package<C>(
 where
     C: FnMut() -> bool,
 {
-    ensure_writable_destination(destination)?;
-    let (stage, leases, receipt) =
-        prepare_initial_manual_package(destination, mode, capture, limits, &mut is_cancelled)?;
+    install_initial_manual_package_inner(
+        destination,
+        mode,
+        capture,
+        None,
+        limits,
+        &mut is_cancelled,
+    )
+}
+
+/// Installs an initial manual package while reusing only bindings
+/// authenticated against the actor's held source generation. Physical bytes
+/// are copied and rehashed into destination-local storage.
+pub(crate) fn install_initial_manual_package_from_generation<C>(
+    destination: &ProjectStorePath,
+    mode: InitialPackageMode,
+    capture: ProjectCommitCapture,
+    source_root: &LocalStoreRoot,
+    source_generation: &GenerationDocument,
+    limits: ProjectStoreLimits,
+    mut is_cancelled: C,
+) -> Result<InstalledInitialPackage, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    install_initial_manual_package_inner(
+        destination,
+        mode,
+        capture,
+        Some(AuthenticatedGenerationSource::copy_from(
+            source_root,
+            source_generation,
+        )),
+        limits,
+        &mut is_cancelled,
+    )
+}
+
+fn install_initial_manual_package_inner<C>(
+    destination: &ProjectStorePath,
+    mode: InitialPackageMode,
+    capture: ProjectCommitCapture,
+    source: Option<AuthenticatedGenerationSource<'_>>,
+    limits: ProjectStoreLimits,
+    mut is_cancelled: C,
+) -> Result<InstalledInitialPackage, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    if let Some(source) = source {
+        ensure_authenticated_copy_destination(destination, source.root, limits)?;
+    } else {
+        ensure_writable_destination(destination)?;
+    }
+    let (stage, leases, receipt) = prepare_initial_manual_package(
+        destination,
+        mode,
+        capture,
+        source,
+        limits,
+        &mut is_cancelled,
+    )?;
     let root = stage
         .install(&mut is_cancelled)
         .map_err(|error| map_local_error(error, "package_install"))?;
@@ -428,8 +586,14 @@ where
     C: FnMut() -> bool,
 {
     ensure_writable_destination(destination)?;
-    let (stage, leases, receipt) =
-        prepare_initial_manual_package(destination, mode, capture, limits, &mut is_cancelled)?;
+    let (stage, leases, receipt) = prepare_initial_manual_package(
+        destination,
+        mode,
+        capture,
+        None,
+        limits,
+        &mut is_cancelled,
+    )?;
     let root = stage
         .install_with_parent_sync_failure(&mut is_cancelled)
         .map_err(|error| map_local_error(error, "package_install"))?;
@@ -444,6 +608,7 @@ fn prepare_initial_manual_package<C>(
     destination: &ProjectStorePath,
     mode: InitialPackageMode,
     capture: ProjectCommitCapture,
+    source: Option<AuthenticatedGenerationSource<'_>>,
     limits: ProjectStoreLimits,
     mut is_cancelled: C,
 ) -> Result<(SiblingPackageStage, ProjectStoreLeases, ProjectStoreReceipt), ProjectStoreFault>
@@ -459,8 +624,11 @@ where
     after_transaction_transition(expected_parent, "expected_parent_check")?;
     check_cancelled(&mut is_cancelled).map_err(map_generation_error)?;
 
-    let stage = SiblingPackageStage::begin(destination, limits)
-        .map_err(|error| map_local_error(error, "package_stage_create"))?;
+    let stage = match source {
+        Some(source) => SiblingPackageStage::begin_copy_from(destination, source.root, limits),
+        None => SiblingPackageStage::begin(destination, limits),
+    }
+    .map_err(|error| map_local_error(error, "package_stage_create"))?;
     stage
         .root()
         .publish_project_envelope(ProjectEnvelope::new(project_id), limits, &mut is_cancelled)
@@ -470,11 +638,12 @@ where
     if !leases.has_writer() {
         return Err(missing_initial_writer_fault(&leases));
     }
-    let receipt = publish_initial_manual_generation(
+    let receipt = publish_initial_manual_generation_inner(
         stage.root(),
         &leases,
         capture,
         mode,
+        source,
         limits,
         &mut is_cancelled,
     )?;
@@ -547,6 +716,29 @@ pub(crate) fn publish_initial_manual_generation<C>(
 where
     C: FnMut() -> bool,
 {
+    publish_initial_manual_generation_inner(
+        root,
+        leases,
+        capture,
+        mode,
+        None,
+        limits,
+        &mut is_cancelled,
+    )
+}
+
+fn publish_initial_manual_generation_inner<C>(
+    root: &LocalStoreRoot,
+    leases: &ProjectStoreLeases,
+    capture: ProjectCommitCapture,
+    mode: InitialPackageMode,
+    source: Option<AuthenticatedGenerationSource<'_>>,
+    limits: ProjectStoreLimits,
+    mut is_cancelled: C,
+) -> Result<ProjectStoreReceipt, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
     let limits = limits.validate()?;
     if !leases.confirm_writer(root).map_err(map_lease_error)? {
         return Err(ProjectStoreFault::ReadOnly);
@@ -578,7 +770,10 @@ where
         GenerationKind::Manual,
         0,
         limits,
-        matches!(mode, InitialPackageMode::SaveAs { .. }),
+        ObjectPublicationContext {
+            source_generation: source,
+            trace_closure_copy_rehash: matches!(mode, InitialPackageMode::SaveAs { .. }),
+        },
         &mut is_cancelled,
     )
     .map_err(map_generation_error)?;
@@ -854,12 +1049,19 @@ where
     let captured_revision_high_water = capture.projection().revision_high_water().clone();
     let expected_autosave = state.autosave();
 
-    let publication = publish_unreferenced_generation(
+    let publication = publish_unreferenced_generation_with_copy_transition(
         root,
         capture,
         GenerationKind::Autosave,
         next_generation_sequence,
         limits,
+        ObjectPublicationContext {
+            source_generation: Some(AuthenticatedGenerationSource::in_place(
+                root,
+                current_generation,
+            )),
+            trace_closure_copy_rehash: false,
+        },
         &mut is_cancelled,
     )
     .map_err(map_generation_error)?;
@@ -1195,12 +1397,25 @@ where
     let captured_revision = capture.projection().revision();
     let captured_revision_high_water = capture.projection().revision_high_water().clone();
     let autosave_base = capture.autosave_base();
-    let publication = publish_unreferenced_generation(
+    let source_generation = match lane {
+        CommitLane::Manual => inspection.manual_generation(),
+        CommitLane::Autosave => inspection
+            .autosave_generation()
+            .unwrap_or_else(|| inspection.manual_generation()),
+    };
+    let publication = publish_unreferenced_generation_with_copy_transition(
         root,
         capture,
         lane.generation_kind(),
         next_generation_sequence,
         limits,
+        ObjectPublicationContext {
+            source_generation: Some(AuthenticatedGenerationSource::in_place(
+                root,
+                source_generation,
+            )),
+            trace_closure_copy_rehash: false,
+        },
         &mut is_cancelled,
     )
     .map_err(map_generation_error)?;
@@ -1553,7 +1768,7 @@ where
         kind,
         generation_sequence,
         limits,
-        false,
+        ObjectPublicationContext::CAPTURED_ONLY,
         &mut is_cancelled,
     )
 }
@@ -1564,12 +1779,16 @@ fn publish_unreferenced_generation_with_copy_transition<C>(
     kind: GenerationKind,
     generation_sequence: u64,
     limits: ProjectStoreLimits,
-    trace_closure_copy_rehash: bool,
+    context: ObjectPublicationContext<'_>,
     mut is_cancelled: C,
 ) -> Result<UnreferencedGenerationPublication, GenerationTransactionError>
 where
     C: FnMut() -> bool,
 {
+    let ObjectPublicationContext {
+        source_generation,
+        trace_closure_copy_rehash,
+    } = context;
     let limits = limits
         .validate()
         .map_err(|_| GenerationTransactionError::Capacity {
@@ -1585,91 +1804,182 @@ where
         .into_iter()
         .map(|source| (source.descriptor().digest(), source))
         .collect::<BTreeMap<_, _>>();
-    if sources.len() != logical.len() {
+
+    let authenticated_logical = source_generation
+        .map(|source| unique_logical_descriptors(source.document.projection()))
+        .transpose()?;
+    let authenticated_reachable = source_generation
+        .map(|source| unique_physical_closure(source.document.reachable_objects(), limits))
+        .transpose()?;
+    let mut prepared = Vec::with_capacity(logical.len());
+    for (digest, descriptor) in logical {
+        check_cancelled(&mut is_cancelled)?;
+        let supplied = sources.remove(&digest);
+        let reused = match (
+            source_generation,
+            authenticated_logical.as_ref(),
+            authenticated_reachable.as_ref(),
+        ) {
+            (Some(source), Some(source_logical), Some(source_reachable)) => authenticated_reuse(
+                source,
+                source_logical,
+                source_reachable,
+                &descriptor,
+                limits,
+                &mut is_cancelled,
+            )?,
+            (None, None, None) => None,
+            _ => return Err(GenerationTransactionError::Closure),
+        };
+        let input = match (supplied, reused) {
+            (Some(source), None) => PreparedLogicalInput::New(source),
+            (None, Some(reused)) => PreparedLogicalInput::Reused(reused.storage),
+            // A source is permitted only for a genuinely new logical object;
+            // an unchanged binding must be authenticated and reused instead.
+            (Some(_), Some(_)) | (None, None) => {
+                return Err(GenerationTransactionError::Closure);
+            }
+        };
+        prepared.push(PreparedLogicalObject {
+            digest,
+            descriptor,
+            input,
+        });
+    }
+    if !sources.is_empty() {
         return Err(GenerationTransactionError::Closure);
     }
 
     let mut bindings = BTreeMap::new();
     let mut closure = BTreeMap::new();
+    let mut copied_reused = BTreeMap::new();
     let mut created_objects = 0_u64;
     let mut created_object_bytes = 0_u64;
 
-    for (digest, descriptor) in logical {
+    for prepared in prepared {
         check_cancelled(&mut is_cancelled)?;
-        let source = sources
-            .remove(&digest)
-            .ok_or(GenerationTransactionError::Closure)?;
-        let storage = if descriptor.byte_length() <= PAGE_BYTES {
-            let object = PhysicalObject::new(descriptor.digest(), descriptor.byte_length());
-            insert_closure(&mut closure, object, limits)?;
-            if !root.durabilize_object_if_present(
-                object.digest(),
-                object.byte_length(),
-                limits.object_or_page_bytes_max,
-                &mut is_cancelled,
-            )? {
-                let copy = before_copy_rehash(trace_closure_copy_rehash)?;
-                let mut reader = source
-                    .open()
-                    .map_err(|_| GenerationTransactionError::SourceIo)?;
-                let publication = root.publish_declared_object(
-                    &mut reader,
+        let PreparedLogicalObject {
+            digest,
+            descriptor,
+            input,
+        } = prepared;
+        let storage = match input {
+            PreparedLogicalInput::Reused(expected_storage) => {
+                let (Some(source), Some(source_logical), Some(source_reachable)) = (
+                    source_generation,
+                    authenticated_logical.as_ref(),
+                    authenticated_reachable.as_ref(),
+                ) else {
+                    return Err(GenerationTransactionError::Closure);
+                };
+                let reused = authenticated_reuse(
+                    source,
+                    source_logical,
+                    source_reachable,
+                    &descriptor,
+                    limits,
+                    &mut is_cancelled,
+                )?
+                .ok_or(GenerationTransactionError::Closure)?;
+                if reused.storage != expected_storage {
+                    return Err(GenerationTransactionError::Closure);
+                }
+                for object in reused.objects {
+                    insert_closure(&mut closure, object, limits)?;
+                    if let Some(source) = source_generation.filter(|source| {
+                        source.copy_to_destination && !copied_reused.contains_key(&object.digest())
+                    }) {
+                        copied_reused.insert(object.digest(), object);
+                        let copy = before_copy_rehash(trace_closure_copy_rehash)?;
+                        let publication = root
+                            .copy_exact_object_from(
+                                source.root,
+                                object.digest(),
+                                object.byte_length(),
+                                limits.object_or_page_bytes_max,
+                                &mut is_cancelled,
+                            )
+                            .map_err(map_authenticated_source_error)?;
+                        record_created(
+                            publication,
+                            &mut created_objects,
+                            &mut created_object_bytes,
+                        )?;
+                        after_copy_rehash(copy)?;
+                    }
+                }
+                expected_storage
+            }
+            PreparedLogicalInput::New(source) if descriptor.byte_length() <= PAGE_BYTES => {
+                let object = PhysicalObject::new(descriptor.digest(), descriptor.byte_length());
+                insert_closure(&mut closure, object, limits)?;
+                if !root.durabilize_object_if_present(
                     object.digest(),
                     object.byte_length(),
                     limits.object_or_page_bytes_max,
                     &mut is_cancelled,
-                )?;
-                record_created(publication, &mut created_objects, &mut created_object_bytes)?;
+                )? {
+                    let copy = before_copy_rehash(trace_closure_copy_rehash)?;
+                    let mut reader = source
+                        .open()
+                        .map_err(|_| GenerationTransactionError::SourceIo)?;
+                    let publication = root.publish_declared_object(
+                        &mut reader,
+                        object.digest(),
+                        object.byte_length(),
+                        limits.object_or_page_bytes_max,
+                        &mut is_cancelled,
+                    )?;
+                    record_created(publication, &mut created_objects, &mut created_object_bytes)?;
+                    after_copy_rehash(copy)?;
+                }
+                ArtifactStorage::direct(&descriptor)?
+            }
+            PreparedLogicalInput::New(source) => {
+                let copy = before_copy_rehash(trace_closure_copy_rehash)?;
+                let pages = derive_page_plan(&source, &descriptor, limits, &mut is_cancelled)?;
+                let binding = LogicalObjectBinding::new(descriptor.clone(), pages, limits)?;
+                let encoded_binding = binding.encode(limits)?;
+
+                for page in binding.pages() {
+                    insert_closure(&mut closure, page.object(), limits)?;
+                }
+                let binding_object = PhysicalObject::new(
+                    encoded_binding.descriptor().digest(),
+                    encoded_binding.descriptor().byte_length(),
+                );
+                insert_closure(&mut closure, binding_object, limits)?;
+
+                let mut reader = source
+                    .open()
+                    .map_err(|_| GenerationTransactionError::SourceIo)?;
+                for page in binding.pages() {
+                    let page = page.object();
+                    let publication = root.publish_consuming_object(
+                        &mut reader,
+                        page.digest(),
+                        page.byte_length(),
+                        limits.object_or_page_bytes_max,
+                        &mut is_cancelled,
+                    )?;
+                    record_created(publication, &mut created_objects, &mut created_object_bytes)?;
+                }
+                require_eof(&mut reader)?;
                 after_copy_rehash(copy)?;
-            }
-            ArtifactStorage::direct(&descriptor)?
-        } else {
-            let copy = before_copy_rehash(trace_closure_copy_rehash)?;
-            let pages = derive_page_plan(&source, &descriptor, limits, &mut is_cancelled)?;
-            let binding = LogicalObjectBinding::new(descriptor.clone(), pages, limits)?;
-            let encoded_binding = binding.encode(limits)?;
 
-            for page in binding.pages() {
-                insert_closure(&mut closure, page.object(), limits)?;
-            }
-            let binding_object = PhysicalObject::new(
-                encoded_binding.descriptor().digest(),
-                encoded_binding.descriptor().byte_length(),
-            );
-            insert_closure(&mut closure, binding_object, limits)?;
-
-            let mut reader = source
-                .open()
-                .map_err(|_| GenerationTransactionError::SourceIo)?;
-            for page in binding.pages() {
-                let page = page.object();
-                let publication = root.publish_consuming_object(
-                    &mut reader,
-                    page.digest(),
-                    page.byte_length(),
+                let mut binding_reader = Cursor::new(encoded_binding.bytes());
+                let publication = root.publish_declared_object(
+                    &mut binding_reader,
+                    binding_object.digest(),
+                    binding_object.byte_length(),
                     limits.object_or_page_bytes_max,
                     &mut is_cancelled,
                 )?;
                 record_created(publication, &mut created_objects, &mut created_object_bytes)?;
+                ArtifactStorage::paged(&descriptor, encoded_binding.descriptor().clone())?
             }
-            require_eof(&mut reader)?;
-            after_copy_rehash(copy)?;
-
-            let mut binding_reader = Cursor::new(encoded_binding.bytes());
-            let publication = root.publish_declared_object(
-                &mut binding_reader,
-                binding_object.digest(),
-                binding_object.byte_length(),
-                limits.object_or_page_bytes_max,
-                &mut is_cancelled,
-            )?;
-            record_created(publication, &mut created_objects, &mut created_object_bytes)?;
-            ArtifactStorage::paged(&descriptor, encoded_binding.descriptor().clone())?
         };
         bindings.insert(digest, storage);
-    }
-    if !sources.is_empty() {
-        return Err(GenerationTransactionError::Closure);
     }
 
     let reachable_objects = closure.values().copied().collect::<Vec<_>>();
@@ -1723,6 +2033,87 @@ fn unique_logical_descriptors(
         }
     }
     Ok(descriptors)
+}
+
+fn unique_physical_closure(
+    objects: &[PhysicalObject],
+    limits: ProjectStoreLimits,
+) -> Result<BTreeMap<ExactBytesDigest, PhysicalObject>, GenerationTransactionError> {
+    let mut closure = BTreeMap::new();
+    for object in objects {
+        if closure.contains_key(&object.digest()) {
+            return Err(GenerationTransactionError::Closure);
+        }
+        insert_closure(&mut closure, *object, limits)?;
+    }
+    Ok(closure)
+}
+
+fn authenticated_reuse<C>(
+    source: AuthenticatedGenerationSource<'_>,
+    source_logical: &BTreeMap<ExactBytesDigest, RawObjectDescriptor>,
+    source_reachable: &BTreeMap<ExactBytesDigest, PhysicalObject>,
+    descriptor: &RawObjectDescriptor,
+    limits: ProjectStoreLimits,
+    is_cancelled: &mut C,
+) -> Result<Option<AuthenticatedReuse>, GenerationTransactionError>
+where
+    C: FnMut() -> bool,
+{
+    let Some(source_descriptor) = source_logical.get(&descriptor.digest()) else {
+        return Ok(None);
+    };
+    if source_descriptor != descriptor {
+        // Digest equality alone never authenticates reuse. A changed full
+        // descriptor is a genuinely new logical object and must arrive via a
+        // caller-supplied source.
+        return Ok(None);
+    }
+    let storage = source
+        .document
+        .bindings()
+        .get(&descriptor.digest())
+        .ok_or(GenerationTransactionError::Closure)?;
+    let objects = match storage {
+        ArtifactStorage::Direct { object }
+            if *object == PhysicalObject::new(descriptor.digest(), descriptor.byte_length()) =>
+        {
+            vec![*object]
+        }
+        ArtifactStorage::Direct { .. } => return Err(GenerationTransactionError::Closure),
+        ArtifactStorage::Paged { binding_manifest } => {
+            let binding_bytes = source
+                .root
+                .read_exact_object_bytes(
+                    binding_manifest.digest(),
+                    binding_manifest.byte_length(),
+                    limits.object_or_page_bytes_max,
+                    &mut *is_cancelled,
+                )
+                .map_err(map_authenticated_source_error)?;
+            let binding =
+                LogicalObjectBinding::decode(&binding_bytes, descriptor, binding_manifest, limits)?;
+            let mut objects = binding
+                .pages()
+                .iter()
+                .map(|page| page.object())
+                .collect::<Vec<_>>();
+            objects.push(PhysicalObject::new(
+                binding_manifest.digest(),
+                binding_manifest.byte_length(),
+            ));
+            objects
+        }
+    };
+    for object in &objects {
+        if source_reachable.get(&object.digest()) != Some(object) {
+            return Err(GenerationTransactionError::Closure);
+        }
+    }
+    Ok(Some(AuthenticatedReuse {
+        storage: storage.clone(),
+        objects,
+    }))
 }
 
 fn preflight(
@@ -2047,6 +2438,7 @@ fn require_eof(reader: &mut dyn Read) -> Result<(), GenerationTransactionError> 
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         fs,
         io::Cursor,
         os::unix::fs::symlink,
@@ -2620,14 +3012,30 @@ mod tests {
             ProjectStorePath::new(save_as_parent.path().join("fork.m4dproj")).unwrap();
         let fork_generation = frozen_generation("divergent.m4dproj", DIVERGENT_INITIAL);
         let fork = fork_generation.forked_from().unwrap();
-        let (save_as_capture, _) = frozen_capture("divergent.m4dproj", &fork_generation);
-        let saved_as = install_initial_manual_package(
+        let source_directory =
+            extracted_frozen_root("package-save-as-source", "recoverable.m4dproj");
+        let source_root = LocalStoreRoot::open(source_directory.path()).unwrap();
+        let source =
+            inspect_established_store(&source_root, ProjectStoreLimits::default(), || false)
+                .unwrap();
+        assert_eq!(source.manual().head.current(), fork.1);
+        let save_as_capture = ProjectCommitCapture::new(
+            fork_generation.projection().clone(),
+            None,
+            None,
+            Some(fork),
+            Vec::new(),
+        )
+        .unwrap();
+        let saved_as = install_initial_manual_package_from_generation(
             &save_as_destination,
             InitialPackageMode::SaveAs {
                 source_project_id: fork.0,
                 source_generation_id: fork.1,
             },
             save_as_capture,
+            &source_root,
+            source.manual_generation(),
             ProjectStoreLimits::default(),
             || false,
         )
@@ -2648,6 +3056,552 @@ mod tests {
         )
         .unwrap();
         assert_eq!(installed_generation.forked_from(), Some(fork));
+        validate_physical_closure(
+            &LocalStoreRoot::open(save_as_destination.as_path()).unwrap(),
+            &installed_generation,
+            ProjectStoreLimits::default(),
+            &mut || false,
+        )
+        .unwrap();
+        assert_eq!(
+            saved_as.receipt().published_objects(),
+            u64::try_from(installed_generation.reachable_objects().len()).unwrap()
+        );
+
+        let corrupt_object = installed_generation
+            .bindings()
+            .values()
+            .find_map(|storage| match storage {
+                ArtifactStorage::Direct { object } => Some(*object),
+                ArtifactStorage::Paged { .. } => None,
+            })
+            .expect("the Save As fixture retains one direct object");
+        let corrupt_path = object_path(source_directory.path(), corrupt_object.digest());
+        let mut corrupt_bytes = fs::read(&corrupt_path).unwrap();
+        assert!(!corrupt_bytes.is_empty());
+        corrupt_bytes[0] ^= 1;
+        fs::write(&corrupt_path, corrupt_bytes).unwrap();
+        let rejected_destination =
+            ProjectStorePath::new(save_as_parent.path().join("corrupt-source.m4dproj")).unwrap();
+        let rejected_capture = ProjectCommitCapture::new(
+            fork_generation.projection().clone(),
+            None,
+            None,
+            Some(fork),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(matches!(
+            install_initial_manual_package_from_generation(
+                &rejected_destination,
+                InitialPackageMode::SaveAs {
+                    source_project_id: fork.0,
+                    source_generation_id: fork.1,
+                },
+                rejected_capture,
+                &source_root,
+                source.manual_generation(),
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::SourceChanged)
+        ));
+        assert!(!rejected_destination.as_path().exists());
+    }
+
+    #[test]
+    fn save_as_copies_the_authenticated_paged_closure_without_sources() {
+        let source_directory = extracted_frozen_root("package-paged-source", "recoverable.m4dproj");
+        let source_root = LocalStoreRoot::open(source_directory.path()).unwrap();
+        let source =
+            inspect_established_store(&source_root, ProjectStoreLimits::default(), || false)
+                .unwrap();
+        let source_generation = source.manual_generation();
+        assert!(
+            source_generation
+                .bindings()
+                .values()
+                .any(|storage| matches!(storage, ArtifactStorage::Paged { .. }))
+        );
+
+        let old = source_generation.projection();
+        let target_project_id = ProjectId::from_bytes([0x88; 16]);
+        let target_state = ProjectState::new(
+            target_project_id,
+            old.state().dataset().clone(),
+            old.state().view().clone(),
+            old.state().channel_presets().to_vec(),
+            old.state().artifacts().to_vec(),
+        )
+        .unwrap();
+        let target_projection = ProjectGenerationProjection::new(
+            ProjectRevisionId::new(target_project_id, old.revision().sequence()),
+            ProjectRevisionHighWater::new(target_project_id, old.revision_high_water().sequence()),
+            target_state,
+        )
+        .unwrap();
+        let fork = (source.project_id(), source.manual().head.current());
+        let capture =
+            ProjectCommitCapture::new(target_projection, None, None, Some(fork), Vec::new())
+                .unwrap();
+        assert_eq!(capture.object_source_count(), 0);
+
+        let destination_parent = TestDirectory::new("package-paged-save-as");
+        let destination =
+            ProjectStorePath::new(destination_parent.path().join("paged.m4dproj")).unwrap();
+        let installed = install_initial_manual_package_from_generation(
+            &destination,
+            InitialPackageMode::SaveAs {
+                source_project_id: fork.0,
+                source_generation_id: fork.1,
+            },
+            capture,
+            &source_root,
+            source_generation,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(
+            installed.receipt().published_objects(),
+            u64::try_from(source_generation.reachable_objects().len()).unwrap()
+        );
+        let (destination_root, _leases, receipt) = installed.into_parts();
+        let destination_store =
+            inspect_established_store(&destination_root, ProjectStoreLimits::default(), || false)
+                .unwrap();
+        assert_eq!(
+            destination_store.manual().head.current(),
+            receipt.new_generation_id()
+        );
+        assert_eq!(
+            destination_store.manual_generation().forked_from(),
+            Some(fork)
+        );
+        assert_eq!(
+            destination_store.manual_generation().bindings(),
+            source_generation.bindings()
+        );
+        assert_eq!(
+            destination_store.manual_generation().reachable_objects(),
+            source_generation.reachable_objects()
+        );
+        validate_physical_closure(
+            &destination_root,
+            destination_store.manual_generation(),
+            ProjectStoreLimits::default(),
+            &mut || false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn authenticated_copy_rejects_source_descendants_and_enforces_the_true_fd_peak() {
+        let source_directory =
+            extracted_frozen_root("package-copy-admission-source", "recoverable.m4dproj");
+        let source_root = LocalStoreRoot::open(source_directory.path()).unwrap();
+        let source =
+            inspect_established_store(&source_root, ProjectStoreLimits::default(), || false)
+                .unwrap();
+        let target = frozen_generation("divergent.m4dproj", DIVERGENT_INITIAL);
+        let fork = (source.project_id(), source.manual().head.current());
+        let source_before = file_tree(source_directory.path());
+
+        for destination in [
+            source_directory.path().join("nested.m4dproj"),
+            source_directory
+                .path()
+                .join("objects/sha256/deeply-nested.m4dproj"),
+        ] {
+            let destination = ProjectStorePath::new(destination).unwrap();
+            assert!(matches!(
+                install_initial_manual_package_from_generation(
+                    &destination,
+                    InitialPackageMode::SaveAs {
+                        source_project_id: fork.0,
+                        source_generation_id: fork.1,
+                    },
+                    store_backed_save_as_capture(&target),
+                    &source_root,
+                    source.manual_generation(),
+                    ProjectStoreLimits::default(),
+                    || false,
+                ),
+                Err(ProjectStoreFault::Corruption {
+                    stage: "destination_source_overlap"
+                })
+            ));
+            assert!(!destination.as_path().exists());
+            assert_eq!(file_tree(source_directory.path()), source_before);
+        }
+
+        let parent = TestDirectory::new("package-copy-fd-admission");
+        let below = ProjectStorePath::new(parent.path().join("below.m4dproj")).unwrap();
+        let below_limits = ProjectStoreLimits {
+            open_file_descriptors_max: AUTHENTICATED_COPY_DESCRIPTORS_MAX - 1,
+            ..ProjectStoreLimits::default()
+        };
+        assert!(matches!(
+            install_initial_manual_package_from_generation(
+                &below,
+                InitialPackageMode::SaveAs {
+                    source_project_id: fork.0,
+                    source_generation_id: fork.1,
+                },
+                store_backed_save_as_capture(&target),
+                &source_root,
+                source.manual_generation(),
+                below_limits,
+                || false,
+            ),
+            Err(ProjectStoreFault::Capacity {
+                stage: "save_as_file_descriptors"
+            })
+        ));
+        assert!(!below.as_path().exists());
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+
+        let exact = ProjectStorePath::new(parent.path().join("exact.m4dproj")).unwrap();
+        let exact_limits = ProjectStoreLimits {
+            open_file_descriptors_max: AUTHENTICATED_COPY_DESCRIPTORS_MAX,
+            ..ProjectStoreLimits::default()
+        };
+        let installed = install_initial_manual_package_from_generation(
+            &exact,
+            InitialPackageMode::SaveAs {
+                source_project_id: fork.0,
+                source_generation_id: fork.1,
+            },
+            store_backed_save_as_capture(&target),
+            &source_root,
+            source.manual_generation(),
+            exact_limits,
+            || false,
+        )
+        .unwrap();
+        assert_eq!(
+            installed.receipt().current_generation_id(),
+            ProjectGenerationId::parse(DIVERGENT_INITIAL).unwrap()
+        );
+        assert_eq!(file_tree(source_directory.path()), source_before);
+    }
+
+    #[test]
+    fn same_digest_with_a_different_descriptor_requires_and_consumes_a_new_source() {
+        let source_directory =
+            extracted_frozen_root("package-descriptor-source", "recoverable.m4dproj");
+        let source_root = LocalStoreRoot::open(source_directory.path()).unwrap();
+        let source =
+            inspect_established_store(&source_root, ProjectStoreLimits::default(), || false)
+                .unwrap();
+        let source_generation = source.manual_generation();
+        let source_artifact = source_generation
+            .projection()
+            .state()
+            .artifacts()
+            .iter()
+            .find(|artifact| {
+                matches!(
+                    source_generation
+                        .bindings()
+                        .get(&artifact.object().digest()),
+                    Some(ArtifactStorage::Direct { .. })
+                )
+            })
+            .unwrap();
+        let bytes = Arc::<[u8]>::from(
+            fs::read(object_path(
+                source_directory.path(),
+                source_artifact.object().digest(),
+            ))
+            .unwrap(),
+        );
+        let schema = if source_artifact.schema() == ArtifactSchema::AnalysisPlotV1 {
+            ArtifactSchema::AnalysisTableV1
+        } else {
+            ArtifactSchema::AnalysisPlotV1
+        };
+        let changed_descriptor = RawObjectDescriptor::new(
+            source_artifact.object().digest(),
+            source_artifact.object().byte_length(),
+            MediaType::parse(schema.media_type()).unwrap(),
+            ObjectRole::parse(schema.object_role()).unwrap(),
+        );
+        assert_ne!(&changed_descriptor, source_artifact.object());
+
+        let project_id = ProjectId::from_bytes([0x89; 16]);
+        let old = source_generation.projection();
+        let state = ProjectState::new(
+            project_id,
+            old.state().dataset().clone(),
+            old.state().view().clone(),
+            old.state().channel_presets().to_vec(),
+            vec![artifact(0x89, schema, changed_descriptor.clone())],
+        )
+        .unwrap();
+        let projection = ProjectGenerationProjection::new(
+            ProjectRevisionId::initial(project_id),
+            ProjectRevisionHighWater::initial(project_id),
+            state,
+        )
+        .unwrap();
+        let fork = (source.project_id(), source.manual().head.current());
+        let parent = TestDirectory::new("package-descriptor-destination");
+
+        let missing = ProjectStorePath::new(parent.path().join("missing.m4dproj")).unwrap();
+        assert!(matches!(
+            install_initial_manual_package_from_generation(
+                &missing,
+                InitialPackageMode::SaveAs {
+                    source_project_id: fork.0,
+                    source_generation_id: fork.1,
+                },
+                ProjectCommitCapture::new(projection.clone(), None, None, Some(fork), Vec::new(),)
+                    .unwrap(),
+                &source_root,
+                source_generation,
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::Corruption {
+                stage: "generation_closure"
+            })
+        ));
+        assert!(!missing.as_path().exists());
+
+        let opens = Arc::new(AtomicUsize::new(0));
+        let supplied = ProjectStorePath::new(parent.path().join("supplied.m4dproj")).unwrap();
+        let capture = ProjectCommitCapture::new(
+            projection,
+            None,
+            None,
+            Some(fork),
+            vec![Box::new(MemorySource {
+                descriptor: changed_descriptor.clone(),
+                bytes,
+                opens: Arc::clone(&opens),
+                flip_second: false,
+            })],
+        )
+        .unwrap();
+        let installed = install_initial_manual_package_from_generation(
+            &supplied,
+            InitialPackageMode::SaveAs {
+                source_project_id: fork.0,
+                source_generation_id: fork.1,
+            },
+            capture,
+            &source_root,
+            source_generation,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert!(opens.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            installed.receipt().captured_revision().project_id(),
+            project_id
+        );
+        let installed_store = inspect_established_store(
+            &LocalStoreRoot::open(supplied.as_path()).unwrap(),
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(
+            installed_store
+                .manual_generation()
+                .projection()
+                .state()
+                .artifacts()[0]
+                .object(),
+            &changed_descriptor
+        );
+    }
+
+    #[test]
+    fn authenticated_source_namespace_and_content_drift_are_source_changed() {
+        for case in ["missing", "replacement", "symlink", "hard-link"] {
+            let source_directory = extracted_frozen_root(
+                &format!("package-source-drift-{case}"),
+                "recoverable.m4dproj",
+            );
+            let source_root = LocalStoreRoot::open(source_directory.path()).unwrap();
+            let source =
+                inspect_established_store(&source_root, ProjectStoreLimits::default(), || false)
+                    .unwrap();
+            let target = frozen_generation("divergent.m4dproj", DIVERGENT_INITIAL);
+            let fork = (source.project_id(), source.manual().head.current());
+            let object = target
+                .bindings()
+                .values()
+                .find_map(|storage| match storage {
+                    ArtifactStorage::Direct { object } => Some(*object),
+                    ArtifactStorage::Paged { .. } => None,
+                })
+                .unwrap();
+            let path = object_path(source_directory.path(), object.digest());
+            match case {
+                "missing" => fs::remove_file(&path).unwrap(),
+                "replacement" => {
+                    let mut bytes = fs::read(&path).unwrap();
+                    assert!(!bytes.is_empty());
+                    bytes[0] ^= 1;
+                    fs::remove_file(&path).unwrap();
+                    fs::write(&path, bytes).unwrap();
+                }
+                "symlink" => {
+                    fs::remove_file(&path).unwrap();
+                    symlink("missing-authenticated-object", &path).unwrap();
+                }
+                "hard-link" => {
+                    fs::hard_link(&path, source_directory.path().join("extra-object-link"))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let parent = TestDirectory::new(&format!("package-source-drift-target-{case}"));
+            let destination = ProjectStorePath::new(parent.path().join("target.m4dproj")).unwrap();
+            assert!(matches!(
+                install_initial_manual_package_from_generation(
+                    &destination,
+                    InitialPackageMode::SaveAs {
+                        source_project_id: fork.0,
+                        source_generation_id: fork.1,
+                    },
+                    store_backed_save_as_capture(&target),
+                    &source_root,
+                    source.manual_generation(),
+                    ProjectStoreLimits::default(),
+                    || false,
+                ),
+                Err(ProjectStoreFault::SourceChanged)
+            ));
+            assert!(!destination.as_path().exists());
+            assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn unreferenced_store_content_cannot_authorize_held_lane_reuse() {
+        let directory = extracted_frozen_root("held-lane-reuse", "recoverable.m4dproj");
+        let root = LocalStoreRoot::open(directory.path()).unwrap();
+        let inspection =
+            inspect_established_store(&root, ProjectStoreLimits::default(), || false).unwrap();
+        let current = inspection.manual_generation();
+        let current_id = inspection.manual().head.current();
+        let leases = ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        assert!(leases.has_writer());
+
+        let bytes = Arc::<[u8]>::from(b"unreferenced object must not authorize reuse".as_slice());
+        let schema = ArtifactSchema::AnalysisPlotV1;
+        let new_descriptor = descriptor(schema, &bytes);
+        let project_id = inspection.project_id();
+        let sequence = inspection.maximum_revision_high_water() + 1;
+        let generation_sequence = inspection.next_generation_sequence().unwrap();
+        let state = ProjectState::new(
+            project_id,
+            current.projection().state().dataset().clone(),
+            current.projection().state().view().clone(),
+            current.projection().state().channel_presets().to_vec(),
+            vec![artifact(0x91, schema, new_descriptor.clone())],
+        )
+        .unwrap();
+        let projection = ProjectGenerationProjection::new(
+            ProjectRevisionId::new(project_id, sequence),
+            ProjectRevisionHighWater::new(project_id, sequence),
+            state,
+        )
+        .unwrap();
+        let opens = Arc::new(AtomicUsize::new(0));
+        let unreferenced = publish_unreferenced_generation(
+            &root,
+            ProjectCommitCapture::new(
+                projection.clone(),
+                Some(current_id),
+                None,
+                None,
+                vec![Box::new(MemorySource {
+                    descriptor: new_descriptor.clone(),
+                    bytes,
+                    opens: Arc::clone(&opens),
+                    flip_second: false,
+                })],
+            )
+            .unwrap(),
+            GenerationKind::Manual,
+            generation_sequence,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert!(opens.load(Ordering::SeqCst) > 0);
+        assert!(object_path(directory.path(), new_descriptor.digest()).is_file());
+        assert!(generation_path(directory.path(), unreferenced.generation_id()).is_file());
+        let before = file_tree(directory.path());
+
+        let capture =
+            ProjectCommitCapture::new(projection, Some(current_id), None, None, Vec::new())
+                .unwrap();
+        let rejected = publish_established_manual_generation(
+            &root,
+            &leases,
+            capture,
+            ProjectStoreLimits::default(),
+            || false,
+        );
+        assert!(
+            matches!(
+                rejected,
+                Err(ProjectStoreFault::Corruption {
+                    stage: "generation_closure"
+                })
+            ),
+            "unexpected held-lane-only reuse result: {rejected:?}"
+        );
+        assert_eq!(file_tree(directory.path()), before);
+        let after =
+            inspect_established_store(&root, ProjectStoreLimits::default(), || false).unwrap();
+        assert_eq!(after.manual().head.current(), current_id);
+    }
+
+    #[test]
+    fn authenticated_copy_cancellation_cleans_the_private_destination_stage() {
+        let source_directory =
+            extracted_frozen_root("package-copy-cancel-source", "recoverable.m4dproj");
+        let source_root = LocalStoreRoot::open(source_directory.path()).unwrap();
+        let source =
+            inspect_established_store(&source_root, ProjectStoreLimits::default(), || false)
+                .unwrap();
+        let target = frozen_generation("divergent.m4dproj", DIVERGENT_INITIAL);
+        let fork = (source.project_id(), source.manual().head.current());
+        let source_before = file_tree(source_directory.path());
+        let parent = TestDirectory::new("package-copy-cancel-target");
+        let destination = ProjectStorePath::new(parent.path().join("cancelled.m4dproj")).unwrap();
+        let mut saw_copied_object = false;
+        assert!(matches!(
+            install_initial_manual_package_from_generation(
+                &destination,
+                InitialPackageMode::SaveAs {
+                    source_project_id: fork.0,
+                    source_generation_id: fork.1,
+                },
+                store_backed_save_as_capture(&target),
+                &source_root,
+                source.manual_generation(),
+                ProjectStoreLimits::default(),
+                || {
+                    saw_copied_object |= package_stage_contains_object(parent.path());
+                    saw_copied_object
+                },
+            ),
+            Err(ProjectStoreFault::Cancelled)
+        ));
+        assert!(saw_copied_object);
+        assert!(!destination.as_path().exists());
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+        assert_eq!(file_tree(source_directory.path()), source_before);
     }
 
     #[test]
@@ -3641,6 +4595,152 @@ mod tests {
         assert!(!directory.path().join("refs/autosave-head").exists());
         assert!(!directory.path().join("refs/autosave-recovery").exists());
         assert!(opens.load(Ordering::SeqCst) >= g2.projection().state().artifacts().len());
+    }
+
+    #[test]
+    fn reopened_unchanged_paged_manual_save_needs_no_object_sources() {
+        let directory = extracted_frozen_root("established-paged-reuse", "recoverable.m4dproj");
+        let root = LocalStoreRoot::open(directory.path()).unwrap();
+        let leases = ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        let before =
+            inspect_established_store(&root, ProjectStoreLimits::default(), || false).unwrap();
+        let current_id = before.manual().head.current();
+        let (paged_digest, paged_storage) = before
+            .manual_generation()
+            .bindings()
+            .iter()
+            .find(|(_, storage)| matches!(storage, ArtifactStorage::Paged { .. }))
+            .map(|(digest, storage)| (*digest, storage.clone()))
+            .expect("the frozen recovery fixture must retain a paged object");
+        let paged_descriptor = before
+            .manual_generation()
+            .projection()
+            .state()
+            .artifacts()
+            .iter()
+            .find(|artifact| artifact.object().digest() == paged_digest)
+            .unwrap()
+            .object();
+        assert!(paged_descriptor.byte_length() > PAGE_BYTES);
+
+        let target = frozen_generation("recoverable.m4dproj", RECOVERABLE_ORPHAN);
+        let capture = ProjectCommitCapture::new(
+            target.projection().clone(),
+            Some(current_id),
+            None,
+            target.forked_from(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(capture.object_source_count(), 0);
+        let receipt = publish_established_manual_generation(
+            &root,
+            &leases,
+            capture,
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(receipt.published_objects(), 0);
+        assert_eq!(receipt.published_bytes(), 0);
+
+        let reopened =
+            inspect_established_store(&root, ProjectStoreLimits::default(), || false).unwrap();
+        assert_eq!(
+            reopened.manual().head.current(),
+            receipt.new_generation_id()
+        );
+        assert_eq!(
+            reopened.manual_generation().bindings().get(&paged_digest),
+            Some(&paged_storage)
+        );
+        validate_physical_closure(
+            &root,
+            reopened.manual_generation(),
+            ProjectStoreLimits::default(),
+            &mut || false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn omitted_new_logical_object_is_rejected_before_ref_publication() {
+        let directory = extracted_frozen_root("established-omitted-new", "recoverable.m4dproj");
+        let root = LocalStoreRoot::open(directory.path()).unwrap();
+        let leases = ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        let inspection =
+            inspect_established_store(&root, ProjectStoreLimits::default(), || false).unwrap();
+        let current_id = inspection.manual().head.current();
+        let target = frozen_generation("recoverable.m4dproj", RECOVERABLE_ORPHAN);
+        let new_bytes = b"new logical object without a source";
+        let new_descriptor = descriptor(ArtifactSchema::AnalysisTableV1, new_bytes);
+        assert!(
+            !inspection
+                .manual_generation()
+                .bindings()
+                .contains_key(&new_descriptor.digest())
+        );
+        let old = target.projection();
+        let mut artifacts = old.state().artifacts().to_vec();
+        artifacts.push(artifact(
+            0x99,
+            ArtifactSchema::AnalysisTableV1,
+            new_descriptor,
+        ));
+        let state = ProjectState::new(
+            old.state().project_id(),
+            old.state().dataset().clone(),
+            old.state().view().clone(),
+            old.state().channel_presets().to_vec(),
+            artifacts,
+        )
+        .unwrap();
+        let revision_sequence = old.revision_high_water().sequence() + 1;
+        let projection = ProjectGenerationProjection::new(
+            ProjectRevisionId::new(old.state().project_id(), revision_sequence),
+            ProjectRevisionHighWater::new(old.state().project_id(), revision_sequence),
+            state,
+        )
+        .unwrap();
+        let capture = ProjectCommitCapture::new(
+            projection,
+            Some(current_id),
+            None,
+            target.forked_from(),
+            Vec::new(),
+        )
+        .unwrap();
+        let head_before = fs::read(directory.path().join("refs/head")).unwrap();
+        let recovery_before = fs::read(directory.path().join("refs/recovery")).unwrap();
+        let generations_before = root
+            .enumerate_generation_ids(ProjectStoreLimits::default(), || false)
+            .unwrap();
+
+        assert!(matches!(
+            publish_established_manual_generation(
+                &root,
+                &leases,
+                capture,
+                ProjectStoreLimits::default(),
+                || false,
+            ),
+            Err(ProjectStoreFault::Corruption {
+                stage: "generation_closure"
+            })
+        ));
+        assert_eq!(
+            fs::read(directory.path().join("refs/head")).unwrap(),
+            head_before
+        );
+        assert_eq!(
+            fs::read(directory.path().join("refs/recovery")).unwrap(),
+            recovery_before
+        );
+        assert_eq!(
+            root.enumerate_generation_ids(ProjectStoreLimits::default(), || false)
+                .unwrap(),
+            generations_before
+        );
     }
 
     #[test]
@@ -4846,6 +5946,72 @@ mod tests {
             .join(&digest[2..])
     }
 
+    fn store_backed_save_as_capture(target: &GenerationDocument) -> ProjectCommitCapture {
+        ProjectCommitCapture::new(
+            target.projection().clone(),
+            None,
+            None,
+            target.forked_from(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    fn file_tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(root: &Path, directory: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            let mut entries = fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let file_type = entry.file_type().unwrap();
+                if file_type.is_dir() {
+                    visit(root, &path, files);
+                } else if file_type.is_file() {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        fs::read(path).unwrap(),
+                    );
+                } else {
+                    panic!("fixture contains an unexpected object");
+                }
+            }
+        }
+
+        let mut files = BTreeMap::new();
+        visit(root, root, &mut files);
+        files
+    }
+
+    fn package_stage_contains_object(parent: &Path) -> bool {
+        fn contains_file(directory: &Path) -> bool {
+            let Ok(entries) = fs::read_dir(directory) else {
+                return false;
+            };
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_file() || (file_type.is_dir() && contains_file(&entry.path())) {
+                    return true;
+                }
+            }
+            false
+        }
+
+        fs::read_dir(parent).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".mirante4d-project-stage-"))
+                    && contains_file(&entry.path().join("objects"))
+            })
+        })
+    }
+
     fn prepared_frozen_root(label: &str) -> TestDirectory {
         prepared_frozen_root_from_store(label, "stale.m4dproj")
     }
@@ -4948,7 +6114,24 @@ mod tests {
     ) -> (ProjectCommitCapture, Arc<AtomicUsize>) {
         let opens = Arc::new(AtomicUsize::new(0));
         let mut sources: Vec<Box<dyn ProjectObjectSource>> = Vec::new();
-        for artifact in frozen.projection().state().artifacts() {
+        let frozen_id = frozen.encode(ProjectStoreLimits::default()).unwrap().id();
+        let reuse_generation = if expected_parent == Some(frozen_id) {
+            Some(frozen.clone())
+        } else if expected_parent.is_some() && expected_parent == frozen.parent_generation_id() {
+            expected_parent.map(|id| frozen_generation(store, &id.to_string()))
+        } else if expected_parent.is_none() {
+            autosave_base.map(|id| frozen_generation(store, &id.to_string()))
+        } else {
+            None
+        };
+        let reuse_descriptors = reuse_generation
+            .as_ref()
+            .map(|generation| unique_logical_descriptors(generation.projection()).unwrap())
+            .unwrap_or_default();
+        for artifact in projection.state().artifacts() {
+            if reuse_descriptors.get(&artifact.object().digest()) == Some(artifact.object()) {
+                continue;
+            }
             let storage = frozen.bindings().get(&artifact.object().digest()).unwrap();
             let bytes = match storage {
                 ArtifactStorage::Direct { object } => {

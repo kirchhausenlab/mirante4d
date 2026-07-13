@@ -162,12 +162,16 @@ impl RecoveryInspection {
 
 pub(crate) struct RecoveryOpen {
     inspection: RecoveryInspection,
-    projection: ProjectGenerationProjection,
+    document: GenerationDocument,
 }
 
 impl RecoveryOpen {
     pub(crate) fn into_parts(self) -> (RecoveryInspection, ProjectGenerationProjection) {
-        (self.inspection, self.projection)
+        (self.inspection, self.document.into_projection())
+    }
+
+    pub(crate) fn into_document_parts(self) -> (RecoveryInspection, GenerationDocument) {
+        (self.inspection, self.document)
     }
 }
 
@@ -834,11 +838,11 @@ pub(crate) fn open_recovery<C>(
 where
     C: FnMut() -> bool,
 {
-    let (inspection, projection) =
+    let (inspection, document) =
         discover_recovery(root, limits, Some(generation_id), is_cancelled)?;
     Ok(RecoveryOpen {
         inspection,
-        projection: projection.ok_or(ProjectStoreFault::Corruption {
+        document: document.ok_or(ProjectStoreFault::Corruption {
             stage: "recovery_selection",
         })?,
     })
@@ -849,7 +853,7 @@ fn discover_recovery<C>(
     limits: ProjectStoreLimits,
     selected: Option<ProjectGenerationId>,
     mut is_cancelled: C,
-) -> Result<(RecoveryInspection, Option<ProjectGenerationProjection>), ProjectStoreFault>
+) -> Result<(RecoveryInspection, Option<GenerationDocument>), ProjectStoreFault>
 where
     C: FnMut() -> bool,
 {
@@ -1115,7 +1119,7 @@ where
         });
     }
 
-    let selected_projection = if let Some(selected) = selected {
+    let selected_document = if let Some(selected) = selected {
         if !candidates
             .iter()
             .any(|candidate| candidate.generation_id() == selected)
@@ -1144,7 +1148,7 @@ where
                 stage: "recovery_selection",
             });
         }
-        Some(selected_document.into_projection())
+        Some(selected_document)
     } else {
         None
     };
@@ -1155,7 +1159,7 @@ where
             current_autosave_generation,
             candidates,
         },
-        selected_projection,
+        selected_document,
     ))
 }
 

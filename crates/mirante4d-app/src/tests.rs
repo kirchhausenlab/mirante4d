@@ -62,6 +62,8 @@ fn test_workbench_app_without_background_runtime(
         project_persistence: None,
         settings_connection,
         source_open_service: None,
+        source_verification_service: None,
+        pending_automatic_source_verification: None,
     }
 }
 

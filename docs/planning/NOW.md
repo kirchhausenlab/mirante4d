@@ -11,12 +11,16 @@ WP-10B B1 and B2 are complete. B2 is accepted on protected main at
 policy and Rust checks passed in
 [run 29273392030](https://github.com/kirchhausenlab/mirante4d/actions/runs/29273392030).
 
-B3 is the current checkpoint. It adds bounded current-source D-009
-verification, source-generation-aware completion and invalidation, atomic
-verified-catalog/runtime replacement, exact revision-based autosave scheduling,
-and an application service over the accepted project-store actor. The new
-service remains unreachable from the product during B3: the private project-v15
-bridge and `CurrentProjectRuntime` stay the sole product route until B4.
+B3 is the current checkpoint, and its implementation candidate is under
+validation. It implements bounded current-source D-009 verification,
+source-generation-aware completion and invalidation, atomic verified-catalog/
+runtime replacement, authenticated capture reuse and Save As copying, exact
+revision-based autosave scheduling, and an application service over the
+accepted project-store actor. The remaining B3 work is final public-gate
+evidence, real-display validation at both accepted resolutions, and protected-
+main acceptance. The new project-store service remains
+unreachable from the product during B3: the private project-v15 bridge and
+`CurrentProjectRuntime` stay the sole product route until B4.
 
 B4 will switch product save/open/autosave/recovery atomically to the successor,
 delete the complete project-v15 path, and run the required real-viewer checks at

@@ -70,6 +70,18 @@ impl CurrentDatasetSource {
         source_id: DatasetSourceId,
         ledger: Arc<dyn CpuByteLedger>,
     ) -> Result<Arc<Self>, CurrentDatasetSourceOpenError> {
+        Self::open_with_identity(
+            root,
+            ScientificIdentityStatus::Unverified(source_id),
+            ledger,
+        )
+    }
+
+    pub(super) fn open_with_identity(
+        root: impl AsRef<Path>,
+        identity: ScientificIdentityStatus,
+        ledger: Arc<dyn CpuByteLedger>,
+    ) -> Result<Arc<Self>, CurrentDatasetSourceOpenError> {
         let root = root.as_ref();
         let manifest_bytes = fs::metadata(root.join("mirante4d.json"))
             .map_err(CurrentDatasetSourceOpenError::ManifestMetadata)?
@@ -88,13 +100,25 @@ impl CurrentDatasetSource {
         }
 
         let dataset = DatasetHandle::open(root)?;
-        let catalog = Arc::new(build_catalog(&dataset, source_id)?);
+        let catalog = Arc::new(build_catalog(&dataset, identity)?);
         Ok(Arc::new(Self {
             dataset,
             catalog,
             ledger,
             _metadata_lease: metadata_lease,
         }))
+    }
+
+    pub(super) const fn verification_dataset(&self) -> &DatasetHandle {
+        &self.dataset
+    }
+
+    pub(super) fn verification_catalog(&self) -> &Arc<DatasetCatalog> {
+        &self.catalog
+    }
+
+    pub(super) fn verification_ledger(&self) -> &Arc<dyn CpuByteLedger> {
+        &self.ledger
     }
 
     fn checkpoint(
@@ -290,7 +314,7 @@ impl DatasetSource for CurrentDatasetSource {
 
 fn build_catalog(
     dataset: &DatasetHandle,
-    source_id: DatasetSourceId,
+    identity: ScientificIdentityStatus,
 ) -> Result<DatasetCatalog, CurrentDatasetSourceOpenError> {
     let mut layers = Vec::with_capacity(dataset.manifest().layers.len());
     for (index, layer) in dataset.manifest().layers.iter().enumerate() {
@@ -322,7 +346,7 @@ fn build_catalog(
     }
     Ok(DatasetCatalog::new(
         dataset.dataset_name(),
-        ScientificIdentityStatus::Unverified(source_id),
+        identity,
         layers,
     )?)
 }

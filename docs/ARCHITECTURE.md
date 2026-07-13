@@ -123,10 +123,16 @@ coverage include at most 128 resources.
 
 ## Persistence And Settings
 
-Unverified sources are unbound workspaces. Project attach/open/save rejects at
-the typed identity gate because current sources do not expose a verified
-scientific-content ID. The private project-v15 actor exists only to exercise
-the future boundary; it is deleted by WP-10B.
+Current schema-1 sources open as unverified workspaces. B3 runs a background,
+cancellable D-009 scan over the base scale between complete source-tree
+inventories, then prepares and atomically promotes a structurally identical
+verified catalog/runtime for the exact source generation. Progress,
+cancellation, success, and source-drift invalidation use the canonical
+application operation path; unrelated view changes do not make a verification
+completion stale. Project attach/open/save remains identity-gated until
+verification succeeds, and observed drift clears interactive demand and blocks
+new project I/O until reverification. The private project-v15 bridge remains
+the sole product persistence path until B4.
 
 WP-10B B1 freezes the successor's canonical envelope, generation, ref, object,
 payload-paging, API, and failure-transition contract plus an independent
@@ -219,12 +225,17 @@ selection, after which Save As installs a new project with exact fork
 provenance while leaving the damaged package untouched. B2's exact ext4
 durability qualification is accepted on protected main.
 
-B3 permits only the compile-time data-to-identity/hash and app/application-to-
-project-store edges needed for current-source D-009 verification, deterministic
-autosave scheduling, and the off-product project-store service. Source
-verification may run in the product, but the service has no product composition
-field or start/poll path. The private project-v15 bridge and
-`CurrentProjectRuntime` remain the sole product project route until B4.
+B3 adds only the data-to-identity/hash and app/application-to-project-store
+edges required by its accepted correction. Project captures now require caller
+sources only for genuinely new logical objects; unchanged direct or paged
+objects may be reused only from the actor-authenticated held generation and
+lane. Save As copies and rehashes that authenticated closure into destination-
+local staging. A private application service implements the injected-monotonic-
+clock 30-second-idle/120-second-maximum autosave schedule over the real actor,
+including edit-during-capture, failure, cancellation, and indeterminate-write
+semantics. The service has no product composition field or start/poll path;
+the project-v15 bridge and `CurrentProjectRuntime` remain the sole product
+project route until B4.
 
 Settings use `mirante4d-settings-v1` at the Linux XDG/HOME path. The UI submits
 validated changes; one background actor owns persistence. Legacy preferences

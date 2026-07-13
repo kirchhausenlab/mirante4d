@@ -159,10 +159,17 @@ those rules with exact uncertain-install adoption and fresh retry. The public
 actor now executes first and advancing provisional Autosave, fresh or
 provisional-to-manual Create, normal Open, explicit recovery selection, and
 recovery-selected Save As. B2's exact ext4 durability qualification is accepted,
-but the store remains off-product. B3 owns source verification, authenticated
-object reuse, and application autosave scheduling; B4 deletes project-v15 and
-makes the new store the sole product path. A separate accepted correction fixes the exact internal
-`staging/tx-*` name and payload grammar plus writer-only cleanup rules.
+but the store remains off-product. The B3 candidate now derives D-009 identity
+for current schema-1 sources by comparing complete normalized
+path/length/BLAKE3 inventories around an `s0` value-and-validity scan. It never
+writes the source and fails closed on closure drift. Project capture now uses
+caller sources only for genuinely new logical objects; unchanged direct or
+paged bindings require held-generation authentication, and Save As copies and
+rehashes the authenticated closure. This does not make schema 1 a target-format
+package or activate successor persistence. B4 still deletes project-v15 and
+makes the new store the sole product path. A separate accepted correction fixes
+the exact internal `staging/tx-*` name and payload grammar plus writer-only
+cleanup rules.
 Writable open now removes only fully preflighted dead transaction residue with
 ordered directory syncs and fresh retry; read-only open does not traverse
 staging. Staging remains non-authoritative.

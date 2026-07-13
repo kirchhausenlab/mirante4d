@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use mirante4d_dataset::{CpuByteLedger, DatasetResourceKey};
+use mirante4d_dataset::{CpuByteLedger, DatasetResourceIdentity, DatasetResourceKey};
 use mirante4d_dataset_runtime::{
     AccountedResourceLease, CancellationGeneration, DatasetRuntime, DatasetRuntimeDiagnostics,
     RequestPriority, RequestTicket, ResourceRequest, RuntimeFault, RuntimeFaultCode,
@@ -25,6 +25,14 @@ pub(crate) const SCOPE_CROSS_SECTION_XY: u64 = 2;
 pub(crate) const SCOPE_CROSS_SECTION_XZ: u64 = 3;
 pub(crate) const SCOPE_CROSS_SECTION_YZ: u64 = 4;
 pub(crate) const SCOPE_PLAYBACK: u64 = 5;
+
+const INTERACTIVE_DEMAND_SCOPES: [u64; 5] = [
+    SCOPE_CURRENT_3D,
+    SCOPE_CROSS_SECTION_XY,
+    SCOPE_CROSS_SECTION_XZ,
+    SCOPE_CROSS_SECTION_YZ,
+    SCOPE_PLAYBACK,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct PendingKey {
@@ -48,6 +56,7 @@ pub(crate) struct DatasetRequestDispatcher {
 pub(crate) struct DatasetDemandState {
     dispatcher: DatasetRequestDispatcher,
     cpu_ledger: Arc<dyn CpuByteLedger>,
+    resource_identity: DatasetResourceIdentity,
     selected_path: PathBuf,
     requirements_by_scope: BTreeMap<u64, Arc<[DatasetResourceKey]>>,
     layer_scales_by_scope: BTreeMap<u64, BTreeMap<mirante4d_domain::LogicalLayerKey, ScaleLevel>>,
@@ -198,11 +207,13 @@ impl DatasetDemandState {
     pub(crate) fn new(
         runtime: Arc<dyn DatasetRuntime>,
         cpu_ledger: Arc<dyn CpuByteLedger>,
+        resource_identity: DatasetResourceIdentity,
         selected_path: PathBuf,
     ) -> Self {
         Self {
             dispatcher: DatasetRequestDispatcher::new(runtime),
             cpu_ledger,
+            resource_identity,
             selected_path,
             requirements_by_scope: BTreeMap::new(),
             layer_scales_by_scope: BTreeMap::new(),
@@ -222,6 +233,14 @@ impl DatasetDemandState {
 
     pub(crate) fn cpu_ledger(&self) -> &dyn CpuByteLedger {
         self.cpu_ledger.as_ref()
+    }
+
+    pub(crate) fn cpu_ledger_arc(&self) -> Arc<dyn CpuByteLedger> {
+        Arc::clone(&self.cpu_ledger)
+    }
+
+    pub(crate) const fn resource_identity(&self) -> DatasetResourceIdentity {
+        self.resource_identity
     }
 
     pub(crate) fn dispatcher_mut(&mut self) -> &mut DatasetRequestDispatcher {
@@ -367,6 +386,31 @@ impl DatasetDemandState {
 
     pub(crate) fn begin_submission_pass(&mut self) {
         self.dispatcher.begin_submission_pass();
+    }
+
+    /// Quarantines every interactive demand owned by this source without
+    /// shutting down the runtime. The CPU ledger must remain usable because
+    /// current-source reverification scans against that same bounded ledger.
+    pub(crate) fn cancel_and_clear_interactive_demand(&mut self) -> Result<(), RuntimeFault> {
+        self.requirements_by_scope.clear();
+        self.layer_scales_by_scope.clear();
+        self.dispatcher.begin_submission_pass();
+        self.last_plan_error = None;
+
+        let mut first_fault = None;
+        for scope in INTERACTIVE_DEMAND_SCOPES {
+            if let Err(fault) = self.dispatcher.advance_scope(scope)
+                && first_fault.is_none()
+            {
+                first_fault = Some(fault);
+            }
+        }
+        let _ = self.dispatcher.take_last_fault();
+
+        match first_fault {
+            Some(fault) => Err(fault),
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn scope_complete(&self, scope: u64, leases: &CurrentLeaseBridge) -> bool {

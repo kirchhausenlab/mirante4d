@@ -57,10 +57,18 @@ fn pending_application_service_work(
             matches!(
                 kind,
                 OperationKind::DatasetOpen
+                    | OperationKind::SourceVerification
                     | OperationKind::ProjectOpen
                     | OperationKind::ProjectSave
             )
         })
+}
+
+pub(crate) const fn source_verification_polling_required(
+    automatic_request_pending: bool,
+    worker_active: bool,
+) -> bool {
+    automatic_request_pending || worker_active
 }
 
 pub(crate) fn enqueue_playback_command_if_due(
@@ -117,6 +125,7 @@ mod tests {
     fn source_and_project_operations_keep_application_services_polling() {
         for kind in [
             OperationKind::DatasetOpen,
+            OperationKind::SourceVerification,
             OperationKind::ProjectOpen,
             OperationKind::ProjectSave,
         ] {
@@ -133,5 +142,13 @@ mod tests {
     fn pending_settings_keep_application_services_polling_without_an_operation() {
         assert!(pending_application_service_work([], true));
         assert!(!pending_application_service_work([], false));
+    }
+
+    #[test]
+    fn deferred_or_retiring_source_verification_keeps_ui_polling() {
+        assert!(source_verification_polling_required(true, false));
+        assert!(source_verification_polling_required(false, true));
+        assert!(source_verification_polling_required(true, true));
+        assert!(!source_verification_polling_required(false, false));
     }
 }
