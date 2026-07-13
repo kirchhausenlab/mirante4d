@@ -197,6 +197,7 @@ struct StoreInventory {
     root_entries: usize,
     refs_entries: Option<usize>,
     staging_entries: Option<usize>,
+    inspect_staging: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -848,6 +849,40 @@ impl LocalStoreRoot {
         limits: ProjectStoreLimits,
         pending_fixed_refs: usize,
         replaces_fixed_ref: bool,
+        is_cancelled: C,
+    ) -> Result<(), LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        self.validate_store_inventory_mode(
+            limits,
+            pending_fixed_refs,
+            replaces_fixed_ref,
+            true,
+            is_cancelled,
+        )
+    }
+
+    /// Read-side inventory validation never follows the writer-private
+    /// staging subtree. A live writer may remove a completed stage while a
+    /// read-only session is opening; staging is not read authority.
+    pub(crate) fn validate_read_inventory<C>(
+        &self,
+        limits: ProjectStoreLimits,
+        is_cancelled: C,
+    ) -> Result<(), LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+    {
+        self.validate_store_inventory_mode(limits, 0, false, false, is_cancelled)
+    }
+
+    fn validate_store_inventory_mode<C>(
+        &self,
+        limits: ProjectStoreLimits,
+        pending_fixed_refs: usize,
+        replaces_fixed_ref: bool,
+        inspect_staging: bool,
         mut is_cancelled: C,
     ) -> Result<(), LocalPublicationError>
     where
@@ -862,7 +897,10 @@ impl LocalStoreRoot {
             enforce_count(publication_descriptors, limits.open_file_descriptors_max)?;
         }
         let root = duplicate_directory(&self.root)?;
-        let mut inventory = StoreInventory::default();
+        let mut inventory = StoreInventory {
+            inspect_staging,
+            ..StoreInventory::default()
+        };
         inspect_store_directory(
             &root,
             InventoryDirectory::Root,
@@ -1762,11 +1800,13 @@ where
                 } else {
                     InventoryDirectory::Other
                 };
-                child_directories.push((
-                    name.to_owned(),
-                    child_role,
-                    DirectoryIdentity::from_stat(metadata)?,
-                ));
+                if child_role != InventoryDirectory::Staging || inventory.inspect_staging {
+                    child_directories.push((
+                        name.to_owned(),
+                        child_role,
+                        DirectoryIdentity::from_stat(metadata)?,
+                    ));
+                }
             }
             FileType::RegularFile if metadata.st_nlink == 1 => {}
             _ => return Err(LocalPublicationError::ExistingMismatch),
@@ -3220,6 +3260,25 @@ mod tests {
             populated_root.validate_store_inventory(limits, 0, false, || false),
             Err(LocalPublicationError::Capacity { .. })
         ));
+    }
+
+    #[test]
+    fn read_inventory_does_not_follow_writer_private_staging() {
+        let directory = TestDirectory::new("read-inventory-staging");
+        let staging = directory.path().join("staging/live-transaction");
+        fs::create_dir_all(&staging).unwrap();
+        let outside = directory.path().join("outside");
+        fs::write(&outside, b"outside sentinel").unwrap();
+        symlink(&outside, staging.join("volatile-link")).unwrap();
+        let root = LocalStoreRoot::open(directory.path()).unwrap();
+
+        root.validate_read_inventory(ProjectStoreLimits::default(), || false)
+            .unwrap();
+        assert!(matches!(
+            root.validate_store_inventory(ProjectStoreLimits::default(), 0, false, || false),
+            Err(LocalPublicationError::ExistingMismatch)
+        ));
+        assert_eq!(fs::read(outside).unwrap(), b"outside sentinel");
     }
 
     #[test]

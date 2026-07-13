@@ -159,9 +159,12 @@ synchronizes it, and installs it with a no-clobber rename while retaining the
 root and leases. The corrected public API now requires successful Open and
 OpenRecovery completions to return both session and loaded projection, and
 distinguishes manual recovery branches from autosave divergence without
-changing any persisted bytes. Execution of those commands is still absent.
-The frozen public actor remains non-constructible and the
-crate remains off-product.
+changing any persisted bytes. A bounded private recovery reader and actor path
+now discover validated manual/autosave fallbacks or capped scan candidates,
+load only an explicit fresh selection, preserve actual head facts, and support
+corrupt-head and writer-contended read-only sessions without repair or
+promotion. The frozen public actor remains non-constructible and the crate
+remains off-product.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.

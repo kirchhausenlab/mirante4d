@@ -8,11 +8,13 @@ use std::{
 };
 
 use mirante4d_identity::{ExactBytesDigest, RawObjectDescriptor, Sha256Digest};
-use mirante4d_project_model::ProjectRevisionHighWater;
 use mirante4d_project_model::{
-    MAX_ARTIFACTS, ProjectGenerationProjection, ProjectId, ProjectRevisionId,
+    MAX_ARTIFACTS, ProjectGenerationProjection, ProjectId, ProjectRevisionHighWater,
+    ProjectRevisionId,
 };
 use thiserror::Error;
+
+use crate::generation::GenerationKind;
 
 const GENERATION_ID_PREFIX: &str = "m4d-project-generation-v1-sha256:";
 
@@ -450,7 +452,7 @@ pub struct ProjectRecoveryCandidate {
 
 #[allow(dead_code)] // Constructed by the B2 actor/recovery slice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RecoveryOrigin {
+pub(crate) enum RecoveryOrigin {
     AutosaveHead,
     AutosaveRecovery,
     ManualPrevious,
@@ -460,7 +462,7 @@ enum RecoveryOrigin {
 
 #[allow(dead_code)] // Constructed by the B2 actor/recovery slice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RecoveryClassification {
+pub(crate) enum RecoveryClassification {
     Provisional,
     Newer,
     Stale,
@@ -468,7 +470,66 @@ enum RecoveryClassification {
     ManualBranch,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RecoveryCandidateFacts {
+    pub(crate) kind: GenerationKind,
+    pub(crate) generation_sequence: u64,
+    pub(crate) revision_sequence: u64,
+    pub(crate) base_manual_generation_id: Option<ProjectGenerationId>,
+    pub(crate) artifact_count: u32,
+    pub(crate) non_regenerable_artifact_count: u32,
+}
+
 impl ProjectRecoveryCandidate {
+    pub(crate) fn from_facts(
+        generation_id: ProjectGenerationId,
+        facts: RecoveryCandidateFacts,
+        origin: RecoveryOrigin,
+        classification: RecoveryClassification,
+        current_manual_generation_id: Option<ProjectGenerationId>,
+    ) -> Result<Self, ProjectStoreFault> {
+        let origin_matches_kind = match origin {
+            RecoveryOrigin::AutosaveHead | RecoveryOrigin::AutosaveRecovery => {
+                facts.kind == GenerationKind::Autosave
+            }
+            RecoveryOrigin::ManualPrevious | RecoveryOrigin::ManualRecovery => {
+                facts.kind == GenerationKind::Manual
+            }
+            RecoveryOrigin::OrphanScan => true,
+        };
+        let classification_matches = match classification {
+            RecoveryClassification::Provisional => {
+                facts.kind == GenerationKind::Autosave
+                    && current_manual_generation_id.is_none()
+                    && facts.base_manual_generation_id.is_none()
+            }
+            RecoveryClassification::Newer | RecoveryClassification::Stale => {
+                facts.kind == GenerationKind::Autosave
+                    && current_manual_generation_id.is_some()
+                    && facts.base_manual_generation_id == current_manual_generation_id
+            }
+            RecoveryClassification::Divergent => facts.kind == GenerationKind::Autosave,
+            RecoveryClassification::ManualBranch => facts.kind == GenerationKind::Manual,
+        };
+        if !origin_matches_kind || !classification_matches {
+            return Err(ProjectStoreFault::Corruption {
+                stage: "recovery_candidate_classification",
+            });
+        }
+
+        Ok(Self {
+            generation_id,
+            generation_sequence: facts.generation_sequence,
+            revision_sequence: facts.revision_sequence,
+            origin,
+            classification,
+            base_manual_generation_id: facts.base_manual_generation_id,
+            current_manual_generation_id,
+            artifact_count: facts.artifact_count,
+            non_regenerable_artifact_count: facts.non_regenerable_artifact_count,
+        })
+    }
+
     pub const fn generation_id(&self) -> ProjectGenerationId {
         self.generation_id
     }
@@ -874,6 +935,22 @@ pub struct ProjectStoreSession {
 }
 
 impl ProjectStoreSession {
+    pub(crate) const fn new(
+        path: ProjectStorePath,
+        project_id: ProjectId,
+        mode: ProjectOpenMode,
+        current_manual_generation: Option<ProjectGenerationId>,
+        current_autosave_generation: Option<ProjectGenerationId>,
+    ) -> Self {
+        Self {
+            path,
+            project_id,
+            mode,
+            current_manual_generation,
+            current_autosave_generation,
+        }
+    }
+
     pub fn path(&self) -> &ProjectStorePath {
         &self.path
     }

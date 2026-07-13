@@ -33,10 +33,12 @@ and capped orphan candidates. It performs no repair, payload hashing, or
 deletion. A narrow accepted correction now makes successful Open and
 OpenRecovery return both the held session and loaded projection and adds an
 honest manual-branch recovery classification without changing persisted bytes.
-B2 remains active off-product: public Create/Open/Save As execution,
-provisional autosave publication, recovery/open, timers, garbage collection,
-full verification, and public actor wiring remain later work, with product
-activation at B4.
+A bounded private recovery reader and actor path now classify all four fixtures,
+fall back across corrupt heads/targets, scan only after exhausted lane fallback,
+and load a freshly selected projection without repair or promotion. B2 remains
+active off-product: public Create/Open/Save As execution, provisional autosave
+publication, timers, garbage collection, full verification, and public actor
+wiring remain later work, with product activation at B4.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.
