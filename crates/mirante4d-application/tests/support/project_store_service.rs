@@ -781,12 +781,10 @@ fn automatic_recovery_review_selects_only_newer_and_leaves_branches_explicit() {
 
 #[test]
 fn real_recovery_selected_save_as_establishes_the_new_project() {
-    let application = verified_bound_application();
-    let source_snapshot = application.snapshot();
     let directory = TestDirectory::new();
     let source = ProjectStorePath::new(directory.path().join("recovery.m4dproj")).unwrap();
     let destination = ProjectStorePath::new(directory.path().join("recovered.m4dproj")).unwrap();
-    create_provisional_store(&source, &source_snapshot);
+    let (selected_generation, _) = create_established_recovery_store(&source, false);
 
     let mut opener = verified_unbound_application();
     opener.drain_events(MAX_PENDING_EVENTS);
@@ -800,18 +798,36 @@ fn real_recovery_selected_save_as_establishes_the_new_project() {
     service
         .submit_open(open_token.clone(), source, ProjectOpenMode::PreferWritable)
         .unwrap();
+    let review = wait_for_service_events(&mut service, &opener.snapshot());
+    assert!(matches!(
+        review.as_slice(),
+        [ProjectStoreServiceEvent::RecoveryReviewRequired {
+            token,
+            candidates,
+            automatic_newer,
+        }] if token == &open_token
+            && *automatic_newer == selected_generation
+            && candidates.iter().any(|candidate| {
+                candidate.generation_id() == selected_generation && candidate.is_newer()
+            })
+    ));
+    service
+        .submit_open_recovery(open_token.clone(), selected_generation)
+        .unwrap();
     let opened = wait_for_service_events(&mut service, &opener.snapshot());
     let recovered = match opened.as_slice() {
         [
-            ProjectStoreServiceEvent::Opened {
+            ProjectStoreServiceEvent::RecoveryOpened {
                 token,
+                generation_id,
                 projection,
-                opens_dirty: true,
-                ..
             },
-        ] if token == &open_token => projection.as_ref().clone(),
-        unexpected => panic!("unexpected provisional Open result: {unexpected:?}"),
+        ] if token == &open_token && *generation_id == selected_generation => {
+            projection.as_ref().clone()
+        }
+        unexpected => panic!("unexpected autosave recovery result: {unexpected:?}"),
     };
+    assert!(recovered.revision().sequence() > 0);
     assert_eq!(
         service.status().lifecycle(),
         ProjectStoreLifecycle::RecoverySelected
@@ -831,6 +847,8 @@ fn real_recovery_selected_save_as_establishes_the_new_project() {
         .dispatch(ApplicationCommand::RequestProjectSaveAs { new_project_id })
         .unwrap();
     let (save_as_token, fork) = project_save_as_request(&mut opener);
+    assert_eq!(fork.revision().sequence(), 0);
+    assert_eq!(fork.revision_high_water().sequence(), 0);
     let save_as_snapshot = opener.snapshot();
     service
         .submit_save_as(
@@ -1621,33 +1639,6 @@ fn close_service(
         thread::yield_now();
     }
     panic!("project-store service did not close");
-}
-
-fn create_provisional_store(path: &ProjectStorePath, snapshot: &ApplicationSnapshot) {
-    let clock = ManualClock::default();
-    let mut service = ProjectStoreApplicationService::start(
-        ProjectStoreConfig::default(),
-        clock.clone(),
-        Some(path.clone()),
-    )
-    .unwrap();
-    assert!(
-        service
-            .drive(snapshot, |_| Ok(Vec::new()))
-            .unwrap()
-            .is_empty()
-    );
-    clock.set(seconds(30));
-    assert!(matches!(
-        service
-            .drive(snapshot, |_| Ok(Vec::new()))
-            .unwrap()
-            .as_slice(),
-        [ProjectStoreServiceEvent::AutosaveSubmitted { .. }]
-    ));
-    wait_for_autosave(&mut service, snapshot).expect("provisional autosave must succeed");
-    close_service(&mut service, snapshot);
-    service.join().unwrap();
 }
 
 fn create_established_store(path: &ProjectStorePath) {

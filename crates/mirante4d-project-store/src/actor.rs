@@ -452,8 +452,6 @@ impl SessionResources {
             .state()
             .dataset()
             .has_same_scientific_content(selected.projection().state().dataset())
-            || capture.projection().revision_high_water().sequence()
-                < selected.projection().revision_high_water().sequence()
         {
             return Err(ProjectStoreFault::Corruption {
                 stage: "save_as_recovery_selection",
@@ -2509,11 +2507,14 @@ mod tests {
         let destination_parent = TestDirectory::new("public-recovery-save-as");
         let destination = destination_parent.destination("recovered.m4dproj");
         let new_project_id = ProjectId::from_bytes([0x42; 16]);
-        let recovered_projection = retarget_projection(
+        assert!(selected_projection.revision_high_water().sequence() > 0);
+        let recovered_projection = fresh_fork_projection(
             &selected,
             new_project_id,
             selected_projection.state().dataset().clone(),
         );
+        assert_eq!(recovered_projection.revision().sequence(), 0);
+        assert_eq!(recovered_projection.revision_high_water().sequence(), 0);
         let source_project_id = selected_projection.state().project_id();
         let rejected_destination =
             ProjectStorePath::new(source.path().join("rejected-recovery-save-as.m4dproj")).unwrap();
@@ -2704,11 +2705,14 @@ mod tests {
         let destination_parent = TestDirectory::new("public-normal-recovery-save-as");
         let destination = destination_parent.destination("recovered.m4dproj");
         let source_project_id = selected_projection.state().project_id();
-        let recovered_projection = retarget_projection(
+        assert!(selected_projection.revision_high_water().sequence() > 0);
+        let recovered_projection = fresh_fork_projection(
             &selected,
             ProjectId::from_bytes([0x43; 16]),
             selected_projection.state().dataset().clone(),
         );
+        assert_eq!(recovered_projection.revision().sequence(), 0);
+        assert_eq!(recovered_projection.revision_high_water().sequence(), 0);
         let (capture, capture_opens) = controlled_fixture_capture(
             "recoverable.m4dproj",
             &selected,
@@ -6014,6 +6018,28 @@ mod tests {
         ProjectGenerationProjection::new(
             ProjectRevisionId::new(project_id, old.revision().sequence()),
             ProjectRevisionHighWater::new(project_id, old.revision_high_water().sequence()),
+            state,
+        )
+        .unwrap()
+    }
+
+    fn fresh_fork_projection(
+        frozen: &GenerationDocument,
+        project_id: ProjectId,
+        dataset: DatasetReference,
+    ) -> ProjectGenerationProjection {
+        let old = frozen.projection();
+        let state = ProjectState::new(
+            project_id,
+            dataset,
+            old.state().view().clone(),
+            old.state().channel_presets().to_vec(),
+            old.state().artifacts().to_vec(),
+        )
+        .unwrap();
+        ProjectGenerationProjection::new(
+            ProjectRevisionId::initial(project_id),
+            ProjectRevisionHighWater::initial(project_id),
             state,
         )
         .unwrap()

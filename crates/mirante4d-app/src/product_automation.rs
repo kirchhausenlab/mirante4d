@@ -2066,9 +2066,10 @@ impl ProductAutomationController {
                     Ok(())
                 } else {
                     Err(format!(
-                        "project state does not match the assertion; expected lifecycle={}, observed={}",
+                        "project state does not match the assertion; expected lifecycle={}, observed={}, status_message={:?}",
                         lifecycle.name(),
-                        project_state_json(app)
+                        project_state_json(app),
+                        app.project_status_message,
                     ))
                 }
             }
