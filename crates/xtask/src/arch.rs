@@ -361,12 +361,36 @@ fn check_wp07b_boundary_source_ownership(repo_root: &Path) -> anyhow::Result<()>
             } else {
                 (&pure_forbidden_std, "pure WP-07B boundary crate")
             };
-            violations.extend(forbidden_std_authority_violations(
-                &path,
-                &source,
-                forbidden_std,
-                policy,
-            ));
+            let mut std_violations =
+                forbidden_std_authority_violations(&path, &source, forbidden_std, policy);
+            if *crate_name == "mirante4d-application"
+                && path == source_root.join("project_store_service.rs")
+            {
+                let expected = BTreeSet::from(["Duration".to_owned(), "Instant".to_owned()]);
+                let prefix = format!(
+                    "{}: {policy} imports forbidden std authority std::time::",
+                    path.display()
+                );
+                let mut observed = BTreeSet::new();
+                std_violations.retain(|violation| {
+                    let Some(authority) = violation.strip_prefix(&prefix) else {
+                        return true;
+                    };
+                    if expected.contains(authority) {
+                        observed.insert(authority.to_owned());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if observed != expected {
+                    std_violations.push(format!(
+                        "{}: WP-10B B4 application clock authority drifted: expected={expected:?}, observed={observed:?}",
+                        path.display()
+                    ));
+                }
+            }
+            violations.extend(std_violations);
         }
     }
     if violations.is_empty() {
@@ -719,16 +743,24 @@ fn check_wp07b_boundary_contract(repo_root: &Path) -> anyhow::Result<()> {
         }
         let actual_public_api =
             public_root_api_names(&repo_root.join(crate_path).join("src/lib.rs"))?;
+        let successor_public_root_additions = wp08a::accepted_successor_public_root_additions(name)
+            .iter()
+            .map(|addition| (*addition).to_owned())
+            .collect::<BTreeSet<_>>();
+        let expected_live_public_api = public_api
+            .union(&successor_public_root_additions)
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let wp08a_supersedes_public_root =
             matches!(name, "mirante4d-dataset" | "mirante4d-render-api");
-        if (!wp08a_supersedes_public_root && actual_public_api != public_api)
+        if (!wp08a_supersedes_public_root && actual_public_api != expected_live_public_api)
             || (wp08a_supersedes_public_root && !public_api.is_subset(&actual_public_api))
         {
-            let missing = public_api
+            let missing = expected_live_public_api
                 .difference(&actual_public_api)
                 .collect::<Vec<_>>();
             let unexpected = actual_public_api
-                .difference(&public_api)
+                .difference(&expected_live_public_api)
                 .collect::<Vec<_>>();
             bail!(
                 "WP-07B boundary crate {name} public API drifted: missing={missing:?}, unexpected={unexpected:?}"
@@ -986,15 +1018,6 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
             ),
         ),
         (
-            "project",
-            (
-                "crates/mirante4d-app/src/current_runtime/project.rs",
-                "CurrentProjectRuntime",
-                "project_runtime",
-                "WP-10B",
-            ),
-        ),
-        (
             "import",
             (
                 "crates/mirante4d-app/src/current_runtime/import.rs",
@@ -1088,7 +1111,7 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
         .map(|module| (*module).to_owned())
         .collect::<BTreeSet<_>>();
     if actual_modules != expected_modules {
-        bail!("current_runtime must declare exactly the six post-WP-08B temporary owners");
+        bail!("current_runtime must declare exactly the five remaining temporary owners");
     }
 
     let app_root = repo_root.join("crates/mirante4d-app/src");
@@ -1425,32 +1448,22 @@ fn check_wp07b_private_bridges(
                 .map_err(Into::into)
         })
         .collect::<anyhow::Result<BTreeSet<_>>>()?;
-    let expected_bridge_paths = BTreeSet::from([
-        "crates/mirante4d-app/src/current_egui_shell_bridge.rs".to_owned(),
-        "crates/mirante4d-app/src/current_project_persistence_bridge.rs".to_owned(),
-    ]);
+    let expected_bridge_paths =
+        BTreeSet::from(["crates/mirante4d-app/src/current_egui_shell_bridge.rs".to_owned()]);
     if bridge_paths != expected_bridge_paths {
         bail!(
-            "WP-07B must retain exactly its two private bridges: expected={expected_bridge_paths:?}, actual={bridge_paths:?}"
+            "the live app must retain only its current egui bridge: expected={expected_bridge_paths:?}, actual={bridge_paths:?}"
         );
     }
 
     let app_source = fs::read_to_string(app_source_root.join("lib.rs"))?;
     let private_modules = private_root_module_names(&app_source)?;
-    for module in [
-        "current_egui_shell_bridge",
-        "current_project_persistence_bridge",
-    ] {
-        if !private_modules.contains(module) {
-            bail!("WP-07B bridge module {module} must remain private");
-        }
+    if !private_modules.contains("current_egui_shell_bridge") {
+        bail!("the current egui bridge module must remain private");
     }
     let app_fields = rust_struct_field_terminal_type_names(&app_source, "MiranteWorkbenchApp")?;
-    if app_fields.get("application").map(String::as_str) != Some("ApplicationState")
-        || app_fields.get("project_persistence").map(String::as_str)
-            != Some("CurrentProjectPersistenceBridge")
-    {
-        bail!("MiranteWorkbenchApp canonical application or project-bridge route drifted");
+    if app_fields.get("application").map(String::as_str) != Some("ApplicationState") {
+        bail!("MiranteWorkbenchApp canonical application route drifted");
     }
 
     let egui_path = app_source_root.join("current_egui_shell_bridge.rs");
@@ -1474,57 +1487,6 @@ fn check_wp07b_private_bridges(
         bail!("current egui shell mutation route no longer closes through the application bridge");
     }
 
-    let project_path = app_source_root.join("current_project_persistence_bridge.rs");
-    let project_source = fs::read_to_string(&project_path)?;
-    if !project_source.contains("WP-10B") {
-        bail!("current project persistence bridge must retain its WP-10B expiry");
-    }
-    let project_items = rust_root_defined_item_names(&project_source)?;
-    let required_project_items = BTreeSet::from([
-        "CurrentProjectPersistenceBridge".to_owned(),
-        "PROJECT_V15_SCHEMA".to_owned(),
-        "PROJECT_V15_SCHEMA_VERSION".to_owned(),
-        "ProjectPersistenceError".to_owned(),
-        "ProjectPersistenceEvent".to_owned(),
-    ]);
-    if !required_project_items.is_subset(&project_items)
-        || !public_root_api_names(&project_path)?.is_empty()
-    {
-        bail!("current project persistence bridge API or privacy drifted");
-    }
-    let project_route_source = format!(
-        "{app_source}\n{}",
-        fs::read_to_string(app_source_root.join("workbench_ui.rs"))?
-    );
-    for marker in [
-        "bridge.request_open",
-        "bridge.request_save",
-        "bridge.cancel",
-        "bridge.try_recv",
-        "project_persistence.shutdown",
-    ] {
-        if !project_route_source.contains(marker) {
-            bail!("project persistence sole route is missing {marker:?}");
-        }
-    }
-    for path in collect_rust_source_files(&app_source_root)? {
-        if path == project_path || path == app_source_root.join("lib.rs") {
-            continue;
-        }
-        let source = fs::read_to_string(&path)?;
-        for identifier in [
-            "CurrentProjectPersistenceBridge",
-            "PROJECT_V15_SCHEMA",
-            "ProjectDocumentDto",
-        ] {
-            if source_contains_identifier(&source, identifier) {
-                bail!(
-                    "{} bypasses the sole private project persistence route with {identifier}",
-                    path.display()
-                );
-            }
-        }
-    }
     Ok(())
 }
 

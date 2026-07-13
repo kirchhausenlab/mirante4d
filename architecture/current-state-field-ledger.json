@@ -37,13 +37,6 @@
       "expires": "WP-09C"
     },
     {
-      "module": "project",
-      "path": "crates/mirante4d-app/src/current_runtime/project.rs",
-      "type": "CurrentProjectRuntime",
-      "composition_field": "project_runtime",
-      "expires": "WP-10B"
-    },
-    {
       "module": "import",
       "path": "crates/mirante4d-app/src/current_runtime/import.rs",
       "type": "CurrentImportRuntime",

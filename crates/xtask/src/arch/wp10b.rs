@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
     path::Path,
@@ -10,8 +10,8 @@ use anyhow::{Context, bail};
 use serde_json::Value;
 
 use super::{
-    collect_rust_source_files, public_root_api_names, sha256_file, workspace_dependency_metadata,
-    wp08a::forbidden_import_violations,
+    WorkspaceDependencyMetadata, collect_rust_source_files, public_root_api_names, sha256_file,
+    workspace_dependency_metadata, wp08a::forbidden_import_violations,
 };
 
 const CONTRACT_PATH: &str = "architecture/wp10b-project-store-contract.json";
@@ -65,6 +65,14 @@ const B3_INTEGRATION_CORRECTION_PATH: &str =
     "architecture/wp10b-project-store-b3-integration-correction.json";
 const B3_INTEGRATION_CORRECTION_SHA256: &str =
     "227b3ff385fdf8d7021758b8013ae6ce98f8fb0d742aadeb2fb6e16e4d5199eb";
+const B4_ACTIVATION_PATH: &str = "architecture/wp10b-project-store-b4-activation.json";
+const B4_ACTIVATION_SHA256: &str =
+    "08f2a5116e063a5e98978bd7a1433732882ecdc869ff3d1949b3a4fdbefddf78";
+const B4_SCOPE_CORRECTION_PATH: &str = "architecture/wp10b-project-store-b4-scope-correction.json";
+const B4_SCOPE_CORRECTION_SHA256: &str =
+    "50dd4a82f3a4ea88c306bd9930ce90323a0303f26b767ab50078cd51f0ae0df4";
+const B4_PREDECESSOR_COMMIT: &str = "8fdd94dc9c60406e8de8a96749d7148d38b1dc7a";
+const B4_PREDECESSOR_TREE: &str = "1b97468c39bb529285d2727c1021057edb38ff82";
 const PROTECTED_MAIN_COMMIT: &str = "b6e0267802f8ac2d0d49a0f04302fd321ef2f617";
 const PROTECTED_MAIN_TREE: &str = "b20b598603b47fdbe7c85c3b6d1cba8c78fd433e";
 const PROTECTED_MAIN_RUN: &str =
@@ -82,6 +90,7 @@ const NORMALIZED_CONTRACT_SHA256: &str =
     "d49116e00aeb3d9e158fcfe9068fe0cc7c23d10c9cbb11d56461348ce99a36ec";
 
 pub(super) fn check_wp10b_project_store_contract(repo_root: &Path) -> anyhow::Result<()> {
+    validate_b4_authorities(repo_root)?;
     let contract_path = repo_root.join(CONTRACT_PATH);
     let mut contract: Value = serde_json::from_slice(
         &fs::read(&contract_path)
@@ -94,6 +103,103 @@ pub(super) fn check_wp10b_project_store_contract(repo_root: &Path) -> anyhow::Re
     validate_fixture_binding(repo_root)?;
     validate_project_store_crate(repo_root, &contract)?;
     Ok(())
+}
+
+fn validate_b4_authorities(repo_root: &Path) -> anyhow::Result<()> {
+    let activation = read_bound_authority(repo_root, B4_ACTIVATION_PATH, B4_ACTIVATION_SHA256)?;
+    validate_b4_correction_header(&activation)?;
+    expect_string(
+        &activation,
+        "/accepted_predecessor/commit",
+        B4_PREDECESSOR_COMMIT,
+    )?;
+    expect_string(
+        &activation,
+        "/accepted_predecessor/tree",
+        B4_PREDECESSOR_TREE,
+    )?;
+    expect_string(
+        &activation,
+        "/authority_flip/successor",
+        "mirante4d-project-store actor through mirante4d-application::ProjectStoreApplicationService",
+    )?;
+    expect_string(
+        &activation,
+        "/authority_flip/composition_owner",
+        "mirante4d-app",
+    )?;
+    let expected_predecessors = BTreeSet::from([
+        "crates/mirante4d-app/src/current_project_persistence_bridge.rs".to_owned(),
+        "crates/mirante4d-app/src/current_runtime/project.rs".to_owned(),
+    ]);
+    if string_set(&activation, "/authority_flip/predecessor_files")? != expected_predecessors {
+        bail!("WP-10B B4 predecessor-file authority drifted");
+    }
+
+    let correction = read_bound_authority(
+        repo_root,
+        B4_SCOPE_CORRECTION_PATH,
+        B4_SCOPE_CORRECTION_SHA256,
+    )?;
+    validate_b4_correction_header(&correction)?;
+    expect_string(
+        &correction,
+        "/accepted_boundary/activation_path",
+        B4_ACTIVATION_PATH,
+    )?;
+    expect_string(
+        &correction,
+        "/accepted_boundary/activation_sha256",
+        B4_ACTIVATION_SHA256,
+    )?;
+    expect_string(
+        &correction,
+        "/accepted_boundary/accepted_predecessor_commit",
+        B4_PREDECESSOR_COMMIT,
+    )?;
+    expect_string(
+        &correction,
+        "/accepted_boundary/accepted_predecessor_tree",
+        B4_PREDECESSOR_TREE,
+    )?;
+    let expected_additional_paths = BTreeSet::from([
+        B4_SCOPE_CORRECTION_PATH.to_owned(),
+        "Cargo.lock".to_owned(),
+        "crates/xtask/src/arch/wp08a.rs".to_owned(),
+    ]);
+    if string_set(&correction, "/correction/additional_allowed_paths")? != expected_additional_paths
+    {
+        bail!("WP-10B B4 scope-correction paths drifted");
+    }
+    Ok(())
+}
+
+fn read_bound_authority(
+    repo_root: &Path,
+    relative_path: &str,
+    expected_sha256: &str,
+) -> anyhow::Result<Value> {
+    let path = repo_root.join(relative_path);
+    let observed = sha256_file(&path)?;
+    if observed != expected_sha256 {
+        bail!(
+            "WP-10B B4 authority {relative_path} drifted: expected {expected_sha256}, observed {observed}"
+        );
+    }
+    serde_json::from_slice(&fs::read(&path)?)
+        .with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn validate_b4_correction_header(document: &Value) -> anyhow::Result<()> {
+    expect_string(
+        document,
+        "/schema",
+        "mirante4d-foundation-package-entry-correction",
+    )?;
+    expect_u64(document, "/schema_version", 1)?;
+    expect_string(document, "/package", "WP-10B")?;
+    expect_string(document, "/checkpoint", "B4")?;
+    expect_string(document, "/status", "accepted")
 }
 
 fn validate_header_and_bindings(repo_root: &Path, contract: &Value) -> anyhow::Result<()> {
@@ -325,7 +431,7 @@ fn validate_project_store_crate(repo_root: &Path, contract: &Value) -> anyhow::R
     ) {
         bail!("WP-10B project-store must not have a build script");
     }
-    let allowed_b3_consumers = BTreeSet::from([
+    let allowed_product_consumers = BTreeSet::from([
         ("mirante4d-app", "normal"),
         ("mirante4d-application", "normal"),
     ]);
@@ -335,11 +441,9 @@ fn validate_project_store_crate(repo_root: &Path, contract: &Value) -> anyhow::R
         }
         for (kind, dependencies) in kinds {
             if dependencies.contains(PROJECT_STORE_CRATE)
-                && !allowed_b3_consumers.contains(&(source.as_str(), kind.as_str()))
+                && !allowed_product_consumers.contains(&(source.as_str(), kind.as_str()))
             {
-                bail!(
-                    "off-product WP-10B B3 project store has unauthorized consumer {source} ({kind})"
-                );
+                bail!("WP-10B project store has unauthorized consumer {source} ({kind})");
             }
         }
     }
@@ -351,7 +455,7 @@ fn validate_project_store_crate(repo_root: &Path, contract: &Value) -> anyhow::R
     }
 
     validate_source_policy(repo_root, contract, &library_root)?;
-    validate_b3_product_isolation(repo_root)
+    validate_b4_product_activation(repo_root, &metadata)
 }
 
 fn validate_canonical_project_store_dependency(manifest_path: &Path) -> anyhow::Result<()> {
@@ -366,13 +470,13 @@ fn validate_canonical_project_store_dependency(manifest_path: &Path) -> anyhow::
         .with_context(|| format!("{} has no dependency table", manifest_path.display()))?;
     if !dependencies.contains_key(PROJECT_STORE_CRATE) {
         bail!(
-            "WP-10B B3 consumer {} must use the canonical {PROJECT_STORE_CRATE} dependency name",
+            "WP-10B product consumer {} must use the canonical {PROJECT_STORE_CRATE} dependency name",
             manifest_path.display()
         );
     }
     if manifest_contains_project_store_rename(&toml::Value::Table(manifest)) {
         bail!(
-            "WP-10B B3 consumer {} must not rename {PROJECT_STORE_CRATE}",
+            "WP-10B product consumer {} must not rename {PROJECT_STORE_CRATE}",
             manifest_path.display()
         );
     }
@@ -390,91 +494,196 @@ fn manifest_contains_project_store_rename(value: &toml::Value) -> bool {
     }
 }
 
-fn validate_b3_product_isolation(repo_root: &Path) -> anyhow::Result<()> {
+fn validate_b4_product_activation(
+    repo_root: &Path,
+    metadata: &WorkspaceDependencyMetadata,
+) -> anyhow::Result<()> {
     for relative in [
         "crates/mirante4d-app/src/current_project_persistence_bridge.rs",
         "crates/mirante4d-app/src/current_runtime/project.rs",
     ] {
-        if !repo_root.join(relative).is_file() {
-            bail!("WP-10B B3 predecessor must remain the sole product route: missing {relative}");
+        if repo_root.join(relative).exists() {
+            bail!("WP-10B B4 predecessor path still exists: {relative}");
         }
     }
 
     let app_root = repo_root.join("crates/mirante4d-app/src");
-    for source_path in collect_rust_source_files(&app_root)? {
-        let relative = source_path
-            .strip_prefix(&app_root)
-            .unwrap_or(&source_path)
-            .to_string_lossy();
-        if relative == "tests.rs"
-            || relative.starts_with("tests/")
-            || relative.ends_with("/tests.rs")
-        {
-            continue;
-        }
-        let source = fs::read_to_string(&source_path)
-            .with_context(|| format!("failed to read {}", source_path.display()))?;
-        for forbidden in ["mirante4d_project_store", "project_store_service"] {
-            if contains_rust_identifier(&source, forbidden) {
-                bail!(
-                    "WP-10B B3 project-store service reached product source {} through {forbidden}",
-                    source_path.display()
-                );
-            }
-        }
-    }
-
     let application_root = repo_root.join("crates/mirante4d-application/src");
     let service = application_root.join("project_store_service.rs");
     let root_path = application_root.join("lib.rs");
     let root_source = fs::read_to_string(&root_path)?;
-    let expected_root_module_occurrences = usize::from(service.exists());
-    if rust_identifier_occurrences(&root_source, "project_store_service")
-        != expected_root_module_occurrences
-        || (service.exists() && !root_source.contains("mod project_store_service;"))
+    if !service.is_file()
+        || rust_identifier_occurrences(&root_source, "project_store_service") != 2
+        || !root_source.contains("mod project_store_service;")
     {
+        bail!("WP-10B B4 application service declaration or public re-export drifted");
+    }
+    let service_source = fs::read_to_string(&service)
+        .with_context(|| format!("failed to read {}", service.display()))?;
+    validate_service_impl_targets(&service_source)?;
+
+    let required_application_api = BTreeSet::from(
+        [
+            "MonotonicClock",
+            "ProjectStoreApplicationService",
+            "ProjectStoreLifecycle",
+            "ProjectStoreServiceError",
+            "ProjectStoreServiceEvent",
+            "ProjectStoreServiceStatus",
+            "SystemMonotonicClock",
+        ]
+        .map(str::to_owned),
+    );
+    let actual_application_api = public_root_api_names(&root_path)?;
+    if !required_application_api.is_subset(&actual_application_api) {
         bail!(
-            "WP-10B B3 project-store service must have exactly one private root declaration and no application-state wiring"
+            "WP-10B B4 application service API is incomplete: missing={:?}",
+            required_application_api
+                .difference(&actual_application_api)
+                .collect::<Vec<_>>()
         );
     }
-    if service.exists() {
-        let service_source = fs::read_to_string(&service)
-            .with_context(|| format!("failed to read {}", service.display()))?;
-        validate_b3_service_impl_targets(&service_source)?;
+
+    let app_source_path = app_root.join("lib.rs");
+    let app_source = fs::read_to_string(&app_source_path)?;
+    let app_fields = top_level_struct_field_type_identifiers(&app_source, "MiranteWorkbenchApp")?;
+    let project_store_field = app_fields
+        .get("project_store")
+        .context("WP-10B B4 app has no project_store composition field")?;
+    let expected_project_store_field_types = BTreeSet::from(
+        [
+            "Option",
+            "ProjectStoreApplicationService",
+            "SystemMonotonicClock",
+        ]
+        .map(str::to_owned),
+    );
+    if !expected_project_store_field_types.is_subset(project_store_field) {
+        bail!(
+            "WP-10B B4 project_store composition type drifted: expected={expected_project_store_field_types:?}, actual={project_store_field:?}"
+        );
+    }
+    for forbidden_field in ["project_runtime", "project_persistence"] {
+        if app_fields.contains_key(forbidden_field) {
+            bail!("WP-10B B4 predecessor composition field remains: {forbidden_field}");
+        }
+    }
+    for marker in [
+        "ProjectStoreApplicationService::start",
+        "start_project_store_service",
+        "self.poll_project_store()",
+        "fn handle_project_store_event",
+        "ProjectStoreServiceEvent::",
+    ] {
+        if !app_source.contains(marker) {
+            bail!("WP-10B B4 successor product route is missing {marker:?}");
+        }
+    }
+    let ui_source = fs::read_to_string(app_root.join("workbench_ui.rs"))?;
+    for marker in [
+        "ProjectStoreApplicationService::has_pending_work",
+        "project_store.close()",
+        "project_store.join()",
+    ] {
+        if !ui_source.contains(marker) {
+            bail!("WP-10B B4 successor UI lifecycle is missing {marker:?}");
+        }
     }
 
-    for source_path in collect_rust_source_files(&application_root)? {
-        if source_path == service || source_path == root_path {
-            continue;
-        }
-        let relative = source_path
-            .strip_prefix(&application_root)
-            .unwrap_or(&source_path)
-            .to_string_lossy();
-        if relative == "tests.rs"
-            || relative.starts_with("tests/")
-            || relative.ends_with("/tests.rs")
-        {
-            continue;
-        }
-        let source = fs::read_to_string(&source_path)
-            .with_context(|| format!("failed to read {}", source_path.display()))?;
-        for forbidden in ["mirante4d_project_store", "project_store_service"] {
-            if contains_rust_identifier(&source, forbidden) {
+    for source_root in [&app_root, &application_root] {
+        for source_path in collect_rust_source_files(source_root)? {
+            let source = fs::read_to_string(&source_path)
+                .with_context(|| format!("failed to read {}", source_path.display()))?;
+            for forbidden in [
+                "current_project_persistence_bridge",
+                "CurrentProjectPersistenceBridge",
+                "CurrentProjectRuntime",
+                "current_project_path",
+                "PROJECT_V15_SCHEMA",
+                "PROJECT_V15_SCHEMA_VERSION",
+                "ProjectDocumentDto",
+            ] {
+                if contains_rust_identifier(&source, forbidden) {
+                    bail!(
+                        "WP-10B B4 predecessor identifier {forbidden} remains in {}",
+                        source_path.display()
+                    );
+                }
+            }
+            if source.contains("mirante4d-project-v15") {
                 bail!(
-                    "WP-10B B3 project-store service escaped its compile/test-only module into {} through {forbidden}",
+                    "WP-10B B4 predecessor schema string remains in {}",
                     source_path.display()
                 );
             }
         }
     }
 
-    if contains_rust_identifier(&root_source, "mirante4d_project_store") {
-        bail!(
-            "WP-10B B3 application root must not construct, store, start, poll, or re-export project-store values"
-        );
+    let app_normal_dependencies = metadata
+        .declared_dependency_kinds_by_name
+        .get("mirante4d-app")
+        .and_then(|kinds| kinds.get("normal"))
+        .context("cargo metadata has no mirante4d-app normal dependencies")?;
+    if app_normal_dependencies.contains("mirante4d-identity") {
+        bail!("WP-10B B4 app still declares the predecessor-only mirante4d-identity edge");
+    }
+    if !app_normal_dependencies.contains(PROJECT_STORE_CRATE) {
+        bail!("WP-10B B4 app lacks its canonical project-store dependency");
     }
     Ok(())
+}
+
+fn top_level_struct_field_type_identifiers(
+    source: &str,
+    struct_name: &str,
+) -> anyhow::Result<BTreeMap<String, BTreeSet<String>>> {
+    let file = syn::parse_file(source).context("failed to parse B4 product composition source")?;
+    let item = file
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Struct(item) if item.ident == struct_name => Some(item),
+            _ => None,
+        })
+        .with_context(|| format!("expected one top-level struct {struct_name}"))?;
+    let syn::Fields::Named(fields) = &item.fields else {
+        bail!("B4 product composition struct {struct_name} must have named fields");
+    };
+    fields
+        .named
+        .iter()
+        .map(|field| {
+            let name = field
+                .ident
+                .as_ref()
+                .map(ToString::to_string)
+                .context("named B4 product field has no identifier")?;
+            let mut identifiers = BTreeSet::new();
+            collect_type_identifiers(&field.ty, &mut identifiers);
+            Ok((name, identifiers))
+        })
+        .collect()
+}
+
+fn collect_type_identifiers(ty: &syn::Type, identifiers: &mut BTreeSet<String>) {
+    match ty {
+        syn::Type::Group(group) => collect_type_identifiers(&group.elem, identifiers),
+        syn::Type::Paren(paren) => collect_type_identifiers(&paren.elem, identifiers),
+        syn::Type::Reference(reference) => collect_type_identifiers(&reference.elem, identifiers),
+        syn::Type::Path(path) => {
+            for segment in &path.path.segments {
+                identifiers.insert(segment.ident.to_string());
+                if let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments {
+                    for argument in &arguments.args {
+                        if let syn::GenericArgument::Type(ty) = argument {
+                            collect_type_identifiers(ty, identifiers);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn contains_rust_identifier(source: &str, identifier: &str) -> bool {
@@ -488,9 +697,9 @@ fn rust_identifier_occurrences(source: &str, identifier: &str) -> usize {
         .count()
 }
 
-fn validate_b3_service_impl_targets(source: &str) -> anyhow::Result<()> {
+fn validate_service_impl_targets(source: &str) -> anyhow::Result<()> {
     let file = syn::parse_file(source)
-        .context("failed to parse the WP-10B B3 private project-store service")?;
+        .context("failed to parse the WP-10B project-store application service")?;
     let local_types = file
         .items
         .iter()
@@ -507,18 +716,16 @@ fn validate_b3_service_impl_targets(source: &str) -> anyhow::Result<()> {
             continue;
         };
         let syn::Type::Path(target) = item.self_ty.as_ref() else {
-            bail!("WP-10B B3 private project-store service may implement only its own local types");
+            bail!("WP-10B project-store service may implement only its own local types");
         };
         let target = target
             .path
             .segments
             .last()
             .map(|segment| segment.ident.to_string())
-            .context("WP-10B B3 service impl target has no type name")?;
+            .context("WP-10B service impl target has no type name")?;
         if !local_types.contains(&target) {
-            bail!(
-                "WP-10B B3 private project-store service must not extend product-owned type {target}"
-            );
+            bail!("WP-10B project-store service must not extend product-owned type {target}");
         }
     }
     Ok(())
@@ -657,34 +864,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn b3_isolation_allows_only_the_private_service_module_declaration() {
-        let root = "mod project_store_service;\npub struct ApplicationState;\n";
+    fn b4_application_root_requires_the_service_module_and_public_route() {
+        let root = "mod project_store_service;\npub use project_store_service::ProjectStoreApplicationService;\n";
 
         assert_eq!(
             rust_identifier_occurrences(root, "project_store_service"),
-            1
+            2
         );
         assert!(!contains_rust_identifier(root, "mirante4d_project_store"));
     }
 
     #[test]
-    fn b3_isolation_detects_indirect_application_state_wiring() {
+    fn b4_predecessor_identifier_detection_is_token_exact() {
         for source in [
-            "struct ApplicationState { service: project_store_service::ProjectStoreService }",
-            "use crate::project_store_service as persistence;",
-            "struct ApplicationState { actor: mirante4d_project_store::ProjectStoreActor }",
+            "mod current_project_persistence_bridge;",
+            "struct Shell { project: CurrentProjectRuntime }",
+            "let path = current_project_path;",
         ] {
             assert!(
-                contains_rust_identifier(source, "project_store_service")
-                    || contains_rust_identifier(source, "mirante4d_project_store"),
-                "missed product wiring: {source}"
+                [
+                    "current_project_persistence_bridge",
+                    "CurrentProjectRuntime",
+                    "current_project_path",
+                ]
+                .iter()
+                .any(|identifier| contains_rust_identifier(source, identifier)),
+                "missed predecessor identifier: {source}"
             );
         }
     }
 
     #[test]
-    fn b3_isolation_rejects_service_side_application_state_extension() {
-        let error = validate_b3_service_impl_targets(
+    fn b4_service_rejects_application_state_extension() {
+        let error = validate_service_impl_targets(
             "use crate::ApplicationState; impl ApplicationState { pub fn persist(&self) {} }",
         )
         .unwrap_err();
@@ -694,12 +906,12 @@ mod tests {
                 .to_string()
                 .contains("product-owned type ApplicationState")
         );
-        validate_b3_service_impl_targets(
+        validate_service_impl_targets(
             "struct ProjectStoreService; impl ProjectStoreService { fn poll(&mut self) {} }",
         )
         .unwrap();
 
-        let alias_error = validate_b3_service_impl_targets(
+        let alias_error = validate_service_impl_targets(
             "type ServiceHost = crate::ApplicationState; impl ServiceHost { pub(crate) fn poll_store(&mut self) {} }",
         )
         .unwrap_err();
@@ -711,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn b3_isolation_rejects_a_renamed_project_store_dependency() {
+    fn b4_activation_rejects_a_renamed_project_store_dependency() {
         let temp = tempfile::tempdir().unwrap();
         let manifest = temp.path().join("Cargo.toml");
         fs::write(
