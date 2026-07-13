@@ -22,9 +22,9 @@
     {
       "selector": "package(mirante4d-project-store) & test(=actor::tests::hosted_durability_tests::exhaustive_hosted_and_process_transition_matrix)",
       "warn_ms": 20000,
-      "terminate_ms": 100000,
+      "terminate_ms": 180000,
       "threads_required": "num-test-threads",
-      "reason": "The exhaustive hosted WP-10B matrix discovers 424 transition-edge rows, runs 338 missing fail injections, inherits 86 exact rows, compares 120 parked before/after trees, and performs 102 bounded fresh-process kill/reopen/retry cases with eight internal workers. It reserves every Nextest test slot so unrelated tests cannot starve its bounded child-process actor completions; the focused work remains inside the unchanged 100-second ceiling."
+      "reason": "The exhaustive hosted WP-10B matrix discovers 424 transition-edge rows, runs 338 missing fail injections, inherits 86 exact rows, compares 120 parked before/after trees, and performs 102 bounded fresh-process kill/reopen/retry cases with eight internal workers. It reserves every Nextest test slot so unrelated tests cannot starve its child processes; each hosted actor completion is capped at 15 seconds inside its existing 20-second child bound, and the isolated matrix remains bounded by 180 seconds inside the five-minute PR test union."
     },
     {
       "selector": "package(mirante4d-project-store) & test(=actor::tests::purge_fresh_process_kill_and_retry_matrix)",

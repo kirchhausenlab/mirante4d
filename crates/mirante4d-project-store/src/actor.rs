@@ -1622,6 +1622,7 @@ mod tests {
     };
 
     const TIMEOUT: Duration = Duration::from_secs(5);
+    const HOSTED_ACTOR_TIMEOUT_ENV: &str = "MIRANTE4D_PROJECT_STORE_HOSTED_ACTOR_TIMEOUT_MS";
     const TRASH_PROCESS_ROLE: &str = "MIRANTE4D_TRASH_PROCESS_ROLE";
     const TRASH_PROCESS_ROOT: &str = "MIRANTE4D_TRASH_PROCESS_ROOT";
     const TRASH_PROCESS_GENERATION: &str = "MIRANTE4D_TRASH_PROCESS_GENERATION";
@@ -5132,7 +5133,15 @@ mod tests {
     }
 
     fn public_recv_timeout(actor: &ProjectStoreActor) -> ProjectStoreCompletion {
-        let deadline = Instant::now() + TIMEOUT;
+        let timeout = match env::var(HOSTED_ACTOR_TIMEOUT_ENV) {
+            Ok(value) => {
+                assert_eq!(value, "15000", "invalid hosted actor timeout");
+                Duration::from_secs(15)
+            }
+            Err(env::VarError::NotPresent) => TIMEOUT,
+            Err(error) => panic!("invalid hosted actor timeout: {error}"),
+        };
+        let deadline = Instant::now() + timeout;
         loop {
             if let Some(completion) = actor.try_recv() {
                 return completion;

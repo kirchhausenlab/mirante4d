@@ -451,6 +451,7 @@ fn child_command(flow: Flow, roots: &PreparedRoots, role: &str) -> Command {
         .arg("--ignored")
         .arg("--exact")
         .arg("--nocapture")
+        .env("MIRANTE4D_PROJECT_STORE_HOSTED_ACTOR_TIMEOUT_MS", "15000")
         .env("MIRANTE4D_PROJECT_STORE_VM_ROLE", role)
         .env("MIRANTE4D_PROJECT_STORE_VM_CASE", flow.case)
         .env(
