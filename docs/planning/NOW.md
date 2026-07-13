@@ -57,10 +57,10 @@ The next B2 checkpoint is bound by a narrow Trash safety correction: only
 freshly revalidated orphans declaring zero non-regenerable artifacts may enter
 the mirrored quarantine. Shared objects stay active, work proceeds in synced
 bounded batches, and every other selection fails with `ConfirmationRequired`.
-The correction does not itself move or delete a file.
-The private lease core now replaces its self-conflicting separate-descriptor
-helper with the required cancellable same-descriptor transition and fallible
-restoration. Trash routing and mutation remain the next slice.
+The private actor-unwired core now implements that subset using the corrected
+cancellable same-descriptor transition, exact retry, and fail-closed inventory.
+Actor routing plus transition/fresh-process evidence are the next slice; Purge
+remains later B2 work.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.

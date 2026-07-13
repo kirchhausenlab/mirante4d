@@ -181,14 +181,15 @@ object/byte plan, a reclaim estimate, or backup approval. The accepted Trash
 safety correction freezes a mirrored quarantine layout, fresh exclusive
 preflight, retained-closure subtraction, bounded synced batches, exact retry,
 and requires `ConfirmationRequired` rejection when any selected generation
-declares a non-regenerable artifact. No Trash mutation is implemented yet. The
-private lease core now provides the required same-descriptor, cancellable
-shared-to-exclusive transition with explicit fallible restoration; it remains
-unwired from Trash. The frozen public actor remains non-constructible and
-unwired. The crate still owns no public Create/Open/Save As execution,
+declares a non-regenerable artifact. The private actor-unwired Trash core now
+implements that subset under the same-descriptor maintenance transition:
+generation-first no-replace quarantine, retained-object preservation, exact
+retry/deduplication, bounded synced batches, and fail-closed active-plus-trash
+inventory. The frozen public actor remains non-constructible and Trash remains
+unrouted. The crate still owns no public Create/Open/Save As execution,
 provisional autosave publication, product
-recovery workflow, timers, garbage-collection mutation, qualified durability,
-or product path.
+recovery workflow, timers, actor-routed garbage collection, Purge, qualified
+durability, or product path.
 
 Settings use `mirante4d-settings-v1` at the Linux XDG/HOME path. The UI submits
 validated changes; one background actor owns persistence. Legacy preferences

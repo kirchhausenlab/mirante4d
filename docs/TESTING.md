@@ -206,8 +206,13 @@ approval, mutation, durability evidence, or public/product wiring.
 The accepted Trash safety correction freezes the later quarantine subset for
 generations declaring zero non-regenerable artifacts and its exact transition
 names, including an honest `ConfirmationRequired` outcome otherwise. This
-checkpoint adds no Trash execution, failure-injection, process-kill, or
-durability evidence.
+checkpoint now has two focused private-core cases: one proves mirrored
+generation quarantine, shared/anonymous-object retention, exact
+retry/deduplication, collision byte accounting, and cancellation after a synced
+directory-only batch; the other proves unsafe selection, non-regenerable
+content, symlinked inventory, and foreign-lineage retries add no mutation.
+Trash remains actor-unwired, and this is not exhaustive failure-injection,
+process-kill, or durability evidence.
 The existing process-lease case now also proves failed in-place maintenance
 upgrade restoration, contended exclusive acquisition, explicit and drop-based
 downgrade, cancellation, writer retention, and read-only rejection. It does

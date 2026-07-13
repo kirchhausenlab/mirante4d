@@ -177,8 +177,10 @@ candidate for every orphan generation without mutation and remains available
 read-only. A bound safety correction freezes the later Trash subset for
 generations declaring no non-regenerable artifacts, its lease transition,
 retained-closure subtraction, bounded batch/retry, and `ConfirmationRequired`
-fault. The private lease core implements that same-descriptor transition and
-fallible restoration, but Trash remains unwired and implements no deletion.
+fault. An actor-unwired private Trash core now executes that exact subset with
+generation-first mirrored quarantine, shared-object retention, exact retry,
+bounded directory sync, and fail-closed inventory. Actor routing, exhaustive
+transition evidence, and Purge remain absent.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
@@ -212,15 +214,16 @@ See [testing](TESTING.md) for commands and claim language.
   established-store inspection authority as transaction preflight. Public
   Create/Open/Save As execution,
   provisional autosave publication, public/product recovery workflow, timers,
-  garbage-collection mutation, public actor construction, durability
+  actor-routed garbage collection, public actor construction, durability
   qualification, and every product path remain unimplemented. PlanCompaction
   does not authorize Trash, expose a physical object/byte plan or reclaim
   estimate, or prove backup approval. Private FullVerify does not validate
   artifact scientific semantics, repair data, inspect trash, or establish a
   durability claim.
-- Trash and Purge do not mutate storage yet. The current Trash API cannot
-  authorize removal of non-regenerable artifacts; supporting that later needs
-  separately approved snapshot-bound itemized confirmation and verified-
+- The actor-unwired Trash core is covered only for its bounded authorized
+  subset; Trash actor routing and Purge are not implemented. The current API
+  cannot authorize removal of non-regenerable artifacts; supporting that later
+  needs separately approved snapshot-bound itemized confirmation and verified-
   backup proof.
 - The package-capability lane remains pending until there is an honest
   unsupported-GPU package command.
