@@ -6526,12 +6526,12 @@
       "reason": "WP-10B B3 returns the typed inactive-cancellation outcome through the project-store service boundary."
     },
     {
-      "id": "libtest:mirante4d-application:project_store_service::tests::real_actor_autosaves_exact_captures_without_advancing_manual_saved_revision",
+      "id": "libtest:mirante4d-application:project_store_service::tests::real_actor_autosave_obeys_filesystem_policy_without_advancing_manual_saved_revision",
       "kind": "libtest",
       "owner": "mirante4d-application",
       "lane": "unit",
       "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
-      "reason": "WP-10B B3 submits one exact immutable capture through the real actor and never advances the manual saved revision."
+      "reason": "WP-10B B3 routes an exact immutable capture through the real actor: qualified ext4 proves chained autosaves, an unqualified host proves typed non-mutating rejection, and neither advances the manual saved revision."
     },
     {
       "id": "libtest:mirante4d-application:tests::cancelled_source_verification_suppresses_its_late_prepared_completion",

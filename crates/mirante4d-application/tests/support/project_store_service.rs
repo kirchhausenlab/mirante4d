@@ -174,7 +174,7 @@ fn inactive_cancellation_uses_the_service_path() {
 }
 
 #[test]
-fn real_actor_autosaves_exact_captures_without_advancing_manual_saved_revision() {
+fn real_actor_autosave_obeys_filesystem_policy_without_advancing_manual_saved_revision() {
     let mut application = verified_bound_application();
     let first_snapshot = application.snapshot();
     let first_revision = bound_revision(&first_snapshot);
@@ -212,7 +212,17 @@ fn real_actor_autosaves_exact_captures_without_advancing_manual_saved_revision()
             revision,
         }] if request_id.get() == 1 && *revision == first_revision
     ));
-    let first_receipt = wait_for_autosave(&mut service, &first_snapshot);
+    let first_receipt = match wait_for_autosave(&mut service, &first_snapshot) {
+        Ok(receipt) => receipt,
+        Err(ProjectStoreFault::UnsupportedFilesystem) => {
+            assert_eq!(captures.load(Ordering::Relaxed), 1);
+            assert_eq!(bound_saved_revision(&application.snapshot()), None);
+            assert!(fs::read_dir(directory.path()).unwrap().next().is_none());
+            service.join().unwrap();
+            return;
+        }
+        Err(fault) => panic!("unexpected first autosave fault: {fault:?}"),
+    };
     assert_eq!(captures.load(Ordering::Relaxed), 1);
     assert_eq!(first_receipt.captured_revision(), first_revision);
     assert_eq!(first_receipt.previous_generation_id(), None);
@@ -242,7 +252,8 @@ fn real_actor_autosaves_exact_captures_without_advancing_manual_saved_revision()
                     if *revision == second_revision
             ))
     );
-    let second_receipt = wait_for_autosave(&mut service, &second_snapshot);
+    let second_receipt = wait_for_autosave(&mut service, &second_snapshot)
+        .expect("a filesystem qualified for the first autosave remains writable");
     assert_eq!(second_receipt.captured_revision(), second_revision);
     assert_eq!(
         second_receipt.previous_generation_id(),
@@ -478,12 +489,12 @@ fn bound_saved_revision(snapshot: &ApplicationSnapshot) -> Option<ProjectRevisio
 fn wait_for_autosave(
     service: &mut ProjectStoreApplicationService<ManualClock>,
     snapshot: &ApplicationSnapshot,
-) -> ProjectStoreReceipt {
+) -> Result<ProjectStoreReceipt, ProjectStoreFault> {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         for event in service.drive(snapshot, |_| Ok(Vec::new())).unwrap() {
             if let ProjectStoreServiceEvent::AutosaveFinished { result, .. } = event {
-                return result.unwrap();
+                return result;
             }
         }
         thread::yield_now();
