@@ -163,8 +163,11 @@ changing any persisted bytes. A bounded private recovery reader and actor path
 now discover validated manual/autosave fallbacks or capped scan candidates,
 load only an explicit fresh selection, preserve actual head facts, and support
 corrupt-head and writer-contended read-only sessions without repair or
-promotion. The frozen public actor remains non-constructible and the crate
-remains off-product. Private Pin/Unpin execution now validates the complete
+promotion. The public actor now starts unbound and owns Create, Open, first and
+advancing provisional Autosave, provisional-to-manual Create handoff, normal
+session work, and recovery-selected Save As. It retains recovery-only resources
+after a recoverable normal-open failure and leaves the damaged package
+unchanged. The crate remains off-product. Private Pin/Unpin execution now validates the complete
 graph and prospective recovery-candidate cap, preserves duplicate-pin liveness,
 rejects read-only sessions, and makes directory-sync uncertainty
 write-suspending. All seven frozen Pin/Unpin transitions now have exact before/
@@ -235,14 +238,12 @@ See [testing](TESTING.md) for commands and claim language.
   under held leases, and can create or advance an established-project autosave
   head. It can also install a new initial package privately with exact Create
   facts or a caller-bound Save As fork tuple, without replacing an existing
-  destination. Its private established-session actor executes and bounds manual
-  save, autosave, and authenticated Save As work, using the same private
-  established-store inspection authority as transaction preflight. Public
-  Create/Open/Save As execution, provisional-autosave actor/timer wiring,
-  public/product recovery workflow,
-  public/product garbage collection and Purge wiring, public actor
-  construction, durability qualification, and every product path remain
-  unimplemented.
+  destination. Its public unbound actor now executes fresh Create, healthy Open,
+  provisional Autosave and manual handoff, established-session work, explicit
+  recovery selection, and authenticated Save As while retaining exact roots and
+  leases. Autosave timer scheduling, product recovery workflow, public/product
+  garbage collection and Purge wiring, durability qualification, and every
+  product path remain unimplemented.
   PlanCompaction
   does not authorize Trash, expose a physical object/byte plan or reclaim
   estimate, or prove backup approval. Private FullVerify does not validate

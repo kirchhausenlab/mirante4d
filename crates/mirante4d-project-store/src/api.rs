@@ -774,6 +774,7 @@ pub enum ProjectStoreCommand {
     },
     Autosave {
         request_id: ProjectStoreRequestId,
+        destination: Option<ProjectStorePath>,
         capture: ProjectCommitCapture,
     },
     InspectRecovery {
@@ -974,17 +975,60 @@ impl ProjectStoreSession {
     }
 }
 
-/// Opaque owner of the future bounded background actor.
-///
-/// B2 intentionally exposes no constructor until the transactional core can
-/// establish its queues, leases, and shutdown protocol together.
-#[derive(Debug)]
+/// Opaque owner of one bounded background project-store actor.
 pub struct ProjectStoreActor {
+    #[cfg(target_os = "linux")]
+    core: crate::actor::EstablishedProjectActor,
+    #[cfg(not(target_os = "linux"))]
     _private: ActorPrivate,
 }
 
+#[cfg(not(target_os = "linux"))]
 #[derive(Debug)]
 struct ActorPrivate;
+
+impl ProjectStoreActor {
+    /// Starts one unbound background actor. Filesystem work begins only after
+    /// a command is accepted by the worker.
+    #[cfg(target_os = "linux")]
+    pub fn start(config: ProjectStoreConfig) -> Result<Self, ProjectStoreFault> {
+        Ok(Self {
+            core: crate::actor::EstablishedProjectActor::start_unbound(config)?,
+        })
+    }
+
+    /// Attempts to enqueue one command without blocking.
+    #[cfg(target_os = "linux")]
+    pub fn try_submit(&self, command: ProjectStoreCommand) -> Result<(), ProjectStoreFault> {
+        self.core.try_submit(command)
+    }
+
+    /// Returns the next completion when one is ready without blocking.
+    #[cfg(target_os = "linux")]
+    pub fn try_recv(&self) -> Option<ProjectStoreCompletion> {
+        self.core.try_recv()
+    }
+
+    /// Reports whether the worker has released its session and terminated.
+    #[cfg(target_os = "linux")]
+    pub fn has_exited(&self) -> bool {
+        self.core.has_exited()
+    }
+
+    /// Requests cancellation shutdown and joins the worker.
+    #[cfg(target_os = "linux")]
+    pub fn join(self) -> std::thread::Result<()> {
+        self.core.join()
+    }
+}
+
+impl fmt::Debug for ProjectStoreActor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProjectStoreActor")
+            .finish_non_exhaustive()
+    }
+}
 
 #[cfg(test)]
 mod tests {

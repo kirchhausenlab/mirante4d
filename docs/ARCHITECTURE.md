@@ -156,7 +156,7 @@ projection. Recovery inspection remains metadata-only; manual fallback uses a
 distinct manual-branch classification, and selection never rewrites refs. A
 separate bounded recovery reader tolerates invalid head bytes or generation
 targets while keeping malformed namespaces, mixed lineage, capacity, and
-provenance fail-closed. The private actor can retain a corrupt-head or
+provenance fail-closed. The project-store actor can retain a corrupt-head or
 writer-contended read-only session for InspectRecovery/OpenRecovery and returns
 the actual ref facts with an explicitly selected projection without changing
 authority. It otherwise solely owns its opened root and leases, serializes
@@ -207,18 +207,18 @@ and exact retry includes required empty-fan-out sync sweeps. All observed Purge
 maintenance, remove, and directory-sync occurrences have exact before/after
 callback and fresh-process kill/reopen/retry coverage: 16 cases in each matrix.
 This proves logic and process-crash recovery only, not power-loss durability or
-filesystem qualification. The frozen public actor remains non-constructible. A
-bound correction now resolves the already-frozen provisional wire: a
-provisional autosave has no manual base, its first private publication uses one
-caller-located no-clobber package, and later provisional autosaves advance that
-lane through the existing protocol. The private publisher now installs that
-first exact package, adopts only an exact fully verified uncertain install,
-and advances the base-less lane with cancellation and exact fresh-retry
-handling. Its focused evidence is not the exhaustive transition, process-kill,
-or power-loss matrix. The crate still owns no public Create/Open/Save As
-execution, provisional-autosave actor or timer wiring, product recovery
-workflow, public/product garbage-collection wiring, qualified durability, or
-product path.
+filesystem qualification. The public actor now starts unbound, accepts
+nonblocking commands, emits correlated completions, and releases its held
+session on Close or joined cancellation shutdown. Create binds either a fresh
+manual package or a healthy provisional project transferred to its first
+manual package. Autosave requires a destination only for the first provisional
+publication; later provisional or established autosaves advance the bound
+lane. Open returns the validated authority projection. A recoverable failed
+normal Open retains a recovery-only root and leases for inspection and explicit
+selection, after which Save As installs a new project with exact fork
+provenance while leaving the damaged package untouched. This actor remains
+off-product: timers, product recovery UI, public/product garbage-collection
+wiring, qualified durability, and every product path remain later work.
 
 Settings use `mirante4d-settings-v1` at the Linux XDG/HOME path. The UI submits
 validated changes; one background actor owns persistence. Legacy preferences

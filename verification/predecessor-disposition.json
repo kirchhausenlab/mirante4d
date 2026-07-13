@@ -6188,6 +6188,38 @@
       "lane": "trusted-gpu",
       "requirement_ids": ["D-022-trusted-gpu-separation", "WP-09A-off-product-progressive-render"],
       "reason": "WP-09A runs one ignored aggregate real-Vulkan case so device creation, three generated fixtures, lifecycle/capacity checks, asynchronous readback, and closed evidence emission occur once."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:actor::tests::public_actor_fresh_create_binds_exact_resources_and_rejects_incompatible_commands",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves the public actor starts unbound, reports exact Create session facts, transfers the held writer, and fails incompatible unbound or bound commands without mutation."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:actor::tests::public_actor_opens_healthy_established_and_provisional_authority",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves public Open binds healthy established and provisional stores and returns their exact held-session and authoritative-projection facts."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:actor::tests::public_actor_first_and_advancing_provisional_autosave_then_manual_handoff",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves caller-located first provisional Autosave, bound lane advance, and atomic same-project Create handoff while the old provisional package remains unchanged."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:actor::tests::public_actor_corrupt_open_is_recovery_only_until_selected_save_as",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves a recoverable failed Open retains recovery-only resources, blocks ordinary mutation, and permits selected-generation Save As with exact fork provenance without changing the damaged source."
     }
   ],
   "expected_summary": {
@@ -6196,6 +6228,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 568
+    "current_additions": 572
   }
 }

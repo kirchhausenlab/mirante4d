@@ -157,15 +157,19 @@ first and advancing autosave generations and refs, replace a divergent lane
 against the current manual base, accept a lower revision with a non-regressing
 high-water mark, reject stale parent/base and invalid recovery/capacity state,
 retry an exact recovery-ahead cancellation, and distinguish recovery-sync
-failure from write-suspending head indeterminacy. Seventeen actor cases
-exercise the real established manual/autosave primitives under one worker and
+failure from write-suspending head indeterminacy. The actor suite exercises the
+real established manual/autosave primitives under one worker and
 prove exact request correlation, the request/completion bounds, queued-autosave
 coalescing,
 active and queued cancellation, close rejection, writer-lease lifetime, and
 joined or nonblocking shutdown. They also prove authenticated Save As session
 and lease transfer, rejection before source reads, and preservation of the old
-session across collision, source failure, and cancellation. Private recovery
-cases cover exact InspectRecovery/OpenRecovery correlation, corrupt-head
+session across collision, source failure, and cancellation. Four of those cases
+exercise the public unbound lifecycle: fresh Create, healthy established and
+provisional Open, first and advancing provisional Autosave followed by manual
+handoff, invalid state/destination combinations, and corrupt-head recovery-only
+selection followed by exact-provenance Save As without changing the source.
+Recovery cases also cover exact InspectRecovery/OpenRecovery correlation, corrupt-head
 startup, read-only writer contention, actual session heads, fresh explicit
 selection, and unchanged refs/resources before a later ordinary save. Ten
 inspection cases cover the three promoted
@@ -207,8 +211,7 @@ logical reconstruction, cancellation, snapshot-drift rejection, and
 byte-identical no-mutation behavior. One actor case proves correlated and
 cancellable execution remains available in a writer-contended read-only
 session. This evidence does not validate artifact scientific semantics, repair
-data, verify trash, establish durability, construct the public actor, or wire a
-product path.
+data, verify trash, establish durability, or wire a product path.
 One inspection case proves PlanCompaction returns every fixture-exact orphan as
 a deterministic bounded recovery-review candidate, including ordered manual
 and autosave classifications, rejects injected snapshot drift, and changes no
@@ -264,20 +267,19 @@ destination, adopt only an exact fully verified uncertain install, reject
 invalid advance facts before source reads, allow lower revision with a
 non-regressing high-water mark, preserve the base-less lane, and retry exactly
 across pre-recovery cancellation, recovery-ahead cancellation, and final-head
-sync uncertainty. This is not exhaustive transition or process-kill evidence,
-dead-writer staging cleanup, power-loss/filesystem qualification, public actor
-construction, timer scheduling, or product wiring.
+sync uncertainty. By itself this is not exhaustive transition or process-kill
+evidence, dead-writer staging cleanup, power-loss/filesystem qualification,
+timer scheduling, or product wiring.
 
 Four initial-package cases
 cover exact Create facts and caller-bound Save As fork encoding, retained root/
 lease validity, exact descriptor admission, existing directory/file/symlink
 refusal before source reads, a final no-clobber race, populated-stage
 cancellation cleanup, and post-rename parent-sync indeterminacy without deleting
-the visible package. They do not claim public Create/Open/Save As execution,
-public provisional-autosave execution, public recovery/open wiring, timers,
-garbage collection,
-full verification, public actor construction, the exhaustive fault matrix or power-cut
-durability, product reachability, or product-open validation.
+the visible package. The public actor lifecycle cases add Create, Open,
+provisional Autosave/handoff, and recovery-selected Save As execution. Neither
+set claims timers, product garbage collection, the exhaustive fault matrix,
+power-cut durability, product reachability, or product-open validation.
 
 The checked independent source report supports only the WP-03 source-TIFF
 archive. WP-10A is accepted off-product and its target authority is promoted.

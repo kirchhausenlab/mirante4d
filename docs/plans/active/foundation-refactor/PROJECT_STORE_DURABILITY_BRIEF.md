@@ -159,6 +159,14 @@ device rename.
   with the validated ProjectGenerationProjection. Candidate inspection remains
   metadata-only at its public boundary: it may decode projection state for
   validation but does not return or expose it before explicit selection.
+- The public actor starts unbound and performs all binding work on its worker.
+  First provisional Autosave carries one explicit destination; later autosaves
+  carry none. Create installs either a fresh project or the first manual package
+  for the same healthy provisional project. A recoverable failed Open retains
+  only a recovery session: it permits inspection, explicit selection, verify,
+  cancellation, and close; after selection, Save As may fork the exact selected
+  generation to a new destination. Failed transfers retain the old session, and
+  no handoff deletes, repairs, or mutates the old package.
 - Automatic cleanup removes only exact writer-private transaction directories
   after an existing-store opener has acquired the writer lease, completed
   bounded store/recovery validation, and reconfirmed the writer against the
