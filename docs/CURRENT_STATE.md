@@ -168,7 +168,7 @@ remains off-product. Private Pin/Unpin execution now validates the complete
 graph and prospective recovery-candidate cap, preserves duplicate-pin liveness,
 rejects read-only sessions, and makes directory-sync uncertainty
 write-suspending. The accepted transition authority names pin, unpin, and purge
-phases, but the exhaustive failpoint/kill matrix is not yet implemented. A
+phases, but their exhaustive failpoint/kill matrix is not yet implemented. A
 private read-only FullVerify path now hashes every physical object in one
 bounded stable active-store snapshot, reconstructs paged logical objects,
 supports cancellation and read-only sessions, and changes no store bytes.
@@ -180,8 +180,10 @@ retained-closure subtraction, bounded batch/retry, and `ConfirmationRequired`
 fault. The private actor now routes that exact Trash subset with bounded
 selection admission, correlated completion and cancellation, generation-first
 mirrored quarantine, shared-object retention, exact retry, bounded directory
-sync, and fail-closed inventory. Exhaustive transition evidence and Purge
-remain absent.
+sync, and fail-closed inventory. All ten frozen Trash transitions now support
+exact before/after and zero-based occurrence injection. A 34-case actor kill
+matrix proves fresh-process reopen and idempotent retry, while explicitly
+making no power-loss durability claim. Purge remains absent.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
@@ -223,10 +225,11 @@ See [testing](TESTING.md) for commands and claim language.
   artifact scientific semantics, repair data, inspect trash, or establish a
   durability claim.
 - Private actor-routed Trash is covered only for its bounded authorized subset;
-  exhaustive transition/fresh-process evidence and Purge are not implemented.
-  The current API cannot authorize removal of non-regenerable artifacts;
-  supporting that later needs separately approved snapshot-bound itemized
-  confirmation and verified-backup proof.
+  its callback and process-crash matrix does not simulate power loss or qualify
+  filesystem durability, and Purge is not implemented. The current API cannot
+  authorize removal of non-regenerable artifacts; supporting that later needs
+  separately approved snapshot-bound itemized confirmation and verified-backup
+  proof.
 - The package-capability lane remains pending until there is an honest
   unsupported-GPU package command.
 - Packaged runtime does not expose unsaved-autosave recovery.
