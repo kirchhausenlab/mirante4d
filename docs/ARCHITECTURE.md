@@ -185,8 +185,11 @@ declares a non-regenerable artifact. The private actor now routes that subset
 under the same-descriptor maintenance transition with bounded selection,
 correlated completion and cancellation, generation-first no-replace
 quarantine, retained-object preservation, exact retry/deduplication, bounded
-synced batches, and fail-closed active-plus-trash inventory. The frozen public
-actor remains non-constructible. The crate still owns no public Create/Open/
+synced batches, and fail-closed active-plus-trash inventory. Its ten frozen
+transitions have exact before/after occurrence hooks and fresh-process
+kill/retry coverage; that evidence does not simulate power loss or qualify
+filesystem durability. The frozen public actor remains non-constructible. The
+crate still owns no public Create/Open/
 Save As execution, provisional autosave publication, product recovery workflow,
 timers, public/product garbage-collection wiring, Purge, qualified durability,
 or product path.

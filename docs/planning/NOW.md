@@ -59,8 +59,10 @@ the mirrored quarantine. Shared objects stay active, work proceeds in synced
 bounded batches, and every other selection fails with `ConfirmationRequired`.
 The private actor now routes that subset using bounded admission, correlated
 completion and cancellation, the corrected same-descriptor transition, exact
-retry, and fail-closed inventory. Exact transition/fresh-process evidence is
-the next slice; Purge remains later B2 work.
+retry, and fail-closed inventory. All ten frozen Trash transitions now have
+before/after and zero-based occurrence injection plus a 34-case fresh-process
+kill/retry matrix. This is process-crash evidence, not power-loss durability.
+Purge and the remaining B2 lifecycle/durability work come next.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.

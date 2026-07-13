@@ -17,6 +17,14 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{Arc, Mutex, atomic::AtomicUsize},
+    time::Instant,
+};
+
 use rustix::{
     fd::OwnedFd,
     fs::{AtFlags, FileType, FlockOperation, Mode, OFlags, flock, fstat, openat, statat},
@@ -35,6 +43,257 @@ const ANCHOR_OPEN_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::NONBLOCK);
 const MAINTENANCE_UPGRADE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GcTransition {
+    MaintenanceUpgrade,
+    RootScan,
+    CandidateListing,
+    TrashDirectoryCreate,
+    TrashCollisionFileSync,
+    TrashMove,
+    ActiveDeduplicateRemove,
+    SourceDirectorySync,
+    TrashDirectorySync,
+    MaintenanceRestore,
+}
+
+impl GcTransition {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 10] = [
+        Self::MaintenanceUpgrade,
+        Self::RootScan,
+        Self::CandidateListing,
+        Self::TrashDirectoryCreate,
+        Self::TrashCollisionFileSync,
+        Self::TrashMove,
+        Self::ActiveDeduplicateRemove,
+        Self::SourceDirectorySync,
+        Self::TrashDirectorySync,
+        Self::MaintenanceRestore,
+    ];
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::MaintenanceUpgrade => "gc_maintenance_upgrade",
+            Self::RootScan => "gc_root_scan",
+            Self::CandidateListing => "gc_candidate_listing",
+            Self::TrashDirectoryCreate => "gc_trash_directory_create",
+            Self::TrashCollisionFileSync => "gc_trash_collision_file_sync",
+            Self::TrashMove => "gc_trash_move",
+            Self::ActiveDeduplicateRemove => "gc_active_deduplicate_remove",
+            Self::SourceDirectorySync => "gc_source_directory_sync",
+            Self::TrashDirectorySync => "gc_trash_directory_sync",
+            Self::MaintenanceRestore => "gc_maintenance_restore",
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|transition| transition.name() == name)
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::MaintenanceUpgrade => 0,
+            Self::RootScan => 1,
+            Self::CandidateListing => 2,
+            Self::TrashDirectoryCreate => 3,
+            Self::TrashCollisionFileSync => 4,
+            Self::TrashMove => 5,
+            Self::ActiveDeduplicateRemove => 6,
+            Self::SourceDirectorySync => 7,
+            Self::TrashDirectorySync => 8,
+            Self::MaintenanceRestore => 9,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TransitionEdge {
+    Before,
+    After,
+}
+
+#[cfg(test)]
+impl TransitionEdge {
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        match name {
+            "before" => Some(Self::Before),
+            "after" => Some(Self::After),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Before => "before",
+            Self::After => "after",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct GcTransitionOccurrence {
+    transition: GcTransition,
+    occurrence: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InjectedGcTransition;
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) enum GcTransitionAction {
+    Fail,
+    Park { marker: Option<PathBuf> },
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GcTransitionTarget {
+    pub(crate) transition: GcTransition,
+    pub(crate) edge: TransitionEdge,
+    pub(crate) occurrence: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct GcTransitionInjector {
+    target: Option<GcTransitionTarget>,
+    action: GcTransitionAction,
+    attempts: [AtomicUsize; 10],
+    fired: AtomicUsize,
+    release: AtomicBool,
+    parked_thread: Mutex<Option<thread::Thread>>,
+}
+
+#[cfg(test)]
+impl GcTransitionInjector {
+    pub(crate) fn recorder() -> Arc<Self> {
+        Arc::new(Self::new(None, GcTransitionAction::Fail))
+    }
+
+    pub(crate) fn failing(target: GcTransitionTarget) -> Arc<Self> {
+        Arc::new(Self::new(Some(target), GcTransitionAction::Fail))
+    }
+
+    pub(crate) fn parking(target: GcTransitionTarget, marker: PathBuf) -> Arc<Self> {
+        Arc::new(Self::new(
+            Some(target),
+            GcTransitionAction::Park {
+                marker: Some(marker),
+            },
+        ))
+    }
+
+    pub(crate) fn gated(target: GcTransitionTarget) -> Arc<Self> {
+        Arc::new(Self::new(
+            Some(target),
+            GcTransitionAction::Park { marker: None },
+        ))
+    }
+
+    fn new(target: Option<GcTransitionTarget>, action: GcTransitionAction) -> Self {
+        Self {
+            target,
+            action,
+            attempts: std::array::from_fn(|_| AtomicUsize::new(0)),
+            fired: AtomicUsize::new(0),
+            release: AtomicBool::new(false),
+            parked_thread: Mutex::new(None),
+        }
+    }
+
+    fn before(
+        &self,
+        transition: GcTransition,
+    ) -> Result<GcTransitionOccurrence, InjectedGcTransition> {
+        let occurrence = self.attempts[transition.index()].fetch_add(1, Ordering::AcqRel);
+        let occurrence = GcTransitionOccurrence {
+            transition,
+            occurrence,
+        };
+        self.hit(occurrence, TransitionEdge::Before)?;
+        Ok(occurrence)
+    }
+
+    fn after(&self, occurrence: GcTransitionOccurrence) -> Result<(), InjectedGcTransition> {
+        self.hit(occurrence, TransitionEdge::After)
+    }
+
+    fn hit(
+        &self,
+        occurrence: GcTransitionOccurrence,
+        edge: TransitionEdge,
+    ) -> Result<(), InjectedGcTransition> {
+        if self.target
+            != Some(GcTransitionTarget {
+                transition: occurrence.transition,
+                edge,
+                occurrence: occurrence.occurrence,
+            })
+        {
+            return Ok(());
+        }
+        self.fired.fetch_add(1, Ordering::AcqRel);
+        match &self.action {
+            GcTransitionAction::Fail => Err(InjectedGcTransition),
+            GcTransitionAction::Park { marker } => {
+                if let Some(marker) = marker {
+                    fs::write(marker, b"ready").expect("transition marker must be writable");
+                }
+                let current = thread::current();
+                *self
+                    .parked_thread
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(current.clone());
+                while !self.release.load(Ordering::Acquire) {
+                    thread::park();
+                }
+                Err(InjectedGcTransition)
+            }
+        }
+    }
+
+    pub(crate) fn attempts(&self, transition: GcTransition) -> usize {
+        self.attempts[transition.index()].load(Ordering::Acquire)
+    }
+
+    pub(crate) fn fired(&self) -> usize {
+        self.fired.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn wait_until_parked(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self
+                .parked_thread
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some()
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "transition hook did not park");
+            thread::yield_now();
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.store(true, Ordering::Release);
+        if let Some(thread) = self
+            .parked_thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            thread.unpark();
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum LeaseError {
@@ -60,6 +319,11 @@ pub(crate) enum MaintenanceTransitionError {
     Lease(#[from] LeaseError),
     #[error("the shared maintenance lease could not be restored: {source}")]
     MaintenanceLost {
+        #[source]
+        source: LeaseError,
+    },
+    #[error("shared maintenance was restored but completion was indeterminate: {source}")]
+    MaintenanceRestoredIndeterminate {
         #[source]
         source: LeaseError,
     },
@@ -120,6 +384,8 @@ pub(crate) struct ProjectStoreLeases {
     writer: Option<WriterLease>,
     writes_suspended: AtomicBool,
     maintenance_lost: AtomicBool,
+    #[cfg(test)]
+    gc_transition_injector: Option<Arc<GcTransitionInjector>>,
 }
 
 impl ProjectStoreLeases {
@@ -163,6 +429,8 @@ impl ProjectStoreLeases {
             writer,
             writes_suspended: AtomicBool::new(false),
             maintenance_lost: AtomicBool::new(false),
+            #[cfg(test)]
+            gc_transition_injector: None,
         })
     }
 
@@ -204,6 +472,37 @@ impl ProjectStoreLeases {
         self.suspend_writes();
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_gc_transition_injector(&mut self, injector: Arc<GcTransitionInjector>) {
+        self.gc_transition_injector = Some(injector);
+    }
+
+    pub(crate) fn gc_transition_before(
+        &self,
+        transition: GcTransition,
+    ) -> Result<GcTransitionOccurrence, InjectedGcTransition> {
+        #[cfg(test)]
+        if let Some(injector) = &self.gc_transition_injector {
+            return injector.before(transition);
+        }
+        Ok(GcTransitionOccurrence {
+            transition,
+            occurrence: 0,
+        })
+    }
+
+    pub(crate) fn gc_transition_after(
+        &self,
+        occurrence: GcTransitionOccurrence,
+    ) -> Result<(), InjectedGcTransition> {
+        #[cfg(test)]
+        if let Some(injector) = &self.gc_transition_injector {
+            return injector.after(occurrence);
+        }
+        let _ = occurrence;
+        Ok(())
+    }
+
     pub(crate) fn with_exclusive_maintenance<C, F, T, E>(
         &mut self,
         root: &LocalStoreRoot,
@@ -212,10 +511,10 @@ impl ProjectStoreLeases {
     ) -> Result<Result<T, E>, MaintenanceTransitionError>
     where
         C: FnMut() -> bool,
-        F: FnOnce(&mut C) -> Result<T, E>,
+        F: FnOnce(&ProjectStoreLeases, &mut C) -> Result<T, E>,
     {
         let guard = self.wait_for_exclusive_maintenance(root, is_cancelled)?;
-        let result = operation(is_cancelled);
+        let result = operation(guard.leases, is_cancelled);
         guard.finish()?;
         Ok(result)
     }
@@ -236,8 +535,23 @@ impl ProjectStoreLeases {
         }
 
         loop {
-            match flock(&self.maintenance, FlockOperation::NonBlockingLockExclusive) {
+            let occurrence = self
+                .gc_transition_before(GcTransition::MaintenanceUpgrade)
+                .map_err(|_| {
+                    MaintenanceTransitionError::Lease(injected_lease_io(
+                        "inject failure before maintenance upgrade",
+                    ))
+                })?;
+            let upgrade = flock(&self.maintenance, FlockOperation::NonBlockingLockExclusive);
+            let injected_after = self.gc_transition_after(occurrence).is_err();
+            match upgrade {
                 Ok(()) => {
+                    if injected_after {
+                        self.restore_shared_or_suspend()?;
+                        return Err(MaintenanceTransitionError::Lease(injected_lease_io(
+                            "inject failure after maintenance upgrade",
+                        )));
+                    }
                     if let Err(error) = self.confirm_writer(root) {
                         self.restore_shared_or_suspend()?;
                         return Err(MaintenanceTransitionError::Lease(error));
@@ -256,6 +570,11 @@ impl ProjectStoreLeases {
                     // nonblocking in-place conversion fails. Restore shared
                     // ownership before observing cancellation or waiting.
                     self.restore_shared_or_suspend()?;
+                    if injected_after {
+                        return Err(MaintenanceTransitionError::Lease(injected_lease_io(
+                            "inject failure after maintenance upgrade",
+                        )));
+                    }
                     match error {
                         Errno::AGAIN => {
                             if is_cancelled() {
@@ -289,10 +608,27 @@ impl ProjectStoreLeases {
     }
 
     fn restore_shared_or_suspend(&self) -> Result<(), MaintenanceTransitionError> {
-        self.restore_shared().map_err(|source| {
-            self.mark_maintenance_lost();
-            MaintenanceTransitionError::MaintenanceLost { source }
-        })
+        let occurrence = self
+            .gc_transition_before(GcTransition::MaintenanceRestore)
+            .map_err(|_| {
+                let source = injected_lease_io("inject failure before maintenance restore");
+                self.mark_maintenance_lost();
+                MaintenanceTransitionError::MaintenanceLost { source }
+            })?;
+        let restored = self.restore_shared();
+        let injected_after = self.gc_transition_after(occurrence).is_err();
+        match (restored, injected_after) {
+            (Ok(()), false) => Ok(()),
+            (Ok(()), true) => {
+                let source = injected_lease_io("inject failure after maintenance restore");
+                self.suspend_writes();
+                Err(MaintenanceTransitionError::MaintenanceRestoredIndeterminate { source })
+            }
+            (Err(source), _) => {
+                self.mark_maintenance_lost();
+                Err(MaintenanceTransitionError::MaintenanceLost { source })
+            }
+        }
     }
 }
 
@@ -312,6 +648,10 @@ impl ExclusiveMaintenanceGuard<'_> {
                 self.exclusive = false;
                 Ok(())
             }
+            Err(error @ MaintenanceTransitionError::MaintenanceRestoredIndeterminate { .. }) => {
+                self.exclusive = false;
+                Err(error)
+            }
             Err(error) => Err(error),
         }
     }
@@ -320,9 +660,7 @@ impl ExclusiveMaintenanceGuard<'_> {
 impl Drop for ExclusiveMaintenanceGuard<'_> {
     fn drop(&mut self) {
         if self.exclusive {
-            if self.leases.restore_shared().is_err() {
-                self.leases.mark_maintenance_lost();
-            }
+            let _ = self.leases.restore_shared_or_suspend();
             self.exclusive = false;
         }
     }
@@ -356,6 +694,13 @@ fn lease_io(operation: &'static str, error: Errno) -> LeaseError {
     LeaseError::Io {
         operation,
         source: io::Error::from(error),
+    }
+}
+
+fn injected_lease_io(operation: &'static str) -> LeaseError {
+    LeaseError::Io {
+        operation,
+        source: io::Error::other("injected project-store transition failure"),
     }
 }
 
@@ -550,7 +895,7 @@ mod tests {
             false
         };
         leases
-            .with_exclusive_maintenance(&root, &mut release_after_contention, |_| {
+            .with_exclusive_maintenance(&root, &mut release_after_contention, |_, _| {
                 assert!(!independent_shared_available(&root));
                 assert!(!independent_exclusive_available(&root));
                 assert!(!independent_writer_available(&root));
@@ -566,7 +911,7 @@ mod tests {
 
         let mut never_cancel = || false;
         let operation_error = leases
-            .with_exclusive_maintenance(&root, &mut never_cancel, |_| {
+            .with_exclusive_maintenance(&root, &mut never_cancel, |_, _| {
                 Err::<(), _>("operation failed")
             })
             .unwrap();

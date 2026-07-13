@@ -27,7 +27,10 @@ use crate::{
     ProjectGenerationId, ProjectStoreDiagnostics, ProjectStoreFault, ProjectStoreLimits,
     generation::{GenerationDocument, GenerationKind, PhysicalObject},
     inspection::inspect_store_graph,
-    lease::{LeaseError, MaintenanceTransitionError, ProjectStoreLeases},
+    lease::{
+        GcTransition, GcTransitionOccurrence, LeaseError, MaintenanceTransitionError,
+        ProjectStoreLeases,
+    },
     local::{LocalPublicationError, LocalStoreRoot},
 };
 
@@ -76,16 +79,24 @@ struct PlannedFile {
 enum Step {
     CreateDirectory(PathBuf),
     File(PlannedFile),
+    SynchronizeRetry {
+        active_path: PathBuf,
+        trash_path: PathBuf,
+        trash_fact: FileFact,
+    },
 }
 
 impl Step {
     const fn namespace_mutations(&self) -> usize {
-        1
+        match self {
+            Self::SynchronizeRetry { .. } => 0,
+            Self::CreateDirectory(_) | Self::File(_) => 1,
+        }
     }
 
     const fn checked_bytes(&self) -> u64 {
         match self {
-            Self::CreateDirectory(_) => 0,
+            Self::CreateDirectory(_) | Self::SynchronizeRetry { .. } => 0,
             Self::File(file) => file.byte_length,
         }
     }
@@ -105,9 +116,10 @@ pub(crate) fn trash_generations<C>(
 where
     C: FnMut() -> bool,
 {
-    let result = leases.with_exclusive_maintenance(root, &mut is_cancelled, |is_cancelled| {
-        trash_exclusive(root, selected, limits, is_cancelled)
-    });
+    let result =
+        leases.with_exclusive_maintenance(root, &mut is_cancelled, |leases, is_cancelled| {
+            trash_exclusive(root, leases, selected, limits, is_cancelled)
+        });
     match result {
         Ok(result) => {
             if matches!(result, Err(ProjectStoreFault::CommitIndeterminate)) {
@@ -118,7 +130,8 @@ where
         Err(MaintenanceTransitionError::ReadOnly) => Err(ProjectStoreFault::ReadOnly),
         Err(MaintenanceTransitionError::Cancelled) => Err(ProjectStoreFault::Cancelled),
         Err(MaintenanceTransitionError::Lease(LeaseError::Indeterminate))
-        | Err(MaintenanceTransitionError::MaintenanceLost { .. }) => {
+        | Err(MaintenanceTransitionError::MaintenanceLost { .. })
+        | Err(MaintenanceTransitionError::MaintenanceRestoredIndeterminate { .. }) => {
             leases.suspend_writes();
             Err(ProjectStoreFault::CommitIndeterminate)
         }
@@ -130,6 +143,7 @@ where
 
 fn trash_exclusive<C>(
     root: &LocalStoreRoot,
+    leases: &ProjectStoreLeases,
     selected: &[ProjectGenerationId],
     limits: ProjectStoreLimits,
     is_cancelled: &mut C,
@@ -162,8 +176,10 @@ where
         });
     }
 
+    let root_scan = transition_before(leases, GcTransition::RootScan)?;
     let graph = inspect_store_graph(root, limits, &mut *is_cancelled)?;
     let mut inventory = scan_strict_store(root, limits, is_cancelled)?;
+    transition_after(leases, root_scan)?;
     if graph
         .generation_ids()
         .len()
@@ -175,6 +191,7 @@ where
         });
     }
 
+    let candidate_listing = transition_before(leases, GcTransition::CandidateListing)?;
     let active_generations = graph
         .generation_ids()
         .iter()
@@ -357,7 +374,30 @@ where
 
     let steps = build_steps(root, &plans, &mut inventory, limits)?;
     let batches = build_batches(steps, limits)?;
-    execute_batches(root, batches, limits, is_cancelled, streamed_bytes)
+    transition_after(leases, candidate_listing)?;
+    execute_batches(root, leases, batches, limits, is_cancelled, streamed_bytes)
+}
+
+fn transition_before(
+    leases: &ProjectStoreLeases,
+    transition: GcTransition,
+) -> Result<GcTransitionOccurrence, ProjectStoreFault> {
+    leases
+        .gc_transition_before(transition)
+        .map_err(|_| ProjectStoreFault::Corruption {
+            stage: "trash_transition_injected",
+        })
+}
+
+fn transition_after(
+    leases: &ProjectStoreLeases,
+    occurrence: GcTransitionOccurrence,
+) -> Result<(), ProjectStoreFault> {
+    leases
+        .gc_transition_after(occurrence)
+        .map_err(|_| ProjectStoreFault::Corruption {
+            stage: "trash_transition_injected",
+        })
 }
 
 fn require_no_non_regenerable(document: &GenerationDocument) -> Result<(), ProjectStoreFault> {
@@ -567,15 +607,24 @@ fn build_steps(
         steps.push(Step::CreateDirectory(directory));
     }
     for plan in plans {
-        if !matches!(plan.action, FileAction::AlreadyQuarantined) {
-            steps.push(Step::File(PlannedFile {
+        match plan.action {
+            FileAction::Move | FileAction::RemoveActiveDuplicate => {
+                steps.push(Step::File(PlannedFile {
+                    active_path: plan.active_path.clone(),
+                    trash_path: plan.trash_path.clone(),
+                    active_fact: plan.active_fact,
+                    trash_fact: plan.trash_fact,
+                    byte_length: plan.byte_length,
+                    action: plan.action,
+                }));
+            }
+            FileAction::AlreadyQuarantined => steps.push(Step::SynchronizeRetry {
                 active_path: plan.active_path.clone(),
                 trash_path: plan.trash_path.clone(),
-                active_fact: plan.active_fact,
-                trash_fact: plan.trash_fact,
-                byte_length: plan.byte_length,
-                action: plan.action,
-            }));
+                trash_fact: plan
+                    .trash_fact
+                    .expect("an already-quarantined plan has an exact trash file"),
+            }),
         }
     }
 
@@ -642,6 +691,7 @@ fn simulate_fanout(
                 }
                 FileAction::AlreadyQuarantined => continue,
             },
+            Step::SynchronizeRetry { .. } => continue,
         };
         let count = counts.entry(parent.to_path_buf()).or_default();
         *count = count
@@ -690,7 +740,8 @@ fn build_batches(
                 stage: "trash_batch_bytes",
             })?;
         if !current.is_empty()
-            && (next_entries > limits.gc_batch_entries_max
+            && (current.len() >= limits.gc_batch_entries_max
+                || next_entries > limits.gc_batch_entries_max
                 || next_bytes > limits.gc_batch_bytes_max)
         {
             batches.push(Batch { steps: current });
@@ -718,6 +769,7 @@ fn build_batches(
 
 fn execute_batches<C>(
     root: &LocalStoreRoot,
+    leases: &ProjectStoreLeases,
     batches: Vec<Batch>,
     _limits: ProjectStoreLimits,
     is_cancelled: &mut C,
@@ -736,21 +788,34 @@ where
         let mut batch_published = 0_u64;
         for step in batch.steps {
             let result = match step {
-                Step::CreateDirectory(path) => create_directory(root, &path).map(|()| {
-                    operation_mutated = true;
-                    affected.insert(path.parent().unwrap_or(Path::new("")).to_path_buf());
-                    affected.insert(path);
-                }),
-                Step::File(file) => {
+                Step::CreateDirectory(path) => {
                     let mut step_mutated = false;
-                    let result = execute_file_step(root, &file, &mut step_mutated);
+                    let result = execute_directory_create(root, leases, &path, &mut step_mutated);
                     operation_mutated |= step_mutated;
                     result.map(|()| {
-                        affected.insert(file.active_path.parent().unwrap().to_path_buf());
-                        affected.insert(file.trash_path.parent().unwrap().to_path_buf());
+                        record_trash_directory_ancestors(&mut affected, &path);
+                    })
+                }
+                Step::File(file) => {
+                    let mut step_mutated = false;
+                    let result = execute_file_step(root, leases, &file, &mut step_mutated);
+                    operation_mutated |= step_mutated;
+                    result.map(|()| {
+                        record_file_sync_directories(
+                            &mut affected,
+                            &file.active_path,
+                            &file.trash_path,
+                        );
                         batch_published += 1;
                     })
                 }
+                Step::SynchronizeRetry {
+                    active_path,
+                    trash_path,
+                    trash_fact,
+                } => synchronize_retry(root, &active_path, &trash_path, trash_fact).map(|()| {
+                    record_file_sync_directories(&mut affected, &active_path, &trash_path);
+                }),
             };
             if let Err(error) = result {
                 return Err(if operation_mutated {
@@ -761,7 +826,7 @@ where
             }
         }
         for directory in affected {
-            if sync_directory(root, &directory).is_err() {
+            if sync_directory_transition(root, leases, &directory).is_err() {
                 return Err(ProjectStoreFault::CommitIndeterminate);
             }
         }
@@ -779,8 +844,61 @@ where
     })
 }
 
+fn execute_directory_create(
+    root: &LocalStoreRoot,
+    leases: &ProjectStoreLeases,
+    path: &Path,
+    mutated: &mut bool,
+) -> Result<(), ProjectStoreFault> {
+    let occurrence = transition_before(leases, GcTransition::TrashDirectoryCreate)?;
+    create_directory(root, path)?;
+    *mutated = true;
+    transition_after(leases, occurrence)
+}
+
+fn synchronize_retry(
+    root: &LocalStoreRoot,
+    active_path: &Path,
+    trash_path: &Path,
+    trash_fact: FileFact,
+) -> Result<(), ProjectStoreFault> {
+    if file_fact(root, active_path)?.is_some() || file_fact(root, trash_path)? != Some(trash_fact) {
+        return Err(ProjectStoreFault::SourceChanged);
+    }
+    Ok(())
+}
+
+fn record_file_sync_directories(
+    affected: &mut BTreeSet<PathBuf>,
+    active_path: &Path,
+    trash_path: &Path,
+) {
+    affected.insert(
+        active_path
+            .parent()
+            .expect("an active file has a parent")
+            .to_path_buf(),
+    );
+    record_trash_directory_ancestors(
+        affected,
+        trash_path.parent().expect("a trash file has a parent"),
+    );
+}
+
+fn record_trash_directory_ancestors(affected: &mut BTreeSet<PathBuf>, directory: &Path) {
+    let mut current = Some(directory);
+    while let Some(directory) = current {
+        affected.insert(directory.to_path_buf());
+        if directory.as_os_str().is_empty() {
+            break;
+        }
+        current = directory.parent();
+    }
+}
+
 fn execute_file_step(
     root: &LocalStoreRoot,
+    leases: &ProjectStoreLeases,
     file: &PlannedFile,
     mutated: &mut bool,
 ) -> Result<(), ProjectStoreFault> {
@@ -797,6 +915,7 @@ fn execute_file_step(
     let trash_name = file.trash_path.file_name().unwrap();
     match file.action {
         FileAction::Move => {
+            let occurrence = transition_before(leases, GcTransition::TrashMove)?;
             renameat_with(
                 &source_parent,
                 source_name,
@@ -806,6 +925,7 @@ fn execute_file_step(
             )
             .map_err(|_| ProjectStoreFault::SourceChanged)?;
             *mutated = true;
+            transition_after(leases, occurrence)?;
         }
         FileAction::RemoveActiveDuplicate => {
             let trash = openat(&trash_parent, trash_name, FILE_FLAGS, Mode::empty())
@@ -813,12 +933,16 @@ fn execute_file_step(
             if opened_file_fact(&trash, "trash_collision_file")? != file.trash_fact.unwrap() {
                 return Err(ProjectStoreFault::SourceChanged);
             }
+            let occurrence = transition_before(leases, GcTransition::TrashCollisionFileSync)?;
             sync_fd(&trash).map_err(|_| ProjectStoreFault::Corruption {
                 stage: "trash_collision_file_sync",
             })?;
+            transition_after(leases, occurrence)?;
+            let occurrence = transition_before(leases, GcTransition::ActiveDeduplicateRemove)?;
             unlinkat(&source_parent, source_name, AtFlags::empty())
                 .map_err(|_| ProjectStoreFault::SourceChanged)?;
             *mutated = true;
+            transition_after(leases, occurrence)?;
         }
         FileAction::AlreadyQuarantined => return Ok(()),
     }
@@ -847,6 +971,32 @@ fn create_directory(root: &LocalStoreRoot, path: &Path) -> Result<(), ProjectSto
 fn sync_directory(root: &LocalStoreRoot, path: &Path) -> Result<(), ProjectStoreFault> {
     let directory = open_directory_path(root.descriptor(), path)?;
     sync_fd(&directory).map_err(|_| ProjectStoreFault::CommitIndeterminate)
+}
+
+fn sync_directory_transition(
+    root: &LocalStoreRoot,
+    leases: &ProjectStoreLeases,
+    path: &Path,
+) -> Result<(), ProjectStoreFault> {
+    let transition = match path.components().next() {
+        None => GcTransition::TrashDirectorySync,
+        Some(Component::Normal(name)) if name == OsStr::new("trash") => {
+            GcTransition::TrashDirectorySync
+        }
+        Some(Component::Normal(name))
+            if name == OsStr::new("generations") || name == OsStr::new("objects") =>
+        {
+            GcTransition::SourceDirectorySync
+        }
+        _ => {
+            return Err(ProjectStoreFault::Corruption {
+                stage: "trash_sync_directory",
+            });
+        }
+    };
+    let occurrence = transition_before(leases, transition)?;
+    sync_directory(root, path)?;
+    transition_after(leases, occurrence)
 }
 
 fn sync_fd(fd: &OwnedFd) -> Result<(), Errno> {
@@ -1525,19 +1675,26 @@ where
 #[cfg(test)]
 pub(crate) mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         fs,
         os::unix::fs::symlink,
         path::{Path, PathBuf},
         process::Command,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use serde_json::Value;
 
     use super::*;
-    use crate::{ProjectOpenMode, wire};
+    use crate::{
+        ProjectOpenMode,
+        lease::{GcTransitionInjector, GcTransitionTarget, LeaseError, TransitionEdge},
+        wire,
+    };
 
     const RECOVERABLE_ORPHAN: &str = concat!(
         "m4d-project-generation-v1-sha256:",
@@ -1570,6 +1727,8 @@ pub(crate) mod tests {
             gc_batch_entries_max: 1,
             ..ProjectStoreLimits::default()
         };
+        let cancellation_trace = GcTransitionInjector::recorder();
+        leases.set_gc_transition_injector(Arc::clone(&cancellation_trace));
         assert_eq!(
             trash_generations(
                 &root,
@@ -1583,6 +1742,14 @@ pub(crate) mod tests {
         assert!(active.exists());
         assert!(!trash.exists());
         assert!(anonymous.exists());
+        assert_eq!(
+            cancellation_trace.attempts(GcTransition::TrashDirectoryCreate),
+            1
+        );
+        assert_eq!(
+            cancellation_trace.attempts(GcTransition::TrashDirectorySync),
+            2
+        );
 
         let first = trash_generations(
             &root,
@@ -1632,6 +1799,249 @@ pub(crate) mod tests {
             all_file_bytes(&project.path().join("objects")),
             objects_before
         );
+    }
+
+    #[test]
+    fn transition_inventory_failures_and_sync_only_retries_are_exact() {
+        assert_eq!(
+            GcTransition::ALL.map(GcTransition::name),
+            [
+                "gc_maintenance_upgrade",
+                "gc_root_scan",
+                "gc_candidate_listing",
+                "gc_trash_directory_create",
+                "gc_trash_collision_file_sync",
+                "gc_trash_move",
+                "gc_active_deduplicate_remove",
+                "gc_source_directory_sync",
+                "gc_trash_directory_sync",
+                "gc_maintenance_restore",
+            ]
+        );
+        let traced = TestProject::extracted("trash-transition-trace", "recoverable.m4dproj");
+        let selected = install_zero_non_regenerable_orphan(traced.path());
+        let active = traced.path().join(active_generation_path(selected));
+        let selected_bytes = fs::read(&active).unwrap();
+        let root = LocalStoreRoot::open(traced.path()).unwrap();
+        let mut leases =
+            ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        let move_trace = GcTransitionInjector::recorder();
+        leases.set_gc_transition_injector(Arc::clone(&move_trace));
+        let first = trash_generations(
+            &root,
+            &mut leases,
+            &[selected],
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(first.published_objects, 1);
+        for (transition, expected) in [
+            (GcTransition::MaintenanceUpgrade, 1),
+            (GcTransition::RootScan, 1),
+            (GcTransition::CandidateListing, 1),
+            (GcTransition::TrashDirectoryCreate, 4),
+            (GcTransition::TrashCollisionFileSync, 0),
+            (GcTransition::TrashMove, 1),
+            (GcTransition::ActiveDeduplicateRemove, 0),
+            (GcTransition::SourceDirectorySync, 1),
+            (GcTransition::TrashDirectorySync, 5),
+            (GcTransition::MaintenanceRestore, 1),
+        ] {
+            assert_eq!(
+                move_trace.attempts(transition),
+                expected,
+                "unexpected {} count",
+                transition.name()
+            );
+        }
+
+        let retry_trace = GcTransitionInjector::recorder();
+        leases.set_gc_transition_injector(Arc::clone(&retry_trace));
+        let retry = trash_generations(
+            &root,
+            &mut leases,
+            &[selected],
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(retry.published_objects, 0);
+        assert_eq!(retry.streamed_bytes, 0);
+        for (transition, expected) in [
+            (GcTransition::MaintenanceUpgrade, 1),
+            (GcTransition::RootScan, 1),
+            (GcTransition::CandidateListing, 1),
+            (GcTransition::TrashDirectoryCreate, 0),
+            (GcTransition::TrashCollisionFileSync, 0),
+            (GcTransition::TrashMove, 0),
+            (GcTransition::ActiveDeduplicateRemove, 0),
+            (GcTransition::SourceDirectorySync, 1),
+            (GcTransition::TrashDirectorySync, 5),
+            (GcTransition::MaintenanceRestore, 1),
+        ] {
+            assert_eq!(retry_trace.attempts(transition), expected);
+        }
+
+        fs::create_dir_all(active.parent().unwrap()).unwrap();
+        fs::write(&active, &selected_bytes).unwrap();
+        let duplicate_trace = GcTransitionInjector::recorder();
+        leases.set_gc_transition_injector(Arc::clone(&duplicate_trace));
+        trash_generations(
+            &root,
+            &mut leases,
+            &[selected],
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        for (transition, expected) in [
+            (GcTransition::MaintenanceUpgrade, 1),
+            (GcTransition::RootScan, 1),
+            (GcTransition::CandidateListing, 1),
+            (GcTransition::TrashDirectoryCreate, 0),
+            (GcTransition::TrashCollisionFileSync, 1),
+            (GcTransition::TrashMove, 0),
+            (GcTransition::ActiveDeduplicateRemove, 1),
+            (GcTransition::SourceDirectorySync, 1),
+            (GcTransition::TrashDirectorySync, 5),
+            (GcTransition::MaintenanceRestore, 1),
+        ] {
+            assert_eq!(duplicate_trace.attempts(transition), expected);
+        }
+        drop(leases);
+        drop(root);
+
+        #[derive(Clone, Copy)]
+        enum Scenario {
+            Move,
+            Duplicate,
+        }
+
+        let mut cases = Vec::new();
+        for edge in [TransitionEdge::Before, TransitionEdge::After] {
+            for transition in GcTransition::ALL {
+                let scenario = match transition {
+                    GcTransition::TrashCollisionFileSync
+                    | GcTransition::ActiveDeduplicateRemove => Scenario::Duplicate,
+                    _ => Scenario::Move,
+                };
+                let occurrences = match transition {
+                    GcTransition::TrashDirectoryCreate => 4,
+                    GcTransition::TrashDirectorySync => 5,
+                    _ => 1,
+                };
+                for occurrence in 0..occurrences {
+                    let indeterminate = match (transition, edge) {
+                        (GcTransition::TrashDirectoryCreate, TransitionEdge::Before) => {
+                            occurrence > 0
+                        }
+                        (GcTransition::TrashDirectoryCreate, TransitionEdge::After)
+                        | (GcTransition::TrashMove, _)
+                        | (GcTransition::ActiveDeduplicateRemove, TransitionEdge::After)
+                        | (GcTransition::SourceDirectorySync, _)
+                        | (GcTransition::TrashDirectorySync, _)
+                        | (GcTransition::MaintenanceRestore, _) => true,
+                        _ => false,
+                    };
+                    cases.push((transition, edge, occurrence, scenario, indeterminate));
+                }
+            }
+        }
+
+        for (transition, edge, occurrence, scenario, indeterminate) in cases {
+            let project = TestProject::extracted("trash-transition", "recoverable.m4dproj");
+            let selected = install_zero_non_regenerable_orphan(project.path());
+            let active = project.path().join(active_generation_path(selected));
+            let trash = project.path().join(trash_generation_path(selected));
+            let selected_bytes = fs::read(&active).unwrap();
+            if matches!(scenario, Scenario::Duplicate) {
+                let root = LocalStoreRoot::open(project.path()).unwrap();
+                let mut leases =
+                    ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+                trash_generations(
+                    &root,
+                    &mut leases,
+                    &[selected],
+                    ProjectStoreLimits::default(),
+                    || false,
+                )
+                .unwrap();
+                fs::create_dir_all(active.parent().unwrap()).unwrap();
+                fs::write(&active, &selected_bytes).unwrap();
+            }
+            let files_before = all_file_bytes(project.path());
+            let directories_before = all_directories(project.path());
+            let refs_before = all_file_bytes(&project.path().join("refs"));
+            let objects_before = all_file_bytes(&project.path().join("objects"));
+            let injector = GcTransitionInjector::failing(GcTransitionTarget {
+                transition,
+                edge,
+                occurrence,
+            });
+            let root = LocalStoreRoot::open(project.path()).unwrap();
+            let mut leases =
+                ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+            leases.set_gc_transition_injector(Arc::clone(&injector));
+            let result = trash_generations(
+                &root,
+                &mut leases,
+                &[selected],
+                ProjectStoreLimits::default(),
+                || false,
+            );
+            assert_eq!(
+                injector.fired(),
+                1,
+                "{} {} occurrence {occurrence} was not reached",
+                transition.name(),
+                edge.name()
+            );
+            if indeterminate {
+                assert_eq!(result, Err(ProjectStoreFault::CommitIndeterminate));
+                assert!(matches!(
+                    leases.confirm_writer(&root),
+                    Err(LeaseError::Indeterminate)
+                ));
+                if transition == GcTransition::MaintenanceRestore {
+                    assert_eq!(leases.maintenance_lost(), edge == TransitionEdge::Before);
+                }
+            } else {
+                assert!(matches!(result, Err(ProjectStoreFault::Corruption { .. })));
+                assert!(leases.confirm_writer(&root).unwrap());
+                assert_eq!(all_file_bytes(project.path()), files_before);
+                assert_eq!(all_directories(project.path()), directories_before);
+            }
+            drop(leases);
+
+            let mut retry_leases =
+                ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+            trash_generations(
+                &root,
+                &mut retry_leases,
+                &[selected],
+                ProjectStoreLimits::default(),
+                || false,
+            )
+            .unwrap();
+            assert!(!active.exists());
+            assert_eq!(fs::read(&trash).unwrap(), selected_bytes);
+            assert_eq!(all_file_bytes(&project.path().join("refs")), refs_before);
+            assert_eq!(
+                all_file_bytes(&project.path().join("objects")),
+                objects_before
+            );
+            let zero_mutation = trash_generations(
+                &root,
+                &mut retry_leases,
+                &[selected],
+                ProjectStoreLimits::default(),
+                || false,
+            )
+            .unwrap();
+            assert_eq!(zero_mutation.published_objects, 0);
+            assert_eq!(zero_mutation.streamed_bytes, 0);
+        }
     }
 
     #[test]
@@ -1744,6 +2154,20 @@ pub(crate) mod tests {
         selected
     }
 
+    pub(crate) fn active_generation_file(
+        root: &Path,
+        generation_id: ProjectGenerationId,
+    ) -> PathBuf {
+        root.join(active_generation_path(generation_id))
+    }
+
+    pub(crate) fn trash_generation_file(
+        root: &Path,
+        generation_id: ProjectGenerationId,
+    ) -> PathBuf {
+        root.join(trash_generation_path(generation_id))
+    }
+
     fn install_foreign_lineage_retry(root: &Path, generation_bytes: &[u8]) -> ProjectGenerationId {
         let mut document = serde_json::from_slice::<Value>(generation_bytes).unwrap();
         document["dataset"]["scientific_content_id"] =
@@ -1756,7 +2180,7 @@ pub(crate) mod tests {
         generation_id
     }
 
-    fn install_anonymous_object(root: &Path) -> PathBuf {
+    pub(crate) fn install_anonymous_object(root: &Path) -> PathBuf {
         let bytes = b"anonymous-unrooted-object";
         let mut hasher = ExactBytesHasher::new();
         hasher.update(bytes).unwrap();
@@ -1789,6 +2213,23 @@ pub(crate) mod tests {
         let mut files = BTreeMap::new();
         visit(root, root, &mut files);
         files
+    }
+
+    fn all_directories(root: &Path) -> BTreeSet<PathBuf> {
+        fn visit(root: &Path, current: &Path, directories: &mut BTreeSet<PathBuf>) {
+            for entry in fs::read_dir(current).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    let path = entry.path();
+                    directories.insert(path.strip_prefix(root).unwrap().to_path_buf());
+                    visit(root, &path, directories);
+                }
+            }
+        }
+
+        let mut directories = BTreeSet::new();
+        visit(root, root, &mut directories);
+        directories
     }
 
     struct TestProject(PathBuf);

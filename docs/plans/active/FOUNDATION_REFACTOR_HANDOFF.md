@@ -7,9 +7,9 @@ Public-data publication: deferred to a separate future handoff
 WP-10B predecessor: `foundation-wp-09a-exit-1`
 Completed through: WP-09A at `foundation-wp-09a-exit-1`
 Current checkpoint: WP-10B transactional project store; private actor-routed B2
-Trash subset
-Next protected-branch checkpoint: WP-10B exact Trash transition and
-fresh-process evidence
+Trash subset with exact transition and fresh-process crash evidence
+Next protected-branch checkpoint: WP-10B remaining B2 garbage collection,
+beginning with Purge
 
 ## Purpose
 

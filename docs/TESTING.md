@@ -157,7 +157,7 @@ first and advancing autosave generations and refs, replace a divergent lane
 against the current manual base, accept a lower revision with a non-regressing
 high-water mark, reject stale parent/base and invalid recovery/capacity state,
 retry an exact recovery-ahead cancellation, and distinguish recovery-sync
-failure from write-suspending head indeterminacy. Thirteen actor cases exercise the
+failure from write-suspending head indeterminacy. Fifteen actor cases exercise the
 real established manual/autosave primitives under one worker and prove exact
 request correlation, the request/completion bounds, queued-autosave coalescing,
 active and queued cancellation, close rejection, writer-lease lifetime, and
@@ -185,8 +185,8 @@ read-only rejection, linked-file rejection, idempotence, and write-suspending
 directory-sync uncertainty. One actor case proves correlated Pin/Unpin graph
 effects and read-only faults, while the shared cancellation case covers both
 queued completion variants. The maintenance-transition correction is bound by
-the architecture gate; it is not yet exhaustive failpoint, process-kill, or
-power-cut evidence.
+the architecture gate. The non-Trash transition inventory is not yet an
+exhaustive failpoint, process-kill, or power-cut matrix.
 Two FullVerify cases prove a bounded stable snapshot of every active generation
 and object outside staging and trash, exact physical-object hashing, paged
 logical reconstruction, cancellation, snapshot-drift rejection, and
@@ -206,20 +206,27 @@ approval, mutation, durability evidence, or public/product wiring.
 The accepted Trash safety correction freezes the later quarantine subset for
 generations declaring zero non-regenerable artifacts and its exact transition
 names, including an honest `ConfirmationRequired` outcome otherwise. This
-checkpoint now has two focused private-core cases: one proves mirrored
+checkpoint now has three focused private-core cases: one proves mirrored
 generation quarantine, shared/anonymous-object retention, exact
 retry/deduplication, collision byte accounting, and cancellation after a synced
 directory-only batch; the other proves unsafe selection, non-regenerable
-content, symlinked inventory, and foreign-lineage retries add no mutation.
-One actor case proves bounded selection admission, exact correlation, active
-cancellation without mutation, writer-contended read-only rejection, and
-successful quarantine diagnostics; the shared cancellation case covers queued
-Trash. This is not exhaustive failure-injection, process-kill, or durability
-evidence.
+content, symlinked inventory, and foreign-lineage retries add no mutation. The
+third proves before/after injection for all ten frozen transitions, a nonzero
+occurrence selector, pre-mutation immutability, post-mutation indeterminacy, and
+bounded sync-only retry. One actor case proves bounded selection admission,
+exact correlation, active cancellation without mutation, writer-contended
+read-only rejection, and successful quarantine diagnostics; the shared
+cancellation case covers queued Trash. A second proves maintenance-restore loss
+terminates the session while preserving every accepted completion. A 34-case
+actor subprocess matrix kills before and after every frozen Trash transition,
+including repeated observed occurrences, then reopens in a fresh process and
+proves exact retry plus a zero-mutation sync retry. This is process-crash
+evidence only: it does not simulate power loss or establish filesystem
+durability.
 The existing process-lease case now also proves failed in-place maintenance
 upgrade restoration, contended exclusive acquisition, explicit and drop-based
 downgrade, cancellation, writer retention, and read-only rejection. It does
-not execute Trash or satisfy the later failpoint/kill matrix.
+not by itself establish power-loss durability.
 
 Four initial-package cases
 cover exact Create facts and caller-bound Save As fork encoding, retained root/

@@ -2451,6 +2451,14 @@
       "reason": "WP-10B B2 proves private FullVerify request correlation, cancellation, and writer-contended read-only availability without changing session authority."
     },
     {
+      "id": "libtest:mirante4d-project-store:actor::tests::maintenance_restore_loss_terminates_and_drains_exact_completions",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves injected maintenance-restore loss terminates the private session, releases its leases, and preserves exactly one typed terminal completion for active, queued, and Close requests."
+    },
+    {
       "id": "libtest:mirante4d-project-store:actor::tests::compaction_plan_is_correlated_cancellable_and_available_read_only",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -2513,6 +2521,14 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 proves private Trash selection admission, exact request correlation, active cancellation without mutation, writer-contended read-only rejection, and successful authorized quarantine diagnostics; shared actor cancellation evidence covers queued Trash."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:actor::tests::trash_fresh_process_kill_and_retry_matrix",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 kills an actor-routed Trash mutator before and after every observed occurrence of the ten frozen transitions, then proves fresh-process reopen, exact retry, zero-mutation sync retry, lease release, and unchanged refs/retained objects without claiming power-loss durability."
     },
     {
       "id": "libtest:mirante4d-project-store:api::tests::accepted_defaults_match_the_frozen_b2_work_bounds",
@@ -2993,6 +3009,14 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 proves explicit zero-non-regenerable Trash preserves retained shared and anonymous objects, cancels after a synced batch prefix, publishes mirrored generation quarantine, retries exactly, and deduplicates without replacement."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:trash::tests::transition_inventory_failures_and_sync_only_retries_are_exact",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves exact before/after injection for every observed occurrence of all ten frozen Trash transitions, pre-mutation immutability, post-mutation indeterminacy, and bounded sync-only recovery of the exercised partial prefixes."
     },
     {
       "id": "libtest:mirante4d-project-store:trash::tests::unsafe_selection_and_symlinked_inventory_do_not_mutate",
@@ -6012,6 +6036,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 545
+    "current_additions": 548
   }
 }

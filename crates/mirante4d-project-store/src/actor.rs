@@ -17,7 +17,13 @@ use std::{
 };
 
 #[cfg(test)]
-use std::time::{Duration, Instant};
+use std::{
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
+
+#[cfg(test)]
+use crate::lease::GcTransitionInjector;
 
 use crate::{
     ProjectCommitCapture, ProjectGenerationId, ProjectOpenMode, ProjectStoreCommand,
@@ -47,6 +53,8 @@ struct Shared {
     completion_limit: usize,
     trash_selection_limit: usize,
     autosave_enabled: bool,
+    #[cfg(test)]
+    gc_transition_injector: OnceLock<Arc<GcTransitionInjector>>,
 }
 
 struct State {
@@ -317,6 +325,8 @@ impl EstablishedProjectActor {
             completion_limit: limits.actor_completion_queue_max(),
             trash_selection_limit: limits.recovery_candidates_max,
             autosave_enabled: config.autosave_enabled(),
+            #[cfg(test)]
+            gc_transition_injector: OnceLock::new(),
         });
         let worker_shared = Arc::clone(&shared);
         let worker_path = path.clone();
@@ -356,6 +366,21 @@ impl EstablishedProjectActor {
             shared,
             worker: Some(worker),
         })
+    }
+
+    #[cfg(test)]
+    fn start_with_gc_transition_injector(
+        path: &ProjectStorePath,
+        config: ProjectStoreConfig,
+        injector: Arc<GcTransitionInjector>,
+    ) -> Result<Self, ProjectStoreFault> {
+        let actor = Self::start(path, config)?;
+        actor
+            .shared
+            .gc_transition_injector
+            .set(injector)
+            .expect("a test actor installs one GC transition injector");
+        Ok(actor)
     }
 
     /// Accepts only the established-session commands implemented by this core.
@@ -862,6 +887,12 @@ fn worker_main(
                 request_id,
                 generations,
             } => {
+                #[cfg(test)]
+                if let Some(injector) = shared.gc_transition_injector.get() {
+                    session
+                        .leases
+                        .set_gc_transition_injector(Arc::clone(injector));
+                }
                 let result = trash_generations(
                     &session.root,
                     &mut session.leases,
@@ -965,10 +996,11 @@ fn open_resources(
 mod tests {
     use std::{
         collections::BTreeMap,
-        fs,
+        env, fs,
         io::{self, Cursor, Read},
+        os::unix::process::ExitStatusExt,
         path::{Path, PathBuf},
-        process::Command,
+        process::{Child, Command, ExitStatus, Stdio},
         sync::{
             Arc, Condvar, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -992,10 +1024,22 @@ mod tests {
     use crate::{
         ProjectGenerationId, ProjectObjectSource, ProjectStoreLimits,
         generation::{ArtifactStorage, GenerationDocument, LogicalObjectBinding},
+        lease::{GcTransition, GcTransitionTarget, TransitionEdge},
         wire::ProjectEnvelope,
     };
 
     const TIMEOUT: Duration = Duration::from_secs(5);
+    const TRASH_PROCESS_ROLE: &str = "MIRANTE4D_TRASH_PROCESS_ROLE";
+    const TRASH_PROCESS_ROOT: &str = "MIRANTE4D_TRASH_PROCESS_ROOT";
+    const TRASH_PROCESS_GENERATION: &str = "MIRANTE4D_TRASH_PROCESS_GENERATION";
+    const TRASH_PROCESS_TRANSITION: &str = "MIRANTE4D_TRASH_PROCESS_TRANSITION";
+    const TRASH_PROCESS_EDGE: &str = "MIRANTE4D_TRASH_PROCESS_EDGE";
+    const TRASH_PROCESS_OCCURRENCE: &str = "MIRANTE4D_TRASH_PROCESS_OCCURRENCE";
+    const TRASH_PROCESS_MARKER: &str = "MIRANTE4D_TRASH_PROCESS_MARKER";
+    const TRASH_PROCESS_TEST: &str = concat!(
+        "actor::tests::",
+        "trash_fresh_process_kill_and_retry_matrix"
+    );
     const STALE_MANUAL: &str = concat!(
         "m4d-project-generation-v1-sha256:",
         "d5020fa3c69a493b34ffbbf3a67a249354e83e5a6d738479d46c7e301786d2ec"
@@ -1105,6 +1149,48 @@ mod tests {
     impl Drop for TestDirectory {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct ChildGuard(Option<Child>);
+
+    impl ChildGuard {
+        fn new(child: Child) -> Self {
+            Self(Some(child))
+        }
+
+        fn child_mut(&mut self) -> &mut Child {
+            self.0.as_mut().expect("child is live")
+        }
+
+        fn kill_and_wait(&mut self) -> ExitStatus {
+            let mut child = self.0.take().expect("child is live");
+            child.kill().unwrap();
+            child.wait().unwrap()
+        }
+
+        fn wait_timeout(&mut self, timeout: Duration) -> ExitStatus {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if let Some(status) = self.child_mut().try_wait().unwrap() {
+                    self.0.take();
+                    return status;
+                }
+                assert!(Instant::now() < deadline, "child process timed out");
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let Some(mut child) = self.0.take() else {
+                return;
+            };
+            if matches!(child.try_wait(), Ok(None)) {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
         }
     }
 
@@ -2219,6 +2305,431 @@ mod tests {
         read_only.try_submit(close_command(2)).unwrap();
         read_only.recv_timeout(TIMEOUT).unwrap();
         read_only.join().unwrap();
+    }
+
+    #[test]
+    fn maintenance_restore_loss_terminates_and_drains_exact_completions() {
+        fn restore_loss_injector() -> Arc<GcTransitionInjector> {
+            GcTransitionInjector::gated(GcTransitionTarget {
+                transition: GcTransition::MaintenanceRestore,
+                edge: TransitionEdge::Before,
+                occurrence: 0,
+            })
+        }
+
+        let project =
+            TestProject::extracted_store("actor-trash-restore-loss", "recoverable.m4dproj");
+        let selected = crate::trash::tests::install_zero_non_regenerable_orphan(project.path());
+        let injector = restore_loss_injector();
+        let actor = EstablishedProjectActor::start_with_gc_transition_injector(
+            &project.store_path(),
+            Default::default(),
+            Arc::clone(&injector),
+        )
+        .unwrap();
+        actor
+            .try_submit(ProjectStoreCommand::Trash {
+                request_id: request_id(1),
+                generations: vec![selected],
+            })
+            .unwrap();
+        injector.wait_until_parked(TIMEOUT);
+        actor
+            .try_submit(ProjectStoreCommand::FullVerify {
+                request_id: request_id(2),
+            })
+            .unwrap();
+        actor
+            .try_submit(ProjectStoreCommand::PlanCompaction {
+                request_id: request_id(3),
+            })
+            .unwrap();
+        injector.release();
+
+        let mut completed = BTreeSet::new();
+        for _ in 0..3 {
+            let completion = actor.recv_timeout(TIMEOUT).unwrap();
+            completed.insert(completion.request_id());
+            match completion {
+                ProjectStoreCompletion::Trashed {
+                    request_id: actual,
+                    result: Err(ProjectStoreFault::CommitIndeterminate),
+                } if actual == request_id(1) => {}
+                ProjectStoreCompletion::Verified {
+                    request_id: actual,
+                    result: Err(ProjectStoreFault::Cancelled),
+                } if actual == request_id(2) => {}
+                ProjectStoreCompletion::CompactionPlanned {
+                    request_id: actual,
+                    result: Err(ProjectStoreFault::Cancelled),
+                } if actual == request_id(3) => {}
+                other => panic!("unexpected maintenance-loss completion: {other:?}"),
+            }
+        }
+        assert_eq!(completed, [1, 2, 3].into_iter().map(request_id).collect());
+        assert!(actor.has_exited());
+        assert_eq!(
+            actor.try_submit(close_command(4)),
+            Err(ProjectStoreFault::Corruption {
+                stage: "actor_closed"
+            })
+        );
+        assert!(actor.recv_timeout(Duration::from_millis(10)).is_none());
+        actor.join().unwrap();
+
+        let root = LocalStoreRoot::open(project.path()).unwrap();
+        let mut leases = acquire_writer_eventually(&root);
+        assert!(leases.has_writer());
+        let retry = crate::trash::trash_generations(
+            &root,
+            &mut leases,
+            &[selected],
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(retry.published_objects, 0);
+        assert_eq!(retry.streamed_bytes, 0);
+
+        let closing =
+            TestProject::extracted_store("actor-trash-restore-close", "recoverable.m4dproj");
+        let selected = crate::trash::tests::install_zero_non_regenerable_orphan(closing.path());
+        let injector = restore_loss_injector();
+        let actor = EstablishedProjectActor::start_with_gc_transition_injector(
+            &closing.store_path(),
+            Default::default(),
+            Arc::clone(&injector),
+        )
+        .unwrap();
+        actor
+            .try_submit(ProjectStoreCommand::Trash {
+                request_id: request_id(1),
+                generations: vec![selected],
+            })
+            .unwrap();
+        injector.wait_until_parked(TIMEOUT);
+        actor.try_submit(close_command(2)).unwrap();
+        injector.release();
+        assert!(matches!(
+            actor.recv_timeout(TIMEOUT),
+            Some(ProjectStoreCompletion::Trashed {
+                request_id: actual,
+                result: Err(ProjectStoreFault::CommitIndeterminate),
+            }) if actual == request_id(1)
+        ));
+        assert!(matches!(
+            actor.recv_timeout(TIMEOUT),
+            Some(ProjectStoreCompletion::Closed {
+                request_id: actual,
+                result: Ok(()),
+            }) if actual == request_id(2)
+        ));
+        assert!(actor.recv_timeout(Duration::from_millis(10)).is_none());
+        actor.join().unwrap();
+
+        let suspended =
+            TestProject::extracted_store("actor-trash-suspended", "recoverable.m4dproj");
+        let selected = crate::trash::tests::install_zero_non_regenerable_orphan(suspended.path());
+        let injector = GcTransitionInjector::failing(GcTransitionTarget {
+            transition: GcTransition::TrashDirectorySync,
+            edge: TransitionEdge::Before,
+            occurrence: 0,
+        });
+        let actor = EstablishedProjectActor::start_with_gc_transition_injector(
+            &suspended.store_path(),
+            Default::default(),
+            injector,
+        )
+        .unwrap();
+        actor
+            .try_submit(ProjectStoreCommand::Trash {
+                request_id: request_id(1),
+                generations: vec![selected],
+            })
+            .unwrap();
+        assert!(matches!(
+            actor.recv_timeout(TIMEOUT),
+            Some(ProjectStoreCompletion::Trashed {
+                request_id: actual,
+                result: Err(ProjectStoreFault::CommitIndeterminate),
+            }) if actual == request_id(1)
+        ));
+        assert!(!actor.has_exited());
+        actor
+            .try_submit(ProjectStoreCommand::FullVerify {
+                request_id: request_id(2),
+            })
+            .unwrap();
+        assert!(matches!(
+            actor.recv_timeout(TIMEOUT),
+            Some(ProjectStoreCompletion::Verified {
+                request_id: actual,
+                result: Ok(_),
+            }) if actual == request_id(2)
+        ));
+        actor
+            .try_submit(ProjectStoreCommand::Trash {
+                request_id: request_id(3),
+                generations: vec![selected],
+            })
+            .unwrap();
+        assert!(matches!(
+            actor.recv_timeout(TIMEOUT),
+            Some(ProjectStoreCompletion::Trashed {
+                request_id: actual,
+                result: Err(ProjectStoreFault::CommitIndeterminate),
+            }) if actual == request_id(3)
+        ));
+        actor.try_submit(close_command(4)).unwrap();
+        assert!(matches!(
+            actor.recv_timeout(TIMEOUT),
+            Some(ProjectStoreCompletion::Closed {
+                request_id: actual,
+                result: Ok(()),
+            }) if actual == request_id(4)
+        ));
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn trash_fresh_process_kill_and_retry_matrix() {
+        if let Some(role) = env::var_os(TRASH_PROCESS_ROLE) {
+            let root_path = PathBuf::from(env::var_os(TRASH_PROCESS_ROOT).unwrap());
+            let store_path = ProjectStorePath::new(root_path.clone()).unwrap();
+            let selected =
+                ProjectGenerationId::parse(env::var(TRASH_PROCESS_GENERATION).unwrap().as_str())
+                    .unwrap();
+            match role.to_str().unwrap() {
+                "mutator" => {
+                    let transition =
+                        GcTransition::parse(env::var(TRASH_PROCESS_TRANSITION).unwrap().as_str())
+                            .unwrap();
+                    let edge =
+                        TransitionEdge::parse(env::var(TRASH_PROCESS_EDGE).unwrap().as_str())
+                            .unwrap();
+                    let occurrence = env::var(TRASH_PROCESS_OCCURRENCE)
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap();
+                    let marker = PathBuf::from(env::var_os(TRASH_PROCESS_MARKER).unwrap());
+                    let injector = GcTransitionInjector::parking(
+                        GcTransitionTarget {
+                            transition,
+                            edge,
+                            occurrence,
+                        },
+                        marker,
+                    );
+                    let actor = EstablishedProjectActor::start_with_gc_transition_injector(
+                        &store_path,
+                        Default::default(),
+                        injector,
+                    )
+                    .unwrap();
+                    actor
+                        .try_submit(ProjectStoreCommand::Trash {
+                            request_id: request_id(1),
+                            generations: vec![selected],
+                        })
+                        .unwrap();
+                    panic!(
+                        "mutator escaped its transition hook: {:?}",
+                        actor.recv_timeout(Duration::from_secs(30))
+                    );
+                }
+                "recover" => {
+                    let actor =
+                        EstablishedProjectActor::start(&store_path, Default::default()).unwrap();
+                    actor
+                        .try_submit(ProjectStoreCommand::Trash {
+                            request_id: request_id(1),
+                            generations: vec![selected],
+                        })
+                        .unwrap();
+                    assert!(matches!(
+                        actor.recv_timeout(TIMEOUT),
+                        Some(ProjectStoreCompletion::Trashed {
+                            request_id: actual,
+                            result: Ok(_),
+                        }) if actual == request_id(1)
+                    ));
+                    actor.try_submit(close_command(2)).unwrap();
+                    assert!(matches!(
+                        actor.recv_timeout(TIMEOUT),
+                        Some(ProjectStoreCompletion::Closed {
+                            request_id: actual,
+                            result: Ok(()),
+                        }) if actual == request_id(2)
+                    ));
+                    actor.join().unwrap();
+
+                    let retry =
+                        EstablishedProjectActor::start(&store_path, Default::default()).unwrap();
+                    retry
+                        .try_submit(ProjectStoreCommand::Trash {
+                            request_id: request_id(1),
+                            generations: vec![selected],
+                        })
+                        .unwrap();
+                    assert!(matches!(
+                        retry.recv_timeout(TIMEOUT),
+                        Some(ProjectStoreCompletion::Trashed {
+                            request_id: actual,
+                            result: Ok(ProjectStoreDiagnostics {
+                                published_objects: 0,
+                                streamed_bytes: 0,
+                                ..
+                            }),
+                        }) if actual == request_id(1)
+                    ));
+                    retry.try_submit(close_command(2)).unwrap();
+                    assert!(matches!(
+                        retry.recv_timeout(TIMEOUT),
+                        Some(ProjectStoreCompletion::Closed {
+                            request_id: actual,
+                            result: Ok(()),
+                        }) if actual == request_id(2)
+                    ));
+                    retry.join().unwrap();
+                    return;
+                }
+                other => panic!("unexpected Trash process role {other}"),
+            }
+        }
+
+        let markers = TestDirectory::new("trash-kill-markers");
+        let mut killed = 0_usize;
+        let mut recovered = 0_usize;
+        let mut cases = Vec::new();
+        for transition in GcTransition::ALL {
+            let occurrences = match transition {
+                GcTransition::TrashDirectoryCreate => 4,
+                GcTransition::TrashDirectorySync => 5,
+                _ => 1,
+            };
+            for edge in [TransitionEdge::Before, TransitionEdge::After] {
+                for occurrence in 0..occurrences {
+                    cases.push((transition, edge, occurrence));
+                }
+            }
+        }
+        assert_eq!(cases.len(), 34);
+        for (case, (transition, edge, occurrence)) in cases.into_iter().enumerate() {
+            let project =
+                TestProject::extracted_store(&format!("trash-kill-{case}"), "recoverable.m4dproj");
+            let selected = crate::trash::tests::install_zero_non_regenerable_orphan(project.path());
+            let active = crate::trash::tests::active_generation_file(project.path(), selected);
+            let trash = crate::trash::tests::trash_generation_file(project.path(), selected);
+            let selected_bytes = fs::read(&active).unwrap();
+            if matches!(
+                transition,
+                GcTransition::TrashCollisionFileSync | GcTransition::ActiveDeduplicateRemove
+            ) {
+                let root = LocalStoreRoot::open(project.path()).unwrap();
+                let mut leases =
+                    ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+                crate::trash::trash_generations(
+                    &root,
+                    &mut leases,
+                    &[selected],
+                    ProjectStoreLimits::default(),
+                    || false,
+                )
+                .unwrap();
+                fs::create_dir_all(active.parent().unwrap()).unwrap();
+                fs::write(&active, &selected_bytes).unwrap();
+            }
+            let anonymous = crate::trash::tests::install_anonymous_object(project.path());
+            let anonymous_bytes = fs::read(&anonymous).unwrap();
+            let refs_before = file_tree(&project.path().join("refs"));
+            let objects_before = file_tree(&project.path().join("objects"));
+            let marker = markers.path().join(format!(
+                "{case}-{}-{}-{occurrence}",
+                transition.name(),
+                edge.name()
+            ));
+            let mut mutator = ChildGuard::new(
+                Command::new(env::current_exe().unwrap())
+                    .arg(TRASH_PROCESS_TEST)
+                    .arg("--exact")
+                    .arg("--nocapture")
+                    .env(TRASH_PROCESS_ROLE, "mutator")
+                    .env(TRASH_PROCESS_ROOT, project.path())
+                    .env(TRASH_PROCESS_GENERATION, selected.to_string())
+                    .env(TRASH_PROCESS_TRANSITION, transition.name())
+                    .env(TRASH_PROCESS_EDGE, edge.name())
+                    .env(TRASH_PROCESS_OCCURRENCE, occurrence.to_string())
+                    .env(TRASH_PROCESS_MARKER, &marker)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + TIMEOUT;
+            while !marker.exists() {
+                if let Some(status) = mutator.child_mut().try_wait().unwrap() {
+                    panic!(
+                        "mutator exited before {} {} occurrence {occurrence}: {status}",
+                        transition.name(),
+                        edge.name()
+                    );
+                }
+                if Instant::now() >= deadline {
+                    panic!(
+                        "mutator did not reach {} {} occurrence {occurrence}",
+                        transition.name(),
+                        edge.name()
+                    );
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            let killed_status = mutator.kill_and_wait();
+            assert_eq!(killed_status.signal(), Some(9));
+            killed += 1;
+
+            let mut recovery = ChildGuard::new(
+                Command::new(env::current_exe().unwrap())
+                    .arg(TRASH_PROCESS_TEST)
+                    .arg("--exact")
+                    .arg("--nocapture")
+                    .env(TRASH_PROCESS_ROLE, "recover")
+                    .env(TRASH_PROCESS_ROOT, project.path())
+                    .env(TRASH_PROCESS_GENERATION, selected.to_string())
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let recovery_status = recovery.wait_timeout(Duration::from_secs(10));
+            assert!(
+                recovery_status.success(),
+                "fresh recovery failed after {} {} occurrence {occurrence}",
+                transition.name(),
+                edge.name()
+            );
+            recovered += 1;
+
+            let root = LocalStoreRoot::open(project.path()).unwrap();
+            assert!(
+                !crate::inspection::inspect_store_graph(
+                    &root,
+                    ProjectStoreLimits::default(),
+                    || false,
+                )
+                .unwrap()
+                .generation_ids()
+                .contains(&selected)
+            );
+            assert!(!active.exists());
+            assert_eq!(fs::read(&trash).unwrap(), selected_bytes);
+            assert_eq!(file_tree(&project.path().join("refs")), refs_before);
+            assert_eq!(file_tree(&project.path().join("objects")), objects_before);
+            assert_eq!(fs::read(&anonymous).unwrap(), anonymous_bytes);
+        }
+        assert_eq!(killed, 34);
+        assert_eq!(recovered, 34);
+        eprintln!(
+            "M4D_TRASH_PROCESS_MATRIX_V1 cases=34 killed=34 fresh_reopens=34 retry_completed=34 zero_mutation_sync_retries=34 process_crash_only=true power_loss_simulated=false durability_claim=false"
+        );
     }
 
     #[test]
