@@ -2451,6 +2451,14 @@
       "reason": "WP-10B B2 proves private FullVerify request correlation, cancellation, and writer-contended read-only availability without changing session authority."
     },
     {
+      "id": "libtest:mirante4d-project-store:actor::tests::compaction_plan_is_correlated_cancellable_and_available_read_only",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves private PlanCompaction request correlation and writer-contended read-only availability without authorizing mutation; shared actor cancellation evidence covers its queued cancellation."
+    },
+    {
       "id": "libtest:mirante4d-project-store:actor::tests::queued_autosaves_coalesce_and_completion_obligations_stay_bounded",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -2585,6 +2593,14 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 proves established-store inspection fails closed on cancellation, inventory capacity, and corrupt control bytes without mutation."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:inspection::tests::compaction_plan_lists_exact_orphan_recovery_review_without_mutation",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves bounded stable-snapshot PlanCompaction lists every fixture-exact orphan as metadata-only recovery review and changes no store bytes."
     },
     {
       "id": "libtest:mirante4d-project-store:inspection::tests::eager_inspection_checks_object_metadata_but_defers_payload_digests",
@@ -5972,6 +5988,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 540
+    "current_additions": 542
   }
 }

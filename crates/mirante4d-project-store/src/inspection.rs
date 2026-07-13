@@ -110,6 +110,7 @@ pub(crate) struct StoreGraphInspection {
     object_facts: Vec<PhysicalObject>,
     live_object_facts: Vec<PhysicalObject>,
     unrooted_object_facts: Vec<PhysicalObject>,
+    orphan_candidates: Vec<ProjectRecoveryCandidate>,
 }
 
 /// Compact exact authority and namespace facts used to reject a verification
@@ -286,6 +287,10 @@ impl StoreGraphInspection {
     /// may still be shared by an unselected recovery candidate.
     pub(crate) fn unrooted_object_facts(&self) -> &[PhysicalObject] {
         &self.unrooted_object_facts
+    }
+
+    pub(crate) fn orphan_candidates(&self) -> &[ProjectRecoveryCandidate] {
+        &self.orphan_candidates
     }
 
     pub(crate) fn snapshot(&self) -> StoreGraphSnapshot {
@@ -601,8 +606,18 @@ where
         .map(|object| (object.digest(), object.byte_length()))
         .collect::<BTreeMap<_, _>>();
     let authority = state.authority_generation();
+    let manual_observation = state
+        .manual()
+        .map(|lane| RefObservation::Valid(lane.head))
+        .unwrap_or(RefObservation::Missing);
+    let current_manual_generation = state.manual().map(|lane| lane.head.current());
+    let current_manual_summary = state
+        .manual_generation()
+        .map(RecoveryGenerationSummary::from_document)
+        .transpose()?;
     let mut live_objects = BTreeSet::new();
     let mut provenance = BTreeMap::new();
+    let mut orphan_candidates = Vec::new();
     for generation_id in &generation_ids {
         check_cancelled(&mut is_cancelled)?;
         let bytes = root
@@ -636,6 +651,22 @@ where
                 document.base_manual_generation_id(),
             ),
         );
+        if !root_set.contains(generation_id) {
+            let summary = RecoveryGenerationSummary::from_document(&document)?;
+            let classification = classify_recovery_summary(
+                &summary,
+                manual_observation,
+                current_manual_generation,
+                current_manual_summary.as_ref(),
+            );
+            orphan_candidates.push(ProjectRecoveryCandidate::from_facts(
+                *generation_id,
+                summary.facts,
+                RecoveryOrigin::OrphanScan,
+                classification,
+                current_manual_generation,
+            )?);
+        }
         validate_physical_closure_metadata(root, &document, limits, &mut is_cancelled)?;
         for object in document.reachable_objects() {
             if actual_objects.get(&object.digest()) != Some(&object.byte_length()) {
@@ -679,7 +710,32 @@ where
         object_facts,
         live_object_facts,
         unrooted_object_facts,
+        orphan_candidates,
     })
+}
+
+pub(crate) fn plan_compaction<C>(
+    root: &LocalStoreRoot,
+    limits: ProjectStoreLimits,
+    mut is_cancelled: C,
+) -> Result<Vec<ProjectRecoveryCandidate>, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    let graph = inspect_store_graph(root, limits, &mut is_cancelled)?;
+    let snapshot = graph.snapshot();
+    let candidates = graph.orphan_candidates().to_vec();
+    check_cancelled(&mut is_cancelled)?;
+    let final_graph = match inspect_store_graph(root, limits, &mut is_cancelled) {
+        Ok(graph) => graph,
+        Err(ProjectStoreFault::Cancelled) => return Err(ProjectStoreFault::Cancelled),
+        Err(_) => return Err(ProjectStoreFault::SourceChanged),
+    };
+    if final_graph.snapshot() != snapshot {
+        return Err(ProjectStoreFault::SourceChanged);
+    }
+    check_cancelled(&mut is_cancelled)?;
+    Ok(candidates)
 }
 
 pub(crate) fn inspect_recovery<C>(
@@ -1727,6 +1783,7 @@ fn map_local_error(error: LocalPublicationError, stage: &'static str) -> Project
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::Cell,
         collections::BTreeMap,
         fs,
         os::unix::fs::symlink,
@@ -2003,6 +2060,109 @@ mod tests {
             );
             assert_eq!(all_file_bytes(project.path()), before);
         }
+    }
+
+    #[test]
+    fn compaction_plan_lists_exact_orphan_recovery_review_without_mutation() {
+        let limits = ProjectStoreLimits::default();
+        for (store, expected) in [
+            (
+                "recoverable.m4dproj",
+                Some((RECOVERABLE_ORPHAN, 2_u32, 1_u32)),
+            ),
+            ("divergent.m4dproj", Some((DIVERGENT_ORPHAN, 1_u32, 1_u32))),
+            ("stale.m4dproj", None),
+            ("provisional.m4dproj", None),
+        ] {
+            let project = TestProject::extracted("compaction-plan", store);
+            let before = all_file_bytes(project.path());
+            let root = LocalStoreRoot::open(project.path()).unwrap();
+            let candidates = plan_compaction(&root, limits, || false).unwrap();
+            match expected {
+                Some((generation, artifacts, non_regenerable)) => {
+                    assert_eq!(candidates.len(), 1);
+                    let candidate = &candidates[0];
+                    assert_eq!(candidate.generation_id(), generation_id(generation));
+                    assert_eq!(candidate.origin(), "orphan_scan");
+                    assert_eq!(candidate.classification(), "manual_branch");
+                    assert_eq!(candidate.artifact_count(), artifacts);
+                    assert_eq!(candidate.non_regenerable_artifact_count(), non_regenerable);
+                }
+                None => assert!(candidates.is_empty()),
+            }
+            assert_eq!(all_file_bytes(project.path()), before);
+        }
+
+        let ordered = TestProject::extracted("compaction-order", "recoverable.m4dproj");
+        fs::remove_file(ordered.path().join("refs/autosave-head")).unwrap();
+        fs::remove_file(ordered.path().join("refs/autosave-recovery")).unwrap();
+        let ordered_before = all_file_bytes(ordered.path());
+        let ordered_root = LocalStoreRoot::open(ordered.path()).unwrap();
+        let ordered_candidates = plan_compaction(&ordered_root, limits, || false).unwrap();
+        assert_eq!(
+            ordered_candidates
+                .iter()
+                .map(ProjectRecoveryCandidate::generation_id)
+                .collect::<Vec<_>>(),
+            [
+                RECOVERABLE_ORPHAN,
+                RECOVERABLE_AUTOSAVE,
+                RECOVERABLE_AUTOSAVE_PREVIOUS,
+            ]
+            .map(generation_id)
+        );
+        assert_eq!(
+            ordered_candidates
+                .iter()
+                .map(ProjectRecoveryCandidate::classification)
+                .collect::<Vec<_>>(),
+            ["manual_branch", "newer", "newer"]
+        );
+        assert!(
+            ordered_candidates
+                .iter()
+                .all(|candidate| candidate.origin() == "orphan_scan")
+        );
+        assert_eq!(all_file_bytes(ordered.path()), ordered_before);
+
+        let cancelled = TestProject::extracted("compaction-cancel", "recoverable.m4dproj");
+        let cancelled_root = LocalStoreRoot::open(cancelled.path()).unwrap();
+        let before = all_file_bytes(cancelled.path());
+        assert!(matches!(
+            plan_compaction(&cancelled_root, limits, || true),
+            Err(ProjectStoreFault::Cancelled)
+        ));
+        assert_eq!(all_file_bytes(cancelled.path()), before);
+
+        let drifted = TestProject::extracted("compaction-drift", "recoverable.m4dproj");
+        let drifted_root = LocalStoreRoot::open(drifted.path()).unwrap();
+        let mut expected_after_drift = all_file_bytes(drifted.path());
+        let old_relative = PathBuf::from("refs/pins/checkpoint-a");
+        let new_relative = PathBuf::from("refs/pins/checkpoint-b");
+        let pin_bytes = expected_after_drift.remove(&old_relative).unwrap();
+        expected_after_drift.insert(new_relative.clone(), pin_bytes);
+        let polls = Cell::new(0_usize);
+        inspect_store_graph(&drifted_root, limits, || {
+            polls.set(polls.get().saturating_add(1));
+            false
+        })
+        .unwrap();
+        let first_pass_polls = polls.get();
+        let old_pin = drifted.path().join(old_relative);
+        let new_pin = drifted.path().join(new_relative);
+        let calls = Cell::new(0_usize);
+        assert!(matches!(
+            plan_compaction(&drifted_root, limits, || {
+                let next = calls.get().saturating_add(1);
+                calls.set(next);
+                if next == first_pass_polls.saturating_add(1) {
+                    fs::rename(&old_pin, &new_pin).unwrap();
+                }
+                false
+            }),
+            Err(ProjectStoreFault::SourceChanged)
+        ));
+        assert_eq!(all_file_bytes(drifted.path()), expected_after_drift);
     }
 
     #[test]

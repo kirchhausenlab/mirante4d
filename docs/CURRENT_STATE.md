@@ -172,6 +172,9 @@ phases, but the exhaustive failpoint/kill matrix is not yet implemented. A
 private read-only FullVerify path now hashes every physical object in one
 bounded stable active-store snapshot, reconstructs paged logical objects,
 supports cancellation and read-only sessions, and changes no store bytes.
+Private PlanCompaction now returns a bounded stable-snapshot recovery-review
+candidate for every orphan generation without mutation and remains available
+read-only.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
@@ -205,8 +208,10 @@ See [testing](TESTING.md) for commands and claim language.
   established-store inspection authority as transaction preflight. Public
   Create/Open/Save As execution,
   provisional autosave publication, public/product recovery workflow, timers,
-  garbage collection, public actor construction, durability qualification, and
-  every product path remain unimplemented. Private FullVerify does not validate
+  garbage-collection mutation, public actor construction, durability
+  qualification, and every product path remain unimplemented. PlanCompaction
+  does not authorize Trash, expose a physical object/byte plan or reclaim
+  estimate, or prove backup approval. Private FullVerify does not validate
   artifact scientific semantics, repair data, inspect trash, or establish a
   durability claim.
 - The package-capability lane remains pending until there is an honest

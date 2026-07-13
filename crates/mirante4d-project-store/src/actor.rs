@@ -96,6 +96,9 @@ enum Work {
         request_id: ProjectStoreRequestId,
         checkpoint_id: String,
     },
+    PlanCompaction {
+        request_id: ProjectStoreRequestId,
+    },
     FullVerify {
         request_id: ProjectStoreRequestId,
     },
@@ -111,6 +114,7 @@ impl Work {
             | Self::OpenRecovery { request_id, .. }
             | Self::Pin { request_id, .. }
             | Self::Unpin { request_id, .. }
+            | Self::PlanCompaction { request_id }
             | Self::FullVerify { request_id } => *request_id,
         }
     }
@@ -146,6 +150,10 @@ impl Work {
                 result: Err(ProjectStoreFault::Cancelled),
             },
             Self::Unpin { request_id, .. } => ProjectStoreCompletion::Unpinned {
+                request_id,
+                result: Err(ProjectStoreFault::Cancelled),
+            },
+            Self::PlanCompaction { request_id } => ProjectStoreCompletion::CompactionPlanned {
                 request_id,
                 result: Err(ProjectStoreFault::Cancelled),
             },
@@ -401,6 +409,9 @@ impl EstablishedProjectActor {
             ProjectStoreCommand::Unpin { .. } => Err(ProjectStoreFault::Corruption {
                 stage: "checkpoint_id",
             }),
+            ProjectStoreCommand::PlanCompaction { request_id } => {
+                self.submit_work(Work::PlanCompaction { request_id })
+            }
             ProjectStoreCommand::FullVerify { request_id } => {
                 self.submit_work(Work::FullVerify { request_id })
             }
@@ -793,6 +804,12 @@ fn worker_main(
                     limits,
                     || cancelled.load(Ordering::Acquire),
                 ),
+            },
+            Work::PlanCompaction { request_id } => ProjectStoreCompletion::CompactionPlanned {
+                request_id,
+                result: crate::inspection::plan_compaction(&session.root, limits, || {
+                    cancelled.load(Ordering::Acquire)
+                }),
             },
             Work::FullVerify { request_id } => {
                 let result = crate::full_verify::full_verify(&session.root, limits, || {
@@ -1922,6 +1939,77 @@ mod tests {
     }
 
     #[test]
+    fn compaction_plan_is_correlated_cancellable_and_available_read_only() {
+        fn assert_exact_plan(completion: ProjectStoreCompletion) {
+            let candidates = match completion {
+                ProjectStoreCompletion::CompactionPlanned {
+                    request_id: actual,
+                    result: Ok(candidates),
+                } if actual == request_id(1) => candidates,
+                other => panic!("unexpected PlanCompaction completion: {other:?}"),
+            };
+            assert_eq!(candidates.len(), 1);
+            let candidate = &candidates[0];
+            assert_eq!(candidate.generation_id(), generation_id(RECOVERABLE_ORPHAN));
+            assert_eq!(candidate.generation_sequence(), 4);
+            assert_eq!(candidate.revision_sequence(), 5);
+            assert_eq!(candidate.origin(), "orphan_scan");
+            assert_eq!(candidate.classification(), "manual_branch");
+            assert_eq!(candidate.base_manual_generation_id(), None);
+            assert_eq!(
+                candidate.current_manual_generation_id(),
+                Some(generation_id(RECOVERABLE_G2))
+            );
+            assert_eq!(candidate.artifact_count(), 2);
+            assert_eq!(candidate.non_regenerable_artifact_count(), 1);
+        }
+
+        let writable = TestProject::extracted_store("actor-compaction-plan", "recoverable.m4dproj");
+        let before = file_tree(writable.path());
+        let actor =
+            EstablishedProjectActor::start(&writable.store_path(), Default::default()).unwrap();
+        actor
+            .try_submit(ProjectStoreCommand::PlanCompaction {
+                request_id: request_id(1),
+            })
+            .unwrap();
+        assert_exact_plan(actor.recv_timeout(TIMEOUT).unwrap());
+        assert_eq!(file_tree(writable.path()), before);
+        actor.try_submit(close_command(2)).unwrap();
+        actor.recv_timeout(TIMEOUT).unwrap();
+        actor.join().unwrap();
+
+        let contended =
+            TestProject::extracted_store("actor-compaction-plan-read-only", "recoverable.m4dproj");
+        let before = file_tree(contended.path());
+        let held_root = LocalStoreRoot::open(contended.path()).unwrap();
+        let held_writer =
+            ProjectStoreLeases::acquire(&held_root, ProjectOpenMode::PreferWritable).unwrap();
+        assert!(held_writer.has_writer());
+        let read_only =
+            EstablishedProjectActor::start(&contended.store_path(), Default::default()).unwrap();
+        read_only
+            .try_submit(ProjectStoreCommand::PlanCompaction {
+                request_id: request_id(1),
+            })
+            .unwrap();
+        assert_exact_plan(read_only.recv_timeout(TIMEOUT).unwrap());
+        assert_eq!(file_tree(contended.path()), before);
+        read_only.try_submit(manual_command(2)).unwrap();
+        assert!(matches!(
+            read_only.recv_timeout(TIMEOUT),
+            Some(ProjectStoreCompletion::ManualSaved {
+                request_id: actual,
+                result: Err(ProjectStoreFault::ReadOnly),
+            }) if actual == request_id(2)
+        ));
+        assert_eq!(file_tree(contended.path()), before);
+        read_only.try_submit(close_command(3)).unwrap();
+        read_only.recv_timeout(TIMEOUT).unwrap();
+        read_only.join().unwrap();
+    }
+
+    #[test]
     fn full_verify_is_correlated_cancellable_and_available_read_only() {
         let writable = TestProject::extracted("actor-full-verify");
         let actor =
@@ -2138,12 +2226,21 @@ mod tests {
         assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 8);
         assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 9);
 
-        actor.try_submit(cancel_command(10, 1)).unwrap();
-        assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 10);
+        actor
+            .try_submit(ProjectStoreCommand::PlanCompaction {
+                request_id: request_id(10),
+            })
+            .unwrap();
+        actor.try_submit(cancel_command(11, 10)).unwrap();
+        assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 10);
+        assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 11);
+
+        actor.try_submit(cancel_command(12, 1)).unwrap();
+        assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 12);
         gate.release();
         assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 1);
 
-        actor.try_submit(close_command(11)).unwrap();
+        actor.try_submit(close_command(13)).unwrap();
         assert!(matches!(
             actor.recv_timeout(TIMEOUT),
             Some(ProjectStoreCompletion::Closed { result: Ok(()), .. })
@@ -2313,6 +2410,9 @@ mod tests {
                 request_id: actual_id,
                 result: Err(ProjectStoreFault::Cancelled)
             } | ProjectStoreCompletion::Unpinned {
+                request_id: actual_id,
+                result: Err(ProjectStoreFault::Cancelled)
+            } | ProjectStoreCompletion::CompactionPlanned {
                 request_id: actual_id,
                 result: Err(ProjectStoreFault::Cancelled)
             } | ProjectStoreCompletion::Verified {

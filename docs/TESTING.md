@@ -157,7 +157,7 @@ first and advancing autosave generations and refs, replace a divergent lane
 against the current manual base, accept a lower revision with a non-regressing
 high-water mark, reject stale parent/base and invalid recovery/capacity state,
 retry an exact recovery-ahead cancellation, and distinguish recovery-sync
-failure from write-suspending head indeterminacy. Eleven actor cases exercise the
+failure from write-suspending head indeterminacy. Twelve actor cases exercise the
 real established manual/autosave primitives under one worker and prove exact
 request correlation, the request/completion bounds, queued-autosave coalescing,
 active and queued cancellation, close rejection, writer-lease lifetime, and
@@ -195,6 +195,14 @@ cancellable execution remains available in a writer-contended read-only
 session. This evidence does not validate artifact scientific semantics, repair
 data, verify trash, establish durability, construct the public actor, or wire a
 product path.
+One inspection case proves PlanCompaction returns every fixture-exact orphan as
+a deterministic bounded recovery-review candidate, including ordered manual
+and autosave classifications, rejects injected snapshot drift, and changes no
+bytes. One actor case proves correlated planning remains available in a
+writer-contended read-only session; the shared cancellation case covers queued
+PlanCompaction. This is not
+Trash authorization, a physical object/byte plan, a reclaim estimate, backup
+approval, mutation, durability evidence, or public/product wiring.
 Four initial-package cases
 cover exact Create facts and caller-bound Save As fork encoding, retained root/
 lease validity, exact descriptor admission, existing directory/file/symlink

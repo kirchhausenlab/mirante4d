@@ -48,6 +48,11 @@ stable active-store snapshot, reconstructs paged logical objects, remains
 cancellable and available read-only, and changes no store authority. Artifact
 scientific semantics, repair, trash, durability, and public/product wiring are
 outside this slice.
+A private bounded PlanCompaction path now returns stable-snapshot metadata-only
+recovery-review candidates for every orphan generation. It is cancellable,
+available read-only, and non-mutating; Trash authorization, object/byte moves,
+reclaim estimates, backup approval, durability, and public/product wiring stay
+outside this slice.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.
