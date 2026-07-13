@@ -29,6 +29,10 @@ const RECOVERY_AHEAD_CORRECTION_PATH: &str =
     "architecture/wp10b-project-store-recovery-ahead-correction.json";
 const RECOVERY_AHEAD_CORRECTION_SHA256: &str =
     "dcc908615da8ba94c937fa4ae6745651734caf56f7583ef2638f9e9cc90a6aa1";
+const RECOVERY_API_CORRECTION_PATH: &str =
+    "architecture/wp10b-project-store-recovery-api-correction.json";
+const RECOVERY_API_CORRECTION_SHA256: &str =
+    "48957fd7c36a34cd916f659cd3becaf8b54c497ab55ad2ed120af8ac2e384e73";
 const PROTECTED_MAIN_COMMIT: &str = "b6e0267802f8ac2d0d49a0f04302fd321ef2f617";
 const PROTECTED_MAIN_TREE: &str = "b20b598603b47fdbe7c85c3b6d1cba8c78fd433e";
 const PROTECTED_MAIN_RUN: &str =
@@ -39,11 +43,11 @@ const FIXTURE_MANIFEST_PATH: &str = "fixtures/project/manifest.json";
 const ZERO_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 // SHA-256 of the parsed contract serialized with sorted object keys and with only
-// fixture_manifest.sha256 replaced by ZERO_SHA256. This freezes every other B1
-// wire, limit, API, and transition fact while allowing the independent fixture
-// producer to be bound after it has emitted its final manifest.
+// fixture_manifest.sha256 replaced by ZERO_SHA256. This freezes the accepted B1
+// contract plus bound corrections while allowing the independent fixture
+// producer to remain bound to its final manifest.
 const NORMALIZED_CONTRACT_SHA256: &str =
-    "b13dd04c37d816d4437ee9cfb564765eca60c10e2d04735db8baffbf8406148d";
+    "8cb08e614c619097d14a95b5634d21a180d431b3fed8a4e155da115def9533a8";
 
 pub(super) fn check_wp10b_project_store_contract(repo_root: &Path) -> anyhow::Result<()> {
     let contract_path = repo_root.join(CONTRACT_PATH);
@@ -81,6 +85,11 @@ fn validate_header_and_bindings(repo_root: &Path, contract: &Value) -> anyhow::R
             "recovery_ahead_correction",
             RECOVERY_AHEAD_CORRECTION_PATH,
             RECOVERY_AHEAD_CORRECTION_SHA256,
+        ),
+        (
+            "recovery_api_correction",
+            RECOVERY_API_CORRECTION_PATH,
+            RECOVERY_API_CORRECTION_SHA256,
         ),
     ] {
         expect_string(contract, &format!("/bindings/{name}/path"), path)?;

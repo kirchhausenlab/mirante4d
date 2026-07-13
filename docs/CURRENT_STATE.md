@@ -156,7 +156,11 @@ parent or autosave-base provenance as liveness. A crate-private destination-
 local installer now builds a
 complete initial Create or Save As package in a sibling stage, validates and
 synchronizes it, and installs it with a no-clobber rename while retaining the
-root and leases. The frozen public actor remains non-constructible and the
+root and leases. The corrected public API now requires successful Open and
+OpenRecovery completions to return both session and loaded projection, and
+distinguishes manual recovery branches from autosave divergence without
+changing any persisted bytes. Execution of those commands is still absent.
+The frozen public actor remains non-constructible and the
 crate remains off-product.
 
 Replacement, import/multiscale generation, and product activation remain

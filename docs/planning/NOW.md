@@ -30,7 +30,10 @@ root and leases only after that transaction durably installs the fork. B2
 now also has one bounded metadata graph over established or provisional store
 state, canonical generation/object namespace enumeration, exact ref/pin roots,
 and capped orphan candidates. It performs no repair, payload hashing, or
-deletion. B2 remains active off-product: public Create/Open/Save As execution,
+deletion. A narrow accepted correction now makes successful Open and
+OpenRecovery return both the held session and loaded projection and adds an
+honest manual-branch recovery classification without changing persisted bytes.
+B2 remains active off-product: public Create/Open/Save As execution,
 provisional autosave publication, recovery/open, timers, garbage collection,
 full verification, and public actor wiring remain later work, with product
 activation at B4.

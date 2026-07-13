@@ -150,7 +150,11 @@ provisional stores and strictly enumerates the immutable generation/object
 namespaces, validates every generation metadata closure, and reports exact
 ref/pin roots plus capped orphan generations. Parent and autosave-base IDs are
 relations, not liveness edges. The result is recovery/compaction input, not a
-trash authorization. The established-session actor solely owns its opened
+trash authorization. The corrected public contract makes successful Open and
+OpenRecovery return the held session together with the validated loaded
+projection. Recovery inspection remains metadata-only; manual fallback uses a
+distinct manual-branch classification, and selection never rewrites refs. The
+established-session actor solely owns its opened
 root and leases, serializes manual/autosave transactions, authenticates Save As
 against the live session, and transfers ownership to the durably installed fork
 only on success. It also enforces bounded requests, completions, autosave

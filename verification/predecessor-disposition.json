@@ -2499,6 +2499,14 @@
       "reason": "WP-10B B2 proves the off-product project-store boundary and frozen work limits."
     },
     {
+      "id": "libtest:mirante4d-project-store:api::tests::recovery_api_returns_loaded_state_and_names_manual_branches_honestly",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 freezes loaded Open/OpenRecovery success payloads and distinguishes manual recovery branches from autosave divergence."
+    },
+    {
       "id": "libtest:mirante4d-project-store:generation::tests::commit_capture_builds_the_same_frozen_direct_generation",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -5860,6 +5868,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 526
+    "current_additions": 527
   }
 }

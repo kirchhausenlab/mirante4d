@@ -465,6 +465,7 @@ enum RecoveryClassification {
     Newer,
     Stale,
     Divergent,
+    ManualBranch,
 }
 
 impl ProjectRecoveryCandidate {
@@ -486,6 +487,7 @@ impl ProjectRecoveryCandidate {
             RecoveryClassification::Newer => "newer",
             RecoveryClassification::Stale => "stale",
             RecoveryClassification::Divergent => "divergent",
+            RecoveryClassification::ManualBranch => "manual_branch",
         }
     }
 
@@ -513,6 +515,10 @@ impl ProjectRecoveryCandidate {
 
     pub const fn is_divergent(&self) -> bool {
         matches!(self.classification, RecoveryClassification::Divergent)
+    }
+
+    pub const fn is_manual_branch(&self) -> bool {
+        matches!(self.classification, RecoveryClassification::ManualBranch)
     }
 
     pub const fn base_manual_generation_id(&self) -> Option<ProjectGenerationId> {
@@ -776,7 +782,8 @@ pub enum ProjectStoreCompletion {
     },
     Opened {
         request_id: ProjectStoreRequestId,
-        result: Result<ProjectStoreSession, ProjectStoreFault>,
+        /// The held session followed by the validated normal-open projection.
+        result: Result<(ProjectStoreSession, ProjectGenerationProjection), ProjectStoreFault>,
     },
     ManualSaved {
         request_id: ProjectStoreRequestId,
@@ -796,7 +803,9 @@ pub enum ProjectStoreCompletion {
     },
     RecoveryOpened {
         request_id: ProjectStoreRequestId,
-        result: Result<ProjectStoreSession, ProjectStoreFault>,
+        /// The held session followed by the explicitly selected projection.
+        /// Session head IDs remain the actual ref facts; selection repairs no ref.
+        result: Result<(ProjectStoreSession, ProjectGenerationProjection), ProjectStoreFault>,
     },
     Pinned {
         request_id: ProjectStoreRequestId,
@@ -963,5 +972,51 @@ mod tests {
                 stage: "duplicate_object_source"
             })
         ));
+    }
+
+    #[test]
+    fn recovery_api_returns_loaded_state_and_names_manual_branches_honestly() {
+        fn assert_loaded_state(
+            _: Result<(ProjectStoreSession, ProjectGenerationProjection), ProjectStoreFault>,
+        ) {
+        }
+
+        let request_id = ProjectStoreRequestId::new(1).unwrap();
+        for completion in [
+            ProjectStoreCompletion::Opened {
+                request_id,
+                result: Err(ProjectStoreFault::Cancelled),
+            },
+            ProjectStoreCompletion::RecoveryOpened {
+                request_id,
+                result: Err(ProjectStoreFault::Cancelled),
+            },
+        ] {
+            match completion {
+                ProjectStoreCompletion::Opened { result, .. }
+                | ProjectStoreCompletion::RecoveryOpened { result, .. } => {
+                    assert_loaded_state(result);
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        let candidate = ProjectRecoveryCandidate {
+            generation_id: ProjectGenerationId::from_digest(Sha256Digest::from_bytes([1; 32])),
+            generation_sequence: 1,
+            revision_sequence: 1,
+            origin: RecoveryOrigin::ManualRecovery,
+            classification: RecoveryClassification::ManualBranch,
+            base_manual_generation_id: None,
+            current_manual_generation_id: Some(ProjectGenerationId::from_digest(
+                Sha256Digest::from_bytes([2; 32]),
+            )),
+            artifact_count: 0,
+            non_regenerable_artifact_count: 0,
+        };
+        assert_eq!(candidate.origin(), "manual_recovery");
+        assert_eq!(candidate.classification(), "manual_branch");
+        assert!(candidate.is_manual_branch());
+        assert!(!candidate.is_divergent());
     }
 }
