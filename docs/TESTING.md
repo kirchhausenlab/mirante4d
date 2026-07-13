@@ -281,6 +281,22 @@ provisional Autosave/handoff, and recovery-selected Save As execution. Neither
 set claims timers, product garbage collection, the exhaustive fault matrix,
 power-cut durability, product reachability, or product-open validation.
 
+The accepted durability-qualification correction now freezes the remaining B2
+evidence target without claiming it exists. Hosted injection remains exhaustive
+across every named before/after occurrence. Fresh-process kills cover mutations
+and writer-private residue; pure reads and comparisons prove byte-identical no
+mutation. Rootless VM cuts are limited to the distinct post-sync,
+publish/replace, package-install, remove/move, and directory-sync boundaries
+listed by the contract, with equivalent adjacent before states deduplicated.
+The only writable tuple is Linux ext4 magic `0xef53` with normalized VFS
+options `[rw,relatime]` and super options `[rw]`; unmatched existing stores open
+read-only and unmatched new destinations fail before source reads or mutation.
+The runtime gate, hostile fixture, hosted/process matrices, trusted-local lane,
+bounded power-cut harness, and performance probes are implemented. Self-tests
+and non-VM checks pass; the clean-revision trusted run and its qualifying report
+remain pending. Until that run passes, this is not power-loss durability
+evidence.
+
 The checked independent source report supports only the WP-03 source-TIFF
 archive. WP-10A is accepted off-product and its target authority is promoted.
 `mirante4d-storage` is assigned to the existing contract leaf. Its lower-level

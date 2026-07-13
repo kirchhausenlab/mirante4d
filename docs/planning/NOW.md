@@ -83,7 +83,12 @@ retry with four focused transaction cases. The public actor now starts unbound
 and owns fresh Create, healthy Open, provisional publication and manual
 handoff, normal session commands, and recovery-selected Save As while retaining
 the damaged source unchanged. Its focused lifecycle cases cover those routes;
-the remaining B2 durability qualification is next.
+the remaining B2 durability qualification is next. Its accepted narrow
+correction freezes one exact ext4 tuple, fail-closed read-only/new-destination
+semantics, exhaustive hosted injection, mutation/residue process kills, and VM
+cuts only at distinct persistence/authority boundaries. The implementation and
+non-VM checks are complete; the clean-revision rootless VM run, qualifying
+report, and B2 exit remain.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.

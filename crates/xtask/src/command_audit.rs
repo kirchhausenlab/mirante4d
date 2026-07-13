@@ -67,10 +67,10 @@ pub(crate) const COMMAND_AUDIT_ENTRIES: &[CommandAuditEntry] = &[
         evidence_class: "trusted_local_verification",
         default_safety: "trusted_machine_opt_in_required",
         requires_heavy_opt_in: true,
-        product_evidence_role: "trusted_gpu_support_only",
+        product_evidence_role: "trusted_local_qualification_support_only",
         stale_or_unsafe_status: "current_registry_owned",
         report_paths: &["target/mirante4d/verification/"],
-        notes: "Runs the single registry-generated trusted-GPU ignored-case union; it is forbidden in GitHub Actions.",
+        notes: "Runs a selected registry-owned trusted-local qualification lane, including GPU or project-store lifecycle evidence; trusted lanes are forbidden in GitHub Actions.",
     },
     CommandAuditEntry {
         command: "verification-sync",

@@ -20,6 +20,12 @@
   "lint_exceptions": [],
   "test_timeout_overrides": [
     {
+      "selector": "package(mirante4d-project-store) & test(=actor::tests::hosted_durability_tests::exhaustive_hosted_and_process_transition_matrix)",
+      "warn_ms": 20000,
+      "terminate_ms": 100000,
+      "reason": "The exhaustive hosted WP-10B matrix discovers 402 transition-edge rows, runs 338 missing fail injections, compares 120 parked before/after trees, and performs 102 bounded fresh-process kill/reopen/retry cases with eight workers; the focused run completed in 74.03 seconds, so only this test receives a 100-second ceiling."
+    },
+    {
       "selector": "package(mirante4d-project-store) & test(=actor::tests::purge_fresh_process_kill_and_retry_matrix)",
       "warn_ms": 5000,
       "terminate_ms": 40000,
@@ -192,6 +198,19 @@
       "command": "cargo xtask verify-local format-lifecycle",
       "hosted_required": false,
       "activation_state": "active-WP-10A"
+    },
+    {
+      "id": "project-store-lifecycle",
+      "owner": "project-store",
+      "capability": "trusted-local-kvm-ext4",
+      "requirements": ["WP-10B-project-store"],
+      "fixture_tier": "T1-project-or-T2",
+      "timeout_secs": 900,
+      "evidence_level": "E0",
+      "trigger": "manual clean revision after project-store durability change or B2 acceptance",
+      "command": "cargo xtask verify-local project-store-lifecycle",
+      "hosted_required": false,
+      "activation_state": "active-WP-10B-B2"
     },
     {
       "id": "trusted-gpu",
@@ -373,6 +392,25 @@
         {
           "package": "mirante4d-storage",
           "test_prefix": "package_catalog::tests::representative_large_manifest_open_stays_inside_the_metadata_working_set"
+        }
+      ],
+      "expected_ignored_cases": 1,
+      "expiry": "WP-14",
+      "deletion_gate": "WP-14-verification-hardening"
+    },
+    {
+      "id": "WP10B-ADAPTER-PROJECT-STORE-LIFECYCLE",
+      "lane": "project-store-lifecycle",
+      "owner": "mirante4d-project-store",
+      "requirements": [
+        "WP-10B-project-store"
+      ],
+      "fixture_tier": "T1-or-T2",
+      "capability": "trusted-local-kvm-ext4",
+      "matches": [
+        {
+          "package": "mirante4d-project-store",
+          "test_prefix": "actor::tests::durability_tests::project_store_vm_guest_driver"
         }
       ],
       "expected_ignored_cases": 1,

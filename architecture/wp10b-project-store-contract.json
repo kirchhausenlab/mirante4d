@@ -47,6 +47,10 @@
       "path": "architecture/wp10b-project-store-public-actor-lifecycle-correction.json",
       "sha256": "ac1a7804655af4dab8110f7a584a7bf990ac25a9b03799da9d03638e3d787bbc"
     },
+    "durability_qualification_correction": {
+      "path": "architecture/wp10b-project-store-durability-qualification-correction.json",
+      "sha256": "6b4bbc23115115e36a449209810764cbce2738ca693a985275f5e6513d4252e6"
+    },
     "protected_main": {
       "commit": "b6e0267802f8ac2d0d49a0f04302fd321ef2f617",
       "tree": "b20b598603b47fdbe7c85c3b6d1cba8c78fd433e",
@@ -446,7 +450,7 @@
       "read_only",
       "prefer_writable"
     ],
-    "writable_fallback": "only prefer_writable may become an explicitly reported read_only session when the writer lease is unavailable",
+    "writable_fallback": "only prefer_writable may become an explicitly reported read_only session when the writer lease is unavailable or the held existing-store filesystem tuple is unqualified; read_only remains read_only, while Create, SaveAs, first provisional Autosave, and every other new destination on an unqualified tuple fail with unsupported_filesystem before source reads or mutation",
     "commit_capture": "immutable validated ProjectGenerationProjection plus expected lane parent, autosave base when applicable, fork provenance for Save As, and bounded lazy object sources",
     "object_source": "opaque cancellable stream factory bound to one expected RawObjectDescriptor; no PathBuf, unbounded owned bytes, or preopened object collection",
     "commands": [
@@ -647,6 +651,86 @@
     "purge_is_separate": true,
     "commit_indeterminate": "failure to establish final ref-directory durability after retry suspends writes, keeps the revision dirty, and requires close/reopen",
     "saved_revision_rule": "only a durable manual-head completion may advance exactly its captured revision; autosave never advances saved_revision"
+  },
+  "durability_qualification_contract": {
+    "status": "accepted-target-not-yet-implemented-or-evidenced",
+    "filesystem_tuple": {
+      "platform": "linux",
+      "filesystem": "ext4",
+      "statfs_magic_hex": "0xef53",
+      "vfs_options": [
+        "rw",
+        "relatime"
+      ],
+      "super_options": [
+        "rw"
+      ],
+      "selection": "use the held root descriptor's statx mount ID to select exactly one /proc/self/mountinfo record and require the exact normalized filesystem, magic, VFS-option set, and super-option set; missing, ambiguous, unreadable, unparsable, or different facts are unqualified",
+      "probe_rule": "runtime capability probes never add a qualified tuple"
+    },
+    "runtime": {
+      "existing_read_only": "ReadOnly remains read_only",
+      "existing_prefer_writable": "an unqualified tuple returns an explicitly reported read_only session without writer-only cleanup or mutation",
+      "new_destination": "Create, SaveAs, first provisional Autosave, and every other new destination on an unqualified tuple fail with unsupported_filesystem before source reads, staging, or destination mutation",
+      "bypass": "no production feature, configuration, environment variable, alternate path, or runtime probe bypass; a crate-private cfg(test)-only detector seam is permitted"
+    },
+    "hosted_coverage": "every named transition supports deterministic before and after injection, lane separation, and zero-based selection of every repeated occurrence",
+    "process_kill_coverage": "fresh-process SIGKILL, reopen, and exact retry cover every occurrence that mutates filesystem or lease state or can leave writer-private residue; pure reads, validation, comparison, root scans, and candidate listing require deterministic injection and byte-identical no-mutation evidence instead",
+    "vm_coverage": {
+      "rule": "cut one pre-sequence baseline and each distinct post-transition persistence or authority boundary below; do not duplicate an adjacent equivalent before state, but keep distinct lanes, directories, and repeated mutation states",
+      "post_transition_boundaries": [
+        "object_file_sync",
+        "object_publish_noreplace",
+        "object_directory_sync",
+        "generation_file_sync",
+        "generation_publish_noreplace",
+        "generation_directory_sync",
+        "recovery_file_sync",
+        "recovery_replace",
+        "recovery_directory_sync",
+        "head_file_sync",
+        "head_replace",
+        "head_directory_sync",
+        "package_tree_sync",
+        "package_install_noreplace",
+        "destination_parent_sync",
+        "pin_file_sync",
+        "pin_replace",
+        "pin_directory_sync",
+        "unpin_remove",
+        "unpin_directory_sync",
+        "gc_trash_directory_create",
+        "gc_trash_collision_file_sync",
+        "gc_trash_move",
+        "gc_active_deduplicate_remove",
+        "gc_source_directory_sync",
+        "gc_trash_directory_sync",
+        "purge_remove",
+        "purge_directory_sync"
+      ],
+      "hosted_only": "Open, commit-prefix comparison, private stage creation/write/copy, staging cleanup, maintenance lease upgrade/restore, root scan, and candidate listing receive no VM cuts"
+    },
+    "harness": {
+      "command": "cargo xtask verify-local project-store-lifecycle",
+      "rootless": true,
+      "guest_memory_bytes": 268435456,
+      "sparse_ext4_disks": 2,
+      "sparse_disk_bytes_each": 134217728,
+      "working_disk_bytes_max": 671088640,
+      "timeout_seconds": 900,
+      "retries": 0,
+      "cross_device": "positive copy-and-rehash Save As uses the two independent ext4 filesystems",
+      "power_loss": "rootless nbdkit cache=writeback discards guest-unpersisted writes while explicit guest flushes reach the backing image"
+    },
+    "performance": {
+      "ui_enqueue_and_poll_p99_milliseconds_max": 5,
+      "samples_min": 1000,
+      "incremental_unchanged_artifact_bytes_rewritten_max": 0,
+      "post_open_or_save_metadata_rss_bytes_max": 100663296,
+      "retries": 0
+    },
+    "report": "bind commit/tree/clean state, fixture and executable digests, exact qualification tuple, filesystem features, filesystem/kernel/mount/QEMU/nbdkit facts, hosted/process/VM transition and kill matrices, byte/object/work counters, product display facts, source digests, performance facts, results, and every failure without private paths",
+    "claim_boundary": "these are accepted B2 requirements, not a claim that the gate, lane, hostile fixture, VM harness, measurements, or evidence currently exists or passes"
   },
   "trash_contract": {
     "selection": "nonempty duplicate-free generation IDs bounded by recovery_candidates_max; fresh exclusive preflight proves each active selection is orphaned, while an absent active generation is accepted only as an exact already-quarantined retry; PlanCompaction never authorizes mutation",

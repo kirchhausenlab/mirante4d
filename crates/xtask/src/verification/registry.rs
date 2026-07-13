@@ -673,6 +673,7 @@ fn validate_registry(registry: &Registry) -> anyhow::Result<()> {
         "format-lifecycle",
         "main-package-capability",
         "performance",
+        "project-store-lifecycle",
         "product-e1",
         "product-e2",
         "product-e3",
@@ -1030,6 +1031,27 @@ pub(super) fn format_lifecycle_timeout(registry: &Registry) -> anyhow::Result<u6
     Ok(lane.timeout_secs)
 }
 
+pub(super) fn project_store_lifecycle_timeout(registry: &Registry) -> anyhow::Result<u64> {
+    let lane = registry
+        .non_pr_lanes
+        .iter()
+        .find(|lane| lane.id == "project-store-lifecycle")
+        .context("verification registry is missing project-store-lifecycle lane")?;
+    if lane.command != "cargo xtask verify-local project-store-lifecycle"
+        || lane.owner != "project-store"
+        || lane.fixture_tier != "T1-project-or-T2"
+        || lane.capability != "trusted-local-kvm-ext4"
+        || lane.requirements != ["WP-10B-project-store"]
+        || lane.timeout_secs != 900
+        || lane.evidence_level != "E0"
+        || lane.hosted_required
+        || lane.activation_state != "active-WP-10B-B2"
+    {
+        bail!("project-store-lifecycle verification policy drifted");
+    }
+    Ok(lane.timeout_secs)
+}
+
 fn required_test_lanes(registry: &Registry) -> anyhow::Result<Vec<&Lane>> {
     ["unit", "contract", "ui"]
         .into_iter()
@@ -1369,6 +1391,12 @@ mod tests {
     fn format_lifecycle_is_an_active_target_authority_consumer() {
         let registry = read_registry().unwrap();
         assert_eq!(format_lifecycle_timeout(&registry).unwrap(), 900);
+    }
+
+    #[test]
+    fn project_store_lifecycle_is_an_active_trusted_local_lane() {
+        let registry = read_registry().unwrap();
+        assert_eq!(project_store_lifecycle_timeout(&registry).unwrap(), 900);
     }
 
     #[test]

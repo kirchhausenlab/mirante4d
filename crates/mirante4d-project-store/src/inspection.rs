@@ -22,6 +22,7 @@ use crate::{
         LocalPublicationError, LocalStoreRoot, StagingCleanupError, StagingCleanupTransition,
         StagingCleanupTransitionObserver,
     },
+    transition::{self, StoreTransition, TransitionPoint},
     wire::{RefKind, RefRecord},
 };
 
@@ -1568,6 +1569,8 @@ fn read_current_generation<C>(
 where
     C: FnMut() -> bool,
 {
+    let generation_validate =
+        inspection_before(StoreTransition::GenerationValidate, "generation_validate")?;
     let bytes = root
         .read_generation_bytes(
             lane.head.current(),
@@ -1583,7 +1586,13 @@ where
     {
         return Err(ProjectStoreFault::Corruption { stage });
     }
+    inspection_after(generation_validate, "generation_validate")?;
+    let payload_binding = inspection_before(
+        StoreTransition::PayloadBindingValidate,
+        "payload_binding_validate",
+    )?;
     validate_physical_closure_metadata(root, &document, limits, &mut *is_cancelled)?;
+    inspection_after(payload_binding, "payload_binding_validate")?;
     Ok(document)
 }
 
@@ -1640,6 +1649,8 @@ where
         if Some(id) == manual_current_id || Some(id) == autosave_current_id {
             continue;
         }
+        let generation_validate =
+            inspection_before(StoreTransition::GenerationValidate, "generation_validate")?;
         let bytes = root
             .read_generation_bytes(id, limits.generation_bytes_max, &mut *is_cancelled)
             .map_err(|error| map_local_error(error, "referenced_generation"))?;
@@ -1661,7 +1672,13 @@ where
                 stage: "referenced_generation",
             });
         }
+        inspection_after(generation_validate, "generation_validate")?;
+        let payload_binding = inspection_before(
+            StoreTransition::PayloadBindingValidate,
+            "payload_binding_validate",
+        )?;
         validate_physical_closure_metadata(root, &document, limits, &mut *is_cancelled)?;
+        inspection_after(payload_binding, "payload_binding_validate")?;
     }
     if manual_current.is_some_and(|manual_current| {
         autosave_current.is_some_and(|document| {
@@ -1833,11 +1850,31 @@ fn map_lease_error(error: LeaseError) -> ProjectStoreFault {
     }
 }
 
+fn inspection_before(
+    transition: StoreTransition,
+    stage: &'static str,
+) -> Result<crate::transition::TransitionOccurrence, ProjectStoreFault> {
+    transition::before(TransitionPoint::new(transition))
+        .map_err(|_| ProjectStoreFault::Corruption { stage })
+}
+
+fn inspection_after(
+    occurrence: crate::transition::TransitionOccurrence,
+    stage: &'static str,
+) -> Result<(), ProjectStoreFault> {
+    transition::after(occurrence).map_err(|_| ProjectStoreFault::Corruption { stage })
+}
+
 fn map_local_error(error: LocalPublicationError, stage: &'static str) -> ProjectStoreFault {
     match error {
         LocalPublicationError::Cancelled => ProjectStoreFault::Cancelled,
-        LocalPublicationError::Capacity { .. } => ProjectStoreFault::Capacity { stage },
-        LocalPublicationError::SourceLength { .. } => ProjectStoreFault::SourceChanged,
+        LocalPublicationError::Capacity { .. } | LocalPublicationError::StorageFull { .. } => {
+            ProjectStoreFault::Capacity { stage }
+        }
+        LocalPublicationError::ReadOnly { .. } => ProjectStoreFault::ReadOnly,
+        LocalPublicationError::SourceIo { .. } | LocalPublicationError::SourceLength { .. } => {
+            ProjectStoreFault::SourceChanged
+        }
         LocalPublicationError::SourceDigest => ProjectStoreFault::DigestMismatch,
         LocalPublicationError::RefAlreadyPresent => ProjectStoreFault::StaleParent,
         LocalPublicationError::RefChanged => ProjectStoreFault::Corruption { stage },

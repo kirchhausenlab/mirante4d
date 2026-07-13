@@ -211,12 +211,16 @@ device rename.
   synced idempotent prefix; a post-unlink failure or process kill is
   indeterminate and requires reopen. Object-phase retry recognizes the ordered
   removal prefix; generation-phase retry revalidates each surviving record.
-- Writable durability is initially claimed only on tested local Linux
-  filesystem and mount-option tuples with same-filesystem staging, no-replace
-  publication, atomic ref replacement, file sync, and directory sync. Unknown,
-  FUSE, overlay, and network stores default to read-only until separately
-  qualified. Internal traversal uses descriptor-relative no-follow operations;
-  path prechecks alone cannot prevent symlink/root-escape races.
+- The first writable tuple is exactly Linux ext4 magic `0xef53`, normalized VFS
+  options `[rw,relatime]`, and super options `[rw]`. Select it by the held root
+  descriptor's `statx` mount ID and one unambiguous `/proc/self/mountinfo`
+  record; missing, erroneous, ambiguous, or different facts are unqualified,
+  and a successful capability probe never adds qualification. `ReadOnly`
+  remains read-only. `PreferWritable` on an existing unqualified store reports
+  a read-only session; Create, Save As, first provisional Autosave, and every
+  other new destination fail `UnsupportedFilesystem` before source reads or
+  mutation. No production bypass exists. Internal traversal remains
+  descriptor-relative and no-follow.
 
 Internal references are digest-derived and survive moving the package.
 Dataset paths/URIs are locator hints, never identity. Relinking binds a new
@@ -258,26 +262,34 @@ bounded by the approved CPU ledger. DS-0 through DS-4 record throughput and
 peak RSS. DS-X receives only a structural simulator identity and cannot claim a
 scientific ID for nonexistent voxel payloads.
 
-D-010/WP-10B must inject failures before and after every write, flush, publish,
-directory sync, generation publication, ref replacement, and ref-directory
-sync. The accepted maintenance-transition correction explicitly adds pin stage,
-write, file-sync, replace, and directory-sync phases; unpin remove and
-directory-sync phases; Trash maintenance upgrade/restore, directory-create,
-collision-sync, move, duplicate-remove, source-sync, and trash-sync phases;
-and separate purge remove and directory-sync phases.
-It must also kill child processes at every transition and reopen in a
-fresh process; exercise `ENOSPC`, short writes, permissions/read-only errors,
+D-010/WP-10B must inject failures before and after every frozen transition,
+including every repeated occurrence and both ref lanes. Fresh-process
+`SIGKILL`, reopen, and exact retry cover transitions that mutate filesystem or
+lease state or can leave writer-private residue. Pure reads, validation,
+comparison, root scans, and candidate listing instead require deterministic
+fault and byte-identical no-mutation evidence. The matrix must also exercise
+`ENOSPC`, short writes, permissions/read-only errors,
 corrupt/truncated refs/generations/objects, concurrent writers, stale-parent
 conflicts, crash-released locks, autosave races/divergence, GC interruption,
 symlink/path attacks, relocation, Save As, and cross-device-copy failure.
 
 Callback mocks and `SIGKILL` establish logic/process-crash behavior but do not
-simulate lost kernel/page-cache writes. Every durability claim names the exact
-Linux filesystem and mount options and also passes an approved VM/loopback/
-fault-injection power-cut harness that can discard unpersisted writes. Unknown
-filesystems remain unqualified even if runtime probing succeeds. Responsiveness
-evidence must also show that incremental saves do not rewrite unchanged objects
-and never block the UI thread.
+simulate lost kernel/page-cache writes. The rootless VM therefore cuts one
+pre-sequence baseline and each distinct post-transition persistence/authority
+boundary: object and generation file-sync/publish/directory-sync; manual and
+autosave recovery/head file-sync/replace/directory-sync; package tree-sync,
+install, and destination-parent sync; pin file-sync/replace/directory-sync;
+unpin remove/directory-sync; Trash directory-create, collision-sync, move,
+duplicate-remove, source-sync, and trash-sync; and Purge remove/directory-sync.
+Equivalent adjacent before states are not duplicated; distinct lanes,
+directories, and repeated mutation states remain separate. Private stage
+creation/write/copy, staging cleanup, open/validation, comparisons, lease
+upgrade/restore, scans, and listings remain hosted/process evidence. The exact
+rootless-QEMU, two-disk, 256-MiB guest, 640-MiB working-disk, 900-second,
+zero-retry, performance, and sanitized-report requirements remain those frozen
+by the entry and correction. The implementation and hosted checks exist, but no
+qualification or durability evidence is claimed until the clean-revision lane
+passes.
 
 ### Identity And Project Resolution
 

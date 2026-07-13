@@ -210,6 +210,13 @@ hierarchies, and idempotent reopen/retry. Sixteen exact callback cases and 16
 actual `SIGKILL` cases cover every observed Purge maintenance, remove, and
 directory-sync occurrence. This is process-crash evidence only, with no power-loss,
 filesystem-durability, public, or product claim.
+The accepted durability-qualification correction freezes the exact ext4 tuple,
+fail-closed read-only/new-destination behavior, exhaustive hosted coverage, and
+the smaller set of distinct persistence boundaries that require rootless VM
+cuts. The runtime gate, hostile hosted/process tests, trusted-local lane, and
+bounded VM harness are implemented. Their self-tests and non-VM checks pass,
+but the clean-revision rootless VM run and B2 evidence remain pending, so no
+power-loss durability or product claim is made.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.

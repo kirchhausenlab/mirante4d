@@ -1,0 +1,162 @@
+{
+  "schema": "mirante4d-wp10b-project-store-vm-manifest",
+  "schema_version": 1,
+  "fixture_id": "wp10b-hostile-lifecycle",
+  "guest_driver": {
+    "test": "actor::tests::durability_tests::project_store_vm_guest_driver",
+    "fixture": "fixtures/project/project-store-v1.tar.gz",
+    "guest_fixture": "/fixtures/project-store-v1.tar.gz",
+    "root_a": "/mnt/project-a",
+    "root_b": "/mnt/project-b"
+  },
+  "pre_sequence": {
+    "case": "save-as",
+    "lane": "none"
+  },
+  "constraints": {
+    "timeout_seconds": 900,
+    "retries": 0,
+    "qemu_package": "qemu-system-x86",
+    "qemu_version": "1:8.2.2+ds-0ubuntu1.17",
+    "kernel_package": "linux-image-6.17.0-35-generic",
+    "kernel_version": "6.17.0-35.35~24.04.1",
+    "kernel_deb_sha256": "d5502a5dfa01203e16f6430e10236efe9e007cd29bd93bbed65ddf20ee6e9cfa",
+    "busybox_package": "busybox-static",
+    "busybox_version": "1:1.36.1-6ubuntu3.1",
+    "busybox_sha256": "dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14",
+    "nbdkit_package": "nbdkit",
+    "nbdkit_version": "1.36.3-1ubuntu10",
+    "nbdkit_deb_sha256": "02ae094a32267be68516e1dedd26a2b83334a1a20303055ce765e2e9cf8580e2",
+    "e2fsprogs_version": "1.47.0",
+    "guest_memory_bytes": 268435456,
+    "disk_count": 2,
+    "disk_bytes_each": 134217728,
+    "working_bytes_max": 671088640,
+    "filesystem": "ext4",
+    "mount_options": [
+      "relatime",
+      "rw"
+    ]
+  },
+  "flows": [
+    {
+      "id": "object",
+      "case": "object",
+      "lane": "none",
+      "transitions": [
+        { "name": "object_file_sync", "occurrences": [0] },
+        { "name": "object_publish_noreplace", "occurrences": [0] },
+        { "name": "object_directory_sync", "occurrences": [0, 1] }
+      ]
+    },
+    {
+      "id": "generation",
+      "case": "generation",
+      "lane": "none",
+      "transitions": [
+        { "name": "generation_file_sync", "occurrences": [0] },
+        { "name": "generation_publish_noreplace", "occurrences": [0] },
+        { "name": "generation_directory_sync", "occurrences": [0, 1] }
+      ]
+    },
+    {
+      "id": "manual-recovery-ref",
+      "case": "recovery-ref",
+      "lane": "manual",
+      "transitions": [
+        { "name": "recovery_file_sync", "occurrences": [0] },
+        { "name": "recovery_replace", "occurrences": [0] },
+        { "name": "recovery_directory_sync", "occurrences": [0, 1] }
+      ]
+    },
+    {
+      "id": "autosave-recovery-ref",
+      "case": "recovery-ref",
+      "lane": "autosave",
+      "transitions": [
+        { "name": "recovery_file_sync", "occurrences": [0] },
+        { "name": "recovery_replace", "occurrences": [0] },
+        { "name": "recovery_directory_sync", "occurrences": [0, 1] }
+      ]
+    },
+    {
+      "id": "manual-head-ref",
+      "case": "head-ref",
+      "lane": "manual",
+      "transitions": [
+        { "name": "head_file_sync", "occurrences": [0] },
+        { "name": "head_replace", "occurrences": [0] },
+        { "name": "head_directory_sync", "occurrences": [0, 1] }
+      ]
+    },
+    {
+      "id": "autosave-head-ref",
+      "case": "head-ref",
+      "lane": "autosave",
+      "transitions": [
+        { "name": "head_file_sync", "occurrences": [0] },
+        { "name": "head_replace", "occurrences": [0] },
+        { "name": "head_directory_sync", "occurrences": [0, 1] }
+      ]
+    },
+    {
+      "id": "save-as",
+      "case": "save-as",
+      "lane": "none",
+      "transitions": [
+        { "name": "package_tree_sync", "occurrences": [0] },
+        { "name": "package_install_noreplace", "occurrences": [0] },
+        { "name": "destination_parent_sync", "occurrences": [0] }
+      ]
+    },
+    {
+      "id": "pin",
+      "case": "pin",
+      "lane": "none",
+      "transitions": [
+        { "name": "pin_file_sync", "occurrences": [0] },
+        { "name": "pin_replace", "occurrences": [0] },
+        { "name": "pin_directory_sync", "occurrences": [0, 1] }
+      ]
+    },
+    {
+      "id": "unpin",
+      "case": "unpin",
+      "lane": "none",
+      "transitions": [
+        { "name": "unpin_remove", "occurrences": [0] },
+        { "name": "unpin_directory_sync", "occurrences": [0] }
+      ]
+    },
+    {
+      "id": "trash",
+      "case": "trash",
+      "lane": "none",
+      "transitions": [
+        { "name": "gc_trash_directory_create", "occurrences": [0, 1, 2, 3] },
+        { "name": "gc_trash_collision_file_sync", "occurrences": [0] },
+        { "name": "gc_trash_move", "occurrences": [0, 1] },
+        { "name": "gc_active_deduplicate_remove", "occurrences": [0] },
+        { "name": "gc_source_directory_sync", "occurrences": [0, 1, 2] },
+        { "name": "gc_trash_directory_sync", "occurrences": [0, 1, 2, 3, 4, 5, 6, 7, 8] }
+      ]
+    },
+    {
+      "id": "purge",
+      "case": "purge",
+      "lane": "none",
+      "transitions": [
+        { "name": "purge_remove", "occurrences": [0, 1] },
+        { "name": "purge_directory_sync", "occurrences": [0, 1, 2, 3] }
+      ]
+    }
+  ],
+  "performance": {
+    "case": "performance",
+    "lane": "none",
+    "samples": 1000,
+    "enqueue_poll_p99_ms_max": 5.0,
+    "incremental_unchanged_artifact_bytes_rewritten_max": 0,
+    "post_open_or_save_metadata_rss_bytes_max": 100663296
+  }
+}

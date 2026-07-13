@@ -260,10 +260,14 @@ fn check_cancelled(is_cancelled: &mut impl FnMut() -> bool) -> Result<(), Projec
 fn map_local_error(error: LocalPublicationError, stage: &'static str) -> ProjectStoreFault {
     match error {
         LocalPublicationError::Cancelled => ProjectStoreFault::Cancelled,
-        LocalPublicationError::Capacity { .. } => ProjectStoreFault::Capacity { stage },
+        LocalPublicationError::Capacity { .. } | LocalPublicationError::StorageFull { .. } => {
+            ProjectStoreFault::Capacity { stage }
+        }
+        LocalPublicationError::ReadOnly { .. } => ProjectStoreFault::ReadOnly,
         LocalPublicationError::SourceLength { .. } | LocalPublicationError::SourceDigest => {
             ProjectStoreFault::DigestMismatch
         }
+        LocalPublicationError::SourceIo { .. } => ProjectStoreFault::SourceChanged,
         LocalPublicationError::InvalidPath
         | LocalPublicationError::ExistingMismatch
         | LocalPublicationError::InvalidGeneration

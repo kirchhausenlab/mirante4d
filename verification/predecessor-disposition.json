@@ -2451,6 +2451,14 @@
       "reason": "WP-10B B2 proves private FullVerify request correlation, cancellation, and writer-contended read-only availability without changing session authority."
     },
     {
+      "id": "libtest:mirante4d-project-store:actor::tests::hosted_durability_tests::exhaustive_hosted_and_process_transition_matrix",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 traces every frozen transition edge and occurrence, fail-injects the rows not already owned by exact maintenance matrices, proves pure read/comparison transitions leave byte-identical parked trees, and performs bounded fresh-process SIGKILL, reopen, and exact retry for every uncovered mutation, lease, and writer-private-residue row without claiming power-loss durability."
+    },
+    {
       "id": "libtest:mirante4d-project-store:actor::tests::maintenance_restore_loss_terminates_and_drains_exact_completions",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -6220,6 +6228,126 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 proves a recoverable failed Open retains recovery-only resources, blocks ordinary mutation, and permits selected-generation Save As with exact fork provenance without changing the damaged source."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:verification::runner::tests::project_store_lifecycle_evidence_is_exact_and_fail_closed",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B2 accepts exactly one sanitized lifecycle record and rejects tool, cut-matrix, or performance drift before trusted-local evidence can be recorded."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:verification::registry::tests::project_store_lifecycle_is_an_active_trusted_local_lane",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B2 freezes the manual KVM/ext4 lifecycle lane command, capability, fixture tier, timeout, evidence level, and hosted exclusion."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:actor::tests::create_and_save_as_report_unqualified_destinations_before_source_reads",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves Create and Save As reject unqualified destinations before reading source objects or creating destination state."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:actor::tests::durability_tests::project_store_vm_guest_driver",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "project-store-lifecycle",
+      "requirement_ids": ["WP-10B-project-store"],
+      "reason": "WP-10B B2 exposes one ignored guest entry point used only by the trusted rootless VM harness for trace, cut, fresh-retry, and performance roles."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:filesystem::tests::parser_accepts_only_the_exact_ext4_mount_tuple",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 accepts only one unambiguous held-mount record with the exact ext4 magic and normalized option sets."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:filesystem::tests::real_policy_rejects_dev_shm_and_downgrades_writes",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 exercises the production detector against a real unqualified mount and proves read-only fallback plus pre-mutation destination rejection."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:hostile_tests::cross_device_save_as_read_failure_preserves_source_and_destination_absence",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves a mid-stream cross-device Save As source failure is typed SourceChanged and leaves the source exact and destination absent."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:hostile_tests::partial_writes_complete_exactly_and_zero_progress_fails_closed",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves staged writes complete repeated short writes and fail closed on zero progress, read-only, and storage-full errors."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:hostile_tests::permission_denial_is_read_only_and_publishes_nothing",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 maps destination permission failure to ReadOnly without publishing authority."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:hostile_tests::storage_full_is_capacity_and_leaves_no_authority_or_residue",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 maps injected ENOSPC to Capacity and proves no authority or writer-private residue remains."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:hostile_tests::whole_package_relocation_survives_a_read_only_cross_device_copy",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves a byte-exact whole-package relocation opens read-only with unchanged project and generation authority."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:lease::tests::writer_confirmation_suspends_after_filesystem_qualification_changes",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 rechecks the held filesystem qualification before mutation and suspends writes when it no longer matches."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transaction::tests::unqualified_initial_destinations_fail_before_source_reads_or_mutation",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 preflights unqualified initial package destinations before capture validation, source reads, staging, or destination mutation."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transition::tests::every_transition_edge_and_repeated_occurrence_is_injectable",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves deterministic before/after injection, lane selection, and zero-based repeated-occurrence targeting."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:transition::tests::transition_inventory_names_are_unique_and_round_trip",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 keeps all frozen transition names unique and exactly parseable."
     }
   ],
   "expected_summary": {
@@ -6228,6 +6356,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 572
+    "current_additions": 588
   }
 }

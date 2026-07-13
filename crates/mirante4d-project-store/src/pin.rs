@@ -199,7 +199,10 @@ fn require_writer(
 fn map_local_error(error: LocalPublicationError, stage: &'static str) -> ProjectStoreFault {
     match error {
         LocalPublicationError::Cancelled => ProjectStoreFault::Cancelled,
-        LocalPublicationError::Capacity { .. } => ProjectStoreFault::Capacity { stage },
+        LocalPublicationError::Capacity { .. } | LocalPublicationError::StorageFull { .. } => {
+            ProjectStoreFault::Capacity { stage }
+        }
+        LocalPublicationError::ReadOnly { .. } => ProjectStoreFault::ReadOnly,
         LocalPublicationError::RefChanged | LocalPublicationError::RefAlreadyPresent => {
             ProjectStoreFault::Corruption { stage }
         }
@@ -209,6 +212,7 @@ fn map_local_error(error: LocalPublicationError, stage: &'static str) -> Project
         }
         LocalPublicationError::AtomicPublishUnsupported => ProjectStoreFault::UnsupportedFilesystem,
         LocalPublicationError::SourceLength { .. } => ProjectStoreFault::SourceChanged,
+        LocalPublicationError::SourceIo { .. } => ProjectStoreFault::SourceChanged,
         LocalPublicationError::SourceDigest => ProjectStoreFault::DigestMismatch,
         LocalPublicationError::InvalidPath
         | LocalPublicationError::ExistingMismatch

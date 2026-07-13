@@ -2,7 +2,7 @@
 
 Status: ACCEPTED TARGET DECISION
 Accepted: 2026-07-09
-Last reviewed: 2026-07-12
+Last reviewed: 2026-07-13
 Decision ID: D-010
 Implementation authorization: NONE INDEPENDENT; ACTIVE HANDOFF AND PACKAGE ENTRY ONLY
 
@@ -75,11 +75,14 @@ purge is separate. Non-regenerable annotations, ROIs, tracks, measurements,
 manual edits, imported material, and artifacts are never guessed or age-pruned
 away.
 
-Writable durability is claimed only for explicitly qualified local Linux
-filesystem and mount-option tuples supporting same-filesystem staging,
-no-replace publication, atomic ref replacement, file sync, and directory sync.
-Unknown, network, FUSE, and overlay stores default to read-only. Internal path
-operations must be descriptor-relative and no-follow.
+The first writable tuple is exactly Linux ext4 magic `0xef53`, normalized VFS
+options `[rw,relatime]`, and super options `[rw]`, selected from the held root
+descriptor's mount ID and one unambiguous `/proc/self/mountinfo` record.
+Unknown, mismatched, unreadable, network, FUSE, and overlay stores are
+unqualified; probing cannot qualify them. Existing `PreferWritable` opens then
+report read-only, while any new destination fails `UnsupportedFilesystem`
+before source reads or mutation. Internal path operations remain descriptor-
+relative and no-follow, with no production qualification bypass.
 
 Dataset bindings use verified D-009 scientific identity; package/release IDs
 and locator hints remain distinct. The WP-10B replacement of transitional
@@ -104,13 +107,15 @@ fallback, or converter is included afterward.
 - WP-10B freezes canonical envelope/ref/generation/object schemas and independent
   vectors, implements the sole project store, switches save/open atomically,
   and deletes the temporary current-persistence bridge and old mutation paths.
-- Acceptance injects failure before and after every write, flush, publish,
-  directory sync, generation, ref, autosave, and GC transition; it also covers
-  process kill, corruption, `ENOSPC`, short writes, permissions, concurrent
-  writers, stale parents, relocation, Save As, symlink attacks, and recovery.
-- Durability evidence names the exact filesystem and mount options and includes
-  a VM/loopback/fault-injection power-loss harness capable of discarding
-  unpersisted writes. Logic mocks and `SIGKILL` alone are insufficient.
+- Hosted acceptance injects failure before and after every frozen transition
+  and repeated occurrence. Fresh-process kills cover transitions that mutate
+  state or leave private residue; pure reads and comparisons instead prove
+  byte-identical no mutation.
+- VM power cuts cover only distinct post-sync, publish/replace, install,
+  remove/move, and required directory-sync authority boundaries, plus one
+  baseline. Equivalent adjacent before states are deduplicated. The harness
+  must discard unpersisted writes; mocks and `SIGKILL` alone remain
+  insufficient.
 - WP-10C verifies dataset/runtime integration but does not recut project
   persistence; WP-10B remains the project save/open authority.
 - No mutable artifact authority, hybrid database/blob commit, UI-thread file
