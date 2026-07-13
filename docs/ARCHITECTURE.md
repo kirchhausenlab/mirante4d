@@ -1,6 +1,6 @@
 # Architecture
 
-Last updated: 2026-07-12
+Last updated: 2026-07-13
 
 Mirante4D is a native Rust desktop viewer and analysis workbench. It opens
 strict `.m4d` packages; source microscopy data enters through explicit
@@ -177,9 +177,13 @@ or prove durability. Private PlanCompaction now repeats the bounded graph
 snapshot and returns deterministic metadata-only recovery-review candidates
 for every orphan generation. It is cancellable, available read-only, and
 changes no authority. Its result is not Trash authorization, a physical
-object/byte plan, a reclaim estimate, or backup approval. The frozen public
-actor remains non-constructible and unwired. The crate still owns no public
-Create/Open/Save As execution, provisional autosave publication, product
+object/byte plan, a reclaim estimate, or backup approval. The accepted Trash
+safety correction freezes a mirrored quarantine layout, fresh exclusive
+preflight, retained-closure subtraction, bounded synced batches, exact retry,
+and requires `ConfirmationRequired` rejection when any selected generation
+declares a non-regenerable artifact. No Trash mutation is implemented yet. The
+frozen public actor remains non-constructible and unwired. The crate still owns
+no public Create/Open/Save As execution, provisional autosave publication, product
 recovery workflow, timers, garbage-collection mutation, qualified durability,
 or product path.
 

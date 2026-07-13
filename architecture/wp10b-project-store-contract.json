@@ -27,6 +27,10 @@
       "path": "architecture/wp10b-project-store-maintenance-transition-correction.json",
       "sha256": "778ac85e7c40c1327f6ce6f1854cf7f2cc3a1d631df2da007d0906d819eafac1"
     },
+    "trash_safety_correction": {
+      "path": "architecture/wp10b-project-store-trash-safety-correction.json",
+      "sha256": "1eb60a85cdaf13f458826dace05ba548559b4fe30bd70616fe97af21f2ed7ee5"
+    },
     "protected_main": {
       "commit": "b6e0267802f8ac2d0d49a0f04302fd321ef2f617",
       "tree": "b20b598603b47fdbe7c85c3b6d1cba8c78fd433e",
@@ -70,6 +74,8 @@
     "staging": "staging/<transaction-id>",
     "locks": "locks",
     "trash": "trash",
+    "trash_generation": "trash/generations/sha256/<first-two-digest-hex>/<remaining-sixty-two-digest-hex>.json",
+    "trash_object": "trash/objects/sha256/<first-two-digest-hex>/<remaining-sixty-two-digest-hex>",
     "digest_fanout_hex_bytes": 1
   },
   "canonical_json": {
@@ -455,6 +461,7 @@
     },
     "recovery_selection": "every explicitly selected recovery projection opens dirty as an unsaved branch; orphan autosaves retain their autosave relation classification, session head IDs remain actual ref facts, and selection never repairs, promotes, or rewrites a ref",
     "diagnostics": "bounded counters and stable reason codes only; no absolute/internal paths or raw OS error strings",
+    "cancellation": "cancelled means work stopped at a safe boundary; existing non-maintenance operations still change no authority, while Trash may leave only a fully synced retryable batch prefix",
     "fault_variants": [
       "queue_full",
       "read_only",
@@ -466,6 +473,7 @@
       "source_changed",
       "digest_mismatch",
       "corruption",
+      "confirmation_required",
       "cancelled",
       "commit_indeterminate"
     ],
@@ -561,11 +569,16 @@
       "unpin_directory_sync"
     ],
     "gc": [
+      "gc_maintenance_upgrade",
       "gc_root_scan",
       "gc_candidate_listing",
+      "gc_trash_directory_create",
+      "gc_trash_collision_file_sync",
       "gc_trash_move",
+      "gc_active_deduplicate_remove",
       "gc_source_directory_sync",
-      "gc_trash_directory_sync"
+      "gc_trash_directory_sync",
+      "gc_maintenance_restore"
     ],
     "purge": [
       "purge_remove",
@@ -574,6 +587,19 @@
     "purge_is_separate": true,
     "commit_indeterminate": "failure to establish final ref-directory durability after retry suspends writes, keeps the revision dirty, and requires close/reopen",
     "saved_revision_rule": "only a durable manual-head completion may advance exactly its captured revision; autosave never advances saved_revision"
+  },
+  "trash_contract": {
+    "selection": "nonempty duplicate-free generation IDs bounded by recovery_candidates_max; fresh exclusive preflight proves each active selection is orphaned, while an absent active generation is accepted only as an exact already-quarantined retry; PlanCompaction never authorizes mutation",
+    "non_regenerable": "every selected generation declares zero non-regenerable artifacts; otherwise reject before mutation with confirmation_required, which the current API cannot satisfy",
+    "retained_closure": "move selected generation files and union(selected physical-object closures) minus union(all active unselected generation closures); roots and unselected orphans are retained, shared objects stay active, and anonymous unrooted objects are never swept",
+    "maintenance": "require a confirmed writer and cancellably convert the actor's own shared maintenance descriptor to exclusive; restore shared ownership immediately after a failed conversion and on every exit; losing maintenance ownership suspends the session and fails indeterminately",
+    "preflight": "before mutation, completely and boundedly validate active and trash namespaces, single-link regular types, canonical generations, refs/pins/graph, declared object lengths, selection, capacity/fan-out, destinations, and the deterministic move plan; unknown or mismatched entries fail closed",
+    "order_and_batches": "generation IDs first, then object digests; each durable batch is at most gc_batch_entries_max namespace mutations and gc_batch_bytes_max checked source bytes, with every affected active/trash parent directory synced deterministically",
+    "retry": "never overwrite; active exact plus trash absent is a no-replace rename, active absent plus trash exact is already quarantined, both exact with an unretained active file syncs trash before removing the active duplicate, every mismatch or double absence fails closed, and a fully quarantined selection succeeds with zero work",
+    "cancellation": "lease wait, preflight, and pre-batch boundaries are cancellable; from a batch's first directory creation, rename, or duplicate removal through its final required directory sync cancellation is deferred; a between-batch cancellation may leave only a durable idempotent prefix, so cancelled means a safe boundary rather than necessarily zero maintenance progress",
+    "indeterminate": "any non-cancellation failure after the first mutation returns commit_indeterminate, suspends writes, performs no rollback, and requires close/reopen; pre-mutation failure changes no bytes",
+    "diagnostics": "published_objects counts files newly removed from active and durably present in trash; streamed_bytes counts only exact-collision verification bytes; neither is a reclaim estimate",
+    "future_non_regenerable": "Trash or Purge of non-regenerable artifacts requires a separate API correction with opaque snapshot-bound exact artifact authorization and verified-backup proof; a boolean is forbidden"
   },
   "source_policy": {
     "unsafe_allowed": false,

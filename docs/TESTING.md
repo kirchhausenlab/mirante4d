@@ -1,6 +1,6 @@
 # Testing And Evidence
 
-Last updated: 2026-07-12
+Last updated: 2026-07-13
 
 ## Claim Language
 
@@ -203,6 +203,12 @@ writer-contended read-only session; the shared cancellation case covers queued
 PlanCompaction. This is not
 Trash authorization, a physical object/byte plan, a reclaim estimate, backup
 approval, mutation, durability evidence, or public/product wiring.
+The accepted Trash safety correction freezes the later quarantine subset for
+generations declaring zero non-regenerable artifacts and its exact transition
+names, including an honest `ConfirmationRequired` outcome otherwise. This
+checkpoint adds no Trash execution, failure-injection, process-kill, or
+durability evidence.
+
 Four initial-package cases
 cover exact Create facts and caller-bound Save As fork encoding, retained root/
 lease validity, exact descriptor admission, existing directory/file/symlink

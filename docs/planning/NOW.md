@@ -1,6 +1,6 @@
 # Current Work
 
-Last updated: 2026-07-12
+Last updated: 2026-07-13
 
 ## Current Checkpoint
 
@@ -53,6 +53,11 @@ recovery-review candidates for every orphan generation. It is cancellable,
 available read-only, and non-mutating; Trash authorization, object/byte moves,
 reclaim estimates, backup approval, durability, and public/product wiring stay
 outside this slice.
+The next B2 checkpoint is bound by a narrow Trash safety correction: only
+freshly revalidated orphans declaring zero non-regenerable artifacts may enter
+the mirrored quarantine. Shared objects stay active, work proceeds in synced
+bounded batches, and every other selection fails with `ConfirmationRequired`.
+The correction does not itself move or delete a file.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.
