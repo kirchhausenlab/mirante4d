@@ -1362,7 +1362,7 @@ where
 fn publish_established_lane_generation<C>(
     root: &LocalStoreRoot,
     leases: &ProjectStoreLeases,
-    capture: ProjectCommitCapture,
+    mut capture: ProjectCommitCapture,
     lane: CommitLane,
     limits: ProjectStoreLimits,
     mut is_cancelled: C,
@@ -1387,7 +1387,7 @@ where
         StoreTransition::ExpectedParentCheck,
         "expected_parent_check",
     )?;
-    validate_established_capture(&capture, lane, &inspection)?;
+    validate_established_capture(&mut capture, lane, &inspection)?;
     after_transaction_transition(expected_parent, "expected_parent_check")?;
     let next_generation_sequence = inspection.next_generation_sequence()?;
     let expected_manual = inspection.manual();
@@ -1518,7 +1518,7 @@ where
 }
 
 fn validate_established_capture(
-    capture: &ProjectCommitCapture,
+    capture: &mut ProjectCommitCapture,
     lane: CommitLane,
     inspection: &EstablishedStoreInspection,
 ) -> Result<(), ProjectStoreFault> {
@@ -1549,7 +1549,7 @@ fn validate_established_capture(
     }
 
     let manual_generation = inspection.manual_generation();
-    if capture.forked_from() != manual_generation.forked_from()
+    if !capture.authenticate_or_inherit_forked_from(manual_generation.forked_from())
         || !capture
             .projection()
             .state()

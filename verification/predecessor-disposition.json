@@ -2483,12 +2483,12 @@
       "reason": "WP-10B B2 proves queued autosaves coalesce with terminal supersession while all completion obligations remain bounded."
     },
     {
-      "id": "libtest:mirante4d-project-store:actor::tests::recovery_inspection_and_open_are_read_only_and_keep_current_save_authority",
+      "id": "libtest:mirante4d-project-store:actor::tests::recovery_inspection_and_open_preserve_heads_and_bytes_across_session_modes",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
-      "reason": "WP-10B B2 proves private recovery inspection/open preserve actual session heads and bytes across normal, corrupt-head, and writer-contended read-only sessions."
+      "reason": "WP-10B proves private recovery inspection/open preserve actual session heads and bytes across normal, corrupt-head, and writer-contended read-only sessions while a successful selection blocks ordinary save authority."
     },
     {
       "id": "libtest:mirante4d-project-store:actor::tests::pin_and_unpin_are_correlated_graph_safe_and_reject_read_only_sessions",
@@ -6259,7 +6259,23 @@
       "owner": "mirante4d-project-store",
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
-      "reason": "WP-10B B2 proves a recoverable failed Open retains recovery-only resources, blocks ordinary mutation, and permits selected-generation Save As with exact fork provenance without changing the damaged source."
+      "reason": "WP-10B proves a recoverable failed Open retains recovery-only resources, blocks ordinary mutation, preserves selection across failed Save As, and copies the selected generation's exact authenticated closure with exact fork provenance without changing the damaged source."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:actor::tests::public_actor_normal_recovery_selection_is_save_as_only",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B proves successful recovery selection from a healthy normal session blocks ManualSave and Autosave before reads, preserves the exact selection after a failed reselection, and permits only selected-closure Save As without source mutation."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:actor::tests::public_actor_reopened_save_as_inherits_held_fork_for_manual_and_autosave",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B proves reopened Save As authority rejects explicit fork-provenance mismatch before reads or mutation and inherits the authenticated held fork tuple when later ManualSave and Autosave captures omit it."
     },
     {
       "id": "libtest:xtask::bin/xtask:verification::runner::tests::project_store_lifecycle_evidence_is_exact_and_fail_closed",
@@ -6756,6 +6772,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 638
+    "current_additions": 640
   }
 }
