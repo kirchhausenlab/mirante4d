@@ -864,30 +864,46 @@ fn worker_main(
                 request_id,
                 checkpoint_id,
                 generation_id,
-            } => ProjectStoreCompletion::Pinned {
-                request_id,
-                result: publish_pin(
-                    &session.root,
-                    &session.leases,
-                    &checkpoint_id,
-                    generation_id,
-                    limits,
-                    || cancelled.load(Ordering::Acquire),
-                ),
-            },
+            } => {
+                #[cfg(test)]
+                if let Some(injector) = shared.gc_transition_injector.get() {
+                    session
+                        .leases
+                        .set_gc_transition_injector(Arc::clone(injector));
+                }
+                ProjectStoreCompletion::Pinned {
+                    request_id,
+                    result: publish_pin(
+                        &session.root,
+                        &session.leases,
+                        &checkpoint_id,
+                        generation_id,
+                        limits,
+                        || cancelled.load(Ordering::Acquire),
+                    ),
+                }
+            }
             Work::Unpin {
                 request_id,
                 checkpoint_id,
-            } => ProjectStoreCompletion::Unpinned {
-                request_id,
-                result: remove_pin(
-                    &session.root,
-                    &session.leases,
-                    &checkpoint_id,
-                    limits,
-                    || cancelled.load(Ordering::Acquire),
-                ),
-            },
+            } => {
+                #[cfg(test)]
+                if let Some(injector) = shared.gc_transition_injector.get() {
+                    session
+                        .leases
+                        .set_gc_transition_injector(Arc::clone(injector));
+                }
+                ProjectStoreCompletion::Unpinned {
+                    request_id,
+                    result: remove_pin(
+                        &session.root,
+                        &session.leases,
+                        &checkpoint_id,
+                        limits,
+                        || cancelled.load(Ordering::Acquire),
+                    ),
+                }
+            }
             Work::PlanCompaction { request_id } => ProjectStoreCompletion::CompactionPlanned {
                 request_id,
                 result: crate::inspection::plan_compaction(&session.root, limits, || {
@@ -1074,6 +1090,17 @@ mod tests {
         "actor::tests::",
         "purge_fresh_process_kill_and_retry_matrix"
     );
+    const PIN_UNPIN_PROCESS_ROLE: &str = "MIRANTE4D_PIN_UNPIN_PROCESS_ROLE";
+    const PIN_UNPIN_PROCESS_ROOT: &str = "MIRANTE4D_PIN_UNPIN_PROCESS_ROOT";
+    const PIN_UNPIN_PROCESS_OPERATION: &str = "MIRANTE4D_PIN_UNPIN_PROCESS_OPERATION";
+    const PIN_UNPIN_PROCESS_TRANSITION: &str = "MIRANTE4D_PIN_UNPIN_PROCESS_TRANSITION";
+    const PIN_UNPIN_PROCESS_EDGE: &str = "MIRANTE4D_PIN_UNPIN_PROCESS_EDGE";
+    const PIN_UNPIN_PROCESS_OCCURRENCE: &str = "MIRANTE4D_PIN_UNPIN_PROCESS_OCCURRENCE";
+    const PIN_UNPIN_PROCESS_MARKER: &str = "MIRANTE4D_PIN_UNPIN_PROCESS_MARKER";
+    const PIN_UNPIN_PROCESS_TEST: &str = concat!(
+        "actor::tests::",
+        "pin_and_unpin_fresh_process_kill_and_retry_matrix"
+    );
     const STALE_MANUAL: &str = concat!(
         "m4d-project-generation-v1-sha256:",
         "d5020fa3c69a493b34ffbbf3a67a249354e83e5a6d738479d46c7e301786d2ec"
@@ -1225,6 +1252,63 @@ mod tests {
                 let _ = child.kill();
             }
             let _ = child.wait();
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PinProcessOperation {
+        Pin,
+        Unpin,
+    }
+
+    impl PinProcessOperation {
+        const fn name(self) -> &'static str {
+            match self {
+                Self::Pin => "pin",
+                Self::Unpin => "unpin",
+            }
+        }
+
+        fn parse(name: &str) -> Option<Self> {
+            match name {
+                "pin" => Some(Self::Pin),
+                "unpin" => Some(Self::Unpin),
+                _ => None,
+            }
+        }
+
+        fn command(self, id: u64) -> ProjectStoreCommand {
+            match self {
+                Self::Pin => ProjectStoreCommand::Pin {
+                    request_id: request_id(id),
+                    checkpoint_id: "checkpoint-a".to_owned(),
+                    generation_id: generation_id(RECOVERABLE_ORPHAN),
+                },
+                Self::Unpin => ProjectStoreCommand::Unpin {
+                    request_id: request_id(id),
+                    checkpoint_id: "checkpoint-a".to_owned(),
+                },
+            }
+        }
+
+        fn completion_succeeded(self, completion: ProjectStoreCompletion, id: u64) -> bool {
+            match (self, completion) {
+                (
+                    Self::Pin,
+                    ProjectStoreCompletion::Pinned {
+                        request_id: actual,
+                        result: Ok(()),
+                    },
+                )
+                | (
+                    Self::Unpin,
+                    ProjectStoreCompletion::Unpinned {
+                        request_id: actual,
+                        result: Ok(()),
+                    },
+                ) => actual == request_id(id),
+                _ => false,
+            }
         }
     }
 
@@ -2813,6 +2897,259 @@ mod tests {
     }
 
     #[test]
+    fn pin_and_unpin_fresh_process_kill_and_retry_matrix() {
+        if let Some(role) = env::var_os(PIN_UNPIN_PROCESS_ROLE) {
+            let root_path = PathBuf::from(env::var_os(PIN_UNPIN_PROCESS_ROOT).unwrap());
+            let store_path = ProjectStorePath::new(root_path).unwrap();
+            let operation =
+                PinProcessOperation::parse(env::var(PIN_UNPIN_PROCESS_OPERATION).unwrap().as_str())
+                    .unwrap();
+            match role.to_str().unwrap() {
+                "mutator" => {
+                    let transition = GcTransition::parse(
+                        env::var(PIN_UNPIN_PROCESS_TRANSITION).unwrap().as_str(),
+                    )
+                    .unwrap();
+                    let allowed = match operation {
+                        PinProcessOperation::Pin => GcTransition::PIN.contains(&transition),
+                        PinProcessOperation::Unpin => GcTransition::UNPIN.contains(&transition),
+                    };
+                    assert!(allowed, "transition does not belong to {operation:?}");
+                    let edge =
+                        TransitionEdge::parse(env::var(PIN_UNPIN_PROCESS_EDGE).unwrap().as_str())
+                            .unwrap();
+                    let occurrence = env::var(PIN_UNPIN_PROCESS_OCCURRENCE)
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap();
+                    let marker = PathBuf::from(env::var_os(PIN_UNPIN_PROCESS_MARKER).unwrap());
+                    let injector = GcTransitionInjector::parking(
+                        GcTransitionTarget {
+                            transition,
+                            edge,
+                            occurrence,
+                        },
+                        marker,
+                    );
+                    let actor = EstablishedProjectActor::start_with_gc_transition_injector(
+                        &store_path,
+                        Default::default(),
+                        injector,
+                    )
+                    .unwrap();
+                    actor.try_submit(operation.command(1)).unwrap();
+                    panic!(
+                        "{operation:?} mutator escaped its transition hook: {:?}",
+                        actor.recv_timeout(Duration::from_secs(30))
+                    );
+                }
+                "recover" => {
+                    let actor =
+                        EstablishedProjectActor::start(&store_path, Default::default()).unwrap();
+                    actor.try_submit(operation.command(41)).unwrap();
+                    assert!(
+                        operation.completion_succeeded(actor.recv_timeout(TIMEOUT).unwrap(), 41,)
+                    );
+                    actor.try_submit(operation.command(42)).unwrap();
+                    assert!(
+                        operation.completion_succeeded(actor.recv_timeout(TIMEOUT).unwrap(), 42,)
+                    );
+                    actor.try_submit(close_command(43)).unwrap();
+                    assert!(matches!(
+                        actor.recv_timeout(TIMEOUT),
+                        Some(ProjectStoreCompletion::Closed {
+                            request_id: actual,
+                            result: Ok(()),
+                        }) if actual == request_id(43)
+                    ));
+                    actor.join().unwrap();
+                    return;
+                }
+                other => panic!("unexpected Pin/Unpin process role {other}"),
+            }
+        }
+
+        assert_eq!(
+            GcTransition::PIN.map(GcTransition::name),
+            [
+                "pin_stage_create",
+                "pin_write",
+                "pin_file_sync",
+                "pin_replace",
+                "pin_directory_sync",
+            ]
+        );
+        assert_eq!(
+            GcTransition::UNPIN.map(GcTransition::name),
+            ["unpin_remove", "unpin_directory_sync"]
+        );
+
+        let mut cases = Vec::new();
+        for (operation, transitions) in [
+            (PinProcessOperation::Pin, GcTransition::PIN.as_slice()),
+            (PinProcessOperation::Unpin, GcTransition::UNPIN.as_slice()),
+        ] {
+            for &transition in transitions {
+                let occurrences = match transition {
+                    GcTransition::PinDirectorySync => 2,
+                    _ => 1,
+                };
+                for edge in [TransitionEdge::Before, TransitionEdge::After] {
+                    for occurrence in 0..occurrences {
+                        cases.push((operation, transition, edge, occurrence));
+                    }
+                }
+            }
+        }
+        assert_eq!(cases.len(), 16);
+
+        let markers = TestDirectory::new("pin-unpin-kill-markers");
+        let mut killed = 0_usize;
+        let mut recovered = 0_usize;
+        let mut idempotent_second_retries = 0_usize;
+        let mut recovery_sync_required_cases = 0_usize;
+        let mut staging_residue_cases = 0_usize;
+        for (case, (operation, transition, edge, occurrence)) in cases.into_iter().enumerate() {
+            let project = TestProject::extracted_store(
+                &format!("pin-unpin-kill-{case}"),
+                "recoverable.m4dproj",
+            );
+            let limits = ProjectStoreLimits::default();
+            let initial_root = LocalStoreRoot::open(project.path()).unwrap();
+            let initial_pin = initial_root
+                .read_pin_ref("checkpoint-a", limits, || false)
+                .unwrap()
+                .unwrap();
+            assert_ne!(initial_pin.current(), generation_id(RECOVERABLE_ORPHAN));
+            drop(initial_root);
+
+            let mut unrelated_refs_before = file_tree(&project.path().join("refs"));
+            unrelated_refs_before.remove(Path::new("pins/checkpoint-a"));
+            let generations_before = file_tree(&project.path().join("generations"));
+            let objects_before = file_tree(&project.path().join("objects"));
+            let marker = markers.path().join(format!(
+                "{case}-{}-{}-{}-{occurrence}",
+                operation.name(),
+                transition.name(),
+                edge.name()
+            ));
+
+            let mut mutator = ChildGuard::new(
+                Command::new(env::current_exe().unwrap())
+                    .arg(PIN_UNPIN_PROCESS_TEST)
+                    .arg("--exact")
+                    .arg("--nocapture")
+                    .env(PIN_UNPIN_PROCESS_ROLE, "mutator")
+                    .env(PIN_UNPIN_PROCESS_ROOT, project.path())
+                    .env(PIN_UNPIN_PROCESS_OPERATION, operation.name())
+                    .env(PIN_UNPIN_PROCESS_TRANSITION, transition.name())
+                    .env(PIN_UNPIN_PROCESS_EDGE, edge.name())
+                    .env(PIN_UNPIN_PROCESS_OCCURRENCE, occurrence.to_string())
+                    .env(PIN_UNPIN_PROCESS_MARKER, &marker)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + TIMEOUT;
+            while !marker.exists() {
+                if let Some(status) = mutator.child_mut().try_wait().unwrap() {
+                    panic!(
+                        "{operation:?} mutator exited before {} {} occurrence {occurrence}: {status}",
+                        transition.name(),
+                        edge.name()
+                    );
+                }
+                if Instant::now() >= deadline {
+                    panic!(
+                        "{operation:?} mutator did not reach {} {} occurrence {occurrence}",
+                        transition.name(),
+                        edge.name()
+                    );
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            let killed_status = mutator.kill_and_wait();
+            assert_eq!(killed_status.signal(), Some(9));
+            killed += 1;
+
+            let mut recovery = ChildGuard::new(
+                Command::new(env::current_exe().unwrap())
+                    .arg(PIN_UNPIN_PROCESS_TEST)
+                    .arg("--exact")
+                    .arg("--nocapture")
+                    .env(PIN_UNPIN_PROCESS_ROLE, "recover")
+                    .env(PIN_UNPIN_PROCESS_ROOT, project.path())
+                    .env(PIN_UNPIN_PROCESS_OPERATION, operation.name())
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let recovery_status = recovery.wait_timeout(Duration::from_secs(10));
+            assert!(
+                recovery_status.success(),
+                "fresh {operation:?} retry failed after {} {} occurrence {occurrence}",
+                transition.name(),
+                edge.name()
+            );
+            recovered += 1;
+            idempotent_second_retries += 1;
+
+            let recovery_synced_existing_state = match operation {
+                PinProcessOperation::Pin => {
+                    (transition == GcTransition::PinReplace && edge == TransitionEdge::After)
+                        || transition == GcTransition::PinDirectorySync
+                }
+                PinProcessOperation::Unpin => {
+                    (transition == GcTransition::UnpinRemove && edge == TransitionEdge::After)
+                        || transition == GcTransition::UnpinDirectorySync
+                }
+            };
+            recovery_sync_required_cases += usize::from(recovery_synced_existing_state);
+
+            let expected_staging_residue = operation == PinProcessOperation::Pin
+                && !(transition == GcTransition::PinStageCreate && edge == TransitionEdge::Before);
+            let staging_residue = private_pin_staging_residue(project.path());
+            assert_eq!(staging_residue, usize::from(expected_staging_residue));
+            staging_residue_cases += staging_residue;
+
+            let root = LocalStoreRoot::open(project.path()).unwrap();
+            let final_pin = root.read_pin_ref("checkpoint-a", limits, || false).unwrap();
+            match operation {
+                PinProcessOperation::Pin => assert_eq!(
+                    final_pin.unwrap().current(),
+                    generation_id(RECOVERABLE_ORPHAN)
+                ),
+                PinProcessOperation::Unpin => assert!(final_pin.is_none()),
+            }
+            let graph = crate::inspection::inspect_store_graph(&root, limits, || false).unwrap();
+            if operation == PinProcessOperation::Pin {
+                assert!(
+                    !graph
+                        .orphan_generation_ids()
+                        .contains(&generation_id(RECOVERABLE_ORPHAN))
+                );
+            }
+            let mut unrelated_refs_after = file_tree(&project.path().join("refs"));
+            unrelated_refs_after.remove(Path::new("pins/checkpoint-a"));
+            assert_eq!(unrelated_refs_after, unrelated_refs_before);
+            assert_eq!(
+                file_tree(&project.path().join("generations")),
+                generations_before
+            );
+            assert_eq!(file_tree(&project.path().join("objects")), objects_before);
+        }
+        assert_eq!(killed, 16);
+        assert_eq!(recovered, 16);
+        assert_eq!(idempotent_second_retries, 16);
+        assert_eq!(recovery_sync_required_cases, 8);
+        assert_eq!(staging_residue_cases, 11);
+        eprintln!(
+            "M4D_PIN_UNPIN_PROCESS_MATRIX_V1 cases=16 killed=16 fresh_reopens=16 retry_completed=16 idempotent_second_retries=16 recovery_sync_required_cases=8 staging_residue_cases=11 staging_cleanup_deferred=true process_crash_only=true power_loss_simulated=false durability_claim=false"
+        );
+    }
+
+    #[test]
     fn trash_fresh_process_kill_and_retry_matrix() {
         if let Some(role) = env::var_os(TRASH_PROCESS_ROLE) {
             let root_path = PathBuf::from(env::var_os(TRASH_PROCESS_ROOT).unwrap());
@@ -3999,6 +4336,31 @@ mod tests {
         let mut files = BTreeMap::new();
         visit(root, root, &mut files);
         files
+    }
+
+    fn private_pin_staging_residue(root: &Path) -> usize {
+        let staging = root.join("staging");
+        let mut entries = match fs::read_dir(&staging) {
+            Ok(entries) => entries.map(|entry| entry.unwrap()).collect::<Vec<_>>(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return 0,
+            Err(error) => panic!("failed to inspect private Pin staging residue: {error}"),
+        };
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in &entries {
+            let file_type = entry.file_type().unwrap();
+            assert!(file_type.is_dir() && !file_type.is_symlink());
+            assert!(
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("tx-"))
+            );
+            for (path, bytes) in file_tree(&entry.path()) {
+                assert_eq!(path, Path::new("payload"));
+                assert!(bytes.is_empty() || bytes.len() == 160);
+            }
+        }
+        entries.len()
     }
 
     fn stage_count(parent: &Path) -> usize {

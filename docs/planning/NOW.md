@@ -40,9 +40,11 @@ active off-product: public Create/Open/Save As execution, provisional autosave
 publication, timers, public/product garbage collection and Purge wiring, and
 public actor wiring remain later work, with product activation at B4.
 Private Pin/Unpin now supplies durable checkpoint roots with fresh graph,
-capacity, cancellation, and read-only enforcement. The accepted maintenance
-transition correction names pin and unpin phases whose exhaustive failure
-matrix remains later B2 work.
+capacity, cancellation, and read-only enforcement. All seven frozen phases now
+have exact before/after occurrence injection plus a 16-case actual `SIGKILL`,
+fresh-process reopen, and retry matrix. This is process-crash evidence only;
+dead-writer staging cleanup and power-loss/filesystem durability remain later
+B2 work.
 A private bounded FullVerify path now hashes every physical object in one
 stable active-store snapshot, reconstructs paged logical objects, remains
 cancellable and available read-only, and changes no store authority. Artifact

@@ -167,8 +167,10 @@ promotion. The frozen public actor remains non-constructible and the crate
 remains off-product. Private Pin/Unpin execution now validates the complete
 graph and prospective recovery-candidate cap, preserves duplicate-pin liveness,
 rejects read-only sessions, and makes directory-sync uncertainty
-write-suspending. The accepted transition authority names pin, unpin, and purge
-phases. Pin and unpin do not yet have their exhaustive failpoint/kill matrix. A
+write-suspending. All seven frozen Pin/Unpin transitions now have exact before/
+after occurrence injection plus a 16-case actual `SIGKILL`, fresh-process
+reopen, and retry matrix. This proves logic and process-crash recovery only;
+dead-writer staging cleanup and power-loss/filesystem durability remain later. A
 private read-only FullVerify path now hashes every physical object in one
 bounded stable active-store snapshot, reconstructs paged logical objects,
 supports cancellation and read-only sessions, and changes no store bytes.

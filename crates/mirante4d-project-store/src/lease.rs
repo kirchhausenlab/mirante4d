@@ -58,6 +58,13 @@ pub(crate) enum GcTransition {
     MaintenanceRestore,
     PurgeRemove,
     PurgeDirectorySync,
+    PinStageCreate,
+    PinWrite,
+    PinFileSync,
+    PinReplace,
+    PinDirectorySync,
+    UnpinRemove,
+    UnpinDirectorySync,
 }
 
 impl GcTransition {
@@ -83,6 +90,18 @@ impl GcTransition {
         Self::MaintenanceRestore,
     ];
 
+    #[cfg(test)]
+    pub(crate) const PIN: [Self; 5] = [
+        Self::PinStageCreate,
+        Self::PinWrite,
+        Self::PinFileSync,
+        Self::PinReplace,
+        Self::PinDirectorySync,
+    ];
+
+    #[cfg(test)]
+    pub(crate) const UNPIN: [Self; 2] = [Self::UnpinRemove, Self::UnpinDirectorySync];
+
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::MaintenanceUpgrade => "gc_maintenance_upgrade",
@@ -97,6 +116,13 @@ impl GcTransition {
             Self::MaintenanceRestore => "gc_maintenance_restore",
             Self::PurgeRemove => "purge_remove",
             Self::PurgeDirectorySync => "purge_directory_sync",
+            Self::PinStageCreate => "pin_stage_create",
+            Self::PinWrite => "pin_write",
+            Self::PinFileSync => "pin_file_sync",
+            Self::PinReplace => "pin_replace",
+            Self::PinDirectorySync => "pin_directory_sync",
+            Self::UnpinRemove => "unpin_remove",
+            Self::UnpinDirectorySync => "unpin_directory_sync",
         }
     }
 
@@ -105,6 +131,8 @@ impl GcTransition {
         Self::ALL
             .into_iter()
             .chain([Self::PurgeRemove, Self::PurgeDirectorySync])
+            .chain(Self::PIN)
+            .chain(Self::UNPIN)
             .find(|transition| transition.name() == name)
     }
 
@@ -122,6 +150,13 @@ impl GcTransition {
             Self::MaintenanceRestore => 9,
             Self::PurgeRemove => 10,
             Self::PurgeDirectorySync => 11,
+            Self::PinStageCreate => 12,
+            Self::PinWrite => 13,
+            Self::PinFileSync => 14,
+            Self::PinReplace => 15,
+            Self::PinDirectorySync => 16,
+            Self::UnpinRemove => 17,
+            Self::UnpinDirectorySync => 18,
         }
     }
 }
@@ -179,7 +214,7 @@ pub(crate) struct GcTransitionTarget {
 pub(crate) struct GcTransitionInjector {
     target: Option<GcTransitionTarget>,
     action: GcTransitionAction,
-    attempts: [AtomicUsize; 12],
+    attempts: [AtomicUsize; 19],
     fired: AtomicUsize,
     release: AtomicBool,
     parked_thread: Mutex<Option<thread::Thread>>,
