@@ -692,7 +692,10 @@ fn check_wp07b_boundary_contract(repo_root: &Path) -> anyhow::Result<()> {
         // WP-07B remains historical evidence. WP-08A's exact matrix, checked
         // first, owns these narrowly superseding dependency/API additions.
         let wp08a_normal_additions = match name {
-            "mirante4d-application" => BTreeSet::from(["mirante4d-render-api".to_owned()]),
+            "mirante4d-application" => BTreeSet::from([
+                "mirante4d-project-store".to_owned(),
+                "mirante4d-render-api".to_owned(),
+            ]),
             "mirante4d-render-api" => BTreeSet::from(["mirante4d-dataset".to_owned()]),
             _ => BTreeSet::new(),
         };

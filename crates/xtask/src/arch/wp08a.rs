@@ -60,8 +60,10 @@ pub(super) fn accepted_successor_normal_dependency_additions(
     crate_name: &str,
 ) -> &'static [&'static str] {
     match crate_name {
-        "mirante4d-app" => &["mirante4d-dataset-runtime"],
-        "mirante4d-data" | "mirante4d-renderer" => &["mirante4d-dataset"],
+        "mirante4d-app" => &["mirante4d-dataset-runtime", "mirante4d-project-store"],
+        "mirante4d-application" => &["mirante4d-project-store"],
+        "mirante4d-data" => &["blake3", "mirante4d-dataset", "mirante4d-identity"],
+        "mirante4d-renderer" => &["mirante4d-dataset"],
         "mirante4d-identity" => &["mirante4d-domain", "sha2", "unicode-normalization"],
         "mirante4d-project-store" => &["mirante4d-domain"],
         "xtask" => &["mirante4d-dataset", "mirante4d-dataset-runtime"],

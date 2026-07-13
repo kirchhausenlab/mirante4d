@@ -2243,6 +2243,7 @@ dependencies = [
  "mirante4d-identity",
  "mirante4d-import",
  "mirante4d-project-model",
+ "mirante4d-project-store",
  "mirante4d-render-api",
  "mirante4d-renderer",
  "mirante4d-settings",
@@ -2265,6 +2266,7 @@ dependencies = [
  "mirante4d-domain",
  "mirante4d-identity",
  "mirante4d-project-model",
+ "mirante4d-project-store",
  "mirante4d-render-api",
  "mirante4d-settings",
 ]
@@ -2273,10 +2275,12 @@ dependencies = [
 name = "mirante4d-data"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "glam",
  "mirante4d-dataset",
  "mirante4d-domain",
  "mirante4d-format",
+ "mirante4d-identity",
  "tempfile",
  "thiserror 2.0.17",
  "tracing",

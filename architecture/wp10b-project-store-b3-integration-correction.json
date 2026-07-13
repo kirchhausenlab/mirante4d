@@ -1,0 +1,155 @@
+{
+  "schema": "mirante4d-foundation-package-entry-correction",
+  "schema_version": 1,
+  "package": "WP-10B",
+  "status": "accepted",
+  "authorization": {
+    "approved_by": "Mirante4D repository owner",
+    "approved_on": "2026-07-13",
+    "reference": "WP10B-PREAUTH-2026-07-12",
+    "scope": "narrow B3 dependency timing, current-source verification, capture reuse, and autosave scheduling correction"
+  },
+  "accepted_boundary": {
+    "contract_path": "architecture/wp10b-project-store-contract.json",
+    "pre_correction_contract_sha256": "81dcb946dc35c664fa14f703b61caf6412f022856fdd9303ed92d450218f03b3",
+    "protected_main_commit": "4a246a1bb7bfe099673ef10d6cb5951729b3ff37",
+    "protected_main_tree": "af5531d8ffbda0c13b342a0b4df47a894e7f99fb",
+    "hosted_run": "https://github.com/kirchhausenlab/mirante4d/actions/runs/29273392030",
+    "hosted_result": "success",
+    "b2_report_sha256": "ced8c82c75c480810e7ebf81e2c032e579f89bbb28c1f854d1681a3ddad1f9e5"
+  },
+  "discovered_gaps": {
+    "dependency_timing": "The entry schedules application and app dependencies on project-store only at B4, but B3 must compile and test the off-product application service before the product cutover.",
+    "source_algorithm": "The entry does not freeze the current schema-1 source traversal, dtype conversion, validity, cache, or source-drift facts needed to derive D-009 honestly.",
+    "application_lifecycle": "The entry does not freeze source-session currentness, verified-runtime handoff, stale prepared-runtime disposal, or identity invalidation behavior.",
+    "capture_reuse": "The existing capture source contract does not distinguish genuinely new artifact bytes from actor-authenticated unchanged direct or paged objects already bound to the open generation.",
+    "autosave_clock": "The provisional-autosave correction explicitly leaves the 30-second idle and 120-second maximum timer semantics unfrozen.",
+    "product_reachability": "The B1 checker rejects every reverse dependency, so it cannot distinguish compile-only B3 integration from B4 product construction and polling.",
+    "validator_scope": "The immutable WP-08A dependency matrix needs an exact successor-owned allowance without rewriting its accepted JSON."
+  },
+  "correction": {
+    "dependencies": {
+      "normal_additions": [
+        "mirante4d-data -> mirante4d-identity",
+        "mirante4d-data -> blake3",
+        "mirante4d-application -> mirante4d-project-store",
+        "mirante4d-app -> mirante4d-project-store"
+      ],
+      "rule": "These are the only B3 additions. Project-store's own dependencies and every inherited lower-level API remain unchanged.",
+      "architecture_validator": "crates/xtask/src/arch/wp08a.rs may recognize exactly these additions while keeping architecture/wp08a-subsystem-contract.json immutable."
+    },
+    "current_source_verification": {
+      "owner": "the existing mirante4d-data current-source bridge",
+      "sequence": "take a complete bounded pre-inventory, run the D-009 base-scale scan, then require an exact complete post-inventory match before issuing a verified catalog",
+      "inventory": "reject symlinks and special files, sort every normalized source-relative regular-file tuple (path, byte_length, BLAKE3 digest) bytewise, and derive one deterministic BLAKE3 inventory root; any addition, removal, type change, length change, digest change, or traversal drift returns SourceChanged",
+      "cache": "an optional machine-local XDG cache is non-authoritative, nonfatal, and at most 67108864 bytes; a cache hit may avoid redundant metadata work but still hashes the complete source closure and cannot bypass either inventory",
+      "memory": "the hashing stream buffer is at most 1048576 bytes; decoder, tile, canonical-value, and validity scratch is admitted and released through the accepted runtime CPU byte ledger",
+      "scan": "hash scale s0 only, require contiguous logical layer ordinals, and use TimeCoordinate::Unknown; accepted source-scientific-to-stored dtype pairs are exactly u8-to-u8, u8-to-u16, u16-to-u16, and f32-to-f32 with exact lossless conversion",
+      "validity": "decode exact least-significant-bit validity; invalid samples hash as integer zero or positive f32 zero, while valid f32 values must be finite and retain their exact accepted bits",
+      "source_safety": "verification never writes to the source tree"
+    },
+    "application_integration": {
+      "operation": "production application state extends its existing public enums/types, without new root exports, to own source-verification request, bounded progress, terminal completion, cancellation, and invalidation facts",
+      "currentness": "completion is current only for the exact opened source generation; view or interaction generation changes do not cancel otherwise-current verification",
+      "promotion": "require the verified catalog to be structurally identical to the opened catalog except for identity, prepare its runtime, then atomically replace the current source/catalog/runtime generation; dispose a prepared runtime when completion is cancelled, stale, failed, or superseded",
+      "test_seam": "delete ApplicationState::admit_verified_source_for_test and exercise the production verification completion route in tests",
+      "drift": "observed source drift invalidates the verified binding and blocks project attach, open, manual save, Save As, and autosave until reverification succeeds"
+    },
+    "project_capture": {
+      "sources": "caller-provided ProjectObjectSource values form a duplicate-free subset containing only genuinely new logical objects",
+      "reuse": "an unchanged direct or paged logical object may omit its source only when the actor authenticates its complete storage binding against the operation's held source generation and lane",
+      "reopen": "an unchanged paged artifact larger than 16777216 bytes remains savable after reopen with zero caller sources",
+      "save_as": "the actor copies and rehashes the authenticated source-generation closure into destination-local staging, including the positive cross-device path",
+      "failure": "a genuinely new logical object without exactly one matching source fails closed before ref publication"
+    },
+    "autosave_scheduler": {
+      "eligibility": "the verified source is bound, the project is dirty and writable, and no commit is active",
+      "deadline": "min(latest durable edit tick plus 30 seconds, first pending edit tick plus 120 seconds)",
+      "capture": "take exactly one immutable capture at the due deadline; edits during capture retain their existing first/latest deadlines",
+      "success": "clear only revisions included in the completed capture and never advance the manual saved revision",
+      "failure": "failure or cancellation schedules no automatic retry for the captured revision; an explicit user retry remains allowed and a later durable edit re-arms the timer; CommitIndeterminate alone suspends all project writes until close/reopen",
+      "clock": "use an injected monotonic clock; a decreasing tick is rejected atomically and tests never sleep"
+    },
+    "b3_reachability": {
+      "source_verification": "the real product may construct and exercise current-source verification during B3",
+      "project_store_service": "the application service is compiled and tested but is not constructed, stored, started, or polled by the product composition root during B3",
+      "sole_product_route": "current_project_persistence_bridge plus CurrentProjectRuntime remain the sole reachable product open/save route until B4",
+      "negative_proof": "architecture checks must reject every other incoming project-store edge and prove the dedicated service is absent from MiranteWorkbenchApp fields, constructors, polling, event-loop, shutdown, and UI call paths"
+    },
+    "verification": {
+      "public": "use the existing policy and Rust groups; add no hosted lane, cache, or artifact",
+      "fixture": "at most one small public T2 current-source corpus may be added",
+      "product": "on a real mapped display at 1280x720 and 1920x1080, exercise verification progress, cancellation, successful completion, continued nonblank rendering, and byte-identical source closure",
+      "deferred_to_b4": "product save, edit-during-save, autosave, recovery, reopen, and Save As validation",
+      "tag": "B3 creates no WP-10B exit tag"
+    }
+  },
+  "superseded_fields": [
+    "wp10b-project-store-entry.json dependency_contract.product_edges_at_b4 timing only",
+    "wp10b-project-store-entry.json dependency rule and stop condition only for the four consumed B3 edges",
+    "wp10b-project-store-entry.json temporary_identity_edge",
+    "wp10b-project-store-durability-qualification-correction.json unreachable invariant only insofar as compile-time edges are now permitted; runtime product reachability remains forbidden",
+    "wp10b-project-store-provisional-autosave-correction.json correction.timers",
+    "wp10b-project-store-contract.json provisional_autosave_contract.timers",
+    "wp10b-project-store-contract.json blanket reverse-dependent ban and exact-source-closure capture behavior"
+  ],
+  "supplemented_contract_paths": [
+    "bindings.b3_integration_correction",
+    "b3_integration_contract"
+  ],
+  "invariants": [
+    "Project-store remains EXPERIMENTAL and product-unreachable throughout B3; B4 alone flips product project persistence authority.",
+    "Project-v15 and CurrentProjectRuntime are not changed or deleted before the atomic B4 cutover.",
+    "Verified scientific identity comes only from the complete bounded source scan and exact inventory stability; a manifest claim, cache entry, path, slug, or package fingerprint is insufficient.",
+    "Source microscopy bytes are never mutated, and all large work remains bounded, cancellable, runtime-accounted, and stale-suppressing.",
+    "No persisted project-store byte, path, public root export, filesystem transition, durability tuple, or B2 evidence requirement changes.",
+    "Segmentation remains absent."
+  ],
+  "allowed_paths": [
+    "architecture/wp10b-project-store-b3-integration-correction.json",
+    "architecture/wp10b-project-store-contract.json",
+    "architecture/current-state-field-ledger.json",
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/mirante4d-project-store/**",
+    "crates/mirante4d-application/**",
+    "crates/mirante4d-data/**",
+    "crates/mirante4d-app/**",
+    "crates/xtask/src/arch.rs",
+    "crates/xtask/src/arch/wp08a.rs",
+    "crates/xtask/src/arch/wp10b.rs",
+    "crates/xtask/src/verification/**",
+    "crates/xtask/src/product_validate.rs",
+    "crates/xtask/src/product_validate/**",
+    "verification/fixtures.json",
+    "verification/registry.json",
+    "verification/generated/selectors.json",
+    "verification/predecessor-disposition.json",
+    ".config/nextest.toml",
+    "fixtures/source-verification/**",
+    "docs/ARCHITECTURE.md",
+    "docs/CURRENT_STATE.md",
+    "docs/DATA_FORMAT.md",
+    "docs/TESTING.md",
+    "docs/DEVELOPMENT.md",
+    "docs/planning/NOW.md",
+    "docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md",
+    "docs/plans/active/foundation-refactor/PROJECT_STORE_DURABILITY_BRIEF.md",
+    "docs/decisions/ADR-0003-immutable-project-generations.md"
+  ],
+  "evidence": [
+    "exact correction binding and unchanged project-store wire/public-root/dependency/durability guards",
+    "source inventory, dtype/validity, cancellation, drift, cache, memory-ledger, promotion, and nonmutation tests",
+    "capture reuse, reopened paged-object, genuinely-new-source rejection, and cross-device Save As tests",
+    "injected-clock autosave deadline, edit-during-capture, completion, failure, indeterminate, and decreasing-tick tests",
+    "architecture proof that project-store service is compiled/tested but not product-constructed or polled",
+    "clean public groups and real-display B3 source-verification validation at both accepted resolutions"
+  ],
+  "non_goals": [
+    "B4 product project-store construction, project-v15 deletion, save/recovery product validation, or WP-10B exit",
+    "WP-10A storage activation, import, analysis, rendering, UI cutover, segmentation, stable formats, or public-data publication",
+    "another CI lane, paid runner, large dataset, TiB allocation, or 4K validation"
+  ],
+  "stop_condition": "Any inherited identity, dataset, dataset-runtime, current-format, or project-store public/wire API must change; verification cannot prove complete source stability within the declared bounds; or B3 requires a reachable second product project path.",
+  "rollback": "revert the B3 correction and implementation together while the project-v15 bridge remains the sole product project route"
+}

@@ -11,5 +11,6 @@ mirante4d-dataset.workspace = true
 mirante4d-domain.workspace = true
 mirante4d-identity.workspace = true
 mirante4d-project-model.workspace = true
+mirante4d-project-store.workspace = true
 mirante4d-render-api.workspace = true
 mirante4d-settings.workspace = true

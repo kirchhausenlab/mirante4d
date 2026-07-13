@@ -61,6 +61,10 @@ const DURABILITY_QUALIFICATION_CORRECTION_PATH: &str =
     "architecture/wp10b-project-store-durability-qualification-correction.json";
 const DURABILITY_QUALIFICATION_CORRECTION_SHA256: &str =
     "6b4bbc23115115e36a449209810764cbce2738ca693a985275f5e6513d4252e6";
+const B3_INTEGRATION_CORRECTION_PATH: &str =
+    "architecture/wp10b-project-store-b3-integration-correction.json";
+const B3_INTEGRATION_CORRECTION_SHA256: &str =
+    "227b3ff385fdf8d7021758b8013ae6ce98f8fb0d742aadeb2fb6e16e4d5199eb";
 const PROTECTED_MAIN_COMMIT: &str = "b6e0267802f8ac2d0d49a0f04302fd321ef2f617";
 const PROTECTED_MAIN_TREE: &str = "b20b598603b47fdbe7c85c3b6d1cba8c78fd433e";
 const PROTECTED_MAIN_RUN: &str =
@@ -75,7 +79,7 @@ const ZERO_SHA256: &str = "00000000000000000000000000000000000000000000000000000
 // contract plus bound corrections while allowing the independent fixture
 // producer to remain bound to its final manifest.
 const NORMALIZED_CONTRACT_SHA256: &str =
-    "2af1ee0435e7ff516c659ed5e3fce5b8e751f57534563b691d8f19c46faa8497";
+    "d49116e00aeb3d9e158fcfe9068fe0cc7c23d10c9cbb11d56461348ce99a36ec";
 
 pub(super) fn check_wp10b_project_store_contract(repo_root: &Path) -> anyhow::Result<()> {
     let contract_path = repo_root.join(CONTRACT_PATH);
@@ -153,6 +157,11 @@ fn validate_header_and_bindings(repo_root: &Path, contract: &Value) -> anyhow::R
             "durability_qualification_correction",
             DURABILITY_QUALIFICATION_CORRECTION_PATH,
             DURABILITY_QUALIFICATION_CORRECTION_SHA256,
+        ),
+        (
+            "b3_integration_correction",
+            B3_INTEGRATION_CORRECTION_PATH,
+            B3_INTEGRATION_CORRECTION_SHA256,
         ),
     ] {
         expect_string(contract, &format!("/bindings/{name}/path"), path)?;
@@ -316,18 +325,79 @@ fn validate_project_store_crate(repo_root: &Path, contract: &Value) -> anyhow::R
     ) {
         bail!("WP-10B project-store must not have a build script");
     }
+    let allowed_b3_consumers = BTreeSet::from([
+        ("mirante4d-app", "normal"),
+        ("mirante4d-application", "normal"),
+    ]);
     for (source, kinds) in &metadata.declared_dependency_kinds_by_name {
         if source == PROJECT_STORE_CRATE {
             continue;
         }
         for (kind, dependencies) in kinds {
             if dependencies.contains(PROJECT_STORE_CRATE) {
-                bail!("off-product WP-10B B1 project store is reachable from {source} ({kind})");
+                if !allowed_b3_consumers.contains(&(source.as_str(), kind.as_str())) {
+                    bail!(
+                        "off-product WP-10B B3 project store has unauthorized consumer {source} ({kind})"
+                    );
+                }
             }
         }
     }
 
-    validate_source_policy(repo_root, contract, &library_root)
+    validate_source_policy(repo_root, contract, &library_root)?;
+    validate_b3_product_isolation(repo_root)
+}
+
+fn validate_b3_product_isolation(repo_root: &Path) -> anyhow::Result<()> {
+    for relative in [
+        "crates/mirante4d-app/src/current_project_persistence_bridge.rs",
+        "crates/mirante4d-app/src/current_runtime/project.rs",
+    ] {
+        if !repo_root.join(relative).is_file() {
+            bail!("WP-10B B3 predecessor must remain the sole product route: missing {relative}");
+        }
+    }
+
+    let app_root = repo_root.join("crates/mirante4d-app/src");
+    for source_path in collect_rust_source_files(&app_root)? {
+        let relative = source_path
+            .strip_prefix(&app_root)
+            .unwrap_or(&source_path)
+            .to_string_lossy();
+        if relative == "tests.rs"
+            || relative.starts_with("tests/")
+            || relative.ends_with("/tests.rs")
+        {
+            continue;
+        }
+        let source = fs::read_to_string(&source_path)
+            .with_context(|| format!("failed to read {}", source_path.display()))?;
+        for forbidden in [
+            "mirante4d_project_store",
+            "ProjectStoreService",
+            "project_store_service::",
+        ] {
+            if source.contains(forbidden) {
+                bail!(
+                    "WP-10B B3 project-store service reached product source {} through {forbidden}",
+                    source_path.display()
+                );
+            }
+        }
+    }
+
+    let application_root = repo_root.join("crates/mirante4d-application/src");
+    let service = application_root.join("project_store_service.rs");
+    if service.exists() {
+        let root_source = fs::read_to_string(application_root.join("lib.rs"))?;
+        if !root_source.contains("mod project_store_service;")
+            || root_source.contains("pub mod project_store_service;")
+            || root_source.contains("pub use project_store_service")
+        {
+            bail!("WP-10B B3 project-store service must compile as one private application module");
+        }
+    }
+    Ok(())
 }
 
 fn validate_source_policy(
