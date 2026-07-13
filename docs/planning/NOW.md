@@ -62,7 +62,11 @@ completion and cancellation, the corrected same-descriptor transition, exact
 retry, and fail-closed inventory. All ten frozen Trash transitions now have
 before/after and zero-based occurrence injection plus a 34-case fresh-process
 kill/retry matrix. This is process-crash evidence, not power-loss durability.
-Purge and the remaining B2 lifecycle/durability work come next.
+The accepted Purge safety correction now freezes a strict complete-trash,
+zero-non-regenerable subset with object-first synced deletion and generation
+metadata retained until the object namespace is durably empty. Implementing
+that private actor path and its exact recovery evidence comes next; the
+remaining B2 lifecycle/durability work follows.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.

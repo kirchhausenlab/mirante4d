@@ -31,6 +31,10 @@
       "path": "architecture/wp10b-project-store-trash-safety-correction.json",
       "sha256": "1eb60a85cdaf13f458826dace05ba548559b4fe30bd70616fe97af21f2ed7ee5"
     },
+    "purge_safety_correction": {
+      "path": "architecture/wp10b-project-store-purge-safety-correction.json",
+      "sha256": "7e7a0e47ae085c2684b9ae9c465eb5568e3555882c7540ef581cce594fff0278"
+    },
     "protected_main": {
       "commit": "b6e0267802f8ac2d0d49a0f04302fd321ef2f617",
       "tree": "b20b598603b47fdbe7c85c3b6d1cba8c78fd433e",
@@ -461,7 +465,7 @@
     },
     "recovery_selection": "every explicitly selected recovery projection opens dirty as an unsaved branch; orphan autosaves retain their autosave relation classification, session head IDs remain actual ref facts, and selection never repairs, promotes, or rewrites a ref",
     "diagnostics": "bounded counters and stable reason codes only; no absolute/internal paths or raw OS error strings",
-    "cancellation": "cancelled means work stopped at a safe boundary; existing non-maintenance operations still change no authority, while Trash may leave only a fully synced retryable batch prefix",
+    "cancellation": "cancelled means current work stopped at a safe boundary; existing non-maintenance operations change no authority; Trash or Purge may leave current-invocation maintenance progress only as a fully synced retryable batch prefix, while cancellation before maintenance progress leaves any preexisting state unchanged",
     "fault_variants": [
       "queue_full",
       "read_only",
@@ -600,6 +604,21 @@
     "indeterminate": "any non-cancellation failure after the first mutation returns commit_indeterminate, suspends writes, performs no rollback, and requires close/reopen; pre-mutation failure changes no bytes",
     "diagnostics": "published_objects counts files newly removed from active and durably present in trash; streamed_bytes counts only exact-collision verification bytes; neither is a reclaim estimate",
     "future_non_regenerable": "Trash or Purge of non-regenerable artifacts requires a separate API correction with opaque snapshot-bound exact artifact authorization and verified-backup proof; a boolean is forbidden"
+  },
+  "purge_contract": {
+    "selection": "the complete freshly inventoried canonical trash snapshot; an empty snapshot is successful zero-namespace-mutation work, and there is no age, caller-selected, automatic, or active-store deletion mode",
+    "authorization": "every remaining trash generation must be canonical, project-consistent, and declare zero non-regenerable artifacts; otherwise reject before unlink with confirmation_required, which the current API cannot satisfy",
+    "maintenance": "require a confirmed writer and cancellably convert the actor's own shared maintenance descriptor to exclusive; preflight and deletion occur only while exclusive, every exit restores shared ownership, and maintenance loss suspends the session and fails indeterminately",
+    "preflight": "completely and boundedly validate the active graph and active-plus-trash namespaces, canonical single-link regular generation and object files, project identity, closures, lengths, exact present trash-object digests, fan-out, and capacity; missing generation parent or base IDs remain permitted provenance rather than liveness edges; unknown, malformed, foreign, linked, mismatched, or unreferenced trash content fails closed",
+    "incomplete_trash": "every trash generation is absent active; an active-only closure object is allowed only when retained by an active generation, while an unretained active-only closure object returns source_changed so Trash finishes first; every present trash object is referenced by an accepted trash generation; an exact active-plus-trash duplicate deletes only the trash file when an active generation retains the active copy, otherwise it returns source_changed",
+    "order_and_barrier": "delete trash objects first in digest order while retaining all trash generations as authorization; sync affected object directories, sync every existing object fan-out including empty, re-inventory, and prove the object namespace empty before deleting remaining generations in generation-ID order; keep the bounded directory hierarchy",
+    "retry": "while all authorizing generations remain, exclude only active-only closure objects retained by active generations; absent trash-owned objects are already purged only when they form an exact digest-ordered prefix followed by the present suffix, and every other absence pattern fails closed; this exact-prefix rule applies only to objects; after the synced empty-object barrier, independently revalidate remaining generations and permit absent provenance parents or bases without claiming a runtime-verifiable generation prefix",
+    "preunlink_identity": "hold the validated file and no-follow parent descriptors and immediately before unlink revalidate regular single-link type, device and inode, length, and expected generation identity or object digest against the held fact; mismatch fails closed; exclusive maintenance excludes compliant writers, while hostile external replacement in the final Linux check-to-unlink race is outside the supported writer model",
+    "batches": "each durable batch has at most gc_batch_entries_max descriptor-relative no-follow unlinks and gc_batch_bytes_max validated file bytes; lease wait and initial inventory may cancel before maintenance progress; once a retry prefix is recognized, a recovery-sync sweep begins, or a batch unlinks, cancellation is deferred through the complete sync and re-inventory boundary; only current-invocation progress may be returned as a synced idempotent prefix",
+    "indeterminate": "any required recovery-sync failure or non-cancellation failure after the first successful unlink returns commit_indeterminate, suspends writes, performs no rollback, and requires close/reopen; a pre-unlink failure changes no namespace bytes",
+    "diagnostics": "published_objects counts regular files newly removed from trash by this invocation, including generation JSON and object files; streamed_bytes counts exact bytes read from those present trash files for identity and integrity validation; neither is a reclaim estimate, and a zero-removal retry reports zero published_objects",
+    "transitions": "compose gc_maintenance_upgrade and gc_maintenance_restore with purge_remove and purge_directory_sync; every observed occurrence supports before and after injection plus fresh-process kill, reopen, and retry",
+    "claim_boundary": "callback and SIGKILL evidence is logic and process-crash evidence only, not power-loss simulation, filesystem qualification, or durability"
   },
   "source_policy": {
     "unsafe_allowed": false,

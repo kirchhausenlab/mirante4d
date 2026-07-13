@@ -41,6 +41,10 @@ const TRASH_SAFETY_CORRECTION_PATH: &str =
     "architecture/wp10b-project-store-trash-safety-correction.json";
 const TRASH_SAFETY_CORRECTION_SHA256: &str =
     "1eb60a85cdaf13f458826dace05ba548559b4fe30bd70616fe97af21f2ed7ee5";
+const PURGE_SAFETY_CORRECTION_PATH: &str =
+    "architecture/wp10b-project-store-purge-safety-correction.json";
+const PURGE_SAFETY_CORRECTION_SHA256: &str =
+    "7e7a0e47ae085c2684b9ae9c465eb5568e3555882c7540ef581cce594fff0278";
 const PROTECTED_MAIN_COMMIT: &str = "b6e0267802f8ac2d0d49a0f04302fd321ef2f617";
 const PROTECTED_MAIN_TREE: &str = "b20b598603b47fdbe7c85c3b6d1cba8c78fd433e";
 const PROTECTED_MAIN_RUN: &str =
@@ -55,7 +59,7 @@ const ZERO_SHA256: &str = "00000000000000000000000000000000000000000000000000000
 // contract plus bound corrections while allowing the independent fixture
 // producer to remain bound to its final manifest.
 const NORMALIZED_CONTRACT_SHA256: &str =
-    "3e78c74e9ca40708bd48761e9799308a4e992f4ad629e603b2cfb05a20dbcfa6";
+    "1c509da4b42cbb5f3a9ae8881ab04b25fc6530f724ba4afe6381a74a2131ec67";
 
 pub(super) fn check_wp10b_project_store_contract(repo_root: &Path) -> anyhow::Result<()> {
     let contract_path = repo_root.join(CONTRACT_PATH);
@@ -108,6 +112,11 @@ fn validate_header_and_bindings(repo_root: &Path, contract: &Value) -> anyhow::R
             "trash_safety_correction",
             TRASH_SAFETY_CORRECTION_PATH,
             TRASH_SAFETY_CORRECTION_SHA256,
+        ),
+        (
+            "purge_safety_correction",
+            PURGE_SAFETY_CORRECTION_PATH,
+            PURGE_SAFETY_CORRECTION_SHA256,
         ),
     ] {
         expect_string(contract, &format!("/bindings/{name}/path"), path)?;

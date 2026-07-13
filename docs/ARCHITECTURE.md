@@ -188,11 +188,15 @@ quarantine, retained-object preservation, exact retry/deduplication, bounded
 synced batches, and fail-closed active-plus-trash inventory. Its ten frozen
 transitions have exact before/after occurrence hooks and fresh-process
 kill/retry coverage; that evidence does not simulate power loss or qualify
-filesystem durability. The frozen public actor remains non-constructible. The
+filesystem durability. The accepted Purge safety correction freezes whole-
+trash selection, strict zero-non-regenerable authorization, object-first
+synced deletion with generation metadata retained through the phase barrier,
+bounded cancellation, and fresh-process retry. Purge execution and evidence
+remain absent. The frozen public actor remains non-constructible. The
 crate still owns no public Create/Open/
 Save As execution, provisional autosave publication, product recovery workflow,
-timers, public/product garbage-collection wiring, Purge, qualified durability,
-or product path.
+timers, public/product garbage-collection wiring, Purge execution, qualified
+durability, or product path.
 
 Settings use `mirante4d-settings-v1` at the Linux XDG/HOME path. The UI submits
 validated changes; one background actor owns persistence. Legacy preferences
