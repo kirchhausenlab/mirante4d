@@ -745,6 +745,11 @@ def parse_prefixed_json(line: str, prefix: str, context: str) -> dict[str, Any]:
     return value
 
 
+def marker_suffix(line: str, prefix: str) -> str | None:
+    offset = line.find(prefix)
+    return None if offset < 0 else line[offset:]
+
+
 def parse_ready(value: dict[str, Any], row: dict[str, Any]) -> None:
     exact_object(
         value,
@@ -924,17 +929,17 @@ def read_qemu(
                 if not line:
                     continue
                 line = line.strip()
-                if line.startswith(READY_PREFIX):
-                    ready.append(parse_prefixed_json(line, READY_PREFIX, "VM ready marker"))
-                elif line.startswith(RESULT_PREFIX):
-                    results.append(parse_prefixed_json(line, RESULT_PREFIX, "VM guest result"))
-                elif line.startswith(TRACE_PREFIX):
-                    traces.append(parse_trace(parse_prefixed_json(line, TRACE_PREFIX, "VM trace")))
-                elif line.startswith(FILESYSTEM_PREFIX):
-                    filesystems.append(parse_filesystem_line(line))
-                elif line.startswith(DRIVER_EXIT_PREFIX):
+                if (marker := marker_suffix(line, READY_PREFIX)) is not None:
+                    ready.append(parse_prefixed_json(marker, READY_PREFIX, "VM ready marker"))
+                elif (marker := marker_suffix(line, RESULT_PREFIX)) is not None:
+                    results.append(parse_prefixed_json(marker, RESULT_PREFIX, "VM guest result"))
+                elif (marker := marker_suffix(line, TRACE_PREFIX)) is not None:
+                    traces.append(parse_trace(parse_prefixed_json(marker, TRACE_PREFIX, "VM trace")))
+                elif (marker := marker_suffix(line, FILESYSTEM_PREFIX)) is not None:
+                    filesystems.append(parse_filesystem_line(marker))
+                elif (marker := marker_suffix(line, DRIVER_EXIT_PREFIX)) is not None:
                     try:
-                        driver_exits.append(int(line[len(DRIVER_EXIT_PREFIX) :]))
+                        driver_exits.append(int(marker[len(DRIVER_EXIT_PREFIX) :]))
                     except ValueError as error:
                         raise HarnessFailure("VM driver exit marker is malformed") from error
             if stop_on_ready and ready:
@@ -949,18 +954,18 @@ def read_qemu(
                 # Drain the text wrapper after EOF.
                 for line in process.stdout:
                     line = line.strip()
-                    if line.startswith(RESULT_PREFIX):
+                    if (marker := marker_suffix(line, RESULT_PREFIX)) is not None:
                         results.append(
-                            parse_prefixed_json(line, RESULT_PREFIX, "VM guest result")
+                            parse_prefixed_json(marker, RESULT_PREFIX, "VM guest result")
                         )
-                    elif line.startswith(TRACE_PREFIX):
+                    elif (marker := marker_suffix(line, TRACE_PREFIX)) is not None:
                         traces.append(
-                            parse_trace(parse_prefixed_json(line, TRACE_PREFIX, "VM trace"))
+                            parse_trace(parse_prefixed_json(marker, TRACE_PREFIX, "VM trace"))
                         )
-                    elif line.startswith(FILESYSTEM_PREFIX):
-                        filesystems.append(parse_filesystem_line(line))
-                    elif line.startswith(DRIVER_EXIT_PREFIX):
-                        driver_exits.append(int(line[len(DRIVER_EXIT_PREFIX) :]))
+                    elif (marker := marker_suffix(line, FILESYSTEM_PREFIX)) is not None:
+                        filesystems.append(parse_filesystem_line(marker))
+                    elif (marker := marker_suffix(line, DRIVER_EXIT_PREFIX)) is not None:
+                        driver_exits.append(int(marker[len(DRIVER_EXIT_PREFIX) :]))
                 return {
                     "ready": ready,
                     "results": results,
@@ -1895,6 +1900,9 @@ def validate_success_evidence(evidence: dict[str, Any], manifest: dict[str, Any]
 
 
 def self_test(manifest: dict[str, Any], repo: Path) -> None:
+    marker = f'{RESULT_PREFIX}{json.dumps({"status": "passed"}, separators=(",", ":"))}'
+    if marker_suffix(f"test guest ... {marker}", RESULT_PREFIX) != marker:
+        raise HarnessFailure("VM libtest marker extraction self-test failed")
     if "sync" not in INITRAMFS_BUSYBOX_APPLETS:
         raise HarnessFailure("VM guest runtime omits the required sync applet")
     validate_unix_socket_path(Path("/tmp/m4d-nbd-12345678/nbd.sock"))
