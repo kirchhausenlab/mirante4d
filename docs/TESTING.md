@@ -180,14 +180,19 @@ and corrupt-target scan, per-lane exhaustion, valid-candidate caps, mixed-lineag
 and wrong-provenance rejection, delayed cancellation, orphan-autosave
 classification, fresh selection, and byte-identical no-repair behavior. The
 graph remains read-only preparation for recovery/compaction, not a trash plan.
-Five pin cases prove create/replace/unpin, exact checkpoint grammar, target and
+Six pin cases prove create/replace/unpin, exact checkpoint grammar, target and
 pin caps, prospective orphan caps with duplicate-root semantics, cancellation,
 read-only rejection, linked-file rejection, idempotence, and write-suspending
-directory-sync uncertainty. One actor case proves correlated Pin/Unpin graph
-effects and read-only faults, while the shared cancellation case covers both
-queued completion variants. The maintenance-transition correction is bound by
-the architecture gate. Pin and unpin still lack an exhaustive failpoint,
-process-kill, or power-cut matrix.
+directory-sync uncertainty. The added core matrix supplies 16 exact before/
+after cases across all seven frozen Pin/Unpin transitions, including both Pin
+directory-sync occurrences, pre-mutation cleanup, post-mutation indeterminacy,
+and fresh retry. One actor case proves correlated Pin/Unpin graph effects and
+read-only faults, while the shared cancellation case covers both queued
+completion variants. A second actor case performs the same 16 points with
+actual `SIGKILL`, fresh-process reopen, exact retry, and an idempotent second
+retry while unrelated authority remains unchanged. This is process-crash
+evidence only: it does not clean dead-writer staging, simulate power loss, or
+establish filesystem durability.
 Two FullVerify cases prove a bounded stable snapshot of every active generation
 and object outside staging and trash, exact physical-object hashing, paged
 logical reconstruction, cancellation, snapshot-drift rejection, and

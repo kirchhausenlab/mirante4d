@@ -283,6 +283,24 @@ pub(crate) enum LocalPublicationError {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PinTransition {
+    StageCreate,
+    Write,
+    FileSync,
+    Replace,
+    DirectorySync,
+    UnpinRemove,
+    UnpinDirectorySync,
+}
+
+pub(crate) trait PinTransitionObserver {
+    type Occurrence;
+
+    fn before(&self, transition: PinTransition) -> Result<Self::Occurrence, ()>;
+    fn after(&self, occurrence: Self::Occurrence) -> Result<(), ()>;
+}
+
 fn object_relative_path(digest: ExactBytesDigest) -> PathBuf {
     let digest = digest.digest().to_string();
     PathBuf::from("objects")
@@ -1201,16 +1219,18 @@ impl LocalStoreRoot {
         }
     }
 
-    pub(crate) fn replace_pin<C>(
+    pub(crate) fn replace_pin<C, O>(
         &self,
         checkpoint_id: &str,
         expected: Option<RefRecord>,
         next: RefRecord,
         limits: ProjectStoreLimits,
+        observer: &O,
         mut is_cancelled: C,
     ) -> Result<(), LocalPublicationError>
     where
         C: FnMut() -> bool,
+        O: PinTransitionObserver,
     {
         let destination = pin_relative_path(checkpoint_id)?;
         if next.kind() != RefKind::Pin
@@ -1225,22 +1245,43 @@ impl LocalStoreRoot {
             return Err(LocalPublicationError::RefChanged);
         }
 
+        let stage_create = observer
+            .before(PinTransition::StageCreate)
+            .map_err(|()| injected_pin_transition("create a staged project pin"))?;
         let (destination_parent, destination_name) = self.open_or_create_parent(&destination)?;
         let mut stage = Stage::begin(self)?;
         let mut staged_file = stage.create_file()?;
+        observer
+            .after(stage_create)
+            .map_err(|()| injected_pin_transition("create a staged project pin"))?;
+        let write = observer
+            .before(PinTransition::Write)
+            .map_err(|()| injected_pin_transition("write a staged project pin"))?;
         staged_file
             .write_all(&next.encode())
             .map_err(|source| LocalPublicationError::Io {
                 operation: "write a staged project pin",
                 source,
             })?;
+        observer
+            .after(write)
+            .map_err(|()| injected_pin_transition("write a staged project pin"))?;
+        let file_sync = observer
+            .before(PinTransition::FileSync)
+            .map_err(|()| injected_pin_transition("synchronize a staged project pin"))?;
         fsync(&staged_file).map_err(|error| io_error("synchronize a staged project pin", error))?;
+        observer
+            .after(file_sync)
+            .map_err(|()| injected_pin_transition("synchronize a staged project pin"))?;
         drop(staged_file);
         check_cancelled(&mut is_cancelled)?;
         if self.read_pin_ref(checkpoint_id, limits, &mut is_cancelled)? != expected {
             return Err(LocalPublicationError::RefChanged);
         }
 
+        let replace = observer
+            .before(PinTransition::Replace)
+            .map_err(|()| injected_pin_transition("replace a project pin"))?;
         let replaced = if expected.is_some() {
             renameat(
                 &stage.directory,
@@ -1260,8 +1301,21 @@ impl LocalStoreRoot {
         match replaced {
             Ok(()) => {
                 stage.file_owned = false;
-                let staging_result = self.sync_ref_commit_directory(&stage.directory);
-                let destination_result = self.sync_ref_commit_directory(&destination_parent);
+                observer
+                    .after(replace)
+                    .map_err(|()| LocalPublicationError::RefCommitIndeterminate)?;
+                let staging_result = self.sync_pin_transition_directory(
+                    &stage.directory,
+                    PinTransition::DirectorySync,
+                    observer,
+                );
+                // The destination remains the authority: always attempt its
+                // sync even if staging-name removal could not be established.
+                let destination_result = self.sync_pin_transition_directory(
+                    &destination_parent,
+                    PinTransition::DirectorySync,
+                    observer,
+                );
                 if staging_result.is_err() || destination_result.is_err() {
                     return Err(LocalPublicationError::RefCommitIndeterminate);
                 }
@@ -1277,15 +1331,17 @@ impl LocalStoreRoot {
         }
     }
 
-    pub(crate) fn remove_pin<C>(
+    pub(crate) fn remove_pin<C, O>(
         &self,
         checkpoint_id: &str,
         expected: RefRecord,
         limits: ProjectStoreLimits,
+        observer: &O,
         mut is_cancelled: C,
     ) -> Result<(), LocalPublicationError>
     where
         C: FnMut() -> bool,
+        O: PinTransitionObserver,
     {
         let path = pin_relative_path(checkpoint_id)?;
         if expected.kind() != RefKind::Pin
@@ -1300,13 +1356,78 @@ impl LocalStoreRoot {
         if self.read_pin_ref(checkpoint_id, limits, &mut is_cancelled)? != Some(expected) {
             return Err(LocalPublicationError::RefChanged);
         }
+        let remove = observer
+            .before(PinTransition::UnpinRemove)
+            .map_err(|()| injected_pin_transition("remove a project pin"))?;
         match unlinkat(&parent, &name, AtFlags::empty()) {
-            Ok(()) => self
-                .sync_ref_commit_directory(&parent)
-                .map_err(|_| LocalPublicationError::RefCommitIndeterminate),
+            Ok(()) => {
+                observer
+                    .after(remove)
+                    .map_err(|()| LocalPublicationError::RefCommitIndeterminate)?;
+                self.sync_pin_transition_directory(
+                    &parent,
+                    PinTransition::UnpinDirectorySync,
+                    observer,
+                )
+            }
             Err(Errno::NOENT) => Err(LocalPublicationError::RefChanged),
             Err(error) => Err(io_error("remove a project pin", error)),
         }
+    }
+
+    pub(crate) fn sync_pin_recovery<C, O>(
+        &self,
+        checkpoint_id: &str,
+        expected: Option<RefRecord>,
+        transition: PinTransition,
+        limits: ProjectStoreLimits,
+        observer: &O,
+        mut is_cancelled: C,
+    ) -> Result<(), LocalPublicationError>
+    where
+        C: FnMut() -> bool,
+        O: PinTransitionObserver,
+    {
+        debug_assert!(matches!(
+            transition,
+            PinTransition::DirectorySync | PinTransition::UnpinDirectorySync
+        ));
+        let path = pin_relative_path(checkpoint_id)?;
+        let Some((parent, _)) = self.open_existing_parent_if_present(&path)? else {
+            return if expected.is_none() {
+                Ok(())
+            } else {
+                Err(LocalPublicationError::RefChanged)
+            };
+        };
+        if self.read_pin_ref(checkpoint_id, limits, &mut is_cancelled)? != expected {
+            return Err(LocalPublicationError::RefChanged);
+        }
+        check_cancelled(&mut is_cancelled)?;
+        self.sync_pin_transition_directory(&parent, transition, observer)?;
+        if self.read_pin_ref(checkpoint_id, limits, &mut is_cancelled)? != expected {
+            return Err(LocalPublicationError::RefChanged);
+        }
+        Ok(())
+    }
+
+    fn sync_pin_transition_directory<O>(
+        &self,
+        directory: &OwnedFd,
+        transition: PinTransition,
+        observer: &O,
+    ) -> Result<(), LocalPublicationError>
+    where
+        O: PinTransitionObserver,
+    {
+        let occurrence = observer
+            .before(transition)
+            .map_err(|()| LocalPublicationError::RefCommitIndeterminate)?;
+        self.sync_ref_commit_directory(directory)
+            .map_err(|_| LocalPublicationError::RefCommitIndeterminate)?;
+        observer
+            .after(occurrence)
+            .map_err(|()| LocalPublicationError::RefCommitIndeterminate)
     }
 
     fn sync_ref_commit_directory(&self, directory: &OwnedFd) -> Result<(), Errno> {
@@ -2950,6 +3071,13 @@ fn io_error(operation: &'static str, error: Errno) -> LocalPublicationError {
     LocalPublicationError::Io {
         operation,
         source: io::Error::from(error),
+    }
+}
+
+fn injected_pin_transition(operation: &'static str) -> LocalPublicationError {
+    LocalPublicationError::Io {
+        operation,
+        source: io::Error::other("injected project-store pin transition failure"),
     }
 }
 

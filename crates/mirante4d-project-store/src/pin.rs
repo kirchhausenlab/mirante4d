@@ -6,10 +6,38 @@
 use crate::{
     ProjectGenerationId, ProjectStoreFault, ProjectStoreLimits,
     inspection::inspect_store_graph,
-    lease::{LeaseError, ProjectStoreLeases},
-    local::{LocalPublicationError, LocalStoreRoot},
+    lease::{GcTransition, GcTransitionOccurrence, LeaseError, ProjectStoreLeases},
+    local::{LocalPublicationError, LocalStoreRoot, PinTransition, PinTransitionObserver},
     wire::{RefKind, RefRecord},
 };
+
+struct LeasePinTransitionObserver<'a>(&'a ProjectStoreLeases);
+
+impl PinTransitionObserver for LeasePinTransitionObserver<'_> {
+    type Occurrence = GcTransitionOccurrence;
+
+    fn before(&self, transition: PinTransition) -> Result<Self::Occurrence, ()> {
+        self.0
+            .gc_transition_before(gc_transition(transition))
+            .map_err(|_| ())
+    }
+
+    fn after(&self, occurrence: Self::Occurrence) -> Result<(), ()> {
+        self.0.gc_transition_after(occurrence).map_err(|_| ())
+    }
+}
+
+const fn gc_transition(transition: PinTransition) -> GcTransition {
+    match transition {
+        PinTransition::StageCreate => GcTransition::PinStageCreate,
+        PinTransition::Write => GcTransition::PinWrite,
+        PinTransition::FileSync => GcTransition::PinFileSync,
+        PinTransition::Replace => GcTransition::PinReplace,
+        PinTransition::DirectorySync => GcTransition::PinDirectorySync,
+        PinTransition::UnpinRemove => GcTransition::UnpinRemove,
+        PinTransition::UnpinDirectorySync => GcTransition::UnpinDirectorySync,
+    }
+}
 
 pub(crate) fn publish_pin<C>(
     root: &LocalStoreRoot,
@@ -41,8 +69,20 @@ where
     let expected = root
         .read_pin_ref(checkpoint_id, limits, &mut is_cancelled)
         .map_err(|error| map_local_error(error, "pin_ref"))?;
+    let observer = LeasePinTransitionObserver(leases);
     if expected == Some(next) {
-        return Ok(());
+        return map_pin_publication_result(
+            leases,
+            root.sync_pin_recovery(
+                checkpoint_id,
+                Some(next),
+                PinTransition::DirectorySync,
+                limits,
+                &observer,
+                &mut is_cancelled,
+            ),
+            "pin_ref",
+        );
     }
     if expected.is_none() && graph.pin_count() >= limits.pin_refs_max {
         return Err(ProjectStoreFault::Capacity { stage: "pin_refs" });
@@ -59,13 +99,18 @@ where
     root.validate_pin_inventory(limits, expected.is_none(), &mut is_cancelled)
         .map_err(|error| map_local_error(error, "pin_inventory"))?;
     require_writer(root, leases)?;
-    match root.replace_pin(checkpoint_id, expected, next, limits, &mut is_cancelled) {
-        Err(LocalPublicationError::RefCommitIndeterminate) => {
-            leases.suspend_writes();
-            Err(ProjectStoreFault::CommitIndeterminate)
-        }
-        result => result.map_err(|error| map_local_error(error, "pin_ref")),
-    }
+    map_pin_publication_result(
+        leases,
+        root.replace_pin(
+            checkpoint_id,
+            expected,
+            next,
+            limits,
+            &observer,
+            &mut is_cancelled,
+        ),
+        "pin_ref",
+    )
 }
 
 pub(crate) fn remove_pin<C>(
@@ -85,7 +130,19 @@ where
         .read_pin_ref(checkpoint_id, limits, &mut is_cancelled)
         .map_err(|error| map_local_error(error, "pin_ref"))?
     else {
-        return Ok(());
+        let observer = LeasePinTransitionObserver(leases);
+        return map_pin_publication_result(
+            leases,
+            root.sync_pin_recovery(
+                checkpoint_id,
+                None,
+                PinTransition::UnpinDirectorySync,
+                limits,
+                &observer,
+                &mut is_cancelled,
+            ),
+            "pin_ref",
+        );
     };
     if graph.prospective_orphan_count_after_pin_change(Some(expected.current()), None)
         > limits.recovery_candidates_max
@@ -97,12 +154,31 @@ where
     root.validate_store_inventory(limits, 0, false, &mut is_cancelled)
         .map_err(|error| map_local_error(error, "pin_inventory"))?;
     require_writer(root, leases)?;
-    match root.remove_pin(checkpoint_id, expected, limits, &mut is_cancelled) {
+    let observer = LeasePinTransitionObserver(leases);
+    map_pin_publication_result(
+        leases,
+        root.remove_pin(
+            checkpoint_id,
+            expected,
+            limits,
+            &observer,
+            &mut is_cancelled,
+        ),
+        "pin_ref",
+    )
+}
+
+fn map_pin_publication_result(
+    leases: &ProjectStoreLeases,
+    result: Result<(), LocalPublicationError>,
+    stage: &'static str,
+) -> Result<(), ProjectStoreFault> {
+    match result {
         Err(LocalPublicationError::RefCommitIndeterminate) => {
             leases.suspend_writes();
             Err(ProjectStoreFault::CommitIndeterminate)
         }
-        result => result.map_err(|error| map_local_error(error, "pin_ref")),
+        result => result.map_err(|error| map_local_error(error, stage)),
     }
 }
 
@@ -156,7 +232,11 @@ mod tests {
     };
 
     use super::*;
-    use crate::{ProjectOpenMode, generation::GenerationDocument};
+    use crate::{
+        ProjectOpenMode,
+        generation::GenerationDocument,
+        lease::{GcTransitionInjector, GcTransitionTarget, TransitionEdge},
+    };
 
     const MANUAL: &str = concat!(
         "m4d-project-generation-v1-sha256:",
@@ -382,6 +462,222 @@ mod tests {
             },),
             Err(ProjectStoreFault::CommitIndeterminate)
         ));
+    }
+
+    #[test]
+    fn pin_and_unpin_transition_failures_and_retries_are_exact() {
+        let limits = ProjectStoreLimits::default();
+        let target = ProjectGenerationId::parse(ORPHAN).unwrap();
+        assert_eq!(
+            GcTransition::PIN.map(GcTransition::name),
+            [
+                "pin_stage_create",
+                "pin_write",
+                "pin_file_sync",
+                "pin_replace",
+                "pin_directory_sync",
+            ]
+        );
+        assert_eq!(
+            GcTransition::UNPIN.map(GcTransition::name),
+            ["unpin_remove", "unpin_directory_sync"]
+        );
+        for transition in GcTransition::PIN.into_iter().chain(GcTransition::UNPIN) {
+            assert_eq!(GcTransition::parse(transition.name()), Some(transition));
+        }
+
+        let traced = TestProject::extracted("transition-trace");
+        let traced_root = LocalStoreRoot::open(traced.path()).unwrap();
+        let mut traced_leases =
+            ProjectStoreLeases::acquire(&traced_root, ProjectOpenMode::PreferWritable).unwrap();
+        let trace = GcTransitionInjector::recorder();
+        traced_leases.set_gc_transition_injector(trace.clone());
+        publish_pin(
+            &traced_root,
+            &traced_leases,
+            "checkpoint-a",
+            target,
+            limits,
+            || false,
+        )
+        .unwrap();
+        remove_pin(&traced_root, &traced_leases, "checkpoint-a", limits, || {
+            false
+        })
+        .unwrap();
+        for (transition, attempts) in [
+            (GcTransition::PinStageCreate, 1),
+            (GcTransition::PinWrite, 1),
+            (GcTransition::PinFileSync, 1),
+            (GcTransition::PinReplace, 1),
+            (GcTransition::PinDirectorySync, 2),
+            (GcTransition::UnpinRemove, 1),
+            (GcTransition::UnpinDirectorySync, 1),
+        ] {
+            assert_eq!(
+                trace.attempts(transition),
+                attempts,
+                "{}",
+                transition.name()
+            );
+        }
+
+        let mut pin_cases = Vec::new();
+        for transition in GcTransition::PIN {
+            let occurrences = if transition == GcTransition::PinDirectorySync {
+                2
+            } else {
+                1
+            };
+            for edge in [TransitionEdge::Before, TransitionEdge::After] {
+                for occurrence in 0..occurrences {
+                    pin_cases.push((transition, edge, occurrence));
+                }
+            }
+        }
+        assert_eq!(pin_cases.len(), 12);
+        for (case, (transition, edge, occurrence)) in pin_cases.into_iter().enumerate() {
+            let project = TestProject::extracted(&format!("pin-transition-{case}"));
+            let root = LocalStoreRoot::open(project.path()).unwrap();
+            let mut leases =
+                ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+            let previous = root
+                .read_pin_ref("checkpoint-a", limits, || false)
+                .unwrap()
+                .unwrap();
+            assert_ne!(previous.current(), target);
+            let injector = GcTransitionInjector::failing(GcTransitionTarget {
+                transition,
+                edge,
+                occurrence,
+            });
+            leases.set_gc_transition_injector(injector.clone());
+            let result = publish_pin(&root, &leases, "checkpoint-a", target, limits, || false);
+            assert_eq!(injector.fired(), 1);
+            let mutation_started = transition == GcTransition::PinDirectorySync
+                || (transition == GcTransition::PinReplace && edge == TransitionEdge::After);
+            if mutation_started {
+                assert!(matches!(
+                    result,
+                    Err(ProjectStoreFault::CommitIndeterminate)
+                ));
+                assert_eq!(
+                    root.read_pin_ref("checkpoint-a", limits, || false)
+                        .unwrap()
+                        .unwrap()
+                        .current(),
+                    target
+                );
+                assert!(matches!(
+                    publish_pin(&root, &leases, "same-session", target, limits, || false,),
+                    Err(ProjectStoreFault::CommitIndeterminate)
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ProjectStoreFault::Corruption { stage: "pin_ref" })
+                ));
+                assert_eq!(
+                    root.read_pin_ref("checkpoint-a", limits, || false).unwrap(),
+                    Some(previous)
+                );
+            }
+
+            drop(leases);
+            let mut retry =
+                ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+            let retry_trace = GcTransitionInjector::recorder();
+            retry.set_gc_transition_injector(retry_trace.clone());
+            publish_pin(&root, &retry, "checkpoint-a", target, limits, || false).unwrap();
+            if mutation_started {
+                assert_eq!(retry_trace.attempts(GcTransition::PinDirectorySync), 1);
+                for transition in [
+                    GcTransition::PinStageCreate,
+                    GcTransition::PinWrite,
+                    GcTransition::PinFileSync,
+                    GcTransition::PinReplace,
+                ] {
+                    assert_eq!(retry_trace.attempts(transition), 0);
+                }
+            }
+            publish_pin(&root, &retry, "checkpoint-a", target, limits, || false).unwrap();
+            assert_eq!(
+                root.read_pin_ref("checkpoint-a", limits, || false)
+                    .unwrap()
+                    .unwrap()
+                    .current(),
+                target
+            );
+        }
+
+        let mut unpin_cases = Vec::new();
+        for transition in GcTransition::UNPIN {
+            for edge in [TransitionEdge::Before, TransitionEdge::After] {
+                unpin_cases.push((transition, edge, 0));
+            }
+        }
+        assert_eq!(unpin_cases.len(), 4);
+        for (case, (transition, edge, occurrence)) in unpin_cases.into_iter().enumerate() {
+            let project = TestProject::extracted(&format!("unpin-transition-{case}"));
+            let root = LocalStoreRoot::open(project.path()).unwrap();
+            let mut leases =
+                ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+            let previous = root
+                .read_pin_ref("checkpoint-a", limits, || false)
+                .unwrap()
+                .unwrap();
+            let injector = GcTransitionInjector::failing(GcTransitionTarget {
+                transition,
+                edge,
+                occurrence,
+            });
+            leases.set_gc_transition_injector(injector.clone());
+            let result = remove_pin(&root, &leases, "checkpoint-a", limits, || false);
+            assert_eq!(injector.fired(), 1);
+            let mutation_started = transition == GcTransition::UnpinDirectorySync
+                || (transition == GcTransition::UnpinRemove && edge == TransitionEdge::After);
+            if mutation_started {
+                assert!(matches!(
+                    result,
+                    Err(ProjectStoreFault::CommitIndeterminate)
+                ));
+                assert!(
+                    root.read_pin_ref("checkpoint-a", limits, || false)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(matches!(
+                    publish_pin(&root, &leases, "same-session", target, limits, || false),
+                    Err(ProjectStoreFault::CommitIndeterminate)
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ProjectStoreFault::Corruption { stage: "pin_ref" })
+                ));
+                assert_eq!(
+                    root.read_pin_ref("checkpoint-a", limits, || false).unwrap(),
+                    Some(previous)
+                );
+            }
+
+            drop(leases);
+            let mut retry =
+                ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+            let retry_trace = GcTransitionInjector::recorder();
+            retry.set_gc_transition_injector(retry_trace.clone());
+            remove_pin(&root, &retry, "checkpoint-a", limits, || false).unwrap();
+            if mutation_started {
+                assert_eq!(retry_trace.attempts(GcTransition::UnpinDirectorySync), 1);
+                assert_eq!(retry_trace.attempts(GcTransition::UnpinRemove), 0);
+            }
+            remove_pin(&root, &retry, "checkpoint-a", limits, || false).unwrap();
+            assert!(
+                root.read_pin_ref("checkpoint-a", limits, || false)
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[test]

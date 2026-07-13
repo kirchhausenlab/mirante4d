@@ -166,8 +166,10 @@ only on success. It also enforces bounded requests, completions, autosave
 coalescing, cancellation, close, and shutdown. Private Pin/Unpin commands now
 atomically create, replace, or remove exact checkpoint roots after fresh graph
 validation, and suspend writes if post-mutation durability is indeterminate.
-The accepted transition inventory names pin, unpin, and Purge mutation phases;
-Pin/Unpin exhaustive injection evidence remains later B2 work. Private
+All seven frozen Pin/Unpin transitions now have exact before/after occurrence
+injection and fresh-process kill/reopen/retry coverage. This is logic and
+process-crash evidence only; it neither cleans dead-writer staging nor proves
+power-loss or filesystem durability. Private
 FullVerify now takes a bounded stable snapshot of every active generation and
 object outside staging and trash, hashes every physical object, reconstructs
 paged logical objects, and repeats the snapshot before success. It is

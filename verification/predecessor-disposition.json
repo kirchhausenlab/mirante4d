@@ -2491,6 +2491,14 @@
       "reason": "WP-10B B2 proves bounded checkpoint admission plus correlated private Pin/Unpin graph effects, typed target faults, and writer-contended read-only rejection."
     },
     {
+      "id": "libtest:mirante4d-project-store:actor::tests::pin_and_unpin_fresh_process_kill_and_retry_matrix",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 kills actor-routed Pin/Unpin mutators before and after every observed occurrence of the seven frozen transitions, then proves fresh-process reopen, exact retry, idempotent second retry, lease release, and unchanged unrelated authority without claiming staging cleanup or power-loss durability."
+    },
+    {
       "id": "libtest:mirante4d-project-store:actor::tests::save_as_authentication_rejects_stale_fork_target_and_science_before_reads",
       "kind": "libtest",
       "owner": "mirante4d-project-store",
@@ -2833,6 +2841,14 @@
       "lane": "contract",
       "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
       "reason": "WP-10B B2 proves post-Pin/Unpin directory-sync uncertainty is indeterminate and suspends further writes."
+    },
+    {
+      "id": "libtest:mirante4d-project-store:pin::tests::pin_and_unpin_transition_failures_and_retries_are_exact",
+      "kind": "libtest",
+      "owner": "mirante4d-project-store",
+      "lane": "contract",
+      "requirement_ids": ["D-022-contract", "WP-10B-project-store"],
+      "reason": "WP-10B B2 proves exact before/after injection across every Pin/Unpin transition occurrence, pre-mutation cleanup, post-mutation indeterminacy and write suspension, destination-authority sync recovery, and exact idempotent retry."
     },
     {
       "id": "libtest:mirante4d-project-store:pin::tests::pin_create_replace_and_unpin_change_only_the_named_root",
@@ -6068,6 +6084,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 552
+    "current_additions": 554
   }
 }
