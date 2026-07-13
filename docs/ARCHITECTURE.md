@@ -166,8 +166,8 @@ only on success. It also enforces bounded requests, completions, autosave
 coalescing, cancellation, close, and shutdown. Private Pin/Unpin commands now
 atomically create, replace, or remove exact checkpoint roots after fresh graph
 validation, and suspend writes if post-mutation durability is indeterminate.
-The accepted transition inventory now names pin, unpin, and purge mutation
-phases; exhaustive injection evidence remains later B2 work. Private
+The accepted transition inventory names pin, unpin, and Purge mutation phases;
+Pin/Unpin exhaustive injection evidence remains later B2 work. Private
 FullVerify now takes a bounded stable snapshot of every active generation and
 object outside staging and trash, hashes every physical object, reconstructs
 paged logical objects, and repeats the snapshot before success. It is
@@ -191,12 +191,21 @@ kill/retry coverage; that evidence does not simulate power loss or qualify
 filesystem durability. The accepted Purge safety correction freezes whole-
 trash selection, strict zero-non-regenerable authorization, object-first
 synced deletion with generation metadata retained through the phase barrier,
-bounded cancellation, and fresh-process retry. Purge execution and evidence
-remain absent. The frozen public actor remains non-constructible. The
-crate still owns no public Create/Open/
+bounded cancellation, and fresh-process retry. The private actor now routes
+that exact Purge subset. Strict active-plus-trash preflight rejects malformed,
+unreferenced, incomplete, foreign, linked, or non-regenerable content before
+unlink; bounded digest-ordered object batches cross a revalidated synced empty-
+object barrier before generation records are removed in generation-ID order.
+Directory hierarchies remain in place, retained active copies are untouched,
+and exact retry includes required empty-fan-out sync sweeps. All observed Purge
+maintenance, remove, and directory-sync occurrences have exact before/after
+callback and fresh-process kill/reopen/retry coverage: 16 cases in each matrix.
+This proves logic and process-crash recovery only, not power-loss durability or
+filesystem qualification. The frozen public actor remains non-constructible. The crate
+still owns no public Create/Open/
 Save As execution, provisional autosave publication, product recovery workflow,
-timers, public/product garbage-collection wiring, Purge execution, qualified
-durability, or product path.
+timers, public/product garbage-collection wiring, qualified durability, or
+product path.
 
 Settings use `mirante4d-settings-v1` at the Linux XDG/HOME path. The UI submits
 validated changes; one background actor owns persistence. Legacy preferences

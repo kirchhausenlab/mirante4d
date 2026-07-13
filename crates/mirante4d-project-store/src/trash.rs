@@ -15,7 +15,7 @@ use std::{
 use mirante4d_identity::{ExactBytesDigest, ExactBytesHasher, Sha256Digest};
 use mirante4d_project_model::ArtifactRecoverability;
 use rustix::{
-    fd::OwnedFd,
+    fd::{AsFd, OwnedFd},
     fs::{
         AtFlags, Dir, FileType, Mode, OFlags, RenameFlags, fstat, fsync, mkdirat, openat,
         renameat_with, statat, unlinkat,
@@ -104,6 +104,759 @@ impl Step {
 
 struct Batch {
     steps: Vec<Step>,
+}
+
+#[derive(Clone, Copy)]
+struct PurgeFile<I> {
+    identity: I,
+    fact: FileFact,
+}
+
+struct PurgePlan {
+    objects: Vec<PurgeFile<ExactBytesDigest>>,
+    generations: Vec<PurgeFile<ProjectGenerationId>>,
+    object_fanouts: BTreeSet<PathBuf>,
+    generation_fanouts: BTreeSet<PathBuf>,
+    generation_facts: BTreeMap<ProjectGenerationId, FileFact>,
+    recognized_object_prefix: bool,
+    streamed_bytes: u64,
+}
+
+pub(crate) fn purge_trash<C>(
+    root: &LocalStoreRoot,
+    leases: &mut ProjectStoreLeases,
+    limits: ProjectStoreLimits,
+    mut is_cancelled: C,
+) -> Result<ProjectStoreDiagnostics, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    let result =
+        leases.with_exclusive_maintenance(root, &mut is_cancelled, |leases, is_cancelled| {
+            purge_exclusive(root, leases, limits, is_cancelled)
+        });
+    match result {
+        Ok(result) => {
+            if matches!(result, Err(ProjectStoreFault::CommitIndeterminate)) {
+                leases.suspend_writes();
+            }
+            result
+        }
+        Err(MaintenanceTransitionError::ReadOnly) => Err(ProjectStoreFault::ReadOnly),
+        Err(MaintenanceTransitionError::Cancelled) => Err(ProjectStoreFault::Cancelled),
+        Err(MaintenanceTransitionError::Lease(LeaseError::Indeterminate))
+        | Err(MaintenanceTransitionError::MaintenanceLost { .. })
+        | Err(MaintenanceTransitionError::MaintenanceRestoredIndeterminate { .. }) => {
+            leases.suspend_writes();
+            Err(ProjectStoreFault::CommitIndeterminate)
+        }
+        Err(MaintenanceTransitionError::Lease(_)) => Err(ProjectStoreFault::Corruption {
+            stage: "purge_maintenance_lease",
+        }),
+    }
+}
+
+fn purge_exclusive<C>(
+    root: &LocalStoreRoot,
+    leases: &ProjectStoreLeases,
+    limits: ProjectStoreLimits,
+    is_cancelled: &mut C,
+) -> Result<ProjectStoreDiagnostics, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    let limits = limits.validate()?;
+    if limits.open_file_descriptors_max < TRASH_OPERATION_DESCRIPTORS_MAX {
+        return Err(ProjectStoreFault::Capacity {
+            stage: "purge_descriptors",
+        });
+    }
+    check_cancelled(is_cancelled)?;
+    let plan = build_purge_plan(root, limits, is_cancelled)?;
+    execute_purge_plan(root, leases, limits, is_cancelled, plan)
+}
+
+fn build_purge_plan<C>(
+    root: &LocalStoreRoot,
+    limits: ProjectStoreLimits,
+    is_cancelled: &mut C,
+) -> Result<PurgePlan, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    let graph = inspect_store_graph(root, limits, &mut *is_cancelled)?;
+    let inventory = scan_strict_store(root, limits, is_cancelled)?;
+    if graph
+        .generation_ids()
+        .len()
+        .checked_add(inventory.generations.len())
+        .is_none_or(|count| count > limits.generations_scanned_max)
+    {
+        return Err(ProjectStoreFault::Capacity {
+            stage: "purge_generations",
+        });
+    }
+
+    let active_generation_ids = graph
+        .generation_ids()
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if inventory
+        .generations
+        .keys()
+        .any(|generation_id| active_generation_ids.contains(generation_id))
+    {
+        return Err(ProjectStoreFault::SourceChanged);
+    }
+    let active_objects = graph
+        .object_facts()
+        .iter()
+        .map(|object| (object.digest(), object.byte_length()))
+        .collect::<BTreeMap<_, _>>();
+    let mut active_closure = BTreeMap::<ExactBytesDigest, u64>::new();
+    let mut provenance = BTreeMap::new();
+    for generation_id in graph.generation_ids() {
+        check_cancelled(is_cancelled)?;
+        let (_, document) = read_active_generation(
+            root,
+            *generation_id,
+            graph.state().project_id(),
+            limits,
+            is_cancelled,
+        )?;
+        record_generation_provenance(&mut provenance, *generation_id, &document);
+        record_purge_closure(
+            &mut active_closure,
+            document.reachable_objects().iter().copied(),
+        )?;
+    }
+
+    let mut trash_closure = BTreeMap::<ExactBytesDigest, u64>::new();
+    let mut streamed_bytes = 0_u64;
+    for (generation_id, fact) in &inventory.generations {
+        check_cancelled(is_cancelled)?;
+        let bytes = read_stable_file(
+            root,
+            &trash_generation_path(*generation_id),
+            *fact,
+            limits.generation_bytes_max,
+            limits.stream_buffer_bytes_max,
+            is_cancelled,
+        )?;
+        let document =
+            GenerationDocument::decode(*generation_id, graph.state().project_id(), &bytes, limits)
+                .map_err(|_| ProjectStoreFault::Corruption {
+                    stage: "purge_generation",
+                })?;
+        validate_purge_generation_lineage(graph.state().authority_generation(), &document)?;
+        require_no_non_regenerable(&document)?;
+        record_generation_provenance(&mut provenance, *generation_id, &document);
+        record_purge_closure(
+            &mut trash_closure,
+            document.reachable_objects().iter().copied(),
+        )?;
+        streamed_bytes =
+            streamed_bytes
+                .checked_add(fact.byte_length)
+                .ok_or(ProjectStoreFault::Capacity {
+                    stage: "purge_streamed_bytes",
+                })?;
+    }
+    validate_combined_generation_provenance(&provenance)?;
+
+    for (digest, fact) in &inventory.objects {
+        if trash_closure.get(digest) != Some(&fact.byte_length) {
+            return Err(ProjectStoreFault::Corruption {
+                stage: "purge_unreferenced_object",
+            });
+        }
+        hash_exact_file(
+            root,
+            &trash_object_path(*digest),
+            *fact,
+            *digest,
+            limits,
+            is_cancelled,
+        )?;
+        streamed_bytes =
+            streamed_bytes
+                .checked_add(fact.byte_length)
+                .ok_or(ProjectStoreFault::Capacity {
+                    stage: "purge_streamed_bytes",
+                })?;
+    }
+
+    let mut objects = Vec::new();
+    let mut missing_prefix = true;
+    let mut recognized_object_prefix = false;
+    for (digest, byte_length) in trash_closure {
+        check_cancelled(is_cancelled)?;
+        let active_present = active_objects.get(&digest).copied();
+        let retained = active_closure.get(&digest) == Some(&byte_length);
+        let trash_fact = inventory.objects.get(&digest).copied();
+        if active_present.is_some_and(|length| length != byte_length) {
+            return Err(ProjectStoreFault::Corruption {
+                stage: "purge_active_object",
+            });
+        }
+        match (active_present, retained, trash_fact) {
+            (Some(_), false, _) => return Err(ProjectStoreFault::SourceChanged),
+            (Some(_), true, None) => {}
+            (_, _, Some(fact)) => {
+                missing_prefix = false;
+                objects.push(PurgeFile {
+                    identity: digest,
+                    fact,
+                });
+            }
+            (None, _, None) if missing_prefix => recognized_object_prefix = true,
+            (None, _, None) => return Err(ProjectStoreFault::SourceChanged),
+        }
+    }
+
+    let object_fanouts = purge_fanout_directories(&inventory, false);
+    let generation_fanouts = purge_fanout_directories(&inventory, true);
+    let generations = inventory
+        .generations
+        .iter()
+        .map(|(identity, fact)| PurgeFile {
+            identity: *identity,
+            fact: *fact,
+        })
+        .collect();
+    Ok(PurgePlan {
+        objects,
+        generations,
+        object_fanouts,
+        generation_fanouts,
+        generation_facts: inventory.generations,
+        recognized_object_prefix,
+        streamed_bytes,
+    })
+}
+
+fn validate_purge_generation_lineage(
+    authority: &GenerationDocument,
+    document: &GenerationDocument,
+) -> Result<(), ProjectStoreFault> {
+    if document.forked_from() != authority.forked_from()
+        || !document
+            .projection()
+            .state()
+            .dataset()
+            .has_same_scientific_content(authority.projection().state().dataset())
+    {
+        Err(ProjectStoreFault::Corruption {
+            stage: "purge_generation_lineage",
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn record_purge_closure(
+    closure: &mut BTreeMap<ExactBytesDigest, u64>,
+    objects: impl Iterator<Item = PhysicalObject>,
+) -> Result<(), ProjectStoreFault> {
+    for object in objects {
+        match closure.insert(object.digest(), object.byte_length()) {
+            Some(length) if length != object.byte_length() => {
+                return Err(ProjectStoreFault::Corruption {
+                    stage: "purge_object_closure",
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn purge_fanout_directories(inventory: &TrashInventory, generation: bool) -> BTreeSet<PathBuf> {
+    let namespace = if generation { "generations" } else { "objects" };
+    let prefix = PathBuf::from("trash").join(namespace).join("sha256");
+    inventory
+        .directory_entries
+        .keys()
+        .filter(|path| path.parent() == Some(prefix.as_path()))
+        .cloned()
+        .collect()
+}
+
+fn execute_purge_plan<C>(
+    root: &LocalStoreRoot,
+    leases: &ProjectStoreLeases,
+    limits: ProjectStoreLimits,
+    is_cancelled: &mut C,
+    plan: PurgePlan,
+) -> Result<ProjectStoreDiagnostics, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    let PurgePlan {
+        objects,
+        generations,
+        object_fanouts,
+        generation_fanouts,
+        generation_facts,
+        recognized_object_prefix,
+        streamed_bytes,
+    } = plan;
+    let mut operation_mutated = false;
+    let mut published_objects = 0_u64;
+    let expected_object_facts = objects
+        .iter()
+        .map(|file| (file.identity, file.fact))
+        .collect::<BTreeMap<_, _>>();
+    let object_batches = purge_batches(objects, limits, "purge_object_batch")?;
+    let generation_batches = purge_batches(generations, limits, "purge_generation_batch")?;
+
+    if recognized_object_prefix {
+        purge_sync_sweep(root, leases, &object_fanouts)?;
+        let inventory = scan_strict_store_deferred(root, limits)?;
+        if inventory.generations != generation_facts {
+            return Err(ProjectStoreFault::SourceChanged);
+        }
+        if inventory.objects != expected_object_facts {
+            return Err(ProjectStoreFault::SourceChanged);
+        }
+    }
+
+    let mut streamed_bytes = streamed_bytes;
+    for batch in object_batches {
+        check_cancelled(is_cancelled)?;
+        let (removed, streamed) =
+            execute_purge_batch(root, leases, batch, limits, &mut operation_mutated)?;
+        published_objects =
+            published_objects
+                .checked_add(removed)
+                .ok_or(ProjectStoreFault::Capacity {
+                    stage: "purge_published_objects",
+                })?;
+        streamed_bytes =
+            streamed_bytes
+                .checked_add(streamed)
+                .ok_or(ProjectStoreFault::Capacity {
+                    stage: "purge_streamed_bytes",
+                })?;
+    }
+
+    // This is the object-phase durability barrier. Cancellation is deferred
+    // from the sweep's first sync through the complete strict re-inventory.
+    purge_sync_sweep(root, leases, &object_fanouts)?;
+    let object_barrier = scan_strict_store_deferred(root, limits).map_err(|error| {
+        if operation_mutated {
+            ProjectStoreFault::CommitIndeterminate
+        } else {
+            error
+        }
+    })?;
+    if !object_barrier.objects.is_empty() || object_barrier.generations != generation_facts {
+        return Err(if operation_mutated {
+            ProjectStoreFault::CommitIndeterminate
+        } else {
+            ProjectStoreFault::SourceChanged
+        });
+    }
+
+    // Always perform the generation recovery sweep before observing the next
+    // cancellation boundary. It makes a prior process's generation-unlink
+    // prefix durable even though absent generation records cannot prove order.
+    purge_sync_sweep(root, leases, &generation_fanouts)?;
+    let generation_barrier = scan_strict_store_deferred(root, limits).map_err(|error| {
+        if operation_mutated {
+            ProjectStoreFault::CommitIndeterminate
+        } else {
+            error
+        }
+    })?;
+    if !generation_barrier.objects.is_empty() || generation_barrier.generations != generation_facts
+    {
+        return Err(if operation_mutated {
+            ProjectStoreFault::CommitIndeterminate
+        } else {
+            ProjectStoreFault::SourceChanged
+        });
+    }
+
+    for batch in generation_batches {
+        check_cancelled(is_cancelled)?;
+        let (removed, streamed) =
+            execute_purge_batch(root, leases, batch, limits, &mut operation_mutated)?;
+        published_objects =
+            published_objects
+                .checked_add(removed)
+                .ok_or(ProjectStoreFault::Capacity {
+                    stage: "purge_published_objects",
+                })?;
+        streamed_bytes =
+            streamed_bytes
+                .checked_add(streamed)
+                .ok_or(ProjectStoreFault::Capacity {
+                    stage: "purge_streamed_bytes",
+                })?;
+    }
+    let final_inventory = scan_strict_store_deferred(root, limits).map_err(|error| {
+        if operation_mutated {
+            ProjectStoreFault::CommitIndeterminate
+        } else {
+            error
+        }
+    })?;
+    if !final_inventory.objects.is_empty() || !final_inventory.generations.is_empty() {
+        return Err(if operation_mutated {
+            ProjectStoreFault::CommitIndeterminate
+        } else {
+            ProjectStoreFault::SourceChanged
+        });
+    }
+    Ok(ProjectStoreDiagnostics {
+        streamed_bytes,
+        published_objects,
+        ..ProjectStoreDiagnostics::default()
+    })
+}
+
+fn purge_batches<I: PurgeIdentity>(
+    files: Vec<PurgeFile<I>>,
+    limits: ProjectStoreLimits,
+    stage: &'static str,
+) -> Result<Vec<Vec<PurgeFile<I>>>, ProjectStoreFault> {
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut bytes = 0_u64;
+    let mut parent = None::<PathBuf>;
+    for file in files {
+        if file.fact.byte_length > limits.gc_batch_bytes_max {
+            return Err(ProjectStoreFault::Capacity { stage });
+        }
+        let next_bytes = bytes
+            .checked_add(file.fact.byte_length)
+            .ok_or(ProjectStoreFault::Capacity { stage })?;
+        let file_parent = file
+            .identity
+            .path()
+            .parent()
+            .expect("a purge file has a containing directory")
+            .to_path_buf();
+        if !current.is_empty()
+            && (parent.as_ref() != Some(&file_parent)
+                || current.len() >= limits.gc_batch_entries_max
+                || next_bytes > limits.gc_batch_bytes_max)
+        {
+            batches.push(current);
+            current = Vec::new();
+            bytes = 0;
+        }
+        if current.is_empty() {
+            parent = Some(file_parent);
+        }
+        bytes = bytes
+            .checked_add(file.fact.byte_length)
+            .ok_or(ProjectStoreFault::Capacity { stage })?;
+        current.push(file);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    Ok(batches)
+}
+
+trait PurgeIdentity: Copy {
+    fn path(self) -> PathBuf;
+
+    fn validate_held(
+        self,
+        file: &mut File,
+        expected: FileFact,
+        limits: ProjectStoreLimits,
+    ) -> Result<u64, ProjectStoreFault>;
+}
+
+impl PurgeIdentity for ExactBytesDigest {
+    fn path(self) -> PathBuf {
+        trash_object_path(self)
+    }
+
+    fn validate_held(
+        self,
+        file: &mut File,
+        expected: FileFact,
+        limits: ProjectStoreLimits,
+    ) -> Result<u64, ProjectStoreFault> {
+        if expected.byte_length > limits.object_or_page_bytes_max {
+            return Err(ProjectStoreFault::Capacity {
+                stage: "purge_object_bytes",
+            });
+        }
+        let mut hasher = ExactBytesHasher::new();
+        let observed = stream_held_file(file, expected, limits.stream_buffer_bytes_max, |bytes| {
+            hasher
+                .update(bytes)
+                .map_err(|_| ProjectStoreFault::Corruption {
+                    stage: "purge_object",
+                })
+        })?;
+        if hasher
+            .finalize()
+            .map_err(|_| ProjectStoreFault::Corruption {
+                stage: "purge_object",
+            })?
+            .digest()
+            != self
+        {
+            return Err(ProjectStoreFault::Corruption {
+                stage: "purge_object",
+            });
+        }
+        Ok(observed)
+    }
+}
+
+impl PurgeIdentity for ProjectGenerationId {
+    fn path(self) -> PathBuf {
+        trash_generation_path(self)
+    }
+
+    fn validate_held(
+        self,
+        file: &mut File,
+        expected: FileFact,
+        limits: ProjectStoreLimits,
+    ) -> Result<u64, ProjectStoreFault> {
+        if expected.byte_length > limits.generation_bytes_max {
+            return Err(ProjectStoreFault::Capacity {
+                stage: "purge_generation_bytes",
+            });
+        }
+        let capacity =
+            usize::try_from(expected.byte_length).map_err(|_| ProjectStoreFault::Capacity {
+                stage: "purge_generation_bytes",
+            })?;
+        let mut bytes = Vec::with_capacity(capacity);
+        let observed = stream_held_file(file, expected, limits.stream_buffer_bytes_max, |chunk| {
+            bytes.extend_from_slice(chunk);
+            Ok(())
+        })?;
+        if crate::wire::framed_generation_id(&bytes).ok() != Some(self) {
+            return Err(ProjectStoreFault::Corruption {
+                stage: "purge_generation",
+            });
+        }
+        Ok(observed)
+    }
+}
+
+fn execute_purge_batch<I: PurgeIdentity>(
+    root: &LocalStoreRoot,
+    leases: &ProjectStoreLeases,
+    batch: Vec<PurgeFile<I>>,
+    limits: ProjectStoreLimits,
+    operation_mutated: &mut bool,
+) -> Result<(u64, u64), ProjectStoreFault> {
+    let first_path = batch
+        .first()
+        .expect("a purge batch is nonempty")
+        .identity
+        .path();
+    let parent_path = first_path
+        .parent()
+        .expect("a purge file has a containing directory");
+    let parent = open_directory_path(root.descriptor(), parent_path).map_err(|_| {
+        if *operation_mutated {
+            ProjectStoreFault::CommitIndeterminate
+        } else {
+            ProjectStoreFault::SourceChanged
+        }
+    })?;
+    let mut removed = 0_u64;
+    let mut streamed = 0_u64;
+    for file in batch {
+        let path = file.identity.path();
+        if path.parent() != Some(parent_path) {
+            return Err(if *operation_mutated {
+                ProjectStoreFault::CommitIndeterminate
+            } else {
+                ProjectStoreFault::Corruption {
+                    stage: "purge_batch_parent",
+                }
+            });
+        }
+        let result = unlink_purge_file(
+            leases,
+            &parent,
+            path.file_name().expect("a purge file has a name"),
+            file.identity,
+            file.fact,
+            limits,
+            operation_mutated,
+        );
+        match result {
+            Ok(file_streamed) => {
+                removed = removed.checked_add(1).ok_or(ProjectStoreFault::Capacity {
+                    stage: "purge_published_objects",
+                })?;
+                streamed =
+                    streamed
+                        .checked_add(file_streamed)
+                        .ok_or(ProjectStoreFault::Capacity {
+                            stage: "purge_streamed_bytes",
+                        })?;
+            }
+            Err(error) => {
+                return Err(if *operation_mutated {
+                    ProjectStoreFault::CommitIndeterminate
+                } else {
+                    error
+                });
+            }
+        }
+    }
+    if purge_sync_held_directory(leases, &parent).is_err() {
+        return Err(ProjectStoreFault::CommitIndeterminate);
+    }
+    Ok((removed, streamed))
+}
+
+fn unlink_purge_file<I: PurgeIdentity>(
+    leases: &ProjectStoreLeases,
+    parent: &OwnedFd,
+    name: &OsStr,
+    identity: I,
+    expected: FileFact,
+    limits: ProjectStoreLimits,
+    operation_mutated: &mut bool,
+) -> Result<u64, ProjectStoreFault> {
+    let named = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| ProjectStoreFault::SourceChanged)?;
+    if stat_file_fact(&named, "purge_file")? != expected {
+        return Err(ProjectStoreFault::SourceChanged);
+    }
+    let held = openat(parent, name, FILE_FLAGS, Mode::empty())
+        .map_err(|_| ProjectStoreFault::SourceChanged)?;
+    if opened_file_fact(&held, "purge_file")? != expected {
+        return Err(ProjectStoreFault::SourceChanged);
+    }
+    let mut held = File::from(held);
+    let streamed = identity.validate_held(&mut held, expected, limits)?;
+    let named = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| ProjectStoreFault::SourceChanged)?;
+    if stat_file_fact(&named, "purge_file")? != expected
+        || opened_file_fact(&held, "purge_file")? != expected
+    {
+        return Err(ProjectStoreFault::SourceChanged);
+    }
+    let occurrence = purge_transition_before(leases, GcTransition::PurgeRemove)?;
+    unlinkat(parent, name, AtFlags::empty()).map_err(|_| ProjectStoreFault::SourceChanged)?;
+    *operation_mutated = true;
+    purge_transition_after(leases, occurrence)?;
+    Ok(streamed)
+}
+
+fn stream_held_file<F>(
+    file: &mut File,
+    expected: FileFact,
+    buffer_bytes: usize,
+    mut consume: F,
+) -> Result<u64, ProjectStoreFault>
+where
+    F: FnMut(&[u8]) -> Result<(), ProjectStoreFault>,
+{
+    let mut observed = 0_u64;
+    let mut buffer = vec![0_u8; buffer_bytes];
+    loop {
+        let remaining = expected.byte_length.saturating_sub(observed);
+        let read_limit = if remaining == 0 {
+            1
+        } else {
+            usize::try_from(remaining)
+                .unwrap_or(usize::MAX)
+                .min(buffer.len())
+        };
+        let read = match file.read(&mut buffer[..read_limit]) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                return Err(ProjectStoreFault::Corruption {
+                    stage: "purge_file",
+                });
+            }
+        };
+        observed = observed
+            .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
+            .ok_or(ProjectStoreFault::Capacity {
+                stage: "purge_streamed_bytes",
+            })?;
+        if observed > expected.byte_length {
+            return Err(ProjectStoreFault::SourceChanged);
+        }
+        consume(&buffer[..read])?;
+    }
+    if observed != expected.byte_length {
+        return Err(ProjectStoreFault::SourceChanged);
+    }
+    Ok(observed)
+}
+
+fn purge_sync_sweep(
+    root: &LocalStoreRoot,
+    leases: &ProjectStoreLeases,
+    directories: &BTreeSet<PathBuf>,
+) -> Result<(), ProjectStoreFault> {
+    for directory in directories {
+        purge_sync_directory(root, leases, directory)
+            .map_err(|_| ProjectStoreFault::CommitIndeterminate)?;
+    }
+    Ok(())
+}
+
+fn purge_sync_directory(
+    root: &LocalStoreRoot,
+    leases: &ProjectStoreLeases,
+    path: &Path,
+) -> Result<(), ProjectStoreFault> {
+    let occurrence = purge_transition_before(leases, GcTransition::PurgeDirectorySync)?;
+    sync_directory(root, path)?;
+    purge_transition_after(leases, occurrence)
+}
+
+fn purge_sync_held_directory(
+    leases: &ProjectStoreLeases,
+    directory: &OwnedFd,
+) -> Result<(), ProjectStoreFault> {
+    let occurrence = purge_transition_before(leases, GcTransition::PurgeDirectorySync)?;
+    sync_fd(directory).map_err(|_| ProjectStoreFault::CommitIndeterminate)?;
+    purge_transition_after(leases, occurrence)
+}
+
+fn purge_transition_before(
+    leases: &ProjectStoreLeases,
+    transition: GcTransition,
+) -> Result<GcTransitionOccurrence, ProjectStoreFault> {
+    leases
+        .gc_transition_before(transition)
+        .map_err(|_| ProjectStoreFault::Corruption {
+            stage: "purge_transition_injected",
+        })
+}
+
+fn purge_transition_after(
+    leases: &ProjectStoreLeases,
+    occurrence: GcTransitionOccurrence,
+) -> Result<(), ProjectStoreFault> {
+    leases
+        .gc_transition_after(occurrence)
+        .map_err(|_| ProjectStoreFault::Corruption {
+            stage: "purge_transition_injected",
+        })
+}
+
+fn scan_strict_store_deferred(
+    root: &LocalStoreRoot,
+    limits: ProjectStoreLimits,
+) -> Result<TrashInventory, ProjectStoreFault> {
+    scan_strict_store(root, limits, &mut || false)
 }
 
 pub(crate) fn trash_generations<C>(
@@ -1117,7 +1870,7 @@ fn stat_file_fact(
 }
 
 fn opened_file_fact(
-    descriptor: &OwnedFd,
+    descriptor: impl AsFd,
     stage: &'static str,
 ) -> Result<FileFact, ProjectStoreFault> {
     let metadata = fstat(descriptor).map_err(|_| ProjectStoreFault::Corruption { stage })?;
@@ -1802,6 +2555,344 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn purge_object_first_bounded_recovery_and_strict_preflight_are_exact() {
+        for copied_object_count in [1_usize, 2] {
+            let project = TestProject::extracted("purge-success", "recoverable.m4dproj");
+            let prepared = prepare_shared_object_purge(project.path(), copied_object_count);
+            let trash_directories = all_directories(&project.path().join("trash"));
+            let root = LocalStoreRoot::open(project.path()).unwrap();
+            let mut leases =
+                ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+            let trace = GcTransitionInjector::recorder();
+            leases.set_gc_transition_injector(Arc::clone(&trace));
+            let result = purge_trash(
+                &root,
+                &mut leases,
+                ProjectStoreLimits {
+                    gc_batch_entries_max: 1,
+                    ..ProjectStoreLimits::default()
+                },
+                || false,
+            )
+            .unwrap();
+            assert_eq!(
+                result.published_objects,
+                u64::try_from(copied_object_count + 1).unwrap()
+            );
+            assert_eq!(result.streamed_bytes, prepared.streamed_bytes);
+            assert!(!prepared.generation_path.exists());
+            for (active, trash, bytes) in &prepared.objects {
+                assert_eq!(fs::read(active).unwrap(), *bytes);
+                assert!(!trash.exists());
+            }
+            assert_eq!(
+                all_directories(&project.path().join("trash")),
+                trash_directories
+            );
+            assert_eq!(
+                trace.attempts(GcTransition::PurgeRemove),
+                copied_object_count + 1
+            );
+            assert_eq!(trace.attempts(GcTransition::MaintenanceUpgrade), 1);
+            assert_eq!(trace.attempts(GcTransition::MaintenanceRestore), 1);
+
+            let retry =
+                purge_trash(&root, &mut leases, ProjectStoreLimits::default(), || false).unwrap();
+            assert_eq!(retry.published_objects, 0);
+            assert_eq!(retry.streamed_bytes, 0);
+        }
+
+        let project = TestProject::extracted("purge-cancel", "recoverable.m4dproj");
+        let prepared = prepare_shared_object_purge(project.path(), 2);
+        let first_trash = prepared.objects[0].1.clone();
+        let root = LocalStoreRoot::open(project.path()).unwrap();
+        let mut leases =
+            ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        assert_eq!(
+            purge_trash(
+                &root,
+                &mut leases,
+                ProjectStoreLimits {
+                    gc_batch_entries_max: 1,
+                    ..ProjectStoreLimits::default()
+                },
+                || !first_trash.exists(),
+            ),
+            Err(ProjectStoreFault::Cancelled)
+        );
+        assert!(!first_trash.exists());
+        assert!(prepared.objects[1].1.exists());
+        assert!(prepared.generation_path.exists());
+        assert!(leases.confirm_writer(&root).unwrap());
+        let recovered = purge_trash(
+            &root,
+            &mut leases,
+            ProjectStoreLimits {
+                gc_batch_entries_max: 1,
+                ..ProjectStoreLimits::default()
+            },
+            || false,
+        )
+        .unwrap();
+        assert_eq!(recovered.published_objects, 2);
+        assert!(!prepared.objects[1].1.exists());
+        assert!(!prepared.generation_path.exists());
+
+        let capacity = TestProject::extracted("purge-capacity", "recoverable.m4dproj");
+        prepare_shared_object_purge(capacity.path(), 1);
+        let files_before = all_file_bytes(capacity.path());
+        let directories_before = all_directories(capacity.path());
+        let root = LocalStoreRoot::open(capacity.path()).unwrap();
+        let mut leases =
+            ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        assert_eq!(
+            purge_trash(
+                &root,
+                &mut leases,
+                ProjectStoreLimits {
+                    gc_batch_bytes_max: 1_000,
+                    ..ProjectStoreLimits::default()
+                },
+                || false,
+            ),
+            Err(ProjectStoreFault::Capacity {
+                stage: "purge_generation_batch"
+            })
+        );
+        assert!(leases.confirm_writer(&root).unwrap());
+        assert_eq!(all_file_bytes(capacity.path()), files_before);
+        assert_eq!(all_directories(capacity.path()), directories_before);
+
+        let changed_parent = TestProject::extracted("purge-changed-parent", "recoverable.m4dproj");
+        let prepared = prepare_shared_object_purge(changed_parent.path(), 2);
+        let first_trash = prepared.objects[0].1.clone();
+        let second_trash = prepared.objects[1].1.clone();
+        let root = LocalStoreRoot::open(changed_parent.path()).unwrap();
+        let mut leases =
+            ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        let mut removed_later_parent = false;
+        assert_eq!(
+            purge_trash(
+                &root,
+                &mut leases,
+                ProjectStoreLimits {
+                    gc_batch_entries_max: 1,
+                    ..ProjectStoreLimits::default()
+                },
+                || {
+                    if !first_trash.exists() && second_trash.exists() {
+                        fs::remove_file(&second_trash).unwrap();
+                        fs::remove_dir(second_trash.parent().unwrap()).unwrap();
+                        removed_later_parent = true;
+                    }
+                    false
+                },
+            ),
+            Err(ProjectStoreFault::CommitIndeterminate)
+        );
+        assert!(removed_later_parent);
+        assert!(prepared.generation_path.exists());
+        assert!(matches!(
+            leases.confirm_writer(&root),
+            Err(LeaseError::Indeterminate)
+        ));
+        assert!(!first_trash.exists());
+        drop(leases);
+        drop(root);
+        let root = LocalStoreRoot::open(changed_parent.path()).unwrap();
+        let mut leases =
+            ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        let recovered =
+            purge_trash(&root, &mut leases, ProjectStoreLimits::default(), || false).unwrap();
+        assert_eq!(recovered.published_objects, 1);
+        assert!(!prepared.generation_path.exists());
+
+        let non_regenerable = TestProject::extracted("purge-nonreg", "divergent.m4dproj");
+        let selected = generation_id(DIVERGENT_ORPHAN);
+        quarantine_generation_only(non_regenerable.path(), selected);
+        let before = all_file_bytes(non_regenerable.path());
+        let root = LocalStoreRoot::open(non_regenerable.path()).unwrap();
+        let mut leases =
+            ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        assert_eq!(
+            purge_trash(&root, &mut leases, ProjectStoreLimits::default(), || false,),
+            Err(ProjectStoreFault::ConfirmationRequired)
+        );
+        assert_eq!(all_file_bytes(non_regenerable.path()), before);
+
+        let incomplete = TestProject::extracted("purge-incomplete", "recoverable.m4dproj");
+        let (selected, object) = install_unique_regenerable_orphan(incomplete.path());
+        quarantine_generation_only(incomplete.path(), selected);
+        let before = all_file_bytes(incomplete.path());
+        let root = LocalStoreRoot::open(incomplete.path()).unwrap();
+        let mut leases =
+            ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        assert_eq!(
+            purge_trash(&root, &mut leases, ProjectStoreLimits::default(), || false,),
+            Err(ProjectStoreFault::SourceChanged)
+        );
+        assert!(object.exists());
+        assert_eq!(all_file_bytes(incomplete.path()), before);
+
+        let object_bytes = fs::read(&object).unwrap();
+        let digest = ExactBytesHasher::hash(&object_bytes).unwrap().digest();
+        let trash_duplicate = incomplete.path().join(trash_object_path(digest));
+        fs::create_dir_all(trash_duplicate.parent().unwrap()).unwrap();
+        fs::write(&trash_duplicate, &object_bytes).unwrap();
+        let duplicate_before = all_file_bytes(incomplete.path());
+        assert_eq!(
+            purge_trash(&root, &mut leases, ProjectStoreLimits::default(), || false,),
+            Err(ProjectStoreFault::SourceChanged)
+        );
+        assert_eq!(all_file_bytes(incomplete.path()), duplicate_before);
+
+        let unreferenced = TestProject::extracted("purge-unreferenced", "recoverable.m4dproj");
+        prepare_shared_object_purge(unreferenced.path(), 1);
+        let bytes = b"unreferenced-trash-object";
+        let digest = ExactBytesHasher::hash(bytes).unwrap().digest();
+        let path = unreferenced.path().join(trash_object_path(digest));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bytes).unwrap();
+        let before = all_file_bytes(unreferenced.path());
+        let root = LocalStoreRoot::open(unreferenced.path()).unwrap();
+        let mut leases =
+            ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        assert_eq!(
+            purge_trash(&root, &mut leases, ProjectStoreLimits::default(), || false,),
+            Err(ProjectStoreFault::Corruption {
+                stage: "purge_unreferenced_object"
+            })
+        );
+        assert_eq!(all_file_bytes(unreferenced.path()), before);
+    }
+
+    #[test]
+    fn purge_transition_failures_and_sync_retries_are_exact() {
+        assert_eq!(GcTransition::ALL.len(), 10);
+        assert_eq!(
+            GcTransition::PURGE.map(GcTransition::name),
+            [
+                "gc_maintenance_upgrade",
+                "purge_remove",
+                "purge_directory_sync",
+                "gc_maintenance_restore",
+            ]
+        );
+        for transition in GcTransition::ALL
+            .into_iter()
+            .chain([GcTransition::PurgeRemove, GcTransition::PurgeDirectorySync])
+        {
+            assert_eq!(GcTransition::parse(transition.name()), Some(transition));
+        }
+        assert_eq!(GcTransition::parse("purge_unknown"), None);
+
+        let trace_project = TestProject::extracted("purge-trace", "recoverable.m4dproj");
+        let prepared = prepare_shared_object_purge(trace_project.path(), 1);
+        let root = LocalStoreRoot::open(trace_project.path()).unwrap();
+        let mut leases =
+            ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        let trace = GcTransitionInjector::recorder();
+        leases.set_gc_transition_injector(Arc::clone(&trace));
+        purge_trash(&root, &mut leases, ProjectStoreLimits::default(), || false).unwrap();
+        for (transition, expected) in [
+            (GcTransition::MaintenanceUpgrade, 1),
+            (GcTransition::PurgeRemove, 2),
+            (GcTransition::PurgeDirectorySync, 4),
+            (GcTransition::MaintenanceRestore, 1),
+        ] {
+            assert_eq!(
+                trace.attempts(transition),
+                expected,
+                "unexpected {} count",
+                transition.name()
+            );
+        }
+        assert!(!prepared.generation_path.exists());
+        drop(leases);
+        drop(root);
+
+        for transition in GcTransition::PURGE {
+            let occurrences = match transition {
+                GcTransition::PurgeRemove => 2,
+                GcTransition::PurgeDirectorySync => 4,
+                _ => 1,
+            };
+            for edge in [TransitionEdge::Before, TransitionEdge::After] {
+                for occurrence in 0..occurrences {
+                    let project = TestProject::extracted("purge-transition", "recoverable.m4dproj");
+                    let prepared = prepare_shared_object_purge(project.path(), 1);
+                    let files_before = all_file_bytes(project.path());
+                    let injector = GcTransitionInjector::failing(GcTransitionTarget {
+                        transition,
+                        edge,
+                        occurrence,
+                    });
+                    let root = LocalStoreRoot::open(project.path()).unwrap();
+                    let mut leases =
+                        ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable)
+                            .unwrap();
+                    leases.set_gc_transition_injector(Arc::clone(&injector));
+                    let result =
+                        purge_trash(&root, &mut leases, ProjectStoreLimits::default(), || false);
+                    assert_eq!(
+                        injector.fired(),
+                        1,
+                        "{} {} occurrence {occurrence}",
+                        transition.name(),
+                        edge.name()
+                    );
+                    let indeterminate = !matches!(
+                        (transition, edge, occurrence),
+                        (GcTransition::MaintenanceUpgrade, _, _)
+                            | (GcTransition::PurgeRemove, TransitionEdge::Before, 0)
+                    );
+                    if indeterminate {
+                        assert_eq!(result, Err(ProjectStoreFault::CommitIndeterminate));
+                        assert!(matches!(
+                            leases.confirm_writer(&root),
+                            Err(LeaseError::Indeterminate)
+                        ));
+                        if transition == GcTransition::MaintenanceRestore {
+                            assert_eq!(leases.maintenance_lost(), edge == TransitionEdge::Before);
+                        }
+                    } else {
+                        assert!(matches!(result, Err(ProjectStoreFault::Corruption { .. })));
+                        assert!(leases.confirm_writer(&root).unwrap());
+                        assert_eq!(all_file_bytes(project.path()), files_before);
+                    }
+                    drop(leases);
+
+                    let mut retry_leases =
+                        ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable)
+                            .unwrap();
+                    purge_trash(
+                        &root,
+                        &mut retry_leases,
+                        ProjectStoreLimits::default(),
+                        || false,
+                    )
+                    .unwrap();
+                    assert!(!prepared.generation_path.exists());
+                    assert!(!prepared.objects[0].1.exists());
+                    assert_eq!(
+                        fs::read(&prepared.objects[0].0).unwrap(),
+                        prepared.objects[0].2
+                    );
+                    let zero_removal = purge_trash(
+                        &root,
+                        &mut retry_leases,
+                        ProjectStoreLimits::default(),
+                        || false,
+                    )
+                    .unwrap();
+                    assert_eq!(zero_removal.published_objects, 0);
+                    assert_eq!(zero_removal.streamed_bytes, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn transition_inventory_failures_and_sync_only_retries_are_exact() {
         assert_eq!(
             GcTransition::ALL.map(GcTransition::name),
@@ -2118,6 +3209,116 @@ pub(crate) mod tests {
             })
         );
         assert_eq!(all_file_bytes(project.path()), foreign_before);
+    }
+
+    struct PreparedPurge {
+        generation_path: PathBuf,
+        objects: Vec<(PathBuf, PathBuf, Vec<u8>)>,
+        streamed_bytes: u64,
+    }
+
+    fn prepare_shared_object_purge(root_path: &Path, object_count: usize) -> PreparedPurge {
+        let selected = install_zero_non_regenerable_orphan(root_path);
+        let root = LocalStoreRoot::open(root_path).unwrap();
+        let mut leases =
+            ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        trash_generations(
+            &root,
+            &mut leases,
+            &[selected],
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        drop(leases);
+        drop(root);
+
+        let generation_path = root_path.join(trash_generation_path(selected));
+        let generation_bytes = fs::read(&generation_path).unwrap();
+        let document = serde_json::from_slice::<Value>(&generation_bytes).unwrap();
+        let mut candidates = document["reachable_objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|object| {
+                let digest = ExactBytesDigest::parse(object["digest"].as_str().unwrap()).unwrap();
+                let byte_length = object["byte_length"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap();
+                (digest, byte_length)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|(_, byte_length)| *byte_length);
+        candidates.truncate(object_count);
+        assert_eq!(candidates.len(), object_count);
+        candidates.sort_unstable_by_key(|(digest, _)| *digest);
+
+        let mut objects = Vec::new();
+        for (digest, _) in candidates {
+            let active = root_path.join(active_object_path(digest));
+            let trash = root_path.join(trash_object_path(digest));
+            let bytes = fs::read(&active).unwrap();
+            fs::create_dir_all(trash.parent().unwrap()).unwrap();
+            fs::write(&trash, &bytes).unwrap();
+            objects.push((active, trash, bytes));
+        }
+        let present_bytes = u64::try_from(generation_bytes.len()).unwrap()
+            + objects
+                .iter()
+                .map(|(_, _, bytes)| u64::try_from(bytes.len()).unwrap())
+                .sum::<u64>();
+        PreparedPurge {
+            generation_path,
+            objects,
+            streamed_bytes: present_bytes * 2,
+        }
+    }
+
+    fn quarantine_generation_only(root: &Path, generation_id: ProjectGenerationId) {
+        let active = root.join(active_generation_path(generation_id));
+        let trash = root.join(trash_generation_path(generation_id));
+        fs::create_dir_all(trash.parent().unwrap()).unwrap();
+        fs::rename(active, trash).unwrap();
+    }
+
+    fn install_unique_regenerable_orphan(root: &Path) -> (ProjectGenerationId, PathBuf) {
+        let old = generation_id(RECOVERABLE_ORPHAN);
+        let old_path = root.join(active_generation_path(old));
+        let mut document = serde_json::from_slice::<Value>(&fs::read(&old_path).unwrap()).unwrap();
+        let artifacts = document["artifacts"].as_array_mut().unwrap();
+        artifacts.retain(|artifact| {
+            artifact.get("recoverability").and_then(Value::as_str) == Some("regenerable")
+        });
+        assert_eq!(artifacts.len(), 1);
+        let object_bytes = b"unique regenerable purge object";
+        let digest = ExactBytesHasher::hash(object_bytes).unwrap().digest();
+        let byte_length = u64::try_from(object_bytes.len()).unwrap();
+        let artifact = &mut artifacts[0];
+        artifact["logical_object"]["digest"] = Value::String(digest.to_string());
+        artifact["logical_object"]["byte_length"] = Value::String(byte_length.to_string());
+        artifact["storage"] = serde_json::json!({
+            "kind": "direct",
+            "object": {
+                "byte_length": byte_length.to_string(),
+                "digest": digest.to_string(),
+            }
+        });
+        document["reachable_objects"] = serde_json::json!([{
+            "byte_length": byte_length.to_string(),
+            "digest": digest.to_string(),
+        }]);
+        let canonical = wire::encode_canonical_json(&document).unwrap();
+        let selected = wire::generation_id_from_validated_canonical(&canonical).unwrap();
+        let selected_path = root.join(active_generation_path(selected));
+        fs::create_dir_all(selected_path.parent().unwrap()).unwrap();
+        fs::write(&selected_path, canonical).unwrap();
+        fs::remove_file(old_path).unwrap();
+        let object_path = root.join(active_object_path(digest));
+        fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        fs::write(&object_path, object_bytes).unwrap();
+        (selected, object_path)
     }
 
     pub(crate) fn install_zero_non_regenerable_orphan(root: &Path) -> ProjectGenerationId {

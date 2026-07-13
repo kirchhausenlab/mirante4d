@@ -37,7 +37,7 @@ use crate::{
         InitialPackageMode, install_initial_manual_package,
         publish_established_autosave_generation, publish_established_manual_generation,
     },
-    trash::trash_generations,
+    trash::{purge_trash, trash_generations},
 };
 
 /// One private worker which owns the store root, leases, and all session work.
@@ -113,6 +113,9 @@ enum Work {
         request_id: ProjectStoreRequestId,
         generations: Vec<ProjectGenerationId>,
     },
+    Purge {
+        request_id: ProjectStoreRequestId,
+    },
     FullVerify {
         request_id: ProjectStoreRequestId,
     },
@@ -130,6 +133,7 @@ impl Work {
             | Self::Unpin { request_id, .. }
             | Self::PlanCompaction { request_id }
             | Self::Trash { request_id, .. }
+            | Self::Purge { request_id }
             | Self::FullVerify { request_id } => *request_id,
         }
     }
@@ -173,6 +177,10 @@ impl Work {
                 result: Err(ProjectStoreFault::Cancelled),
             },
             Self::Trash { request_id, .. } => ProjectStoreCompletion::Trashed {
+                request_id,
+                result: Err(ProjectStoreFault::Cancelled),
+            },
+            Self::Purge { request_id } => ProjectStoreCompletion::Purged {
                 request_id,
                 result: Err(ProjectStoreFault::Cancelled),
             },
@@ -470,6 +478,9 @@ impl EstablishedProjectActor {
                     request_id,
                     generations,
                 })
+            }
+            ProjectStoreCommand::Purge { request_id } => {
+                self.submit_work(Work::Purge { request_id })
             }
             ProjectStoreCommand::FullVerify { request_id } => {
                 self.submit_work(Work::FullVerify { request_id })
@@ -903,6 +914,19 @@ fn worker_main(
                 .map(|diagnostics| actor_diagnostics(&shared, &session.leases, diagnostics));
                 ProjectStoreCompletion::Trashed { request_id, result }
             }
+            Work::Purge { request_id } => {
+                #[cfg(test)]
+                if let Some(injector) = shared.gc_transition_injector.get() {
+                    session
+                        .leases
+                        .set_gc_transition_injector(Arc::clone(injector));
+                }
+                let result = purge_trash(&session.root, &mut session.leases, limits, || {
+                    cancelled.load(Ordering::Acquire)
+                })
+                .map(|diagnostics| actor_diagnostics(&shared, &session.leases, diagnostics));
+                ProjectStoreCompletion::Purged { request_id, result }
+            }
             Work::FullVerify { request_id } => {
                 let result = crate::full_verify::full_verify(&session.root, limits, || {
                     cancelled.load(Ordering::Acquire)
@@ -1039,6 +1063,16 @@ mod tests {
     const TRASH_PROCESS_TEST: &str = concat!(
         "actor::tests::",
         "trash_fresh_process_kill_and_retry_matrix"
+    );
+    const PURGE_PROCESS_ROLE: &str = "MIRANTE4D_PURGE_PROCESS_ROLE";
+    const PURGE_PROCESS_ROOT: &str = "MIRANTE4D_PURGE_PROCESS_ROOT";
+    const PURGE_PROCESS_TRANSITION: &str = "MIRANTE4D_PURGE_PROCESS_TRANSITION";
+    const PURGE_PROCESS_EDGE: &str = "MIRANTE4D_PURGE_PROCESS_EDGE";
+    const PURGE_PROCESS_OCCURRENCE: &str = "MIRANTE4D_PURGE_PROCESS_OCCURRENCE";
+    const PURGE_PROCESS_MARKER: &str = "MIRANTE4D_PURGE_PROCESS_MARKER";
+    const PURGE_PROCESS_TEST: &str = concat!(
+        "actor::tests::",
+        "purge_fresh_process_kill_and_retry_matrix"
     );
     const STALE_MANUAL: &str = concat!(
         "m4d-project-generation-v1-sha256:",
@@ -2492,6 +2526,293 @@ mod tests {
     }
 
     #[test]
+    fn purge_is_correlated_cancellable_read_only_and_indeterminate() {
+        #[derive(Clone, Copy)]
+        enum Case {
+            CorrelatedCancellation,
+            ReadOnly,
+            PostUnlinkIndeterminate,
+            MaintenanceLossDrain,
+        }
+
+        for case in [
+            Case::CorrelatedCancellation,
+            Case::ReadOnly,
+            Case::PostUnlinkIndeterminate,
+            Case::MaintenanceLossDrain,
+        ] {
+            match case {
+                Case::CorrelatedCancellation => {
+                    let project = TestProject::extracted_store(
+                        "actor-purge-correlation",
+                        "recoverable.m4dproj",
+                    );
+                    let snapshot = install_purge_snapshot(&project);
+                    let refs_before = file_tree(&project.path().join("refs"));
+                    let objects_before = file_tree(&project.path().join("objects"));
+                    let blocker_root = LocalStoreRoot::open(project.path()).unwrap();
+                    let blocker =
+                        ProjectStoreLeases::acquire(&blocker_root, ProjectOpenMode::ReadOnly)
+                            .unwrap();
+                    let actor =
+                        EstablishedProjectActor::start(&project.store_path(), Default::default())
+                            .unwrap();
+
+                    actor.try_submit(purge_command(1)).unwrap();
+                    wait_until_active(&actor, 1);
+                    actor.try_submit(purge_command(2)).unwrap();
+                    actor.try_submit(cancel_command(3, 2)).unwrap();
+                    assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 2);
+                    assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 3);
+                    actor.try_submit(cancel_command(4, 1)).unwrap();
+                    assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 4);
+                    assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 1);
+                    assert!(snapshot.trash_generation.exists());
+                    assert!(snapshot.trash_object.exists());
+
+                    drop(blocker);
+                    actor.try_submit(purge_command(5)).unwrap();
+                    let diagnostics = match actor.recv_timeout(TIMEOUT) {
+                        Some(ProjectStoreCompletion::Purged {
+                            request_id: actual,
+                            result: Ok(diagnostics),
+                        }) if actual == request_id(5) => diagnostics,
+                        other => panic!("unexpected Purge completion: {other:?}"),
+                    };
+                    assert_eq!(diagnostics.queued_requests, 0);
+                    assert_eq!(diagnostics.queued_completions, 0);
+                    assert_eq!(diagnostics.active_transactions, 1);
+                    assert_eq!(diagnostics.open_file_descriptors, 3);
+                    assert_eq!(diagnostics.published_objects, 2);
+                    assert_eq!(
+                        diagnostics.streamed_bytes,
+                        2 * (snapshot.generation_bytes + snapshot.object_bytes)
+                    );
+                    assert!(!snapshot.trash_generation.exists());
+                    assert!(!snapshot.trash_object.exists());
+                    assert!(file_tree(&project.path().join("trash")).is_empty());
+                    assert_eq!(file_tree(&project.path().join("refs")), refs_before);
+                    assert_eq!(file_tree(&project.path().join("objects")), objects_before);
+
+                    actor.try_submit(purge_command(6)).unwrap();
+                    assert!(matches!(
+                        actor.recv_timeout(TIMEOUT),
+                        Some(ProjectStoreCompletion::Purged {
+                            request_id: actual,
+                            result: Ok(ProjectStoreDiagnostics {
+                                published_objects: 0,
+                                streamed_bytes: 0,
+                                ..
+                            }),
+                        }) if actual == request_id(6)
+                    ));
+                    actor.try_submit(close_command(7)).unwrap();
+                    assert!(matches!(
+                        actor.recv_timeout(TIMEOUT),
+                        Some(ProjectStoreCompletion::Closed {
+                            request_id: actual,
+                            result: Ok(()),
+                        }) if actual == request_id(7)
+                    ));
+                    actor.join().unwrap();
+                }
+                Case::ReadOnly => {
+                    let project = TestProject::extracted_store(
+                        "actor-purge-read-only",
+                        "recoverable.m4dproj",
+                    );
+                    install_purge_snapshot(&project);
+                    let before = file_tree(project.path());
+                    let held_root = LocalStoreRoot::open(project.path()).unwrap();
+                    let held_writer =
+                        ProjectStoreLeases::acquire(&held_root, ProjectOpenMode::PreferWritable)
+                            .unwrap();
+                    assert!(held_writer.has_writer());
+                    let actor =
+                        EstablishedProjectActor::start(&project.store_path(), Default::default())
+                            .unwrap();
+                    actor.try_submit(purge_command(1)).unwrap();
+                    assert!(matches!(
+                        actor.recv_timeout(TIMEOUT),
+                        Some(ProjectStoreCompletion::Purged {
+                            request_id: actual,
+                            result: Err(ProjectStoreFault::ReadOnly),
+                        }) if actual == request_id(1)
+                    ));
+                    assert_eq!(file_tree(project.path()), before);
+                    actor.try_submit(close_command(2)).unwrap();
+                    assert!(matches!(
+                        actor.recv_timeout(TIMEOUT),
+                        Some(ProjectStoreCompletion::Closed {
+                            request_id: actual,
+                            result: Ok(()),
+                        }) if actual == request_id(2)
+                    ));
+                    actor.join().unwrap();
+                    drop(held_writer);
+                }
+                Case::PostUnlinkIndeterminate => {
+                    let project = TestProject::extracted_store(
+                        "actor-purge-indeterminate",
+                        "recoverable.m4dproj",
+                    );
+                    let snapshot = install_purge_snapshot(&project);
+                    let injector = GcTransitionInjector::failing(GcTransitionTarget {
+                        transition: GcTransition::PurgeDirectorySync,
+                        edge: TransitionEdge::Before,
+                        occurrence: 0,
+                    });
+                    let actor = EstablishedProjectActor::start_with_gc_transition_injector(
+                        &project.store_path(),
+                        Default::default(),
+                        injector,
+                    )
+                    .unwrap();
+                    actor.try_submit(purge_command(1)).unwrap();
+                    assert!(matches!(
+                        actor.recv_timeout(TIMEOUT),
+                        Some(ProjectStoreCompletion::Purged {
+                            request_id: actual,
+                            result: Err(ProjectStoreFault::CommitIndeterminate),
+                        }) if actual == request_id(1)
+                    ));
+                    assert!(!actor.has_exited());
+                    assert!(!snapshot.trash_object.exists());
+                    assert!(snapshot.trash_generation.exists());
+
+                    actor
+                        .try_submit(ProjectStoreCommand::FullVerify {
+                            request_id: request_id(2),
+                        })
+                        .unwrap();
+                    assert!(matches!(
+                        actor.recv_timeout(TIMEOUT),
+                        Some(ProjectStoreCompletion::Verified {
+                            request_id: actual,
+                            result: Ok(_),
+                        }) if actual == request_id(2)
+                    ));
+                    actor.try_submit(purge_command(3)).unwrap();
+                    assert!(matches!(
+                        actor.recv_timeout(TIMEOUT),
+                        Some(ProjectStoreCompletion::Purged {
+                            request_id: actual,
+                            result: Err(ProjectStoreFault::CommitIndeterminate),
+                        }) if actual == request_id(3)
+                    ));
+                    actor.try_submit(close_command(4)).unwrap();
+                    actor.recv_timeout(TIMEOUT).unwrap();
+                    actor.join().unwrap();
+
+                    let retry =
+                        EstablishedProjectActor::start(&project.store_path(), Default::default())
+                            .unwrap();
+                    retry.try_submit(purge_command(1)).unwrap();
+                    let diagnostics = match retry.recv_timeout(TIMEOUT) {
+                        Some(ProjectStoreCompletion::Purged {
+                            request_id: actual,
+                            result: Ok(diagnostics),
+                        }) if actual == request_id(1) => diagnostics,
+                        other => panic!("unexpected Purge reopen completion: {other:?}"),
+                    };
+                    assert_eq!(diagnostics.published_objects, 1);
+                    assert_eq!(diagnostics.streamed_bytes, 2 * snapshot.generation_bytes);
+                    retry.try_submit(purge_command(2)).unwrap();
+                    assert!(matches!(
+                        retry.recv_timeout(TIMEOUT),
+                        Some(ProjectStoreCompletion::Purged {
+                            request_id: actual,
+                            result: Ok(ProjectStoreDiagnostics {
+                                published_objects: 0,
+                                streamed_bytes: 0,
+                                ..
+                            }),
+                        }) if actual == request_id(2)
+                    ));
+                    retry.try_submit(close_command(3)).unwrap();
+                    retry.recv_timeout(TIMEOUT).unwrap();
+                    retry.join().unwrap();
+                }
+                Case::MaintenanceLossDrain => {
+                    let project = TestProject::extracted_store(
+                        "actor-purge-maintenance-loss",
+                        "recoverable.m4dproj",
+                    );
+                    install_purge_snapshot(&project);
+                    let injector = GcTransitionInjector::gated(GcTransitionTarget {
+                        transition: GcTransition::MaintenanceRestore,
+                        edge: TransitionEdge::Before,
+                        occurrence: 0,
+                    });
+                    let actor = EstablishedProjectActor::start_with_gc_transition_injector(
+                        &project.store_path(),
+                        Default::default(),
+                        Arc::clone(&injector),
+                    )
+                    .unwrap();
+                    actor.try_submit(purge_command(1)).unwrap();
+                    injector.wait_until_parked(TIMEOUT);
+                    actor
+                        .try_submit(ProjectStoreCommand::FullVerify {
+                            request_id: request_id(2),
+                        })
+                        .unwrap();
+                    actor.try_submit(close_command(3)).unwrap();
+                    injector.release();
+
+                    let mut completed = BTreeSet::new();
+                    for _ in 0..3 {
+                        let completion = actor.recv_timeout(TIMEOUT).unwrap();
+                        completed.insert(completion.request_id());
+                        match completion {
+                            ProjectStoreCompletion::Purged {
+                                request_id: actual,
+                                result: Err(ProjectStoreFault::CommitIndeterminate),
+                            } if actual == request_id(1) => {}
+                            ProjectStoreCompletion::Verified {
+                                request_id: actual,
+                                result: Err(ProjectStoreFault::Cancelled),
+                            } if actual == request_id(2) => {}
+                            ProjectStoreCompletion::Closed {
+                                request_id: actual,
+                                result: Ok(()),
+                            } if actual == request_id(3) => {}
+                            other => panic!("unexpected Purge drain completion: {other:?}"),
+                        }
+                    }
+                    assert_eq!(completed, [1, 2, 3].into_iter().map(request_id).collect());
+                    assert!(actor.has_exited());
+                    assert_eq!(
+                        actor.try_submit(purge_command(4)),
+                        Err(ProjectStoreFault::Corruption {
+                            stage: "actor_closed"
+                        })
+                    );
+                    actor.join().unwrap();
+
+                    let retry =
+                        EstablishedProjectActor::start(&project.store_path(), Default::default())
+                            .unwrap();
+                    retry.try_submit(purge_command(1)).unwrap();
+                    assert!(matches!(
+                        retry.recv_timeout(TIMEOUT),
+                        Some(ProjectStoreCompletion::Purged {
+                            request_id: actual,
+                            result: Ok(ProjectStoreDiagnostics {
+                                published_objects: 0,
+                                ..
+                            }),
+                        }) if actual == request_id(1)
+                    ));
+                    retry.try_submit(close_command(2)).unwrap();
+                    retry.recv_timeout(TIMEOUT).unwrap();
+                    retry.join().unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
     fn trash_fresh_process_kill_and_retry_matrix() {
         if let Some(role) = env::var_os(TRASH_PROCESS_ROLE) {
             let root_path = PathBuf::from(env::var_os(TRASH_PROCESS_ROOT).unwrap());
@@ -2729,6 +3050,215 @@ mod tests {
         assert_eq!(recovered, 34);
         eprintln!(
             "M4D_TRASH_PROCESS_MATRIX_V1 cases=34 killed=34 fresh_reopens=34 retry_completed=34 zero_mutation_sync_retries=34 process_crash_only=true power_loss_simulated=false durability_claim=false"
+        );
+    }
+
+    #[test]
+    fn purge_fresh_process_kill_and_retry_matrix() {
+        if let Some(role) = env::var_os(PURGE_PROCESS_ROLE) {
+            let root_path = PathBuf::from(env::var_os(PURGE_PROCESS_ROOT).unwrap());
+            let store_path = ProjectStorePath::new(root_path).unwrap();
+            match role.to_str().unwrap() {
+                "mutator" => {
+                    let transition_name = env::var(PURGE_PROCESS_TRANSITION).unwrap();
+                    let transition = GcTransition::PURGE
+                        .into_iter()
+                        .find(|candidate| candidate.name() == transition_name)
+                        .unwrap();
+                    let edge =
+                        TransitionEdge::parse(env::var(PURGE_PROCESS_EDGE).unwrap().as_str())
+                            .unwrap();
+                    let occurrence = env::var(PURGE_PROCESS_OCCURRENCE)
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap();
+                    let marker = PathBuf::from(env::var_os(PURGE_PROCESS_MARKER).unwrap());
+                    let injector = GcTransitionInjector::parking(
+                        GcTransitionTarget {
+                            transition,
+                            edge,
+                            occurrence,
+                        },
+                        marker,
+                    );
+                    let actor = EstablishedProjectActor::start_with_gc_transition_injector(
+                        &store_path,
+                        Default::default(),
+                        injector,
+                    )
+                    .unwrap();
+                    actor.try_submit(purge_command(1)).unwrap();
+                    panic!(
+                        "Purge mutator escaped its transition hook: {:?}",
+                        actor.recv_timeout(Duration::from_secs(30))
+                    );
+                }
+                "recover" => {
+                    let actor =
+                        EstablishedProjectActor::start(&store_path, Default::default()).unwrap();
+                    actor.try_submit(purge_command(1)).unwrap();
+                    assert!(matches!(
+                        actor.recv_timeout(TIMEOUT),
+                        Some(ProjectStoreCompletion::Purged {
+                            request_id: actual,
+                            result: Ok(_),
+                        }) if actual == request_id(1)
+                    ));
+                    actor.try_submit(close_command(2)).unwrap();
+                    assert!(matches!(
+                        actor.recv_timeout(TIMEOUT),
+                        Some(ProjectStoreCompletion::Closed {
+                            request_id: actual,
+                            result: Ok(()),
+                        }) if actual == request_id(2)
+                    ));
+                    actor.join().unwrap();
+
+                    let retry =
+                        EstablishedProjectActor::start(&store_path, Default::default()).unwrap();
+                    retry.try_submit(purge_command(1)).unwrap();
+                    assert!(matches!(
+                        retry.recv_timeout(TIMEOUT),
+                        Some(ProjectStoreCompletion::Purged {
+                            request_id: actual,
+                            result: Ok(ProjectStoreDiagnostics {
+                                published_objects: 0,
+                                streamed_bytes: 0,
+                                ..
+                            }),
+                        }) if actual == request_id(1)
+                    ));
+                    retry.try_submit(close_command(2)).unwrap();
+                    assert!(matches!(
+                        retry.recv_timeout(TIMEOUT),
+                        Some(ProjectStoreCompletion::Closed {
+                            request_id: actual,
+                            result: Ok(()),
+                        }) if actual == request_id(2)
+                    ));
+                    retry.join().unwrap();
+                    return;
+                }
+                other => panic!("unexpected Purge process role {other}"),
+            }
+        }
+
+        assert_eq!(
+            GcTransition::PURGE.map(GcTransition::name),
+            [
+                "gc_maintenance_upgrade",
+                "purge_remove",
+                "purge_directory_sync",
+                "gc_maintenance_restore",
+            ]
+        );
+        let markers = TestDirectory::new("purge-kill-markers");
+        let mut cases = Vec::new();
+        for transition in GcTransition::PURGE {
+            let occurrences = match transition {
+                GcTransition::MaintenanceUpgrade | GcTransition::MaintenanceRestore => 1,
+                GcTransition::PurgeRemove => 2,
+                GcTransition::PurgeDirectorySync => 4,
+                _ => panic!("the Purge transition inventory must stay separate from Trash"),
+            };
+            for edge in [TransitionEdge::Before, TransitionEdge::After] {
+                for occurrence in 0..occurrences {
+                    cases.push((transition, edge, occurrence));
+                }
+            }
+        }
+        assert_eq!(cases.len(), 16);
+
+        let mut killed = 0_usize;
+        let mut recovered = 0_usize;
+        for (case, (transition, edge, occurrence)) in cases.into_iter().enumerate() {
+            let project =
+                TestProject::extracted_store(&format!("purge-kill-{case}"), "recoverable.m4dproj");
+            let snapshot = install_purge_snapshot(&project);
+            let active_generation =
+                crate::trash::tests::active_generation_file(project.path(), snapshot.generation_id);
+            assert!(!active_generation.exists());
+            assert!(snapshot.trash_generation.exists());
+            assert!(snapshot.trash_object.exists());
+            let anonymous = crate::trash::tests::install_anonymous_object(project.path());
+            let anonymous_bytes = fs::read(&anonymous).unwrap();
+            let refs_before = file_tree(&project.path().join("refs"));
+            let objects_before = file_tree(&project.path().join("objects"));
+            let marker = markers.path().join(format!(
+                "{case}-{}-{}-{occurrence}",
+                transition.name(),
+                edge.name()
+            ));
+            let mut mutator = ChildGuard::new(
+                Command::new(env::current_exe().unwrap())
+                    .arg(PURGE_PROCESS_TEST)
+                    .arg("--exact")
+                    .arg("--nocapture")
+                    .env(PURGE_PROCESS_ROLE, "mutator")
+                    .env(PURGE_PROCESS_ROOT, project.path())
+                    .env(PURGE_PROCESS_TRANSITION, transition.name())
+                    .env(PURGE_PROCESS_EDGE, edge.name())
+                    .env(PURGE_PROCESS_OCCURRENCE, occurrence.to_string())
+                    .env(PURGE_PROCESS_MARKER, &marker)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + TIMEOUT;
+            while !marker.exists() {
+                if let Some(status) = mutator.child_mut().try_wait().unwrap() {
+                    panic!(
+                        "Purge mutator exited before {} {} occurrence {occurrence}: {status}",
+                        transition.name(),
+                        edge.name()
+                    );
+                }
+                if Instant::now() >= deadline {
+                    panic!(
+                        "Purge mutator did not reach {} {} occurrence {occurrence}",
+                        transition.name(),
+                        edge.name()
+                    );
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            let killed_status = mutator.kill_and_wait();
+            assert_eq!(killed_status.signal(), Some(9));
+            killed += 1;
+
+            let mut recovery = ChildGuard::new(
+                Command::new(env::current_exe().unwrap())
+                    .arg(PURGE_PROCESS_TEST)
+                    .arg("--exact")
+                    .arg("--nocapture")
+                    .env(PURGE_PROCESS_ROLE, "recover")
+                    .env(PURGE_PROCESS_ROOT, project.path())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let recovery_status = recovery.wait_timeout(Duration::from_secs(10));
+            assert!(
+                recovery_status.success(),
+                "fresh Purge recovery failed after {} {} occurrence {occurrence}",
+                transition.name(),
+                edge.name()
+            );
+            recovered += 1;
+
+            assert!(!snapshot.trash_generation.exists());
+            assert!(!snapshot.trash_object.exists());
+            assert!(file_tree(&project.path().join("trash")).is_empty());
+            assert_eq!(file_tree(&project.path().join("refs")), refs_before);
+            assert_eq!(file_tree(&project.path().join("objects")), objects_before);
+            assert_eq!(fs::read(&anonymous).unwrap(), anonymous_bytes);
+        }
+        assert_eq!(killed, 16);
+        assert_eq!(recovered, 16);
+        eprintln!(
+            "M4D_PURGE_PROCESS_MATRIX_V1 cases=16 killed=16 fresh_reopens=16 retry_completed=16 zero_removal_sync_retries=16 process_crash_only=true power_loss_simulated=false durability_claim=false"
         );
     }
 
@@ -3103,6 +3633,72 @@ mod tests {
         }
     }
 
+    fn purge_command(id: u64) -> ProjectStoreCommand {
+        ProjectStoreCommand::Purge {
+            request_id: request_id(id),
+        }
+    }
+
+    struct PurgeSnapshot {
+        generation_id: ProjectGenerationId,
+        generation_bytes: u64,
+        trash_generation: PathBuf,
+        trash_object: PathBuf,
+        object_bytes: u64,
+    }
+
+    fn install_purge_snapshot(project: &TestProject) -> PurgeSnapshot {
+        let selected = crate::trash::tests::install_zero_non_regenerable_orphan(project.path());
+        let root = LocalStoreRoot::open(project.path()).unwrap();
+        let mut leases =
+            ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        assert!(leases.has_writer());
+        let diagnostics = crate::trash::trash_generations(
+            &root,
+            &mut leases,
+            &[selected],
+            ProjectStoreLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(diagnostics.published_objects, 1);
+        assert_eq!(diagnostics.streamed_bytes, 0);
+        drop(leases);
+
+        let active = crate::trash::tests::active_generation_file(project.path(), selected);
+        let trash = crate::trash::tests::trash_generation_file(project.path(), selected);
+        assert!(!active.exists());
+        let generation_bytes = fs::read(&trash).unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&generation_bytes).unwrap();
+        let digest = document["reachable_objects"][0]["digest"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("sha256:")
+            .unwrap();
+        let (fanout, suffix) = digest.split_at(2);
+        let active_object = project
+            .path()
+            .join("objects/sha256")
+            .join(fanout)
+            .join(suffix);
+        let trash_object = project
+            .path()
+            .join("trash/objects/sha256")
+            .join(fanout)
+            .join(suffix);
+        assert!(active_object.exists());
+        fs::create_dir_all(trash_object.parent().unwrap()).unwrap();
+        fs::copy(&active_object, &trash_object).unwrap();
+
+        PurgeSnapshot {
+            generation_id: selected,
+            generation_bytes: u64::try_from(generation_bytes.len()).unwrap(),
+            trash_generation: trash,
+            object_bytes: fs::metadata(&trash_object).unwrap().len(),
+            trash_object,
+        }
+    }
+
     fn request_id(id: u64) -> ProjectStoreRequestId {
         ProjectStoreRequestId::new(id).unwrap()
     }
@@ -3173,6 +3769,9 @@ mod tests {
                 request_id: actual_id,
                 result: Err(ProjectStoreFault::Cancelled)
             } | ProjectStoreCompletion::Trashed {
+                request_id: actual_id,
+                result: Err(ProjectStoreFault::Cancelled)
+            } | ProjectStoreCompletion::Purged {
                 request_id: actual_id,
                 result: Err(ProjectStoreFault::Cancelled)
             } | ProjectStoreCompletion::Verified {

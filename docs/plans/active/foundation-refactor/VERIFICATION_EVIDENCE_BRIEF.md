@@ -229,6 +229,12 @@ Semantic per-case limits are:
 | Trusted GPU | `20 s` | `60 s` |
 | Generated packaged-product scenario | — | `5 min` |
 
+One exact component/contract exception is registered for
+`actor::tests::purge_fresh_process_kill_and_retry_matrix`: it keeps the `5 s`
+warning and terminates at `40 s`. That test deliberately covers 16 real
+`SIGKILL`/fresh-process recovery points by spawning 32 child processes and
+performing filesystem syncs. No other contract case inherits this ceiling.
+
 Nextest does not run doctests, so `doctest` has a separate aggregate warning at
 `60 s` and hard subprocess ceiling at `120 s`; any doctest needing meaningful
 per-case runtime control becomes a normal unit/contract case. Property cases

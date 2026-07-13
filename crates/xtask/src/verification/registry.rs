@@ -22,6 +22,8 @@ pub(super) struct Registry {
     tools: Vec<ToolPin>,
     property_groups: Vec<PropertyGroup>,
     pub(super) lint_exceptions: Vec<LintException>,
+    #[serde(default)]
+    test_timeout_overrides: Vec<TestTimeoutOverride>,
     pub(super) lanes: Vec<Lane>,
     non_pr_lanes: Vec<NonPrLane>,
     pub(super) selector_adapters: Vec<SelectorAdapter>,
@@ -45,6 +47,14 @@ struct PropertyGroup {
     max_shrink_iters: u64,
     persistence: bool,
     replay: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TestTimeoutOverride {
+    selector: String,
+    warn_ms: u64,
+    terminate_ms: u64,
+    reason: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -580,6 +590,7 @@ fn validate_registry(registry: &Registry) -> anyhow::Result<()> {
     validate_tool_pins(&registry.tools)?;
     validate_property_groups(&registry.property_groups)?;
     validate_lint_exceptions(&registry.lint_exceptions)?;
+    validate_test_timeout_overrides(&registry.test_timeout_overrides)?;
 
     let required = ["policy", "lint", "unit", "contract", "ui", "doctest"];
     let allowed_fixture_tiers = [
@@ -700,6 +711,24 @@ fn validate_registry(registry: &Registry) -> anyhow::Result<()> {
         }
         if !all_lane_ids.contains(adapter.lane.as_str()) {
             bail!("selector adapter {:?} names an unknown lane", adapter.id);
+        }
+    }
+    Ok(())
+}
+
+fn validate_test_timeout_overrides(overrides: &[TestTimeoutOverride]) -> anyhow::Result<()> {
+    let mut selectors = BTreeSet::new();
+    for timeout in overrides {
+        if !selectors.insert(timeout.selector.as_str())
+            || !timeout.selector.contains("package(")
+            || !timeout.selector.contains("test(=")
+            || timeout.selector.contains('\'')
+            || timeout.warn_ms == 0
+            || timeout.terminate_ms < timeout.warn_ms
+            || timeout.terminate_ms % timeout.warn_ms != 0
+            || timeout.reason.trim().is_empty()
+        {
+            bail!("per-test timeout override has incomplete policy metadata");
         }
     }
     Ok(())
@@ -905,6 +934,14 @@ fn generated_nextest(registry: &Registry) -> anyhow::Result<String> {
          contract = { max-threads = 2 }\n\
          ui = { max-threads = 1 }\n",
     );
+    for timeout in &registry.test_timeout_overrides {
+        text.push_str(&format!(
+            "\n[[profile.default.overrides]]\nfilter = '{}'\nslow-timeout = {{ period = \"{}\", terminate-after = {} }}\n",
+            timeout.selector,
+            duration_text(timeout.warn_ms),
+            timeout.terminate_ms / timeout.warn_ms,
+        ));
+    }
     for lane in required_test_lanes(registry)? {
         let selector = lane
             .selector
