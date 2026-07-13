@@ -43,11 +43,11 @@ Private Pin/Unpin now supplies durable checkpoint roots with fresh graph,
 capacity, cancellation, and read-only enforcement. All seven frozen phases now
 have exact before/after occurrence injection plus a 16-case actual `SIGKILL`,
 fresh-process reopen, and retry matrix. This is process-crash evidence only;
-power-loss/filesystem durability remain later B2 work. The next narrow
-correction now freezes writer-only dead-staging selection, complete bounded
-preflight, ordered synced removal, three transition names, cancellation,
-indeterminacy, and exact retry. Its private implementation and focused evidence
-are next.
+power-loss/filesystem durability remain later B2 work. Writer-only dead-staging
+cleanup is now implemented after successful bounded validation and immediate
+writer reconfirmation. It performs complete bounded preflight, ordered synced
+removal, final re-inventory, and exact retry; focused transition injection and
+the existing process-kill matrix cover its current logic/process-crash claim.
 A private bounded FullVerify path now hashes every physical object in one
 stable active-store snapshot, reconstructs paged logical objects, remains
 cancellable and available read-only, and changes no store authority. Artifact
@@ -82,9 +82,8 @@ caller-supplied no-clobber package path, and advances through the existing lane
 protocol. The private publisher now implements first publication, exact-only
 uncertain-install adoption, base-less advance, cancellation, and exact fresh
 retry with four focused transaction cases. Exhaustive transition/process-kill
-evidence remains later. The next narrow B2 checkpoint is the already-audited
-dead-writer staging-cleanup implementation; public actor/session lifecycle
-follows it.
+evidence remains later. The next narrow B2 checkpoint is public actor/session
+lifecycle, followed by the remaining durability qualification.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.

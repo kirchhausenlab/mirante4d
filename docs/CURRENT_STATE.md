@@ -171,9 +171,13 @@ write-suspending. All seven frozen Pin/Unpin transitions now have exact before/
 after occurrence injection plus a 16-case actual `SIGKILL`, fresh-process
 reopen, and retry matrix. This proves logic and process-crash recovery only;
 power-loss/filesystem durability remains later. A bound staging-cleanup
-correction now freezes exact writer-only selection, whole-namespace preflight,
-ordered synced removal, cancellation, indeterminacy, and fresh retry. Its
-implementation evidence remains pending. A
+correction now owns implemented writer-only selection, whole-namespace
+preflight, ordered synced removal, cancellation, indeterminacy, final
+re-inventory, and fresh retry. Writable open removes exact dead transaction
+residue only after successful store validation and writer reconfirmation;
+read-only open leaves staging untouched. Focused transition injection and the
+existing Pin/Unpin process-kill matrix prove fresh reopen and retry without
+claiming power-loss durability. A
 bound correction now resolves the provisional-autosave base contradiction and
 freezes first no-clobber publication, advance, receipt, cancellation, and retry
 semantics. The private publisher now installs the first exact base-less package,

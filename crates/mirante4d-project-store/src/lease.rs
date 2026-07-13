@@ -65,6 +65,9 @@ pub(crate) enum GcTransition {
     PinDirectorySync,
     UnpinRemove,
     UnpinDirectorySync,
+    StagingCleanupPayloadRemove,
+    StagingCleanupDirectorySync,
+    StagingCleanupTransactionRemove,
 }
 
 impl GcTransition {
@@ -102,6 +105,13 @@ impl GcTransition {
     #[cfg(test)]
     pub(crate) const UNPIN: [Self; 2] = [Self::UnpinRemove, Self::UnpinDirectorySync];
 
+    #[cfg(test)]
+    pub(crate) const STAGING_CLEANUP: [Self; 3] = [
+        Self::StagingCleanupPayloadRemove,
+        Self::StagingCleanupDirectorySync,
+        Self::StagingCleanupTransactionRemove,
+    ];
+
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::MaintenanceUpgrade => "gc_maintenance_upgrade",
@@ -123,6 +133,9 @@ impl GcTransition {
             Self::PinDirectorySync => "pin_directory_sync",
             Self::UnpinRemove => "unpin_remove",
             Self::UnpinDirectorySync => "unpin_directory_sync",
+            Self::StagingCleanupPayloadRemove => "staging_cleanup_payload_remove",
+            Self::StagingCleanupDirectorySync => "staging_cleanup_directory_sync",
+            Self::StagingCleanupTransactionRemove => "staging_cleanup_transaction_remove",
         }
     }
 
@@ -133,6 +146,7 @@ impl GcTransition {
             .chain([Self::PurgeRemove, Self::PurgeDirectorySync])
             .chain(Self::PIN)
             .chain(Self::UNPIN)
+            .chain(Self::STAGING_CLEANUP)
             .find(|transition| transition.name() == name)
     }
 
@@ -157,6 +171,9 @@ impl GcTransition {
             Self::PinDirectorySync => 16,
             Self::UnpinRemove => 17,
             Self::UnpinDirectorySync => 18,
+            Self::StagingCleanupPayloadRemove => 19,
+            Self::StagingCleanupDirectorySync => 20,
+            Self::StagingCleanupTransactionRemove => 21,
         }
     }
 }
@@ -214,7 +231,7 @@ pub(crate) struct GcTransitionTarget {
 pub(crate) struct GcTransitionInjector {
     target: Option<GcTransitionTarget>,
     action: GcTransitionAction,
-    attempts: [AtomicUsize; 19],
+    attempts: [AtomicUsize; 22],
     fired: AtomicUsize,
     release: AtomicBool,
     parked_thread: Mutex<Option<thread::Thread>>,

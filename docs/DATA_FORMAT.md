@@ -158,7 +158,9 @@ no-clobber publication and advance rules. The private publisher now implements
 those rules with exact uncertain-install adoption and fresh retry. This remains
 off-product and is not a public Create/Save, actor/timer, recovery-open, or
 durability claim. B4 deletes project-v15 and makes the new store the sole
-product path. A separate accepted correction now fixes the exact internal
-`staging/tx-*` name and payload grammar plus writer-only cleanup rules. Staging
-remains non-authoritative; cleanup implementation and durability evidence are
-still pending.
+product path. A separate accepted correction fixes the exact internal
+`staging/tx-*` name and payload grammar plus writer-only cleanup rules.
+Writable open now removes only fully preflighted dead transaction residue with
+ordered directory syncs and fresh retry; read-only open does not traverse
+staging. Staging remains non-authoritative, and power-loss/filesystem
+qualification is still pending.

@@ -57,6 +57,9 @@ const WRITABLE_SESSION_DESCRIPTORS: usize = 3;
 // private staging directory, and the separate parent/file pair used by the
 // final exact predecessor recheck.
 const REF_PUBLICATION_DESCRIPTORS: usize = WRITABLE_SESSION_DESCRIPTORS + 5;
+// Cleanup additionally holds the staging directory, one transaction
+// directory, and either one directory iterator or one payload descriptor.
+const STAGING_CLEANUP_DESCRIPTORS: usize = WRITABLE_SESSION_DESCRIPTORS + 3;
 // Package installation additionally holds the destination parent, one
 // directory-enumeration descriptor, and one file descriptor at the walk peak.
 const PACKAGE_INSTALL_DESCRIPTORS: usize = WRITABLE_SESSION_DESCRIPTORS + 3;
@@ -281,6 +284,49 @@ pub(crate) enum LocalPublicationError {
         #[source]
         source: io::Error,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StagingCleanupError {
+    Cancelled,
+    ReadOnly,
+    Capacity,
+    Corruption,
+    CommitIndeterminate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StagingCleanupTransition {
+    PayloadRemove,
+    DirectorySync,
+    TransactionRemove,
+}
+
+pub(crate) trait StagingCleanupTransitionObserver {
+    type Occurrence;
+
+    fn before(&self, transition: StagingCleanupTransition) -> Result<Self::Occurrence, ()>;
+    fn after(&self, occurrence: Self::Occurrence) -> Result<(), ()>;
+}
+
+#[derive(Debug)]
+pub(crate) struct StagingCleanupPlan {
+    staging: Option<PreflightStaging>,
+}
+
+#[derive(Debug)]
+struct PreflightStaging {
+    directory: OwnedFd,
+    identity: DirectoryIdentity,
+    limits: ProjectStoreLimits,
+    transactions: Vec<PreflightTransaction>,
+}
+
+#[derive(Debug)]
+struct PreflightTransaction {
+    name: OsString,
+    identity: DirectoryIdentity,
+    payload: Option<FileIdentity>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -996,6 +1042,167 @@ impl LocalStoreRoot {
         C: FnMut() -> bool,
     {
         self.validate_store_inventory_mode(limits, 0, 0, false, false, is_cancelled)
+    }
+
+    /// Completely validates the visible writer-private staging namespace
+    /// without removing anything. The caller must reconfirm its writer lease
+    /// after this returns and immediately before executing the plan.
+    pub(crate) fn preflight_staging_cleanup<C>(
+        &self,
+        limits: ProjectStoreLimits,
+        mut is_cancelled: C,
+    ) -> Result<StagingCleanupPlan, StagingCleanupError>
+    where
+        C: FnMut() -> bool,
+    {
+        self.validate_store_inventory(limits, 0, false, &mut is_cancelled)
+            .map_err(map_staging_preflight_error)?;
+        let descriptors = STAGING_CLEANUP_DESCRIPTORS
+            .checked_add(self.external_held_descriptors)
+            .ok_or(StagingCleanupError::Capacity)?;
+        enforce_count(descriptors, limits.open_file_descriptors_max)
+            .map_err(map_staging_preflight_error)?;
+        check_cancelled(&mut is_cancelled).map_err(map_staging_preflight_error)?;
+
+        let root_identity = DirectoryIdentity::from_stat(
+            fstat(&self.root).map_err(|_| StagingCleanupError::Corruption)?,
+        )
+        .map_err(map_staging_preflight_error)?;
+        let Some((directory, identity)) =
+            open_stable_directory_if_present(&self.root, OsStr::new(STAGING_DIRECTORY))
+                .map_err(map_staging_preflight_error)?
+        else {
+            check_cancelled(&mut is_cancelled).map_err(map_staging_preflight_error)?;
+            return Ok(StagingCleanupPlan { staging: None });
+        };
+        if identity.device != root_identity.device {
+            return Err(StagingCleanupError::Corruption);
+        }
+
+        let listed =
+            list_staging_transactions(&directory, root_identity.device, limits, &mut is_cancelled)
+                .map_err(map_staging_preflight_error)?;
+        let mut transactions = Vec::with_capacity(listed.len());
+        for (name, expected_identity) in listed {
+            check_cancelled(&mut is_cancelled).map_err(map_staging_preflight_error)?;
+            let transaction = open_stable_directory(&directory, &name, expected_identity)
+                .map_err(map_staging_preflight_error)?;
+            let payload = inspect_staging_transaction(
+                &transaction,
+                root_identity.device,
+                limits,
+                &mut is_cancelled,
+            )
+            .map_err(map_staging_preflight_error)?;
+            confirm_named_directory(&directory, &name, expected_identity)
+                .map_err(map_staging_preflight_error)?;
+            transactions.push(PreflightTransaction {
+                name,
+                identity: expected_identity,
+                payload,
+            });
+        }
+        transactions.sort_by(|left, right| {
+            left.name
+                .as_os_str()
+                .as_bytes()
+                .cmp(right.name.as_os_str().as_bytes())
+        });
+        revalidate_staging_snapshot(
+            &directory,
+            root_identity.device,
+            &transactions,
+            limits,
+            &mut is_cancelled,
+        )
+        .map_err(map_staging_preflight_error)?;
+        confirm_named_directory(&self.root, OsStr::new(STAGING_DIRECTORY), identity)
+            .map_err(map_staging_preflight_error)?;
+        check_cancelled(&mut is_cancelled).map_err(map_staging_preflight_error)?;
+
+        Ok(StagingCleanupPlan {
+            staging: Some(PreflightStaging {
+                directory,
+                identity,
+                limits,
+                transactions,
+            }),
+        })
+    }
+
+    /// Executes one fully preflighted cleanup without observing cancellation.
+    /// Every required sync failure and every failure after the first removal
+    /// is reported as durability-indeterminate.
+    pub(crate) fn execute_staging_cleanup<O, R>(
+        &self,
+        plan: StagingCleanupPlan,
+        observer: &O,
+        mut reconfirm_writer: R,
+    ) -> Result<(), StagingCleanupError>
+    where
+        O: StagingCleanupTransitionObserver,
+        R: FnMut() -> Result<(), StagingCleanupError>,
+    {
+        let Some(staging) = plan.staging else {
+            reconfirm_writer()?;
+            return match statat(
+                &self.root,
+                OsStr::new(STAGING_DIRECTORY),
+                AtFlags::SYMLINK_NOFOLLOW,
+            ) {
+                Err(Errno::NOENT) => Ok(()),
+                Ok(_) | Err(_) => Err(StagingCleanupError::Corruption),
+            };
+        };
+        let PreflightStaging {
+            directory,
+            identity,
+            limits,
+            transactions,
+        } = staging;
+        let root_device = DirectoryIdentity::from_stat(
+            fstat(&self.root).map_err(|_| StagingCleanupError::Corruption)?,
+        )
+        .map_err(map_staging_preflight_error)?
+        .device;
+        if identity.device != root_device {
+            return Err(StagingCleanupError::Corruption);
+        }
+        confirm_named_directory(&self.root, OsStr::new(STAGING_DIRECTORY), identity)
+            .map_err(map_staging_preflight_error)?;
+
+        let mut execution_state = StagingCleanupExecutionState::default();
+        if transactions.is_empty() {
+            reconfirm_writer()?;
+            execution_state.writer_reconfirmed = true;
+            sync_staging_cleanup_directory(&directory, observer)?;
+        }
+        for transaction in transactions {
+            let result = execute_staging_transaction(
+                &directory,
+                root_device,
+                limits,
+                transaction,
+                observer,
+                &mut execution_state,
+                &mut reconfirm_writer,
+            );
+            if let Err(error) = result {
+                return Err(if execution_state.removed {
+                    StagingCleanupError::CommitIndeterminate
+                } else {
+                    error
+                });
+            }
+        }
+
+        final_staging_reinventory(&self.root, &directory, identity).map_err(|error| {
+            if execution_state.removed {
+                StagingCleanupError::CommitIndeterminate
+            } else {
+                error
+            }
+        })
     }
 
     /// Requires the exact root namespace produced by one initial package
@@ -2546,6 +2753,285 @@ fn capacity_overflow(maximum: usize) -> LocalPublicationError {
     }
 }
 
+fn map_staging_preflight_error(error: LocalPublicationError) -> StagingCleanupError {
+    match error {
+        LocalPublicationError::Cancelled => StagingCleanupError::Cancelled,
+        LocalPublicationError::Capacity { .. } => StagingCleanupError::Capacity,
+        LocalPublicationError::InvalidPath
+        | LocalPublicationError::SourceLength { .. }
+        | LocalPublicationError::SourceDigest
+        | LocalPublicationError::ExistingMismatch
+        | LocalPublicationError::DestinationExists
+        | LocalPublicationError::AtomicPublishUnsupported
+        | LocalPublicationError::InvalidGeneration
+        | LocalPublicationError::InvalidControl
+        | LocalPublicationError::RefAlreadyPresent
+        | LocalPublicationError::RefChanged
+        | LocalPublicationError::RefCommitIndeterminate
+        | LocalPublicationError::PackageCommitIndeterminate
+        | LocalPublicationError::Io { .. } => StagingCleanupError::Corruption,
+    }
+}
+
+fn valid_staging_transaction_name(name: &[u8]) -> bool {
+    let mut parts = name.split(|byte| *byte == b'-');
+    let valid = match (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        (Some(b"tx"), Some(pid), Some(nonce), Some(sequence), Some(attempt)) => {
+            !pid.is_empty()
+                && matches!(pid[0], b'1'..=b'9')
+                && pid.iter().all(u8::is_ascii_digit)
+                && std::str::from_utf8(pid)
+                    .ok()
+                    .and_then(|pid| pid.parse::<u32>().ok())
+                    .is_some()
+                && is_exact_lower_hex(nonce, 32)
+                && is_exact_lower_hex(sequence, 16)
+                && is_exact_lower_hex(attempt, 2)
+                && matches!(attempt[0], b'0'..=b'7')
+        }
+        _ => false,
+    };
+    valid && parts.next().is_none()
+}
+
+fn list_staging_transactions<C>(
+    staging: &OwnedFd,
+    root_device: u64,
+    limits: ProjectStoreLimits,
+    is_cancelled: &mut C,
+) -> Result<Vec<(OsString, DirectoryIdentity)>, LocalPublicationError>
+where
+    C: FnMut() -> bool,
+{
+    let mut entries = 0_usize;
+    let mut transactions = Vec::new();
+    for entry in Dir::read_from(staging).map_err(|_| LocalPublicationError::ExistingMismatch)? {
+        check_cancelled(is_cancelled)?;
+        let entry = entry.map_err(|_| LocalPublicationError::ExistingMismatch)?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        entries = checked_count_add(entries, 1, limits.directory_fanout_entries_max)?;
+        enforce_count(entries, limits.directory_fanout_entries_max)?;
+        if !valid_staging_transaction_name(name.to_bytes()) {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+        let identity = DirectoryIdentity::from_stat(
+            statat(staging, name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        if identity.device != root_device {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+        transactions.push((OsString::from_vec(name.to_bytes().to_vec()), identity));
+    }
+    transactions.sort_by(|left, right| {
+        left.0
+            .as_os_str()
+            .as_bytes()
+            .cmp(right.0.as_os_str().as_bytes())
+    });
+    Ok(transactions)
+}
+
+fn inspect_staging_transaction<C>(
+    transaction: &OwnedFd,
+    root_device: u64,
+    limits: ProjectStoreLimits,
+    is_cancelled: &mut C,
+) -> Result<Option<FileIdentity>, LocalPublicationError>
+where
+    C: FnMut() -> bool,
+{
+    let mut payload = None;
+    let mut entries = 0_usize;
+    for entry in Dir::read_from(transaction).map_err(|_| LocalPublicationError::ExistingMismatch)? {
+        check_cancelled(is_cancelled)?;
+        let entry = entry.map_err(|_| LocalPublicationError::ExistingMismatch)?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        entries = checked_count_add(entries, 1, limits.directory_fanout_entries_max)?;
+        enforce_count(entries, limits.directory_fanout_entries_max)?;
+        if entries != 1 || name.to_bytes() != STAGED_FILE.as_bytes() {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+        let identity = FileIdentity::from_stat(
+            statat(transaction, name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        if identity.device != root_device || identity.bytes > limits.generation_bytes_max {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+        payload = Some(identity);
+    }
+    if let Some(expected) = payload {
+        check_cancelled(is_cancelled)?;
+        let held = openat(
+            transaction,
+            OsStr::new(STAGED_FILE),
+            FILE_METADATA_FLAGS,
+            Mode::empty(),
+        )
+        .map_err(|_| LocalPublicationError::ExistingMismatch)?;
+        let opened = FileIdentity::from_stat(
+            fstat(&held).map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        let named = FileIdentity::from_stat(
+            statat(
+                transaction,
+                OsStr::new(STAGED_FILE),
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(|_| LocalPublicationError::ExistingMismatch)?,
+        )?;
+        if opened != expected || named != expected {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+    }
+    check_cancelled(is_cancelled)?;
+    Ok(payload)
+}
+
+fn revalidate_staging_snapshot<C>(
+    staging: &OwnedFd,
+    root_device: u64,
+    expected: &[PreflightTransaction],
+    limits: ProjectStoreLimits,
+    is_cancelled: &mut C,
+) -> Result<(), LocalPublicationError>
+where
+    C: FnMut() -> bool,
+{
+    let listed = list_staging_transactions(staging, root_device, limits, is_cancelled)?;
+    if listed.len() != expected.len() {
+        return Err(LocalPublicationError::ExistingMismatch);
+    }
+    for ((name, identity), expected) in listed.into_iter().zip(expected) {
+        if name != expected.name || identity != expected.identity {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+        let transaction = open_stable_directory(staging, &name, identity)?;
+        if inspect_staging_transaction(&transaction, root_device, limits, is_cancelled)?
+            != expected.payload
+        {
+            return Err(LocalPublicationError::ExistingMismatch);
+        }
+        confirm_named_directory(staging, &name, identity)?;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct StagingCleanupExecutionState {
+    removed: bool,
+    writer_reconfirmed: bool,
+}
+
+fn execute_staging_transaction<O, R>(
+    staging: &OwnedFd,
+    root_device: u64,
+    limits: ProjectStoreLimits,
+    expected: PreflightTransaction,
+    observer: &O,
+    state: &mut StagingCleanupExecutionState,
+    reconfirm_writer: &mut R,
+) -> Result<(), StagingCleanupError>
+where
+    O: StagingCleanupTransitionObserver,
+    R: FnMut() -> Result<(), StagingCleanupError>,
+{
+    let transaction = open_stable_directory(staging, &expected.name, expected.identity)
+        .map_err(map_staging_preflight_error)?;
+    let actual = inspect_staging_transaction(&transaction, root_device, limits, &mut || false)
+        .map_err(map_staging_preflight_error)?;
+    if actual != expected.payload {
+        return Err(StagingCleanupError::Corruption);
+    }
+    if !state.writer_reconfirmed {
+        reconfirm_writer()?;
+        state.writer_reconfirmed = true;
+    }
+
+    if expected.payload.is_some() {
+        let occurrence = observer
+            .before(StagingCleanupTransition::PayloadRemove)
+            .map_err(|()| StagingCleanupError::Corruption)?;
+        unlinkat(&transaction, OsStr::new(STAGED_FILE), AtFlags::empty())
+            .map_err(|_| StagingCleanupError::Corruption)?;
+        state.removed = true;
+        observer
+            .after(occurrence)
+            .map_err(|()| StagingCleanupError::CommitIndeterminate)?;
+        if inspect_staging_transaction(&transaction, root_device, limits, &mut || false)
+            .map_err(|_| StagingCleanupError::CommitIndeterminate)?
+            .is_some()
+        {
+            return Err(StagingCleanupError::CommitIndeterminate);
+        }
+        sync_staging_cleanup_directory(&transaction, observer)?;
+    }
+
+    confirm_named_directory(staging, &expected.name, expected.identity)
+        .map_err(map_staging_preflight_error)?;
+    let occurrence = observer
+        .before(StagingCleanupTransition::TransactionRemove)
+        .map_err(|()| StagingCleanupError::Corruption)?;
+    unlinkat(staging, &expected.name, AtFlags::REMOVEDIR)
+        .map_err(|_| StagingCleanupError::Corruption)?;
+    state.removed = true;
+    observer
+        .after(occurrence)
+        .map_err(|()| StagingCleanupError::CommitIndeterminate)?;
+    sync_staging_cleanup_directory(staging, observer)
+}
+
+fn sync_staging_cleanup_directory<O>(
+    directory: &OwnedFd,
+    observer: &O,
+) -> Result<(), StagingCleanupError>
+where
+    O: StagingCleanupTransitionObserver,
+{
+    let occurrence = observer
+        .before(StagingCleanupTransition::DirectorySync)
+        .map_err(|()| StagingCleanupError::CommitIndeterminate)?;
+    sync_with_retry(directory).map_err(|_| StagingCleanupError::CommitIndeterminate)?;
+    observer
+        .after(occurrence)
+        .map_err(|()| StagingCleanupError::CommitIndeterminate)
+}
+
+fn final_staging_reinventory(
+    root: &OwnedFd,
+    staging: &OwnedFd,
+    expected: DirectoryIdentity,
+) -> Result<(), StagingCleanupError> {
+    let held =
+        DirectoryIdentity::from_stat(fstat(staging).map_err(|_| StagingCleanupError::Corruption)?)
+            .map_err(map_staging_preflight_error)?;
+    if held != expected {
+        return Err(StagingCleanupError::Corruption);
+    }
+    for entry in Dir::read_from(staging).map_err(|_| StagingCleanupError::Corruption)? {
+        let entry = entry.map_err(|_| StagingCleanupError::Corruption)?;
+        let name = entry.file_name().to_bytes();
+        if name != b"." && name != b".." {
+            return Err(StagingCleanupError::Corruption);
+        }
+    }
+    confirm_named_directory(root, OsStr::new(STAGING_DIRECTORY), expected)
+        .map_err(map_staging_preflight_error)
+}
+
 struct Stage {
     parent: OwnedFd,
     name: OsString,
@@ -3232,6 +3718,7 @@ fn injected_pin_transition(operation: &'static str) -> LocalPublicationError {
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::{Cell, RefCell},
         fs,
         io::Cursor,
         os::unix::fs::symlink,
@@ -3248,6 +3735,55 @@ mod tests {
     struct TestDirectory(PathBuf);
 
     struct MustNotRead;
+
+    #[derive(Default)]
+    struct RecordingStagingObserver {
+        transitions: RefCell<Vec<StagingCleanupTransition>>,
+    }
+
+    impl StagingCleanupTransitionObserver for RecordingStagingObserver {
+        type Occurrence = (StagingCleanupTransition, usize);
+
+        fn before(&self, transition: StagingCleanupTransition) -> Result<Self::Occurrence, ()> {
+            let occurrence = self
+                .transitions
+                .borrow()
+                .iter()
+                .filter(|observed| **observed == transition)
+                .count();
+            self.transitions.borrow_mut().push(transition);
+            Ok((transition, occurrence))
+        }
+
+        fn after(&self, _occurrence: Self::Occurrence) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    struct ReinventoryDriftObserver {
+        staging: PathBuf,
+        directory_syncs: Cell<usize>,
+    }
+
+    impl StagingCleanupTransitionObserver for ReinventoryDriftObserver {
+        type Occurrence = StagingCleanupTransition;
+
+        fn before(&self, transition: StagingCleanupTransition) -> Result<Self::Occurrence, ()> {
+            Ok(transition)
+        }
+
+        fn after(&self, transition: Self::Occurrence) -> Result<(), ()> {
+            if transition == StagingCleanupTransition::DirectorySync {
+                let occurrence = self.directory_syncs.get();
+                self.directory_syncs.set(occurrence + 1);
+                if occurrence == 1 {
+                    fs::create_dir(self.staging.join(staging_transaction_name(9, 0, 0, 0)))
+                        .unwrap();
+                }
+            }
+            Ok(())
+        }
+    }
 
     impl Read for MustNotRead {
         fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
@@ -3315,6 +3851,19 @@ mod tests {
 
     fn object_path(root: &Path, digest: ExactBytesDigest) -> PathBuf {
         root.join(object_relative_path(digest))
+    }
+
+    fn staging_transaction_name(pid: u32, nonce: u128, sequence: u64, attempt: u8) -> String {
+        format!("tx-{pid}-{nonce:032x}-{sequence:016x}-{attempt:02x}")
+    }
+
+    fn create_staging_transaction(root: &Path, name: &str, payload: Option<&[u8]>) -> PathBuf {
+        let transaction = root.join(STAGING_DIRECTORY).join(name);
+        fs::create_dir_all(&transaction).unwrap();
+        if let Some(payload) = payload {
+            fs::write(transaction.join(STAGED_FILE), payload).unwrap();
+        }
+        transaction
     }
 
     fn extracted_fixture_store(label: &str, store: &str) -> (TestDirectory, PathBuf) {
@@ -3531,6 +4080,269 @@ mod tests {
             remaining,
             vec![destination.as_path().file_name().unwrap().to_os_string()]
         );
+    }
+
+    #[test]
+    fn staging_transaction_name_grammar_is_exact() {
+        let valid = [
+            staging_transaction_name(1, 0, 0, 0),
+            staging_transaction_name(u32::MAX, u128::MAX, u64::MAX, 0x7f),
+            unique_stage_name(0).into_string().unwrap(),
+        ];
+        for name in valid {
+            assert!(valid_staging_transaction_name(name.as_bytes()), "{name}");
+        }
+
+        let nonce = "0".repeat(32);
+        let sequence = "0".repeat(16);
+        let invalid = [
+            format!("tx-0-{nonce}-{sequence}-00"),
+            format!("tx-01-{nonce}-{sequence}-00"),
+            format!("tx-4294967296-{nonce}-{sequence}-00"),
+            format!("tx-1-{}-{sequence}-00", "0".repeat(31)),
+            format!("tx-1-{}-{sequence}-00", "A".repeat(32)),
+            format!("tx-1-{nonce}-{}-00", "0".repeat(15)),
+            format!("tx-1-{nonce}-{sequence}-0A"),
+            format!("tx-1-{nonce}-{sequence}-80"),
+            format!("tx-1-{nonce}-{sequence}-00-extra"),
+            String::from("transaction-1"),
+        ];
+        for name in invalid {
+            assert!(!valid_staging_transaction_name(name.as_bytes()), "{name}");
+        }
+    }
+
+    #[test]
+    fn staging_cleanup_is_sorted_bounded_and_idempotent() {
+        let directory = TestDirectory::new("staging-cleanup");
+        let store = directory.path().join("store");
+        fs::create_dir(&store).unwrap();
+        fs::create_dir(store.join(STAGING_DIRECTORY)).unwrap();
+        let sibling = directory.path().join(".mirante4d-project-stage-sibling");
+        fs::create_dir(&sibling).unwrap();
+        fs::write(sibling.join("sentinel"), b"sibling package").unwrap();
+
+        let first = staging_transaction_name(1, 0, 0, 0);
+        let second = staging_transaction_name(2, 0, 0, 0);
+        create_staging_transaction(&store, &second, None);
+        create_staging_transaction(&store, &first, Some(b"partial payload"));
+        let root = LocalStoreRoot::open(&store).unwrap();
+        let mut cancellation_polls = 0_usize;
+        let plan = root
+            .preflight_staging_cleanup(ProjectStoreLimits::default(), || {
+                cancellation_polls += 1;
+                false
+            })
+            .unwrap();
+        let polls_after_preflight = cancellation_polls;
+        let observer = RecordingStagingObserver::default();
+        root.execute_staging_cleanup(plan, &observer, || Ok(()))
+            .unwrap();
+
+        assert_eq!(cancellation_polls, polls_after_preflight);
+        assert_eq!(
+            fs::read_dir(store.join(STAGING_DIRECTORY)).unwrap().count(),
+            0
+        );
+        assert_eq!(
+            observer.transitions.borrow().as_slice(),
+            [
+                StagingCleanupTransition::PayloadRemove,
+                StagingCleanupTransition::DirectorySync,
+                StagingCleanupTransition::TransactionRemove,
+                StagingCleanupTransition::DirectorySync,
+                StagingCleanupTransition::TransactionRemove,
+                StagingCleanupTransition::DirectorySync,
+            ]
+        );
+        assert_eq!(
+            fs::read(sibling.join("sentinel")).unwrap(),
+            b"sibling package"
+        );
+
+        let retry = root
+            .preflight_staging_cleanup(ProjectStoreLimits::default(), || false)
+            .unwrap();
+        let retry_observer = RecordingStagingObserver::default();
+        root.execute_staging_cleanup(retry, &retry_observer, || Ok(()))
+            .unwrap();
+        assert_eq!(
+            retry_observer.transitions.borrow().as_slice(),
+            [StagingCleanupTransition::DirectorySync]
+        );
+
+        fs::remove_dir(store.join(STAGING_DIRECTORY)).unwrap();
+        let absent = root
+            .preflight_staging_cleanup(ProjectStoreLimits::default(), || false)
+            .unwrap();
+        let absent_observer = RecordingStagingObserver::default();
+        root.execute_staging_cleanup(absent, &absent_observer, || Ok(()))
+            .unwrap();
+        assert!(!store.join(STAGING_DIRECTORY).exists());
+        assert!(absent_observer.transitions.borrow().is_empty());
+    }
+
+    #[test]
+    fn staging_cleanup_cancellation_and_invalid_entry_leave_everything_untouched() {
+        let directory = TestDirectory::new("staging-preflight");
+        let valid_name = staging_transaction_name(1, 0, 0, 0);
+        let valid = create_staging_transaction(directory.path(), &valid_name, Some(b"valid"));
+        let invalid = directory
+            .path()
+            .join(STAGING_DIRECTORY)
+            .join("not-a-transaction");
+        fs::create_dir(&invalid).unwrap();
+        let before = fs::read(valid.join(STAGED_FILE)).unwrap();
+        let root = LocalStoreRoot::open(directory.path()).unwrap();
+
+        assert_eq!(
+            root.preflight_staging_cleanup(ProjectStoreLimits::default(), || true)
+                .unwrap_err(),
+            StagingCleanupError::Cancelled
+        );
+        assert_eq!(fs::read(valid.join(STAGED_FILE)).unwrap(), before);
+        assert!(invalid.exists());
+
+        assert_eq!(
+            root.preflight_staging_cleanup(ProjectStoreLimits::default(), || false)
+                .unwrap_err(),
+            StagingCleanupError::Corruption
+        );
+        assert_eq!(fs::read(valid.join(STAGED_FILE)).unwrap(), before);
+        assert!(invalid.exists());
+    }
+
+    #[test]
+    fn staging_cleanup_rejects_every_foreign_entry_without_selective_scavenging() {
+        for case in [
+            "malformed-name",
+            "transaction-symlink",
+            "transaction-file",
+            "payload-symlink",
+            "payload-hardlink",
+            "payload-directory",
+            "extra-child",
+            "oversized-payload",
+        ] {
+            let directory = TestDirectory::new(case);
+            let store = directory.path().join("store");
+            fs::create_dir(&store).unwrap();
+            let valid_name = staging_transaction_name(1, 0, 0, 0);
+            let valid = create_staging_transaction(&store, &valid_name, Some(b"keep me"));
+            let invalid_name = staging_transaction_name(2, 0, 0, 0);
+            let invalid = store.join(STAGING_DIRECTORY).join(&invalid_name);
+            let outside = directory.path().join("outside");
+            fs::write(&outside, b"outside sentinel").unwrap();
+
+            match case {
+                "malformed-name" => {
+                    fs::create_dir(store.join(STAGING_DIRECTORY).join("foreign")).unwrap();
+                }
+                "transaction-symlink" => {
+                    let outside_directory = directory.path().join("outside-directory");
+                    fs::create_dir(&outside_directory).unwrap();
+                    symlink(outside_directory, &invalid).unwrap();
+                }
+                "transaction-file" => fs::write(&invalid, b"not a directory").unwrap(),
+                "payload-symlink" => {
+                    fs::create_dir(&invalid).unwrap();
+                    symlink(&outside, invalid.join(STAGED_FILE)).unwrap();
+                }
+                "payload-hardlink" => {
+                    fs::create_dir(&invalid).unwrap();
+                    fs::hard_link(&outside, invalid.join(STAGED_FILE)).unwrap();
+                }
+                "payload-directory" => {
+                    fs::create_dir(&invalid).unwrap();
+                    fs::create_dir(invalid.join(STAGED_FILE)).unwrap();
+                }
+                "extra-child" => {
+                    fs::create_dir(&invalid).unwrap();
+                    fs::write(invalid.join(STAGED_FILE), b"payload").unwrap();
+                    fs::write(invalid.join("extra"), b"extra").unwrap();
+                }
+                "oversized-payload" => {
+                    fs::create_dir(&invalid).unwrap();
+                    let payload = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(invalid.join(STAGED_FILE))
+                        .unwrap();
+                    payload
+                        .set_len(ProjectStoreLimits::default().generation_bytes_max + 1)
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let root = LocalStoreRoot::open(&store).unwrap();
+            assert_eq!(
+                root.preflight_staging_cleanup(ProjectStoreLimits::default(), || false)
+                    .unwrap_err(),
+                StagingCleanupError::Corruption,
+                "{case}"
+            );
+            assert_eq!(fs::read(valid.join(STAGED_FILE)).unwrap(), b"keep me");
+            assert_eq!(fs::read(&outside).unwrap(), b"outside sentinel");
+        }
+    }
+
+    #[test]
+    fn staging_cleanup_capacity_failure_removes_nothing() {
+        let directory = TestDirectory::new("staging-capacity");
+        let first = create_staging_transaction(
+            directory.path(),
+            &staging_transaction_name(1, 0, 0, 0),
+            Some(b"first"),
+        );
+        let second = create_staging_transaction(
+            directory.path(),
+            &staging_transaction_name(2, 0, 0, 0),
+            Some(b"second"),
+        );
+        let root = LocalStoreRoot::open(directory.path()).unwrap();
+        let limits = ProjectStoreLimits {
+            directory_fanout_entries_max: 1,
+            ..ProjectStoreLimits::default()
+        };
+        assert_eq!(
+            root.preflight_staging_cleanup(limits, || false)
+                .unwrap_err(),
+            StagingCleanupError::Capacity
+        );
+        assert_eq!(fs::read(first.join(STAGED_FILE)).unwrap(), b"first");
+        assert_eq!(fs::read(second.join(STAGED_FILE)).unwrap(), b"second");
+    }
+
+    #[test]
+    fn staging_cleanup_final_reinventory_fails_indeterminate_on_namespace_drift() {
+        let directory = TestDirectory::new("staging-reinventory");
+        let staging = directory.path().join(STAGING_DIRECTORY);
+        create_staging_transaction(
+            directory.path(),
+            &staging_transaction_name(1, 0, 0, 0),
+            Some(b"payload"),
+        );
+        let root = LocalStoreRoot::open(directory.path()).unwrap();
+        let plan = root
+            .preflight_staging_cleanup(ProjectStoreLimits::default(), || false)
+            .unwrap();
+        let observer = ReinventoryDriftObserver {
+            staging: staging.clone(),
+            directory_syncs: Cell::new(0),
+        };
+        assert_eq!(
+            root.execute_staging_cleanup(plan, &observer, || Ok(())),
+            Err(StagingCleanupError::CommitIndeterminate)
+        );
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 1);
+
+        let retry = root
+            .preflight_staging_cleanup(ProjectStoreLimits::default(), || false)
+            .unwrap();
+        root.execute_staging_cleanup(retry, &RecordingStagingObserver::default(), || Ok(()))
+            .unwrap();
+        assert_eq!(fs::read_dir(staging).unwrap().count(), 0);
     }
 
     #[test]
