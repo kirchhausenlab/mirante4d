@@ -1,0 +1,35 @@
+{
+  "schema": "mirante4d-foundation-package-entry-correction",
+  "schema_version": 1,
+  "package": "WP-10B",
+  "checkpoint": "B4",
+  "status": "accepted",
+  "authorization": {
+    "approved_by": "Mirante4D repository owner",
+    "approved_on": "2026-07-13",
+    "reference": "WP10B-PREAUTH-2026-07-12",
+    "scope": "mandatory predecessor dependency and architecture-guard cleanup"
+  },
+  "accepted_boundary": {
+    "activation_path": "architecture/wp10b-project-store-b4-activation.json",
+    "activation_sha256": "08f2a5116e063a5e98978bd7a1433732882ecdc869ff3d1949b3a4fdbefddf78",
+    "accepted_predecessor_commit": "8fdd94dc9c60406e8de8a96749d7148d38b1dc7a",
+    "accepted_predecessor_tree": "1b97468c39bb529285d2727c1021057edb38ff82"
+  },
+  "discovered_gap": [
+    "Deleting the predecessor makes mirante4d-app's direct mirante4d-identity dependency unused, so the workspace lockfile must change.",
+    "The WP-08A architecture validator owns the two expiring project bridge exceptions and must retire them at the B4 authority flip."
+  ],
+  "correction": {
+    "additional_allowed_paths": [
+      "architecture/wp10b-project-store-b4-scope-correction.json",
+      "Cargo.lock",
+      "crates/xtask/src/arch/wp08a.rs"
+    ],
+    "rule": "Only remove the obsolete dependency edge and expire the two accepted WP-10B bridge exceptions; do not rewrite frozen historical contracts."
+  },
+  "unchanged": [
+    "B4 outcome, authority flip, mandatory deletions, invariants, evidence, stop conditions, rollback unit, and package order",
+    "Every frozen WP-07B, WP-08A, and WP-10B historical contract"
+  ]
+}
