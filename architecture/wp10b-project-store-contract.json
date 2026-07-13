@@ -19,6 +19,10 @@
       "path": "architecture/wp10b-project-store-recovery-ahead-correction.json",
       "sha256": "dcc908615da8ba94c937fa4ae6745651734caf56f7583ef2638f9e9cc90a6aa1"
     },
+    "recovery_api_correction": {
+      "path": "architecture/wp10b-project-store-recovery-api-correction.json",
+      "sha256": "48957fd7c36a34cd916f659cd3becaf8b54c497ab55ad2ed120af8ac2e384e73"
+    },
     "protected_main": {
       "commit": "b6e0267802f8ac2d0d49a0f04302fd321ef2f617",
       "tree": "b20b598603b47fdbe7c85c3b6d1cba8c78fd433e",
@@ -435,15 +439,17 @@
       "close"
     ],
     "save_as": "caller supplies a projection with the new ProjectId and explicit source generation; the actor changes session only after durable destination installation and retains the old session on failure",
-    "completion": "every accepted request produces exactly one terminal completion carrying its ProjectStoreRequestId, including cancellation and an autosave superseded by coalescing",
+    "completion": "every accepted request produces exactly one terminal completion carrying its ProjectStoreRequestId, including cancellation and an autosave superseded by coalescing; successful Opened and RecoveryOpened completions carry (ProjectStoreSession, ProjectGenerationProjection) in that order, while Created remains session-only because its caller supplied the created projection",
     "receipt": "opaque operation-specific anti-TOCTOU token; durable commits carry captured revision/high-water and new/current/previous generation IDs; autosave receipts also carry base manual generation and cannot mark a project saved",
-    "recovery_candidate": "bounded metadata only with generation, captured revision, origin, base/current relation, provisional/newer/stale/divergent classification, and recoverability summary; projection bytes load only after explicit selection",
-    "autosave_classification": {
-      "provisional": "no manual head exists and autosave base is absent",
-      "divergent": "a manual head exists and autosave base differs from manual head current",
-      "newer": "autosave base equals manual head current and autosave revision_sequence differs from manual head revision_sequence; revision IDs are immutable state identities, so undo may make the autosave sequence numerically lower",
-      "stale": "autosave base equals manual head current and autosave revision_sequence equals manual head revision_sequence"
+    "recovery_candidate": "bounded metadata only with generation, captured revision, origin, base/current relation, recovery classification, and recoverability summary; inspection may decode projection state internally for bounded validation but never returns or exposes it, and only successful explicit OpenRecovery returns the selected projection",
+    "recovery_classification": {
+      "provisional": "the candidate is an autosave, no manual head exists, and its base is absent",
+      "newer": "the candidate is an autosave, its base equals the current manual generation, and its revision_sequence differs from the current manual revision_sequence; revision IDs are immutable state identities, so numeric revision order is irrelevant",
+      "stale": "the candidate is an autosave, its base equals the current manual generation, and its revision_sequence equals the current manual revision_sequence",
+      "divergent": "the candidate is an autosave outside the provisional and same-base cases",
+      "manual_branch": "the candidate is a manual previous, manual recovery, or manual generation found by bounded orphan scan"
     },
+    "recovery_selection": "every explicitly selected recovery projection opens dirty as an unsaved branch; orphan autosaves retain their autosave relation classification, session head IDs remain actual ref facts, and selection never repairs, promotes, or rewrites a ref",
     "diagnostics": "bounded counters and stable reason codes only; no absolute/internal paths or raw OS error strings",
     "fault_variants": [
       "queue_full",

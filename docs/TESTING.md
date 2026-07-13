@@ -141,7 +141,8 @@ generation and does not claim filesystem durability or product save/open
 support.
 
 The unreachable `mirante4d-project-store` crate is assigned to the hosted
-contract lane. Its current tests cover the frozen API/limits, canonical
+contract lane. Its current tests cover the frozen API/limits, corrected loaded
+Open/OpenRecovery result shape, distinct manual-branch classification, canonical
 envelope/ref identities, typed canonical generations, direct and deterministic
 paged closure, held-descriptor traversal, bounded immutable object and
 generation-last publication, process lease contention, and exact reproduction

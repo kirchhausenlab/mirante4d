@@ -131,10 +131,14 @@ device rename.
   refs only after the manual head is durable. A crash before that cleanup leaves
   a harmless stale autosave suppressed by base/revision comparison rather than
   prompting the user or becoming a permanent live root.
-- Recovery is offered only for a newer autosave. A changed-base autosave is
-  labeled divergent and opened as an unsaved branch; it is never silently
-  merged or promoted. Unsaved projects use the same store in the application
-  recovery area under a provisional ID.
+- The normal recovery prompt is offered only for a newer same-base autosave.
+  A changed-base autosave is labeled divergent. Manual previous, manual
+  recovery, and manual generations found by bounded scan are labeled manual
+  branches. Orphan autosaves retain the classification derived from their own
+  base/revision facts. Every explicitly selected recovery projection opens
+  dirty as an unsaved branch; it is never silently merged, promoted, or used to
+  repair a ref. Unsaved projects use the same store in the application recovery
+  area under a provisional ID.
 - Open validates the envelope, refs, generation digests/schema, and referenced
   object names/types/lengths eagerly. Bulk object digests are checked during
   streaming or an explicit/background full verify, not through an unbounded
@@ -145,6 +149,10 @@ device rename.
   a bounded scan may list validated generations only as user-selected recovery
   candidates; it cannot distinguish every committed old tip from pre-commit
   orphans and never auto-repairs a ref.
+- Successful Open and OpenRecovery return the held ProjectStoreSession together
+  with the validated ProjectGenerationProjection. Candidate inspection remains
+  metadata-only at its public boundary: it may decode projection state for
+  validation but does not return or expose it before explicit selection.
 - Automatic cleanup removes only dead-writer staging. Explicit compaction
   roots only the current/previous manual head, manual recovery, current/
   previous autosave head, autosave recovery, and pins. `generation.parent` is
