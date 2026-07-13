@@ -61,6 +61,10 @@ const DURABILITY_QUALIFICATION_CORRECTION_PATH: &str =
     "architecture/wp10b-project-store-durability-qualification-correction.json";
 const DURABILITY_QUALIFICATION_CORRECTION_SHA256: &str =
     "6b4bbc23115115e36a449209810764cbce2738ca693a985275f5e6513d4252e6";
+const B3_INTEGRATION_CORRECTION_PATH: &str =
+    "architecture/wp10b-project-store-b3-integration-correction.json";
+const B3_INTEGRATION_CORRECTION_SHA256: &str =
+    "227b3ff385fdf8d7021758b8013ae6ce98f8fb0d742aadeb2fb6e16e4d5199eb";
 const PROTECTED_MAIN_COMMIT: &str = "b6e0267802f8ac2d0d49a0f04302fd321ef2f617";
 const PROTECTED_MAIN_TREE: &str = "b20b598603b47fdbe7c85c3b6d1cba8c78fd433e";
 const PROTECTED_MAIN_RUN: &str =
@@ -75,7 +79,7 @@ const ZERO_SHA256: &str = "00000000000000000000000000000000000000000000000000000
 // contract plus bound corrections while allowing the independent fixture
 // producer to remain bound to its final manifest.
 const NORMALIZED_CONTRACT_SHA256: &str =
-    "2af1ee0435e7ff516c659ed5e3fce5b8e751f57534563b691d8f19c46faa8497";
+    "d49116e00aeb3d9e158fcfe9068fe0cc7c23d10c9cbb11d56461348ce99a36ec";
 
 pub(super) fn check_wp10b_project_store_contract(repo_root: &Path) -> anyhow::Result<()> {
     let contract_path = repo_root.join(CONTRACT_PATH);
@@ -153,6 +157,11 @@ fn validate_header_and_bindings(repo_root: &Path, contract: &Value) -> anyhow::R
             "durability_qualification_correction",
             DURABILITY_QUALIFICATION_CORRECTION_PATH,
             DURABILITY_QUALIFICATION_CORRECTION_SHA256,
+        ),
+        (
+            "b3_integration_correction",
+            B3_INTEGRATION_CORRECTION_PATH,
+            B3_INTEGRATION_CORRECTION_SHA256,
         ),
     ] {
         expect_string(contract, &format!("/bindings/{name}/path"), path)?;
@@ -316,18 +325,203 @@ fn validate_project_store_crate(repo_root: &Path, contract: &Value) -> anyhow::R
     ) {
         bail!("WP-10B project-store must not have a build script");
     }
+    let allowed_b3_consumers = BTreeSet::from([
+        ("mirante4d-app", "normal"),
+        ("mirante4d-application", "normal"),
+    ]);
     for (source, kinds) in &metadata.declared_dependency_kinds_by_name {
         if source == PROJECT_STORE_CRATE {
             continue;
         }
         for (kind, dependencies) in kinds {
-            if dependencies.contains(PROJECT_STORE_CRATE) {
-                bail!("off-product WP-10B B1 project store is reachable from {source} ({kind})");
+            if dependencies.contains(PROJECT_STORE_CRATE)
+                && !allowed_b3_consumers.contains(&(source.as_str(), kind.as_str()))
+            {
+                bail!(
+                    "off-product WP-10B B3 project store has unauthorized consumer {source} ({kind})"
+                );
+            }
+        }
+    }
+    for manifest in [
+        "crates/mirante4d-app/Cargo.toml",
+        "crates/mirante4d-application/Cargo.toml",
+    ] {
+        validate_canonical_project_store_dependency(&repo_root.join(manifest))?;
+    }
+
+    validate_source_policy(repo_root, contract, &library_root)?;
+    validate_b3_product_isolation(repo_root)
+}
+
+fn validate_canonical_project_store_dependency(manifest_path: &Path) -> anyhow::Result<()> {
+    let source = fs::read_to_string(manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    let manifest = source
+        .parse::<toml::Table>()
+        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+    let dependencies = manifest
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .with_context(|| format!("{} has no dependency table", manifest_path.display()))?;
+    if !dependencies.contains_key(PROJECT_STORE_CRATE) {
+        bail!(
+            "WP-10B B3 consumer {} must use the canonical {PROJECT_STORE_CRATE} dependency name",
+            manifest_path.display()
+        );
+    }
+    if manifest_contains_project_store_rename(&toml::Value::Table(manifest)) {
+        bail!(
+            "WP-10B B3 consumer {} must not rename {PROJECT_STORE_CRATE}",
+            manifest_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn manifest_contains_project_store_rename(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::Table(table) => {
+            table.get("package").and_then(toml::Value::as_str) == Some(PROJECT_STORE_CRATE)
+                || table.values().any(manifest_contains_project_store_rename)
+        }
+        toml::Value::Array(values) => values.iter().any(manifest_contains_project_store_rename),
+        _ => false,
+    }
+}
+
+fn validate_b3_product_isolation(repo_root: &Path) -> anyhow::Result<()> {
+    for relative in [
+        "crates/mirante4d-app/src/current_project_persistence_bridge.rs",
+        "crates/mirante4d-app/src/current_runtime/project.rs",
+    ] {
+        if !repo_root.join(relative).is_file() {
+            bail!("WP-10B B3 predecessor must remain the sole product route: missing {relative}");
+        }
+    }
+
+    let app_root = repo_root.join("crates/mirante4d-app/src");
+    for source_path in collect_rust_source_files(&app_root)? {
+        let relative = source_path
+            .strip_prefix(&app_root)
+            .unwrap_or(&source_path)
+            .to_string_lossy();
+        if relative == "tests.rs"
+            || relative.starts_with("tests/")
+            || relative.ends_with("/tests.rs")
+        {
+            continue;
+        }
+        let source = fs::read_to_string(&source_path)
+            .with_context(|| format!("failed to read {}", source_path.display()))?;
+        for forbidden in ["mirante4d_project_store", "project_store_service"] {
+            if contains_rust_identifier(&source, forbidden) {
+                bail!(
+                    "WP-10B B3 project-store service reached product source {} through {forbidden}",
+                    source_path.display()
+                );
             }
         }
     }
 
-    validate_source_policy(repo_root, contract, &library_root)
+    let application_root = repo_root.join("crates/mirante4d-application/src");
+    let service = application_root.join("project_store_service.rs");
+    let root_path = application_root.join("lib.rs");
+    let root_source = fs::read_to_string(&root_path)?;
+    let expected_root_module_occurrences = usize::from(service.exists());
+    if rust_identifier_occurrences(&root_source, "project_store_service")
+        != expected_root_module_occurrences
+        || (service.exists() && !root_source.contains("mod project_store_service;"))
+    {
+        bail!(
+            "WP-10B B3 project-store service must have exactly one private root declaration and no application-state wiring"
+        );
+    }
+    if service.exists() {
+        let service_source = fs::read_to_string(&service)
+            .with_context(|| format!("failed to read {}", service.display()))?;
+        validate_b3_service_impl_targets(&service_source)?;
+    }
+
+    for source_path in collect_rust_source_files(&application_root)? {
+        if source_path == service || source_path == root_path {
+            continue;
+        }
+        let relative = source_path
+            .strip_prefix(&application_root)
+            .unwrap_or(&source_path)
+            .to_string_lossy();
+        if relative == "tests.rs"
+            || relative.starts_with("tests/")
+            || relative.ends_with("/tests.rs")
+        {
+            continue;
+        }
+        let source = fs::read_to_string(&source_path)
+            .with_context(|| format!("failed to read {}", source_path.display()))?;
+        for forbidden in ["mirante4d_project_store", "project_store_service"] {
+            if contains_rust_identifier(&source, forbidden) {
+                bail!(
+                    "WP-10B B3 project-store service escaped its compile/test-only module into {} through {forbidden}",
+                    source_path.display()
+                );
+            }
+        }
+    }
+
+    if contains_rust_identifier(&root_source, "mirante4d_project_store") {
+        bail!(
+            "WP-10B B3 application root must not construct, store, start, poll, or re-export project-store values"
+        );
+    }
+    Ok(())
+}
+
+fn contains_rust_identifier(source: &str, identifier: &str) -> bool {
+    rust_identifier_occurrences(source, identifier) != 0
+}
+
+fn rust_identifier_occurrences(source: &str, identifier: &str) -> usize {
+    source
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .filter(|token| *token == identifier)
+        .count()
+}
+
+fn validate_b3_service_impl_targets(source: &str) -> anyhow::Result<()> {
+    let file = syn::parse_file(source)
+        .context("failed to parse the WP-10B B3 private project-store service")?;
+    let local_types = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Enum(item) => Some(item.ident.to_string()),
+            syn::Item::Struct(item) => Some(item.ident.to_string()),
+            syn::Item::Union(item) => Some(item.ident.to_string()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+
+    for item in &file.items {
+        let syn::Item::Impl(item) = item else {
+            continue;
+        };
+        let syn::Type::Path(target) = item.self_ty.as_ref() else {
+            bail!("WP-10B B3 private project-store service may implement only its own local types");
+        };
+        let target = target
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string())
+            .context("WP-10B B3 service impl target has no type name")?;
+        if !local_types.contains(&target) {
+            bail!(
+                "WP-10B B3 private project-store service must not extend product-owned type {target}"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_source_policy(
@@ -456,4 +650,81 @@ fn is_lower_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn b3_isolation_allows_only_the_private_service_module_declaration() {
+        let root = "mod project_store_service;\npub struct ApplicationState;\n";
+
+        assert_eq!(
+            rust_identifier_occurrences(root, "project_store_service"),
+            1
+        );
+        assert!(!contains_rust_identifier(root, "mirante4d_project_store"));
+    }
+
+    #[test]
+    fn b3_isolation_detects_indirect_application_state_wiring() {
+        for source in [
+            "struct ApplicationState { service: project_store_service::ProjectStoreService }",
+            "use crate::project_store_service as persistence;",
+            "struct ApplicationState { actor: mirante4d_project_store::ProjectStoreActor }",
+        ] {
+            assert!(
+                contains_rust_identifier(source, "project_store_service")
+                    || contains_rust_identifier(source, "mirante4d_project_store"),
+                "missed product wiring: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn b3_isolation_rejects_service_side_application_state_extension() {
+        let error = validate_b3_service_impl_targets(
+            "use crate::ApplicationState; impl ApplicationState { pub fn persist(&self) {} }",
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("product-owned type ApplicationState")
+        );
+        validate_b3_service_impl_targets(
+            "struct ProjectStoreService; impl ProjectStoreService { fn poll(&mut self) {} }",
+        )
+        .unwrap();
+
+        let alias_error = validate_b3_service_impl_targets(
+            "type ServiceHost = crate::ApplicationState; impl ServiceHost { pub(crate) fn poll_store(&mut self) {} }",
+        )
+        .unwrap_err();
+        assert!(
+            alias_error
+                .to_string()
+                .contains("product-owned type ServiceHost")
+        );
+    }
+
+    #[test]
+    fn b3_isolation_rejects_a_renamed_project_store_dependency() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            "[dependencies]\nmirante4d-project-store = { path = \"../store\" }\n[target.'cfg(unix)'.dependencies]\nstore = { package = \"mirante4d-project-store\", path = \"../store\" }\n",
+        )
+        .unwrap();
+
+        assert!(
+            validate_canonical_project_store_dependency(&manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("must not rename mirante4d-project-store")
+        );
+    }
 }

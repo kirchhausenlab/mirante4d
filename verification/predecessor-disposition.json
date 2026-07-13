@@ -5998,6 +5998,38 @@
       "reason": "WP-10A enforces the off-product storage successor boundary and exact predecessor delegation."
     },
     {
+      "id": "libtest:xtask::bin/xtask:arch::wp10b::tests::b3_isolation_allows_only_the_private_service_module_declaration",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B3 permits the private compile/test-only project-store service declaration without making it product reachable."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp10b::tests::b3_isolation_detects_indirect_application_state_wiring",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B3 rejects direct and indirect production wiring of the compile/test-only project-store service."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp10b::tests::b3_isolation_rejects_a_renamed_project_store_dependency",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B3 rejects normal or target-specific Cargo aliases that could bypass the product-isolation source guard."
+    },
+    {
+      "id": "libtest:xtask::bin/xtask:arch::wp10b::tests::b3_isolation_rejects_service_side_application_state_extension",
+      "kind": "libtest",
+      "owner": "xtask",
+      "lane": "unit",
+      "requirement_ids": ["D-022-unit", "WP-10B-project-store"],
+      "reason": "WP-10B B3 prevents the private service module from extending or aliasing product-owned application state."
+    },
+    {
       "id": "libtest:xtask::bin/xtask:verification::registry::tests::format_lifecycle_is_an_active_target_authority_consumer",
       "kind": "libtest",
       "owner": "xtask",
@@ -6364,6 +6396,6 @@
     "moved": 23,
     "rewritten": 7,
     "deleted": 533,
-    "current_additions": 589
+    "current_additions": 593
   }
 }

@@ -6,9 +6,9 @@ Current technical sequence: WP-10B, WP-11, then the remaining packages below
 Public-data publication: deferred to a separate future handoff
 WP-10B predecessor: `foundation-wp-09a-exit-1`
 Completed through: WP-09A at `foundation-wp-09a-exit-1`
-Current checkpoint: WP-10B B2 clean aggregate qualification passes at
-`0f24f255b45e1ce274f5ae527e02ef7fe5906285`; protected-main acceptance remains
-Next protected-branch checkpoint: accept WP-10B B2 evidence, then enter B3
+Current checkpoint: WP-10B B2 is accepted on protected main at
+`4a246a1bb7bfe099673ef10d6cb5951729b3ff37`
+Next protected-branch checkpoint: WP-10B B3 source verification and application integration
 
 ## Purpose
 

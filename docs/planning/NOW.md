@@ -4,96 +4,23 @@ Last updated: 2026-07-13
 
 ## Current Checkpoint
 
-WP-09A is accepted and immutable at `foundation-wp-09a-exit-1`
-(`1b1e7d5534f29b010cc346d434811a3906fb40e1`). WP-10B's entry is accepted at
-`4d0e4853637a0466ca37548134822c5ec83a240f`. Its B1 wire contract and
-independent fixture are frozen; B2 transactional store implementation is
-active off-product. Its first core checkpoint provides the exact crate/API
-boundary, control-record wire, and immutable object primitive. Its current
-checkpoint adds typed canonical generations, direct and deterministic paged
-closure, generation-last immutable publication, process-held maintenance and
-writer leases, an exact no-replace initial manual head, and crate-private
-established manual recovery-before-head replacement with bounded store
-inventory and recovery-ahead retry. The same transaction now creates and
-advances an established-project autosave lane, including divergent-base and
-lower-revision cases. A crate-private established-session actor now owns the
-root and leases, serializes those manual/autosave primitives, and enforces the
-frozen queue, coalescing, cancellation, close, and shutdown rules. One shared
-private inspection core now opens and validates established stores for actor
-startup and transaction preflight, with bounded object-metadata checks and no
-eager bulk-payload hashing. A shared crate-private initial-package transaction
-now gives future Create and Save As one destination-local sibling-stage,
-full-tree-sync, no-clobber install path with a caller-bound fork tuple and
-retained leases. The private established-session actor now authenticates Save
-As against the live manual head and scientific identity, then changes its owned
-root and leases only after that transaction durably installs the fork. B2
-now also has one bounded metadata graph over established or provisional store
-state, canonical generation/object namespace enumeration, exact ref/pin roots,
-and capped orphan candidates. It performs no repair, payload hashing, or
-deletion. A narrow accepted correction now makes successful Open and
-OpenRecovery return both the held session and loaded projection and adds an
-honest manual-branch recovery classification without changing persisted bytes.
-A bounded private recovery reader and actor path now classify all four fixtures,
-fall back across corrupt heads/targets, scan only after exhausted lane fallback,
-and load a freshly selected projection without repair or promotion. B2 remains
-active off-product, with product activation at B4.
-Private Pin/Unpin now supplies durable checkpoint roots with fresh graph,
-capacity, cancellation, and read-only enforcement. All seven frozen phases now
-have exact before/after occurrence injection plus a 16-case actual `SIGKILL`,
-fresh-process reopen, and retry matrix. This is process-crash evidence only;
-power-loss/filesystem durability remain later B2 work. Writer-only dead-staging
-cleanup is now implemented after successful bounded validation and immediate
-writer reconfirmation. It performs complete bounded preflight, ordered synced
-removal, final re-inventory, and exact retry; focused transition injection and
-the existing process-kill matrix cover its current logic/process-crash claim.
-A private bounded FullVerify path now hashes every physical object in one
-stable active-store snapshot, reconstructs paged logical objects, remains
-cancellable and available read-only, and changes no store authority. Artifact
-scientific semantics, repair, trash, durability, and public/product wiring are
-outside this slice.
-A private bounded PlanCompaction path now returns stable-snapshot metadata-only
-recovery-review candidates for every orphan generation. It is cancellable,
-available read-only, and non-mutating; Trash authorization, object/byte moves,
-reclaim estimates, backup approval, durability, and public/product wiring stay
-outside this slice.
-The next B2 checkpoint is bound by a narrow Trash safety correction: only
-freshly revalidated orphans declaring zero non-regenerable artifacts may enter
-the mirrored quarantine. Shared objects stay active, work proceeds in synced
-bounded batches, and every other selection fails with `ConfirmationRequired`.
-The private actor now routes that subset using bounded admission, correlated
-completion and cancellation, the corrected same-descriptor transition, exact
-retry, and fail-closed inventory. All ten frozen Trash transitions now have
-before/after and zero-based occurrence injection plus a 34-case fresh-process
-kill/retry matrix. This is process-crash evidence, not power-loss durability.
-The accepted Purge safety correction now freezes a strict complete-trash,
-zero-non-regenerable subset with object-first synced deletion and generation
-metadata retained until the object namespace is synced and revalidated empty. The private
-actor now routes that exact subset with strict fail-closed preflight, bounded
-object batches, a revalidated sync barrier, generation-last removal,
-cancellation, read-only rejection, and indeterminate-session handling. Sixteen
-exact callback cases and 16 actual `SIGKILL` cases prove fresh-process retry
-for every observed Purge transition occurrence. This is process-crash evidence,
-not power-loss durability. The separate aggregate B2 lifecycle/durability proof
-is described below.
-Its first bound correction resolves provisional autosave publication: the
-already-frozen autosave-only state has no manual base, starts at one
-caller-supplied no-clobber package path, and advances through the existing lane
-protocol. The private publisher now implements first publication, exact-only
-uncertain-install adoption, base-less advance, cancellation, and exact fresh
-retry with four focused transaction cases. The public actor now starts unbound
-and owns fresh Create, healthy Open, provisional publication and manual
-handoff, normal session commands, and recovery-selected Save As while retaining
-the damaged source unchanged. Its focused lifecycle cases cover those routes;
-the aggregate B2 durability qualification covers their separate durability
-claim. Its accepted narrow
-correction freezes one exact ext4 tuple, fail-closed read-only/new-destination
-semantics, exhaustive hosted injection, mutation/residue process kills, and VM
-cuts only at distinct persistence/authority boundaries. The implementation and
-clean aggregate qualification pass at
-`0f24f255b45e1ce274f5ae527e02ef7fe5906285`: 120 hosted tests and all 60 VM
-cut cases passed with zero harness retries. The sanitized report SHA-256 is
-`ba7c41bbea543e4e576ad9188e99a77611e01479d7a3ea5b928166203ad10b0e`.
-Public-CI/protected-main B2 acceptance remains; B3 follows immediately.
+WP-10B B1 and B2 are complete. B2 is accepted on protected main at
+`4a246a1bb7bfe099673ef10d6cb5951729b3ff37` (tree
+`af5531d8ffbda0c13b342a0b4df47a894e7f99fb`). Its clean aggregate passed all
+120 hosted tests and 60 rootless-VM cuts with zero retries; protected-main
+policy and Rust checks passed in
+[run 29273392030](https://github.com/kirchhausenlab/mirante4d/actions/runs/29273392030).
+
+B3 is the current checkpoint. It adds bounded current-source D-009
+verification, source-generation-aware completion and invalidation, atomic
+verified-catalog/runtime replacement, exact revision-based autosave scheduling,
+and an application service over the accepted project-store actor. The new
+service remains unreachable from the product during B3: the private project-v15
+bridge and `CurrentProjectRuntime` stay the sole product route until B4.
+
+B4 will switch product save/open/autosave/recovery atomically to the successor,
+delete the complete project-v15 path, and run the required real-viewer checks at
+1280x720 and 1920x1080. WP-10B does not exit before that deletion and evidence.
 
 The unified runtime is the sole live interactive dataset-demand and CPU-byte
 authority. Analysis execution remains unavailable until WP-12.

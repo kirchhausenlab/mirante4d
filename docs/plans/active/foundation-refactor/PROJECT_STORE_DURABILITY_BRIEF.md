@@ -287,12 +287,14 @@ creation/write/copy, staging cleanup, open/validation, comparisons, lease
 upgrade/restore, scans, and listings remain hosted/process evidence. The exact
 rootless-QEMU, two-disk, 256-MiB guest, 640-MiB working-disk, 900-second,
 zero-retry, performance, and sanitized-report requirements remain those frozen
-by the entry and correction. The clean aggregate lane passed at
-`0f24f255b45e1ce274f5ae527e02ef7fe5906285`; all 120 hosted tests and 60 VM
+by the entry and correction. The clean aggregate lane passed on protected-main
+commit `4a246a1bb7bfe099673ef10d6cb5951729b3ff37` (tree
+`af5531d8ffbda0c13b342a0b4df47a894e7f99fb`): all 120 hosted tests and 60 VM
 cut cases passed with zero harness retries. The sanitized report SHA-256 is
-`ba7c41bbea543e4e576ad9188e99a77611e01479d7a3ea5b928166203ad10b0e`.
-This qualifies only that exact off-product B2 revision and filesystem tuple;
-public-CI/protected-main acceptance remains pending.
+`ced8c82c75c480810e7ebf81e2c032e579f89bbb28c1f854d1681a3ddad1f9e5`, and
+protected-main policy/Rust checks passed in GitHub Actions run 29273392030.
+This qualifies only that exact off-product B2 revision and ext4 tuple; B3/B4
+integration and B4 product validation remain pending.
 
 ### Identity And Project Resolution
 

@@ -127,99 +127,25 @@ independent CPU reference at
 `1b1e7d5534f29b010cc346d434811a3906fb40e1`, tagged
 `foundation-wp-09a-exit-1`. Exact protected-main policy/Rust and trusted Vulkan
 evidence passed; product activation and product-open validation remain WP-09B
-work. WP-10B's entry is accepted. B1 freezes the successor project-store wire,
-limits, public boundary, transition inventory, and independent project fixture;
-B2 transactional implementation is active off-product. Its current slice owns
-typed canonical generations, direct and deterministic paged object closure,
-immutable generation-last publication, process-held maintenance/writer leases,
-exact initial manual-head publication, and crate-private established manual
-recovery-before-head replacement. The same private transaction now creates and
-advances the established-project autosave lane while preserving the manual
-authority. Ref publication is preceded by a bounded descriptor-relative whole-
-store entry/fan-out inventory. The corrected recovery-ahead state keeps the old
-lane head authoritative and supports an exact retry without repair or
-promotion. A crate-private established-session actor owns the root and leases,
-serializes those manual/autosave transactions, bounds requests and completions,
-coalesces queued autosaves, cancels active or queued work, and releases its
-session through Close or shutdown. The same actor authenticates Save As against
-the live manual head and scientific identity, installs the fork through the
-shared no-clobber package transaction, and changes its owned root and leases
-only after durable success. A shared private inspection core now opens
-and validates established stores for actor startup and transaction preflight,
-including exact ref/generation continuity, bounded physical metadata closure,
-autosave classification, and explicit read-only writer fallback without eager
-bulk-payload hashing. A bounded read-only graph pass now also recognizes the
-exact provisional autosave-only state, enumerates canonical generation/object
-namespaces, validates every generation metadata closure, and separates the
-declared live roots from capped orphan recovery candidates without treating
-parent or autosave-base provenance as liveness. A crate-private destination-
-local installer now builds a
-complete initial Create or Save As package in a sibling stage, validates and
-synchronizes it, and installs it with a no-clobber rename while retaining the
-root and leases. The corrected public API now requires successful Open and
-OpenRecovery completions to return both session and loaded projection, and
-distinguishes manual recovery branches from autosave divergence without
-changing any persisted bytes. A bounded private recovery reader and actor path
-now discover validated manual/autosave fallbacks or capped scan candidates,
-load only an explicit fresh selection, preserve actual head facts, and support
-corrupt-head and writer-contended read-only sessions without repair or
-promotion. The public actor now starts unbound and owns Create, Open, first and
-advancing provisional Autosave, provisional-to-manual Create handoff, normal
-session work, and recovery-selected Save As. It retains recovery-only resources
-after a recoverable normal-open failure and leaves the damaged package
-unchanged. The crate remains off-product. Private Pin/Unpin execution now validates the complete
-graph and prospective recovery-candidate cap, preserves duplicate-pin liveness,
-rejects read-only sessions, and makes directory-sync uncertainty
-write-suspending. All seven frozen Pin/Unpin transitions now have exact before/
-after occurrence injection plus a 16-case actual `SIGKILL`, fresh-process
-reopen, and retry matrix. This proves logic and process-crash recovery only;
-power-loss/filesystem durability remains later. A bound staging-cleanup
-correction now owns implemented writer-only selection, whole-namespace
-preflight, ordered synced removal, cancellation, indeterminacy, final
-re-inventory, and fresh retry. Writable open removes exact dead transaction
-residue only after successful store validation and writer reconfirmation;
-read-only open leaves staging untouched. Focused transition injection and the
-existing Pin/Unpin process-kill matrix prove fresh reopen and retry without
-claiming power-loss durability. A
-bound correction now resolves the provisional-autosave base contradiction and
-freezes first no-clobber publication, advance, receipt, cancellation, and retry
-semantics. The private publisher now installs the first exact base-less package,
-adopts only an exact fully verified uncertain install, advances the provisional
-lane, and supports cancellation plus exact fresh retry. Its focused evidence
-does not supply exhaustive transition, process-kill, staging-cleanup, or
-power-loss coverage. A
-private read-only FullVerify path now hashes every physical object in one
-bounded stable active-store snapshot, reconstructs paged logical objects,
-supports cancellation and read-only sessions, and changes no store bytes.
-Private PlanCompaction now returns a bounded stable-snapshot recovery-review
-candidate for every orphan generation without mutation and remains available
-read-only. A bound safety correction freezes the later Trash subset for
-generations declaring no non-regenerable artifacts, its lease transition,
-retained-closure subtraction, bounded batch/retry, and `ConfirmationRequired`
-fault. The private actor now routes that exact Trash subset with bounded
-selection admission, correlated completion and cancellation, generation-first
-mirrored quarantine, shared-object retention, exact retry, bounded directory
-sync, and fail-closed inventory. All ten frozen Trash transitions now support
-exact before/after and zero-based occurrence injection. A 34-case actor kill
-matrix proves fresh-process reopen and idempotent retry, while explicitly
-making no power-loss durability claim. A bound Purge safety correction now
-owns the implemented private actor-routed safe subset: complete-snapshot and
-strict zero-non-regenerable preflight, object-first bounded synced deletion, a
-revalidated empty-object barrier, generation-last removal, retained directory
-hierarchies, and idempotent reopen/retry. Sixteen exact callback cases and 16
-actual `SIGKILL` cases cover every observed Purge maintenance, remove, and
-directory-sync occurrence. This is process-crash evidence only, with no power-loss,
-filesystem-durability, public, or product claim.
-The accepted durability-qualification correction freezes the exact ext4 tuple,
-fail-closed read-only/new-destination behavior, exhaustive hosted coverage, and
-the smaller set of distinct persistence boundaries that require rootless VM
-cuts. The runtime gate, hostile hosted/process tests, trusted-local lane, and
-bounded VM harness are implemented. The clean aggregate qualification passed
-at `0f24f255b45e1ce274f5ae527e02ef7fe5906285`: 120 hosted tests and all 60
-rootless VM cut cases passed with zero harness retries. The sanitized report's
-SHA-256 is `ba7c41bbea543e4e576ad9188e99a77611e01479d7a3ea5b928166203ad10b0e`.
-This is exact-revision, off-product B2 power-loss evidence; public-CI and
-protected-main acceptance remain pending, and no product claim is made.
+work. WP-10B B1 froze the successor project-store wire, limits, public boundary,
+transition inventory, and independent fixture. B2 implemented the off-product
+transactional store: immutable direct/paged object closure and generations,
+manual and autosave refs, leases, Create/Open/Save As/recovery, bounded
+verification and maintenance, and conservative Trash/Purge subsets.
+
+B2 is accepted on protected main at
+`4a246a1bb7bfe099673ef10d6cb5951729b3ff37` (tree
+`af5531d8ffbda0c13b342a0b4df47a894e7f99fb`). The clean aggregate report at
+`target/mirante4d/verification/local-1-2659586/verify-local-project-store-lifecycle.json`
+has SHA-256
+`ced8c82c75c480810e7ebf81e2c032e579f89bbb28c1f854d1681a3ddad1f9e5`:
+all 120 hosted tests and 60 rootless-VM cuts passed with zero harness retries.
+The exhaustive hosted matrix took 85,683 ms and the VM evidence phase took
+340,235 ms. Protected-main policy and Rust checks also passed in
+[run 29273392030](https://github.com/kirchhausenlab/mirante4d/actions/runs/29273392030).
+This qualifies only the exact off-product B2 ext4 tuple and revision. B3 source
+verification/application integration and B4 product cutover remain pending;
+no product persistence claim is made.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.

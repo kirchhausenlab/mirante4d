@@ -17,8 +17,8 @@ The workspace has nineteen packages (eighteen `mirante4d-*` crates plus
   scientific-tree primitives; no filesystem I/O.
 - `mirante4d-project-model`: canonical durable project/view state and
   persistence-neutral generation projections.
-- `mirante4d-project-store`: private off-product successor project storage;
-  currently unreachable from the application.
+- `mirante4d-project-store`: private successor project storage; B3 compiles its
+  application service, but the product does not construct or poll it until B4.
 - `mirante4d-application`: the sole command reducer, revision/history owner,
   transient semantic state, operations, events, snapshots, and typed faults.
 - `mirante4d-settings`: closed settings document and bounded background I/O.
@@ -130,7 +130,7 @@ the future boundary; it is deleted by WP-10B.
 
 WP-10B B1 freezes the successor's canonical envelope, generation, ref, object,
 payload-paging, API, and failure-transition contract plus an independent
-project fixture. B2 now has an unreachable `mirante4d-project-store` crate with
+project fixture. B2 implemented the off-product `mirante4d-project-store` with
 the frozen public boundary, typed canonical generation records, deterministic
 direct and paged object closure, and descriptor-relative immutable object and
 generation-last publication. Its private lease core now enforces shared
@@ -216,9 +216,15 @@ publication; later provisional or established autosaves advance the bound
 lane. Open returns the validated authority projection. A recoverable failed
 normal Open retains a recovery-only root and leases for inspection and explicit
 selection, after which Save As installs a new project with exact fork
-provenance while leaving the damaged package untouched. This actor remains
-off-product: timers, product recovery UI, public/product garbage-collection
-wiring, qualified durability, and every product path remain later work.
+provenance while leaving the damaged package untouched. B2's exact ext4
+durability qualification is accepted on protected main.
+
+B3 permits only the compile-time data-to-identity/hash and app/application-to-
+project-store edges needed for current-source D-009 verification, deterministic
+autosave scheduling, and the off-product project-store service. Source
+verification may run in the product, but the service has no product composition
+field or start/poll path. The private project-v15 bridge and
+`CurrentProjectRuntime` remain the sole product project route until B4.
 
 Settings use `mirante4d-settings-v1` at the Linux XDG/HOME path. The UI submits
 validated changes; one background actor owns persistence. Legacy preferences

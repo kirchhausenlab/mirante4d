@@ -20,6 +20,7 @@ mirante4d-format.workspace = true
 mirante4d-identity.workspace = true
 mirante4d-import.workspace = true
 mirante4d-project-model.workspace = true
+mirante4d-project-store.workspace = true
 mirante4d-render-api.workspace = true
 mirante4d-renderer.workspace = true
 mirante4d-settings.workspace = true

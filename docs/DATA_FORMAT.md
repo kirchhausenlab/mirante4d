@@ -158,11 +158,11 @@ no-clobber publication and advance rules. The private publisher now implements
 those rules with exact uncertain-install adoption and fresh retry. The public
 actor now executes first and advancing provisional Autosave, fresh or
 provisional-to-manual Create, normal Open, explicit recovery selection, and
-recovery-selected Save As. This remains off-product and is not a timer,
-product-open, or durability claim. B4 deletes project-v15 and makes the new
-store the sole product path. A separate accepted correction fixes the exact internal
+recovery-selected Save As. B2's exact ext4 durability qualification is accepted,
+but the store remains off-product. B3 owns source verification, authenticated
+object reuse, and application autosave scheduling; B4 deletes project-v15 and
+makes the new store the sole product path. A separate accepted correction fixes the exact internal
 `staging/tx-*` name and payload grammar plus writer-only cleanup rules.
 Writable open now removes only fully preflighted dead transaction residue with
 ordered directory syncs and fresh retry; read-only open does not traverse
-staging. Staging remains non-authoritative, and power-loss/filesystem
-qualification is still pending.
+staging. Staging remains non-authoritative.

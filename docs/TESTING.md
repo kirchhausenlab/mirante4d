@@ -293,12 +293,15 @@ options `[rw,relatime]` and super options `[rw]`; unmatched existing stores open
 read-only and unmatched new destinations fail before source reads or mutation.
 The runtime gate, hostile fixture, hosted/process matrices, trusted-local lane,
 bounded power-cut harness, and performance probes are implemented. On clean
-commit `0f24f255b45e1ce274f5ae527e02ef7fe5906285`, the trusted-local
+protected-main commit `4a246a1bb7bfe099673ef10d6cb5951729b3ff37`
+(tree `af5531d8ffbda0c13b342a0b4df47a894e7f99fb`), the trusted-local
 `project-store-lifecycle` group passed all 120 hosted tests and 60/60 rootless
 VM cuts with zero harness retries. Its sanitized report has SHA-256
-`ba7c41bbea543e4e576ad9188e99a77611e01479d7a3ea5b928166203ad10b0e`.
-This qualifies only the exact B2 off-product filesystem tuple and revision;
-public-CI/protected-main acceptance and B4 product validation remain pending.
+`ced8c82c75c480810e7ebf81e2c032e579f89bbb28c1f854d1681a3ddad1f9e5`.
+Protected-main policy and Rust checks also passed in
+[run 29273392030](https://github.com/kirchhausenlab/mirante4d/actions/runs/29273392030).
+This qualifies only the exact B2 off-product ext4 tuple and revision; B3/B4
+integration and B4 product validation remain pending.
 
 The checked independent source report supports only the WP-03 source-TIFF
 archive. WP-10A is accepted off-product and its target authority is promoted.
