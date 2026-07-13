@@ -13,6 +13,8 @@ use std::{
     io,
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
+    thread,
+    time::Duration,
 };
 
 use rustix::{
@@ -32,6 +34,7 @@ const ANCHOR_OPEN_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::CLOEXEC)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::NONBLOCK);
+const MAINTENANCE_UPGRADE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Error)]
 pub(crate) enum LeaseError {
@@ -44,6 +47,21 @@ pub(crate) enum LeaseError {
         operation: &'static str,
         #[source]
         source: io::Error,
+    },
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum MaintenanceTransitionError {
+    #[error("exclusive maintenance requires the held writer lease")]
+    ReadOnly,
+    #[error("exclusive maintenance acquisition was cancelled")]
+    Cancelled,
+    #[error(transparent)]
+    Lease(#[from] LeaseError),
+    #[error("the shared maintenance lease could not be restored: {source}")]
+    MaintenanceLost {
+        #[source]
+        source: LeaseError,
     },
 }
 
@@ -98,7 +116,7 @@ impl WriterLease {
 /// lease. Field ownership releases both automatically on drop or process exit.
 #[derive(Debug)]
 pub(crate) struct ProjectStoreLeases {
-    _maintenance: OwnedFd,
+    maintenance: OwnedFd,
     writer: Option<WriterLease>,
     writes_suspended: AtomicBool,
 }
@@ -140,7 +158,7 @@ impl ProjectStoreLeases {
         };
 
         Ok(Self {
-            _maintenance: maintenance,
+            maintenance,
             writer,
             writes_suspended: AtomicBool::new(false),
         })
@@ -174,24 +192,127 @@ impl ProjectStoreLeases {
     pub(crate) fn suspend_writes(&self) {
         self.writes_suspended.store(true, Ordering::Release);
     }
+
+    pub(crate) fn with_exclusive_maintenance<C, F, T, E>(
+        &mut self,
+        root: &LocalStoreRoot,
+        is_cancelled: &mut C,
+        operation: F,
+    ) -> Result<Result<T, E>, MaintenanceTransitionError>
+    where
+        C: FnMut() -> bool,
+        F: FnOnce(&mut C) -> Result<T, E>,
+    {
+        let guard = self.wait_for_exclusive_maintenance(root, is_cancelled)?;
+        let result = operation(is_cancelled);
+        guard.finish()?;
+        Ok(result)
+    }
+
+    fn wait_for_exclusive_maintenance<C>(
+        &mut self,
+        root: &LocalStoreRoot,
+        is_cancelled: &mut C,
+    ) -> Result<ExclusiveMaintenanceGuard<'_>, MaintenanceTransitionError>
+    where
+        C: FnMut() -> bool,
+    {
+        if !self.confirm_writer(root)? {
+            return Err(MaintenanceTransitionError::ReadOnly);
+        }
+        if is_cancelled() {
+            return Err(MaintenanceTransitionError::Cancelled);
+        }
+
+        loop {
+            match flock(&self.maintenance, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => {
+                    if let Err(error) = self.confirm_writer(root) {
+                        self.restore_shared_or_suspend()?;
+                        return Err(MaintenanceTransitionError::Lease(error));
+                    }
+                    if is_cancelled() {
+                        self.restore_shared_or_suspend()?;
+                        return Err(MaintenanceTransitionError::Cancelled);
+                    }
+                    return Ok(ExclusiveMaintenanceGuard {
+                        leases: self,
+                        exclusive: true,
+                    });
+                }
+                Err(error) => {
+                    // Linux may discard the existing shared flock when a
+                    // nonblocking in-place conversion fails. Restore shared
+                    // ownership before observing cancellation or waiting.
+                    self.restore_shared_or_suspend()?;
+                    match error {
+                        Errno::AGAIN => {
+                            if is_cancelled() {
+                                return Err(MaintenanceTransitionError::Cancelled);
+                            }
+                            thread::sleep(MAINTENANCE_UPGRADE_POLL_INTERVAL);
+                        }
+                        Errno::INTR => {
+                            if is_cancelled() {
+                                return Err(MaintenanceTransitionError::Cancelled);
+                            }
+                        }
+                        error => {
+                            return Err(MaintenanceTransitionError::Lease(lease_io(
+                                "upgrade maintenance lease",
+                                error,
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn restore_shared(&self) -> Result<(), LeaseError> {
+        lock_blocking(
+            &self.maintenance,
+            FlockOperation::LockShared,
+            "restore shared maintenance lease",
+        )
+    }
+
+    fn restore_shared_or_suspend(&self) -> Result<(), MaintenanceTransitionError> {
+        self.restore_shared().map_err(|source| {
+            self.suspend_writes();
+            MaintenanceTransitionError::MaintenanceLost { source }
+        })
+    }
 }
 
-/// Exclusive maintenance capability reserved for later compaction.
+/// Exclusive maintenance capability over the session's existing descriptor.
+/// Explicit restoration is the normal path; `Drop` is only a safety fallback.
+#[must_use = "call finish() on every normal exit so restoration failures remain observable"]
 #[derive(Debug)]
-pub(crate) struct ExclusiveMaintenanceLease {
-    _root: OwnedFd,
+struct ExclusiveMaintenanceGuard<'a> {
+    leases: &'a mut ProjectStoreLeases,
+    exclusive: bool,
 }
 
-impl ExclusiveMaintenanceLease {
-    pub(crate) fn try_acquire(root: &LocalStoreRoot) -> Result<Option<Self>, LeaseError> {
-        let anchor = duplicate_root(root)?;
-        match flock(&anchor, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(Some(Self { _root: anchor })),
-            Err(error) if error == Errno::AGAIN => Ok(None),
-            Err(error) => Err(lease_io(
-                "try to acquire exclusive maintenance lease",
-                error,
-            )),
+impl ExclusiveMaintenanceGuard<'_> {
+    fn finish(mut self) -> Result<(), MaintenanceTransitionError> {
+        match self.leases.restore_shared_or_suspend() {
+            Ok(()) => {
+                self.exclusive = false;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Drop for ExclusiveMaintenanceGuard<'_> {
+    fn drop(&mut self) {
+        if self.exclusive {
+            if self.leases.restore_shared().is_err() {
+                self.leases.suspend_writes();
+            }
+            self.exclusive = false;
         }
     }
 }
@@ -232,7 +353,7 @@ mod tests {
     use std::{
         env, fs,
         path::{Path, PathBuf},
-        process::{Command, Stdio},
+        process::{Child, Command, Stdio},
         sync::atomic::{AtomicU64, Ordering},
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -244,6 +365,7 @@ mod tests {
     use crate::wire::ProjectEnvelope;
 
     const CHILD_ROOT: &str = "MIRANTE4D_LEASE_TEST_CHILD_ROOT";
+    const CHILD_DEADLINE: Duration = Duration::from_secs(10);
     const TEST_NAME: &str = concat!(
         "lease::tests::",
         "process_contention_preserves_shared_maintenance_and_single_writer_ownership"
@@ -285,6 +407,68 @@ mod tests {
         }
     }
 
+    struct ChildGuard(Option<Child>);
+
+    impl ChildGuard {
+        fn child_mut(&mut self) -> &mut Child {
+            self.0.as_mut().unwrap()
+        }
+
+        fn terminate(&mut self) {
+            let Some(mut child) = self.0.take() else {
+                return;
+            };
+            if child.try_wait().unwrap().is_none() {
+                child.kill().unwrap();
+            }
+            let _ = child.wait().unwrap();
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let Some(mut child) = self.0.take() else {
+                return;
+            };
+            if matches!(child.try_wait(), Ok(None)) {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+    }
+
+    fn independent_root_lock_available(root: &LocalStoreRoot, operation: FlockOperation) -> bool {
+        let descriptor = duplicate_root(root).unwrap();
+        match flock(&descriptor, operation) {
+            Ok(()) => true,
+            Err(Errno::AGAIN) => false,
+            Err(error) => panic!("independent root-lock probe failed: {error}"),
+        }
+    }
+
+    fn independent_shared_available(root: &LocalStoreRoot) -> bool {
+        independent_root_lock_available(root, FlockOperation::NonBlockingLockShared)
+    }
+
+    fn independent_exclusive_available(root: &LocalStoreRoot) -> bool {
+        independent_root_lock_available(root, FlockOperation::NonBlockingLockExclusive)
+    }
+
+    fn independent_writer_available(root: &LocalStoreRoot) -> bool {
+        let anchor = openat(
+            root.descriptor(),
+            OsStr::new("project.json"),
+            ANCHOR_OPEN_FLAGS,
+            Mode::empty(),
+        )
+        .unwrap();
+        match flock(&anchor, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => true,
+            Err(Errno::AGAIN) => false,
+            Err(error) => panic!("independent writer-lock probe failed: {error}"),
+        }
+    }
+
     #[test]
     fn process_contention_preserves_shared_maintenance_and_single_writer_ownership() {
         if let Some(root) = env::var_os(CHILD_ROOT) {
@@ -294,56 +478,145 @@ mod tests {
                 ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
             assert_eq!(leases.effective_mode(), ProjectOpenMode::ReadOnly);
             fs::write(root_path.join("child-ready"), b"ready").unwrap();
-            loop {
+            let deadline = Instant::now() + CHILD_DEADLINE;
+            while Instant::now() < deadline {
                 thread::sleep(Duration::from_secs(1));
             }
+            drop(leases);
+            return;
         }
 
         let directory = TestDirectory::new();
         let root = LocalStoreRoot::open(directory.path()).unwrap();
-        let first = ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
-        assert_eq!(first.effective_mode(), ProjectOpenMode::PreferWritable);
-        assert!(first.confirm_writer(&root).unwrap());
+        let mut leases =
+            ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        assert_eq!(leases.effective_mode(), ProjectOpenMode::PreferWritable);
+        assert!(leases.confirm_writer(&root).unwrap());
 
-        let mut child = Command::new(env::current_exe().unwrap())
-            .arg(TEST_NAME)
-            .arg("--exact")
-            .arg("--nocapture")
-            .env(CHILD_ROOT, directory.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut child = ChildGuard(Some(
+            Command::new(env::current_exe().unwrap())
+                .arg(TEST_NAME)
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(CHILD_ROOT, directory.path())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        ));
         let ready = directory.path().join("child-ready");
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + CHILD_DEADLINE;
         while !ready.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "lease child did not become ready"
-            );
+            assert!(child.child_mut().try_wait().unwrap().is_none());
+            assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(
-            ExclusiveMaintenanceLease::try_acquire(&root)
-                .unwrap()
-                .is_none()
-        );
+        let mut cancellation_checks = 0_u8;
+        let mut cancel_after_contention = || {
+            cancellation_checks += 1;
+            cancellation_checks >= 2
+        };
+        assert!(matches!(
+            leases.wait_for_exclusive_maintenance(&root, &mut cancel_after_contention),
+            Err(MaintenanceTransitionError::Cancelled)
+        ));
+        assert!(child.child_mut().try_wait().unwrap().is_none());
+        child.terminate();
+        assert!(independent_shared_available(&root));
+        assert!(!independent_exclusive_available(&root));
+        assert!(!independent_writer_available(&root));
+        assert!(leases.confirm_writer(&root).unwrap());
 
-        drop(first);
-        assert!(
-            ExclusiveMaintenanceLease::try_acquire(&root)
-                .unwrap()
-                .is_none(),
-            "the child alone still holds shared maintenance"
-        );
-        child.kill().unwrap();
-        let _ = child.wait().unwrap();
-        let exclusive = ExclusiveMaintenanceLease::try_acquire(&root)
+        let contender = duplicate_root(&root).unwrap();
+        flock(&contender, FlockOperation::LockShared).unwrap();
+        let mut contender = Some(contender);
+        let mut wait_checks = 0_u8;
+        let mut release_after_contention = || {
+            wait_checks += 1;
+            if wait_checks == 2 {
+                drop(contender.take());
+            }
+            false
+        };
+        leases
+            .with_exclusive_maintenance(&root, &mut release_after_contention, |_| {
+                assert!(!independent_shared_available(&root));
+                assert!(!independent_exclusive_available(&root));
+                assert!(!independent_writer_available(&root));
+                Ok::<(), ()>(())
+            })
             .unwrap()
-            .expect("all shared maintenance leases were released");
-        drop(exclusive);
-        let replacement =
-            ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
-        assert!(replacement.has_writer());
+            .unwrap();
+        assert!(wait_checks >= 3);
+        assert!(independent_shared_available(&root));
+        assert!(!independent_exclusive_available(&root));
+        assert!(!independent_writer_available(&root));
+        assert!(leases.confirm_writer(&root).unwrap());
+
+        let mut never_cancel = || false;
+        let operation_error = leases
+            .with_exclusive_maintenance(&root, &mut never_cancel, |_| {
+                Err::<(), _>("operation failed")
+            })
+            .unwrap();
+        assert_eq!(operation_error, Err("operation failed"));
+        assert!(independent_shared_available(&root));
+        assert!(!independent_exclusive_available(&root));
+
+        {
+            let _guard = leases
+                .wait_for_exclusive_maintenance(&root, &mut never_cancel)
+                .unwrap();
+            assert!(!independent_shared_available(&root));
+            assert!(!independent_exclusive_available(&root));
+        }
+        assert!(independent_shared_available(&root));
+        assert!(!independent_exclusive_available(&root));
+        assert!(!independent_writer_available(&root));
+        assert!(leases.confirm_writer(&root).unwrap());
+
+        let mut cancel_now = || true;
+        assert!(matches!(
+            leases.wait_for_exclusive_maintenance(&root, &mut cancel_now),
+            Err(MaintenanceTransitionError::Cancelled)
+        ));
+        assert!(independent_shared_available(&root));
+        assert!(!independent_exclusive_available(&root));
+        assert!(!independent_writer_available(&root));
+        assert!(leases.confirm_writer(&root).unwrap());
+
+        let mut post_upgrade_checks = 0_u8;
+        let mut cancel_after_upgrade = || {
+            post_upgrade_checks += 1;
+            post_upgrade_checks >= 2
+        };
+        assert!(matches!(
+            leases.wait_for_exclusive_maintenance(&root, &mut cancel_after_upgrade),
+            Err(MaintenanceTransitionError::Cancelled)
+        ));
+        assert!(independent_shared_available(&root));
+        assert!(!independent_exclusive_available(&root));
+        assert!(leases.confirm_writer(&root).unwrap());
+
+        leases.suspend_writes();
+        assert!(matches!(
+            leases.wait_for_exclusive_maintenance(&root, &mut never_cancel),
+            Err(MaintenanceTransitionError::Lease(LeaseError::Indeterminate))
+        ));
+        assert!(independent_shared_available(&root));
+        assert!(!independent_exclusive_available(&root));
+        drop(leases);
+        assert!(independent_exclusive_available(&root));
+        assert!(independent_writer_available(&root));
+
+        let mut read_only = ProjectStoreLeases::acquire(&root, ProjectOpenMode::ReadOnly).unwrap();
+        assert!(matches!(
+            read_only.wait_for_exclusive_maintenance(&root, &mut never_cancel),
+            Err(MaintenanceTransitionError::ReadOnly)
+        ));
+        assert!(independent_shared_available(&root));
+        assert!(!independent_exclusive_available(&root));
+        drop(read_only);
+        assert!(independent_exclusive_available(&root));
     }
 }

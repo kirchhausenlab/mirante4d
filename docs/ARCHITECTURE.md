@@ -182,8 +182,11 @@ safety correction freezes a mirrored quarantine layout, fresh exclusive
 preflight, retained-closure subtraction, bounded synced batches, exact retry,
 and requires `ConfirmationRequired` rejection when any selected generation
 declares a non-regenerable artifact. No Trash mutation is implemented yet. The
-frozen public actor remains non-constructible and unwired. The crate still owns
-no public Create/Open/Save As execution, provisional autosave publication, product
+private lease core now provides the required same-descriptor, cancellable
+shared-to-exclusive transition with explicit fallible restoration; it remains
+unwired from Trash. The frozen public actor remains non-constructible and
+unwired. The crate still owns no public Create/Open/Save As execution,
+provisional autosave publication, product
 recovery workflow, timers, garbage-collection mutation, qualified durability,
 or product path.
 

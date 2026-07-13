@@ -208,6 +208,10 @@ generations declaring zero non-regenerable artifacts and its exact transition
 names, including an honest `ConfirmationRequired` outcome otherwise. This
 checkpoint adds no Trash execution, failure-injection, process-kill, or
 durability evidence.
+The existing process-lease case now also proves failed in-place maintenance
+upgrade restoration, contended exclusive acquisition, explicit and drop-based
+downgrade, cancellation, writer retention, and read-only rejection. It does
+not execute Trash or satisfy the later failpoint/kill matrix.
 
 Four initial-package cases
 cover exact Create facts and caller-bound Save As fork encoding, retained root/
