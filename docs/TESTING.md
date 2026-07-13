@@ -281,8 +281,8 @@ provisional Autosave/handoff, and recovery-selected Save As execution. Neither
 set claims timers, product garbage collection, the exhaustive fault matrix,
 power-cut durability, product reachability, or product-open validation.
 
-The accepted durability-qualification correction now freezes the remaining B2
-evidence target without claiming it exists. Hosted injection remains exhaustive
+The accepted durability-qualification correction freezes the B2 evidence
+target. Hosted injection remains exhaustive
 across every named before/after occurrence. Fresh-process kills cover mutations
 and writer-private residue; pure reads and comparisons prove byte-identical no
 mutation. Rootless VM cuts are limited to the distinct post-sync,
@@ -292,10 +292,13 @@ The only writable tuple is Linux ext4 magic `0xef53` with normalized VFS
 options `[rw,relatime]` and super options `[rw]`; unmatched existing stores open
 read-only and unmatched new destinations fail before source reads or mutation.
 The runtime gate, hostile fixture, hosted/process matrices, trusted-local lane,
-bounded power-cut harness, and performance probes are implemented. Self-tests
-and non-VM checks pass; the clean-revision trusted run and its qualifying report
-remain pending. Until that run passes, this is not power-loss durability
-evidence.
+bounded power-cut harness, and performance probes are implemented. On clean
+commit `0f24f255b45e1ce274f5ae527e02ef7fe5906285`, the trusted-local
+`project-store-lifecycle` group passed all 120 hosted tests and 60/60 rootless
+VM cuts with zero harness retries. Its sanitized report has SHA-256
+`ba7c41bbea543e4e576ad9188e99a77611e01479d7a3ea5b928166203ad10b0e`.
+This qualifies only the exact B2 off-product filesystem tuple and revision;
+public-CI/protected-main acceptance and B4 product validation remain pending.
 
 The checked independent source report supports only the WP-03 source-TIFF
 archive. WP-10A is accepted off-product and its target authority is promoted.

@@ -214,9 +214,12 @@ The accepted durability-qualification correction freezes the exact ext4 tuple,
 fail-closed read-only/new-destination behavior, exhaustive hosted coverage, and
 the smaller set of distinct persistence boundaries that require rootless VM
 cuts. The runtime gate, hostile hosted/process tests, trusted-local lane, and
-bounded VM harness are implemented. Their self-tests and non-VM checks pass,
-but the clean-revision rootless VM run and B2 evidence remain pending, so no
-power-loss durability or product claim is made.
+bounded VM harness are implemented. The clean aggregate qualification passed
+at `0f24f255b45e1ce274f5ae527e02ef7fe5906285`: 120 hosted tests and all 60
+rootless VM cut cases passed with zero harness retries. The sanitized report's
+SHA-256 is `ba7c41bbea543e4e576ad9188e99a77611e01479d7a3ea5b928166203ad10b0e`.
+This is exact-revision, off-product B2 power-loss evidence; public-CI and
+protected-main acceptance remain pending, and no product claim is made.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
@@ -248,9 +251,10 @@ See [testing](TESTING.md) for commands and claim language.
   destination. Its public unbound actor now executes fresh Create, healthy Open,
   provisional Autosave and manual handoff, established-session work, explicit
   recovery selection, and authenticated Save As while retaining exact roots and
-  leases. Autosave timer scheduling, product recovery workflow, public/product
-  garbage collection and Purge wiring, durability qualification, and every
-  product path remain unimplemented.
+  leases. B2 durability qualification now passes for its exact off-product
+  revision. Source-identity integration, autosave timer scheduling, product
+  recovery workflow, public/product garbage collection and Purge wiring, and
+  every product path remain unimplemented.
   PlanCompaction
   does not authorize Trash, expose a physical object/byte plan or reclaim
   estimate, or prove backup approval. Private FullVerify does not validate
