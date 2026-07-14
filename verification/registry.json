@@ -364,7 +364,7 @@
           "test_prefix": "gpu::"
         }
       ],
-      "expected_ignored_cases": 34,
+      "expected_ignored_cases": 8,
       "expiry": "WP-09B",
       "deletion_gate": "WP-09B-product-render-hard-cutover"
     },

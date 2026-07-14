@@ -30,7 +30,9 @@ use super::*;
 pub(crate) fn write_target_fixture(output_root: &Path) -> anyhow::Result<PathBuf> {
     if TARGET_FIXTURE_ARCHIVE.is_empty()
         || TARGET_FIXTURE_ARCHIVE.len() > TARGET_FIXTURE_ARCHIVE_BYTES_MAX
-        || TARGET_FIXTURE_ARCHIVE.len() % USTAR_BLOCK_BYTES != 0
+        || !TARGET_FIXTURE_ARCHIVE
+            .len()
+            .is_multiple_of(USTAR_BLOCK_BYTES)
     {
         bail!("target fixture archive has an invalid bounded length");
     }
@@ -49,7 +51,9 @@ pub(crate) fn write_target_fixture(output_root: &Path) -> anyhow::Result<PathBuf
 pub(crate) fn write_source_time_series_fixture(output_root: &Path) -> anyhow::Result<PathBuf> {
     if SOURCE_FIXTURE_ARCHIVE.is_empty()
         || SOURCE_FIXTURE_ARCHIVE.len() > TARGET_FIXTURE_ARCHIVE_BYTES_MAX
-        || SOURCE_FIXTURE_ARCHIVE.len() % USTAR_BLOCK_BYTES != 0
+        || !SOURCE_FIXTURE_ARCHIVE
+            .len()
+            .is_multiple_of(USTAR_BLOCK_BYTES)
     {
         bail!("source fixture archive has an invalid bounded length");
     }

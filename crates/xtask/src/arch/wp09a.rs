@@ -269,7 +269,7 @@ fn validate_fixed_policy(contract: &RenderContract) -> anyhow::Result<()> {
     let verification = &contract.verification;
     if verification.trusted_lane != "trusted-gpu"
         || verification.predecessor_selector_adapter != "WP06-ADAPTER-TRUSTED-SPECIAL-SELECTOR"
-        || verification.predecessor_ignored_cases != 34
+        || verification.predecessor_ignored_cases != 8
         || verification.successor_selector_adapter != "WP09A-ADAPTER-TRUSTED-GPU"
         || verification.successor_ignored_cases != 1
         || verification.successor_test_package != WGPU_CRATE

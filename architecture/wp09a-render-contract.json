@@ -139,7 +139,7 @@
   "verification": {
     "trusted_lane": "trusted-gpu",
     "predecessor_selector_adapter": "WP06-ADAPTER-TRUSTED-SPECIAL-SELECTOR",
-    "predecessor_ignored_cases": 34,
+    "predecessor_ignored_cases": 8,
     "successor_selector_adapter": "WP09A-ADAPTER-TRUSTED-GPU",
     "successor_ignored_cases": 1,
     "successor_test_package": "mirante4d-render-wgpu",

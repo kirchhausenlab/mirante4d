@@ -443,16 +443,16 @@ fn is_cancelled(cancellation: &AtomicBool) -> bool {
 fn target_verification_cancelled(
     error: &unified_source_open::TargetPackageVerificationError,
 ) -> bool {
-    match error {
+    matches!(
+        error,
         unified_source_open::TargetPackageVerificationError::Cancelled
-        | unified_source_open::TargetPackageVerificationError::Exact(
-            PackageValidationError::Cancelled,
-        )
-        | unified_source_open::TargetPackageVerificationError::Scientific(
-            ScientificPackageValidationError::Cancelled,
-        ) => true,
-        _ => false,
-    }
+            | unified_source_open::TargetPackageVerificationError::Exact(
+                PackageValidationError::Cancelled,
+            )
+            | unified_source_open::TargetPackageVerificationError::Scientific(
+                ScientificPackageValidationError::Cancelled,
+            )
+    )
 }
 
 fn map_target_verification_error(

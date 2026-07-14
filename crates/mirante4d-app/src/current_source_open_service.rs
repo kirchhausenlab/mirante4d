@@ -409,14 +409,12 @@ fn map_admission_error(error: &PackageAdmissionError) -> OperationFailureCode {
             DirectoryInventoryError::Range(error) => map_range_error(error),
             _ => OperationFailureCode::DatasetInvalid,
         },
-        PackageAdmissionError::Profile(error) => match error {
+        PackageAdmissionError::Profile(
             StorageProfileError::ArithmeticOverflow { .. }
             | StorageProfileError::CeilingExceeded { .. }
-            | StorageProfileError::ExactCountMismatch { .. } => {
-                OperationFailureCode::DatasetCapacityExceeded
-            }
-            _ => OperationFailureCode::DatasetInvalid,
-        },
+            | StorageProfileError::ExactCountMismatch { .. },
+        ) => OperationFailureCode::DatasetCapacityExceeded,
+        PackageAdmissionError::Profile(_) => OperationFailureCode::DatasetInvalid,
         _ => OperationFailureCode::DatasetInvalid,
     }
 }
