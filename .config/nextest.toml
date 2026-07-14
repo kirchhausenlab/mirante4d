@@ -13,7 +13,7 @@ ui = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'package(mirante4d-app) & test(=tests::import_verify_analyze_save_and_reopen_atomically)'
-slow-timeout = { period = "5s", terminate-after = 4 }
+slow-timeout = { period = "5s", terminate-after = 6 }
 
 [[profile.default.overrides]]
 filter = 'package(mirante4d-project-store) & test(=actor::tests::hosted_durability_tests::exhaustive_hosted_and_process_transition_matrix)'

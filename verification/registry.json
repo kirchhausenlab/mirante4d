@@ -22,8 +22,8 @@
     {
       "selector": "package(mirante4d-app) & test(=tests::import_verify_analyze_save_and_reopen_atomically)",
       "warn_ms": 5000,
-      "terminate_ms": 20000,
-      "reason": "This one product integration imports and validates a real sharded target package before opening, analyzing, saving, and reopening it; the debug import takes about 10 seconds on the supported small fixture."
+      "terminate_ms": 30000,
+      "reason": "This one product integration imports and validates a real sharded target package before opening, analyzing, saving, and reopening it; the debug path takes about 11 seconds locally and can approach 20 seconds on a shared hosted runner."
     },
     {
       "selector": "package(mirante4d-project-store) & test(=actor::tests::hosted_durability_tests::exhaustive_hosted_and_process_transition_matrix)",
