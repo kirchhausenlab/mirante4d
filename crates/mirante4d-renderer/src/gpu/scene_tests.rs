@@ -1,5 +1,6 @@
 use glam::DVec3;
-use mirante4d_domain::TimeIndex;
+use mirante4d_domain::{Projection, TimeIndex};
+use mirante4d_render_api::CameraFrame;
 
 use crate::scene_render::build_scene_render_commands;
 use crate::{
@@ -9,7 +10,42 @@ use crate::{
     extract_scene_draw_list,
 };
 
-use super::{GpuRenderTimings, GpuRenderer, test_support::*};
+use super::{GpuRenderTimings, GpuRenderer};
+
+fn scene_test_camera() -> CameraFrame {
+    crate::current_camera::frame_from_look_at(
+        Projection::Orthographic,
+        DVec3::new(0.0, 0.0, 10.0),
+        DVec3::ZERO,
+        DVec3::Y,
+        1.0,
+        10.0 / (2.0 * (std::f64::consts::FRAC_PI_3 * 0.5).tan()),
+        crate::current_camera::presentation(10.0, 10.0),
+    )
+}
+
+fn line_layer(
+    layer_id: &str,
+    kind: SceneLayerKind,
+    color: SceneColorRgba,
+    object_id: &str,
+    start: DVec3,
+    end: DVec3,
+) -> SceneLayer {
+    SceneLayer::new(SceneLayerId::new(layer_id).unwrap(), kind)
+        .with_style(SceneStyle::new(color))
+        .with_object(SceneObject::new(
+            SceneObjectId::new(object_id).unwrap(),
+            CoordinateSpace::World,
+            SceneTime::Static,
+            OcclusionPolicy::VolumeDepthCued,
+            SceneGeometry::LineSegment {
+                start,
+                end,
+                width_px: 4.0,
+            },
+        ))
+}
 
 fn assert_gpu_timings_if_enabled(
     renderer: &GpuRenderer,

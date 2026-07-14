@@ -277,65 +277,6 @@ impl GpuRenderer {
             timestamp,
         )
     }
-
-    pub(super) fn submit_and_read_f32_with_optional_timestamp(
-        &self,
-        mut encoder: wgpu::CommandEncoder,
-        readback_buffer: wgpu::Buffer,
-        timestamp: Option<GpuTimestampQueryPair>,
-    ) -> Result<(Vec<f32>, Option<u64>), GpuRenderError> {
-        if let Some(timestamp) = &timestamp {
-            encoder.resolve_query_set(&timestamp.query_set, 0..2, &timestamp.resolve_buffer, 0);
-            encoder.copy_buffer_to_buffer(
-                &timestamp.resolve_buffer,
-                0,
-                &timestamp.readback_buffer,
-                0,
-                u64::from(wgpu::QUERY_SIZE) * 2,
-            );
-        }
-        let submission = self.queue.submit(Some(encoder.finish()));
-        let (read_sender, read_receiver) = mpsc::channel();
-        readback_buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                let _ = read_sender.send(result);
-            });
-        let timestamp_receiver = timestamp.as_ref().map(|timestamp| {
-            let (sender, receiver) = mpsc::channel();
-            timestamp
-                .readback_buffer
-                .slice(..)
-                .map_async(wgpu::MapMode::Read, move |result| {
-                    let _ = sender.send(result);
-                });
-            receiver
-        });
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: None,
-            })
-            .map_err(|err| GpuRenderError::PollFailed(err.to_string()))?;
-        read_receiver
-            .recv()
-            .map_err(|_| GpuRenderError::ReadbackChannelClosed)?
-            .map_err(|err| GpuRenderError::MapFailed(err.to_string()))?;
-        if let Some(receiver) = timestamp_receiver {
-            receiver
-                .recv()
-                .map_err(|_| GpuRenderError::ReadbackChannelClosed)?
-                .map_err(|err| GpuRenderError::MapFailed(err.to_string()))?;
-        }
-
-        let mapped = readback_buffer.slice(..).get_mapped_range();
-        let output_f32 = bytemuck::cast_slice::<u8, f32>(&mapped).to_vec();
-        drop(mapped);
-        readback_buffer.unmap();
-        let gpu_compute_ns =
-            timestamp.map(|timestamp| mapped_timestamp_elapsed_ns(&self.queue, timestamp));
-        Ok((output_f32, gpu_compute_ns))
-    }
 }
 
 fn mapped_timestamp_elapsed_ns(queue: &wgpu::Queue, timestamp: GpuTimestampQueryPair) -> u64 {

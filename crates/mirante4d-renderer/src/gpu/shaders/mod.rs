@@ -3,11 +3,9 @@ mod camera_u16;
 mod cross_section;
 mod display;
 mod scene;
-mod summary;
-mod z_mip;
 
 pub(super) use camera_f32::BRICKED_CAMERA_F32_SHADER;
-pub(super) use camera_u16::{CAMERA_MIP_SHADER, bricked_camera_shader_source};
+pub(super) use camera_u16::bricked_camera_shader_source;
 pub(super) use cross_section::{
     CROSS_SECTION_CHUNK_DISPLAY_F32_SHADER, CROSS_SECTION_CHUNK_DISPLAY_INTEGER_SHADER,
 };
@@ -16,5 +14,3 @@ pub(super) use display::{
     DISPLAY_FRAME_BLEND_SHADER, DISPLAY_ISO_MULTI_CHANNEL_SHADER,
 };
 pub(super) use scene::{SCENE_PICK_SHADER, SCENE_RENDER_SHADER, SCENE_RENDER_TEXTURE_SHADER};
-pub(super) use summary::{INTENSITY_SUMMARY_F32_SHADER, INTENSITY_SUMMARY_SHADER};
-pub(super) use z_mip::MIP_SHADER;

@@ -16,7 +16,6 @@ mod atlas;
 mod buffers;
 mod cross_section;
 mod decode;
-mod dense_camera;
 mod display;
 mod display_resources;
 mod params;
@@ -25,9 +24,6 @@ mod resident_f32;
 mod resident_u16;
 mod scene;
 mod shaders;
-mod summary;
-mod volume_cache;
-mod z_mip;
 
 pub use adapter::{
     AdapterDiagnostics, GPU_ADAPTER_ENV, GPU_TIMESTAMPS_ENV, GpuLimitDiagnostics,
@@ -42,25 +38,18 @@ pub use display::{
     GpuLeaseDisplayRequest,
 };
 pub use scene::{GpuScenePickOutput, GpuSceneRenderOutput};
-pub use summary::{GpuIntensitySummaryF32, GpuIntensitySummaryU16};
-pub use z_mip::{
-    render_camera_mip_wgpu_blocking, render_camera_wgpu_blocking, render_mip_z_wgpu,
-    render_mip_z_wgpu_blocking,
-};
 
 use adapter::{diagnostics_for_existing_device, request_device, timestamp_queries_requested};
 use atlas::{GpuBrickAtlasCache, GpuBrickAtlasF32Cache};
 use buffers::{storage_entry, storage_texture_entry, texture_entry, uniform_entry};
 use display_resources::GpuDisplayResourceCache;
 use shaders::{
-    BRICKED_CAMERA_F32_SHADER, CAMERA_MIP_SHADER, CROSS_SECTION_CHUNK_DISPLAY_F32_SHADER,
+    BRICKED_CAMERA_F32_SHADER, CROSS_SECTION_CHUNK_DISPLAY_F32_SHADER,
     CROSS_SECTION_CHUNK_DISPLAY_INTEGER_SHADER, DISPLAY_COMPOSITE_F32_SHADER,
     DISPLAY_COMPOSITE_SHADER, DISPLAY_DVR_MULTI_CHANNEL_SHADER, DISPLAY_FRAME_BLEND_SHADER,
-    DISPLAY_ISO_MULTI_CHANNEL_SHADER, INTENSITY_SUMMARY_F32_SHADER, INTENSITY_SUMMARY_SHADER,
-    SCENE_PICK_SHADER, SCENE_RENDER_SHADER, SCENE_RENDER_TEXTURE_SHADER,
-    bricked_camera_shader_source,
+    DISPLAY_ISO_MULTI_CHANNEL_SHADER, SCENE_PICK_SHADER, SCENE_RENDER_SHADER,
+    SCENE_RENDER_TEXTURE_SHADER, bricked_camera_shader_source,
 };
-use volume_cache::{DEFAULT_GPU_VOLUME_CACHE_BYTES, GpuVolumeCache};
 
 const WORKGROUP_SIZE_X: u32 = 8;
 const WORKGROUP_SIZE_Y: u32 = 8;
@@ -156,8 +145,6 @@ pub struct GpuRenderer {
     queue: wgpu::Queue,
     adapter: AdapterDiagnostics,
     timestamp_queries_enabled: bool,
-    camera_mip_bind_group_layout: wgpu::BindGroupLayout,
-    camera_mip_pipeline: wgpu::ComputePipeline,
     bricked_camera_bind_group_layout: wgpu::BindGroupLayout,
     bricked_camera_pipeline: wgpu::ComputePipeline,
     cross_section_integer_chunk_display_bind_group_layout: wgpu::BindGroupLayout,
@@ -172,9 +159,6 @@ pub struct GpuRenderer {
     scene_render_texture_pipeline: wgpu::ComputePipeline,
     scene_pick_bind_group_layout: wgpu::BindGroupLayout,
     scene_pick_pipeline: wgpu::ComputePipeline,
-    intensity_summary_bind_group_layout: wgpu::BindGroupLayout,
-    intensity_summary_pipeline: wgpu::ComputePipeline,
-    intensity_summary_f32_pipeline: wgpu::ComputePipeline,
     display_composite_bind_group_layout: wgpu::BindGroupLayout,
     display_composite_pipeline: wgpu::ComputePipeline,
     display_composite_f32_pipeline: wgpu::ComputePipeline,
@@ -186,7 +170,6 @@ pub struct GpuRenderer {
     display_frame_blend_pipeline: wgpu::ComputePipeline,
     display_finalize_bind_group_layout: wgpu::BindGroupLayout,
     display_finalize_pipeline: wgpu::ComputePipeline,
-    volume_cache: Mutex<GpuVolumeCache>,
     brick_atlas_cache: Mutex<GpuBrickAtlasCache>,
     brick_atlas_f32_cache: Mutex<GpuBrickAtlasF32Cache>,
     display_resources: Mutex<GpuDisplayResourceCache>,
@@ -262,11 +245,7 @@ impl GpuRenderer {
     }
 
     pub async fn new() -> Result<Self, GpuRenderError> {
-        Self::new_with_cache_budgets(
-            DEFAULT_GPU_VOLUME_CACHE_BYTES,
-            DEFAULT_GPU_BRICK_ATLAS_CACHE_BYTES,
-        )
-        .await
+        Self::new_with_cache_budgets(0, DEFAULT_GPU_BRICK_ATLAS_CACHE_BYTES).await
     }
 
     pub async fn new_with_volume_cache_budget(
@@ -320,17 +299,13 @@ impl GpuRenderer {
         device: wgpu::Device,
         queue: wgpu::Queue,
         adapter: AdapterDiagnostics,
-        max_volume_cache_bytes: u64,
+        _max_volume_cache_bytes: u64,
         max_brick_atlas_cache_bytes: u64,
     ) -> Result<Self, GpuRenderError> {
         let timestamp_features =
             wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
         let timestamp_queries_enabled =
             timestamp_queries_requested() && device.features().contains(timestamp_features);
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("mirante4d-camera-mip-wgsl"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(CAMERA_MIP_SHADER)),
-        });
         let bricked_shader_source = bricked_camera_shader_source();
         let bricked_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("mirante4d-bricked-camera-wgsl"),
@@ -366,15 +341,6 @@ impl GpuRenderer {
             label: Some("mirante4d-scene-pick-wgsl"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SCENE_PICK_SHADER)),
         });
-        let intensity_summary_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("mirante4d-intensity-summary-wgsl"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(INTENSITY_SUMMARY_SHADER)),
-        });
-        let intensity_summary_f32_shader =
-            device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("mirante4d-intensity-summary-f32-wgsl"),
-                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(INTENSITY_SUMMARY_F32_SHADER)),
-            });
         let display_composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("mirante4d-display-composite-wgsl"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(DISPLAY_COMPOSITE_SHADER)),
@@ -398,16 +364,6 @@ impl GpuRenderer {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("mirante4d-display-frame-blend-wgsl"),
                 source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(DISPLAY_FRAME_BLEND_SHADER)),
-            });
-        let camera_mip_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("mirante4d-camera-mip-bind-group-layout"),
-                entries: &[
-                    storage_entry(0, true),
-                    storage_entry(1, false),
-                    storage_entry(2, true),
-                    storage_entry(3, true),
-                ],
             });
         let bricked_camera_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -493,15 +449,6 @@ impl GpuRenderer {
                     storage_entry(4, false),
                 ],
             });
-        let intensity_summary_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("mirante4d-intensity-summary-bind-group-layout"),
-                entries: &[
-                    storage_entry(0, true),
-                    storage_entry(1, false),
-                    storage_entry(2, true),
-                ],
-            });
         let display_composite_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("mirante4d-display-composite-bind-group-layout"),
@@ -559,11 +506,6 @@ impl GpuRenderer {
                     storage_entry(2, true),
                 ],
             });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("mirante4d-camera-mip-pipeline-layout"),
-            bind_group_layouts: &[Some(&camera_mip_bind_group_layout)],
-            immediate_size: 0,
-        });
         let bricked_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("mirante4d-bricked-camera-pipeline-layout"),
@@ -606,12 +548,6 @@ impl GpuRenderer {
                 bind_group_layouts: &[Some(&scene_pick_bind_group_layout)],
                 immediate_size: 0,
             });
-        let intensity_summary_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("mirante4d-intensity-summary-pipeline-layout"),
-                bind_group_layouts: &[Some(&intensity_summary_bind_group_layout)],
-                immediate_size: 0,
-            });
         let display_composite_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("mirante4d-display-composite-pipeline-layout"),
@@ -641,15 +577,6 @@ impl GpuRenderer {
                 label: Some("mirante4d-display-finalize-pipeline-layout"),
                 bind_group_layouts: &[Some(&display_finalize_bind_group_layout)],
                 immediate_size: 0,
-            });
-        let camera_mip_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("mirante4d-camera-mip-compute-pipeline"),
-                layout: Some(&pipeline_layout),
-                module: &shader,
-                entry_point: Some("camera_mip_main"),
-                compilation_options: Default::default(),
-                cache: None,
             });
         let bricked_camera_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -714,24 +641,6 @@ impl GpuRenderer {
                 compilation_options: Default::default(),
                 cache: None,
             });
-        let intensity_summary_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("mirante4d-intensity-summary-compute-pipeline"),
-                layout: Some(&intensity_summary_pipeline_layout),
-                module: &intensity_summary_shader,
-                entry_point: Some("intensity_summary_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        let intensity_summary_f32_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("mirante4d-intensity-summary-f32-compute-pipeline"),
-                layout: Some(&intensity_summary_pipeline_layout),
-                module: &intensity_summary_f32_shader,
-                entry_point: Some("intensity_summary_f32_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
         let display_composite_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("mirante4d-display-composite-compute-pipeline"),
@@ -791,8 +700,6 @@ impl GpuRenderer {
             queue,
             adapter,
             timestamp_queries_enabled,
-            camera_mip_bind_group_layout,
-            camera_mip_pipeline,
             bricked_camera_bind_group_layout,
             bricked_camera_pipeline,
             cross_section_integer_chunk_display_bind_group_layout,
@@ -807,9 +714,6 @@ impl GpuRenderer {
             scene_render_texture_pipeline,
             scene_pick_bind_group_layout,
             scene_pick_pipeline,
-            intensity_summary_bind_group_layout,
-            intensity_summary_pipeline,
-            intensity_summary_f32_pipeline,
             display_composite_bind_group_layout,
             display_composite_pipeline,
             display_composite_f32_pipeline,
@@ -821,7 +725,6 @@ impl GpuRenderer {
             display_frame_blend_pipeline,
             display_finalize_bind_group_layout,
             display_finalize_pipeline,
-            volume_cache: Mutex::new(GpuVolumeCache::new(max_volume_cache_bytes)),
             brick_atlas_cache: Mutex::new(GpuBrickAtlasCache::new(max_brick_atlas_cache_bytes)),
             brick_atlas_f32_cache: Mutex::new(GpuBrickAtlasF32Cache::new(
                 max_brick_atlas_cache_bytes,
@@ -839,11 +742,6 @@ impl GpuRenderer {
     }
 
     pub fn stats(&self) -> Result<GpuRendererStats, GpuRenderError> {
-        let (volume_budget, volume_stats) = self
-            .volume_cache
-            .lock()
-            .map(|cache| (cache.max_bytes, cache.stats))
-            .map_err(|_| GpuRenderError::CachePoisoned)?;
         let (brick_budget, brick_stats) = self
             .brick_atlas_cache
             .lock()
@@ -860,14 +758,14 @@ impl GpuRenderer {
             .map(|cache| cache.stats())
             .map_err(|_| GpuRenderError::CachePoisoned)?;
         Ok(GpuRendererStats {
-            volume_cache_budget_bytes: volume_budget,
+            volume_cache_budget_bytes: 0,
             brick_atlas_cache_budget_bytes: brick_budget,
-            volume_cache_hits: volume_stats.volume_cache_hits,
-            volume_cache_misses: volume_stats.volume_cache_misses,
-            volume_uploads: volume_stats.volume_uploads,
-            volume_uploaded_bytes: volume_stats.volume_uploaded_bytes,
-            volume_evictions: volume_stats.volume_evictions,
-            volume_resident_bytes: volume_stats.volume_resident_bytes,
+            volume_cache_hits: 0,
+            volume_cache_misses: 0,
+            volume_uploads: 0,
+            volume_uploaded_bytes: 0,
+            volume_evictions: 0,
+            volume_resident_bytes: 0,
             brick_atlas_cache_hits: brick_stats.brick_atlas_cache_hits
                 + brick_f32_stats.brick_atlas_cache_hits,
             brick_atlas_cache_misses: brick_stats.brick_atlas_cache_misses
@@ -929,8 +827,3 @@ mod lease_input_tests;
 mod scene_tests;
 #[cfg(test)]
 mod shader_contract_tests;
-#[cfg(test)]
-mod summary_tests;
-#[cfg(test)]
-#[allow(dead_code)]
-mod test_support;
