@@ -181,10 +181,16 @@ readback, and exact-main run passed. Product activation and deletion of the
 current importer remain WP-10C work; current schema-1 packages remain
 transitional T2 fixtures and the sole product route.
 
-WP-12 has implemented the bounded exact analysis runtime and switched the sole
-product analysis route to it. Focused scientific, scheduler, cancellation,
-atomic save/reopen, source-failure, and supported-window checks pass on the
-candidate branch. Protected-main acceptance is the remaining checkpoint.
+WP-12 is accepted on protected main at
+`5be750d060284d0a591ea6b5c0007bfeb136ac8d` (tree
+`d704f02e4dc530c8c144fc5a2f29c572012835a2`), tagged
+`foundation-wp-12-exit-1`. The bounded exact analysis runtime is the sole
+product analysis route; its predecessor and segmentation code are deleted.
+
+WP-10C is active. It will connect the accepted sharded target packages and
+importer to the product, retain responsive background verification, bind
+proved package and scientific identities to projects, and delete the current
+schema-1 data/format/import path.
 
 ## Current Verification Boundary
 

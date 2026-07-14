@@ -2,13 +2,13 @@
 
 Status: ACTIVE PUBLIC-EPOCH PROGRAM
 Last reviewed: 2026-07-14
-Current technical sequence: WP-12, then the remaining packages below
+Current technical sequence: WP-10C, then the remaining packages below
 Public-data publication: deferred to a separate future handoff
-WP-12 predecessor: `foundation-wp-11-exit-1`
-Completed through: WP-11 at
-`04987f64c309166caddf931be9c1ef4948010128`
-Current checkpoint: WP-12 product analysis cutover acceptance candidate
-Next protected-branch checkpoint: accept the WP-12 product analysis cutover
+WP-10C predecessor: `foundation-wp-12-exit-1`
+Completed through: WP-12 at
+`5be750d060284d0a591ea6b5c0007bfeb136ac8d`
+Current checkpoint: WP-10C storage/runtime product cutover
+Next protected-branch checkpoint: accept the sole target-format product path
 
 ## Purpose
 

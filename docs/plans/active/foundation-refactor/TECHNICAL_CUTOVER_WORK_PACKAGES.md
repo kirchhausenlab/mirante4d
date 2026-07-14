@@ -375,17 +375,22 @@ Required work:
 
 Exit proof and deletion gate:
 
-- Representative new-format small and large packages pass automated and
-  product-open workflows.
+- Focused source-adapter tests use the existing bounded target archives and
+  cover their useful dtype, validity, multiscale, and cross-brick behavior.
+- One integration covers target import, product open, background verification,
+  analysis, project save, and reopen. One focused corruption or source-change
+  case proves fail-closed behavior.
+- A short real-product exercise covers 1280x720 and 1920x1080. No huge-data,
+  KVM, power-cut, broad performance, or 4K matrix applies.
 - Old manifest/index/validator/writer/reader adapters, storage-source bridges,
   current importer, and product branches are deleted only after the replacement
   importer, project store, and analysis consumers pass their predecessor gates.
 - `mirante4d-format`, the residual current-source responsibilities in
   `mirante4d-data`, and `mirante4d-import` are deleted rather than retained as
   re-export facades; their approved target owners are the only remaining path.
-- Metadata open, memory, corruption, and bounded-validation gates pass.
-- Target-format independent conformance passes; writer/reader round-trip alone
-  cannot close the cutover.
+- Metadata, memory accounting, cancellation, and bounded validation are checked
+  where the new product adapter joins the already accepted storage/runtime
+  contracts. WP-10A conformance and WP-10B/WP-11/WP-12 evidence are inherited.
 - Every WP-06 bootstrap/current-format fixture and its apparent authority is
   deleted at its declared expiry; only the WP-10A target-profile registry may
   remain as candidate-format evidence.
