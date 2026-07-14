@@ -21,11 +21,11 @@ use mirante4d_render_api::{PresentationViewport, RenderExtent};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::DisplayRefreshTiming;
 use crate::cross_section_readout::{
     CrossSectionHoverGenerationStatus, CrossSectionHoverReadout, CrossSectionHoverStatus,
     CrossSectionHoverValue, CrossSectionReadoutInput, cross_section_hover_readout_for_panel_point,
 };
-use crate::display_refresh::DisplayRefreshTiming;
 use crate::{
     DVR_DENSITY_SCALE_MAX, DVR_DENSITY_SCALE_MIN, DisplayedFrameFreshness, FrameCompleteness,
     MiranteWorkbenchApp, application_view, current_egui_shell_bridge, set_render_viewport,
@@ -272,7 +272,6 @@ impl PendingCrossSectionLatencySample {
             return None;
         }
         let panel = app
-            .render_runtime
             .render_coordination
             .surface(self.panel_id.presentation_slot());
         let displayed_generation = panel.displayed_generation()?;
@@ -456,7 +455,7 @@ impl ProductAutomationController {
         let command = self.script.commands[self.command_index].clone();
         let command_index = self.command_index;
         let command_started = Instant::now();
-        let previous_display_refresh_timing = app.render_runtime.last_display_refresh_timing;
+        let previous_display_refresh_timing = app.render_coordination.last_display_refresh_timing;
         let result = self.execute_command(app, ctx, &command, previous_display_refresh_timing);
         let command_execution_elapsed = command_started.elapsed();
         if let Err(reason) = self.observe_and_enforce_limits(app) {
@@ -815,8 +814,8 @@ impl ProductAutomationController {
                     ));
                 }
                 self.render_target_override = Some(viewport);
-                if set_render_viewport(&mut app.render_runtime, viewport) {
-                    app.render_runtime.lod_replan_pending = true;
+                if set_render_viewport(&mut app.render_coordination, viewport) {
+                    app.render_coordination.request_refresh();
                     ctx.request_repaint();
                 }
                 Ok(CommandProgress::Done(json!({
@@ -1146,7 +1145,7 @@ impl ProductAutomationController {
                     *view.camera(),
                     layer.shape().spatial(),
                     layer.grid_to_world(),
-                    app.render_runtime.presentation_viewport,
+                    app.render_coordination.presentation_viewport,
                 );
                 dispatch_application_command(app, ctx, ApplicationCommand::SetCamera(camera))?;
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
@@ -1522,7 +1521,7 @@ impl ProductAutomationController {
         let snapshot = current_egui_shell_bridge::snapshot(&app.application);
         let view = application_view(&snapshot);
         let readout = cross_section_hover_readout_for_panel_point(
-            &app.render_runtime.render_coordination,
+            &app.render_coordination,
             app.dataset.retained_leases(),
             CrossSectionReadoutInput {
                 view,
@@ -1674,7 +1673,7 @@ impl ProductAutomationController {
         match condition {
             ProductAutomationWaitCondition::WindowReady => true,
             ProductAutomationWaitCondition::FirstFrame => {
-                app.render_runtime
+                app.render_coordination
                     .frame_fidelity
                     .displayed_scale_level
                     .is_some()
@@ -1686,25 +1685,25 @@ impl ProductAutomationController {
                     &app.import.workers,
                     &app.analysis_runtime,
                     &app.dataset,
-                    &app.render_runtime,
+                    &app.render_coordination,
                     &app.native_presentation,
                 )
             }
             ProductAutomationWaitCondition::FrameFreshnessCurrent => {
-                app.render_runtime.frame_fidelity.display_freshness
+                app.render_coordination.frame_fidelity.display_freshness
                     == DisplayedFrameFreshness::Current
                     || matches!(
-                        app.render_runtime.frame_fidelity.completeness,
+                        app.render_coordination.frame_fidelity.completeness,
                         FrameCompleteness::Exact | FrameCompleteness::Complete
                     )
             }
             ProductAutomationWaitCondition::NoRenderError => {
-                app.render_runtime
+                app.render_coordination
                     .frame_fidelity
                     .last_failure_kind
                     .is_none()
                     && app
-                        .render_runtime
+                        .render_coordination
                         .frame_fidelity
                         .last_capacity_error
                         .is_none()
@@ -1778,10 +1777,10 @@ impl ProductAutomationController {
                 }
             }
             ProductAutomationAssertCondition::NoRenderError => {
-                if let Some(kind) = app.render_runtime.frame_fidelity.last_failure_kind {
+                if let Some(kind) = app.render_coordination.frame_fidelity.last_failure_kind {
                     Err(format!("render failure is set: {kind:?}"))
                 } else if let Some(error) = app
-                    .render_runtime
+                    .render_coordination
                     .frame_fidelity
                     .last_capacity_error
                     .as_ref()
@@ -1799,7 +1798,7 @@ impl ProductAutomationController {
                 } else {
                     Err(format!(
                         "frame is not current: {:?}",
-                        app.render_runtime.frame_fidelity.display_freshness
+                        app.render_coordination.frame_fidelity.display_freshness
                     ))
                 }
             }
@@ -1809,7 +1808,7 @@ impl ProductAutomationController {
                     &app.import.workers,
                     &app.analysis_runtime,
                     &app.dataset,
-                    &app.render_runtime,
+                    &app.render_coordination,
                     &app.native_presentation,
                 ) {
                     Err("background work is still active".to_owned())
@@ -1918,7 +1917,6 @@ impl ProductAutomationController {
                     return Err("four-panel runtime is not active".to_owned());
                 }
                 let panel_state = app
-                    .render_runtime
                     .render_coordination
                     .surface(panel_id.presentation_slot());
                 let schedule = panel_state.cross_section_schedule().ok_or_else(|| {
@@ -2112,12 +2110,12 @@ impl ProductAutomationController {
             .layer(view.active_layer())
             .expect("application view closes over the dataset catalog");
         let typed_render_error = app
-            .render_runtime
+            .render_coordination
             .frame_fidelity
             .last_failure_kind
             .map(|kind| format!("{kind:?}"))
             .or_else(|| {
-                app.render_runtime
+                app.render_coordination
                     .frame_fidelity
                     .last_capacity_error
                     .clone()
@@ -2142,22 +2140,22 @@ impl ProductAutomationController {
             "render": {
                 "active_render_mode": format!("{:?}", view.layer(view.active_layer()).expect("active layer").render_state().mode()),
                 "projection": format!("{:?}", view.camera().projection()),
-                "backend": format!("{:?}", app.render_runtime.frame_fidelity.backend),
+                "backend": format!("{:?}", app.render_coordination.frame_fidelity.backend),
                 "adapter": app.startup_diagnostics.gpu_adapter.clone(),
                 "last_error": typed_render_error,
                 "gpu_display_frame_present": product_presentation(app, PanelId::ThreeD).is_some(),
                 "frame_fidelity": {
-                    "target_scale_level": app.render_runtime.frame_fidelity.target_scale_level,
-                    "displayed_scale_level": app.render_runtime.frame_fidelity.displayed_scale_level,
-                    "completeness": format!("{:?}", app.render_runtime.frame_fidelity.completeness),
-                    "reason": format!("{:?}", app.render_runtime.frame_fidelity.reason),
-                    "display_freshness": format!("{:?}", app.render_runtime.frame_fidelity.display_freshness),
-                    "frame_time_ms": app.render_runtime.frame_fidelity.frame_time_ms,
-                    "last_failure_kind": app.render_runtime.frame_fidelity.last_failure_kind.map(|kind| format!("{kind:?}")),
-                    "last_capacity_error": app.render_runtime.frame_fidelity.last_capacity_error.clone(),
+                    "target_scale_level": app.render_coordination.frame_fidelity.target_scale_level,
+                    "displayed_scale_level": app.render_coordination.frame_fidelity.displayed_scale_level,
+                    "completeness": format!("{:?}", app.render_coordination.frame_fidelity.completeness),
+                    "reason": format!("{:?}", app.render_coordination.frame_fidelity.reason),
+                    "display_freshness": format!("{:?}", app.render_coordination.frame_fidelity.display_freshness),
+                    "frame_time_ms": app.render_coordination.frame_fidelity.frame_time_ms,
+                    "last_failure_kind": app.render_coordination.frame_fidelity.last_failure_kind.map(|kind| format!("{kind:?}")),
+                    "last_capacity_error": app.render_coordination.frame_fidelity.last_capacity_error.clone(),
                 },
                 "display_refresh_timing": app
-                    .render_runtime.last_display_refresh_timing
+                    .render_coordination.last_display_refresh_timing
                     .map(display_refresh_timing_json),
                 "progressive_presentation": app.native_presentation.product_gpu.as_ref().map(|product| json!({
                     "current_partial_frames_presented": product.current_partial_frames_presented,
@@ -2188,8 +2186,8 @@ impl ProductAutomationController {
             "camera": {
                 "projection": format!("{:?}", view.camera().projection()),
                 "viewport": {
-                    "width": app.render_runtime.render_viewport.width_pixels(),
-                    "height": app.render_runtime.render_viewport.height_pixels(),
+                    "width": app.render_coordination.render_viewport.width_pixels(),
+                    "height": app.render_coordination.render_viewport.height_pixels(),
                 },
             },
             "project_state": project_state_json(app),
@@ -2401,15 +2399,15 @@ impl ProductAutomationController {
                     &app.import.workers,
                     &app.analysis_runtime,
                     &app.dataset,
-                    &app.render_runtime,
+                    &app.render_coordination,
                     &app.native_presentation,
                 ),
                 active_timepoint: view.timepoint().get(),
                 render_mode,
-                display_freshness: app.render_runtime.frame_fidelity.display_freshness,
-                target_scale_level: app.render_runtime.frame_fidelity.target_scale_level,
-                displayed_scale_level: app.render_runtime.frame_fidelity.displayed_scale_level,
-                visible_bricks: app.render_runtime.frame_fidelity.visible_bricks,
+                display_freshness: app.render_coordination.frame_fidelity.display_freshness,
+                target_scale_level: app.render_coordination.frame_fidelity.target_scale_level,
+                displayed_scale_level: app.render_coordination.frame_fidelity.displayed_scale_level,
+                visible_bricks: app.render_coordination.frame_fidelity.visible_bricks,
                 resident_bricks: app.dataset.retained_leases().retained_len(),
             });
     }
@@ -2523,7 +2521,6 @@ impl ProductAutomationController {
             return;
         }
         let panel = app
-            .render_runtime
             .render_coordination
             .surface(panel_id.presentation_slot());
         self.pending_cross_section_latency_samples
@@ -2608,8 +2605,7 @@ fn cross_section_panel_presentation_viewport(
     app: &MiranteWorkbenchApp,
     panel_id: PanelId,
 ) -> Result<PresentationViewport, String> {
-    app.render_runtime
-        .render_coordination
+    app.render_coordination
         .surface(panel_id.presentation_slot())
         .presentation_viewport()
         .ok_or_else(|| {
@@ -2743,7 +2739,6 @@ fn vec3_json(value: glam::DVec3) -> Value {
 
 fn panel_hover_readout_side_effect_snapshot(app: &MiranteWorkbenchApp) -> Value {
     let panels = app
-        .render_runtime
         .render_coordination
         .iter()
         .map(|(slot, panel)| {
@@ -2985,7 +2980,6 @@ fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
     let snapshot = current_egui_shell_bridge::snapshot(&app.application);
     let view = application_view(&snapshot);
     let panels = app
-        .render_runtime
         .render_coordination
         .iter()
         .map(|(slot, panel)| {

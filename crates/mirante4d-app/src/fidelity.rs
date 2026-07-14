@@ -1,7 +1,7 @@
 use crate::{
     DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind, FrameFidelityStatus,
-    LodDecisionReason, RenderBackend, application_view,
-    current_runtime::render::CurrentRenderRuntime, display_graph::DisplayGraph, ui_kit,
+    LodDecisionReason, RenderBackend, RenderCoordinationState, application_view,
+    display_graph::DisplayGraph, ui_kit,
 };
 use eframe::egui;
 use mirante4d_application::ApplicationSnapshot;
@@ -70,7 +70,7 @@ pub(crate) fn frame_render_time_label(fidelity: &FrameFidelityStatus) -> String 
 
 pub(crate) fn composite_fidelity_label(
     snapshot: &ApplicationSnapshot,
-    render: &CurrentRenderRuntime,
+    render: &RenderCoordinationState,
 ) -> String {
     let mut label = frame_fidelity_label(&render.frame_fidelity);
     label.push_str(" | ");

@@ -5,5 +5,4 @@
 //! wrapped in another mutable runtime aggregate.
 
 pub(crate) mod analysis;
-pub(crate) mod render;
 pub(crate) mod validation;

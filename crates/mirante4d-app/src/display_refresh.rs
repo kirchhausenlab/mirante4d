@@ -31,18 +31,10 @@ pub(crate) enum ViewportDisplayImage {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DisplayRefreshPath {
-    GpuResidentDisplay,
-    UiBackground,
-}
-
-impl DisplayRefreshPath {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::GpuResidentDisplay => "gpu display",
-            Self::UiBackground => "ui background",
-        }
+pub(crate) const fn display_refresh_path_label(path: DisplayRefreshPath) -> &'static str {
+    match path {
+        DisplayRefreshPath::GpuResidentDisplay => "gpu display",
+        DisplayRefreshPath::UiBackground => "ui background",
     }
 }
 
@@ -53,17 +45,6 @@ pub(crate) struct DisplayRenderTiming {
     pub(crate) gpu_upload_ms: Option<f64>,
     pub(crate) gpu_compute_ms: Option<f64>,
     pub(crate) egui_texture_ms: f64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct DisplayRefreshTiming {
-    pub(crate) path: DisplayRefreshPath,
-    pub(crate) render_ms: f64,
-    pub(crate) gpu_upload_ms: Option<f64>,
-    pub(crate) gpu_compute_ms: Option<f64>,
-    pub(crate) egui_texture_ms: f64,
-    pub(crate) visible_brick_request_ms: f64,
-    pub(crate) total_ms: f64,
 }
 
 impl ViewportDisplayImage {
@@ -84,7 +65,7 @@ impl MiranteWorkbenchApp {
         let snapshot = current_egui_shell_bridge::snapshot(&self.application);
         let three_d = Some(self.presentation_surface(
             PanelId::ThreeD,
-            self.render_runtime.presentation_viewport,
+            self.render_coordination.presentation_viewport,
             true,
         ));
         let (xy, xz, yz) =
@@ -104,7 +85,6 @@ impl MiranteWorkbenchApp {
 
     fn cross_section_presentation_surface(&self, panel_id: PanelId) -> Option<PresentationSurface> {
         let panel = self
-            .render_runtime
             .render_coordination
             .surface(panel_id.presentation_slot());
         Some(self.presentation_surface(
@@ -145,7 +125,7 @@ impl MiranteWorkbenchApp {
             };
         }
         ViewportDisplayImage::UiBackground {
-            size: extent_size(self.render_runtime.render_viewport),
+            size: extent_size(self.render_coordination.render_viewport),
         }
     }
 
@@ -186,7 +166,8 @@ impl MiranteWorkbenchApp {
             target.completed_capture = None;
             target.partial_seen = false;
         }
-        self.render_runtime.frame_fidelity.display_freshness = DisplayedFrameFreshness::Unknown;
+        self.render_coordination.frame_fidelity.display_freshness =
+            DisplayedFrameFreshness::Unknown;
     }
 
     pub(crate) fn clear_cross_section_product_presentations(&mut self) {
@@ -204,9 +185,7 @@ impl MiranteWorkbenchApp {
     }
 
     pub(crate) fn invalidate_cross_section_panel_display_frames(&mut self) {
-        self.render_runtime
-            .render_coordination
-            .invalidate_cross_sections();
+        self.render_coordination.invalidate_cross_sections();
     }
 
     pub(crate) fn clear_product_presentations(&mut self) {
@@ -219,7 +198,8 @@ impl MiranteWorkbenchApp {
                 target.partial_seen = false;
             }
         }
-        self.render_runtime.frame_fidelity.display_freshness = DisplayedFrameFreshness::Unknown;
+        self.render_coordination.frame_fidelity.display_freshness =
+            DisplayedFrameFreshness::Unknown;
     }
 
     fn cross_section_panel_needs_display_render(&self, panel_id: PanelId) -> bool {
@@ -227,7 +207,6 @@ impl MiranteWorkbenchApp {
             return false;
         }
         let panel = self
-            .render_runtime
             .render_coordination
             .surface(panel_id.presentation_slot());
         let target_is_progressive = self
@@ -257,7 +236,7 @@ impl MiranteWorkbenchApp {
         let requirements = self.dataset.scope_requirements(scope).to_vec();
         let gpu_available = self.native_presentation.product_gpu.is_some();
         let schedule = schedule_cross_section_panel(
-            &mut self.render_runtime.render_coordination,
+            &mut self.render_coordination,
             CrossSectionScheduleInput {
                 catalog: snapshot.catalog(),
                 view,
@@ -275,7 +254,6 @@ impl MiranteWorkbenchApp {
             return Ok(None);
         }
         let panel = self
-            .render_runtime
             .render_coordination
             .surface(panel_id.presentation_slot());
         let presentation = panel
@@ -297,20 +275,22 @@ impl MiranteWorkbenchApp {
             Ok(rendered) => rendered,
             Err(error) => {
                 let failure = render_state::render_failure_status(&error);
-                self.render_runtime
-                    .render_coordination
-                    .record_cross_section_failure(panel_id.presentation_slot(), schedule, failure);
+                self.render_coordination.record_cross_section_failure(
+                    panel_id.presentation_slot(),
+                    schedule,
+                    failure,
+                );
                 return Err(error);
             }
         };
         if !rendered {
             return Ok(None);
         }
-        if !self
-            .render_runtime
-            .render_coordination
-            .record_cross_section_presentation(panel_id.presentation_slot(), generation, schedule)
-        {
+        if !self.render_coordination.record_cross_section_presentation(
+            panel_id.presentation_slot(),
+            generation,
+            schedule,
+        ) {
             anyhow::bail!("stale cross-section frame was suppressed");
         }
         Ok(Some(DisplayRenderTiming {
@@ -381,7 +361,7 @@ impl MiranteWorkbenchApp {
             target.completed_capture = None;
         } else if !self.poll_product_target_validation_capture(target_id)? {
             if target_id == PanelId::ThreeD {
-                self.render_runtime.lod_replan_pending = true;
+                self.render_coordination.request_refresh();
             }
             return Ok(false);
         }
@@ -432,7 +412,7 @@ impl MiranteWorkbenchApp {
         };
         let Some(presented) = report.presentation().cloned() else {
             if target_id == PanelId::ThreeD && report.uploaded_resources() > 0 {
-                self.render_runtime.lod_replan_pending = true;
+                self.render_coordination.request_refresh();
             }
             return Ok(false);
         };
@@ -463,7 +443,7 @@ impl MiranteWorkbenchApp {
             target.completed_capture = None;
         }
         if target_id == PanelId::ThreeD && current_is_partial {
-            self.render_runtime.lod_replan_pending = true;
+            self.render_coordination.request_refresh();
         }
         self.bind_product_texture(target_id, extent_changed)?;
         if target_id == PanelId::ThreeD {
@@ -569,15 +549,17 @@ impl MiranteWorkbenchApp {
     fn record_product_frame(&mut self, frame: &mirante4d_render_api::PresentedFrame) {
         let progress = frame.progress();
         let coverage = progress.coverage();
-        self.render_runtime.frame_fidelity.resident_bricks =
+        self.render_coordination.frame_fidelity.resident_bricks =
             usize::try_from(coverage.available_requirements()).unwrap_or(usize::MAX);
-        self.render_runtime.frame_fidelity.missing_occupied_bricks = usize::try_from(
+        self.render_coordination
+            .frame_fidelity
+            .missing_occupied_bricks = usize::try_from(
             coverage
                 .total_requirements()
                 .saturating_sub(coverage.available_requirements()),
         )
         .unwrap_or(usize::MAX);
-        self.render_runtime.frame_fidelity.completeness = match progress.completeness() {
+        self.render_coordination.frame_fidelity.completeness = match progress.completeness() {
             RenderFrameCompleteness::Progressive => FrameCompleteness::Incomplete,
             RenderFrameCompleteness::Complete => FrameCompleteness::Complete,
             RenderFrameCompleteness::Exact => {
@@ -588,7 +570,7 @@ impl MiranteWorkbenchApp {
                 }
             }
         };
-        self.render_runtime.frame_fidelity.reason = match progress.limitation() {
+        self.render_coordination.frame_fidelity.reason = match progress.limitation() {
             Some(FrameLimitation::BudgetLimited | FrameLimitation::CapacityLimited) => {
                 LodDecisionReason::GpuBudgetLimited
             }
@@ -605,17 +587,19 @@ impl MiranteWorkbenchApp {
             .expect("the current view contains its active layer")
             .render_state()
             .mode();
-        self.render_runtime.frame_fidelity.backend = render_backend_for_mode(mode);
-        self.render_runtime.frame_fidelity.display_freshness = DisplayedFrameFreshness::Current;
-        self.render_runtime.frame_fidelity.displayed_scale_level =
-            Some(self.dataset.current_scale().get());
+        self.render_coordination.frame_fidelity.backend = render_backend_for_mode(mode);
+        self.render_coordination.frame_fidelity.display_freshness =
+            DisplayedFrameFreshness::Current;
+        self.render_coordination
+            .frame_fidelity
+            .displayed_scale_level = Some(self.dataset.current_scale().get());
     }
 
     pub(crate) fn render_current_product_frame(&mut self) -> anyhow::Result<DisplayRenderTiming> {
         let snapshot = current_egui_shell_bridge::snapshot(&self.application);
         let requirements = self.dataset.scope_requirements(SCOPE_CURRENT_3D).to_vec();
-        let presentation = self.render_runtime.presentation_viewport;
-        let extent = self.render_runtime.render_viewport;
+        let presentation = self.render_coordination.presentation_viewport;
+        let extent = self.render_coordination.render_viewport;
         let started = Instant::now();
         let rendered = self.render_product_target(
             PanelId::ThreeD,
@@ -646,10 +630,11 @@ impl MiranteWorkbenchApp {
         self.request_visible_bricks();
         if self.dataset.scope_is_empty(SCOPE_CURRENT_3D) {
             self.clear_3d_product_presentation();
-            self.render_runtime.frame_fidelity.backend = RenderBackend::Empty;
-            self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Complete;
-            self.render_runtime.frame_fidelity.reason = LodDecisionReason::NoVisibleData;
-            self.render_runtime.frame_fidelity.display_freshness = DisplayedFrameFreshness::Current;
+            self.render_coordination.frame_fidelity.backend = RenderBackend::Empty;
+            self.render_coordination.frame_fidelity.completeness = FrameCompleteness::Complete;
+            self.render_coordination.frame_fidelity.reason = LodDecisionReason::NoVisibleData;
+            self.render_coordination.frame_fidelity.display_freshness =
+                DisplayedFrameFreshness::Current;
             return Ok(DisplayRenderTiming {
                 path: DisplayRefreshPath::UiBackground,
                 render_ms: 0.0,
@@ -667,7 +652,7 @@ impl MiranteWorkbenchApp {
         visible_brick_request_ms: f64,
         total_ms: f64,
     ) {
-        self.render_runtime.last_display_refresh_timing = Some(DisplayRefreshTiming {
+        self.render_coordination.last_display_refresh_timing = Some(DisplayRefreshTiming {
             path: render.path,
             render_ms: render.render_ms,
             gpu_upload_ms: render.gpu_upload_ms,
@@ -691,10 +676,11 @@ impl MiranteWorkbenchApp {
             Err(error) => {
                 tracing::error!(%error, "GPU display refresh failed");
                 let failure = render_state::render_failure_status(&error);
-                self.render_runtime.frame_fidelity.last_failure_kind = Some(failure.kind());
-                self.render_runtime.frame_fidelity.last_capacity_error =
+                self.render_coordination.frame_fidelity.last_failure_kind = Some(failure.kind());
+                self.render_coordination.frame_fidelity.last_capacity_error =
                     Some(failure.message().to_owned());
-                self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Incomplete;
+                self.render_coordination.frame_fidelity.completeness =
+                    FrameCompleteness::Incomplete;
             }
         }
         ctx.request_repaint();

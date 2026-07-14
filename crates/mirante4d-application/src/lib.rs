@@ -19,9 +19,10 @@ pub use project_store_service::{
 };
 pub use render_coordination::{
     CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
-    CrossSectionPanelScheduleStatus, DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind,
-    FrameFidelityStatus, LodDecisionReason, RenderBackend, RenderCoordinationState,
-    RenderSurfaceState, ResidentRenderFailureStatus,
+    CrossSectionPanelScheduleStatus, DisplayRefreshPath, DisplayRefreshTiming,
+    DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind, FrameFidelityStatus,
+    LodDecisionReason, RenderBackend, RenderCoordinationState, RenderSurfaceState,
+    ResidentRenderFailureStatus,
 };
 
 use std::{

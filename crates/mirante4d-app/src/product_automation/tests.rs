@@ -588,7 +588,7 @@ fn presentation_timing_json_names_proxy_and_compositor_timestamp_status() {
 #[test]
 fn display_refresh_timing_json_uses_stable_phase_taxonomy() {
     let timing = DisplayRefreshTiming {
-        path: crate::display_refresh::DisplayRefreshPath::GpuResidentDisplay,
+        path: crate::DisplayRefreshPath::GpuResidentDisplay,
         render_ms: 4.0,
         gpu_upload_ms: Some(1.5),
         gpu_compute_ms: Some(9.5),
@@ -753,7 +753,7 @@ fn display_refresh_timing_summary_reports_phase_percentiles() {
             command: "camera_orbit",
             event_epoch_ms: 10,
             timing: DisplayRefreshTiming {
-                path: crate::display_refresh::DisplayRefreshPath::GpuResidentDisplay,
+                path: crate::DisplayRefreshPath::GpuResidentDisplay,
                 render_ms: 4.0,
                 gpu_upload_ms: Some(1.0),
                 gpu_compute_ms: Some(7.0),
@@ -767,7 +767,7 @@ fn display_refresh_timing_summary_reports_phase_percentiles() {
             command: "camera_pan",
             event_epoch_ms: 20,
             timing: DisplayRefreshTiming {
-                path: crate::display_refresh::DisplayRefreshPath::UiBackground,
+                path: crate::DisplayRefreshPath::UiBackground,
                 render_ms: 11.0,
                 gpu_upload_ms: None,
                 gpu_compute_ms: None,
@@ -781,7 +781,7 @@ fn display_refresh_timing_summary_reports_phase_percentiles() {
             command: "camera_zoom",
             event_epoch_ms: 30,
             timing: DisplayRefreshTiming {
-                path: crate::display_refresh::DisplayRefreshPath::GpuResidentDisplay,
+                path: crate::DisplayRefreshPath::GpuResidentDisplay,
                 render_ms: 6.0,
                 gpu_upload_ms: Some(2.0),
                 gpu_compute_ms: Some(12.0),
@@ -839,7 +839,7 @@ fn input_to_present_timing_summary_reports_proxy_latency_percentiles() {
             event_epoch_ms: 10,
             latency_ms: 18.0,
             display_refresh_timing: DisplayRefreshTiming {
-                path: crate::display_refresh::DisplayRefreshPath::GpuResidentDisplay,
+                path: crate::DisplayRefreshPath::GpuResidentDisplay,
                 render_ms: 4.0,
                 gpu_upload_ms: Some(1.0),
                 gpu_compute_ms: Some(7.0),
@@ -854,7 +854,7 @@ fn input_to_present_timing_summary_reports_proxy_latency_percentiles() {
             event_epoch_ms: 20,
             latency_ms: 32.0,
             display_refresh_timing: DisplayRefreshTiming {
-                path: crate::display_refresh::DisplayRefreshPath::UiBackground,
+                path: crate::DisplayRefreshPath::UiBackground,
                 render_ms: 11.0,
                 gpu_upload_ms: None,
                 gpu_compute_ms: None,
@@ -869,7 +869,7 @@ fn input_to_present_timing_summary_reports_proxy_latency_percentiles() {
             event_epoch_ms: 30,
             latency_ms: 24.0,
             display_refresh_timing: DisplayRefreshTiming {
-                path: crate::display_refresh::DisplayRefreshPath::GpuResidentDisplay,
+                path: crate::DisplayRefreshPath::GpuResidentDisplay,
                 render_ms: 6.0,
                 gpu_upload_ms: Some(2.0),
                 gpu_compute_ms: Some(12.0),

@@ -363,7 +363,7 @@ fn test_workbench_app_without_background_runtime(
         catalog: _,
         workspace: _,
         dataset,
-        render_runtime,
+        render_coordination,
         analysis_runtime,
     } = opened;
     let resource_policy = ResourcePolicy::default();
@@ -381,7 +381,7 @@ fn test_workbench_app_without_background_runtime(
         application,
         startup_diagnostics,
         dataset,
-        render_runtime,
+        render_coordination,
         native_presentation: native_presentation::NativePresentationBridge::unavailable(),
         egui_ui,
         import: ImportWorkflow::new(),

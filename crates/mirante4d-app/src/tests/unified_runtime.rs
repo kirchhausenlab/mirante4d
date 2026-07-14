@@ -32,8 +32,8 @@ fn unified_demand_plan_uses_semantic_keys_for_every_visible_layer() {
     let plan = dataset_demand_plan::plan_current_3d(
         snapshot.catalog(),
         application_view(&snapshot),
-        opened.render_runtime.presentation_viewport,
-        opened.render_runtime.render_viewport,
+        opened.render_coordination.presentation_viewport,
+        opened.render_coordination.render_viewport,
         dataset_demand_plan::DatasetDemandPlanLimits::new(
             mirante4d_render_api::MAX_RENDER_REQUIREMENTS,
             mirante4d_render_api::MAX_RENDER_REQUIREMENTS,
@@ -695,7 +695,7 @@ fn terminal_decode_failure_is_stable_until_the_scope_changes() {
         submitted
     );
     assert!(
-        app.render_runtime
+        app.render_coordination
             .frame_fidelity
             .last_capacity_error
             .is_some()
@@ -963,7 +963,7 @@ fn automatic_source_verification_waits_for_the_previous_worker_to_retire() {
         dataset,
         catalog,
         workspace,
-        render_runtime,
+        render_coordination,
         analysis_runtime,
         startup_diagnostics: _,
     } = replacement;
@@ -979,7 +979,7 @@ fn automatic_source_verification_waits_for_the_previous_worker_to_retire() {
         .unwrap();
     app.install_current_source_runtime(current_source_open_service::CurrentSourceRuntimeTransfer {
         dataset,
-        render_runtime,
+        render_coordination,
         analysis_runtime,
     });
 
@@ -1099,8 +1099,7 @@ fn four_panel_playback_demand_shares_one_aggregate_resource_and_byte_budget() {
     let presentation = PresentationViewport::new(64.0, 64.0).unwrap();
     let render = mirante4d_render_api::RenderExtent::new(64, 64).unwrap();
     for panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
-        app.render_runtime
-            .render_coordination
+        app.render_coordination
             .record_viewports(panel.presentation_slot(), presentation, render);
     }
     app.apply_application_command(ApplicationCommand::SetPlaybackActive(true), &context)

@@ -369,18 +369,15 @@ fn timepoint_command_dirties_cross_section_panels_without_dirtying_3d_panel() {
     .unwrap();
     for panel_id in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
         assert!(
-            app.render_runtime
-                .render_coordination
+            app.render_coordination
                 .record_viewports(panel_id.presentation_slot(), presentation, render)
         );
         let generation = app
-            .render_runtime
             .render_coordination
             .surface(panel_id.presentation_slot())
             .generation();
         assert!(
-            app.render_runtime
-                .render_coordination
+            app.render_coordination
                 .record_cross_section_presentation(
                     panel_id.presentation_slot(),
                     generation,
@@ -390,8 +387,7 @@ fn timepoint_command_dirties_cross_section_panels_without_dirtying_3d_panel() {
     }
     let generations_before =
         [PanelId::Xy, PanelId::Xz, PanelId::ThreeD, PanelId::Yz].map(|panel_id| {
-            app.render_runtime
-                .render_coordination
+            app.render_coordination
                 .surface(panel_id.presentation_slot())
                 .generation()
         });
@@ -403,7 +399,7 @@ fn timepoint_command_dirties_cross_section_panels_without_dirtying_3d_panel() {
         application_view(&app.application.snapshot()).timepoint(),
         TimeIndex::new(1)
     );
-    let runtime = &app.render_runtime.render_coordination;
+    let runtime = &app.render_coordination;
     for (panel_id, generation_before) in [PanelId::Xy, PanelId::Xz, PanelId::Yz].into_iter().zip([
         generations_before[0],
         generations_before[1],

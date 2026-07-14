@@ -10,8 +10,8 @@ use mirante4d_domain::RenderMode;
 use mirante4d_ui_egui::{EguiUiState, ViewportHover, ViewportIntensity};
 
 use crate::{
-    FrameCompleteness, application_view,
-    current_runtime::{analysis::AnalysisProductRuntime, render::CurrentRenderRuntime},
+    FrameCompleteness, RenderCoordinationState, application_view,
+    current_runtime::analysis::AnalysisProductRuntime,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -24,7 +24,7 @@ pub(crate) fn apply_viewport_tool_response(
     snapshot: &ApplicationSnapshot,
     analysis: &mut AnalysisProductRuntime,
     egui_ui: &mut EguiUiState,
-    render: &CurrentRenderRuntime,
+    render: &RenderCoordinationState,
     response: &egui::Response,
     hover: Option<ViewportHover>,
 ) -> anyhow::Result<ToolInteractionOutcome> {
@@ -71,7 +71,7 @@ pub(crate) fn apply_viewport_tool_response(
 /// World/grid/source fields remain absent instead of being guessed.
 pub(crate) fn pick_hit_from_viewport_hover(
     snapshot: &ApplicationSnapshot,
-    render: &CurrentRenderRuntime,
+    render: &RenderCoordinationState,
     hover: ViewportHover,
 ) -> anyhow::Result<PickHit> {
     let view = application_view(snapshot);

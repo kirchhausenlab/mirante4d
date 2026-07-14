@@ -5,8 +5,8 @@ use mirante4d_application::{
 use mirante4d_domain::ViewerLayout;
 
 use crate::{
-    BACKGROUND_WORK_REPAINT_INTERVAL,
-    current_runtime::{analysis::AnalysisProductRuntime, render::CurrentRenderRuntime},
+    BACKGROUND_WORK_REPAINT_INTERVAL, RenderCoordinationState,
+    current_runtime::analysis::AnalysisProductRuntime,
     dataset_requests::{DatasetDemandState, SCOPE_CURRENT_3D},
     import_worker_service::ImportWorkerService,
     native_presentation::NativePresentationBridge,
@@ -18,7 +18,7 @@ pub(crate) fn background_work_active(
     import: &ImportWorkerService,
     _analysis: &AnalysisProductRuntime,
     dataset: &DatasetDemandState,
-    render: &CurrentRenderRuntime,
+    render: &RenderCoordinationState,
     presentation: &NativePresentationBridge,
 ) -> bool {
     application_service_work_active(snapshot)
@@ -35,7 +35,7 @@ pub(crate) fn background_work_active(
             })
         })
         || (crate::application_view(snapshot).layout() == ViewerLayout::FourPanel
-            && render.render_coordination.iter().any(|(_, panel)| {
+            && render.iter().any(|(_, panel)| {
                 panel.cross_section_schedule().is_some_and(|schedule| {
                     matches!(
                         schedule.status,

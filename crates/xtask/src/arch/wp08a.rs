@@ -124,6 +124,8 @@ pub(super) fn accepted_successor_public_root_additions(
             "CrossSectionPanelScheduleReason",
             "CrossSectionPanelScheduleState",
             "CrossSectionPanelScheduleStatus",
+            "DisplayRefreshPath",
+            "DisplayRefreshTiming",
             "RenderCoordinationState",
             "RenderSurfaceState",
             "ResidentRenderFailureStatus",

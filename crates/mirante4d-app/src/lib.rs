@@ -59,7 +59,7 @@ use analysis_workspace::{
 };
 use cross_section_readout::cross_section_hover_readout_for_response;
 pub use diagnostics::{StartupDiagnostics, collect_startup_diagnostics, default_log_path};
-use display_refresh::{DisplayRefreshTiming, ViewportDisplayImage, duration_ms};
+use display_refresh::{ViewportDisplayImage, duration_ms};
 use eframe::egui;
 use fidelity::{
     composite_fidelity_label, iso_shading_policy_label, render_sampling_policy_label,
@@ -80,11 +80,12 @@ use import_worker_service::{ImportWorkerCompletion, ImportWorkerOutcome};
 use import_workflow::{ImportWorkflow, reset_checkpoint_directory, tiff_destination};
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, ApplicationFault, ApplicationFaultCode,
-    ApplicationSnapshot, ApplicationState, CommandEffect, OperationCompletion,
-    OperationFailureCode, OperationKind, OperationToken, PresentationSlot, PresentationSnapshot,
-    PresentationSurface, ProjectRecoveryStoreLocator, ProjectStoreApplicationService,
-    ProjectStoreLifecycle, ProjectStoreServiceEvent, ResidentRenderFailureStatus,
-    SourceSessionGeneration, SourceVerificationSnapshot, SystemMonotonicClock, WorkspaceSnapshot,
+    ApplicationSnapshot, ApplicationState, CommandEffect, DisplayRefreshPath, DisplayRefreshTiming,
+    OperationCompletion, OperationFailureCode, OperationKind, OperationToken, PresentationSlot,
+    PresentationSnapshot, PresentationSurface, ProjectRecoveryStoreLocator,
+    ProjectStoreApplicationService, ProjectStoreLifecycle, ProjectStoreServiceEvent,
+    RenderCoordinationState, ResidentRenderFailureStatus, SourceSessionGeneration,
+    SourceVerificationSnapshot, SystemMonotonicClock, WorkspaceSnapshot,
     import_workflow::{ImportCommand, ImportReviewId, ImportWorkflowSnapshot},
     viewer_tools::{ViewerTool, ViewerToolState},
 };
@@ -120,7 +121,7 @@ use playback::playback_status_label;
 #[cfg(test)]
 use playback::stepped_timepoint;
 use product_automation::{ProductAutomationAppUpdateTiming, ProductAutomationController};
-use render_state::{set_presentation_viewport, set_render_viewport, take_lod_replan_pending};
+use render_state::{set_presentation_viewport, set_render_viewport};
 pub use smoke::{AppSmokeOptions, AppSmokeReport, PlaybackSmokeFrame, run_headless_smoke};
 pub use state::{HistogramStatus, LayerHistogramSummary};
 use tool_interactions::apply_viewport_tool_response;
@@ -484,7 +485,7 @@ pub struct MiranteWorkbenchApp {
     application: ApplicationState,
     startup_diagnostics: StartupDiagnostics,
     dataset: dataset_requests::DatasetDemandState,
-    render_runtime: current_runtime::render::CurrentRenderRuntime,
+    render_coordination: RenderCoordinationState,
     native_presentation: native_presentation::NativePresentationBridge,
     egui_ui: ui_kit::EguiUiState,
     import: ImportWorkflow,
@@ -537,7 +538,7 @@ impl MiranteWorkbenchApp {
             catalog,
             workspace,
             dataset,
-            render_runtime,
+            render_coordination,
             analysis_runtime,
         } = opened;
         let provisional_project_id = workspace.provisional_project_id();
@@ -589,7 +590,7 @@ impl MiranteWorkbenchApp {
             application,
             startup_diagnostics,
             dataset,
-            render_runtime,
+            render_coordination,
             native_presentation,
             egui_ui,
             import: ImportWorkflow::new(),
@@ -2233,9 +2234,9 @@ impl MiranteWorkbenchApp {
         }
         let retired_leases = self.dataset.take_retained_leases();
         self.clear_product_presentations();
-        self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Loading;
-        self.render_runtime.frame_fidelity.reason = LodDecisionReason::LoadingTargetScale;
-        self.render_runtime.frame_fidelity.backend = RenderBackend::Loading;
+        self.render_coordination.frame_fidelity.completeness = FrameCompleteness::Loading;
+        self.render_coordination.frame_fidelity.reason = LodDecisionReason::LoadingTargetScale;
+        self.render_coordination.frame_fidelity.backend = RenderBackend::Loading;
         std::thread::spawn(move || drop(retired_leases));
     }
 
@@ -2477,12 +2478,13 @@ impl MiranteWorkbenchApp {
     ) {
         let current_source_open_service::CurrentSourceRuntimeTransfer {
             dataset,
-            render_runtime,
+            render_coordination,
             analysis_runtime,
         } = transfer;
         self.clear_product_presentations();
         let old_dataset = std::mem::replace(&mut self.dataset, dataset);
-        let old_render_runtime = std::mem::replace(&mut self.render_runtime, render_runtime);
+        let old_render_coordination =
+            std::mem::replace(&mut self.render_coordination, render_coordination);
         let old_analysis_runtime = std::mem::replace(&mut self.analysis_runtime, analysis_runtime);
         self.pending_analysis_artifact_load = None;
         self.import.clear_for_source_replacement();
@@ -2501,7 +2503,7 @@ impl MiranteWorkbenchApp {
         self.request_opened_state_visible_work(None);
 
         std::thread::spawn(move || {
-            drop((old_dataset, old_render_runtime, old_analysis_runtime));
+            drop((old_dataset, old_render_coordination, old_analysis_runtime));
         });
     }
 
@@ -2514,7 +2516,7 @@ impl MiranteWorkbenchApp {
             .layer(active_key)
             .expect("application view closes over the dataset catalog");
         let scale = ScaleLevel::new(
-            self.render_runtime
+            self.render_coordination
                 .frame_fidelity
                 .displayed_scale_level
                 .unwrap_or(self.dataset.current_scale().get()),
@@ -2587,14 +2589,15 @@ impl MiranteWorkbenchApp {
             previous_view,
             snapshot,
             &mut self.dataset,
-            &mut self.render_runtime,
+            &mut self.render_coordination,
             &mut self.analysis_runtime,
         ) {
             Ok(changed) => changed,
             Err(error) => {
                 tracing::error!(%error, "failed to reconcile the canonical view with current runtime");
                 self.dataset.record_plan_error(error.to_string());
-                self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Incomplete;
+                self.render_coordination.frame_fidelity.completeness =
+                    FrameCompleteness::Incomplete;
                 false
             }
         };
@@ -2604,9 +2607,7 @@ impl MiranteWorkbenchApp {
             self.egui_ui.viewport_orbit_drag = None;
             if next_view.layout() == CanonicalViewerLayout::Single3d {
                 self.clear_cross_section_product_presentations();
-                self.render_runtime
-                    .render_coordination
-                    .invalidate_cross_sections();
+                self.render_coordination.invalidate_cross_sections();
             }
         }
         if source_selection_changed {
@@ -2618,7 +2619,8 @@ impl MiranteWorkbenchApp {
             if let Err(error) = self.rerender_display_state() {
                 tracing::error!(%error, "failed to render the accepted canonical view");
                 self.dataset.record_plan_error(error.to_string());
-                self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Incomplete;
+                self.render_coordination.frame_fidelity.completeness =
+                    FrameCompleteness::Incomplete;
                 self.request_visible_bricks();
             } else {
                 self.request_visible_bricks();

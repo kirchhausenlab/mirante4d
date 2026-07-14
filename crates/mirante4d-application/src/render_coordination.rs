@@ -58,6 +58,23 @@ pub enum FrameFailureKind {
     InvalidTransform,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayRefreshPath {
+    GpuResidentDisplay,
+    UiBackground,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DisplayRefreshTiming {
+    pub path: DisplayRefreshPath,
+    pub render_ms: f64,
+    pub gpu_upload_ms: Option<f64>,
+    pub gpu_compute_ms: Option<f64>,
+    pub egui_texture_ms: f64,
+    pub visible_brick_request_ms: f64,
+    pub total_ms: f64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FrameFidelityStatus {
     pub target_scale_level: u32,
@@ -314,23 +331,60 @@ impl RenderSurfaceState {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderCoordinationState {
+    pub presentation_viewport: PresentationViewport,
+    pub render_viewport: RenderExtent,
+    pub frame_fidelity: FrameFidelityStatus,
+    refresh_requested: bool,
+    pub last_display_refresh_timing: Option<DisplayRefreshTiming>,
     surfaces: [RenderSurfaceState; 4],
 }
 
-impl Default for RenderCoordinationState {
-    fn default() -> Self {
+impl RenderCoordinationState {
+    pub fn new(frame_fidelity: FrameFidelityStatus) -> Self {
+        let presentation_viewport = frame_fidelity.presentation_viewport;
+        let render_viewport = frame_fidelity.viewport;
+        let mut three_d = RenderSurfaceState::new(false);
+        three_d.presentation_viewport = Some(presentation_viewport);
+        three_d.render_viewport = Some(render_viewport);
         Self {
+            presentation_viewport,
+            render_viewport,
+            frame_fidelity,
+            refresh_requested: false,
+            last_display_refresh_timing: None,
             surfaces: [
-                RenderSurfaceState::new(false),
+                three_d,
                 RenderSurfaceState::new(true),
                 RenderSurfaceState::new(true),
                 RenderSurfaceState::new(true),
             ],
         }
     }
-}
 
-impl RenderCoordinationState {
+    pub fn set_presentation_viewport(&mut self, viewport: PresentationViewport) -> bool {
+        self.record_viewports(PresentationSlot::ThreeD, viewport, self.render_viewport)
+    }
+
+    pub fn set_render_viewport(&mut self, viewport: RenderExtent) -> bool {
+        self.record_viewports(
+            PresentationSlot::ThreeD,
+            self.presentation_viewport,
+            viewport,
+        )
+    }
+
+    pub fn request_refresh(&mut self) {
+        self.refresh_requested = true;
+    }
+
+    pub const fn refresh_requested(&self) -> bool {
+        self.refresh_requested
+    }
+
+    pub fn take_refresh_request(&mut self) -> bool {
+        std::mem::take(&mut self.refresh_requested)
+    }
+
     pub fn surface(&self, slot: PresentationSlot) -> &RenderSurfaceState {
         &self.surfaces[slot.index()]
     }
@@ -347,6 +401,17 @@ impl RenderCoordinationState {
         presentation_viewport: PresentationViewport,
         render_viewport: RenderExtent,
     ) -> bool {
+        if slot == PresentationSlot::ThreeD {
+            if self.presentation_viewport == presentation_viewport
+                && self.render_viewport == render_viewport
+            {
+                return false;
+            }
+            self.presentation_viewport = presentation_viewport;
+            self.render_viewport = render_viewport;
+            self.frame_fidelity.presentation_viewport = presentation_viewport;
+            self.frame_fidelity.viewport = render_viewport;
+        }
         self.surfaces[slot.index()].record_viewports(presentation_viewport, render_viewport)
     }
 
@@ -420,21 +485,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn frame_fidelity_starts_in_an_explicit_loading_state() {
+    fn render_coordination_starts_from_the_real_frame_status() {
         let viewport = RenderExtent::new(1280, 720).unwrap();
         let presentation_viewport = PresentationViewport::new(1280.0, 720.0).unwrap();
 
         let status = FrameFidelityStatus::new_with_presentation(viewport, presentation_viewport);
+        let mut state = RenderCoordinationState::new(status);
 
-        assert_eq!(status.viewport, viewport);
-        assert_eq!(status.presentation_viewport, presentation_viewport);
-        assert_eq!(status.completeness, FrameCompleteness::Loading);
-        assert_eq!(status.reason, LodDecisionReason::LoadingTargetScale);
-        assert_eq!(status.backend, RenderBackend::Loading);
-        assert_eq!(status.display_freshness, DisplayedFrameFreshness::Unknown);
-        assert_eq!(status.displayed_scale_level, None);
-        assert_eq!(status.last_failure_kind, None);
-        assert_eq!(status.last_capacity_error, None);
+        assert_eq!(state.render_viewport, viewport);
+        assert_eq!(state.presentation_viewport, presentation_viewport);
+        assert_eq!(
+            state.frame_fidelity.completeness,
+            FrameCompleteness::Loading
+        );
+        assert_eq!(
+            state.frame_fidelity.reason,
+            LodDecisionReason::LoadingTargetScale
+        );
+        assert_eq!(state.frame_fidelity.backend, RenderBackend::Loading);
+        assert_eq!(
+            state.frame_fidelity.display_freshness,
+            DisplayedFrameFreshness::Unknown
+        );
+        assert_eq!(
+            state.surface(PresentationSlot::ThreeD).render_viewport(),
+            Some(viewport)
+        );
+        assert_eq!(
+            state
+                .surface(PresentationSlot::ThreeD)
+                .presentation_viewport(),
+            Some(presentation_viewport)
+        );
+        assert!(!state.take_refresh_request());
+        state.request_refresh();
+        assert!(state.take_refresh_request());
+        assert!(!state.take_refresh_request());
     }
 
     fn viewports() -> (PresentationViewport, RenderExtent) {
@@ -444,9 +530,17 @@ mod tests {
         )
     }
 
+    fn coordination_state() -> RenderCoordinationState {
+        let (presentation, render) = viewports();
+        RenderCoordinationState::new(FrameFidelityStatus::new_with_presentation(
+            render,
+            presentation,
+        ))
+    }
+
     #[test]
     fn viewport_changes_advance_generation_and_invalidate_display() {
-        let mut state = RenderCoordinationState::default();
+        let mut state = coordination_state();
         let (presentation, render) = viewports();
         assert!(state.record_viewports(PresentationSlot::Xy, presentation, render));
         let generation = state.surface(PresentationSlot::Xy).generation();
@@ -471,7 +565,7 @@ mod tests {
 
     #[test]
     fn identical_viewports_do_not_advance_generation() {
-        let mut state = RenderCoordinationState::default();
+        let mut state = coordination_state();
         let (presentation, render) = viewports();
         assert!(state.record_viewports(PresentationSlot::Xy, presentation, render));
         let generation = state.surface(PresentationSlot::Xy).generation();
@@ -481,7 +575,7 @@ mod tests {
 
     #[test]
     fn stale_presentation_schedule_and_failure_updates_are_rejected_atomically() {
-        let mut state = RenderCoordinationState::default();
+        let mut state = coordination_state();
         let (presentation, render) = viewports();
         assert!(state.record_viewports(PresentationSlot::Xy, presentation, render));
         let generation = state.surface(PresentationSlot::Xy).generation();
@@ -506,7 +600,7 @@ mod tests {
 
     #[test]
     fn invalidating_cross_sections_leaves_three_d_generation_unchanged() {
-        let mut state = RenderCoordinationState::default();
+        let mut state = coordination_state();
         let three_d = state.surface(PresentationSlot::ThreeD).generation();
         assert!(state.invalidate_cross_sections());
         assert_eq!(
@@ -524,7 +618,7 @@ mod tests {
 
     #[test]
     fn render_failures_are_generation_scoped_and_cleared_by_invalidation() {
-        let mut state = RenderCoordinationState::default();
+        let mut state = coordination_state();
         let generation = state.surface(PresentationSlot::Xy).generation();
         let schedule = CrossSectionPanelScheduleState::missing_viewport(generation);
         let failure = ResidentRenderFailureStatus::new(
@@ -554,7 +648,7 @@ mod tests {
 
     #[test]
     fn three_d_rejects_cross_section_schedule_and_failure_updates() {
-        let mut state = RenderCoordinationState::default();
+        let mut state = coordination_state();
         let schedule = CrossSectionPanelScheduleState::missing_viewport(0);
         let failure = ResidentRenderFailureStatus::new(
             FrameFailureKind::InvalidModeParameter,

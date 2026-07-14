@@ -198,7 +198,7 @@ fn ui_snapshot_projects_visible_surfaces_without_native_handles() {
         .unwrap();
     assert_eq!(
         three_d.viewport(),
-        app.render_runtime.presentation_viewport
+        app.render_coordination.presentation_viewport
     );
     assert_eq!(three_d.frame(), None);
     for slot in [

@@ -179,7 +179,7 @@ impl MiranteWorkbenchApp {
             presentation_viewport_for_display_size(display_size_points)
         {
             viewport_changed |=
-                set_presentation_viewport(&mut self.render_runtime, presentation_viewport);
+                set_presentation_viewport(&mut self.render_coordination, presentation_viewport);
         }
         let automation_render_target = self
             .validation_runtime
@@ -193,10 +193,10 @@ impl MiranteWorkbenchApp {
                 max_texture_side,
             )
         }) {
-            viewport_changed |= set_render_viewport(&mut self.render_runtime, render_viewport);
+            viewport_changed |= set_render_viewport(&mut self.render_coordination, render_viewport);
         }
         if viewport_changed {
-            self.render_runtime.lod_replan_pending = true;
+            self.render_coordination.request_refresh();
             ctx.request_repaint();
         }
     }
@@ -215,13 +215,13 @@ impl MiranteWorkbenchApp {
             ctx.pixels_per_point(),
             max_texture_side,
         )?;
-        let changed = self.render_runtime.render_coordination.record_viewports(
+        let changed = self.render_coordination.record_viewports(
             panel_id.presentation_slot(),
             presentation_viewport,
             render_viewport,
         );
         if changed {
-            self.render_runtime.lod_replan_pending = true;
+            self.render_coordination.request_refresh();
             ctx.request_repaint();
         }
         Some(presentation_viewport)
@@ -393,11 +393,12 @@ impl MiranteWorkbenchApp {
                     ui.allocate_exact_size(image_size, egui::Sense::click_and_drag());
                 ui.painter()
                     .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
-                let label = if self.render_runtime.frame_fidelity.backend == RenderBackend::Empty {
-                    "No visible data"
-                } else {
-                    "Loading…"
-                };
+                let label =
+                    if self.render_coordination.frame_fidelity.backend == RenderBackend::Empty {
+                        "No visible data"
+                    } else {
+                        "Loading…"
+                    };
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -415,7 +416,8 @@ impl MiranteWorkbenchApp {
                 egui::Sense::click_and_drag(),
             ),
         };
-        let hover = viewport_hover_from_response(snapshot, view, &self.render_runtime, &response);
+        let hover =
+            viewport_hover_from_response(snapshot, view, &self.render_coordination, &response);
         if response.hovered() || view.layout() == CanonicalViewerLayout::Single3d {
             self.egui_ui.hovered_pixel = hover;
             self.egui_ui.hovered_source_readout = None;
@@ -424,7 +426,7 @@ impl MiranteWorkbenchApp {
             snapshot,
             &mut self.analysis_runtime,
             &mut self.egui_ui,
-            &self.render_runtime,
+            &self.render_coordination,
             &response,
             hover,
         ) {
@@ -460,7 +462,7 @@ impl MiranteWorkbenchApp {
         let available = ui.available_size();
         let ctx = ui.ctx().clone();
         let presentation_viewport = self.record_four_panel_viewport(&ctx, panel_id, available);
-        if !self.render_runtime.lod_replan_pending
+        if !self.render_coordination.refresh_requested()
             && let Err(err) = self.render_cross_section_panel_for_display_if_needed(panel_id)
         {
             tracing::error!(
@@ -496,7 +498,7 @@ impl MiranteWorkbenchApp {
 
         if let Some(presentation_viewport) = presentation_viewport
             && let Some(readout) = cross_section_hover_readout_for_response(
-                &self.render_runtime.render_coordination,
+                &self.render_coordination,
                 self.dataset.retained_leases(),
                 cross_section_readout::CrossSectionReadoutInput {
                     view,
@@ -605,7 +607,6 @@ impl MiranteWorkbenchApp {
             )
         });
         let panel = self
-            .render_runtime
             .render_coordination
             .surface(panel_id.presentation_slot());
         let status = panel
@@ -1124,7 +1125,7 @@ impl eframe::App for MiranteWorkbenchApp {
                                 *view.camera(),
                                 active_catalog_layer.shape().spatial(),
                                 active_catalog_layer.grid_to_world(),
-                                self.render_runtime.presentation_viewport,
+                                self.render_coordination.presentation_viewport,
                             ),
                         ));
                     }
@@ -1132,7 +1133,7 @@ impl eframe::App for MiranteWorkbenchApp {
                         match reset_view_command(
                             &application_snapshot,
                             view,
-                            self.render_runtime.presentation_viewport,
+                            self.render_coordination.presentation_viewport,
                         ) {
                             Ok(command) => application_commands.push(command),
                             Err(error) => tracing::warn!(%error, "view reset rejected"),
@@ -1248,7 +1249,7 @@ impl eframe::App for MiranteWorkbenchApp {
                             "fidelity",
                             composite_fidelity_label(
                                 &application_snapshot,
-                                &self.render_runtime,
+                                &self.render_coordination,
                             ),
                         );
                         if let Some(hover) = self.egui_ui.hovered_pixel {
@@ -1718,14 +1719,19 @@ impl eframe::App for MiranteWorkbenchApp {
                         );
                     });
                     ui_kit::section(ui, "Frame", |ui| {
-                        show_frame_fidelity_property_rows(ui, &self.render_runtime.frame_fidelity);
+                        show_frame_fidelity_property_rows(
+                            ui,
+                            &self.render_coordination.frame_fidelity,
+                        );
                         ui_kit::property_row(
                             ui,
                             "pixels",
-                            self.render_runtime
+                            self.render_coordination
                                 .render_viewport
                                 .width_pixels()
-                                .saturating_mul(self.render_runtime.render_viewport.height_pixels())
+                                .saturating_mul(
+                                    self.render_coordination.render_viewport.height_pixels(),
+                                )
                                 .to_string(),
                         );
                         ui_kit::property_row(ui, "nonzero", "unavailable");
@@ -2164,7 +2170,7 @@ impl eframe::App for MiranteWorkbenchApp {
                         );
                         if let Ok(camera_frame) = CameraFrame::new(
                             *view.camera(),
-                            self.render_runtime.presentation_viewport,
+                            self.render_coordination.presentation_viewport,
                         ) {
                             let camera_forward = camera_frame.axes().forward();
                             ui_kit::property_row(
@@ -2192,12 +2198,13 @@ impl eframe::App for MiranteWorkbenchApp {
                         if let Some(error) = self.dataset.last_plan_error() {
                             ui_kit::status_badge(ui, StatusTone::Error, error);
                         }
-                        if let Some(error) = &self.render_runtime.frame_fidelity.last_capacity_error
+                        if let Some(error) =
+                            &self.render_coordination.frame_fidelity.last_capacity_error
                             && self.dataset.last_plan_error() != Some(error.as_str())
                         {
                             ui_kit::status_badge(ui, StatusTone::Error, error);
                         }
-                        for (slot, panel) in self.render_runtime.render_coordination.iter() {
+                        for (slot, panel) in self.render_coordination.iter() {
                             if let Some(failure) = panel.render_failure() {
                                 let panel_id = PanelId::from_presentation_slot(slot);
                                 ui_kit::status_badge(
@@ -2273,7 +2280,7 @@ impl eframe::App for MiranteWorkbenchApp {
         let command_apply_ms = duration_ms(command_apply_started.elapsed());
 
         let display_refresh_trigger_started = Instant::now();
-        rerender_requested |= take_lod_replan_pending(&mut self.render_runtime);
+        rerender_requested |= self.render_coordination.take_refresh_request();
         if rerender_requested {
             self.refresh_frame(ui.ctx());
         } else if texture_refresh_requested {
@@ -2302,7 +2309,7 @@ impl eframe::App for MiranteWorkbenchApp {
             &self.import.workers,
             &self.analysis_runtime,
             &self.dataset,
-            &self.render_runtime,
+            &self.render_coordination,
             &self.native_presentation,
         ) || workbench_playback_runtime::source_verification_polling_required(
             self.pending_automatic_source_verification.is_some(),

@@ -150,8 +150,8 @@ pub fn run_headless_smoke(
     let report = AppSmokeReport {
         dataset_label: snapshot.catalog().label().to_owned(),
         layer_count: snapshot.catalog().len(),
-        frame_width: u64::from(opened.render_runtime.render_viewport.width_pixels()),
-        frame_height: u64::from(opened.render_runtime.render_viewport.height_pixels()),
+        frame_width: u64::from(opened.render_coordination.render_viewport.width_pixels()),
+        frame_height: u64::from(opened.render_coordination.render_viewport.height_pixels()),
         nonzero_pixels,
         max_value,
         displayed_scale_level: Some(opened.dataset.current_scale().get()),
@@ -223,10 +223,10 @@ fn load_current_requirements(
     let plan = plan_current_3d(
         snapshot.catalog(),
         application_view(&snapshot),
-        opened.render_runtime.presentation_viewport,
+        opened.render_coordination.presentation_viewport,
         render_extent_from_dimensions(
-            u64::from(opened.render_runtime.render_viewport.width_pixels()),
-            u64::from(opened.render_runtime.render_viewport.height_pixels()),
+            u64::from(opened.render_coordination.render_viewport.width_pixels()),
+            u64::from(opened.render_coordination.render_viewport.height_pixels()),
         )?,
         DatasetDemandPlanLimits::new(
             MAX_RENDER_REQUIREMENTS,

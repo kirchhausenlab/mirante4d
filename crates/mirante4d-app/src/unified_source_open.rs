@@ -27,7 +27,7 @@ use mirante4d_storage::{
 use crate::{
     FrameCompleteness, FrameFidelityStatus, LodDecisionReason, StartupDiagnostics,
     collect_startup_diagnostics,
-    current_runtime::{analysis::AnalysisProductRuntime, render::CurrentRenderRuntime},
+    current_runtime::analysis::AnalysisProductRuntime,
     dataset_requests::DatasetDemandState,
     transfer_presets::default_channel_presets,
     viewport::{
@@ -43,7 +43,7 @@ pub(crate) struct UnifiedOpenedSource {
     pub(crate) dataset: DatasetDemandState,
     pub(crate) catalog: Arc<DatasetCatalog>,
     pub(crate) workspace: UnboundWorkspace,
-    pub(crate) render_runtime: CurrentRenderRuntime,
+    pub(crate) render_coordination: RenderCoordinationState,
     pub(crate) analysis_runtime: AnalysisProductRuntime,
     pub(crate) startup_diagnostics: StartupDiagnostics,
 }
@@ -130,14 +130,15 @@ pub(crate) fn open(
         .ok_or_else(|| anyhow::anyhow!("unified runtime did not supply its CPU ledger"))?;
 
     let workspace = workspace_from_catalog(catalog.as_ref())?;
-    let (render_runtime, analysis_runtime) = initial_runtime_state(catalog.as_ref(), &workspace)?;
+    let (render_coordination, analysis_runtime) =
+        initial_runtime_state(catalog.as_ref(), &workspace)?;
     let resource_identity = catalog.scientific_identity().resource_identity();
     let dataset = DatasetDemandState::new(runtime, cpu_ledger, resource_identity, selected_path);
     Ok(UnifiedOpenedSource {
         dataset,
         catalog,
         workspace,
-        render_runtime,
+        render_coordination,
         analysis_runtime,
         startup_diagnostics: collect_startup_diagnostics(),
     })
@@ -289,7 +290,7 @@ fn runtime_config(
 fn initial_runtime_state(
     catalog: &DatasetCatalog,
     workspace: &UnboundWorkspace,
-) -> anyhow::Result<(CurrentRenderRuntime, AnalysisProductRuntime)> {
+) -> anyhow::Result<(RenderCoordinationState, AnalysisProductRuntime)> {
     let view = workspace.view();
     let active = catalog
         .layer(view.active_layer())
@@ -299,12 +300,7 @@ fn initial_runtime_state(
     let mut fidelity = FrameFidelityStatus::new_with_presentation(viewport, presentation);
     fidelity.completeness = FrameCompleteness::Loading;
     fidelity.reason = LodDecisionReason::ExactS0;
-    let render = CurrentRenderRuntime::opened(
-        presentation,
-        viewport,
-        fidelity,
-        RenderCoordinationState::default(),
-    );
+    let render = RenderCoordinationState::new(fidelity);
     let mut analysis = AnalysisProductRuntime::new();
     analysis.set_roi([0; 3], active.shape().spatial().dimensions())?;
     Ok((render, analysis))

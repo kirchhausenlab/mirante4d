@@ -107,8 +107,8 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
         "LOD",
         format!(
             "shown {:?}, target s{}",
-            app.render_runtime.frame_fidelity.displayed_scale_level,
-            app.render_runtime.frame_fidelity.target_scale_level,
+            app.render_coordination.frame_fidelity.displayed_scale_level,
+            app.render_coordination.frame_fidelity.target_scale_level,
         ),
     );
     ui_kit::property_row(
@@ -121,7 +121,7 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
             .map(|panel| panel.label().to_owned())
             .unwrap_or_else(|| "none".to_owned()),
     );
-    for (slot, panel) in app.render_runtime.render_coordination.iter() {
+    for (slot, panel) in app.render_coordination.iter() {
         if slot.is_cross_section() {
             let panel_id = PanelId::from_presentation_slot(slot);
             ui_kit::property_row(ui, format!("2D {}", panel_id.label()), panel_summary(panel));
@@ -151,13 +151,13 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
             ),
         );
     }
-    if let Some(timing) = app.render_runtime.last_display_refresh_timing {
+    if let Some(timing) = app.render_coordination.last_display_refresh_timing {
         ui_kit::property_row(
             ui,
             "display timing",
             format!(
                 "{}: render {:.2} ms, GPU upload {}, GPU compute {}, total {:.2} ms",
-                timing.path.label(),
+                crate::display_refresh::display_refresh_path_label(timing.path),
                 timing.render_ms,
                 optional_ms(timing.gpu_upload_ms),
                 optional_ms(timing.gpu_compute_ms),
@@ -165,7 +165,7 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
             ),
         );
     }
-    show_frame_fidelity_property_rows(ui, &app.render_runtime.frame_fidelity);
+    show_frame_fidelity_property_rows(ui, &app.render_coordination.frame_fidelity);
 }
 
 pub(crate) fn diagnostics_summary_text(app: &MiranteWorkbenchApp) -> String {
@@ -218,7 +218,7 @@ pub(crate) fn diagnostics_summary_text(app: &MiranteWorkbenchApp) -> String {
         app.dataset.retained_leases().missing_len(),
         app.dataset.current_scale().get(),
     ));
-    for (slot, panel) in app.render_runtime.render_coordination.iter() {
+    for (slot, panel) in app.render_coordination.iter() {
         if let Some(schedule) = panel.cross_section_schedule() {
             let panel_id = PanelId::from_presentation_slot(slot);
             text.push_str(&format!(

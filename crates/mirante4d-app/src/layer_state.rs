@@ -2,8 +2,8 @@ use mirante4d_application::ApplicationSnapshot;
 use mirante4d_project_model::ViewState;
 
 use crate::{
-    DisplayedFrameFreshness, FrameCompleteness, LodDecisionReason, application_view,
-    current_runtime::{analysis::AnalysisProductRuntime, render::CurrentRenderRuntime},
+    DisplayedFrameFreshness, FrameCompleteness, LodDecisionReason, RenderCoordinationState,
+    application_view, current_runtime::analysis::AnalysisProductRuntime,
     dataset_requests::DatasetDemandState,
 };
 
@@ -14,7 +14,7 @@ pub(crate) fn reconcile_view_runtime(
     previous_view: &ViewState,
     snapshot: &ApplicationSnapshot,
     dataset: &mut DatasetDemandState,
-    render: &mut CurrentRenderRuntime,
+    render: &mut RenderCoordinationState,
     analysis: &mut AnalysisProductRuntime,
 ) -> anyhow::Result<bool> {
     let view = application_view(snapshot);
@@ -38,7 +38,7 @@ pub(crate) fn reconcile_view_runtime(
             );
         }
         drop(dataset.take_retained_leases());
-        render.render_coordination.invalidate_cross_sections();
+        render.invalidate_cross_sections();
         analysis.set_roi([0; 3], layer.shape().spatial().dimensions())?;
     }
 
@@ -46,12 +46,12 @@ pub(crate) fn reconcile_view_runtime(
     Ok(source_selection_changed)
 }
 
-fn mark_preserved_frame_stale(render: &mut CurrentRenderRuntime) {
+fn mark_preserved_frame_stale(render: &mut RenderCoordinationState) {
     render.frame_fidelity.display_freshness = DisplayedFrameFreshness::Stale;
     render.frame_fidelity.completeness = FrameCompleteness::Loading;
     render.frame_fidelity.reason = LodDecisionReason::LoadingTargetScale;
     render.frame_fidelity.frame_time_ms = None;
     render.frame_fidelity.last_failure_kind = None;
     render.frame_fidelity.last_capacity_error = None;
-    render.lod_replan_pending = true;
+    render.request_refresh();
 }
