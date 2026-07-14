@@ -1,7 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use mirante4d_format::{FORMAT_ID, SCHEMA_VERSION};
-
 pub(crate) const DIAGNOSTICS_FORMAT: &str = "mirante4d-diagnostics-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,16 +46,12 @@ impl StartupDiagnostics {
             "Mirante4D diagnostics\n\
              diagnostics_format: {}\n\
              app_version: {}\n\
-             native_format: {}\n\
-             native_schema_version: {}\n\
              platform: {}\n\
              logs_path: {}\n\
              dataset: {}\n\
              gpu_adapter: {}\n",
             self.format,
             self.app_version,
-            FORMAT_ID,
-            SCHEMA_VERSION,
             self.target_summary(),
             logs_path,
             dataset,
@@ -143,5 +137,16 @@ mod tests {
                 .unwrap()
                 .contains("Vulkan")
         );
+    }
+
+    #[test]
+    fn startup_summary_reports_runtime_facts_without_assuming_a_dataset_format() {
+        let diagnostics = collect_startup_diagnostics();
+
+        let summary = diagnostics.summary_text(None, None);
+
+        assert!(summary.contains("diagnostics_format: mirante4d-diagnostics-v1"));
+        assert!(summary.contains("dataset: none"));
+        assert!(summary.contains("gpu_adapter: not initialized"));
     }
 }

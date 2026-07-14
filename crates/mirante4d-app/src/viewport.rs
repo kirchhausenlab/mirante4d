@@ -5,7 +5,6 @@ use mirante4d_domain::{
     CameraView, GridToWorld, IsoShadingPolicy, Projection, RenderState, SamplingPolicy, Shape3D,
     UnitQuaternion, WorldPoint3,
 };
-use mirante4d_format::CurrentGridToWorldExt;
 use mirante4d_project_model::ViewState;
 use mirante4d_render_api::{CameraFrame, DEFAULT_PRESENTATION_VIEWPORT, PresentationViewport};
 use mirante4d_renderer::{
@@ -100,11 +99,14 @@ pub(crate) fn render_viewport_for_display_size(
 }
 
 fn shape_center_world(shape: Shape3D, grid_to_world: GridToWorld) -> DVec3 {
-    grid_to_world.transform_point_vec(DVec3::new(
-        (shape.x().saturating_sub(1)) as f64 * 0.5,
-        (shape.y().saturating_sub(1)) as f64 * 0.5,
-        (shape.z().saturating_sub(1)) as f64 * 0.5,
-    ))
+    transform_grid_point(
+        grid_to_world,
+        DVec3::new(
+            (shape.x().saturating_sub(1)) as f64 * 0.5,
+            (shape.y().saturating_sub(1)) as f64 * 0.5,
+            (shape.z().saturating_sub(1)) as f64 * 0.5,
+        ),
+    )
 }
 
 fn shape_bounds_corners_world(shape: Shape3D, grid_to_world: GridToWorld) -> [DVec3; 8] {
@@ -115,15 +117,25 @@ fn shape_bounds_corners_world(shape: Shape3D, grid_to_world: GridToWorld) -> [DV
     let max_y = shape.y() as f64 - 0.5;
     let max_z = shape.z() as f64 - 0.5;
     [
-        grid_to_world.transform_point_vec(DVec3::new(min_x, min_y, min_z)),
-        grid_to_world.transform_point_vec(DVec3::new(max_x, min_y, min_z)),
-        grid_to_world.transform_point_vec(DVec3::new(min_x, max_y, min_z)),
-        grid_to_world.transform_point_vec(DVec3::new(max_x, max_y, min_z)),
-        grid_to_world.transform_point_vec(DVec3::new(min_x, min_y, max_z)),
-        grid_to_world.transform_point_vec(DVec3::new(max_x, min_y, max_z)),
-        grid_to_world.transform_point_vec(DVec3::new(min_x, max_y, max_z)),
-        grid_to_world.transform_point_vec(DVec3::new(max_x, max_y, max_z)),
+        transform_grid_point(grid_to_world, DVec3::new(min_x, min_y, min_z)),
+        transform_grid_point(grid_to_world, DVec3::new(max_x, min_y, min_z)),
+        transform_grid_point(grid_to_world, DVec3::new(min_x, max_y, min_z)),
+        transform_grid_point(grid_to_world, DVec3::new(max_x, max_y, min_z)),
+        transform_grid_point(grid_to_world, DVec3::new(min_x, min_y, max_z)),
+        transform_grid_point(grid_to_world, DVec3::new(max_x, min_y, max_z)),
+        transform_grid_point(grid_to_world, DVec3::new(min_x, max_y, max_z)),
+        transform_grid_point(grid_to_world, DVec3::new(max_x, max_y, max_z)),
     ]
+}
+
+fn transform_grid_point(grid_to_world: GridToWorld, grid_point: DVec3) -> DVec3 {
+    let grid_point = WorldPoint3::new(grid_point.x, grid_point.y, grid_point.z)
+        .expect("shape-derived grid point is finite");
+    dvec3(
+        grid_to_world
+            .transform_point(grid_point)
+            .expect("validated grid transform maps the shape to finite world coordinates"),
+    )
 }
 
 fn fit_camera_to_world_bounds(
@@ -513,4 +525,22 @@ pub(crate) fn fit_size(image_size: egui::Vec2, available: egui::Vec2) -> egui::V
     }
     let scale = (available.x / image_size.x).min(available.y / image_size.y);
     image_size * scale
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_camera_targets_the_affine_world_center() {
+        let shape = Shape3D::new(7, 5, 3).unwrap();
+        let grid_to_world = GridToWorld::from_row_major([
+            2.0, 0.0, 0.0, 10.0, 0.0, 3.0, 0.0, 20.0, 0.0, 0.0, 4.0, 30.0, 0.0, 0.0, 0.0, 1.0,
+        ])
+        .unwrap();
+
+        let camera = default_camera_for_shape(shape, grid_to_world);
+
+        assert_eq!(camera.target().components(), [12.0, 26.0, 42.0]);
+    }
 }

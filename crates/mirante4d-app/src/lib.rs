@@ -83,7 +83,6 @@ use histogram::{
     auto_dvr_opacity_transfer_from_histogram, auto_signal_window_from_histogram,
     histogram_bins_label, histogram_can_auto_window, histogram_status_label,
 };
-pub use image_compositing::mip_to_color_image;
 use import_ui::{
     ImportTask, ImportTaskMessage, PendingTiffImport, TiffImportSetupTask,
     TiffImportSetupTaskMessage, accepted_reviewed_plan_for_pending_tiff_import,
