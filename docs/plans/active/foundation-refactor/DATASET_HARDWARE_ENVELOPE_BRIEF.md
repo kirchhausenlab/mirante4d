@@ -56,14 +56,10 @@ size varies with the data and is not a substitute for workload complexity.
 | `DS-2 combined` | Deterministic scheduled stress case: `8t x 4c x 256 x 256 x 256`, with one dtype per case and `float32` as the widest case (`2 GiB` logical `s0`) | Prove channel/time scheduling, hidden-channel exclusion, mixed display, playback, and resource accounting together without combining the extreme profiles | New target; current deterministic evidence reaches only 2 channels x 3 timepoints and 4 channels separately at `8^3` |
 | `DS-3 spatial-extreme` | Opaque restricted reference profile: `1t x 1c`, `uint8`, `2563 x 2240 x 4183`, seven scales, about `22.366 GiB` logical `s0` | Progressive large-volume open, 2D/3D navigation, MIP/DVR/ISO, truthful LOD/capacity state, cancellation, and bounded RSS/VRAM | Useful private product diagnostics exist; clean revision-bound qualification does not |
 | `DS-4 temporal-extreme` | Opaque restricted reference profile: `365t x 1c`, `float32`, `74 x 608 x 600` per timepoint, four scales, about `36.706 GiB` logical `s0` across time | Progressive open, timepoint switching, playback/prefetch, exact analysis, cancellation, and bounded RSS/VRAM | Useful private product diagnostics exist; clean revision-bound qualification does not |
-| `DS-X logical-scale-simulator` | Deterministic arithmetic/lazy store that advertises at least `1 TiB` of logical source, `1,000,000` possible resource keys, and `1,000` timepoints without storing the payload or a per-key table | Prove bootstrap/open/planning/scheduler complexity depends on small metadata plus the visible budgeted working set, not total logical size | New structural test only; its own disk footprint is capped at `64 MiB`, memory stays inside the normal ledger, and it never qualifies a real `1 TiB` dataset |
 
-`DS-X` is not a generated `.m4d` package and never allocates or writes `1 TiB`.
-It behaves like a calculator: when a test asks for one brick coordinate, it
-generates that small brick deterministically and discards or caches it under the
-normal budget. If open or planning code tries to allocate one object per voxel,
-brick, or timepoint, the test exposes that scaling defect without requiring
-large storage.
+Checked count, overflow, and lazy-planning tests use small inputs and explicit
+arithmetic bounds. The foundation does not advertise simulated TiB datasets or
+materialize large packages merely to test scaling.
 
 The supported envelope is a **union of named profiles, not a Cartesian product
 of maxima**. In particular, `365` timepoints, four channels, `float32`, and the
@@ -105,25 +101,14 @@ does not qualify hundreds-of-gigabytes or terabyte-scale real data.
   byte-budgeted. Full validation may scan all payloads only as a cancellable
   background operation.
 
-### Required Pathology Matrix
+### Focused Pathology Coverage
 
-The replacement suite must distinguish these cases rather than hiding them
-inside happy-path writer/reader round trips:
-
-- all-valid zero data, sparse nonzero signal, dense/smooth signal, explicitly
-  all-invalid masked bricks, and a reviewed no-data sentinel;
-- thin/2D axes, anisotropic spacing, non-identity transforms and units,
-  non-divisible boundary bricks, and multiscale edge alignment;
-- all three dtypes, finite `float32` extremes, explicit rejection of non-finite
-  values, and hidden-channel exclusion from read/decode/upload work;
-- highly compressible and effectively incompressible payloads;
-- missing occupied payloads, missing/truncated/corrupt shards, checksum or
-  index mismatch, unsupported codec/dtype/layout, and contradictory metadata;
-- ambiguous TIFF grouping, mixed source shapes/dtypes, recursive or mixed
-  directory layouts, incomplete calibration, and insufficient output space;
-- budget smaller than a minimum work unit, queue/eviction pressure, stale
-  generations, cancellation at every long stage, playback/prefetch pressure,
-  and clean restart after interruption.
+A small set of fixtures collectively covers valid zero and sparse data, the
+supported dtypes and source layouts, anisotropy and non-divisible edges,
+validity, representative malformed grouping/metadata/corruption,
+cancellation/restart, and insufficient space. No Cartesian product is
+required. Rendering, playback, GPU upload, and scheduler-pressure cases belong
+to their owning packages.
 
 Valid zero is scientific data. Only explicit validated validity metadata may
 classify a brick as having no renderable samples.

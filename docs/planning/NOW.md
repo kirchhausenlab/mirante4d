@@ -4,43 +4,57 @@ Last updated: 2026-07-13
 
 ## Current Checkpoint
 
-WP-10B B1 through B3 are complete. B3 is accepted on protected main at
-`8fdd94dc9c60406e8de8a96749d7148d38b1dc7a`.
+WP-10B is accepted on protected main at
+`8257f8c5bdc011651c8e74ab85dfdc86717b82d6` (tree
+`56e4ac27f50311b49226520ae6c382aacfe9dde6`), tagged
+`foundation-wp-10b-exit-1`. Native project persistence is the sole product
+route. Its exhaustive durability matrix is not a recurring gate for unrelated
+work.
 
-B4 is the current implementation candidate. The product now constructs and
-polls `ProjectStoreApplicationService` as its sole project-persistence route;
-New, Open, Save, Save As, revision-aware autosave, recovery, dirty close, and
-actor join use the accepted project-store actor. The project-v15 bridge and
-`CurrentProjectRuntime` files are deleted, with architecture and predecessor
-guards enforcing their absence.
+WP-11 is active. It builds the off-product target TIFF/OME-TIFF importer; the
+current importer remains the sole reachable product route until WP-10C.
+Analysis execution remains unavailable until WP-12.
 
-The fixed `b4_project_persistence` automation implements the required bounded
-three-launch save/autosave/external-kill/recovery/Save-As/final-reopen
-scenario. B4 and WP-10B remain unaccepted until one exact clean revision passes
-the public, trusted project-store-lifecycle, and required real-display evidence
-at 1280x720 and 1920x1080, then lands on protected main.
+## WP-11 Entry Note
 
-The unified runtime is the sole live interactive dataset-demand and CPU-byte
-authority. Analysis execution remains unavailable until WP-12.
+Predecessor: clean `foundation-wp-10b-exit-1` at the commit and tree above.
 
-## WP-10B Entry Boundary
+Outcome: one bounded, cancellable, restartable, deterministic importer that
+turns reviewed TIFF/OME-TIFF sources into the accepted sharded target format,
+records reproducible source/recipe/derivation facts, validates the result, and
+publishes it atomically to a previously absent destination.
 
-The accepted entry's sole correction permits `mirante4d-project-store` to
-depend directly on the unchanged `mirante4d-domain` API so it can encode and
-reconstruct the domain-owned values in `ProjectGenerationProjection`. It does
-not authorize another persistence DTO owner or any other dependency change.
+Inherited invariants: source bytes are never modified; memory, queues, I/O, and
+physical objects are bounded; target storage stays sharded; cancellation never
+exposes an incomplete package; scientific identity is storage-independent;
+segmentation remains absent.
 
-The entry must bind to tag `foundation-wp-09a-exit-1`, commit
-`1b1e7d5534f29b010cc346d434811a3906fb40e1`, and tree
-`42846232a04ec7548a3bb9b1b6598e79be29e72b`. It must freeze the final
-directory-backed project-store contract, persistence-owned canonical records
-and independent fixtures, background actor and lease ownership, exact
-revision/autosave/recovery behavior, bounded object growth, and the declared
-Linux durability/fault-injection matrix. Project binding remains gated on a
-verified D-009 scientific identity.
+Allowed scope: the new `mirante4d-import-pipeline` crate, its focused tests,
+small supporting changes to accepted target APIs where immediately necessary,
+the existing contract-lane registry, and owning documentation. The target
+crate may depend only on `domain`, `identity`, `dataset`, and `storage`.
 
-WP-10B is a product persistence hard cutover. The B4 candidate deletes the
-private project-v15 bridge without a legacy reader or converter; acceptance
-still requires the clean-revision evidence above. WP-11 is the next protected-
-branch checkpoint, following the
-[foundation handoff](../plans/active/FOUNDATION_REFACTOR_HANDOFF.md).
+Authority and deletion: WP-11 owns the off-product replacement producer. It
+does not wire a second UI/application route or delete `mirante4d-import`;
+WP-10C performs that activation and predecessor deletion.
+
+Non-goals: replacement/backup publication, proprietary formats, generic
+OME-Zarr import, remote stores, public-data release machinery, private-data or
+simulated-TiB qualification, hard throughput claims, GPU/display work, and
+segmentation.
+
+Risks and stop conditions: stop for owner review if the accepted storage or
+identity wire must change, if the TIFF decoder cannot honor the declared byte
+budget without narrowing supported input, or if restart would require a
+file-per-brick scratch layout.
+
+Evidence: focused contract tests for source layout/dtype rejection, bounded
+streaming, deterministic output, cancellation/restart and corrupt-checkpoint
+handling, free-space refusal, source/destination preservation, and atomic
+publication; one accepted-source-fixture import checked with exact/scientific
+target validation and the existing independent target reader. Product-open,
+private T5, and repeated performance matrices do not apply while WP-11 remains
+off-product.
+
+Rollback unit: the WP-11 branch/checkpoint; no product authority changes before
+WP-10C.

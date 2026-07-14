@@ -2,14 +2,13 @@
 
 Status: ACTIVE PUBLIC-EPOCH PROGRAM
 Last reviewed: 2026-07-13
-Current technical sequence: WP-10B, WP-11, then the remaining packages below
+Current technical sequence: WP-11, then the remaining packages below
 Public-data publication: deferred to a separate future handoff
-WP-10B predecessor: `foundation-wp-09a-exit-1`
-Completed through: WP-10B B3 at
-`8fdd94dc9c60406e8de8a96749d7148d38b1dc7a`
-Current checkpoint: WP-10B B4 product-persistence cutover candidate
-Next protected-branch checkpoint: accept B4 and exit WP-10B after exact clean
-public, trusted-local, and real-display evidence
+WP-11 predecessor: `foundation-wp-10b-exit-1`
+Completed through: WP-10B at
+`8257f8c5bdc011651c8e74ab85dfdc86717b82d6`
+Current checkpoint: WP-11 import-pipeline entry
+Next protected-branch checkpoint: accept the off-product WP-11 importer
 
 ## Purpose
 
@@ -186,11 +185,10 @@ target conformance package at `9b3a81d79a50027c0a8ddedc535021809a99d928`
 WP-09A accepted the bounded off-product progressive Vulkan runtime and
 independent CPU reference at `1b1e7d5534f29b010cc346d434811a3906fb40e1`
 (`foundation-wp-09a-exit-1`) before WP-10B entry work began.
-WP-10B B3 accepted source verification and application integration at
-`8fdd94dc9c60406e8de8a96749d7148d38b1dc7a`. The B4 candidate makes the
-successor service the sole product project route and deletes its predecessor;
-its qualifying evidence, protected-main acceptance, and WP-10B exit remain
-pending.
+WP-10B accepted native project persistence at
+`8257f8c5bdc011651c8e74ab85dfdc86717b82d6`
+(`foundation-wp-10b-exit-1`). The successor service is the sole product
+project route and its predecessor is deleted.
 
 ## Dataset And Fixture Boundary
 
@@ -207,15 +205,12 @@ open-data handoff after the technical foundation exists.
 
 ## Package Entry And Exit
 
-Before editing an eligible high-risk package, create a short entry brief bound
-to the accepted predecessor. It must name:
-
-- exact outcome and inherited requirements;
-- current commit/tree/tag and clean-worktree proof;
-- allowed paths, APIs, deletions, and forbidden shortcuts;
-- exact tools, commands, fixtures, hardware, thresholds, and evidence root;
-- automated and product-open acceptance;
-- stop conditions, checkpoint size, rollback unit, and authority flip.
+Before editing an eligible high-risk package, record a short entry note bound
+to the accepted predecessor. It names the outcome, inherited invariants,
+allowed scope and deletions, focused verification, stop conditions, rollback
+unit, and authority flip. Name hardware and performance thresholds only when
+the package makes such a claim. Product-open validation is required only when
+product-reachable behavior changes.
 
 An entry brief may specialize current paths and measurements; it cannot change
 this program's scope, architecture, order, or proof class. A discovered gap

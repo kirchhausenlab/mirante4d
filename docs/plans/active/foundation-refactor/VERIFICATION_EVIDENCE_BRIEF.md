@@ -116,12 +116,10 @@ rediscovers proof by scanning persistent paths.
 | T5 restricted pre-public | Data not yet cleared for publication | Trusted local storage only | Temporary validation until replaced by T3/T4 |
 
 Writer/reader round trips are not independent conformance evidence by
-themselves. T1 bytes or expected facts must be produced from an independent
-specification/tool/oracle, not merely reviewed after the Mirante writer created
-them. The handoff fixture matrix must cover every supported dtype; time/channel
-and axis arrangement; anisotropy, transforms, and units; multiscale, sharding,
-compression, no-data, validity, empty/boundary/sparse cases; representative TIFF
-layouts; and corrupt, truncated, missing, or unsupported inputs.
+themselves. T1 bytes or expected facts come from an independent specification,
+tool, or oracle. Each package reuses the smallest accepted fixture set that
+covers its changed behavior and adds a fixture only for a demonstrated gap; no
+Cartesian validation matrix is required.
 
 The fixture registry records ID/version, digest algorithm/value, generator and
 tool versions, provenance, license, size, expected-fact version, roles, owner,
@@ -454,17 +452,14 @@ per-physical-object/per-shard descriptors, provenance/recipe objects,
 directories, and maximum depth/fan-out.
 
 A non-fill DS-0 fixture forces every expected shard to exist and asserts the
-exact addressed-versus-actual count. Every production import and acceptance
-report records logical bricks, addressed/actual outer shards, all regular
-metadata/index/provenance objects, maximum directory depth/fan-out, logical
-uncompressed shard capacity, encoded object size, actual bytes read and bytes
-decoded for one-brick access, and storage/decode amplification. Instrument this
-at the storage boundary; never infer it from whole-package totals. Any
+exact addressed-versus-actual count. Every import enforces the accepted
+storage limits. Acceptance records concise shard, object, and fan-out totals;
+one focused storage test records exact one-brick read/decode amplification at
+the storage boundary. Any
 per-logical-brick file, checksum sidecar, manifest record, or other unbounded
 physical-object relation fails. Per-shard/object descriptors in bounded
 canonical manifest pages remain required by D-009. Legitimately elided all-fill
-shards must be derivable from validated metadata. DS-X remains a lazy calculator
-and never enumerates or materializes its advertised keyspace.
+shards must be derivable from validated metadata.
 
 D-010 has a separate filesystem-growth invariant: project object/generation
 counts may scale with saved revisions, retained artifacts, and total encoded
@@ -542,9 +537,10 @@ Release-quality profiles are:
 - sustained presented-frame-interval session-p95 qualification: sixty
   independent thirty-second scenario runs; retain each within-run nearest-rank
   empirical p95 and require zero session-level threshold violations;
-- import/throughput/RSS: at least seven independent process runs; five
-  DS-3/DS-4 runs can yield only explicitly preliminary/inconclusive relative
-  evidence, and neither sample count supports a p95 claim; and
+- import/throughput/RSS: assert hard byte, queue, object-count, free-space, and
+  cancellation bounds with deterministic counters and focused tests. One or a
+  few practical local runs may report throughput and observed RSS without a
+  release-quality performance claim; and
 - resource ceilings, corruption, identity, and correctness: any one valid
   violation fails and cannot be averaged away.
 

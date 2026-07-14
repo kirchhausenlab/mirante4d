@@ -150,13 +150,15 @@ D-009 verification, source-generation-aware promotion and invalidation,
 authenticated project-object reuse and Save As closure copying, and the
 revision-aware autosave service.
 
-The B4 implementation candidate makes that service and the accepted actor the
-sole product project-persistence route. New, Open, Save, Save As, autosave,
-recovery, dirty close, and joined shutdown are wired, while the project-v15
-bridge and `CurrentProjectRuntime` files are deleted. The fixed three-launch
-native automation is implemented. Final clean-revision public, trusted-local,
-and real-display evidence and protected-main acceptance remain pending; B4 and
-WP-10B are not yet accepted.
+WP-10B B4 is accepted on protected main at
+`8257f8c5bdc011651c8e74ab85dfdc86717b82d6` (tree
+`56e4ac27f50311b49226520ae6c382aacfe9dde6`), tagged
+`foundation-wp-10b-exit-1`. The service and actor are the sole product
+project-persistence route. New, Open, Save, Save As, autosave, recovery, dirty
+close, and joined shutdown are wired; the project-v15 bridge and
+`CurrentProjectRuntime` are deleted. The exact-main public run passed, and the
+owner accepted the preceding durability and three-launch product evidence
+without requiring a redundant power-cut rerun.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
@@ -192,9 +194,9 @@ See [testing](TESTING.md) for commands and claim language.
   recovery selection, and authenticated Save As while retaining exact roots and
   leases. B2 durability qualification now passes for its exact off-product
   revision. B3 added actor-authenticated unchanged-object reuse, destination-
-  local Save As closure copying, and exact autosave scheduling. The B4
-  candidate constructs and polls that application service as the sole product
-  path for ordinary project persistence and recovery. Product maintenance and
+  local Save As closure copying, and exact autosave scheduling. The application
+  service is the sole product path for ordinary project persistence and
+  recovery. Product maintenance and
   Purge UI remain absent. PlanCompaction
   does not authorize Trash, expose a physical object/byte plan or reclaim
   estimate, or prove backup approval. Private FullVerify does not validate

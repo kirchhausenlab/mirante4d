@@ -232,8 +232,8 @@ lane. Save As copies and rehashes that authenticated closure into destination-
 local staging. The application service implements the injected-monotonic-
 clock 30-second-idle/120-second-maximum autosave schedule over the real actor,
 including edit-during-capture, failure, cancellation, and indeterminate-write
-semantics. The B4 candidate constructs and polls it as the sole product project
-route and deletes the project-v15 bridge and `CurrentProjectRuntime`. New,
+semantics. The accepted B4 cutover constructs and polls it as the sole product
+project route and deletes the project-v15 bridge and `CurrentProjectRuntime`. New,
 Open, Save, Save As, recovery selection, dirty close, source replacement, and
 application exit all pass through the service and joined actor lifecycle.
 
