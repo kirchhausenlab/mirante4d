@@ -55,15 +55,20 @@ const SUCCESSOR_OWNED_WORKSPACE_CRATES: [&str; 7] = [
     "mirante4d-render-wgpu",
     "mirante4d-storage",
 ];
+const RETIRED_WORKSPACE_CRATES: [&str; 1] = ["mirante4d-analysis"];
 
-// Keep the WP-08A JSON immutable while checking the small set of dependency
-// edges activated by accepted successor packages. Each addition remains exact;
-// successor-owned crates themselves are delegated separately below.
+// Keep the frozen WP-08A predecessor matrix unchanged while checking the
+// exact dependency changes made by accepted successor cutovers.
 pub(super) fn accepted_successor_normal_dependency_additions(
     crate_name: &str,
 ) -> &'static [&'static str] {
     match crate_name {
-        "mirante4d-app" => &["mirante4d-dataset-runtime", "mirante4d-project-store"],
+        "mirante4d-app" => &[
+            "mirante4d-analysis-core",
+            "mirante4d-analysis-runtime",
+            "mirante4d-dataset-runtime",
+            "mirante4d-project-store",
+        ],
         "mirante4d-application" => &["mirante4d-project-store"],
         "mirante4d-data" => &["blake3", "mirante4d-dataset", "mirante4d-identity"],
         "mirante4d-renderer" => &["mirante4d-dataset"],
@@ -74,22 +79,22 @@ pub(super) fn accepted_successor_normal_dependency_additions(
     }
 }
 
-// Keep the frozen WP-08A predecessor matrix unchanged while retiring the one
-// direct edge made obsolete by the accepted WP-10B B4 hard cutover.
 fn accepted_successor_normal_dependency_removals(crate_name: &str) -> &'static [&'static str] {
     match crate_name {
-        "mirante4d-app" => &["mirante4d-identity"],
+        "mirante4d-app" => &["mirante4d-analysis", "mirante4d-identity"],
+        "xtask" => &["mirante4d-analysis"],
         _ => &[],
     }
 }
 
-// Keep the frozen WP-08A public-root inventory unchanged while admitting the
-// exact application service surface activated by the accepted WP-10B B4 cutover.
+// Keep the frozen WP-08A public-root inventory unchanged while admitting exact
+// additions from accepted successor cutovers.
 pub(super) fn accepted_successor_public_root_additions(
     crate_name: &str,
 ) -> &'static [&'static str] {
     match crate_name {
         "mirante4d-application" => &[
+            "LoadedAnalysisDescriptorBundle",
             "MonotonicClock",
             "ProjectRecoveryStoreLocator",
             "ProjectStoreApplicationService",
@@ -371,16 +376,20 @@ fn validate_dependency_matrix(
         }
     }
 
-    // The immutable WP-08A matrix remains authoritative for its exact
-    // predecessor workspace. A successor checker owns only the crates named
-    // here; every other addition still fails this closure check.
+    // Separately owned successor crates are delegated to their package checks;
+    // every other live workspace crate must match the frozen registry after
+    // accepted predecessor retirement.
     let actual_crates = metadata
         .declared_dependency_kinds_by_name
         .keys()
         .filter(|name| !SUCCESSOR_OWNED_WORKSPACE_CRATES.contains(&name.as_str()))
         .cloned()
         .collect::<BTreeSet<_>>();
-    let expected_crates = declared.keys().cloned().collect::<BTreeSet<_>>();
+    let expected_crates = declared
+        .keys()
+        .filter(|name| !RETIRED_WORKSPACE_CRATES.contains(&name.as_str()))
+        .cloned()
+        .collect::<BTreeSet<_>>();
     if actual_crates != expected_crates {
         bail!(
             "WP-08A dependency matrix does not cover the workspace exactly: missing={:?}, extra={:?}",
@@ -395,6 +404,9 @@ fn validate_dependency_matrix(
 
     let mut crate_paths = BTreeMap::new();
     for (name, entry) in declared {
+        if RETIRED_WORKSPACE_CRATES.contains(&name.as_str()) {
+            continue;
+        }
         let manifest_path = repo_root.join(&entry.path).join("Cargo.toml");
         let manifest = fs::read_to_string(&manifest_path)
             .with_context(|| format!("failed to read {}", manifest_path.display()))?;
@@ -435,7 +447,7 @@ fn validate_dependency_matrix(
                 for dependency in accepted_successor_normal_dependency_removals(&name) {
                     if !expected.remove(*dependency) {
                         bail!(
-                            "WP-10B B4 dependency removal {name} -> {dependency} is not present in the frozen predecessor matrix"
+                            "accepted dependency removal {name} -> {dependency} is absent from the frozen predecessor matrix"
                         );
                     }
                 }
@@ -520,10 +532,15 @@ fn validate_transitional_edges(
 }
 
 fn accepted_expired_transitional_edge(edge: &TransitionalEdge) -> bool {
-    edge.from == "mirante4d-app"
+    let retired_analysis_edge = (edge.from == "mirante4d-analysis"
+        || edge.to == "mirante4d-analysis")
+        && edge.kind == "normal"
+        && matches!(edge.expiry_gate.as_str(), "WP-10C" | "WP-12" | "WP-14");
+    (edge.from == "mirante4d-app"
         && edge.to == "mirante4d-identity"
         && edge.kind == "normal"
-        && edge.expiry_gate == "WP-09C"
+        && edge.expiry_gate == "WP-09C")
+        || retired_analysis_edge
 }
 
 fn validate_normal_edge_closure(
@@ -624,14 +641,16 @@ fn validate_side_effect_capabilities(
             let expired_at_wp08b = capability.capability == "dataset-demand-and-open-workers"
                 && exception.crate_name == "mirante4d-data"
                 && exception.expiry_gate == "WP-08B";
-            let disabled_at_wp08b = capability.capability == "analysis-background-workers"
-                && exception.crate_name == "mirante4d-app";
+            let retired_at_wp12 = (capability.capability == "analysis-export-filesystem"
+                && exception.crate_name == "mirante4d-analysis")
+                || (capability.capability == "analysis-background-workers"
+                    && exception.crate_name == "mirante4d-app");
             let expired_at_wp10b = matches!(
                 capability.capability.as_str(),
                 "project-package-filesystem" | "project-store-background-worker"
             ) && exception.crate_name == "mirante4d-app"
                 && exception.expiry_gate == "WP-10B";
-            if expired_at_wp08b || disabled_at_wp08b || expired_at_wp10b {
+            if expired_at_wp08b || retired_at_wp12 || expired_at_wp10b {
                 continue;
             }
             if !current_crates.insert(&exception.crate_name) {
@@ -672,7 +691,12 @@ fn validate_side_effect_capabilities(
                 &capability.target_owner,
             )?;
         }
-        if current_crates.is_empty() && capability.capability != "analysis-background-workers" {
+        if current_crates.is_empty()
+            && !matches!(
+                capability.capability.as_str(),
+                "analysis-background-workers" | "analysis-export-filesystem"
+            )
+        {
             bail!(
                 "WP-08A side-effect capability {} has no evidenced current owner or exception",
                 capability.capability

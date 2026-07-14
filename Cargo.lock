@@ -2210,21 +2210,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mirante4d-analysis"
-version = "0.1.0"
-dependencies = [
- "approx",
- "glam",
- "mirante4d-data",
- "mirante4d-domain",
- "mirante4d-format",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.17",
-]
-
-[[package]]
 name = "mirante4d-analysis-core"
 version = "0.1.0"
 dependencies = [
@@ -2258,7 +2243,8 @@ dependencies = [
  "egui_kittest",
  "glam",
  "insta",
- "mirante4d-analysis",
+ "mirante4d-analysis-core",
+ "mirante4d-analysis-runtime",
  "mirante4d-application",
  "mirante4d-data",
  "mirante4d-dataset",
@@ -5323,7 +5309,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "glam",
- "mirante4d-analysis",
  "mirante4d-data",
  "mirante4d-dataset",
  "mirante4d-dataset-runtime",

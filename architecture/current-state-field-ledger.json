@@ -44,14 +44,6 @@
       "expires": "WP-10C"
     },
     {
-      "module": "analysis",
-      "path": "crates/mirante4d-app/src/current_runtime/analysis.rs",
-      "type": "CurrentAnalysisRuntime",
-      "composition_field": "analysis_runtime",
-      "expires": "WP-12",
-      "mode": "passive-results-only"
-    },
-    {
       "module": "validation",
       "path": "crates/mirante4d-app/src/current_runtime/validation.rs",
       "type": "CurrentValidationRuntime",
@@ -103,7 +95,6 @@
     "The application owns bounded payload-free request correlation, not decoded pixels.",
     "Only DatasetRequestDispatcher polls DatasetRuntime in product application code.",
     "CurrentDatasetSource is the sole current-storage source bridge.",
-    "CurrentLeaseBridge is the sole current-renderer lease bridge.",
-    "Analysis execution remains unavailable until WP-12."
+    "CurrentLeaseBridge is the sole current-renderer lease bridge."
   ]
 }

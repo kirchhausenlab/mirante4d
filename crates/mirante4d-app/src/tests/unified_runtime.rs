@@ -92,6 +92,258 @@ fn app_dispatches_and_drains_visible_demand_through_one_runtime() {
 }
 
 #[test]
+fn exact_analyses_cancel_save_and_reopen_atomically() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_fixture(FixtureKind::TimeU16_8Cube3T, temp.path()).unwrap();
+    let project_path = temp.path().join("analysis-result.m4dproj");
+    let context = egui::Context::default();
+
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    install_test_project_store(&mut app);
+    verify_test_source(&mut app);
+    app.apply_application_command(ApplicationCommand::AttachVerifiedDataset, &context)
+        .unwrap();
+    assert!(app.project_dirty());
+    app.project_store_noninteractive_paths.initial_save = Some(project_path.clone());
+    app.apply_application_command(ApplicationCommand::RequestProjectSave, &context)
+        .unwrap();
+    wait_for_test_app(&mut app, |app| {
+        app.project_store.as_ref().is_some_and(|service| {
+            let status = service.status();
+            status.lifecycle() == ProjectStoreLifecycle::Established
+                && !status.foreground_active()
+                && !status.autosave_active()
+        }) && !app.project_dirty()
+    });
+
+    assert_eq!(app.analysis_start_unavailable_reason(), None);
+    app.start_product_analysis(analysis_product::ProductAnalysisScope::FullTimeTrace)
+        .unwrap();
+    app.request_analysis_cancel().unwrap();
+    wait_for_test_app(&mut app, |app| {
+        app.analysis_runtime.active_token().is_none()
+            && !app
+                .application
+                .snapshot()
+                .active_operations()
+                .iter()
+                .any(|token| token.kind() == OperationKind::Analysis)
+    });
+    assert!(app.application.snapshot().transient().analysis_tables().is_empty());
+    assert!(app.application.snapshot().transient().analysis_plots().is_empty());
+
+    app.start_product_analysis(analysis_product::ProductAnalysisScope::FullTimeTrace)
+        .unwrap();
+    wait_for_test_app(&mut app, |app| {
+        app.analysis_runtime.active_token().is_none()
+            && app.application.snapshot().transient().analysis_tables().len() == 1
+            && app.application.snapshot().transient().analysis_plots().len() == 1
+            && app
+                .project_store
+                .as_ref()
+                .is_some_and(|service| !service.has_pending_work())
+    });
+    let saved_snapshot = app.application.snapshot();
+    let table_id = saved_snapshot.transient().analysis_tables()[0].id();
+    let plot_id = saved_snapshot.transient().analysis_plots()[0].id();
+    assert_eq!(app.analysis_runtime.table(table_id).unwrap().rows().len(), 3);
+    assert_eq!(app.analysis_runtime.plot(plot_id).unwrap().points().len(), 3);
+    assert!(!app.project_dirty());
+
+    app.start_product_analysis(analysis_product::ProductAnalysisScope::FullTimeTrace)
+        .unwrap();
+    wait_for_test_app(&mut app, |app| {
+        app.analysis_runtime.active_token().is_none()
+            && app.application.snapshot().transient().analysis_tables().len() == 2
+            && app.application.snapshot().transient().analysis_plots().len() == 2
+    });
+
+    app.analysis_runtime.set_roi([1, 1, 1], [2, 2, 2]).unwrap();
+    app.start_product_analysis(analysis_product::ProductAnalysisScope::CurrentTimepointBox)
+        .unwrap();
+    wait_for_test_app(&mut app, |app| {
+        app.analysis_runtime.active_token().is_none()
+            && app.application.snapshot().transient().analysis_tables().len() == 3
+            && app.application.snapshot().transient().analysis_plots().len() == 2
+            && app
+                .project_store
+                .as_ref()
+                .is_some_and(|service| !service.has_pending_work())
+    });
+    let box_table_id = app
+        .application
+        .snapshot()
+        .transient()
+        .selected_analysis_table()
+        .expect("the completed box analysis is selected");
+    assert_eq!(app.analysis_runtime.table(box_table_id).unwrap().rows().len(), 1);
+    assert!(project_path.is_dir());
+
+    close_test_project_store(&mut app);
+    app.dataset.request_shutdown().unwrap();
+    app.source_verification_service
+        .take()
+        .unwrap()
+        .shutdown()
+        .unwrap();
+    drop(app);
+
+    let reopened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut reopened_app = test_workbench_app_without_background_runtime(reopened);
+    install_test_project_store(&mut reopened_app);
+    verify_test_source(&mut reopened_app);
+    reopened_app.project_store_noninteractive_paths.open = Some(project_path);
+    reopened_app
+        .apply_application_command(ApplicationCommand::RequestProjectOpen, &context)
+        .unwrap();
+    wait_for_test_app(&mut reopened_app, |reopened_app| {
+        let snapshot = reopened_app.application.snapshot();
+        matches!(snapshot.workspace(), WorkspaceSnapshot::Bound { .. })
+            && snapshot.transient().analysis_tables().len() == 3
+            && snapshot.transient().analysis_plots().len() == 2
+            && reopened_app.pending_analysis_artifact_load.is_none()
+    });
+    let reopened_snapshot = reopened_app.application.snapshot();
+    let mut row_counts = reopened_snapshot
+        .transient()
+        .analysis_tables()
+        .iter()
+        .map(|descriptor| {
+            reopened_app
+                .analysis_runtime
+                .table(descriptor.id())
+                .expect("reopened analysis table")
+                .rows()
+                .len()
+        })
+        .collect::<Vec<_>>();
+    row_counts.sort_unstable();
+    assert_eq!(row_counts, vec![1, 3, 3]);
+    assert!(reopened_snapshot.transient().analysis_plots().iter().all(
+        |descriptor| reopened_app
+            .analysis_runtime
+            .plot(descriptor.id())
+            .is_some_and(|plot| plot.points().len() == 3)
+    ));
+
+    close_test_project_store(&mut reopened_app);
+    reopened_app.dataset.request_shutdown().unwrap();
+    reopened_app
+        .source_verification_service
+        .take()
+        .unwrap()
+        .shutdown()
+        .unwrap();
+}
+
+#[test]
+fn analysis_only_source_failure_invalidates_the_verified_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_fixture(FixtureKind::TimeU16_8Cube3T, temp.path()).unwrap();
+    let project_path = temp.path().join("analysis-source-failure.m4dproj");
+    let context = egui::Context::default();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    install_test_project_store(&mut app);
+    verify_test_source(&mut app);
+    app.apply_application_command(ApplicationCommand::AttachVerifiedDataset, &context)
+        .unwrap();
+    app.project_store_noninteractive_paths.initial_save = Some(project_path);
+    app.apply_application_command(ApplicationCommand::RequestProjectSave, &context)
+        .unwrap();
+    wait_for_test_app(&mut app, |app| {
+        !app.project_dirty()
+            && app.project_store.as_ref().is_some_and(|service| {
+                service.status().lifecycle() == ProjectStoreLifecycle::Established
+            })
+    });
+
+    fs::remove_dir_all(&package).unwrap();
+    app.start_product_analysis(analysis_product::ProductAnalysisScope::FullTimeTrace)
+        .unwrap();
+    wait_for_test_app(&mut app, |app| {
+        app.analysis_runtime.active_token().is_none()
+            && matches!(
+                app.application.snapshot().source(),
+                SourceVerificationSnapshot::Required
+            )
+    });
+    assert!(app.application.snapshot().transient().analysis_tables().is_empty());
+    assert!(app.application.snapshot().transient().analysis_plots().is_empty());
+
+    close_test_project_store(&mut app);
+    app.dataset.request_shutdown().unwrap();
+    app.source_verification_service
+        .take()
+        .unwrap()
+        .shutdown()
+        .unwrap();
+}
+
+fn install_test_project_store(app: &mut MiranteWorkbenchApp) {
+    let snapshot = app.application.snapshot();
+    let WorkspaceSnapshot::Unbound { workspace } = snapshot.workspace() else {
+        panic!("test project store must start before the workspace is bound");
+    };
+    let (service, warning) =
+        start_project_store_service(None, workspace.provisional_project_id()).unwrap();
+    assert_eq!(warning, None);
+    app.project_store = Some(service);
+}
+
+fn verify_test_source(app: &mut MiranteWorkbenchApp) {
+    app.source_verification_service = Some(
+        current_source_verification_service::CurrentSourceVerificationService::new(),
+    );
+    app.request_current_source_verification();
+    wait_for_test_app(app, |app| {
+        matches!(
+            app.application.snapshot().source(),
+            SourceVerificationSnapshot::Verified(_)
+        ) && app
+            .source_verification_service
+            .as_ref()
+            .is_some_and(|service| service.active_token().is_none())
+    });
+}
+
+fn wait_for_test_app(
+    app: &mut MiranteWorkbenchApp,
+    mut ready: impl FnMut(&MiranteWorkbenchApp) -> bool,
+) {
+    let context = egui::Context::default();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !ready(app) {
+        if std::time::Instant::now() >= deadline {
+            let snapshot = app.application.snapshot();
+            panic!(
+                "test app timed out: active={:?}, tables={}, plots={}, pending_load={:?}, status={:?}, store={:?}",
+                app.analysis_runtime.active_token(),
+                snapshot.transient().analysis_tables().len(),
+                snapshot.transient().analysis_plots().len(),
+                app.pending_analysis_artifact_load,
+                app.project_status_message,
+                app.project_store.as_ref().map(|service| service.status()),
+            );
+        }
+        app.pump_application_services();
+        app.drain_brick_results(&context);
+        std::thread::yield_now();
+    }
+}
+
+fn close_test_project_store(app: &mut MiranteWorkbenchApp) {
+    app.project_store.as_mut().unwrap().close().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while app.project_store.is_some() {
+        assert!(std::time::Instant::now() < deadline);
+        app.pump_application_services();
+        std::thread::yield_now();
+    }
+}
+
+#[test]
 fn terminal_decode_failure_is_stable_until_the_scope_changes() {
     let temp = tempfile::tempdir().unwrap();
     let package = write_fixture(FixtureKind::BasicU16_16Cube, temp.path()).unwrap();

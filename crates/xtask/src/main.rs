@@ -4,9 +4,8 @@ use std::{
 };
 
 use crate::audits::{
-    bench_phase14_multichannel, bench_phase15_analysis, phase10_audit, phase12_audit,
-    phase14_audit, phase15_audit, phase17_audit, phase19_audit, phase20_extreme_audit,
-    phase20_extreme_sample_audit, phase20_smoke_audit,
+    bench_phase14_multichannel, phase10_audit, phase12_audit, phase14_audit, phase17_audit,
+    phase19_audit, phase20_extreme_audit, phase20_extreme_sample_audit, phase20_smoke_audit,
 };
 use crate::baseline_audit::baseline_audit;
 use crate::baseline_promote::{baseline_promote, baseline_promote_manifest, baseline_refresh_plan};
@@ -232,12 +231,6 @@ fn main() -> anyhow::Result<()> {
             println!("{}", path.display());
         }),
         "bench-phase14-multichannel" => bench_phase14_multichannel().map(|path| {
-            println!("{}", path.display());
-        }),
-        "phase15-audit" => phase15_audit().map(|path| {
-            println!("{}", path.display());
-        }),
-        "bench-phase15-analysis" => bench_phase15_analysis().map(|path| {
             println!("{}", path.display());
         }),
         "phase17-audit" => phase17_audit().map(|path| {
@@ -546,10 +539,6 @@ Commands:
   cargo xtask bench-phase14-multichannel
       writes the Phase 14 synthetic multi-channel benchmark JSON report
       env: MIRANTE4D_SAMPLE_DATA=<sample root>
-  cargo xtask phase15-audit
-      analysis-workbench audit with typed operation records, source streaming, CSV metadata, and SVG export evidence
-  cargo xtask bench-phase15-analysis
-      writes the Phase 15 deterministic analysis benchmark JSON report plus exported table/plot artifacts
   cargo xtask phase17-audit
       import metadata hardening audit with approved-format matrix, reviewed TIFF plan, strict validation, and provenance evidence
   cargo xtask phase19-audit

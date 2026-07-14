@@ -71,7 +71,6 @@
       "capability": "hosted-cpu",
       "hosted_required": true,
       "packages": [
-        "mirante4d-analysis",
         "mirante4d-analysis-core",
         "mirante4d-analysis-runtime",
         "mirante4d-application",
@@ -88,7 +87,7 @@
         "mirante4d-settings",
         "xtask"
       ],
-      "selector": "package(mirante4d-analysis) | package(mirante4d-analysis-core) | package(mirante4d-analysis-runtime) | package(mirante4d-application) | package(mirante4d-data) | package(mirante4d-dataset) | package(mirante4d-dataset-runtime) | package(mirante4d-domain) | package(mirante4d-identity) | package(mirante4d-project-model) | package(mirante4d-render-api) | package(mirante4d-render-reference) | package(mirante4d-render-wgpu) | package(mirante4d-renderer) | package(mirante4d-settings) | package(xtask)",
+      "selector": "package(mirante4d-analysis-core) | package(mirante4d-analysis-runtime) | package(mirante4d-application) | package(mirante4d-data) | package(mirante4d-dataset) | package(mirante4d-dataset-runtime) | package(mirante4d-domain) | package(mirante4d-identity) | package(mirante4d-project-model) | package(mirante4d-render-api) | package(mirante4d-render-reference) | package(mirante4d-render-wgpu) | package(mirante4d-renderer) | package(mirante4d-settings) | package(xtask)",
       "warn_ms": 500,
       "terminate_ms": 2000,
       "aggregate_timeout_secs": 720

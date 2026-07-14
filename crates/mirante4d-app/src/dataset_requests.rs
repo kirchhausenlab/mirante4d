@@ -11,7 +11,7 @@ use std::{
 
 use mirante4d_dataset::{CpuByteLedger, DatasetResourceIdentity, DatasetResourceKey};
 use mirante4d_dataset_runtime::{
-    AccountedResourceLease, CancellationGeneration, DatasetRuntime, DatasetRuntimeDiagnostics,
+    AccountedCpuLease, CancellationGeneration, DatasetRuntime, DatasetRuntimeDiagnostics,
     RequestPriority, RequestTicket, ResourceRequest, RuntimeFault, RuntimeFaultCode,
     RuntimeOutcome, RuntimeRequestId,
 };
@@ -25,6 +25,7 @@ pub(crate) const SCOPE_CROSS_SECTION_XY: u64 = 2;
 pub(crate) const SCOPE_CROSS_SECTION_XZ: u64 = 3;
 pub(crate) const SCOPE_CROSS_SECTION_YZ: u64 = 4;
 pub(crate) const SCOPE_PLAYBACK: u64 = 5;
+pub(crate) const SCOPE_ANALYSIS: u64 = 6;
 
 const INTERACTIVE_DEMAND_SCOPES: [u64; 5] = [
     SCOPE_CURRENT_3D,
@@ -132,7 +133,7 @@ impl DatasetRequestDispatcher {
     pub(crate) fn drain(
         &mut self,
         maximum: usize,
-        mut accept: impl FnMut(RequestTicket, AccountedResourceLease),
+        mut accept: impl FnMut(RequestTicket, RuntimeOutcome),
     ) -> Result<usize, RuntimeFault> {
         let completions = self.runtime.poll(maximum)?;
         let count = completions.len();
@@ -145,11 +146,9 @@ impl DatasetRequestDispatcher {
             if !ticket.is_current(current).map_err(RuntimeFault::new)? {
                 continue;
             }
-            match completion.outcome() {
-                RuntimeOutcome::Ready(lease) => {
-                    accept(ticket, lease.clone());
-                }
-                RuntimeOutcome::Cancelled => {}
+            let outcome = completion.outcome().clone();
+            match &outcome {
+                RuntimeOutcome::Ready(_) | RuntimeOutcome::Cancelled => {}
                 RuntimeOutcome::Failed(fault) => {
                     if runtime_failure_is_sticky(fault.code()) {
                         self.failed_by_scope
@@ -157,11 +156,21 @@ impl DatasetRequestDispatcher {
                             .or_default()
                             .insert(ticket.resource(), fault.clone());
                     }
-                    self.last_fault = Some(fault.clone());
+                    if ticket.generation().scope() != SCOPE_ANALYSIS {
+                        self.last_fault = Some(fault.clone());
+                    }
                 }
             }
+            accept(ticket, outcome);
         }
         Ok(count)
+    }
+
+    pub(crate) fn try_acquire_analysis_bytes(
+        &self,
+        bytes: u64,
+    ) -> Result<AccountedCpuLease, RuntimeFault> {
+        self.runtime.try_acquire_analysis_bytes(bytes)
     }
 
     pub(crate) fn diagnostics(&self) -> Result<DatasetRuntimeDiagnostics, RuntimeFault> {

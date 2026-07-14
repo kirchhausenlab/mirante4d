@@ -9,9 +9,7 @@ use mirante4d_renderer::{
 use crate::{
     FrameCompleteness, ViewportHover, ViewportIntensity, application_view,
     current_runtime::{
-        analysis::{ANALYSIS_EXECUTION_DEFERRED_MESSAGE, CurrentAnalysisRuntime},
-        render::CurrentRenderRuntime,
-        ui::CurrentUiRuntime,
+        analysis::AnalysisProductRuntime, render::CurrentRenderRuntime, ui::CurrentUiRuntime,
     },
     tools::{ViewerToolCommand, ViewerToolEvent},
 };
@@ -24,7 +22,7 @@ pub(crate) struct ToolInteractionOutcome {
 
 pub(crate) fn apply_viewport_tool_response(
     snapshot: &ApplicationSnapshot,
-    analysis: &mut CurrentAnalysisRuntime,
+    analysis: &mut AnalysisProductRuntime,
     ui_runtime: &mut CurrentUiRuntime,
     render: &CurrentRenderRuntime,
     response: &egui::Response,
@@ -132,7 +130,7 @@ fn pick_completeness_for_frame(completeness: FrameCompleteness) -> PickCompleten
 
 pub(crate) fn apply_viewer_tool_commands(
     _snapshot: &ApplicationSnapshot,
-    _analysis: &mut CurrentAnalysisRuntime,
+    _analysis: &mut AnalysisProductRuntime,
     ui_runtime: &mut CurrentUiRuntime,
     commands: Vec<ViewerToolCommand>,
 ) -> anyhow::Result<ToolInteractionOutcome> {
@@ -153,7 +151,7 @@ pub(crate) fn apply_viewer_tool_commands(
             | ViewerToolCommand::DragSceneHandle { .. }
             | ViewerToolCommand::CommitSceneHandleDrag { .. } => {
                 anyhow::bail!(
-                    "{ANALYSIS_EXECUTION_DEFERRED_MESSAGE} ROI, measurement, and scene editing are unavailable."
+                    "ROI drawing, measurement, and scene editing are not part of the current foundation scope."
                 );
             }
             ViewerToolCommand::CancelTransientToolState => {}

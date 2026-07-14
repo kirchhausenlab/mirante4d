@@ -27,7 +27,7 @@ use mirante4d_renderer::RenderError;
 use mirante4d_settings::ResourcePolicy;
 
 use crate::{
-    current_runtime::{analysis::CurrentAnalysisRuntime, render::CurrentRenderRuntime},
+    current_runtime::{analysis::AnalysisProductRuntime, render::CurrentRenderRuntime},
     dataset_requests::DatasetDemandState,
     unified_source_open::{self, UnifiedOpenedSource},
 };
@@ -63,7 +63,7 @@ pub(crate) enum CurrentSourceOpenOutcome {
 pub(crate) struct PreparedCurrentSourceOpen {
     pub(crate) dataset: DatasetDemandState,
     pub(crate) render_runtime: CurrentRenderRuntime,
-    pub(crate) analysis_runtime: CurrentAnalysisRuntime,
+    pub(crate) analysis_runtime: AnalysisProductRuntime,
     pub(crate) catalog: Arc<DatasetCatalog>,
     pub(crate) workspace: UnboundWorkspace,
     source_generation: SourceSessionGeneration,
@@ -74,7 +74,7 @@ pub(crate) struct PreparedCurrentSourceOpen {
 pub(crate) struct CurrentSourceRuntimeTransfer {
     pub(crate) dataset: DatasetDemandState,
     pub(crate) render_runtime: CurrentRenderRuntime,
-    pub(crate) analysis_runtime: CurrentAnalysisRuntime,
+    pub(crate) analysis_runtime: AnalysisProductRuntime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

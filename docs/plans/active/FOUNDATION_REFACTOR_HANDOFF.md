@@ -7,7 +7,7 @@ Public-data publication: deferred to a separate future handoff
 WP-12 predecessor: `foundation-wp-11-exit-1`
 Completed through: WP-11 at
 `04987f64c309166caddf931be9c1ef4948010128`
-Current checkpoint: WP-12 analysis-runtime entry
+Current checkpoint: WP-12 product analysis cutover acceptance candidate
 Next protected-branch checkpoint: accept the WP-12 product analysis cutover
 
 ## Purpose
@@ -194,8 +194,9 @@ WP-11 accepted the off-product bounded, restartable TIFF/OME-TIFF producer at
 `04987f64c309166caddf931be9c1ef4948010128`
 (`foundation-wp-11-exit-1`). Its focused checks and independent target readback
 passed. Product activation and deletion of the current importer remain WP-10C
-work. WP-12 now owns the product analysis-runtime rebuild and predecessor
-deletion.
+work. The WP-12 candidate implements the product analysis-runtime cutover and
+deletes its predecessor; protected-main acceptance remains before WP-10C
+begins.
 
 ## Dataset And Fixture Boundary
 

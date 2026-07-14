@@ -3,9 +3,8 @@ use mirante4d_project_model::ViewState;
 
 use crate::{
     DisplayedFrameFreshness, FrameCompleteness, LodDecisionReason, application_view,
-    current_runtime::{analysis::CurrentAnalysisRuntime, render::CurrentRenderRuntime},
+    current_runtime::{analysis::AnalysisProductRuntime, render::CurrentRenderRuntime},
     dataset_requests::DatasetDemandState,
-    render_state::metadata_intensity_summary,
 };
 
 /// Reconciles payload-free presentation state after a canonical view change.
@@ -16,7 +15,7 @@ pub(crate) fn reconcile_view_runtime(
     snapshot: &ApplicationSnapshot,
     _dataset: &mut DatasetDemandState,
     render: &mut CurrentRenderRuntime,
-    analysis: &mut CurrentAnalysisRuntime,
+    analysis: &mut AnalysisProductRuntime,
 ) -> anyhow::Result<bool> {
     let view = application_view(snapshot);
     if previous_view == view {
@@ -42,7 +41,7 @@ pub(crate) fn reconcile_view_runtime(
         render
             .cross_section_runtime
             .mark_cross_section_panels_dirty();
-        analysis.active_intensity_summary = metadata_intensity_summary(layer.shape().spatial())?;
+        analysis.set_roi([0; 3], layer.shape().spatial().dimensions())?;
     }
 
     mark_preserved_frame_stale(render);

@@ -13,8 +13,11 @@ passed policy and Rust checks. The accepted producer remains off-product;
 `mirante4d-import` stays the sole product route until WP-10C activates the
 replacement and deletes the predecessor.
 
-WP-12 is active on `wp12-analysis-runtime`. Analysis execution remains
-unavailable while the successor is built and cut over.
+WP-12 is an implemented acceptance candidate on `wp12-analysis-runtime`.
+Exact whole-layer time traces and current-timepoint numeric box statistics now
+run through the shared bounded scheduler and publish table/plot pairs atomically
+through the project store. The focused candidate checks pass; a clean commit
+and protected-main acceptance remain before WP-10C begins.
 
 ## WP-12 Entry Note
 

@@ -1827,49 +1827,118 @@ impl eframe::App for MiranteWorkbenchApp {
                             ui_kit::property_row(ui, "selection", format!("{selection:?}"));
                         }
                     });
-                    ui_kit::section(
-                        ui,
-                        "Scene Artifacts",
-                        |ui| match show_scene_artifacts_editor(
-                            ui,
-                            &mut self.analysis_runtime,
-                            &mut self.ui_runtime,
-                        ) {
-                            Ok(changed) => rerender_requested |= changed,
-                            Err(error) => tracing::warn!(%error, "scene edit rejected"),
-                        },
-                    );
                     ui_kit::section(ui, "Analysis", |ui| {
                         let snapshot = current_egui_shell_bridge::snapshot(&self.application);
                         let transient = snapshot.transient();
+                        let start_reason = self.analysis_start_unavailable_reason();
+                        let can_start = start_reason.is_none();
+                        let mut start_time = false;
+                        let mut start_box = false;
                         ui.horizontal_wrapped(|ui| {
-                            ui_kit::toolbar_button(ui, "Analyze Time", false);
-                            ui_kit::toolbar_button(ui, "Analyze ROIs", false);
+                            start_time =
+                                ui_kit::toolbar_button(ui, "Analyze Time", can_start).clicked();
+                            start_box =
+                                ui_kit::toolbar_button(ui, "Analyze Box", can_start).clicked();
+                            if ui_kit::toolbar_button(
+                                ui,
+                                "Cancel",
+                                self.analysis_runtime.active_token().is_some(),
+                            )
+                            .clicked()
+                                && let Err(error) = self.request_analysis_cancel()
+                            {
+                                self.project_status_message =
+                                    Some(format!("Analysis could not be cancelled: {error}"));
+                            }
                             if ui_kit::toolbar_button(ui, "Workspace", true).clicked() {
                                 self.ui_runtime.analysis_workspace_open = true;
                             }
                             if ui_kit::toolbar_button(
                                 ui,
-                                "Export CSV",
+                                "Copy CSV",
                                 transient.selected_analysis_table().is_some(),
                             )
                             .clicked()
-                                && let Err(error) = export_selected_analysis_table(
+                            {
+                                match export_selected_analysis_table(
                                     &mut self.analysis_runtime,
                                     AnalysisTableExportInput {
                                         table_descriptors: transient.analysis_tables(),
                                         selected_table: transient.selected_analysis_table(),
                                     },
-                                )
-                            {
-                                tracing::warn!(%error, "analysis table export rejected");
+                                ) {
+                                    Ok(_) => {
+                                        if let Some(csv) = self.analysis_runtime.last_export_csv() {
+                                            ui.ctx().copy_text(csv.to_owned());
+                                        }
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(%error, "analysis table export rejected");
+                                    }
+                                }
                             }
                         });
-                        ui_kit::status_badge(
-                            ui,
-                            StatusTone::Warning,
-                            current_runtime::analysis::ANALYSIS_EXECUTION_DEFERRED_MESSAGE,
-                        );
+                        let layer_shape = snapshot
+                            .catalog()
+                            .layer(application_view(&snapshot).active_layer())
+                            .expect("the active layer closes over the catalog")
+                            .shape()
+                            .spatial()
+                            .dimensions();
+                        let mut roi_origin = self.analysis_runtime.roi_origin();
+                        let mut roi_shape = self.analysis_runtime.roi_shape();
+                        ui.label("Box coordinates (z, y, x voxels)");
+                        ui.small("Analyze Box uses the current timepoint.");
+                        ui.horizontal_wrapped(|ui| {
+                            for axis in 0..3 {
+                                ui.add(
+                                    egui::DragValue::new(&mut roi_origin[axis])
+                                        .range(0..=layer_shape[axis].saturating_sub(1))
+                                        .prefix(format!("{} ", ["z", "y", "x"][axis])),
+                                );
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            for axis in 0..3 {
+                                let maximum = layer_shape[axis].saturating_sub(roi_origin[axis]);
+                                ui.add(
+                                    egui::DragValue::new(&mut roi_shape[axis])
+                                        .range(1..=maximum.max(1))
+                                        .prefix(format!("{} size ", ["z", "y", "x"][axis])),
+                                );
+                            }
+                        });
+                        for axis in 0..3 {
+                            roi_origin[axis] =
+                                roi_origin[axis].min(layer_shape[axis].saturating_sub(1));
+                            roi_shape[axis] = roi_shape[axis]
+                                .clamp(1, layer_shape[axis].saturating_sub(roi_origin[axis]));
+                        }
+                        if (roi_origin != self.analysis_runtime.roi_origin()
+                            || roi_shape != self.analysis_runtime.roi_shape())
+                            && let Err(error) = self.analysis_runtime.set_roi(roi_origin, roi_shape)
+                        {
+                            tracing::warn!(%error, "analysis box was rejected");
+                        }
+                        if start_time
+                            && let Err(error) = self.start_product_analysis(
+                                analysis_product::ProductAnalysisScope::FullTimeTrace,
+                            )
+                        {
+                            self.project_status_message =
+                                Some(format!("Analysis could not start: {error}"));
+                        }
+                        if start_box
+                            && let Err(error) = self.start_product_analysis(
+                                analysis_product::ProductAnalysisScope::CurrentTimepointBox,
+                            )
+                        {
+                            self.project_status_message =
+                                Some(format!("Analysis could not start: {error}"));
+                        }
+                        if let Some(reason) = start_reason {
+                            ui_kit::status_badge(ui, StatusTone::Warning, reason);
+                        }
                         let commands = show_analysis_workspace(
                             ui,
                             &self.analysis_runtime,

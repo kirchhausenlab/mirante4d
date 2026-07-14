@@ -262,19 +262,36 @@
       "deletion_gate": "WP06-A-shadow-machinery"
     },
     {
-      "id": "keep-analysis-unit-tests",
+      "id": "delete-wp12-analysis-predecessor-tests",
       "match": {
         "source_dispositions": ["retained"],
         "kinds": ["libtest"],
         "owners": ["mirante4d-analysis"],
         "ignored": false
       },
-      "disposition": "kept",
-      "reason": "Analysis model and pure scientific-operation cases remain ordinary hosted CPU unit evidence.",
-      "lane": "unit",
+      "disposition": "deleted",
+      "reason": "WP-12 replaces the predecessor analysis crate with focused analysis-core and analysis-runtime evidence.",
+      "lane": null,
       "requirement_ids": ["D-022-unit"],
       "replacement_command": "cargo xtask verify-leaf unit",
-      "deletion_gate": null
+      "deletion_gate": "WP-12-analysis-runtime-cutover"
+    },
+    {
+      "id": "delete-wp12-phase15-analysis-commands",
+      "match": {
+        "source_dispositions": ["retained"],
+        "kinds": ["xtask_command"],
+        "ids": [
+          "xtask_command:bench-phase15-analysis",
+          "xtask_command:phase15-audit"
+        ]
+      },
+      "disposition": "deleted",
+      "reason": "WP-12 removes the audit and benchmark commands that exercised the deleted analysis implementation.",
+      "lane": null,
+      "requirement_ids": ["D-022-unit"],
+      "replacement_command": "cargo xtask verify-leaf unit",
+      "deletion_gate": "WP-12-analysis-runtime-cutover"
     },
     {
       "id": "delete-wp07b-application-ui-predecessors",
@@ -1281,7 +1298,6 @@
           "xtask_command:bench-phase13-renderer",
           "xtask_command:bench-phase13-viewport-matrix",
           "xtask_command:bench-phase14-multichannel",
-          "xtask_command:bench-phase15-analysis",
           "xtask_command:bench-smoke"
         ]
       },
@@ -1432,7 +1448,6 @@
           "xtask_command:phase10-audit",
           "xtask_command:phase12-audit",
           "xtask_command:phase14-audit",
-          "xtask_command:phase15-audit",
           "xtask_command:phase17-audit",
           "xtask_command:phase19-audit"
         ]
@@ -6960,10 +6975,10 @@
   ],
   "expected_summary": {
     "source_records": 1055,
-    "kept": 492,
+    "kept": 464,
     "moved": 23,
     "rewritten": 7,
-    "deleted": 533,
+    "deleted": 561,
     "current_additions": 664
   }
 }
