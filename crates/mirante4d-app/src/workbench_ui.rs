@@ -239,7 +239,7 @@ impl MiranteWorkbenchApp {
         let available = ui.available_size();
         let ctx = ui.ctx().clone();
         self.sync_3d_viewport_for_display_size(&ctx, available);
-        let display_image = self.viewport_display_image(&ctx);
+        let display_image = self.viewport_display_image();
         let image_size = fit_size(display_image.size_vec2(), available);
         ui.centered_and_justified(|ui| {
             self.show_3d_viewport_image(
@@ -356,7 +356,7 @@ impl MiranteWorkbenchApp {
         let ctx = ui.ctx().clone();
         self.record_four_panel_viewport(&ctx, PanelId::ThreeD, available);
         self.sync_3d_viewport_for_display_size(&ctx, available);
-        let display_image = self.viewport_display_image(&ctx);
+        let display_image = self.viewport_display_image();
         let image_size = fit_size(display_image.size_vec2(), available);
         ui.centered_and_justified(|ui| {
             self.show_3d_viewport_image(
@@ -387,17 +387,32 @@ impl MiranteWorkbenchApp {
         if image_size == egui::Vec2::ZERO {
             return;
         }
-        let image = match display_image {
-            ViewportDisplayImage::Cpu(texture) => egui::Image::new(&texture),
-            ViewportDisplayImage::Gpu { texture_id, size } => {
-                egui::Image::from_texture((texture_id, size))
+        let response = match display_image {
+            ViewportDisplayImage::UiBackground { .. } => {
+                let (rect, response) =
+                    ui.allocate_exact_size(image_size, egui::Sense::click_and_drag());
+                ui.painter()
+                    .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+                let label = if self.render_runtime.render_backend == RenderBackend::Empty {
+                    "No visible data"
+                } else {
+                    "Loading…"
+                };
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    label,
+                    egui::FontId::proportional(18.0),
+                    ui.visuals().weak_text_color(),
+                );
+                response
             }
+            ViewportDisplayImage::Gpu { texture_id, size } => ui.add(
+                egui::Image::from_texture((texture_id, size))
+                    .fit_to_exact_size(image_size)
+                    .sense(egui::Sense::click_and_drag()),
+            ),
         };
-        let response = ui.add(
-            image
-                .fit_to_exact_size(image_size)
-                .sense(egui::Sense::click_and_drag()),
-        );
         let hover = viewport_hover_from_response(snapshot, view, &self.render_runtime, &response);
         if response.hovered() || view.layout() == CanonicalViewerLayout::Single3d {
             self.ui_runtime.hovered_pixel = hover;
@@ -492,7 +507,7 @@ impl MiranteWorkbenchApp {
         if let Some(presentation_viewport) = presentation_viewport
             && let Some(readout) = cross_section_hover_readout_for_response(
                 &self.render_runtime.cross_section_runtime,
-                &self.render_runtime.lease_bridge,
+                &self.render_runtime.retained_leases,
                 cross_section_readout::CrossSectionReadoutInput {
                     view,
                     catalog: snapshot.catalog(),
@@ -535,17 +550,20 @@ impl MiranteWorkbenchApp {
         image_size: egui::Vec2,
         panel_id: PanelId,
     ) -> egui::Response {
-        let image = match display_image {
-            ViewportDisplayImage::Cpu(texture) => egui::Image::new(&texture),
-            ViewportDisplayImage::Gpu { texture_id, size } => {
-                egui::Image::from_texture((texture_id, size))
+        let response = match display_image {
+            ViewportDisplayImage::UiBackground { .. } => {
+                let (rect, response) =
+                    ui.allocate_exact_size(image_size, egui::Sense::click_and_drag());
+                ui.painter()
+                    .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+                response
             }
+            ViewportDisplayImage::Gpu { texture_id, size } => ui.add(
+                egui::Image::from_texture((texture_id, size))
+                    .fit_to_exact_size(image_size)
+                    .sense(egui::Sense::click_and_drag()),
+            ),
         };
-        let response = ui.add(
-            image
-                .fit_to_exact_size(image_size)
-                .sense(egui::Sense::click_and_drag()),
-        );
         response.widget_info(|| {
             egui::WidgetInfo::labeled(
                 egui::WidgetType::Other,
@@ -673,7 +691,7 @@ fn cross_section_interaction_commands(
     if !edited {
         return Ok(Vec::new());
     }
-    let cross_section = canonical_cross_section_view(cross_section)?;
+    let cross_section = cross_section.into_canonical()?;
     Ok(vec![
         ApplicationCommand::SetActiveCrossSectionPanel(Some(application_panel)),
         ApplicationCommand::SetLayout {
@@ -690,20 +708,6 @@ fn application_cross_section_panel_id(panel_id: PanelId) -> Option<CrossSectionP
         PanelId::Yz => Some(CrossSectionPanelId::Yz),
         PanelId::ThreeD => None,
     }
-}
-
-fn canonical_cross_section_view(
-    runtime: mirante4d_renderer::CrossSectionViewState,
-) -> Result<CrossSectionView, String> {
-    let [x, y, z] = runtime.center_world.to_array();
-    let [qx, qy, qz, qw] = runtime.orientation.to_array();
-    CrossSectionView::new(
-        WorldPoint3::new(x, y, z).map_err(|error| error.to_string())?,
-        UnitQuaternion::new_xyzw(qx, qy, qz, qw).map_err(|error| error.to_string())?,
-        runtime.scale_world_per_screen_point,
-        runtime.depth_world,
-    )
-    .map_err(|error| error.to_string())
 }
 
 fn scroll_y_points_from_zoom_delta(zoom_delta: f32) -> Option<f32> {
@@ -740,18 +744,15 @@ fn layer_render_state_for_mode(
     mode: mirante4d_domain::RenderMode,
 ) -> Result<CanonicalRenderState, String> {
     let current = *layer.render_state();
-    let sampling = current.sampling_policy();
+    let sampling = SamplingPolicy::VoxelExact;
     match mode {
         mirante4d_domain::RenderMode::Mip => Ok(CanonicalRenderState::mip(sampling)),
         mirante4d_domain::RenderMode::Isosurface => {
-            let (shading, display_level) = current
+            let display_level = current
                 .iso_parameters()
-                .map(|parameters| (parameters.shading_policy(), parameters.display_level()))
-                .unwrap_or((
-                    IsoShadingPolicy::GradientLighting,
-                    DEFAULT_ISO_DISPLAY_LEVEL,
-                ));
-            CanonicalRenderState::iso(sampling, shading, display_level)
+                .map(|parameters| parameters.display_level())
+                .unwrap_or(DEFAULT_ISO_DISPLAY_LEVEL);
+            CanonicalRenderState::iso(sampling, IsoShadingPolicy::Flat, display_level)
                 .map_err(|error| error.to_string())
         }
         mirante4d_domain::RenderMode::Dvr => {
@@ -862,7 +863,6 @@ impl eframe::App for MiranteWorkbenchApp {
         let update_started = Instant::now();
         let setup_started = Instant::now();
         self.pump_application_services();
-        self.free_retired_gpu_display_textures();
         self.handle_close_request(ui.ctx());
         let setup_ms = duration_ms(setup_started.elapsed());
 
@@ -1716,7 +1716,11 @@ impl eframe::App for MiranteWorkbenchApp {
                         ui_kit::property_row(
                             ui,
                             "pixels",
-                            self.render_runtime.diagnostics.output_pixels.to_string(),
+                            self.render_runtime
+                                .render_viewport
+                                .width_pixels()
+                                .saturating_mul(self.render_runtime.render_viewport.height_pixels())
+                                .to_string(),
                         );
                         ui_kit::property_row(ui, "nonzero", "unavailable");
                         ui_kit::property_row(ui, "max", "unavailable");
@@ -1891,11 +1895,6 @@ impl eframe::App for MiranteWorkbenchApp {
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(
                                     &mut sampling_policy,
-                                    SamplingPolicy::SmoothLinear,
-                                    render_sampling_policy_label(SamplingPolicy::SmoothLinear),
-                                );
-                                ui.selectable_value(
-                                    &mut sampling_policy,
                                     SamplingPolicy::VoxelExact,
                                     render_sampling_policy_label(SamplingPolicy::VoxelExact),
                                 );
@@ -1957,11 +1956,6 @@ impl eframe::App for MiranteWorkbenchApp {
                                 egui::ComboBox::from_label("ISO shading")
                                     .selected_text(iso_shading_policy_label(iso_shading_policy))
                                     .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut iso_shading_policy,
-                                            IsoShadingPolicy::GradientLighting,
-                                            "Gradient lighting",
-                                        );
                                         ui.selectable_value(
                                             &mut iso_shading_policy,
                                             IsoShadingPolicy::Flat,

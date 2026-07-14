@@ -1,4 +1,110 @@
-use mirante4d_renderer::{PickHit, PickHitKind};
+use mirante4d_domain::TimeIndex;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SceneObjectId(String);
+
+impl SceneObjectId {
+    #[allow(dead_code)]
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err("scene object id must not be empty".to_owned());
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(format!(
+                "scene object id must contain only ASCII letters, digits, '-' or '_', got {value:?}"
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PickCompleteness {
+    Exact,
+    Approximate,
+    Incomplete,
+    Loading,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PickPolicy {
+    SceneObject,
+    FirstThresholdHit,
+    MipArgmax,
+    ProbeRay,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PickHitKind {
+    Voxel,
+    Track,
+    Roi,
+    Annotation,
+    AnnotationHandle,
+    Measurement,
+    Plane,
+    Ui,
+    Empty,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScreenPosition {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl ScreenPosition {
+    pub fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum PickValue {
+    IntensityU8(u8),
+    IntensityU16(u16),
+    IntensityF32(f32),
+    ObjectMetadata(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PickHit {
+    pub kind: PickHitKind,
+    pub object_id: Option<SceneObjectId>,
+    pub timepoint: TimeIndex,
+    pub screen_position: Option<ScreenPosition>,
+    pub value: Option<PickValue>,
+    pub policy: PickPolicy,
+    pub completeness: PickCompleteness,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PickQuery {
+    pub timepoint: TimeIndex,
+    pub screen_position: ScreenPosition,
+}
+
+pub fn empty_pick_hit(query: PickQuery) -> PickHit {
+    PickHit {
+        kind: PickHitKind::Empty,
+        object_id: None,
+        timepoint: query.timepoint,
+        screen_position: Some(query.screen_position),
+        value: None,
+        policy: PickPolicy::SceneObject,
+        completeness: PickCompleteness::Exact,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewerTool {
@@ -216,11 +322,15 @@ pub fn selection_from_hit(hit: &PickHit) -> Option<ToolSelection> {
 #[cfg(test)]
 mod tests {
     use mirante4d_domain::TimeIndex;
-    use mirante4d_renderer::{
-        PickCompleteness, PickHitKind, PickPolicy, PickValue, ScreenPosition, empty_pick_hit,
-    };
 
     use super::*;
+
+    #[test]
+    fn scene_object_ids_keep_the_strict_neutral_identifier_contract() {
+        assert!(SceneObjectId::new("").is_err());
+        assert!(SceneObjectId::new("roi/a").is_err());
+        assert_eq!(SceneObjectId::new("roi-a_2").unwrap().as_str(), "roi-a_2");
+    }
 
     #[test]
     fn roi_tool_tracks_anchor_and_emits_commit_command() {
@@ -322,12 +432,8 @@ mod tests {
     fn scene_handle_hit(object_id: &str, handle: &str) -> PickHit {
         PickHit {
             kind: PickHitKind::AnnotationHandle,
-            layer_id: None,
-            object_id: Some(mirante4d_renderer::SceneObjectId::new(object_id).unwrap()),
-            source_layer_id: None,
+            object_id: Some(SceneObjectId::new(object_id).unwrap()),
             timepoint: TimeIndex::new(0),
-            world_position: None,
-            grid_position: None,
             screen_position: Some(ScreenPosition::new(1.0, 2.0)),
             value: Some(PickValue::ObjectMetadata(handle.to_owned())),
             policy: PickPolicy::SceneObject,
@@ -336,7 +442,7 @@ mod tests {
     }
 
     fn empty_hit() -> PickHit {
-        empty_pick_hit(mirante4d_renderer::PickQuery {
+        empty_pick_hit(PickQuery {
             timepoint: TimeIndex::new(0),
             screen_position: ScreenPosition::new(1.0, 2.0),
         })

@@ -52,7 +52,7 @@ pub(crate) fn architecture_self_check() -> anyhow::Result<()> {
         "crates/mirante4d-identity",
         "crates/mirante4d-project-model",
         "crates/mirante4d-render-api",
-        "crates/mirante4d-renderer",
+        "crates/mirante4d-render-wgpu",
         "crates/mirante4d-settings",
         "crates/mirante4d-application",
         "crates/mirante4d-app",
@@ -70,6 +70,7 @@ pub(crate) fn architecture_self_check() -> anyhow::Result<()> {
         "crates/mirante4d-format",
         "crates/mirante4d-import",
         "crates/mirante4d-preprocess",
+        "crates/mirante4d-renderer",
     ] {
         if Path::new(forbidden).exists() {
             bail!("retired or unowned crate directory exists: {forbidden}");
@@ -128,7 +129,7 @@ fn source_architecture_violations(path: &Path, source: &str) -> Vec<String> {
             "non-app crate must not import UI/app layer",
         ));
     }
-    if normalized.starts_with("crates/mirante4d-renderer/src/") {
+    if normalized.starts_with("crates/mirante4d-render-wgpu/src/") {
         violations.extend(source_pattern_violations(
             path,
             source,
@@ -141,7 +142,7 @@ fn source_architecture_violations(path: &Path, source: &str) -> Vec<String> {
                 "read_to_string",
                 "read_dir",
             ],
-            "renderer source must not perform direct filesystem I/O",
+            "product renderer source must not perform direct filesystem I/O",
         ));
     }
     if [
@@ -867,7 +868,12 @@ fn check_wp07b_live_cutover(
     let active_boundary_edges = expected_edges
         .iter()
         .copied()
-        .filter(|edge| *edge != ("xtask", "mirante4d-render-api"))
+        .filter(|edge| {
+            !matches!(
+                *edge,
+                ("xtask", "mirante4d-render-api") | ("mirante4d-renderer", "mirante4d-render-api")
+            )
+        })
         .collect::<BTreeSet<_>>();
     let live_foundation_edges = BTreeSet::from([
         ("mirante4d-analysis-core", "mirante4d-dataset"),
@@ -880,7 +886,6 @@ fn check_wp07b_live_cutover(
         ("mirante4d-render-reference", "mirante4d-render-api"),
         ("mirante4d-render-wgpu", "mirante4d-dataset"),
         ("mirante4d-render-wgpu", "mirante4d-render-api"),
-        ("mirante4d-renderer", "mirante4d-dataset"),
         ("mirante4d-storage", "mirante4d-dataset"),
     ]);
     let live_expected_edges = active_boundary_edges
@@ -977,17 +982,17 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
             .and_then(serde_json::Value::as_u64)
             != Some(2)
         || ledger.get("status").and_then(serde_json::Value::as_str)
-            != Some("wp10c-storage-runtime-cutover")
+            != Some("wp09b-product-render-cutover")
         || ledger
             .pointer("/predecessor/tag")
             .and_then(serde_json::Value::as_str)
-            != Some("foundation-wp-08a-exit-2")
+            != Some("foundation-wp-10c-exit-1")
         || ledger
             .pointer("/predecessor/revision")
             .and_then(serde_json::Value::as_str)
-            != Some("f2e520da891134d1b3f65d8fcac7afb4140579a2")
+            != Some("b9ac2a5f08101094933f80a0ce98fbdbdbe6c8d6")
     {
-        bail!("{} is not the current WP-10C live ledger", path.display());
+        bail!("{} is not the current WP-09B live ledger", path.display());
     }
 
     let expected_dataset_authority = serde_json::json!({
@@ -997,27 +1002,25 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
         "source": {
             "type": "LocalDatasetSource",
             "path": "crates/mirante4d-storage/src/dataset_source.rs"
-        },
-        "renderer_bridge": {
-            "type": "CurrentLeaseBridge",
-            "path": "crates/mirante4d-renderer/src/current_lease_bridge.rs",
-            "expires": "WP-09B"
         }
     });
     if ledger.get("dataset_authority") != Some(&expected_dataset_authority) {
-        bail!("WP-08B dataset authority ledger drifted");
+        bail!("WP-09B dataset authority ledger drifted");
+    }
+
+    let expected_render_authority = serde_json::json!({
+        "runtime_owner": "mirante4d-render-wgpu",
+        "contract_owner": "mirante4d-render-api",
+        "lease_retention": {
+            "type": "RetainedLeases",
+            "path": "crates/mirante4d-app/src/retained_leases.rs"
+        }
+    });
+    if ledger.get("render_authority") != Some(&expected_render_authority) {
+        bail!("WP-09B render authority ledger drifted");
     }
 
     let expected_owners = BTreeMap::from([
-        (
-            "render",
-            (
-                "crates/mirante4d-app/src/current_runtime/render.rs",
-                "CurrentRenderRuntime",
-                "render_runtime",
-                "WP-09B",
-            ),
-        ),
         (
             "ui",
             (
@@ -1049,74 +1052,37 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
     let owner_entries = ledger
         .get("temporary_owners")
         .and_then(serde_json::Value::as_array)
-        .context("WP-08B temporary_owners must be an array")?;
+        .context("WP-09B temporary_owners must be an array")?;
     let mut observed_owners = BTreeMap::new();
     for owner in owner_entries {
         let module = owner
             .get("module")
             .and_then(serde_json::Value::as_str)
-            .context("WP-08B temporary owner must name its module")?;
+            .context("WP-09B temporary owner must name its module")?;
         let facts = (
             owner
                 .get("path")
                 .and_then(serde_json::Value::as_str)
-                .context("WP-08B temporary owner must name its path")?,
+                .context("WP-09B temporary owner must name its path")?,
             owner
                 .get("type")
                 .and_then(serde_json::Value::as_str)
-                .context("WP-08B temporary owner must name its type")?,
+                .context("WP-09B temporary owner must name its type")?,
             owner
                 .get("composition_field")
                 .and_then(serde_json::Value::as_str)
-                .context("WP-08B temporary owner must name its composition field")?,
+                .context("WP-09B temporary owner must name its composition field")?,
             owner
                 .get("expires")
                 .and_then(serde_json::Value::as_str)
-                .context("WP-08B temporary owner must name its expiry")?,
+                .context("WP-09B temporary owner must name its expiry")?,
         );
         if observed_owners.insert(module, facts).is_some() {
-            bail!("WP-08B temporary owner {module} is repeated");
+            bail!("WP-09B temporary owner {module} is repeated");
         }
     }
     if observed_owners != expected_owners {
-        bail!("WP-08B temporary owner ledger drifted");
-    }
-
-    let runtime_root = repo_root.join("crates/mirante4d-app/src/current_runtime");
-    let actual_runtime_files = fs::read_dir(&runtime_root)?
-        .map(|entry| {
-            let entry = entry?;
-            Ok(entry
-                .file_type()?
-                .is_file()
-                .then(|| entry.file_name().to_string_lossy().into_owned()))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect::<BTreeSet<_>>();
-    let expected_runtime_files = expected_owners
-        .keys()
-        .map(|module| format!("{module}.rs"))
-        .chain(std::iter::once("analysis.rs".to_owned()))
-        .chain(std::iter::once("mod.rs".to_owned()))
-        .collect::<BTreeSet<_>>();
-    if actual_runtime_files != expected_runtime_files {
-        bail!(
-            "WP-08B current-runtime modules drifted: expected={expected_runtime_files:?}, actual={actual_runtime_files:?}"
-        );
-    }
-    let runtime_mod_source = fs::read_to_string(runtime_root.join("mod.rs"))?;
-    let actual_modules = crate_private_root_module_names(&runtime_mod_source)?;
-    let expected_modules = expected_owners
-        .keys()
-        .map(|module| (*module).to_owned())
-        .chain(std::iter::once("analysis".to_owned()))
-        .collect::<BTreeSet<_>>();
-    if actual_modules != expected_modules {
-        bail!(
-            "current_runtime must declare four temporary owners plus the analysis product bridge"
-        );
+        bail!("WP-09B temporary owner ledger drifted");
     }
 
     let app_root = repo_root.join("crates/mirante4d-app/src");
@@ -1147,7 +1113,7 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
         .collect::<BTreeMap<_, _>>();
     if actual_composition != expected_composition {
         bail!(
-            "post-WP-08B temporary-owner composition drifted: expected={expected_composition:?}, actual={actual_composition:?}"
+            "post-WP-09B temporary-owner composition drifted: expected={expected_composition:?}, actual={actual_composition:?}"
         );
     }
     for (relative_path, type_name, _, expiry) in expected_owners.values() {
@@ -1159,7 +1125,8 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
     }
 
     check_wp08b_dataset_dispatcher(repo_root, &app_root, &app_fields)?;
-    check_wp08b_bridges(repo_root, &app_root)?;
+    check_target_dataset_source(repo_root, &app_root)?;
+    check_wp09b_render_cutover(repo_root, &ledger)?;
     check_wp08b_predecessor_absence(repo_root, &ledger)?;
     check_wp12_analysis_cutover(repo_root, &ledger)
 }
@@ -1206,7 +1173,7 @@ fn check_wp08b_dataset_dispatcher(
     Ok(())
 }
 
-fn check_wp08b_bridges(repo_root: &Path, app_root: &Path) -> anyhow::Result<()> {
+fn check_target_dataset_source(repo_root: &Path, app_root: &Path) -> anyhow::Result<()> {
     let source_path = repo_root.join("crates/mirante4d-storage/src/dataset_source.rs");
     let source = fs::read_to_string(&source_path)?;
     if !rust_root_defined_item_names(&source)?.contains("LocalDatasetSource")
@@ -1236,35 +1203,68 @@ fn check_wp08b_bridges(repo_root: &Path, app_root: &Path) -> anyhow::Result<()> 
         bail!("target source must open through one unified route: {source_open_routes:?}");
     }
 
-    let lease_bridge_path = repo_root.join("crates/mirante4d-renderer/src/current_lease_bridge.rs");
-    let lease_bridge = fs::read_to_string(&lease_bridge_path)?;
-    if !rust_root_defined_item_names(&lease_bridge)?.contains("CurrentLeaseBridge")
-        || !public_root_api_names(&repo_root.join("crates/mirante4d-renderer/src/lib.rs"))?
-            .contains("CurrentLeaseBridge")
-    {
-        bail!("the sole WP-08B current-renderer lease bridge is missing");
-    }
-    for forbidden in [
-        "mirante4d_data",
-        "mirante4d_format",
-        "DatasetHandle",
-        "DenseVolumeU8",
-        "DenseVolumeU16",
-        "DenseVolumeF32",
-        "VolumeBrickU8",
-        "VolumeBrickU16",
-        "VolumeBrickF32",
-        "SpatialBrickIndex",
+    Ok(())
+}
+
+fn check_wp09b_render_cutover(repo_root: &Path, ledger: &serde_json::Value) -> anyhow::Result<()> {
+    for relative_path in [
+        "crates/mirante4d-renderer",
+        "crates/mirante4d-app/src/display_identity.rs",
+        "crates/mirante4d-app/src/resident_rendering.rs",
     ] {
-        if source_contains_identifier(&lease_bridge, forbidden) {
-            bail!("current renderer lease bridge imports forbidden owning fact {forbidden}");
+        if repo_root.join(relative_path).exists() {
+            bail!("WP-09B predecessor render path still exists: {relative_path}");
         }
     }
-    let render_runtime = fs::read_to_string(app_root.join("current_runtime/render.rs"))?;
-    let render_fields =
-        rust_struct_field_terminal_type_names(&render_runtime, "CurrentRenderRuntime")?;
-    if render_fields.get("lease_bridge").map(String::as_str) != Some("CurrentLeaseBridge") {
-        bail!("CurrentRenderRuntime must retain the sole CurrentLeaseBridge");
+
+    let ledger_text = serde_json::to_string(ledger)?;
+    for predecessor in ["CurrentLeaseBridge", "mirante4d-renderer"] {
+        if ledger_text.contains(predecessor) {
+            bail!("WP-09B live ledger still names predecessor {predecessor}");
+        }
+    }
+
+    let retained_path = repo_root.join("crates/mirante4d-app/src/retained_leases.rs");
+    let retained_source = fs::read_to_string(&retained_path)?;
+    if !rust_root_defined_item_names(&retained_source)?.contains("RetainedLeases") {
+        bail!("WP-09B app-owned lease retention is missing");
+    }
+
+    let metadata = workspace_dependency_metadata(repo_root)?;
+    if metadata
+        .declared_dependency_kinds_by_name
+        .contains_key("mirante4d-renderer")
+    {
+        bail!("the predecessor renderer remains a workspace package");
+    }
+    let app_normal = metadata
+        .declared_dependency_kinds_by_name
+        .get("mirante4d-app")
+        .and_then(|kinds| kinds.get("normal"))
+        .context("cargo metadata is missing mirante4d-app normal dependencies")?;
+    if !app_normal.contains("mirante4d-render-wgpu")
+        || app_normal.contains("mirante4d-render-reference")
+        || app_normal.contains("mirante4d-renderer")
+    {
+        bail!("mirante4d-app must depend only on render-wgpu for product rendering");
+    }
+
+    let app_root = repo_root.join("crates/mirante4d-app/src");
+    let mut successor_references = 0_usize;
+    for source_path in collect_rust_source_files(&app_root)? {
+        let source = fs::read_to_string(&source_path)?;
+        successor_references += source.matches("WgpuRenderRuntime").count();
+        for predecessor in ["CurrentLeaseBridge", "GpuRenderer", "mirante4d_renderer"] {
+            if source_contains_identifier(&source, predecessor) {
+                bail!(
+                    "WP-09B predecessor {predecessor} remains in {}",
+                    source_path.display()
+                );
+            }
+        }
+    }
+    if successor_references == 0 {
+        bail!("mirante4d-app does not construct the product WgpuRenderRuntime");
     }
     Ok(())
 }
@@ -2416,27 +2416,6 @@ fn private_root_module_names(source: &str) -> anyhow::Result<BTreeSet<String>> {
         .collect()
 }
 
-fn crate_private_root_module_names(source: &str) -> anyhow::Result<BTreeSet<String>> {
-    let file =
-        syn::parse_file(source).context("failed to parse Rust source for module inventory")?;
-    file.items
-        .iter()
-        .filter_map(|item| match item {
-            syn::Item::Mod(item) => Some(item),
-            _ => None,
-        })
-        .map(|module| {
-            if matches!(module.vis, syn::Visibility::Public(_)) {
-                bail!("module {} must not be public", module.ident);
-            }
-            if module.content.is_some() {
-                bail!("module {} must remain file-backed", module.ident);
-            }
-            Ok(module.ident.to_string())
-        })
-        .collect()
-}
-
 fn rust_root_defined_item_names(source: &str) -> anyhow::Result<BTreeSet<String>> {
     let file =
         syn::parse_file(source).context("failed to parse Rust source for root API inventory")?;
@@ -2649,16 +2628,6 @@ mod tests {
     }
 
     #[test]
-    fn source_architecture_policy_accepts_current_resident_rendering_bridge_only() {
-        let path = Path::new("crates/mirante4d-app/src/resident_rendering.rs");
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let source = fs::read_to_string(repo_root.join(path)).unwrap();
-        let violations = source_architecture_violations(path, &source);
-
-        assert!(violations.is_empty(), "{violations:#?}");
-    }
-
-    #[test]
     fn source_architecture_policy_accepts_current_app_root() {
         let path = Path::new("crates/mirante4d-app/src/lib.rs");
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -2669,14 +2638,17 @@ mod tests {
     }
 
     #[test]
-    fn source_architecture_policy_rejects_renderer_file_io() {
+    fn source_architecture_policy_rejects_product_renderer_file_io() {
         let violations = source_architecture_violations(
-            Path::new("crates/mirante4d-renderer/src/lib.rs"),
+            Path::new("crates/mirante4d-render-wgpu/src/lib.rs"),
             "use std::fs;\nlet _ = File::open(path);\n",
         );
 
         assert_eq!(violations.len(), 2);
-        assert!(violations[0].contains("renderer source must not perform direct filesystem I/O"));
+        assert!(
+            violations[0]
+                .contains("product renderer source must not perform direct filesystem I/O")
+        );
     }
 
     #[test]

@@ -20,6 +20,7 @@ use crate::{
         SCOPE_ANALYSIS, SCOPE_CROSS_SECTION_XY, SCOPE_CROSS_SECTION_XZ, SCOPE_CROSS_SECTION_YZ,
         SCOPE_CURRENT_3D, SCOPE_PLAYBACK,
     },
+    product_render_intent::PRODUCT_RENDER_RESOURCE_LIMIT,
     viewer_layout::{
         CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
         CrossSectionPanelScheduleStatus, PanelId,
@@ -74,17 +75,18 @@ impl MiranteWorkbenchApp {
         let current_limits = DatasetDemandPlanLimits::new(
             SEMANTIC_PLAN_CANDIDATES_PER_LAYER,
             budget_share_usize(
-                MAX_RENDER_REQUIREMENTS,
+                PRODUCT_RENDER_RESOURCE_LIMIT,
                 current_share_numerator,
                 demand_cohorts,
             ),
             budget_share_u64(decoded_capacity, current_share_numerator, demand_cohorts),
         );
+        let render_viewport = self.render_runtime.render_viewport;
         let plan = match plan_current_3d(
             snapshot.catalog(),
             view,
             self.render_runtime.presentation_viewport,
-            self.render_runtime.render_viewport,
+            render_viewport,
             current_limits,
             playback_active,
         ) {
@@ -168,8 +170,8 @@ impl MiranteWorkbenchApp {
         }
         if let Err(error) = self
             .render_runtime
-            .lease_bridge
-            .replace_current_requirements(self.dataset.renderer_requirements())
+            .retained_leases
+            .replace_requirements(self.dataset.renderer_requirements())
         {
             self.dataset.record_plan_error(error.to_string());
             self.render_runtime.visible_brick_plan_error = Some(error.to_string());
@@ -190,7 +192,7 @@ impl MiranteWorkbenchApp {
             }
             if let Err(fault) =
                 self.dataset
-                    .submit_scope(scope, priority, &self.render_runtime.lease_bridge)
+                    .submit_scope(scope, priority, &self.render_runtime.retained_leases)
             {
                 submission_fault = Some(fault);
                 break;
@@ -202,7 +204,7 @@ impl MiranteWorkbenchApp {
 
         let ready = self
             .dataset
-            .scope_complete(SCOPE_CURRENT_3D, &self.render_runtime.lease_bridge);
+            .scope_complete(SCOPE_CURRENT_3D, &self.render_runtime.retained_leases);
         self.update_dataset_fidelity(ready);
         VisibleBrickRequestOutcome {
             current_changed,
@@ -237,7 +239,7 @@ impl MiranteWorkbenchApp {
             &mut self.render_runtime,
             &mut self.analysis_runtime,
         );
-        let bridge = &mut render.lease_bridge;
+        let bridge = &mut render.retained_leases;
         let mut installed = false;
         let mut analysis_events = Vec::new();
         let mut analysis_errors = Vec::new();
@@ -295,7 +297,7 @@ impl MiranteWorkbenchApp {
 
         let ready = self
             .dataset
-            .scope_complete(SCOPE_CURRENT_3D, &self.render_runtime.lease_bridge);
+            .scope_complete(SCOPE_CURRENT_3D, &self.render_runtime.retained_leases);
         self.update_dataset_fidelity(ready);
         if completion_drain_needs_replan(
             installed,
@@ -364,7 +366,7 @@ impl MiranteWorkbenchApp {
             };
             let limits = DatasetDemandPlanLimits::new(
                 SEMANTIC_PLAN_CANDIDATES_PER_LAYER,
-                MAX_RENDER_REQUIREMENTS
+                PRODUCT_RENDER_RESOURCE_LIMIT
                     .saturating_sub(union.len())
                     .checked_div(remaining_panels)
                     .unwrap_or(0),
@@ -377,9 +379,7 @@ impl MiranteWorkbenchApp {
             let panel_plan = plan_cross_section_panel(
                 snapshot.catalog(),
                 application_view(snapshot),
-                panel_id
-                    .cross_section_panel()
-                    .expect("a cross-section scope has a cross-section panel"),
+                panel_id,
                 presentation,
                 scale,
                 limits,
@@ -399,12 +399,17 @@ impl MiranteWorkbenchApp {
     fn update_dataset_fidelity(&mut self, ready: bool) {
         let snapshot = self.application.snapshot();
         let view = application_view(&snapshot);
-        let status = self.render_runtime.lease_bridge.cohort_status(
-            snapshot.catalog().scientific_identity().resource_identity(),
-            view.active_layer(),
-            view.timepoint(),
-            self.dataset.current_scale(),
-        );
+        let status = self
+            .render_runtime
+            .retained_leases
+            .resident_subset(
+                self.dataset.scope_requirements(SCOPE_CURRENT_3D),
+                snapshot.catalog().scientific_identity().resource_identity(),
+                view.active_layer(),
+                view.timepoint(),
+                self.dataset.current_scale(),
+            )
+            .status();
         self.render_runtime.frame_fidelity.resident_bricks = status.retained;
         self.render_runtime.frame_fidelity.missing_occupied_bricks = status.missing;
         self.render_runtime.frame_fidelity.cpu_cache_bytes = self
@@ -422,7 +427,7 @@ impl MiranteWorkbenchApp {
         self.render_runtime.frame_fidelity.backend = if empty {
             RenderBackend::Empty
         } else if ready {
-            RenderBackend::GpuResidentBricks
+            self.render_runtime.render_backend
         } else {
             RenderBackend::Loading
         };

@@ -1,6 +1,6 @@
 use mirante4d_dataset::CpuLedgerCategory;
 use mirante4d_dataset_runtime::DatasetRuntimeDiagnostics;
-use mirante4d_renderer::gpu::{AdapterDiagnostics, GpuLimitDiagnostics};
+use mirante4d_render_wgpu::WgpuRenderRuntimeDiagnostics;
 use serde_json::{Value, json};
 
 pub(crate) fn dataset_runtime_diagnostics_json(diagnostics: DatasetRuntimeDiagnostics) -> Value {
@@ -52,54 +52,32 @@ fn category_bytes_json(diagnostics: DatasetRuntimeDiagnostics, capacity: bool) -
     })
 }
 
-pub(crate) fn gpu_adapter_diagnostics_json(adapter: &AdapterDiagnostics) -> Value {
+pub(crate) fn gpu_adapter_diagnostics_json(adapter: &WgpuRenderRuntimeDiagnostics) -> Value {
     json!({
-        "name": adapter.name.as_str(),
-        "backend": adapter.backend.as_str(),
-        "device_type": adapter.device_type.as_str(),
-        "driver": adapter.driver.as_str(),
-        "driver_info": adapter.driver_info.as_str(),
-        "timestamp_queries_supported": adapter.timestamp_queries_supported,
-        "timestamp_queries_requested": adapter.timestamp_queries_requested,
-        "timestamp_queries_enabled": adapter.timestamp_queries_enabled,
-        "adapter_limits": gpu_limit_diagnostics_json(&adapter.adapter_limits),
-        "requested_limits": gpu_limit_diagnostics_json(&adapter.requested_limits),
+        "name": adapter.adapter_name(),
+        "backend": adapter.backend(),
+        "driver": adapter.driver(),
+        "limits": {
+            "max_buffer_size": adapter.max_buffer_size_bytes(),
+            "max_storage_buffer_binding_size": adapter.max_storage_buffer_binding_size_bytes(),
+            "max_storage_buffers_per_shader_stage": adapter.max_storage_buffers_per_shader_stage(),
+        },
+        "gpu_budget_bytes": adapter.gpu_budget_bytes(),
+        "payload_capacity_bytes": adapter.payload_capacity_bytes(),
+        "transfer_capacity_bytes": adapter.transfer_capacity_bytes(),
+        "other_capacity_bytes": adapter.other_capacity_bytes(),
+        "resident_payload_bytes": adapter.resident_payload_bytes(),
+        "frames_executed": adapter.frames_executed(),
+        "queue_submissions": adapter.queue_submissions(),
+        "validation_error_count": adapter.validation_error_count(),
     })
 }
 
-fn gpu_limit_diagnostics_json(limits: &GpuLimitDiagnostics) -> Value {
+pub(crate) fn gpu_timestamp_timing_json() -> Value {
     json!({
-        "max_buffer_size": limits.max_buffer_size,
-        "max_storage_buffer_binding_size": limits.max_storage_buffer_binding_size,
-        "max_storage_buffers_per_shader_stage": limits.max_storage_buffers_per_shader_stage,
-    })
-}
-
-pub(crate) fn gpu_timestamp_timing_json(adapter: &AdapterDiagnostics) -> Value {
-    json!({
-        "kind": "gpu_timestamp_timing",
+        "kind": "gpu_timing",
         "taxonomy_version": 1,
-        "status": gpu_timestamp_timing_status(adapter),
-        "env_var": "MIRANTE4D_GPU_TIMESTAMPS",
-        "measurement_scope": "renderer_compute_pass_elapsed_time_from_wgpu_timestamp_queries",
-        "sample_field": "gpu_compute_ms",
-        "unit": "milliseconds",
-        "adapter_timestamp_queries_supported": adapter.timestamp_queries_supported,
-        "timestamp_queries_requested": adapter.timestamp_queries_requested,
-        "timestamp_queries_enabled": adapter.timestamp_queries_enabled,
+        "status": "not_collected",
+        "reason": "WP-09B makes no performance claim",
     })
-}
-
-fn gpu_timestamp_timing_status(adapter: &AdapterDiagnostics) -> &'static str {
-    match (
-        adapter.timestamp_queries_supported,
-        adapter.timestamp_queries_requested,
-        adapter.timestamp_queries_enabled,
-    ) {
-        (_, _, true) => "enabled",
-        (true, true, false) => "requested_but_device_feature_missing",
-        (false, true, false) => "requested_but_unsupported",
-        (true, false, false) => "supported_not_requested",
-        (false, false, false) => "unsupported_not_requested",
-    }
 }

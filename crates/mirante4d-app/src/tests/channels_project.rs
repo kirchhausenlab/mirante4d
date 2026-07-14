@@ -1,10 +1,10 @@
+use crate::retained_leases::RetainedLeases;
 use crate::viewer_layout::PanelId;
 use mirante4d_dataset::{
     DatasetResourceIdentity, DatasetResourceKey, DatasetSourceId, ResourceLease,
     ResourcePayloadDescriptor, ResourcePayloadView, ResourceRegion, ResourceValidity,
 };
 use mirante4d_domain::{LogicalLayerKey, ScaleLevel};
-use mirante4d_renderer::CurrentLeaseBridge;
 
 struct HistogramTestLease {
     key: DatasetResourceKey,
@@ -75,7 +75,7 @@ fn u16_histogram_lease(
 }
 
 fn histogram_for_test(
-    bridge: &CurrentLeaseBridge,
+    bridge: &RetainedLeases,
     layer: u32,
     timepoint: u64,
     scale: u32,
@@ -122,8 +122,8 @@ fn workbench_shell_exposes_channel_display_controls() {
 #[test]
 fn active_layer_histogram_reads_only_valid_lease_samples_and_keeps_valid_zero() {
     let key = histogram_key(0, 0, 0, 0, 4);
-    let mut bridge = CurrentLeaseBridge::new();
-    bridge.replace_current_requirements([key]).unwrap();
+    let mut bridge = RetainedLeases::new();
+    bridge.replace_requirements([key]).unwrap();
     bridge
         .install(u16_histogram_lease(key, &[0, 4, 10, 20], Some(0b0000_1101)))
         .unwrap();
@@ -143,10 +143,8 @@ fn active_layer_histogram_reads_only_valid_lease_samples_and_keeps_valid_zero() 
 fn active_layer_histogram_is_pending_when_its_own_cohort_lease_is_missing() {
     let retained = histogram_key(0, 0, 0, 0, 2);
     let missing = histogram_key(0, 0, 0, 2, 2);
-    let mut bridge = CurrentLeaseBridge::new();
-    bridge
-        .replace_current_requirements([retained, missing])
-        .unwrap();
+    let mut bridge = RetainedLeases::new();
+    bridge.replace_requirements([retained, missing]).unwrap();
     bridge
         .install(u16_histogram_lease(retained, &[1, 2], None))
         .unwrap();
@@ -167,10 +165,8 @@ fn active_layer_histogram_is_pending_when_its_own_cohort_lease_is_missing() {
 fn unrelated_missing_lease_does_not_keep_active_histogram_pending() {
     let active = histogram_key(0, 0, 0, 0, 2);
     let unrelated = histogram_key(1, 0, 0, 0, 2);
-    let mut bridge = CurrentLeaseBridge::new();
-    bridge
-        .replace_current_requirements([active, unrelated])
-        .unwrap();
+    let mut bridge = RetainedLeases::new();
+    bridge.replace_requirements([active, unrelated]).unwrap();
     bridge
         .install(u16_histogram_lease(active, &[3, 9], None))
         .unwrap();
@@ -186,8 +182,8 @@ fn unrelated_missing_lease_does_not_keep_active_histogram_pending() {
 fn linked_view_missing_lease_in_same_cohort_does_not_block_histogram() {
     let active = histogram_key(0, 0, 0, 0, 2);
     let linked = histogram_key(0, 0, 0, 2, 2);
-    let mut bridge = CurrentLeaseBridge::new();
-    bridge.replace_current_requirements([active, linked]).unwrap();
+    let mut bridge = RetainedLeases::new();
+    bridge.replace_requirements([active, linked]).unwrap();
     bridge
         .install(u16_histogram_lease(active, &[3, 9], None))
         .unwrap();
@@ -212,7 +208,7 @@ fn linked_view_missing_lease_in_same_cohort_does_not_block_histogram() {
 
 #[test]
 fn histogram_without_a_requested_lease_reports_loading_without_io() {
-    let histogram = histogram_for_test(&CurrentLeaseBridge::new(), 0, 0, 0);
+    let histogram = histogram_for_test(&RetainedLeases::new(), 0, 0, 0);
     match histogram.status {
         HistogramStatus::Pending { reason } => assert!(reason.contains("leases loading")),
         other => panic!("expected pending lease histogram, got {other:?}"),
@@ -350,7 +346,7 @@ fn timepoint_command_dirties_cross_section_panels_without_dirtying_3d_panel() {
     let mut app = test_workbench_app_without_background_runtime(opened);
     let ctx = egui::Context::default();
     let presentation = PresentationViewport::new(240.0, 180.0).unwrap();
-    let render = RenderViewport::new(480, 360).unwrap();
+    let render = mirante4d_render_api::RenderExtent::new(480, 360).unwrap();
 
     let initial_snapshot = app.application.snapshot();
     let cross_section = *application_view(&initial_snapshot).cross_section();

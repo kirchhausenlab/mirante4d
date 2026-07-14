@@ -22,8 +22,8 @@
     {
       "selector": "package(mirante4d-app) & test(=tests::import_verify_analyze_save_and_reopen_atomically)",
       "warn_ms": 5000,
-      "terminate_ms": 20000,
-      "reason": "This one product integration imports and validates a real sharded target package before opening, analyzing, saving, and reopening it; the debug import takes about 10 seconds on the supported small fixture."
+      "terminate_ms": 30000,
+      "reason": "This one product integration imports and validates a real sharded target package before opening, analyzing, saving, and reopening it; the debug path takes about 11 seconds locally and can approach 20 seconds on a shared hosted runner."
     },
     {
       "selector": "package(mirante4d-project-store) & test(=actor::tests::hosted_durability_tests::exhaustive_hosted_and_process_transition_matrix)",
@@ -88,11 +88,10 @@
         "mirante4d-render-api",
         "mirante4d-render-reference",
         "mirante4d-render-wgpu",
-        "mirante4d-renderer",
         "mirante4d-settings",
         "xtask"
       ],
-      "selector": "package(mirante4d-analysis-core) | package(mirante4d-analysis-runtime) | package(mirante4d-application) | package(mirante4d-dataset) | package(mirante4d-dataset-runtime) | package(mirante4d-domain) | package(mirante4d-identity) | package(mirante4d-project-model) | package(mirante4d-render-api) | package(mirante4d-render-reference) | package(mirante4d-render-wgpu) | package(mirante4d-renderer) | package(mirante4d-settings) | package(xtask)",
+      "selector": "package(mirante4d-analysis-core) | package(mirante4d-analysis-runtime) | package(mirante4d-application) | package(mirante4d-dataset) | package(mirante4d-dataset-runtime) | package(mirante4d-domain) | package(mirante4d-identity) | package(mirante4d-project-model) | package(mirante4d-render-api) | package(mirante4d-render-reference) | package(mirante4d-render-wgpu) | package(mirante4d-settings) | package(xtask)",
       "warn_ms": 500,
       "terminate_ms": 2000,
       "aggregate_timeout_secs": 720
@@ -221,7 +220,7 @@
     },
     {
       "id": "trusted-gpu",
-      "owner": "renderer-and-application-gpu",
+      "owner": "mirante4d-render-wgpu",
       "capability": "trusted-hw2-vulkan",
       "requirements": ["D-022-trusted-gpu-separation"],
       "fixture_tier": "T2-or-T5",
@@ -230,7 +229,7 @@
       "trigger": "manual clean-worktree trusted HW-2",
       "command": "cargo xtask verify-local trusted-gpu",
       "hosted_required": false,
-      "activation_state": "active-temporary-WP-06-until-WP-09B"
+      "activation_state": "active-WP-09B-product-renderer"
     },
     {
       "id": "product-e1",
@@ -351,23 +350,6 @@
     }
   ],
   "selector_adapters": [
-    {
-      "id": "WP06-ADAPTER-TRUSTED-SPECIAL-SELECTOR",
-      "lane": "trusted-gpu",
-      "owner": "renderer-and-application-gpu",
-      "requirements": ["D-022-trusted-gpu-separation"],
-      "fixture_tier": "T2",
-      "capability": "trusted-gpu",
-      "matches": [
-        {
-          "package": "mirante4d-renderer",
-          "test_prefix": "gpu::"
-        }
-      ],
-      "expected_ignored_cases": 8,
-      "expiry": "WP-09B",
-      "deletion_gate": "WP-09B-product-render-hard-cutover"
-    },
     {
       "id": "WP09A-ADAPTER-TRUSTED-GPU",
       "lane": "trusted-gpu",

@@ -25,9 +25,9 @@ use mirante4d_domain::{
     WorldPoint3,
 };
 use mirante4d_render_api::{
-    FrameIdentity, FrameLimitation, GpuLedgerCategory, LayerRenderIntent, PresentationViewport,
-    RenderExtent, RenderIntent, RenderRequirement, RenderRequirementRole, RenderRequirements,
-    RenderViewIntent,
+    FrameCompleteness, FrameIdentity, FrameLimitation, GpuLedgerCategory, LayerRenderIntent,
+    PresentationToken, PresentationViewport, RenderExtent, RenderIntent, RenderRequirement,
+    RenderRequirementRole, RenderRequirements, RenderViewIntent,
 };
 use mirante4d_render_reference::{ReferenceFrame, ReferenceRenderer};
 
@@ -629,17 +629,28 @@ impl Counters {
     }
 }
 
+struct ComparisonInput<'a> {
+    catalog: &'a DatasetCatalog,
+    intent: &'a RenderIntent,
+    requirements: &'a RenderRequirements,
+    leases: &'a [&'a dyn ResourceLease],
+}
+
 fn execute_and_compare(
     gpu: &mut WgpuRenderRuntime,
-    catalog: &DatasetCatalog,
-    intent: &RenderIntent,
-    requirements: &RenderRequirements,
-    leases: &[&dyn ResourceLease],
+    presentation: PresentationToken,
+    input: ComparisonInput<'_>,
     deadline: Instant,
     counters: &mut Counters,
 ) -> (ValidationCapture, u8) {
     let report = gpu
-        .execute_frame(catalog, intent, requirements, leases)
+        .execute_frame(
+            presentation,
+            input.catalog,
+            input.intent,
+            input.requirements,
+            input.leases,
+        )
         .expect("semantic GPU frame executes");
     counters.record(&report);
     let ticket = report
@@ -647,7 +658,7 @@ fn execute_and_compare(
         .expect("qualification enables asynchronous validation capture");
     let capture = poll_capture(gpu, ticket, deadline);
     let reference = ReferenceRenderer::new()
-        .render(catalog, intent, leases)
+        .render(input.catalog, input.intent, input.leases)
         .expect("independent CPU reference renders fixture leases");
     let max_delta = compare_reference(&capture, &reference);
     (capture, max_delta)
@@ -806,6 +817,10 @@ fn qualification() {
     assert_eq!(gpu.diagnostics().backend(), "Vulkan");
     let mut counters = Counters::default();
     let extent = RenderExtent::new(96, 96).expect("semantic extent is valid");
+    let presentation = gpu
+        .register_presentation(extent)
+        .expect("qualification presentation registers")
+        .token();
     let mut rgba8_max_delta = 0_u8;
 
     let (mip, mip_requirements) = intent_and_requirements(
@@ -819,10 +834,13 @@ fn qualification() {
     let u8_leases = borrowed_leases(&fixtures.semantic[0], &leases, Some(fixtures.missing_u8));
     let (_, delta) = execute_and_compare(
         &mut gpu,
-        &catalog,
-        &mip,
-        &mip_requirements,
-        &u8_leases,
+        presentation,
+        ComparisonInput {
+            catalog: &catalog,
+            intent: &mip,
+            requirements: &mip_requirements,
+            leases: &u8_leases,
+        },
         deadline,
         &mut counters,
     );
@@ -848,10 +866,13 @@ fn qualification() {
     let u16_leases = borrowed_leases(&fixtures.semantic[1], &leases, None);
     let (_, delta) = execute_and_compare(
         &mut gpu,
-        &catalog,
-        &dvr,
-        &dvr_requirements,
-        &u16_leases,
+        presentation,
+        ComparisonInput {
+            catalog: &catalog,
+            intent: &dvr,
+            requirements: &dvr_requirements,
+            leases: &u16_leases,
+        },
         deadline,
         &mut counters,
     );
@@ -871,10 +892,13 @@ fn qualification() {
     let f32_leases = borrowed_leases(&fixtures.semantic[2], &leases, None);
     let (_, delta) = execute_and_compare(
         &mut gpu,
-        &catalog,
-        &iso,
-        &iso_requirements,
-        &f32_leases,
+        presentation,
+        ComparisonInput {
+            catalog: &catalog,
+            intent: &iso,
+            requirements: &iso_requirements,
+            leases: &f32_leases,
+        },
         deadline,
         &mut counters,
     );
@@ -890,10 +914,13 @@ fn qualification() {
     );
     let (section_capture, delta) = execute_and_compare(
         &mut gpu,
-        &catalog,
-        &section,
-        &section_requirements,
-        &u8_leases,
+        presentation,
+        ComparisonInput {
+            catalog: &catalog,
+            intent: &section,
+            requirements: &section_requirements,
+            leases: &u8_leases,
+        },
         deadline,
         &mut counters,
     );
@@ -922,6 +949,7 @@ fn qualification() {
     let upload_borrowed = borrowed_leases(&fixtures.upload, &upload_leases, None);
     let first_upload = gpu
         .execute_frame(
+            presentation,
             &catalog,
             &upload_intent,
             &upload_requirements,
@@ -930,6 +958,12 @@ fn qualification() {
         .expect("first upload-boundary frame executes");
     assert_eq!(first_upload.uploaded_resources(), 8);
     assert_eq!(first_upload.payload_upload_bytes(), 8 * MIB);
+    assert_eq!(
+        first_upload
+            .progress()
+            .map(mirante4d_render_api::FrameProgress::completeness),
+        Some(FrameCompleteness::Progressive)
+    );
     assert_eq!(
         first_upload
             .progress()
@@ -946,6 +980,7 @@ fn qualification() {
     );
     let second_upload = gpu
         .execute_frame(
+            presentation,
             &catalog,
             &upload_intent,
             &upload_requirements,
@@ -954,6 +989,18 @@ fn qualification() {
         .expect("second upload-boundary frame executes");
     assert_eq!(second_upload.uploaded_resources(), 1);
     assert_eq!(second_upload.payload_upload_bytes(), MIB);
+    assert_eq!(
+        second_upload
+            .progress()
+            .map(mirante4d_render_api::FrameProgress::completeness),
+        Some(FrameCompleteness::Exact)
+    );
+    assert_eq!(
+        second_upload
+            .progress()
+            .and_then(mirante4d_render_api::FrameProgress::limitation),
+        None
+    );
     counters.record(&second_upload);
     let _ = poll_capture(
         &mut gpu,
@@ -980,6 +1027,7 @@ fn qualification() {
     let work_borrowed = borrowed_leases(&fixtures.work, &work_leases, None);
     let first_work = gpu
         .execute_frame(
+            presentation,
             &catalog,
             &work_intent,
             &work_requirements,
@@ -997,6 +1045,7 @@ fn qualification() {
     );
     let second_work = gpu
         .execute_frame(
+            presentation,
             &catalog,
             &work_intent,
             &work_requirements,
@@ -1022,7 +1071,13 @@ fn qualification() {
         &fixtures.semantic[0],
     );
     let stale_report = gpu
-        .execute_frame(&catalog, &stale_intent, &stale_requirements, &u8_leases)
+        .execute_frame(
+            presentation,
+            &catalog,
+            &stale_intent,
+            &stale_requirements,
+            &u8_leases,
+        )
         .expect("candidate stale frame executes");
     counters.record(&stale_report);
     let stale_ticket = stale_report
@@ -1037,7 +1092,13 @@ fn qualification() {
         &fixtures.semantic[0],
     );
     let current_report = gpu
-        .execute_frame(&catalog, &current_intent, &current_requirements, &u8_leases)
+        .execute_frame(
+            presentation,
+            &catalog,
+            &current_intent,
+            &current_requirements,
+            &u8_leases,
+        )
         .expect("newer current frame executes");
     counters.record(&current_report);
     assert_eq!(
@@ -1054,7 +1115,13 @@ fn qualification() {
     assert_eq!(current_capture.frame(), FrameIdentity::new(31));
     let submissions_before_stale = gpu.diagnostics().queue_submissions();
     assert!(matches!(
-        gpu.execute_frame(&catalog, &stale_intent, &stale_requirements, &u8_leases,),
+        gpu.execute_frame(
+            presentation,
+            &catalog,
+            &stale_intent,
+            &stale_requirements,
+            &u8_leases,
+        ),
         Err(WgpuRenderRuntimeError::StaleFrame { .. })
     ));
     assert_eq!(
@@ -1075,6 +1142,7 @@ fn qualification() {
         );
         let report = gpu
             .execute_frame(
+                presentation,
                 &catalog,
                 &qualified_intent,
                 &qualified_requirements,
@@ -1101,6 +1169,10 @@ fn qualification() {
                 .expect("small qualification ledger is valid"),
         ))
         .expect("small-ledger runtime uses the same qualifying Vulkan adapter");
+        let small_presentation = small_gpu
+            .register_presentation(upload_extent)
+            .expect("small-ledger presentation registers")
+            .token();
         let mut capacity_counters = Counters::default();
         for (index, key) in fixtures.upload.iter().enumerate() {
             let (intent, requirements) = intent_and_requirements(
@@ -1113,7 +1185,13 @@ fn qualification() {
             );
             let lease = upload_leases.get(key).expect("upload lease exists");
             let report = small_gpu
-                .execute_frame(&catalog, &intent, &requirements, &[lease])
+                .execute_frame(
+                    small_presentation,
+                    &catalog,
+                    &intent,
+                    &requirements,
+                    &[lease],
+                )
                 .expect("small-ledger eviction sequence executes");
             assert_eq!(report.uploaded_resources(), 1);
             capacity_counters.record(&report);
@@ -1132,6 +1210,7 @@ fn qualification() {
             .expect("first upload lease exists");
         let replacement = small_gpu
             .execute_frame(
+                small_presentation,
                 &catalog,
                 &replacement_intent,
                 &replacement_requirements,
@@ -1157,6 +1236,7 @@ fn qualification() {
         let submissions_before_capacity = small_gpu.diagnostics().queue_submissions();
         assert!(matches!(
             small_gpu.execute_frame(
+                small_presentation,
                 &catalog,
                 &capacity_intent,
                 &capacity_requirements,
@@ -1197,6 +1277,7 @@ fn qualification() {
     );
     let lease_release_report = gpu
         .execute_frame(
+            presentation,
             &catalog,
             &lease_release_intent,
             &lease_release_requirements,

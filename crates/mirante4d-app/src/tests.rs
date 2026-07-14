@@ -3,6 +3,7 @@ use std::{
     fs,
     io::Write,
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -366,7 +367,7 @@ fn test_workbench_app_without_background_runtime(
         analysis_runtime,
     } = opened;
     let resource_policy = ResourcePolicy::default();
-    let ui_runtime = current_runtime::ui::CurrentUiRuntime::new(resource_policy, None);
+    let ui_runtime = current_runtime::ui::CurrentUiRuntime::new(resource_policy, None, None);
     let (mut settings_connection, _) =
         current_settings_connection::CurrentSettingsConnection::start();
     settings_connection

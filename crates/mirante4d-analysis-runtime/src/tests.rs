@@ -282,6 +282,9 @@ fn dataset_failure_drops_partial_state_and_requires_a_new_generation() {
     let demand = analysis.next_demand().unwrap();
     let ticket = runtime.submit(demand.request()).unwrap();
     analysis.register_submission(demand, ticket).unwrap();
+    // Finish the real background request before comparing the shared ledger;
+    // this test injects its own failure outcome below.
+    drop(collect(&runtime, 1));
     let before_failure = runtime
         .diagnostics()
         .unwrap()

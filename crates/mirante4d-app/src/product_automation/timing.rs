@@ -125,7 +125,7 @@ impl ProductAutomationCrossSectionLatencySample {
             "kind": "cross_section_command_to_current_partial_latency",
             "taxonomy_version": 1,
             "measurement_scope": cross_section_latency_measurement_scope(),
-            "presentation_proxy": "panel_displayed_generation_with_gpu_display_frame",
+            "presentation_proxy": "panel_displayed_generation_with_successor_presentation",
             "command_index": self.command_index,
             "command": self.command,
             "operation": self.operation,
@@ -385,7 +385,6 @@ pub(crate) fn display_refresh_timing_json(timing: DisplayRefreshTiming) -> Value
             "gpu_compute": timing.gpu_compute_ms,
             "egui_texture_registration": timing.egui_texture_ms,
             "visible_brick_request": timing.visible_brick_request_ms,
-            "cpu_texture_update": timing.cpu_texture_update_ms,
             "total_refresh": timing.total_ms,
         },
     })
@@ -399,10 +398,9 @@ pub(crate) fn display_refresh_timing_summary_json(
     let mut gpu_compute = Vec::new();
     let mut egui_texture_registration = Vec::with_capacity(samples.len());
     let mut visible_brick_request = Vec::with_capacity(samples.len());
-    let mut cpu_texture_update = Vec::with_capacity(samples.len());
     let mut total_refresh = Vec::with_capacity(samples.len());
     let mut gpu_path_samples = 0_u64;
-    let mut cpu_path_samples = 0_u64;
+    let mut ui_background_samples = 0_u64;
     let mut dominant_counts = Map::new();
 
     for sample in samples {
@@ -416,11 +414,10 @@ pub(crate) fn display_refresh_timing_summary_json(
         }
         egui_texture_registration.push(timing.egui_texture_ms);
         visible_brick_request.push(timing.visible_brick_request_ms);
-        cpu_texture_update.push(timing.cpu_texture_update_ms);
         total_refresh.push(timing.total_ms);
         match timing.path {
             crate::display_refresh::DisplayRefreshPath::GpuResidentDisplay => gpu_path_samples += 1,
-            crate::display_refresh::DisplayRefreshPath::CpuTexture => cpu_path_samples += 1,
+            crate::display_refresh::DisplayRefreshPath::UiBackground => ui_background_samples += 1,
         }
         let dominant = dominant_display_refresh_phase(timing);
         let current = dominant_counts
@@ -452,10 +449,6 @@ pub(crate) fn display_refresh_timing_summary_json(
             "visible_brick_request",
             timing_values_summary_json(visible_brick_request),
         ),
-        (
-            "cpu_texture_update",
-            timing_values_summary_json(cpu_texture_update),
-        ),
         ("total_refresh", timing_values_summary_json(total_refresh)),
     ];
     let dominant_by_p95 = phase_summaries
@@ -484,7 +477,7 @@ pub(crate) fn display_refresh_timing_summary_json(
         "sample_count": samples.len(),
         "path_counts": {
             "gpu display": gpu_path_samples,
-            "cpu texture": cpu_path_samples,
+            "ui background": ui_background_samples,
         },
         "dominant_non_total_phase_counts": dominant_counts,
         "dominant_non_total_phase_by_p95": dominant_by_p95,
@@ -497,14 +490,14 @@ pub(crate) fn input_to_present_timing_summary_json(
 ) -> Value {
     let mut latency = Vec::with_capacity(samples.len());
     let mut gpu_path_samples = 0_u64;
-    let mut cpu_path_samples = 0_u64;
+    let mut ui_background_samples = 0_u64;
     let mut command_counts = Map::new();
 
     for sample in samples {
         latency.push(sample.latency_ms);
         match sample.display_refresh_timing.path {
             crate::display_refresh::DisplayRefreshPath::GpuResidentDisplay => gpu_path_samples += 1,
-            crate::display_refresh::DisplayRefreshPath::CpuTexture => cpu_path_samples += 1,
+            crate::display_refresh::DisplayRefreshPath::UiBackground => ui_background_samples += 1,
         }
         let current = command_counts
             .get(sample.command)
@@ -522,7 +515,7 @@ pub(crate) fn input_to_present_timing_summary_json(
         "latency_ms": timing_values_summary_json(latency),
         "path_counts": {
             "gpu display": gpu_path_samples,
-            "cpu texture": cpu_path_samples,
+            "ui background": ui_background_samples,
         },
         "command_counts": command_counts,
     })
@@ -594,7 +587,7 @@ pub(crate) fn cross_section_latency_summary_json(
         "kind": "cross_section_latency_summary",
         "taxonomy_version": 1,
         "measurement_scope": cross_section_latency_measurement_scope(),
-        "presentation_proxy": "panel_displayed_generation_with_gpu_display_frame",
+        "presentation_proxy": "panel_displayed_generation_with_successor_presentation",
         "sample_count": samples.len(),
         "pending_sample_count": pending_count,
         "latency_ms": all_summary,
@@ -696,7 +689,6 @@ fn display_refresh_phase_measurement_scopes_json() -> Value {
         "gpu_compute": "wgpu_timestamp_query_elapsed_when_enabled",
         "egui_texture_registration": "cpu_wall_clock",
         "visible_brick_request": "cpu_wall_clock",
-        "cpu_texture_update": "cpu_wall_clock",
         "total_refresh": "cpu_wall_clock",
     })
 }
@@ -739,7 +731,6 @@ fn dominant_display_refresh_phase(timing: DisplayRefreshTiming) -> &'static str 
     for phase in [
         ("egui_texture_registration", timing.egui_texture_ms),
         ("visible_brick_request", timing.visible_brick_request_ms),
-        ("cpu_texture_update", timing.cpu_texture_update_ms),
     ] {
         if phase.1 > dominant.1 {
             dominant = phase;

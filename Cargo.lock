@@ -180,15 +180,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
-name = "approx"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cab112f0a86d568ea0e627cc1d6be74a1e9cd55214684db5561995f6dad897c6"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
 name = "arboard"
 version = "3.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2115,7 +2106,7 @@ dependencies = [
  "mirante4d-project-model",
  "mirante4d-project-store",
  "mirante4d-render-api",
- "mirante4d-renderer",
+ "mirante4d-render-wgpu",
  "mirante4d-settings",
  "mirante4d-storage",
  "rfd",
@@ -2248,22 +2239,6 @@ dependencies = [
  "mirante4d-render-api",
  "mirante4d-render-reference",
  "pollster",
- "thiserror 2.0.17",
- "wgpu",
-]
-
-[[package]]
-name = "mirante4d-renderer"
-version = "0.1.0"
-dependencies = [
- "approx",
- "bytemuck",
- "glam",
- "mirante4d-dataset",
- "mirante4d-domain",
- "mirante4d-render-api",
- "pollster",
- "tempfile",
  "thiserror 2.0.17",
  "wgpu",
 ]

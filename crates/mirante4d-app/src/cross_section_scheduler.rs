@@ -121,7 +121,7 @@ fn build_cross_section_panel_schedule(
     let retained = input
         .requirements
         .iter()
-        .filter(|key| render.lease_bridge.payload(**key).is_some())
+        .filter(|key| render.retained_leases.payload(**key).is_some())
         .count();
     let missing = required.saturating_sub(retained);
 

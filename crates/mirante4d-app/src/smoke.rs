@@ -5,8 +5,11 @@
 //! CPU product-rendering fallback.
 
 use std::{
+    future::Future,
     path::Path,
     sync::Arc,
+    task::{Context, Poll, Wake, Waker},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -15,12 +18,14 @@ use mirante4d_dataset::{CpuLedgerCategory, ResourceLease, ResourcePayloadView};
 use mirante4d_dataset_runtime::RequestPriority;
 use mirante4d_domain::IntensityDType;
 use mirante4d_render_api::MAX_RENDER_REQUIREMENTS;
-use mirante4d_renderer::gpu::GpuRenderer;
+use mirante4d_render_wgpu::{qualify_adapter, renderer_device_descriptor};
 use mirante4d_settings::recommended_for_current_system;
 
 use crate::{
     application_view,
-    dataset_demand_plan::{DatasetDemandPlanLimits, plan_current_3d},
+    dataset_demand_plan::{
+        DatasetDemandPlanLimits, plan_current_3d, render_extent_from_dimensions,
+    },
     dataset_requests::SCOPE_CURRENT_3D,
     playback::stepped_timepoint,
     unified_source_open,
@@ -86,25 +91,15 @@ pub fn run_headless_smoke(
     )
     .map_err(|code| anyhow::anyhow!("smoke application state rejected: {code:?}"))?;
 
-    let gpu_renderer = if options.disable_gpu {
+    let gpu_adapter_summary = if options.disable_gpu {
         None
     } else {
-        let policy = resource_policy.current_runtime_adapter();
-        Some(GpuRenderer::new_with_cache_budgets_blocking(
-            policy.gpu_dense_cache_budget_bytes(),
-            policy.gpu_brick_cache_budget_bytes(),
-        )?)
+        Some(successor_gpu_adapter_summary()?)
     };
-    let gpu_adapter_summary = gpu_renderer.as_ref().map(|renderer| {
-        let adapter = renderer.adapter_diagnostics();
-        format!(
-            "{} {} {} driver={} {}",
-            adapter.backend, adapter.device_type, adapter.name, adapter.driver, adapter.driver_info
-        )
-    });
 
     load_current_requirements(&application, &mut opened, options.timeout)?;
-    let (nonzero_pixels, max_value) = retained_sample_summary(&opened.render_runtime.lease_bridge)?;
+    let (nonzero_pixels, max_value) =
+        retained_sample_summary(&opened.render_runtime.retained_leases)?;
     if nonzero_pixels == 0 {
         anyhow::bail!("unified runtime smoke decoded only zero or invalid visible samples");
     }
@@ -129,7 +124,7 @@ pub fn run_headless_smoke(
         let started = Instant::now();
         load_current_requirements(&application, &mut opened, options.timeout)?;
         let (nonzero_pixels, max_value) =
-            retained_sample_summary(&opened.render_runtime.lease_bridge)?;
+            retained_sample_summary(&opened.render_runtime.retained_leases)?;
         if nonzero_pixels == 0 {
             anyhow::bail!(
                 "unified runtime smoke decoded a blank timepoint {}",
@@ -156,8 +151,8 @@ pub fn run_headless_smoke(
     let report = AppSmokeReport {
         dataset_label: snapshot.catalog().label().to_owned(),
         layer_count: snapshot.catalog().len(),
-        frame_width: opened.render_runtime.render_viewport.width,
-        frame_height: opened.render_runtime.render_viewport.height,
+        frame_width: u64::from(opened.render_runtime.render_viewport.width_pixels()),
+        frame_height: u64::from(opened.render_runtime.render_viewport.height_pixels()),
         nonzero_pixels,
         max_value,
         displayed_scale_level: Some(opened.dataset.current_scale().get()),
@@ -168,6 +163,55 @@ pub fn run_headless_smoke(
     };
     opened.dataset.request_shutdown()?;
     Ok(report)
+}
+
+fn successor_gpu_adapter_summary() -> anyhow::Result<String> {
+    wait_for_future(async {
+        let instance = eframe::wgpu::Instance::new(eframe::wgpu::InstanceDescriptor {
+            backends: eframe::wgpu::Backends::VULKAN,
+            ..eframe::wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = instance
+            .request_adapter(&eframe::wgpu::RequestAdapterOptions {
+                power_preference: eframe::wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("no Vulkan GPU adapter is available: {error}"))?;
+        qualify_adapter(&adapter)?;
+        let descriptor = renderer_device_descriptor(&adapter, "mirante4d-headless-smoke-device")?;
+        let (_device, _queue) = adapter.request_device(&descriptor).await?;
+        let info = adapter.get_info();
+        Ok(format!(
+            "{:?} {:?} {} driver={} {}",
+            info.backend, info.device_type, info.name, info.driver, info.driver_info
+        ))
+    })
+}
+
+fn wait_for_future<F: Future>(future: F) -> F::Output {
+    struct ThreadWake(thread::Thread);
+
+    impl Wake for ThreadWake {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => thread::park(),
+        }
+    }
 }
 
 fn load_current_requirements(
@@ -181,7 +225,10 @@ fn load_current_requirements(
         snapshot.catalog(),
         application_view(&snapshot),
         opened.render_runtime.presentation_viewport,
-        opened.render_runtime.render_viewport,
+        render_extent_from_dimensions(
+            u64::from(opened.render_runtime.render_viewport.width_pixels()),
+            u64::from(opened.render_runtime.render_viewport.height_pixels()),
+        )?,
         DatasetDemandPlanLimits::new(
             MAX_RENDER_REQUIREMENTS,
             MAX_RENDER_REQUIREMENTS,
@@ -192,28 +239,28 @@ fn load_current_requirements(
     opened.dataset.install_current_plan(plan, false)?;
     opened
         .render_runtime
-        .lease_bridge
-        .replace_current_requirements(opened.dataset.renderer_requirements())?;
+        .retained_leases
+        .replace_requirements(opened.dataset.renderer_requirements())?;
     opened.dataset.submit_scope(
         SCOPE_CURRENT_3D,
         RequestPriority::CurrentView,
-        &opened.render_runtime.lease_bridge,
+        &opened.render_runtime.retained_leases,
     )?;
 
     let deadline = Instant::now() + timeout;
     while !opened
         .dataset
-        .scope_complete(SCOPE_CURRENT_3D, &opened.render_runtime.lease_bridge)
+        .scope_complete(SCOPE_CURRENT_3D, &opened.render_runtime.retained_leases)
     {
         if Instant::now() >= deadline {
             anyhow::bail!(
                 "timed out waiting for unified runtime leases: {} retained, {} missing",
-                opened.render_runtime.lease_bridge.retained_len(),
-                opened.render_runtime.lease_bridge.missing_len()
+                opened.render_runtime.retained_leases.retained_len(),
+                opened.render_runtime.retained_leases.missing_len()
             );
         }
         let (dataset, render) = (&mut opened.dataset, &mut opened.render_runtime);
-        let bridge = &mut render.lease_bridge;
+        let bridge = &mut render.retained_leases;
         dataset.dispatcher_mut().drain(32, |ticket, outcome| {
             if let mirante4d_dataset_runtime::RuntimeOutcome::Ready(lease) = outcome
                 && bridge.requires(ticket.resource())
@@ -230,7 +277,7 @@ fn load_current_requirements(
 }
 
 fn retained_sample_summary(
-    bridge: &mirante4d_renderer::CurrentLeaseBridge,
+    bridge: &crate::retained_leases::RetainedLeases,
 ) -> anyhow::Result<(u64, u16)> {
     let mut nonzero = 0_u64;
     let mut maximum = 0_u16;

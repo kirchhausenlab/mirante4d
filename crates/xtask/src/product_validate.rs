@@ -56,8 +56,10 @@ const T5_QUAL_001_FOUR_PANEL_CONTINUOUS_CROSS_SECTION_SCENARIO: &str =
 const T5_QUAL_002_FOUR_PANEL_TIMEPOINT_SCENARIO: &str = "t5_qual_002_four_panel_timepoint";
 const T5_QUAL_002_FOUR_PANEL_AUTOPLAY_SCENARIO: &str = "t5_qual_002_four_panel_autoplay";
 const CUSTOM_SCRIPT_SCENARIO: &str = "custom_script";
-const GENERATED_VIEWPORT_WIDTH: u32 = 960;
+const GENERATED_VIEWPORT_WIDTH: u32 = 1280;
 const GENERATED_VIEWPORT_HEIGHT: u32 = 720;
+const GENERATED_RESIZED_VIEWPORT_WIDTH: u32 = 1920;
+const GENERATED_RESIZED_VIEWPORT_HEIGHT: u32 = 1080;
 const B3_VIEWPORT_WIDTH: u32 = 1280;
 const B3_VIEWPORT_HEIGHT: u32 = 720;
 const B3_SECOND_VIEWPORT_WIDTH: u32 = 1920;
@@ -1683,6 +1685,7 @@ fn target_fixture_camera_smoke_script(package: &Path) -> Value {
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
             { "command": "set_viewport_size", "width": GENERATED_VIEWPORT_WIDTH, "height": GENERATED_VIEWPORT_HEIGHT },
+            { "command": "set_render_target_size", "width": GENERATED_VIEWPORT_WIDTH, "height": GENERATED_VIEWPORT_HEIGHT },
             { "command": "sleep_or_frames", "frames": 3 },
             { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30000 },
             { "command": "assert", "condition": "no_render_error" },
@@ -1704,7 +1707,7 @@ fn target_fixture_camera_smoke_script(package: &Path) -> Value {
 }
 
 fn target_fixture_render_modes_script(package: &Path) -> Value {
-    json!({
+    let mut script = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": GENERATED_RENDER_MODES_SCENARIO,
@@ -1713,18 +1716,21 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
             { "command": "set_viewport_size", "width": GENERATED_VIEWPORT_WIDTH, "height": GENERATED_VIEWPORT_HEIGHT },
+            { "command": "set_render_target_size", "width": GENERATED_VIEWPORT_WIDTH, "height": GENERATED_VIEWPORT_HEIGHT },
             { "command": "set_layer_window", "layer_index": 0, "low": 0.0, "high": 4096.0 },
             { "command": "set_layer_window", "layer_index": 1, "low": 20000.0, "high": 24096.0 },
             { "command": "set_layer_opacity", "layer_index": 0, "opacity": 1.0 },
             { "command": "set_layer_opacity", "layer_index": 1, "opacity": 1.0 },
             { "command": "sleep_or_frames", "frames": 3 },
             { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30000 },
             { "command": "camera_fit_data" },
             { "command": "set_render_mode", "mode": "mip" },
             { "command": "set_layer_render_mode", "layer_index": 1, "mode": "mip" },
             { "command": "assert", "condition": { "render_mode": { "mode": "mip" } } },
             { "command": "assert", "condition": "nonblank_frame" },
             { "command": "assert", "condition": "no_render_error" },
+            { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30000 },
             { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
             { "command": "copy_diagnostics" },
             { "command": "capture_screenshot", "name": "generated-mip" },
@@ -1745,11 +1751,49 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
             { "command": "assert", "condition": "no_render_error" },
             { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
             { "command": "copy_diagnostics" },
-            { "command": "capture_screenshot", "name": "generated-iso" },
+            { "command": "capture_screenshot", "name": "generated-iso" }
+        ]
+    });
+    let Value::Array(tail) = json!([
+            { "command": "set_render_mode", "mode": "mip" },
+            { "command": "set_layer_render_mode", "layer_index": 1, "mode": "mip" },
+            { "command": "set_viewer_layout", "layout": "four_panel" },
+            { "command": "sleep_or_frames", "frames": 8 },
+            { "command": "assert", "condition": { "viewer_layout": { "layout": "four_panel" } } },
+            { "command": "assert", "condition": { "cross_section_panel_schedule": {
+                "panel": "xz",
+                "min_generation": 1,
+                "min_selected_resources": 1
+            } } },
+            { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "four_panel_images_distinct": {
+                "min_different_pixels": 1
+            } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "name": "generated-linked-panels" },
+            { "command": "set_viewer_layout", "layout": "single3d" },
+            { "command": "sleep_or_frames", "frames": 3 },
+            { "command": "assert", "condition": "cross_section_retired" },
+            { "command": "set_viewport_size", "width": GENERATED_RESIZED_VIEWPORT_WIDTH, "height": GENERATED_RESIZED_VIEWPORT_HEIGHT },
+            { "command": "set_render_target_size", "width": GENERATED_RESIZED_VIEWPORT_WIDTH, "height": GENERATED_RESIZED_VIEWPORT_HEIGHT },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "render_target_pixels": {
+                "width": GENERATED_RESIZED_VIEWPORT_WIDTH,
+                "height": GENERATED_RESIZED_VIEWPORT_HEIGHT
+            } } },
+            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "name": "generated-resized-1920x1080" },
             { "command": "copy_diagnostics" },
             { "command": "quit" }
-        ]
-    })
+    ]) else {
+        unreachable!("the product validation command tail is an array")
+    };
+    script["commands"]
+        .as_array_mut()
+        .expect("the generated product validation script has commands")
+        .extend(tail);
+    script
 }
 
 fn target_source_verification_script(package: &Path) -> Value {

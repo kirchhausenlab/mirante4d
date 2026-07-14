@@ -10,7 +10,9 @@ mod runtime;
 
 use mirante4d_dataset::{DatasetCatalog, ResourceLease};
 use mirante4d_render_api::{
-    FrameIdentity, FrameProgress, GpuLedgerCategory, RenderExtent, RenderIntent, RenderRequirements,
+    FrameIdentity, FrameProgress, GpuLedgerCategory, PresentationRegistration,
+    PresentationRetirement, PresentationToken, PresentedFrame, RenderExtent, RenderIntent,
+    RenderRequirements,
 };
 use thiserror::Error;
 
@@ -219,11 +221,16 @@ impl WgpuRenderRuntimeDiagnostics {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ValidationCaptureTicket {
     id: u64,
+    presentation: PresentationToken,
     frame: FrameIdentity,
     extent: RenderExtent,
 }
 
 impl ValidationCaptureTicket {
+    pub const fn presentation(self) -> PresentationToken {
+        self.presentation
+    }
+
     pub const fn frame(self) -> FrameIdentity {
         self.frame
     }
@@ -269,6 +276,7 @@ impl ValidationCapture {
 /// `FrameProgress` proves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameExecutionReport {
+    presentation: Option<PresentedFrame>,
     frame: FrameIdentity,
     progress: Option<FrameProgress>,
     visited_resources: usize,
@@ -281,6 +289,10 @@ pub struct FrameExecutionReport {
 }
 
 impl FrameExecutionReport {
+    pub const fn presentation(&self) -> Option<&PresentedFrame> {
+        self.presentation.as_ref()
+    }
+
     pub const fn frame(&self) -> FrameIdentity {
         self.frame
     }
@@ -327,8 +339,12 @@ pub enum WgpuRenderRuntimeError {
     DeviceUnavailable,
     #[error("a CPU or software adapter cannot run the interactive renderer")]
     SoftwareAdapter,
+    #[error("the interactive renderer requires a Vulkan adapter")]
+    UnsupportedBackend,
     #[error("the adapter does not satisfy the accepted WP-09A limits")]
     AdapterLimitsInsufficient,
+    #[error("the existing WGPU device was created below the renderer limits")]
+    DeviceLimitsInsufficient,
     #[error("the GPU device could not be created")]
     DeviceCreationFailed,
     #[error("render intent and requirements name different frame generations")]
@@ -346,6 +362,12 @@ pub enum WgpuRenderRuntimeError {
         "the render requirement set contains {actual} resources, exceeding the successor limit of {maximum}"
     )]
     RequirementCapacityExceeded { actual: usize, maximum: usize },
+    #[error("the successor renderer reached its limit of {maximum} presentation targets")]
+    PresentationCapacityExceeded { maximum: usize },
+    #[error("presentation token {token:?} is not registered in this renderer")]
+    PresentationNotRegistered { token: PresentationToken },
+    #[error("the successor renderer exhausted its presentation token space")]
+    PresentationTokenExhausted,
     #[error(
         "the supplied lease set contains {actual} resources, exceeding the successor limit of {maximum}"
     )]
@@ -392,6 +414,26 @@ pub enum WgpuRenderRuntimeError {
     FrameProgressContract,
 }
 
+/// Checks whether an adapter can run the interactive successor renderer.
+///
+/// Product startup uses this before asking WGPU to create the window device,
+/// so unsupported software, non-Vulkan, and undersized adapters fail before
+/// the viewer opens.
+pub fn qualify_adapter(adapter: &wgpu::Adapter) -> Result<(), WgpuRenderRuntimeError> {
+    runtime::validate_adapter(adapter)
+}
+
+/// Builds the device request used by the interactive successor renderer.
+///
+/// The requested features and limits are the same fixed set used by
+/// [`WgpuRenderRuntime::new`].
+pub fn renderer_device_descriptor(
+    adapter: &wgpu::Adapter,
+    label: &'static str,
+) -> Result<wgpu::DeviceDescriptor<'static>, WgpuRenderRuntimeError> {
+    runtime::renderer_device_descriptor(adapter, label)
+}
+
 /// Sole off-product owner of successor WGPU resources.
 pub struct WgpuRenderRuntime {
     inner: runtime::Runtime,
@@ -405,6 +447,20 @@ impl WgpuRenderRuntime {
         })
     }
 
+    /// Builds the successor around the device already selected for the native
+    /// window. The runtime retains its own handles and remains the owner of all
+    /// Mirante4D render resources created on that device.
+    pub fn from_existing_device(
+        adapter: &wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        config: WgpuRenderRuntimeConfig,
+    ) -> Result<Self, WgpuRenderRuntimeError> {
+        Ok(Self {
+            inner: runtime::Runtime::from_existing_device(adapter, device, queue, config)?,
+        })
+    }
+
     pub const fn frame_budget(&self) -> FrameBudget {
         FrameBudget::wp09a()
     }
@@ -413,15 +469,41 @@ impl WgpuRenderRuntime {
         self.inner.diagnostics()
     }
 
+    /// Creates one renderer-owned target and returns only its opaque identity
+    /// and scalar extent to the composition layer.
+    pub fn register_presentation(
+        &mut self,
+        extent: RenderExtent,
+    ) -> Result<PresentationRegistration, WgpuRenderRuntimeError> {
+        self.inner.register_presentation(extent)
+    }
+
+    /// Borrows the color view for the sole native composition bridge. The
+    /// token is checked by the renderer and the texture remains renderer-owned.
+    pub fn presentation_texture_view(
+        &self,
+        token: PresentationToken,
+    ) -> Result<&wgpu::TextureView, WgpuRenderRuntimeError> {
+        self.inner.presentation_texture_view(token)
+    }
+
+    pub fn retire_presentation(
+        &mut self,
+        token: PresentationToken,
+    ) -> Result<PresentationRetirement, WgpuRenderRuntimeError> {
+        self.inner.retire_presentation(token)
+    }
+
     pub fn execute_frame(
         &mut self,
+        presentation: PresentationToken,
         catalog: &DatasetCatalog,
         intent: &RenderIntent,
         requirements: &RenderRequirements,
         leases: &[&dyn ResourceLease],
     ) -> Result<FrameExecutionReport, WgpuRenderRuntimeError> {
         self.inner
-            .execute_frame(catalog, intent, requirements, leases)
+            .execute_frame(presentation, catalog, intent, requirements, leases)
     }
 
     /// Polls once without waiting. `None` means the GPU/map callback has not

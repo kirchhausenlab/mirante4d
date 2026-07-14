@@ -10,7 +10,8 @@ use std::{
 use mirante4d_dataset::{DatasetCatalog, DatasetResourceKey, ResourceLease};
 use mirante4d_render_api::{
     CameraFrame, FrameCompleteness, FrameCoverage, FrameIdentity, FrameLimitation, FrameProgress,
-    GpuLedgerCategory, RenderExtent, RenderIntent, RenderRequirement, RenderRequirementRole,
+    GpuLedgerCategory, PresentationRegistration, PresentationRetirement, PresentationToken,
+    PresentedFrame, RenderExtent, RenderIntent, RenderRequirement, RenderRequirementRole,
     RenderRequirements, RenderViewIntent,
 };
 
@@ -31,6 +32,7 @@ const MAX_FRAME_REQUIREMENTS: usize = 256;
 const MAX_FRAME_LEASES: usize = MAX_VISITS;
 const MAX_RESIDENT_RESOURCES: usize = MAX_FRAME_REQUIREMENTS;
 const MAX_SHADER_RESOURCES: usize = MAX_VISITS;
+const MAX_PRESENTATION_TARGETS: usize = 4;
 const MAX_RAY_SAMPLES: u64 = 16_384;
 const MIN_BUFFER_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
 const MIN_STORAGE_BINDING_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
@@ -291,7 +293,9 @@ fn create_display(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: COLOR_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -375,6 +379,7 @@ fn encode_capture(
     device: &wgpu::Device,
     encoder: &mut wgpu::CommandEncoder,
     id: u64,
+    presentation: PresentationToken,
     frame: FrameIdentity,
     display: &DisplayTarget,
 ) -> Result<PendingCapture, WgpuRenderRuntimeError> {
@@ -428,6 +433,7 @@ fn encode_capture(
     Ok(PendingCapture {
         ticket: ValidationCaptureTicket {
             id,
+            presentation,
             frame,
             extent: display.extent,
         },
@@ -781,6 +787,12 @@ struct DisplayTarget {
     allocated_bytes: u64,
 }
 
+struct PresentationState {
+    frame_state: Option<FrameState>,
+    display: DisplayTarget,
+    pending_capture: Option<PendingCapture>,
+}
+
 type MapState = Arc<Mutex<Option<Result<(), ()>>>>;
 
 struct PendingCapture {
@@ -814,7 +826,7 @@ impl PendingCapture {
 }
 
 pub(super) struct Runtime {
-    _instance: wgpu::Instance,
+    _instance: Option<wgpu::Instance>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
@@ -823,9 +835,8 @@ pub(super) struct Runtime {
     control_buffer: wgpu::Buffer,
     allocator: ArenaAllocator,
     resident: BTreeMap<DatasetResourceKey, ResidentResource>,
-    frame_state: Option<FrameState>,
-    display: Option<DisplayTarget>,
-    pending_capture: Option<PendingCapture>,
+    presentations: BTreeMap<PresentationToken, PresentationState>,
+    next_presentation: u64,
     next_capture: u64,
     validation_errors: Arc<Mutex<Vec<String>>>,
     config: WgpuRenderRuntimeConfig,
@@ -848,18 +859,36 @@ impl Runtime {
             })
             .await
             .map_err(|_| WgpuRenderRuntimeError::DeviceUnavailable)?;
-        let info = adapter.get_info();
-        if matches!(info.device_type, wgpu::DeviceType::Cpu) {
-            return Err(WgpuRenderRuntimeError::SoftwareAdapter);
-        }
-        let adapter_limits = adapter.limits();
-        if adapter_limits.max_buffer_size < MIN_BUFFER_LIMIT_BYTES
-            || adapter_limits.max_storage_buffer_binding_size < MIN_STORAGE_BINDING_LIMIT_BYTES
-            || adapter_limits.max_storage_buffers_per_shader_stage < MIN_STORAGE_BUFFERS_PER_STAGE
-        {
-            return Err(WgpuRenderRuntimeError::AdapterLimitsInsufficient);
-        }
+        let device_descriptor = renderer_device_descriptor(&adapter, "mirante4d-wp09a-device")?;
+        let (device, queue) = adapter
+            .request_device(&device_descriptor)
+            .await
+            .map_err(|_| WgpuRenderRuntimeError::DeviceCreationFailed)?;
 
+        Self::from_device_parts(Some(instance), &adapter, device, queue, config)
+    }
+
+    pub(super) fn from_existing_device(
+        adapter: &wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        config: WgpuRenderRuntimeConfig,
+    ) -> Result<Self, WgpuRenderRuntimeError> {
+        validate_adapter(adapter)?;
+        validate_device_limits(&device.limits())?;
+        Self::from_device_parts(None, adapter, device, queue, config)
+    }
+
+    fn from_device_parts(
+        instance: Option<wgpu::Instance>,
+        adapter: &wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        config: WgpuRenderRuntimeConfig,
+    ) -> Result<Self, WgpuRenderRuntimeError> {
+        let info = adapter.get_info();
+        let adapter_limits = adapter.limits();
+        validate_device_limits(&device.limits())?;
         let payload_ledger_bytes = config.gpu_budget_bytes().saturating_mul(75) / 100;
         let transfer_capacity_bytes = config.gpu_budget_bytes().saturating_mul(10) / 100;
         let other_capacity_bytes = config
@@ -867,32 +896,14 @@ impl Runtime {
             .saturating_sub(payload_ledger_bytes)
             .saturating_sub(transfer_capacity_bytes);
         let arena_capacity = payload_ledger_bytes
-            .min(adapter_limits.max_storage_buffer_binding_size)
-            .min(adapter_limits.max_buffer_size)
+            .min(device.limits().max_storage_buffer_binding_size)
+            .min(device.limits().max_buffer_size)
             .min(MIN_STORAGE_BINDING_LIMIT_BYTES)
             / COPY_ALIGNMENT
             * COPY_ALIGNMENT;
         if arena_capacity < COPY_ALIGNMENT {
             return Err(WgpuRenderRuntimeError::InvalidConfiguration);
         }
-
-        let required_limits = wgpu::Limits {
-            max_buffer_size: MIN_BUFFER_LIMIT_BYTES,
-            max_storage_buffer_binding_size: MIN_STORAGE_BINDING_LIMIT_BYTES,
-            max_storage_buffers_per_shader_stage: MIN_STORAGE_BUFFERS_PER_STAGE,
-            ..wgpu::Limits::default()
-        };
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("mirante4d-wp09a-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits,
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
-                trace: wgpu::Trace::Off,
-            })
-            .await
-            .map_err(|_| WgpuRenderRuntimeError::DeviceCreationFailed)?;
 
         let validation_errors = Arc::new(Mutex::new(Vec::new()));
         let error_sink = Arc::clone(&validation_errors);
@@ -992,9 +1003,8 @@ impl Runtime {
             control_buffer,
             allocator: ArenaAllocator::new(arena_capacity),
             resident: BTreeMap::new(),
-            frame_state: None,
-            display: None,
-            pending_capture: None,
+            presentations: BTreeMap::new(),
+            next_presentation: 1,
             next_capture: 1,
             validation_errors,
             config,
@@ -1029,17 +1039,135 @@ impl Runtime {
         &self.diagnostics
     }
 
+    pub(super) fn register_presentation(
+        &mut self,
+        extent: RenderExtent,
+    ) -> Result<PresentationRegistration, WgpuRenderRuntimeError> {
+        validate_extent(extent)?;
+        validate_presentation_capacity(self.presentations.len())?;
+        let token = PresentationToken::new(self.next_presentation)
+            .map_err(|_| WgpuRenderRuntimeError::PresentationTokenExhausted)?;
+        let next_presentation = self
+            .next_presentation
+            .checked_add(1)
+            .ok_or(WgpuRenderRuntimeError::PresentationTokenExhausted)?;
+        let display_bytes = self
+            .active_display_bytes()
+            .checked_add(display_allocation_bytes(extent)?)
+            .ok_or(WgpuRenderRuntimeError::CoordinateLimitExceeded)?;
+        self.validate_other_capacity(display_bytes, self.active_capture_bytes())?;
+        let display = create_display(&self.device, extent)?;
+        self.presentations.insert(
+            token,
+            PresentationState {
+                frame_state: None,
+                display,
+                pending_capture: None,
+            },
+        );
+        self.next_presentation = next_presentation;
+        self.diagnostics.peak_display_target_bytes = self
+            .diagnostics
+            .peak_display_target_bytes
+            .max(display_bytes);
+        Ok(PresentationRegistration::new(token, extent))
+    }
+
+    pub(super) fn presentation_texture_view(
+        &self,
+        token: PresentationToken,
+    ) -> Result<&wgpu::TextureView, WgpuRenderRuntimeError> {
+        self.presentations
+            .get(&token)
+            .map(|presentation| &presentation.display.color_view)
+            .ok_or(WgpuRenderRuntimeError::PresentationNotRegistered { token })
+    }
+
+    pub(super) fn retire_presentation(
+        &mut self,
+        token: PresentationToken,
+    ) -> Result<PresentationRetirement, WgpuRenderRuntimeError> {
+        self.presentations
+            .remove(&token)
+            .map(|_| PresentationRetirement::new(token))
+            .ok_or(WgpuRenderRuntimeError::PresentationNotRegistered { token })
+    }
+
+    fn active_display_bytes(&self) -> u64 {
+        self.presentations
+            .values()
+            .map(|presentation| presentation.display.allocated_bytes)
+            .sum()
+    }
+
+    fn active_capture_bytes(&self) -> u64 {
+        self.presentations
+            .values()
+            .filter_map(|presentation| presentation.pending_capture.as_ref())
+            .map(|capture| capture.allocated_bytes)
+            .sum()
+    }
+
+    fn validate_other_capacity(
+        &self,
+        display_bytes: u64,
+        capture_bytes: u64,
+    ) -> Result<(), WgpuRenderRuntimeError> {
+        if CONTROL_BUFFER_BYTES > self.diagnostics.other_capacity_bytes {
+            return Err(WgpuRenderRuntimeError::CapacityExceeded {
+                category: GpuLedgerCategory::PageTable,
+                requested_bytes: CONTROL_BUFFER_BYTES,
+                available_bytes: self.diagnostics.other_capacity_bytes,
+            });
+        }
+        let after_control = self
+            .diagnostics
+            .other_capacity_bytes
+            .saturating_sub(CONTROL_BUFFER_BYTES);
+        if display_bytes > after_control {
+            return Err(WgpuRenderRuntimeError::CapacityExceeded {
+                category: GpuLedgerCategory::DisplayTarget,
+                requested_bytes: display_bytes,
+                available_bytes: after_control,
+            });
+        }
+        let after_display = after_control.saturating_sub(display_bytes);
+        if capture_bytes > after_display {
+            return Err(WgpuRenderRuntimeError::CapacityExceeded {
+                category: GpuLedgerCategory::Scratch,
+                requested_bytes: capture_bytes,
+                available_bytes: after_display,
+            });
+        }
+        Ok(())
+    }
+
     pub(super) fn execute_frame(
         &mut self,
+        presentation_token: PresentationToken,
         catalog: &DatasetCatalog,
         intent: &RenderIntent,
         requirements: &RenderRequirements,
         leases: &[&dyn ResourceLease],
     ) -> Result<FrameExecutionReport, WgpuRenderRuntimeError> {
-        let lease_by_key = self.validate_inputs(catalog, intent, requirements, leases)?;
-        let (planned_frame, visited) = self.plan_frame(requirements)?;
-        let frame_changed = self
+        let current_frame_state = self
+            .presentations
+            .get(&presentation_token)
+            .ok_or(WgpuRenderRuntimeError::PresentationNotRegistered {
+                token: presentation_token,
+            })?
             .frame_state
+            .clone();
+        let lease_by_key = self.validate_inputs(
+            current_frame_state.as_ref(),
+            catalog,
+            intent,
+            requirements,
+            leases,
+        )?;
+        let (planned_frame, visited) =
+            Self::plan_frame(current_frame_state.as_ref(), requirements)?;
+        let frame_changed = current_frame_state
             .as_ref()
             .is_none_or(|current| current.frame != planned_frame.frame);
 
@@ -1154,24 +1282,19 @@ impl Runtime {
         }
 
         let render = progress.is_some();
-        let display_bytes = if render {
-            display_allocation_bytes(intent.extent())?
-        } else {
-            0
-        };
         let capture_bytes = if render && self.config.validation_capture() {
             capture_allocation_bytes(intent.extent())?
         } else {
             0
         };
-        let replaces_display = render
-            && self
-                .display
-                .as_ref()
-                .is_some_and(|display| display.extent != intent.extent());
+        let presentation = self
+            .presentations
+            .get(&presentation_token)
+            .expect("presentation registration was checked before frame planning");
+        let replaces_display = render && presentation.display.extent != intent.extent();
         if render
             && self.config.validation_capture()
-            && self.pending_capture.is_some()
+            && presentation.pending_capture.is_some()
             && !frame_changed
         {
             return Err(WgpuRenderRuntimeError::CapacityExceeded {
@@ -1181,57 +1304,19 @@ impl Runtime {
             });
         }
         let display_peak_bytes = if replaces_display {
-            self.display
-                .as_ref()
-                .map_or(0, |display| display.allocated_bytes)
-                .saturating_add(display_bytes)
+            self.active_display_bytes()
+                .saturating_add(display_allocation_bytes(intent.extent())?)
         } else {
-            self.display
-                .as_ref()
-                .map_or(display_bytes, |display| display.allocated_bytes)
+            self.active_display_bytes()
         };
-        let capture_peak_bytes = self
-            .pending_capture
-            .as_ref()
-            .map_or(0, |pending| pending.allocated_bytes)
-            .saturating_add(capture_bytes);
-        if CONTROL_BUFFER_BYTES > self.diagnostics.other_capacity_bytes {
-            return Err(WgpuRenderRuntimeError::CapacityExceeded {
-                category: GpuLedgerCategory::PageTable,
-                requested_bytes: CONTROL_BUFFER_BYTES,
-                available_bytes: self.diagnostics.other_capacity_bytes,
-            });
-        }
-        let after_control = self
-            .diagnostics
-            .other_capacity_bytes
-            .saturating_sub(CONTROL_BUFFER_BYTES);
-        if display_peak_bytes > after_control {
-            return Err(WgpuRenderRuntimeError::CapacityExceeded {
-                category: GpuLedgerCategory::DisplayTarget,
-                requested_bytes: display_peak_bytes,
-                available_bytes: after_control,
-            });
-        }
-        let after_display = after_control.saturating_sub(display_peak_bytes);
-        if capture_peak_bytes > after_display {
-            return Err(WgpuRenderRuntimeError::CapacityExceeded {
-                category: GpuLedgerCategory::Scratch,
-                requested_bytes: capture_peak_bytes,
-                available_bytes: after_display,
-            });
-        }
+        let capture_peak_bytes = self.active_capture_bytes().saturating_add(capture_bytes);
+        self.validate_other_capacity(display_peak_bytes, capture_peak_bytes)?;
 
         let needs_submission = !uploads.is_empty() || render;
         let mut command_buffers = 0_u32;
         let mut queue_submissions = 0_u32;
         let mut capture_ticket = None;
-        let mut new_display = if render
-            && self
-                .display
-                .as_ref()
-                .is_none_or(|display| display.extent != intent.extent())
-        {
+        let mut new_display = if replaces_display {
             Some(create_display(&self.device, intent.extent())?)
         } else {
             None
@@ -1269,16 +1354,20 @@ impl Runtime {
                 );
                 encoder.copy_buffer_to_buffer(&staging, 0, &self.control_buffer, 0, control_bytes);
                 staging_buffers.push(staging);
-                let display = new_display
-                    .as_ref()
-                    .or(self.display.as_ref())
-                    .expect("render preflight creates or retains a display target");
+                let display = new_display.as_ref().unwrap_or_else(|| {
+                    &self
+                        .presentations
+                        .get(&presentation_token)
+                        .expect("presentation registration was checked before submission")
+                        .display
+                });
                 encode_render_pass(&mut encoder, &self.pipeline, &self.bind_group, display);
                 if self.config.validation_capture() {
                     let pending = encode_capture(
                         &self.device,
                         &mut encoder,
                         self.next_capture,
+                        presentation_token,
                         intent.frame(),
                         display,
                     )?;
@@ -1300,15 +1389,19 @@ impl Runtime {
         // allowed submission have succeeded.
         self.allocator = planned_allocator;
         self.resident = planned_resident;
-        self.frame_state = Some(planned_frame.clone());
+        let presentation = self
+            .presentations
+            .get_mut(&presentation_token)
+            .expect("presentation registration was checked before commit");
+        presentation.frame_state = Some(planned_frame.clone());
         if let Some(display) = new_display.take() {
-            self.display = Some(display);
+            presentation.display = display;
         }
         if frame_changed {
-            self.pending_capture = None;
+            presentation.pending_capture = None;
         }
         if let Some(pending) = pending_capture {
-            self.pending_capture = Some(pending);
+            presentation.pending_capture = Some(pending);
             self.next_capture = self.next_capture.saturating_add(1);
         }
         self.refresh_diagnostics(
@@ -1320,6 +1413,9 @@ impl Runtime {
         );
 
         Ok(FrameExecutionReport {
+            presentation: progress
+                .clone()
+                .map(|progress| PresentedFrame::new(presentation_token, intent.extent(), progress)),
             frame: intent.frame(),
             progress,
             visited_resources: visited.len(),
@@ -1337,6 +1433,11 @@ impl Runtime {
         ticket: ValidationCaptureTicket,
     ) -> Result<Option<ValidationCapture>, WgpuRenderRuntimeError> {
         if self
+            .presentations
+            .get(&ticket.presentation)
+            .ok_or(WgpuRenderRuntimeError::PresentationNotRegistered {
+                token: ticket.presentation,
+            })?
             .frame_state
             .as_ref()
             .is_some_and(|current| ticket.frame != current.frame)
@@ -1350,7 +1451,11 @@ impl Runtime {
         if self.diagnostics.validation_error_count != 0 {
             return Err(WgpuRenderRuntimeError::BackendValidation);
         }
-        let Some(pending) = self.pending_capture.as_ref() else {
+        let presentation = self
+            .presentations
+            .get_mut(&ticket.presentation)
+            .expect("presentation registration was checked before capture polling");
+        let Some(pending) = presentation.pending_capture.as_ref() else {
             return Err(WgpuRenderRuntimeError::UnknownValidationCapture);
         };
         if pending.ticket != ticket {
@@ -1364,11 +1469,11 @@ impl Runtime {
         match status {
             None => Ok(None),
             Some(Err(())) => {
-                self.pending_capture = None;
+                presentation.pending_capture = None;
                 Err(WgpuRenderRuntimeError::ValidationCaptureFailed)
             }
             Some(Ok(())) => {
-                let pending = self
+                let pending = presentation
                     .pending_capture
                     .take()
                     .ok_or(WgpuRenderRuntimeError::UnknownValidationCapture)?;
@@ -1415,6 +1520,7 @@ impl Runtime {
 
     fn validate_inputs<'a>(
         &self,
+        current_frame_state: Option<&FrameState>,
         catalog: &DatasetCatalog,
         intent: &RenderIntent,
         requirements: &RenderRequirements,
@@ -1425,12 +1531,8 @@ impl Runtime {
         }
         validate_requirement_contract(requirements)?;
         validate_lease_capacity(leases.len())?;
-        if intent.extent().width_pixels() > MAX_WIDTH
-            || intent.extent().height_pixels() > MAX_HEIGHT
-        {
-            return Err(WgpuRenderRuntimeError::ExtentExceeded);
-        }
-        if let Some(current) = self.frame_state.as_ref()
+        validate_extent(intent.extent())?;
+        if let Some(current) = current_frame_state
             && intent.frame() < current.frame
         {
             return Err(WgpuRenderRuntimeError::StaleFrame {
@@ -1464,7 +1566,7 @@ impl Runtime {
     }
 
     fn plan_frame(
-        &self,
+        current_frame_state: Option<&FrameState>,
         requirements: &RenderRequirements,
     ) -> Result<(FrameState, Vec<DatasetResourceKey>), WgpuRenderRuntimeError> {
         let keys = requirements
@@ -1472,15 +1574,23 @@ impl Runtime {
             .iter()
             .map(|requirement| requirement.key())
             .collect::<Vec<_>>();
-        let mut state = match self.frame_state.as_ref() {
-            Some(current) if current.frame == requirements.frame() => {
+        Self::plan_frame_keys(current_frame_state, requirements.frame(), keys)
+    }
+
+    fn plan_frame_keys(
+        current_frame_state: Option<&FrameState>,
+        frame: FrameIdentity,
+        keys: Vec<DatasetResourceKey>,
+    ) -> Result<(FrameState, Vec<DatasetResourceKey>), WgpuRenderRuntimeError> {
+        let mut state = match current_frame_state {
+            Some(current) if current.frame == frame => {
                 if current.requirements != keys {
                     return Err(WgpuRenderRuntimeError::RequirementSetChanged);
                 }
                 current.clone()
             }
             _ => FrameState {
-                frame: requirements.frame(),
+                frame,
                 requirements: keys,
                 cursor: 0,
             },
@@ -1536,6 +1646,81 @@ impl Runtime {
             .lock()
             .map_or(u64::MAX, |errors| errors.len() as u64);
     }
+}
+
+pub(super) fn validate_adapter(adapter: &wgpu::Adapter) -> Result<(), WgpuRenderRuntimeError> {
+    let info = adapter.get_info();
+    validate_adapter_facts(info.device_type, info.backend, &adapter.limits())
+}
+
+pub(super) fn renderer_device_descriptor(
+    adapter: &wgpu::Adapter,
+    label: &'static str,
+) -> Result<wgpu::DeviceDescriptor<'static>, WgpuRenderRuntimeError> {
+    validate_adapter(adapter)?;
+    Ok(wgpu::DeviceDescriptor {
+        label: Some(label),
+        required_features: wgpu::Features::empty(),
+        required_limits: renderer_required_limits(),
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        memory_hints: wgpu::MemoryHints::MemoryUsage,
+        trace: wgpu::Trace::Off,
+    })
+}
+
+fn validate_adapter_facts(
+    device_type: wgpu::DeviceType,
+    backend: wgpu::Backend,
+    limits: &wgpu::Limits,
+) -> Result<(), WgpuRenderRuntimeError> {
+    if matches!(device_type, wgpu::DeviceType::Cpu) {
+        return Err(WgpuRenderRuntimeError::SoftwareAdapter);
+    }
+    if backend != wgpu::Backend::Vulkan {
+        return Err(WgpuRenderRuntimeError::UnsupportedBackend);
+    }
+    if limits.max_buffer_size < MIN_BUFFER_LIMIT_BYTES
+        || limits.max_storage_buffer_binding_size < MIN_STORAGE_BINDING_LIMIT_BYTES
+        || limits.max_storage_buffers_per_shader_stage < MIN_STORAGE_BUFFERS_PER_STAGE
+    {
+        return Err(WgpuRenderRuntimeError::AdapterLimitsInsufficient);
+    }
+    Ok(())
+}
+
+fn renderer_required_limits() -> wgpu::Limits {
+    wgpu::Limits {
+        max_buffer_size: MIN_BUFFER_LIMIT_BYTES,
+        max_storage_buffer_binding_size: MIN_STORAGE_BINDING_LIMIT_BYTES,
+        max_storage_buffers_per_shader_stage: MIN_STORAGE_BUFFERS_PER_STAGE,
+        ..wgpu::Limits::default()
+    }
+}
+
+fn validate_device_limits(limits: &wgpu::Limits) -> Result<(), WgpuRenderRuntimeError> {
+    if limits.max_buffer_size < MIN_BUFFER_LIMIT_BYTES
+        || limits.max_storage_buffer_binding_size < MIN_STORAGE_BINDING_LIMIT_BYTES
+        || limits.max_storage_buffers_per_shader_stage < MIN_STORAGE_BUFFERS_PER_STAGE
+    {
+        return Err(WgpuRenderRuntimeError::DeviceLimitsInsufficient);
+    }
+    Ok(())
+}
+
+fn validate_extent(extent: RenderExtent) -> Result<(), WgpuRenderRuntimeError> {
+    if extent.width_pixels() > MAX_WIDTH || extent.height_pixels() > MAX_HEIGHT {
+        return Err(WgpuRenderRuntimeError::ExtentExceeded);
+    }
+    Ok(())
+}
+
+fn validate_presentation_capacity(registered: usize) -> Result<(), WgpuRenderRuntimeError> {
+    if registered >= MAX_PRESENTATION_TARGETS {
+        return Err(WgpuRenderRuntimeError::PresentationCapacityExceeded {
+            maximum: MAX_PRESENTATION_TARGETS,
+        });
+    }
+    Ok(())
 }
 
 fn storage_layout_entry(binding: u32, bytes: u64) -> wgpu::BindGroupLayoutEntry {
@@ -1636,6 +1821,86 @@ mod tests {
                 actual: MAX_FRAME_LEASES + 1,
                 maximum: MAX_FRAME_LEASES,
             })
+        );
+    }
+
+    #[test]
+    fn presentation_capacity_allows_exactly_four_renderer_owned_targets() {
+        assert_eq!(validate_presentation_capacity(0), Ok(()));
+        assert_eq!(validate_presentation_capacity(3), Ok(()));
+        assert_eq!(
+            validate_presentation_capacity(4),
+            Err(WgpuRenderRuntimeError::PresentationCapacityExceeded { maximum: 4 })
+        );
+    }
+
+    #[test]
+    fn equal_frame_numbers_keep_requirement_state_scoped_to_their_presentation() {
+        let frame = FrameIdentity::new(7);
+        let first_key = key(0, 0, 0, 1);
+        let second_key = key(1, 0, 0, 1);
+        let first_state = FrameState {
+            frame,
+            requirements: vec![first_key],
+            cursor: 0,
+        };
+
+        assert_eq!(
+            Runtime::plan_frame_keys(Some(&first_state), frame, vec![second_key]),
+            Err(WgpuRenderRuntimeError::RequirementSetChanged)
+        );
+        let (second_state, visited) =
+            Runtime::plan_frame_keys(None, frame, vec![second_key]).unwrap();
+        assert_eq!(second_state.requirements, vec![second_key]);
+        assert_eq!(visited, vec![second_key]);
+    }
+
+    #[test]
+    fn existing_device_preflight_requires_the_renderer_limits() {
+        let mut limits = wgpu::Limits {
+            max_buffer_size: MIN_BUFFER_LIMIT_BYTES,
+            max_storage_buffer_binding_size: MIN_STORAGE_BINDING_LIMIT_BYTES,
+            max_storage_buffers_per_shader_stage: MIN_STORAGE_BUFFERS_PER_STAGE,
+            ..wgpu::Limits::default()
+        };
+        assert_eq!(validate_device_limits(&limits), Ok(()));
+
+        limits.max_storage_buffer_binding_size = MIN_STORAGE_BINDING_LIMIT_BYTES - 1;
+        assert_eq!(
+            validate_device_limits(&limits),
+            Err(WgpuRenderRuntimeError::DeviceLimitsInsufficient)
+        );
+    }
+
+    #[test]
+    fn adapter_preflight_is_vulkan_hardware_with_the_accepted_limits() {
+        let limits = renderer_required_limits();
+        assert_eq!(
+            validate_adapter_facts(
+                wgpu::DeviceType::DiscreteGpu,
+                wgpu::Backend::Vulkan,
+                &limits,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_adapter_facts(wgpu::DeviceType::Cpu, wgpu::Backend::Vulkan, &limits),
+            Err(WgpuRenderRuntimeError::SoftwareAdapter)
+        );
+        assert_eq!(
+            validate_adapter_facts(wgpu::DeviceType::DiscreteGpu, wgpu::Backend::Gl, &limits),
+            Err(WgpuRenderRuntimeError::UnsupportedBackend)
+        );
+
+        let mut undersized = limits;
+        undersized.max_buffer_size = MIN_BUFFER_LIMIT_BYTES - 1;
+        assert_eq!(
+            validate_adapter_facts(
+                wgpu::DeviceType::DiscreteGpu,
+                wgpu::Backend::Vulkan,
+                &undersized,
+            ),
+            Err(WgpuRenderRuntimeError::AdapterLimitsInsufficient)
         );
     }
 }

@@ -20,8 +20,6 @@ use mirante4d_application::{
 };
 use mirante4d_dataset::{DatasetCatalog, DatasetSourceId};
 use mirante4d_dataset_runtime::{RuntimeFault, RuntimeFaultCode};
-use mirante4d_domain::ShapeError;
-use mirante4d_renderer::RenderError;
 use mirante4d_settings::ResourcePolicy;
 use mirante4d_storage::{
     ControlError, DirectoryInventoryError, LocalDatasetSourceOpenError, PackageAdmissionError,
@@ -350,9 +348,6 @@ fn map_open_failure(error: &anyhow::Error, path: &Path) -> OperationFailureCode 
         {
             return OperationFailureCode::DatasetUnsupported;
         }
-        if let Some(error) = cause.downcast_ref::<RenderError>() {
-            return map_render_error(error);
-        }
         if let Some(error) = cause.downcast_ref::<RuntimeFault>() {
             return map_runtime_fault(error);
         }
@@ -428,16 +423,6 @@ fn map_range_error(error: &RangeReadError) -> OperationFailureCode {
         | RangeReadError::LengthOverflow => OperationFailureCode::DatasetCapacityExceeded,
         RangeReadError::Io { kind, .. } => map_io_kind(*kind),
         RangeReadError::ShortRead { .. } => OperationFailureCode::DatasetReadFailed,
-        _ => OperationFailureCode::DatasetInvalid,
-    }
-}
-
-fn map_render_error(error: &RenderError) -> OperationFailureCode {
-    match error {
-        RenderError::DimensionTooLarge { .. }
-        | RenderError::Shape(ShapeError::ElementCountOverflow) => {
-            OperationFailureCode::DatasetCapacityExceeded
-        }
         _ => OperationFailureCode::DatasetInvalid,
     }
 }

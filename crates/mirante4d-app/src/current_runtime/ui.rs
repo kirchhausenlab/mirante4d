@@ -38,15 +38,15 @@ pub(crate) struct CurrentUiRuntime {
     pub(crate) allow_close_without_prompt: bool,
     pub(crate) settings_runtime_draft: ResourcePolicyDraft,
     pub(crate) analysis_workspace_open: bool,
-    pub(crate) gpu_display_texture_id: Option<egui::TextureId>,
-    pub(crate) retired_gpu_display_texture_ids: Vec<egui::TextureId>,
     pub(crate) wgpu_texture_renderer: Option<Arc<egui::mutex::RwLock<eframe::egui_wgpu::Renderer>>>,
+    pub(crate) wgpu_device: Option<eframe::wgpu::Device>,
 }
 
 impl CurrentUiRuntime {
     pub(crate) fn new(
         resource_policy: ResourcePolicy,
         wgpu_texture_renderer: Option<Arc<egui::mutex::RwLock<eframe::egui_wgpu::Renderer>>>,
+        wgpu_device: Option<eframe::wgpu::Device>,
     ) -> Self {
         Self {
             viewport_orbit_drag: None,
@@ -60,9 +60,8 @@ impl CurrentUiRuntime {
             allow_close_without_prompt: false,
             settings_runtime_draft: resource_policy.into(),
             analysis_workspace_open: false,
-            gpu_display_texture_id: None,
-            retired_gpu_display_texture_ids: Vec::new(),
             wgpu_texture_renderer,
+            wgpu_device,
         }
     }
 }

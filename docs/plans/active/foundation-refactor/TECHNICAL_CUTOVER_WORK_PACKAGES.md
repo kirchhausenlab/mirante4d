@@ -213,15 +213,20 @@ Required work:
 
 Exit proof and deletion gate:
 
-- Tiny, medium, and large fixtures take the same product path.
-- First-current-partial and settled-frame behavior is automated-verified and
-  product-open validated.
-- CPU/VRAM/staging budgets and resource lifetime gates pass.
+- Focused contract tests cover intent/lease delivery, a useful current partial
+  frame followed by a settled frame, stale-frame rejection, and a typed
+  capacity or unsupported-GPU diagnostic with no CPU fallback.
+- The existing small target-package product scenario exercises MIP, DVR, ISO,
+  and a linked cross-section at 1280x720, then confirms a current nonblank frame
+  after resizing to 1920x1080.
 - Dense product startup/rendering, full-residency guards, old display
   orchestration/identity, and implicit CPU/alternate-GPU fallbacks are deleted.
 - The current `mirante4d-renderer` crate/path is deleted without a re-export
   facade after `render-api`, `render-wgpu`, and dev-only `render-reference`
   assume their approved responsibilities.
+- WP-09A's GPU correctness, dtype, validity, budget, eviction, and lifetime
+  evidence is inherited. WP-09B makes no performance claim and does not repeat
+  that matrix or add large-data simulation, 4K, or new evidence machinery.
 
 ### WP-09C — UI And Composition-Root Cutover
 

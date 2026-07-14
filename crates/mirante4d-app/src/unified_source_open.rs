@@ -29,7 +29,6 @@ use crate::{
     LodScheduleState, StartupDiagnostics, collect_startup_diagnostics,
     current_runtime::{analysis::AnalysisProductRuntime, render::CurrentRenderRuntime},
     dataset_requests::DatasetDemandState,
-    render_state::placeholder_frame_for_mode,
     transfer_presets::default_channel_presets,
     viewport::{
         default_camera_for_shape, default_presentation_viewport, default_render_viewport_for_shape,
@@ -297,13 +296,6 @@ fn initial_runtime_state(
         .expect("the initial view closes over the catalog");
     let presentation = default_presentation_viewport();
     let viewport = default_render_viewport_for_shape(active.shape().spatial())?;
-    let mode = view
-        .layer(view.active_layer())
-        .expect("the initial view has an active layer")
-        .render_state()
-        .mode();
-    let frame = placeholder_frame_for_mode(viewport, mode);
-    let diagnostics = mirante4d_renderer::frame_diagnostics(0, frame.pixels());
     let mut fidelity = FrameFidelityStatus::new_with_presentation(viewport, presentation);
     fidelity.completeness = FrameCompleteness::Loading;
     fidelity.reason = LodDecisionReason::ExactS0;
@@ -312,10 +304,7 @@ fn initial_runtime_state(
         viewport,
         fidelity,
         LodScheduleState::new(None),
-        diagnostics,
         CrossSectionRuntime::default(),
-        frame,
-        None,
     );
     let mut analysis = AnalysisProductRuntime::new();
     analysis.set_roi([0; 3], active.shape().spatial().dimensions())?;
@@ -340,7 +329,7 @@ fn workspace_from_catalog(catalog: &DatasetCatalog) -> anyhow::Result<UnboundWor
             layer.key(),
             true,
             default_transfer(layer.dtype(), index)?,
-            RenderState::mip(SamplingPolicy::SmoothLinear),
+            RenderState::mip(SamplingPolicy::VoxelExact),
         ));
     }
     let active = first.key();

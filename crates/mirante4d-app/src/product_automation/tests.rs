@@ -2,9 +2,7 @@ use super::capture::{
     ProductAutomationArtifact, ProductAutomationImageStats, color_image_from_rgba,
     sanitize_artifact_label, write_color_image_ppm,
 };
-use super::diagnostics::{
-    dataset_runtime_diagnostics_json, gpu_adapter_diagnostics_json, gpu_timestamp_timing_json,
-};
+use super::diagnostics::dataset_runtime_diagnostics_json;
 use super::timing::{
     ProductAutomationAppUpdatePhases, ProductAutomationAppUpdateSample,
     ProductAutomationCrossSectionLatencySample, ProductAutomationDisplayRefreshSample,
@@ -17,7 +15,6 @@ use super::*;
 use std::{fs, path::PathBuf};
 
 use mirante4d_dataset_runtime::{DatasetRuntimeConfig, DatasetRuntimeDiagnostics};
-use mirante4d_renderer::gpu::{AdapterDiagnostics, GpuLimitDiagnostics};
 
 #[test]
 fn automation_script_parses_the_b4_project_store_contract() {
@@ -557,46 +554,6 @@ fn runtime_diagnostics(
 }
 
 #[test]
-fn gpu_timestamp_timing_json_names_support_request_and_enablement() {
-    let mut adapter = AdapterDiagnostics {
-        name: "adapter".to_owned(),
-        backend: "Vulkan".to_owned(),
-        device_type: "DiscreteGpu".to_owned(),
-        driver: "driver".to_owned(),
-        driver_info: "driver-info".to_owned(),
-        timestamp_queries_supported: true,
-        timestamp_queries_requested: false,
-        timestamp_queries_enabled: false,
-        adapter_limits: GpuLimitDiagnostics {
-            max_buffer_size: 1024,
-            max_storage_buffer_binding_size: 2048,
-            max_storage_buffers_per_shader_stage: 8,
-        },
-        requested_limits: GpuLimitDiagnostics {
-            max_buffer_size: 1024,
-            max_storage_buffer_binding_size: 2048,
-            max_storage_buffers_per_shader_stage: 8,
-        },
-    };
-
-    assert_eq!(
-        gpu_adapter_diagnostics_json(&adapter)["timestamp_queries_supported"],
-        true
-    );
-    assert_eq!(
-        gpu_timestamp_timing_json(&adapter)["status"],
-        "supported_not_requested"
-    );
-    adapter.timestamp_queries_requested = true;
-    assert_eq!(
-        gpu_timestamp_timing_json(&adapter)["status"],
-        "requested_but_device_feature_missing"
-    );
-    adapter.timestamp_queries_enabled = true;
-    assert_eq!(gpu_timestamp_timing_json(&adapter)["status"], "enabled");
-}
-
-#[test]
 fn presentation_timing_json_names_proxy_and_compositor_timestamp_status() {
     let value = presentation_timing_json();
 
@@ -637,7 +594,6 @@ fn display_refresh_timing_json_uses_stable_phase_taxonomy() {
         gpu_compute_ms: Some(9.5),
         egui_texture_ms: 1.25,
         visible_brick_request_ms: 2.0,
-        cpu_texture_update_ms: 0.5,
         total_ms: 14.0,
     };
 
@@ -803,7 +759,6 @@ fn display_refresh_timing_summary_reports_phase_percentiles() {
                 gpu_compute_ms: Some(7.0),
                 egui_texture_ms: 1.0,
                 visible_brick_request_ms: 2.0,
-                cpu_texture_update_ms: 0.0,
                 total_ms: 9.0,
             },
         },
@@ -812,13 +767,12 @@ fn display_refresh_timing_summary_reports_phase_percentiles() {
             command: "camera_pan",
             event_epoch_ms: 20,
             timing: DisplayRefreshTiming {
-                path: crate::display_refresh::DisplayRefreshPath::CpuTexture,
+                path: crate::display_refresh::DisplayRefreshPath::UiBackground,
                 render_ms: 11.0,
                 gpu_upload_ms: None,
                 gpu_compute_ms: None,
                 egui_texture_ms: 0.5,
                 visible_brick_request_ms: 3.0,
-                cpu_texture_update_ms: 5.0,
                 total_ms: 19.0,
             },
         },
@@ -833,7 +787,6 @@ fn display_refresh_timing_summary_reports_phase_percentiles() {
                 gpu_compute_ms: Some(12.0),
                 egui_texture_ms: 1.5,
                 visible_brick_request_ms: 4.0,
-                cpu_texture_update_ms: 0.0,
                 total_ms: 17.0,
             },
         },
@@ -865,7 +818,7 @@ fn display_refresh_timing_summary_reports_phase_percentiles() {
     );
     assert_eq!(summary["sample_count"], 3);
     assert_eq!(summary["path_counts"]["gpu display"], 2);
-    assert_eq!(summary["path_counts"]["cpu texture"], 1);
+    assert_eq!(summary["path_counts"]["ui background"], 1);
     assert_eq!(summary["phases_ms"]["render"]["p50"], 6.0);
     assert_eq!(summary["phases_ms"]["render"]["p95"], 11.0);
     assert_eq!(summary["phases_ms"]["gpu_upload"]["sample_count"], 2);
@@ -892,7 +845,6 @@ fn input_to_present_timing_summary_reports_proxy_latency_percentiles() {
                 gpu_compute_ms: Some(7.0),
                 egui_texture_ms: 1.0,
                 visible_brick_request_ms: 2.0,
-                cpu_texture_update_ms: 0.0,
                 total_ms: 9.0,
             },
         },
@@ -902,13 +854,12 @@ fn input_to_present_timing_summary_reports_proxy_latency_percentiles() {
             event_epoch_ms: 20,
             latency_ms: 32.0,
             display_refresh_timing: DisplayRefreshTiming {
-                path: crate::display_refresh::DisplayRefreshPath::CpuTexture,
+                path: crate::display_refresh::DisplayRefreshPath::UiBackground,
                 render_ms: 11.0,
                 gpu_upload_ms: None,
                 gpu_compute_ms: None,
                 egui_texture_ms: 0.5,
                 visible_brick_request_ms: 3.0,
-                cpu_texture_update_ms: 5.0,
                 total_ms: 19.0,
             },
         },
@@ -924,7 +875,6 @@ fn input_to_present_timing_summary_reports_proxy_latency_percentiles() {
                 gpu_compute_ms: Some(12.0),
                 egui_texture_ms: 1.5,
                 visible_brick_request_ms: 4.0,
-                cpu_texture_update_ms: 0.0,
                 total_ms: 17.0,
             },
         },
@@ -946,7 +896,7 @@ fn input_to_present_timing_summary_reports_proxy_latency_percentiles() {
     assert_eq!(summary["latency_ms"]["p50"], 24.0);
     assert_eq!(summary["latency_ms"]["p95"], 32.0);
     assert_eq!(summary["path_counts"]["gpu display"], 2);
-    assert_eq!(summary["path_counts"]["cpu texture"], 1);
+    assert_eq!(summary["path_counts"]["ui background"], 1);
     assert_eq!(summary["command_counts"]["camera_orbit"], 2);
     assert_eq!(summary["command_counts"]["camera_pan"], 1);
 }
@@ -1007,7 +957,7 @@ fn cross_section_latency_summary_reports_operation_gate_rows() {
     );
     assert_eq!(
         sample["presentation_proxy"],
-        "panel_displayed_generation_with_gpu_display_frame"
+        "panel_displayed_generation_with_successor_presentation"
     );
     assert_eq!(sample["operation"], "pan");
     assert_eq!(sample["panel"], "XZ");

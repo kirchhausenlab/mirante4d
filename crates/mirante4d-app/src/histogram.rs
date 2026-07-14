@@ -3,9 +3,8 @@ use mirante4d_domain::{
     DisplayWindow, DvrOpacityTransfer, IntensityDType, LogicalLayerKey, ScaleLevel, TimeIndex,
     TransferCurve,
 };
-use mirante4d_renderer::CurrentLeaseBridge;
 
-use crate::{HistogramStatus, LayerHistogramSummary};
+use crate::{HistogramStatus, LayerHistogramSummary, retained_leases::RetainedLeases};
 
 const HISTOGRAM_BIN_COUNT: usize = 32;
 const LEASE_HISTOGRAM_SAMPLE_LIMIT: u64 = 65_536;
@@ -29,7 +28,7 @@ struct LeaseHistogramResource<'a> {
 }
 
 pub(crate) fn active_layer_histogram_summary(
-    leases: &CurrentLeaseBridge,
+    leases: &RetainedLeases,
     input: ActiveLayerHistogramInput<'_>,
 ) -> LayerHistogramSummary {
     let cohort = leases.resident_subset(

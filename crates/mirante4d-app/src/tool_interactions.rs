@@ -1,17 +1,16 @@
 use eframe::egui;
 use mirante4d_application::ApplicationSnapshot;
 use mirante4d_domain::RenderMode;
-use mirante4d_renderer::{
-    PickCompleteness, PickHit, PickHitKind, PickPolicy, PickQuery, PickValue, ScreenPosition,
-    empty_pick_hit,
-};
 
 use crate::{
     FrameCompleteness, ViewportHover, ViewportIntensity, application_view,
     current_runtime::{
         analysis::AnalysisProductRuntime, render::CurrentRenderRuntime, ui::CurrentUiRuntime,
     },
-    tools::{ViewerToolCommand, ViewerToolEvent},
+    tools::{
+        PickCompleteness, PickHit, PickHitKind, PickPolicy, PickQuery, PickValue, ScreenPosition,
+        ViewerToolCommand, ViewerToolEvent, empty_pick_hit,
+    },
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -92,12 +91,8 @@ pub(crate) fn pick_hit_from_viewport_hover(
 
     Ok(PickHit {
         kind: PickHitKind::Voxel,
-        layer_id: None,
         object_id: None,
-        source_layer_id: None,
         timepoint: view.timepoint(),
-        world_position: None,
-        grid_position: None,
         screen_position: Some(screen_position),
         value: Some(match hover.intensity {
             ViewportIntensity::U8(value) => PickValue::IntensityU8(value),

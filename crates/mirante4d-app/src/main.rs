@@ -10,10 +10,9 @@ use mirante4d_app::{
     run_headless_smoke,
 };
 use mirante4d_domain::RenderMode;
-use mirante4d_renderer::gpu::{
-    GPU_ADAPTER_ENV, adapter_info_matches_name, adapter_info_summary, adapter_preference_score,
-    renderer_device_descriptor, renderer_required_limits_for_adapter,
-};
+use mirante4d_render_wgpu::{qualify_adapter, renderer_device_descriptor};
+
+const GPU_ADAPTER_ENV: &str = "MIRANTE4D_GPU_ADAPTER";
 
 fn main() -> anyhow::Result<()> {
     const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -179,6 +178,41 @@ fn render_mode_label(mode: RenderMode) -> &'static str {
     }
 }
 
+fn adapter_info_summary(info: &eframe::wgpu::AdapterInfo) -> String {
+    format!(
+        "{:?} {:?} {} driver={} {} pci={}",
+        info.backend,
+        info.device_type,
+        info.name,
+        info.driver,
+        info.driver_info,
+        info.device_pci_bus_id
+    )
+}
+
+fn adapter_info_matches_name(info: &eframe::wgpu::AdapterInfo, requested: &str) -> bool {
+    let requested = requested.trim().to_ascii_lowercase();
+    if requested.is_empty() {
+        return true;
+    }
+    format!(
+        "{} {} {} {:?} {:?}",
+        info.name, info.driver, info.driver_info, info.backend, info.device_type
+    )
+    .to_ascii_lowercase()
+    .contains(&requested)
+}
+
+fn adapter_preference_score(info: &eframe::wgpu::AdapterInfo) -> u8 {
+    match info.device_type {
+        eframe::wgpu::DeviceType::DiscreteGpu => 4,
+        eframe::wgpu::DeviceType::IntegratedGpu => 3,
+        eframe::wgpu::DeviceType::VirtualGpu => 2,
+        eframe::wgpu::DeviceType::Other => 1,
+        eframe::wgpu::DeviceType::Cpu => 0,
+    }
+}
+
 fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
     let mut options = eframe::egui_wgpu::WgpuConfiguration::default();
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut options.wgpu_setup {
@@ -213,15 +247,12 @@ fn select_window_adapter(
         {
             continue;
         }
-        if info.device_type == eframe::wgpu::DeviceType::Cpu {
-            continue;
-        }
         if let Some(requested) = &requested
             && !adapter_info_matches_name(&info, requested)
         {
             continue;
         }
-        if let Err(err) = renderer_required_limits_for_adapter(adapter) {
+        if let Err(err) = qualify_adapter(adapter) {
             available.push(format!(
                 "{} rejected for renderer limits: {err}",
                 adapter_info_summary(&info)
@@ -246,7 +277,67 @@ fn select_window_adapter(
         .map(|value| format!(" matching {GPU_ADAPTER_ENV}={value:?}"))
         .unwrap_or_default();
     Err(format!(
-        "no usable non-CPU window adapter{requested}; available adapters: {}",
+        "no qualifying Vulkan window adapter{requested}; available adapters: {}",
         available.join("; ")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adapter_override_matches_case_insensitive_visible_facts() {
+        let info = adapter_info(
+            "Example Discrete GPU",
+            eframe::wgpu::DeviceType::DiscreteGpu,
+            eframe::wgpu::Backend::Vulkan,
+        );
+
+        assert!(adapter_info_matches_name(&info, "discrete gpu"));
+        assert!(adapter_info_matches_name(&info, "VULKAN"));
+        assert!(!adapter_info_matches_name(&info, "integrated"));
+    }
+
+    #[test]
+    fn adapter_ranking_prefers_discrete_then_integrated_hardware() {
+        let discrete = adapter_info(
+            "discrete",
+            eframe::wgpu::DeviceType::DiscreteGpu,
+            eframe::wgpu::Backend::Vulkan,
+        );
+        let integrated = adapter_info(
+            "integrated",
+            eframe::wgpu::DeviceType::IntegratedGpu,
+            eframe::wgpu::Backend::Vulkan,
+        );
+        let cpu = adapter_info(
+            "software",
+            eframe::wgpu::DeviceType::Cpu,
+            eframe::wgpu::Backend::Vulkan,
+        );
+
+        assert!(adapter_preference_score(&discrete) > adapter_preference_score(&integrated));
+        assert!(adapter_preference_score(&integrated) > adapter_preference_score(&cpu));
+    }
+
+    fn adapter_info(
+        name: &str,
+        device_type: eframe::wgpu::DeviceType,
+        backend: eframe::wgpu::Backend,
+    ) -> eframe::wgpu::AdapterInfo {
+        eframe::wgpu::AdapterInfo {
+            name: name.to_owned(),
+            vendor: 0,
+            device: 0,
+            device_type,
+            device_pci_bus_id: String::new(),
+            driver: "test-driver".to_owned(),
+            driver_info: "test-driver-info".to_owned(),
+            backend,
+            subgroup_min_size: 32,
+            subgroup_max_size: 32,
+            transient_saves_memory: false,
+        }
+    }
 }

@@ -55,11 +55,12 @@ const SUCCESSOR_OWNED_WORKSPACE_CRATES: [&str; 7] = [
     "mirante4d-render-wgpu",
     "mirante4d-storage",
 ];
-const RETIRED_WORKSPACE_CRATES: [&str; 4] = [
+const RETIRED_WORKSPACE_CRATES: [&str; 5] = [
     "mirante4d-analysis",
     "mirante4d-data",
     "mirante4d-format",
     "mirante4d-import",
+    "mirante4d-renderer",
 ];
 
 // Keep the frozen WP-08A predecessor matrix unchanged while checking the
@@ -74,6 +75,7 @@ pub(super) fn accepted_successor_normal_dependency_additions(
             "mirante4d-dataset-runtime",
             "mirante4d-import-pipeline",
             "mirante4d-project-store",
+            "mirante4d-render-wgpu",
             "mirante4d-storage",
         ],
         "mirante4d-application" => &["mirante4d-project-store"],
@@ -93,6 +95,7 @@ fn accepted_successor_normal_dependency_removals(crate_name: &str) -> &'static [
             "mirante4d-format",
             "mirante4d-identity",
             "mirante4d-import",
+            "mirante4d-renderer",
         ],
         "mirante4d-renderer" => &["mirante4d-data", "mirante4d-format"],
         "xtask" => &[
@@ -736,6 +739,17 @@ fn validate_side_effect_capabilities(
         if capability.capability == "source-import-background-workers" {
             current_crates.insert(&capability.target_owner);
             validate_wp10c_import_worker_owner(repo_root, &capability.target_owner)?;
+        }
+        if capability.capability == "gpu-resource-and-submission" {
+            current_crates.insert(&capability.target_owner);
+            validate_side_effect_evidence(
+                repo_root,
+                metadata,
+                crate_paths,
+                &capability.target_owner,
+                Some("wgpu"),
+                None,
+            )?;
         }
         if current_crates.is_empty()
             && !matches!(
