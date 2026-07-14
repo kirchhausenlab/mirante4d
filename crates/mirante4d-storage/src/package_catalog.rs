@@ -341,6 +341,20 @@ impl LocalPackageCatalog {
         )
     }
 
+    /// Reads one brick for an opened-but-not-yet-verified product source.
+    ///
+    /// This deliberately stays crate-private: the returned bytes are protected
+    /// by the normal range, codec, CRC, and snapshot checks, but they carry no
+    /// `PackageId` authority. Only the dataset-source adapter may use this
+    /// provisional path while full package and scientific verification runs.
+    pub(crate) fn read_brick_unverified(
+        &self,
+        coordinates: crate::PackedIndexCoordinates,
+    ) -> Result<crate::LocalBrickRead, crate::PackageReadError> {
+        let plan = self.plan_brick_storage(coordinates)?;
+        crate::package_read::read_local_brick(&self.reader, &self.descriptors, plan)
+    }
+
     pub(crate) const fn reader(&self) -> &LocalPackageReader {
         &self.reader
     }

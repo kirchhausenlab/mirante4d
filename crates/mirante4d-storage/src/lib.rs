@@ -13,6 +13,7 @@
 
 mod brick_address;
 mod control;
+mod dataset_source;
 mod directory_inventory;
 mod error;
 mod limits;
@@ -48,6 +49,9 @@ pub use control::{
     RightsPayload, ScienceDescriptor, ScienceLayer, ScienceTemporalCalibration,
     ScienceTemporalKind, SourceIdentifier, SourceIdentifierScheme, SourcePayload, SpdxLicense,
     TypedId, U64Decimal, manifest_page_path, pack_manifest_pages, profile_compatibility_bytes,
+};
+pub use dataset_source::{
+    LocalDatasetSource, LocalDatasetSourceOpenError, PACKAGE_VALIDATION_WORKING_BYTES,
 };
 pub use directory_inventory::{DirectoryInventory, DirectoryInventoryError};
 pub use error::StorageProfileError;
