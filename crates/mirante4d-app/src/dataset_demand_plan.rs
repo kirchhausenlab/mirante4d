@@ -5,14 +5,16 @@ use std::{collections::BTreeMap, error::Error, fmt};
 use mirante4d_dataset::{DatasetCatalog, DatasetResourceKey, ResourceRegion};
 use mirante4d_domain::{LogicalLayerKey, RenderMode, ScaleLevel, Shape3D};
 use mirante4d_project_model::ViewState;
-use mirante4d_render_api::{CameraFrame, PresentationViewport};
-use mirante4d_renderer::{
-    BrickPlanOptions, CrossSectionPanel, CrossSectionViewState, RenderError, RenderViewport,
-    ResourcePlanLimits, SemanticRegionGridSpec, plan_cross_section_resource_regions,
-    plan_visible_resource_regions,
-};
+use mirante4d_render_api::{CameraFrame, PresentationViewport, RenderExtent};
 
-use crate::semantic_tiles::SEMANTIC_TILE_SIDE;
+use crate::{
+    semantic_demand::{
+        CrossSectionPlane, SemanticPlanError, SemanticPlanLimits, SemanticRegionGridSpec,
+        VolumePlanOptions, plan_cross_section_resource_regions, plan_visible_resource_regions,
+    },
+    semantic_tiles::SEMANTIC_TILE_SIDE,
+    viewer_layout::PanelId,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct DatasetDemandPlan {
@@ -55,6 +57,17 @@ impl DatasetDemandPlanLimits {
             self
         }
     }
+}
+
+pub(crate) fn render_extent_from_dimensions(
+    width: u64,
+    height: u64,
+) -> anyhow::Result<RenderExtent> {
+    let width = u32::try_from(width)
+        .map_err(|_| anyhow::anyhow!("render width {width} exceeds u32 limits"))?;
+    let height = u32::try_from(height)
+        .map_err(|_| anyhow::anyhow!("render height {height} exceeds u32 limits"))?;
+    RenderExtent::new(width, height).map_err(Into::into)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,7 +126,7 @@ pub(crate) fn plan_current_3d(
     catalog: &DatasetCatalog,
     view: &ViewState,
     presentation: PresentationViewport,
-    viewport: RenderViewport,
+    viewport: RenderExtent,
     limits: DatasetDemandPlanLimits,
     playback_active: bool,
 ) -> anyhow::Result<DatasetDemandPlan> {
@@ -162,7 +175,7 @@ pub(crate) fn plan_current_3d(
 pub(crate) fn plan_cross_section_panel(
     catalog: &DatasetCatalog,
     view: &ViewState,
-    panel: CrossSectionPanel,
+    panel: PanelId,
     presentation: PresentationViewport,
     active_level: ScaleLevel,
     limits: DatasetDemandPlanLimits,
@@ -174,15 +187,12 @@ pub(crate) fn plan_cross_section_panel(
         anyhow::anyhow!("active layer has no selected scale {}", active_level.get())
     })?;
     let target_resolution = representative_voxel_world_size(active_scale.grid_to_world());
-    let cross_section = view.cross_section();
-    let render_view = CrossSectionViewState::new(
-        glam::DVec3::from_array(cross_section.center_world().components()),
-        glam::DQuat::from_array(cross_section.orientation().xyzw()),
-        cross_section.scale_world_per_screen_point(),
-        cross_section.depth_world(),
-    )
-    .view(panel);
-    let slab = render_view.slab(presentation);
+    let panel = match panel {
+        PanelId::Xy => CrossSectionPlane::Xy,
+        PanelId::Xz => CrossSectionPlane::Xz,
+        PanelId::Yz => CrossSectionPlane::Yz,
+        PanelId::ThreeD => anyhow::bail!("the 3D panel is not a cross-section demand target"),
+    };
     let mut plan = PlanAccumulator::default();
     for view_layer in view.layers().iter().filter(|layer| layer.visible()) {
         let key = view_layer.layer_key();
@@ -198,15 +208,17 @@ pub(crate) fn plan_cross_section_panel(
             scale_for_target_resolution(layer, target_resolution)
         };
         let regions = plan_cross_section_resource_regions(
-            slab,
+            *view.cross_section(),
+            panel,
+            presentation,
             SemanticRegionGridSpec {
                 volume_shape: scale.shape(),
                 resource_shape: semantic_resource_shape(scale.shape()),
                 grid_to_world: scale.grid_to_world(),
             },
-            renderer_limits(limits, plan.resources.len()),
+            semantic_limits(limits, plan.resources.len()),
         )
-        .map_err(plan_attempt_from_render_error);
+        .map_err(plan_attempt_from_semantic_error);
         let regions = match regions {
             Ok(regions) => regions,
             Err(PlanAttemptError::Capacity) => {
@@ -245,7 +257,7 @@ fn plan_level(
     catalog: &DatasetCatalog,
     view: &ViewState,
     camera: CameraFrame,
-    viewport: RenderViewport,
+    viewport: RenderExtent,
     active_level: ScaleLevel,
     target_resolution: f64,
     limits: DatasetDemandPlanLimits,
@@ -278,12 +290,18 @@ fn plan_level(
                 resource_shape,
                 grid_to_world: scale.grid_to_world(),
             },
-            BrickPlanOptions {
-                pixel_stride: viewport.width.max(viewport.height).div_ceil(128).max(1),
+            VolumePlanOptions {
+                pixel_stride: u64::from(
+                    viewport
+                        .width_pixels()
+                        .max(viewport.height_pixels())
+                        .div_ceil(128)
+                        .max(1),
+                ),
             },
-            renderer_limits(limits, plan.resources.len()),
+            semantic_limits(limits, plan.resources.len()),
         )
-        .map_err(plan_attempt_from_render_error)?;
+        .map_err(plan_attempt_from_semantic_error)?;
         append_layer_resources(
             catalog,
             view,
@@ -343,11 +361,11 @@ fn append_layer_resources(
     Ok(())
 }
 
-fn renderer_limits(
+fn semantic_limits(
     limits: DatasetDemandPlanLimits,
     resources_already_planned: usize,
-) -> ResourcePlanLimits {
-    ResourcePlanLimits::new(
+) -> SemanticPlanLimits {
+    SemanticPlanLimits::new(
         limits.max_candidates_per_layer,
         limits
             .max_resources
@@ -355,8 +373,8 @@ fn renderer_limits(
     )
 }
 
-fn plan_attempt_from_render_error(error: RenderError) -> PlanAttemptError {
-    if matches!(error, RenderError::ResourcePlanCapacityExceeded { .. }) {
+fn plan_attempt_from_semantic_error(error: SemanticPlanError) -> PlanAttemptError {
+    if error.is_capacity() {
         PlanAttemptError::Capacity
     } else {
         PlanAttemptError::Other(error.into())
@@ -469,7 +487,7 @@ mod tests {
             &catalog,
             &view,
             PresentationViewport::new(64.0, 64.0).unwrap(),
-            RenderViewport::new(64, 64).unwrap(),
+            RenderExtent::new(64, 64).unwrap(),
             DatasetDemandPlanLimits::new(4_096, 64, 0),
             false,
         )
@@ -489,7 +507,7 @@ mod tests {
             &catalog,
             &view,
             PresentationViewport::new(64.0, 64.0).unwrap(),
-            RenderViewport::new(64, 64).unwrap(),
+            RenderExtent::new(64, 64).unwrap(),
             DatasetDemandPlanLimits::new(4_096, 64, 1_048_576),
             false,
         )
@@ -525,7 +543,7 @@ mod tests {
             &catalog,
             &view,
             PresentationViewport::new(64.0, 64.0).unwrap(),
-            RenderViewport::new(64, 64).unwrap(),
+            RenderExtent::new(64, 64).unwrap(),
             DatasetDemandPlanLimits::new(4_096, 1, 1_048_576),
             false,
         )
@@ -537,7 +555,7 @@ mod tests {
             &catalog,
             &view,
             PresentationViewport::new(64.0, 64.0).unwrap(),
-            RenderViewport::new(64, 64).unwrap(),
+            RenderExtent::new(64, 64).unwrap(),
             DatasetDemandPlanLimits::new(4_096, 4, 262_144),
             true,
         )
@@ -580,7 +598,7 @@ mod tests {
             &catalog,
             &view,
             PresentationViewport::new(64.0, 64.0).unwrap(),
-            RenderViewport::new(64, 64).unwrap(),
+            RenderExtent::new(64, 64).unwrap(),
             DatasetDemandPlanLimits::new(4_096, 64, 1_048_576),
             false,
         )

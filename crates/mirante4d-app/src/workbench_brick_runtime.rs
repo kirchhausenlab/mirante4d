@@ -14,7 +14,7 @@ use crate::{
     application_view,
     dataset_demand_plan::{
         DatasetDemandPlanCapacityError, DatasetDemandPlanLimits, plan_cross_section_panel,
-        plan_current_3d,
+        plan_current_3d, render_extent_from_dimensions,
     },
     dataset_requests::{
         SCOPE_ANALYSIS, SCOPE_CROSS_SECTION_XY, SCOPE_CROSS_SECTION_XZ, SCOPE_CROSS_SECTION_YZ,
@@ -81,20 +81,25 @@ impl MiranteWorkbenchApp {
             ),
             budget_share_u64(decoded_capacity, current_share_numerator, demand_cohorts),
         );
-        let plan = match plan_current_3d(
-            snapshot.catalog(),
-            view,
-            self.render_runtime.presentation_viewport,
-            self.render_runtime.render_viewport,
-            current_limits,
-            playback_active,
-        ) {
-            Ok(plan) => plan,
-            Err(error) => {
-                self.record_dataset_plan_error(&error);
-                return VisibleBrickRequestOutcome::default();
-            }
-        };
+        let render_viewport = self.render_runtime.render_viewport;
+        let plan =
+            match render_extent_from_dimensions(render_viewport.width, render_viewport.height)
+                .and_then(|extent| {
+                    plan_current_3d(
+                        snapshot.catalog(),
+                        view,
+                        self.render_runtime.presentation_viewport,
+                        extent,
+                        current_limits,
+                        playback_active,
+                    )
+                }) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    self.record_dataset_plan_error(&error);
+                    return VisibleBrickRequestOutcome::default();
+                }
+            };
 
         let scale = plan.scale;
         let visible_count = plan.resources.len();
@@ -378,9 +383,7 @@ impl MiranteWorkbenchApp {
             let panel_plan = plan_cross_section_panel(
                 snapshot.catalog(),
                 application_view(snapshot),
-                panel_id
-                    .cross_section_panel()
-                    .expect("a cross-section scope has a cross-section panel"),
+                panel_id,
                 presentation,
                 scale,
                 limits,

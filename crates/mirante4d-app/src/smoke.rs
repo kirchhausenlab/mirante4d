@@ -20,7 +20,9 @@ use mirante4d_settings::recommended_for_current_system;
 
 use crate::{
     application_view,
-    dataset_demand_plan::{DatasetDemandPlanLimits, plan_current_3d},
+    dataset_demand_plan::{
+        DatasetDemandPlanLimits, plan_current_3d, render_extent_from_dimensions,
+    },
     dataset_requests::SCOPE_CURRENT_3D,
     playback::stepped_timepoint,
     unified_source_open,
@@ -181,7 +183,10 @@ fn load_current_requirements(
         snapshot.catalog(),
         application_view(&snapshot),
         opened.render_runtime.presentation_viewport,
-        opened.render_runtime.render_viewport,
+        render_extent_from_dimensions(
+            opened.render_runtime.render_viewport.width,
+            opened.render_runtime.render_viewport.height,
+        )?,
         DatasetDemandPlanLimits::new(
             MAX_RENDER_REQUIREMENTS,
             MAX_RENDER_REQUIREMENTS,

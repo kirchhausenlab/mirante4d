@@ -33,7 +33,11 @@ fn unified_demand_plan_uses_semantic_keys_for_every_visible_layer() {
         snapshot.catalog(),
         application_view(&snapshot),
         opened.render_runtime.presentation_viewport,
-        opened.render_runtime.render_viewport,
+        dataset_demand_plan::render_extent_from_dimensions(
+            opened.render_runtime.render_viewport.width,
+            opened.render_runtime.render_viewport.height,
+        )
+        .unwrap(),
         dataset_demand_plan::DatasetDemandPlanLimits::new(
             mirante4d_render_api::MAX_RENDER_REQUIREMENTS,
             mirante4d_render_api::MAX_RENDER_REQUIREMENTS,
