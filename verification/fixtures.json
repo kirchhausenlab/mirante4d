@@ -211,11 +211,11 @@
       "publication": "public-safe-generated",
       "license": "MIT",
       "path": "crates/mirante4d-render-wgpu/src/gpu_tests.rs",
-      "sha256": "898386623eeeaed5faecd36df5490a84d2b01f7de5d303dc91001d58ac35feda",
+      "sha256": "b8a716a6c475577f00854ee96700930d8ca454e8da0c4f98748b7e8a61a9fe4e",
       "generator": {
         "command": "MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 cargo xtask verify-local trusted-gpu",
         "source": "crates/mirante4d-render-wgpu/src/gpu_tests.rs",
-        "sha256": "898386623eeeaed5faecd36df5490a84d2b01f7de5d303dc91001d58ac35feda",
+        "sha256": "b8a716a6c475577f00854ee96700930d8ca454e8da0c4f98748b7e8a61a9fe4e",
         "production_writer_used": false
       },
       "lineages": [],
@@ -240,11 +240,11 @@
       "publication": "public-safe-generated",
       "license": "MIT",
       "path": "crates/mirante4d-render-wgpu/src/gpu_tests.rs",
-      "sha256": "898386623eeeaed5faecd36df5490a84d2b01f7de5d303dc91001d58ac35feda",
+      "sha256": "b8a716a6c475577f00854ee96700930d8ca454e8da0c4f98748b7e8a61a9fe4e",
       "generator": {
         "command": "MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 cargo xtask verify-local trusted-gpu",
         "source": "crates/mirante4d-render-wgpu/src/gpu_tests.rs",
-        "sha256": "898386623eeeaed5faecd36df5490a84d2b01f7de5d303dc91001d58ac35feda",
+        "sha256": "b8a716a6c475577f00854ee96700930d8ca454e8da0c4f98748b7e8a61a9fe4e",
         "production_writer_used": false
       },
       "lineages": [],
@@ -272,11 +272,11 @@
       "publication": "public-safe-generated",
       "license": "MIT",
       "path": "crates/mirante4d-render-wgpu/src/gpu_tests.rs",
-      "sha256": "898386623eeeaed5faecd36df5490a84d2b01f7de5d303dc91001d58ac35feda",
+      "sha256": "b8a716a6c475577f00854ee96700930d8ca454e8da0c4f98748b7e8a61a9fe4e",
       "generator": {
         "command": "MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 cargo xtask verify-local trusted-gpu",
         "source": "crates/mirante4d-render-wgpu/src/gpu_tests.rs",
-        "sha256": "898386623eeeaed5faecd36df5490a84d2b01f7de5d303dc91001d58ac35feda",
+        "sha256": "b8a716a6c475577f00854ee96700930d8ca454e8da0c4f98748b7e8a61a9fe4e",
         "production_writer_used": false
       },
       "lineages": [],
