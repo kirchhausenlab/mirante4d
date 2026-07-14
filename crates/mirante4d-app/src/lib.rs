@@ -35,6 +35,7 @@ mod playback;
 mod product_automation;
 mod render_state;
 mod resident_rendering;
+mod retained_leases;
 mod runtime_diagnostics_panel;
 mod semantic_tiles;
 mod smoke;
