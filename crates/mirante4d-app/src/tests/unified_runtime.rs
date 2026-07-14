@@ -89,22 +89,114 @@ fn app_dispatches_and_drains_visible_demand_through_one_runtime() {
     app.dataset.request_shutdown().unwrap();
 }
 
+fn reviewed_import_options(
+    source: TiffSource,
+    inspection: mirante4d_import_pipeline::TiffInspection,
+    destination: PathBuf,
+) -> (ImportReviewId, ImportOptions) {
+    let mut workflow = ImportWorkflow::new();
+    let review_id = workflow
+        .install_review(source, inspection, destination)
+        .unwrap();
+    let mut draft = workflow.pending_review.as_ref().unwrap().initial_draft;
+    draft.calibration_confirmed = true;
+    draft.time_step_seconds = Some(1.0);
+    let options = workflow.start_options(review_id, draft).unwrap().unwrap();
+    (review_id, options)
+}
+
+#[test]
+fn inspection_review_and_typed_start_form_one_import_workflow() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let source = write_source_time_series_fixture(temp.path()).unwrap();
+    let destination = temp.path().join("typed-import.m4d");
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let context = egui::Context::default();
+
+    app.enter_tiff_import_setup_waiting_state(TiffSource::auto(&source), destination)
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        app.drain_tiff_import_setup_results(&context);
+        if matches!(
+            app.application_snapshot_for_ui().import_workflow(),
+            ImportWorkflowSnapshot::Review(_)
+        ) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+
+    let ImportWorkflowSnapshot::Review(review) = app.import.snapshot() else {
+        panic!("inspection must produce an import review");
+    };
+    let mut draft = review.initial_draft;
+    app.apply_import_command(
+        ImportCommand::Start {
+            review_id: review.review_id,
+            draft,
+        },
+        &context,
+    );
+    assert!(matches!(app.import.snapshot(), ImportWorkflowSnapshot::Failed(_)));
+    assert!(app.import.pending_review.is_some());
+    app.apply_import_command(ImportCommand::DismissProblem, &context);
+
+    draft.calibration_confirmed = true;
+    draft.time_step_seconds = Some(1.0);
+    let stale_id = ImportReviewId::new(review.review_id.get() + 1);
+    app.apply_import_command(
+        ImportCommand::Start {
+            review_id: stale_id,
+            draft,
+        },
+        &context,
+    );
+    assert!(matches!(app.import.snapshot(), ImportWorkflowSnapshot::Review(_)));
+
+    app.apply_import_command(
+        ImportCommand::Start {
+            review_id: review.review_id,
+            draft,
+        },
+        &context,
+    );
+    assert!(matches!(
+        app.import.snapshot(),
+        ImportWorkflowSnapshot::Importing(_)
+    ));
+    assert!(app.import.pending_review.is_none());
+
+    let token = app
+        .application
+        .snapshot()
+        .active_operations()
+        .iter()
+        .find(|token| token.kind() == OperationKind::Import)
+        .unwrap()
+        .clone();
+    app.import.workers.shutdown();
+    assert!(app.complete_background_operation(token, OperationCompletion::Cancelled));
+    app.dataset.request_shutdown().unwrap();
+}
+
 #[test]
 fn import_cancellation_waits_for_the_worker_terminal_result() {
     let temp = tempfile::tempdir().unwrap();
     let package = write_target_fixture(temp.path()).unwrap();
     let source = write_source_time_series_fixture(temp.path()).unwrap();
     let inspection = mirante4d_import_pipeline::inspect_tiff(TiffSource::auto(&source)).unwrap();
-    let mut pending = PendingTiffImport::from_inspection(
+    let (review_id, options) = reviewed_import_options(
         TiffSource::auto(&source),
         inspection,
         temp.path().join("cancelled-import.m4d"),
     );
-    pending.calibration_confirmed = true;
-    pending.time_step_seconds = Some(1.0);
     let opened = open_dataset_and_render_first_frame(&package).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
-    app.start_import_task(build_import_options(&pending).unwrap());
+    assert!(app.start_import_task(review_id, options));
     let token = app
         .application
         .snapshot()
@@ -114,10 +206,10 @@ fn import_cancellation_waits_for_the_worker_terminal_result() {
         .unwrap()
         .clone();
 
-    app.cancel_import_task();
+    app.apply_import_command(ImportCommand::CancelImport, &egui::Context::default());
 
     assert!(matches!(
-        app.import_workers.status(),
+        app.import.workers.status(),
         ImportWorkerStatus::Importing {
             cancellation_requested: true,
             ..
@@ -129,7 +221,7 @@ fn import_cancellation_waits_for_the_worker_terminal_result() {
             .active_operations()
             .contains(&token)
     );
-    app.import_workers.shutdown();
+    app.import.workers.shutdown();
     assert!(app.complete_background_operation(token, OperationCompletion::Cancelled));
     app.dataset.request_shutdown().unwrap();
 }
@@ -216,12 +308,10 @@ fn import_verify_analyze_save_and_reopen_atomically() {
     let context = egui::Context::default();
 
     let inspection = mirante4d_import_pipeline::inspect_tiff(TiffSource::auto(&source)).unwrap();
-    let mut pending =
-        PendingTiffImport::from_inspection(TiffSource::auto(&source), inspection, package.clone());
-    pending.calibration_confirmed = true;
-    pending.time_step_seconds = Some(1.0);
+    let (_, options) =
+        reviewed_import_options(TiffSource::auto(&source), inspection, package.clone());
     mirante4d_import_pipeline::import_tiff(
-        build_import_options(&pending).unwrap(),
+        options,
         &TestImportLedger,
         &ImportCancellation::new(),
         |_| {},

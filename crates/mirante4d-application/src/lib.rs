@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod import_workflow;
 mod project_store_service;
 pub mod viewer_tools;
 pub mod viewport_interaction;
@@ -1328,6 +1329,7 @@ impl ApplicationState {
             pending_event_count: self.events.len(),
             latest_problem: self.latest_problem.clone(),
             presentations: PresentationSnapshot::default(),
+            import_workflow: import_workflow::ImportWorkflowSnapshot::default(),
         }
     }
 
@@ -2306,6 +2308,14 @@ impl ApplicationState {
         &mut self,
         kind: OperationKind,
     ) -> Result<OperationToken, ApplicationFaultCode> {
+        if kind == OperationKind::Import
+            && self
+                .operations
+                .values()
+                .any(|operation| operation.token.kind() == OperationKind::DatasetOpen)
+        {
+            return Err(ApplicationFaultCode::OperationConflict);
+        }
         let token = self.create_operation(kind)?;
         self.push_event(ApplicationEvent::OperationStarted {
             token: token.clone(),
@@ -3175,6 +3185,7 @@ pub struct ApplicationSnapshot {
     pending_event_count: usize,
     latest_problem: Option<ApplicationEvent>,
     presentations: PresentationSnapshot,
+    import_workflow: import_workflow::ImportWorkflowSnapshot,
 }
 
 impl ApplicationSnapshot {
@@ -3234,11 +3245,25 @@ impl ApplicationSnapshot {
         &self.presentations
     }
 
+    /// Returns native import facts projected for framework UI code.
+    pub const fn import_workflow(&self) -> &import_workflow::ImportWorkflowSnapshot {
+        &self.import_workflow
+    }
+
     /// Composition attaches the current presentation projection after taking
     /// an immutable application snapshot. This does not mutate application or
     /// durable project state.
     pub fn with_presentations(mut self, presentations: PresentationSnapshot) -> Self {
         self.presentations = presentations;
+        self
+    }
+
+    /// Composition attaches native import facts without mutating canonical state.
+    pub fn with_import_workflow(
+        mut self,
+        workflow: import_workflow::ImportWorkflowSnapshot,
+    ) -> Self {
+        self.import_workflow = workflow;
         self
     }
 

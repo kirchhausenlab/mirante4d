@@ -229,14 +229,14 @@ fn tiff_import_setup_state_is_visible_immediately_after_output_selection() {
     .unwrap();
 
     assert!(matches!(
-        app.import_workers.status(),
+        app.import.workers.status(),
         ImportWorkerStatus::Inspecting {
             source: active_source,
             destination: active_destination,
             ..
         } if active_source.path == source && active_destination == destination
     ));
-    assert!(app.import_runtime.pending_tiff_import.is_none());
-    assert!(app.import_runtime.tiff_import_setup_error.is_none());
-    app.import_workers.shutdown();
+    assert!(app.import.pending_review.is_none());
+    assert!(app.import.problem.is_none());
+    app.import.workers.shutdown();
 }

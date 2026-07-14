@@ -137,6 +137,7 @@ pub(super) fn accepted_successor_public_root_additions(
             "SystemMonotonicClock",
             "viewer_tools",
             "viewport_interaction",
+            "import_workflow",
         ],
         _ => &[],
     }

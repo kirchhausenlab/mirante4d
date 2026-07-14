@@ -193,12 +193,12 @@ the sole product dataset path, verification remains responsive, proved package
 and scientific identities bind to projects, and the predecessor data, format,
 and import crates are deleted.
 
-The WP-09B candidate makes `mirante4d-render-wgpu` the sole product render
-route, presents progressive frames without complete-residency gating, and
-deletes the predecessor renderer and CPU placeholder rendering. Its focused
-checks and one real-display small-package scenario cover MIP, DVR, ISO, linked
-panels, a 1280x720 render target, and a current 1920x1080 render-target resize.
-Protected-main acceptance is the remaining bookkeeping step before WP-09C.
+WP-09B is accepted on protected main at
+`b73dd86fed8cc3ac7b34f75f20dcd8bb8ac85672`, tagged
+`foundation-wp-09b-exit-1`. `mirante4d-render-wgpu` is the sole product render
+route; the predecessor renderer and CPU placeholder route are deleted. WP-09C
+is moving the visible egui shell and remaining process coordination onto the
+accepted application, dataset, render, import, and project boundaries.
 
 ## Current Verification Boundary
 

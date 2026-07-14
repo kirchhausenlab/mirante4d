@@ -9,7 +9,7 @@ use std::{
     thread::JoinHandle,
 };
 
-use mirante4d_application::OperationToken;
+use mirante4d_application::{OperationToken, import_workflow::ImportReviewId};
 use mirante4d_dataset::CpuByteLedger;
 use mirante4d_import_pipeline::{
     ImportCancellation, ImportError, ImportEvent, ImportOptions, ImportReceipt, TiffInspection,
@@ -69,6 +69,7 @@ pub(crate) struct InspectionWorkerCompletion {
 }
 
 pub(crate) struct ImportExecutionCompletion {
+    pub(crate) review_id: ImportReviewId,
     pub(crate) token: OperationToken,
     pub(crate) destination: PathBuf,
     pub(crate) retry_options: Option<ImportOptions>,
@@ -99,6 +100,7 @@ struct InspectionWorker {
 }
 
 struct ImportWorker {
+    review_id: ImportReviewId,
     token: OperationToken,
     destination: PathBuf,
     retry_options: Option<ImportOptions>,
@@ -174,6 +176,7 @@ impl ImportWorkerService {
 
     pub(crate) fn start_import(
         &mut self,
+        review_id: ImportReviewId,
         token: OperationToken,
         options: ImportOptions,
         ledger: Arc<dyn CpuByteLedger>,
@@ -196,6 +199,7 @@ impl ImportWorkerService {
             },
         );
         self.active = Some(ActiveWorker::Import(Box::new(ImportWorker {
+            review_id,
             token,
             destination,
             retry_options: Some(options),
@@ -256,9 +260,9 @@ impl ImportWorkerService {
 
 impl Drop for ImportWorkerService {
     fn drop(&mut self) {
-        if let Some(active) = self.active.as_ref() {
-            active.cancellation().cancel();
-            tracing::error!("active import worker dropped without explicit shutdown");
+        if self.active.is_some() {
+            tracing::warn!("joining an active import worker during drop");
+            self.shutdown();
         }
     }
 }
@@ -303,6 +307,7 @@ fn finish_worker(active: ActiveWorker, ready: ReadyCompletion) -> ImportWorkerCo
             let mut active = *active;
             let joined = join_worker(active.worker.take()).is_ok();
             ImportWorkerCompletion::Import(Box::new(ImportExecutionCompletion {
+                review_id: active.review_id,
                 token: active.token,
                 destination: active.destination,
                 retry_options: active.retry_options.take(),
@@ -440,6 +445,34 @@ mod tests {
 
         assert_eq!(joined.load(Ordering::SeqCst), 1);
         assert!(matches!(service.status(), ImportWorkerStatus::Idle));
+    }
+
+    #[test]
+    fn drop_cancels_and_joins_an_active_worker() {
+        let joined = Arc::new(AtomicUsize::new(0));
+        let worker_joined = Arc::clone(&joined);
+        let cancellation = ImportCancellation::new();
+        let worker_cancellation = cancellation.clone();
+        let (_sender, result) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            while !worker_cancellation.is_cancelled() {
+                std::thread::yield_now();
+            }
+            worker_joined.fetch_add(1, Ordering::SeqCst);
+        });
+        let service = ImportWorkerService {
+            active: Some(ActiveWorker::Inspection(InspectionWorker {
+                source: TiffSource::auto("drop.tif"),
+                destination: PathBuf::from("drop.m4d"),
+                cancellation,
+                result,
+                worker: Some(worker),
+            })),
+        };
+
+        drop(service);
+
+        assert_eq!(joined.load(Ordering::SeqCst), 1);
     }
 
     fn wait_for_completion(service: &mut ImportWorkerService) -> ImportWorkerCompletion {

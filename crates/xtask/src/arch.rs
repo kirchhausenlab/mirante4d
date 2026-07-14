@@ -1022,26 +1022,15 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
         bail!("WP-09B render authority ledger drifted");
     }
 
-    let expected_owners = BTreeMap::from([
+    let expected_owners = BTreeMap::from([(
+        "validation",
         (
-            "import",
-            (
-                "crates/mirante4d-app/src/current_runtime/import.rs",
-                "ImportRuntime",
-                "import_runtime",
-                "WP-09C",
-            ),
+            "crates/mirante4d-app/src/current_runtime/validation.rs",
+            "CurrentValidationRuntime",
+            "validation_runtime",
+            "WP-14",
         ),
-        (
-            "validation",
-            (
-                "crates/mirante4d-app/src/current_runtime/validation.rs",
-                "CurrentValidationRuntime",
-                "validation_runtime",
-                "WP-14",
-            ),
-        ),
-    ]);
+    )]);
     let owner_entries = ledger
         .get("temporary_owners")
         .and_then(serde_json::Value::as_array)
@@ -1093,6 +1082,14 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
             .exists()
     {
         bail!("egui-local state must be owned by mirante4d-ui-egui after the WP-09C cutover");
+    }
+    if app_fields.get("import").map(String::as_str) != Some("ImportWorkflow")
+        || app_fields.contains_key("import_runtime")
+        || repo_root
+            .join("crates/mirante4d-app/src/current_runtime/import.rs")
+            .exists()
+    {
+        bail!("native import composition must use ImportWorkflow without ImportRuntime");
     }
     let mut owner_type_names = expected_owners
         .values()

@@ -21,8 +21,8 @@ mod display_graph;
 mod display_refresh;
 mod fidelity;
 mod histogram;
-mod import_ui;
 mod import_worker_service;
+mod import_workflow;
 mod layer_state;
 mod lod_scheduler;
 mod native_presentation;
@@ -77,14 +77,10 @@ use histogram::{
     auto_dvr_opacity_transfer_from_histogram, auto_signal_window_from_histogram,
     histogram_bins_label, histogram_can_auto_window, histogram_status_label,
 };
-use import_ui::{
-    PendingTiffImport, active_layer_no_data_policy_label, build_import_options,
-    import_progress_fraction, import_task_status_text, pending_tiff_import_ready_to_start,
-    reset_checkpoint_directory, show_pending_tiff_import_controls, tiff_destination,
-};
-use import_worker_service::{
-    ImportWorkerCompletion, ImportWorkerOutcome, ImportWorkerService, ImportWorkerStatus,
-};
+#[cfg(test)]
+use import_worker_service::ImportWorkerStatus;
+use import_worker_service::{ImportWorkerCompletion, ImportWorkerOutcome};
+use import_workflow::{ImportWorkflow, reset_checkpoint_directory, tiff_destination};
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, ApplicationFault, ApplicationFaultCode,
     ApplicationSnapshot, ApplicationState, CommandEffect, OperationCompletion,
@@ -92,9 +88,10 @@ use mirante4d_application::{
     PresentationSurface, ProjectRecoveryStoreLocator, ProjectStoreApplicationService,
     ProjectStoreLifecycle, ProjectStoreServiceEvent, SourceSessionGeneration,
     SourceVerificationSnapshot, SystemMonotonicClock, WorkspaceSnapshot,
+    import_workflow::{ImportCommand, ImportReviewId, ImportWorkflowSnapshot},
     viewer_tools::{ViewerTool, ViewerToolState},
 };
-use mirante4d_dataset::DatasetSourceId;
+use mirante4d_dataset::{DatasetSourceId, ResourceValidity};
 use mirante4d_domain::{
     CameraView, CrossSectionView, DisplayWindow, DvrOpacityTransfer as CanonicalDvrOpacityTransfer,
     IsoLightState, IsoShadingPolicy, LayerTransfer, RenderState as CanonicalRenderState, RgbColor,
@@ -492,8 +489,7 @@ pub struct MiranteWorkbenchApp {
     render_runtime: current_runtime::render::CurrentRenderRuntime,
     native_presentation: native_presentation::NativePresentationBridge,
     egui_ui: ui_kit::EguiUiState,
-    import_workers: ImportWorkerService,
-    import_runtime: current_runtime::import::ImportRuntime,
+    import: ImportWorkflow,
     analysis_runtime: current_runtime::analysis::AnalysisProductRuntime,
     validation_runtime: current_runtime::validation::CurrentValidationRuntime,
     project_store: Option<ProjectStoreApplicationService<SystemMonotonicClock>>,
@@ -600,8 +596,7 @@ impl MiranteWorkbenchApp {
             render_runtime,
             native_presentation,
             egui_ui,
-            import_workers: ImportWorkerService::new(),
-            import_runtime: current_runtime::import::ImportRuntime::idle(),
+            import: ImportWorkflow::new(),
             analysis_runtime,
             validation_runtime,
             project_store,
@@ -2496,8 +2491,7 @@ impl MiranteWorkbenchApp {
         let old_render_runtime = std::mem::replace(&mut self.render_runtime, render_runtime);
         let old_analysis_runtime = std::mem::replace(&mut self.analysis_runtime, analysis_runtime);
         self.pending_analysis_artifact_load = None;
-        self.import_workers.shutdown();
-        self.import_runtime = current_runtime::import::ImportRuntime::idle();
+        self.import.clear_for_source_replacement();
         self.egui_ui.viewer_tools = ViewerToolState::default();
         self.egui_ui.analysis_plot_view = None;
         self.egui_ui.analysis_filter.clear();

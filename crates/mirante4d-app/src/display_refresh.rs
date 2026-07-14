@@ -97,7 +97,9 @@ impl MiranteWorkbenchApp {
             } else {
                 (None, None, None)
             };
-        snapshot.with_presentations(PresentationSnapshot::new(three_d, xy, xz, yz))
+        snapshot
+            .with_presentations(PresentationSnapshot::new(three_d, xy, xz, yz))
+            .with_import_workflow(self.import.snapshot())
     }
 
     fn cross_section_presentation_surface(&self, panel_id: PanelId) -> Option<PresentationSurface> {

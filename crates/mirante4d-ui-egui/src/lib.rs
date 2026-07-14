@@ -7,7 +7,13 @@ use std::{fmt::Display, hash::Hash};
 use eframe::egui::{self, Color32, RichText};
 use mirante4d_application::{
     ApplicationEvent, OperationOutcome, PresentationPaintRequest, PresentationSlot,
-    PresentationSurface, viewer_tools::ViewerToolState, viewport_interaction::ViewportOrbitDrag,
+    PresentationSurface,
+    import_workflow::{
+        ImportCommand, ImportProgressSnapshot, ImportReviewDraft, ImportReviewId,
+        ImportReviewSnapshot, ImportSourceDtype, ImportSourceLayout, ImportWorkflowSnapshot,
+    },
+    viewer_tools::ViewerToolState,
+    viewport_interaction::ViewportOrbitDrag,
 };
 
 /// Egui-local draft values and interaction state.
@@ -24,6 +30,9 @@ pub struct EguiUiState {
     pub allow_close_without_prompt: bool,
     pub settings_runtime_draft: ResourcePolicyDraft,
     pub analysis_workspace_open: bool,
+    import_review: Option<ImportReviewUiState>,
+    import_checkpoint_reset_confirmed: bool,
+    import_checkpoint_retry_id: Option<ImportReviewId>,
 }
 
 impl EguiUiState {
@@ -43,8 +52,17 @@ impl EguiUiState {
                 gpu_budget_bytes,
             },
             analysis_workspace_open: false,
+            import_review: None,
+            import_checkpoint_reset_confirmed: false,
+            import_checkpoint_retry_id: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ImportReviewUiState {
+    review_id: ImportReviewId,
+    draft: ImportReviewDraft,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,6 +331,390 @@ pub fn application_problem_message(event: Option<&ApplicationEvent>) -> Option<S
     }
 }
 
+/// Presents the current import workflow and returns only framework-neutral commands.
+pub fn show_import_workflow_window(
+    ctx: &egui::Context,
+    state: &mut EguiUiState,
+    snapshot: &ImportWorkflowSnapshot,
+) -> Vec<ImportCommand> {
+    state.synchronize_import_snapshot(snapshot);
+    if matches!(snapshot, ImportWorkflowSnapshot::Idle) {
+        return Vec::new();
+    }
+
+    let mut commands = Vec::new();
+    egui::Window::new("TIFF Import")
+        .collapsible(false)
+        .resizable(true)
+        .default_width(560.0)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .max_height((ctx.content_rect().height() - 80.0).max(240.0))
+                .show(ui, |ui| match snapshot {
+                    ImportWorkflowSnapshot::Idle => {}
+                    ImportWorkflowSnapshot::Inspecting(inspection) => {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new());
+                            status_badge(
+                                ui,
+                                StatusTone::Warning,
+                                if inspection.cancellation_requested {
+                                    "stopping inspection"
+                                } else {
+                                    "inspecting input"
+                                },
+                            );
+                        });
+                        property_row(ui, "source", &inspection.source);
+                        property_row(ui, "destination", &inspection.destination);
+                        ui.add_space(8.0);
+                        if toolbar_button(
+                            ui,
+                            "Cancel Inspection",
+                            !inspection.cancellation_requested,
+                        )
+                        .clicked()
+                        {
+                            commands.push(ImportCommand::CancelInspection);
+                        }
+                    }
+                    ImportWorkflowSnapshot::Review(review) => {
+                        if let Some(review_state) = state.import_review.as_mut() {
+                            show_import_review(ui, review, review_state, &mut commands);
+                        }
+                    }
+                    ImportWorkflowSnapshot::Importing(import) => {
+                        ui.horizontal(|ui| {
+                            if !matches!(import.progress, ImportProgressSnapshot::Finished) {
+                                ui.add(egui::Spinner::new());
+                            }
+                            status_badge(
+                                ui,
+                                StatusTone::Warning,
+                                if import.cancellation_requested {
+                                    "stopping import"
+                                } else {
+                                    "importing"
+                                },
+                            );
+                        });
+                        property_row(ui, "destination", &import.destination);
+                        property_row(ui, "progress", import_progress_message(import.progress));
+                        if let Some(progress) = import_progress_fraction(import.progress) {
+                            ui.add(egui::ProgressBar::new(progress).show_percentage());
+                        }
+                        ui.add_space(8.0);
+                        if toolbar_button(ui, "Cancel Import", !import.cancellation_requested)
+                            .clicked()
+                        {
+                            commands.push(ImportCommand::CancelImport);
+                        }
+                    }
+                    ImportWorkflowSnapshot::Failed(failure) => {
+                        status_badge(ui, StatusTone::Error, "import could not continue");
+                        ui.add_space(6.0);
+                        ui.label(&failure.message);
+                        if let Some(checkpoint) = failure.checkpoint.as_deref() {
+                            property_row(ui, "checkpoint", checkpoint);
+                        }
+                        if let Some(retry_id) = failure.retry_id {
+                            ui.checkbox(
+                                &mut state.import_checkpoint_reset_confirmed,
+                                "I confirm this saved import checkpoint may be deleted",
+                            );
+                            ui.add_space(8.0);
+                            if toolbar_button(
+                                ui,
+                                "Reset and Restart",
+                                state.import_checkpoint_reset_confirmed,
+                            )
+                            .clicked()
+                            {
+                                commands.push(ImportCommand::ResetCheckpointAndRestart {
+                                    retry_id,
+                                });
+                                state.import_checkpoint_reset_confirmed = false;
+                            }
+                        } else {
+                            muted_label(
+                                ui,
+                                "Select a supported grayscale TIFF file or an unambiguous TIFF directory.",
+                            );
+                        }
+                        ui.add_space(8.0);
+                        if toolbar_button(ui, "Dismiss", true).clicked() {
+                            commands.push(ImportCommand::DismissProblem);
+                            state.import_checkpoint_reset_confirmed = false;
+                            state.import_checkpoint_retry_id = None;
+                        }
+                    }
+                });
+        });
+    commands
+}
+
+impl EguiUiState {
+    fn synchronize_import_snapshot(&mut self, snapshot: &ImportWorkflowSnapshot) {
+        match snapshot {
+            ImportWorkflowSnapshot::Review(review) => {
+                if self
+                    .import_review
+                    .is_none_or(|current| current.review_id != review.review_id)
+                {
+                    self.import_review = Some(ImportReviewUiState {
+                        review_id: review.review_id,
+                        draft: review.initial_draft,
+                    });
+                }
+            }
+            ImportWorkflowSnapshot::Idle
+            | ImportWorkflowSnapshot::Inspecting(_)
+            | ImportWorkflowSnapshot::Importing(_) => self.import_review = None,
+            ImportWorkflowSnapshot::Failed(_) => {}
+        }
+
+        let retry_id = match snapshot {
+            ImportWorkflowSnapshot::Failed(failure) => failure.retry_id,
+            _ => None,
+        };
+        if self.import_checkpoint_retry_id != retry_id {
+            self.import_checkpoint_reset_confirmed = false;
+            self.import_checkpoint_retry_id = retry_id;
+        }
+    }
+}
+
+fn show_import_review(
+    ui: &mut egui::Ui,
+    review: &ImportReviewSnapshot,
+    state: &mut ImportReviewUiState,
+    commands: &mut Vec<ImportCommand>,
+) {
+    status_badge(ui, StatusTone::Warning, "review import");
+    ui.add_space(6.0);
+    property_row(ui, "source", &review.source);
+    property_row(ui, "destination", &review.destination);
+    property_row(
+        ui,
+        "layout",
+        import_source_layout_label(review.source_layout),
+    );
+    property_row(
+        ui,
+        "shape",
+        format!(
+            "t{} c{} z{} y{} x{}",
+            review.shape.timepoints,
+            review.shape.channels,
+            review.shape.depth,
+            review.shape.height,
+            review.shape.width
+        ),
+    );
+    property_row(
+        ui,
+        "source dtype",
+        import_source_dtype_label(review.source_dtype),
+    );
+    property_row(ui, "source size", format_byte_quantity(review.source_bytes));
+    property_row(
+        ui,
+        "calibration metadata",
+        review.ome_spacing_zyx_um.map_or_else(
+            || "not present; enter calibrated values".to_owned(),
+            |spacing| {
+                format!(
+                    "OME z {:.4}, y {:.4}, x {:.4} micrometers",
+                    spacing[0], spacing[1], spacing[2]
+                )
+            },
+        ),
+    );
+
+    ui.add_space(6.0);
+    ui.label("spatial calibration (micrometers)");
+    ui.horizontal_wrapped(|ui| {
+        ui.add(
+            egui::DragValue::new(&mut state.draft.spacing_zyx_um[0])
+                .speed(0.01)
+                .prefix("z "),
+        );
+        ui.add(
+            egui::DragValue::new(&mut state.draft.spacing_zyx_um[1])
+                .speed(0.01)
+                .prefix("y "),
+        );
+        ui.add(
+            egui::DragValue::new(&mut state.draft.spacing_zyx_um[2])
+                .speed(0.01)
+                .prefix("x "),
+        );
+    });
+    ui.checkbox(
+        &mut state.draft.calibration_confirmed,
+        "spatial calibration reviewed",
+    );
+
+    ui.add_space(6.0);
+    let mut time_step_enabled = state.draft.time_step_seconds.is_some();
+    if ui
+        .checkbox(&mut time_step_enabled, "regular time step")
+        .changed()
+    {
+        state.draft.time_step_seconds = time_step_enabled.then_some(1.0);
+    }
+    if let Some(time_step) = state.draft.time_step_seconds.as_mut() {
+        ui.horizontal(|ui| {
+            ui.label("seconds per timepoint");
+            ui.add(egui::DragValue::new(time_step).speed(0.01));
+        });
+    }
+
+    ui.add_space(6.0);
+    let sentinel_supported = review.source_dtype == ImportSourceDtype::Uint8;
+    if !sentinel_supported {
+        state.draft.no_data_sentinel = None;
+    }
+    let mut sentinel_enabled = state.draft.no_data_sentinel.is_some();
+    if ui
+        .add_enabled(
+            sentinel_supported,
+            egui::Checkbox::new(&mut sentinel_enabled, "uint8 no-data sentinel"),
+        )
+        .changed()
+    {
+        state.draft.no_data_sentinel = sentinel_enabled.then_some(255);
+    }
+    if let Some(sentinel) = state.draft.no_data_sentinel.as_mut() {
+        let mut value = u16::from(*sentinel);
+        ui.horizontal(|ui| {
+            ui.label("sentinel value");
+            if ui
+                .add(egui::DragValue::new(&mut value).range(0..=255))
+                .changed()
+            {
+                *sentinel = value as u8;
+            }
+        });
+    } else if !sentinel_supported {
+        property_row(ui, "no-data sentinel", "available only for uint8 sources");
+    }
+
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label("working memory");
+        egui::ComboBox::from_id_salt("tiff-import-working-memory")
+            .selected_text(format_byte_quantity(state.draft.working_memory_bytes))
+            .show_ui(ui, |ui| {
+                for bytes in review.working_memory_choices {
+                    ui.selectable_value(
+                        &mut state.draft.working_memory_bytes,
+                        bytes,
+                        format_byte_quantity(bytes),
+                    );
+                }
+            });
+    });
+    property_row(
+        ui,
+        "publication",
+        "create new package; never replace source or output",
+    );
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if toolbar_button(ui, "Start Import", import_review_ready(review, state.draft)).clicked() {
+            commands.push(ImportCommand::Start {
+                review_id: review.review_id,
+                draft: state.draft,
+            });
+        }
+        if toolbar_button(ui, "Cancel", true).clicked() {
+            commands.push(ImportCommand::CancelReview {
+                review_id: review.review_id,
+            });
+        }
+    });
+}
+
+fn import_review_ready(review: &ImportReviewSnapshot, draft: ImportReviewDraft) -> bool {
+    draft.calibration_confirmed
+        && draft
+            .spacing_zyx_um
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0)
+        && draft
+            .time_step_seconds
+            .is_none_or(|value| value.is_finite() && value > 0.0)
+        && (draft.no_data_sentinel.is_none() || review.source_dtype == ImportSourceDtype::Uint8)
+        && review
+            .working_memory_choices
+            .contains(&draft.working_memory_bytes)
+}
+
+fn import_source_layout_label(layout: ImportSourceLayout) -> &'static str {
+    match layout {
+        ImportSourceLayout::Automatic => "automatic",
+        ImportSourceLayout::MultipageStacks => "multipage stacks",
+        ImportSourceLayout::ChannelFoldersOfPlanes => "channel folders of planes",
+    }
+}
+
+fn import_source_dtype_label(dtype: ImportSourceDtype) -> &'static str {
+    match dtype {
+        ImportSourceDtype::Uint8 => "uint8",
+        ImportSourceDtype::Uint16 => "uint16",
+        ImportSourceDtype::Float32 => "float32",
+    }
+}
+
+fn import_progress_message(progress: ImportProgressSnapshot) -> String {
+    match progress {
+        ImportProgressSnapshot::Preparing => "Preparing import".to_owned(),
+        ImportProgressSnapshot::Producing {
+            completed_work_units,
+            total_work_units,
+        } => format!("Building package {completed_work_units}/{total_work_units}"),
+        ImportProgressSnapshot::HashingScience => "Checking scientific content".to_owned(),
+        ImportProgressSnapshot::Publishing => "Validating and publishing package".to_owned(),
+        ImportProgressSnapshot::Finished => "Import finished".to_owned(),
+    }
+}
+
+fn import_progress_fraction(progress: ImportProgressSnapshot) -> Option<f32> {
+    match progress {
+        ImportProgressSnapshot::Preparing => None,
+        ImportProgressSnapshot::Producing {
+            completed_work_units,
+            total_work_units,
+        } if total_work_units > 0 => Some(
+            (0.05 + 0.70 * (completed_work_units as f32 / total_work_units as f32))
+                .clamp(0.05, 0.75),
+        ),
+        ImportProgressSnapshot::Producing { .. } => None,
+        ImportProgressSnapshot::HashingScience => Some(0.80),
+        ImportProgressSnapshot::Publishing => Some(0.90),
+        ImportProgressSnapshot::Finished => Some(1.0),
+    }
+}
+
+fn format_byte_quantity(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * KIB;
+    const GIB: f64 = 1024.0 * MIB;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.2} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{bytes:.0} B")
+    }
+}
+
 pub fn reserve_presentation(
     ui: &mut egui::Ui,
     slot: PresentationSlot,
@@ -469,7 +871,52 @@ pub fn layer_row(
 mod tests {
     use std::{cell::Cell, rc::Rc};
 
+    use egui_kittest::{Harness, kittest::Queryable};
+    use mirante4d_application::import_workflow::{ImportFailureSnapshot, ImportShapeSnapshot};
+
     use super::*;
+
+    fn import_draft(spacing: f64) -> ImportReviewDraft {
+        ImportReviewDraft {
+            spacing_zyx_um: [spacing; 3],
+            calibration_confirmed: true,
+            time_step_seconds: Some(1.5),
+            no_data_sentinel: None,
+            working_memory_bytes: 256 * 1024 * 1024,
+        }
+    }
+
+    fn import_review(review_id: u64, initial_draft: ImportReviewDraft) -> ImportWorkflowSnapshot {
+        ImportWorkflowSnapshot::Review(ImportReviewSnapshot {
+            review_id: ImportReviewId::new(review_id),
+            source: "/source/cells.ome.tiff".to_owned(),
+            destination: "/output/cells.m4d".to_owned(),
+            source_layout: ImportSourceLayout::MultipageStacks,
+            shape: ImportShapeSnapshot {
+                timepoints: 3,
+                channels: 2,
+                depth: 5,
+                height: 32,
+                width: 48,
+            },
+            source_dtype: ImportSourceDtype::Uint8,
+            source_bytes: 4096,
+            ome_spacing_zyx_um: Some([0.5, 0.2, 0.2]),
+            initial_draft,
+            working_memory_choices: [
+                128 * 1024 * 1024,
+                256 * 1024 * 1024,
+                512 * 1024 * 1024,
+                1024 * 1024 * 1024,
+            ],
+        })
+    }
+
+    struct ImportWindowHarnessState {
+        ui: EguiUiState,
+        snapshot: ImportWorkflowSnapshot,
+        commands: Vec<ImportCommand>,
+    }
 
     #[test]
     fn egui_state_starts_with_only_the_supplied_resource_draft() {
@@ -486,8 +933,108 @@ mod tests {
         assert!(state.analysis_filter.is_empty());
         assert!(!state.close_prompt_open);
         assert!(!state.analysis_workspace_open);
+        assert!(state.import_review.is_none());
+        assert!(!state.import_checkpoint_reset_confirmed);
     }
     use mirante4d_application::{PresentationSurface, PresentationViewport};
+
+    #[test]
+    fn import_review_preserves_edits_until_a_new_review_arrives() {
+        let mut state = EguiUiState::new(256, 128);
+        let first = import_review(7, import_draft(1.0));
+        state.synchronize_import_snapshot(&first);
+        state.import_review.as_mut().unwrap().draft.spacing_zyx_um = [2.0; 3];
+
+        state.synchronize_import_snapshot(&import_review(7, import_draft(3.0)));
+        assert_eq!(state.import_review.unwrap().draft.spacing_zyx_um, [2.0; 3]);
+
+        state.synchronize_import_snapshot(&import_review(8, import_draft(4.0)));
+        assert_eq!(state.import_review.unwrap().draft.spacing_zyx_um, [4.0; 3]);
+    }
+
+    #[test]
+    fn ready_import_review_emits_draft_and_review_identity() {
+        let draft = import_draft(0.5);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 700.0))
+            .build_ui_state(
+                |ui, state: &mut ImportWindowHarnessState| {
+                    state.commands =
+                        show_import_workflow_window(ui.ctx(), &mut state.ui, &state.snapshot);
+                },
+                ImportWindowHarnessState {
+                    ui: EguiUiState::new(256, 128),
+                    snapshot: import_review(11, draft),
+                    commands: Vec::new(),
+                },
+            );
+
+        harness.get_by_label("Start Import").click_accesskit();
+        harness.step();
+
+        assert_eq!(
+            harness.state().commands,
+            vec![ImportCommand::Start {
+                review_id: ImportReviewId::new(11),
+                draft,
+            }]
+        );
+    }
+
+    #[test]
+    fn checkpoint_restart_requires_confirmation_and_emits_retry_identity() {
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 500.0))
+            .build_ui_state(
+                |ui, state: &mut ImportWindowHarnessState| {
+                    state.commands =
+                        show_import_workflow_window(ui.ctx(), &mut state.ui, &state.snapshot);
+                },
+                ImportWindowHarnessState {
+                    ui: EguiUiState::new(256, 128),
+                    snapshot: ImportWorkflowSnapshot::Failed(ImportFailureSnapshot {
+                        message: "the saved checkpoint is invalid".to_owned(),
+                        checkpoint: Some("/output/.cells.m4d.import-checkpoint".to_owned()),
+                        retry_id: Some(ImportReviewId::new(19)),
+                    }),
+                    commands: Vec::new(),
+                },
+            );
+
+        harness
+            .get_by_label("I confirm this saved import checkpoint may be deleted")
+            .click();
+        harness.step();
+        assert!(harness.state().commands.is_empty());
+
+        harness.get_by_label("Reset and Restart").click();
+        harness.step();
+        assert_eq!(
+            harness.state().commands,
+            vec![ImportCommand::ResetCheckpointAndRestart {
+                retry_id: ImportReviewId::new(19),
+            }]
+        );
+    }
+
+    #[test]
+    fn import_progress_is_coarse_and_monotonic() {
+        assert_eq!(
+            import_progress_fraction(ImportProgressSnapshot::Producing {
+                completed_work_units: 5,
+                total_work_units: 10,
+            }),
+            Some(0.4)
+        );
+        assert!(
+            import_progress_fraction(ImportProgressSnapshot::HashingScience)
+                < import_progress_fraction(ImportProgressSnapshot::Publishing)
+        );
+        assert_eq!(
+            import_progress_fraction(ImportProgressSnapshot::Finished),
+            Some(1.0)
+        );
+    }
 
     #[test]
     fn presentation_without_frame_reserves_ui_space_without_requesting_paint() {

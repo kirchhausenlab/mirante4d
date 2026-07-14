@@ -116,6 +116,34 @@ fn snapshot_carries_four_fixed_backend_neutral_presentation_slots() {
 }
 
 #[test]
+fn composition_can_attach_import_facts_without_mutating_application_state() {
+    let application = application();
+    let snapshot = application.snapshot();
+    assert_eq!(
+        snapshot.import_workflow(),
+        &import_workflow::ImportWorkflowSnapshot::Idle
+    );
+
+    let projected = snapshot.with_import_workflow(import_workflow::ImportWorkflowSnapshot::Failed(
+        import_workflow::ImportFailureSnapshot {
+            message: "inspection failed".to_owned(),
+            checkpoint: None,
+            retry_id: None,
+        },
+    ));
+
+    assert!(matches!(
+        projected.import_workflow(),
+        import_workflow::ImportWorkflowSnapshot::Failed(failure)
+            if failure.message == "inspection failed"
+    ));
+    assert_eq!(
+        application.snapshot().import_workflow(),
+        &import_workflow::ImportWorkflowSnapshot::Idle
+    );
+}
+
+#[test]
 fn presentation_surface_without_a_frame_has_no_paint_request() {
     let viewport = PresentationViewport::new(32.0, 24.0).unwrap();
     let surface = PresentationSurface::new(viewport, None);
@@ -1514,6 +1542,24 @@ fn dataset_open_failure_remains_exact_after_a_rejected_durable_edit() {
         CommandEffect::Changed
     );
     assert!(application.snapshot().active_operations().is_empty());
+}
+
+#[test]
+fn import_cannot_start_while_a_dataset_replacement_is_pending() {
+    let mut application = application();
+    application
+        .dispatch(ApplicationCommand::RequestDatasetOpen)
+        .unwrap();
+    let before = application.fork_for_dispatch();
+
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::BeginOperation(OperationKind::Import))
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::OperationConflict
+    );
+    assert_eq!(application, before);
 }
 
 #[test]

@@ -25,13 +25,6 @@
   },
   "temporary_owners": [
     {
-      "module": "import",
-      "path": "crates/mirante4d-app/src/current_runtime/import.rs",
-      "type": "ImportRuntime",
-      "composition_field": "import_runtime",
-      "expires": "WP-09C"
-    },
-    {
       "module": "validation",
       "path": "crates/mirante4d-app/src/current_runtime/validation.rs",
       "type": "CurrentValidationRuntime",
