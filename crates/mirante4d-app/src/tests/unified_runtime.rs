@@ -108,14 +108,19 @@ fn exact_analyses_cancel_save_and_reopen_atomically() {
     app.project_store_noninteractive_paths.initial_save = Some(project_path.clone());
     app.apply_application_command(ApplicationCommand::RequestProjectSave, &context)
         .unwrap();
-    wait_for_test_app(&mut app, |app| {
-        app.project_store.as_ref().is_some_and(|service| {
-            let status = service.status();
-            status.lifecycle() == ProjectStoreLifecycle::Established
-                && !status.foreground_active()
-                && !status.autosave_active()
-        }) && !app.project_dirty()
-    });
+    if wait_for_initial_project_save(&mut app) == InitialProjectSave::UnsupportedFilesystem {
+        assert!(!project_path.exists());
+        assert!(app.project_dirty());
+        assert!(app.analysis_start_unavailable_reason().is_some());
+        close_test_project_store(&mut app);
+        app.dataset.request_shutdown().unwrap();
+        app.source_verification_service
+            .take()
+            .unwrap()
+            .shutdown()
+            .unwrap();
+        return;
+    }
 
     assert_eq!(app.analysis_start_unavailable_reason(), None);
     app.start_product_analysis(analysis_product::ProductAnalysisScope::FullTimeTrace)
@@ -252,12 +257,18 @@ fn analysis_only_source_failure_invalidates_the_verified_source() {
     app.project_store_noninteractive_paths.initial_save = Some(project_path);
     app.apply_application_command(ApplicationCommand::RequestProjectSave, &context)
         .unwrap();
-    wait_for_test_app(&mut app, |app| {
-        !app.project_dirty()
-            && app.project_store.as_ref().is_some_and(|service| {
-                service.status().lifecycle() == ProjectStoreLifecycle::Established
-            })
-    });
+    if wait_for_initial_project_save(&mut app) == InitialProjectSave::UnsupportedFilesystem {
+        assert!(app.project_dirty());
+        assert!(app.analysis_start_unavailable_reason().is_some());
+        close_test_project_store(&mut app);
+        app.dataset.request_shutdown().unwrap();
+        app.source_verification_service
+            .take()
+            .unwrap()
+            .shutdown()
+            .unwrap();
+        return;
+    }
 
     fs::remove_dir_all(&package).unwrap();
     app.start_product_analysis(analysis_product::ProductAnalysisScope::FullTimeTrace)
@@ -329,6 +340,44 @@ fn wait_for_test_app(
         }
         app.pump_application_services();
         app.drain_brick_results(&context);
+        std::thread::yield_now();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InitialProjectSave {
+    Established,
+    UnsupportedFilesystem,
+}
+
+fn wait_for_initial_project_save(app: &mut MiranteWorkbenchApp) -> InitialProjectSave {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let unsupported = format!(
+        "Project operation failed: {}",
+        ProjectStoreFault::UnsupportedFilesystem
+    );
+    loop {
+        app.pump_application_services();
+        let status = app.project_store.as_ref().unwrap().status();
+        if status.lifecycle() == ProjectStoreLifecycle::Established
+            && !status.foreground_active()
+            && !status.autosave_active()
+            && !app.project_dirty()
+        {
+            return InitialProjectSave::Established;
+        }
+        if status.lifecycle() == ProjectStoreLifecycle::Unbound
+            && !status.foreground_active()
+            && !status.autosave_active()
+            && app.project_status_message.as_deref() == Some(unsupported.as_str())
+        {
+            return InitialProjectSave::UnsupportedFilesystem;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "initial project save did not complete: status={status:?}, message={:?}",
+            app.project_status_message,
+        );
         std::thread::yield_now();
     }
 }
