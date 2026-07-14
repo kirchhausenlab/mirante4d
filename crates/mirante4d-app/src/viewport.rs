@@ -487,15 +487,6 @@ fn arcball_vector(
     Some(DVec3::new(x, y, z).normalize())
 }
 
-pub(crate) fn resident_brick_render_supported(mode: mirante4d_domain::RenderMode) -> bool {
-    matches!(
-        mode,
-        mirante4d_domain::RenderMode::Mip
-            | mirante4d_domain::RenderMode::Isosurface
-            | mirante4d_domain::RenderMode::Dvr
-    )
-}
-
 pub(crate) fn fit_size(image_size: egui::Vec2, available: egui::Vec2) -> egui::Vec2 {
     if image_size.x <= 0.0 || image_size.y <= 0.0 || available.x <= 0.0 || available.y <= 0.0 {
         return egui::Vec2::ZERO;

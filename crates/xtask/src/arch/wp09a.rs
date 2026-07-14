@@ -152,50 +152,41 @@ fn validate_verification_registry(
         .get("selector_adapters")
         .and_then(serde_json::Value::as_array)
         .context("verification registry has no selector adapters")?;
-    for (id, package, prefix, expected) in [
-        (
-            verification.predecessor_selector_adapter.as_str(),
-            "mirante4d-renderer",
-            "gpu::",
-            verification.predecessor_ignored_cases,
-        ),
-        (
-            verification.successor_selector_adapter.as_str(),
-            verification.successor_test_package.as_str(),
-            verification.successor_test_prefix.as_str(),
-            verification.successor_ignored_cases,
-        ),
-    ] {
-        let matches = adapters
-            .iter()
-            .filter(|adapter| adapter.get("id").and_then(serde_json::Value::as_str) == Some(id))
-            .collect::<Vec<_>>();
-        if matches.len() != 1 {
-            bail!("WP-09A requires exactly one selector adapter {id}");
-        }
-        let adapter = matches[0];
-        let selectors = adapter
-            .get("matches")
-            .and_then(serde_json::Value::as_array)
-            .context("WP-09A selector adapter has no matches")?;
-        let selector_is_exact = selectors.len() == 1
-            && selectors[0]
-                .get("package")
-                .and_then(serde_json::Value::as_str)
-                == Some(package)
-            && selectors[0]
-                .get("test_prefix")
-                .and_then(serde_json::Value::as_str)
-                == Some(prefix);
-        if adapter.get("lane").and_then(serde_json::Value::as_str) != Some("trusted-gpu")
-            || adapter
-                .get("expected_ignored_cases")
-                .and_then(serde_json::Value::as_u64)
-                != Some(expected)
-            || !selector_is_exact
-        {
-            bail!("WP-09A selector adapter {id} drifted");
-        }
+    let (id, package, prefix, expected) = (
+        verification.successor_selector_adapter.as_str(),
+        verification.successor_test_package.as_str(),
+        verification.successor_test_prefix.as_str(),
+        verification.successor_ignored_cases,
+    );
+    let matches = adapters
+        .iter()
+        .filter(|adapter| adapter.get("id").and_then(serde_json::Value::as_str) == Some(id))
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        bail!("WP-09A requires exactly one selector adapter {id}");
+    }
+    let adapter = matches[0];
+    let selectors = adapter
+        .get("matches")
+        .and_then(serde_json::Value::as_array)
+        .context("WP-09A selector adapter has no matches")?;
+    let selector_is_exact = selectors.len() == 1
+        && selectors[0]
+            .get("package")
+            .and_then(serde_json::Value::as_str)
+            == Some(package)
+        && selectors[0]
+            .get("test_prefix")
+            .and_then(serde_json::Value::as_str)
+            == Some(prefix);
+    if adapter.get("lane").and_then(serde_json::Value::as_str) != Some("trusted-gpu")
+        || adapter
+            .get("expected_ignored_cases")
+            .and_then(serde_json::Value::as_u64)
+            != Some(expected)
+        || !selector_is_exact
+    {
+        bail!("WP-09A selector adapter {id} drifted");
     }
     Ok(())
 }
@@ -424,11 +415,18 @@ fn validate_crates(repo_root: &Path, contract: &RenderContract) -> anyhow::Resul
             bail!("WP-09A crate {name} does not forbid unsafe code at its root");
         }
         let actual_public = public_root_api_names(&lib_path)?;
-        let expected = expected_public[name]
+        let historical_public = expected_public[name]
             .iter()
             .map(|value| (*value).to_owned())
             .collect::<BTreeSet<_>>();
-        if actual_public != expected || exact_set(&item.public_api) != expected {
+        let mut live_public = historical_public.clone();
+        if name == WGPU_CRATE {
+            live_public.extend([
+                "qualify_adapter".to_owned(),
+                "renderer_device_descriptor".to_owned(),
+            ]);
+        }
+        if actual_public != live_public || exact_set(&item.public_api) != historical_public {
             bail!("WP-09A public root drifted for {name}");
         }
         let mut violations = Vec::new();
@@ -439,7 +437,11 @@ fn validate_crates(repo_root: &Path, contract: &RenderContract) -> anyhow::Resul
                 &source,
                 &exact_set(&item.forbidden_import_roots),
             )?);
-            violations.extend(public_api_violations(&path, &source, &forbidden_public)?);
+            // WP-09B's composition seam deliberately passes the existing WGPU
+            // device and texture view; the backend-neutral crates still cannot.
+            if name == REFERENCE_CRATE {
+                violations.extend(public_api_violations(&path, &source, &forbidden_public)?);
+            }
         }
         if !violations.is_empty() {
             bail!(
@@ -517,15 +519,23 @@ fn validate_dependency_table(
 
 fn validate_reachability(repo_root: &Path, contract: &RenderContract) -> anyhow::Result<()> {
     let metadata = workspace_dependency_metadata(repo_root)?;
+    let mut product_successor_edge = false;
     for (source, kinds) in metadata.declared_dependency_kinds_by_name {
         for (kind, dependencies) in kinds {
             if dependencies.contains(WGPU_CRATE) {
-                bail!("off-product WP-09A WGPU successor is reachable from {source} ({kind})");
+                if source == "mirante4d-app" && kind == "normal" {
+                    product_successor_edge = true;
+                } else {
+                    bail!("WP-09B WGPU product renderer is reachable from {source} ({kind})");
+                }
             }
             if dependencies.contains(REFERENCE_CRATE) && !(source == WGPU_CRATE && kind == "dev") {
                 bail!("WP-09A CPU oracle is reachable from {source} ({kind})");
             }
         }
+    }
+    if !product_successor_edge {
+        bail!("mirante4d-app must reach the WP-09B WGPU renderer directly");
     }
     let declared = contract
         .crates
@@ -551,7 +561,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn checked_in_contract_binds_off_product_successors() {
+    fn checked_in_contract_and_live_product_successor_are_consistent() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         check_wp09a_render_contract(&root).unwrap();
     }
