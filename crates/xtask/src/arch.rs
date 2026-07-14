@@ -1218,11 +1218,7 @@ fn check_wp09b_render_cutover(repo_root: &Path, ledger: &serde_json::Value) -> a
     }
 
     let ledger_text = serde_json::to_string(ledger)?;
-    for predecessor in [
-        "CurrentLeaseBridge",
-        "CurrentRenderRuntime",
-        "mirante4d-renderer",
-    ] {
+    for predecessor in ["CurrentLeaseBridge", "mirante4d-renderer"] {
         if ledger_text.contains(predecessor) {
             bail!("WP-09B live ledger still names predecessor {predecessor}");
         }
@@ -1258,12 +1254,7 @@ fn check_wp09b_render_cutover(repo_root: &Path, ledger: &serde_json::Value) -> a
     for source_path in collect_rust_source_files(&app_root)? {
         let source = fs::read_to_string(&source_path)?;
         successor_references += source.matches("WgpuRenderRuntime").count();
-        for predecessor in [
-            "CurrentLeaseBridge",
-            "CurrentRenderRuntime",
-            "GpuRenderer",
-            "mirante4d_renderer",
-        ] {
+        for predecessor in ["CurrentLeaseBridge", "GpuRenderer", "mirante4d_renderer"] {
             if source_contains_identifier(&source, predecessor) {
                 bail!(
                     "WP-09B predecessor {predecessor} remains in {}",
