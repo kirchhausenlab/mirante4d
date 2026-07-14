@@ -673,7 +673,7 @@ fn cross_section_interaction_commands(
     if !edited {
         return Ok(Vec::new());
     }
-    let cross_section = canonical_cross_section_view(cross_section)?;
+    let cross_section = cross_section.into_canonical()?;
     Ok(vec![
         ApplicationCommand::SetActiveCrossSectionPanel(Some(application_panel)),
         ApplicationCommand::SetLayout {
@@ -690,20 +690,6 @@ fn application_cross_section_panel_id(panel_id: PanelId) -> Option<CrossSectionP
         PanelId::Yz => Some(CrossSectionPanelId::Yz),
         PanelId::ThreeD => None,
     }
-}
-
-fn canonical_cross_section_view(
-    runtime: mirante4d_renderer::CrossSectionViewState,
-) -> Result<CrossSectionView, String> {
-    let [x, y, z] = runtime.center_world.to_array();
-    let [qx, qy, qz, qw] = runtime.orientation.to_array();
-    CrossSectionView::new(
-        WorldPoint3::new(x, y, z).map_err(|error| error.to_string())?,
-        UnitQuaternion::new_xyzw(qx, qy, qz, qw).map_err(|error| error.to_string())?,
-        runtime.scale_world_per_screen_point,
-        runtime.depth_world,
-    )
-    .map_err(|error| error.to_string())
 }
 
 fn scroll_y_points_from_zoom_delta(zoom_delta: f32) -> Option<f32> {
@@ -859,7 +845,6 @@ impl eframe::App for MiranteWorkbenchApp {
         let update_started = Instant::now();
         let setup_started = Instant::now();
         self.pump_application_services();
-        self.free_retired_gpu_display_textures();
         self.handle_close_request(ui.ctx());
         let setup_ms = duration_ms(setup_started.elapsed());
 
@@ -1713,7 +1698,11 @@ impl eframe::App for MiranteWorkbenchApp {
                         ui_kit::property_row(
                             ui,
                             "pixels",
-                            self.render_runtime.diagnostics.output_pixels.to_string(),
+                            self.render_runtime
+                                .render_viewport
+                                .width_pixels()
+                                .saturating_mul(self.render_runtime.render_viewport.height_pixels())
+                                .to_string(),
                         );
                         ui_kit::property_row(ui, "nonzero", "unavailable");
                         ui_kit::property_row(ui, "max", "unavailable");

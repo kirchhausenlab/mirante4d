@@ -15,7 +15,7 @@ use crate::{
     viewer_layout::PanelId,
 };
 use mirante4d_dataset::{DatasetResourceKey, ResourceLease};
-use mirante4d_domain::{RenderMode, ViewerLayout};
+use mirante4d_domain::RenderMode;
 use mirante4d_render_api::{
     FrameCompleteness as RenderFrameCompleteness, FrameIdentity, FrameLimitation, RenderExtent,
 };
@@ -253,7 +253,6 @@ impl MiranteWorkbenchApp {
         let extent = panel
             .render_viewport
             .ok_or_else(|| anyhow::anyhow!("cross-section render viewport is unavailable"))?;
-        let extent = render_extent(extent)?;
         let generation = panel.generation;
         let render_start = Instant::now();
         let rendered = match self.render_product_target(
@@ -635,7 +634,7 @@ impl MiranteWorkbenchApp {
         let snapshot = current_egui_shell_bridge::snapshot(&self.application);
         let requirements = self.dataset.scope_requirements(SCOPE_CURRENT_3D).to_vec();
         let presentation = self.render_runtime.presentation_viewport;
-        let extent = render_extent(self.render_runtime.render_viewport)?;
+        let extent = self.render_runtime.render_viewport;
         let started = Instant::now();
         let rendered = self.render_product_target(
             PanelId::ThreeD,
@@ -770,14 +769,6 @@ fn cross_section_scope(panel_id: PanelId) -> anyhow::Result<u64> {
         PanelId::Yz => Ok(SCOPE_CROSS_SECTION_YZ),
         PanelId::ThreeD => anyhow::bail!("the 3D panel has no cross-section demand scope"),
     }
-}
-
-fn render_extent(viewport: mirante4d_renderer::RenderViewport) -> anyhow::Result<RenderExtent> {
-    RenderExtent::new(
-        u32::try_from(viewport.width)?,
-        u32::try_from(viewport.height)?,
-    )
-    .map_err(Into::into)
 }
 
 fn extent_size(extent: RenderExtent) -> egui::Vec2 {

@@ -6,8 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use mirante4d_render_api::PresentationViewport;
-use mirante4d_renderer::RenderViewport;
+use mirante4d_render_api::{PresentationViewport, RenderExtent};
 
 use crate::{
     render_state::ResidentRenderFailureStatus,
@@ -21,7 +20,7 @@ use crate::{
 pub(crate) struct CrossSectionPanelRuntime {
     pub(crate) panel_id: PanelId,
     pub(crate) presentation_viewport: Option<PresentationViewport>,
-    pub(crate) render_viewport: Option<RenderViewport>,
+    pub(crate) render_viewport: Option<RenderExtent>,
     pub(crate) generation: u64,
     pub(crate) displayed_generation: Option<u64>,
     pub(crate) cross_section_schedule: Option<CrossSectionPanelScheduleState>,
@@ -66,7 +65,7 @@ impl CrossSectionPanelRuntime {
     fn record_viewports(
         &mut self,
         presentation_viewport: PresentationViewport,
-        render_viewport: RenderViewport,
+        render_viewport: RenderExtent,
     ) -> bool {
         if self.presentation_viewport == Some(presentation_viewport)
             && self.render_viewport == Some(render_viewport)
@@ -142,7 +141,7 @@ impl CrossSectionRuntime {
         &mut self,
         panel_id: PanelId,
         presentation_viewport: PresentationViewport,
-        render_viewport: RenderViewport,
+        render_viewport: RenderExtent,
     ) -> bool {
         self.panels
             .get_mut(&panel_id)
@@ -193,10 +192,10 @@ mod tests {
     use super::*;
     use crate::{FrameFailureKind, render_state::ResidentRenderFailureStatus};
 
-    fn viewports() -> (PresentationViewport, RenderViewport) {
+    fn viewports() -> (PresentationViewport, RenderExtent) {
         (
             PresentationViewport::new(240.0, 180.0).unwrap(),
-            RenderViewport::new(480, 360).unwrap(),
+            RenderExtent::new(480, 360).unwrap(),
         )
     }
 
@@ -209,7 +208,7 @@ mod tests {
         assert!(runtime.mark_panel_displayed(PanelId::Xy, generation));
         assert!(runtime.panel(PanelId::Xy).unwrap().display_current());
 
-        let next_render = RenderViewport::new(640, 360).unwrap();
+        let next_render = RenderExtent::new(640, 360).unwrap();
         assert!(runtime.record_panel_viewports(PanelId::Xy, presentation, next_render));
         let panel = runtime.panel(PanelId::Xy).unwrap();
         assert_eq!(panel.generation, generation + 1);

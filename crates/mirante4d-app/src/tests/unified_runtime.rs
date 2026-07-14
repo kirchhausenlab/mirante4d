@@ -33,11 +33,7 @@ fn unified_demand_plan_uses_semantic_keys_for_every_visible_layer() {
         snapshot.catalog(),
         application_view(&snapshot),
         opened.render_runtime.presentation_viewport,
-        dataset_demand_plan::render_extent_from_dimensions(
-            opened.render_runtime.render_viewport.width,
-            opened.render_runtime.render_viewport.height,
-        )
-        .unwrap(),
+        opened.render_runtime.render_viewport,
         dataset_demand_plan::DatasetDemandPlanLimits::new(
             mirante4d_render_api::MAX_RENDER_REQUIREMENTS,
             mirante4d_render_api::MAX_RENDER_REQUIREMENTS,
@@ -1001,7 +997,7 @@ fn four_panel_playback_demand_shares_one_aggregate_resource_and_byte_budget() {
     )
     .unwrap();
     let presentation = PresentationViewport::new(64.0, 64.0).unwrap();
-    let render = RenderViewport::new(64, 64).unwrap();
+    let render = mirante4d_render_api::RenderExtent::new(64, 64).unwrap();
     for panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
         app.render_runtime
             .cross_section_runtime

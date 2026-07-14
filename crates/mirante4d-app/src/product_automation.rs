@@ -13,13 +13,11 @@ use mirante4d_application::{
     ProjectStoreLifecycle, SourceVerificationSnapshot, WorkspaceSnapshot,
 };
 use mirante4d_domain::{
-    CrossSectionView as CanonicalCrossSectionView, DisplayWindow, DvrOpacityTransfer,
-    IsoShadingPolicy, LayerTransfer, Opacity, RenderMode, RenderState, SamplingPolicy, TimeIndex,
-    UnitQuaternion, ViewerLayout, WorldPoint3,
+    DisplayWindow, DvrOpacityTransfer, IsoShadingPolicy, LayerTransfer, Opacity, RenderMode,
+    RenderState, SamplingPolicy, TimeIndex, ViewerLayout,
 };
 use mirante4d_project_model::{LayerViewState, ProjectRevisionId};
-use mirante4d_render_api::PresentationViewport;
-use mirante4d_renderer::RenderViewport;
+use mirante4d_render_api::{PresentationViewport, RenderExtent};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -31,7 +29,9 @@ use crate::display_refresh::DisplayRefreshTiming;
 use crate::{
     DVR_DENSITY_SCALE_MAX, DVR_DENSITY_SCALE_MIN, DisplayedFrameFreshness, FrameCompleteness,
     MiranteWorkbenchApp, application_view, current_egui_shell_bridge, set_render_viewport,
-    viewer_layout::{PanelId, render_cross_section_view_state},
+    viewer_layout::{
+        CrossSectionPanel, CrossSectionViewState, PanelId, render_cross_section_view_state,
+    },
 };
 
 mod capture;
@@ -177,28 +177,11 @@ fn application_cross_section_panel_id(panel_id: PanelId) -> Option<CrossSectionP
     }
 }
 
-fn canonical_cross_section_view(
-    runtime: mirante4d_renderer::CrossSectionViewState,
-) -> Result<CanonicalCrossSectionView, String> {
-    let [x, y, z] = runtime.center_world.to_array();
-    let [qx, qy, qz, qw] = runtime.orientation.to_array();
-    CanonicalCrossSectionView::new(
-        WorldPoint3::new(x, y, z).map_err(|error| error.to_string())?,
-        UnitQuaternion::new_xyzw(qx, qy, qz, qw).map_err(|error| error.to_string())?,
-        runtime.scale_world_per_screen_point,
-        runtime.depth_world,
-    )
-    .map_err(|error| error.to_string())
-}
-
 fn apply_cross_section_edit(
     app: &mut MiranteWorkbenchApp,
     ctx: &egui::Context,
     panel_id: PanelId,
-    edit: impl FnOnce(
-        &mut mirante4d_renderer::CrossSectionViewState,
-        mirante4d_renderer::CrossSectionPanel,
-    ),
+    edit: impl FnOnce(&mut CrossSectionViewState, CrossSectionPanel),
 ) -> Result<(), String> {
     let application_panel = application_cross_section_panel_id(panel_id)
         .ok_or_else(|| "3D is not a cross-section panel".to_owned())?;
@@ -217,7 +200,7 @@ fn apply_cross_section_edit(
             .expect("validated cross-section panel"),
     );
     let layout = view.layout();
-    let cross_section = canonical_cross_section_view(cross_section)?;
+    let cross_section = cross_section.into_canonical()?;
     dispatch_application_command(
         app,
         ctx,
@@ -249,7 +232,7 @@ pub(crate) struct ProductAutomationController {
     cross_section_latency_samples: Vec<ProductAutomationCrossSectionLatencySample>,
     pending_cross_section_latency_samples: Vec<PendingCrossSectionLatencySample>,
     limit_observations: ProductAutomationLimitObservations,
-    render_target_override: Option<RenderViewport>,
+    render_target_override: Option<RenderExtent>,
     requested_mapped_client_pixels: Option<(u32, u32)>,
     report_written: bool,
 }
@@ -433,7 +416,7 @@ impl ProductAutomationController {
         }
     }
 
-    pub(crate) const fn render_target_override(&self) -> Option<RenderViewport> {
+    pub(crate) const fn render_target_override(&self) -> Option<RenderExtent> {
         self.render_target_override
     }
 
@@ -813,23 +796,24 @@ impl ProductAutomationController {
                 })))
             }
             ProductAutomationCommand::SetRenderTargetSize { width, height } => {
-                let viewport = RenderViewport::new(u64::from(*width), u64::from(*height))
+                let viewport = RenderExtent::new(*width, *height)
                     .map_err(|error| format!("invalid automation render target: {error}"))?;
                 let context_max = ctx.input(|input| input.max_texture_side);
                 let maximum = app
                     .validation_runtime
                     .test_render_viewport_max_side
                     .map_or(context_max, |test_max| context_max.min(test_max));
-                if usize::try_from(viewport.width)
+                if usize::try_from(viewport.width_pixels())
                     .ok()
                     .is_none_or(|width| width > maximum)
-                    || usize::try_from(viewport.height)
+                    || usize::try_from(viewport.height_pixels())
                         .ok()
                         .is_none_or(|height| height > maximum)
                 {
                     return Err(format!(
                         "automation render target {}x{} exceeds maximum texture side {maximum}",
-                        viewport.width, viewport.height
+                        viewport.width_pixels(),
+                        viewport.height_pixels()
                     ));
                 }
                 self.render_target_override = Some(viewport);
@@ -839,8 +823,8 @@ impl ProductAutomationController {
                 }
                 Ok(CommandProgress::Done(json!({
                     "requested_render_target_pixels": {
-                        "width": viewport.width,
-                        "height": viewport.height,
+                        "width": viewport.width_pixels(),
+                        "height": viewport.height_pixels(),
                     },
                     "evidence_scope": "automation_only_internal_gpu_render_target",
                 })))
@@ -1697,7 +1681,6 @@ impl ProductAutomationController {
                     .displayed_scale_level
                     .is_some()
                     || product_presentation(app, PanelId::ThreeD).is_some()
-                    || app.render_runtime.diagnostics.output_pixels > 0
             }
             ProductAutomationWaitCondition::RuntimeIdle => {
                 !crate::workbench_playback_runtime::background_work_active(
@@ -2201,8 +2184,8 @@ impl ProductAutomationController {
             "camera": {
                 "projection": format!("{:?}", view.camera().projection()),
                 "viewport": {
-                    "width": app.render_runtime.render_viewport.width,
-                    "height": app.render_runtime.render_viewport.height,
+                    "width": app.render_runtime.render_viewport.width_pixels(),
+                    "height": app.render_runtime.render_viewport.height_pixels(),
                 },
             },
             "project_state": project_state_json(app),
@@ -3012,8 +2995,8 @@ fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
                 }),
                 "render_viewport": panel.render_viewport.map(|viewport| {
                     json!({
-                        "width": viewport.width,
-                        "height": viewport.height,
+                        "width": viewport.width_pixels(),
+                        "height": viewport.height_pixels(),
                     })
                 }),
                 "schedule": panel.cross_section_schedule.map(panel_schedule_json),

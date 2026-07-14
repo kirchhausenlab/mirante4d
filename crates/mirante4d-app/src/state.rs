@@ -1,5 +1,4 @@
-use mirante4d_render_api::PresentationViewport;
-use mirante4d_renderer::RenderViewport;
+use mirante4d_render_api::{PresentationViewport, RenderExtent};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ViewportHover {
@@ -29,9 +28,6 @@ impl std::fmt::Display for ViewportIntensity {
 pub enum RenderBackend {
     Loading,
     Empty,
-    CpuReference,
-    CpuResidentBricks,
-    GpuResidentBricks,
     GpuCameraMip,
     GpuCameraIso,
     GpuCameraDvr,
@@ -89,7 +85,7 @@ pub struct FrameFidelityStatus {
     pub completeness: FrameCompleteness,
     pub reason: LodDecisionReason,
     pub backend: RenderBackend,
-    pub viewport: RenderViewport,
+    pub viewport: RenderExtent,
     pub presentation_viewport: PresentationViewport,
     pub display_freshness: DisplayedFrameFreshness,
     pub frame_time_ms: Option<f64>,
@@ -105,7 +101,7 @@ pub struct FrameFidelityStatus {
 
 impl FrameFidelityStatus {
     pub(crate) fn new_with_presentation(
-        viewport: RenderViewport,
+        viewport: RenderExtent,
         presentation_viewport: PresentationViewport,
     ) -> Self {
         Self {
@@ -113,7 +109,7 @@ impl FrameFidelityStatus {
             displayed_scale_level: None,
             completeness: FrameCompleteness::Loading,
             reason: LodDecisionReason::LoadingTargetScale,
-            backend: RenderBackend::CpuResidentBricks,
+            backend: RenderBackend::Loading,
             viewport,
             presentation_viewport,
             display_freshness: DisplayedFrameFreshness::Unknown,

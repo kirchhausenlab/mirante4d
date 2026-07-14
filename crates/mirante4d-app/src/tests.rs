@@ -3,6 +3,7 @@ use std::{
     fs,
     io::Write,
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 

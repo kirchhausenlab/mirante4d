@@ -1,14 +1,10 @@
 use eframe::egui;
 use glam::{DQuat, DVec3};
 use mirante4d_application::{ApplicationCommand, ApplicationSnapshot};
-use mirante4d_domain::{
-    CameraView, GridToWorld, IsoShadingPolicy, Projection, RenderState, SamplingPolicy, Shape3D,
-    UnitQuaternion, WorldPoint3,
-};
+use mirante4d_domain::{CameraView, GridToWorld, Projection, Shape3D, UnitQuaternion, WorldPoint3};
 use mirante4d_project_model::ViewState;
-use mirante4d_render_api::{CameraFrame, DEFAULT_PRESENTATION_VIEWPORT, PresentationViewport};
-use mirante4d_renderer::{
-    CameraRenderQuality, IntensitySamplingPolicy, IsoShadingMode, RenderViewport,
+use mirante4d_render_api::{
+    CameraFrame, DEFAULT_PRESENTATION_VIEWPORT, PresentationViewport, RenderExtent,
 };
 
 use crate::{
@@ -16,7 +12,7 @@ use crate::{
     current_runtime::{render::CurrentRenderRuntime, ui::CurrentUiRuntime},
 };
 
-const DEFAULT_INITIAL_VIEWPORT_SIDE: u64 = 512;
+const DEFAULT_INITIAL_VIEWPORT_SIDE: u32 = 512;
 const FIT_MARGIN: f64 = 1.25;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,11 +49,11 @@ pub(crate) fn fit_camera_to_shape_preserving_view(
     )
 }
 
-pub(crate) fn default_render_viewport_for_shape(shape: Shape3D) -> anyhow::Result<RenderViewport> {
+pub(crate) fn default_render_viewport_for_shape(shape: Shape3D) -> anyhow::Result<RenderExtent> {
     let _ = shape;
     let width = DEFAULT_INITIAL_VIEWPORT_SIDE;
     let height = DEFAULT_INITIAL_VIEWPORT_SIDE;
-    RenderViewport::new(width, height).map_err(Into::into)
+    RenderExtent::new(width, height).map_err(Into::into)
 }
 
 pub(crate) fn default_presentation_viewport() -> PresentationViewport {
@@ -78,7 +74,7 @@ pub(crate) fn render_viewport_for_display_size(
     display_size_points: egui::Vec2,
     pixels_per_point: f32,
     max_texture_side: usize,
-) -> Option<RenderViewport> {
+) -> Option<RenderExtent> {
     if display_size_points.x <= 0.0
         || display_size_points.y <= 0.0
         || !display_size_points.x.is_finite()
@@ -91,11 +87,11 @@ pub(crate) fn render_viewport_for_display_size(
     }
     let desired_width = f64::from(display_size_points.x * pixels_per_point).max(1.0);
     let desired_height = f64::from(display_size_points.y * pixels_per_point).max(1.0);
-    let max_side = max_texture_side as f64;
+    let max_side = max_texture_side.min(u32::MAX as usize) as f64;
     let scale = (max_side / desired_width.max(desired_height)).min(1.0);
-    let width = (desired_width * scale).round().max(1.0) as u64;
-    let height = (desired_height * scale).round().max(1.0) as u64;
-    RenderViewport::new(width, height).ok()
+    let width = (desired_width * scale).round().max(1.0) as u32;
+    let height = (desired_height * scale).round().max(1.0) as u32;
+    RenderExtent::new(width, height).ok()
 }
 
 fn shape_center_world(shape: Shape3D, grid_to_world: GridToWorld) -> DVec3 {
@@ -489,25 +485,6 @@ fn arcball_vector(
         0.0
     };
     Some(DVec3::new(x, y, z).normalize())
-}
-
-pub(crate) fn camera_render_quality_for_render_state(
-    render_state: RenderState,
-) -> CameraRenderQuality {
-    CameraRenderQuality {
-        intensity_sampling: match render_state.sampling_policy() {
-            SamplingPolicy::VoxelExact => IntensitySamplingPolicy::VoxelExact,
-            SamplingPolicy::SmoothLinear => IntensitySamplingPolicy::SmoothLinear,
-        },
-        iso_shading: match render_state
-            .iso_parameters()
-            .map(|parameters| parameters.shading_policy())
-            .unwrap_or(IsoShadingPolicy::GradientLighting)
-        {
-            IsoShadingPolicy::Flat => IsoShadingMode::Flat,
-            IsoShadingPolicy::GradientLighting => IsoShadingMode::GradientLighting,
-        },
-    }
 }
 
 pub(crate) fn resident_brick_render_supported(mode: mirante4d_domain::RenderMode) -> bool {
