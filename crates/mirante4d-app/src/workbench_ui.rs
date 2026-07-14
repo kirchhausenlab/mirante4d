@@ -272,8 +272,8 @@ impl MiranteWorkbenchApp {
         );
         let panels = [PanelId::Xy, PanelId::Xz, PanelId::ThreeD, PanelId::Yz];
 
-        self.ui_runtime.hovered_pixel = None;
-        self.ui_runtime.hovered_source_readout = None;
+        self.egui_ui.hovered_pixel = None;
+        self.egui_ui.hovered_source_readout = None;
 
         ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
         ui.vertical(|ui| {
@@ -417,13 +417,13 @@ impl MiranteWorkbenchApp {
         };
         let hover = viewport_hover_from_response(snapshot, view, &self.render_runtime, &response);
         if response.hovered() || view.layout() == CanonicalViewerLayout::Single3d {
-            self.ui_runtime.hovered_pixel = hover;
-            self.ui_runtime.hovered_source_readout = None;
+            self.egui_ui.hovered_pixel = hover;
+            self.egui_ui.hovered_source_readout = None;
         }
         match apply_viewport_tool_response(
             snapshot,
             &mut self.analysis_runtime,
-            &mut self.ui_runtime,
+            &mut self.egui_ui,
             &self.render_runtime,
             &response,
             hover,
@@ -437,11 +437,11 @@ impl MiranteWorkbenchApp {
             }
         }
         if matches!(
-            self.ui_runtime.viewer_tools.active_tool,
+            self.egui_ui.viewer_tools.active_tool,
             ViewerTool::Navigate | ViewerTool::Inspect
         ) {
             application_commands.extend(viewport_interaction_commands(
-                &mut self.ui_runtime,
+                &mut self.egui_ui,
                 view,
                 &response,
                 image_size,
@@ -521,12 +521,12 @@ impl MiranteWorkbenchApp {
                 &response,
             )
         {
-            self.ui_runtime.hovered_pixel = None;
-            self.ui_runtime.hovered_source_readout = Some(readout.text);
+            self.egui_ui.hovered_pixel = None;
+            self.egui_ui.hovered_source_readout = Some(readout.text);
         }
 
         if matches!(
-            self.ui_runtime.viewer_tools.active_tool,
+            self.egui_ui.viewer_tools.active_tool,
             ViewerTool::Navigate | ViewerTool::Inspect
         ) && let Some(presentation_viewport) = presentation_viewport
         {
@@ -904,8 +904,8 @@ impl eframe::App for MiranteWorkbenchApp {
         let application_snapshot = self.application_snapshot_for_ui();
         let view = application_view(&application_snapshot);
         let canonical_tool = viewer_tool_for_kind(application_snapshot.transient().active_tool());
-        if self.ui_runtime.viewer_tools.active_tool != canonical_tool {
-            self.ui_runtime.viewer_tools.set_active_tool(canonical_tool);
+        if self.egui_ui.viewer_tools.active_tool != canonical_tool {
+            self.egui_ui.viewer_tools.set_active_tool(canonical_tool);
         }
 
         let mut rerender_requested = false;
@@ -1232,10 +1232,10 @@ impl eframe::App for MiranteWorkbenchApp {
                                 &self.render_runtime,
                             ),
                         );
-                        if let Some(hover) = self.ui_runtime.hovered_pixel {
+                        if let Some(hover) = self.egui_ui.hovered_pixel {
                             ui_kit::property_row(ui, "hover", viewport_hover_status_label(hover));
                         }
-                        if let Some(readout) = &self.ui_runtime.hovered_source_readout {
+                        if let Some(readout) = &self.egui_ui.hovered_source_readout {
                             ui_kit::property_row(ui, "readout", readout);
                         }
                         ui_kit::property_row(
@@ -1774,7 +1774,7 @@ impl eframe::App for MiranteWorkbenchApp {
                             application_commands
                                 .push(ApplicationCommand::SetActiveTool(active_tool));
                         }
-                        if let Some(crosshair) = &self.ui_runtime.viewer_tools.crosshair
+                        if let Some(crosshair) = &self.egui_ui.viewer_tools.crosshair
                             && let Some(screen) = crosshair.screen_position
                         {
                             ui_kit::property_row(
@@ -1783,7 +1783,7 @@ impl eframe::App for MiranteWorkbenchApp {
                                 format!("x{:.0} y{:.0} {:?}", screen.x, screen.y, crosshair.kind),
                             );
                         }
-                        if let Some(selection) = &self.ui_runtime.viewer_tools.selection {
+                        if let Some(selection) = &self.egui_ui.viewer_tools.selection {
                             ui_kit::property_row(ui, "selection", format!("{selection:?}"));
                         }
                     });
@@ -1811,7 +1811,7 @@ impl eframe::App for MiranteWorkbenchApp {
                                     Some(format!("Analysis could not be cancelled: {error}"));
                             }
                             if ui_kit::toolbar_button(ui, "Workspace", true).clicked() {
-                                self.ui_runtime.analysis_workspace_open = true;
+                                self.egui_ui.analysis_workspace_open = true;
                             }
                             if ui_kit::toolbar_button(
                                 ui,
@@ -1902,7 +1902,7 @@ impl eframe::App for MiranteWorkbenchApp {
                         let commands = show_analysis_workspace(
                             ui,
                             &self.analysis_runtime,
-                            &mut self.ui_runtime,
+                            &mut self.egui_ui,
                             AnalysisWorkspaceViewInput {
                                 table_descriptors: transient.analysis_tables(),
                                 plot_descriptors: transient.analysis_plots(),
@@ -2245,7 +2245,7 @@ impl eframe::App for MiranteWorkbenchApp {
                                 );
                             }
                         }
-                        if let Some(hover) = self.ui_runtime.hovered_pixel {
+                        if let Some(hover) = self.egui_ui.hovered_pixel {
                             ui_kit::property_row(
                                 ui,
                                 "hover",
@@ -2272,7 +2272,7 @@ impl eframe::App for MiranteWorkbenchApp {
         let commands = show_analysis_workspace_window(
             ui.ctx(),
             &self.analysis_runtime,
-            &mut self.ui_runtime,
+            &mut self.egui_ui,
             AnalysisWorkspaceViewInput {
                 table_descriptors: transient.analysis_tables(),
                 plot_descriptors: transient.analysis_plots(),
@@ -2302,8 +2302,8 @@ impl eframe::App for MiranteWorkbenchApp {
         }
         let accepted_snapshot = current_egui_shell_bridge::snapshot(&self.application);
         let accepted_tool = viewer_tool_for_kind(accepted_snapshot.transient().active_tool());
-        if self.ui_runtime.viewer_tools.active_tool != accepted_tool {
-            self.ui_runtime.viewer_tools.set_active_tool(accepted_tool);
+        if self.egui_ui.viewer_tools.active_tool != accepted_tool {
+            self.egui_ui.viewer_tools.set_active_tool(accepted_tool);
         }
         let command_apply_ms = duration_ms(command_apply_started.elapsed());
 

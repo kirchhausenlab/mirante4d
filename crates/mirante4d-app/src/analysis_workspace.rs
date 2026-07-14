@@ -7,9 +7,10 @@ use mirante4d_application::{
     AnalysisPlotDescriptor, AnalysisPlotId, AnalysisPlotPointSelection, AnalysisTableDescriptor,
     AnalysisTableId, ApplicationCommand,
 };
+use mirante4d_ui_egui::{AnalysisPlotViewRange, AnalysisTableSort, EguiUiState};
 
 use crate::{
-    current_runtime::{analysis::AnalysisProductRuntime, ui::CurrentUiRuntime},
+    current_runtime::analysis::AnalysisProductRuntime,
     ui_kit::{self, StatusTone},
 };
 
@@ -26,21 +27,6 @@ const TABLE_COLUMNS: [(&str, &str); 9] = [
     ("mean", "mean"),
     ("variance", "variance"),
 ];
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AnalysisTableSort {
-    pub(crate) column_key: String,
-    pub(crate) ascending: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct AnalysisPlotViewRange {
-    pub(crate) plot_index: usize,
-    pub(crate) min_x: f64,
-    pub(crate) max_x: f64,
-    pub(crate) min_y: f64,
-    pub(crate) max_y: f64,
-}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AnalysisWorkspaceViewInput<'a> {
@@ -60,13 +46,13 @@ pub(crate) struct AnalysisTableExportInput<'a> {
 pub(crate) fn show_analysis_workspace_window(
     ctx: &egui::Context,
     analysis: &AnalysisProductRuntime,
-    ui_runtime: &mut CurrentUiRuntime,
+    egui_ui: &mut EguiUiState,
     input: AnalysisWorkspaceViewInput<'_>,
 ) -> Vec<ApplicationCommand> {
-    if !ui_runtime.analysis_workspace_open {
+    if !egui_ui.analysis_workspace_open {
         return Vec::new();
     }
-    let mut open = ui_runtime.analysis_workspace_open;
+    let mut open = egui_ui.analysis_workspace_open;
     let mut commands = Vec::new();
     egui::Window::new("Analysis Workspace")
         .open(&mut open)
@@ -78,17 +64,17 @@ pub(crate) fn show_analysis_workspace_window(
                 .id_salt("analysis-workspace-scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    commands.extend(show_analysis_workspace(ui, analysis, ui_runtime, input));
+                    commands.extend(show_analysis_workspace(ui, analysis, egui_ui, input));
                 });
         });
-    ui_runtime.analysis_workspace_open = open;
+    egui_ui.analysis_workspace_open = open;
     commands
 }
 
 pub(crate) fn show_analysis_workspace(
     ui: &mut egui::Ui,
     analysis: &AnalysisProductRuntime,
-    ui_runtime: &mut CurrentUiRuntime,
+    egui_ui: &mut EguiUiState,
     input: AnalysisWorkspaceViewInput<'_>,
 ) -> Vec<ApplicationCommand> {
     let mut commands = Vec::new();
@@ -122,7 +108,7 @@ pub(crate) fn show_analysis_workspace(
         ui,
         analysis,
         input,
-        &mut ui_runtime.analysis_plot_view,
+        &mut egui_ui.analysis_plot_view,
         &mut commands,
     );
     if let Some(table_id) = input.selected_table {
@@ -142,8 +128,8 @@ pub(crate) fn show_analysis_workspace(
             show_analysis_table_preview(
                 ui,
                 table,
-                &mut ui_runtime.analysis_filter,
-                &mut ui_runtime.analysis_sort,
+                &mut egui_ui.analysis_filter,
+                &mut egui_ui.analysis_sort,
             );
         } else {
             ui_kit::status_badge(ui, StatusTone::Warning, "selected table is not loaded");
@@ -165,7 +151,7 @@ pub(crate) fn show_analysis_workspace(
                 plot_index,
                 plot_id,
                 input.selected_plot_point,
-                &mut ui_runtime.analysis_plot_view,
+                &mut egui_ui.analysis_plot_view,
                 &mut commands,
             );
         } else {

@@ -1,16 +1,17 @@
 use eframe::egui;
-use mirante4d_application::ApplicationSnapshot;
-use mirante4d_domain::RenderMode;
-
-use crate::{
-    FrameCompleteness, ViewportHover, ViewportIntensity, application_view,
-    current_runtime::{
-        analysis::AnalysisProductRuntime, render::CurrentRenderRuntime, ui::CurrentUiRuntime,
-    },
-    tools::{
+use mirante4d_application::{
+    ApplicationSnapshot,
+    viewer_tools::{
         PickCompleteness, PickHit, PickHitKind, PickPolicy, PickQuery, PickValue, ScreenPosition,
         ViewerToolCommand, ViewerToolEvent, empty_pick_hit,
     },
+};
+use mirante4d_domain::RenderMode;
+use mirante4d_ui_egui::{EguiUiState, ViewportHover, ViewportIntensity};
+
+use crate::{
+    FrameCompleteness, application_view,
+    current_runtime::{analysis::AnalysisProductRuntime, render::CurrentRenderRuntime},
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -22,7 +23,7 @@ pub(crate) struct ToolInteractionOutcome {
 pub(crate) fn apply_viewport_tool_response(
     snapshot: &ApplicationSnapshot,
     analysis: &mut AnalysisProductRuntime,
-    ui_runtime: &mut CurrentUiRuntime,
+    egui_ui: &mut EguiUiState,
     render: &CurrentRenderRuntime,
     response: &egui::Response,
     hover: Option<ViewportHover>,
@@ -30,43 +31,39 @@ pub(crate) fn apply_viewport_tool_response(
     let hit = hover
         .map(|hover| pick_hit_from_viewport_hover(snapshot, render, hover))
         .transpose()?;
-    let mut commands = ui_runtime
+    let mut commands = egui_ui
         .viewer_tools
         .handle_event(ViewerToolEvent::Hover(hit.clone()));
     if response
         .ctx
         .input(|input| input.key_pressed(egui::Key::Escape))
     {
-        commands.extend(
-            ui_runtime
-                .viewer_tools
-                .handle_event(ViewerToolEvent::Cancel),
-        );
+        commands.extend(egui_ui.viewer_tools.handle_event(ViewerToolEvent::Cancel));
     }
     if let Some(hit) = hit {
         if response.clicked_by(egui::PointerButton::Primary) {
             commands.extend(
-                ui_runtime
+                egui_ui
                     .viewer_tools
                     .handle_event(ViewerToolEvent::PrimaryClick(hit.clone())),
             );
         }
         if response.dragged_by(egui::PointerButton::Primary) {
             commands.extend(
-                ui_runtime
+                egui_ui
                     .viewer_tools
                     .handle_event(ViewerToolEvent::PrimaryDrag(hit.clone())),
             );
         }
         if response.drag_stopped_by(egui::PointerButton::Primary) {
             commands.extend(
-                ui_runtime
+                egui_ui
                     .viewer_tools
                     .handle_event(ViewerToolEvent::PrimaryRelease(hit)),
             );
         }
     }
-    apply_viewer_tool_commands(snapshot, analysis, ui_runtime, commands)
+    apply_viewer_tool_commands(snapshot, analysis, egui_ui, commands)
 }
 
 /// Converts a value from an explicit CPU/reference frame into a hover hit.
@@ -126,15 +123,15 @@ fn pick_completeness_for_frame(completeness: FrameCompleteness) -> PickCompleten
 pub(crate) fn apply_viewer_tool_commands(
     _snapshot: &ApplicationSnapshot,
     _analysis: &mut AnalysisProductRuntime,
-    ui_runtime: &mut CurrentUiRuntime,
+    egui_ui: &mut EguiUiState,
     commands: Vec<ViewerToolCommand>,
 ) -> anyhow::Result<ToolInteractionOutcome> {
     for command in commands {
         match command {
-            ViewerToolCommand::SetHover(hit) => ui_runtime.viewer_tools.hover = hit,
-            ViewerToolCommand::Select(selection) => ui_runtime.viewer_tools.selection = selection,
+            ViewerToolCommand::SetHover(hit) => egui_ui.viewer_tools.hover = hit,
+            ViewerToolCommand::Select(selection) => egui_ui.viewer_tools.selection = selection,
             ViewerToolCommand::SetCrosshair(hit) => {
-                ui_runtime.viewer_tools.crosshair = Some(hit);
+                egui_ui.viewer_tools.crosshair = Some(hit);
             }
             ViewerToolCommand::BeginRoi { .. }
             | ViewerToolCommand::PreviewRoi { .. }

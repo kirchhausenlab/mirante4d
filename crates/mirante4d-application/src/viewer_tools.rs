@@ -1,3 +1,5 @@
+//! Framework-neutral viewer-tool interaction state and commands.
+
 use mirante4d_domain::TimeIndex;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

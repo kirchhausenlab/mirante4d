@@ -135,6 +135,8 @@ pub(super) fn accepted_successor_public_root_additions(
             "ProjectStoreServiceEvent",
             "ProjectStoreServiceStatus",
             "SystemMonotonicClock",
+            "viewer_tools",
+            "viewport_interaction",
         ],
         _ => &[],
     }

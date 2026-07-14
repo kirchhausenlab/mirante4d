@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 
 mod project_store_service;
+pub mod viewer_tools;
+pub mod viewport_interaction;
 
 pub use project_store_service::{
     MonotonicClock, ProjectRecoveryStoreLocator, ProjectStoreApplicationService,

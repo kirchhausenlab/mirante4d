@@ -984,17 +984,17 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
             .and_then(serde_json::Value::as_u64)
             != Some(2)
         || ledger.get("status").and_then(serde_json::Value::as_str)
-            != Some("wp09b-product-render-cutover")
+            != Some("wp09c-ui-composition-cutover")
         || ledger
             .pointer("/predecessor/tag")
             .and_then(serde_json::Value::as_str)
-            != Some("foundation-wp-10c-exit-1")
+            != Some("foundation-wp-09b-exit-1")
         || ledger
             .pointer("/predecessor/revision")
             .and_then(serde_json::Value::as_str)
-            != Some("b9ac2a5f08101094933f80a0ce98fbdbdbe6c8d6")
+            != Some("b73dd86fed8cc3ac7b34f75f20dcd8bb8ac85672")
     {
-        bail!("{} is not the current WP-09B live ledger", path.display());
+        bail!("{} is not the current WP-09C live ledger", path.display());
     }
 
     let expected_dataset_authority = serde_json::json!({
@@ -1024,15 +1024,6 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
 
     let expected_owners = BTreeMap::from([
         (
-            "ui",
-            (
-                "crates/mirante4d-app/src/current_runtime/ui.rs",
-                "CurrentUiRuntime",
-                "ui_runtime",
-                "WP-09C",
-            ),
-        ),
-        (
             "import",
             (
                 "crates/mirante4d-app/src/current_runtime/import.rs",
@@ -1054,37 +1045,37 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
     let owner_entries = ledger
         .get("temporary_owners")
         .and_then(serde_json::Value::as_array)
-        .context("WP-09B temporary_owners must be an array")?;
+        .context("WP-09C temporary_owners must be an array")?;
     let mut observed_owners = BTreeMap::new();
     for owner in owner_entries {
         let module = owner
             .get("module")
             .and_then(serde_json::Value::as_str)
-            .context("WP-09B temporary owner must name its module")?;
+            .context("WP-09C temporary owner must name its module")?;
         let facts = (
             owner
                 .get("path")
                 .and_then(serde_json::Value::as_str)
-                .context("WP-09B temporary owner must name its path")?,
+                .context("WP-09C temporary owner must name its path")?,
             owner
                 .get("type")
                 .and_then(serde_json::Value::as_str)
-                .context("WP-09B temporary owner must name its type")?,
+                .context("WP-09C temporary owner must name its type")?,
             owner
                 .get("composition_field")
                 .and_then(serde_json::Value::as_str)
-                .context("WP-09B temporary owner must name its composition field")?,
+                .context("WP-09C temporary owner must name its composition field")?,
             owner
                 .get("expires")
                 .and_then(serde_json::Value::as_str)
-                .context("WP-09B temporary owner must name its expiry")?,
+                .context("WP-09C temporary owner must name its expiry")?,
         );
         if observed_owners.insert(module, facts).is_some() {
-            bail!("WP-09B temporary owner {module} is repeated");
+            bail!("WP-09C temporary owner {module} is repeated");
         }
     }
     if observed_owners != expected_owners {
-        bail!("WP-09B temporary owner ledger drifted");
+        bail!("WP-09C temporary owner ledger drifted");
     }
 
     let app_root = repo_root.join("crates/mirante4d-app/src");
@@ -1094,6 +1085,14 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
         || app_fields.contains_key("dataset_runtime")
     {
         bail!("MiranteWorkbenchApp must compose DatasetDemandState without CurrentDatasetRuntime");
+    }
+    if app_fields.get("egui_ui").map(String::as_str) != Some("EguiUiState")
+        || app_fields.contains_key("ui_runtime")
+        || repo_root
+            .join("crates/mirante4d-app/src/current_runtime/ui.rs")
+            .exists()
+    {
+        bail!("egui-local state must be owned by mirante4d-ui-egui after the WP-09C cutover");
     }
     let mut owner_type_names = expected_owners
         .values()
@@ -1115,7 +1114,7 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
         .collect::<BTreeMap<_, _>>();
     if actual_composition != expected_composition {
         bail!(
-            "post-WP-09B temporary-owner composition drifted: expected={expected_composition:?}, actual={actual_composition:?}"
+            "WP-09C temporary-owner composition drifted: expected={expected_composition:?}, actual={actual_composition:?}"
         );
     }
     for (relative_path, type_name, _, expiry) in expected_owners.values() {

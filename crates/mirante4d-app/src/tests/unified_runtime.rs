@@ -143,7 +143,7 @@ fn imported_dataset_uses_the_existing_dirty_project_open_handoff() {
     );
 
     assert_eq!(app.pending_dataset_open_path.as_ref(), Some(&imported));
-    assert!(app.ui_runtime.close_prompt_open);
+    assert!(app.egui_ui.close_prompt_open);
     assert!(
         app.application
             .snapshot()

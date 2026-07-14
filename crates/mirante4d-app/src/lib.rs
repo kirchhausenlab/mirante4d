@@ -38,7 +38,6 @@ mod semantic_tiles;
 mod smoke;
 mod state;
 mod tool_interactions;
-mod tools;
 mod transfer_presets;
 mod unified_source_open;
 mod viewer_layout;
@@ -57,8 +56,8 @@ use analysis_workspace::{
     zoom_analysis_plot_view,
 };
 use analysis_workspace::{
-    AnalysisPlotViewRange, AnalysisTableExportInput, AnalysisTableSort, AnalysisWorkspaceViewInput,
-    export_selected_analysis_table, show_analysis_workspace, show_analysis_workspace_window,
+    AnalysisTableExportInput, AnalysisWorkspaceViewInput, export_selected_analysis_table,
+    show_analysis_workspace, show_analysis_workspace_window,
 };
 use cross_section_readout::cross_section_hover_readout_for_response;
 use cross_section_runtime::CrossSectionRuntime;
@@ -92,6 +91,7 @@ use mirante4d_application::{
     PresentationSurface, ProjectRecoveryStoreLocator, ProjectStoreApplicationService,
     ProjectStoreLifecycle, ProjectStoreServiceEvent, SourceSessionGeneration,
     SourceVerificationSnapshot, SystemMonotonicClock, WorkspaceSnapshot,
+    viewer_tools::{ViewerTool, ViewerToolState},
 };
 use mirante4d_dataset::DatasetSourceId;
 use mirante4d_domain::{
@@ -126,15 +126,16 @@ pub use smoke::{AppSmokeOptions, AppSmokeReport, PlaybackSmokeFrame, run_headles
 pub use state::{
     ChannelFidelityStatus, ChannelFidelityWarning, DisplayedFrameFreshness, FrameCompleteness,
     FrameFailureKind, FrameFidelityStatus, HistogramStatus, LayerHistogramSummary,
-    LodDecisionReason, LodScheduleState, RenderBackend, ViewportHover, ViewportIntensity,
+    LodDecisionReason, LodScheduleState, RenderBackend,
 };
 use tool_interactions::apply_viewport_tool_response;
-use tools::{ViewerTool, ViewerToolState};
 use transfer_presets::{
     built_in_transfer_preset_curve, built_in_transfer_preset_label, built_in_transfer_presets,
     channel_preset_from_current_view, next_user_channel_preset_id,
 };
-use ui_kit::{StatusTone, WorkbenchLayoutSpec};
+#[cfg(test)]
+use ui_kit::{AnalysisPlotViewRange, AnalysisTableSort, ViewportIntensity};
+use ui_kit::{StatusTone, ViewportHover, WorkbenchLayoutSpec};
 use viewport::{
     default_camera_for_shape, fit_camera_to_shape_preserving_view, fit_size,
     presentation_viewport_for_display_size, render_viewport_for_display_size,
@@ -490,7 +491,7 @@ pub struct MiranteWorkbenchApp {
     dataset: dataset_requests::DatasetDemandState,
     render_runtime: current_runtime::render::CurrentRenderRuntime,
     native_presentation: native_presentation::NativePresentationBridge,
-    ui_runtime: current_runtime::ui::CurrentUiRuntime,
+    egui_ui: ui_kit::EguiUiState,
     import_runtime: current_runtime::import::ImportRuntime,
     analysis_runtime: current_runtime::analysis::AnalysisProductRuntime,
     validation_runtime: current_runtime::validation::CurrentValidationRuntime,
@@ -581,7 +582,10 @@ impl MiranteWorkbenchApp {
         render_runtime.product_gpu = Some(current_runtime::render::ProductGpuRenderRuntime::new(
             product_renderer,
         ));
-        let ui_runtime = current_runtime::ui::CurrentUiRuntime::new(resource_policy);
+        let egui_ui = ui_kit::EguiUiState::new(
+            resource_policy.cpu_dataset_budget_bytes(),
+            resource_policy.gpu_budget_bytes(),
+        );
         let (project_recovery_root, recovery_root_warning) =
             initialize_project_recovery_root(dataset.selected_path());
         let (project_store, discovery_warning) =
@@ -594,7 +598,7 @@ impl MiranteWorkbenchApp {
             dataset,
             render_runtime,
             native_presentation,
-            ui_runtime,
+            egui_ui,
             import_runtime: current_runtime::import::ImportRuntime::idle(),
             analysis_runtime,
             validation_runtime,
@@ -637,11 +641,8 @@ impl MiranteWorkbenchApp {
     }
 
     fn show_settings_body(&mut self, ui: &mut egui::Ui) {
-        let mut cpu_dataset_mib = bytes_to_mib_rounded(
-            self.ui_runtime
-                .settings_runtime_draft
-                .cpu_dataset_budget_bytes,
-        );
+        let mut cpu_dataset_mib =
+            bytes_to_mib_rounded(self.egui_ui.settings_runtime_draft.cpu_dataset_budget_bytes);
         if ui
             .add(
                 egui::DragValue::new(&mut cpu_dataset_mib)
@@ -652,14 +653,13 @@ impl MiranteWorkbenchApp {
             .on_hover_text("total CPU dataset ledger")
             .changed()
         {
-            self.ui_runtime
-                .settings_runtime_draft
-                .cpu_dataset_budget_bytes = mib_to_bytes(cpu_dataset_mib);
+            self.egui_ui.settings_runtime_draft.cpu_dataset_budget_bytes =
+                mib_to_bytes(cpu_dataset_mib);
         }
         ui_kit::property_row(ui, "CPU dataset MiB", cpu_dataset_mib.to_string());
 
         let mut gpu_mib =
-            bytes_to_mib_rounded(self.ui_runtime.settings_runtime_draft.gpu_budget_bytes);
+            bytes_to_mib_rounded(self.egui_ui.settings_runtime_draft.gpu_budget_bytes);
         if ui
             .add(
                 egui::DragValue::new(&mut gpu_mib)
@@ -670,15 +670,13 @@ impl MiranteWorkbenchApp {
             .on_hover_text("total GPU ledger")
             .changed()
         {
-            self.ui_runtime.settings_runtime_draft.gpu_budget_bytes = mib_to_bytes(gpu_mib);
+            self.egui_ui.settings_runtime_draft.gpu_budget_bytes = mib_to_bytes(gpu_mib);
         }
         ui_kit::property_row(ui, "GPU MiB", gpu_mib.to_string());
 
         let policy = ResourcePolicy::new(
-            self.ui_runtime
-                .settings_runtime_draft
-                .cpu_dataset_budget_bytes,
-            self.ui_runtime.settings_runtime_draft.gpu_budget_bytes,
+            self.egui_ui.settings_runtime_draft.cpu_dataset_budget_bytes,
+            self.egui_ui.settings_runtime_draft.gpu_budget_bytes,
         )
         .ok();
         let pending = self.settings_connection.pending().is_some();
@@ -691,7 +689,10 @@ impl MiranteWorkbenchApp {
             if ui_kit::toolbar_button(ui, "Recommended", !pending).clicked()
                 && let Ok(policy) = recommended_for_current_system(None)
             {
-                self.ui_runtime.settings_runtime_draft = policy.into();
+                self.egui_ui.settings_runtime_draft = ui_kit::ResourcePolicyDraft {
+                    cpu_dataset_budget_bytes: policy.cpu_dataset_budget_bytes(),
+                    gpu_budget_bytes: policy.gpu_budget_bytes(),
+                };
             }
         });
         if self.settings_connection.rejected_file_present()
@@ -1045,13 +1046,13 @@ impl MiranteWorkbenchApp {
             {
                 if self.project_dirty() {
                     self.close_after_project_save = false;
-                    self.ui_runtime.close_prompt_open = true;
+                    self.egui_ui.close_prompt_open = true;
                     self.project_status_message =
                         Some("Project changed while saving; save again before closing.".to_owned());
                 } else {
                     self.close_after_project_save = false;
                     if let Some(path) = self.pending_dataset_open_path.take() {
-                        self.ui_runtime.close_prompt_open = false;
+                        self.egui_ui.close_prompt_open = false;
                         if let Err(error) = self.replace_state_from_dataset_path(path, None) {
                             self.project_status_message =
                                 Some(format!("Dataset open could not start: {error}"));
@@ -1074,7 +1075,7 @@ impl MiranteWorkbenchApp {
                     ) =>
             {
                 self.close_after_project_save = false;
-                self.ui_runtime.close_prompt_open = true;
+                self.egui_ui.close_prompt_open = true;
             }
             ApplicationEvent::CurrentSourceReplaced { .. } => {
                 self.project_recovery_candidates.clear();
@@ -1683,26 +1684,26 @@ impl MiranteWorkbenchApp {
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         if self.pending_viewport_close {
             self.pending_viewport_close = false;
-            self.ui_runtime.allow_close_without_prompt = true;
+            self.egui_ui.allow_close_without_prompt = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
         if !ctx.input(|input| input.viewport().close_requested()) {
             return;
         }
-        if self.ui_runtime.allow_close_without_prompt {
+        if self.egui_ui.allow_close_without_prompt {
             return;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         if self.project_dirty() {
-            self.ui_runtime.close_prompt_open = true;
+            self.egui_ui.close_prompt_open = true;
         } else {
             self.request_project_store_close_for_exit();
         }
     }
 
     fn show_dirty_project_close_prompt(&mut self, ctx: &egui::Context) {
-        if !self.ui_runtime.close_prompt_open {
+        if !self.egui_ui.close_prompt_open {
             return;
         }
         egui::Window::new("Unsaved Project")
@@ -1734,13 +1735,13 @@ impl MiranteWorkbenchApp {
                             self.save_current_project()
                         };
                         if started && self.close_after_project_save {
-                            self.ui_runtime.close_prompt_open = false;
+                            self.egui_ui.close_prompt_open = false;
                         } else if !started {
                             self.close_after_project_save = false;
                         }
                     }
                     if ui_kit::toolbar_button(ui, "Discard", true).clicked() {
-                        self.ui_runtime.close_prompt_open = false;
+                        self.egui_ui.close_prompt_open = false;
                         self.close_after_project_save = false;
                         if let Some(path) = self.pending_dataset_open_path.take() {
                             if let Err(error) = self.replace_state_from_dataset_path(path, None) {
@@ -1752,8 +1753,8 @@ impl MiranteWorkbenchApp {
                         }
                     }
                     if ui_kit::toolbar_button(ui, "Cancel", true).clicked() {
-                        self.ui_runtime.close_prompt_open = false;
-                        self.ui_runtime.allow_close_without_prompt = false;
+                        self.egui_ui.close_prompt_open = false;
+                        self.egui_ui.allow_close_without_prompt = false;
                         self.close_after_project_save = false;
                         self.pending_dataset_open_path = None;
                         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1930,7 +1931,7 @@ impl MiranteWorkbenchApp {
 
     fn request_project_store_close_for_exit(&mut self) {
         self.exit_after_project_close = true;
-        self.ui_runtime.close_prompt_open = false;
+        self.egui_ui.close_prompt_open = false;
         match self.project_store.as_mut() {
             Some(service) if service.status().lifecycle() != ProjectStoreLifecycle::Closed => {
                 if let Err(error) = service.close()
@@ -2055,7 +2056,7 @@ impl MiranteWorkbenchApp {
     ) -> anyhow::Result<bool> {
         if self.project_dirty() {
             self.pending_dataset_open_path = Some(path);
-            self.ui_runtime.close_prompt_open = true;
+            self.egui_ui.close_prompt_open = true;
             Ok(false)
         } else {
             self.replace_state_from_dataset_path(path, ctx)?;
@@ -2497,12 +2498,12 @@ impl MiranteWorkbenchApp {
             &mut self.import_runtime,
             current_runtime::import::ImportRuntime::idle(),
         );
-        self.ui_runtime.viewer_tools = ViewerToolState::default();
-        self.ui_runtime.analysis_plot_view = None;
-        self.ui_runtime.analysis_filter.clear();
-        self.ui_runtime.analysis_sort = None;
-        self.ui_runtime.hovered_pixel = None;
-        self.ui_runtime.hovered_source_readout = None;
+        self.egui_ui.viewer_tools = ViewerToolState::default();
+        self.egui_ui.analysis_plot_view = None;
+        self.egui_ui.analysis_filter.clear();
+        self.egui_ui.analysis_sort = None;
+        self.egui_ui.hovered_pixel = None;
+        self.egui_ui.hovered_source_readout = None;
         if let Err(error) = old_dataset.request_shutdown() {
             tracing::warn!(%error, "replaced dataset runtime shutdown request failed");
         }
@@ -2611,9 +2612,9 @@ impl MiranteWorkbenchApp {
             }
         };
         if previous_view.layout() != next_view.layout() {
-            self.ui_runtime.hovered_pixel = None;
-            self.ui_runtime.hovered_source_readout = None;
-            self.ui_runtime.viewport_orbit_drag = None;
+            self.egui_ui.hovered_pixel = None;
+            self.egui_ui.hovered_source_readout = None;
+            self.egui_ui.viewport_orbit_drag = None;
             if next_view.layout() == CanonicalViewerLayout::Single3d {
                 self.clear_cross_section_product_presentations();
                 self.render_runtime

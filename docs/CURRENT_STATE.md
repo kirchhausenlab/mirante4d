@@ -28,7 +28,8 @@ validation and reads, and create-only package publication.
 `mirante4d-import-pipeline` is the active bounded, cancellable, restartable
 TIFF/OME-TIFF producer. The predecessor `mirante4d-data`, `mirante4d-format`,
 and `mirante4d-import` crates are deleted. `mirante4d-ui-egui` now owns shared
-egui visuals and application-problem presentation. `mirante4d-render-wgpu` is
+egui visuals, application-problem presentation, and transient UI drafts and
+interaction state. `mirante4d-render-wgpu` is
 the sole product renderer. The unpublished `mirante4d-render-reference` CPU
 oracle is test-only, and the predecessor `mirante4d-renderer` crate is deleted.
 

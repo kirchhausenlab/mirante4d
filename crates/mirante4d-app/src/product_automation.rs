@@ -1617,8 +1617,8 @@ impl ProductAutomationController {
                 expected_schedule_generation
             ));
         }
-        app.ui_runtime.hovered_pixel = None;
-        app.ui_runtime.hovered_source_readout = Some(readout.text.clone());
+        app.egui_ui.hovered_pixel = None;
+        app.egui_ui.hovered_source_readout = Some(readout.text.clone());
         Ok(CommandProgress::Done(json!({
             "panel": panel.name(),
             "x_fraction": x_fraction,
@@ -1654,8 +1654,8 @@ impl ProductAutomationController {
         {
             return Err("probe_hover fractions must be finite and between 0.0 and 1.0".to_owned());
         }
-        app.ui_runtime.hovered_pixel = None;
-        app.ui_runtime.hovered_source_readout = None;
+        app.egui_ui.hovered_pixel = None;
+        app.egui_ui.hovered_source_readout = None;
         Ok(CommandProgress::Done(json!({
             "x_fraction": x_fraction,
             "y_fraction": y_fraction,
@@ -2355,7 +2355,7 @@ impl ProductAutomationController {
                 tracing::error!(error = %err, "failed to serialize product automation report");
             }
         }
-        app.ui_runtime.allow_close_without_prompt = true;
+        app.egui_ui.allow_close_without_prompt = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 

@@ -1,24 +1,19 @@
 use eframe::egui;
 use glam::{DQuat, DVec3};
-use mirante4d_application::{ApplicationCommand, ApplicationSnapshot};
+use mirante4d_application::{
+    ApplicationCommand, ApplicationSnapshot, viewport_interaction::ViewportOrbitDrag,
+};
 use mirante4d_domain::{CameraView, GridToWorld, Projection, Shape3D, UnitQuaternion, WorldPoint3};
 use mirante4d_project_model::ViewState;
 use mirante4d_render_api::{
     CameraFrame, DEFAULT_PRESENTATION_VIEWPORT, PresentationViewport, RenderExtent,
 };
 
-use crate::{
-    ViewportHover,
-    current_runtime::{render::CurrentRenderRuntime, ui::CurrentUiRuntime},
-};
+use crate::current_runtime::render::CurrentRenderRuntime;
+use mirante4d_ui_egui::{EguiUiState, ViewportHover};
 
 const DEFAULT_INITIAL_VIEWPORT_SIDE: u32 = 512;
 const FIT_MARGIN: f64 = 1.25;
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct ViewportOrbitDragState {
-    pub(crate) start_camera: CameraView,
-}
 
 pub(crate) fn default_camera_for_shape(shape: Shape3D, grid_to_world: GridToWorld) -> CameraView {
     let target = shape_center_world(shape, grid_to_world);
@@ -234,24 +229,24 @@ pub(crate) fn viewport_hover_from_response(
 }
 
 pub(crate) fn viewport_interaction_commands(
-    ui_runtime: &mut CurrentUiRuntime,
+    egui_ui: &mut EguiUiState,
     view: &ViewState,
     response: &egui::Response,
     viewport_size: egui::Vec2,
 ) -> Vec<ApplicationCommand> {
     let mut commands = Vec::new();
     if response.drag_stopped() {
-        ui_runtime.viewport_orbit_drag = None;
+        egui_ui.viewport_orbit_drag = None;
     }
     if response.dragged() {
         let camera_pan_requested = response.ctx.input(|input| {
             input.pointer.middle_down() || input.pointer.secondary_down() || input.modifiers.shift
         });
         if camera_pan_requested {
-            ui_runtime.viewport_orbit_drag = None;
+            egui_ui.viewport_orbit_drag = None;
         }
         if let Some(command) = viewport_drag_command(
-            ui_runtime,
+            egui_ui,
             *view.camera(),
             response,
             viewport_size,
@@ -273,7 +268,7 @@ pub(crate) fn viewport_interaction_commands(
 }
 
 pub(crate) fn viewport_drag_command(
-    ui_runtime: &mut CurrentUiRuntime,
+    egui_ui: &mut EguiUiState,
     camera: CameraView,
     response: &egui::Response,
     viewport_size_points: egui::Vec2,
@@ -305,17 +300,15 @@ pub(crate) fn viewport_drag_command(
     {
         return None;
     }
-    let drag_state = ui_runtime
+    let drag_state = egui_ui
         .viewport_orbit_drag
-        .get_or_insert(ViewportOrbitDragState {
-            start_camera: camera,
-        });
+        .get_or_insert(ViewportOrbitDrag::new(camera));
     let current_position_points = current_pointer - response.rect.min.to_vec2();
     let start_position_points = current_position_points - total_drag_delta;
-    let mut camera = drag_state.start_camera;
+    let mut camera = drag_state.start_camera();
     apply_camera_orbit(
         &mut camera,
-        drag_state.start_camera,
+        drag_state.start_camera(),
         start_position_points,
         current_position_points,
         viewport_size_points,

@@ -7,8 +7,90 @@ use std::{fmt::Display, hash::Hash};
 use eframe::egui::{self, Color32, RichText};
 use mirante4d_application::{
     ApplicationEvent, OperationOutcome, PresentationPaintRequest, PresentationSlot,
-    PresentationSurface,
+    PresentationSurface, viewer_tools::ViewerToolState, viewport_interaction::ViewportOrbitDrag,
 };
+
+/// Egui-local draft values and interaction state.
+#[derive(Debug)]
+pub struct EguiUiState {
+    pub viewport_orbit_drag: Option<ViewportOrbitDrag>,
+    pub analysis_plot_view: Option<AnalysisPlotViewRange>,
+    pub analysis_filter: String,
+    pub analysis_sort: Option<AnalysisTableSort>,
+    pub viewer_tools: ViewerToolState,
+    pub hovered_pixel: Option<ViewportHover>,
+    pub hovered_source_readout: Option<String>,
+    pub close_prompt_open: bool,
+    pub allow_close_without_prompt: bool,
+    pub settings_runtime_draft: ResourcePolicyDraft,
+    pub analysis_workspace_open: bool,
+}
+
+impl EguiUiState {
+    pub fn new(cpu_dataset_budget_bytes: u64, gpu_budget_bytes: u64) -> Self {
+        Self {
+            viewport_orbit_drag: None,
+            analysis_plot_view: None,
+            analysis_filter: String::new(),
+            analysis_sort: None,
+            viewer_tools: ViewerToolState::default(),
+            hovered_pixel: None,
+            hovered_source_readout: None,
+            close_prompt_open: false,
+            allow_close_without_prompt: false,
+            settings_runtime_draft: ResourcePolicyDraft {
+                cpu_dataset_budget_bytes,
+                gpu_budget_bytes,
+            },
+            analysis_workspace_open: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourcePolicyDraft {
+    pub cpu_dataset_budget_bytes: u64,
+    pub gpu_budget_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalysisTableSort {
+    pub column_key: String,
+    pub ascending: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AnalysisPlotViewRange {
+    pub plot_index: usize,
+    pub min_x: f64,
+    pub max_x: f64,
+    pub min_y: f64,
+    pub max_y: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewportHover {
+    pub x: u64,
+    pub y: u64,
+    pub intensity: ViewportIntensity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ViewportIntensity {
+    U8(u8),
+    U16(u16),
+    F32(f32),
+}
+
+impl Display for ViewportIntensity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::U8(value) => write!(formatter, "{value}"),
+            Self::U16(value) => write!(formatter, "{value}"),
+            Self::F32(value) => write!(formatter, "{value:.6}"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UiColors {
@@ -388,6 +470,23 @@ mod tests {
     use std::{cell::Cell, rc::Rc};
 
     use super::*;
+
+    #[test]
+    fn egui_state_starts_with_only_the_supplied_resource_draft() {
+        let state = EguiUiState::new(256, 128);
+
+        assert_eq!(
+            state.settings_runtime_draft,
+            ResourcePolicyDraft {
+                cpu_dataset_budget_bytes: 256,
+                gpu_budget_bytes: 128,
+            }
+        );
+        assert!(state.viewport_orbit_drag.is_none());
+        assert!(state.analysis_filter.is_empty());
+        assert!(!state.close_prompt_open);
+        assert!(!state.analysis_workspace_open);
+    }
     use mirante4d_application::{PresentationSurface, PresentationViewport};
 
     #[test]

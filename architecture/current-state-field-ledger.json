@@ -1,10 +1,10 @@
 {
   "schema": "mirante4d-current-state-field-ledger",
   "schema_version": 2,
-  "status": "wp09b-product-render-cutover",
+  "status": "wp09c-ui-composition-cutover",
   "predecessor": {
-    "tag": "foundation-wp-10c-exit-1",
-    "revision": "b9ac2a5f08101094933f80a0ce98fbdbdbe6c8d6"
+    "tag": "foundation-wp-09b-exit-1",
+    "revision": "b73dd86fed8cc3ac7b34f75f20dcd8bb8ac85672"
   },
   "dataset_authority": {
     "runtime_owner": "mirante4d-dataset-runtime",
@@ -24,13 +24,6 @@
     }
   },
   "temporary_owners": [
-    {
-      "module": "ui",
-      "path": "crates/mirante4d-app/src/current_runtime/ui.rs",
-      "type": "CurrentUiRuntime",
-      "composition_field": "ui_runtime",
-      "expires": "WP-09C"
-    },
     {
       "module": "import",
       "path": "crates/mirante4d-app/src/current_runtime/import.rs",
@@ -90,6 +83,7 @@
     "The application owns bounded payload-free request correlation, not decoded pixels.",
     "Only DatasetRequestDispatcher polls DatasetRuntime in product application code.",
     "LocalDatasetSource is the sole product dataset source.",
-    "mirante4d-render-wgpu is the sole product renderer."
+    "mirante4d-render-wgpu is the sole product renderer.",
+    "mirante4d-ui-egui owns egui-local drafts and interaction facts."
   ]
 }

@@ -1,29 +1,5 @@
 use mirante4d_render_api::{PresentationViewport, RenderExtent};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ViewportHover {
-    pub x: u64,
-    pub y: u64,
-    pub intensity: ViewportIntensity,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ViewportIntensity {
-    U8(u8),
-    U16(u16),
-    F32(f32),
-}
-
-impl std::fmt::Display for ViewportIntensity {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::U8(value) => write!(formatter, "{value}"),
-            Self::U16(value) => write!(formatter, "{value}"),
-            Self::F32(value) => write!(formatter, "{value:.6}"),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderBackend {
     Loading,

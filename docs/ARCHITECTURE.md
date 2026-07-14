@@ -45,8 +45,9 @@ The workspace has eighteen packages (seventeen `mirante4d-*` crates plus
   capabilities, dataset source, and deterministic create-only local writer.
 - `mirante4d-import-pipeline`: active bounded, cancellable, restartable
   TIFF/OME-TIFF producer for validated sharded target packages.
-- `mirante4d-ui-egui`: active egui visual components and UI-facing message
-  projection; its only Mirante dependency is `mirante4d-application`.
+- `mirante4d-ui-egui`: active egui visual components, UI-facing message
+  projection, and transient egui interaction state; its only Mirante
+  dependency is `mirante4d-application`.
 - `mirante4d-app`: native composition and the remaining shell during WP-09C.
 - `xtask`: developer and verification tooling, never a product mode.
 
@@ -60,8 +61,9 @@ product uses `mirante4d-storage`, `mirante4d-import-pipeline`, and
 ## Application Composition
 
 `MiranteWorkbenchApp` holds `ApplicationState`, payload-free
-`DatasetDemandState`, process diagnostics, four remaining temporary runtime
-owners, and narrow project-store/settings/source-open handles. It is a
+`DatasetDemandState`, process diagnostics, three remaining temporary runtime
+owners, egui state owned by `mirante4d-ui-egui`, and narrow
+project-store/settings/source-open handles. It is a
 composition root, not a second model.
 
 The temporary owners and deletion gates are:
@@ -69,7 +71,6 @@ The temporary owners and deletion gates are:
 | Owner | Scope | Gate |
 |---|---|---|
 | `CurrentRenderRuntime` | app-side successor status and presentation composition | WP-09C |
-| `CurrentUiRuntime` | egui-local drafts and interaction facts | WP-09C |
 | `ImportRuntime` | UI-owned task handling around the target import pipeline | WP-09C |
 | `CurrentValidationRuntime` | product-validation harness only | WP-14 |
 
