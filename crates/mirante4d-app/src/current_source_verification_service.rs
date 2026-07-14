@@ -462,7 +462,7 @@ fn map_target_verification_error(
         unified_source_open::TargetPackageVerificationError::Cancelled => {
             OperationFailureCode::SourceVerificationReadFailed
         }
-        unified_source_open::TargetPackageVerificationError::Reservation(_)
+        unified_source_open::TargetPackageVerificationError::Reservation
         | unified_source_open::TargetPackageVerificationError::InvalidReservation => {
             OperationFailureCode::SourceVerificationCapacityExceeded
         }

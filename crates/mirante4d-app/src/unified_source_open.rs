@@ -7,8 +7,7 @@ use std::{
 
 use mirante4d_application::UnboundWorkspace;
 use mirante4d_dataset::{
-    CpuByteLedger, CpuLedgerCategory, CpuLedgerError, DatasetCatalog, DatasetSource,
-    DatasetSourceId,
+    CpuByteLedger, CpuLedgerCategory, DatasetCatalog, DatasetSource, DatasetSourceId,
 };
 use mirante4d_dataset_runtime::{
     DatasetRuntime, DatasetRuntimeConfig, RuntimeFault, RuntimeFaultCode,
@@ -74,7 +73,7 @@ pub(crate) enum TargetPackageVerificationStage {
 pub(crate) enum TargetPackageVerificationError {
     Cancelled,
     Open(PackageOpenError),
-    Reservation(CpuLedgerError),
+    Reservation,
     InvalidReservation,
     Exact(PackageValidationError),
     Scientific(ScientificPackageValidationError),
@@ -159,7 +158,7 @@ pub(crate) fn verify_target_package(
             CpuLedgerCategory::InFlightDecode,
             PACKAGE_VALIDATION_WORKING_BYTES,
         )
-        .map_err(TargetPackageVerificationError::Reservation)?;
+        .map_err(|_| TargetPackageVerificationError::Reservation)?;
     if validation_lease.category() != CpuLedgerCategory::InFlightDecode
         || validation_lease.reserved_bytes() != PACKAGE_VALIDATION_WORKING_BYTES
     {
