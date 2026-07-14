@@ -10,7 +10,8 @@ use mirante4d_domain::{
     Shape4D, TimeIndex, ToolKind, TransferCurve, UnitQuaternion, ViewerLayout, WorldPoint3,
 };
 use mirante4d_identity::{
-    ArtifactContentId, ExactBytesDigest, MediaType, ObjectRole, RawObjectDescriptor,
+    ArtifactContentId, DerivationRecordId, ExactBytesDigest, MediaType, ObjectRole,
+    RawObjectDescriptor, RecipeId,
 };
 use mirante4d_project_model::{
     ArtifactCompleteness, ArtifactRecoverability, ArtifactSchema, ChannelPresetEntry,
@@ -1381,36 +1382,31 @@ fn project_open_rebinds_same_content_to_the_verified_reference_as_dirty() {
 }
 
 #[test]
-fn unverified_analysis_and_import_operations_are_allowed_but_cannot_admit_artifacts() {
+fn unverified_analysis_can_start_but_cannot_stage_artifacts() {
     let mut application = application();
     application
         .dispatch(ApplicationCommand::BeginOperation(OperationKind::Analysis))
         .unwrap();
     let token = started_token(&mut application, OperationKind::Analysis);
     assert_eq!(token.source_identity(), None);
-    application
-        .dispatch(ApplicationCommand::CompleteOperation {
-            token,
-            completion: OperationCompletion::Succeeded,
-        })
-        .unwrap();
-
-    application
-        .dispatch(ApplicationCommand::BeginOperation(OperationKind::Import))
-        .unwrap();
-    let token = started_token(&mut application, OperationKind::Import);
     let before = application.fork_for_dispatch();
     let fault = application
-        .dispatch(ApplicationCommand::CompleteOperation {
-            token,
-            completion: OperationCompletion::ArtifactReady(Box::new(artifact(7))),
+        .dispatch(ApplicationCommand::StageAnalysisBundle {
+            token: token.clone(),
+            artifacts: vec![analysis_artifact(7, ArtifactSchema::AnalysisTableV1)],
         })
         .unwrap_err();
     assert_eq!(
         fault.code(),
-        ApplicationFaultCode::InvalidOperationCompletion
+        ApplicationFaultCode::IdentityVerificationRequired
     );
     assert_eq!(application, before);
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::Cancelled,
+        })
+        .unwrap();
 }
 
 #[test]
@@ -1579,196 +1575,342 @@ fn typed_project_store_faults_are_admitted_only_by_read_or_mutation_operations()
 }
 
 #[test]
-fn verified_analysis_artifact_admission_is_one_durable_revision() {
+fn analysis_bundle_is_invisible_until_commit_then_undo_removes_both_artifacts() {
     let mut application = bound_application();
     application.drain_events(MAX_PENDING_EVENTS);
     application
         .dispatch(ApplicationCommand::BeginOperation(OperationKind::Analysis))
         .unwrap();
     let token = started_token(&mut application, OperationKind::Analysis);
-    application
-        .dispatch(ApplicationCommand::CompleteOperation {
-            token,
-            completion: OperationCompletion::ArtifactReady(Box::new(artifact(7))),
-        })
-        .unwrap();
-    let WorkspaceSnapshot::Bound {
-        project, revision, ..
-    } = application.snapshot().workspace().clone()
-    else {
-        panic!("workspace was not bound");
-    };
-    assert_eq!(revision.sequence(), 1);
-    assert_eq!(project.artifacts().len(), 1);
-    assert!(application.snapshot().active_operations().is_empty());
-}
-
-#[test]
-fn analysis_ready_appends_bounded_descriptors_with_deterministic_ids_and_selections() {
-    let mut application = application();
-    application
-        .dispatch(ApplicationCommand::BeginOperation(OperationKind::Analysis))
-        .unwrap();
-    let token = started_token(&mut application, OperationKind::Analysis);
-    let table_0 =
-        AnalysisTableDescriptor::new(AnalysisTableId::from_operation(token.operation_id(), 0), 12);
-    let table_1 =
-        AnalysisTableDescriptor::new(AnalysisTableId::from_operation(token.operation_id(), 1), 5);
-    let plot_0 = AnalysisPlotDescriptor::new(
-        AnalysisPlotId::from_operation(token.operation_id(), 0),
+    let table_artifact = analysis_artifact(7, ArtifactSchema::AnalysisTableV1);
+    let plot_artifact = analysis_artifact(8, ArtifactSchema::AnalysisPlotV1);
+    let table = AnalysisTableDescriptor::new(
+        AnalysisTableId::from_artifact_handle(table_artifact.handle_id()),
+        12,
+    );
+    let plot = AnalysisPlotDescriptor::new(
+        AnalysisPlotId::from_artifact_handle(plot_artifact.handle_id()),
         vec![2, 3],
     )
     .unwrap();
+    let table_id = table.id();
+    let plot_id = plot.id();
+
+    let projection = stage_analysis_bundle(
+        &mut application,
+        token.clone(),
+        vec![table_artifact.clone(), plot_artifact.clone()],
+    );
+    let staged = application.snapshot();
+    assert_eq!(bound_project_arc(&staged).artifacts(), &[]);
+    assert!(staged.transient().analysis_tables().is_empty());
+    assert!(staged.transient().analysis_plots().is_empty());
+    assert_eq!(projection.state().artifacts().len(), 2);
+    assert_eq!(projection.revision().sequence(), 1);
+
+    let before_frozen_edit = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::SetTimepoint(TimeIndex::new(1)))
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::OperationConflict
+    );
+    assert_eq!(application, before_frozen_edit);
+
     application
         .dispatch(ApplicationCommand::CompleteOperation {
-            token: token.clone(),
-            completion: OperationCompletion::AnalysisReady {
-                tables: vec![table_0.clone(), table_1.clone()],
-                plots: vec![plot_0.clone()],
+            token,
+            completion: OperationCompletion::AnalysisCommitted {
+                projection: Box::new(projection.as_ref().clone()),
+                table: table.clone(),
+                plot: Some(plot.clone()),
             },
         })
         .unwrap();
-
-    let snapshot = application.snapshot();
-    let transient = snapshot.transient();
-    assert_eq!(transient.analysis_tables(), &[table_0, table_1.clone()]);
-    assert_eq!(transient.analysis_plots(), std::slice::from_ref(&plot_0));
-    assert_eq!(transient.selected_analysis_table(), Some(table_1.id()));
-    assert_eq!(transient.selected_analysis_plot(), Some(plot_0.id()));
-    assert_eq!(transient.selected_analysis_plot_point(), None);
-    assert!(snapshot.active_operations().is_empty());
-    assert_eq!(snapshot.dirty(), None);
-    assert_eq!(snapshot.currentness(), CurrentnessGeneration::initial());
-
-    let before_missing = application.fork_for_dispatch();
+    let committed = application.snapshot();
+    let WorkspaceSnapshot::Bound {
+        project,
+        revision,
+        saved_revision,
+        ..
+    } = committed.workspace()
+    else {
+        panic!("workspace was not bound");
+    };
+    assert_eq!(project.artifacts().len(), 2);
+    assert_eq!(revision.sequence(), 1);
+    assert_eq!(saved_revision.map(ProjectRevisionId::sequence), Some(1));
+    assert_eq!(committed.dirty(), Some(false));
+    assert_eq!(committed.transient().analysis_tables(), &[table]);
+    assert_eq!(committed.transient().analysis_plots(), &[plot]);
     assert_eq!(
-        application
-            .dispatch(ApplicationCommand::SelectAnalysisTable(Some(
-                AnalysisTableId::from_operation(OperationId(999), 0),
-            )))
-            .unwrap_err()
-            .code(),
-        ApplicationFaultCode::AnalysisTableNotFound
+        committed.transient().selected_analysis_table(),
+        Some(table_id)
     );
-    assert_eq!(application, before_missing);
+    assert_eq!(
+        committed.transient().selected_analysis_plot(),
+        Some(plot_id)
+    );
+    assert!(committed.active_operations().is_empty());
 
-    let point = AnalysisPlotPointSelection::new(plot_0.id(), 1, 2);
+    let point = AnalysisPlotPointSelection::new(plot_id, 1, 2);
     application
         .dispatch(ApplicationCommand::SelectAnalysisPlotPoint(Some(point)))
         .unwrap();
-    assert_eq!(
-        application
-            .snapshot()
-            .transient()
-            .selected_analysis_plot_point(),
-        Some(point)
-    );
-
-    let before_invalid = application.fork_for_dispatch();
+    let before_invalid_point = application.fork_for_dispatch();
     assert_eq!(
         application
             .dispatch(ApplicationCommand::SelectAnalysisPlotPoint(Some(
-                AnalysisPlotPointSelection::new(plot_0.id(), 1, 3),
+                AnalysisPlotPointSelection::new(plot_id, 1, 3),
             )))
             .unwrap_err()
             .code(),
         ApplicationFaultCode::AnalysisPointOutOfBounds
     );
-    assert_eq!(application, before_invalid);
+    assert_eq!(application, before_invalid_point);
 
-    application
-        .dispatch(ApplicationCommand::BeginOperation(OperationKind::Analysis))
-        .unwrap();
-    let next = started_token(&mut application, OperationKind::Analysis);
-    let next_table =
-        AnalysisTableDescriptor::new(AnalysisTableId::from_operation(next.operation_id(), 0), 7);
-    application
-        .dispatch(ApplicationCommand::CompleteOperation {
-            token: next,
-            completion: OperationCompletion::AnalysisReady {
-                tables: vec![next_table.clone()],
-                plots: Vec::new(),
-            },
-        })
-        .unwrap();
-    let transient = application.snapshot().transient().clone();
-    assert_eq!(transient.analysis_tables().len(), 3);
-    assert_eq!(transient.analysis_plots(), std::slice::from_ref(&plot_0));
-    assert_eq!(transient.selected_analysis_table(), Some(next_table.id()));
-    assert_eq!(transient.selected_analysis_plot(), Some(plot_0.id()));
-    assert_eq!(transient.selected_analysis_plot_point(), Some(point));
+    application.dispatch(ApplicationCommand::Undo).unwrap();
+    let undone = application.snapshot();
+    assert!(bound_project_arc(&undone).artifacts().is_empty());
+    assert!(undone.transient().analysis_tables().is_empty());
+    assert!(undone.transient().analysis_plots().is_empty());
+    assert_eq!(undone.transient().selected_analysis_table(), None);
+    assert_eq!(undone.transient().selected_analysis_plot(), None);
+    assert_eq!(undone.transient().selected_analysis_plot_point(), None);
 }
 
 #[test]
-fn analysis_descriptors_reject_wrong_operation_slots_and_all_bounds_atomically() {
-    assert_eq!(
-        AnalysisPlotDescriptor::new(
-            AnalysisPlotId::from_operation(OperationId(1), 0),
-            vec![0; MAX_ANALYSIS_PLOT_SERIES + 1],
-        ),
-        Err(AnalysisDescriptorError::TooManySeries)
+fn authenticated_reopen_descriptors_become_visible_together() {
+    let table_artifact = analysis_artifact(7, ArtifactSchema::AnalysisTableV1);
+    let plot_artifact = analysis_artifact(8, ArtifactSchema::AnalysisPlotV1);
+    let table = AnalysisTableDescriptor::new(
+        AnalysisTableId::from_artifact_handle(table_artifact.handle_id()),
+        4,
     );
-    assert_eq!(
-        AnalysisPlotDescriptor::new(
-            AnalysisPlotId::from_operation(OperationId(1), 0),
-            vec![MAX_ANALYSIS_PLOT_POINTS + 1],
-        ),
-        Err(AnalysisDescriptorError::TooManyPoints)
+    let plot = AnalysisPlotDescriptor::new(
+        AnalysisPlotId::from_artifact_handle(plot_artifact.handle_id()),
+        vec![4],
+    )
+    .unwrap();
+    let project_id = project_id(9);
+    let state = ProjectState::new(
+        project_id,
+        dataset_reference('1'),
+        view(),
+        vec![preset()],
+        vec![table_artifact, plot_artifact],
+    )
+    .unwrap();
+    let projection = ProjectGenerationProjection::new(
+        ProjectRevisionId::new(project_id, 3),
+        ProjectRevisionHighWater::new(project_id, 3),
+        state,
+    )
+    .unwrap();
+    let mut application = application_for_project_open('1');
+    let token = project_open_token(&mut application);
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::ProjectOpened(Box::new(projection)),
+        })
+        .unwrap();
+    assert!(
+        application
+            .snapshot()
+            .transient()
+            .analysis_tables()
+            .is_empty()
     );
-    assert_eq!(
-        AnalysisPlotDescriptor::new(
-            AnalysisPlotId::from_operation(OperationId(1), 0),
-            vec![u64::MAX, 1],
-        ),
-        Err(AnalysisDescriptorError::PointCountOverflow)
+    assert!(
+        application
+            .snapshot()
+            .transient()
+            .analysis_plots()
+            .is_empty()
     );
 
-    let mut application = application();
     application
-        .dispatch(ApplicationCommand::BeginOperation(OperationKind::Analysis))
+        .dispatch(ApplicationCommand::InstallLoadedAnalysisDescriptors {
+            tables: vec![table.clone()],
+            plots: vec![plot.clone()],
+        })
         .unwrap();
-    let token = started_token(&mut application, OperationKind::Analysis);
+    let loaded = application.snapshot();
+    assert_eq!(loaded.transient().analysis_tables(), &[table]);
+    assert_eq!(loaded.transient().analysis_plots(), &[plot]);
+
     let before = application.fork_for_dispatch();
+    let missing = AnalysisTableDescriptor::new(
+        AnalysisTableId::from_artifact_handle(
+            analysis_artifact(9, ArtifactSchema::AnalysisTableV1).handle_id(),
+        ),
+        1,
+    );
     assert_eq!(
         application
-            .dispatch(ApplicationCommand::CompleteOperation {
-                token: token.clone(),
-                completion: OperationCompletion::AnalysisReady {
-                    tables: vec![AnalysisTableDescriptor::new(
-                        AnalysisTableId::from_operation(token.operation_id(), 1),
-                        1,
-                    )],
-                    plots: Vec::new(),
-                },
+            .dispatch(ApplicationCommand::InstallLoadedAnalysisDescriptors {
+                tables: vec![missing],
+                plots: Vec::new(),
             })
             .unwrap_err()
             .code(),
         ApplicationFaultCode::InvalidOperationCompletion
     );
     assert_eq!(application, before);
+}
 
-    let too_many = (0..=MAX_ANALYSIS_TABLES)
-        .map(|slot| {
-            AnalysisTableDescriptor::new(
-                AnalysisTableId::from_operation(token.operation_id(), u16::try_from(slot).unwrap()),
-                0,
-            )
-        })
-        .collect();
+#[test]
+fn analysis_stage_and_commit_reject_stale_or_wrong_input_atomically() {
+    let mut stale = bound_application();
+    stale.drain_events(MAX_PENDING_EVENTS);
+    stale
+        .dispatch(ApplicationCommand::BeginOperation(OperationKind::Analysis))
+        .unwrap();
+    let stale_token = started_token(&mut stale, OperationKind::Analysis);
+    stale
+        .dispatch(ApplicationCommand::SetTimepoint(TimeIndex::new(1)))
+        .unwrap();
+    let before_stale = stale.fork_for_dispatch();
     assert_eq!(
-        application
+        stale
+            .dispatch(ApplicationCommand::StageAnalysisBundle {
+                token: stale_token,
+                artifacts: vec![analysis_artifact(7, ArtifactSchema::AnalysisTableV1)],
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::StaleOperationCompletion
+    );
+    assert_eq!(stale, before_stale);
+
+    let mut wrong = bound_application();
+    wrong.drain_events(MAX_PENDING_EVENTS);
+    wrong
+        .dispatch(ApplicationCommand::BeginOperation(OperationKind::Analysis))
+        .unwrap();
+    let token = started_token(&mut wrong, OperationKind::Analysis);
+    let artifact = analysis_artifact(7, ArtifactSchema::AnalysisTableV1);
+    let projection = stage_analysis_bundle(&mut wrong, token.clone(), vec![artifact.clone()]);
+    let before_wrong = wrong.fork_for_dispatch();
+    let wrong_table = AnalysisTableDescriptor::new(
+        AnalysisTableId::from_artifact_handle(
+            analysis_artifact(9, ArtifactSchema::AnalysisTableV1).handle_id(),
+        ),
+        12,
+    );
+    assert_eq!(
+        wrong
             .dispatch(ApplicationCommand::CompleteOperation {
                 token,
-                completion: OperationCompletion::AnalysisReady {
-                    tables: too_many,
-                    plots: Vec::new(),
+                completion: OperationCompletion::AnalysisCommitted {
+                    projection: Box::new(projection.as_ref().clone()),
+                    table: wrong_table,
+                    plot: None,
                 },
             })
             .unwrap_err()
             .code(),
-        ApplicationFaultCode::AnalysisRegistryFull
+        ApplicationFaultCode::InvalidOperationCompletion
     );
-    assert_eq!(application, before);
+    assert_eq!(wrong, before_wrong);
+    assert!(bound_project_arc(&wrong.snapshot()).artifacts().is_empty());
+}
+
+#[test]
+fn failed_staged_analysis_leaves_project_and_descriptors_unchanged() {
+    let mut application = bound_application();
+    application.drain_events(MAX_PENDING_EVENTS);
+    let before = application.snapshot();
+    let before_project = bound_project_arc(&before);
+    let WorkspaceSnapshot::Bound {
+        revision: before_revision,
+        ..
+    } = before.workspace()
+    else {
+        panic!("workspace was not bound");
+    };
+    let before_revision = *before_revision;
+    let before_transient = application.snapshot().transient().clone();
+    application
+        .dispatch(ApplicationCommand::BeginOperation(OperationKind::Analysis))
+        .unwrap();
+    let token = started_token(&mut application, OperationKind::Analysis);
+    stage_analysis_bundle(
+        &mut application,
+        token.clone(),
+        vec![analysis_artifact(7, ArtifactSchema::AnalysisTableV1)],
+    );
+
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::Failed(OperationFailureCode::AnalysisExecutionFailed),
+        })
+        .unwrap();
+    let after = application.snapshot();
+    assert_eq!(bound_project_arc(&after), before_project);
+    let WorkspaceSnapshot::Bound { revision, .. } = after.workspace() else {
+        panic!("workspace was not bound");
+    };
+    assert_eq!(*revision, before_revision);
+    assert_eq!(after.transient(), &before_transient);
+    assert!(after.active_operations().is_empty());
+}
+
+#[test]
+fn source_invalidation_cancels_staged_analysis_without_exposing_results() {
+    let mut application = bound_application();
+    application.drain_events(MAX_PENDING_EVENTS);
+    application
+        .dispatch(ApplicationCommand::BeginOperation(OperationKind::Analysis))
+        .unwrap();
+    let token = started_token(&mut application, OperationKind::Analysis);
+    stage_analysis_bundle(
+        &mut application,
+        token.clone(),
+        vec![analysis_artifact(7, ArtifactSchema::AnalysisTableV1)],
+    );
+
+    application
+        .dispatch(ApplicationCommand::InvalidateSourceVerification {
+            source_generation: SourceSessionGeneration::new(1),
+        })
+        .unwrap();
+    let snapshot = application.snapshot();
+    assert!(snapshot.active_operations().is_empty());
+    assert!(bound_project_arc(&snapshot).artifacts().is_empty());
+    assert!(snapshot.transient().analysis_tables().is_empty());
+    assert!(
+        application
+            .drain_events(MAX_PENDING_EVENTS)
+            .iter()
+            .any(|event| matches!(
+                event,
+                ApplicationEvent::OperationCancellationRequested { token: event_token }
+                    if event_token == &token
+            ))
+    );
+}
+
+#[test]
+fn analysis_plot_descriptors_remain_bounded() {
+    let id = AnalysisPlotId::from_artifact_handle(
+        analysis_artifact(8, ArtifactSchema::AnalysisPlotV1).handle_id(),
+    );
+    assert_eq!(
+        AnalysisPlotDescriptor::new(id, vec![0; MAX_ANALYSIS_PLOT_SERIES + 1]),
+        Err(AnalysisDescriptorError::TooManySeries)
+    );
+    assert_eq!(
+        AnalysisPlotDescriptor::new(id, vec![MAX_ANALYSIS_PLOT_POINTS + 1]),
+        Err(AnalysisDescriptorError::TooManyPoints)
+    );
+    assert_eq!(
+        AnalysisPlotDescriptor::new(id, vec![u64::MAX, 1]),
+        Err(AnalysisDescriptorError::PointCountOverflow)
+    );
 }
 
 #[test]
@@ -2657,6 +2799,39 @@ fn artifact(byte: u8) -> ArtifactReference {
     .unwrap()
 }
 
+fn analysis_artifact(byte: u8, schema: ArtifactSchema) -> ArtifactReference {
+    let content_digit = format!("{:x}", byte % 16);
+    ArtifactReference::new(
+        ArtifactHandleId::from_bytes([byte; 16]),
+        schema,
+        ArtifactContentId::parse(&format!(
+            "{}{}",
+            ArtifactContentId::PREFIX,
+            content_digit.repeat(64)
+        ))
+        .unwrap(),
+        RawObjectDescriptor::new(
+            ExactBytesDigest::parse(&format!(
+                "{}{}",
+                ExactBytesDigest::PREFIX,
+                content_digit.repeat(64)
+            ))
+            .unwrap(),
+            12,
+            MediaType::parse(schema.media_type()).unwrap(),
+            ObjectRole::parse(schema.object_role()).unwrap(),
+        ),
+        Some(DerivationRecordId::from_canonical_body_bytes(br#"{"operation":"test"}"#).unwrap()),
+        Some(RecipeId::from_canonical_body_bytes(br#"{"recipe":"test"}"#).unwrap()),
+        vec![LogicalLayerKey::new(0)],
+        "Analysis result",
+        true,
+        ArtifactCompleteness::Complete,
+        ArtifactRecoverability::Regenerable,
+    )
+    .unwrap()
+}
+
 fn projection(
     id: ProjectId,
     dataset: DatasetReference,
@@ -2708,6 +2883,30 @@ fn started_token(application: &mut ApplicationState, kind: OperationKind) -> Ope
             _ => None,
         })
         .expect("operation-start event")
+}
+
+fn stage_analysis_bundle(
+    application: &mut ApplicationState,
+    token: OperationToken,
+    artifacts: Vec<ArtifactReference>,
+) -> Arc<ProjectGenerationProjection> {
+    application
+        .dispatch(ApplicationCommand::StageAnalysisBundle {
+            token: token.clone(),
+            artifacts,
+        })
+        .unwrap();
+    application
+        .drain_events(MAX_PENDING_EVENTS)
+        .into_iter()
+        .find_map(|event| match event {
+            ApplicationEvent::AnalysisCommitRequested {
+                token: event_token,
+                projection,
+            } if event_token == token => Some(projection),
+            _ => None,
+        })
+        .expect("analysis-commit request event")
 }
 
 fn project_open_token(application: &mut ApplicationState) -> OperationToken {
