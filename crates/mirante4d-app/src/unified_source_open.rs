@@ -27,9 +27,9 @@ use mirante4d_settings::ResourcePolicy;
 use crate::{
     CrossSectionRuntime, FrameCompleteness, FrameFidelityStatus, LodDecisionReason,
     LodScheduleState, StartupDiagnostics, collect_startup_diagnostics,
-    current_runtime::{analysis::CurrentAnalysisRuntime, render::CurrentRenderRuntime},
+    current_runtime::{analysis::AnalysisProductRuntime, render::CurrentRenderRuntime},
     dataset_requests::DatasetDemandState,
-    render_state::{metadata_intensity_summary, placeholder_frame_for_mode},
+    render_state::placeholder_frame_for_mode,
     transfer_presets::default_channel_presets,
     viewport::{
         default_camera_for_shape, default_presentation_viewport, default_render_viewport_for_shape,
@@ -45,7 +45,7 @@ pub(crate) struct UnifiedOpenedSource {
     pub(crate) catalog: Arc<DatasetCatalog>,
     pub(crate) workspace: UnboundWorkspace,
     pub(crate) render_runtime: CurrentRenderRuntime,
-    pub(crate) analysis_runtime: CurrentAnalysisRuntime,
+    pub(crate) analysis_runtime: AnalysisProductRuntime,
     pub(crate) startup_diagnostics: StartupDiagnostics,
 }
 
@@ -222,7 +222,7 @@ fn runtime_config(
 fn initial_runtime_state(
     catalog: &DatasetCatalog,
     workspace: &UnboundWorkspace,
-) -> anyhow::Result<(CurrentRenderRuntime, CurrentAnalysisRuntime)> {
+) -> anyhow::Result<(CurrentRenderRuntime, AnalysisProductRuntime)> {
     let view = workspace.view();
     let active = catalog
         .layer(view.active_layer())
@@ -249,8 +249,8 @@ fn initial_runtime_state(
         frame,
         None,
     );
-    let analysis =
-        CurrentAnalysisRuntime::empty(metadata_intensity_summary(active.shape().spatial())?);
+    let mut analysis = AnalysisProductRuntime::new();
+    analysis.set_roi([0; 3], active.shape().spatial().dimensions())?;
     Ok((render, analysis))
 }
 

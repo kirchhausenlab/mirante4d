@@ -214,8 +214,10 @@ fn load_current_requirements(
         }
         let (dataset, render) = (&mut opened.dataset, &mut opened.render_runtime);
         let bridge = &mut render.lease_bridge;
-        dataset.dispatcher_mut().drain(32, |ticket, lease| {
-            if bridge.requires(ticket.resource()) {
+        dataset.dispatcher_mut().drain(32, |ticket, outcome| {
+            if let mirante4d_dataset_runtime::RuntimeOutcome::Ready(lease) = outcome
+                && bridge.requires(ticket.resource())
+            {
                 let lease: Arc<dyn ResourceLease> = Arc::new(lease);
                 bridge
                     .install(lease)

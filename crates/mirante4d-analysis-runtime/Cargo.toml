@@ -1,0 +1,18 @@
+[package]
+name = "mirante4d-analysis-runtime"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mirante4d-analysis-core.workspace = true
+mirante4d-dataset-runtime.workspace = true
+mirante4d-project-model.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+mirante4d-dataset.workspace = true
+mirante4d-domain.workspace = true
+mirante4d-identity.workspace = true

@@ -1,5 +1,3 @@
-#[cfg(test)]
-use std::collections::BTreeMap;
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -11,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod analysis_product;
 mod analysis_workspace;
 mod cross_section_readout;
 mod cross_section_runtime;
@@ -37,7 +36,6 @@ mod product_automation;
 mod render_state;
 mod resident_rendering;
 mod runtime_diagnostics_panel;
-mod scene_artifacts;
 mod semantic_tiles;
 mod smoke;
 mod state;
@@ -95,14 +93,6 @@ use import_ui::{
     tiff_import_storage_estimate_label, tiff_source_profile_label,
     tiff_voxel_spacing_metadata_label, validate_pending_tiff_import,
 };
-use mirante4d_analysis::IntensitySummary;
-#[cfg(test)]
-use mirante4d_analysis::{
-    AnalysisCell, AnalysisExecutionClass, AnalysisPlot, AnalysisProvenance, AnalysisResultState,
-    AnalysisTable,
-};
-#[cfg(test)]
-use mirante4d_application::{AnalysisTableDescriptor, AnalysisTableId};
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, ApplicationFault, ApplicationFaultCode,
     ApplicationSnapshot, ApplicationState, CommandEffect, OperationCompletion,
@@ -128,7 +118,7 @@ use mirante4d_project_model::{
 };
 use mirante4d_project_store::{
     ProjectGenerationId, ProjectOpenMode, ProjectRecoveryCandidate, ProjectStoreConfig,
-    ProjectStoreFault, ProjectStorePath,
+    ProjectStoreFault, ProjectStorePath, ProjectStoreRequestId,
 };
 use mirante4d_render_api::PresentationViewport;
 use mirante4d_renderer::gpu::{GpuDisplayFrame, GpuRenderer};
@@ -146,7 +136,6 @@ use resident_rendering::{
     render_gpu_cross_section_panel_frame_from_global_runtime,
     render_gpu_display_frame_from_resident_bricks,
 };
-use scene_artifacts::show_scene_artifacts_editor;
 pub use smoke::{AppSmokeOptions, AppSmokeReport, PlaybackSmokeFrame, run_headless_smoke};
 pub use state::{
     ChannelFidelityStatus, ChannelFidelityWarning, DisplayedFrameFreshness, FrameCompleteness,
@@ -201,6 +190,14 @@ fn project_failure_code(
     operation: OperationKind,
     fault: &ProjectStoreFault,
 ) -> OperationFailureCode {
+    if operation == OperationKind::Analysis {
+        return match fault {
+            ProjectStoreFault::Capacity { .. } | ProjectStoreFault::QueueFull { .. } => {
+                OperationFailureCode::AnalysisCapacityExceeded
+            }
+            _ => OperationFailureCode::AnalysisExecutionFailed,
+        };
+    }
     match fault {
         ProjectStoreFault::ReadOnly => OperationFailureCode::ProjectReadOnly,
         ProjectStoreFault::WriterContended => OperationFailureCode::ProjectWriterContended,
@@ -508,7 +505,7 @@ pub struct MiranteWorkbenchApp {
     render_runtime: current_runtime::render::CurrentRenderRuntime,
     ui_runtime: current_runtime::ui::CurrentUiRuntime,
     import_runtime: current_runtime::import::CurrentImportRuntime,
-    analysis_runtime: current_runtime::analysis::CurrentAnalysisRuntime,
+    analysis_runtime: current_runtime::analysis::AnalysisProductRuntime,
     validation_runtime: current_runtime::validation::CurrentValidationRuntime,
     project_store: Option<ProjectStoreApplicationService<SystemMonotonicClock>>,
     project_recovery_root: Option<PathBuf>,
@@ -517,6 +514,7 @@ pub struct MiranteWorkbenchApp {
     project_recovery_panel_open: bool,
     pending_recovery_selection: Option<ProjectGenerationId>,
     pending_project_open_locator: Option<ProjectId>,
+    pending_analysis_artifact_load: Option<ProjectStoreRequestId>,
     project_store_noninteractive_paths: ProjectStoreNoninteractivePaths,
     project_store_product_evidence: ProjectStoreProductEvidence,
     pending_dataset_open_path: Option<PathBuf>,
@@ -617,6 +615,7 @@ impl MiranteWorkbenchApp {
             project_recovery_panel_open: false,
             pending_recovery_selection: None,
             pending_project_open_locator: None,
+            pending_analysis_artifact_load: None,
             project_store_noninteractive_paths: ProjectStoreNoninteractivePaths::default(),
             project_store_product_evidence: ProjectStoreProductEvidence::default(),
             pending_dataset_open_path: None,
@@ -761,6 +760,7 @@ impl MiranteWorkbenchApp {
                 }
                 self.observe_source_application_event(event);
                 self.observe_project_application_event(event);
+                self.observe_analysis_application_event(event);
             }
             let had_completion_commands = !completion_commands.is_empty();
             for command in completion_commands {
@@ -1092,6 +1092,7 @@ impl MiranteWorkbenchApp {
                 self.project_recovery_panel_open = false;
                 self.pending_recovery_selection = None;
                 self.pending_project_open_locator = None;
+                self.pending_analysis_artifact_load = None;
                 self.project_store_noninteractive_paths =
                     ProjectStoreNoninteractivePaths::default();
                 self.project_store_product_evidence = ProjectStoreProductEvidence::default();
@@ -1387,6 +1388,11 @@ impl MiranteWorkbenchApp {
                 } else {
                     "Project opened.".to_owned()
                 });
+                if opens_dirty {
+                    self.analysis_runtime.clear_loaded();
+                } else {
+                    self.request_current_analysis_artifacts();
+                }
             }
             ProjectStoreServiceEvent::RecoveryReviewRequired {
                 token,
@@ -1444,6 +1450,58 @@ impl MiranteWorkbenchApp {
                 self.project_recovery_panel_open = false;
                 self.project_status_message = Some("Project saved.".to_owned());
             }
+            ProjectStoreServiceEvent::AnalysisCommitted {
+                token,
+                projection,
+                receipt: _,
+            } => {
+                let descriptors = self.analysis_runtime.staged_descriptors(&token);
+                let (table, plot) = match descriptors {
+                    Ok(descriptors) => descriptors,
+                    Err(error) => {
+                        tracing::error!(%error, "durable analysis descriptors were unavailable");
+                        let _ = self.analysis_runtime.drop_commit(&token);
+                        self.complete_background_operation(
+                            token.clone(),
+                            OperationCompletion::Failed(
+                                OperationFailureCode::AnalysisExecutionFailed,
+                            ),
+                        );
+                        if let Some(service) = self.project_store.as_mut() {
+                            let _ = service.close();
+                        }
+                        self.project_status_message = Some(
+                            "Analysis was saved, but the application could not admit it. Reopen the project before further project I/O."
+                                .to_owned(),
+                        );
+                        return;
+                    }
+                };
+                if self.complete_project_store_operation(
+                    token.clone(),
+                    OperationCompletion::AnalysisCommitted {
+                        projection,
+                        table,
+                        plot,
+                    },
+                ) {
+                    if let Err(error) = self.analysis_runtime.finish_commit(&token) {
+                        tracing::error!(%error, "durable analysis values could not be installed");
+                        self.project_status_message = Some(
+                            "Analysis was saved, but its values could not be shown until reopen."
+                                .to_owned(),
+                        );
+                    } else {
+                        self.project_status_message = Some("Analysis saved.".to_owned());
+                    }
+                } else {
+                    let _ = self.analysis_runtime.drop_commit(&token);
+                    self.complete_background_operation(
+                        token,
+                        OperationCompletion::Failed(OperationFailureCode::AnalysisExecutionFailed),
+                    );
+                }
+            }
             ProjectStoreServiceEvent::SavedAs {
                 token,
                 projection,
@@ -1478,6 +1536,7 @@ impl MiranteWorkbenchApp {
                 }
                 self.project_recovery_review = None;
                 self.project_recovery_panel_open = false;
+                self.analysis_runtime.clear_loaded();
                 self.project_status_message =
                     Some("Recovery opened as an unsaved Save-As-only project.".to_owned());
             }
@@ -1492,6 +1551,67 @@ impl MiranteWorkbenchApp {
                 } else {
                     self.complete_project_store_fault(token, fault);
                 }
+            }
+            ProjectStoreServiceEvent::ArtifactsLoaded {
+                project_id,
+                revision,
+                currentness,
+                generation_id: _,
+                result,
+            } => {
+                self.pending_analysis_artifact_load = None;
+                match result {
+                    Ok(artifacts) => {
+                        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+                        let expected_source = match snapshot.source() {
+                            SourceVerificationSnapshot::Verified(source) => Some(source.clone()),
+                            SourceVerificationSnapshot::Required
+                            | SourceVerificationSnapshot::Verifying { .. } => None,
+                        };
+                        let staged = expected_source
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("the analysis source is no longer verified")
+                            })
+                            .and_then(|source| {
+                                self.analysis_runtime
+                                    .stage_authenticated_bundles(artifacts, &source)
+                            })
+                            .and_then(|bundles| {
+                                current_egui_shell_bridge::dispatch(
+                                    &mut self.application,
+                                    ApplicationCommand::InstallLoadedAnalysisDescriptors {
+                                        project_id,
+                                        revision,
+                                        currentness,
+                                        bundles,
+                                    },
+                                )
+                                .map_err(|fault| {
+                                    anyhow::anyhow!(
+                                        "saved analysis descriptors were rejected: {fault:?}"
+                                    )
+                                })?;
+                                self.analysis_runtime.finish_authenticated_bundles()
+                            });
+                        if let Err(error) = staged {
+                            self.analysis_runtime.drop_authenticated_bundles();
+                            self.project_status_message =
+                                Some(format!("Saved analysis values could not be shown: {error}"));
+                        }
+                    }
+                    Err(fault) => {
+                        self.analysis_runtime.drop_authenticated_bundles();
+                        self.project_status_message = Some(format!(
+                            "Saved analysis values could not be loaded: {fault}"
+                        ));
+                    }
+                }
+            }
+            ProjectStoreServiceEvent::OperationFailed { token, fault }
+                if token.kind() == OperationKind::Analysis =>
+            {
+                let _ = self.analysis_runtime.drop_commit(&token);
+                self.complete_project_store_fault(token, fault);
             }
             ProjectStoreServiceEvent::OperationFailed { token, fault } => {
                 self.complete_project_store_fault(token, fault);
@@ -2380,6 +2500,7 @@ impl MiranteWorkbenchApp {
         let old_dataset = std::mem::replace(&mut self.dataset, dataset);
         let old_render_runtime = std::mem::replace(&mut self.render_runtime, render_runtime);
         let old_analysis_runtime = std::mem::replace(&mut self.analysis_runtime, analysis_runtime);
+        self.pending_analysis_artifact_load = None;
         let old_import_runtime = std::mem::replace(
             &mut self.import_runtime,
             current_runtime::import::CurrentImportRuntime::idle(),
@@ -2449,6 +2570,9 @@ impl MiranteWorkbenchApp {
         if effect == CommandEffect::Changed {
             let after = current_egui_shell_bridge::snapshot(&self.application);
             self.reconcile_application_change(&previous_view, &after, ctx);
+            if let Err(error) = self.reconcile_analysis_currentness() {
+                tracing::warn!(%error, "stale analysis could not be retired");
+            }
         }
         self.pump_application_services();
         Ok(effect)

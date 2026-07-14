@@ -448,19 +448,17 @@ Required work:
   presentation.
 - Route all dataset reads through scheduler-controlled priority and cache
   admission.
-- Define exact, approximate, and preview semantics per operation.
-- For every retained scientific operation, freeze accumulation precision/order,
-  mask and validity semantics, variance/percentile definitions, exact versus
-  approximate behavior, and tolerance rules against hand-derived rational or
-  dependency-independent high-precision facts; shared production math or a
-  vague “NumPy-style” comparison is not an oracle.
-- Promote those facts, oracle/tolerance manifests, and provenance assertions
-  before the corresponding operation becomes an authoritative product route.
+- Retain only exact full-intensity summaries/time traces and exact axis-aligned
+  box-ROI intensity statistics. Reject approximate and preview execution.
+- Freeze deterministic traversal and accumulation, validity-mask behavior, and
+  population-variance semantics for `uint8`, `uint16`, and finite `float32`
+  against small checked-in hand-computed facts. Do not add an oracle manifest
+  or separate evidence workflow.
 - Implement bounded progress, cancellation, provenance, and derived-artifact
   commit contracts through WP-10B's transactional project store; analysis must
   not create a second artifact-persistence authority.
-- Preserve ROI, track, measurement, table, plot, annotation, and intensity
-  capabilities only where their product contracts are approved.
+- Preserve existing ROI, track, measurement, table, plot, and annotation value
+  types where needed, but add no new tracking or segmentation algorithms.
 - Do not reintroduce label/segmentation models through a generic artifact path.
 - Switch the sole reachable product analysis route to `analysis-runtime` and
   delete the app-local predecessor in the WP-12 cutover; WP-10C later changes
@@ -468,18 +466,26 @@ Required work:
 
 Exit proof:
 
-- Analysis cannot starve or bypass interactive data policy.
-- Cancelled/failed work cannot produce an artifact that appears complete.
-- Independently governed scientific goldens, reviewed tolerances, and
-  provenance round trips pass; the candidate implementation cannot update and
-  bless its oracle in the same evidence run.
-- Failure injection proves derived artifacts become visible atomically through
-  the project store or not at all.
-- Large-data analysis stays within approved resources.
+- Focused scheduling tests prove analysis uses analysis priority, remains
+  bounded, and cannot prevent a current-view request from completing first.
+- Cancelled, failed, or stale work cannot produce an artifact that appears
+  complete, and all accounted resources are released.
+- Small hand-computed scientific cases and provenance round trips pass for the
+  two retained operations without sharing production math as the expected
+  result.
+- One table/plot bundle becomes visible in a single project generation and
+  survives reopen; focused failure injection before publication exposes
+  neither artifact. Accepted WP-10B durability evidence is inherited rather
+  than rerun.
+- One configured-memory pressure case proves bounded streaming without a huge
+  dataset simulation or a performance claim.
 - App-local analysis job channels, direct `DatasetHandle` scans, stringified
   operation plumbing, and the temporary WP-08B analysis adapter are deleted.
 - The current `mirante4d-analysis` crate/path is deleted without a compatibility
   facade after `analysis-core` and `analysis-runtime` own the retained scope.
+- One small product exercise covers cancel, complete, save, and reopen at
+  1280×720, with a short 1920×1080 check. No 4K, private-data, performance,
+  or broad operation matrix applies to WP-12.
 
 ### WP-14 — Verification, Release, And Contributor Hardening
 

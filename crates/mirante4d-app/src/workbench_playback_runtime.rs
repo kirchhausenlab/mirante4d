@@ -6,7 +6,7 @@ use mirante4d_project_model::ViewState;
 use crate::{
     BACKGROUND_WORK_REPAINT_INTERVAL,
     current_runtime::{
-        analysis::CurrentAnalysisRuntime, import::CurrentImportRuntime,
+        analysis::AnalysisProductRuntime, import::CurrentImportRuntime,
         render::CurrentRenderRuntime,
     },
     dataset_requests::{DatasetDemandState, SCOPE_CURRENT_3D},
@@ -17,7 +17,7 @@ use crate::{
 pub(crate) fn background_work_active(
     snapshot: &ApplicationSnapshot,
     import: &CurrentImportRuntime,
-    _analysis: &CurrentAnalysisRuntime,
+    _analysis: &AnalysisProductRuntime,
     dataset: &DatasetDemandState,
     render: &CurrentRenderRuntime,
 ) -> bool {
@@ -60,6 +60,7 @@ fn pending_application_service_work(
                     | OperationKind::SourceVerification
                     | OperationKind::ProjectOpen
                     | OperationKind::ProjectSave
+                    | OperationKind::Analysis
             )
         })
 }
@@ -122,18 +123,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_and_project_operations_keep_application_services_polling() {
+    fn source_project_and_analysis_operations_keep_application_services_polling() {
         for kind in [
             OperationKind::DatasetOpen,
             OperationKind::SourceVerification,
             OperationKind::ProjectOpen,
             OperationKind::ProjectSave,
+            OperationKind::Analysis,
         ] {
             assert!(pending_application_service_work([kind], false));
         }
 
         assert!(!pending_application_service_work(
-            [OperationKind::Analysis, OperationKind::Import],
+            [OperationKind::Import],
             false,
         ));
     }

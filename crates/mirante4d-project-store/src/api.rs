@@ -1,16 +1,17 @@
 use std::{
     collections::{BTreeMap, btree_map::Entry},
     fmt,
-    io::{self, Read},
+    io::{self, Cursor, Read},
     num::NonZeroU64,
     path::{Component, Path, PathBuf},
     str::FromStr,
+    sync::Arc,
 };
 
-use mirante4d_identity::{ExactBytesDigest, RawObjectDescriptor, Sha256Digest};
+use mirante4d_identity::{ExactBytesDigest, ExactBytesHasher, RawObjectDescriptor, Sha256Digest};
 use mirante4d_project_model::{
-    MAX_ARTIFACTS, ProjectGenerationProjection, ProjectId, ProjectRevisionHighWater,
-    ProjectRevisionId,
+    ArtifactHandleId, ArtifactReference, MAX_ARTIFACTS, ProjectGenerationProjection, ProjectId,
+    ProjectRevisionHighWater, ProjectRevisionId,
 };
 use thiserror::Error;
 
@@ -279,6 +280,66 @@ pub trait ProjectObjectSource: Send + Sync {
     fn descriptor(&self) -> &RawObjectDescriptor;
 
     fn open(&self) -> io::Result<Box<dyn Read + Send>>;
+}
+
+/// A small owned exact-byte source for callers that already hold an artifact
+/// descriptor and its complete immutable bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectObjectBytes {
+    descriptor: RawObjectDescriptor,
+    bytes: Arc<[u8]>,
+}
+
+impl ProjectObjectBytes {
+    pub fn new(descriptor: RawObjectDescriptor, bytes: Vec<u8>) -> Result<Self, ProjectStoreFault> {
+        let facts = ExactBytesHasher::hash(&bytes).map_err(|_| ProjectStoreFault::Capacity {
+            stage: "object_bytes",
+        })?;
+        if facts.digest() != descriptor.digest() || facts.byte_length() != descriptor.byte_length()
+        {
+            return Err(ProjectStoreFault::DigestMismatch);
+        }
+        Ok(Self {
+            descriptor,
+            bytes: Arc::from(bytes),
+        })
+    }
+}
+
+impl ProjectObjectSource for ProjectObjectBytes {
+    fn descriptor(&self) -> &RawObjectDescriptor {
+        &self.descriptor
+    }
+
+    fn open(&self) -> io::Result<Box<dyn Read + Send>> {
+        Ok(Box::new(Cursor::new(Arc::clone(&self.bytes))))
+    }
+}
+
+/// One authenticated artifact value loaded from an explicitly named project
+/// generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadedProjectArtifact {
+    reference: ArtifactReference,
+    bytes: Vec<u8>,
+}
+
+impl LoadedProjectArtifact {
+    pub(crate) const fn new(reference: ArtifactReference, bytes: Vec<u8>) -> Self {
+        Self { reference, bytes }
+    }
+
+    pub fn reference(&self) -> &ArtifactReference {
+        &self.reference
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn into_parts(self) -> (ArtifactReference, Vec<u8>) {
+        (self.reference, self.bytes)
+    }
 }
 
 /// One object source bound to the descriptor observed when the commit was
@@ -801,6 +862,11 @@ pub enum ProjectStoreCommand {
         request_id: ProjectStoreRequestId,
         generation_id: ProjectGenerationId,
     },
+    LoadArtifacts {
+        request_id: ProjectStoreRequestId,
+        generation_id: ProjectGenerationId,
+        artifact_handles: Vec<ArtifactHandleId>,
+    },
     Pin {
         request_id: ProjectStoreRequestId,
         checkpoint_id: String,
@@ -842,6 +908,7 @@ impl ProjectStoreCommand {
             | Self::SaveAs { request_id, .. }
             | Self::InspectRecovery { request_id }
             | Self::OpenRecovery { request_id, .. }
+            | Self::LoadArtifacts { request_id, .. }
             | Self::Pin { request_id, .. }
             | Self::Unpin { request_id, .. }
             | Self::PlanCompaction { request_id }
@@ -888,6 +955,10 @@ pub enum ProjectStoreCompletion {
         /// Session head IDs remain the actual ref facts; selection repairs no ref.
         result: Result<(ProjectStoreSession, ProjectGenerationProjection), ProjectStoreFault>,
     },
+    ArtifactsLoaded {
+        request_id: ProjectStoreRequestId,
+        result: Result<Vec<LoadedProjectArtifact>, ProjectStoreFault>,
+    },
     Pinned {
         request_id: ProjectStoreRequestId,
         result: Result<(), ProjectStoreFault>,
@@ -932,6 +1003,7 @@ impl ProjectStoreCompletion {
             | Self::Autosaved { request_id, .. }
             | Self::RecoveryInspected { request_id, .. }
             | Self::RecoveryOpened { request_id, .. }
+            | Self::ArtifactsLoaded { request_id, .. }
             | Self::Pinned { request_id, .. }
             | Self::Unpinned { request_id, .. }
             | Self::CompactionPlanned { request_id, .. }
@@ -1112,6 +1184,37 @@ mod tests {
                 stage: "duplicate_object_source"
             })
         ));
+    }
+
+    #[test]
+    fn owned_object_bytes_authenticate_once_and_open_fresh_cursors() {
+        let bytes = b"small analysis artifact".to_vec();
+        let facts = ExactBytesHasher::hash(&bytes).unwrap();
+        let descriptor = RawObjectDescriptor::new(
+            facts.digest(),
+            facts.byte_length(),
+            mirante4d_identity::MediaType::parse("application/octet-stream").unwrap(),
+            mirante4d_identity::ObjectRole::parse("project.object").unwrap(),
+        );
+        let source = ProjectObjectBytes::new(descriptor.clone(), bytes.clone()).unwrap();
+        assert_eq!(source.descriptor(), &descriptor);
+        for _ in 0..2 {
+            let mut opened = source.open().unwrap();
+            let mut observed = Vec::new();
+            opened.read_to_end(&mut observed).unwrap();
+            assert_eq!(observed, bytes);
+        }
+
+        let wrong_descriptor = RawObjectDescriptor::new(
+            descriptor.digest(),
+            descriptor.byte_length() + 1,
+            descriptor.media_type().clone(),
+            descriptor.role().clone(),
+        );
+        assert_eq!(
+            ProjectObjectBytes::new(wrong_descriptor, bytes),
+            Err(ProjectStoreFault::DigestMismatch)
+        );
     }
 
     #[test]

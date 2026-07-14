@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use mirante4d_domain::{DvrOpacityTransfer, RenderMode, RenderState, Shape3D};
+use mirante4d_domain::{DvrOpacityTransfer, RenderMode, RenderState};
 use mirante4d_render_api::PresentationViewport;
 use mirante4d_renderer::{
     CameraRenderMode, CameraRenderModeF32, DvrRenderParameters, IntensityTransfer,
@@ -9,7 +9,7 @@ use mirante4d_renderer::{
 };
 
 use crate::{
-    FrameCompleteness, FrameFailureKind, IntensitySummary, LodDecisionReason,
+    FrameCompleteness, FrameFailureKind, LodDecisionReason,
     current_runtime::render::CurrentRenderRuntime,
 };
 
@@ -62,18 +62,6 @@ pub(crate) fn empty_iso_surface_frame(viewport: RenderViewport) -> IsoSurfaceFra
         PixelCoverage::Mask(vec![0; pixel_count]),
     )
     .expect("placeholder ISO surface dimensions are internally consistent")
-}
-
-pub(crate) fn metadata_intensity_summary(shape: Shape3D) -> anyhow::Result<IntensitySummary> {
-    let voxel_count = shape.element_count()?;
-    Ok(IntensitySummary {
-        voxel_count,
-        geometric_voxel_count: voxel_count,
-        nonzero_count: 0,
-        min: 0,
-        max: 0,
-        mean: 0.0,
-    })
 }
 
 pub(crate) fn set_render_viewport(

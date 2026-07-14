@@ -45,7 +45,8 @@ const WP07B_BOUNDARY_CRATES: &[&str] = &[
 
 pub(crate) fn architecture_self_check() -> anyhow::Result<()> {
     let required = [
-        "crates/mirante4d-analysis",
+        "crates/mirante4d-analysis-core",
+        "crates/mirante4d-analysis-runtime",
         "crates/mirante4d-format",
         "crates/mirante4d-import",
         "crates/mirante4d-data",
@@ -64,6 +65,9 @@ pub(crate) fn architecture_self_check() -> anyhow::Result<()> {
         if !Path::new(path).is_dir() {
             bail!("required crate directory is missing: {path}");
         }
+    }
+    if Path::new("crates/mirante4d-analysis").exists() {
+        bail!("retired predecessor crate directory exists: crates/mirante4d-analysis");
     }
     for forbidden in ["crates/mirante4d-core", "crates/mirante4d-preprocess"] {
         if Path::new(forbidden).exists() {
@@ -860,6 +864,8 @@ fn check_wp07b_live_cutover(
         })
         .collect::<BTreeSet<_>>();
     let live_foundation_edges = BTreeSet::from([
+        ("mirante4d-analysis-core", "mirante4d-dataset"),
+        ("mirante4d-analysis-runtime", "mirante4d-dataset"),
         ("mirante4d-application", "mirante4d-render-api"),
         ("mirante4d-data", "mirante4d-dataset"),
         ("mirante4d-dataset-runtime", "mirante4d-dataset"),
@@ -1028,15 +1034,6 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
             ),
         ),
         (
-            "analysis",
-            (
-                "crates/mirante4d-app/src/current_runtime/analysis.rs",
-                "CurrentAnalysisRuntime",
-                "analysis_runtime",
-                "WP-12",
-            ),
-        ),
-        (
             "validation",
             (
                 "crates/mirante4d-app/src/current_runtime/validation.rs",
@@ -1098,6 +1095,7 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
     let expected_runtime_files = expected_owners
         .keys()
         .map(|module| format!("{module}.rs"))
+        .chain(std::iter::once("analysis.rs".to_owned()))
         .chain(std::iter::once("mod.rs".to_owned()))
         .collect::<BTreeSet<_>>();
     if actual_runtime_files != expected_runtime_files {
@@ -1110,9 +1108,12 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
     let expected_modules = expected_owners
         .keys()
         .map(|module| (*module).to_owned())
+        .chain(std::iter::once("analysis".to_owned()))
         .collect::<BTreeSet<_>>();
     if actual_modules != expected_modules {
-        bail!("current_runtime must declare exactly the five remaining temporary owners");
+        bail!(
+            "current_runtime must declare four temporary owners plus the analysis product bridge"
+        );
     }
 
     let app_root = repo_root.join("crates/mirante4d-app/src");
@@ -1123,14 +1124,19 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
     {
         bail!("MiranteWorkbenchApp must compose DatasetDemandState without CurrentDatasetRuntime");
     }
-    let owner_type_names = expected_owners
+    let mut owner_type_names = expected_owners
         .values()
         .map(|(_, type_name, _, _)| *type_name)
         .collect::<BTreeSet<_>>();
-    let expected_composition = expected_owners
+    owner_type_names.insert("AnalysisProductRuntime");
+    let mut expected_composition = expected_owners
         .values()
         .map(|(_, type_name, field, _)| ((*field).to_owned(), (*type_name).to_owned()))
         .collect::<BTreeMap<_, _>>();
+    expected_composition.insert(
+        "analysis_runtime".to_owned(),
+        "AnalysisProductRuntime".to_owned(),
+    );
     let actual_composition = app_fields
         .iter()
         .filter(|(_, type_name)| owner_type_names.contains(type_name.as_str()))
@@ -1152,7 +1158,7 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
     check_wp08b_dataset_dispatcher(repo_root, &app_root, &app_fields)?;
     check_wp08b_bridges(repo_root, &app_root)?;
     check_wp08b_predecessor_absence(repo_root, &ledger)?;
-    check_wp08b_passive_analysis(repo_root, &ledger)
+    check_wp12_analysis_cutover(repo_root, &ledger)
 }
 
 fn check_wp08b_dataset_dispatcher(
@@ -1359,49 +1365,23 @@ fn check_wp08b_predecessor_absence(
     Ok(())
 }
 
-fn check_wp08b_passive_analysis(
-    repo_root: &Path,
-    ledger: &serde_json::Value,
-) -> anyhow::Result<()> {
-    let analysis_owner = ledger
+fn check_wp12_analysis_cutover(repo_root: &Path, ledger: &serde_json::Value) -> anyhow::Result<()> {
+    if ledger
         .get("temporary_owners")
         .and_then(serde_json::Value::as_array)
-        .and_then(|owners| {
-            owners.iter().find(|owner| {
+        .is_some_and(|owners| {
+            owners.iter().any(|owner| {
                 owner.get("module").and_then(serde_json::Value::as_str) == Some("analysis")
             })
         })
-        .context("WP-08B ledger must retain the passive analysis owner")?;
-    if analysis_owner
-        .get("mode")
-        .and_then(serde_json::Value::as_str)
-        != Some("passive-results-only")
-        || analysis_owner
-            .get("expires")
-            .and_then(serde_json::Value::as_str)
-            != Some("WP-12")
     {
-        bail!("current analysis must remain passive until WP-12");
+        bail!("the retired passive analysis owner remains in the live field ledger");
     }
     let path = repo_root.join("crates/mirante4d-app/src/current_runtime/analysis.rs");
     let source = fs::read_to_string(&path)?;
-    if !source.contains("Analysis execution is deferred until WP-12.") {
-        bail!("current analysis does not expose its WP-12 deferred state");
-    }
-    for forbidden in [
-        "AccountedResourceLease",
-        "DatasetHandle",
-        "DatasetRuntime",
-        "ResourceRequest",
-        "mpsc",
-        "thread",
-        "read_u8",
-        "read_u16",
-        "read_f32",
-    ] {
-        if source_contains_identifier(&source, forbidden) {
-            bail!("passive analysis owner contains execution authority {forbidden}");
-        }
+    rust_struct_field_names(&source, "AnalysisProductRuntime")?;
+    if source.contains("struct CurrentAnalysisRuntime") {
+        bail!("the retired passive analysis owner remains after WP-12");
     }
     Ok(())
 }

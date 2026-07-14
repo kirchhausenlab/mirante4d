@@ -9,7 +9,6 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 glam.workspace = true
-mirante4d-analysis.workspace = true
 mirante4d-data.workspace = true
 mirante4d-dataset.workspace = true
 mirante4d-dataset-runtime.workspace = true

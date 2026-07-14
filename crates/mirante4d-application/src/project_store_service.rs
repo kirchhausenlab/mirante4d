@@ -11,19 +11,19 @@ use std::time::{Duration, Instant};
 
 use mirante4d_identity::ScientificContentId;
 use mirante4d_project_model::{
-    ProjectGenerationProjection, ProjectId, ProjectRevisionHighWater, ProjectRevisionId,
-    ProjectState,
+    ArtifactHandleId, ArtifactReference, ProjectGenerationProjection, ProjectId,
+    ProjectRevisionHighWater, ProjectRevisionId, ProjectState,
 };
 use mirante4d_project_store::{
-    ProjectCommitCapture, ProjectGenerationId, ProjectObjectSource, ProjectOpenMode,
-    ProjectRecoveryCandidate, ProjectStoreActor, ProjectStoreCommand, ProjectStoreCompletion,
-    ProjectStoreConfig, ProjectStoreFault, ProjectStorePath, ProjectStoreReceipt,
-    ProjectStoreRequestId, ProjectStoreSession,
+    LoadedProjectArtifact, ProjectCommitCapture, ProjectGenerationId, ProjectObjectSource,
+    ProjectOpenMode, ProjectRecoveryCandidate, ProjectStoreActor, ProjectStoreCommand,
+    ProjectStoreCompletion, ProjectStoreConfig, ProjectStoreFault, ProjectStorePath,
+    ProjectStoreReceipt, ProjectStoreRequestId, ProjectStoreSession,
 };
 
 use super::{
-    ApplicationSnapshot, OperationId, OperationKind, OperationToken, SourceVerificationSnapshot,
-    WorkspaceSnapshot,
+    ApplicationSnapshot, CurrentnessGeneration, OperationId, OperationKind, OperationToken,
+    SourceVerificationSnapshot, WorkspaceSnapshot,
 };
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
@@ -389,6 +389,25 @@ impl StoreBinding {
         }
     }
 
+    fn established_manual_project_for_artifact_load(
+        &self,
+        generation_id: ProjectGenerationId,
+    ) -> Result<ProjectId, ProjectStoreServiceError> {
+        match self {
+            Self::Established(facts) if facts.current_manual == Some(generation_id) => {
+                Ok(facts.project_id)
+            }
+            Self::Closed => Err(ProjectStoreServiceError::Closing),
+            Self::Unbound { .. }
+            | Self::Provisional(_)
+            | Self::Established(_)
+            | Self::RecoveryOnly
+            | Self::RecoverySelected { .. } => {
+                Err(ProjectStoreServiceError::RecoveryCandidateUnavailable)
+            }
+        }
+    }
+
     fn autosave_capture_facts(
         &self,
         project_id: ProjectId,
@@ -534,6 +553,11 @@ enum ForegroundKind {
         revision_high_water: ProjectRevisionHighWater,
         expected_parent: ProjectGenerationId,
     },
+    AnalysisCommit {
+        token: OperationToken,
+        projection: Box<ProjectGenerationProjection>,
+        expected_parent: ProjectGenerationId,
+    },
     SaveAs {
         token: OperationToken,
         destination: ProjectStorePath,
@@ -554,6 +578,14 @@ enum ForegroundKind {
         generation_id: ProjectGenerationId,
         expected_projection: Box<ProjectGenerationProjection>,
     },
+    LoadArtifacts {
+        project_id: ProjectId,
+        revision: ProjectRevisionId,
+        currentness: CurrentnessGeneration,
+        source_identity: ScientificContentId,
+        generation_id: ProjectGenerationId,
+        artifacts: Vec<ArtifactReference>,
+    },
 }
 
 impl ForegroundKind {
@@ -562,6 +594,7 @@ impl ForegroundKind {
             Self::Open { token, .. }
             | Self::Create { token, .. }
             | Self::ManualSave { token, .. }
+            | Self::AnalysisCommit { token, .. }
             | Self::SaveAs { token, .. }
             | Self::OpenRecovery { token, .. }
             | Self::SelectProvisionalOpen { token, .. } => Some(token),
@@ -570,6 +603,7 @@ impl ForegroundKind {
                 | InspectionContext::FailedOpen { token, .. } => Some(token),
                 InspectionContext::Explicit => None,
             },
+            Self::LoadArtifacts { .. } => None,
         }
     }
 }
@@ -579,6 +613,12 @@ struct ActiveForeground {
     request_id: ProjectStoreRequestId,
     cancellation_request: Option<ProjectStoreRequestId>,
     kind: ForegroundKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RetiredForegroundCancellation {
+    request_id: ProjectStoreRequestId,
+    target_request_id: ProjectStoreRequestId,
 }
 
 #[derive(Debug)]
@@ -607,6 +647,11 @@ pub enum ProjectStoreServiceEvent {
         token: OperationToken,
         receipt: ProjectStoreReceipt,
     },
+    AnalysisCommitted {
+        token: OperationToken,
+        projection: Box<ProjectGenerationProjection>,
+        receipt: ProjectStoreReceipt,
+    },
     SavedAs {
         token: OperationToken,
         projection: Box<ProjectGenerationProjection>,
@@ -627,6 +672,13 @@ pub enum ProjectStoreServiceEvent {
         token: OperationToken,
         fault: ProjectStoreFault,
         normal_open_still_available: bool,
+    },
+    ArtifactsLoaded {
+        project_id: ProjectId,
+        revision: ProjectRevisionId,
+        currentness: CurrentnessGeneration,
+        generation_id: ProjectGenerationId,
+        result: Result<Vec<LoadedProjectArtifact>, ProjectStoreFault>,
     },
     OperationFailed {
         token: OperationToken,
@@ -683,6 +735,7 @@ pub struct ProjectStoreApplicationService<C> {
     scheduler: AutosaveScheduler,
     binding: StoreBinding,
     active_foreground: Option<ActiveForeground>,
+    retired_foreground_cancellation: Option<RetiredForegroundCancellation>,
     active_autosave: Option<ActiveAutosave>,
     pending_normal_open: Option<PendingNormalOpen>,
     recovery_candidates: Vec<ProjectRecoveryCandidate>,
@@ -730,6 +783,7 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
                 provisional_destination,
             },
             active_foreground: None,
+            retired_foreground_cancellation: None,
             active_autosave: None,
             pending_normal_open: None,
             recovery_candidates: Vec::new(),
@@ -959,6 +1013,99 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
         Ok(request_id)
     }
 
+    /// Atomically publishes an analysis revision and all of its artifact objects.
+    ///
+    /// Analysis may only append to an established writable project. The
+    /// projection remains prospective until the existing manual-save command
+    /// durably commits it, so callers cannot expose either the table or plot
+    /// before both are stored.
+    pub fn submit_analysis_commit(
+        &mut self,
+        snapshot: &ApplicationSnapshot,
+        token: OperationToken,
+        projection: ProjectGenerationProjection,
+        object_sources: Vec<Box<dyn ProjectObjectSource>>,
+    ) -> Result<ProjectStoreRequestId, ProjectStoreServiceError> {
+        self.require_writable_idle()?;
+
+        if token.kind() != OperationKind::Analysis
+            || !snapshot
+                .active_operations()
+                .iter()
+                .any(|active| active == &token)
+            || token.source_session_generation() != snapshot.source_generation()
+            || token.currentness_generation() != snapshot.currentness()
+        {
+            return Err(ProjectStoreServiceError::InvalidOperationToken);
+        }
+        let SourceVerificationSnapshot::Verified(source) = snapshot.source() else {
+            return Err(ProjectStoreServiceError::InvalidApplicationSnapshot);
+        };
+        let WorkspaceSnapshot::Bound {
+            project,
+            revision,
+            revision_high_water,
+            ..
+        } = snapshot.workspace()
+        else {
+            return Err(ProjectStoreServiceError::InvalidApplicationSnapshot);
+        };
+        let project_id = project.project_id();
+        if token.project_id() != Some(project_id)
+            || token.project_revision() != Some(*revision)
+            || token.source_identity() != Some(*source.scientific_content_id())
+            || !project.dataset().has_same_scientific_content(source)
+        {
+            return Err(ProjectStoreServiceError::InvalidOperationToken);
+        }
+        let mut expected_high_water = revision_high_water.clone();
+        let expected_revision = expected_high_water
+            .allocate_after(*revision)
+            .map_err(|_| ProjectStoreServiceError::InvalidProjection)?;
+        if projection.state().project_id() != project_id
+            || projection.state().dataset() != project.dataset()
+            || projection.revision() != expected_revision
+            || projection.revision_high_water() != &expected_high_water
+        {
+            return Err(ProjectStoreServiceError::InvalidProjection);
+        }
+
+        let StoreBinding::Established(facts) = &self.binding else {
+            return Err(ProjectStoreServiceError::SaveAsRequired);
+        };
+        if facts.project_id != project_id {
+            return Err(ProjectStoreServiceError::ProjectMismatch);
+        }
+        if facts.mode != ProjectOpenMode::PreferWritable {
+            return Err(ProjectStoreServiceError::ReadOnly);
+        }
+        let expected_parent = facts
+            .current_manual
+            .ok_or(ProjectStoreServiceError::UnexpectedCompletion)?;
+        let request_id = self.allocate_request_id()?;
+        let capture = ProjectCommitCapture::new(
+            projection.clone(),
+            Some(expected_parent),
+            None,
+            None,
+            object_sources,
+        )?;
+        self.actor()?.try_submit(ProjectStoreCommand::ManualSave {
+            request_id,
+            capture,
+        })?;
+        self.active_foreground = Some(ActiveForeground {
+            request_id,
+            cancellation_request: None,
+            kind: ForegroundKind::AnalysisCommit {
+                token,
+                projection: Box::new(projection),
+                expected_parent,
+            },
+        });
+        Ok(request_id)
+    }
+
     pub fn submit_save_as(
         &mut self,
         snapshot: &ApplicationSnapshot,
@@ -1039,6 +1186,68 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
             return Err(ProjectStoreServiceError::OperationConflict);
         }
         self.submit_inspection(InspectionContext::Explicit)
+    }
+
+    /// Loads one explicitly selected, bounded artifact bundle from a current
+    /// project head. The actor authenticates every byte before this service
+    /// publishes the bundle as one result.
+    pub fn submit_load_artifacts(
+        &mut self,
+        snapshot: &ApplicationSnapshot,
+        generation_id: ProjectGenerationId,
+        artifact_handles: Vec<ArtifactHandleId>,
+    ) -> Result<ProjectStoreRequestId, ProjectStoreServiceError> {
+        self.require_idle()?;
+        let bound_project_id = self
+            .binding
+            .established_manual_project_for_artifact_load(generation_id)?;
+        let SourceVerificationSnapshot::Verified(source) = snapshot.source() else {
+            return Err(ProjectStoreServiceError::InvalidApplicationSnapshot);
+        };
+        let WorkspaceSnapshot::Bound {
+            project, revision, ..
+        } = snapshot.workspace()
+        else {
+            return Err(ProjectStoreServiceError::InvalidApplicationSnapshot);
+        };
+        if project.project_id() != bound_project_id
+            || !project.dataset().has_same_scientific_content(source)
+        {
+            return Err(ProjectStoreServiceError::InvalidApplicationSnapshot);
+        }
+        let artifacts = artifact_handles
+            .iter()
+            .map(|handle| {
+                project
+                    .artifact(handle)
+                    .cloned()
+                    .ok_or(ProjectStoreServiceError::InvalidProjection)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let project_id = project.project_id();
+        let revision = *revision;
+        let currentness = snapshot.currentness();
+        let source_identity = *source.scientific_content_id();
+        let request_id = self.allocate_request_id()?;
+        self.actor()?
+            .try_submit(ProjectStoreCommand::LoadArtifacts {
+                request_id,
+                generation_id,
+                artifact_handles: artifact_handles.clone(),
+            })?;
+        self.active_foreground = Some(ActiveForeground {
+            request_id,
+            cancellation_request: None,
+            kind: ForegroundKind::LoadArtifacts {
+                project_id,
+                revision,
+                currentness,
+                source_identity,
+                generation_id,
+                artifacts,
+            },
+        });
+        Ok(request_id)
     }
 
     pub fn accept_normal_open(
@@ -1139,6 +1348,32 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
         Ok(request_id)
     }
 
+    pub fn cancel_artifact_load(
+        &mut self,
+        target_request_id: ProjectStoreRequestId,
+    ) -> Result<ProjectStoreRequestId, ProjectStoreServiceError> {
+        let active = self
+            .active_foreground
+            .as_ref()
+            .ok_or(ProjectStoreServiceError::OperationConflict)?;
+        if active.request_id != target_request_id
+            || !matches!(active.kind, ForegroundKind::LoadArtifacts { .. })
+            || active.cancellation_request.is_some()
+        {
+            return Err(ProjectStoreServiceError::OperationConflict);
+        }
+        let request_id = self.allocate_request_id()?;
+        self.actor()?.try_submit(ProjectStoreCommand::Cancel {
+            request_id,
+            target_request_id,
+        })?;
+        self.active_foreground
+            .as_mut()
+            .expect("artifact load was checked")
+            .cancellation_request = Some(request_id);
+        Ok(request_id)
+    }
+
     pub fn cancel_active_autosave(
         &mut self,
     ) -> Result<ProjectStoreRequestId, ProjectStoreServiceError> {
@@ -1212,7 +1447,7 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
             let Some(completion) = self.actor()?.try_recv() else {
                 break;
             };
-            events.extend(self.handle_completion(completion)?);
+            events.extend(self.handle_completion_with_snapshot(completion, Some(snapshot))?);
         }
         if !events.is_empty() {
             // Any completion can change the reducer snapshot or retire work.
@@ -1297,6 +1532,7 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
 
     pub const fn has_pending_work(&self) -> bool {
         self.active_foreground.is_some()
+            || self.retired_foreground_cancellation.is_some()
             || self.active_autosave.is_some()
             || self.close_request.is_some()
     }
@@ -1325,6 +1561,7 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
 
     fn require_no_actor_work(&self) -> Result<(), ProjectStoreServiceError> {
         if self.active_foreground.is_some()
+            || self.retired_foreground_cancellation.is_some()
             || self.active_autosave.is_some()
             || self.close_request.is_some()
         {
@@ -1386,9 +1623,18 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
         Ok(request_id)
     }
 
+    #[cfg(test)]
     fn handle_completion(
         &mut self,
         completion: ProjectStoreCompletion,
+    ) -> Result<Vec<ProjectStoreServiceEvent>, ProjectStoreServiceError> {
+        self.handle_completion_with_snapshot(completion, None)
+    }
+
+    fn handle_completion_with_snapshot(
+        &mut self,
+        completion: ProjectStoreCompletion,
+        snapshot: Option<&ApplicationSnapshot>,
     ) -> Result<Vec<ProjectStoreServiceEvent>, ProjectStoreServiceError> {
         match completion {
             ProjectStoreCompletion::Cancelled { request_id, result } => {
@@ -1404,6 +1650,7 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
                 self.close_request = None;
                 self.binding = StoreBinding::Closed;
                 self.active_foreground = None;
+                self.retired_foreground_cancellation = None;
                 self.active_autosave = None;
                 self.recovery_candidates.clear();
                 Ok(vec![ProjectStoreServiceEvent::Closed {
@@ -1411,7 +1658,7 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
                     result,
                 }])
             }
-            completion => self.handle_foreground_completion(completion),
+            completion => self.handle_foreground_completion(completion, snapshot),
         }
     }
 
@@ -1437,6 +1684,19 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
             return Ok(vec![ProjectStoreServiceEvent::CancellationAcknowledged {
                 request_id,
                 target_request_id: active.request_id,
+            }]);
+        }
+        if self
+            .retired_foreground_cancellation
+            .is_some_and(|retired| retired.request_id == request_id)
+        {
+            let retired = self
+                .retired_foreground_cancellation
+                .take()
+                .expect("late foreground cancellation was matched");
+            return Ok(vec![ProjectStoreServiceEvent::CancellationAcknowledged {
+                request_id,
+                target_request_id: retired.target_request_id,
             }]);
         }
         Err(ProjectStoreServiceError::UnexpectedCompletion)
@@ -1478,6 +1738,7 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
     fn handle_foreground_completion(
         &mut self,
         completion: ProjectStoreCompletion,
+        snapshot: Option<&ApplicationSnapshot>,
     ) -> Result<Vec<ProjectStoreServiceEvent>, ProjectStoreServiceError> {
         let request_id = completion.request_id();
         let active = self
@@ -1488,7 +1749,8 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
             self.active_foreground = Some(active);
             return Err(ProjectStoreServiceError::UnexpectedCompletion);
         }
-        match (active.kind, completion) {
+        let cancellation_request = active.cancellation_request;
+        let outcome = match (active.kind, completion) {
             (
                 ForegroundKind::Open { token, path, mode },
                 ProjectStoreCompletion::Opened { result, .. },
@@ -1512,36 +1774,39 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
                                 .and_then(|facts| facts.current_autosave)
                                 .ok_or(ProjectStoreServiceError::UnexpectedCompletion)?;
                             let request_id = self.allocate_request_id()?;
-                            if let Err(fault) =
-                                self.actor()?.try_submit(ProjectStoreCommand::OpenRecovery {
-                                    request_id,
-                                    generation_id,
-                                })
-                            {
-                                self.binding = StoreBinding::RecoveryOnly;
-                                return Ok(vec![ProjectStoreServiceEvent::OpenFailed {
-                                    token,
-                                    fault,
-                                    candidates: Vec::new(),
-                                }]);
-                            }
-                            self.active_foreground = Some(ActiveForeground {
+                            match self.actor()?.try_submit(ProjectStoreCommand::OpenRecovery {
                                 request_id,
-                                cancellation_request: None,
-                                kind: ForegroundKind::SelectProvisionalOpen {
-                                    token,
-                                    generation_id,
-                                    expected_projection: Box::new(projection),
-                                },
-                            });
+                                generation_id,
+                            }) {
+                                Ok(()) => {
+                                    self.active_foreground = Some(ActiveForeground {
+                                        request_id,
+                                        cancellation_request: None,
+                                        kind: ForegroundKind::SelectProvisionalOpen {
+                                            token,
+                                            generation_id,
+                                            expected_projection: Box::new(projection),
+                                        },
+                                    });
+                                    Ok(Vec::new())
+                                }
+                                Err(fault) => {
+                                    self.binding = StoreBinding::RecoveryOnly;
+                                    Ok(vec![ProjectStoreServiceEvent::OpenFailed {
+                                        token,
+                                        fault,
+                                        candidates: Vec::new(),
+                                    }])
+                                }
+                            }
                         } else {
                             self.submit_inspection(InspectionContext::HealthyOpen {
                                 token,
                                 projection: Box::new(projection),
                                 opens_dirty: false,
                             })?;
+                            Ok(Vec::new())
                         }
-                        Ok(Vec::new())
                     } else {
                         Err(ProjectStoreServiceError::UnexpectedCompletion)
                     }
@@ -1611,6 +1876,38 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
                     self.recovery_candidates.clear();
                     Ok(vec![ProjectStoreServiceEvent::ManualSaved {
                         token,
+                        receipt,
+                    }])
+                }
+                Err(fault) => Ok(vec![self.failed_mutation_event(token, fault)]),
+            },
+            (
+                ForegroundKind::AnalysisCommit {
+                    token,
+                    projection,
+                    expected_parent,
+                },
+                ProjectStoreCompletion::ManualSaved { result, .. },
+            ) => match result {
+                Ok(receipt) => {
+                    if receipt.captured_revision() != projection.revision()
+                        || receipt.captured_revision_high_water()
+                            != projection.revision_high_water()
+                        || receipt.previous_generation_id() != Some(expected_parent)
+                        || receipt.autosave_base_generation_id().is_some()
+                    {
+                        self.writes_suspended = true;
+                        return Err(ProjectStoreServiceError::UnexpectedCompletion);
+                    }
+                    let StoreBinding::Established(facts) = &mut self.binding else {
+                        return Err(ProjectStoreServiceError::UnexpectedCompletion);
+                    };
+                    facts.current_manual = Some(receipt.current_generation_id());
+                    facts.current_autosave = None;
+                    self.recovery_candidates.clear();
+                    Ok(vec![ProjectStoreServiceEvent::AnalysisCommitted {
+                        token,
+                        projection,
                         receipt,
                     }])
                 }
@@ -1721,16 +2018,75 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
                     Ok(Vec::new())
                 }
             },
+            (
+                ForegroundKind::LoadArtifacts {
+                    project_id,
+                    revision,
+                    currentness,
+                    source_identity,
+                    generation_id,
+                    artifacts,
+                },
+                ProjectStoreCompletion::ArtifactsLoaded { result, .. },
+            ) => {
+                let result = match result {
+                    Ok(loaded)
+                        if loaded.len() != artifacts.len()
+                            || loaded
+                                .iter()
+                                .zip(&artifacts)
+                                .any(|(loaded, expected)| loaded.reference() != expected) =>
+                    {
+                        return Err(ProjectStoreServiceError::UnexpectedCompletion);
+                    }
+                    Ok(loaded) => {
+                        let snapshot =
+                            snapshot.ok_or(ProjectStoreServiceError::UnexpectedCompletion)?;
+                        if artifact_load_source_is_current(
+                            project_id,
+                            revision,
+                            currentness,
+                            source_identity,
+                            &artifacts,
+                            snapshot,
+                        ) {
+                            Ok(loaded)
+                        } else {
+                            Err(ProjectStoreFault::SourceChanged)
+                        }
+                    }
+                    Err(fault) => Err(fault),
+                };
+                Ok(vec![ProjectStoreServiceEvent::ArtifactsLoaded {
+                    project_id,
+                    revision,
+                    currentness,
+                    generation_id,
+                    result,
+                }])
+            }
             (kind, unexpected) => {
                 self.active_foreground = Some(ActiveForeground {
                     request_id,
-                    cancellation_request: active.cancellation_request,
+                    cancellation_request,
                     kind,
                 });
                 let _ = unexpected;
                 Err(ProjectStoreServiceError::UnexpectedCompletion)
             }
+        };
+        if outcome.is_ok()
+            && let Some(cancellation_request) = cancellation_request
+        {
+            if self.retired_foreground_cancellation.is_some() {
+                return Err(ProjectStoreServiceError::UnexpectedCompletion);
+            }
+            self.retired_foreground_cancellation = Some(RetiredForegroundCancellation {
+                request_id: cancellation_request,
+                target_request_id: request_id,
+            });
         }
+        outcome
     }
 
     fn finish_recovery_inspection(
@@ -1869,6 +2225,36 @@ fn active_autosave_source_is_current(
         && project.dataset().has_same_scientific_content(source)
 }
 
+fn artifact_load_source_is_current(
+    project_id: ProjectId,
+    revision: ProjectRevisionId,
+    currentness: CurrentnessGeneration,
+    source_identity: ScientificContentId,
+    artifacts: &[ArtifactReference],
+    snapshot: &ApplicationSnapshot,
+) -> bool {
+    let SourceVerificationSnapshot::Verified(source) = snapshot.source() else {
+        return false;
+    };
+    let WorkspaceSnapshot::Bound {
+        project,
+        revision: current_revision,
+        ..
+    } = snapshot.workspace()
+    else {
+        return false;
+    };
+    snapshot.currentness() == currentness
+        && project.project_id() == project_id
+        && *current_revision == revision
+        && source.scientific_content_id() == &source_identity
+        && project.dataset().scientific_content_id() == &source_identity
+        && project.dataset().has_same_scientific_content(source)
+        && artifacts
+            .iter()
+            .all(|artifact| project.artifact(artifact.handle_id()) == Some(artifact))
+}
+
 fn projection_from_snapshot(
     snapshot: &ApplicationSnapshot,
 ) -> Result<ProjectGenerationProjection, ProjectStoreServiceError> {
@@ -1949,3 +2335,55 @@ fn save_as_projection_from_snapshot(
 #[cfg(test)]
 #[path = "../tests/support/project_store_service.rs"]
 mod tests;
+
+#[cfg(test)]
+mod artifact_load_binding_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_established_manual_generation_can_load_artifacts() {
+        let project_id = ProjectId::from_bytes([91; 16]);
+        let manual = generation_id('a');
+        let autosave = generation_id('b');
+        let facts = |current_manual, current_autosave| SessionFacts {
+            path: ProjectStorePath::new("/tmp/artifact-load.m4dproj").unwrap(),
+            project_id,
+            mode: ProjectOpenMode::PreferWritable,
+            current_manual,
+            current_autosave,
+        };
+
+        assert_eq!(
+            StoreBinding::Established(facts(Some(manual), Some(autosave)))
+                .established_manual_project_for_artifact_load(manual),
+            Ok(project_id)
+        );
+        assert_eq!(
+            StoreBinding::Established(facts(Some(manual), Some(autosave)))
+                .established_manual_project_for_artifact_load(autosave),
+            Err(ProjectStoreServiceError::RecoveryCandidateUnavailable)
+        );
+        assert_eq!(
+            StoreBinding::Provisional(facts(None, Some(autosave)))
+                .established_manual_project_for_artifact_load(autosave),
+            Err(ProjectStoreServiceError::RecoveryCandidateUnavailable)
+        );
+        assert_eq!(
+            StoreBinding::RecoverySelected {
+                facts: facts(Some(manual), Some(autosave)),
+                selected_generation: autosave,
+            }
+            .established_manual_project_for_artifact_load(autosave),
+            Err(ProjectStoreServiceError::RecoveryCandidateUnavailable)
+        );
+    }
+
+    fn generation_id(digit: char) -> ProjectGenerationId {
+        ProjectGenerationId::parse(&format!(
+            "{}{}",
+            ProjectGenerationId::PREFIX,
+            digit.to_string().repeat(64)
+        ))
+        .unwrap()
+    }
+}

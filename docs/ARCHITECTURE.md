@@ -1,6 +1,6 @@
 # Architecture
 
-Last updated: 2026-07-13
+Last updated: 2026-07-14
 
 Mirante4D is a native Rust desktop viewer and analysis workbench. It opens
 strict `.m4d` packages; source microscopy data enters through explicit
@@ -8,7 +8,7 @@ import/preprocessing workflows.
 
 ## Workspace Boundaries
 
-The workspace has twenty packages (nineteen `mirante4d-*` crates plus
+The workspace has twenty-one packages (twenty `mirante4d-*` crates plus
 `xtask`):
 
 - `mirante4d-domain`: validated framework-neutral geometry, view, transfer,
@@ -29,6 +29,10 @@ The workspace has twenty packages (nineteen `mirante4d-*` crates plus
   deduplication, bounded configuration/diagnostics/progress, CPU-ledger,
   completion, fault, and accounted-lease contract plus the sole production
   scheduler and worker owner.
+- `mirante4d-analysis-core`: pure exact intensity operations, deterministic
+  statistics, and canonical table/plot artifact payloads.
+- `mirante4d-analysis-runtime`: bounded, cancellable analysis execution over
+  shared dataset-runtime requests, producing pending atomic artifact bundles.
 - `mirante4d-render-api`: backend-neutral intent, requirements, progressive
   frame status, opaque presentation lifecycle, and camera math.
 - `mirante4d-render-reference`: unpublished, bounded CPU oracle for renderer
@@ -43,9 +47,9 @@ The workspace has twenty packages (nineteen `mirante4d-*` crates plus
 - `mirante4d-import-pipeline`: off-product bounded, cancellable, restartable
   TIFF/OME-TIFF producer for validated sharded target packages; WP-10C owns its
   future product activation.
-- `mirante4d-data`, `mirante4d-format`, `mirante4d-import`,
-  `mirante4d-analysis`, and `mirante4d-renderer`: current storage/runtime,
-  format, import, analysis, and rendering implementations.
+- `mirante4d-data`, `mirante4d-format`, `mirante4d-import`, and
+  `mirante4d-renderer`: current storage/runtime, format, import, and rendering
+  implementations.
 - `mirante4d-app`: native composition and egui shell.
 - `xtask`: developer and verification tooling, never a product mode.
 
@@ -60,7 +64,7 @@ the render cutover.
 ## Application Composition
 
 `MiranteWorkbenchApp` holds `ApplicationState`, payload-free
-`DatasetDemandState`, process diagnostics, five remaining temporary runtime
+`DatasetDemandState`, process diagnostics, four remaining temporary runtime
 owners, and narrow project-store/settings/source-open handles. It is a
 composition root, not a second model.
 
@@ -71,7 +75,6 @@ The temporary owners and deletion gates are:
 | `CurrentRenderRuntime` | render status, frames, GPU and presentation resources | WP-09B |
 | `CurrentUiRuntime` | egui-local drafts and interaction facts | WP-09C |
 | `CurrentImportRuntime` | current import execution | WP-10C |
-| `CurrentAnalysisRuntime` | passive tables, plots, artifacts, and exports | WP-12 |
 | `CurrentValidationRuntime` | product-validation harness only | WP-14 |
 
 The private egui bridge translates UI input to `ApplicationCommand` and reads
@@ -88,6 +91,14 @@ WP-10C. `CurrentLeaseBridge` retains runtime leases without copying their
 payloads and is the one temporary current-renderer bridge until WP-09B. There
 is no alternate reader, scheduler, CPU display fallback, or app-owned payload
 map.
+
+`AnalysisProductRuntime` is the narrow product bridge to the analysis
+runtime. It uses the shared dispatcher below interactive priority and keeps at
+most two analysis blocks in flight. Exact whole-layer time traces and numeric
+box statistics produce one table/plot bundle; the application exposes decoded
+values only after the project store publishes that bundle atomically. Reopen
+authenticates the stored source identity and both artifact payloads before
+installing either result.
 
 Payload validity is explicit, so valid zero, invalid/no-data, and missing are
 distinct. Cancellation generations are ordered only within their scope;

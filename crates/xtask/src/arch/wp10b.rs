@@ -393,12 +393,24 @@ fn validate_project_store_crate(repo_root: &Path, contract: &Value) -> anyhow::R
     if expected_api.len() != 16 {
         bail!("WP-10B freezes exactly sixteen public root names");
     }
+    let accepted_wp12_api = BTreeSet::from([
+        "LoadedProjectArtifact".to_owned(),
+        "ProjectObjectBytes".to_owned(),
+    ]);
+    let expected_live_api = expected_api
+        .union(&accepted_wp12_api)
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let actual_api = public_root_api_names(&library_root)?;
-    if actual_api != expected_api {
+    if actual_api != expected_live_api {
         bail!(
             "WP-10B project-store public root drifted: missing={:?}, extra={:?}",
-            expected_api.difference(&actual_api).collect::<Vec<_>>(),
-            actual_api.difference(&expected_api).collect::<Vec<_>>()
+            expected_live_api
+                .difference(&actual_api)
+                .collect::<Vec<_>>(),
+            actual_api
+                .difference(&expected_live_api)
+                .collect::<Vec<_>>()
         );
     }
 

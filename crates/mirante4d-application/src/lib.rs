@@ -25,10 +25,10 @@ use mirante4d_domain::{
 };
 use mirante4d_identity::ScientificContentId;
 use mirante4d_project_model::{
-    ArtifactHandleId, ArtifactReference, ChannelPreset, ChannelPresetId, DatasetReference,
-    LayerViewState, MAX_CHANNEL_PRESETS, MAX_TOTAL_CHANNEL_PRESET_ENTRIES,
-    ProjectGenerationProjection, ProjectId, ProjectRevisionHighWater, ProjectRevisionId,
-    ProjectState, ViewState,
+    ArtifactCompleteness, ArtifactHandleId, ArtifactRecoverability, ArtifactReference,
+    ArtifactSchema, ChannelPreset, ChannelPresetId, DatasetReference, LayerViewState,
+    MAX_CHANNEL_PRESETS, MAX_TOTAL_CHANNEL_PRESET_ENTRIES, ProjectGenerationProjection, ProjectId,
+    ProjectRevisionHighWater, ProjectRevisionId, ProjectState, ViewState,
 };
 use mirante4d_render_api::PresentedFrame;
 use mirante4d_settings::{RejectedFileDisposition, ResourcePolicy};
@@ -83,49 +83,31 @@ impl OperationId {
     }
 }
 
-/// Stable key for a table payload retained by the current analysis owner.
-///
-/// The application retains only this descriptor key. The table payload stays
-/// outside the reducer and can derive the same key from the operation token
-/// and result slot without a second allocator.
+/// Stable key for a durable analysis-table artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct AnalysisTableId {
-    operation_id: OperationId,
-    slot: u16,
-}
+pub struct AnalysisTableId([u8; 16]);
 
 impl AnalysisTableId {
-    pub const fn from_operation(operation_id: OperationId, slot: u16) -> Self {
-        Self { operation_id, slot }
+    pub fn from_artifact_handle(handle: &ArtifactHandleId) -> Self {
+        Self(handle.bytes())
     }
 
-    pub const fn operation_id(self) -> OperationId {
-        self.operation_id
-    }
-
-    pub const fn slot(self) -> u16 {
-        self.slot
+    pub const fn artifact_handle_id(self) -> ArtifactHandleId {
+        ArtifactHandleId::from_bytes(self.0)
     }
 }
 
-/// Stable key for a plot payload retained by the current analysis owner.
+/// Stable key for a durable analysis-plot artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct AnalysisPlotId {
-    operation_id: OperationId,
-    slot: u16,
-}
+pub struct AnalysisPlotId([u8; 16]);
 
 impl AnalysisPlotId {
-    pub const fn from_operation(operation_id: OperationId, slot: u16) -> Self {
-        Self { operation_id, slot }
+    pub fn from_artifact_handle(handle: &ArtifactHandleId) -> Self {
+        Self(handle.bytes())
     }
 
-    pub const fn operation_id(self) -> OperationId {
-        self.operation_id
-    }
-
-    pub const fn slot(self) -> u16 {
-        self.slot
+    pub const fn artifact_handle_id(self) -> ArtifactHandleId {
+        ArtifactHandleId::from_bytes(self.0)
     }
 }
 
@@ -196,6 +178,40 @@ impl AnalysisPlotDescriptor {
         self.series_point_counts
             .get(usize::from(series_index))
             .copied()
+    }
+}
+
+/// One authenticated analysis result reconstructed from durable project artifacts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedAnalysisDescriptorBundle {
+    artifacts: Vec<ArtifactReference>,
+    table: AnalysisTableDescriptor,
+    plot: Option<AnalysisPlotDescriptor>,
+}
+
+impl LoadedAnalysisDescriptorBundle {
+    pub const fn new(
+        artifacts: Vec<ArtifactReference>,
+        table: AnalysisTableDescriptor,
+        plot: Option<AnalysisPlotDescriptor>,
+    ) -> Self {
+        Self {
+            artifacts,
+            table,
+            plot,
+        }
+    }
+
+    pub fn artifacts(&self) -> &[ArtifactReference] {
+        &self.artifacts
+    }
+
+    pub const fn table(&self) -> &AnalysisTableDescriptor {
+        &self.table
+    }
+
+    pub const fn plot(&self) -> Option<&AnalysisPlotDescriptor> {
+        self.plot.as_ref()
     }
 }
 
@@ -403,11 +419,11 @@ pub enum OperationCompletion {
         catalog: Arc<DatasetCatalog>,
         dataset: DatasetReference,
     },
-    AnalysisReady {
-        tables: Vec<AnalysisTableDescriptor>,
-        plots: Vec<AnalysisPlotDescriptor>,
+    AnalysisCommitted {
+        projection: Box<ProjectGenerationProjection>,
+        table: AnalysisTableDescriptor,
+        plot: Option<AnalysisPlotDescriptor>,
     },
-    ArtifactReady(Box<ArtifactReference>),
     ProjectOpened(Box<ProjectGenerationProjection>),
     ProjectSaved(ProjectRevisionId),
     ProjectSavedAs(Box<ProjectGenerationProjection>),
@@ -555,6 +571,16 @@ pub enum ApplicationCommand {
     },
     RequestProjectRecovery,
     BeginOperation(OperationKind),
+    StageAnalysisBundle {
+        token: OperationToken,
+        artifacts: Vec<ArtifactReference>,
+    },
+    InstallLoadedAnalysisDescriptors {
+        project_id: ProjectId,
+        revision: ProjectRevisionId,
+        currentness: CurrentnessGeneration,
+        bundles: Vec<LoadedAnalysisDescriptorBundle>,
+    },
     CompleteOperation {
         token: OperationToken,
         completion: OperationCompletion,
@@ -606,6 +632,8 @@ pub enum ApplicationCommandKind {
     RequestProjectSaveAs,
     RequestProjectRecovery,
     BeginOperation,
+    StageAnalysisBundle,
+    InstallLoadedAnalysisDescriptors,
     CompleteOperation,
     CancelOperation,
     RequestResourcePolicyChange,
@@ -655,6 +683,10 @@ impl ApplicationCommand {
             Self::RequestProjectSaveAs { .. } => ApplicationCommandKind::RequestProjectSaveAs,
             Self::RequestProjectRecovery => ApplicationCommandKind::RequestProjectRecovery,
             Self::BeginOperation(_) => ApplicationCommandKind::BeginOperation,
+            Self::StageAnalysisBundle { .. } => ApplicationCommandKind::StageAnalysisBundle,
+            Self::InstallLoadedAnalysisDescriptors { .. } => {
+                ApplicationCommandKind::InstallLoadedAnalysisDescriptors
+            }
             Self::CompleteOperation { .. } => ApplicationCommandKind::CompleteOperation,
             Self::CancelOperation(_) => ApplicationCommandKind::CancelOperation,
             Self::RequestResourcePolicyChange { .. } => {
@@ -691,10 +723,7 @@ impl ApplicationCommand {
                 | Self::RequestProjectSaveAs { .. }
                 | Self::RequestProjectRecovery
                 | Self::BeginOperation(_)
-                | Self::CompleteOperation {
-                    completion: OperationCompletion::ArtifactReady(_),
-                    ..
-                }
+                | Self::StageAnalysisBundle { .. }
         )
     }
 }
@@ -825,6 +854,10 @@ pub enum ApplicationEvent {
     ProjectRecoveryRequested {
         token: OperationToken,
     },
+    AnalysisCommitRequested {
+        token: OperationToken,
+        projection: Arc<ProjectGenerationProjection>,
+    },
     ProjectSaved {
         revision: ProjectRevisionId,
     },
@@ -866,8 +899,7 @@ pub enum OperationOutcome {
     Failed(OperationFailureCode),
     DatasetOpened,
     SourceVerified,
-    AnalysisReady,
-    ArtifactAdmitted,
+    AnalysisCommitted,
     ProjectOpened,
     ProjectSaved,
     ProjectSavedAs,
@@ -1090,6 +1122,37 @@ impl BoundWorkspace {
         }
         Ok(revision)
     }
+
+    fn push_committed_projection(
+        &mut self,
+        projection: ProjectGenerationProjection,
+    ) -> Result<ProjectRevisionId, ApplicationFaultCode> {
+        let mut expected_high_water = self.high_water.clone();
+        let expected_revision = expected_high_water
+            .allocate_after(self.current_revision())
+            .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)?;
+        if projection.revision() != expected_revision
+            || projection.revision_high_water() != &expected_high_water
+            || projection.state().project_id() != self.current_state().project_id()
+        {
+            return Err(ApplicationFaultCode::InvalidOperationCompletion);
+        }
+
+        let (revision, high_water, state) = projection.into_parts();
+        self.history.truncate(self.cursor + 1);
+        self.history.push_back(HistoryEntry {
+            revision,
+            state: Arc::new(state),
+        });
+        self.cursor = self.history.len() - 1;
+        if self.history.len() > MAX_HISTORY_ENTRIES {
+            self.history.pop_front();
+            self.cursor -= 1;
+        }
+        self.high_water = high_water;
+        self.saved_revision = Some(revision);
+        Ok(revision)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1102,6 +1165,13 @@ enum Workspace {
 struct ActiveOperation {
     token: OperationToken,
     retained_projection: Option<Arc<ProjectGenerationProjection>>,
+    cancellation_requested: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnalysisBundleHandles {
+    table: ArtifactHandleId,
+    plot: Option<ArtifactHandleId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1119,6 +1189,8 @@ pub struct ApplicationState {
     source_verification_progress: Option<SourceVerificationProgressState>,
     workspace: Workspace,
     transient: TransientApplicationState,
+    analysis_table_catalog: BTreeMap<AnalysisTableId, AnalysisTableDescriptor>,
+    analysis_plot_catalog: BTreeMap<AnalysisPlotId, AnalysisPlotDescriptor>,
     currentness: CurrentnessGeneration,
     operations: BTreeMap<OperationId, ActiveOperation>,
     next_operation_id: u64,
@@ -1146,6 +1218,8 @@ impl ApplicationState {
             source_verification_progress: None,
             workspace: Workspace::Unbound(Arc::new(workspace)),
             transient: TransientApplicationState::default(),
+            analysis_table_catalog: BTreeMap::new(),
+            analysis_plot_catalog: BTreeMap::new(),
             currentness: CurrentnessGeneration::initial(),
             operations: BTreeMap::new(),
             next_operation_id: 1,
@@ -1166,6 +1240,8 @@ impl ApplicationState {
             source_verification_progress: self.source_verification_progress,
             workspace: self.workspace.clone(),
             transient: self.transient.clone(),
+            analysis_table_catalog: self.analysis_table_catalog.clone(),
+            analysis_plot_catalog: self.analysis_plot_catalog.clone(),
             currentness: self.currentness,
             operations: self.operations.clone(),
             next_operation_id: self.next_operation_id,
@@ -1186,7 +1262,8 @@ impl ApplicationState {
     ) -> Result<CommandEffect, ApplicationFault> {
         let command_kind = command.kind();
         let fault_token = match &command {
-            ApplicationCommand::CompleteOperation { token, .. }
+            ApplicationCommand::StageAnalysisBundle { token, .. }
+            | ApplicationCommand::CompleteOperation { token, .. }
             | ApplicationCommand::UpdateSourceVerificationProgress { token, .. } => {
                 Some(token.clone())
             }
@@ -1262,12 +1339,13 @@ impl ApplicationState {
         command_kind: ApplicationCommandKind,
     ) -> Result<CommandEffect, ApplicationFaultCode> {
         let durable_project_freeze_active = self.operations.values().any(|operation| {
-            matches!(
-                operation.token.kind,
-                OperationKind::DatasetOpen
-                    | OperationKind::ProjectSaveAs
-                    | OperationKind::ProjectRecovery
-            )
+            operation.retained_projection.is_some()
+                || matches!(
+                    operation.token.kind,
+                    OperationKind::DatasetOpen
+                        | OperationKind::ProjectSaveAs
+                        | OperationKind::ProjectRecovery
+                )
         });
         if durable_project_freeze_active && command.mutates_durable_project() {
             return Err(ApplicationFaultCode::OperationConflict);
@@ -1360,6 +1438,17 @@ impl ApplicationState {
                 }
                 self.begin_operation(kind).map(|_| CommandEffect::Changed)
             }
+            ApplicationCommand::StageAnalysisBundle { token, artifacts } => {
+                self.stage_analysis_bundle(token, artifacts)
+            }
+            ApplicationCommand::InstallLoadedAnalysisDescriptors {
+                project_id,
+                revision,
+                currentness,
+                bundles,
+            } => {
+                self.install_loaded_analysis_descriptors(project_id, revision, currentness, bundles)
+            }
             ApplicationCommand::CompleteOperation { token, completion } => {
                 self.complete_operation(command_kind, token, completion)
             }
@@ -1392,6 +1481,8 @@ impl ApplicationState {
         self.source_verification_progress = None;
         self.workspace = Workspace::Unbound(Arc::new(workspace));
         self.transient = TransientApplicationState::default();
+        self.analysis_table_catalog.clear();
+        self.analysis_plot_catalog.clear();
         self.advance_currentness()?;
         self.push_event(ApplicationEvent::CurrentSourceReplaced {
             source_generation,
@@ -1468,6 +1559,27 @@ impl ApplicationState {
             return Err(ApplicationFaultCode::SourceSessionMismatch);
         }
 
+        let retained_analysis_ids = self
+            .operations
+            .iter()
+            .filter_map(|(operation_id, operation)| {
+                (operation.token.kind == OperationKind::Analysis
+                    && operation.retained_projection.is_some())
+                .then_some(*operation_id)
+            })
+            .collect::<Vec<_>>();
+        let mut cancellation_tokens = Vec::new();
+        for operation_id in &retained_analysis_ids {
+            let operation = self
+                .operations
+                .get_mut(operation_id)
+                .expect("retained analysis operation was collected");
+            if !operation.cancellation_requested {
+                operation.cancellation_requested = true;
+                cancellation_tokens.push(operation.token.clone());
+            }
+        }
+
         let cancelled_ids = self
             .operations
             .iter()
@@ -1480,16 +1592,23 @@ impl ApplicationState {
                         | OperationKind::ProjectSave
                         | OperationKind::ProjectSaveAs
                         | OperationKind::ProjectRecovery
+                        | OperationKind::Analysis
                 )
                 .then_some(*operation_id)
+                .filter(|operation_id| !retained_analysis_ids.contains(operation_id))
             })
             .collect::<Vec<_>>();
         let cancelled_operations = cancelled_ids
             .into_iter()
             .filter_map(|operation_id| self.operations.remove(&operation_id))
             .collect::<Vec<_>>();
+        cancellation_tokens.extend(
+            cancelled_operations
+                .into_iter()
+                .map(|operation| operation.token),
+        );
         let was_verified = self.verified_source.take().is_some();
-        if cancelled_operations.is_empty() && !was_verified {
+        if cancellation_tokens.is_empty() && !was_verified {
             return Ok(CommandEffect::NoChange);
         }
 
@@ -1498,10 +1617,8 @@ impl ApplicationState {
             ScientificIdentityStatus::Unverified(DatasetSourceId::new(source_generation.get())),
         )?);
         self.source_verification_progress = None;
-        for operation in cancelled_operations {
-            self.push_event(ApplicationEvent::OperationCancellationRequested {
-                token: operation.token,
-            })?;
+        for token in cancellation_tokens {
+            self.push_event(ApplicationEvent::OperationCancellationRequested { token })?;
         }
         self.advance_currentness()?;
         self.push_event(ApplicationEvent::SourceVerificationInvalidated { source_generation })?;
@@ -1681,6 +1798,14 @@ impl ApplicationState {
         let Workspace::Bound(bound) = &self.workspace else {
             return Err(ApplicationFaultCode::WorkspaceUnbound);
         };
+        if is_analysis_schema(artifact.schema())
+            || bound
+                .current_state()
+                .artifact(artifact.handle_id())
+                .is_some_and(|existing| is_analysis_schema(existing.schema()))
+        {
+            return Err(ApplicationFaultCode::InvalidProjectTransition);
+        }
         let mut artifacts = bound.current_state().artifacts().to_vec();
         upsert_artifact(&mut artifacts, artifact);
         if artifacts == bound.current_state().artifacts() {
@@ -1705,6 +1830,9 @@ impl ApplicationState {
         else {
             return Err(ApplicationFaultCode::ArtifactNotFound);
         };
+        if is_analysis_schema(artifacts[index].schema()) {
+            return Err(ApplicationFaultCode::InvalidProjectTransition);
+        }
         artifacts.remove(index);
         let project = rebuild_project(bound.current_state(), None, None, Some(artifacts))?;
         self.commit_project(project)
@@ -1902,6 +2030,34 @@ impl ApplicationState {
     }
 
     fn normalize_transient_selections(&mut self) {
+        let (analysis_tables, analysis_plots) = match &self.workspace {
+            Workspace::Unbound(_) => (Vec::new(), Vec::new()),
+            Workspace::Bound(workspace) => {
+                let mut tables = Vec::new();
+                let mut plots = Vec::new();
+                for artifact in workspace.current_state().artifacts() {
+                    match artifact.schema() {
+                        ArtifactSchema::AnalysisTableV1 => {
+                            let id = AnalysisTableId::from_artifact_handle(artifact.handle_id());
+                            if let Some(descriptor) = self.analysis_table_catalog.get(&id) {
+                                tables.push(descriptor.clone());
+                            }
+                        }
+                        ArtifactSchema::AnalysisPlotV1 => {
+                            let id = AnalysisPlotId::from_artifact_handle(artifact.handle_id());
+                            if let Some(descriptor) = self.analysis_plot_catalog.get(&id) {
+                                plots.push(descriptor.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                (tables, plots)
+            }
+        };
+        self.transient.analysis_tables = Arc::from(analysis_tables);
+        self.transient.analysis_plots = Arc::from(analysis_plots);
+
         let preset_exists = self
             .transient
             .selected_channel_preset
@@ -1929,6 +2085,42 @@ impl ApplicationState {
                 });
         if !artifact_exists {
             self.transient.selected_artifact = None;
+        }
+
+        if self.transient.selected_analysis_table.is_some_and(|id| {
+            !self
+                .transient
+                .analysis_tables
+                .iter()
+                .any(|descriptor| descriptor.id == id)
+        }) {
+            self.transient.selected_analysis_table = None;
+        }
+        if self.transient.selected_analysis_plot.is_some_and(|id| {
+            !self
+                .transient
+                .analysis_plots
+                .iter()
+                .any(|descriptor| descriptor.id == id)
+        }) {
+            self.transient.selected_analysis_plot = None;
+            self.transient.selected_analysis_plot_point = None;
+        }
+        if self
+            .transient
+            .selected_analysis_plot_point
+            .is_some_and(|selection| {
+                self.transient.selected_analysis_plot != Some(selection.plot_id)
+                    || self
+                        .transient
+                        .analysis_plots
+                        .iter()
+                        .find(|descriptor| descriptor.id == selection.plot_id)
+                        .and_then(|descriptor| descriptor.point_count(selection.series_index))
+                        .is_none_or(|count| selection.point_index >= count)
+            })
+        {
+            self.transient.selected_analysis_plot_point = None;
         }
     }
 
@@ -2161,9 +2353,166 @@ impl ApplicationState {
             ActiveOperation {
                 token: token.clone(),
                 retained_projection: None,
+                cancellation_requested: false,
             },
         );
         Ok(token)
+    }
+
+    fn stage_analysis_bundle(
+        &mut self,
+        token: OperationToken,
+        artifacts: Vec<ArtifactReference>,
+    ) -> Result<CommandEffect, ApplicationFaultCode> {
+        let Some(active) = self.operations.get(&token.operation_id) else {
+            return Err(ApplicationFaultCode::OperationNotFound);
+        };
+        if active.token != token {
+            return Err(ApplicationFaultCode::OperationTokenMismatch);
+        }
+        if token.kind != OperationKind::Analysis || active.retained_projection.is_some() {
+            return Err(ApplicationFaultCode::InvalidOperationCompletion);
+        }
+        self.validate_token_current(&token)?;
+        if self.verified_source.is_none() {
+            return Err(ApplicationFaultCode::IdentityVerificationRequired);
+        }
+        let Workspace::Bound(bound) = &self.workspace else {
+            return Err(ApplicationFaultCode::WorkspaceUnbound);
+        };
+        let handles = validate_analysis_bundle(&artifacts)?;
+        if artifacts.iter().any(|artifact| {
+            bound
+                .current_state()
+                .artifact(artifact.handle_id())
+                .is_some()
+        }) {
+            return Err(ApplicationFaultCode::InvalidOperationCompletion);
+        }
+        let table_id = AnalysisTableId::from_artifact_handle(&handles.table);
+        let plot_id = handles
+            .plot
+            .as_ref()
+            .map(AnalysisPlotId::from_artifact_handle);
+        if (!self.analysis_table_catalog.contains_key(&table_id)
+            && self.analysis_table_catalog.len() >= MAX_ANALYSIS_TABLES)
+            || plot_id.is_some_and(|id| {
+                !self.analysis_plot_catalog.contains_key(&id)
+                    && self.analysis_plot_catalog.len() >= MAX_ANALYSIS_PLOTS
+            })
+        {
+            return Err(ApplicationFaultCode::AnalysisRegistryFull);
+        }
+
+        let mut next_artifacts = bound.current_state().artifacts().to_vec();
+        next_artifacts.extend(artifacts);
+        next_artifacts.sort_by(|left, right| left.handle_id().cmp(right.handle_id()));
+        let state = rebuild_project(bound.current_state(), None, None, Some(next_artifacts))?;
+        let mut high_water = bound.high_water.clone();
+        let revision = high_water
+            .allocate_after(bound.current_revision())
+            .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)?;
+        let projection = Arc::new(
+            ProjectGenerationProjection::new(revision, high_water, state)
+                .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)?,
+        );
+        self.operations
+            .get_mut(&token.operation_id)
+            .expect("analysis operation was validated")
+            .retained_projection = Some(Arc::clone(&projection));
+        self.push_event(ApplicationEvent::AnalysisCommitRequested { token, projection })?;
+        Ok(CommandEffect::Changed)
+    }
+
+    fn install_loaded_analysis_descriptors(
+        &mut self,
+        project_id: ProjectId,
+        revision: ProjectRevisionId,
+        currentness: CurrentnessGeneration,
+        bundles: Vec<LoadedAnalysisDescriptorBundle>,
+    ) -> Result<CommandEffect, ApplicationFaultCode> {
+        let Workspace::Bound(bound) = &self.workspace else {
+            return Err(ApplicationFaultCode::WorkspaceUnbound);
+        };
+        if bound.current_state().project_id() != project_id
+            || bound.current_revision() != revision
+            || self.currentness != currentness
+        {
+            return Err(ApplicationFaultCode::StaleOperationCompletion);
+        }
+        if bundles.is_empty() {
+            return Ok(CommandEffect::NoChange);
+        }
+
+        let mut artifact_handles = BTreeSet::new();
+        let mut table_ids = BTreeSet::new();
+        let mut plot_ids = BTreeSet::new();
+        for bundle in &bundles {
+            let handles = validate_analysis_bundle(&bundle.artifacts)?;
+            if bundle.artifacts.iter().any(|artifact| {
+                bound.current_state().artifact(artifact.handle_id()) != Some(artifact)
+                    || !artifact_handles.insert(artifact.handle_id().clone())
+            }) || bundle.table.id != AnalysisTableId::from_artifact_handle(&handles.table)
+                || !table_ids.insert(bundle.table.id)
+                || match (&bundle.plot, &handles.plot) {
+                    (Some(descriptor), Some(handle)) => {
+                        descriptor.id != AnalysisPlotId::from_artifact_handle(handle)
+                            || !plot_ids.insert(descriptor.id)
+                    }
+                    (None, None) => false,
+                    _ => true,
+                }
+            {
+                return Err(ApplicationFaultCode::InvalidOperationCompletion);
+            }
+            if self
+                .analysis_table_catalog
+                .get(&bundle.table.id)
+                .is_some_and(|existing| existing != &bundle.table)
+                || bundle.plot.as_ref().is_some_and(|descriptor| {
+                    self.analysis_plot_catalog
+                        .get(&descriptor.id)
+                        .is_some_and(|existing| existing != descriptor)
+                })
+            {
+                return Err(ApplicationFaultCode::InvalidOperationCompletion);
+            }
+        }
+
+        let new_tables = table_ids
+            .iter()
+            .filter(|id| !self.analysis_table_catalog.contains_key(id))
+            .count();
+        let new_plots = plot_ids
+            .iter()
+            .filter(|id| !self.analysis_plot_catalog.contains_key(id))
+            .count();
+        if self.analysis_table_catalog.len().saturating_add(new_tables) > MAX_ANALYSIS_TABLES
+            || self.analysis_plot_catalog.len().saturating_add(new_plots) > MAX_ANALYSIS_PLOTS
+        {
+            return Err(ApplicationFaultCode::AnalysisRegistryFull);
+        }
+
+        let selected_table = bundles.first().map(|bundle| bundle.table.id);
+        let selected_plot = bundles
+            .iter()
+            .find_map(|bundle| bundle.plot.as_ref().map(AnalysisPlotDescriptor::id));
+        for bundle in bundles {
+            self.analysis_table_catalog
+                .insert(bundle.table.id, bundle.table);
+            if let Some(plot) = bundle.plot {
+                self.analysis_plot_catalog.insert(plot.id, plot);
+            }
+        }
+        self.normalize_transient_selections();
+        if self.transient.selected_analysis_table.is_none() {
+            self.transient.selected_analysis_table = selected_table;
+        }
+        if self.transient.selected_analysis_plot.is_none() {
+            self.transient.selected_analysis_plot = selected_plot;
+        }
+        self.push_event(ApplicationEvent::TransientStateChanged)?;
+        Ok(CommandEffect::Changed)
     }
 
     fn complete_operation(
@@ -2178,15 +2527,26 @@ impl ApplicationState {
         if active.token != token {
             return Err(ApplicationFaultCode::OperationTokenMismatch);
         }
-        if token.kind == OperationKind::SourceVerification {
-            self.validate_source_verification_token_current(&token)?;
-        } else if token.kind == OperationKind::ProjectSave {
-            self.validate_save_token_current(&token)?;
+        let retires_stale_analysis = token.kind == OperationKind::Analysis
+            && matches!(
+                completion,
+                OperationCompletion::Cancelled | OperationCompletion::Failed(_)
+            );
+        if retires_stale_analysis {
+            if !completion_matches_kind(token.kind, &completion) {
+                return Err(ApplicationFaultCode::InvalidOperationCompletion);
+            }
         } else {
-            self.validate_token_current(&token)?;
-        }
-        if !completion_matches_kind(token.kind, &completion) {
-            return Err(ApplicationFaultCode::InvalidOperationCompletion);
+            if token.kind == OperationKind::SourceVerification {
+                self.validate_source_verification_token_current(&token)?;
+            } else if token.kind == OperationKind::ProjectSave {
+                self.validate_save_token_current(&token)?;
+            } else {
+                self.validate_token_current(&token)?;
+            }
+            if !completion_matches_kind(token.kind, &completion) {
+                return Err(ApplicationFaultCode::InvalidOperationCompletion);
+            }
         }
         let outcome = match completion {
             OperationCompletion::Succeeded => OperationOutcome::Succeeded,
@@ -2237,29 +2597,13 @@ impl ApplicationState {
                 self.admit_verified_source(source_generation, catalog, dataset)?;
                 OperationOutcome::SourceVerified
             }
-            OperationCompletion::AnalysisReady { tables, plots } => {
-                if token.kind != OperationKind::Analysis {
-                    return Err(ApplicationFaultCode::InvalidOperationCompletion);
-                }
-                self.admit_analysis_descriptors(token.operation_id, tables, plots)?;
-                OperationOutcome::AnalysisReady
-            }
-            OperationCompletion::ArtifactReady(artifact) => {
-                if token.kind != OperationKind::Analysis {
-                    return Err(ApplicationFaultCode::InvalidOperationCompletion);
-                }
-                let Workspace::Bound(bound) = &self.workspace else {
-                    return Err(ApplicationFaultCode::WorkspaceUnbound);
-                };
-                let mut artifacts = bound.current_state().artifacts().to_vec();
-                upsert_artifact(&mut artifacts, *artifact);
-                let project = rebuild_project(bound.current_state(), None, None, Some(artifacts))?;
-                if project == *bound.current_state() {
-                    OperationOutcome::ArtifactAdmitted
-                } else {
-                    self.commit_project(project)?;
-                    OperationOutcome::ArtifactAdmitted
-                }
+            OperationCompletion::AnalysisCommitted {
+                projection,
+                table,
+                plot,
+            } => {
+                self.admit_committed_analysis(&token, *projection, table, plot)?;
+                OperationOutcome::AnalysisCommitted
             }
             OperationCompletion::ProjectOpened(projection) => {
                 if token.kind != OperationKind::ProjectOpen {
@@ -2414,60 +2758,86 @@ impl ApplicationState {
         Ok(())
     }
 
-    fn admit_analysis_descriptors(
+    fn admit_committed_analysis(
         &mut self,
-        operation_id: OperationId,
-        tables: Vec<AnalysisTableDescriptor>,
-        plots: Vec<AnalysisPlotDescriptor>,
+        token: &OperationToken,
+        projection: ProjectGenerationProjection,
+        table: AnalysisTableDescriptor,
+        plot: Option<AnalysisPlotDescriptor>,
     ) -> Result<(), ApplicationFaultCode> {
-        if tables.is_empty() && plots.is_empty() {
+        if token.kind != OperationKind::Analysis {
             return Err(ApplicationFaultCode::InvalidOperationCompletion);
         }
-        let table_count = self
-            .transient
-            .analysis_tables
-            .len()
-            .checked_add(tables.len())
-            .ok_or(ApplicationFaultCode::AnalysisRegistryFull)?;
-        let plot_count = self
-            .transient
-            .analysis_plots
-            .len()
-            .checked_add(plots.len())
-            .ok_or(ApplicationFaultCode::AnalysisRegistryFull)?;
-        if table_count > MAX_ANALYSIS_TABLES || plot_count > MAX_ANALYSIS_PLOTS {
+        let retained = self
+            .operations
+            .get(&token.operation_id)
+            .and_then(|operation| operation.retained_projection.as_ref())
+            .ok_or(ApplicationFaultCode::InvalidOperationCompletion)?;
+        if retained.as_ref() != &projection {
+            return Err(ApplicationFaultCode::InvalidOperationCompletion);
+        }
+        let Workspace::Bound(bound) = &self.workspace else {
+            return Err(ApplicationFaultCode::WorkspaceUnbound);
+        };
+        let staged_artifacts = projection
+            .state()
+            .artifacts()
+            .iter()
+            .filter(|artifact| {
+                bound
+                    .current_state()
+                    .artifact(artifact.handle_id())
+                    .is_none()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let handles = validate_analysis_bundle(&staged_artifacts)?;
+        if table.id != AnalysisTableId::from_artifact_handle(&handles.table)
+            || match (&plot, &handles.plot) {
+                (Some(descriptor), Some(handle)) => {
+                    descriptor.id != AnalysisPlotId::from_artifact_handle(handle)
+                }
+                (None, None) => false,
+                _ => true,
+            }
+        {
+            return Err(ApplicationFaultCode::InvalidOperationCompletion);
+        }
+        if (!self.analysis_table_catalog.contains_key(&table.id)
+            && self.analysis_table_catalog.len() >= MAX_ANALYSIS_TABLES)
+            || plot.as_ref().is_some_and(|descriptor| {
+                !self.analysis_plot_catalog.contains_key(&descriptor.id)
+                    && self.analysis_plot_catalog.len() >= MAX_ANALYSIS_PLOTS
+            })
+        {
             return Err(ApplicationFaultCode::AnalysisRegistryFull);
         }
-        for (slot, table) in tables.iter().enumerate() {
-            let slot = u16::try_from(slot)
-                .map_err(|_| ApplicationFaultCode::InvalidOperationCompletion)?;
-            if table.id != AnalysisTableId::from_operation(operation_id, slot) {
-                return Err(ApplicationFaultCode::InvalidOperationCompletion);
-            }
-        }
-        for (slot, plot) in plots.iter().enumerate() {
-            let slot = u16::try_from(slot)
-                .map_err(|_| ApplicationFaultCode::InvalidOperationCompletion)?;
-            if plot.id != AnalysisPlotId::from_operation(operation_id, slot) {
-                return Err(ApplicationFaultCode::InvalidOperationCompletion);
-            }
-        }
 
-        let selected_table = tables.last().map(AnalysisTableDescriptor::id);
-        let selected_plot = plots.last().map(AnalysisPlotDescriptor::id);
-        let mut all_tables = self.transient.analysis_tables.to_vec();
-        all_tables.extend(tables);
-        self.transient.analysis_tables = Arc::from(all_tables);
-        let mut all_plots = self.transient.analysis_plots.to_vec();
-        all_plots.extend(plots);
-        self.transient.analysis_plots = Arc::from(all_plots);
-        if let Some(id) = selected_table {
-            self.transient.selected_analysis_table = Some(id);
+        let table_id = table.id;
+        let plot_id = plot.as_ref().map(AnalysisPlotDescriptor::id);
+        let (revision, project_id, dirty) = {
+            let Workspace::Bound(bound) = &mut self.workspace else {
+                return Err(ApplicationFaultCode::WorkspaceUnbound);
+            };
+            let revision = bound.push_committed_projection(projection)?;
+            (revision, bound.current_state().project_id(), bound.dirty())
+        };
+        self.analysis_table_catalog.insert(table_id, table);
+        if let Some(plot) = plot {
+            self.analysis_plot_catalog.insert(plot.id, plot);
         }
-        if let Some(id) = selected_plot {
-            self.transient.selected_analysis_plot = Some(id);
+        self.normalize_transient_selections();
+        self.transient.selected_analysis_table = Some(table_id);
+        if let Some(plot_id) = plot_id {
+            self.transient.selected_analysis_plot = Some(plot_id);
             self.transient.selected_analysis_plot_point = None;
         }
+        self.advance_currentness()?;
+        self.push_event(ApplicationEvent::ProjectRevisionChanged {
+            project_id,
+            revision,
+            dirty,
+        })?;
         self.push_event(ApplicationEvent::TransientStateChanged)?;
         Ok(())
     }
@@ -2476,6 +2846,18 @@ impl ApplicationState {
         &mut self,
         operation_id: OperationId,
     ) -> Result<CommandEffect, ApplicationFaultCode> {
+        if let Some(operation) = self.operations.get_mut(&operation_id)
+            && operation.token.kind == OperationKind::Analysis
+            && operation.retained_projection.is_some()
+        {
+            if operation.cancellation_requested {
+                return Ok(CommandEffect::NoChange);
+            }
+            operation.cancellation_requested = true;
+            let token = operation.token.clone();
+            self.push_event(ApplicationEvent::OperationCancellationRequested { token })?;
+            return Ok(CommandEffect::Changed);
+        }
         let operation = self
             .operations
             .remove(&operation_id)
@@ -3012,6 +3394,59 @@ fn upsert_artifact(artifacts: &mut Vec<ArtifactReference>, artifact: ArtifactRef
     artifacts.sort_by(|left, right| left.handle_id().cmp(right.handle_id()));
 }
 
+const fn is_analysis_schema(schema: ArtifactSchema) -> bool {
+    matches!(
+        schema,
+        ArtifactSchema::AnalysisTableV1 | ArtifactSchema::AnalysisPlotV1
+    )
+}
+
+fn validate_analysis_bundle(
+    artifacts: &[ArtifactReference],
+) -> Result<AnalysisBundleHandles, ApplicationFaultCode> {
+    let Some(first) = artifacts.first() else {
+        return Err(ApplicationFaultCode::InvalidOperationCompletion);
+    };
+    let Some(recipe_id) = first.recipe_id() else {
+        return Err(ApplicationFaultCode::InvalidOperationCompletion);
+    };
+    let Some(derivation_id) = first.derivation_id() else {
+        return Err(ApplicationFaultCode::InvalidOperationCompletion);
+    };
+    if first.source_layers().is_empty() {
+        return Err(ApplicationFaultCode::InvalidOperationCompletion);
+    }
+
+    let mut handles = BTreeSet::new();
+    let mut table = None;
+    let mut plot = None;
+    for artifact in artifacts {
+        if artifact.completeness() != ArtifactCompleteness::Complete
+            || artifact.recoverability() != ArtifactRecoverability::Regenerable
+            || artifact.recipe_id() != Some(recipe_id)
+            || artifact.derivation_id() != Some(derivation_id)
+            || artifact.source_layers() != first.source_layers()
+            || !handles.insert(artifact.handle_id().clone())
+        {
+            return Err(ApplicationFaultCode::InvalidOperationCompletion);
+        }
+        match artifact.schema() {
+            ArtifactSchema::AnalysisTableV1 if table.is_none() => {
+                table = Some(artifact.handle_id().clone());
+            }
+            ArtifactSchema::AnalysisPlotV1 if plot.is_none() => {
+                plot = Some(artifact.handle_id().clone());
+            }
+            _ => return Err(ApplicationFaultCode::InvalidOperationCompletion),
+        }
+    }
+
+    Ok(AnalysisBundleHandles {
+        table: table.ok_or(ApplicationFaultCode::InvalidOperationCompletion)?,
+        plot,
+    })
+}
+
 fn completion_matches_kind(kind: OperationKind, completion: &OperationCompletion) -> bool {
     if let OperationCompletion::Failed(code) = completion {
         return failure_code_matches_kind(kind, *code);
@@ -3045,10 +3480,7 @@ fn completion_matches_kind(kind: OperationKind, completion: &OperationCompletion
         ),
         OperationKind::Analysis => matches!(
             completion,
-            OperationCompletion::AnalysisReady { .. }
-                | OperationCompletion::ArtifactReady(_)
-                | OperationCompletion::Succeeded
-                | OperationCompletion::Cancelled
+            OperationCompletion::AnalysisCommitted { .. } | OperationCompletion::Cancelled
         ),
         OperationKind::Import => matches!(
             completion,

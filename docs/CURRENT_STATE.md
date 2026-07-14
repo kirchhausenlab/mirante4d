@@ -1,6 +1,6 @@
 # Current State
 
-Last reviewed: 2026-07-13
+Last reviewed: 2026-07-14
 
 Mirante4D is public, pre-alpha academic research software. Persisted formats
 and APIs can change through explicit hard cutovers; there is no supported
@@ -16,24 +16,34 @@ public release or public full microscopy dataset yet.
   dataset-catalog, render-API, and settings boundaries.
 - MIP, DVR, and ISO intensity rendering with per-channel controls.
 - One bounded, byte-accounted semantic-resource runtime for 3D, linked 2D,
-  playback prefetch, histogram, and interactive readout demand.
-- TIFF/OME-TIFF import and a passive table/plot/export workspace. Analysis
-  execution and viewport artifact authoring are deferred until WP-12.
+  playback prefetch, histogram, interactive readout, and analysis demand.
+- TIFF/OME-TIFF import plus exact whole-layer time traces and numeric box
+  intensity statistics, with atomic table/plot project artifacts and CSV copy.
 - Linux release-directory, tarball, and AppImage build paths.
 - No segmentation or derived-label subsystem.
 
-The workspace has twenty packages: nineteen `mirante4d-*` crates plus
+The workspace has twenty-one packages: twenty `mirante4d-*` crates plus
 `xtask`. `mirante4d-storage` is an off-product
 WP-10A library whose first slice owns frozen profile facts, portable package
 paths, checked package-count arithmetic, size/amplification ceilings, and
 bounded read-only local range I/O. It remains unreachable from the product.
-`mirante4d-import-pipeline` is the off-product WP-11 exit candidate: it owns
+`mirante4d-import-pipeline` is the accepted off-product WP-11 producer: it owns
 bounded, cancellable, restartable TIFF/OME-TIFF production of validated
 sharded target packages, but no product route.
 The new `mirante4d-render-wgpu` successor and unpublished
 `mirante4d-render-reference` oracle are accepted off-product and remain
 deliberately unreachable; `mirante4d-renderer` remains the only product render
 route until WP-09B.
+
+`mirante4d-analysis-core` owns exact `uint8`, `uint16`, and finite `float32`
+intensity statistics and artifact payloads. `mirante4d-analysis-runtime` runs
+those operations through the shared dataset scheduler with a fixed two-block
+window, lower priority than interactive work, scoped cancellation, and stale
+result suppression. The product exposes whole-layer summaries over time and a
+numeric axis-aligned box at the current timepoint. A complete table/plot pair
+becomes visible only after one atomic project-store commit, and authenticated
+pairs are restored when the project reopens. The predecessor
+`mirante4d-analysis` crate and its segmentation code are deleted.
 
 `mirante4d-core`, the application
 `AppState` god-state, `WorkbenchCommand`, project-v14 authority, and
@@ -163,12 +173,18 @@ close, and joined shutdown are wired; the project-v15 bridge and
 owner accepted the preceding durability and three-launch product evidence
 without requiring a redundant power-cut rerun.
 
-The current WP-11 branch implements and tests the off-product replacement
-import/multiscale producer. An importer-produced package also passed the
-existing independent target reader. Protected-main acceptance and the
-create-once WP-11 exit tag remain pending, so WP-12 has not started. Product
-activation and deletion of the current importer remain WP-10C work; current
-schema-1 packages remain transitional T2 fixtures and the sole product route.
+WP-11 is accepted on protected main at
+`04987f64c309166caddf931be9c1ef4948010128` (tree
+`fd39e0be3a0883726972b25d037c916f0e3ca4c0`), tagged
+`foundation-wp-11-exit-1`. Its focused importer checks, independent target
+readback, and exact-main run passed. Product activation and deletion of the
+current importer remain WP-10C work; current schema-1 packages remain
+transitional T2 fixtures and the sole product route.
+
+WP-12 has implemented the bounded exact analysis runtime and switched the sole
+product analysis route to it. Focused scientific, scheduler, cancellation,
+atomic save/reopen, source-failure, and supported-window checks pass on the
+candidate branch. Protected-main acceptance is the remaining checkpoint.
 
 ## Current Verification Boundary
 
@@ -222,9 +238,10 @@ See [testing](TESTING.md) for commands and claim language.
   panic; the dirty-project save/discard/cancel route exits cleanly.
 - Exact linked-panel cursor readout is available from retained leases; 3D GPU
   intensity hover remains unavailable rather than sampling a placeholder.
-- Frame intensity statistics remain unavailable until a real lease-backed
-  computation exists; loading placeholders are never reported as scientific
-  zeros.
+- Rendered-viewport-derived statistics remain unavailable. Product analysis
+  instead computes exact source-voxel statistics for a whole layer over time or
+  a numeric box at the current timepoint; loading placeholders are never
+  reported as scientific zeros.
 - The off-product WP-09A successor qualification is limited to voxel-exact
   sampling, flat ISO shading, one semantic scale per layer, 256 requirement
   records, and 128 supplied leases per call. Unsupported cases fail explicitly.

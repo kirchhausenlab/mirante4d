@@ -33,8 +33,9 @@ mod trash;
 mod wire;
 
 pub use api::{
-    ProjectCommitCapture, ProjectGenerationId, ProjectObjectSource, ProjectOpenMode,
-    ProjectRecoveryCandidate, ProjectStoreActor, ProjectStoreCommand, ProjectStoreCompletion,
-    ProjectStoreConfig, ProjectStoreDiagnostics, ProjectStoreFault, ProjectStoreLimits,
-    ProjectStorePath, ProjectStoreReceipt, ProjectStoreRequestId, ProjectStoreSession,
+    LoadedProjectArtifact, ProjectCommitCapture, ProjectGenerationId, ProjectObjectBytes,
+    ProjectObjectSource, ProjectOpenMode, ProjectRecoveryCandidate, ProjectStoreActor,
+    ProjectStoreCommand, ProjectStoreCompletion, ProjectStoreConfig, ProjectStoreDiagnostics,
+    ProjectStoreFault, ProjectStoreLimits, ProjectStorePath, ProjectStoreReceipt,
+    ProjectStoreRequestId, ProjectStoreSession,
 };

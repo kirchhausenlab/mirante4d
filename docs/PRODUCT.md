@@ -34,9 +34,9 @@ publication and external dataset contribution are separate future decisions.
 ## Current Scope
 
 The prototype includes import/preprocessing, streaming native data,
-MIP/DVR/ISO intensity rendering, multichannel display, project state, a
-passive analysis-results workspace, and Linux packaging. Analysis execution is
-temporarily absent while its foundation is rebuilt in WP-12.
+MIP/DVR/ISO intensity rendering, multichannel display, project state, exact
+whole-layer and numeric box intensity analysis, a table/plot results workspace,
+and Linux packaging.
 [Current state](CURRENT_STATE.md) is the sole authority for exact implemented
 behavior and limitations.
 

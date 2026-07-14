@@ -1,7 +1,6 @@
 use std::{fs, time::Duration};
 
 use eframe::egui;
-use mirante4d_analysis::{AnalysisColumn, AnalysisPlotPoint, AnalysisPlotSeries, AnalysisTableRow};
 use mirante4d_format::{FixtureKind, write_fixture};
 
 const TEST_INITIAL_RENDER_VIEWPORT_SIDE: u64 = 32;
@@ -206,6 +205,7 @@ fn test_workbench_app_without_background_runtime(
         project_recovery_panel_open: false,
         pending_recovery_selection: None,
         pending_project_open_locator: None,
+        pending_analysis_artifact_load: None,
         project_store_noninteractive_paths: ProjectStoreNoninteractivePaths::default(),
         project_store_product_evidence: ProjectStoreProductEvidence::default(),
         pending_dataset_open_path: None,
