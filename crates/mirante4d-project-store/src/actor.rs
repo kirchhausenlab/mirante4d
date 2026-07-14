@@ -12,6 +12,9 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+use mirante4d_identity::ExactBytesHasher;
+use mirante4d_project_model::{ArtifactHandleId, ArtifactReference};
+
 #[cfg(test)]
 use std::{
     sync::OnceLock,
@@ -22,12 +25,15 @@ use std::{
 use crate::lease::GcTransitionInjector;
 
 use crate::{
-    ProjectCommitCapture, ProjectGenerationId, ProjectOpenMode, ProjectStoreCommand,
-    ProjectStoreCompletion, ProjectStoreConfig, ProjectStoreDiagnostics, ProjectStoreFault,
-    ProjectStorePath, ProjectStoreReceipt, ProjectStoreRequestId, ProjectStoreSession,
+    LoadedProjectArtifact, ProjectCommitCapture, ProjectGenerationId, ProjectOpenMode,
+    ProjectStoreCommand, ProjectStoreCompletion, ProjectStoreConfig, ProjectStoreDiagnostics,
+    ProjectStoreFault, ProjectStorePath, ProjectStoreReceipt, ProjectStoreRequestId,
+    ProjectStoreSession,
+    generation::{ArtifactStorage, GenerationDocument, LogicalObjectBinding},
     inspection::{
         RecoveryInspection, StoreStateInspection, cleanup_dead_writer_staging,
-        inspect_established_store, inspect_recovery, inspect_store_state, open_recovery,
+        inspect_established_store, inspect_recovery, inspect_store_state, map_local_error,
+        open_recovery,
     },
     lease::{LeaseError, ProjectStoreLeases},
     local::{LocalStoreRoot, valid_checkpoint_id},
@@ -53,6 +59,7 @@ struct Shared {
     request_limit: usize,
     completion_limit: usize,
     trash_selection_limit: usize,
+    artifact_selection_limit: usize,
     autosave_enabled: bool,
     #[cfg(test)]
     gc_transition_injector: OnceLock<Arc<GcTransitionInjector>>,
@@ -109,6 +116,11 @@ enum Work {
         request_id: ProjectStoreRequestId,
         generation_id: ProjectGenerationId,
     },
+    LoadArtifacts {
+        request_id: ProjectStoreRequestId,
+        generation_id: ProjectGenerationId,
+        artifact_handles: Vec<ArtifactHandleId>,
+    },
     Pin {
         request_id: ProjectStoreRequestId,
         checkpoint_id: String,
@@ -143,6 +155,7 @@ impl Work {
             | Self::SaveAs { request_id, .. }
             | Self::InspectRecovery { request_id }
             | Self::OpenRecovery { request_id, .. }
+            | Self::LoadArtifacts { request_id, .. }
             | Self::Pin { request_id, .. }
             | Self::Unpin { request_id, .. }
             | Self::PlanCompaction { request_id }
@@ -183,6 +196,10 @@ impl Work {
                 result: Err(ProjectStoreFault::Cancelled),
             },
             Self::OpenRecovery { request_id, .. } => ProjectStoreCompletion::RecoveryOpened {
+                request_id,
+                result: Err(ProjectStoreFault::Cancelled),
+            },
+            Self::LoadArtifacts { request_id, .. } => ProjectStoreCompletion::ArtifactsLoaded {
                 request_id,
                 result: Err(ProjectStoreFault::Cancelled),
             },
@@ -562,6 +579,7 @@ impl EstablishedProjectActor {
             request_limit: limits.actor_request_queue_max(),
             completion_limit: limits.actor_completion_queue_max(),
             trash_selection_limit: limits.recovery_candidates_max,
+            artifact_selection_limit: limits.artifact_records_per_generation_max,
             autosave_enabled: config.autosave_enabled(),
             #[cfg(test)]
             gc_transition_injector: OnceLock::new(),
@@ -680,6 +698,34 @@ impl EstablishedProjectActor {
                 request_id,
                 generation_id,
             }),
+            ProjectStoreCommand::LoadArtifacts {
+                request_id,
+                generation_id,
+                artifact_handles,
+            } => {
+                if artifact_handles.len() > self.shared.artifact_selection_limit {
+                    return Err(ProjectStoreFault::Capacity {
+                        stage: "artifact_load_selection",
+                    });
+                }
+                if artifact_handles.is_empty()
+                    || artifact_handles
+                        .iter()
+                        .cloned()
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        != artifact_handles.len()
+                {
+                    return Err(ProjectStoreFault::Corruption {
+                        stage: "artifact_load_selection",
+                    });
+                }
+                self.submit_work(Work::LoadArtifacts {
+                    request_id,
+                    generation_id,
+                    artifact_handles,
+                })
+            }
             ProjectStoreCommand::Pin {
                 request_id,
                 checkpoint_id,
@@ -1020,6 +1066,225 @@ fn any_session_mut(
         .as_mut()
         .map(ActorSession::resources_mut)
         .ok_or_else(|| lifecycle_fault("actor_unbound"))
+}
+
+fn execute_load_artifacts<C>(
+    session: Option<&ActorSession>,
+    generation_id: ProjectGenerationId,
+    artifact_handles: &[ArtifactHandleId],
+    limits: crate::ProjectStoreLimits,
+    mut is_cancelled: C,
+) -> Result<Vec<LoadedProjectArtifact>, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    match session.ok_or_else(|| lifecycle_fault("actor_unbound"))? {
+        ActorSession::Normal { resources, kind } => {
+            let state = inspect_store_state(&resources.root, limits, &mut is_cancelled)?;
+            let document = match kind {
+                NormalSessionKind::Established
+                    if state.manual().map(|lane| lane.head.current()) == Some(generation_id) =>
+                {
+                    state.manual_generation()
+                }
+                NormalSessionKind::Established
+                    if state.manual().is_some()
+                        && state.autosave().map(|lane| lane.head.current())
+                            == Some(generation_id) =>
+                {
+                    state.autosave_generation()
+                }
+                NormalSessionKind::Provisional
+                    if state.is_provisional()
+                        && state.autosave().map(|lane| lane.head.current())
+                            == Some(generation_id) =>
+                {
+                    state.autosave_generation()
+                }
+                _ => None,
+            };
+            let document = document.ok_or(ProjectStoreFault::Corruption {
+                stage: "artifact_load_generation",
+            })?;
+            load_artifact_bundle(
+                &resources.root,
+                document,
+                artifact_handles,
+                limits,
+                &mut is_cancelled,
+            )
+        }
+        ActorSession::RecoverySelected {
+            resources,
+            selected_generation,
+        } => {
+            if *selected_generation != generation_id {
+                return Err(ProjectStoreFault::Corruption {
+                    stage: "artifact_load_generation",
+                });
+            }
+            let opened = open_recovery(
+                &resources.root,
+                *selected_generation,
+                limits,
+                &mut is_cancelled,
+            )?;
+            let (_, document) = opened.into_document_parts();
+            load_artifact_bundle(
+                &resources.root,
+                &document,
+                artifact_handles,
+                limits,
+                &mut is_cancelled,
+            )
+        }
+        ActorSession::RecoveryOnly { .. } => Err(lifecycle_fault("actor_recovery_only")),
+    }
+}
+
+fn load_artifact_bundle<C>(
+    root: &LocalStoreRoot,
+    document: &GenerationDocument,
+    artifact_handles: &[ArtifactHandleId],
+    limits: crate::ProjectStoreLimits,
+    mut is_cancelled: C,
+) -> Result<Vec<LoadedProjectArtifact>, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    let artifacts = document.projection().state().artifacts();
+    let mut selected = Vec::<ArtifactReference>::with_capacity(artifact_handles.len());
+    let mut logical_bytes = 0_u64;
+    for handle in artifact_handles {
+        let artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.handle_id() == handle)
+            .ok_or(ProjectStoreFault::Corruption {
+                stage: "artifact_load_selection",
+            })?;
+        logical_bytes = logical_bytes
+            .checked_add(artifact.object().byte_length())
+            .ok_or(ProjectStoreFault::Capacity {
+                stage: "artifact_load_bytes",
+            })?;
+        if logical_bytes > limits.object_or_page_bytes_max() {
+            return Err(ProjectStoreFault::Capacity {
+                stage: "artifact_load_bytes",
+            });
+        }
+        selected.push(artifact.clone());
+    }
+    let _bundle_capacity =
+        usize::try_from(logical_bytes).map_err(|_| ProjectStoreFault::Capacity {
+            stage: "artifact_load_bytes",
+        })?;
+
+    let mut loaded = Vec::with_capacity(selected.len());
+    for artifact in selected {
+        let bytes = read_artifact_bytes(root, document, &artifact, limits, &mut is_cancelled)?;
+        loaded.push(LoadedProjectArtifact::new(artifact, bytes));
+    }
+    Ok(loaded)
+}
+
+fn read_artifact_bytes<C>(
+    root: &LocalStoreRoot,
+    document: &GenerationDocument,
+    artifact: &ArtifactReference,
+    limits: crate::ProjectStoreLimits,
+    mut is_cancelled: C,
+) -> Result<Vec<u8>, ProjectStoreFault>
+where
+    C: FnMut() -> bool,
+{
+    let descriptor = artifact.object();
+    let storage =
+        document
+            .bindings()
+            .get(&descriptor.digest())
+            .ok_or(ProjectStoreFault::Corruption {
+                stage: "artifact_load_binding",
+            })?;
+    let capacity =
+        usize::try_from(descriptor.byte_length()).map_err(|_| ProjectStoreFault::Capacity {
+            stage: "artifact_load_bytes",
+        })?;
+    match storage {
+        ArtifactStorage::Direct { object } => {
+            if object.digest() != descriptor.digest()
+                || object.byte_length() != descriptor.byte_length()
+            {
+                return Err(ProjectStoreFault::Corruption {
+                    stage: "artifact_load_binding",
+                });
+            }
+            let mut bytes = Vec::with_capacity(capacity);
+            root.read_exact_object(
+                descriptor.digest(),
+                descriptor.byte_length(),
+                limits.object_or_page_bytes_max(),
+                &mut is_cancelled,
+                |chunk| bytes.extend_from_slice(chunk),
+            )
+            .map_err(|error| map_local_error(error, "artifact_load_object"))?;
+            Ok(bytes)
+        }
+        ArtifactStorage::Paged { binding_manifest } => {
+            let binding_capacity =
+                usize::try_from(binding_manifest.byte_length()).map_err(|_| {
+                    ProjectStoreFault::Capacity {
+                        stage: "artifact_load_binding",
+                    }
+                })?;
+            let mut binding_bytes = Vec::with_capacity(binding_capacity);
+            root.read_exact_object(
+                binding_manifest.digest(),
+                binding_manifest.byte_length(),
+                limits.object_or_page_bytes_max(),
+                &mut is_cancelled,
+                |chunk| binding_bytes.extend_from_slice(chunk),
+            )
+            .map_err(|error| map_local_error(error, "artifact_load_binding"))?;
+            let binding =
+                LogicalObjectBinding::decode(&binding_bytes, descriptor, binding_manifest, limits)
+                    .map_err(|_| ProjectStoreFault::Corruption {
+                        stage: "artifact_load_binding",
+                    })?;
+            let mut bytes = Vec::with_capacity(capacity);
+            let mut logical_hasher = ExactBytesHasher::new();
+            let mut hash_failed = false;
+            for page in binding.pages() {
+                let page = page.object();
+                root.read_exact_object(
+                    page.digest(),
+                    page.byte_length(),
+                    limits.object_or_page_bytes_max(),
+                    &mut is_cancelled,
+                    |chunk| {
+                        bytes.extend_from_slice(chunk);
+                        hash_failed |= logical_hasher.update(chunk).is_err();
+                    },
+                )
+                .map_err(|error| map_local_error(error, "artifact_load_object"))?;
+            }
+            if hash_failed {
+                return Err(ProjectStoreFault::Capacity {
+                    stage: "artifact_load_bytes",
+                });
+            }
+            let facts = logical_hasher
+                .finalize()
+                .map_err(|_| ProjectStoreFault::Capacity {
+                    stage: "artifact_load_bytes",
+                })?;
+            if facts.digest() != descriptor.digest()
+                || facts.byte_length() != descriptor.byte_length()
+            {
+                return Err(ProjectStoreFault::DigestMismatch);
+            }
+            Ok(bytes)
+        }
+    }
 }
 
 fn execute_create<C>(
@@ -1409,6 +1674,20 @@ fn worker_main(
                 result: execute_open_recovery(&mut session, generation_id, limits, || {
                     cancelled.load(Ordering::Acquire)
                 }),
+            },
+            Work::LoadArtifacts {
+                request_id,
+                generation_id,
+                artifact_handles,
+            } => ProjectStoreCompletion::ArtifactsLoaded {
+                request_id,
+                result: execute_load_artifacts(
+                    session.as_ref(),
+                    generation_id,
+                    &artifact_handles,
+                    limits,
+                    || cancelled.load(Ordering::Acquire),
+                ),
             },
             Work::Pin {
                 request_id,
@@ -2314,6 +2593,305 @@ mod tests {
         }
         actor.try_submit(close_command(2)).unwrap();
         public_recv_timeout(&actor);
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn artifact_load_selection_is_nonempty_and_unique_before_enqueue() {
+        let actor = ProjectStoreActor::start(Default::default()).unwrap();
+        let generation = frozen_generation(STALE_MANUAL);
+        let handle = generation.projection().state().artifacts()[0]
+            .handle_id()
+            .clone();
+
+        for artifact_handles in [Vec::new(), vec![handle.clone(), handle.clone()]] {
+            assert_eq!(
+                actor.try_submit(ProjectStoreCommand::LoadArtifacts {
+                    request_id: request_id(1),
+                    generation_id: generation_id(STALE_MANUAL),
+                    artifact_handles,
+                }),
+                Err(ProjectStoreFault::Corruption {
+                    stage: "artifact_load_selection",
+                })
+            );
+        }
+        assert!(actor.try_recv().is_none());
+
+        actor.try_submit(close_command(1)).unwrap();
+        public_recv_timeout(&actor);
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn public_actor_loads_current_and_selected_recovery_artifacts_in_request_order() {
+        let project = TestProject::extracted_store("public-load-artifacts", "recoverable.m4dproj");
+        let current_id = generation_id(RECOVERABLE_G2);
+        let current = frozen_generation_in("recoverable.m4dproj", RECOVERABLE_G2);
+        let direct = current
+            .projection()
+            .state()
+            .artifacts()
+            .iter()
+            .find(|artifact| {
+                matches!(
+                    current.bindings().get(&artifact.object().digest()),
+                    Some(ArtifactStorage::Direct { .. })
+                )
+            })
+            .unwrap()
+            .clone();
+        let paged = current
+            .projection()
+            .state()
+            .artifacts()
+            .iter()
+            .find(|artifact| {
+                matches!(
+                    current.bindings().get(&artifact.object().digest()),
+                    Some(ArtifactStorage::Paged { .. })
+                )
+            })
+            .unwrap()
+            .clone();
+        let bundle_limit = direct.object().byte_length() + paged.object().byte_length();
+        let limits = ProjectStoreLimits {
+            object_or_page_bytes_max: bundle_limit,
+            ..ProjectStoreLimits::default()
+        };
+        let actor =
+            ProjectStoreActor::start(ProjectStoreConfig::new(limits, true).unwrap()).unwrap();
+        actor
+            .try_submit(ProjectStoreCommand::Open {
+                request_id: request_id(1),
+                path: project.store_path(),
+                mode: ProjectOpenMode::ReadOnly,
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&actor),
+            ProjectStoreCompletion::Opened {
+                request_id: actual,
+                result: Ok(_),
+            } if actual == request_id(1)
+        ));
+
+        let requested = vec![paged.handle_id().clone(), direct.handle_id().clone()];
+        actor
+            .try_submit(ProjectStoreCommand::LoadArtifacts {
+                request_id: request_id(2),
+                generation_id: current_id,
+                artifact_handles: requested.clone(),
+            })
+            .unwrap();
+        let loaded = match public_recv_timeout(&actor) {
+            ProjectStoreCompletion::ArtifactsLoaded {
+                request_id: actual,
+                result: Ok(loaded),
+            } if actual == request_id(2) => loaded,
+            other => panic!("unexpected artifact load completion: {other:?}"),
+        };
+        assert_eq!(loaded.len(), requested.len());
+        for ((loaded, handle), expected) in loaded.iter().zip(&requested).zip([&paged, &direct]) {
+            assert_eq!(loaded.reference().handle_id(), handle);
+            assert_eq!(loaded.reference(), expected);
+            assert_eq!(
+                loaded.bytes(),
+                fixture_artifact_bytes("recoverable.m4dproj", &current, expected)
+            );
+        }
+
+        let autosave_id = generation_id(RECOVERABLE_AUTOSAVE);
+        let autosave = frozen_generation_in("recoverable.m4dproj", RECOVERABLE_AUTOSAVE);
+        let autosave_handle = autosave.projection().state().artifacts()[0]
+            .handle_id()
+            .clone();
+        actor
+            .try_submit(ProjectStoreCommand::LoadArtifacts {
+                request_id: request_id(3),
+                generation_id: autosave_id,
+                artifact_handles: vec![autosave_handle],
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&actor),
+            ProjectStoreCompletion::ArtifactsLoaded {
+                request_id: actual,
+                result: Ok(loaded),
+            } if actual == request_id(3) && loaded.len() == 1
+        ));
+
+        let recovery_id = autosave_id;
+        let recovery_handle = autosave.projection().state().artifacts()[0]
+            .handle_id()
+            .clone();
+        actor
+            .try_submit(ProjectStoreCommand::OpenRecovery {
+                request_id: request_id(4),
+                generation_id: recovery_id,
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&actor),
+            ProjectStoreCompletion::RecoveryOpened {
+                request_id: actual,
+                result: Ok(_),
+            } if actual == request_id(4)
+        ));
+        actor
+            .try_submit(ProjectStoreCommand::LoadArtifacts {
+                request_id: request_id(5),
+                generation_id: recovery_id,
+                artifact_handles: vec![recovery_handle],
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&actor),
+            ProjectStoreCompletion::ArtifactsLoaded {
+                request_id: actual,
+                result: Ok(loaded),
+            } if actual == request_id(5) && loaded.len() == 1
+        ));
+        actor
+            .try_submit(ProjectStoreCommand::LoadArtifacts {
+                request_id: request_id(6),
+                generation_id: current_id,
+                artifact_handles: vec![direct.handle_id().clone()],
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&actor),
+            ProjectStoreCompletion::ArtifactsLoaded {
+                request_id: actual,
+                result: Err(ProjectStoreFault::Corruption {
+                    stage: "artifact_load_generation"
+                }),
+            } if actual == request_id(6)
+        ));
+
+        actor.try_submit(close_command(7)).unwrap();
+        public_recv_timeout(&actor);
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn artifact_load_returns_no_partial_bundle_when_a_later_object_is_corrupt() {
+        let project = TestProject::extracted_store("atomic-load", "recoverable.m4dproj");
+        let generation = frozen_generation_in("recoverable.m4dproj", RECOVERABLE_G2);
+        let artifacts = generation.projection().state().artifacts();
+        let direct = artifacts
+            .iter()
+            .find(|artifact| {
+                matches!(
+                    generation.bindings().get(&artifact.object().digest()),
+                    Some(ArtifactStorage::Direct { .. })
+                )
+            })
+            .unwrap();
+        let paged = artifacts
+            .iter()
+            .find(|artifact| {
+                matches!(
+                    generation.bindings().get(&artifact.object().digest()),
+                    Some(ArtifactStorage::Paged { .. })
+                )
+            })
+            .unwrap();
+        let ArtifactStorage::Paged { binding_manifest } =
+            generation.bindings().get(&paged.object().digest()).unwrap()
+        else {
+            unreachable!()
+        };
+        let binding_bytes = fs::read(project_object_path(
+            project.path(),
+            binding_manifest.digest(),
+        ))
+        .unwrap();
+        let limits = ProjectStoreLimits {
+            object_or_page_bytes_max: direct.object().byte_length() + paged.object().byte_length(),
+            ..ProjectStoreLimits::default()
+        };
+        let binding =
+            LogicalObjectBinding::decode(&binding_bytes, paged.object(), binding_manifest, limits)
+                .unwrap();
+        let final_page = binding.pages().last().unwrap().object();
+        let final_page_path = project_object_path(project.path(), final_page.digest());
+        let mut corrupt = fs::read(&final_page_path).unwrap();
+        corrupt[0] ^= 1;
+        fs::write(final_page_path, corrupt).unwrap();
+
+        let actor =
+            ProjectStoreActor::start(ProjectStoreConfig::new(limits, true).unwrap()).unwrap();
+        actor
+            .try_submit(ProjectStoreCommand::Open {
+                request_id: request_id(1),
+                path: project.store_path(),
+                mode: ProjectOpenMode::ReadOnly,
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&actor),
+            ProjectStoreCompletion::Opened { result: Ok(_), .. }
+        ));
+        actor
+            .try_submit(ProjectStoreCommand::LoadArtifacts {
+                request_id: request_id(2),
+                generation_id: generation_id(RECOVERABLE_G2),
+                artifact_handles: vec![direct.handle_id().clone(), paged.handle_id().clone()],
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&actor),
+            ProjectStoreCompletion::ArtifactsLoaded {
+                request_id: actual,
+                result: Err(ProjectStoreFault::Corruption {
+                    stage: "artifact_load_object"
+                }),
+            } if actual == request_id(2)
+        ));
+
+        actor.try_submit(close_command(3)).unwrap();
+        public_recv_timeout(&actor);
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn queued_artifact_load_cancellation_returns_no_bundle() {
+        let project = TestProject::extracted("cancel-load");
+        let actor =
+            EstablishedProjectActor::start(&project.store_path(), Default::default()).unwrap();
+        let (capture, gate) = gated_manual_capture();
+        actor
+            .try_submit(ProjectStoreCommand::ManualSave {
+                request_id: request_id(1),
+                capture,
+            })
+            .unwrap();
+        gate.wait_started();
+
+        let handle = frozen_generation(STALE_MANUAL)
+            .projection()
+            .state()
+            .artifacts()[0]
+            .handle_id()
+            .clone();
+        actor
+            .try_submit(ProjectStoreCommand::LoadArtifacts {
+                request_id: request_id(2),
+                generation_id: generation_id(STALE_MANUAL),
+                artifact_handles: vec![handle],
+            })
+            .unwrap();
+        actor.try_submit(cancel_command(3, 2)).unwrap();
+        assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 2);
+        assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 3);
+
+        actor.try_submit(cancel_command(4, 1)).unwrap();
+        assert_cancel_ack(actor.recv_timeout(TIMEOUT).unwrap(), 4);
+        gate.release();
+        assert_cancelled_target(actor.recv_timeout(TIMEOUT).unwrap(), 1);
+        actor.try_submit(close_command(5)).unwrap();
+        actor.recv_timeout(TIMEOUT).unwrap();
         actor.join().unwrap();
     }
 
@@ -5703,6 +6281,9 @@ mod tests {
             } | ProjectStoreCompletion::RecoveryOpened {
                 request_id: actual_id,
                 result: Err(ProjectStoreFault::Cancelled)
+            } | ProjectStoreCompletion::ArtifactsLoaded {
+                request_id: actual_id,
+                result: Err(ProjectStoreFault::Cancelled)
             } | ProjectStoreCompletion::Pinned {
                 request_id: actual_id,
                 result: Err(ProjectStoreFault::Cancelled)
@@ -6155,6 +6736,48 @@ mod tests {
             ProjectStoreLimits::default(),
         )
         .unwrap()
+    }
+
+    fn fixture_artifact_bytes(
+        store: &str,
+        generation: &GenerationDocument,
+        artifact: &ArtifactReference,
+    ) -> Vec<u8> {
+        match generation
+            .bindings()
+            .get(&artifact.object().digest())
+            .unwrap()
+        {
+            ArtifactStorage::Direct { object } => {
+                fixture_extract(&fixture_object_member_in(store, object.digest()))
+            }
+            ArtifactStorage::Paged { binding_manifest } => {
+                let binding_bytes =
+                    fixture_extract(&fixture_object_member_in(store, binding_manifest.digest()));
+                let binding = LogicalObjectBinding::decode(
+                    &binding_bytes,
+                    artifact.object(),
+                    binding_manifest,
+                    ProjectStoreLimits::default(),
+                )
+                .unwrap();
+                let mut bytes = Vec::new();
+                for page in binding.pages() {
+                    bytes.extend_from_slice(&fixture_extract(&fixture_object_member_in(
+                        store,
+                        page.object().digest(),
+                    )));
+                }
+                bytes
+            }
+        }
+    }
+
+    fn project_object_path(root: &Path, digest: ExactBytesDigest) -> PathBuf {
+        let digest = digest.digest().to_string();
+        root.join("objects/sha256")
+            .join(&digest[..2])
+            .join(&digest[2..])
     }
 
     fn fixture_extract(member: &str) -> Vec<u8> {

@@ -1869,7 +1869,10 @@ fn inspection_after(
     transition::after(occurrence).map_err(|_| ProjectStoreFault::Corruption { stage })
 }
 
-fn map_local_error(error: LocalPublicationError, stage: &'static str) -> ProjectStoreFault {
+pub(crate) fn map_local_error(
+    error: LocalPublicationError,
+    stage: &'static str,
+) -> ProjectStoreFault {
     match error {
         LocalPublicationError::Cancelled => ProjectStoreFault::Cancelled,
         LocalPublicationError::Capacity { .. } | LocalPublicationError::StorageFull { .. } => {
