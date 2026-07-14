@@ -414,6 +414,26 @@ pub enum WgpuRenderRuntimeError {
     FrameProgressContract,
 }
 
+/// Checks whether an adapter can run the interactive successor renderer.
+///
+/// Product startup uses this before asking WGPU to create the window device,
+/// so unsupported software, non-Vulkan, and undersized adapters fail before
+/// the viewer opens.
+pub fn qualify_adapter(adapter: &wgpu::Adapter) -> Result<(), WgpuRenderRuntimeError> {
+    runtime::validate_adapter(adapter)
+}
+
+/// Builds the device request used by the interactive successor renderer.
+///
+/// The requested features and limits are the same fixed set used by
+/// [`WgpuRenderRuntime::new`].
+pub fn renderer_device_descriptor(
+    adapter: &wgpu::Adapter,
+    label: &'static str,
+) -> Result<wgpu::DeviceDescriptor<'static>, WgpuRenderRuntimeError> {
+    runtime::renderer_device_descriptor(adapter, label)
+}
+
 /// Sole off-product owner of successor WGPU resources.
 pub struct WgpuRenderRuntime {
     inner: runtime::Runtime,

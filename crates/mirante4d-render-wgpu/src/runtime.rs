@@ -859,23 +859,9 @@ impl Runtime {
             })
             .await
             .map_err(|_| WgpuRenderRuntimeError::DeviceUnavailable)?;
-        validate_adapter(&adapter)?;
-
-        let required_limits = wgpu::Limits {
-            max_buffer_size: MIN_BUFFER_LIMIT_BYTES,
-            max_storage_buffer_binding_size: MIN_STORAGE_BINDING_LIMIT_BYTES,
-            max_storage_buffers_per_shader_stage: MIN_STORAGE_BUFFERS_PER_STAGE,
-            ..wgpu::Limits::default()
-        };
+        let device_descriptor = renderer_device_descriptor(&adapter, "mirante4d-wp09a-device")?;
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("mirante4d-wp09a-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits,
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
-                trace: wgpu::Trace::Off,
-            })
+            .request_device(&device_descriptor)
             .await
             .map_err(|_| WgpuRenderRuntimeError::DeviceCreationFailed)?;
 
@@ -1662,15 +1648,37 @@ impl Runtime {
     }
 }
 
-fn validate_adapter(adapter: &wgpu::Adapter) -> Result<(), WgpuRenderRuntimeError> {
+pub(super) fn validate_adapter(adapter: &wgpu::Adapter) -> Result<(), WgpuRenderRuntimeError> {
     let info = adapter.get_info();
-    if matches!(info.device_type, wgpu::DeviceType::Cpu) {
+    validate_adapter_facts(info.device_type, info.backend, &adapter.limits())
+}
+
+pub(super) fn renderer_device_descriptor(
+    adapter: &wgpu::Adapter,
+    label: &'static str,
+) -> Result<wgpu::DeviceDescriptor<'static>, WgpuRenderRuntimeError> {
+    validate_adapter(adapter)?;
+    Ok(wgpu::DeviceDescriptor {
+        label: Some(label),
+        required_features: wgpu::Features::empty(),
+        required_limits: renderer_required_limits(),
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        memory_hints: wgpu::MemoryHints::MemoryUsage,
+        trace: wgpu::Trace::Off,
+    })
+}
+
+fn validate_adapter_facts(
+    device_type: wgpu::DeviceType,
+    backend: wgpu::Backend,
+    limits: &wgpu::Limits,
+) -> Result<(), WgpuRenderRuntimeError> {
+    if matches!(device_type, wgpu::DeviceType::Cpu) {
         return Err(WgpuRenderRuntimeError::SoftwareAdapter);
     }
-    if info.backend != wgpu::Backend::Vulkan {
+    if backend != wgpu::Backend::Vulkan {
         return Err(WgpuRenderRuntimeError::UnsupportedBackend);
     }
-    let limits = adapter.limits();
     if limits.max_buffer_size < MIN_BUFFER_LIMIT_BYTES
         || limits.max_storage_buffer_binding_size < MIN_STORAGE_BINDING_LIMIT_BYTES
         || limits.max_storage_buffers_per_shader_stage < MIN_STORAGE_BUFFERS_PER_STAGE
@@ -1678,6 +1686,15 @@ fn validate_adapter(adapter: &wgpu::Adapter) -> Result<(), WgpuRenderRuntimeErro
         return Err(WgpuRenderRuntimeError::AdapterLimitsInsufficient);
     }
     Ok(())
+}
+
+fn renderer_required_limits() -> wgpu::Limits {
+    wgpu::Limits {
+        max_buffer_size: MIN_BUFFER_LIMIT_BYTES,
+        max_storage_buffer_binding_size: MIN_STORAGE_BINDING_LIMIT_BYTES,
+        max_storage_buffers_per_shader_stage: MIN_STORAGE_BUFFERS_PER_STAGE,
+        ..wgpu::Limits::default()
+    }
 }
 
 fn validate_device_limits(limits: &wgpu::Limits) -> Result<(), WgpuRenderRuntimeError> {
@@ -1850,6 +1867,38 @@ mod tests {
         assert_eq!(
             validate_device_limits(&limits),
             Err(WgpuRenderRuntimeError::DeviceLimitsInsufficient)
+        );
+    }
+
+    #[test]
+    fn adapter_preflight_is_vulkan_hardware_with_the_accepted_limits() {
+        let limits = renderer_required_limits();
+        assert_eq!(
+            validate_adapter_facts(
+                wgpu::DeviceType::DiscreteGpu,
+                wgpu::Backend::Vulkan,
+                &limits,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_adapter_facts(wgpu::DeviceType::Cpu, wgpu::Backend::Vulkan, &limits),
+            Err(WgpuRenderRuntimeError::SoftwareAdapter)
+        );
+        assert_eq!(
+            validate_adapter_facts(wgpu::DeviceType::DiscreteGpu, wgpu::Backend::Gl, &limits),
+            Err(WgpuRenderRuntimeError::UnsupportedBackend)
+        );
+
+        let mut undersized = limits;
+        undersized.max_buffer_size = MIN_BUFFER_LIMIT_BYTES - 1;
+        assert_eq!(
+            validate_adapter_facts(
+                wgpu::DeviceType::DiscreteGpu,
+                wgpu::Backend::Vulkan,
+                &undersized,
+            ),
+            Err(WgpuRenderRuntimeError::AdapterLimitsInsufficient)
         );
     }
 }
