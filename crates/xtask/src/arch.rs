@@ -860,6 +860,7 @@ fn check_wp07b_live_cutover(
         })
         .collect::<BTreeSet<_>>();
     let live_foundation_edges = BTreeSet::from([
+        ("mirante4d-analysis-core", "mirante4d-dataset"),
         ("mirante4d-application", "mirante4d-render-api"),
         ("mirante4d-data", "mirante4d-dataset"),
         ("mirante4d-dataset-runtime", "mirante4d-dataset"),

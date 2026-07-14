@@ -46,7 +46,8 @@ const TARGET_CRATES: [&str; 17] = [
     "mirante4d-storage",
     "mirante4d-ui-egui",
 ];
-const SUCCESSOR_OWNED_WORKSPACE_CRATES: [&str; 5] = [
+const SUCCESSOR_OWNED_WORKSPACE_CRATES: [&str; 6] = [
+    "mirante4d-analysis-core",
     "mirante4d-import-pipeline",
     "mirante4d-project-store",
     "mirante4d-render-reference",

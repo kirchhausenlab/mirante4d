@@ -2225,6 +2225,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mirante4d-analysis-core"
+version = "0.1.0"
+dependencies = [
+ "mirante4d-dataset",
+ "mirante4d-domain",
+ "mirante4d-identity",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "mirante4d-app"
 version = "0.1.0"
 dependencies = [

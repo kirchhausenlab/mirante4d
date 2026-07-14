@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/mirante4d-analysis",
+    "crates/mirante4d-analysis-core",
     "crates/mirante4d-app",
     "crates/mirante4d-application",
     "crates/mirante4d-data",
@@ -67,6 +68,7 @@ zstd = { version = "=0.13.3", default-features = false }
 
 mirante4d-app = { path = "crates/mirante4d-app" }
 mirante4d-analysis = { path = "crates/mirante4d-analysis" }
+mirante4d-analysis-core = { path = "crates/mirante4d-analysis-core" }
 mirante4d-application = { path = "crates/mirante4d-application" }
 mirante4d-data = { path = "crates/mirante4d-data" }
 mirante4d-dataset = { path = "crates/mirante4d-dataset" }

@@ -1,0 +1,15 @@
+[package]
+name = "mirante4d-analysis-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mirante4d-dataset.workspace = true
+mirante4d-domain.workspace = true
+mirante4d-identity.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
