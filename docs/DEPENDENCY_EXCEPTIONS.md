@@ -1,7 +1,7 @@
 # Dependency Exceptions
 
 Status: ACCEPTED
-Last updated: 2026-07-11
+Last updated: 2026-07-14
 
 This file records dependency-policy exceptions allowed by `cargo xtask verify-deps`.
 Exceptions that are encountered by `cargo-deny` are also listed in `deny.toml`;
@@ -9,37 +9,6 @@ native-checker-only dev/test exceptions are documented here and enforced by
 `xtask`.
 
 ## Active Exceptions
-
-### `EXC-PASTE-WP10A-1` — `paste`
-
-Allowed advisory exception:
-
-- `RUSTSEC-2024-0436`
-
-Exact reviewed inclusion graph:
-
-- `paste 1.0.15`
-- `zarrs 0.23.13`
-- `zarrs_data_type 0.9.0`
-- `zarrs_plugin 0.4.1`
-
-The dependency gate checks the all-features metadata graph, including every
-target-conditioned edge. It rejects workspace paths that bypass
-`mirante4d-data` or `mirante4d-format`, and rejects any path from
-`mirante4d-storage` to this exception.
-
-Reason: the current schema-1 bridge in `mirante4d-format` and `mirante4d-data`
-still needs this released Zarr graph. RustSec classifies the advisory as
-unmaintained information and provides no patched `paste` release. This is not
-authorization for target storage to inherit the exception; WP-10A must choose
-that implementation dependency separately in its profile-freeze supplement.
-
-Owner: Mirante4D maintainers.
-
-Review: on every Zarr dependency update.
-
-Expiry: when the current schema-1 path is deleted at WP-10C, or earlier if an
-upstream release removes `paste`.
 
 ### `epaint_default_fonts`
 
