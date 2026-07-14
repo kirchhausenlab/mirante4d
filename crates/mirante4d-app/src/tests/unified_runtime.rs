@@ -92,6 +92,73 @@ fn app_dispatches_and_drains_visible_demand_through_one_runtime() {
 }
 
 #[test]
+fn import_cancellation_waits_for_the_worker_terminal_result() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let token = app
+        .begin_background_operation(OperationKind::Import)
+        .unwrap();
+    let cancellation = ImportCancellation::new();
+    let (_sender, receiver) = mpsc::channel();
+    app.import_runtime.import_task = Some(ImportTask {
+        token: token.clone(),
+        destination: temp.path().join("imported.m4d"),
+        cancellation: cancellation.clone(),
+        receiver,
+        latest_event: None,
+        retry_options: None,
+        worker: None,
+    });
+
+    app.cancel_import_task();
+
+    assert!(cancellation.is_cancelled());
+    assert!(
+        app.application
+            .snapshot()
+            .active_operations()
+            .contains(&token)
+    );
+    app.import_runtime.import_task = None;
+    assert!(app.complete_background_operation(token, OperationCompletion::Succeeded));
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
+fn imported_dataset_uses_the_existing_dirty_project_open_handoff() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let context = egui::Context::default();
+    verify_test_source(&mut app);
+    app.apply_application_command(ApplicationCommand::AttachVerifiedDataset, &context)
+        .unwrap();
+    assert!(app.project_dirty());
+    let imported = temp.path().join("imported.m4d");
+
+    assert!(!app.open_or_queue_dataset_path(imported.clone(), None).unwrap());
+
+    assert_eq!(app.pending_dataset_open_path.as_ref(), Some(&imported));
+    assert!(app.ui_runtime.close_prompt_open);
+    assert!(
+        app.application
+            .snapshot()
+            .active_operations()
+            .iter()
+            .all(|operation| operation.kind() != OperationKind::DatasetOpen)
+    );
+    app.dataset.request_shutdown().unwrap();
+    app.source_verification_service
+        .take()
+        .unwrap()
+        .shutdown()
+        .unwrap();
+}
+
+#[test]
 fn exact_analyses_cancel_save_and_reopen_atomically() {
     let temp = tempfile::tempdir().unwrap();
     let package = write_target_fixture(temp.path()).unwrap();

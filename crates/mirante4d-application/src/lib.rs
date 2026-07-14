@@ -2537,7 +2537,12 @@ impl ApplicationState {
                 return Err(ApplicationFaultCode::InvalidOperationCompletion);
             }
         } else {
-            if token.kind == OperationKind::SourceVerification {
+            if token.kind == OperationKind::Import {
+                // Import reads an external TIFF source and publishes a new
+                // package. Viewer/project edits do not make that result
+                // stale, so only the exact active operation token above is
+                // relevant to its terminal outcome.
+            } else if token.kind == OperationKind::SourceVerification {
                 self.validate_source_verification_token_current(&token)?;
             } else if token.kind == OperationKind::ProjectSave {
                 self.validate_save_token_current(&token)?;

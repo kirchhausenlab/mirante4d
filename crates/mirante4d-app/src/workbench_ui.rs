@@ -892,6 +892,7 @@ impl eframe::App for MiranteWorkbenchApp {
         let mut start_pending_tiff_import = false;
         let mut cancel_pending_tiff_import = false;
         let mut dismiss_tiff_import_setup_error = false;
+        let mut reset_invalid_import_checkpoint = false;
         let layout = WorkbenchLayoutSpec::default();
         let playback_started = Instant::now();
         workbench_playback_runtime::enqueue_playback_command_if_due(
@@ -1045,9 +1046,25 @@ impl eframe::App for MiranteWorkbenchApp {
                     {
                         self.import_tiff_file_from_dialog(ui.ctx());
                     }
-                    if import_active && ui_kit::toolbar_button(ui, "Cancel Import", true).clicked()
-                    {
-                        self.cancel_import_task();
+                    if import_active {
+                        let cancellation_pending = self
+                            .import_runtime
+                            .import_task
+                            .as_ref()
+                            .is_some_and(|task| task.cancellation.is_cancelled());
+                        if ui_kit::toolbar_button(
+                            ui,
+                            if cancellation_pending {
+                                "Stopping Import"
+                            } else {
+                                "Cancel Import"
+                            },
+                            !cancellation_pending,
+                        )
+                        .clicked()
+                        {
+                            self.cancel_import_task();
+                        }
                     }
                     ui.separator();
                     ui_kit::elided_label(ui, application_snapshot.catalog().label(), 42);
@@ -2247,6 +2264,7 @@ impl eframe::App for MiranteWorkbenchApp {
             &mut start_pending_tiff_import,
             &mut cancel_pending_tiff_import,
             &mut dismiss_tiff_import_setup_error,
+            &mut reset_invalid_import_checkpoint,
         );
         self.show_project_recovery_ui(ui.ctx());
         self.show_dirty_project_close_prompt(ui.ctx());
@@ -2277,12 +2295,17 @@ impl eframe::App for MiranteWorkbenchApp {
         let import_action_started = Instant::now();
         if dismiss_tiff_import_setup_error {
             self.import_runtime.tiff_import_setup_error = None;
+            self.import_runtime.checkpoint_retry_options = None;
+            self.import_runtime.checkpoint_reset_confirmed = false;
         }
         if cancel_pending_tiff_import {
             self.cancel_pending_tiff_import();
         }
         if start_pending_tiff_import {
             self.start_pending_tiff_import();
+        }
+        if reset_invalid_import_checkpoint {
+            self.reset_invalid_checkpoint_and_restart();
         }
         let import_action_ms = duration_ms(import_action_started.elapsed());
 

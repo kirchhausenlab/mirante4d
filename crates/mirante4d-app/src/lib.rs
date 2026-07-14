@@ -87,7 +87,7 @@ use import_ui::{
     ImportTask, ImportTaskMessage, PendingTiffImport, TiffImportSetupTask,
     TiffImportSetupTaskMessage, active_layer_no_data_policy_label, build_import_options,
     import_progress_fraction, import_task_status_text, pending_tiff_import_ready_to_start,
-    show_pending_tiff_import_controls, tiff_destination,
+    reset_checkpoint_directory, show_pending_tiff_import_controls, tiff_destination,
 };
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, ApplicationFault, ApplicationFaultCode,
@@ -1332,15 +1332,6 @@ impl MiranteWorkbenchApp {
         }
     }
 
-    fn cancel_background_operation(&mut self, token: &OperationToken) {
-        if let Err(fault) = current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::CancelOperation(token.operation_id()),
-        ) {
-            tracing::warn!(?fault, "background operation cancellation was rejected");
-        }
-    }
-
     fn poll_project_store(&mut self) {
         let snapshot = current_egui_shell_bridge::snapshot(&self.application);
         let result = self
@@ -2058,11 +2049,23 @@ impl MiranteWorkbenchApp {
         else {
             return;
         };
+        if let Err(error) = self.open_or_queue_dataset_path(path, Some(ctx)) {
+            tracing::warn!(%error, "dataset open request was rejected");
+        }
+    }
+
+    fn open_or_queue_dataset_path(
+        &mut self,
+        path: PathBuf,
+        ctx: Option<&egui::Context>,
+    ) -> anyhow::Result<bool> {
         if self.project_dirty() {
             self.pending_dataset_open_path = Some(path);
             self.ui_runtime.close_prompt_open = true;
-        } else if let Err(error) = self.replace_state_from_dataset_path(path, Some(ctx)) {
-            tracing::warn!(%error, "dataset open request was rejected");
+            Ok(false)
+        } else {
+            self.replace_state_from_dataset_path(path, ctx)?;
+            Ok(true)
         }
     }
 

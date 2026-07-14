@@ -91,6 +91,8 @@ impl MiranteWorkbenchApp {
     ) {
         self.import_runtime.pending_tiff_import = None;
         self.import_runtime.tiff_import_setup_error = None;
+        self.import_runtime.checkpoint_retry_options = None;
+        self.import_runtime.checkpoint_reset_confirmed = false;
         self.import_runtime.tiff_import_setup_task = Some(TiffImportSetupTask {
             source,
             destination,
@@ -182,6 +184,8 @@ impl MiranteWorkbenchApp {
         }
         self.import_runtime.pending_tiff_import = None;
         self.import_runtime.tiff_import_setup_error = None;
+        self.import_runtime.checkpoint_retry_options = None;
+        self.import_runtime.checkpoint_reset_confirmed = false;
     }
 
     pub(super) fn start_import_task(&mut self, options: ImportOptions) {
@@ -189,21 +193,29 @@ impl MiranteWorkbenchApp {
         let Some(token) = self.begin_background_operation(OperationKind::Import) else {
             return;
         };
+        self.import_runtime.checkpoint_retry_options = None;
+        self.import_runtime.checkpoint_reset_confirmed = false;
         let ledger = self.dataset.cpu_ledger_arc();
         let cancellation = ImportCancellation::new();
         let worker_cancellation = cancellation.clone();
         let progress_cancellation = cancellation.clone();
         let (sender, receiver) = mpsc::channel();
         let progress_sender = sender.clone();
+        let worker_options = options.clone();
         let worker = thread::spawn(move || {
-            let result = import_tiff(options, ledger.as_ref(), &worker_cancellation, |event| {
-                if progress_sender
-                    .send(ImportTaskMessage::Progress(event))
-                    .is_err()
-                {
-                    progress_cancellation.cancel();
-                }
-            });
+            let result = import_tiff(
+                worker_options,
+                ledger.as_ref(),
+                &worker_cancellation,
+                |event| {
+                    if progress_sender
+                        .send(ImportTaskMessage::Progress(event))
+                        .is_err()
+                    {
+                        progress_cancellation.cancel();
+                    }
+                },
+            );
             let _ = sender.send(ImportTaskMessage::Finished(result));
         });
         self.import_runtime.import_task = Some(ImportTask {
@@ -212,6 +224,7 @@ impl MiranteWorkbenchApp {
             cancellation,
             receiver,
             latest_event: None,
+            retry_options: Some(options),
             worker: Some(worker),
         });
         tracing::info!(destination = %destination.display(), "started TIFF import");
@@ -219,9 +232,7 @@ impl MiranteWorkbenchApp {
 
     pub(super) fn cancel_import_task(&mut self) {
         if let Some(task) = self.import_runtime.import_task.as_ref() {
-            let token = task.token.clone();
             task.cancellation.cancel();
-            self.cancel_background_operation(&token);
         }
     }
 
@@ -255,16 +266,19 @@ impl MiranteWorkbenchApp {
         }
 
         if let Some(completion) = completion {
-            let task = self
+            let mut task = self
                 .import_runtime
                 .import_task
                 .take()
                 .expect("an import completion has an active task");
             let token = task.token.clone();
             let destination = task.destination.clone();
+            let retry_options = task.retry_options.take();
             drop(task);
             match completion {
                 ImportCompletion::Finished(Ok(receipt)) => {
+                    self.import_runtime.checkpoint_retry_options = None;
+                    self.import_runtime.checkpoint_reset_confirmed = false;
                     if self.complete_background_operation(token, OperationCompletion::Succeeded) {
                         self.finish_successful_import(receipt, destination, ctx);
                     }
@@ -272,6 +286,20 @@ impl MiranteWorkbenchApp {
                 ImportCompletion::Finished(Err(ImportError::Cancelled)) => {
                     self.complete_background_operation(token, OperationCompletion::Cancelled);
                     self.import_runtime.tiff_import_setup_error = None;
+                    self.import_runtime.checkpoint_retry_options = None;
+                    self.import_runtime.checkpoint_reset_confirmed = false;
+                }
+                ImportCompletion::Finished(Err(ImportError::InvalidCheckpoint(reason))) => {
+                    self.complete_background_operation(
+                        token,
+                        OperationCompletion::Failed(OperationFailureCode::ImportInvalidInput),
+                    );
+                    self.import_runtime.tiff_import_setup_error = Some(format!(
+                        "The saved import checkpoint is corrupt or belongs to different inputs: {reason}. Confirm Reset and Restart below to remove only that checkpoint and retry."
+                    ));
+                    self.import_runtime.checkpoint_retry_options = retry_options;
+                    self.import_runtime.checkpoint_reset_confirmed = false;
+                    tracing::error!(%reason, "failed to reuse TIFF import checkpoint");
                 }
                 ImportCompletion::Finished(Err(error)) => {
                     self.complete_background_operation(
@@ -279,6 +307,8 @@ impl MiranteWorkbenchApp {
                         OperationCompletion::Failed(import_failure_code(&error)),
                     );
                     self.import_runtime.tiff_import_setup_error = Some(error.to_string());
+                    self.import_runtime.checkpoint_retry_options = None;
+                    self.import_runtime.checkpoint_reset_confirmed = false;
                     tracing::error!(%error, "failed to import TIFF input");
                 }
                 ImportCompletion::WorkerStopped => {
@@ -288,6 +318,8 @@ impl MiranteWorkbenchApp {
                     );
                     self.import_runtime.tiff_import_setup_error =
                         Some("TIFF import worker stopped unexpectedly".to_owned());
+                    self.import_runtime.checkpoint_retry_options = None;
+                    self.import_runtime.checkpoint_reset_confirmed = false;
                     tracing::error!("TIFF import worker stopped unexpectedly");
                 }
             }
@@ -305,22 +337,57 @@ impl MiranteWorkbenchApp {
         destination: PathBuf,
         ctx: &egui::Context,
     ) {
-        if let Err(error) = self.replace_state_from_dataset_path(destination.clone(), Some(ctx)) {
-            self.import_runtime.tiff_import_setup_error = Some(format!(
-                "The package was created, but Mirante4D could not open it: {error}"
-            ));
-            tracing::error!(%error, "failed to open imported dataset");
-            return;
-        }
+        let open_started = match self.open_or_queue_dataset_path(destination.clone(), Some(ctx)) {
+            Ok(open_started) => open_started,
+            Err(error) => {
+                self.import_runtime.tiff_import_setup_error = Some(format!(
+                    "The package was created, but Mirante4D could not open it: {error}"
+                ));
+                tracing::error!(%error, "failed to open imported dataset");
+                return;
+            }
+        };
         self.import_runtime.tiff_import_setup_error = None;
+        if !open_started {
+            self.project_status_message = Some(
+                "Import completed. Save or discard the current project to open the new package."
+                    .to_owned(),
+            );
+        }
         tracing::info!(
             source_bytes_read = receipt.statistics.source_bytes_read,
             peak_working_bytes = receipt.statistics.peak_working_bytes,
             resumed_work_units = receipt.statistics.resumed_work_units,
             produced_work_units = receipt.statistics.produced_work_units,
             destination = %destination.display(),
-            "TIFF import completed and package open was requested"
+            open_started,
+            "TIFF import completed"
         );
+    }
+
+    pub(super) fn reset_invalid_checkpoint_and_restart(&mut self) {
+        if !self.import_runtime.checkpoint_reset_confirmed {
+            return;
+        }
+        let Some(options) = self.import_runtime.checkpoint_retry_options.take() else {
+            self.import_runtime.checkpoint_reset_confirmed = false;
+            return;
+        };
+        let checkpoint = options.checkpoint_directory.clone();
+        match reset_checkpoint_directory(&checkpoint) {
+            Ok(()) => {
+                self.import_runtime.tiff_import_setup_error = None;
+                self.import_runtime.checkpoint_reset_confirmed = false;
+                self.start_import_task(options);
+            }
+            Err(error) => {
+                self.import_runtime.checkpoint_retry_options = Some(options);
+                self.import_runtime.checkpoint_reset_confirmed = false;
+                self.import_runtime.tiff_import_setup_error = Some(format!(
+                    "The checkpoint was not reset, so nothing was restarted: {error}"
+                ));
+            }
+        }
     }
 
     pub(super) fn show_tiff_import_setup_window(
@@ -329,6 +396,7 @@ impl MiranteWorkbenchApp {
         start_pending_tiff_import: &mut bool,
         cancel_pending_tiff_import: &mut bool,
         dismiss_setup_error: &mut bool,
+        reset_invalid_checkpoint: &mut bool,
     ) {
         if self.import_runtime.tiff_import_setup_task.is_none()
             && self.import_runtime.pending_tiff_import.is_none()
@@ -371,18 +439,42 @@ impl MiranteWorkbenchApp {
                     return;
                 }
 
-                if let Some(error) = self.import_runtime.tiff_import_setup_error.as_deref() {
+                if let Some(error) = self.import_runtime.tiff_import_setup_error.clone() {
                     ui_kit::status_badge(ui, StatusTone::Error, "import could not continue");
                     ui.add_space(6.0);
                     ui.label(error);
                     ui.add_space(6.0);
-                    ui.label(
-                        "Select a supported grayscale TIFF file or an unambiguous TIFF directory.",
-                    );
-                    ui.add_space(8.0);
-                    if ui_kit::toolbar_button(ui, "Dismiss", true).clicked() {
-                        *dismiss_setup_error = true;
+                    if let Some(options) = self.import_runtime.checkpoint_retry_options.as_ref() {
+                        ui_kit::property_row(
+                            ui,
+                            "checkpoint",
+                            options.checkpoint_directory.display(),
+                        );
+                        ui.checkbox(
+                            &mut self.import_runtime.checkpoint_reset_confirmed,
+                            "I confirm this saved import checkpoint may be deleted",
+                        );
+                    } else {
+                        ui.label(
+                            "Select a supported grayscale TIFF file or an unambiguous TIFF directory.",
+                        );
                     }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if self.import_runtime.checkpoint_retry_options.is_some()
+                            && ui_kit::toolbar_button(
+                                ui,
+                                "Reset and Restart",
+                                self.import_runtime.checkpoint_reset_confirmed,
+                            )
+                            .clicked()
+                        {
+                            *reset_invalid_checkpoint = true;
+                        }
+                        if ui_kit::toolbar_button(ui, "Dismiss", true).clicked() {
+                            *dismiss_setup_error = true;
+                        }
+                    });
                     return;
                 }
 

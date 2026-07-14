@@ -1,5 +1,7 @@
 //! Product TIFF inspection and import execution facts.
 
+use mirante4d_import_pipeline::ImportOptions;
+
 use crate::{ImportTask, PendingTiffImport, TiffImportSetupTask};
 
 pub(crate) struct ImportRuntime {
@@ -7,6 +9,8 @@ pub(crate) struct ImportRuntime {
     pub(crate) tiff_import_setup_error: Option<String>,
     pub(crate) pending_tiff_import: Option<PendingTiffImport>,
     pub(crate) import_task: Option<ImportTask>,
+    pub(crate) checkpoint_retry_options: Option<ImportOptions>,
+    pub(crate) checkpoint_reset_confirmed: bool,
 }
 
 impl ImportRuntime {
@@ -16,6 +20,8 @@ impl ImportRuntime {
             tiff_import_setup_error: None,
             pending_tiff_import: None,
             import_task: None,
+            checkpoint_retry_options: None,
+            checkpoint_reset_confirmed: false,
         }
     }
 }

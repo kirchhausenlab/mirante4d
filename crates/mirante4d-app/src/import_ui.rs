@@ -1,4 +1,5 @@
 use std::{
+    fs,
     path::{Path, PathBuf},
     sync::mpsc::Receiver,
     thread::JoinHandle,
@@ -82,6 +83,7 @@ pub(crate) struct ImportTask {
     pub(crate) cancellation: ImportCancellation,
     pub(crate) receiver: Receiver<ImportTaskMessage>,
     pub(crate) latest_event: Option<ImportEvent>,
+    pub(crate) retry_options: Option<ImportOptions>,
     pub(crate) worker: Option<JoinHandle<()>>,
 }
 
@@ -153,6 +155,40 @@ fn checkpoint_directory(destination: &Path) -> anyhow::Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("the import destination needs a package name"))?
         .to_string_lossy();
     Ok(parent.join(format!(".{name}.import-checkpoint")))
+}
+
+pub(crate) fn reset_checkpoint_directory(path: &Path) -> anyhow::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        anyhow::bail!("the checkpoint path is not a real directory");
+    }
+
+    let allowed = ["header", "journal", "payload"];
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("the checkpoint contains a non-UTF-8 entry"))?;
+        if !allowed.contains(&name.as_str()) {
+            anyhow::bail!("the checkpoint contains an unrelated entry: {name}");
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            anyhow::bail!("checkpoint entry {name} is not a regular file");
+        }
+        entries.push(entry.path());
+    }
+    for entry in entries {
+        fs::remove_file(entry)?;
+    }
+    fs::remove_dir(path)?;
+    Ok(())
 }
 
 pub(crate) fn validate_pending_tiff_import(pending: &PendingTiffImport) -> anyhow::Result<()> {
@@ -357,6 +393,9 @@ pub(crate) fn active_layer_no_data_policy_label(snapshot: &ApplicationSnapshot) 
 }
 
 pub(crate) fn import_task_status_text(task: &ImportTask) -> String {
+    if task.cancellation.is_cancelled() {
+        return "Stopping import".to_owned();
+    }
     task.latest_event
         .as_ref()
         .map(import_progress_message)
@@ -447,6 +486,36 @@ mod tests {
         assert_eq!(
             import_progress_fraction(Some(&ImportEvent::Finished)),
             Some(1.0)
+        );
+    }
+
+    #[test]
+    fn checkpoint_reset_removes_only_the_known_checkpoint_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkpoint = temp.path().join(".cells.m4d.import-checkpoint");
+        fs::create_dir(&checkpoint).unwrap();
+        for name in ["header", "journal", "payload"] {
+            fs::write(checkpoint.join(name), name).unwrap();
+        }
+
+        reset_checkpoint_directory(&checkpoint).unwrap();
+
+        assert!(!checkpoint.exists());
+    }
+
+    #[test]
+    fn checkpoint_reset_preserves_a_directory_with_unrelated_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkpoint = temp.path().join(".cells.m4d.import-checkpoint");
+        fs::create_dir(&checkpoint).unwrap();
+        fs::write(checkpoint.join("header"), b"checkpoint").unwrap();
+        fs::write(checkpoint.join("notes.txt"), b"unrelated").unwrap();
+
+        assert!(reset_checkpoint_directory(&checkpoint).is_err());
+        assert_eq!(fs::read(checkpoint.join("header")).unwrap(), b"checkpoint");
+        assert_eq!(
+            fs::read(checkpoint.join("notes.txt")).unwrap(),
+            b"unrelated"
         );
     }
 }
