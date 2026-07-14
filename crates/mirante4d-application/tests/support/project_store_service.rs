@@ -1335,6 +1335,77 @@ fn cancelled_completion_does_not_rearm_the_captured_revision() {
 }
 
 #[test]
+fn queued_analysis_target_before_cancel_ack_preserves_both_events() {
+    let mut application = verified_bound_application();
+    application.drain_events(MAX_PENDING_EVENTS);
+    application
+        .dispatch(ApplicationCommand::BeginOperation(OperationKind::Analysis))
+        .unwrap();
+    let token = application
+        .drain_events(MAX_PENDING_EVENTS)
+        .into_iter()
+        .find_map(|event| match event {
+            ApplicationEvent::OperationStarted { token } => Some(token),
+            _ => None,
+        })
+        .expect("analysis operation token");
+    let projection = projection_from_snapshot(&application.snapshot()).unwrap();
+    let target_request_id = request_id(1);
+    let cancellation_request_id = request_id(2);
+    let mut service = ProjectStoreApplicationService::start(
+        ProjectStoreConfig::default(),
+        ManualClock::default(),
+        None,
+    )
+    .unwrap();
+    service.active_foreground = Some(ActiveForeground {
+        request_id: target_request_id,
+        cancellation_request: Some(cancellation_request_id),
+        kind: ForegroundKind::AnalysisCommit {
+            token: token.clone(),
+            projection: Box::new(projection),
+            expected_parent: generation_id('d'),
+        },
+    });
+
+    let terminal = service
+        .handle_completion(ProjectStoreCompletion::ManualSaved {
+            request_id: target_request_id,
+            result: Err(ProjectStoreFault::Cancelled),
+        })
+        .unwrap();
+    assert!(matches!(
+        terminal.as_slice(),
+        [ProjectStoreServiceEvent::OperationFailed {
+            token: completed,
+            fault: ProjectStoreFault::Cancelled,
+        }] if completed == &token
+    ));
+    assert!(service.active_foreground.is_none());
+    assert!(service.has_pending_work());
+    assert_eq!(
+        service.require_no_actor_work(),
+        Err(ProjectStoreServiceError::OperationConflict)
+    );
+
+    let acknowledgement = service
+        .handle_completion(ProjectStoreCompletion::Cancelled {
+            request_id: cancellation_request_id,
+            result: Ok(()),
+        })
+        .unwrap();
+    assert!(matches!(
+        acknowledgement.as_slice(),
+        [ProjectStoreServiceEvent::CancellationAcknowledged {
+            request_id,
+            target_request_id: target,
+        }] if *request_id == cancellation_request_id && *target == target_request_id
+    ));
+    assert!(!service.has_pending_work());
+    service.join().unwrap();
+}
+
+#[test]
 fn commit_indeterminate_suspends_writes_until_service_reopen() {
     let mut application = verified_bound_application();
     application.drain_events(MAX_PENDING_EVENTS);
@@ -1551,7 +1622,7 @@ fn gated_artifact_source() -> (
 ) {
     let bytes = Arc::<[u8]>::from(b"bounded stale autosave source".as_slice());
     let facts = ExactBytesHasher::hash(&bytes).unwrap();
-    let schema = ArtifactSchema::AnalysisTableV1;
+    let schema = ArtifactSchema::AnnotationV1;
     let descriptor = RawObjectDescriptor::new(
         facts.digest(),
         facts.byte_length(),

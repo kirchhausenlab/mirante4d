@@ -1608,6 +1608,33 @@ fn analysis_bundle_is_invisible_until_commit_then_undo_removes_both_artifacts() 
     assert_eq!(projection.state().artifacts().len(), 2);
     assert_eq!(projection.revision().sequence(), 1);
 
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CancelOperation(token.operation_id()))
+            .unwrap(),
+        CommandEffect::Changed
+    );
+    assert_eq!(
+        application.snapshot().active_operations(),
+        std::slice::from_ref(&token)
+    );
+    assert!(
+        application
+            .drain_events(MAX_PENDING_EVENTS)
+            .iter()
+            .any(|event| matches!(
+                event,
+                ApplicationEvent::OperationCancellationRequested { token: event_token }
+                    if event_token == &token
+            ))
+    );
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CancelOperation(token.operation_id()))
+            .unwrap(),
+        CommandEffect::NoChange
+    );
+
     let before_frozen_edit = application.fork_for_dispatch();
     assert_eq!(
         application
@@ -1654,6 +1681,18 @@ fn analysis_bundle_is_invisible_until_commit_then_undo_removes_both_artifacts() 
     );
     assert!(committed.active_operations().is_empty());
 
+    let before_direct_remove = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::RemoveArtifact(
+                table_id.artifact_handle_id(),
+            ))
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::InvalidProjectTransition
+    );
+    assert_eq!(application, before_direct_remove);
+
     let point = AnalysisPlotPointSelection::new(plot_id, 1, 2);
     application
         .dispatch(ApplicationCommand::SelectAnalysisPlotPoint(Some(point)))
@@ -1681,9 +1720,90 @@ fn analysis_bundle_is_invisible_until_commit_then_undo_removes_both_artifacts() 
 }
 
 #[test]
+fn generic_artifact_commands_cannot_admit_analysis_schemas() {
+    let mut application = bound_application();
+    application.drain_events(MAX_PENDING_EVENTS);
+    let before = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::UpsertArtifact(analysis_artifact(
+                7,
+                ArtifactSchema::AnalysisTableV1,
+            )))
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::InvalidProjectTransition
+    );
+    assert_eq!(application, before);
+}
+
+#[test]
+fn analysis_stage_rejects_full_descriptor_registries_atomically() {
+    let mut full_tables = bound_application();
+    for index in 0..MAX_ANALYSIS_TABLES {
+        let mut bytes = [0_u8; 16];
+        bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+        bytes[15] = 1;
+        let id = AnalysisTableId::from_artifact_handle(&ArtifactHandleId::from_bytes(bytes));
+        full_tables
+            .analysis_table_catalog
+            .insert(id, AnalysisTableDescriptor::new(id, 0));
+    }
+    full_tables.drain_events(MAX_PENDING_EVENTS);
+    full_tables
+        .dispatch(ApplicationCommand::BeginOperation(OperationKind::Analysis))
+        .unwrap();
+    let token = started_token(&mut full_tables, OperationKind::Analysis);
+    let before = full_tables.fork_for_dispatch();
+    assert_eq!(
+        full_tables
+            .dispatch(ApplicationCommand::StageAnalysisBundle {
+                token,
+                artifacts: vec![analysis_artifact(250, ArtifactSchema::AnalysisTableV1)],
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::AnalysisRegistryFull
+    );
+    assert_eq!(full_tables, before);
+
+    let mut full_plots = bound_application();
+    for index in 0..MAX_ANALYSIS_PLOTS {
+        let mut bytes = [0_u8; 16];
+        bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+        bytes[15] = 2;
+        let id = AnalysisPlotId::from_artifact_handle(&ArtifactHandleId::from_bytes(bytes));
+        full_plots
+            .analysis_plot_catalog
+            .insert(id, AnalysisPlotDescriptor::new(id, Vec::new()).unwrap());
+    }
+    full_plots.drain_events(MAX_PENDING_EVENTS);
+    full_plots
+        .dispatch(ApplicationCommand::BeginOperation(OperationKind::Analysis))
+        .unwrap();
+    let token = started_token(&mut full_plots, OperationKind::Analysis);
+    let before = full_plots.fork_for_dispatch();
+    assert_eq!(
+        full_plots
+            .dispatch(ApplicationCommand::StageAnalysisBundle {
+                token,
+                artifacts: vec![
+                    analysis_artifact(250, ArtifactSchema::AnalysisTableV1),
+                    analysis_artifact(251, ArtifactSchema::AnalysisPlotV1),
+                ],
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::AnalysisRegistryFull
+    );
+    assert_eq!(full_plots, before);
+}
+
+#[test]
 fn authenticated_reopen_descriptors_become_visible_together() {
     let table_artifact = analysis_artifact(7, ArtifactSchema::AnalysisTableV1);
     let plot_artifact = analysis_artifact(8, ArtifactSchema::AnalysisPlotV1);
+    let second_table_artifact = analysis_artifact(9, ArtifactSchema::AnalysisTableV1);
     let table = AnalysisTableDescriptor::new(
         AnalysisTableId::from_artifact_handle(table_artifact.handle_id()),
         4,
@@ -1693,13 +1813,21 @@ fn authenticated_reopen_descriptors_become_visible_together() {
         vec![4],
     )
     .unwrap();
+    let second_table = AnalysisTableDescriptor::new(
+        AnalysisTableId::from_artifact_handle(second_table_artifact.handle_id()),
+        2,
+    );
     let project_id = project_id(9);
     let state = ProjectState::new(
         project_id,
         dataset_reference('1'),
         view(),
         vec![preset()],
-        vec![table_artifact, plot_artifact],
+        vec![
+            table_artifact.clone(),
+            plot_artifact.clone(),
+            second_table_artifact.clone(),
+        ],
     )
     .unwrap();
     let projection = ProjectGenerationProjection::new(
@@ -1731,28 +1859,73 @@ fn authenticated_reopen_descriptors_become_visible_together() {
             .is_empty()
     );
 
+    let currentness = application.snapshot().currentness();
     application
         .dispatch(ApplicationCommand::InstallLoadedAnalysisDescriptors {
-            tables: vec![table.clone()],
-            plots: vec![plot.clone()],
+            project_id,
+            revision: ProjectRevisionId::new(project_id, 3),
+            currentness,
+            bundles: vec![
+                LoadedAnalysisDescriptorBundle::new(
+                    vec![table_artifact.clone(), plot_artifact.clone()],
+                    table.clone(),
+                    Some(plot.clone()),
+                ),
+                LoadedAnalysisDescriptorBundle::new(
+                    vec![second_table_artifact.clone()],
+                    second_table.clone(),
+                    None,
+                ),
+            ],
         })
         .unwrap();
     let loaded = application.snapshot();
-    assert_eq!(loaded.transient().analysis_tables(), &[table]);
-    assert_eq!(loaded.transient().analysis_plots(), &[plot]);
+    assert_eq!(
+        loaded.transient().analysis_tables(),
+        &[table.clone(), second_table.clone()]
+    );
+    assert_eq!(
+        loaded.transient().analysis_plots(),
+        std::slice::from_ref(&plot)
+    );
+
+    let before_stale = application.fork_for_dispatch();
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::InstallLoadedAnalysisDescriptors {
+                project_id,
+                revision: ProjectRevisionId::new(project_id, 2),
+                currentness,
+                bundles: vec![LoadedAnalysisDescriptorBundle::new(
+                    vec![table_artifact.clone(), plot_artifact.clone()],
+                    table.clone(),
+                    Some(plot.clone()),
+                )],
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::StaleOperationCompletion
+    );
+    assert_eq!(application, before_stale);
 
     let before = application.fork_for_dispatch();
     let missing = AnalysisTableDescriptor::new(
         AnalysisTableId::from_artifact_handle(
-            analysis_artifact(9, ArtifactSchema::AnalysisTableV1).handle_id(),
+            analysis_artifact(10, ArtifactSchema::AnalysisTableV1).handle_id(),
         ),
         1,
     );
     assert_eq!(
         application
             .dispatch(ApplicationCommand::InstallLoadedAnalysisDescriptors {
-                tables: vec![missing],
-                plots: Vec::new(),
+                project_id,
+                revision: ProjectRevisionId::new(project_id, 3),
+                currentness,
+                bundles: vec![LoadedAnalysisDescriptorBundle::new(
+                    vec![second_table_artifact],
+                    missing,
+                    None,
+                )],
             })
             .unwrap_err()
             .code(),
@@ -1776,7 +1949,7 @@ fn analysis_stage_and_commit_reject_stale_or_wrong_input_atomically() {
     assert_eq!(
         stale
             .dispatch(ApplicationCommand::StageAnalysisBundle {
-                token: stale_token,
+                token: stale_token.clone(),
                 artifacts: vec![analysis_artifact(7, ArtifactSchema::AnalysisTableV1)],
             })
             .unwrap_err()
@@ -1784,6 +1957,13 @@ fn analysis_stage_and_commit_reject_stale_or_wrong_input_atomically() {
         ApplicationFaultCode::StaleOperationCompletion
     );
     assert_eq!(stale, before_stale);
+    stale
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token: stale_token,
+            completion: OperationCompletion::Cancelled,
+        })
+        .unwrap();
+    assert!(stale.snapshot().active_operations().is_empty());
 
     let mut wrong = bound_application();
     wrong.drain_events(MAX_PENDING_EVENTS);
@@ -1879,7 +2059,7 @@ fn source_invalidation_cancels_staged_analysis_without_exposing_results() {
         })
         .unwrap();
     let snapshot = application.snapshot();
-    assert!(snapshot.active_operations().is_empty());
+    assert_eq!(snapshot.active_operations(), std::slice::from_ref(&token));
     assert!(bound_project_arc(&snapshot).artifacts().is_empty());
     assert!(snapshot.transient().analysis_tables().is_empty());
     assert!(
@@ -1892,6 +2072,13 @@ fn source_invalidation_cancels_staged_analysis_without_exposing_results() {
                     if event_token == &token
             ))
     );
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::Cancelled,
+        })
+        .unwrap();
+    assert!(application.snapshot().active_operations().is_empty());
 }
 
 #[test]
@@ -2776,7 +2963,7 @@ fn preset() -> ChannelPreset {
 
 fn artifact(byte: u8) -> ArtifactReference {
     let zero = "0".repeat(64);
-    let schema = ArtifactSchema::AnalysisTableV1;
+    let schema = ArtifactSchema::AnnotationV1;
     ArtifactReference::new(
         ArtifactHandleId::from_bytes([byte; 16]),
         schema,
