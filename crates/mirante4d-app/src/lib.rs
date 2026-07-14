@@ -90,6 +90,10 @@ use mirante4d_application::{
     import_workflow::{ImportCommand, ImportReviewId, ImportWorkflowSnapshot},
     viewer_tools::{ViewerTool, ViewerToolState},
 };
+pub use mirante4d_application::{
+    DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind, FrameFidelityStatus,
+    LodDecisionReason, RenderBackend,
+};
 use mirante4d_dataset::{DatasetSourceId, ResourceValidity};
 use mirante4d_domain::{
     CameraView, CrossSectionView, DisplayWindow, DvrOpacityTransfer as CanonicalDvrOpacityTransfer,
@@ -119,10 +123,7 @@ use playback::stepped_timepoint;
 use product_automation::{ProductAutomationAppUpdateTiming, ProductAutomationController};
 use render_state::{set_presentation_viewport, set_render_viewport, take_lod_replan_pending};
 pub use smoke::{AppSmokeOptions, AppSmokeReport, PlaybackSmokeFrame, run_headless_smoke};
-pub use state::{
-    DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind, FrameFidelityStatus,
-    HistogramStatus, LayerHistogramSummary, LodDecisionReason, RenderBackend,
-};
+pub use state::{HistogramStatus, LayerHistogramSummary};
 use tool_interactions::apply_viewport_tool_response;
 use transfer_presets::{
     built_in_transfer_preset_curve, built_in_transfer_preset_label, built_in_transfer_presets,

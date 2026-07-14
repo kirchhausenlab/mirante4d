@@ -8,6 +8,7 @@
 
 pub mod import_workflow;
 mod project_store_service;
+pub mod render_coordination;
 pub mod viewer_tools;
 pub mod viewport_interaction;
 
@@ -15,6 +16,10 @@ pub use project_store_service::{
     MonotonicClock, ProjectRecoveryStoreLocator, ProjectStoreApplicationService,
     ProjectStoreLifecycle, ProjectStoreServiceError, ProjectStoreServiceEvent,
     ProjectStoreServiceStatus, SystemMonotonicClock,
+};
+pub use render_coordination::{
+    DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind, FrameFidelityStatus,
+    LodDecisionReason, RenderBackend,
 };
 
 use std::{
