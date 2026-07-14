@@ -6,7 +6,9 @@ use thiserror::Error;
 
 use crate::brick_address::plan_local_brick_address;
 use crate::directory_inventory::{ExpectedFile, ExpectedFileRole, inspect_directory_closure};
-use crate::package_admission::{DatasetProfileAdmissionInput, admit_dataset_profile};
+use crate::package_admission::{
+    DatasetProfileAdmissionInput, admit_dataset_profile, admit_supported_dataset_profile,
+};
 use crate::package_integrity::{
     ExactPackageCapability, PackageIntegrityInput, PackageValidationError,
     validate_package_integrity,
@@ -232,6 +234,29 @@ impl LocalPackageCatalog {
         )
     }
 
+    /// Selects the first supported DS envelope in fixed DS-0 through DS-4
+    /// order after deriving the package facts once.
+    ///
+    /// The selected profile is a runtime capacity result. It is not persisted
+    /// package metadata and does not participate in package or scientific
+    /// identity.
+    pub fn admit_supported_dataset_profile(
+        &self,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<crate::DatasetProfileAdmission, crate::PackageAdmissionError> {
+        let inventory = self.inspect_directory_closure(&mut is_cancelled)?;
+        admit_supported_dataset_profile(
+            DatasetProfileAdmissionInput {
+                profile: &self.profile,
+                science: &self.science,
+                arrays: &self.zarr_arrays,
+                descriptors: &self.descriptors,
+                inventory,
+            },
+            &mut is_cancelled,
+        )
+    }
+
     /// Consumes this catalog and issues the sole exact-package capability.
     ///
     /// Validation performs explicit DS admission, whole-package structural
@@ -248,6 +273,26 @@ impl LocalPackageCatalog {
         let admission = self
             .admit_dataset_profile(requested, &mut is_cancelled)
             .map_err(map_admission_validation_error)?;
+        self.validate_exact_package_with_admission(admission, &mut is_cancelled)
+    }
+
+    /// Consumes this catalog, selects a supported DS envelope, and issues the
+    /// sole exact-package capability.
+    pub fn validate_exact_supported_package(
+        self,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<ExactPackageCapability, PackageValidationError> {
+        let admission = self
+            .admit_supported_dataset_profile(&mut is_cancelled)
+            .map_err(map_admission_validation_error)?;
+        self.validate_exact_package_with_admission(admission, &mut is_cancelled)
+    }
+
+    fn validate_exact_package_with_admission(
+        self,
+        admission: crate::DatasetProfileAdmission,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<ExactPackageCapability, PackageValidationError> {
         let report = reconcile_package_structure(
             PackageStructureInput {
                 reader: &self.reader,
@@ -256,13 +301,13 @@ impl LocalPackageCatalog {
                 descriptors: &self.descriptors,
                 admission,
             },
-            &mut is_cancelled,
+            &mut *is_cancelled,
         )
         .map_err(map_structure_validation_error)?;
-        self.inspect_directory_closure(&mut is_cancelled)
+        self.inspect_directory_closure(&mut *is_cancelled)
             .map_err(map_inventory_validation_error)?;
         report
-            .revalidate_snapshots(&self.reader, &mut is_cancelled)
+            .revalidate_snapshots(&self.reader, &mut *is_cancelled)
             .map_err(map_structure_validation_error)?;
 
         let proof = validate_package_integrity(
@@ -275,11 +320,11 @@ impl LocalPackageCatalog {
                 descriptors: &self.descriptors,
                 structure: &report,
             },
-            &mut is_cancelled,
+            &mut *is_cancelled,
         )?;
-        self.inspect_directory_closure(&mut is_cancelled)
+        self.inspect_directory_closure(&mut *is_cancelled)
             .map_err(map_inventory_validation_error)?;
-        proof.revalidate_all(&self.reader, &mut is_cancelled)?;
+        proof.revalidate_all(&self.reader, &mut *is_cancelled)?;
         Ok(ExactPackageCapability::new(self, admission, proof))
     }
 
@@ -1764,6 +1809,42 @@ mod tests {
     }
 
     #[test]
+    fn automatically_admits_the_first_supported_profile_without_masking_corruption() {
+        let root = fixture(FixtureDrift::None);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        let admission = catalog.admit_supported_dataset_profile(|| false).unwrap();
+        assert_eq!(admission.profile(), crate::ProfileKind::Ds0);
+
+        let root = fixture_with_brick(FixtureDrift::None, BrickFixture::OutOfGridPixelShard);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        assert!(matches!(
+            catalog.admit_supported_dataset_profile(|| false),
+            Err(crate::PackageAdmissionError::ShardCoordinateOutOfBounds { .. })
+        ));
+
+        let root = fixture_with_brick(FixtureDrift::None, BrickFixture::MissingPackedShard);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        assert_eq!(
+            catalog.admit_supported_dataset_profile(|| false),
+            Err(crate::PackageAdmissionError::Profile(
+                crate::StorageProfileError::PackedIndexShardCoverageMismatch {
+                    actual: 0,
+                    addressed: 1,
+                }
+            ))
+        );
+
+        let root = fixture(FixtureDrift::None);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        assert_eq!(
+            catalog.admit_supported_dataset_profile(|| true),
+            Err(crate::PackageAdmissionError::Inventory(
+                crate::DirectoryInventoryError::Cancelled
+            ))
+        );
+    }
+
+    #[test]
     fn reconciles_every_packed_record_with_canonical_shard_slots() {
         for (brick, listed_pixel, addressed_validity, listed_validity) in [
             (BrickFixture::PixelPresent, 1, 0, 0),
@@ -1953,6 +2034,13 @@ mod tests {
         let brick = capability.read_brick(coordinates, || false).unwrap();
         assert_eq!(&brick.pixel_payload().unwrap()[..6], &[0, 1, 2, 0, 0, 0]);
         assert_eq!(brick.validity_payload().unwrap()[0], 0b0000_0111);
+
+        let automatic_root = fixture(FixtureDrift::None);
+        let automatic = LocalPackageCatalog::open(&automatic_root.0)
+            .unwrap()
+            .validate_exact_supported_package(|| false)
+            .unwrap();
+        assert_eq!(automatic.admission().profile(), crate::ProfileKind::Ds0);
 
         for relative in ["images/i00000000/s00/c/0/0/0/0/0", "m4d/display.json"] {
             let root = fixture(FixtureDrift::None);

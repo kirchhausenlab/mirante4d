@@ -8,7 +8,7 @@ use crate::{
     ShardProfileKind, StorageProfileError, ZarrArrayMetadata, checked_ceil_div, profile_limits,
 };
 
-/// Exact aggregate facts for one explicitly selected dataset-size profile.
+/// Exact aggregate facts for one selected dataset-size profile.
 ///
 /// Admission checks addressing and count ceilings only. It is not full package
 /// validation and does not authorize payload bytes as belonging to the package.
@@ -80,7 +80,17 @@ pub enum PackageAdmissionError {
         pixel: u64,
         validity: u64,
     },
+    #[error("package does not fit any supported dataset profile")]
+    NoSupportedProfile,
 }
+
+const SUPPORTED_PROFILE_ORDER: [ProfileKind; 5] = [
+    ProfileKind::Ds0,
+    ProfileKind::Ds1,
+    ProfileKind::Ds2,
+    ProfileKind::Ds3,
+    ProfileKind::Ds4,
+];
 
 #[derive(Clone, Debug)]
 struct AddressedArray {
@@ -103,6 +113,40 @@ pub(crate) fn admit_dataset_profile(
     requested: ProfileKind,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<DatasetProfileAdmission, PackageAdmissionError> {
+    let profile = input.profile;
+    let counts = derive_dataset_profile_counts(input, is_cancelled)?;
+    admit_derived_dataset_profile(profile, counts, requested, is_cancelled)
+}
+
+pub(crate) fn admit_supported_dataset_profile(
+    input: DatasetProfileAdmissionInput<'_>,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<DatasetProfileAdmission, PackageAdmissionError> {
+    let profile = input.profile;
+    let counts = derive_dataset_profile_counts(input, is_cancelled)?;
+    select_supported_dataset_profile(profile, counts, is_cancelled)
+}
+
+fn select_supported_dataset_profile(
+    profile: &ProfileHeader,
+    counts: PackageCounts,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<DatasetProfileAdmission, PackageAdmissionError> {
+    for requested in SUPPORTED_PROFILE_ORDER {
+        match admit_derived_dataset_profile(profile, counts, requested, is_cancelled) {
+            Ok(admission) => return Ok(admission),
+            Err(error) if is_profile_mismatch(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    check_cancelled(is_cancelled)?;
+    Err(PackageAdmissionError::NoSupportedProfile)
+}
+
+fn derive_dataset_profile_counts(
+    input: DatasetProfileAdmissionInput<'_>,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<PackageCounts, PackageAdmissionError> {
     let DatasetProfileAdmissionInput {
         profile,
         science,
@@ -111,7 +155,6 @@ pub(crate) fn admit_dataset_profile(
         inventory,
     } = input;
     check_cancelled(is_cancelled)?;
-    validate_scale_rules(profile, requested, is_cancelled)?;
     let maximum_scales_per_image = profile
         .images()
         .iter()
@@ -266,12 +309,33 @@ pub(crate) fn admit_dataset_profile(
         maximum_directory_depth: inventory.maximum_directory_depth(),
         maximum_directory_fan_out: inventory.maximum_directory_fan_out(),
     };
+    check_cancelled(is_cancelled)?;
+    Ok(counts)
+}
+
+fn admit_derived_dataset_profile(
+    profile: &ProfileHeader,
+    counts: PackageCounts,
+    requested: ProfileKind,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<DatasetProfileAdmission, PackageAdmissionError> {
+    validate_scale_rules(profile, requested, is_cancelled)?;
     counts.validate(requested)?;
     check_cancelled(is_cancelled)?;
     Ok(DatasetProfileAdmission {
         profile: requested,
         counts,
     })
+}
+
+fn is_profile_mismatch(error: &PackageAdmissionError) -> bool {
+    matches!(
+        error,
+        PackageAdmissionError::Profile(
+            StorageProfileError::CeilingExceeded { .. }
+                | StorageProfileError::ExactCountMismatch { .. }
+        )
+    )
 }
 
 fn validate_scale_rules(
@@ -552,6 +616,80 @@ mod tests {
             "3ff0000000000000",
         ]
         .map(|bits| F64Bits::parse(bits).unwrap())
+    }
+
+    fn profile_with_scales(scales: u32) -> ProfileHeader {
+        let image = ProfileImage::new(
+            0,
+            vec![ProfileLogicalLayer::new(LogicalLayerKey::new(0), 0)],
+            (0..scales)
+                .map(|scale| ProfileLevel::new(0, scale, ProfileValidityMode::AllValid).unwrap())
+                .collect(),
+        )
+        .unwrap();
+        ProfileHeader::new(
+            scientific_id(),
+            vec![image],
+            0,
+            OmeInteroperabilityBase::Io2,
+        )
+        .unwrap()
+    }
+
+    fn minimal_counts(maximum_scales_per_image: u64, logical_s0_bytes: u64) -> PackageCounts {
+        PackageCounts {
+            maximum_scales_per_image,
+            logical_s0_bytes,
+            logical_bricks: 1,
+            addressed_pixel_shards: 1,
+            actual_pixel_shards: 1,
+            addressed_validity_shards: 0,
+            actual_validity_shards: 0,
+            addressed_packed_index_shards: 1,
+            actual_packed_index_shards: 1,
+            zarr_metadata_objects: 7,
+            portable_provenance_records: 0,
+            manifest_pages: 1,
+            total_physical_objects: 14,
+            directories: 1,
+            maximum_directory_depth: 1,
+            maximum_directory_fan_out: 1,
+        }
+    }
+
+    #[test]
+    fn supported_profile_selection_is_fixed_and_only_skips_envelope_mismatches() {
+        let above_ds0_bytes = profile_limits(ProfileKind::Ds0)
+            .logical_s0_bytes_max
+            .unwrap()
+            + 1;
+        let profile = profile_with_scales(1);
+        let admission = select_supported_dataset_profile(
+            &profile,
+            minimal_counts(1, above_ds0_bytes),
+            &mut || false,
+        )
+        .unwrap();
+        assert_eq!(admission.profile(), ProfileKind::Ds1);
+
+        let mut inconsistent = minimal_counts(1, above_ds0_bytes);
+        inconsistent.total_physical_objects += 1;
+        assert!(matches!(
+            select_supported_dataset_profile(&profile, inconsistent, &mut || false),
+            Err(PackageAdmissionError::Profile(
+                StorageProfileError::InconsistentCount { .. }
+            ))
+        ));
+
+        let six_scale_profile = profile_with_scales(6);
+        assert_eq!(
+            select_supported_dataset_profile(
+                &six_scale_profile,
+                minimal_counts(6, above_ds0_bytes),
+                &mut || false,
+            ),
+            Err(PackageAdmissionError::NoSupportedProfile)
+        );
     }
 
     #[test]
