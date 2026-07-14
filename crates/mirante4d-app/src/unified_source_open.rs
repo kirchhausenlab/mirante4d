@@ -2,18 +2,14 @@
 
 use std::{
     path::Path,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
 };
 
 use mirante4d_application::UnboundWorkspace;
-use mirante4d_data::{
-    CurrentDatasetSource, CurrentSourceVerification, CurrentSourceVerificationError,
-    CurrentSourceVerificationProgress,
+use mirante4d_dataset::{
+    CpuByteLedger, CpuLedgerCategory, CpuLedgerError, DatasetCatalog, DatasetSource,
+    DatasetSourceId,
 };
-use mirante4d_dataset::{CpuByteLedger, DatasetCatalog, DatasetSource, DatasetSourceId};
 use mirante4d_dataset_runtime::{
     DatasetRuntime, DatasetRuntimeConfig, RuntimeFault, RuntimeFaultCode,
 };
@@ -23,6 +19,11 @@ use mirante4d_domain::{
 };
 use mirante4d_project_model::{LayerViewState, ProjectId, ViewState};
 use mirante4d_settings::ResourcePolicy;
+use mirante4d_storage::{
+    LocalDatasetSource, LocalDatasetSourceOpenError, LocalPackageCatalog,
+    PACKAGE_VALIDATION_WORKING_BYTES, PackageOpenError, PackageValidationError,
+    ScientificPackageValidationError, VerifiedScientificPackageCapability,
+};
 
 use crate::{
     CrossSectionRuntime, FrameCompleteness, FrameFidelityStatus, LodDecisionReason,
@@ -57,14 +58,26 @@ pub(crate) struct UnifiedVerifiedSource {
 #[derive(Debug)]
 pub(crate) enum UnifiedVerifiedSourceOpenError {
     RuntimeConfiguration(RuntimeFaultCode),
-    Verification(CurrentSourceVerificationError),
+    Adapter(LocalDatasetSourceOpenError),
     Runtime(RuntimeFault),
     MissingCpuLedger,
 }
 
-pub(crate) enum UnifiedCurrentSourceVerificationError {
-    Open(mirante4d_data::CurrentDatasetSourceOpenError),
-    Verification(CurrentSourceVerificationError),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetPackageVerificationStage {
+    MetadataOpened,
+    ExactPackageVerified,
+    ScientificContentVerified,
+}
+
+#[derive(Debug)]
+pub(crate) enum TargetPackageVerificationError {
+    Cancelled,
+    Open(PackageOpenError),
+    Reservation(CpuLedgerError),
+    InvalidReservation,
+    Exact(PackageValidationError),
+    Scientific(ScientificPackageValidationError),
 }
 
 pub(crate) fn open(
@@ -76,16 +89,23 @@ pub(crate) fn open(
     let config = runtime_config(resource_policy)
         .map_err(|code| anyhow::anyhow!("unified dataset runtime configuration failed: {code}"))?;
 
-    let source_error = Arc::new(Mutex::new(None));
+    let source_error = Arc::new(Mutex::new(None::<anyhow::Error>));
     let worker_error = Arc::clone(&source_error);
     let captured_ledger = Arc::new(Mutex::new(None));
     let worker_ledger = Arc::clone(&captured_ledger);
     let source_path = selected_path.clone();
+    let display_label = dataset_display_label(&selected_path);
     let (runtime, catalog) = <dyn DatasetRuntime>::start(config, move |ledger| {
         *worker_ledger
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(&ledger));
-        match open_current_source(source_path, source_id, ledger) {
+        let source = LocalPackageCatalog::open(&source_path)
+            .map_err(SourceConstructionError::Open)
+            .and_then(|catalog| {
+                LocalDatasetSource::from_provisional(catalog, source_id, &display_label, ledger)
+                    .map_err(SourceConstructionError::Adapter)
+            });
+        match source {
             Ok(source) => {
                 let source: Arc<dyn DatasetSource> = source;
                 Ok(source)
@@ -93,7 +113,7 @@ pub(crate) fn open(
             Err(error) => {
                 *worker_error
                     .lock()
-                    .unwrap_or_else(|poison| poison.into_inner()) = Some(error);
+                    .unwrap_or_else(|poison| poison.into_inner()) = Some(error.into());
                 Err(RuntimeFault::new(RuntimeFaultCode::SourceRejected))
             }
         }
@@ -103,7 +123,6 @@ pub(crate) fn open(
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .take()
-            .map(anyhow::Error::new)
             .unwrap_or_else(|| anyhow::Error::new(runtime_error))
     })?;
     let cpu_ledger = captured_ledger
@@ -126,34 +145,50 @@ pub(crate) fn open(
     })
 }
 
-pub(crate) fn verify_current_source(
+pub(crate) fn verify_target_package(
     path: impl AsRef<Path>,
-    source_id: DatasetSourceId,
     scan_ledger: Arc<dyn CpuByteLedger>,
-    is_cancelled: impl Fn() -> bool,
-    report_progress: impl FnMut(CurrentSourceVerificationProgress),
-) -> Result<CurrentSourceVerification, UnifiedCurrentSourceVerificationError> {
-    let source = open_current_source(path, source_id, scan_ledger)
-        .map_err(UnifiedCurrentSourceVerificationError::Open)?;
-    source
-        .verify_scientific_content(is_cancelled, report_progress)
-        .map_err(UnifiedCurrentSourceVerificationError::Verification)
-}
+    mut is_cancelled: impl FnMut() -> bool,
+    mut report_stage: impl FnMut(TargetPackageVerificationStage),
+) -> Result<VerifiedScientificPackageCapability, TargetPackageVerificationError> {
+    if is_cancelled() {
+        return Err(TargetPackageVerificationError::Cancelled);
+    }
+    let validation_lease = scan_ledger
+        .try_acquire(
+            CpuLedgerCategory::InFlightDecode,
+            PACKAGE_VALIDATION_WORKING_BYTES,
+        )
+        .map_err(TargetPackageVerificationError::Reservation)?;
+    if validation_lease.category() != CpuLedgerCategory::InFlightDecode
+        || validation_lease.reserved_bytes() != PACKAGE_VALIDATION_WORKING_BYTES
+    {
+        return Err(TargetPackageVerificationError::InvalidReservation);
+    }
 
-fn open_current_source(
-    path: impl AsRef<Path>,
-    source_id: DatasetSourceId,
-    ledger: Arc<dyn CpuByteLedger>,
-) -> Result<Arc<CurrentDatasetSource>, mirante4d_data::CurrentDatasetSourceOpenError> {
-    CurrentDatasetSource::open(path, source_id, ledger)
+    let catalog = LocalPackageCatalog::open(path).map_err(TargetPackageVerificationError::Open)?;
+    report_stage(TargetPackageVerificationStage::MetadataOpened);
+    if is_cancelled() {
+        return Err(TargetPackageVerificationError::Cancelled);
+    }
+    let exact = catalog
+        .validate_exact_supported_package(&mut is_cancelled)
+        .map_err(TargetPackageVerificationError::Exact)?;
+    report_stage(TargetPackageVerificationStage::ExactPackageVerified);
+    if is_cancelled() {
+        return Err(TargetPackageVerificationError::Cancelled);
+    }
+    let verified = exact
+        .validate_scientific_content(&mut is_cancelled)
+        .map_err(TargetPackageVerificationError::Scientific)?;
+    report_stage(TargetPackageVerificationStage::ScientificContentVerified);
+    Ok(verified)
 }
 
 pub(crate) fn open_verified(
     path: impl AsRef<Path>,
     resource_policy: ResourcePolicy,
-    verification: CurrentSourceVerification,
-    cancellation: &AtomicBool,
-    report_progress: impl Fn(CurrentSourceVerificationProgress) + Send + Sync + 'static,
+    capability: VerifiedScientificPackageCapability,
 ) -> Result<UnifiedVerifiedSource, UnifiedVerifiedSourceOpenError> {
     let selected_path = path.as_ref().to_path_buf();
     let config = runtime_config(resource_policy)
@@ -162,18 +197,12 @@ pub(crate) fn open_verified(
     let worker_error = Arc::clone(&source_error);
     let captured_ledger = Arc::new(Mutex::new(None));
     let worker_ledger = Arc::clone(&captured_ledger);
-    let source_path = selected_path.clone();
+    let display_label = dataset_display_label(&selected_path);
     let (runtime, catalog) = <dyn DatasetRuntime>::start(config, move |ledger| {
         *worker_ledger
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(&ledger));
-        match CurrentDatasetSource::open_verified(
-            source_path,
-            &verification,
-            ledger,
-            || cancellation.load(Ordering::Acquire),
-            report_progress,
-        ) {
+        match LocalDatasetSource::from_verified(capability, &display_label, ledger) {
             Ok(source) => {
                 let source: Arc<dyn DatasetSource> = source;
                 Ok(source)
@@ -191,7 +220,7 @@ pub(crate) fn open_verified(
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .take()
-            .map(UnifiedVerifiedSourceOpenError::Verification)
+            .map(UnifiedVerifiedSourceOpenError::Adapter)
             .unwrap_or(UnifiedVerifiedSourceOpenError::Runtime(runtime_error))
     })?;
     let cpu_ledger = captured_ledger
@@ -202,6 +231,46 @@ pub(crate) fn open_verified(
     let resource_identity = catalog.scientific_identity().resource_identity();
     let dataset = DatasetDemandState::new(runtime, cpu_ledger, resource_identity, selected_path);
     Ok(UnifiedVerifiedSource { dataset, catalog })
+}
+
+#[derive(Debug)]
+enum SourceConstructionError {
+    Open(PackageOpenError),
+    Adapter(LocalDatasetSourceOpenError),
+}
+
+impl From<PackageOpenError> for SourceConstructionError {
+    fn from(error: PackageOpenError) -> Self {
+        Self::Open(error)
+    }
+}
+
+impl std::fmt::Display for SourceConstructionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open(error) => write!(formatter, "target package open failed: {error}"),
+            Self::Adapter(error) => {
+                write!(formatter, "target package runtime binding failed: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SourceConstructionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Open(error) => Some(error),
+            Self::Adapter(error) => Some(error),
+        }
+    }
+}
+
+fn dataset_display_label(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Dataset")
+        .to_owned()
 }
 
 fn runtime_config(

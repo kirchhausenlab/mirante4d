@@ -24,6 +24,7 @@ mirante4d-project-store.workspace = true
 mirante4d-render-api.workspace = true
 mirante4d-renderer.workspace = true
 mirante4d-settings.workspace = true
+mirante4d-storage.workspace = true
 rfd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
