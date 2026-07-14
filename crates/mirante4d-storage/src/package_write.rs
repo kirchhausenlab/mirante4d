@@ -259,6 +259,8 @@ impl LocalPackageWriter {
             &ome_images,
             arrays,
         )?;
+        drop((science, display_defaults, portable_records, ome_images));
+        let PreparedMetadata { objects, arrays } = prepared;
         let limits = profile_limits(profile_kind);
         let shard_input_limit = limits
             .pixel_shards
@@ -275,7 +277,7 @@ impl LocalPackageWriter {
         let mut snapshots = Vec::new();
         let mut written_paths = BTreeSet::new();
 
-        for object in prepared.objects {
+        for object in objects {
             check_cancelled(&mut is_cancelled)?;
             require_descriptor_capacity(descriptors.len(), limits.total_physical_objects)?;
             require_new_path(&mut written_paths, &object.path)?;
@@ -300,13 +302,11 @@ impl LocalPackageWriter {
             if shard_inputs_seen > shard_input_limit {
                 return invalid_input("shard inputs exceed the selected profile bound");
             }
-            let array =
-                prepared
-                    .arrays
-                    .get(&shard.array_path)
-                    .ok_or(PackageWriteError::InvalidInput {
-                        reason: "a shard names an array outside the profile",
-                    })?;
+            let array = arrays
+                .get(&shard.array_path)
+                .ok_or(PackageWriteError::InvalidInput {
+                    reason: "a shard names an array outside the profile",
+                })?;
             let expected_coordinates = match array.shard_kind {
                 PackageObjectKind::PackedIndexShard => 2,
                 PackageObjectKind::PixelShard | PackageObjectKind::ValidityShard => 5,
@@ -352,6 +352,7 @@ impl LocalPackageWriter {
         }
 
         check_cancelled(&mut is_cancelled)?;
+        drop((arrays, written_paths));
         let pages = pack_manifest_pages(descriptors)?;
         let root = ManifestRoot::new(&pages)?;
         for (ordinal, page) in pages.iter().enumerate() {
@@ -363,7 +364,9 @@ impl LocalPackageWriter {
             let snapshot = write_authority_bytes(&mut publication, path, &page.canonical_bytes()?)?;
             snapshots.push(snapshot);
         }
+        drop(pages);
         let root_path = profile.manifest_root_path().clone();
+        drop(profile);
         let root_snapshot =
             write_authority_bytes(&mut publication, root_path, &root.canonical_bytes()?)?;
         snapshots.push(root_snapshot);
@@ -387,6 +390,7 @@ impl LocalPackageWriter {
             check_cancelled(&mut is_cancelled)?;
             catalog.reader().revalidate_snapshot(snapshot)?;
         }
+        drop(snapshots);
         check_cancelled(&mut is_cancelled)?;
 
         if staged_validation == StagedValidation::Scientific {
