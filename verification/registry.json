@@ -288,7 +288,7 @@
       "timeout_secs": 2700,
       "evidence_level": "E4",
       "trigger": "manual applicable performance claim",
-      "command": "cargo xtask bench-native-package <package.m4d>",
+      "command": "cargo xtask product-validate <target-package> <registered-performance-scenario>",
       "hosted_required": false,
       "activation_state": "planned-WP-14"
     },
@@ -301,7 +301,7 @@
       "timeout_secs": 1800,
       "evidence_level": "E2-E4",
       "trigger": "manual applicable pressure or stress claim",
-      "command": "cargo xtask bench-runtime-stress",
+      "command": "cargo xtask product-validate <target-package> <registered-stress-scenario>",
       "hosted_required": false,
       "activation_state": "planned-WP-14"
     },

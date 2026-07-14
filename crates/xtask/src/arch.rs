@@ -877,7 +877,6 @@ fn check_wp07b_live_cutover(
         ("mirante4d-render-wgpu", "mirante4d-render-api"),
         ("mirante4d-renderer", "mirante4d-dataset"),
         ("mirante4d-storage", "mirante4d-dataset"),
-        ("xtask", "mirante4d-dataset"),
     ]);
     let live_expected_edges = expected_edges
         .union(&live_foundation_edges)

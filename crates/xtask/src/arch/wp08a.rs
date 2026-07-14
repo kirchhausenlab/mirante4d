@@ -74,7 +74,7 @@ pub(super) fn accepted_successor_normal_dependency_additions(
         "mirante4d-renderer" => &["mirante4d-dataset"],
         "mirante4d-identity" => &["mirante4d-domain", "sha2", "unicode-normalization"],
         "mirante4d-project-store" => &["mirante4d-domain"],
-        "xtask" => &["mirante4d-dataset", "mirante4d-dataset-runtime"],
+        "xtask" => &["mirante4d-storage"],
         _ => &[],
     }
 }
@@ -82,7 +82,16 @@ pub(super) fn accepted_successor_normal_dependency_additions(
 fn accepted_successor_normal_dependency_removals(crate_name: &str) -> &'static [&'static str] {
     match crate_name {
         "mirante4d-app" => &["mirante4d-analysis", "mirante4d-identity"],
-        "xtask" => &["mirante4d-analysis"],
+        "xtask" => &[
+            "glam",
+            "mirante4d-analysis",
+            "mirante4d-data",
+            "mirante4d-domain",
+            "mirante4d-format",
+            "mirante4d-import",
+            "mirante4d-render-api",
+            "mirante4d-renderer",
+        ],
         _ => &[],
     }
 }

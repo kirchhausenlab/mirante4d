@@ -1,7 +1,7 @@
 {
   "schema": "mirante4d-verification-fixture-registry",
   "schema_version": 1,
-  "record_count": 12,
+  "record_count": 11,
   "rules": {
     "maximum_records": 64,
     "candidate_output_root": "target/mirante4d/fixture-candidates",
@@ -290,50 +290,6 @@
       "promotion": null,
       "expiry": "WP-14 review",
       "deletion_gate": "WP-14 verification hardening",
-      "target_format_conformance": false
-    },
-    {
-      "id": "bootstrap-m4d-schema1",
-      "tier": "T2",
-      "claim_scope": "current-schema1-generated-test-support",
-      "authority_state": "non-authoritative-generated",
-      "owner": "WP-06 verification bootstrap",
-      "capability": "public-cpu",
-      "publication": "generated-synthetic",
-      "license": "MIT",
-      "path": "crates/xtask/src/fixtures.rs",
-      "sha256": "fd6c96fe0880cab9c09488c24eaff238efad8f291fb0442652835115da9338b6",
-      "generator": {
-        "command": "cargo xtask generate-fixture <fixture-name>",
-        "source": "crates/xtask/src/fixtures.rs",
-        "sha256": "fd6c96fe0880cab9c09488c24eaff238efad8f291fb0442652835115da9338b6",
-        "production_writer_used": true
-      },
-      "fixture_names": [
-        "basic-u16-16cube",
-        "anisotropic-u16-16cube",
-        "time-u16-8cube-3t",
-        "time-multichannel-u16-8cube-3t-2c",
-        "multichannel-u16-8cube-4c",
-        "basic-f32-8cube"
-      ],
-      "lineages": [
-        {
-          "role": "production-writer-support-only",
-          "id": "WP06-ADAPTER-SCHEMA1-T2",
-          "path": "crates/xtask/src/fixtures.rs",
-          "sha256": "fd6c96fe0880cab9c09488c24eaff238efad8f291fb0442652835115da9338b6"
-        }
-      ],
-      "limits": {
-        "output_root": "target/mirante4d/fixtures",
-        "archive": false,
-        "authority": false
-      },
-      "validation_command": "cargo xtask generate-fixture basic-u16-16cube",
-      "promotion": null,
-      "expiry": "WP-10C entry",
-      "deletion_gate": "WP-10C storage/runtime product hard cutover",
       "target_format_conformance": false
     },
     {

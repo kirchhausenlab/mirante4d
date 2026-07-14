@@ -308,14 +308,15 @@ accepted on protected main at
 three-launch native scenario, exact-main public checks, and the already
 accepted durability evidence. No redundant power-cut rerun is required.
 
-Run the supporting B3 product scenario on the real display with:
+Run the bounded target-package verification scenario on the real display with:
 
 ```bash
-cargo xtask product-validate b3_source_verification
+cargo xtask product-validate target_source_verification
 ```
 
-The accepted B3 scenario uses a small generated T2 package and remains
-supporting E1 evidence.
+With no explicit package, this scenario extracts the small promoted target U16
+archive and remains supporting product-check evidence rather than a substitute
+for the short real-display WP-10C exercise.
 
 The B4 automation remains available for future project-persistence changes,
 but ordinary foundation work does not rerun its accepted durability matrix.

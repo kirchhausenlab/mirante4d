@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 
 use crate::{
     deps::{CargoMetadata, cargo_metadata},
-    fixtures::generate_fixture,
     process::{run_cargo, run_command},
+    target_fixture::extract_target_u16_fixture,
     verify,
 };
 
@@ -102,7 +102,7 @@ fn build_linux_release_package() -> anyhow::Result<LinuxReleaseArtifacts> {
         &artifacts.package_root.join("runtime-dependencies.txt"),
     )?;
 
-    let fixture = generate_fixture("basic-u16-16cube")?;
+    let fixture = extract_target_u16_fixture(Path::new("target/mirante4d/fixtures"))?;
     let release_dir_smoke = run_package_smoke_test(
         &packaged_binary,
         &fixture,
@@ -269,8 +269,11 @@ fn write_release_manifest(
         "platform": "linux",
         "architecture": arch,
         "build_profile": RELEASE_BUILD_PROFILE,
-        "native_format": mirante4d_format::FORMAT_ID,
-        "native_schema_version": mirante4d_format::SCHEMA_VERSION,
+        "dataset_profile": {
+            "format_family": mirante4d_storage::PROFILE.format_family,
+            "semantic_schema": mirante4d_storage::PROFILE.semantic_schema,
+            "storage_profile": mirante4d_storage::PROFILE.storage_profile,
+        },
         "binary": binary_name,
         "desktop_metadata": "share/applications/org.kirchhausenlab.Mirante4D.desktop",
         "icon": "share/icons/hicolor/scalable/apps/mirante4d.svg",
@@ -615,8 +618,11 @@ fn linux_release_contents_report(
         "platform": "linux",
         "architecture": arch,
         "build_profile": RELEASE_BUILD_PROFILE,
-        "native_format": mirante4d_format::FORMAT_ID,
-        "native_schema_version": mirante4d_format::SCHEMA_VERSION,
+        "dataset_profile": {
+            "format_family": mirante4d_storage::PROFILE.format_family,
+            "semantic_schema": mirante4d_storage::PROFILE.semantic_schema,
+            "storage_profile": mirante4d_storage::PROFILE.storage_profile,
+        },
         "dependency_gate": "passed",
         "artifacts": {
             "release_directory": {

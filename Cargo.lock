@@ -5308,15 +5308,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "glam",
- "mirante4d-data",
- "mirante4d-dataset",
- "mirante4d-dataset-runtime",
- "mirante4d-domain",
- "mirante4d-format",
- "mirante4d-import",
- "mirante4d-render-api",
- "mirante4d-renderer",
+ "mirante4d-storage",
  "serde",
  "serde_json",
  "syn",
