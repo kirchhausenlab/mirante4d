@@ -7,7 +7,6 @@ use std::{
 mod analysis_product;
 mod analysis_workspace;
 mod cross_section_readout;
-mod cross_section_runtime;
 mod cross_section_scheduler;
 mod current_egui_shell_bridge;
 mod current_runtime;
@@ -59,7 +58,6 @@ use analysis_workspace::{
     show_analysis_workspace, show_analysis_workspace_window,
 };
 use cross_section_readout::cross_section_hover_readout_for_response;
-use cross_section_runtime::CrossSectionRuntime;
 pub use diagnostics::{StartupDiagnostics, collect_startup_diagnostics, default_log_path};
 use display_refresh::{DisplayRefreshTiming, ViewportDisplayImage, duration_ms};
 use eframe::egui;
@@ -85,14 +83,15 @@ use mirante4d_application::{
     ApplicationSnapshot, ApplicationState, CommandEffect, OperationCompletion,
     OperationFailureCode, OperationKind, OperationToken, PresentationSlot, PresentationSnapshot,
     PresentationSurface, ProjectRecoveryStoreLocator, ProjectStoreApplicationService,
-    ProjectStoreLifecycle, ProjectStoreServiceEvent, SourceSessionGeneration,
-    SourceVerificationSnapshot, SystemMonotonicClock, WorkspaceSnapshot,
+    ProjectStoreLifecycle, ProjectStoreServiceEvent, ResidentRenderFailureStatus,
+    SourceSessionGeneration, SourceVerificationSnapshot, SystemMonotonicClock, WorkspaceSnapshot,
     import_workflow::{ImportCommand, ImportReviewId, ImportWorkflowSnapshot},
     viewer_tools::{ViewerTool, ViewerToolState},
 };
 pub use mirante4d_application::{
-    DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind, FrameFidelityStatus,
-    LodDecisionReason, RenderBackend,
+    CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
+    CrossSectionPanelScheduleStatus, DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind,
+    FrameFidelityStatus, LodDecisionReason, RenderBackend,
 };
 use mirante4d_dataset::{DatasetSourceId, ResourceValidity};
 use mirante4d_domain::{
@@ -2606,8 +2605,8 @@ impl MiranteWorkbenchApp {
             if next_view.layout() == CanonicalViewerLayout::Single3d {
                 self.clear_cross_section_product_presentations();
                 self.render_runtime
-                    .cross_section_runtime
-                    .mark_cross_section_panels_dirty();
+                    .render_coordination
+                    .invalidate_cross_sections();
             }
         }
         if source_selection_changed {

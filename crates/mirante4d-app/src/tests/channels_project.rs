@@ -367,31 +367,33 @@ fn timepoint_command_dirties_cross_section_panels_without_dirtying_3d_panel() {
         &ctx,
     )
     .unwrap();
-    for panel_id in [PanelId::Xy, PanelId::Xz, PanelId::ThreeD, PanelId::Yz] {
+    for panel_id in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
         assert!(
             app.render_runtime
-                .cross_section_runtime
-                .record_panel_viewports(panel_id, presentation, render)
+                .render_coordination
+                .record_viewports(panel_id.presentation_slot(), presentation, render)
         );
         let generation = app
             .render_runtime
-            .cross_section_runtime
-            .panel(panel_id)
-            .unwrap()
-            .generation;
+            .render_coordination
+            .surface(panel_id.presentation_slot())
+            .generation();
         assert!(
             app.render_runtime
-                .cross_section_runtime
-                .mark_panel_displayed(panel_id, generation)
+                .render_coordination
+                .record_cross_section_presentation(
+                    panel_id.presentation_slot(),
+                    generation,
+                    CrossSectionPanelScheduleState::missing_viewport(generation),
+                )
         );
     }
     let generations_before =
         [PanelId::Xy, PanelId::Xz, PanelId::ThreeD, PanelId::Yz].map(|panel_id| {
             app.render_runtime
-                .cross_section_runtime
-                .panel(panel_id)
-                .unwrap()
-                .generation
+                .render_coordination
+                .surface(panel_id.presentation_slot())
+                .generation()
         });
 
     app.apply_application_command(ApplicationCommand::SetTimepoint(TimeIndex::new(1)), &ctx)
@@ -401,23 +403,22 @@ fn timepoint_command_dirties_cross_section_panels_without_dirtying_3d_panel() {
         application_view(&app.application.snapshot()).timepoint(),
         TimeIndex::new(1)
     );
-    let runtime = &app.render_runtime.cross_section_runtime;
+    let runtime = &app.render_runtime.render_coordination;
     for (panel_id, generation_before) in [PanelId::Xy, PanelId::Xz, PanelId::Yz].into_iter().zip([
         generations_before[0],
         generations_before[1],
         generations_before[3],
     ]) {
-        let panel = runtime.panel(panel_id).unwrap();
-        assert!(panel.generation > generation_before);
+        let panel = runtime.surface(panel_id.presentation_slot());
+        assert!(panel.generation() > generation_before);
         assert!(
             !panel.display_current(),
             "{} should be dirty after a timepoint change",
             panel_id.label()
         );
     }
-    let three_d = runtime.panel(PanelId::ThreeD).unwrap();
-    assert_eq!(three_d.generation, generations_before[2]);
-    assert!(three_d.display_current());
+    let three_d = runtime.surface(PanelId::ThreeD.presentation_slot());
+    assert_eq!(three_d.generation(), generations_before[2]);
 }
 
 #[test]

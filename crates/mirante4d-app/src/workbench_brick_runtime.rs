@@ -3,7 +3,10 @@
 use std::{collections::BTreeSet, time::Instant};
 
 use eframe::egui;
-use mirante4d_application::ApplicationCommand;
+use mirante4d_application::{
+    ApplicationCommand, CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
+    CrossSectionPanelScheduleStatus,
+};
 use mirante4d_dataset::{CpuLedgerCategory, DatasetCatalog, DatasetResourceKey};
 use mirante4d_dataset_runtime::{RequestPriority, RuntimeFault, RuntimeFaultCode};
 use mirante4d_domain::{TimeIndex, ViewerLayout};
@@ -22,10 +25,7 @@ use crate::{
     },
     display_refresh::render_backend_for_mode,
     product_render_intent::PRODUCT_RENDER_RESOURCE_LIMIT,
-    viewer_layout::{
-        CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
-        CrossSectionPanelScheduleStatus, PanelId,
-    },
+    viewer_layout::PanelId,
 };
 
 const SEMANTIC_PLAN_CANDIDATES_PER_LAYER: usize = MAX_RENDER_REQUIREMENTS;
@@ -158,8 +158,8 @@ impl MiranteWorkbenchApp {
         }
         if cross_requirements_changed || cross_plan_error.is_some() {
             self.render_runtime
-                .cross_section_runtime
-                .mark_cross_section_panels_dirty();
+                .render_coordination
+                .invalidate_cross_sections();
         }
         if let Some(error) = cross_plan_error.as_ref() {
             self.mark_cross_section_plan_failure(error);
@@ -306,9 +306,9 @@ impl MiranteWorkbenchApp {
                 scope,
                 panel_id,
                 self.render_runtime
-                    .cross_section_runtime
-                    .panel(panel_id)
-                    .and_then(|panel| panel.presentation_viewport),
+                    .render_coordination
+                    .surface(panel_id.presentation_slot())
+                    .presentation_viewport(),
             )
         });
         let mut remaining_panels = presentations
@@ -425,9 +425,9 @@ impl MiranteWorkbenchApp {
         for panel_id in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
             let generation = self
                 .render_runtime
-                .cross_section_runtime
-                .panel(panel_id)
-                .map_or(0, |panel| panel.generation);
+                .render_coordination
+                .surface(panel_id.presentation_slot())
+                .generation();
             let mut schedule = CrossSectionPanelScheduleState::missing_viewport(generation);
             schedule.status = if capacity {
                 CrossSectionPanelScheduleStatus::BudgetLimited
@@ -440,8 +440,8 @@ impl MiranteWorkbenchApp {
                 CrossSectionPanelScheduleReason::PlanningFailed
             };
             self.render_runtime
-                .cross_section_runtime
-                .set_panel_schedule(panel_id, schedule);
+                .render_coordination
+                .set_cross_section_schedule(panel_id.presentation_slot(), schedule);
         }
     }
 

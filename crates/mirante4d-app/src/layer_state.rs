@@ -38,9 +38,7 @@ pub(crate) fn reconcile_view_runtime(
             );
         }
         drop(dataset.take_retained_leases());
-        render
-            .cross_section_runtime
-            .mark_cross_section_panels_dirty();
+        render.render_coordination.invalidate_cross_sections();
         analysis.set_roi([0; 3], layer.shape().spatial().dimensions())?;
     }
 

@@ -18,8 +18,10 @@ pub use project_store_service::{
     ProjectStoreServiceStatus, SystemMonotonicClock,
 };
 pub use render_coordination::{
-    DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind, FrameFidelityStatus,
-    LodDecisionReason, RenderBackend,
+    CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
+    CrossSectionPanelScheduleStatus, DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind,
+    FrameFidelityStatus, LodDecisionReason, RenderBackend, RenderCoordinationState,
+    RenderSurfaceState, ResidentRenderFailureStatus,
 };
 
 use std::{
@@ -3107,6 +3109,10 @@ pub enum PresentationSlot {
 
 impl PresentationSlot {
     pub const ALL: [Self; 4] = [Self::ThreeD, Self::Xy, Self::Xz, Self::Yz];
+
+    pub const fn is_cross_section(self) -> bool {
+        !matches!(self, Self::ThreeD)
+    }
 
     const fn index(self) -> usize {
         match self {

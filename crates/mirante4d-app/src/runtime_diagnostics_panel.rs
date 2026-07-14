@@ -1,4 +1,5 @@
 use eframe::egui;
+use mirante4d_application::RenderSurfaceState;
 use mirante4d_dataset::CpuLedgerCategory;
 
 use crate::{
@@ -120,13 +121,10 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
             .map(|panel| panel.label().to_owned())
             .unwrap_or_else(|| "none".to_owned()),
     );
-    for panel in app.render_runtime.cross_section_runtime.panels() {
-        if panel.panel_id.cross_section_panel().is_some() {
-            ui_kit::property_row(
-                ui,
-                format!("2D {}", panel.panel_id.label()),
-                panel_summary(panel),
-            );
+    for (slot, panel) in app.render_runtime.render_coordination.iter() {
+        if slot.is_cross_section() {
+            let panel_id = PanelId::from_presentation_slot(slot);
+            ui_kit::property_row(ui, format!("2D {}", panel_id.label()), panel_summary(panel));
         }
     }
     if let Some(product) = app.native_presentation.product_gpu.as_ref() {
@@ -220,8 +218,9 @@ pub(crate) fn diagnostics_summary_text(app: &MiranteWorkbenchApp) -> String {
         app.dataset.retained_leases().missing_len(),
         app.dataset.current_scale().get(),
     ));
-    for panel in app.render_runtime.cross_section_runtime.panels() {
-        if let Some(schedule) = panel.cross_section_schedule {
+    for (slot, panel) in app.render_runtime.render_coordination.iter() {
+        if let Some(schedule) = panel.cross_section_schedule() {
+            let panel_id = PanelId::from_presentation_slot(slot);
             text.push_str(&format!(
                 "cross_section_{}_generation: {}\n\
                  cross_section_{}_displayed_generation: {}\n\
@@ -229,19 +228,19 @@ pub(crate) fn diagnostics_summary_text(app: &MiranteWorkbenchApp) -> String {
                  cross_section_{}_required: {}\n\
                  cross_section_{}_retained: {}\n\
                  cross_section_{}_missing: {}\n",
-                panel.panel_id.label(),
-                panel.generation,
-                panel.panel_id.label(),
+                panel_id.label(),
+                panel.generation(),
+                panel_id.label(),
                 panel
-                    .displayed_generation
+                    .displayed_generation()
                     .map_or_else(|| "none".to_owned(), |value| value.to_string()),
-                panel.panel_id.label(),
+                panel_id.label(),
                 schedule.status,
-                panel.panel_id.label(),
+                panel_id.label(),
                 schedule.selected_bricks,
-                panel.panel_id.label(),
+                panel_id.label(),
                 schedule.occupied_selected_bricks,
-                panel.panel_id.label(),
+                panel_id.label(),
                 schedule.missing_occupied_bricks,
             ));
         }
@@ -249,9 +248,9 @@ pub(crate) fn diagnostics_summary_text(app: &MiranteWorkbenchApp) -> String {
     text
 }
 
-fn panel_summary(panel: &crate::cross_section_runtime::CrossSectionPanelRuntime) -> String {
-    let Some(schedule) = panel.cross_section_schedule else {
-        return format!("generation {}, no schedule", panel.generation);
+fn panel_summary(panel: &RenderSurfaceState) -> String {
+    let Some(schedule) = panel.cross_section_schedule() else {
+        return format!("generation {}, no schedule", panel.generation());
     };
     format!(
         "{:?}, s{:?}, {}/{} retained, {} missing, generation {}/{}",
@@ -261,9 +260,9 @@ fn panel_summary(panel: &crate::cross_section_runtime::CrossSectionPanelRuntime)
         schedule.selected_bricks,
         schedule.missing_occupied_bricks,
         panel
-            .displayed_generation
+            .displayed_generation()
             .map_or_else(|| "none".to_owned(), |value| value.to_string()),
-        panel.generation,
+        panel.generation(),
     )
 }
 

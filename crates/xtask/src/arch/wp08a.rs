@@ -121,6 +121,12 @@ pub(super) fn accepted_successor_public_root_additions(
 ) -> &'static [&'static str] {
     match crate_name {
         "mirante4d-application" => &[
+            "CrossSectionPanelScheduleReason",
+            "CrossSectionPanelScheduleState",
+            "CrossSectionPanelScheduleStatus",
+            "RenderCoordinationState",
+            "RenderSurfaceState",
+            "ResidentRenderFailureStatus",
             "LoadedAnalysisDescriptorBundle",
             "MonotonicClock",
             "PresentationPaintRequest",

@@ -1,15 +1,16 @@
 //! Application-side state for successor render coordination.
 
+use mirante4d_application::RenderCoordinationState;
 use mirante4d_render_api::{PresentationViewport, RenderExtent};
 
-use crate::{CrossSectionRuntime, DisplayRefreshTiming, FrameFidelityStatus};
+use crate::{DisplayRefreshTiming, FrameFidelityStatus};
 
 pub(crate) struct CurrentRenderRuntime {
     pub(crate) presentation_viewport: PresentationViewport,
     pub(crate) render_viewport: RenderExtent,
     pub(crate) frame_fidelity: FrameFidelityStatus,
     pub(crate) lod_replan_pending: bool,
-    pub(crate) cross_section_runtime: CrossSectionRuntime,
+    pub(crate) render_coordination: RenderCoordinationState,
     pub(crate) last_display_refresh_timing: Option<DisplayRefreshTiming>,
 }
 
@@ -18,14 +19,14 @@ impl CurrentRenderRuntime {
         presentation_viewport: PresentationViewport,
         render_viewport: RenderExtent,
         frame_fidelity: FrameFidelityStatus,
-        cross_section_runtime: CrossSectionRuntime,
+        render_coordination: RenderCoordinationState,
     ) -> Self {
         Self {
             presentation_viewport,
             render_viewport,
             frame_fidelity,
             lod_replan_pending: false,
-            cross_section_runtime,
+            render_coordination,
             last_display_refresh_timing: None,
         }
     }

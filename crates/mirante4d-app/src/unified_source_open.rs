@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use mirante4d_application::UnboundWorkspace;
+use mirante4d_application::{RenderCoordinationState, UnboundWorkspace};
 use mirante4d_dataset::{
     CpuByteLedger, CpuLedgerCategory, DatasetCatalog, DatasetSource, DatasetSourceId,
 };
@@ -25,8 +25,8 @@ use mirante4d_storage::{
 };
 
 use crate::{
-    CrossSectionRuntime, FrameCompleteness, FrameFidelityStatus, LodDecisionReason,
-    StartupDiagnostics, collect_startup_diagnostics,
+    FrameCompleteness, FrameFidelityStatus, LodDecisionReason, StartupDiagnostics,
+    collect_startup_diagnostics,
     current_runtime::{analysis::AnalysisProductRuntime, render::CurrentRenderRuntime},
     dataset_requests::DatasetDemandState,
     transfer_presets::default_channel_presets,
@@ -303,7 +303,7 @@ fn initial_runtime_state(
         presentation,
         viewport,
         fidelity,
-        CrossSectionRuntime::default(),
+        RenderCoordinationState::default(),
     );
     let mut analysis = AnalysisProductRuntime::new();
     analysis.set_roi([0; 3], active.shape().spatial().dimensions())?;

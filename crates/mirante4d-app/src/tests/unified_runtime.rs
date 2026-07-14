@@ -1100,8 +1100,8 @@ fn four_panel_playback_demand_shares_one_aggregate_resource_and_byte_budget() {
     let render = mirante4d_render_api::RenderExtent::new(64, 64).unwrap();
     for panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
         app.render_runtime
-            .cross_section_runtime
-            .record_panel_viewports(panel, presentation, render);
+            .render_coordination
+            .record_viewports(panel.presentation_slot(), presentation, render);
     }
     app.apply_application_command(ApplicationCommand::SetPlaybackActive(true), &context)
         .unwrap();

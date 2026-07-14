@@ -6,7 +6,7 @@ use mirante4d_domain::{RenderMode, ViewerLayout};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::viewer_layout::{CrossSectionPanelScheduleStatus, PanelId};
+use crate::{CrossSectionPanelScheduleStatus, viewer_layout::PanelId};
 
 use super::{AUTOMATION_SCHEMA_VERSION, AUTOMATION_SCRIPT_SCHEMA};
 

@@ -1,14 +1,18 @@
 use eframe::egui;
 use glam::{DMat4, DVec3};
+use mirante4d_application::{
+    CrossSectionPanelScheduleStatus, RenderCoordinationState, RenderSurfaceState,
+};
 use mirante4d_dataset::DatasetCatalog;
 use mirante4d_domain::{GridToWorld, LogicalLayerKey, ScaleLevel, Shape3D, ViewerLayout};
 use mirante4d_project_model::ViewState;
 use mirante4d_render_api::PresentationViewport;
 
 use crate::{
-    cross_section_runtime::{CrossSectionPanelRuntime, CrossSectionRuntime},
     retained_leases::{RetainedLeaseSample, RetainedLeases},
-    viewer_layout::{CrossSectionPanelScheduleStatus, PanelId, render_cross_section_view_state},
+    viewer_layout::{
+        PanelId, cross_section_schedule_status_label, render_cross_section_view_state,
+    },
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -70,7 +74,7 @@ pub(crate) struct CrossSectionHoverReadout {
 }
 
 pub(crate) fn cross_section_hover_readout_for_response(
-    cross_section: &CrossSectionRuntime,
+    coordination: &RenderCoordinationState,
     leases: &RetainedLeases,
     input: CrossSectionReadoutInput<'_>,
     panel_id: PanelId,
@@ -88,7 +92,7 @@ pub(crate) fn cross_section_hover_readout_for_response(
     let normalized_y =
         ((position.y - response.rect.min.y) / response.rect.height()).clamp(0.0, 1.0);
     cross_section_hover_readout_for_panel_point(
-        cross_section,
+        coordination,
         leases,
         input,
         panel_id,
@@ -99,7 +103,7 @@ pub(crate) fn cross_section_hover_readout_for_response(
 }
 
 pub(crate) fn cross_section_hover_readout_for_panel_point(
-    cross_section: &CrossSectionRuntime,
+    coordination: &RenderCoordinationState,
     leases: &RetainedLeases,
     input: CrossSectionReadoutInput<'_>,
     panel_id: PanelId,
@@ -111,7 +115,7 @@ pub(crate) fn cross_section_hover_readout_for_panel_point(
         return None;
     }
     let panel = panel_id.cross_section_panel()?;
-    let panel_runtime = cross_section.panel(panel_id)?;
+    let panel_runtime = coordination.surface(panel_id.presentation_slot());
     let layer_key = input.view.active_layer();
     let layer_id = logical_layer_id(layer_key);
     let timepoint = input.view.timepoint();
@@ -121,7 +125,7 @@ pub(crate) fn cross_section_hover_readout_for_panel_point(
         CrossSectionHoverGenerationStatus::Unavailable,
     );
 
-    let Some(schedule) = panel_runtime.cross_section_schedule else {
+    let Some(schedule) = panel_runtime.cross_section_schedule() else {
         return Some(unmapped_readout(
             panel_id,
             &layer_id,
@@ -143,7 +147,7 @@ pub(crate) fn cross_section_hover_readout_for_panel_point(
             timepoint.get(),
             unavailable_generation,
             schedule_status_for_missing_value(schedule.status),
-            schedule.status_label(),
+            cross_section_schedule_status_label(schedule),
         ));
     };
 
@@ -219,7 +223,7 @@ pub(crate) fn cross_section_hover_readout_for_panel_point(
             "unavailable (active layer hidden)",
         ));
     }
-    if schedule.generation != panel_runtime.generation {
+    if schedule.generation != panel_runtime.generation() {
         let generation = ReadoutGeneration::for_panel(
             panel_runtime,
             Some(schedule.generation),
@@ -239,17 +243,17 @@ pub(crate) fn cross_section_hover_readout_for_panel_point(
         ));
     }
     if !panel_runtime.display_current() {
-        let generation_status = if panel_runtime.displayed_generation.is_some() {
+        let generation_status = if panel_runtime.displayed_generation().is_some() {
             CrossSectionHoverGenerationStatus::RetainedStale
         } else {
             CrossSectionHoverGenerationStatus::CurrentUndisplayed
         };
-        let status = if panel_runtime.displayed_generation.is_some() {
+        let status = if panel_runtime.displayed_generation().is_some() {
             CrossSectionHoverStatus::Stale
         } else {
             schedule_status_for_missing_value(schedule.status)
         };
-        let label = if panel_runtime.displayed_generation.is_some() {
+        let label = if panel_runtime.displayed_generation().is_some() {
             "stale (retained displayed generation)"
         } else {
             missing_resident_label(schedule.status)
@@ -343,13 +347,13 @@ struct ReadoutGeneration {
 
 impl ReadoutGeneration {
     fn for_panel(
-        panel: &CrossSectionPanelRuntime,
+        panel: &RenderSurfaceState,
         schedule_generation: Option<u64>,
         status: CrossSectionHoverGenerationStatus,
     ) -> Self {
         Self {
-            target_generation: panel.generation,
-            displayed_generation: panel.displayed_generation,
+            target_generation: panel.generation(),
+            displayed_generation: panel.displayed_generation(),
             schedule_generation,
             display_current: panel.display_current(),
             status,

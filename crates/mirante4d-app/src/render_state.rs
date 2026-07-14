@@ -1,7 +1,9 @@
 use mirante4d_render_api::{PresentationViewport, RenderExtent};
 use mirante4d_render_wgpu::WgpuRenderRuntimeError;
 
-use crate::{FrameFailureKind, current_runtime::render::CurrentRenderRuntime};
+use crate::{
+    FrameFailureKind, ResidentRenderFailureStatus, current_runtime::render::CurrentRenderRuntime,
+};
 
 pub(crate) fn set_render_viewport(
     render: &mut CurrentRenderRuntime,
@@ -25,21 +27,6 @@ pub(crate) fn set_presentation_viewport(
     render.presentation_viewport = viewport;
     render.frame_fidelity.presentation_viewport = viewport;
     true
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ResidentRenderFailureStatus {
-    pub(crate) kind: FrameFailureKind,
-    pub(crate) message: String,
-}
-
-impl ResidentRenderFailureStatus {
-    pub(crate) fn new(kind: FrameFailureKind, message: impl Into<String>) -> Self {
-        Self {
-            kind,
-            message: message.into(),
-        }
-    }
 }
 
 pub(crate) fn render_failure_status(error: &anyhow::Error) -> ResidentRenderFailureStatus {

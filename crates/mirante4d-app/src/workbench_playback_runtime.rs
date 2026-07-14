@@ -1,5 +1,7 @@
 use eframe::egui;
-use mirante4d_application::{ApplicationCommand, ApplicationSnapshot, OperationKind};
+use mirante4d_application::{
+    ApplicationCommand, ApplicationSnapshot, CrossSectionPanelScheduleStatus, OperationKind,
+};
 use mirante4d_domain::ViewerLayout;
 
 use crate::{
@@ -9,7 +11,6 @@ use crate::{
     import_worker_service::ImportWorkerService,
     native_presentation::NativePresentationBridge,
     playback::{PLAYBACK_FRAME_INTERVAL, playback_tick_for_ui_time},
-    viewer_layout::CrossSectionPanelScheduleStatus,
 };
 
 pub(crate) fn background_work_active(
@@ -34,8 +35,8 @@ pub(crate) fn background_work_active(
             })
         })
         || (crate::application_view(snapshot).layout() == ViewerLayout::FourPanel
-            && render.cross_section_runtime.panels().any(|panel| {
-                panel.cross_section_schedule.is_some_and(|schedule| {
+            && render.render_coordination.iter().any(|(_, panel)| {
+                panel.cross_section_schedule().is_some_and(|schedule| {
                     matches!(
                         schedule.status,
                         CrossSectionPanelScheduleStatus::Loading

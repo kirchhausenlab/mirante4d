@@ -3,8 +3,7 @@ use mirante4d_application::CrossSectionPanelId;
 use mirante4d_domain::{Opacity, ToolKind};
 use mirante4d_render_api::CameraFrame;
 
-use crate::cross_section_scheduler::mark_cross_section_panel_render_failed;
-use crate::viewer_layout::PanelId;
+use crate::viewer_layout::{PanelId, cross_section_schedule_status_label};
 
 fn show_iso_light_controls(
     ui: &mut egui::Ui,
@@ -216,10 +215,11 @@ impl MiranteWorkbenchApp {
             ctx.pixels_per_point(),
             max_texture_side,
         )?;
-        let changed = self
-            .render_runtime
-            .cross_section_runtime
-            .record_panel_viewports(panel_id, presentation_viewport, render_viewport);
+        let changed = self.render_runtime.render_coordination.record_viewports(
+            panel_id.presentation_slot(),
+            presentation_viewport,
+            render_viewport,
+        );
         if changed {
             self.render_runtime.lod_replan_pending = true;
             ctx.request_repaint();
@@ -468,20 +468,6 @@ impl MiranteWorkbenchApp {
                 panel = panel_id.label(),
                 "cross-section panel render failed"
             );
-            if let Some(schedule) = self
-                .render_runtime
-                .cross_section_runtime
-                .panel(panel_id)
-                .and_then(|panel| panel.cross_section_schedule)
-            {
-                let failure = render_state::render_failure_status(&err);
-                mark_cross_section_panel_render_failed(
-                    &mut self.render_runtime,
-                    panel_id,
-                    schedule,
-                    failure,
-                );
-            }
         }
         let response = if let Some(display_image) =
             self.cross_section_panel_display_image(panel_id, snapshot)
@@ -510,7 +496,7 @@ impl MiranteWorkbenchApp {
 
         if let Some(presentation_viewport) = presentation_viewport
             && let Some(readout) = cross_section_hover_readout_for_response(
-                &self.render_runtime.cross_section_runtime,
+                &self.render_runtime.render_coordination,
                 self.dataset.retained_leases(),
                 cross_section_readout::CrossSectionReadoutInput {
                     view,
@@ -618,11 +604,14 @@ impl MiranteWorkbenchApp {
                 format!("{} cross-section panel", panel_id.label()),
             )
         });
-        let panel = self.render_runtime.cross_section_runtime.panel(panel_id);
+        let panel = self
+            .render_runtime
+            .render_coordination
+            .surface(panel_id.presentation_slot());
         let status = panel
-            .and_then(|panel| panel.cross_section_schedule)
-            .map(|schedule| schedule.status_label());
-        let text = if panel.is_some_and(|panel| panel.render_failure.is_some()) {
+            .cross_section_schedule()
+            .map(cross_section_schedule_status_label);
+        let text = if panel.render_failure().is_some() {
             format!("{}\nrender failed", panel_id.label())
         } else {
             status
@@ -2208,16 +2197,17 @@ impl eframe::App for MiranteWorkbenchApp {
                         {
                             ui_kit::status_badge(ui, StatusTone::Error, error);
                         }
-                        for panel in self.render_runtime.cross_section_runtime.panels() {
-                            if let Some(failure) = &panel.render_failure {
+                        for (slot, panel) in self.render_runtime.render_coordination.iter() {
+                            if let Some(failure) = panel.render_failure() {
+                                let panel_id = PanelId::from_presentation_slot(slot);
                                 ui_kit::status_badge(
                                     ui,
                                     StatusTone::Error,
                                     format!(
                                         "{} cross-section failed ({:?}): {}",
-                                        panel.panel_id.label(),
-                                        failure.kind,
-                                        failure.message
+                                        panel_id.label(),
+                                        failure.kind(),
+                                        failure.message()
                                     ),
                                 );
                             }

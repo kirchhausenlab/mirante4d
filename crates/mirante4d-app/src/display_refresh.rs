@@ -4,7 +4,6 @@ use super::*;
 use crate::{
     cross_section_scheduler::{
         CROSS_SECTION_PANEL_RENDER_SUBMISSIONS_PER_PANEL_REFRESH, CrossSectionScheduleInput,
-        mark_cross_section_panel_render_failed, mark_cross_section_panel_rendered,
         schedule_cross_section_panel,
     },
     dataset_requests::{
@@ -104,10 +103,13 @@ impl MiranteWorkbenchApp {
     }
 
     fn cross_section_presentation_surface(&self, panel_id: PanelId) -> Option<PresentationSurface> {
-        let panel = self.render_runtime.cross_section_runtime.panel(panel_id)?;
+        let panel = self
+            .render_runtime
+            .render_coordination
+            .surface(panel_id.presentation_slot());
         Some(self.presentation_surface(
             panel_id,
-            panel.presentation_viewport?,
+            panel.presentation_viewport()?,
             panel.display_current(),
         ))
     }
@@ -203,8 +205,8 @@ impl MiranteWorkbenchApp {
 
     pub(crate) fn invalidate_cross_section_panel_display_frames(&mut self) {
         self.render_runtime
-            .cross_section_runtime
-            .mark_cross_section_panels_dirty();
+            .render_coordination
+            .invalidate_cross_sections();
     }
 
     pub(crate) fn clear_product_presentations(&mut self) {
@@ -221,9 +223,13 @@ impl MiranteWorkbenchApp {
     }
 
     fn cross_section_panel_needs_display_render(&self, panel_id: PanelId) -> bool {
-        let Some(panel) = self.render_runtime.cross_section_runtime.panel(panel_id) else {
+        if panel_id.cross_section_panel().is_none() {
             return false;
-        };
+        }
+        let panel = self
+            .render_runtime
+            .render_coordination
+            .surface(panel_id.presentation_slot());
         let target_is_progressive = self
             .native_presentation
             .product_gpu
@@ -233,9 +239,7 @@ impl MiranteWorkbenchApp {
             .is_some_and(|frame| {
                 frame.progress().completeness() == RenderFrameCompleteness::Progressive
             });
-        panel_id.cross_section_panel().is_some()
-            && panel.render_failure.is_none()
-            && (!panel.display_current() || target_is_progressive)
+        panel.render_failure().is_none() && (!panel.display_current() || target_is_progressive)
     }
 
     pub(crate) fn render_cross_section_panel_for_display_if_needed(
@@ -253,7 +257,7 @@ impl MiranteWorkbenchApp {
         let requirements = self.dataset.scope_requirements(scope).to_vec();
         let gpu_available = self.native_presentation.product_gpu.is_some();
         let schedule = schedule_cross_section_panel(
-            &mut self.render_runtime,
+            &mut self.render_runtime.render_coordination,
             CrossSectionScheduleInput {
                 catalog: snapshot.catalog(),
                 view,
@@ -272,16 +276,15 @@ impl MiranteWorkbenchApp {
         }
         let panel = self
             .render_runtime
-            .cross_section_runtime
-            .panel(panel_id)
-            .ok_or_else(|| anyhow::anyhow!("cross-section panel state is unavailable"))?;
+            .render_coordination
+            .surface(panel_id.presentation_slot());
         let presentation = panel
-            .presentation_viewport
+            .presentation_viewport()
             .ok_or_else(|| anyhow::anyhow!("cross-section presentation viewport is unavailable"))?;
         let extent = panel
-            .render_viewport
+            .render_viewport()
             .ok_or_else(|| anyhow::anyhow!("cross-section render viewport is unavailable"))?;
-        let generation = panel.generation;
+        let generation = panel.generation();
         let render_start = Instant::now();
         let rendered = match self.render_product_target(
             panel_id,
@@ -294,12 +297,9 @@ impl MiranteWorkbenchApp {
             Ok(rendered) => rendered,
             Err(error) => {
                 let failure = render_state::render_failure_status(&error);
-                mark_cross_section_panel_render_failed(
-                    &mut self.render_runtime,
-                    panel_id,
-                    schedule,
-                    failure,
-                );
+                self.render_runtime
+                    .render_coordination
+                    .record_cross_section_failure(panel_id.presentation_slot(), schedule, failure);
                 return Err(error);
             }
         };
@@ -308,12 +308,11 @@ impl MiranteWorkbenchApp {
         }
         if !self
             .render_runtime
-            .cross_section_runtime
-            .mark_panel_displayed(panel_id, generation)
+            .render_coordination
+            .record_cross_section_presentation(panel_id.presentation_slot(), generation, schedule)
         {
             anyhow::bail!("stale cross-section frame was suppressed");
         }
-        mark_cross_section_panel_rendered(&mut self.render_runtime, panel_id, schedule);
         Ok(Some(DisplayRenderTiming {
             path: DisplayRefreshPath::GpuResidentDisplay,
             render_ms: duration_ms(render_start.elapsed()),
@@ -692,8 +691,9 @@ impl MiranteWorkbenchApp {
             Err(error) => {
                 tracing::error!(%error, "GPU display refresh failed");
                 let failure = render_state::render_failure_status(&error);
-                self.render_runtime.frame_fidelity.last_failure_kind = Some(failure.kind);
-                self.render_runtime.frame_fidelity.last_capacity_error = Some(failure.message);
+                self.render_runtime.frame_fidelity.last_failure_kind = Some(failure.kind());
+                self.render_runtime.frame_fidelity.last_capacity_error =
+                    Some(failure.message().to_owned());
                 self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Incomplete;
             }
         }

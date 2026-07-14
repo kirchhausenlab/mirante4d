@@ -5,19 +5,17 @@
 
 use std::time::Instant;
 
+use mirante4d_application::{
+    CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
+    CrossSectionPanelScheduleStatus, RenderCoordinationState,
+};
 use mirante4d_dataset::{DatasetCatalog, DatasetResourceKey};
 use mirante4d_domain::{LogicalLayerKey, ScaleLevel, ViewerLayout};
 use mirante4d_project_model::ViewState;
 
 use crate::{
-    current_runtime::render::CurrentRenderRuntime,
-    lod_scheduler::representative_voxel_world_size,
-    render_state::ResidentRenderFailureStatus,
-    retained_leases::RetainedLeases,
-    viewer_layout::{
-        CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
-        CrossSectionPanelScheduleStatus, PanelId,
-    },
+    lod_scheduler::representative_voxel_world_size, retained_leases::RetainedLeases,
+    viewer_layout::PanelId,
 };
 
 pub(crate) const CROSS_SECTION_PANEL_SCHEDULER_CPU_BUDGET_MS: f64 = 1.0;
@@ -40,14 +38,14 @@ pub(crate) struct CrossSectionScheduleInput<'a> {
 }
 
 pub(crate) fn schedule_cross_section_panel(
-    render: &mut CurrentRenderRuntime,
+    coordination: &mut RenderCoordinationState,
     input: CrossSectionScheduleInput<'_>,
     panel_id: PanelId,
     gpu_display_available: bool,
 ) -> anyhow::Result<CrossSectionPanelSchedulePlan> {
     let schedule_start = Instant::now();
     let schedule =
-        build_cross_section_panel_schedule(render, input, panel_id, gpu_display_available)?;
+        build_cross_section_panel_schedule(coordination, input, panel_id, gpu_display_available)?;
     let schedule_ms = schedule_start.elapsed().as_secs_f64() * 1000.0;
     if schedule_ms > CROSS_SECTION_PANEL_SCHEDULER_CPU_BUDGET_MS {
         tracing::debug!(
@@ -57,40 +55,12 @@ pub(crate) fn schedule_cross_section_panel(
             "cross-section panel scheduling exceeded its per-panel CPU budget"
         );
     }
-    render
-        .cross_section_runtime
-        .set_panel_schedule(panel_id, schedule);
+    coordination.set_cross_section_schedule(panel_id.presentation_slot(), schedule);
     Ok(CrossSectionPanelSchedulePlan { schedule })
 }
 
-pub(crate) fn mark_cross_section_panel_rendered(
-    render: &mut CurrentRenderRuntime,
-    panel_id: PanelId,
-    schedule: CrossSectionPanelScheduleState,
-) {
-    render
-        .cross_section_runtime
-        .set_panel_schedule(panel_id, schedule.rendered());
-}
-
-pub(crate) fn mark_cross_section_panel_render_failed(
-    render: &mut CurrentRenderRuntime,
-    panel_id: PanelId,
-    mut schedule: CrossSectionPanelScheduleState,
-    failure: ResidentRenderFailureStatus,
-) {
-    schedule.status = CrossSectionPanelScheduleStatus::Unavailable;
-    schedule.reason = CrossSectionPanelScheduleReason::RenderFailed;
-    render
-        .cross_section_runtime
-        .set_panel_schedule(panel_id, schedule);
-    render
-        .cross_section_runtime
-        .mark_panel_render_failed(panel_id, schedule.generation, failure);
-}
-
 fn build_cross_section_panel_schedule(
-    render: &CurrentRenderRuntime,
+    coordination: &RenderCoordinationState,
     input: CrossSectionScheduleInput<'_>,
     panel_id: PanelId,
     gpu_display_available: bool,
@@ -103,14 +73,10 @@ fn build_cross_section_panel_schedule(
         });
     }
 
-    let generation = render
-        .cross_section_runtime
-        .panel(panel_id)
-        .map_or(0, |panel| panel.generation);
-    let Some(panel_runtime) = render.cross_section_runtime.panel(panel_id) else {
-        return Ok(CrossSectionPanelScheduleState::missing_viewport(generation));
-    };
-    if panel_runtime.presentation_viewport.is_none() || panel_runtime.render_viewport.is_none() {
+    let panel_runtime = coordination.surface(panel_id.presentation_slot());
+    let generation = panel_runtime.generation();
+    if panel_runtime.presentation_viewport().is_none() || panel_runtime.render_viewport().is_none()
+    {
         return Ok(CrossSectionPanelScheduleState::missing_viewport(generation));
     }
 

@@ -273,14 +273,14 @@ impl PendingCrossSectionLatencySample {
         }
         let panel = app
             .render_runtime
-            .cross_section_runtime
-            .panel(self.panel_id)?;
-        let displayed_generation = panel.displayed_generation?;
+            .render_coordination
+            .surface(self.panel_id.presentation_slot());
+        let displayed_generation = panel.displayed_generation()?;
         if displayed_generation < self.target_generation {
             return None;
         }
         product_presentation(app, self.panel_id)?;
-        let schedule = panel.cross_section_schedule;
+        let schedule = panel.cross_section_schedule();
         Some(ProductAutomationCrossSectionLatencySample {
             command_index: self.command_index,
             command: self.command,
@@ -1522,7 +1522,7 @@ impl ProductAutomationController {
         let snapshot = current_egui_shell_bridge::snapshot(&app.application);
         let view = application_view(&snapshot);
         let readout = cross_section_hover_readout_for_panel_point(
-            &app.render_runtime.cross_section_runtime,
+            &app.render_runtime.render_coordination,
             app.dataset.retained_leases(),
             CrossSectionReadoutInput {
                 view,
@@ -1919,10 +1919,9 @@ impl ProductAutomationController {
                 }
                 let panel_state = app
                     .render_runtime
-                    .cross_section_runtime
-                    .panel(panel_id)
-                    .ok_or_else(|| format!("panel {} is not active", panel_id.label()))?;
-                let schedule = panel_state.cross_section_schedule.ok_or_else(|| {
+                    .render_coordination
+                    .surface(panel_id.presentation_slot());
+                let schedule = panel_state.cross_section_schedule().ok_or_else(|| {
                     format!("panel {} has no cross-section schedule", panel_id.label())
                 })?;
                 if let Some(expected_status) = status {
@@ -2520,12 +2519,13 @@ impl ProductAutomationController {
         panel_id: PanelId,
         started_at: Instant,
     ) {
-        let Some(panel) = app.render_runtime.cross_section_runtime.panel(panel_id) else {
-            return;
-        };
         if panel_id.cross_section_panel().is_none() {
             return;
         }
+        let panel = app
+            .render_runtime
+            .render_coordination
+            .surface(panel_id.presentation_slot());
         self.pending_cross_section_latency_samples
             .push(PendingCrossSectionLatencySample {
                 command_index,
@@ -2533,7 +2533,7 @@ impl ProductAutomationController {
                 operation,
                 panel_id,
                 started_at,
-                target_generation: panel.generation,
+                target_generation: panel.generation(),
                 active_timepoint: application_view(&current_egui_shell_bridge::snapshot(
                     &app.application,
                 ))
@@ -2609,9 +2609,9 @@ fn cross_section_panel_presentation_viewport(
     panel_id: PanelId,
 ) -> Result<PresentationViewport, String> {
     app.render_runtime
-        .cross_section_runtime
-        .panel(panel_id)
-        .and_then(|panel| panel.presentation_viewport)
+        .render_coordination
+        .surface(panel_id.presentation_slot())
+        .presentation_viewport()
         .ok_or_else(|| {
             format!(
                 "panel {} has no recorded presentation viewport; wait for the four-panel UI before zooming",
@@ -2744,14 +2744,15 @@ fn vec3_json(value: glam::DVec3) -> Value {
 fn panel_hover_readout_side_effect_snapshot(app: &MiranteWorkbenchApp) -> Value {
     let panels = app
         .render_runtime
-        .cross_section_runtime
-        .panels()
-        .map(|panel| {
+        .render_coordination
+        .iter()
+        .map(|(slot, panel)| {
+            let panel_id = PanelId::from_presentation_slot(slot);
             json!({
-                "panel_id": panel.panel_id.label(),
-                "generation": panel.generation,
-                "displayed_generation": panel.displayed_generation,
-                "schedule": panel.cross_section_schedule.map(panel_schedule_json),
+                "panel_id": panel_id.label(),
+                "generation": panel.generation(),
+                "displayed_generation": panel.displayed_generation(),
+                "schedule": panel.cross_section_schedule().map(panel_schedule_json),
             })
         })
         .collect::<Vec<_>>();
@@ -2985,32 +2986,33 @@ fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
     let view = application_view(&snapshot);
     let panels = app
         .render_runtime
-        .cross_section_runtime
-        .panels()
-        .map(|panel| {
+        .render_coordination
+        .iter()
+        .map(|(slot, panel)| {
+            let panel_id = PanelId::from_presentation_slot(slot);
             json!({
-                "panel_id": panel.panel_id.label(),
-                "generation": panel.generation,
-                "displayed_generation": panel.displayed_generation,
+                "panel_id": panel_id.label(),
+                "generation": panel.generation(),
+                "displayed_generation": panel.displayed_generation(),
                 "display_current": panel.display_current(),
-                "presentation_viewport": panel.presentation_viewport.map(|viewport| {
+                "presentation_viewport": panel.presentation_viewport().map(|viewport| {
                     json!({
                         "width_points": viewport.width_points(),
                         "height_points": viewport.height_points(),
                     })
                 }),
-                "render_viewport": panel.render_viewport.map(|viewport| {
+                "render_viewport": panel.render_viewport().map(|viewport| {
                     json!({
                         "width": viewport.width_pixels(),
                         "height": viewport.height_pixels(),
                     })
                 }),
-                "schedule": panel.cross_section_schedule.map(panel_schedule_json),
+                "schedule": panel.cross_section_schedule().map(panel_schedule_json),
                 "display_frame": app
                     .native_presentation
                     .product_gpu
                     .as_ref()
-                    .and_then(|product| product.targets.get(&panel.panel_id))
+                    .and_then(|product| product.targets.get(&panel_id))
                     .and_then(|target| target.presented.as_ref())
                     .map(|displayed| {
                         let progress = displayed.progress();
@@ -3053,7 +3055,7 @@ fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
     })
 }
 
-fn panel_schedule_json(schedule: crate::viewer_layout::CrossSectionPanelScheduleState) -> Value {
+fn panel_schedule_json(schedule: crate::CrossSectionPanelScheduleState) -> Value {
     json!({
         "generation": schedule.generation,
         "target_scale_level": schedule.target_scale_level,
