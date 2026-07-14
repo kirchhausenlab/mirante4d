@@ -633,6 +633,15 @@ struct AccountedPayload {
 }
 
 impl AccountedResourceLease {
+    /// Borrows the immutable decoded payload held by this accounted lease.
+    ///
+    /// This is the same view exposed through [`ResourceLease`], provided as an
+    /// inherent method so scheduler consumers do not need a second dataset
+    /// dependency merely to inspect a runtime-issued lease.
+    pub fn payload(&self) -> ResourcePayloadView<'_> {
+        <Self as ResourceLease>::payload(self)
+    }
+
     pub fn accounted_bytes(&self) -> u64 {
         self.inner.charge.bytes()
     }

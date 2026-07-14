@@ -1331,8 +1331,8 @@ mod tests {
     };
 
     use mirante4d_dataset::{
-        DatasetLayer, DatasetResourceIdentity, DatasetSourceId, ResourceLease, ResourceRegion,
-        ResourceValidity, ScientificIdentityStatus,
+        DatasetLayer, DatasetResourceIdentity, DatasetSourceId, ResourceRegion, ResourceValidity,
+        ScientificIdentityStatus,
     };
     use mirante4d_domain::{
         GridToWorld, IntensityDType, LogicalLayerKey, ScaleLevel, Shape3D, Shape4D, TimeIndex,
