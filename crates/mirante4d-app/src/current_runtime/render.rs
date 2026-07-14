@@ -2,7 +2,6 @@
 
 use std::collections::BTreeMap;
 
-use eframe::egui;
 use mirante4d_render_api::{
     FrameIdentity, PresentationToken, PresentationViewport, PresentedFrame, RenderExtent,
 };
@@ -21,7 +20,6 @@ pub(crate) struct ProductPresentationTarget {
     pub(crate) presented: Option<PresentedFrame>,
     pub(crate) pending_capture: Option<(PresentedFrame, ValidationCaptureTicket)>,
     pub(crate) completed_capture: Option<(PresentedFrame, ValidationCapture)>,
-    pub(crate) texture_id: Option<egui::TextureId>,
     pub(crate) partial_seen: bool,
 }
 

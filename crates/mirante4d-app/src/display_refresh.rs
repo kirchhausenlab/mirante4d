@@ -115,7 +115,10 @@ impl MiranteWorkbenchApp {
             .targets
             .get(&panel_id)?;
         target.presented.as_ref()?;
-        Some((target.texture_id?, target.extent))
+        Some((
+            self.native_presentation.texture_id(target.token)?,
+            target.extent,
+        ))
     }
 
     pub(crate) fn clear_3d_product_presentation(&mut self) {
@@ -439,7 +442,6 @@ impl MiranteWorkbenchApp {
                 presented: None,
                 pending_capture: None,
                 completed_capture: None,
-                texture_id: None,
                 partial_seen: false,
             },
         );
@@ -505,17 +507,9 @@ impl MiranteWorkbenchApp {
             .get(&target_id)
             .ok_or_else(|| anyhow::anyhow!("product presentation target is unavailable"))?;
         let token = target.token;
-        let existing = target.texture_id;
         let view = product.renderer.presentation_texture_view(token)?;
-        let texture_id = self
-            .native_presentation
-            .bind_texture(view, existing, extent_changed)?;
-        self.render_runtime
-            .product_gpu
-            .as_mut()
-            .and_then(|product| product.targets.get_mut(&target_id))
-            .expect("the product target remains registered")
-            .texture_id = Some(texture_id);
+        self.native_presentation
+            .bind_texture(token, view, extent_changed)?;
         Ok(())
     }
 
