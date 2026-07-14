@@ -1,14 +1,14 @@
 # Mirante4D Foundation Refactor Handoff
 
 Status: ACTIVE PUBLIC-EPOCH PROGRAM
-Last reviewed: 2026-07-13
-Current technical sequence: WP-11 acceptance, then the remaining packages below
+Last reviewed: 2026-07-14
+Current technical sequence: WP-12, then the remaining packages below
 Public-data publication: deferred to a separate future handoff
-WP-11 predecessor: `foundation-wp-10b-exit-1`
-Completed through: WP-10B at
-`8257f8c5bdc011651c8e74ab85dfdc86717b82d6`
-Current checkpoint: WP-11 off-product import-pipeline exit candidate
-Next protected-branch checkpoint: accept the off-product WP-11 importer
+WP-12 predecessor: `foundation-wp-11-exit-1`
+Completed through: WP-11 at
+`04987f64c309166caddf931be9c1ef4948010128`
+Current checkpoint: WP-12 analysis-runtime entry
+Next protected-branch checkpoint: accept the WP-12 product analysis cutover
 
 ## Purpose
 
@@ -190,12 +190,12 @@ WP-10B accepted native project persistence at
 (`foundation-wp-10b-exit-1`). The successor service is the sole product
 project route and its predecessor is deleted.
 
-The current WP-11 branch implements the off-product bounded, restartable
-TIFF/OME-TIFF producer and its focused tests. An importer-produced package
-passed the existing independent target reader. Protected-main acceptance and
-the create-once WP-11 exit tag remain pending, so this handoff remains
-completed through WP-10B and WP-12 has not started. Product activation and
-deletion of the current importer remain WP-10C work.
+WP-11 accepted the off-product bounded, restartable TIFF/OME-TIFF producer at
+`04987f64c309166caddf931be9c1ef4948010128`
+(`foundation-wp-11-exit-1`). Its focused checks and independent target readback
+passed. Product activation and deletion of the current importer remain WP-10C
+work. WP-12 now owns the product analysis-runtime rebuild and predecessor
+deletion.
 
 ## Dataset And Fixture Boundary
 

@@ -1,6 +1,6 @@
 # Current State
 
-Last reviewed: 2026-07-13
+Last reviewed: 2026-07-14
 
 Mirante4D is public, pre-alpha academic research software. Persisted formats
 and APIs can change through explicit hard cutovers; there is no supported
@@ -27,7 +27,7 @@ The workspace has twenty packages: nineteen `mirante4d-*` crates plus
 WP-10A library whose first slice owns frozen profile facts, portable package
 paths, checked package-count arithmetic, size/amplification ceilings, and
 bounded read-only local range I/O. It remains unreachable from the product.
-`mirante4d-import-pipeline` is the off-product WP-11 exit candidate: it owns
+`mirante4d-import-pipeline` is the accepted off-product WP-11 producer: it owns
 bounded, cancellable, restartable TIFF/OME-TIFF production of validated
 sharded target packages, but no product route.
 The new `mirante4d-render-wgpu` successor and unpublished
@@ -163,12 +163,14 @@ close, and joined shutdown are wired; the project-v15 bridge and
 owner accepted the preceding durability and three-launch product evidence
 without requiring a redundant power-cut rerun.
 
-The current WP-11 branch implements and tests the off-product replacement
-import/multiscale producer. An importer-produced package also passed the
-existing independent target reader. Protected-main acceptance and the
-create-once WP-11 exit tag remain pending, so WP-12 has not started. Product
-activation and deletion of the current importer remain WP-10C work; current
-schema-1 packages remain transitional T2 fixtures and the sole product route.
+WP-11 is accepted on protected main at
+`04987f64c309166caddf931be9c1ef4948010128` (tree
+`fd39e0be3a0883726972b25d037c916f0e3ca4c0`), tagged
+`foundation-wp-11-exit-1`. Its focused importer checks, independent target
+readback, and exact-main run passed. Product activation and deletion of the
+current importer remain WP-10C work; current schema-1 packages remain
+transitional T2 fixtures and the sole product route. WP-12 is now building the
+replacement analysis runtime; analysis execution is not yet available.
 
 ## Current Verification Boundary
 
