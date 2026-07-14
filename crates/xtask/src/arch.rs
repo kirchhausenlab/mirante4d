@@ -1433,43 +1433,29 @@ fn check_wp07b_private_bridges(
                 .map_err(Into::into)
         })
         .collect::<anyhow::Result<BTreeSet<_>>>()?;
-    let expected_bridge_paths =
-        BTreeSet::from(["crates/mirante4d-app/src/current_egui_shell_bridge.rs".to_owned()]);
-    if bridge_paths != expected_bridge_paths {
-        bail!(
-            "the live app must retain only its current egui bridge: expected={expected_bridge_paths:?}, actual={bridge_paths:?}"
-        );
+    if !bridge_paths.is_empty() {
+        bail!("the live app must not retain private bridge files: actual={bridge_paths:?}");
     }
 
     let app_source = fs::read_to_string(app_source_root.join("lib.rs"))?;
     let private_modules = private_root_module_names(&app_source)?;
-    if !private_modules.contains("current_egui_shell_bridge") {
-        bail!("the current egui bridge module must remain private");
+    let private_bridge_modules = private_modules
+        .iter()
+        .filter(|name| name.ends_with("_bridge"))
+        .collect::<BTreeSet<_>>();
+    if !private_bridge_modules.is_empty() {
+        bail!("the live app must not retain private bridge modules: {private_bridge_modules:?}");
     }
     let app_fields = rust_struct_field_terminal_type_names(&app_source, "MiranteWorkbenchApp")?;
     if app_fields.get("application").map(String::as_str) != Some("ApplicationState") {
         bail!("MiranteWorkbenchApp canonical application route drifted");
     }
-
-    let egui_path = app_source_root.join("current_egui_shell_bridge.rs");
-    let egui_source = fs::read_to_string(&egui_path)?;
-    if !egui_source.contains("until\n//! WP-09C.") && !egui_source.contains("WP-09C") {
-        bail!("current egui shell bridge must retain its WP-09C expiry");
-    }
-    let egui_items = rust_root_defined_item_names(&egui_source)?;
-    let expected_egui_items = BTreeSet::from([
-        "dispatch".to_owned(),
-        "drain_events".to_owned(),
-        "snapshot".to_owned(),
-    ]);
-    if egui_items != expected_egui_items || !public_root_api_names(&egui_path)?.is_empty() {
-        bail!("current egui shell bridge API or privacy drifted");
-    }
-    if !egui_source.contains("application.dispatch(command)")
-        || !app_source.contains("current_egui_shell_bridge::dispatch")
+    if !app_source.contains("self.application.dispatch(")
+        || !app_source.contains("self.application.snapshot()")
+        || !app_source.contains("self.application.drain_events(")
         || !app_source.contains("fn apply_application_command")
     {
-        bail!("current egui shell mutation route no longer closes through the application bridge");
+        bail!("the egui shell must route directly through ApplicationState");
     }
 
     Ok(())

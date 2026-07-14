@@ -447,12 +447,11 @@ impl MiranteWorkbenchApp {
         if runtime_fault_invalidates_verified_source(fault.code()) {
             let snapshot = self.application.snapshot();
             if snapshot.catalog().scientific_identity().is_verified()
-                && let Err(application_fault) = crate::current_egui_shell_bridge::dispatch(
-                    &mut self.application,
-                    ApplicationCommand::InvalidateSourceVerification {
-                        source_generation: snapshot.source_generation(),
-                    },
-                )
+                && let Err(application_fault) =
+                    self.application
+                        .dispatch(ApplicationCommand::InvalidateSourceVerification {
+                            source_generation: snapshot.source_generation(),
+                        })
             {
                 tracing::warn!(
                     ?application_fault,

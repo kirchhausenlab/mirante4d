@@ -62,7 +62,7 @@ pub(crate) fn duration_ms(duration: Duration) -> f64 {
 
 impl MiranteWorkbenchApp {
     pub(crate) fn application_snapshot_for_ui(&self) -> ApplicationSnapshot {
-        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let snapshot = self.application.snapshot();
         let three_d = Some(self.presentation_surface(
             PanelId::ThreeD,
             self.render_coordination.presentation_viewport,
@@ -230,7 +230,7 @@ impl MiranteWorkbenchApp {
         {
             return Ok(None);
         }
-        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let snapshot = self.application.snapshot();
         let view = application_view(&snapshot);
         let scope = cross_section_scope(panel_id)?;
         let requirements = self.dataset.scope_requirements(scope).to_vec();
@@ -579,11 +579,8 @@ impl MiranteWorkbenchApp {
             None if self.dataset.current_scale().get() == 0 => LodDecisionReason::ExactS0,
             None => LodDecisionReason::ScreenEquivalentCoarserScale,
         };
-        let mode = application_view(&current_egui_shell_bridge::snapshot(&self.application))
-            .layer(
-                application_view(&current_egui_shell_bridge::snapshot(&self.application))
-                    .active_layer(),
-            )
+        let mode = application_view(&self.application.snapshot())
+            .layer(application_view(&self.application.snapshot()).active_layer())
             .expect("the current view contains its active layer")
             .render_state()
             .mode();
@@ -596,7 +593,7 @@ impl MiranteWorkbenchApp {
     }
 
     pub(crate) fn render_current_product_frame(&mut self) -> anyhow::Result<DisplayRenderTiming> {
-        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let snapshot = self.application.snapshot();
         let requirements = self.dataset.scope_requirements(SCOPE_CURRENT_3D).to_vec();
         let presentation = self.render_coordination.presentation_viewport;
         let extent = self.render_coordination.render_viewport;

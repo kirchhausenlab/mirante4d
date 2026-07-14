@@ -3,8 +3,8 @@ use mirante4d_application::RenderSurfaceState;
 use mirante4d_dataset::CpuLedgerCategory;
 
 use crate::{
-    MiranteWorkbenchApp, current_egui_shell_bridge, fidelity::show_frame_fidelity_property_rows,
-    ui_kit, viewer_layout::PanelId,
+    MiranteWorkbenchApp, fidelity::show_frame_fidelity_property_rows, ui_kit,
+    viewer_layout::PanelId,
 };
 
 const CPU_CATEGORIES: [(CpuLedgerCategory, &str); 7] = [
@@ -18,7 +18,7 @@ const CPU_CATEGORIES: [(CpuLedgerCategory, &str); 7] = [
 ];
 
 pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut egui::Ui) {
-    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let snapshot = app.application.snapshot();
     if ui_kit::toolbar_button(ui, "Copy Diagnostics", true).clicked() {
         ui.ctx().copy_text(app.diagnostics_summary_text());
     }

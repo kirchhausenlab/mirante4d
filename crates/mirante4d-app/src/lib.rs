@@ -8,7 +8,6 @@ mod analysis_product;
 mod analysis_workspace;
 mod cross_section_readout;
 mod cross_section_scheduler;
-mod current_egui_shell_bridge;
 mod current_runtime;
 mod current_settings_connection;
 mod current_source_open_service;
@@ -723,13 +722,13 @@ impl MiranteWorkbenchApp {
         policy: ResourcePolicy,
         rejected_file_disposition: RejectedFileDisposition,
     ) {
-        if let Err(fault) = current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::RequestResourcePolicyChange {
-                policy,
-                rejected_file_disposition,
-            },
-        ) {
+        if let Err(fault) =
+            self.application
+                .dispatch(ApplicationCommand::RequestResourcePolicyChange {
+                    policy,
+                    rejected_file_disposition,
+                })
+        {
             tracing::warn!(?fault, "resource policy command rejected");
         }
         self.pump_application_services();
@@ -738,7 +737,7 @@ impl MiranteWorkbenchApp {
     fn pump_application_services(&mut self) {
         for _ in 0..4 {
             let mut completion_commands = self.settings_connection.poll();
-            let events = current_egui_shell_bridge::drain_events(&mut self.application, 256);
+            let events = self.application.drain_events(256);
             for event in &events {
                 if let Some(command) = self.settings_connection.observe_application_event(event) {
                     completion_commands.push(command);
@@ -749,9 +748,7 @@ impl MiranteWorkbenchApp {
             }
             let had_completion_commands = !completion_commands.is_empty();
             for command in completion_commands {
-                if let Err(fault) =
-                    current_egui_shell_bridge::dispatch(&mut self.application, command)
-                {
+                if let Err(fault) = self.application.dispatch(command) {
                     tracing::warn!(?fault, "application service completion rejected");
                 }
             }
@@ -763,7 +760,7 @@ impl MiranteWorkbenchApp {
             self.try_start_pending_automatic_source_verification();
             if events.is_empty()
                 && !had_completion_commands
-                && current_egui_shell_bridge::snapshot(&self.application).pending_event_count() == 0
+                && self.application.snapshot().pending_event_count() == 0
             {
                 break;
             }
@@ -971,7 +968,7 @@ impl MiranteWorkbenchApp {
                     .and_then(|service| {
                         service
                             .submit_save_as(
-                                &current_egui_shell_bridge::snapshot(&self.application),
+                                &self.application.snapshot(),
                                 token.clone(),
                                 path,
                                 projection.as_ref().clone(),
@@ -1095,8 +1092,7 @@ impl MiranteWorkbenchApp {
         match event {
             ApplicationEvent::SourceVerificationRequested { token } => {
                 let path = self.dataset.selected_path().to_path_buf();
-                let resource_policy =
-                    current_egui_shell_bridge::snapshot(&self.application).resource_policy();
+                let resource_policy = self.application.snapshot().resource_policy();
                 let scan_ledger = self.dataset.cpu_ledger_arc();
                 let request = self
                     .source_verification_service
@@ -1123,7 +1119,7 @@ impl MiranteWorkbenchApp {
                 }
             }
             ApplicationEvent::SourceVerificationInvalidated { source_generation } => {
-                let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+                let snapshot = self.application.snapshot();
                 if *source_generation == snapshot.source_generation()
                     && self.dataset.resource_identity()
                         != snapshot.catalog().scientific_identity().resource_identity()
@@ -1171,18 +1167,18 @@ impl MiranteWorkbenchApp {
         completion: OperationCompletion,
     ) -> bool {
         let operation_id = token.operation_id();
-        match current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::CompleteOperation { token, completion },
-        ) {
+        match self
+            .application
+            .dispatch(ApplicationCommand::CompleteOperation { token, completion })
+        {
             Ok(_) => true,
             Err(fault) if fault.code() == ApplicationFaultCode::OperationNotFound => false,
             Err(fault) => {
                 tracing::warn!(?fault, "source operation completion was rejected");
-                match current_egui_shell_bridge::dispatch(
-                    &mut self.application,
-                    ApplicationCommand::CancelOperation(operation_id),
-                ) {
+                match self
+                    .application
+                    .dispatch(ApplicationCommand::CancelOperation(operation_id))
+                {
                     Ok(_) => {}
                     Err(cancel_fault)
                         if cancel_fault.code() == ApplicationFaultCode::OperationNotFound => {}
@@ -1204,18 +1200,18 @@ impl MiranteWorkbenchApp {
         completion: OperationCompletion,
     ) -> bool {
         let operation_id = token.operation_id();
-        match current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::CompleteOperation { token, completion },
-        ) {
+        match self
+            .application
+            .dispatch(ApplicationCommand::CompleteOperation { token, completion })
+        {
             Ok(_) => true,
             Err(fault) if fault.code() == ApplicationFaultCode::OperationNotFound => false,
             Err(fault) => {
                 tracing::warn!(?fault, "project persistence completion was rejected");
-                match current_egui_shell_bridge::dispatch(
-                    &mut self.application,
-                    ApplicationCommand::CancelOperation(operation_id),
-                ) {
+                match self
+                    .application
+                    .dispatch(ApplicationCommand::CancelOperation(operation_id))
+                {
                     Ok(_) => {}
                     Err(cancel_fault)
                         if cancel_fault.code() == ApplicationFaultCode::OperationNotFound => {}
@@ -1241,7 +1237,7 @@ impl MiranteWorkbenchApp {
                 .to_owned(),
         );
         if matches!(
-            current_egui_shell_bridge::snapshot(&self.application).workspace(),
+            self.application.snapshot().workspace(),
             WorkspaceSnapshot::Unbound { .. }
         ) {
             self.request_project_store_restart();
@@ -1280,19 +1276,22 @@ impl MiranteWorkbenchApp {
     }
 
     fn begin_background_operation(&mut self, kind: OperationKind) -> Option<OperationToken> {
-        let before = current_egui_shell_bridge::snapshot(&self.application)
+        let before = self
+            .application
+            .snapshot()
             .active_operations()
             .iter()
             .map(OperationToken::operation_id)
             .collect::<Vec<_>>();
-        if let Err(fault) = current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::BeginOperation(kind),
-        ) {
+        if let Err(fault) = self
+            .application
+            .dispatch(ApplicationCommand::BeginOperation(kind))
+        {
             tracing::warn!(?fault, ?kind, "background operation was rejected");
             return None;
         }
-        current_egui_shell_bridge::snapshot(&self.application)
+        self.application
+            .snapshot()
             .active_operations()
             .iter()
             .find(|token| token.kind() == kind && !before.contains(&token.operation_id()))
@@ -1305,24 +1304,23 @@ impl MiranteWorkbenchApp {
         completion: OperationCompletion,
     ) -> bool {
         let operation_id = token.operation_id();
-        match current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::CompleteOperation { token, completion },
-        ) {
+        match self
+            .application
+            .dispatch(ApplicationCommand::CompleteOperation { token, completion })
+        {
             Ok(_) => true,
             Err(fault) => {
                 tracing::warn!(?fault, "background operation completion was rejected");
-                let _ = current_egui_shell_bridge::dispatch(
-                    &mut self.application,
-                    ApplicationCommand::CancelOperation(operation_id),
-                );
+                let _ = self
+                    .application
+                    .dispatch(ApplicationCommand::CancelOperation(operation_id));
                 false
             }
         }
     }
 
     fn poll_project_store(&mut self) {
-        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let snapshot = self.application.snapshot();
         let result = self
             .project_store
             .as_mut()
@@ -1538,7 +1536,7 @@ impl MiranteWorkbenchApp {
                 self.pending_analysis_artifact_load = None;
                 match result {
                     Ok(artifacts) => {
-                        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+                        let snapshot = self.application.snapshot();
                         let expected_source = match snapshot.source() {
                             SourceVerificationSnapshot::Verified(source) => Some(source.clone()),
                             SourceVerificationSnapshot::Required
@@ -1553,20 +1551,20 @@ impl MiranteWorkbenchApp {
                                     .stage_authenticated_bundles(artifacts, &source)
                             })
                             .and_then(|bundles| {
-                                current_egui_shell_bridge::dispatch(
-                                    &mut self.application,
-                                    ApplicationCommand::InstallLoadedAnalysisDescriptors {
-                                        project_id,
-                                        revision,
-                                        currentness,
-                                        bundles,
-                                    },
-                                )
-                                .map_err(|fault| {
-                                    anyhow::anyhow!(
-                                        "saved analysis descriptors were rejected: {fault:?}"
+                                self.application
+                                    .dispatch(
+                                        ApplicationCommand::InstallLoadedAnalysisDescriptors {
+                                            project_id,
+                                            revision,
+                                            currentness,
+                                            bundles,
+                                        },
                                     )
-                                })?;
+                                    .map_err(|fault| {
+                                        anyhow::anyhow!(
+                                            "saved analysis descriptors were rejected: {fault:?}"
+                                        )
+                                    })?;
                                 self.analysis_runtime.finish_authenticated_bundles()
                             });
                         if let Err(error) = staged {
@@ -1670,9 +1668,7 @@ impl MiranteWorkbenchApp {
     }
 
     fn project_dirty(&self) -> bool {
-        current_egui_shell_bridge::snapshot(&self.application)
-            .dirty()
-            .unwrap_or(false)
+        self.application.snapshot().dirty().unwrap_or(false)
     }
 
     fn handle_close_request(&mut self, ctx: &egui::Context) {
@@ -1981,7 +1977,7 @@ impl MiranteWorkbenchApp {
     }
 
     fn restart_unbound_project_store(&mut self) {
-        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let snapshot = self.application.snapshot();
         let WorkspaceSnapshot::Unbound { workspace } = snapshot.workspace() else {
             self.project_status_message = Some(
                 "Project storage is unavailable for the bound project; reopen the application before saving again."
@@ -2007,10 +2003,10 @@ impl MiranteWorkbenchApp {
     }
 
     fn open_session_from_dialog(&mut self, _ctx: &egui::Context) {
-        if let Err(fault) = current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::RequestProjectOpen,
-        ) {
+        if let Err(fault) = self
+            .application
+            .dispatch(ApplicationCommand::RequestProjectOpen)
+        {
             tracing::info!(?fault, "project open is unavailable for the current source");
         }
         self.pump_application_services();
@@ -2018,10 +2014,10 @@ impl MiranteWorkbenchApp {
 
     fn open_recovery_locator(&mut self, project_id: ProjectId) {
         self.pending_project_open_locator = Some(project_id);
-        if let Err(fault) = current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::RequestProjectOpen,
-        ) {
+        if let Err(fault) = self
+            .application
+            .dispatch(ApplicationCommand::RequestProjectOpen)
+        {
             self.pending_project_open_locator = None;
             self.project_status_message = Some(format!(
                 "Recovery cannot open for the current dataset: {fault:?}"
@@ -2063,12 +2059,10 @@ impl MiranteWorkbenchApp {
         path: PathBuf,
         ctx: Option<&egui::Context>,
     ) -> anyhow::Result<()> {
-        current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::RequestDatasetOpen,
-        )
-        .map_err(|fault| anyhow::anyhow!("dataset open command rejected: {fault:?}"))?;
-        let events = current_egui_shell_bridge::drain_events(&mut self.application, 256);
+        self.application
+            .dispatch(ApplicationCommand::RequestDatasetOpen)
+            .map_err(|fault| anyhow::anyhow!("dataset open command rejected: {fault:?}"))?;
+        let events = self.application.drain_events(256);
         let token = events
             .iter()
             .find_map(|event| match event {
@@ -2076,8 +2070,7 @@ impl MiranteWorkbenchApp {
                 _ => None,
             })
             .ok_or_else(|| anyhow::anyhow!("dataset open request emitted no operation token"))?;
-        let resource_policy =
-            current_egui_shell_bridge::snapshot(&self.application).resource_policy();
+        let resource_policy = self.application.snapshot().resource_policy();
         let Some(service) = self.source_open_service.as_mut() else {
             self.complete_source_operation(
                 token,
@@ -2104,10 +2097,10 @@ impl MiranteWorkbenchApp {
     }
 
     fn save_current_project(&mut self) -> bool {
-        if let Err(fault) = current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::RequestProjectSave,
-        ) {
+        if let Err(fault) = self
+            .application
+            .dispatch(ApplicationCommand::RequestProjectSave)
+        {
             tracing::info!(?fault, "project save is unavailable for the current source");
             return false;
         }
@@ -2117,10 +2110,10 @@ impl MiranteWorkbenchApp {
 
     fn save_current_project_as(&mut self) -> bool {
         let new_project_id = ProjectId::from_bytes(*uuid::Uuid::new_v4().as_bytes());
-        if let Err(fault) = current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::RequestProjectSaveAs { new_project_id },
-        ) {
+        if let Err(fault) = self
+            .application
+            .dispatch(ApplicationCommand::RequestProjectSaveAs { new_project_id })
+        {
             tracing::info!(
                 ?fault,
                 "project Save As is unavailable for the current source"
@@ -2132,10 +2125,10 @@ impl MiranteWorkbenchApp {
     }
 
     fn new_current_project(&mut self) {
-        if let Err(fault) = current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::AttachVerifiedDataset,
-        ) {
+        if let Err(fault) = self
+            .application
+            .dispatch(ApplicationCommand::AttachVerifiedDataset)
+        {
             tracing::info!(?fault, "new project is unavailable for the current source");
         }
         self.pump_application_services();
@@ -2177,10 +2170,10 @@ impl MiranteWorkbenchApp {
             return;
         }
         self.pending_recovery_selection = Some(generation_id);
-        if let Err(fault) = current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::RequestProjectRecovery,
-        ) {
+        if let Err(fault) = self
+            .application
+            .dispatch(ApplicationCommand::RequestProjectRecovery)
+        {
             self.pending_recovery_selection = None;
             tracing::info!(?fault, "project recovery is unavailable");
         }
@@ -2188,10 +2181,10 @@ impl MiranteWorkbenchApp {
     }
 
     fn request_current_source_verification(&mut self) {
-        if let Err(fault) = current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::RequestSourceVerification,
-        ) {
+        if let Err(fault) = self
+            .application
+            .dispatch(ApplicationCommand::RequestSourceVerification)
+        {
             tracing::warn!(?fault, "source verification request was rejected");
         }
     }
@@ -2200,7 +2193,7 @@ impl MiranteWorkbenchApp {
         let Some(pending_generation) = self.pending_automatic_source_verification else {
             return;
         };
-        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let snapshot = self.application.snapshot();
         if snapshot.source_generation() != pending_generation
             || !matches!(snapshot.source(), SourceVerificationSnapshot::Required)
         {
@@ -2215,10 +2208,10 @@ impl MiranteWorkbenchApp {
             return;
         }
 
-        match current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::RequestSourceVerification,
-        ) {
+        match self
+            .application
+            .dispatch(ApplicationCommand::RequestSourceVerification)
+        {
             Ok(_) => self.pending_automatic_source_verification = None,
             Err(fault) if fault.code() == ApplicationFaultCode::OperationConflict => {}
             Err(fault) => {
@@ -2267,7 +2260,9 @@ impl MiranteWorkbenchApp {
         match result.outcome {
             current_source_open_service::CurrentSourceOpenOutcome::Prepared(prepared) => {
                 let (runtime, completion) = prepared.into_runtime_and_completion();
-                let token_is_current = current_egui_shell_bridge::snapshot(&self.application)
+                let token_is_current = self
+                    .application
+                    .snapshot()
                     .active_operations()
                     .iter()
                     .any(|active| active == &token);
@@ -2327,7 +2322,7 @@ impl MiranteWorkbenchApp {
         };
         if self.complete_source_operation(pending.token, pending.completion) {
             self.install_current_source_runtime(pending.runtime);
-            let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+            let snapshot = self.application.snapshot();
             let WorkspaceSnapshot::Unbound { workspace } = snapshot.workspace() else {
                 tracing::error!("new source did not produce an unbound project workspace");
                 return;
@@ -2391,8 +2386,7 @@ impl MiranteWorkbenchApp {
 
         match progress {
             Ok(Some(progress)) => {
-                match current_egui_shell_bridge::dispatch(
-                    &mut self.application,
+                match self.application.dispatch(
                     ApplicationCommand::UpdateSourceVerificationProgress {
                         token: progress.token,
                         completed_work: progress.completed_work,
@@ -2498,7 +2492,7 @@ impl MiranteWorkbenchApp {
             tracing::warn!(%error, "replaced dataset runtime shutdown request failed");
         }
         self.pending_automatic_source_verification =
-            Some(current_egui_shell_bridge::snapshot(&self.application).source_generation());
+            Some(self.application.snapshot().source_generation());
         self.try_start_pending_automatic_source_verification();
         self.request_opened_state_visible_work(None);
 
@@ -2508,7 +2502,7 @@ impl MiranteWorkbenchApp {
     }
 
     fn active_histogram_summary(&mut self) -> LayerHistogramSummary {
-        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let snapshot = self.application.snapshot();
         let view = application_view(&snapshot);
         let active_key = view.active_layer();
         let layer = snapshot
@@ -2542,12 +2536,12 @@ impl MiranteWorkbenchApp {
         command: ApplicationCommand,
         ctx: &egui::Context,
     ) -> Result<CommandEffect, ApplicationFault> {
-        let before = current_egui_shell_bridge::snapshot(&self.application);
+        let before = self.application.snapshot();
         let previous_view = application_view(&before).clone();
         let previous_playback_active = before.transient().playback_active();
-        let effect = current_egui_shell_bridge::dispatch(&mut self.application, command)?;
+        let effect = self.application.dispatch(command)?;
         if effect == CommandEffect::Changed {
-            let after = current_egui_shell_bridge::snapshot(&self.application);
+            let after = self.application.snapshot();
             self.reconcile_application_change(
                 &previous_view,
                 previous_playback_active,

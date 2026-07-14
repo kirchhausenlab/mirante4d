@@ -1763,7 +1763,7 @@ impl eframe::App for MiranteWorkbenchApp {
                         }
                     });
                     ui_kit::section(ui, "Analysis", |ui| {
-                        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+                        let snapshot = self.application.snapshot();
                         let transient = snapshot.transient();
                         let start_reason = self.analysis_start_unavailable_reason();
                         let can_start = start_reason.is_none();
@@ -2241,7 +2241,7 @@ impl eframe::App for MiranteWorkbenchApp {
             );
         });
 
-        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let snapshot = self.application.snapshot();
         let transient = snapshot.transient();
         let commands = show_analysis_workspace_window(
             ui.ctx(),
@@ -2272,7 +2272,7 @@ impl eframe::App for MiranteWorkbenchApp {
                 tracing::warn!(?fault, "UI application command rejected");
             }
         }
-        let accepted_snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let accepted_snapshot = self.application.snapshot();
         let accepted_tool = viewer_tool_for_kind(accepted_snapshot.transient().active_tool());
         if self.egui_ui.viewer_tools.active_tool != accepted_tool {
             self.egui_ui.viewer_tools.set_active_tool(accepted_tool);
@@ -2299,7 +2299,7 @@ impl eframe::App for MiranteWorkbenchApp {
         let brick_result_drain_ms = duration_ms(brick_result_drain_started.elapsed());
 
         let background_repaint_started = Instant::now();
-        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let snapshot = self.application.snapshot();
         let project_store_pending = self
             .project_store
             .as_ref()

@@ -28,7 +28,7 @@ use crate::cross_section_readout::{
 };
 use crate::{
     DVR_DENSITY_SCALE_MAX, DVR_DENSITY_SCALE_MIN, DisplayedFrameFreshness, FrameCompleteness,
-    MiranteWorkbenchApp, application_view, current_egui_shell_bridge, set_render_viewport,
+    MiranteWorkbenchApp, application_view, set_render_viewport,
     viewer_layout::{
         CrossSectionPanel, CrossSectionViewState, PanelId, render_cross_section_view_state,
     },
@@ -122,7 +122,7 @@ fn layer_command(
     layer_index: usize,
     update: impl FnOnce(&LayerViewState) -> Result<LayerViewState, String>,
 ) -> Result<ApplicationCommand, String> {
-    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let snapshot = app.application.snapshot();
     let layer = application_view(&snapshot)
         .layers()
         .get(layer_index)
@@ -131,7 +131,7 @@ fn layer_command(
 }
 
 fn active_layer_index(app: &MiranteWorkbenchApp) -> usize {
-    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let snapshot = app.application.snapshot();
     let view = application_view(&snapshot);
     view.layers()
         .iter()
@@ -190,7 +190,7 @@ fn apply_cross_section_edit(
         ctx,
         ApplicationCommand::SetActiveCrossSectionPanel(Some(application_panel)),
     )?;
-    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let snapshot = app.application.snapshot();
     let view = application_view(&snapshot);
     let mut cross_section = render_cross_section_view_state(*view.cross_section());
     edit(
@@ -267,7 +267,7 @@ impl PendingCrossSectionLatencySample {
         &self,
         app: &MiranteWorkbenchApp,
     ) -> Option<ProductAutomationCrossSectionLatencySample> {
-        let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+        let snapshot = app.application.snapshot();
         if application_view(&snapshot).timepoint().get() != self.active_timepoint {
             return None;
         }
@@ -555,7 +555,7 @@ impl ProductAutomationController {
             }
             ProductAutomationCommand::NewProject => {
                 dispatch_application_command(app, ctx, ApplicationCommand::AttachVerifiedDataset)?;
-                if !current_egui_shell_bridge::snapshot(&app.application).is_bound() {
+                if !app.application.snapshot().is_bound() {
                     return Err("new_project did not establish a bound workspace".to_owned());
                 }
                 Ok(CommandProgress::Done(project_state_json(app)))
@@ -669,18 +669,16 @@ impl ProductAutomationController {
                     .reset_diagnostics()
                     .map_err(|error| error.to_string())?;
 
-                let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+                let snapshot = app.application.snapshot();
                 match snapshot.source() {
                     SourceVerificationSnapshot::Verified(_) => {
-                        current_egui_shell_bridge::dispatch(
-                            &mut app.application,
-                            ApplicationCommand::InvalidateSourceVerification {
+                        app.application
+                            .dispatch(ApplicationCommand::InvalidateSourceVerification {
                                 source_generation: snapshot.source_generation(),
-                            },
-                        )
-                        .map_err(|fault| {
-                            format!("source-verification invalidation was rejected: {fault:?}")
-                        })?;
+                            })
+                            .map_err(|fault| {
+                                format!("source-verification invalidation was rejected: {fault:?}")
+                            })?;
                     }
                     SourceVerificationSnapshot::Required => {}
                     SourceVerificationSnapshot::Verifying { .. } => {
@@ -689,26 +687,24 @@ impl ProductAutomationController {
                         );
                     }
                 }
-                current_egui_shell_bridge::dispatch(
-                    &mut app.application,
-                    ApplicationCommand::RequestSourceVerification,
-                )
-                .map_err(|fault| format!("source-verification request was rejected: {fault:?}"))?;
-                let operation_id =
-                    match current_egui_shell_bridge::snapshot(&app.application).source() {
-                        SourceVerificationSnapshot::Verifying { operation_id, .. } => *operation_id,
-                        _ => {
-                            return Err("source-verification request did not create an operation"
-                                .to_owned());
-                        }
-                    };
-                current_egui_shell_bridge::dispatch(
-                    &mut app.application,
-                    ApplicationCommand::CancelOperation(operation_id),
-                )
-                .map_err(|fault| {
-                    format!("source-verification cancellation was rejected: {fault:?}")
-                })?;
+                app.application
+                    .dispatch(ApplicationCommand::RequestSourceVerification)
+                    .map_err(|fault| {
+                        format!("source-verification request was rejected: {fault:?}")
+                    })?;
+                let operation_id = match app.application.snapshot().source() {
+                    SourceVerificationSnapshot::Verifying { operation_id, .. } => *operation_id,
+                    _ => {
+                        return Err(
+                            "source-verification request did not create an operation".to_owned()
+                        );
+                    }
+                };
+                app.application
+                    .dispatch(ApplicationCommand::CancelOperation(operation_id))
+                    .map_err(|fault| {
+                        format!("source-verification cancellation was rejected: {fault:?}")
+                    })?;
                 app.pump_application_services();
                 Ok(CommandProgress::Done(json!({
                     "operation_id": operation_id.get(),
@@ -828,7 +824,7 @@ impl ProductAutomationController {
             }
             ProductAutomationCommand::SetViewerLayout { layout } => {
                 let viewer_layout: ViewerLayout = (*layout).into();
-                let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+                let snapshot = app.application.snapshot();
                 let cross_section = *application_view(&snapshot).cross_section();
                 dispatch_application_command(
                     app,
@@ -847,7 +843,7 @@ impl ProductAutomationController {
                 )))
             }
             ProductAutomationCommand::SetTimepoint { timepoint } => {
-                let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+                let snapshot = app.application.snapshot();
                 let view = application_view(&snapshot);
                 let timepoint_count = snapshot
                     .catalog()
@@ -866,10 +862,9 @@ impl ProductAutomationController {
                     ctx,
                     ApplicationCommand::SetTimepoint(TimeIndex::new(*timepoint)),
                 )?;
-                let active_timepoint =
-                    application_view(&current_egui_shell_bridge::snapshot(&app.application))
-                        .timepoint()
-                        .get();
+                let active_timepoint = application_view(&app.application.snapshot())
+                    .timepoint()
+                    .get();
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
                     previous_display_refresh_timing,
@@ -880,7 +875,7 @@ impl ProductAutomationController {
                 )))
             }
             ProductAutomationCommand::StepTimepoint { delta } => {
-                let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+                let snapshot = app.application.snapshot();
                 let view = application_view(&snapshot);
                 let count = snapshot
                     .catalog()
@@ -890,10 +885,9 @@ impl ProductAutomationController {
                     .t();
                 let next = crate::playback::stepped_timepoint(view.timepoint(), count, *delta);
                 dispatch_application_command(app, ctx, ApplicationCommand::SetTimepoint(next))?;
-                let active_timepoint =
-                    application_view(&current_egui_shell_bridge::snapshot(&app.application))
-                        .timepoint()
-                        .get();
+                let active_timepoint = application_view(&app.application.snapshot())
+                    .timepoint()
+                    .get();
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
                     previous_display_refresh_timing,
@@ -909,10 +903,9 @@ impl ProductAutomationController {
                     ctx,
                     ApplicationCommand::SetPlaybackActive(*playing),
                 )?;
-                let active_timepoint =
-                    application_view(&current_egui_shell_bridge::snapshot(&app.application))
-                        .timepoint()
-                        .get();
+                let active_timepoint = application_view(&app.application.snapshot())
+                    .timepoint()
+                    .get();
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
                     previous_display_refresh_timing,
@@ -1135,7 +1128,7 @@ impl ProductAutomationController {
                 )))
             }
             ProductAutomationCommand::CameraFitData => {
-                let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+                let snapshot = app.application.snapshot();
                 let view = application_view(&snapshot);
                 let layer = snapshot
                     .catalog()
@@ -1155,7 +1148,7 @@ impl ProductAutomationController {
                 )))
             }
             ProductAutomationCommand::CameraReset => {
-                let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+                let snapshot = app.application.snapshot();
                 let view = application_view(&snapshot);
                 let layer = snapshot
                     .catalog()
@@ -1180,7 +1173,7 @@ impl ProductAutomationController {
                 let viewport_side = viewport_height_points.unwrap_or(800.0);
                 let start = egui::pos2(viewport_side * 0.5, viewport_side * 0.5);
                 let current = start + egui::vec2(*yaw_points, *pitch_points);
-                let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+                let snapshot = app.application.snapshot();
                 let start_camera = *application_view(&snapshot).camera();
                 let mut camera = start_camera;
                 crate::viewport::apply_camera_orbit(
@@ -1205,7 +1198,7 @@ impl ProductAutomationController {
                 y_points,
                 viewport_height_points,
             } => {
-                let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+                let snapshot = app.application.snapshot();
                 let mut camera = *application_view(&snapshot).camera();
                 crate::viewport::apply_camera_pan(&mut camera, egui::vec2(*x_points, *y_points));
                 dispatch_application_command(app, ctx, ApplicationCommand::SetCamera(camera))?;
@@ -1220,7 +1213,7 @@ impl ProductAutomationController {
                 )))
             }
             ProductAutomationCommand::CameraZoom { scroll_y_points } => {
-                let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+                let snapshot = app.application.snapshot();
                 let mut camera = *application_view(&snapshot).camera();
                 crate::viewport::apply_camera_zoom(&mut camera, *scroll_y_points);
                 dispatch_application_command(app, ctx, ApplicationCommand::SetCamera(camera))?;
@@ -1287,7 +1280,7 @@ impl ProductAutomationController {
                     return Err("cross_section_slice_step notches must be finite".to_owned());
                 }
                 let panel_id = automation_cross_section_panel_id(*panel)?;
-                let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+                let snapshot = app.application.snapshot();
                 let view = application_view(&snapshot);
                 let voxel_size = crate::lod_scheduler::representative_voxel_world_size(
                     snapshot
@@ -1518,7 +1511,7 @@ impl ProductAutomationController {
         let x_points = f64::from(x_fraction) * presentation_viewport.width_points();
         let y_points = f64::from(y_fraction) * presentation_viewport.height_points();
         let before = panel_hover_readout_side_effect_snapshot(app);
-        let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+        let snapshot = app.application.snapshot();
         let view = application_view(&snapshot);
         let readout = cross_section_hover_readout_for_panel_point(
             &app.render_coordination,
@@ -1669,7 +1662,7 @@ impl ProductAutomationController {
         app: &MiranteWorkbenchApp,
         condition: ProductAutomationWaitCondition,
     ) -> bool {
-        let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+        let snapshot = app.application.snapshot();
         match condition {
             ProductAutomationWaitCondition::WindowReady => true,
             ProductAutomationWaitCondition::FirstFrame => {
@@ -1762,7 +1755,7 @@ impl ProductAutomationController {
         app: &MiranteWorkbenchApp,
         condition: &ProductAutomationAssertCondition,
     ) -> Result<(), String> {
-        let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+        let snapshot = app.application.snapshot();
         let view = application_view(&snapshot);
         match condition {
             ProductAutomationAssertCondition::NonblankFrame => {
@@ -2103,7 +2096,7 @@ impl ProductAutomationController {
     }
 
     fn diagnostics_json(&self, app: &MiranteWorkbenchApp) -> Value {
-        let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+        let snapshot = app.application.snapshot();
         let view = application_view(&snapshot);
         let active_layer = snapshot
             .catalog()
@@ -2237,7 +2230,7 @@ impl ProductAutomationController {
                 })
             })
             .unwrap_or(Value::Null);
-        let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+        let snapshot = app.application.snapshot();
         let requested_mapped_client_pixels = self
             .requested_mapped_client_pixels
             .map(|(width, height)| json!({ "width": width, "height": height }))
@@ -2368,7 +2361,7 @@ impl ProductAutomationController {
             return;
         }
         let total_update_ms = duration_ms(timing.update_started.elapsed());
-        let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+        let snapshot = app.application.snapshot();
         let view = application_view(&snapshot);
         let render_mode = view
             .layer(view.active_layer())
@@ -2531,11 +2524,9 @@ impl ProductAutomationController {
                 panel_id,
                 started_at,
                 target_generation: panel.generation(),
-                active_timepoint: application_view(&current_egui_shell_bridge::snapshot(
-                    &app.application,
-                ))
-                .timepoint()
-                .get(),
+                active_timepoint: application_view(&app.application.snapshot())
+                    .timepoint()
+                    .get(),
             });
     }
 
@@ -2766,7 +2757,7 @@ fn panel_hover_readout_side_effect_snapshot(app: &MiranteWorkbenchApp) -> Value 
 fn active_lease_cohort_status(
     app: &MiranteWorkbenchApp,
 ) -> Option<crate::retained_leases::RetainedLeaseStatus> {
-    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let snapshot = app.application.snapshot();
     let view = application_view(&snapshot);
     let identity = app
         .dataset
@@ -2932,7 +2923,7 @@ fn assert_gpu_display_images_distinct(
 }
 
 fn assert_cross_section_retired(app: &MiranteWorkbenchApp) -> Result<(), String> {
-    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let snapshot = app.application.snapshot();
     let view = application_view(&snapshot);
     if view.layout() != ViewerLayout::Single3d {
         return Err(format!(
@@ -2977,7 +2968,7 @@ fn assert_cross_section_retired(app: &MiranteWorkbenchApp) -> Result<(), String>
 }
 
 fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
-    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let snapshot = app.application.snapshot();
     let view = application_view(&snapshot);
     let panels = app
         .render_coordination
@@ -3159,14 +3150,14 @@ fn initial_save_with_durable_edit(
     }
 
     app.project_store_noninteractive_paths.initial_save = Some(path.to_path_buf());
-    if let Err(fault) = current_egui_shell_bridge::dispatch(
-        &mut app.application,
-        ApplicationCommand::RequestProjectSave,
-    ) {
+    if let Err(fault) = app
+        .application
+        .dispatch(ApplicationCommand::RequestProjectSave)
+    {
         app.project_store_noninteractive_paths.initial_save = None;
         return Err(format!("initial project Save was rejected: {fault:?}"));
     }
-    let events = current_egui_shell_bridge::drain_events(&mut app.application, 256);
+    let events = app.application.drain_events(256);
     let captured_revision = events
         .iter()
         .find_map(|event| match event {
@@ -3195,7 +3186,7 @@ fn initial_save_with_durable_edit(
         return Err("initial Save was not active before the durable edit".to_owned());
     }
 
-    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let snapshot = app.application.snapshot();
     let mut camera = *application_view(&snapshot).camera();
     crate::viewport::apply_camera_pan(&mut camera, egui::vec2(8.0, -4.0));
     let durable_edit_started_at = Instant::now();
@@ -3207,7 +3198,7 @@ fn initial_save_with_durable_edit(
         app.project_store_product_evidence.durable_edit_started_at = None;
         return Err("durable camera edit after initial Save changed no state".to_owned());
     }
-    let current_revision = match current_egui_shell_bridge::snapshot(&app.application).workspace() {
+    let current_revision = match app.application.snapshot().workspace() {
         WorkspaceSnapshot::Bound { revision, .. } => *revision,
         WorkspaceSnapshot::Unbound { .. } => {
             return Err("durable edit left the project workspace unbound".to_owned());
@@ -3227,7 +3218,7 @@ fn initial_save_with_durable_edit(
 }
 
 fn project_state_facts(app: &MiranteWorkbenchApp) -> ProductAutomationProjectStateFacts {
-    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let snapshot = app.application.snapshot();
     let (bound, dirty) = match snapshot.workspace() {
         WorkspaceSnapshot::Bound { dirty, .. } => (true, *dirty),
         WorkspaceSnapshot::Unbound { .. } => (false, false),
@@ -3264,7 +3255,7 @@ fn project_state_facts(app: &MiranteWorkbenchApp) -> ProductAutomationProjectSta
 }
 
 fn project_state_json(app: &MiranteWorkbenchApp) -> Value {
-    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
+    let snapshot = app.application.snapshot();
     let (current_revision, saved_revision) = match snapshot.workspace() {
         WorkspaceSnapshot::Bound {
             revision,
