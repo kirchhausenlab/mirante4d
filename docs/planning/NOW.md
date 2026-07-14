@@ -11,9 +11,15 @@ WP-10B is accepted on protected main at
 route. Its exhaustive durability matrix is not a recurring gate for unrelated
 work.
 
-WP-11 is active. It builds the off-product target TIFF/OME-TIFF importer; the
-current importer remains the sole reachable product route until WP-10C.
-Analysis execution remains unavailable until WP-12.
+WP-11 is an exit candidate on the current branch. The off-product
+`mirante4d-import-pipeline` now performs bounded, cancellable, restartable
+TIFF/OME-TIFF import into validated sharded target packages. Its focused tests
+pass, and an importer-produced package passed the existing independent target
+reader. The current importer remains the sole reachable product route until
+WP-10C activates the replacement and deletes the predecessor.
+
+Protected-main acceptance and the create-once WP-11 exit tag remain pending,
+so WP-12 has not started. Analysis execution remains unavailable until WP-12.
 
 ## WP-11 Entry Note
 

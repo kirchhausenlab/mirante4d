@@ -320,6 +320,14 @@ supporting E1 evidence.
 The B4 automation remains available for future project-persistence changes,
 but ordinary foundation work does not rerun its accepted durability matrix.
 
+The current WP-11 exit candidate passes focused importer unit, contract, and
+integration checks for supported source admission, bounded/restartable work,
+deterministic sharded output, cancellation and failure safety, multiscale edge
+behavior, and atomic publication. An importer-produced package also passed the
+existing independent target reader. This is off-product automated evidence;
+protected-main acceptance and the create-once exit tag remain pending, and
+product activation belongs to WP-10C. WP-12 has not started.
+
 The checked independent source report supports only the WP-03 source-TIFF
 archive. WP-10A is accepted off-product and its target authority is promoted.
 `mirante4d-storage` is assigned to the existing contract leaf. Its lower-level

@@ -22,11 +22,14 @@ public release or public full microscopy dataset yet.
 - Linux release-directory, tarball, and AppImage build paths.
 - No segmentation or derived-label subsystem.
 
-The workspace has nineteen packages: eighteen `mirante4d-*` crates plus
+The workspace has twenty packages: nineteen `mirante4d-*` crates plus
 `xtask`. `mirante4d-storage` is an off-product
 WP-10A library whose first slice owns frozen profile facts, portable package
 paths, checked package-count arithmetic, size/amplification ceilings, and
 bounded read-only local range I/O. It remains unreachable from the product.
+`mirante4d-import-pipeline` is the off-product WP-11 exit candidate: it owns
+bounded, cancellable, restartable TIFF/OME-TIFF production of validated
+sharded target packages, but no product route.
 The new `mirante4d-render-wgpu` successor and unpublished
 `mirante4d-render-reference` oracle are accepted off-product and remain
 deliberately unreachable; `mirante4d-renderer` remains the only product render
@@ -160,10 +163,12 @@ close, and joined shutdown are wired; the project-v15 bridge and
 owner accepted the preceding durability and three-launch product evidence
 without requiring a redundant power-cut rerun.
 
-Replacement, import/multiscale generation, and product activation remain
-incomplete.
-Current schema-1 packages remain transitional T2 fixtures and the sole product
-route.
+The current WP-11 branch implements and tests the off-product replacement
+import/multiscale producer. An importer-produced package also passed the
+existing independent target reader. Protected-main acceptance and the
+create-once WP-11 exit tag remain pending, so WP-12 has not started. Product
+activation and deletion of the current importer remain WP-10C work; current
+schema-1 packages remain transitional T2 fixtures and the sole product route.
 
 ## Current Verification Boundary
 

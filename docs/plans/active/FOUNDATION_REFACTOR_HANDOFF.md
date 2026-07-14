@@ -2,12 +2,12 @@
 
 Status: ACTIVE PUBLIC-EPOCH PROGRAM
 Last reviewed: 2026-07-13
-Current technical sequence: WP-11, then the remaining packages below
+Current technical sequence: WP-11 acceptance, then the remaining packages below
 Public-data publication: deferred to a separate future handoff
 WP-11 predecessor: `foundation-wp-10b-exit-1`
 Completed through: WP-10B at
 `8257f8c5bdc011651c8e74ab85dfdc86717b82d6`
-Current checkpoint: WP-11 import-pipeline entry
+Current checkpoint: WP-11 off-product import-pipeline exit candidate
 Next protected-branch checkpoint: accept the off-product WP-11 importer
 
 ## Purpose
@@ -189,6 +189,13 @@ WP-10B accepted native project persistence at
 `8257f8c5bdc011651c8e74ab85dfdc86717b82d6`
 (`foundation-wp-10b-exit-1`). The successor service is the sole product
 project route and its predecessor is deleted.
+
+The current WP-11 branch implements the off-product bounded, restartable
+TIFF/OME-TIFF producer and its focused tests. An importer-produced package
+passed the existing independent target reader. Protected-main acceptance and
+the create-once WP-11 exit tag remain pending, so this handoff remains
+completed through WP-10B and WP-12 has not started. Product activation and
+deletion of the current importer remain WP-10C work.
 
 ## Dataset And Fixture Boundary
 
