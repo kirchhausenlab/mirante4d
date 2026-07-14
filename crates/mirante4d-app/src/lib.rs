@@ -107,7 +107,7 @@ use mirante4d_domain::{
 use mirante4d_domain::{IntensityDType, RenderMode, Shape3D, TimeIndex};
 use mirante4d_import_pipeline::{
     ImportCancellation, ImportError, ImportOptions, ImportReceipt, TiffInspection, TiffSource,
-    import_tiff, inspect_tiff_cancellable,
+    spawn_tiff_import_worker, spawn_tiff_inspection_worker,
 };
 use mirante4d_project_model::{
     ChannelPreset, LayerViewState, ProjectId, ProjectRevisionId, ViewState,

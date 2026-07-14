@@ -1,7 +1,7 @@
-//! Bounded off-product TIFF/OME-TIFF import into the target Mirante4D profile.
+//! Bounded TIFF/OME-TIFF import into the target Mirante4D profile.
 //!
-//! WP-11 owns this replacement producer. It remains unreachable from the
-//! application until WP-10C removes the predecessor importer.
+//! WP-11 built the replacement producer. WP-10C makes this crate the product
+//! owner for source inspection, import execution, and their worker threads.
 
 #![forbid(unsafe_code)]
 
@@ -16,6 +16,7 @@ mod publish;
 mod pyramid;
 mod source;
 mod spool;
+mod worker;
 
 pub use cancel::ImportCancellation;
 pub use error::ImportError;
@@ -24,3 +25,4 @@ pub use model::{
     SpatialCalibration, TiffInspection, TiffSource,
 };
 pub use pipeline::{import_tiff, inspect_tiff, inspect_tiff_cancellable, select_supported_profile};
+pub use worker::{spawn_tiff_import_worker, spawn_tiff_inspection_worker};

@@ -60,11 +60,11 @@ impl MiranteWorkbenchApp {
         let worker_cancellation = cancellation.clone();
         let repaint_ctx = ctx.clone();
         let (sender, receiver) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            let result = inspect_tiff_cancellable(worker_source, &worker_cancellation);
-            let _ = sender.send(TiffImportSetupTaskMessage::Finished(result));
-            request_background_work_repaint(&repaint_ctx);
-        });
+        let worker =
+            spawn_tiff_inspection_worker(worker_source, worker_cancellation, move |result| {
+                let _ = sender.send(TiffImportSetupTaskMessage::Finished(result));
+                request_background_work_repaint(&repaint_ctx);
+            });
 
         self.enter_tiff_import_setup_waiting_state(
             source,
@@ -202,22 +202,22 @@ impl MiranteWorkbenchApp {
         let (sender, receiver) = mpsc::channel();
         let progress_sender = sender.clone();
         let worker_options = options.clone();
-        let worker = thread::spawn(move || {
-            let result = import_tiff(
-                worker_options,
-                ledger.as_ref(),
-                &worker_cancellation,
-                |event| {
-                    if progress_sender
-                        .send(ImportTaskMessage::Progress(event))
-                        .is_err()
-                    {
-                        progress_cancellation.cancel();
-                    }
-                },
-            );
-            let _ = sender.send(ImportTaskMessage::Finished(result));
-        });
+        let worker = spawn_tiff_import_worker(
+            worker_options,
+            ledger,
+            worker_cancellation,
+            move |event| {
+                if progress_sender
+                    .send(ImportTaskMessage::Progress(event))
+                    .is_err()
+                {
+                    progress_cancellation.cancel();
+                }
+            },
+            move |result| {
+                let _ = sender.send(ImportTaskMessage::Finished(result));
+            },
+        );
         self.import_runtime.import_task = Some(ImportTask {
             token,
             destination: destination.clone(),
