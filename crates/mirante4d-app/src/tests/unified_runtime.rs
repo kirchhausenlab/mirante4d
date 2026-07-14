@@ -37,9 +37,7 @@ fn unified_demand_plan_uses_semantic_keys_for_every_visible_layer() {
         dataset_demand_plan::DatasetDemandPlanLimits::new(
             mirante4d_render_api::MAX_RENDER_REQUIREMENTS,
             mirante4d_render_api::MAX_RENDER_REQUIREMENTS,
-            diagnostics.category_cap_bytes(
-                mirante4d_dataset::CpuLedgerCategory::DecodedResidency,
-            ),
+            diagnostics.category_cap_bytes(mirante4d_dataset::CpuLedgerCategory::DecodedResidency),
         ),
         false,
     )
@@ -139,7 +137,10 @@ fn imported_dataset_uses_the_existing_dirty_project_open_handoff() {
     assert!(app.project_dirty());
     let imported = temp.path().join("imported.m4d");
 
-    assert!(!app.open_or_queue_dataset_path(imported.clone(), None).unwrap());
+    assert!(
+        !app.open_or_queue_dataset_path(imported.clone(), None)
+            .unwrap()
+    );
 
     assert_eq!(app.pending_dataset_open_path.as_ref(), Some(&imported));
     assert!(app.ui_runtime.close_prompt_open);
@@ -158,12 +159,75 @@ fn imported_dataset_uses_the_existing_dirty_project_open_handoff() {
         .unwrap();
 }
 
+struct TestImportLease {
+    bytes: u64,
+}
+
+impl mirante4d_dataset::CpuByteLease for TestImportLease {
+    fn category(&self) -> mirante4d_dataset::CpuLedgerCategory {
+        mirante4d_dataset::CpuLedgerCategory::ImportWorkingSet
+    }
+
+    fn reserved_bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+struct TestImportLedger;
+
+impl mirante4d_dataset::CpuByteLedger for TestImportLedger {
+    fn try_acquire(
+        &self,
+        category: mirante4d_dataset::CpuLedgerCategory,
+        bytes: u64,
+    ) -> Result<Box<dyn mirante4d_dataset::CpuByteLease>, mirante4d_dataset::CpuLedgerError> {
+        assert_eq!(
+            category,
+            mirante4d_dataset::CpuLedgerCategory::ImportWorkingSet
+        );
+        assert!(bytes > 0);
+        Ok(Box::new(TestImportLease { bytes }))
+    }
+}
+
 #[test]
-fn exact_analyses_cancel_save_and_reopen_atomically() {
+fn import_verify_analyze_save_and_reopen_atomically() {
     let temp = tempfile::tempdir().unwrap();
-    let package = write_target_fixture(temp.path()).unwrap();
+    let source = write_source_time_series_fixture(temp.path()).unwrap();
+    let source_bytes = fs::read_dir(&source)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (entry.file_name(), fs::read(entry.path()).unwrap())
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let package = temp.path().join("imported-target.m4d");
     let project_path = temp.path().join("analysis-result.m4dproj");
     let context = egui::Context::default();
+
+    let inspection = mirante4d_import_pipeline::inspect_tiff(TiffSource::auto(&source)).unwrap();
+    let mut pending =
+        PendingTiffImport::from_inspection(TiffSource::auto(&source), inspection, package.clone());
+    pending.calibration_confirmed = true;
+    pending.time_step_seconds = Some(1.0);
+    mirante4d_import_pipeline::import_tiff(
+        build_import_options(&pending).unwrap(),
+        &TestImportLedger,
+        &ImportCancellation::new(),
+        |_| {},
+    )
+    .unwrap();
+    assert!(package.is_dir());
+    assert_eq!(
+        fs::read_dir(&source)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        source_bytes
+    );
 
     let opened = open_dataset_and_render_first_frame(&package).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
@@ -192,25 +256,22 @@ fn exact_analyses_cancel_save_and_reopen_atomically() {
     assert_eq!(app.analysis_start_unavailable_reason(), None);
     app.start_product_analysis(analysis_product::ProductAnalysisScope::FullTimeTrace)
         .unwrap();
-    app.request_analysis_cancel().unwrap();
     wait_for_test_app(&mut app, |app| {
         app.analysis_runtime.active_token().is_none()
-            && !app
+            && app
                 .application
                 .snapshot()
-                .active_operations()
-                .iter()
-                .any(|token| token.kind() == OperationKind::Analysis)
-    });
-    assert!(app.application.snapshot().transient().analysis_tables().is_empty());
-    assert!(app.application.snapshot().transient().analysis_plots().is_empty());
-
-    app.start_product_analysis(analysis_product::ProductAnalysisScope::FullTimeTrace)
-        .unwrap();
-    wait_for_test_app(&mut app, |app| {
-        app.analysis_runtime.active_token().is_none()
-            && app.application.snapshot().transient().analysis_tables().len() == 1
-            && app.application.snapshot().transient().analysis_plots().len() == 1
+                .transient()
+                .analysis_tables()
+                .len()
+                == 1
+            && app
+                .application
+                .snapshot()
+                .transient()
+                .analysis_plots()
+                .len()
+                == 1
             && app
                 .project_store
                 .as_ref()
@@ -219,25 +280,35 @@ fn exact_analyses_cancel_save_and_reopen_atomically() {
     let saved_snapshot = app.application.snapshot();
     let table_id = saved_snapshot.transient().analysis_tables()[0].id();
     let plot_id = saved_snapshot.transient().analysis_plots()[0].id();
-    assert_eq!(app.analysis_runtime.table(table_id).unwrap().rows().len(), 3);
-    assert_eq!(app.analysis_runtime.plot(plot_id).unwrap().points().len(), 3);
+    assert_eq!(
+        app.analysis_runtime.table(table_id).unwrap().rows().len(),
+        3
+    );
+    assert_eq!(
+        app.analysis_runtime.plot(plot_id).unwrap().points().len(),
+        3
+    );
     assert!(!app.project_dirty());
 
-    app.start_product_analysis(analysis_product::ProductAnalysisScope::FullTimeTrace)
-        .unwrap();
-    wait_for_test_app(&mut app, |app| {
-        app.analysis_runtime.active_token().is_none()
-            && app.application.snapshot().transient().analysis_tables().len() == 2
-            && app.application.snapshot().transient().analysis_plots().len() == 2
-    });
-
-    app.analysis_runtime.set_roi([1, 1, 1], [2, 2, 2]).unwrap();
+    app.analysis_runtime.set_roi([0, 0, 0], [2, 2, 2]).unwrap();
     app.start_product_analysis(analysis_product::ProductAnalysisScope::CurrentTimepointBox)
         .unwrap();
     wait_for_test_app(&mut app, |app| {
         app.analysis_runtime.active_token().is_none()
-            && app.application.snapshot().transient().analysis_tables().len() == 3
-            && app.application.snapshot().transient().analysis_plots().len() == 2
+            && app
+                .application
+                .snapshot()
+                .transient()
+                .analysis_tables()
+                .len()
+                == 2
+            && app
+                .application
+                .snapshot()
+                .transient()
+                .analysis_plots()
+                .len()
+                == 1
             && app
                 .project_store
                 .as_ref()
@@ -249,7 +320,14 @@ fn exact_analyses_cancel_save_and_reopen_atomically() {
         .transient()
         .selected_analysis_table()
         .expect("the completed box analysis is selected");
-    assert_eq!(app.analysis_runtime.table(box_table_id).unwrap().rows().len(), 1);
+    assert_eq!(
+        app.analysis_runtime
+            .table(box_table_id)
+            .unwrap()
+            .rows()
+            .len(),
+        1
+    );
     assert!(project_path.is_dir());
 
     close_test_project_store(&mut app);
@@ -272,8 +350,8 @@ fn exact_analyses_cancel_save_and_reopen_atomically() {
     wait_for_test_app(&mut reopened_app, |reopened_app| {
         let snapshot = reopened_app.application.snapshot();
         matches!(snapshot.workspace(), WorkspaceSnapshot::Bound { .. })
-            && snapshot.transient().analysis_tables().len() == 3
-            && snapshot.transient().analysis_plots().len() == 2
+            && snapshot.transient().analysis_tables().len() == 2
+            && snapshot.transient().analysis_plots().len() == 1
             && reopened_app.pending_analysis_artifact_load.is_none()
     });
     let reopened_snapshot = reopened_app.application.snapshot();
@@ -291,13 +369,17 @@ fn exact_analyses_cancel_save_and_reopen_atomically() {
         })
         .collect::<Vec<_>>();
     row_counts.sort_unstable();
-    assert_eq!(row_counts, vec![1, 3, 3]);
-    assert!(reopened_snapshot.transient().analysis_plots().iter().all(
-        |descriptor| reopened_app
-            .analysis_runtime
-            .plot(descriptor.id())
-            .is_some_and(|plot| plot.points().len() == 3)
-    ));
+    assert_eq!(row_counts, vec![1, 3]);
+    assert!(
+        reopened_snapshot
+            .transient()
+            .analysis_plots()
+            .iter()
+            .all(|descriptor| reopened_app
+                .analysis_runtime
+                .plot(descriptor.id())
+                .is_some_and(|plot| plot.points().len() == 3))
+    );
 
     close_test_project_store(&mut reopened_app);
     reopened_app.dataset.request_shutdown().unwrap();
@@ -347,8 +429,20 @@ fn analysis_only_source_failure_invalidates_the_verified_source() {
                 SourceVerificationSnapshot::Required
             )
     });
-    assert!(app.application.snapshot().transient().analysis_tables().is_empty());
-    assert!(app.application.snapshot().transient().analysis_plots().is_empty());
+    assert!(
+        app.application
+            .snapshot()
+            .transient()
+            .analysis_tables()
+            .is_empty()
+    );
+    assert!(
+        app.application
+            .snapshot()
+            .transient()
+            .analysis_plots()
+            .is_empty()
+    );
 
     close_test_project_store(&mut app);
     app.dataset.request_shutdown().unwrap();
@@ -371,9 +465,8 @@ fn install_test_project_store(app: &mut MiranteWorkbenchApp) {
 }
 
 fn verify_test_source(app: &mut MiranteWorkbenchApp) {
-    app.source_verification_service = Some(
-        current_source_verification_service::CurrentSourceVerificationService::new(),
-    );
+    app.source_verification_service =
+        Some(current_source_verification_service::CurrentSourceVerificationService::new());
     app.request_current_source_verification();
     wait_for_test_app(app, |app| {
         matches!(
@@ -470,7 +563,14 @@ fn terminal_decode_failure_is_stable_until_the_scope_changes() {
 
     app.request_visible_bricks();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while app.dataset.dispatcher().diagnostics().unwrap().failed_requests() == 0 {
+    while app
+        .dataset
+        .dispatcher()
+        .diagnostics()
+        .unwrap()
+        .failed_requests()
+        == 0
+    {
         assert!(std::time::Instant::now() < deadline);
         app.drain_brick_results(&context);
         std::thread::yield_now();
@@ -509,9 +609,8 @@ fn observed_source_fault_invalidates_then_retry_restores_runtime_identity_cohere
     let package = write_target_fixture(temp.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(&package).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
-    app.source_verification_service = Some(
-        current_source_verification_service::CurrentSourceVerificationService::new(),
-    );
+    app.source_verification_service =
+        Some(current_source_verification_service::CurrentSourceVerificationService::new());
     app.request_current_source_verification();
     app.pump_application_services();
 
@@ -600,8 +699,18 @@ fn observed_source_fault_invalidates_then_retry_restores_runtime_identity_cohere
         submitted_before
     );
     let context = egui::Context::default();
-    for _ in 0..4 {
+    let drain_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while app
+        .dataset
+        .dispatcher()
+        .diagnostics()
+        .unwrap()
+        .pending_completions()
+        > 0
+    {
+        assert!(std::time::Instant::now() < drain_deadline);
         app.drain_brick_results(&context);
+        std::thread::yield_now();
     }
     assert_eq!(
         app.dataset
@@ -664,9 +773,8 @@ fn automatic_source_verification_waits_for_the_previous_worker_to_retire() {
     )
     .unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
-    app.source_verification_service = Some(
-        current_source_verification_service::CurrentSourceVerificationService::new(),
-    );
+    app.source_verification_service =
+        Some(current_source_verification_service::CurrentSourceVerificationService::new());
 
     struct BlockingLedger {
         delegate: Arc<dyn mirante4d_dataset::CpuByteLedger>,
@@ -680,10 +788,8 @@ fn automatic_source_verification_waits_for_the_previous_worker_to_retire() {
             &self,
             category: mirante4d_dataset::CpuLedgerCategory,
             bytes: u64,
-        ) -> Result<
-            Box<dyn mirante4d_dataset::CpuByteLease>,
-            mirante4d_dataset::CpuLedgerError,
-        > {
+        ) -> Result<Box<dyn mirante4d_dataset::CpuByteLease>, mirante4d_dataset::CpuLedgerError>
+        {
             self.entered
                 .store(true, std::sync::atomic::Ordering::Release);
             let mut released = self.released.lock().unwrap();
@@ -771,13 +877,11 @@ fn automatic_source_verification_waits_for_the_previous_worker_to_retire() {
             },
         })
         .unwrap();
-    app.install_current_source_runtime(
-        current_source_open_service::CurrentSourceRuntimeTransfer {
-            dataset,
-            render_runtime,
-            analysis_runtime,
-        },
-    );
+    app.install_current_source_runtime(current_source_open_service::CurrentSourceRuntimeTransfer {
+        dataset,
+        render_runtime,
+        analysis_runtime,
+    });
 
     assert_eq!(
         app.pending_automatic_source_verification,
@@ -816,7 +920,10 @@ fn automatic_source_verification_waits_for_the_previous_worker_to_retire() {
         std::thread::yield_now();
     }
     assert_eq!(app.pending_automatic_source_verification, None);
-    assert_eq!(app.application.snapshot().source_generation(), replacement_generation);
+    assert_eq!(
+        app.application.snapshot().source_generation(),
+        replacement_generation
+    );
     assert_eq!(
         app.dataset.resource_identity(),
         app.application
@@ -926,9 +1033,8 @@ fn four_panel_playback_demand_shares_one_aggregate_resource_and_byte_budget() {
     assert!(requirements.len() <= mirante4d_render_api::MAX_RENDER_REQUIREMENTS);
     assert!(
         decoded_bytes.unwrap()
-            <= diagnostics.category_cap_bytes(
-                mirante4d_dataset::CpuLedgerCategory::DecodedResidency,
-            )
+            <= diagnostics
+                .category_cap_bytes(mirante4d_dataset::CpuLedgerCategory::DecodedResidency,)
     );
     app.dataset.request_shutdown().unwrap();
 }

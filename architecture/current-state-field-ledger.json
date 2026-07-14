@@ -1,7 +1,7 @@
 {
   "schema": "mirante4d-current-state-field-ledger",
   "schema_version": 2,
-  "status": "wp08b-unified-runtime-cutover",
+  "status": "wp10c-storage-runtime-cutover",
   "predecessor": {
     "tag": "foundation-wp-08a-exit-2",
     "revision": "f2e520da891134d1b3f65d8fcac7afb4140579a2"
@@ -10,10 +10,9 @@
     "runtime_owner": "mirante4d-dataset-runtime",
     "composition_state": "DatasetDemandState",
     "sole_poll_owner": "DatasetRequestDispatcher",
-    "source_bridge": {
-      "type": "CurrentDatasetSource",
-      "path": "crates/mirante4d-data/src/current_source_bridge.rs",
-      "expires": "WP-10C"
+    "source": {
+      "type": "LocalDatasetSource",
+      "path": "crates/mirante4d-storage/src/dataset_source.rs"
     },
     "renderer_bridge": {
       "type": "CurrentLeaseBridge",
@@ -39,9 +38,9 @@
     {
       "module": "import",
       "path": "crates/mirante4d-app/src/current_runtime/import.rs",
-      "type": "CurrentImportRuntime",
+      "type": "ImportRuntime",
       "composition_field": "import_runtime",
-      "expires": "WP-10C"
+      "expires": "WP-09C"
     },
     {
       "module": "validation",
@@ -94,7 +93,7 @@
     "No exact field count is an architecture contract.",
     "The application owns bounded payload-free request correlation, not decoded pixels.",
     "Only DatasetRequestDispatcher polls DatasetRuntime in product application code.",
-    "CurrentDatasetSource is the sole current-storage source bridge.",
+    "LocalDatasetSource is the sole product dataset source.",
     "CurrentLeaseBridge is the sole current-renderer lease bridge."
   ]
 }

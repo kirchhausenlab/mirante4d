@@ -4,6 +4,7 @@ use mirante4d_import_pipeline::ImportOptions;
 
 use crate::{ImportTask, PendingTiffImport, TiffImportSetupTask};
 
+// The product importer is final; only these UI-owned task handles move at WP-09C.
 pub(crate) struct ImportRuntime {
     pub(crate) tiff_import_setup_task: Option<TiffImportSetupTask>,
     pub(crate) tiff_import_setup_error: Option<String>,

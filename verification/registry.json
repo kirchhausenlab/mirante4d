@@ -20,6 +20,12 @@
   "lint_exceptions": [],
   "test_timeout_overrides": [
     {
+      "selector": "package(mirante4d-app) & test(=tests::import_verify_analyze_save_and_reopen_atomically)",
+      "warn_ms": 5000,
+      "terminate_ms": 20000,
+      "reason": "This one product integration imports and validates a real sharded target package before opening, analyzing, saving, and reopening it; the debug import takes about 10 seconds on the supported small fixture."
+    },
+    {
       "selector": "package(mirante4d-project-store) & test(=actor::tests::hosted_durability_tests::exhaustive_hosted_and_process_transition_matrix)",
       "warn_ms": 20000,
       "terminate_ms": 180000,
@@ -74,7 +80,6 @@
         "mirante4d-analysis-core",
         "mirante4d-analysis-runtime",
         "mirante4d-application",
-        "mirante4d-data",
         "mirante4d-dataset",
         "mirante4d-dataset-runtime",
         "mirante4d-domain",
@@ -87,7 +92,7 @@
         "mirante4d-settings",
         "xtask"
       ],
-      "selector": "package(mirante4d-analysis-core) | package(mirante4d-analysis-runtime) | package(mirante4d-application) | package(mirante4d-data) | package(mirante4d-dataset) | package(mirante4d-dataset-runtime) | package(mirante4d-domain) | package(mirante4d-identity) | package(mirante4d-project-model) | package(mirante4d-render-api) | package(mirante4d-render-reference) | package(mirante4d-render-wgpu) | package(mirante4d-renderer) | package(mirante4d-settings) | package(xtask)",
+      "selector": "package(mirante4d-analysis-core) | package(mirante4d-analysis-runtime) | package(mirante4d-application) | package(mirante4d-dataset) | package(mirante4d-dataset-runtime) | package(mirante4d-domain) | package(mirante4d-identity) | package(mirante4d-project-model) | package(mirante4d-render-api) | package(mirante4d-render-reference) | package(mirante4d-render-wgpu) | package(mirante4d-renderer) | package(mirante4d-settings) | package(xtask)",
       "warn_ms": 500,
       "terminate_ms": 2000,
       "aggregate_timeout_secs": 720
@@ -95,13 +100,13 @@
     {
       "id": "contract",
       "kind": "nextest",
-      "owner": "format-import-storage-project-store-contract-owners",
+      "owner": "import-storage-project-store-contract-owners",
       "requirements": ["D-022-contract"],
       "fixture_tier": "T1-or-T2",
       "capability": "hosted-cpu",
       "hosted_required": true,
-      "packages": ["mirante4d-format", "mirante4d-import", "mirante4d-import-pipeline", "mirante4d-project-store", "mirante4d-storage"],
-      "selector": "package(mirante4d-format) | package(mirante4d-import) | package(mirante4d-import-pipeline) | package(mirante4d-project-store) | package(mirante4d-storage)",
+      "packages": ["mirante4d-import-pipeline", "mirante4d-project-store", "mirante4d-storage"],
+      "selector": "package(mirante4d-import-pipeline) | package(mirante4d-project-store) | package(mirante4d-storage)",
       "warn_ms": 5000,
       "terminate_ms": 20000,
       "aggregate_timeout_secs": 720

@@ -13,6 +13,10 @@ const TARGET_FIXTURE_ARCHIVE: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../fixtures/target/archives/m4d-t1-u16-3d-multiscale.tar"
 ));
+const SOURCE_FIXTURE_ARCHIVE: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../fixtures/source/mirante4d-source-tiff-fixtures-v1.tar"
+));
 const TARGET_FIXTURE_NAME: &str = "m4d-t1-u16-3d-multiscale";
 const USTAR_BLOCK_BYTES: usize = 512;
 const TARGET_FIXTURE_ARCHIVE_BYTES_MAX: usize = 512 * 1024;
@@ -40,6 +44,23 @@ pub(crate) fn write_target_fixture(output_root: &Path) -> anyhow::Result<PathBuf
         return Err(error);
     }
     Ok(package)
+}
+
+pub(crate) fn write_source_time_series_fixture(output_root: &Path) -> anyhow::Result<PathBuf> {
+    if SOURCE_FIXTURE_ARCHIVE.is_empty()
+        || SOURCE_FIXTURE_ARCHIVE.len() > TARGET_FIXTURE_ARCHIVE_BYTES_MAX
+        || SOURCE_FIXTURE_ARCHIVE.len() % USTAR_BLOCK_BYTES != 0
+    {
+        bail!("source fixture archive has an invalid bounded length");
+    }
+    let fixture_root = output_root.join("source-tiff-fixtures");
+    fs::create_dir(&fixture_root)
+        .with_context(|| format!("failed to create {}", fixture_root.display()))?;
+    if let Err(error) = extract_target_fixture(SOURCE_FIXTURE_ARCHIVE, &fixture_root) {
+        let _ = fs::remove_dir_all(&fixture_root);
+        return Err(error);
+    }
+    Ok(fixture_root.join("spec-002"))
 }
 
 fn extract_target_fixture(archive: &[u8], root: &Path) -> anyhow::Result<()> {

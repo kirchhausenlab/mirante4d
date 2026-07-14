@@ -655,6 +655,7 @@ fn join_active(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mirante4d_dataset::DatasetSourceId;
 
     #[test]
     fn verification_stages_map_to_one_fixed_monotonic_scalar() {
