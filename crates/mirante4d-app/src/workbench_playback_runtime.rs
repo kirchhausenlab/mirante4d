@@ -91,7 +91,7 @@ pub(crate) fn enqueue_playback_command_if_due(
     }
 
     if snapshot.transient().last_playback_tick().is_some()
-        && !dataset.scope_complete(SCOPE_CURRENT_3D, &render.lease_bridge)
+        && !dataset.scope_complete(SCOPE_CURRENT_3D, &render.retained_leases)
     {
         ctx.request_repaint_after(BACKGROUND_WORK_REPAINT_INTERVAL);
         return;

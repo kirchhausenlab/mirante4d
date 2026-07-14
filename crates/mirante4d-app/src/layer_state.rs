@@ -37,7 +37,7 @@ pub(crate) fn reconcile_view_runtime(
                 layer.shape().t()
             );
         }
-        render.lease_bridge.replace_current_requirements([])?;
+        render.retained_leases.replace_requirements([])?;
         render
             .cross_section_runtime
             .mark_cross_section_panels_dirty();

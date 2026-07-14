@@ -35,7 +35,6 @@ mod playback;
 mod product_automation;
 mod product_render_intent;
 mod render_state;
-mod resident_rendering;
 mod retained_leases;
 mod runtime_diagnostics_panel;
 mod semantic_demand;
@@ -120,6 +119,7 @@ use mirante4d_project_store::{
     ProjectStoreFault, ProjectStorePath, ProjectStoreRequestId,
 };
 use mirante4d_render_api::PresentationViewport;
+use mirante4d_render_wgpu::{WgpuRenderRuntime, WgpuRenderRuntimeConfig};
 use mirante4d_renderer::gpu::{GpuDisplayFrame, GpuRenderer};
 #[cfg(test)]
 use mirante4d_renderer::{PixelCoverage, RenderViewport};
@@ -131,10 +131,6 @@ use product_automation::{ProductAutomationAppUpdateTiming, ProductAutomationCont
 #[cfg(test)]
 use render_state::placeholder_frame_for_mode;
 use render_state::{set_presentation_viewport, set_render_viewport, take_lod_replan_pending};
-use resident_rendering::{
-    render_gpu_cross_section_panel_frame_from_global_runtime,
-    render_gpu_display_frame_from_resident_bricks,
-};
 pub use smoke::{AppSmokeOptions, AppSmokeReport, PlaybackSmokeFrame, run_headless_smoke};
 pub use state::{
     ChannelFidelityStatus, ChannelFidelityWarning, DisplayedFrameFreshness, FrameCompleteness,
@@ -589,8 +585,21 @@ impl MiranteWorkbenchApp {
         startup_diagnostics.gpu_adapter = Some(adapter_summary);
         let gpu_renderer = Arc::new(renderer);
         render_runtime.gpu_renderer = Some(Arc::clone(&gpu_renderer));
-        let ui_runtime =
-            current_runtime::ui::CurrentUiRuntime::new(resource_policy, wgpu_texture_renderer);
+        let product_renderer = WgpuRenderRuntime::from_existing_device(
+            &render_state.adapter,
+            render_state.device.clone(),
+            render_state.queue.clone(),
+            WgpuRenderRuntimeConfig::new(resource_policy.gpu_budget_bytes())?,
+        )
+        .map_err(|error| anyhow::anyhow!("the progressive GPU renderer is required: {error}"))?;
+        render_runtime.product_gpu = Some(current_runtime::render::ProductGpuRenderRuntime::new(
+            product_renderer,
+        ));
+        let ui_runtime = current_runtime::ui::CurrentUiRuntime::new(
+            resource_policy,
+            wgpu_texture_renderer,
+            Some(render_state.device.clone()),
+        );
         let (project_recovery_root, recovery_root_warning) =
             initialize_project_recovery_root(dataset.selected_path());
         let (project_store, discovery_warning) =
@@ -2246,7 +2255,7 @@ impl MiranteWorkbenchApp {
         if let Err(error) = self.dataset.cancel_and_clear_interactive_demand() {
             tracing::warn!(%error, "invalidated dataset demand cancellation failed");
         }
-        let retired_leases = std::mem::take(&mut self.render_runtime.lease_bridge);
+        let retired_leases = std::mem::take(&mut self.render_runtime.retained_leases);
         self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Loading;
         self.render_runtime.frame_fidelity.reason = LodDecisionReason::LoadingTargetScale;
         self.render_runtime.frame_fidelity.backend = RenderBackend::Loading;
@@ -2477,7 +2486,7 @@ impl MiranteWorkbenchApp {
         &mut self,
         transfer: current_source_verification_service::CurrentSourceVerificationRuntimeTransfer,
     ) {
-        let retired_leases = std::mem::take(&mut self.render_runtime.lease_bridge);
+        let retired_leases = std::mem::take(&mut self.render_runtime.retained_leases);
         let old_dataset = std::mem::replace(&mut self.dataset, transfer.dataset);
         if let Err(error) = old_dataset.request_shutdown() {
             tracing::warn!(%error, "unverified dataset runtime shutdown request failed");
@@ -2496,6 +2505,7 @@ impl MiranteWorkbenchApp {
             analysis_runtime,
         } = transfer;
         render_runtime.gpu_renderer = self.render_runtime.gpu_renderer.clone();
+        render_runtime.product_gpu = self.render_runtime.product_gpu.take();
         self.clear_gpu_display_frame();
         self.retire_gpu_display_texture_id();
         self.retire_cross_section_gpu_display_texture_ids();
@@ -2546,7 +2556,7 @@ impl MiranteWorkbenchApp {
                 .unwrap_or(self.render_runtime.lod_schedule.target_scale_level),
         );
         active_layer_histogram_summary(
-            &self.render_runtime.lease_bridge,
+            &self.render_runtime.retained_leases,
             histogram::ActiveLayerHistogramInput {
                 requirements: self
                     .dataset

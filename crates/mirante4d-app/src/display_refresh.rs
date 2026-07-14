@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::*;
 use crate::{
     cross_section_scheduler::{
@@ -5,11 +7,19 @@ use crate::{
         mark_cross_section_panel_render_failed, mark_cross_section_panel_rendered,
         schedule_cross_section_panel,
     },
-    dataset_requests::SCOPE_CURRENT_3D,
+    dataset_requests::{
+        SCOPE_CROSS_SECTION_XY, SCOPE_CROSS_SECTION_XZ, SCOPE_CROSS_SECTION_YZ, SCOPE_CURRENT_3D,
+    },
     image_compositing::color_image_for_snapshot,
+    product_render_intent::{ProductRenderRequest, cross_section_request, volume_request},
     viewer_layout::PanelId,
 };
-use mirante4d_domain::ViewerLayout;
+use mirante4d_dataset::{DatasetResourceKey, ResourceLease};
+use mirante4d_domain::{RenderMode, ViewerLayout};
+use mirante4d_render_api::{
+    FrameCompleteness as RenderFrameCompleteness, FrameIdentity, FrameLimitation, RenderExtent,
+};
+use mirante4d_render_wgpu::WgpuRenderRuntimeError;
 
 #[derive(Clone)]
 pub(crate) enum ViewportDisplayImage {
@@ -87,13 +97,10 @@ impl MiranteWorkbenchApp {
     }
 
     pub(crate) fn viewport_display_image(&mut self, ctx: &egui::Context) -> ViewportDisplayImage {
-        if let (Some(frame), Some(texture_id)) = (
-            self.render_runtime.gpu_display_frame.as_ref(),
-            self.ui_runtime.gpu_display_texture_id,
-        ) {
+        if let Some((texture_id, extent)) = self.product_display(PanelId::ThreeD) {
             return ViewportDisplayImage::Gpu {
                 texture_id,
-                size: egui::vec2(frame.viewport.width as f32, frame.viewport.height as f32),
+                size: extent_size(extent),
             };
         }
         ViewportDisplayImage::Cpu(self.ensure_texture(ctx).clone())
@@ -104,47 +111,48 @@ impl MiranteWorkbenchApp {
         panel_id: PanelId,
     ) -> Option<ViewportDisplayImage> {
         let panel = self.render_runtime.cross_section_runtime.panel(panel_id)?;
-        let displayed = self
-            .render_runtime
-            .cross_section_gpu_display_frames
-            .get(&panel_id)?;
-        if displayed.generation != panel.generation || !panel.display_current() {
+        if !panel.display_current() {
             return None;
         }
+        let (texture_id, extent) = self.product_display(panel_id)?;
         Some(ViewportDisplayImage::Gpu {
-            texture_id: displayed.texture_id,
-            size: egui::vec2(
-                displayed.frame.viewport.width as f32,
-                displayed.frame.viewport.height as f32,
-            ),
+            texture_id,
+            size: extent_size(extent),
         })
     }
 
+    fn product_display(&self, panel_id: PanelId) -> Option<(egui::TextureId, RenderExtent)> {
+        let target = self
+            .render_runtime
+            .product_gpu
+            .as_ref()?
+            .targets
+            .get(&panel_id)?;
+        target.presented.as_ref()?;
+        Some((target.texture_id?, target.extent))
+    }
+
     pub(crate) fn clear_gpu_display_frame(&mut self) {
-        self.render_runtime.gpu_display_frame = None;
-        self.render_runtime.gpu_display_frame_identity = None;
+        if let Some(product) = self.render_runtime.product_gpu.as_mut()
+            && let Some(target) = product.targets.get_mut(&PanelId::ThreeD)
+        {
+            target.presented = None;
+        }
         self.render_runtime.frame_fidelity.display_freshness = DisplayedFrameFreshness::Unknown;
     }
 
     pub(crate) fn retire_gpu_display_texture_id(&mut self) {
-        if let Some(texture_id) = self.ui_runtime.gpu_display_texture_id.take() {
-            self.ui_runtime
-                .retired_gpu_display_texture_ids
-                .push(texture_id);
-        }
+        self.clear_gpu_display_frame();
     }
 
     pub(crate) fn retire_cross_section_gpu_display_texture_ids(&mut self) {
-        for displayed in self
-            .render_runtime
-            .cross_section_gpu_display_frames
-            .values()
-        {
-            self.ui_runtime
-                .retired_gpu_display_texture_ids
-                .push(displayed.texture_id);
+        if let Some(product) = self.render_runtime.product_gpu.as_mut() {
+            for panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
+                if let Some(target) = product.targets.get_mut(&panel) {
+                    target.presented = None;
+                }
+            }
         }
-        self.render_runtime.cross_section_gpu_display_frames.clear();
     }
 
     pub(crate) fn invalidate_cross_section_panel_display_frames(&mut self) {
@@ -167,85 +175,13 @@ impl MiranteWorkbenchApp {
         }
     }
 
-    fn ensure_gpu_display_path_ready(&self) -> anyhow::Result<()> {
-        if self.render_runtime.gpu_renderer.is_none() {
-            anyhow::bail!("GPU renderer is unavailable");
-        }
-        if !self
-            .dataset
-            .scope_complete(SCOPE_CURRENT_3D, &self.render_runtime.lease_bridge)
-        {
-            anyhow::bail!("current semantic lease set is incomplete");
-        }
-        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
-        if application_view(&snapshot)
-            .layers()
-            .iter()
-            .all(|layer| !layer.visible())
-        {
-            anyhow::bail!("GPU display requires at least one visible layer");
-        }
-        Ok(())
-    }
-
-    fn register_or_update_gpu_display_texture(
-        &mut self,
-        frame: &GpuDisplayFrame,
-    ) -> anyhow::Result<egui::TextureId> {
-        let texture_id =
-            self.register_or_update_gpu_texture_id(frame, self.ui_runtime.gpu_display_texture_id)?;
-        self.ui_runtime.gpu_display_texture_id = Some(texture_id);
-        Ok(texture_id)
-    }
-
-    fn register_or_update_gpu_texture_id(
-        &self,
-        frame: &GpuDisplayFrame,
-        existing_texture_id: Option<egui::TextureId>,
-    ) -> anyhow::Result<egui::TextureId> {
-        let gpu_renderer = self
-            .render_runtime
-            .gpu_renderer
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("GPU renderer is unavailable"))?;
-        let Some(texture_renderer) = self.ui_runtime.wgpu_texture_renderer.as_ref() else {
-            #[cfg(test)]
-            if let Some(texture_id) = existing_texture_id {
-                return Ok(texture_id);
-            }
-            anyhow::bail!("wgpu texture renderer is unavailable");
-        };
-        let mut texture_renderer = texture_renderer.write();
-        if let Some(texture_id) = existing_texture_id {
-            texture_renderer.update_egui_texture_from_wgpu_texture(
-                gpu_renderer.device(),
-                frame.texture_view(),
-                gpu_display_texture_filter(),
-                texture_id,
-            );
-            Ok(texture_id)
-        } else {
-            Ok(texture_renderer.register_native_texture(
-                gpu_renderer.device(),
-                frame.texture_view(),
-                gpu_display_texture_filter(),
-            ))
-        }
-    }
-
     fn cross_section_panel_needs_display_render(&self, panel_id: PanelId) -> bool {
         let Some(panel) = self.render_runtime.cross_section_runtime.panel(panel_id) else {
             return false;
         };
         panel_id.cross_section_panel().is_some()
             && panel.render_failure.is_none()
-            && self
-                .render_runtime
-                .cross_section_gpu_display_frames
-                .get(&panel_id)
-                .is_none_or(|displayed| {
-                    displayed.generation != panel.generation || !panel.display_current()
-                })
+            && !panel.display_current()
     }
 
     pub(crate) fn render_cross_section_panel_for_display_if_needed(
@@ -259,44 +195,47 @@ impl MiranteWorkbenchApp {
         }
         let snapshot = current_egui_shell_bridge::snapshot(&self.application);
         let view = application_view(&snapshot);
-        let scope = match panel_id {
-            PanelId::Xy => crate::dataset_requests::SCOPE_CROSS_SECTION_XY,
-            PanelId::Xz => crate::dataset_requests::SCOPE_CROSS_SECTION_XZ,
-            PanelId::Yz => crate::dataset_requests::SCOPE_CROSS_SECTION_YZ,
-            PanelId::ThreeD => return Ok(None),
-        };
-        let requirements = self.dataset.scope_requirements(scope);
-        let gpu_display_available = self.render_runtime.gpu_renderer.is_some()
-            && self.ui_runtime.wgpu_texture_renderer.is_some();
+        let scope = cross_section_scope(panel_id)?;
+        let requirements = self.dataset.scope_requirements(scope).to_vec();
+        let gpu_available = self.render_runtime.product_gpu.is_some();
         let schedule = schedule_cross_section_panel(
             &mut self.render_runtime,
             CrossSectionScheduleInput {
                 catalog: snapshot.catalog(),
                 view,
                 active_layer: view.active_layer(),
-                requirements,
+                requirements: &requirements,
                 render_scale: self.dataset.current_scale(),
                 dataset_failed: self.dataset.dispatcher().scope_failure(scope).is_some(),
             },
             panel_id,
-            gpu_display_available,
+            gpu_available,
         )?
         .schedule;
         if !schedule.is_renderable() {
             return Ok(None);
         }
-        let gpu_renderer = self
+        let panel = self
             .render_runtime
-            .gpu_renderer
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("GPU renderer is unavailable"))?;
+            .cross_section_runtime
+            .panel(panel_id)
+            .ok_or_else(|| anyhow::anyhow!("cross-section panel state is unavailable"))?;
+        let presentation = panel
+            .presentation_viewport
+            .ok_or_else(|| anyhow::anyhow!("cross-section presentation viewport is unavailable"))?;
+        let extent = panel
+            .render_viewport
+            .ok_or_else(|| anyhow::anyhow!("cross-section render viewport is unavailable"))?;
+        let extent = render_extent(extent)?;
+        let generation = panel.generation;
         let render_start = Instant::now();
-        let rendered = match render_gpu_cross_section_panel_frame_from_global_runtime(
-            &snapshot,
-            &self.dataset,
-            &self.render_runtime,
-            gpu_renderer.as_ref(),
+        let rendered = match self.render_product_target(
             panel_id,
+            Some(panel_id),
+            &snapshot,
+            presentation,
+            extent,
+            &requirements,
         ) {
             Ok(rendered) => rendered,
             Err(error) => {
@@ -310,90 +249,321 @@ impl MiranteWorkbenchApp {
                 return Err(error);
             }
         };
-        let render_ms = duration_ms(render_start.elapsed());
-        let texture_start = Instant::now();
-        let existing_texture_id = self
-            .render_runtime
-            .cross_section_gpu_display_frames
-            .get(&panel_id)
-            .map(|displayed| displayed.texture_id);
-        let texture_id =
-            self.register_or_update_gpu_texture_id(&rendered.frame, existing_texture_id)?;
-        let egui_texture_ms = duration_ms(texture_start.elapsed());
+        if !rendered {
+            return Ok(None);
+        }
         if !self
             .render_runtime
             .cross_section_runtime
-            .mark_panel_displayed(rendered.panel_id, rendered.generation)
+            .mark_panel_displayed(panel_id, generation)
         {
-            if existing_texture_id != Some(texture_id) {
-                self.ui_runtime
-                    .retired_gpu_display_texture_ids
-                    .push(texture_id);
-            }
             anyhow::bail!("stale cross-section frame was suppressed");
         }
-        mark_cross_section_panel_rendered(&mut self.render_runtime, rendered.panel_id, schedule);
-        let gpu_upload_ms = rendered.frame.timings.upload_ms();
-        let gpu_compute_ms = rendered.frame.timings.gpu_compute_ms();
-        self.render_runtime.cross_section_gpu_display_frames.insert(
-            rendered.panel_id,
-            CrossSectionPanelGpuDisplayFrame {
-                generation: rendered.generation,
-                frame: rendered.frame,
-                texture_id,
-            },
-        );
+        mark_cross_section_panel_rendered(&mut self.render_runtime, panel_id, schedule);
         Ok(Some(DisplayRenderTiming {
             path: DisplayRefreshPath::GpuResidentDisplay,
-            render_ms,
-            gpu_upload_ms: Some(gpu_upload_ms),
-            gpu_compute_ms,
-            egui_texture_ms,
+            render_ms: duration_ms(render_start.elapsed()),
+            gpu_upload_ms: None,
+            gpu_compute_ms: None,
+            egui_texture_ms: 0.0,
         }))
+    }
+
+    fn render_product_target(
+        &mut self,
+        target_id: PanelId,
+        cross_section: Option<PanelId>,
+        snapshot: &ApplicationSnapshot,
+        presentation: PresentationViewport,
+        extent: RenderExtent,
+        resources: &[DatasetResourceKey],
+    ) -> anyhow::Result<bool> {
+        self.ensure_product_target(target_id, extent)?;
+        let current_frame = self
+            .render_runtime
+            .product_gpu
+            .as_ref()
+            .and_then(|product| product.targets.get(&target_id))
+            .and_then(|target| target.request.as_ref())
+            .map_or(FrameIdentity::new(1), |request| request.intent.frame());
+        let mut next = build_product_request(
+            snapshot,
+            current_frame,
+            cross_section,
+            presentation,
+            extent,
+            resources,
+        )?;
+        let changed = self
+            .render_runtime
+            .product_gpu
+            .as_ref()
+            .and_then(|product| product.targets.get(&target_id))
+            .and_then(|target| target.request.as_ref())
+            != next.as_ref();
+        if changed {
+            let frame = self
+                .render_runtime
+                .product_gpu
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("progressive GPU renderer is unavailable"))?
+                .allocate_frame_identity();
+            next = build_product_request(
+                snapshot,
+                frame,
+                cross_section,
+                presentation,
+                extent,
+                resources,
+            )?;
+            let target = self
+                .render_runtime
+                .product_gpu
+                .as_mut()
+                .and_then(|product| product.targets.get_mut(&target_id))
+                .expect("the product target was registered before request construction");
+            target.request = next;
+            target.presented = None;
+        }
+        let Some(request) = self
+            .render_runtime
+            .product_gpu
+            .as_ref()
+            .and_then(|product| product.targets.get(&target_id))
+            .and_then(|target| target.request.clone())
+        else {
+            return Ok(false);
+        };
+        let keys = request
+            .requirements
+            .resources()
+            .iter()
+            .map(|requirement| requirement.key())
+            .collect::<Vec<_>>();
+        let leases = self.render_runtime.retained_leases.lease_handles(&keys);
+        let lease_refs = leases
+            .iter()
+            .map(|lease| Arc::as_ref(lease) as &dyn ResourceLease)
+            .collect::<Vec<_>>();
+        let product = self
+            .render_runtime
+            .product_gpu
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("progressive GPU renderer is unavailable"))?;
+        let token = product
+            .targets
+            .get(&target_id)
+            .expect("the product target was registered")
+            .token;
+        let report = match product.renderer.execute_frame(
+            token,
+            snapshot.catalog(),
+            &request.intent,
+            &request.requirements,
+            &lease_refs,
+        ) {
+            Ok(report) => report,
+            Err(error @ WgpuRenderRuntimeError::StaleFrame { .. }) => {
+                product.stale_frames_rejected = product.stale_frames_rejected.saturating_add(1);
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let Some(presented) = report.presentation().cloned() else {
+            return Ok(false);
+        };
+        let previous = product
+            .targets
+            .get(&target_id)
+            .and_then(|target| target.presented.as_ref());
+        let current_is_partial =
+            presented.progress().completeness() == RenderFrameCompleteness::Progressive;
+        if current_is_partial
+            && previous.is_none_or(|frame| {
+                frame.frame() != presented.frame()
+                    || frame.progress().completeness() != RenderFrameCompleteness::Progressive
+            })
+        {
+            product.current_partial_frames_presented =
+                product.current_partial_frames_presented.saturating_add(1);
+        }
+        if !current_is_partial
+            && previous.is_some_and(|frame| {
+                frame.frame() == presented.frame()
+                    && frame.progress().completeness() == RenderFrameCompleteness::Progressive
+            })
+        {
+            product.partial_to_settled_transitions =
+                product.partial_to_settled_transitions.saturating_add(1);
+        }
+        let target = product
+            .targets
+            .get_mut(&target_id)
+            .expect("the product target was registered");
+        let extent_changed = target.extent != presented.extent();
+        target.extent = presented.extent();
+        target.presented = Some(presented.clone());
+        self.bind_product_texture(target_id, extent_changed)?;
+        if target_id == PanelId::ThreeD {
+            self.record_product_frame(&presented);
+        }
+        Ok(true)
+    }
+
+    fn ensure_product_target(
+        &mut self,
+        target_id: PanelId,
+        extent: RenderExtent,
+    ) -> anyhow::Result<()> {
+        let product = self
+            .render_runtime
+            .product_gpu
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("progressive GPU renderer is unavailable"))?;
+        if product.targets.contains_key(&target_id) {
+            return Ok(());
+        }
+        let registration = product.renderer.register_presentation(extent)?;
+        product.targets.insert(
+            target_id,
+            current_runtime::render::ProductPresentationTarget {
+                token: registration.token(),
+                extent,
+                request: None,
+                presented: None,
+                texture_id: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn bind_product_texture(
+        &mut self,
+        target_id: PanelId,
+        extent_changed: bool,
+    ) -> anyhow::Result<()> {
+        let product = self
+            .render_runtime
+            .product_gpu
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("progressive GPU renderer is unavailable"))?;
+        let target = product
+            .targets
+            .get(&target_id)
+            .ok_or_else(|| anyhow::anyhow!("product presentation target is unavailable"))?;
+        let token = target.token;
+        let existing = target.texture_id;
+        let view = product.renderer.presentation_texture_view(token)?;
+        let Some(texture_renderer) = self.ui_runtime.wgpu_texture_renderer.as_ref() else {
+            #[cfg(test)]
+            if existing.is_some() {
+                return Ok(());
+            }
+            anyhow::bail!("wgpu texture renderer is unavailable");
+        };
+        let device = self
+            .ui_runtime
+            .wgpu_device
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("wgpu device is unavailable"))?;
+        let mut texture_renderer = texture_renderer.write();
+        let texture_id = if let Some(texture_id) = existing {
+            if extent_changed {
+                texture_renderer.update_egui_texture_from_wgpu_texture(
+                    device,
+                    view,
+                    gpu_display_texture_filter(),
+                    texture_id,
+                );
+            }
+            texture_id
+        } else {
+            texture_renderer.register_native_texture(device, view, gpu_display_texture_filter())
+        };
+        self.render_runtime
+            .product_gpu
+            .as_mut()
+            .and_then(|product| product.targets.get_mut(&target_id))
+            .expect("the product target remains registered")
+            .texture_id = Some(texture_id);
+        Ok(())
+    }
+
+    fn record_product_frame(&mut self, frame: &mirante4d_render_api::PresentedFrame) {
+        let progress = frame.progress();
+        let coverage = progress.coverage();
+        self.render_runtime.frame_fidelity.resident_bricks =
+            usize::try_from(coverage.available_requirements()).unwrap_or(usize::MAX);
+        self.render_runtime.frame_fidelity.missing_occupied_bricks = usize::try_from(
+            coverage
+                .total_requirements()
+                .saturating_sub(coverage.available_requirements()),
+        )
+        .unwrap_or(usize::MAX);
+        self.render_runtime.frame_fidelity.completeness = match progress.completeness() {
+            RenderFrameCompleteness::Progressive => FrameCompleteness::Incomplete,
+            RenderFrameCompleteness::Complete => FrameCompleteness::Complete,
+            RenderFrameCompleteness::Exact => {
+                if self.dataset.current_scale().get() == 0 {
+                    FrameCompleteness::Exact
+                } else {
+                    FrameCompleteness::Complete
+                }
+            }
+        };
+        self.render_runtime.frame_fidelity.reason = match progress.limitation() {
+            Some(FrameLimitation::BudgetLimited | FrameLimitation::CapacityLimited) => {
+                LodDecisionReason::GpuBudgetLimited
+            }
+            Some(FrameLimitation::CoarserScale) => LodDecisionReason::ScreenEquivalentCoarserScale,
+            Some(FrameLimitation::MissingResources) => LodDecisionReason::IncompleteResidency,
+            None if self.dataset.current_scale().get() == 0 => LodDecisionReason::ExactS0,
+            None => LodDecisionReason::ScreenEquivalentCoarserScale,
+        };
+        let mode = application_view(&current_egui_shell_bridge::snapshot(&self.application))
+            .layer(
+                application_view(&current_egui_shell_bridge::snapshot(&self.application))
+                    .active_layer(),
+            )
+            .expect("the current view contains its active layer")
+            .render_state()
+            .mode();
+        self.render_runtime.render_backend = render_backend_for_mode(mode);
+        self.render_runtime.frame_fidelity.backend = self.render_runtime.render_backend;
+        self.render_runtime.frame_fidelity.display_freshness = DisplayedFrameFreshness::Current;
+        self.render_runtime.lod_schedule.displayed_scale_level =
+            Some(self.dataset.current_scale().get());
+        self.render_runtime.frame_fidelity.displayed_scale_level =
+            self.render_runtime.lod_schedule.displayed_scale_level;
+        self.render_runtime.texture = None;
     }
 
     pub(crate) fn render_gpu_display_frame_for_current_state(
         &mut self,
     ) -> anyhow::Result<DisplayRenderTiming> {
-        self.ensure_gpu_display_path_ready()?;
-        let gpu_renderer = self
-            .render_runtime
-            .gpu_renderer
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("GPU renderer is unavailable"))?;
         let snapshot = current_egui_shell_bridge::snapshot(&self.application);
-        let render_start = Instant::now();
-        let mut frame = render_gpu_display_frame_from_resident_bricks(
+        let requirements = self.dataset.scope_requirements(SCOPE_CURRENT_3D).to_vec();
+        let presentation = self.render_runtime.presentation_viewport;
+        let extent = render_extent(self.render_runtime.render_viewport)?;
+        let started = Instant::now();
+        let rendered = self.render_product_target(
+            PanelId::ThreeD,
+            None,
             &snapshot,
-            &self.dataset,
-            &mut self.render_runtime,
-            gpu_renderer.as_ref(),
+            presentation,
+            extent,
+            &requirements,
         )?;
-        if application_view(&snapshot).layout() == ViewerLayout::FourPanel {
-            frame = gpu_renderer.detach_display_frame_texture(frame)?;
-        }
-        let render_ms = duration_ms(render_start.elapsed());
-        let texture_start = Instant::now();
-        self.register_or_update_gpu_display_texture(&frame)?;
-        let egui_texture_ms = duration_ms(texture_start.elapsed());
-        let gpu_upload_ms = frame.timings.upload_ms();
-        let gpu_compute_ms = frame.timings.gpu_compute_ms();
-        let display_identity = GpuDisplayedFrameIdentity::from_snapshot(
-            &snapshot,
-            &self.dataset,
-            &self.render_runtime,
-        )?;
-        self.render_runtime.frame_fidelity.display_freshness = display_identity
-            .display_freshness_for_snapshot(&snapshot, &self.dataset, &self.render_runtime)?;
-        self.render_runtime.gpu_display_frame_identity = Some(display_identity);
-        self.render_runtime.gpu_display_frame = Some(frame);
-        self.render_runtime.texture = None;
         Ok(DisplayRenderTiming {
-            path: DisplayRefreshPath::GpuResidentDisplay,
-            render_ms,
-            gpu_upload_ms: Some(gpu_upload_ms),
-            gpu_compute_ms,
-            egui_texture_ms,
+            path: if rendered || self.product_display(PanelId::ThreeD).is_some() {
+                DisplayRefreshPath::GpuResidentDisplay
+            } else {
+                DisplayRefreshPath::CpuTexture
+            },
+            render_ms: duration_ms(started.elapsed()),
+            gpu_upload_ms: None,
+            gpu_compute_ms: None,
+            egui_texture_ms: 0.0,
         })
     }
 
@@ -407,7 +577,6 @@ impl MiranteWorkbenchApp {
         self.request_visible_bricks();
         if self.dataset.scope_is_empty(SCOPE_CURRENT_3D) {
             self.clear_gpu_display_frame();
-            self.retire_gpu_display_texture_id();
             self.render_runtime.render_backend = RenderBackend::Empty;
             self.render_runtime.frame_fidelity.backend = RenderBackend::Empty;
             self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Complete;
@@ -422,72 +591,7 @@ impl MiranteWorkbenchApp {
                 egui_texture_ms: 0.0,
             });
         }
-        if self
-            .dataset
-            .scope_complete(SCOPE_CURRENT_3D, &self.render_runtime.lease_bridge)
-        {
-            return self.render_current_resident_frame_for_display();
-        }
-        if self.can_preserve_gpu_presented_frame_for_pending_request() {
-            self.mark_target_pending_while_preserving_gpu_frame();
-            return Ok(DisplayRenderTiming {
-                path: DisplayRefreshPath::GpuResidentDisplay,
-                render_ms: 0.0,
-                gpu_upload_ms: None,
-                gpu_compute_ms: None,
-                egui_texture_ms: 0.0,
-            });
-        }
-        self.clear_gpu_display_frame();
-        self.render_runtime.render_backend = RenderBackend::Loading;
-        self.render_runtime.frame_fidelity.backend = RenderBackend::Loading;
-        self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Loading;
-        self.render_runtime.frame_fidelity.reason = LodDecisionReason::LoadingTargetScale;
-        self.render_runtime.texture = None;
-        Ok(DisplayRenderTiming {
-            path: DisplayRefreshPath::CpuTexture,
-            render_ms: 0.0,
-            gpu_upload_ms: None,
-            gpu_compute_ms: None,
-            egui_texture_ms: 0.0,
-        })
-    }
-
-    fn can_preserve_gpu_presented_frame_for_pending_request(&self) -> bool {
-        if self.render_runtime.gpu_display_frame.is_none() {
-            return false;
-        }
-        let Ok(requested) = GpuDisplayedFrameIdentity::from_snapshot(
-            &current_egui_shell_bridge::snapshot(&self.application),
-            &self.dataset,
-            &self.render_runtime,
-        ) else {
-            return false;
-        };
-        gpu_presented_frame_compatible_for_pending_request(
-            self.render_runtime.gpu_display_frame_identity.as_ref(),
-            self.ui_runtime.gpu_display_texture_id.is_some(),
-            &requested,
-        )
-    }
-
-    fn mark_target_pending_while_preserving_gpu_frame(&mut self) {
-        self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Loading;
-        self.render_runtime.frame_fidelity.reason = LodDecisionReason::LoadingTargetScale;
-        self.render_runtime.frame_fidelity.display_freshness = self
-            .render_runtime
-            .gpu_display_frame_identity
-            .as_ref()
-            .map(|identity| {
-                identity
-                    .display_freshness_for_snapshot(
-                        &current_egui_shell_bridge::snapshot(&self.application),
-                        &self.dataset,
-                        &self.render_runtime,
-                    )
-                    .unwrap_or(DisplayedFrameFreshness::Unknown)
-            })
-            .unwrap_or(DisplayedFrameFreshness::Unknown);
+        self.render_current_resident_frame_for_display()
     }
 
     pub(crate) fn record_display_refresh_timing(
@@ -511,7 +615,7 @@ impl MiranteWorkbenchApp {
 
     pub(crate) fn update_cpu_texture_if_needed(&mut self) -> f64 {
         let started = Instant::now();
-        if self.render_runtime.gpu_display_frame.is_none() {
+        if self.product_display(PanelId::ThreeD).is_none() {
             let image = color_image_for_snapshot(
                 &current_egui_shell_bridge::snapshot(&self.application),
                 &self.render_runtime,
@@ -552,18 +656,53 @@ impl MiranteWorkbenchApp {
     }
 }
 
-fn gpu_display_texture_filter() -> eframe::wgpu::FilterMode {
-    eframe::wgpu::FilterMode::Linear
+fn build_product_request(
+    snapshot: &ApplicationSnapshot,
+    frame: FrameIdentity,
+    cross_section: Option<PanelId>,
+    presentation: PresentationViewport,
+    extent: RenderExtent,
+    resources: &[DatasetResourceKey],
+) -> anyhow::Result<Option<ProductRenderRequest>> {
+    match cross_section {
+        Some(panel) => {
+            cross_section_request(snapshot, frame, panel, presentation, extent, resources)
+        }
+        None => volume_request(snapshot, frame, presentation, extent, resources),
+    }
 }
 
-fn gpu_presented_frame_compatible_for_pending_request(
-    frame_identity: Option<&GpuDisplayedFrameIdentity>,
-    texture_registered: bool,
-    requested_identity: &GpuDisplayedFrameIdentity,
-) -> bool {
-    frame_identity.is_some_and(|identity| {
-        texture_registered && identity.compatible_with_pending_request(requested_identity)
-    })
+fn cross_section_scope(panel_id: PanelId) -> anyhow::Result<u64> {
+    match panel_id {
+        PanelId::Xy => Ok(SCOPE_CROSS_SECTION_XY),
+        PanelId::Xz => Ok(SCOPE_CROSS_SECTION_XZ),
+        PanelId::Yz => Ok(SCOPE_CROSS_SECTION_YZ),
+        PanelId::ThreeD => anyhow::bail!("the 3D panel has no cross-section demand scope"),
+    }
+}
+
+fn render_extent(viewport: mirante4d_renderer::RenderViewport) -> anyhow::Result<RenderExtent> {
+    RenderExtent::new(
+        u32::try_from(viewport.width)?,
+        u32::try_from(viewport.height)?,
+    )
+    .map_err(Into::into)
+}
+
+fn extent_size(extent: RenderExtent) -> egui::Vec2 {
+    egui::vec2(extent.width_pixels() as f32, extent.height_pixels() as f32)
+}
+
+fn render_backend_for_mode(mode: RenderMode) -> RenderBackend {
+    match mode {
+        RenderMode::Mip => RenderBackend::GpuCameraMip,
+        RenderMode::Isosurface => RenderBackend::GpuCameraIso,
+        RenderMode::Dvr => RenderBackend::GpuCameraDvr,
+    }
+}
+
+fn gpu_display_texture_filter() -> eframe::wgpu::FilterMode {
+    eframe::wgpu::FilterMode::Linear
 }
 
 #[cfg(test)]

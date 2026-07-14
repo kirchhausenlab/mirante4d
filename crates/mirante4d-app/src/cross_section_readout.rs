@@ -4,10 +4,10 @@ use mirante4d_dataset::DatasetCatalog;
 use mirante4d_domain::{GridToWorld, LogicalLayerKey, ScaleLevel, Shape3D, ViewerLayout};
 use mirante4d_project_model::ViewState;
 use mirante4d_render_api::PresentationViewport;
-use mirante4d_renderer::{CurrentLeaseBridge, CurrentLeaseSample};
 
 use crate::{
     cross_section_runtime::{CrossSectionPanelRuntime, CrossSectionRuntime},
+    retained_leases::{RetainedLeaseSample, RetainedLeases},
     viewer_layout::{CrossSectionPanelScheduleStatus, PanelId, render_cross_section_view_state},
 };
 
@@ -71,7 +71,7 @@ pub(crate) struct CrossSectionHoverReadout {
 
 pub(crate) fn cross_section_hover_readout_for_response(
     cross_section: &CrossSectionRuntime,
-    leases: &CurrentLeaseBridge,
+    leases: &RetainedLeases,
     input: CrossSectionReadoutInput<'_>,
     panel_id: PanelId,
     presentation_viewport: PresentationViewport,
@@ -100,7 +100,7 @@ pub(crate) fn cross_section_hover_readout_for_response(
 
 pub(crate) fn cross_section_hover_readout_for_panel_point(
     cross_section: &CrossSectionRuntime,
-    leases: &CurrentLeaseBridge,
+    leases: &RetainedLeases,
     input: CrossSectionReadoutInput<'_>,
     panel_id: PanelId,
     x_points: f64,
@@ -358,7 +358,7 @@ impl ReadoutGeneration {
 }
 
 fn sample_resident_value(
-    leases: &CurrentLeaseBridge,
+    leases: &RetainedLeases,
     catalog: &DatasetCatalog,
     layer: LogicalLayerKey,
     timepoint: mirante4d_domain::TimeIndex,
@@ -372,17 +372,17 @@ fn sample_resident_value(
         ScaleLevel::new(scale_level),
     );
     match resident.sample([index.z, index.y, index.x]) {
-        CurrentLeaseSample::Uint8(value) => {
+        RetainedLeaseSample::Uint8(value) => {
             ResidentSample::Value(CrossSectionHoverValue::U8(value))
         }
-        CurrentLeaseSample::Uint16(value) => {
+        RetainedLeaseSample::Uint16(value) => {
             ResidentSample::Value(CrossSectionHoverValue::U16(value))
         }
-        CurrentLeaseSample::Float32(value) => {
+        RetainedLeaseSample::Float32(value) => {
             ResidentSample::Value(CrossSectionHoverValue::F32(value))
         }
-        CurrentLeaseSample::InvalidNoData => ResidentSample::InvalidNoData,
-        CurrentLeaseSample::Missing => ResidentSample::Missing,
+        RetainedLeaseSample::InvalidNoData => ResidentSample::InvalidNoData,
+        RetainedLeaseSample::Missing => ResidentSample::Missing,
     }
 }
 
@@ -637,7 +637,7 @@ mod tests {
         }
     }
 
-    fn fixture() -> (DatasetCatalog, CurrentLeaseBridge) {
+    fn fixture() -> (DatasetCatalog, RetainedLeases) {
         let source_id = DatasetSourceId::new(7);
         let layer_key = LogicalLayerKey::new(0);
         let layer = DatasetLayer::new(
@@ -675,8 +675,8 @@ mod tests {
             values,
             validity,
         });
-        let mut bridge = CurrentLeaseBridge::new();
-        bridge.replace_current_requirements([key]).unwrap();
+        let mut bridge = RetainedLeases::new();
+        bridge.replace_requirements([key]).unwrap();
         bridge.install(lease).unwrap();
         (catalog, bridge)
     }

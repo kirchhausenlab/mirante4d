@@ -20,7 +20,7 @@ use mirante4d_domain::{
 use mirante4d_project_model::{LayerViewState, ProjectRevisionId};
 use mirante4d_render_api::PresentationViewport;
 use mirante4d_renderer::{
-    CurrentLeaseCohortStatus, RenderViewport,
+    RenderViewport,
     gpu::{GpuDisplayFrame, GpuRenderer},
 };
 use serde::Serialize;
@@ -1497,7 +1497,7 @@ impl ProductAutomationController {
         let view = application_view(&snapshot);
         let readout = cross_section_hover_readout_for_panel_point(
             &app.render_runtime.cross_section_runtime,
-            &app.render_runtime.lease_bridge,
+            &app.render_runtime.retained_leases,
             CrossSectionReadoutInput {
                 view,
                 catalog: snapshot.catalog(),
@@ -2144,7 +2144,7 @@ impl ProductAutomationController {
                 .diagnostics()
                 .ok()
                 .map(dataset_runtime_diagnostics_json),
-            "lease_bridge": lease_bridge_diagnostics_json(app),
+            "retained_leases": retained_leases_diagnostics_json(app),
             "cross_section": cross_section_diagnostics_json(app),
             "gpu_adapter": app
                 .render_runtime.gpu_renderer
@@ -2379,7 +2379,7 @@ impl ProductAutomationController {
                 target_scale_level: app.render_runtime.frame_fidelity.target_scale_level,
                 displayed_scale_level: app.render_runtime.frame_fidelity.displayed_scale_level,
                 visible_bricks: app.render_runtime.frame_fidelity.visible_bricks,
-                resident_bricks: app.render_runtime.lease_bridge.retained_len(),
+                resident_bricks: app.render_runtime.retained_leases.retained_len(),
             });
     }
 
@@ -2729,13 +2729,15 @@ fn panel_hover_readout_side_effect_snapshot(app: &MiranteWorkbenchApp) -> Value 
             .dataset
             .scope_requirements(crate::dataset_requests::SCOPE_CURRENT_3D)
             .len(),
-        "lease_bridge_required": app.render_runtime.lease_bridge.required_len(),
-        "lease_bridge_retained": app.render_runtime.lease_bridge.retained_len(),
+        "retained_leases_required": app.render_runtime.retained_leases.required_len(),
+        "retained_leases_resident": app.render_runtime.retained_leases.retained_len(),
         "panels": panels,
     })
 }
 
-fn active_lease_cohort_status(app: &MiranteWorkbenchApp) -> Option<CurrentLeaseCohortStatus> {
+fn active_lease_cohort_status(
+    app: &MiranteWorkbenchApp,
+) -> Option<crate::retained_leases::RetainedLeaseStatus> {
     let snapshot = current_egui_shell_bridge::snapshot(&app.application);
     let view = application_view(&snapshot);
     let identity = app
@@ -2743,7 +2745,7 @@ fn active_lease_cohort_status(app: &MiranteWorkbenchApp) -> Option<CurrentLeaseC
         .scope_requirements(crate::dataset_requests::SCOPE_CURRENT_3D)
         .first()?
         .identity();
-    Some(app.render_runtime.lease_bridge.cohort_status(
+    Some(app.render_runtime.retained_leases.cohort_status(
         identity,
         view.active_layer(),
         view.timepoint(),
@@ -2751,7 +2753,7 @@ fn active_lease_cohort_status(app: &MiranteWorkbenchApp) -> Option<CurrentLeaseC
     ))
 }
 
-fn lease_cohort_status_json(status: CurrentLeaseCohortStatus) -> Value {
+fn lease_cohort_status_json(status: crate::retained_leases::RetainedLeaseStatus) -> Value {
     json!({
         "required": status.required,
         "retained": status.retained,
@@ -2760,8 +2762,8 @@ fn lease_cohort_status_json(status: CurrentLeaseCohortStatus) -> Value {
     })
 }
 
-fn lease_bridge_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
-    let bridge = &app.render_runtime.lease_bridge;
+fn retained_leases_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
+    let bridge = &app.render_runtime.retained_leases;
     json!({
         "required": bridge.required_len(),
         "retained": bridge.retained_len(),

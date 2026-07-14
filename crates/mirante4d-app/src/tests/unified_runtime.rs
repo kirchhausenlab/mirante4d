@@ -4,8 +4,8 @@ fn unified_source_open_starts_with_no_owned_interactive_payloads() {
     let package = write_target_fixture(temp.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(&package).unwrap();
 
-    assert_eq!(opened.render_runtime.lease_bridge.required_len(), 0);
-    assert_eq!(opened.render_runtime.lease_bridge.retained_len(), 0);
+    assert_eq!(opened.render_runtime.retained_leases.required_len(), 0);
+    assert_eq!(opened.render_runtime.retained_leases.retained_len(), 0);
     assert!(!opened.dataset.dispatcher().has_pending_work());
     assert_eq!(opened.dataset.current_scale(), ScaleLevel::BASE);
     opened.dataset.request_shutdown().unwrap();
@@ -76,7 +76,7 @@ fn app_dispatches_and_drains_visible_demand_through_one_runtime() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while !app.dataset.scope_complete(
         dataset_requests::SCOPE_CURRENT_3D,
-        &app.render_runtime.lease_bridge,
+        &app.render_runtime.retained_leases,
     ) {
         assert!(std::time::Instant::now() < deadline);
         app.drain_brick_results(&context);
@@ -84,8 +84,8 @@ fn app_dispatches_and_drains_visible_demand_through_one_runtime() {
     }
 
     assert_eq!(
-        app.render_runtime.lease_bridge.required_len(),
-        app.render_runtime.lease_bridge.retained_len()
+        app.render_runtime.retained_leases.required_len(),
+        app.render_runtime.retained_leases.retained_len()
     );
     let diagnostics = app.dataset.dispatcher().diagnostics().unwrap();
     assert!(diagnostics.resident_resources() > 0);
@@ -644,7 +644,7 @@ fn observed_source_fault_invalidates_then_retry_restores_runtime_identity_cohere
         .scientific_identity()
         .resource_identity();
     assert_eq!(app.dataset.resource_identity(), verified_identity);
-    assert!(app.render_runtime.lease_bridge.required_len() > 0);
+    assert!(app.render_runtime.retained_leases.required_len() > 0);
     let completion_deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let diagnostics = app.dataset.dispatcher().diagnostics().unwrap();
@@ -664,8 +664,8 @@ fn observed_source_fault_invalidates_then_retry_restores_runtime_identity_cohere
         app.application.snapshot().source(),
         SourceVerificationSnapshot::Required
     ));
-    assert_eq!(app.render_runtime.lease_bridge.required_len(), 0);
-    assert_eq!(app.render_runtime.lease_bridge.retained_len(), 0);
+    assert_eq!(app.render_runtime.retained_leases.required_len(), 0);
+    assert_eq!(app.render_runtime.retained_leases.retained_len(), 0);
     assert!(app.dataset.renderer_requirements().is_empty());
     for scope in [
         dataset_requests::SCOPE_CURRENT_3D,
@@ -724,8 +724,8 @@ fn observed_source_fault_invalidates_then_retry_restores_runtime_identity_cohere
             .pending_completions(),
         0
     );
-    assert_eq!(app.render_runtime.lease_bridge.required_len(), 0);
-    assert_eq!(app.render_runtime.lease_bridge.retained_len(), 0);
+    assert_eq!(app.render_runtime.retained_leases.required_len(), 0);
+    assert_eq!(app.render_runtime.retained_leases.retained_len(), 0);
 
     app.apply_application_command(ApplicationCommand::RequestSourceVerification, &context)
         .unwrap();
@@ -966,7 +966,7 @@ fn playback_prefetch_readiness_is_backed_by_retained_accounted_leases() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while !app.dataset.scope_complete(
         dataset_requests::SCOPE_PLAYBACK,
-        &app.render_runtime.lease_bridge,
+        &app.render_runtime.retained_leases,
     ) {
         assert!(std::time::Instant::now() < deadline);
         app.drain_brick_results(&context);
@@ -979,7 +979,7 @@ fn playback_prefetch_readiness_is_backed_by_retained_accounted_leases() {
     assert!(
         playback
             .iter()
-            .all(|key| app.render_runtime.lease_bridge.payload(*key).is_some())
+            .all(|key| app.render_runtime.retained_leases.payload(*key).is_some())
     );
     app.dataset.request_shutdown().unwrap();
 }

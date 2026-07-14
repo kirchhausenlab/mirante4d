@@ -202,6 +202,26 @@ impl RetainedLeases {
         self.leases.get(&key).map(|lease| lease.payload())
     }
 
+    pub(crate) fn lease_refs<'a>(
+        &'a self,
+        requirements: &[DatasetResourceKey],
+    ) -> Vec<&'a dyn ResourceLease> {
+        requirements
+            .iter()
+            .filter_map(|key| self.leases.get(key).map(Arc::as_ref))
+            .collect()
+    }
+
+    pub(crate) fn lease_handles(
+        &self,
+        requirements: &[DatasetResourceKey],
+    ) -> Vec<Arc<dyn ResourceLease>> {
+        requirements
+            .iter()
+            .filter_map(|key| self.leases.get(key).cloned())
+            .collect()
+    }
+
     pub(crate) fn retained_payloads(
         &self,
     ) -> impl ExactSizeIterator<Item = (DatasetResourceKey, ResourcePayloadView<'_>)> + '_ {

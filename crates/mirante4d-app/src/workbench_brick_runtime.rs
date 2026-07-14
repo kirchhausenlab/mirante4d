@@ -174,8 +174,8 @@ impl MiranteWorkbenchApp {
         }
         if let Err(error) = self
             .render_runtime
-            .lease_bridge
-            .replace_current_requirements(self.dataset.renderer_requirements())
+            .retained_leases
+            .replace_requirements(self.dataset.renderer_requirements())
         {
             self.dataset.record_plan_error(error.to_string());
             self.render_runtime.visible_brick_plan_error = Some(error.to_string());
@@ -196,7 +196,7 @@ impl MiranteWorkbenchApp {
             }
             if let Err(fault) =
                 self.dataset
-                    .submit_scope(scope, priority, &self.render_runtime.lease_bridge)
+                    .submit_scope(scope, priority, &self.render_runtime.retained_leases)
             {
                 submission_fault = Some(fault);
                 break;
@@ -208,7 +208,7 @@ impl MiranteWorkbenchApp {
 
         let ready = self
             .dataset
-            .scope_complete(SCOPE_CURRENT_3D, &self.render_runtime.lease_bridge);
+            .scope_complete(SCOPE_CURRENT_3D, &self.render_runtime.retained_leases);
         self.update_dataset_fidelity(ready);
         VisibleBrickRequestOutcome {
             current_changed,
@@ -243,7 +243,7 @@ impl MiranteWorkbenchApp {
             &mut self.render_runtime,
             &mut self.analysis_runtime,
         );
-        let bridge = &mut render.lease_bridge;
+        let bridge = &mut render.retained_leases;
         let mut installed = false;
         let mut analysis_events = Vec::new();
         let mut analysis_errors = Vec::new();
@@ -301,7 +301,7 @@ impl MiranteWorkbenchApp {
 
         let ready = self
             .dataset
-            .scope_complete(SCOPE_CURRENT_3D, &self.render_runtime.lease_bridge);
+            .scope_complete(SCOPE_CURRENT_3D, &self.render_runtime.retained_leases);
         self.update_dataset_fidelity(ready);
         if completion_drain_needs_replan(
             installed,
@@ -403,7 +403,7 @@ impl MiranteWorkbenchApp {
     fn update_dataset_fidelity(&mut self, ready: bool) {
         let snapshot = self.application.snapshot();
         let view = application_view(&snapshot);
-        let status = self.render_runtime.lease_bridge.cohort_status(
+        let status = self.render_runtime.retained_leases.cohort_status(
             snapshot.catalog().scientific_identity().resource_identity(),
             view.active_layer(),
             view.timepoint(),

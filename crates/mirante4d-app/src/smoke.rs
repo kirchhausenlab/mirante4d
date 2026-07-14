@@ -106,7 +106,8 @@ pub fn run_headless_smoke(
     });
 
     load_current_requirements(&application, &mut opened, options.timeout)?;
-    let (nonzero_pixels, max_value) = retained_sample_summary(&opened.render_runtime.lease_bridge)?;
+    let (nonzero_pixels, max_value) =
+        retained_sample_summary(&opened.render_runtime.retained_leases)?;
     if nonzero_pixels == 0 {
         anyhow::bail!("unified runtime smoke decoded only zero or invalid visible samples");
     }
@@ -131,7 +132,7 @@ pub fn run_headless_smoke(
         let started = Instant::now();
         load_current_requirements(&application, &mut opened, options.timeout)?;
         let (nonzero_pixels, max_value) =
-            retained_sample_summary(&opened.render_runtime.lease_bridge)?;
+            retained_sample_summary(&opened.render_runtime.retained_leases)?;
         if nonzero_pixels == 0 {
             anyhow::bail!(
                 "unified runtime smoke decoded a blank timepoint {}",
@@ -197,28 +198,28 @@ fn load_current_requirements(
     opened.dataset.install_current_plan(plan, false)?;
     opened
         .render_runtime
-        .lease_bridge
-        .replace_current_requirements(opened.dataset.renderer_requirements())?;
+        .retained_leases
+        .replace_requirements(opened.dataset.renderer_requirements())?;
     opened.dataset.submit_scope(
         SCOPE_CURRENT_3D,
         RequestPriority::CurrentView,
-        &opened.render_runtime.lease_bridge,
+        &opened.render_runtime.retained_leases,
     )?;
 
     let deadline = Instant::now() + timeout;
     while !opened
         .dataset
-        .scope_complete(SCOPE_CURRENT_3D, &opened.render_runtime.lease_bridge)
+        .scope_complete(SCOPE_CURRENT_3D, &opened.render_runtime.retained_leases)
     {
         if Instant::now() >= deadline {
             anyhow::bail!(
                 "timed out waiting for unified runtime leases: {} retained, {} missing",
-                opened.render_runtime.lease_bridge.retained_len(),
-                opened.render_runtime.lease_bridge.missing_len()
+                opened.render_runtime.retained_leases.retained_len(),
+                opened.render_runtime.retained_leases.missing_len()
             );
         }
         let (dataset, render) = (&mut opened.dataset, &mut opened.render_runtime);
-        let bridge = &mut render.lease_bridge;
+        let bridge = &mut render.retained_leases;
         dataset.dispatcher_mut().drain(32, |ticket, outcome| {
             if let mirante4d_dataset_runtime::RuntimeOutcome::Ready(lease) = outcome
                 && bridge.requires(ticket.resource())
@@ -235,7 +236,7 @@ fn load_current_requirements(
 }
 
 fn retained_sample_summary(
-    bridge: &mirante4d_renderer::CurrentLeaseBridge,
+    bridge: &crate::retained_leases::RetainedLeases,
 ) -> anyhow::Result<(u64, u16)> {
     let mut nonzero = 0_u64;
     let mut maximum = 0_u16;

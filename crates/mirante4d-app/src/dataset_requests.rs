@@ -16,9 +16,8 @@ use mirante4d_dataset_runtime::{
     RuntimeOutcome, RuntimeRequestId,
 };
 use mirante4d_domain::ScaleLevel;
-use mirante4d_renderer::CurrentLeaseBridge;
 
-use crate::dataset_demand_plan::DatasetDemandPlan;
+use crate::{dataset_demand_plan::DatasetDemandPlan, retained_leases::RetainedLeases};
 
 pub(crate) const SCOPE_CURRENT_3D: u64 = 1;
 pub(crate) const SCOPE_CROSS_SECTION_XY: u64 = 2;
@@ -364,7 +363,7 @@ impl DatasetDemandState {
         &mut self,
         scope: u64,
         priority: RequestPriority,
-        leases: &CurrentLeaseBridge,
+        leases: &RetainedLeases,
     ) -> Result<usize, RuntimeFault> {
         if let Some(fault) = self.dispatcher.scope_failure(scope) {
             return Err(fault.clone());
@@ -422,7 +421,7 @@ impl DatasetDemandState {
         }
     }
 
-    pub(crate) fn scope_complete(&self, scope: u64, leases: &CurrentLeaseBridge) -> bool {
+    pub(crate) fn scope_complete(&self, scope: u64, leases: &RetainedLeases) -> bool {
         scope_requirements_complete(
             self.requirements_by_scope
                 .get(&scope)

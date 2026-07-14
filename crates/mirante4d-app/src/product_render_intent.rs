@@ -18,6 +18,7 @@ use crate::viewer_layout::PanelId;
 /// window. Aggregate dataset demand uses the same bound.
 pub(crate) const PRODUCT_RENDER_RESOURCE_LIMIT: usize = 128;
 
+#[derive(Clone, PartialEq)]
 pub(crate) struct ProductRenderRequest {
     pub(crate) intent: RenderIntent,
     pub(crate) requirements: RenderRequirements,

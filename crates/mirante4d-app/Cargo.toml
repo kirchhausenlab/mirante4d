@@ -20,6 +20,7 @@ mirante4d-import-pipeline.workspace = true
 mirante4d-project-model.workspace = true
 mirante4d-project-store.workspace = true
 mirante4d-render-api.workspace = true
+mirante4d-render-wgpu.workspace = true
 mirante4d-renderer.workspace = true
 mirante4d-settings.workspace = true
 mirante4d-storage.workspace = true

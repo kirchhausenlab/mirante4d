@@ -2115,6 +2115,7 @@ dependencies = [
  "mirante4d-project-model",
  "mirante4d-project-store",
  "mirante4d-render-api",
+ "mirante4d-render-wgpu",
  "mirante4d-renderer",
  "mirante4d-settings",
  "mirante4d-storage",

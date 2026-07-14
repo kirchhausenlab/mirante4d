@@ -96,9 +96,9 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
         "renderer leases",
         format!(
             "{} / {} retained, {} missing",
-            app.render_runtime.lease_bridge.retained_len(),
-            app.render_runtime.lease_bridge.required_len(),
-            app.render_runtime.lease_bridge.missing_len()
+            app.render_runtime.retained_leases.retained_len(),
+            app.render_runtime.retained_leases.required_len(),
+            app.render_runtime.retained_leases.missing_len()
         ),
     );
     ui_kit::property_row(
@@ -207,9 +207,9 @@ pub(crate) fn diagnostics_summary_text(app: &MiranteWorkbenchApp) -> String {
          renderer_retained_leases: {}\n\
          renderer_missing_leases: {}\n\
          current_scale_level: {}\n",
-        app.render_runtime.lease_bridge.required_len(),
-        app.render_runtime.lease_bridge.retained_len(),
-        app.render_runtime.lease_bridge.missing_len(),
+        app.render_runtime.retained_leases.required_len(),
+        app.render_runtime.retained_leases.retained_len(),
+        app.render_runtime.retained_leases.missing_len(),
         app.dataset.current_scale().get(),
     ));
     for panel in app.render_runtime.cross_section_runtime.panels() {

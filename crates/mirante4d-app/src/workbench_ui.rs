@@ -492,7 +492,7 @@ impl MiranteWorkbenchApp {
         if let Some(presentation_viewport) = presentation_viewport
             && let Some(readout) = cross_section_hover_readout_for_response(
                 &self.render_runtime.cross_section_runtime,
-                &self.render_runtime.lease_bridge,
+                &self.render_runtime.retained_leases,
                 cross_section_readout::CrossSectionReadoutInput {
                     view,
                     catalog: snapshot.catalog(),

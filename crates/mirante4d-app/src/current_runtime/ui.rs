@@ -41,12 +41,14 @@ pub(crate) struct CurrentUiRuntime {
     pub(crate) gpu_display_texture_id: Option<egui::TextureId>,
     pub(crate) retired_gpu_display_texture_ids: Vec<egui::TextureId>,
     pub(crate) wgpu_texture_renderer: Option<Arc<egui::mutex::RwLock<eframe::egui_wgpu::Renderer>>>,
+    pub(crate) wgpu_device: Option<eframe::wgpu::Device>,
 }
 
 impl CurrentUiRuntime {
     pub(crate) fn new(
         resource_policy: ResourcePolicy,
         wgpu_texture_renderer: Option<Arc<egui::mutex::RwLock<eframe::egui_wgpu::Renderer>>>,
+        wgpu_device: Option<eframe::wgpu::Device>,
     ) -> Self {
         Self {
             viewport_orbit_drag: None,
@@ -63,6 +65,7 @@ impl CurrentUiRuntime {
             gpu_display_texture_id: None,
             retired_gpu_display_texture_ids: Vec::new(),
             wgpu_texture_renderer,
+            wgpu_device,
         }
     }
 }
