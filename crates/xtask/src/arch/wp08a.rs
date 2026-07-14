@@ -740,6 +740,17 @@ fn validate_side_effect_capabilities(
             current_crates.insert(&capability.target_owner);
             validate_wp10c_import_worker_owner(repo_root, &capability.target_owner)?;
         }
+        if capability.capability == "gpu-resource-and-submission" {
+            current_crates.insert(&capability.target_owner);
+            validate_side_effect_evidence(
+                repo_root,
+                metadata,
+                crate_paths,
+                &capability.target_owner,
+                Some("wgpu"),
+                None,
+            )?;
+        }
         if current_crates.is_empty()
             && !matches!(
                 capability.capability.as_str(),
