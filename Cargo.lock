@@ -2109,7 +2109,6 @@ dependencies = [
  "mirante4d-render-wgpu",
  "mirante4d-settings",
  "mirante4d-storage",
- "pollster",
  "rfd",
  "serde",
  "serde_json",

@@ -5,8 +5,11 @@
 //! CPU product-rendering fallback.
 
 use std::{
+    future::Future,
     path::Path,
     sync::Arc,
+    task::{Context, Poll, Wake, Waker},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -163,7 +166,7 @@ pub fn run_headless_smoke(
 }
 
 fn successor_gpu_adapter_summary() -> anyhow::Result<String> {
-    pollster::block_on(async {
+    wait_for_future(async {
         let instance = eframe::wgpu::Instance::new(eframe::wgpu::InstanceDescriptor {
             backends: eframe::wgpu::Backends::VULKAN,
             ..eframe::wgpu::InstanceDescriptor::new_without_display_handle()
@@ -185,6 +188,30 @@ fn successor_gpu_adapter_summary() -> anyhow::Result<String> {
             info.backend, info.device_type, info.name, info.driver, info.driver_info
         ))
     })
+}
+
+fn wait_for_future<F: Future>(future: F) -> F::Output {
+    struct ThreadWake(thread::Thread);
+
+    impl Wake for ThreadWake {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => thread::park(),
+        }
+    }
 }
 
 fn load_current_requirements(
