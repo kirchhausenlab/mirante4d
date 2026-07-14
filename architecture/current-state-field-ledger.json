@@ -10,6 +10,10 @@
     "runtime_owner": "mirante4d-dataset-runtime",
     "composition_state": "DatasetDemandState",
     "sole_poll_owner": "DatasetRequestDispatcher",
+    "lease_retention": {
+      "type": "RetainedLeases",
+      "path": "crates/mirante4d-app/src/retained_leases.rs"
+    },
     "source": {
       "type": "LocalDatasetSource",
       "path": "crates/mirante4d-storage/src/dataset_source.rs"
@@ -17,11 +21,7 @@
   },
   "render_authority": {
     "runtime_owner": "mirante4d-render-wgpu",
-    "contract_owner": "mirante4d-render-api",
-    "lease_retention": {
-      "type": "RetainedLeases",
-      "path": "crates/mirante4d-app/src/retained_leases.rs"
-    }
+    "contract_owner": "mirante4d-render-api"
   },
   "temporary_owners": [
     {

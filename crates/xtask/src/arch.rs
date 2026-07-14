@@ -1001,6 +1001,10 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
         "runtime_owner": "mirante4d-dataset-runtime",
         "composition_state": "DatasetDemandState",
         "sole_poll_owner": "DatasetRequestDispatcher",
+        "lease_retention": {
+            "type": "RetainedLeases",
+            "path": "crates/mirante4d-app/src/retained_leases.rs"
+        },
         "source": {
             "type": "LocalDatasetSource",
             "path": "crates/mirante4d-storage/src/dataset_source.rs"
@@ -1012,11 +1016,7 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
 
     let expected_render_authority = serde_json::json!({
         "runtime_owner": "mirante4d-render-wgpu",
-        "contract_owner": "mirante4d-render-api",
-        "lease_retention": {
-            "type": "RetainedLeases",
-            "path": "crates/mirante4d-app/src/retained_leases.rs"
-        }
+        "contract_owner": "mirante4d-render-api"
     });
     if ledger.get("render_authority") != Some(&expected_render_authority) {
         bail!("WP-09B render authority ledger drifted");
@@ -1148,6 +1148,22 @@ fn check_wp08b_dataset_dispatcher(
     {
         bail!("the WP-08B runtime/dispatcher/composition ownership chain drifted");
     }
+    let demand_fields = rust_struct_field_names(&dispatcher_source, "DatasetDemandState")?;
+    if !demand_fields.iter().any(|field| field == "retained_leases") {
+        bail!("DatasetDemandState must own retained dataset leases");
+    }
+    let current_render_path = app_root.join("current_runtime/render.rs");
+    if current_render_path.exists() {
+        let current_render_source = fs::read_to_string(&current_render_path)?;
+        let current_render_fields =
+            rust_struct_field_names(&current_render_source, "CurrentRenderRuntime")?;
+        if current_render_fields
+            .iter()
+            .any(|field| field == "retained_leases")
+        {
+            bail!("CurrentRenderRuntime must not own retained dataset leases");
+        }
+    }
     if dispatcher_source.matches(".runtime.poll(").count() != 1 {
         bail!("DatasetRequestDispatcher must contain the sole DatasetRuntime poll call");
     }
@@ -1225,7 +1241,7 @@ fn check_wp09b_render_cutover(repo_root: &Path, ledger: &serde_json::Value) -> a
     let retained_path = repo_root.join("crates/mirante4d-app/src/retained_leases.rs");
     let retained_source = fs::read_to_string(&retained_path)?;
     if !rust_root_defined_item_names(&retained_source)?.contains("RetainedLeases") {
-        bail!("WP-09B app-owned lease retention is missing");
+        bail!("dataset-demand lease retention is missing");
     }
 
     let metadata = workspace_dependency_metadata(repo_root)?;

@@ -1523,7 +1523,7 @@ impl ProductAutomationController {
         let view = application_view(&snapshot);
         let readout = cross_section_hover_readout_for_panel_point(
             &app.render_runtime.cross_section_runtime,
-            &app.render_runtime.retained_leases,
+            app.dataset.retained_leases(),
             CrossSectionReadoutInput {
                 view,
                 catalog: snapshot.catalog(),
@@ -2411,7 +2411,7 @@ impl ProductAutomationController {
                 target_scale_level: app.render_runtime.frame_fidelity.target_scale_level,
                 displayed_scale_level: app.render_runtime.frame_fidelity.displayed_scale_level,
                 visible_bricks: app.render_runtime.frame_fidelity.visible_bricks,
-                resident_bricks: app.render_runtime.retained_leases.retained_len(),
+                resident_bricks: app.dataset.retained_leases().retained_len(),
             });
     }
 
@@ -2761,8 +2761,8 @@ fn panel_hover_readout_side_effect_snapshot(app: &MiranteWorkbenchApp) -> Value 
             .dataset
             .scope_requirements(crate::dataset_requests::SCOPE_CURRENT_3D)
             .len(),
-        "retained_leases_required": app.render_runtime.retained_leases.required_len(),
-        "retained_leases_resident": app.render_runtime.retained_leases.retained_len(),
+        "retained_leases_required": app.dataset.retained_leases().required_len(),
+        "retained_leases_resident": app.dataset.retained_leases().retained_len(),
         "panels": panels,
     })
 }
@@ -2777,7 +2777,7 @@ fn active_lease_cohort_status(
         .scope_requirements(crate::dataset_requests::SCOPE_CURRENT_3D)
         .first()?
         .identity();
-    Some(app.render_runtime.retained_leases.cohort_status(
+    Some(app.dataset.retained_leases().cohort_status(
         identity,
         view.active_layer(),
         view.timepoint(),
@@ -2795,7 +2795,7 @@ fn lease_cohort_status_json(status: crate::retained_leases::RetainedLeaseStatus)
 }
 
 fn retained_leases_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
-    let bridge = &app.render_runtime.retained_leases;
+    let bridge = app.dataset.retained_leases();
     json!({
         "required": bridge.required_len(),
         "retained": bridge.retained_len(),

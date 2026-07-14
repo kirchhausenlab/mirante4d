@@ -13,6 +13,7 @@ use crate::{
     current_runtime::render::CurrentRenderRuntime,
     lod_scheduler::representative_voxel_world_size,
     render_state::ResidentRenderFailureStatus,
+    retained_leases::RetainedLeases,
     viewer_layout::{
         CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
         CrossSectionPanelScheduleStatus, PanelId,
@@ -33,6 +34,7 @@ pub(crate) struct CrossSectionScheduleInput<'a> {
     pub(crate) view: &'a ViewState,
     pub(crate) active_layer: LogicalLayerKey,
     pub(crate) requirements: &'a [DatasetResourceKey],
+    pub(crate) retained_leases: &'a RetainedLeases,
     pub(crate) render_scale: ScaleLevel,
     pub(crate) dataset_failed: bool,
 }
@@ -121,7 +123,7 @@ fn build_cross_section_panel_schedule(
     let retained = input
         .requirements
         .iter()
-        .filter(|key| render.retained_leases.payload(**key).is_some())
+        .filter(|key| input.retained_leases.payload(**key).is_some())
         .count();
     let missing = required.saturating_sub(retained);
 

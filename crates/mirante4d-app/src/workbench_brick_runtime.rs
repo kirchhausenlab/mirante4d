@@ -1,11 +1,11 @@
 //! Unified interactive dataset demand and completion delivery.
 
-use std::{collections::BTreeSet, sync::Arc, time::Instant};
+use std::{collections::BTreeSet, time::Instant};
 
 use eframe::egui;
 use mirante4d_application::ApplicationCommand;
-use mirante4d_dataset::{CpuLedgerCategory, DatasetCatalog, DatasetResourceKey, ResourceLease};
-use mirante4d_dataset_runtime::{RequestPriority, RuntimeFault, RuntimeFaultCode, RuntimeOutcome};
+use mirante4d_dataset::{CpuLedgerCategory, DatasetCatalog, DatasetResourceKey};
+use mirante4d_dataset_runtime::{RequestPriority, RuntimeFault, RuntimeFaultCode};
 use mirante4d_domain::{TimeIndex, ViewerLayout};
 use mirante4d_render_api::MAX_RENDER_REQUIREMENTS;
 
@@ -166,11 +166,7 @@ impl MiranteWorkbenchApp {
         if let Some(error) = cross_plan_error.as_ref() {
             self.mark_cross_section_plan_failure(error);
         }
-        if let Err(error) = self
-            .render_runtime
-            .retained_leases
-            .replace_requirements(self.dataset.renderer_requirements())
-        {
+        if let Err(error) = self.dataset.refresh_retained_requirements() {
             self.dataset.record_plan_error(error.to_string());
             self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Incomplete;
             return VisibleBrickRequestOutcome::default();
@@ -187,10 +183,7 @@ impl MiranteWorkbenchApp {
             if scope != SCOPE_CURRENT_3D && scope != SCOPE_PLAYBACK && !four_panel {
                 continue;
             }
-            if let Err(fault) =
-                self.dataset
-                    .submit_scope(scope, priority, &self.render_runtime.retained_leases)
-            {
+            if let Err(fault) = self.dataset.submit_scope(scope, priority) {
                 submission_fault = Some(fault);
                 break;
             }
@@ -199,9 +192,7 @@ impl MiranteWorkbenchApp {
             self.record_dataset_fault(&fault);
         }
 
-        let ready = self
-            .dataset
-            .scope_complete(SCOPE_CURRENT_3D, &self.render_runtime.retained_leases);
+        let ready = self.dataset.scope_complete(SCOPE_CURRENT_3D);
         self.update_dataset_fidelity(ready);
         VisibleBrickRequestOutcome {
             current_changed,
@@ -231,35 +222,20 @@ impl MiranteWorkbenchApp {
             }
             return;
         }
-        let (dataset, render, analysis) = (
-            &mut self.dataset,
-            &mut self.render_runtime,
-            &mut self.analysis_runtime,
-        );
-        let bridge = &mut render.retained_leases;
-        let mut installed = false;
+        let (dataset, analysis) = (&mut self.dataset, &mut self.analysis_runtime);
         let mut analysis_events = Vec::new();
         let mut analysis_errors = Vec::new();
-        let drained = dataset.dispatcher_mut().drain(RESULT_DRAIN_LIMIT, |ticket, outcome| {
-            if ticket.generation().scope() == SCOPE_ANALYSIS {
-                if let Some(token) = analysis.active_token().cloned() {
-                    match analysis.accept_completion(ticket, outcome) {
-                        Ok(event) => analysis_events.push((token, event)),
-                        Err(error) => analysis_errors.push((token, error)),
-                    }
-                }
-            } else if let RuntimeOutcome::Ready(lease) = outcome
-                && bridge.requires(ticket.resource())
-            {
-                let lease: Arc<dyn ResourceLease> = Arc::new(lease);
-                match bridge.install(lease) {
-                    Ok(newly_installed) => installed |= newly_installed,
-                    Err(error) => tracing::error!(%error, "runtime lease delivery violated the renderer bridge contract"),
+        let drained = dataset.drain_runtime_results(RESULT_DRAIN_LIMIT, |ticket, outcome| {
+            debug_assert_eq!(ticket.generation().scope(), SCOPE_ANALYSIS);
+            if let Some(token) = analysis.active_token().cloned() {
+                match analysis.accept_completion(ticket, outcome) {
+                    Ok(event) => analysis_events.push((token, event)),
+                    Err(error) => analysis_errors.push((token, error)),
                 }
             }
         });
-        let drained = match drained {
-            Ok(drained) => drained,
+        let (drained, installed) = match drained {
+            Ok(outcome) => outcome,
             Err(fault) => {
                 self.record_dataset_fault(&fault);
                 return;
@@ -292,9 +268,7 @@ impl MiranteWorkbenchApp {
             );
         }
 
-        let ready = self
-            .dataset
-            .scope_complete(SCOPE_CURRENT_3D, &self.render_runtime.retained_leases);
+        let ready = self.dataset.scope_complete(SCOPE_CURRENT_3D);
         self.update_dataset_fidelity(ready);
         if completion_drain_needs_replan(
             installed,
@@ -397,8 +371,8 @@ impl MiranteWorkbenchApp {
         let snapshot = self.application.snapshot();
         let view = application_view(&snapshot);
         let status = self
-            .render_runtime
-            .retained_leases
+            .dataset
+            .retained_leases()
             .resident_subset(
                 self.dataset.scope_requirements(SCOPE_CURRENT_3D),
                 snapshot.catalog().scientific_identity().resource_identity(),

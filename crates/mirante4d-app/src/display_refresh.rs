@@ -259,6 +259,7 @@ impl MiranteWorkbenchApp {
                 view,
                 active_layer: view.active_layer(),
                 requirements: &requirements,
+                retained_leases: self.dataset.retained_leases(),
                 render_scale: self.dataset.current_scale(),
                 dataset_failed: self.dataset.dispatcher().scope_failure(scope).is_some(),
             },
@@ -400,7 +401,7 @@ impl MiranteWorkbenchApp {
             .iter()
             .map(|requirement| requirement.key())
             .collect::<Vec<_>>();
-        let leases = self.render_runtime.retained_leases.lease_handles(&keys);
+        let leases = self.dataset.retained_leases().lease_handles(&keys);
         let lease_refs = leases
             .iter()
             .map(|lease| Arc::as_ref(lease) as &dyn ResourceLease)

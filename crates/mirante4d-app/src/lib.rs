@@ -2231,7 +2231,7 @@ impl MiranteWorkbenchApp {
         if let Err(error) = self.dataset.cancel_and_clear_interactive_demand() {
             tracing::warn!(%error, "invalidated dataset demand cancellation failed");
         }
-        let retired_leases = std::mem::take(&mut self.render_runtime.retained_leases);
+        let retired_leases = self.dataset.take_retained_leases();
         self.clear_product_presentations();
         self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Loading;
         self.render_runtime.frame_fidelity.reason = LodDecisionReason::LoadingTargetScale;
@@ -2463,13 +2463,12 @@ impl MiranteWorkbenchApp {
         &mut self,
         transfer: current_source_verification_service::CurrentSourceVerificationRuntimeTransfer,
     ) {
-        let retired_leases = std::mem::take(&mut self.render_runtime.retained_leases);
         let old_dataset = std::mem::replace(&mut self.dataset, transfer.dataset);
         if let Err(error) = old_dataset.request_shutdown() {
             tracing::warn!(%error, "unverified dataset runtime shutdown request failed");
         }
         self.request_opened_state_visible_work(None);
-        std::thread::spawn(move || drop((old_dataset, retired_leases)));
+        std::thread::spawn(move || drop(old_dataset));
     }
 
     fn install_current_source_runtime(
@@ -2521,7 +2520,7 @@ impl MiranteWorkbenchApp {
                 .unwrap_or(self.render_runtime.lod_schedule.target_scale_level),
         );
         active_layer_histogram_summary(
-            &self.render_runtime.retained_leases,
+            self.dataset.retained_leases(),
             histogram::ActiveLayerHistogramInput {
                 requirements: self
                     .dataset

@@ -13,7 +13,7 @@ use crate::{
 pub(crate) fn reconcile_view_runtime(
     previous_view: &ViewState,
     snapshot: &ApplicationSnapshot,
-    _dataset: &mut DatasetDemandState,
+    dataset: &mut DatasetDemandState,
     render: &mut CurrentRenderRuntime,
     analysis: &mut AnalysisProductRuntime,
 ) -> anyhow::Result<bool> {
@@ -37,7 +37,7 @@ pub(crate) fn reconcile_view_runtime(
                 layer.shape().t()
             );
         }
-        render.retained_leases.replace_requirements([])?;
+        drop(dataset.take_retained_leases());
         render
             .cross_section_runtime
             .mark_cross_section_panels_dirty();

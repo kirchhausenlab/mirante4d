@@ -60,7 +60,7 @@ product uses `mirante4d-storage`, `mirante4d-import-pipeline`, and
 
 ## Application Composition
 
-`MiranteWorkbenchApp` holds `ApplicationState`, payload-free
+`MiranteWorkbenchApp` holds `ApplicationState`, bounded
 `DatasetDemandState`, process diagnostics, two remaining temporary runtime
 owners, egui state owned by `mirante4d-ui-egui`, and narrow
 project-store/settings/source-open handles. It is a
@@ -89,9 +89,9 @@ worker channel, or thread handle.
 bounded request correlation and cancellation generations; decoded allocations
 remain owned and byte-accounted by `mirante4d-dataset-runtime`.
 `mirante4d-storage::LocalDatasetSource` is the sole product dataset source.
-The app retains exact runtime lease handles without copying their payloads and
-passes borrowed semantic views to `mirante4d-render-wgpu`. There is no alternate
-reader, scheduler, CPU display fallback, or app-owned payload map.
+`DatasetDemandState` retains exact runtime lease handles without copying their
+payloads and passes borrowed semantic views to `mirante4d-render-wgpu`. There is
+no alternate reader, scheduler, CPU display fallback, or app-owned payload map.
 
 `AnalysisProductRuntime` is the narrow product bridge to the analysis
 runtime. It uses the shared dispatcher below interactive priority and keeps at

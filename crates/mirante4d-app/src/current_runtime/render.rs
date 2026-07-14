@@ -2,10 +2,7 @@
 
 use mirante4d_render_api::{PresentationViewport, RenderExtent};
 
-use crate::{
-    CrossSectionRuntime, DisplayRefreshTiming, FrameFidelityStatus, LodScheduleState,
-    retained_leases::RetainedLeases,
-};
+use crate::{CrossSectionRuntime, DisplayRefreshTiming, FrameFidelityStatus, LodScheduleState};
 
 pub(crate) struct CurrentRenderRuntime {
     pub(crate) presentation_viewport: PresentationViewport,
@@ -16,7 +13,6 @@ pub(crate) struct CurrentRenderRuntime {
     pub(crate) playback_lod_downshift_active: bool,
     pub(crate) cross_section_runtime: CrossSectionRuntime,
     pub(crate) last_display_refresh_timing: Option<DisplayRefreshTiming>,
-    pub(crate) retained_leases: RetainedLeases,
 }
 
 impl CurrentRenderRuntime {
@@ -37,7 +33,6 @@ impl CurrentRenderRuntime {
             playback_lod_downshift_active: false,
             cross_section_runtime,
             last_display_refresh_timing: None,
-            retained_leases: RetainedLeases::new(),
         }
     }
 }
