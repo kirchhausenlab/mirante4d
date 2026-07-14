@@ -193,10 +193,11 @@ project route and its predecessor is deleted.
 WP-11 accepted the off-product bounded, restartable TIFF/OME-TIFF producer at
 `04987f64c309166caddf931be9c1ef4948010128`
 (`foundation-wp-11-exit-1`). Its focused checks and independent target readback
-passed. Product activation and deletion of the current importer remain WP-10C
-work. The WP-12 candidate implements the product analysis-runtime cutover and
-deletes its predecessor; protected-main acceptance remains before WP-10C
-begins.
+passed. WP-12 accepted the product analysis-runtime cutover at
+`5be750d060284d0a591ea6b5c0007bfeb136ac8d`
+(`foundation-wp-12-exit-1`) and deleted its predecessor and segmentation code.
+The WP-10C candidate activates target storage and import and deletes their
+predecessor crates; protected-main acceptance is the current checkpoint.
 
 ## Dataset And Fixture Boundary
 

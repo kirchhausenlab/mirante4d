@@ -10,12 +10,13 @@ Rust with `wgpu`, `winit`, and `egui`.
 
 ## Current Capabilities
 
-- Import microscopy data into strict native `mirante4d-v1` packages.
+- Import TIFF/OME-TIFF data into strict, sharded experimental Mirante4D
+  packages without modifying the source.
 - Stream datasets that are larger than RAM or VRAM.
 - Render intensity channels with MIP, DVR, and ISO modes.
 - Display multiple channels with per-channel rendering controls.
-- Save native project/session state and inspect/export existing analysis
-  results; analysis execution is deferred during the foundation rebuild.
+- Run exact whole-layer time traces and numeric box intensity analysis, then
+  save and reopen their table and plot results.
 - Build and package the application for Linux x86_64.
 
 Current implementation facts and limitations are recorded in

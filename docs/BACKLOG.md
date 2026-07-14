@@ -5,9 +5,8 @@ contains unresolved work only.
 
 ## Foundation Program
 
-- Complete WP-09A and the remaining storage, renderer, project,
-  import, analysis, UI, release, and final-deletion packages in the order stated
-  by the [foundation handoff](plans/active/FOUNDATION_REFACTOR_HANDOFF.md).
+- Complete WP-10C, WP-09B, WP-09C, WP-14, and WP-15 in the order stated by the
+  [foundation handoff](plans/active/FOUNDATION_REFACTOR_HANDOFF.md).
 - Expose packaged unsaved-autosave recovery in its owning application package.
 - Repair the inherited clean-state X11/Winit shutdown panic in its owning
   application package.

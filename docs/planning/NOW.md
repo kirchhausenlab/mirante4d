@@ -13,6 +13,12 @@ store. The predecessor analysis crate and segmentation code are deleted.
 
 WP-10C is active on `wp10c-storage-runtime-cutover`.
 
+The candidate now uses target storage and import throughout the product,
+deletes the predecessor data/format/import crates and obsolete fuzz package,
+and passes the focused import-to-project-reopen integration. Remaining
+acceptance work is the supported-resolution product exercise and normal PR
+checks; inherited exhaustive suites are not rerun.
+
 ## WP-10C Entry Note
 
 Outcome: make the accepted sharded target format and importer the only dataset

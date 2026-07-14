@@ -10,8 +10,8 @@ public release or public full microscopy dataset yet.
 
 - Native Rust desktop application for Linux x86_64 using `wgpu`, `winit`, and
   `egui`.
-- Strict experimental `mirante4d-v1` schema-1 dataset packages using sharded
-  Zarr v3 storage.
+- Strict experimental `m4d-science-1.0` datasets in the
+  `m4d-zarr3-local-1.0` OME-NGFF 0.5.2/Zarr v3 sharded storage profile.
 - Canonical framework-neutral domain, identity, project-model, application,
   dataset-catalog, render-API, and settings boundaries.
 - MIP, DVR, and ISO intensity rendering with per-channel controls.
@@ -22,15 +22,13 @@ public release or public full microscopy dataset yet.
 - Linux release-directory, tarball, and AppImage build paths.
 - No segmentation or derived-label subsystem.
 
-The workspace has twenty-one packages: twenty `mirante4d-*` crates plus
-`xtask`. `mirante4d-storage` is an off-product
-WP-10A library whose first slice owns frozen profile facts, portable package
-paths, checked package-count arithmetic, size/amplification ceilings, and
-bounded read-only local range I/O. It remains unreachable from the product.
-`mirante4d-import-pipeline` is the accepted off-product WP-11 producer: it owns
-bounded, cancellable, restartable TIFF/OME-TIFF production of validated
-sharded target packages, but no product route.
-The new `mirante4d-render-wgpu` successor and unpublished
+The workspace has eighteen packages: seventeen `mirante4d-*` crates plus
+`xtask`. `mirante4d-storage` owns the active package catalog, bounded
+validation and reads, and create-only package publication.
+`mirante4d-import-pipeline` is the active bounded, cancellable, restartable
+TIFF/OME-TIFF producer. The predecessor `mirante4d-data`, `mirante4d-format`,
+and `mirante4d-import` crates are deleted. The new `mirante4d-render-wgpu`
+successor and unpublished
 `mirante4d-render-reference` oracle are accepted off-product and remain
 deliberately unreachable; `mirante4d-renderer` remains the only product render
 route until WP-09B.
@@ -132,8 +130,9 @@ with the same scientific and image facts while exact PackageIds may differ.
 Isolated 2,750/5,500/11,000-descriptor opens satisfy the linear metadata-work
 contract, and the largest stays inside its 10-second and 64-MiB post-open RSS
 ceilings. `cargo xtask verify-local format-lifecycle` is the real local gate.
-The profile remains EXPERIMENTAL and off-product; no stable-format,
-product-support, performance, or generic OME-Zarr claim follows.
+At WP-10A acceptance the profile was EXPERIMENTAL and off-product; no stable-
+format, performance, or generic OME-Zarr claim follows from that evidence
+alone.
 
 WP-09A accepted the bounded off-product progressive Vulkan runtime and
 independent CPU reference at
@@ -177,9 +176,8 @@ WP-11 is accepted on protected main at
 `04987f64c309166caddf931be9c1ef4948010128` (tree
 `fd39e0be3a0883726972b25d037c916f0e3ca4c0`), tagged
 `foundation-wp-11-exit-1`. Its focused importer checks, independent target
-readback, and exact-main run passed. Product activation and deletion of the
-current importer remain WP-10C work; current schema-1 packages remain
-transitional T2 fixtures and the sole product route.
+readback, and exact-main run passed. WP-10C subsequently activated that
+pipeline and removed the predecessor importer.
 
 WP-12 is accepted on protected main at
 `5be750d060284d0a591ea6b5c0007bfeb136ac8d` (tree
@@ -187,10 +185,11 @@ WP-12 is accepted on protected main at
 `foundation-wp-12-exit-1`. The bounded exact analysis runtime is the sole
 product analysis route; its predecessor and segmentation code are deleted.
 
-WP-10C is active. It will connect the accepted sharded target packages and
-importer to the product, retain responsive background verification, bind
-proved package and scientific identities to projects, and delete the current
-schema-1 data/format/import path.
+The WP-10C candidate activates the sharded target package and importer as the
+sole product dataset path, retains responsive background verification, binds
+proved package and scientific identities to projects, and deletes the
+predecessor data, format, and import crates. Protected-main acceptance is the
+remaining checkpoint.
 
 ## Current Verification Boundary
 
@@ -203,12 +202,12 @@ See [testing](TESTING.md) for commands and claim language.
 
 ## Known Limitations
 
-- Current schema-1 sources begin unverified and can derive a verified
-  `ScientificContentId` through the bounded B3 source scan. Project attach,
-  open, and save reject at the typed identity gate until that scan succeeds,
-  and observed source drift returns the source to the unverified state.
-- Dataset schema 1 and the project-store format are experimental, not stable-
-  format or target-dataset conformance claims.
+- Target packages open provisionally while bounded exact-package and
+  scientific-content verification runs in the background. Project attach,
+  open, and save remain blocked until verification succeeds; observed source
+  drift invalidates that result and requires verification again.
+- The target dataset profile and project-store format are experimental and
+  carry no compatibility promise.
 - The product project-store crate has its frozen API,
   control-record wire, typed generation/direct-and-paged closure, and
   generation-last immutable publication. Its crate-private transaction core

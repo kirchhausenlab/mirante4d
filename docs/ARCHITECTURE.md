@@ -8,7 +8,7 @@ import/preprocessing workflows.
 
 ## Workspace Boundaries
 
-The workspace has twenty-one packages (twenty `mirante4d-*` crates plus
+The workspace has eighteen packages (seventeen `mirante4d-*` crates plus
 `xtask`):
 
 - `mirante4d-domain`: validated framework-neutral geometry, view, transfer,
@@ -40,26 +40,21 @@ The workspace has twenty-one packages (twenty `mirante4d-*` crates plus
 - `mirante4d-render-wgpu`: off-product progressive GPU successor built only
   against dataset leases and render contracts; WP-09B owns its future product
   activation.
-- `mirante4d-storage`: off-product target-profile facts, checked ceilings,
-  portable package paths, bounded local validation/reads, an exact-package
-  capability, and a deterministic create-only local writer; currently no
-  product authority.
-- `mirante4d-import-pipeline`: off-product bounded, cancellable, restartable
-  TIFF/OME-TIFF producer for validated sharded target packages; WP-10C owns its
-  future product activation.
-- `mirante4d-data`, `mirante4d-format`, `mirante4d-import`, and
-  `mirante4d-renderer`: current storage/runtime, format, import, and rendering
-  implementations.
+- `mirante4d-storage`: active target-profile catalog, checked ceilings,
+  portable package paths, bounded local validation/reads, exact and scientific
+  capabilities, dataset source, and deterministic create-only local writer.
+- `mirante4d-import-pipeline`: active bounded, cancellable, restartable
+  TIFF/OME-TIFF producer for validated sharded target packages.
+- `mirante4d-renderer`: current product rendering implementation until WP-09B.
 - `mirante4d-app`: native composition and egui shell.
 - `xtask`: developer and verification tooling, never a product mode.
 
 `mirante4d-core` and the predecessor application/session/preferences models
 do not exist. Lower crates do not depend on the app/UI layer; the renderer
 does not read files; format code does not own viewer state.
-No product crate depends on `mirante4d-storage`,
-`mirante4d-import-pipeline`, `mirante4d-render-reference`, or
-`mirante4d-render-wgpu`. WP-10C owns the storage/import cutover and WP-09B owns
-the render cutover.
+The predecessor data, format, and import crates do not exist. The product uses
+`mirante4d-storage` and `mirante4d-import-pipeline`; the reference and successor
+renderers remain off-product until WP-09B.
 
 ## Application Composition
 
@@ -74,7 +69,7 @@ The temporary owners and deletion gates are:
 |---|---|---|
 | `CurrentRenderRuntime` | render status, frames, GPU and presentation resources | WP-09B |
 | `CurrentUiRuntime` | egui-local drafts and interaction facts | WP-09C |
-| `CurrentImportRuntime` | current import execution | WP-10C |
+| `ImportRuntime` | UI-owned task handling around the target import pipeline | WP-09C |
 | `CurrentValidationRuntime` | product-validation harness only | WP-14 |
 
 The private egui bridge translates UI input to `ApplicationCommand` and reads
@@ -86,8 +81,8 @@ deleted, with no compatibility reader or fallback.
 `DatasetRequestDispatcher` is the sole application poll owner. It keeps only
 bounded request correlation and cancellation generations; decoded allocations
 remain owned and byte-accounted by `mirante4d-dataset-runtime`.
-`CurrentDatasetSource` is the one temporary current-storage bridge until
-WP-10C. `CurrentLeaseBridge` retains runtime leases without copying their
+`mirante4d-storage::LocalDatasetSource` is the sole product dataset source.
+`CurrentLeaseBridge` retains runtime leases without copying their
 payloads and is the one temporary current-renderer bridge until WP-09B. There
 is no alternate reader, scheduler, CPU display fallback, or app-owned payload
 map.
@@ -109,7 +104,7 @@ use an opaque per-open source ID, never a fabricated scientific-content ID.
 
 ```text
 native package
-  -> CurrentDatasetSource and immutable logical catalog
+  -> LocalPackageCatalog, LocalDatasetSource, and immutable logical catalog
   -> canonical application snapshot
   -> semantic 3D / linked-panel / playback demand
   -> one bounded scheduler and CPU byte ledger
@@ -138,15 +133,11 @@ coverage include at most 128 resources.
 
 ## Persistence And Settings
 
-Current schema-1 sources open as unverified workspaces. B3 added a background,
-cancellable D-009 scan over the base scale between complete source-tree
-inventories, then prepares and atomically promotes a structurally identical
-verified catalog/runtime for the exact source generation. Progress,
-cancellation, success, and source-drift invalidation use the canonical
-application operation path; unrelated view changes do not make a verification
-completion stale. Project attach/open/save remains identity-gated until
-verification succeeds, and observed drift clears interactive demand and blocks
-new project I/O until reverification.
+Target packages open provisionally through `LocalPackageCatalog` and
+`LocalDatasetSource`. Background exact-package and scientific-content
+verification promotes the same source generation. Project attach, open, and
+save remain identity-gated, and observed source drift invalidates the verified
+state.
 
 WP-10B B1 freezes the successor's canonical envelope, generation, ref, object,
 payload-paging, API, and failure-transition contract plus an independent
