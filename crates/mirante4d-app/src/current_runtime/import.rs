@@ -1,16 +1,15 @@
-//! Current import execution facts retained only until WP-10C.
+//! Product TIFF inspection and import execution facts.
 
 use crate::{ImportTask, PendingTiffImport, TiffImportSetupTask};
 
-/// Exact four-field temporary owner frozen by the WP-07B entry.
-pub(crate) struct CurrentImportRuntime {
+pub(crate) struct ImportRuntime {
     pub(crate) tiff_import_setup_task: Option<TiffImportSetupTask>,
     pub(crate) tiff_import_setup_error: Option<String>,
     pub(crate) pending_tiff_import: Option<PendingTiffImport>,
     pub(crate) import_task: Option<ImportTask>,
 }
 
-impl CurrentImportRuntime {
+impl ImportRuntime {
     pub(crate) const fn idle() -> Self {
         Self {
             tiff_import_setup_task: None,

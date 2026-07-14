@@ -97,7 +97,10 @@ fn frame_fidelity_labels_cover_status_reason_and_failure_vocabularies() {
     ] {
         assert_eq!(frame_failure_kind_label(value), expected);
     }
-    assert_eq!(crate::fidelity::render_backend_label(RenderBackend::Empty), "empty");
+    assert_eq!(
+        crate::fidelity::render_backend_label(RenderBackend::Empty),
+        "empty"
+    );
 }
 
 #[test]
@@ -201,16 +204,20 @@ fn tiff_import_setup_state_is_visible_immediately_after_output_selection() {
     fs::create_dir(&output_parent).unwrap();
     let (_sender, receiver) = mpsc::channel();
     let mut app = test_workbench_app_without_background_runtime(opened);
+    let tiff_source = TiffSource::auto(source.clone());
+    let destination = tiff_destination(&tiff_source, &output_parent);
 
     app.enter_tiff_import_setup_waiting_state(
-        TiffImportSource::SingleFile(source.clone()),
-        output_parent.clone(),
+        tiff_source,
+        destination.clone(),
+        ImportCancellation::new(),
         receiver,
+        None,
     );
 
     let task = app.import_runtime.tiff_import_setup_task.as_ref().unwrap();
-    assert_eq!(task.source.path(), source.as_path());
-    assert_eq!(task.output_parent, output_parent);
+    assert_eq!(task.source.path, source);
+    assert_eq!(task.destination, destination);
     assert!(app.import_runtime.pending_tiff_import.is_none());
     assert!(app.import_runtime.tiff_import_setup_error.is_none());
 }

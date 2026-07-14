@@ -6,8 +6,7 @@ use mirante4d_project_model::ViewState;
 use crate::{
     BACKGROUND_WORK_REPAINT_INTERVAL,
     current_runtime::{
-        analysis::AnalysisProductRuntime, import::CurrentImportRuntime,
-        render::CurrentRenderRuntime,
+        analysis::AnalysisProductRuntime, import::ImportRuntime, render::CurrentRenderRuntime,
     },
     dataset_requests::{DatasetDemandState, SCOPE_CURRENT_3D},
     playback::{PLAYBACK_FRAME_INTERVAL, playback_tick_for_ui_time},
@@ -16,7 +15,7 @@ use crate::{
 
 pub(crate) fn background_work_active(
     snapshot: &ApplicationSnapshot,
-    import: &CurrentImportRuntime,
+    import: &ImportRuntime,
     _analysis: &AnalysisProductRuntime,
     dataset: &DatasetDemandState,
     render: &CurrentRenderRuntime,

@@ -192,7 +192,7 @@ fn test_workbench_app_without_background_runtime(
         dataset,
         render_runtime,
         ui_runtime,
-        import_runtime: current_runtime::import::CurrentImportRuntime::idle(),
+        import_runtime: current_runtime::import::ImportRuntime::idle(),
         analysis_runtime,
         validation_runtime: current_runtime::validation::CurrentValidationRuntime {
             product_automation: None,
