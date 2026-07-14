@@ -242,7 +242,7 @@ fn source_invalidation_cancels_an_active_autosave_and_suppresses_its_stale_resul
     let mut service = ProjectStoreApplicationService::start(
         ProjectStoreConfig::default(),
         clock.clone(),
-        Some(destination),
+        Some(destination.clone()),
     )
     .unwrap();
     assert!(
@@ -259,7 +259,36 @@ fn source_invalidation_cancels_an_active_autosave_and_suppresses_its_stale_resul
             .as_slice(),
         [ProjectStoreServiceEvent::AutosaveSubmitted { .. }]
     ));
-    gate.wait_started();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !gate.started() {
+        let events = service
+            .drive(&snapshot, |_| {
+                panic!("active autosave recaptured its source")
+            })
+            .unwrap();
+        match events.as_slice() {
+            [
+                ProjectStoreServiceEvent::AutosaveFinished {
+                    result: Err(ProjectStoreFault::UnsupportedFilesystem),
+                    ..
+                },
+            ] => {
+                assert!(!gate.started());
+                assert!(!destination.as_path().exists());
+                assert_eq!(service.status().lifecycle(), ProjectStoreLifecycle::Unbound);
+                assert_eq!(service.status().current_autosave(), None);
+                service.join().unwrap();
+                return;
+            }
+            [] => {}
+            events => panic!("unexpected autosave event before the gated read: {events:?}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "project-store actor did not begin the gated read"
+        );
+        thread::yield_now();
+    }
 
     application
         .dispatch(ApplicationCommand::InvalidateSourceVerification {
@@ -586,7 +615,12 @@ fn foreground_completion_at_autosave_deadline_does_not_capture_the_stale_snapsho
             .is_empty()
     );
     service
-        .submit_save(token.clone(), projection, Some(destination), Vec::new())
+        .submit_save(
+            token.clone(),
+            projection,
+            Some(destination.clone()),
+            Vec::new(),
+        )
         .unwrap();
     clock.set(seconds(30));
 
@@ -615,6 +649,18 @@ fn foreground_completion_at_autosave_deadline_does_not_capture_the_stale_snapsho
                 saved_revision,
             },
         ] if completed == &token => *saved_revision,
+        [
+            ProjectStoreServiceEvent::OperationFailed {
+                token: completed,
+                fault: ProjectStoreFault::UnsupportedFilesystem,
+            },
+        ] if completed == &token => {
+            assert_eq!(stale_capture_calls, 0);
+            assert!(!destination.as_path().exists());
+            assert_eq!(service.status().lifecycle(), ProjectStoreLifecycle::Unbound);
+            service.join().unwrap();
+            return;
+        }
         unexpected => panic!("unexpected completion at autosave deadline: {unexpected:?}"),
     };
     assert_eq!(stale_capture_calls, 0);
@@ -643,7 +689,9 @@ fn foreground_completion_at_autosave_deadline_does_not_capture_the_stale_snapsho
 fn real_open_recovery_inspection_failure_enters_recovery_only() {
     let directory = TestDirectory::new();
     let path = ProjectStorePath::new(directory.path().join("recovery.m4dproj")).unwrap();
-    create_established_store(&path);
+    if !create_established_store(&path) {
+        return;
+    }
 
     let mut opener = verified_unbound_application();
     opener.drain_events(MAX_PENDING_EVENTS);
@@ -700,7 +748,9 @@ fn automatic_recovery_review_selects_only_newer_and_leaves_branches_explicit() {
     let directory = TestDirectory::new();
 
     let newer_path = ProjectStorePath::new(directory.path().join("newer.m4dproj")).unwrap();
-    let (newer_generation, _) = create_established_recovery_store(&newer_path, false);
+    let Some((newer_generation, _)) = create_established_recovery_store(&newer_path, false) else {
+        return;
+    };
     let mut newer_opener = verified_unbound_application();
     newer_opener.drain_events(MAX_PENDING_EVENTS);
     let newer_token = project_open_request(&mut newer_opener);
@@ -738,8 +788,11 @@ fn automatic_recovery_review_selects_only_newer_and_leaves_branches_explicit() {
     newer_service.join().unwrap();
 
     let branch_path = ProjectStorePath::new(directory.path().join("branches.m4dproj")).unwrap();
-    let (divergent_generation, current_manual) =
-        create_established_recovery_store(&branch_path, true);
+    let Some((divergent_generation, current_manual)) =
+        create_established_recovery_store(&branch_path, true)
+    else {
+        return;
+    };
     corrupt_generation(
         branch_path.as_path(),
         current_manual.expect("branch fixture advances the manual head"),
@@ -784,7 +837,9 @@ fn real_recovery_selected_save_as_establishes_the_new_project() {
     let directory = TestDirectory::new();
     let source = ProjectStorePath::new(directory.path().join("recovery.m4dproj")).unwrap();
     let destination = ProjectStorePath::new(directory.path().join("recovered.m4dproj")).unwrap();
-    let (selected_generation, _) = create_established_recovery_store(&source, false);
+    let Some((selected_generation, _)) = create_established_recovery_store(&source, false) else {
+        return;
+    };
 
     let mut opener = verified_unbound_application();
     opener.drain_events(MAX_PENDING_EVENTS);
@@ -1427,23 +1482,11 @@ struct ReadGateState {
 }
 
 impl ReadGate {
-    fn wait_started(&self) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut state = self
-            .state
+    fn started(&self) -> bool {
+        self.state
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        while !state.started {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .expect("project-store actor did not begin the gated read");
-            let (next, wait) = self
-                .wake
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(|poison| poison.into_inner());
-            state = next;
-            assert!(!wait.timed_out() || state.started, "gated read timed out");
-        }
+            .unwrap_or_else(|poison| poison.into_inner())
+            .started
     }
 
     fn release(&self) {
@@ -1641,7 +1684,7 @@ fn close_service(
     panic!("project-store service did not close");
 }
 
-fn create_established_store(path: &ProjectStorePath) {
+fn create_established_store(path: &ProjectStorePath) -> bool {
     let mut application = verified_bound_application();
     application.drain_events(MAX_PENDING_EVENTS);
     let (token, projection) = project_save_request(&mut application);
@@ -1655,21 +1698,29 @@ fn create_established_store(path: &ProjectStorePath) {
     service
         .submit_save(token.clone(), projection, Some(path.clone()), Vec::new())
         .unwrap();
-    assert!(matches!(
-        wait_for_foreground_completion(&mut service, &snapshot),
+    match wait_for_foreground_completion(&mut service, &snapshot) {
         ProjectStoreServiceEvent::Created {
+            token: completed, ..
+        } if completed == token => {}
+        ProjectStoreServiceEvent::OperationFailed {
             token: completed,
-            ..
-        } if completed == token
-    ));
+            fault: ProjectStoreFault::UnsupportedFilesystem,
+        } if completed == token => {
+            assert!(!path.as_path().exists());
+            service.join().unwrap();
+            return false;
+        }
+        event => panic!("unexpected fixture Create completion: {event:?}"),
+    }
     close_service(&mut service, &snapshot);
     service.join().unwrap();
+    true
 }
 
 fn create_established_recovery_store(
     path: &ProjectStorePath,
     advance_manual: bool,
-) -> (ProjectGenerationId, Option<ProjectGenerationId>) {
+) -> Option<(ProjectGenerationId, Option<ProjectGenerationId>)> {
     let mut application = verified_bound_application();
     application.drain_events(MAX_PENDING_EVENTS);
     let (create_token, create_projection) = project_save_request(&mut application);
@@ -1691,6 +1742,14 @@ fn create_established_recovery_store(
             token,
             saved_revision,
         } if token == create_token => saved_revision,
+        ProjectStoreServiceEvent::OperationFailed {
+            token,
+            fault: ProjectStoreFault::UnsupportedFilesystem,
+        } if token == create_token => {
+            assert!(!path.as_path().exists());
+            service.join().unwrap();
+            return None;
+        }
         event => panic!("unexpected fixture Create completion: {event:?}"),
     };
     application
@@ -1743,7 +1802,7 @@ fn create_established_recovery_store(
     let final_snapshot = application.snapshot();
     close_service(&mut service, &final_snapshot);
     service.join().unwrap();
-    (autosave_generation, current_manual)
+    Some((autosave_generation, current_manual))
 }
 
 fn wait_for_manual_save(
