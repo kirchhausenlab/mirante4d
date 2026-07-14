@@ -10,7 +10,6 @@ use crate::{
     dataset_requests::{
         SCOPE_CROSS_SECTION_XY, SCOPE_CROSS_SECTION_XZ, SCOPE_CROSS_SECTION_YZ, SCOPE_CURRENT_3D,
     },
-    image_compositing::color_image_for_snapshot,
     product_render_intent::{ProductRenderRequest, cross_section_request, volume_request},
     viewer_layout::PanelId,
 };
@@ -23,7 +22,9 @@ use mirante4d_render_wgpu::WgpuRenderRuntimeError;
 
 #[derive(Clone)]
 pub(crate) enum ViewportDisplayImage {
-    Cpu(egui::TextureHandle),
+    UiBackground {
+        size: egui::Vec2,
+    },
     Gpu {
         texture_id: egui::TextureId,
         size: egui::Vec2,
@@ -33,14 +34,14 @@ pub(crate) enum ViewportDisplayImage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DisplayRefreshPath {
     GpuResidentDisplay,
-    CpuTexture,
+    UiBackground,
 }
 
 impl DisplayRefreshPath {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::GpuResidentDisplay => "gpu display",
-            Self::CpuTexture => "loading texture",
+            Self::UiBackground => "ui background",
         }
     }
 }
@@ -62,14 +63,13 @@ pub(crate) struct DisplayRefreshTiming {
     pub(crate) gpu_compute_ms: Option<f64>,
     pub(crate) egui_texture_ms: f64,
     pub(crate) visible_brick_request_ms: f64,
-    pub(crate) cpu_texture_update_ms: f64,
     pub(crate) total_ms: f64,
 }
 
 impl ViewportDisplayImage {
     pub(crate) fn size_vec2(&self) -> egui::Vec2 {
         match self {
-            Self::Cpu(texture) => texture.size_vec2(),
+            Self::UiBackground { size } => *size,
             Self::Gpu { size, .. } => *size,
         }
     }
@@ -80,30 +80,16 @@ pub(crate) fn duration_ms(duration: Duration) -> f64 {
 }
 
 impl MiranteWorkbenchApp {
-    pub(crate) fn ensure_texture(&mut self, ctx: &egui::Context) -> &egui::TextureHandle {
-        if self.render_runtime.texture.is_none() {
-            let snapshot = current_egui_shell_bridge::snapshot(&self.application);
-            let image = color_image_for_snapshot(&snapshot, &self.render_runtime);
-            self.render_runtime.texture = Some(ctx.load_texture(
-                "mirante4d-loading-frame",
-                image,
-                egui::TextureOptions::NEAREST,
-            ));
-        }
-        self.render_runtime
-            .texture
-            .as_ref()
-            .expect("the loading texture was initialized")
-    }
-
-    pub(crate) fn viewport_display_image(&mut self, ctx: &egui::Context) -> ViewportDisplayImage {
+    pub(crate) fn viewport_display_image(&self) -> ViewportDisplayImage {
         if let Some((texture_id, extent)) = self.product_display(PanelId::ThreeD) {
             return ViewportDisplayImage::Gpu {
                 texture_id,
                 size: extent_size(extent),
             };
         }
-        ViewportDisplayImage::Cpu(self.ensure_texture(ctx).clone())
+        ViewportDisplayImage::UiBackground {
+            size: extent_size(self.render_runtime.render_viewport),
+        }
     }
 
     pub(crate) fn cross_section_panel_display_image(
@@ -132,7 +118,7 @@ impl MiranteWorkbenchApp {
         Some((target.texture_id?, target.extent))
     }
 
-    pub(crate) fn clear_gpu_display_frame(&mut self) {
+    pub(crate) fn clear_3d_product_presentation(&mut self) {
         if let Some(product) = self.render_runtime.product_gpu.as_mut()
             && let Some(target) = product.targets.get_mut(&PanelId::ThreeD)
         {
@@ -140,15 +126,12 @@ impl MiranteWorkbenchApp {
             target.presented = None;
             target.pending_capture = None;
             target.completed_capture = None;
+            target.partial_seen = false;
         }
         self.render_runtime.frame_fidelity.display_freshness = DisplayedFrameFreshness::Unknown;
     }
 
-    pub(crate) fn retire_gpu_display_texture_id(&mut self) {
-        self.clear_gpu_display_frame();
-    }
-
-    pub(crate) fn retire_cross_section_gpu_display_texture_ids(&mut self) {
+    pub(crate) fn clear_cross_section_product_presentations(&mut self) {
         if let Some(product) = self.render_runtime.product_gpu.as_mut() {
             for panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
                 if let Some(target) = product.targets.get_mut(&panel) {
@@ -156,6 +139,7 @@ impl MiranteWorkbenchApp {
                     target.presented = None;
                     target.pending_capture = None;
                     target.completed_capture = None;
+                    target.partial_seen = false;
                 }
             }
         }
@@ -174,23 +158,10 @@ impl MiranteWorkbenchApp {
                 target.presented = None;
                 target.pending_capture = None;
                 target.completed_capture = None;
+                target.partial_seen = false;
             }
         }
         self.render_runtime.frame_fidelity.display_freshness = DisplayedFrameFreshness::Unknown;
-    }
-
-    pub(crate) fn free_retired_gpu_display_textures(&mut self) {
-        if self.ui_runtime.retired_gpu_display_texture_ids.is_empty() {
-            return;
-        }
-        let Some(texture_renderer) = self.ui_runtime.wgpu_texture_renderer.as_ref() else {
-            self.ui_runtime.retired_gpu_display_texture_ids.clear();
-            return;
-        };
-        let mut texture_renderer = texture_renderer.write();
-        for texture_id in self.ui_runtime.retired_gpu_display_texture_ids.drain(..) {
-            texture_renderer.free_texture(&texture_id);
-        }
     }
 
     fn cross_section_panel_needs_display_render(&self, panel_id: PanelId) -> bool {
@@ -409,27 +380,17 @@ impl MiranteWorkbenchApp {
             }
             return Ok(false);
         };
-        let previous = product
+        let partial_seen = product
             .targets
             .get(&target_id)
-            .and_then(|target| target.presented.as_ref());
+            .is_some_and(|target| target.partial_seen);
         let current_is_partial =
             presented.progress().completeness() == RenderFrameCompleteness::Progressive;
-        if current_is_partial
-            && previous.is_none_or(|frame| {
-                frame.frame() != presented.frame()
-                    || frame.progress().completeness() != RenderFrameCompleteness::Progressive
-            })
-        {
+        if current_is_partial && !partial_seen {
             product.current_partial_frames_presented =
                 product.current_partial_frames_presented.saturating_add(1);
         }
-        if !current_is_partial
-            && previous.is_some_and(|frame| {
-                frame.frame() == presented.frame()
-                    && frame.progress().completeness() == RenderFrameCompleteness::Progressive
-            })
-        {
+        if !current_is_partial && partial_seen {
             product.partial_to_settled_transitions =
                 product.partial_to_settled_transitions.saturating_add(1);
         }
@@ -440,6 +401,7 @@ impl MiranteWorkbenchApp {
         let extent_changed = target.extent != presented.extent();
         target.extent = presented.extent();
         target.presented = Some(presented.clone());
+        target.partial_seen = current_is_partial;
         if let Some(ticket) = report.validation_capture() {
             target.pending_capture = Some((presented.clone(), ticket));
             target.completed_capture = None;
@@ -478,6 +440,7 @@ impl MiranteWorkbenchApp {
                 pending_capture: None,
                 completed_capture: None,
                 texture_id: None,
+                partial_seen: false,
             },
         );
         Ok(())
@@ -625,12 +588,9 @@ impl MiranteWorkbenchApp {
             Some(self.dataset.current_scale().get());
         self.render_runtime.frame_fidelity.displayed_scale_level =
             self.render_runtime.lod_schedule.displayed_scale_level;
-        self.render_runtime.texture = None;
     }
 
-    pub(crate) fn render_gpu_display_frame_for_current_state(
-        &mut self,
-    ) -> anyhow::Result<DisplayRenderTiming> {
+    pub(crate) fn render_current_product_frame(&mut self) -> anyhow::Result<DisplayRenderTiming> {
         let snapshot = current_egui_shell_bridge::snapshot(&self.application);
         let requirements = self.dataset.scope_requirements(SCOPE_CURRENT_3D).to_vec();
         let presentation = self.render_runtime.presentation_viewport;
@@ -648,7 +608,7 @@ impl MiranteWorkbenchApp {
             path: if rendered || self.product_display(PanelId::ThreeD).is_some() {
                 DisplayRefreshPath::GpuResidentDisplay
             } else {
-                DisplayRefreshPath::CpuTexture
+                DisplayRefreshPath::UiBackground
             },
             render_ms: duration_ms(started.elapsed()),
             gpu_upload_ms: None,
@@ -657,38 +617,30 @@ impl MiranteWorkbenchApp {
         })
     }
 
-    pub(crate) fn render_current_resident_frame_for_display(
-        &mut self,
-    ) -> anyhow::Result<DisplayRenderTiming> {
-        self.render_gpu_display_frame_for_current_state()
-    }
-
     pub(crate) fn rerender_display_state(&mut self) -> anyhow::Result<DisplayRenderTiming> {
         self.request_visible_bricks();
         if self.dataset.scope_is_empty(SCOPE_CURRENT_3D) {
-            self.clear_gpu_display_frame();
+            self.clear_3d_product_presentation();
             self.render_runtime.render_backend = RenderBackend::Empty;
             self.render_runtime.frame_fidelity.backend = RenderBackend::Empty;
             self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Complete;
             self.render_runtime.frame_fidelity.reason = LodDecisionReason::NoVisibleData;
             self.render_runtime.frame_fidelity.display_freshness = DisplayedFrameFreshness::Current;
-            self.render_runtime.texture = None;
             return Ok(DisplayRenderTiming {
-                path: DisplayRefreshPath::CpuTexture,
+                path: DisplayRefreshPath::UiBackground,
                 render_ms: 0.0,
                 gpu_upload_ms: None,
                 gpu_compute_ms: None,
                 egui_texture_ms: 0.0,
             });
         }
-        self.render_current_resident_frame_for_display()
+        self.render_current_product_frame()
     }
 
     pub(crate) fn record_display_refresh_timing(
         &mut self,
         render: DisplayRenderTiming,
         visible_brick_request_ms: f64,
-        cpu_texture_update_ms: f64,
         total_ms: f64,
     ) {
         self.render_runtime.last_display_refresh_timing = Some(DisplayRefreshTiming {
@@ -698,34 +650,17 @@ impl MiranteWorkbenchApp {
             gpu_compute_ms: render.gpu_compute_ms,
             egui_texture_ms: render.egui_texture_ms,
             visible_brick_request_ms,
-            cpu_texture_update_ms,
             total_ms,
         });
-    }
-
-    pub(crate) fn update_cpu_texture_if_needed(&mut self) -> f64 {
-        let started = Instant::now();
-        if self.product_display(PanelId::ThreeD).is_none() {
-            let image = color_image_for_snapshot(
-                &current_egui_shell_bridge::snapshot(&self.application),
-                &self.render_runtime,
-            );
-            if let Some(texture) = self.render_runtime.texture.as_mut() {
-                texture.set(image, egui::TextureOptions::NEAREST);
-            }
-        }
-        duration_ms(started.elapsed())
     }
 
     pub(crate) fn refresh_frame(&mut self, ctx: &egui::Context) {
         let total_start = Instant::now();
         match self.rerender_display_state() {
             Ok(render_timing) => {
-                let cpu_texture_update_ms = self.update_cpu_texture_if_needed();
                 self.record_display_refresh_timing(
                     render_timing,
                     0.0,
-                    cpu_texture_update_ms,
                     duration_ms(total_start.elapsed()),
                 );
             }

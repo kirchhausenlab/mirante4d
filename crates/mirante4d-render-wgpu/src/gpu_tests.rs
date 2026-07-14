@@ -25,9 +25,9 @@ use mirante4d_domain::{
     WorldPoint3,
 };
 use mirante4d_render_api::{
-    FrameIdentity, FrameLimitation, GpuLedgerCategory, LayerRenderIntent, PresentationToken,
-    PresentationViewport, RenderExtent, RenderIntent, RenderRequirement, RenderRequirementRole,
-    RenderRequirements, RenderViewIntent,
+    FrameCompleteness, FrameIdentity, FrameLimitation, GpuLedgerCategory, LayerRenderIntent,
+    PresentationToken, PresentationViewport, RenderExtent, RenderIntent, RenderRequirement,
+    RenderRequirementRole, RenderRequirements, RenderViewIntent,
 };
 use mirante4d_render_reference::{ReferenceFrame, ReferenceRenderer};
 
@@ -943,6 +943,12 @@ fn qualification() {
     assert_eq!(
         first_upload
             .progress()
+            .map(mirante4d_render_api::FrameProgress::completeness),
+        Some(FrameCompleteness::Progressive)
+    );
+    assert_eq!(
+        first_upload
+            .progress()
             .and_then(|progress| progress.limitation()),
         Some(FrameLimitation::BudgetLimited)
     );
@@ -965,6 +971,18 @@ fn qualification() {
         .expect("second upload-boundary frame executes");
     assert_eq!(second_upload.uploaded_resources(), 1);
     assert_eq!(second_upload.payload_upload_bytes(), MIB);
+    assert_eq!(
+        second_upload
+            .progress()
+            .map(mirante4d_render_api::FrameProgress::completeness),
+        Some(FrameCompleteness::Exact)
+    );
+    assert_eq!(
+        second_upload
+            .progress()
+            .and_then(mirante4d_render_api::FrameProgress::limitation),
+        None
+    );
     counters.record(&second_upload);
     let _ = poll_capture(
         &mut gpu,

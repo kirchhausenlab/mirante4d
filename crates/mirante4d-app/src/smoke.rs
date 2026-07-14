@@ -15,7 +15,7 @@ use mirante4d_dataset::{CpuLedgerCategory, ResourceLease, ResourcePayloadView};
 use mirante4d_dataset_runtime::RequestPriority;
 use mirante4d_domain::IntensityDType;
 use mirante4d_render_api::MAX_RENDER_REQUIREMENTS;
-use mirante4d_renderer::gpu::GpuRenderer;
+use mirante4d_render_wgpu::{qualify_adapter, renderer_device_descriptor};
 use mirante4d_settings::recommended_for_current_system;
 
 use crate::{
@@ -88,22 +88,11 @@ pub fn run_headless_smoke(
     )
     .map_err(|code| anyhow::anyhow!("smoke application state rejected: {code:?}"))?;
 
-    let gpu_renderer = if options.disable_gpu {
+    let gpu_adapter_summary = if options.disable_gpu {
         None
     } else {
-        let policy = resource_policy.current_runtime_adapter();
-        Some(GpuRenderer::new_with_cache_budgets_blocking(
-            policy.gpu_dense_cache_budget_bytes(),
-            policy.gpu_brick_cache_budget_bytes(),
-        )?)
+        Some(successor_gpu_adapter_summary()?)
     };
-    let gpu_adapter_summary = gpu_renderer.as_ref().map(|renderer| {
-        let adapter = renderer.adapter_diagnostics();
-        format!(
-            "{} {} {} driver={} {}",
-            adapter.backend, adapter.device_type, adapter.name, adapter.driver, adapter.driver_info
-        )
-    });
 
     load_current_requirements(&application, &mut opened, options.timeout)?;
     let (nonzero_pixels, max_value) =
@@ -159,8 +148,8 @@ pub fn run_headless_smoke(
     let report = AppSmokeReport {
         dataset_label: snapshot.catalog().label().to_owned(),
         layer_count: snapshot.catalog().len(),
-        frame_width: opened.render_runtime.render_viewport.width,
-        frame_height: opened.render_runtime.render_viewport.height,
+        frame_width: u64::from(opened.render_runtime.render_viewport.width_pixels()),
+        frame_height: u64::from(opened.render_runtime.render_viewport.height_pixels()),
         nonzero_pixels,
         max_value,
         displayed_scale_level: Some(opened.dataset.current_scale().get()),
@@ -171,6 +160,31 @@ pub fn run_headless_smoke(
     };
     opened.dataset.request_shutdown()?;
     Ok(report)
+}
+
+fn successor_gpu_adapter_summary() -> anyhow::Result<String> {
+    pollster::block_on(async {
+        let instance = eframe::wgpu::Instance::new(eframe::wgpu::InstanceDescriptor {
+            backends: eframe::wgpu::Backends::VULKAN,
+            ..eframe::wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = instance
+            .request_adapter(&eframe::wgpu::RequestAdapterOptions {
+                power_preference: eframe::wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("no Vulkan GPU adapter is available: {error}"))?;
+        qualify_adapter(&adapter)?;
+        let descriptor = renderer_device_descriptor(&adapter, "mirante4d-headless-smoke-device")?;
+        let (_device, _queue) = adapter.request_device(&descriptor).await?;
+        let info = adapter.get_info();
+        Ok(format!(
+            "{:?} {:?} {} driver={} {}",
+            info.backend, info.device_type, info.name, info.driver, info.driver_info
+        ))
+    })
 }
 
 fn load_current_requirements(
@@ -185,8 +199,8 @@ fn load_current_requirements(
         application_view(&snapshot),
         opened.render_runtime.presentation_viewport,
         render_extent_from_dimensions(
-            opened.render_runtime.render_viewport.width,
-            opened.render_runtime.render_viewport.height,
+            u64::from(opened.render_runtime.render_viewport.width_pixels()),
+            u64::from(opened.render_runtime.render_viewport.height_pixels()),
         )?,
         DatasetDemandPlanLimits::new(
             MAX_RENDER_REQUIREMENTS,

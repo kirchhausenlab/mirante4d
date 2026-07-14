@@ -239,7 +239,7 @@ impl MiranteWorkbenchApp {
         let available = ui.available_size();
         let ctx = ui.ctx().clone();
         self.sync_3d_viewport_for_display_size(&ctx, available);
-        let display_image = self.viewport_display_image(&ctx);
+        let display_image = self.viewport_display_image();
         let image_size = fit_size(display_image.size_vec2(), available);
         ui.centered_and_justified(|ui| {
             self.show_3d_viewport_image(
@@ -356,7 +356,7 @@ impl MiranteWorkbenchApp {
         let ctx = ui.ctx().clone();
         self.record_four_panel_viewport(&ctx, PanelId::ThreeD, available);
         self.sync_3d_viewport_for_display_size(&ctx, available);
-        let display_image = self.viewport_display_image(&ctx);
+        let display_image = self.viewport_display_image();
         let image_size = fit_size(display_image.size_vec2(), available);
         ui.centered_and_justified(|ui| {
             self.show_3d_viewport_image(
@@ -387,17 +387,32 @@ impl MiranteWorkbenchApp {
         if image_size == egui::Vec2::ZERO {
             return;
         }
-        let image = match display_image {
-            ViewportDisplayImage::Cpu(texture) => egui::Image::new(&texture),
-            ViewportDisplayImage::Gpu { texture_id, size } => {
-                egui::Image::from_texture((texture_id, size))
+        let response = match display_image {
+            ViewportDisplayImage::UiBackground { .. } => {
+                let (rect, response) =
+                    ui.allocate_exact_size(image_size, egui::Sense::click_and_drag());
+                ui.painter()
+                    .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+                let label = if self.render_runtime.render_backend == RenderBackend::Empty {
+                    "No visible data"
+                } else {
+                    "Loading…"
+                };
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    label,
+                    egui::FontId::proportional(18.0),
+                    ui.visuals().weak_text_color(),
+                );
+                response
             }
+            ViewportDisplayImage::Gpu { texture_id, size } => ui.add(
+                egui::Image::from_texture((texture_id, size))
+                    .fit_to_exact_size(image_size)
+                    .sense(egui::Sense::click_and_drag()),
+            ),
         };
-        let response = ui.add(
-            image
-                .fit_to_exact_size(image_size)
-                .sense(egui::Sense::click_and_drag()),
-        );
         let hover = viewport_hover_from_response(snapshot, view, &self.render_runtime, &response);
         if response.hovered() || view.layout() == CanonicalViewerLayout::Single3d {
             self.ui_runtime.hovered_pixel = hover;
@@ -535,17 +550,20 @@ impl MiranteWorkbenchApp {
         image_size: egui::Vec2,
         panel_id: PanelId,
     ) -> egui::Response {
-        let image = match display_image {
-            ViewportDisplayImage::Cpu(texture) => egui::Image::new(&texture),
-            ViewportDisplayImage::Gpu { texture_id, size } => {
-                egui::Image::from_texture((texture_id, size))
+        let response = match display_image {
+            ViewportDisplayImage::UiBackground { .. } => {
+                let (rect, response) =
+                    ui.allocate_exact_size(image_size, egui::Sense::click_and_drag());
+                ui.painter()
+                    .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+                response
             }
+            ViewportDisplayImage::Gpu { texture_id, size } => ui.add(
+                egui::Image::from_texture((texture_id, size))
+                    .fit_to_exact_size(image_size)
+                    .sense(egui::Sense::click_and_drag()),
+            ),
         };
-        let response = ui.add(
-            image
-                .fit_to_exact_size(image_size)
-                .sense(egui::Sense::click_and_drag()),
-        );
         response.widget_info(|| {
             egui::WidgetInfo::labeled(
                 egui::WidgetType::Other,

@@ -7,7 +7,6 @@ use crate::{
 use eframe::egui;
 use mirante4d_application::ApplicationSnapshot;
 use mirante4d_domain::{IsoShadingPolicy, RenderMode, SamplingPolicy};
-use mirante4d_renderer::gpu::GpuRenderer;
 
 pub(crate) fn visible_channel_fidelity_is_mixed(channels: &[ChannelFidelityStatus]) -> bool {
     let mut visible = channels.iter().filter(|channel| channel.visible);
@@ -204,9 +203,6 @@ pub(crate) fn render_backend_label(backend: RenderBackend) -> &'static str {
     match backend {
         RenderBackend::Loading => "loading",
         RenderBackend::Empty => "empty",
-        RenderBackend::CpuReference => "CPU dense",
-        RenderBackend::CpuResidentBricks => "CPU bricks",
-        RenderBackend::GpuResidentBricks => "GPU bricks",
         RenderBackend::GpuCameraMip => "GPU MIP",
         RenderBackend::GpuCameraIso => "GPU ISO",
         RenderBackend::GpuCameraDvr => "GPU DVR",
@@ -216,15 +212,20 @@ pub(crate) fn render_backend_label(backend: RenderBackend) -> &'static str {
 pub(crate) fn frame_viewport_label(fidelity: &FrameFidelityStatus) -> String {
     let render = format!(
         "{}x{} px",
-        fidelity.viewport.width, fidelity.viewport.height
+        fidelity.viewport.width_pixels(),
+        fidelity.viewport.height_pixels()
     );
     let presentation = format!(
         "{:.0}x{:.0} pt",
         fidelity.presentation_viewport.width_points(),
         fidelity.presentation_viewport.height_points()
     );
-    if (fidelity.presentation_viewport.width_points() - fidelity.viewport.width as f64).abs() < 0.5
-        && (fidelity.presentation_viewport.height_points() - fidelity.viewport.height as f64).abs()
+    if (fidelity.presentation_viewport.width_points() - f64::from(fidelity.viewport.width_pixels()))
+        .abs()
+        < 0.5
+        && (fidelity.presentation_viewport.height_points()
+            - f64::from(fidelity.viewport.height_pixels()))
+        .abs()
             < 0.5
     {
         render
@@ -245,25 +246,4 @@ pub(crate) fn iso_shading_policy_label(policy: IsoShadingPolicy) -> &'static str
         IsoShadingPolicy::GradientLighting => "Gradient lighting",
         IsoShadingPolicy::Flat => "Flat threshold hit",
     }
-}
-
-pub(crate) fn format_adapter_summary(renderer: &GpuRenderer) -> String {
-    let adapter = renderer.adapter_diagnostics();
-    let timestamp_status = match (
-        adapter.timestamp_queries_requested,
-        adapter.timestamp_queries_enabled,
-    ) {
-        (true, true) => "timestamps=enabled",
-        (true, false) => "timestamps=unavailable",
-        (false, _) => "timestamps=off",
-    };
-    format!(
-        "{} {} {} driver={} {} {}",
-        adapter.backend,
-        adapter.device_type,
-        adapter.name,
-        adapter.driver,
-        adapter.driver_info,
-        timestamp_status
-    )
 }

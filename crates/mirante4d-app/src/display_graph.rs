@@ -16,12 +16,6 @@ pub(crate) struct DisplayGraphChannel {
     pub(crate) render_state: RenderState,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct DisplayChannelModeIdentity {
-    pub(crate) layer: LogicalLayerKey,
-    pub(crate) render_state: RenderState,
-}
-
 impl DisplayGraph {
     pub(crate) fn from_snapshot(snapshot: &ApplicationSnapshot) -> Self {
         let channels = application_view(snapshot)
@@ -34,16 +28,6 @@ impl DisplayGraph {
             })
             .collect();
         Self { channels }
-    }
-
-    pub(crate) fn mode_identities(&self) -> Vec<DisplayChannelModeIdentity> {
-        self.channels
-            .iter()
-            .map(|channel| DisplayChannelModeIdentity {
-                layer: channel.layer,
-                render_state: channel.render_state,
-            })
-            .collect()
     }
 
     #[cfg(test)]
@@ -105,6 +89,5 @@ mod tests {
             vec![LogicalLayerKey::new(1)]
         );
         assert!(graph.is_mixed_mode());
-        assert_eq!(graph.mode_identities().len(), 2);
     }
 }

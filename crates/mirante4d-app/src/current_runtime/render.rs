@@ -1,22 +1,17 @@
-//! Current render/presentation facts retained only until WP-09B.
+//! Application-side state for successor GPU presentation.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
 use eframe::egui;
 use mirante4d_render_api::{
     FrameIdentity, PresentationToken, PresentationViewport, PresentedFrame, RenderExtent,
 };
 use mirante4d_render_wgpu::{ValidationCapture, ValidationCaptureTicket, WgpuRenderRuntime};
-use mirante4d_renderer::{
-    FrameDiagnostics, MipImageF32, MipImageU16, RenderViewport,
-    gpu::{GpuDisplayFrame, GpuRenderer},
-};
 
 use crate::{
-    ChannelFidelityStatus, CrossSectionPanelGpuDisplayFrame, CrossSectionRuntime,
-    DisplayRefreshTiming, FrameFidelityStatus, GpuDisplayedFrameIdentity, LodScheduleState,
-    RenderBackend, product_render_intent::ProductRenderRequest, retained_leases::RetainedLeases,
-    viewer_layout::PanelId,
+    ChannelFidelityStatus, CrossSectionRuntime, DisplayRefreshTiming, FrameFidelityStatus,
+    LodScheduleState, RenderBackend, product_render_intent::ProductRenderRequest,
+    retained_leases::RetainedLeases, viewer_layout::PanelId,
 };
 
 pub(crate) struct ProductPresentationTarget {
@@ -27,6 +22,7 @@ pub(crate) struct ProductPresentationTarget {
     pub(crate) pending_capture: Option<(PresentedFrame, ValidationCaptureTicket)>,
     pub(crate) completed_capture: Option<(PresentedFrame, ValidationCapture)>,
     pub(crate) texture_id: Option<egui::TextureId>,
+    pub(crate) partial_seen: bool,
 }
 
 pub(crate) struct ProductGpuRenderRuntime {
@@ -57,10 +53,9 @@ impl ProductGpuRenderRuntime {
     }
 }
 
-/// Temporary render/presentation owner scheduled for replacement in WP-09B.
 pub(crate) struct CurrentRenderRuntime {
     pub(crate) presentation_viewport: PresentationViewport,
-    pub(crate) render_viewport: RenderViewport,
+    pub(crate) render_viewport: RenderExtent,
     pub(crate) render_backend: RenderBackend,
     pub(crate) frame_fidelity: FrameFidelityStatus,
     pub(crate) channel_fidelity: Vec<ChannelFidelityStatus>,
@@ -69,17 +64,8 @@ pub(crate) struct CurrentRenderRuntime {
     pub(crate) playback_lod_downshift_active: bool,
     pub(crate) visible_brick_count: usize,
     pub(crate) visible_brick_plan_error: Option<String>,
-    pub(crate) diagnostics: FrameDiagnostics,
     pub(crate) cross_section_runtime: CrossSectionRuntime,
-    pub(crate) frame: MipImageU16,
-    pub(crate) frame_f32: Option<MipImageF32>,
-    pub(crate) texture: Option<egui::TextureHandle>,
-    pub(crate) gpu_display_frame: Option<GpuDisplayFrame>,
-    pub(crate) gpu_renderer: Option<Arc<GpuRenderer>>,
-    pub(crate) gpu_display_frame_identity: Option<GpuDisplayedFrameIdentity>,
     pub(crate) last_display_refresh_timing: Option<DisplayRefreshTiming>,
-    pub(crate) cross_section_gpu_display_frames:
-        BTreeMap<PanelId, CrossSectionPanelGpuDisplayFrame>,
     pub(crate) retained_leases: RetainedLeases,
     pub(crate) product_gpu: Option<ProductGpuRenderRuntime>,
 }
@@ -88,18 +74,15 @@ impl CurrentRenderRuntime {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn opened(
         presentation_viewport: PresentationViewport,
-        render_viewport: RenderViewport,
+        render_viewport: RenderExtent,
         frame_fidelity: FrameFidelityStatus,
         lod_schedule: LodScheduleState,
-        diagnostics: FrameDiagnostics,
         cross_section_runtime: CrossSectionRuntime,
-        frame: MipImageU16,
-        frame_f32: Option<MipImageF32>,
     ) -> Self {
         Self {
             presentation_viewport,
             render_viewport,
-            render_backend: RenderBackend::CpuReference,
+            render_backend: RenderBackend::Loading,
             frame_fidelity,
             channel_fidelity: Vec::new(),
             lod_schedule,
@@ -107,16 +90,8 @@ impl CurrentRenderRuntime {
             playback_lod_downshift_active: false,
             visible_brick_count: 0,
             visible_brick_plan_error: None,
-            diagnostics,
             cross_section_runtime,
-            frame,
-            frame_f32,
-            texture: None,
-            gpu_display_frame: None,
-            gpu_renderer: None,
-            gpu_display_frame_identity: None,
             last_display_refresh_timing: None,
-            cross_section_gpu_display_frames: BTreeMap::new(),
             retained_leases: RetainedLeases::new(),
             product_gpu: None,
         }

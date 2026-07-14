@@ -25,6 +25,15 @@ pub(crate) fn background_work_active(
         || import.import_task.is_some()
         || snapshot.transient().playback_active()
         || dataset.dispatcher().has_pending_work()
+        || render.product_gpu.as_ref().is_some_and(|product| {
+            product.targets.values().any(|target| {
+                (target.request.is_some() && target.presented.is_none())
+                    || target.presented.as_ref().is_some_and(|frame| {
+                        frame.progress().completeness()
+                            == mirante4d_render_api::FrameCompleteness::Progressive
+                    })
+            })
+        })
         || (crate::application_view(snapshot).layout() == ViewerLayout::FourPanel
             && render.cross_section_runtime.panels().any(|panel| {
                 panel.cross_section_schedule.is_some_and(|schedule| {

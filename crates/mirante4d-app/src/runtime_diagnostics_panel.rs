@@ -130,18 +130,27 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
             );
         }
     }
-    if let Some(renderer) = app.render_runtime.gpu_renderer.as_ref()
-        && let Ok(stats) = renderer.stats()
-    {
+    if let Some(product) = app.render_runtime.product_gpu.as_ref() {
+        let diagnostics = product.renderer.diagnostics();
         ui_kit::property_row(
             ui,
-            "GPU atlas",
+            "GPU residency",
             format!(
-                "{} / {} bytes, {} uploads, {} evictions",
-                stats.brick_atlas_resident_bytes,
-                stats.brick_atlas_cache_budget_bytes,
-                stats.brick_atlas_uploads,
-                stats.brick_atlas_evictions
+                "{} / {} bytes, {} frames, {} submissions",
+                diagnostics.resident_payload_bytes(),
+                diagnostics.payload_capacity_bytes(),
+                diagnostics.frames_executed(),
+                diagnostics.queue_submissions(),
+            ),
+        );
+        ui_kit::property_row(
+            ui,
+            "progressive frames",
+            format!(
+                "{} partial, {} settled, {} stale rejected",
+                product.current_partial_frames_presented,
+                product.partial_to_settled_transitions,
+                product.stale_frames_rejected,
             ),
         );
     }

@@ -6,8 +6,7 @@ use std::{
 use eframe::egui;
 use serde_json::{Value, json};
 
-use crate::image_compositing::color_image_for_snapshot;
-use crate::{MiranteWorkbenchApp, current_egui_shell_bridge, viewer_layout::PanelId};
+use crate::{MiranteWorkbenchApp, viewer_layout::PanelId};
 
 pub(crate) fn product_target_capture(
     app: &MiranteWorkbenchApp,
@@ -126,7 +125,6 @@ pub(crate) fn sanitize_artifact_label(raw: &str) -> String {
 pub(crate) fn capture_color_image(
     app: &mut MiranteWorkbenchApp,
 ) -> Result<(&'static str, egui::ColorImage), String> {
-    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
     if let Some(capture) = product_target_capture(app, PanelId::ThreeD) {
         let width = usize::try_from(capture.extent().width_pixels())
             .map_err(|_| "GPU display frame width does not fit in usize".to_owned())?;
@@ -147,16 +145,12 @@ pub(crate) fn capture_color_image(
     {
         return Err("current GPU validation capture is still pending".to_owned());
     }
-    Ok((
-        "loading_reference_color_image",
-        color_image_for_snapshot(&snapshot, &app.render_runtime),
-    ))
+    Err("no current GPU display frame is available".to_owned())
 }
 
 pub(crate) fn current_display_image_stats(
     app: &MiranteWorkbenchApp,
 ) -> Result<(&'static str, ProductAutomationImageStats), String> {
-    let snapshot = current_egui_shell_bridge::snapshot(&app.application);
     if let Some(capture) = product_target_capture(app, PanelId::ThreeD) {
         let width = usize::try_from(capture.extent().width_pixels())
             .map_err(|_| "GPU display frame width does not fit in usize".to_owned())?;
@@ -178,13 +172,7 @@ pub(crate) fn current_display_image_stats(
     {
         return Err("current GPU validation capture is still pending".to_owned());
     }
-    Ok((
-        "loading_reference_color_image",
-        ProductAutomationImageStats::from_color_image(&color_image_for_snapshot(
-            &snapshot,
-            &app.render_runtime,
-        )),
-    ))
+    Err("no current GPU display frame is available".to_owned())
 }
 
 pub(crate) fn color_image_from_rgba(

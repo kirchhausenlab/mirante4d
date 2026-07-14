@@ -14,7 +14,6 @@ members = [
     "crates/mirante4d-render-api",
     "crates/mirante4d-render-reference",
     "crates/mirante4d-render-wgpu",
-    "crates/mirante4d-renderer",
     "crates/mirante4d-settings",
     "crates/mirante4d-storage",
     "crates/xtask",
@@ -30,7 +29,6 @@ repository = "https://github.com/kirchhausenlab/mirante4d"
 
 [workspace.dependencies]
 anyhow = "1.0.103"
-approx = "0.5.1"
 bytemuck = "1.25.0"
 crc32c = "=0.6.8"
 eframe = { version = "0.34.3", default-features = false, features = ["accesskit", "default_fonts", "wayland", "web_screen_reader", "wgpu", "x11"] }
@@ -74,7 +72,6 @@ mirante4d-project-store = { path = "crates/mirante4d-project-store" }
 mirante4d-render-api = { path = "crates/mirante4d-render-api" }
 mirante4d-render-reference = { path = "crates/mirante4d-render-reference" }
 mirante4d-render-wgpu = { path = "crates/mirante4d-render-wgpu" }
-mirante4d-renderer = { path = "crates/mirante4d-renderer" }
 mirante4d-settings = { path = "crates/mirante4d-settings" }
 mirante4d-storage = { path = "crates/mirante4d-storage" }
 

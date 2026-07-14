@@ -2160,6 +2160,11 @@ impl ProductAutomationController {
                 "display_refresh_timing": app
                     .render_runtime.last_display_refresh_timing
                     .map(display_refresh_timing_json),
+                "progressive_presentation": app.render_runtime.product_gpu.as_ref().map(|product| json!({
+                    "current_partial_frames_presented": product.current_partial_frames_presented,
+                    "partial_to_settled_transitions": product.partial_to_settled_transitions,
+                    "stale_frames_rejected": product.stale_frames_rejected,
+                })),
             },
             "dataset_demand": {
                 "current_scale_level": app.dataset.current_scale().get(),

@@ -1,10 +1,7 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        mpsc::{self, Receiver},
-    },
+    sync::mpsc::{self, Receiver},
     thread,
     time::{Duration, Instant},
 };
@@ -23,11 +20,9 @@ mod dataset_demand_plan;
 mod dataset_requests;
 mod diagnostics;
 mod display_graph;
-mod display_identity;
 mod display_refresh;
 mod fidelity;
 mod histogram;
-mod image_compositing;
 mod import_ui;
 mod layer_state;
 mod lod_scheduler;
@@ -68,7 +63,6 @@ use analysis_workspace::{
 use cross_section_readout::cross_section_hover_readout_for_response;
 use cross_section_runtime::CrossSectionRuntime;
 pub use diagnostics::{StartupDiagnostics, collect_startup_diagnostics, default_log_path};
-use display_identity::GpuDisplayedFrameIdentity;
 use display_refresh::{DisplayRefreshTiming, ViewportDisplayImage, duration_ms};
 use eframe::egui;
 use fidelity::{
@@ -103,10 +97,10 @@ use mirante4d_domain::{
     CameraView, CrossSectionView, DisplayWindow, DvrOpacityTransfer as CanonicalDvrOpacityTransfer,
     IsoLightState, IsoShadingPolicy, LayerTransfer, RenderState as CanonicalRenderState, RgbColor,
     SamplingPolicy, ScaleLevel, TRANSFER_GAMMA_MAX, TRANSFER_GAMMA_MIN, TransferCurve,
-    UnitQuaternion, ViewerLayout as CanonicalViewerLayout, WorldPoint3,
+    UnitQuaternion, ViewerLayout as CanonicalViewerLayout,
 };
 #[cfg(test)]
-use mirante4d_domain::{IntensityDType, RenderMode, Shape3D, TimeIndex};
+use mirante4d_domain::{IntensityDType, Shape3D, TimeIndex};
 use mirante4d_import_pipeline::{
     ImportCancellation, ImportError, ImportOptions, ImportReceipt, TiffInspection, TiffSource,
     spawn_tiff_import_worker, spawn_tiff_inspection_worker,
@@ -120,16 +114,11 @@ use mirante4d_project_store::{
 };
 use mirante4d_render_api::PresentationViewport;
 use mirante4d_render_wgpu::{WgpuRenderRuntime, WgpuRenderRuntimeConfig};
-use mirante4d_renderer::gpu::{GpuDisplayFrame, GpuRenderer};
-#[cfg(test)]
-use mirante4d_renderer::{PixelCoverage, RenderViewport};
 use mirante4d_settings::{RejectedFileDisposition, ResourcePolicy, recommended_for_current_system};
 use playback::playback_status_label;
 #[cfg(test)]
 use playback::stepped_timepoint;
 use product_automation::{ProductAutomationAppUpdateTiming, ProductAutomationController};
-#[cfg(test)]
-use render_state::placeholder_frame_for_mode;
 use render_state::{set_presentation_viewport, set_render_viewport, take_lod_replan_pending};
 pub use smoke::{AppSmokeOptions, AppSmokeReport, PlaybackSmokeFrame, run_headless_smoke};
 pub use state::{
@@ -526,12 +515,6 @@ pub struct MiranteWorkbenchApp {
     pending_automatic_source_verification: Option<SourceSessionGeneration>,
 }
 
-struct CrossSectionPanelGpuDisplayFrame {
-    generation: u64,
-    frame: GpuDisplayFrame,
-    texture_id: egui::TextureId,
-}
-
 impl MiranteWorkbenchApp {
     pub fn open_dataset(
         cc: &eframe::CreationContext<'_>,
@@ -566,7 +549,6 @@ impl MiranteWorkbenchApp {
             resource_policy,
         )
         .map_err(|code| anyhow::anyhow!("initial application state rejected: {code:?}"))?;
-        let runtime_policy = resource_policy.current_runtime_adapter();
         let render_state = cc
             .wgpu_render_state
             .as_ref()
@@ -2503,7 +2485,6 @@ impl MiranteWorkbenchApp {
             analysis_runtime,
         } = transfer;
         self.clear_product_presentations();
-        render_runtime.gpu_renderer = self.render_runtime.gpu_renderer.clone();
         render_runtime.product_gpu = self.render_runtime.product_gpu.take();
         let old_dataset = std::mem::replace(&mut self.dataset, dataset);
         let old_render_runtime = std::mem::replace(&mut self.render_runtime, render_runtime);
@@ -2631,20 +2612,18 @@ impl MiranteWorkbenchApp {
             self.ui_runtime.hovered_source_readout = None;
             self.ui_runtime.viewport_orbit_drag = None;
             if next_view.layout() == CanonicalViewerLayout::Single3d {
-                self.retire_cross_section_gpu_display_texture_ids();
+                self.clear_cross_section_product_presentations();
                 self.render_runtime
                     .cross_section_runtime
                     .mark_cross_section_panels_dirty();
             }
         }
         if source_selection_changed {
-            self.clear_gpu_display_frame();
-            self.retire_gpu_display_texture_id();
+            self.clear_3d_product_presentation();
             self.request_visible_bricks();
         } else {
             self.invalidate_cross_section_panel_display_frames();
-            self.clear_gpu_display_frame();
-            self.retire_gpu_display_texture_id();
+            self.clear_3d_product_presentation();
             if let Err(error) = self.rerender_display_state() {
                 tracing::error!(%error, "failed to render the accepted canonical view");
                 self.dataset.record_plan_error(error.to_string());

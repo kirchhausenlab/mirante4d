@@ -594,7 +594,6 @@ fn display_refresh_timing_json_uses_stable_phase_taxonomy() {
         gpu_compute_ms: Some(9.5),
         egui_texture_ms: 1.25,
         visible_brick_request_ms: 2.0,
-        cpu_texture_update_ms: 0.5,
         total_ms: 14.0,
     };
 
@@ -760,7 +759,6 @@ fn display_refresh_timing_summary_reports_phase_percentiles() {
                 gpu_compute_ms: Some(7.0),
                 egui_texture_ms: 1.0,
                 visible_brick_request_ms: 2.0,
-                cpu_texture_update_ms: 0.0,
                 total_ms: 9.0,
             },
         },
@@ -769,13 +767,12 @@ fn display_refresh_timing_summary_reports_phase_percentiles() {
             command: "camera_pan",
             event_epoch_ms: 20,
             timing: DisplayRefreshTiming {
-                path: crate::display_refresh::DisplayRefreshPath::CpuTexture,
+                path: crate::display_refresh::DisplayRefreshPath::UiBackground,
                 render_ms: 11.0,
                 gpu_upload_ms: None,
                 gpu_compute_ms: None,
                 egui_texture_ms: 0.5,
                 visible_brick_request_ms: 3.0,
-                cpu_texture_update_ms: 5.0,
                 total_ms: 19.0,
             },
         },
@@ -790,7 +787,6 @@ fn display_refresh_timing_summary_reports_phase_percentiles() {
                 gpu_compute_ms: Some(12.0),
                 egui_texture_ms: 1.5,
                 visible_brick_request_ms: 4.0,
-                cpu_texture_update_ms: 0.0,
                 total_ms: 17.0,
             },
         },
@@ -822,7 +818,7 @@ fn display_refresh_timing_summary_reports_phase_percentiles() {
     );
     assert_eq!(summary["sample_count"], 3);
     assert_eq!(summary["path_counts"]["gpu display"], 2);
-    assert_eq!(summary["path_counts"]["cpu texture"], 1);
+    assert_eq!(summary["path_counts"]["ui background"], 1);
     assert_eq!(summary["phases_ms"]["render"]["p50"], 6.0);
     assert_eq!(summary["phases_ms"]["render"]["p95"], 11.0);
     assert_eq!(summary["phases_ms"]["gpu_upload"]["sample_count"], 2);
@@ -849,7 +845,6 @@ fn input_to_present_timing_summary_reports_proxy_latency_percentiles() {
                 gpu_compute_ms: Some(7.0),
                 egui_texture_ms: 1.0,
                 visible_brick_request_ms: 2.0,
-                cpu_texture_update_ms: 0.0,
                 total_ms: 9.0,
             },
         },
@@ -859,13 +854,12 @@ fn input_to_present_timing_summary_reports_proxy_latency_percentiles() {
             event_epoch_ms: 20,
             latency_ms: 32.0,
             display_refresh_timing: DisplayRefreshTiming {
-                path: crate::display_refresh::DisplayRefreshPath::CpuTexture,
+                path: crate::display_refresh::DisplayRefreshPath::UiBackground,
                 render_ms: 11.0,
                 gpu_upload_ms: None,
                 gpu_compute_ms: None,
                 egui_texture_ms: 0.5,
                 visible_brick_request_ms: 3.0,
-                cpu_texture_update_ms: 5.0,
                 total_ms: 19.0,
             },
         },
@@ -881,7 +875,6 @@ fn input_to_present_timing_summary_reports_proxy_latency_percentiles() {
                 gpu_compute_ms: Some(12.0),
                 egui_texture_ms: 1.5,
                 visible_brick_request_ms: 4.0,
-                cpu_texture_update_ms: 0.0,
                 total_ms: 17.0,
             },
         },
@@ -903,7 +896,7 @@ fn input_to_present_timing_summary_reports_proxy_latency_percentiles() {
     assert_eq!(summary["latency_ms"]["p50"], 24.0);
     assert_eq!(summary["latency_ms"]["p95"], 32.0);
     assert_eq!(summary["path_counts"]["gpu display"], 2);
-    assert_eq!(summary["path_counts"]["cpu texture"], 1);
+    assert_eq!(summary["path_counts"]["ui background"], 1);
     assert_eq!(summary["command_counts"]["camera_orbit"], 2);
     assert_eq!(summary["command_counts"]["camera_pan"], 1);
 }

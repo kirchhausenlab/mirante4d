@@ -239,10 +239,6 @@ impl DatasetDemandState {
         &self.dispatcher
     }
 
-    pub(crate) fn cpu_ledger(&self) -> &dyn CpuByteLedger {
-        self.cpu_ledger.as_ref()
-    }
-
     pub(crate) fn cpu_ledger_arc(&self) -> Arc<dyn CpuByteLedger> {
         Arc::clone(&self.cpu_ledger)
     }
@@ -346,17 +342,6 @@ impl DatasetDemandState {
         self.requirements_by_scope
             .get(&scope)
             .map_or(&[], |resources| resources.as_ref())
-    }
-
-    pub(crate) fn scope_layer_scale(
-        &self,
-        scope: u64,
-        layer: mirante4d_domain::LogicalLayerKey,
-    ) -> Option<ScaleLevel> {
-        self.layer_scales_by_scope
-            .get(&scope)
-            .and_then(|scales| scales.get(&layer))
-            .copied()
     }
 
     pub(crate) fn submit_scope(
