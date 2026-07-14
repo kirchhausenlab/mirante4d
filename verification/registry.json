@@ -31,6 +31,13 @@
       "warn_ms": 5000,
       "terminate_ms": 40000,
       "reason": "The real-process Purge crash matrix spawns 32 child processes and performs filesystem syncs; public hosted runners can exceed the 20-second contract-lane default, so only its termination ceiling is 40 seconds."
+    },
+    {
+      "selector": "(package(mirante4d-app) & test(=tests::analysis_only_source_failure_invalidates_the_verified_source)) | (package(mirante4d-app) & test(=tests::exact_analyses_cancel_save_and_reopen_atomically))",
+      "warn_ms": 2000,
+      "terminate_ms": 10000,
+      "threads_required": "num-test-threads",
+      "reason": "These two product integrations start real dataset, verification, and project-store actors. Reserve the four test slots so concurrent importer and storage contracts cannot starve their worker threads; retain the normal 10-second UI ceiling."
     }
   ],
   "lanes": [

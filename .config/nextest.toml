@@ -21,6 +21,11 @@ filter = 'package(mirante4d-project-store) & test(=actor::tests::purge_fresh_pro
 slow-timeout = { period = "5s", terminate-after = 8 }
 
 [[profile.default.overrides]]
+filter = '(package(mirante4d-app) & test(=tests::analysis_only_source_failure_invalidates_the_verified_source)) | (package(mirante4d-app) & test(=tests::exact_analyses_cancel_save_and_reopen_atomically))'
+threads-required = "num-test-threads"
+slow-timeout = { period = "2s", terminate-after = 5 }
+
+[[profile.default.overrides]]
 filter = 'package(mirante4d-analysis-core) | package(mirante4d-analysis-runtime) | package(mirante4d-application) | package(mirante4d-data) | package(mirante4d-dataset) | package(mirante4d-dataset-runtime) | package(mirante4d-domain) | package(mirante4d-identity) | package(mirante4d-project-model) | package(mirante4d-render-api) | package(mirante4d-render-reference) | package(mirante4d-render-wgpu) | package(mirante4d-renderer) | package(mirante4d-settings) | package(xtask)'
 test-group = 'unit'
 slow-timeout = { period = "500ms", terminate-after = 4 }
