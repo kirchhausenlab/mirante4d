@@ -5,11 +5,11 @@ Last reviewed: 2026-07-13
 Current technical sequence: WP-10B, WP-11, then the remaining packages below
 Public-data publication: deferred to a separate future handoff
 WP-10B predecessor: `foundation-wp-09a-exit-1`
-Completed through: WP-09A at `foundation-wp-09a-exit-1`
-Current checkpoint: WP-10B B2 is accepted on protected main at
-`4a246a1bb7bfe099673ef10d6cb5951729b3ff37`
-Next protected-branch checkpoint: WP-10B B3 source verification and application
-integration; its implementation candidate is under validation, not yet accepted
+Completed through: WP-10B B3 at
+`8fdd94dc9c60406e8de8a96749d7148d38b1dc7a`
+Current checkpoint: WP-10B B4 product-persistence cutover candidate
+Next protected-branch checkpoint: accept B4 and exit WP-10B after exact clean
+public, trusted-local, and real-display evidence
 
 ## Purpose
 
@@ -186,6 +186,11 @@ target conformance package at `9b3a81d79a50027c0a8ddedc535021809a99d928`
 WP-09A accepted the bounded off-product progressive Vulkan runtime and
 independent CPU reference at `1b1e7d5534f29b010cc346d434811a3906fb40e1`
 (`foundation-wp-09a-exit-1`) before WP-10B entry work began.
+WP-10B B3 accepted source verification and application integration at
+`8fdd94dc9c60406e8de8a96749d7148d38b1dc7a`. The B4 candidate makes the
+successor service the sole product project route and deletes its predecessor;
+its qualifying evidence, protected-main acceptance, and WP-10B exit remain
+pending.
 
 ## Dataset And Fixture Boundary
 

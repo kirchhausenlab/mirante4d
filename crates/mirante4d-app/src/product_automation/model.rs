@@ -214,6 +214,23 @@ pub(super) enum ProductAutomationCommand {
     OpenDataset {
         path: PathBuf,
     },
+    NewProject,
+    InitialSaveWithEdit {
+        path: PathBuf,
+    },
+    OpenProject {
+        path: PathBuf,
+    },
+    RecoverAutomaticAutosave,
+    SaveProjectAs {
+        path: PathBuf,
+    },
+    CloseProjectStore,
+    WriteExternalKillCheckpoint {
+        path: PathBuf,
+        stage: String,
+    },
+    HoldForExternalKill,
     CancelSourceVerification,
     RequestSourceVerification,
     WaitFor {
@@ -221,6 +238,10 @@ pub(super) enum ProductAutomationCommand {
         timeout_ms: u64,
     },
     SetViewportSize {
+        width: u32,
+        height: u32,
+    },
+    SetMappedClientPixels {
         width: u32,
         height: u32,
     },
@@ -338,10 +359,19 @@ impl ProductAutomationCommand {
     pub(super) fn name(&self) -> &'static str {
         match self {
             Self::OpenDataset { .. } => "open_dataset",
+            Self::NewProject => "new_project",
+            Self::InitialSaveWithEdit { .. } => "initial_save_with_edit",
+            Self::OpenProject { .. } => "open_project",
+            Self::RecoverAutomaticAutosave => "recover_automatic_autosave",
+            Self::SaveProjectAs { .. } => "save_project_as",
+            Self::CloseProjectStore => "close_project_store",
+            Self::WriteExternalKillCheckpoint { .. } => "write_external_kill_checkpoint",
+            Self::HoldForExternalKill => "hold_for_external_kill",
             Self::CancelSourceVerification => "cancel_source_verification",
             Self::RequestSourceVerification => "request_source_verification",
             Self::WaitFor { .. } => "wait_for",
             Self::SetViewportSize { .. } => "set_viewport_size",
+            Self::SetMappedClientPixels { .. } => "set_mapped_client_pixels",
             Self::SetRenderTargetSize { .. } => "set_render_target_size",
             Self::SetViewerLayout { .. } => "set_viewer_layout",
             Self::SetTimepoint { .. } => "set_timepoint",
@@ -385,6 +415,10 @@ pub(super) enum ProductAutomationWaitCondition {
     GpuFramePresented,
     SourceVerificationRequired,
     SourceVerificationVerified,
+    ProjectStoreIdle,
+    ProjectAutosaved,
+    RecoveryReviewRequired,
+    ProjectStoreClosed,
 }
 
 impl ProductAutomationWaitCondition {
@@ -398,7 +432,21 @@ impl ProductAutomationWaitCondition {
             Self::GpuFramePresented => "gpu_frame_presented",
             Self::SourceVerificationRequired => "source_verification_required",
             Self::SourceVerificationVerified => "source_verification_verified",
+            Self::ProjectStoreIdle => "project_store_idle",
+            Self::ProjectAutosaved => "project_autosaved",
+            Self::RecoveryReviewRequired => "recovery_review_required",
+            Self::ProjectStoreClosed => "project_store_closed",
         }
+    }
+
+    pub(super) const fn is_passive(self) -> bool {
+        matches!(
+            self,
+            Self::ProjectStoreIdle
+                | Self::ProjectAutosaved
+                | Self::RecoveryReviewRequired
+                | Self::ProjectStoreClosed
+        )
     }
 }
 
@@ -463,6 +511,15 @@ pub(super) enum ProductAutomationAssertCondition {
         width: u64,
         height: u64,
     },
+    ProjectState {
+        bound: bool,
+        dirty: bool,
+        lifecycle: ProductAutomationProjectStoreLifecycle,
+        can_save: bool,
+        can_save_as: bool,
+        manual: bool,
+        autosave: bool,
+    },
 }
 
 impl ProductAutomationAssertCondition {
@@ -486,6 +543,7 @@ impl ProductAutomationAssertCondition {
             Self::CrossSectionRetired => "cross_section_retired",
             Self::SourceVerificationEvidence { .. } => "source_verification_evidence",
             Self::RenderTargetPixels { .. } => "render_target_pixels",
+            Self::ProjectState { .. } => "project_state",
         }
     }
 
@@ -499,6 +557,32 @@ impl ProductAutomationAssertCondition {
                 | Self::FourPanelImagesDistinct { .. }
                 | Self::CrossSectionRetired
         )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProductAutomationProjectStoreLifecycle {
+    Unbound,
+    Provisional,
+    Established,
+    RecoveryOnly,
+    RecoverySelected,
+    Closing,
+    Closed,
+}
+
+impl ProductAutomationProjectStoreLifecycle {
+    pub(super) const fn name(self) -> &'static str {
+        match self {
+            Self::Unbound => "unbound",
+            Self::Provisional => "provisional",
+            Self::Established => "established",
+            Self::RecoveryOnly => "recovery_only",
+            Self::RecoverySelected => "recovery_selected",
+            Self::Closing => "closing",
+            Self::Closed => "closed",
+        }
     }
 }
 

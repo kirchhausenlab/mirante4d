@@ -82,15 +82,26 @@ MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
 
 This lane is local-only and is not a GitHub Actions requirement.
 
-Run the B3 current-source verification scenario on a real mapped display with:
+The accepted B3 current-source verification support scenario remains available:
 
 ```bash
 cargo xtask product-validate b3_source_verification
 ```
 
-This produces supporting E1 evidence. B3 validation also observes the mapped
-physical client area externally at 1280x720 and 1920x1080; successor project
-save, autosave, and recovery remain B4 work.
+For the B4 candidate, run both commands from the same clean committed revision
+on the trusted Linux/X11 workstation:
+
+```bash
+MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
+  cargo xtask verify-local project-store-lifecycle
+
+MIRANTE4D_PRODUCT_VALIDATE_PROJECT_STORE_LIFECYCLE_REPORT=<report.json> \
+  cargo xtask product-validate b4_project_persistence
+```
+
+Replace `<report.json>` with the aggregate emitted by the first command. The
+validator requires that report's exact clean commit and tree, a real X11
+display, and the externally observed 1280x720 and 1920x1080 client sizes.
 
 ## Working Rules
 

@@ -8,6 +8,12 @@
 
 mod project_store_service;
 
+pub use project_store_service::{
+    MonotonicClock, ProjectRecoveryStoreLocator, ProjectStoreApplicationService,
+    ProjectStoreLifecycle, ProjectStoreServiceError, ProjectStoreServiceEvent,
+    ProjectStoreServiceStatus, SystemMonotonicClock,
+};
+
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
@@ -267,6 +273,8 @@ pub enum OperationKind {
     SourceVerification,
     ProjectOpen,
     ProjectSave,
+    ProjectSaveAs,
+    ProjectRecovery,
     Analysis,
     Import,
 }
@@ -280,6 +288,7 @@ pub struct OperationToken {
     source_session_generation: SourceSessionGeneration,
     project_id: Option<ProjectId>,
     project_revision: Option<ProjectRevisionId>,
+    target_project_id: Option<ProjectId>,
     currentness_generation: CurrentnessGeneration,
 }
 
@@ -310,6 +319,10 @@ impl OperationToken {
 
     pub const fn project_revision(&self) -> Option<ProjectRevisionId> {
         self.project_revision
+    }
+
+    pub const fn target_project_id(&self) -> Option<ProjectId> {
+        self.target_project_id
     }
 
     pub const fn currentness_generation(&self) -> CurrentnessGeneration {
@@ -357,6 +370,16 @@ pub enum OperationFailureCode {
     ProjectReadFailed,
     ProjectWriteFailed,
     ProjectCommitIndeterminate,
+    ProjectReadOnly,
+    ProjectWriterContended,
+    ProjectStaleParent,
+    ProjectDestinationExists,
+    ProjectUnsupportedFilesystem,
+    ProjectCapacityExceeded,
+    ProjectSourceChanged,
+    ProjectDigestMismatch,
+    ProjectCorrupt,
+    ProjectBusy,
     AnalysisInvalidInput,
     AnalysisCapacityExceeded,
     AnalysisExecutionFailed,
@@ -387,6 +410,8 @@ pub enum OperationCompletion {
     ArtifactReady(Box<ArtifactReference>),
     ProjectOpened(Box<ProjectGenerationProjection>),
     ProjectSaved(ProjectRevisionId),
+    ProjectSavedAs(Box<ProjectGenerationProjection>),
+    ProjectRecovered(Box<ProjectGenerationProjection>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -525,6 +550,10 @@ pub enum ApplicationCommand {
     Redo,
     RequestProjectOpen,
     RequestProjectSave,
+    RequestProjectSaveAs {
+        new_project_id: ProjectId,
+    },
+    RequestProjectRecovery,
     BeginOperation(OperationKind),
     CompleteOperation {
         token: OperationToken,
@@ -574,6 +603,8 @@ pub enum ApplicationCommandKind {
     Redo,
     RequestProjectOpen,
     RequestProjectSave,
+    RequestProjectSaveAs,
+    RequestProjectRecovery,
     BeginOperation,
     CompleteOperation,
     CancelOperation,
@@ -621,6 +652,8 @@ impl ApplicationCommand {
             Self::Redo => ApplicationCommandKind::Redo,
             Self::RequestProjectOpen => ApplicationCommandKind::RequestProjectOpen,
             Self::RequestProjectSave => ApplicationCommandKind::RequestProjectSave,
+            Self::RequestProjectSaveAs { .. } => ApplicationCommandKind::RequestProjectSaveAs,
+            Self::RequestProjectRecovery => ApplicationCommandKind::RequestProjectRecovery,
             Self::BeginOperation(_) => ApplicationCommandKind::BeginOperation,
             Self::CompleteOperation { .. } => ApplicationCommandKind::CompleteOperation,
             Self::CancelOperation(_) => ApplicationCommandKind::CancelOperation,
@@ -631,6 +664,38 @@ impl ApplicationCommand {
                 ApplicationCommandKind::CompleteResourcePolicyPersistence
             }
         }
+    }
+
+    fn mutates_durable_project(&self) -> bool {
+        matches!(
+            self,
+            Self::AttachVerifiedDataset
+                | Self::SetActiveLayer(_)
+                | Self::SetTimepoint(_)
+                | Self::SetLayerView(_)
+                | Self::ReplaceView(_)
+                | Self::SetCamera(_)
+                | Self::SetLayout { .. }
+                | Self::SetIsoLight(_)
+                | Self::SetLayerOrder(_)
+                | Self::UpsertChannelPreset(_)
+                | Self::RemoveChannelPreset(_)
+                | Self::ApplyChannelPreset(_)
+                | Self::UpsertArtifact(_)
+                | Self::RemoveArtifact(_)
+                | Self::AdvancePlaybackTick(_)
+                | Self::Undo
+                | Self::Redo
+                | Self::RequestProjectOpen
+                | Self::RequestProjectSave
+                | Self::RequestProjectSaveAs { .. }
+                | Self::RequestProjectRecovery
+                | Self::BeginOperation(_)
+                | Self::CompleteOperation {
+                    completion: OperationCompletion::ArtifactReady(_),
+                    ..
+                }
+        )
     }
 }
 
@@ -753,7 +818,22 @@ pub enum ApplicationEvent {
         token: OperationToken,
         projection: Arc<ProjectGenerationProjection>,
     },
+    ProjectSaveAsRequested {
+        token: OperationToken,
+        projection: Arc<ProjectGenerationProjection>,
+    },
+    ProjectRecoveryRequested {
+        token: OperationToken,
+    },
     ProjectSaved {
+        revision: ProjectRevisionId,
+    },
+    ProjectSavedAs {
+        project_id: ProjectId,
+        revision: ProjectRevisionId,
+    },
+    ProjectRecovered {
+        project_id: ProjectId,
         revision: ProjectRevisionId,
     },
     OperationStarted {
@@ -790,6 +870,8 @@ pub enum OperationOutcome {
     ArtifactAdmitted,
     ProjectOpened,
     ProjectSaved,
+    ProjectSavedAs,
+    ProjectRecovered,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -907,6 +989,62 @@ impl BoundWorkspace {
         ))
     }
 
+    fn replaced_by_durable_projection(projection: ProjectGenerationProjection) -> Self {
+        let (revision, high_water, state) = projection.into_parts();
+        Self {
+            history: VecDeque::from([HistoryEntry {
+                revision,
+                state: Arc::new(state),
+            }]),
+            cursor: 0,
+            high_water,
+            saved_revision: Some(revision),
+        }
+    }
+
+    fn recovered_for_verified_source(
+        projection: ProjectGenerationProjection,
+        verified_source: &DatasetReference,
+        expected_project_id: Option<ProjectId>,
+    ) -> Result<Self, ApplicationFaultCode> {
+        let (recovered_revision, mut high_water, state) = projection.into_parts();
+        if expected_project_id.is_some_and(|expected| state.project_id() != expected) {
+            return Err(ApplicationFaultCode::InvalidProjectTransition);
+        }
+        if !state.dataset().has_same_scientific_content(verified_source) {
+            return Err(ApplicationFaultCode::DatasetIdentityMismatch);
+        }
+
+        let (revision, state) = if state.dataset() == verified_source {
+            (recovered_revision, state)
+        } else {
+            let rebound = ProjectState::new(
+                state.project_id(),
+                verified_source.clone(),
+                state.view().clone(),
+                state.channel_presets().to_vec(),
+                state.artifacts().to_vec(),
+            )
+            .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)?;
+            let revision = high_water
+                .allocate_after(recovered_revision)
+                .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)?;
+            (revision, rebound)
+        };
+
+        Ok(Self {
+            history: VecDeque::from([HistoryEntry {
+                revision,
+                state: Arc::new(state),
+            }]),
+            cursor: 0,
+            high_water,
+            // A selected recovery is an unsaved branch even when its dataset
+            // reference, including its locator, is already exact.
+            saved_revision: None,
+        })
+    }
+
     fn current(&self) -> &HistoryEntry {
         &self.history[self.cursor]
     }
@@ -963,6 +1101,7 @@ enum Workspace {
 #[derive(Debug, Clone, PartialEq)]
 struct ActiveOperation {
     token: OperationToken,
+    retained_projection: Option<Arc<ProjectGenerationProjection>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1122,6 +1261,17 @@ impl ApplicationState {
         command: ApplicationCommand,
         command_kind: ApplicationCommandKind,
     ) -> Result<CommandEffect, ApplicationFaultCode> {
+        let durable_project_freeze_active = self.operations.values().any(|operation| {
+            matches!(
+                operation.token.kind,
+                OperationKind::DatasetOpen
+                    | OperationKind::ProjectSaveAs
+                    | OperationKind::ProjectRecovery
+            )
+        });
+        if durable_project_freeze_active && command.mutates_durable_project() {
+            return Err(ApplicationFaultCode::OperationConflict);
+        }
         match command {
             ApplicationCommand::RequestDatasetOpen => self.request_dataset_open(),
             ApplicationCommand::RequestSourceVerification => self.request_source_verification(),
@@ -1192,6 +1342,10 @@ impl ApplicationState {
             ApplicationCommand::Redo => self.move_history(command_kind, true),
             ApplicationCommand::RequestProjectOpen => self.request_project_open(),
             ApplicationCommand::RequestProjectSave => self.request_project_save(),
+            ApplicationCommand::RequestProjectSaveAs { new_project_id } => {
+                self.request_project_save_as(new_project_id)
+            }
+            ApplicationCommand::RequestProjectRecovery => self.request_project_recovery(),
             ApplicationCommand::BeginOperation(kind) => {
                 if matches!(
                     kind,
@@ -1199,6 +1353,8 @@ impl ApplicationState {
                         | OperationKind::SourceVerification
                         | OperationKind::ProjectOpen
                         | OperationKind::ProjectSave
+                        | OperationKind::ProjectSaveAs
+                        | OperationKind::ProjectRecovery
                 ) {
                     return Err(ApplicationFaultCode::InvalidProjectTransition);
                 }
@@ -1318,9 +1474,12 @@ impl ApplicationState {
             .filter_map(|(operation_id, operation)| {
                 matches!(
                     operation.token.kind,
-                    OperationKind::SourceVerification
+                    OperationKind::DatasetOpen
+                        | OperationKind::SourceVerification
                         | OperationKind::ProjectOpen
                         | OperationKind::ProjectSave
+                        | OperationKind::ProjectSaveAs
+                        | OperationKind::ProjectRecovery
                 )
                 .then_some(*operation_id)
             })
@@ -1847,16 +2006,22 @@ impl ApplicationState {
         if self.verified_source.is_none() {
             return Err(ApplicationFaultCode::IdentityVerificationRequired);
         }
-        if self
-            .operations
-            .values()
-            .any(|operation| operation.token.kind == OperationKind::ProjectSave)
-        {
+        if self.operations.values().any(|operation| {
+            matches!(
+                operation.token.kind,
+                OperationKind::ProjectSave
+                    | OperationKind::ProjectSaveAs
+                    | OperationKind::ProjectRecovery
+            )
+        }) {
             return Err(ApplicationFaultCode::OperationConflict);
         }
         let Workspace::Bound(bound) = &self.workspace else {
             return Err(ApplicationFaultCode::IdentityVerificationRequired);
         };
+        if !bound.dirty() {
+            return Ok(CommandEffect::NoChange);
+        }
         let projection = ProjectGenerationProjection::new(
             bound.current_revision(),
             bound.high_water.clone(),
@@ -1868,6 +2033,77 @@ impl ApplicationState {
             token,
             projection: Arc::new(projection),
         })?;
+        Ok(CommandEffect::Changed)
+    }
+
+    fn request_project_save_as(
+        &mut self,
+        new_project_id: ProjectId,
+    ) -> Result<CommandEffect, ApplicationFaultCode> {
+        let verified_source = self
+            .verified_source
+            .as_ref()
+            .ok_or(ApplicationFaultCode::IdentityVerificationRequired)?;
+        if !self.operations.is_empty() {
+            return Err(ApplicationFaultCode::OperationConflict);
+        }
+        let Workspace::Bound(bound) = &self.workspace else {
+            return Err(ApplicationFaultCode::WorkspaceUnbound);
+        };
+        if new_project_id == bound.current_state().project_id()
+            || !bound
+                .current_state()
+                .dataset()
+                .has_same_scientific_content(verified_source)
+        {
+            return Err(ApplicationFaultCode::InvalidProjectTransition);
+        }
+        let state = ProjectState::new(
+            new_project_id,
+            bound.current_state().dataset().clone(),
+            bound.current_state().view().clone(),
+            bound.current_state().channel_presets().to_vec(),
+            bound.current_state().artifacts().to_vec(),
+        )
+        .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)?;
+        let projection = Arc::new(
+            ProjectGenerationProjection::new(
+                ProjectRevisionId::initial(new_project_id),
+                ProjectRevisionHighWater::initial(new_project_id),
+                state,
+            )
+            .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)?,
+        );
+        let token = self.create_operation(OperationKind::ProjectSaveAs)?;
+        let operation = self
+            .operations
+            .get_mut(&token.operation_id)
+            .ok_or(ApplicationFaultCode::OperationNotFound)?;
+        operation.token.target_project_id = Some(new_project_id);
+        operation.retained_projection = Some(Arc::clone(&projection));
+        let token = operation.token.clone();
+        self.push_event(ApplicationEvent::ProjectSaveAsRequested { token, projection })?;
+        Ok(CommandEffect::Changed)
+    }
+
+    fn request_project_recovery(&mut self) -> Result<CommandEffect, ApplicationFaultCode> {
+        let verified_source = self
+            .verified_source
+            .as_ref()
+            .ok_or(ApplicationFaultCode::IdentityVerificationRequired)?;
+        if !self.operations.is_empty() {
+            return Err(ApplicationFaultCode::OperationConflict);
+        }
+        if let Workspace::Bound(bound) = &self.workspace
+            && !bound
+                .current_state()
+                .dataset()
+                .has_same_scientific_content(verified_source)
+        {
+            return Err(ApplicationFaultCode::DatasetIdentityMismatch);
+        }
+        let token = self.create_operation(OperationKind::ProjectRecovery)?;
+        self.push_event(ApplicationEvent::ProjectRecoveryRequested { token })?;
         Ok(CommandEffect::Changed)
     }
 
@@ -1917,12 +2153,14 @@ impl ApplicationState {
             source_session_generation: self.source_generation,
             project_id,
             project_revision,
+            target_project_id: None,
             currentness_generation: self.currentness,
         };
         self.operations.insert(
             operation_id,
             ActiveOperation {
                 token: token.clone(),
+                retained_projection: None,
             },
         );
         Ok(token)
@@ -2063,6 +2301,74 @@ impl ApplicationState {
                 bound.saved_revision = Some(revision);
                 self.push_event(ApplicationEvent::ProjectSaved { revision })?;
                 OperationOutcome::ProjectSaved
+            }
+            OperationCompletion::ProjectSavedAs(projection) => {
+                if token.kind != OperationKind::ProjectSaveAs {
+                    return Err(ApplicationFaultCode::InvalidOperationCompletion);
+                }
+                let retained = self
+                    .operations
+                    .get(&token.operation_id)
+                    .and_then(|operation| operation.retained_projection.as_ref())
+                    .ok_or(ApplicationFaultCode::InvalidOperationCompletion)?;
+                if retained.as_ref() != projection.as_ref() {
+                    return Err(ApplicationFaultCode::InvalidOperationCompletion);
+                }
+                let source = self
+                    .verified_source
+                    .as_ref()
+                    .ok_or(ApplicationFaultCode::IdentityVerificationRequired)?;
+                if !projection
+                    .state()
+                    .dataset()
+                    .has_same_scientific_content(source)
+                {
+                    return Err(ApplicationFaultCode::DatasetIdentityMismatch);
+                }
+                validate_view_against_catalog(&self.catalog, projection.state().view())?;
+                let project_id = projection.state().project_id();
+                let revision = projection.revision();
+                self.workspace =
+                    Workspace::Bound(BoundWorkspace::replaced_by_durable_projection(*projection));
+                self.normalize_transient_selections();
+                self.advance_currentness()?;
+                self.push_event(ApplicationEvent::ProjectSavedAs {
+                    project_id,
+                    revision,
+                })?;
+                OperationOutcome::ProjectSavedAs
+            }
+            OperationCompletion::ProjectRecovered(projection) => {
+                if !matches!(
+                    token.kind,
+                    OperationKind::ProjectOpen | OperationKind::ProjectRecovery
+                ) {
+                    return Err(ApplicationFaultCode::InvalidOperationCompletion);
+                }
+                let expected_project_id = match &self.workspace {
+                    Workspace::Unbound(_) => None,
+                    Workspace::Bound(current) => Some(current.current_state().project_id()),
+                };
+                let source = self
+                    .verified_source
+                    .as_ref()
+                    .ok_or(ApplicationFaultCode::IdentityVerificationRequired)?;
+                validate_view_against_catalog(&self.catalog, projection.state().view())?;
+                let recovered = BoundWorkspace::recovered_for_verified_source(
+                    *projection,
+                    source,
+                    expected_project_id,
+                )?;
+                let project_id = recovered.current_state().project_id();
+                let revision = recovered.current_revision();
+                self.workspace = Workspace::Bound(recovered);
+                self.normalize_transient_selections();
+                self.advance_currentness()?;
+                self.push_event(ApplicationEvent::ProjectRecovered {
+                    project_id,
+                    revision,
+                })?;
+                OperationOutcome::ProjectRecovered
             }
         };
         self.operations.remove(&token.operation_id);
@@ -2326,6 +2632,8 @@ impl ApplicationState {
             | ApplicationEvent::SourceVerificationRequested { .. }
             | ApplicationEvent::ProjectOpenRequested { .. }
             | ApplicationEvent::ProjectSaveRequested { .. }
+            | ApplicationEvent::ProjectSaveAsRequested { .. }
+            | ApplicationEvent::ProjectRecoveryRequested { .. }
             | ApplicationEvent::ResourcePolicyChangePending { .. } => {
                 self.latest_problem = None;
             }
@@ -2719,11 +3027,21 @@ fn completion_matches_kind(kind: OperationKind, completion: &OperationCompletion
         ),
         OperationKind::ProjectOpen => matches!(
             completion,
-            OperationCompletion::ProjectOpened(_) | OperationCompletion::Cancelled
+            OperationCompletion::ProjectOpened(_)
+                | OperationCompletion::ProjectRecovered(_)
+                | OperationCompletion::Cancelled
         ),
         OperationKind::ProjectSave => matches!(
             completion,
             OperationCompletion::ProjectSaved(_) | OperationCompletion::Cancelled
+        ),
+        OperationKind::ProjectSaveAs => matches!(
+            completion,
+            OperationCompletion::ProjectSavedAs(_) | OperationCompletion::Cancelled
+        ),
+        OperationKind::ProjectRecovery => matches!(
+            completion,
+            OperationCompletion::ProjectRecovered(_) | OperationCompletion::Cancelled
         ),
         OperationKind::Analysis => matches!(
             completion,
@@ -2764,6 +3082,10 @@ const fn failure_code_matches_kind(kind: OperationKind, code: OperationFailureCo
                 | OperationFailureCode::ProjectInvalidDocument
                 | OperationFailureCode::ProjectUnsupportedSchema
                 | OperationFailureCode::ProjectReadFailed
+                | OperationFailureCode::ProjectCapacityExceeded
+                | OperationFailureCode::ProjectDigestMismatch
+                | OperationFailureCode::ProjectCorrupt
+                | OperationFailureCode::ProjectBusy
         ),
         OperationKind::ProjectSave => matches!(
             code,
@@ -2771,6 +3093,45 @@ const fn failure_code_matches_kind(kind: OperationKind, code: OperationFailureCo
                 | OperationFailureCode::ProjectInvalidDocument
                 | OperationFailureCode::ProjectWriteFailed
                 | OperationFailureCode::ProjectCommitIndeterminate
+                | OperationFailureCode::ProjectReadOnly
+                | OperationFailureCode::ProjectWriterContended
+                | OperationFailureCode::ProjectStaleParent
+                | OperationFailureCode::ProjectDestinationExists
+                | OperationFailureCode::ProjectUnsupportedFilesystem
+                | OperationFailureCode::ProjectCapacityExceeded
+                | OperationFailureCode::ProjectSourceChanged
+                | OperationFailureCode::ProjectDigestMismatch
+                | OperationFailureCode::ProjectCorrupt
+                | OperationFailureCode::ProjectBusy
+        ),
+        OperationKind::ProjectSaveAs => matches!(
+            code,
+            OperationFailureCode::ProjectPermissionDenied
+                | OperationFailureCode::ProjectInvalidDocument
+                | OperationFailureCode::ProjectWriteFailed
+                | OperationFailureCode::ProjectCommitIndeterminate
+                | OperationFailureCode::ProjectReadOnly
+                | OperationFailureCode::ProjectWriterContended
+                | OperationFailureCode::ProjectStaleParent
+                | OperationFailureCode::ProjectDestinationExists
+                | OperationFailureCode::ProjectUnsupportedFilesystem
+                | OperationFailureCode::ProjectCapacityExceeded
+                | OperationFailureCode::ProjectSourceChanged
+                | OperationFailureCode::ProjectDigestMismatch
+                | OperationFailureCode::ProjectCorrupt
+                | OperationFailureCode::ProjectBusy
+        ),
+        OperationKind::ProjectRecovery => matches!(
+            code,
+            OperationFailureCode::ProjectNotFound
+                | OperationFailureCode::ProjectPermissionDenied
+                | OperationFailureCode::ProjectInvalidDocument
+                | OperationFailureCode::ProjectUnsupportedSchema
+                | OperationFailureCode::ProjectReadFailed
+                | OperationFailureCode::ProjectCapacityExceeded
+                | OperationFailureCode::ProjectDigestMismatch
+                | OperationFailureCode::ProjectCorrupt
+                | OperationFailureCode::ProjectBusy
         ),
         OperationKind::Analysis => matches!(
             code,

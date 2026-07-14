@@ -377,6 +377,19 @@ impl ProjectCommitCapture {
         self.forked_from
     }
 
+    pub(crate) fn authenticate_or_inherit_forked_from(
+        &mut self,
+        expected: Option<(ProjectId, ProjectGenerationId)>,
+    ) -> bool {
+        match self.forked_from {
+            Some(actual) => Some(actual) == expected,
+            None => {
+                self.forked_from = expected;
+                true
+            }
+        }
+    }
+
     pub(crate) fn into_parts(self) -> ProjectCommitCaptureParts {
         ProjectCommitCaptureParts {
             projection: self.projection,

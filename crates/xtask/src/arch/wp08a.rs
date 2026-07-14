@@ -71,6 +71,35 @@ pub(super) fn accepted_successor_normal_dependency_additions(
     }
 }
 
+// Keep the frozen WP-08A predecessor matrix unchanged while retiring the one
+// direct edge made obsolete by the accepted WP-10B B4 hard cutover.
+fn accepted_successor_normal_dependency_removals(crate_name: &str) -> &'static [&'static str] {
+    match crate_name {
+        "mirante4d-app" => &["mirante4d-identity"],
+        _ => &[],
+    }
+}
+
+// Keep the frozen WP-08A public-root inventory unchanged while admitting the
+// exact application service surface activated by the accepted WP-10B B4 cutover.
+pub(super) fn accepted_successor_public_root_additions(
+    crate_name: &str,
+) -> &'static [&'static str] {
+    match crate_name {
+        "mirante4d-application" => &[
+            "MonotonicClock",
+            "ProjectRecoveryStoreLocator",
+            "ProjectStoreApplicationService",
+            "ProjectStoreLifecycle",
+            "ProjectStoreServiceError",
+            "ProjectStoreServiceEvent",
+            "ProjectStoreServiceStatus",
+            "SystemMonotonicClock",
+        ],
+        _ => &[],
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SubsystemContract {
@@ -400,6 +429,13 @@ fn validate_dependency_matrix(
                         .iter()
                         .map(|dependency| (*dependency).to_owned()),
                 );
+                for dependency in accepted_successor_normal_dependency_removals(&name) {
+                    if !expected.remove(*dependency) {
+                        bail!(
+                            "WP-10B B4 dependency removal {name} -> {dependency} is not present in the frozen predecessor matrix"
+                        );
+                    }
+                }
             }
             let actual = actual.get(kind).cloned().unwrap_or_default();
             if actual != expected {
@@ -446,6 +482,9 @@ fn validate_transitional_edges(
                 edge.kind
             );
         }
+        if accepted_expired_transitional_edge(edge) {
+            continue;
+        }
         if !metadata
             .declared_dependency_kinds_by_name
             .contains_key(&edge.to)
@@ -477,6 +516,13 @@ fn validate_transitional_edges(
     Ok(())
 }
 
+fn accepted_expired_transitional_edge(edge: &TransitionalEdge) -> bool {
+    edge.from == "mirante4d-app"
+        && edge.to == "mirante4d-identity"
+        && edge.kind == "normal"
+        && edge.expiry_gate == "WP-09C"
+}
+
 fn validate_normal_edge_closure(
     contract: &SubsystemContract,
     metadata: &WorkspaceDependencyMetadata,
@@ -485,7 +531,7 @@ fn validate_normal_edge_closure(
     let transitional = contract
         .transitional_edges
         .iter()
-        .filter(|edge| edge.kind == "normal")
+        .filter(|edge| edge.kind == "normal" && !accepted_expired_transitional_edge(edge))
         .map(|edge| (edge.from.as_str(), edge.to.as_str()))
         .collect::<BTreeSet<_>>();
     let workspace_crates = metadata
@@ -577,7 +623,12 @@ fn validate_side_effect_capabilities(
                 && exception.expiry_gate == "WP-08B";
             let disabled_at_wp08b = capability.capability == "analysis-background-workers"
                 && exception.crate_name == "mirante4d-app";
-            if expired_at_wp08b || disabled_at_wp08b {
+            let expired_at_wp10b = matches!(
+                capability.capability.as_str(),
+                "project-package-filesystem" | "project-store-background-worker"
+            ) && exception.crate_name == "mirante4d-app"
+                && exception.expiry_gate == "WP-10B";
+            if expired_at_wp08b || disabled_at_wp08b || expired_at_wp10b {
                 continue;
             }
             if !current_crates.insert(&exception.crate_name) {
@@ -607,6 +658,17 @@ fn validate_side_effect_capabilities(
                 Some("thread::Builder::new"),
             )?;
         }
+        if matches!(
+            capability.capability.as_str(),
+            "project-package-filesystem" | "project-store-background-worker"
+        ) {
+            current_crates.insert(&capability.target_owner);
+            validate_wp10b_project_store_side_effect_owner(
+                repo_root,
+                &capability.capability,
+                &capability.target_owner,
+            )?;
+        }
         if current_crates.is_empty() && capability.capability != "analysis-background-workers" {
             bail!(
                 "WP-08A side-effect capability {} has no evidenced current owner or exception",
@@ -618,6 +680,34 @@ fn validate_side_effect_capabilities(
         bail!("WP-08A side-effect capability ledger must not be empty");
     }
     validate_thread_creation_owners(repo_root, contract, crate_paths)?;
+    Ok(())
+}
+
+fn validate_wp10b_project_store_side_effect_owner(
+    repo_root: &Path,
+    capability: &str,
+    target_owner: &str,
+) -> anyhow::Result<()> {
+    if target_owner != "mirante4d-project-store" {
+        bail!("WP-10B B4 project side-effect target owner drifted: {target_owner}");
+    }
+    let (relative_path, marker) = match capability {
+        "project-package-filesystem" => (
+            "crates/mirante4d-project-store/src/local.rs",
+            "fs::OpenOptions::new",
+        ),
+        "project-store-background-worker" => (
+            "crates/mirante4d-project-store/src/actor.rs",
+            "thread::Builder::new",
+        ),
+        _ => bail!("unsupported WP-10B B4 project side-effect capability {capability}"),
+    };
+    let path = repo_root.join(relative_path);
+    let source =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    if !source.contains(marker) {
+        bail!("WP-10B B4 target owner {target_owner} lacks {capability} evidence {marker:?}");
+    }
     Ok(())
 }
 
@@ -947,10 +1037,18 @@ fn validate_frozen_public_api(
                 root.crate_name
             );
         }
-        let expected = unique_string_set(
+        let mut expected = unique_string_set(
             &root.items,
             &format!("WP-08A {} public root items", root.crate_name),
         )?;
+        for addition in accepted_successor_public_root_additions(&root.crate_name) {
+            if !expected.insert((*addition).to_owned()) {
+                bail!(
+                    "WP-08A {} accepted successor public-root addition duplicates the frozen inventory: {addition}",
+                    root.crate_name
+                );
+            }
+        }
         let actual = public_root_api_names(&repo_root.join(&root.path))?;
         if actual != expected {
             bail!(

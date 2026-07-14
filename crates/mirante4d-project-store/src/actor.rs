@@ -235,20 +235,35 @@ enum ActorSession {
     },
     RecoveryOnly {
         resources: SessionResources,
-        selected_generation: Option<ProjectGenerationId>,
+    },
+    RecoverySelected {
+        resources: SessionResources,
+        selected_generation: ProjectGenerationId,
     },
 }
 
 impl ActorSession {
     fn resources(&self) -> &SessionResources {
         match self {
-            Self::Normal { resources, .. } | Self::RecoveryOnly { resources, .. } => resources,
+            Self::Normal { resources, .. }
+            | Self::RecoveryOnly { resources }
+            | Self::RecoverySelected { resources, .. } => resources,
         }
     }
 
     fn resources_mut(&mut self) -> &mut SessionResources {
         match self {
-            Self::Normal { resources, .. } | Self::RecoveryOnly { resources, .. } => resources,
+            Self::Normal { resources, .. }
+            | Self::RecoveryOnly { resources }
+            | Self::RecoverySelected { resources, .. } => resources,
+        }
+    }
+
+    fn into_resources(self) -> SessionResources {
+        match self {
+            Self::Normal { resources, .. }
+            | Self::RecoveryOnly { resources }
+            | Self::RecoverySelected { resources, .. } => resources,
         }
     }
 }
@@ -437,8 +452,6 @@ impl SessionResources {
             .state()
             .dataset()
             .has_same_scientific_content(selected.projection().state().dataset())
-            || capture.projection().revision_high_water().sequence()
-                < selected.projection().revision_high_water().sequence()
         {
             return Err(ProjectStoreFault::Corruption {
                 stage: "save_as_recovery_selection",
@@ -577,10 +590,9 @@ impl EstablishedProjectActor {
             OpenResources::Normal {
                 resources, kind, ..
             } => ActorSession::Normal { resources, kind },
-            OpenResources::RecoveryOnly { resources, .. } => ActorSession::RecoveryOnly {
-                resources,
-                selected_generation: None,
-            },
+            OpenResources::RecoveryOnly { resources, .. } => {
+                ActorSession::RecoveryOnly { resources }
+            }
         };
         Self::start_inner(config, Some(session))
     }
@@ -994,6 +1006,9 @@ fn normal_session_mut(
     match session {
         Some(ActorSession::Normal { resources, kind }) => Ok((resources, *kind)),
         Some(ActorSession::RecoveryOnly { .. }) => Err(lifecycle_fault("actor_recovery_only")),
+        Some(ActorSession::RecoverySelected { .. }) => {
+            Err(lifecycle_fault("actor_recovery_selected"))
+        }
         None => Err(lifecycle_fault("actor_unbound")),
     }
 }
@@ -1090,13 +1105,39 @@ where
             resources,
             normal_fault,
         } => {
-            *session = Some(ActorSession::RecoveryOnly {
-                resources,
-                selected_generation: None,
-            });
+            *session = Some(ActorSession::RecoveryOnly { resources });
             Err(normal_fault)
         }
     }
+}
+
+fn execute_open_recovery<C>(
+    session: &mut Option<ActorSession>,
+    generation_id: ProjectGenerationId,
+    limits: crate::ProjectStoreLimits,
+    is_cancelled: C,
+) -> Result<
+    (
+        ProjectStoreSession,
+        mirante4d_project_model::ProjectGenerationProjection,
+    ),
+    ProjectStoreFault,
+>
+where
+    C: FnMut() -> bool,
+{
+    let result = any_session_mut(session)?.open_recovery(generation_id, limits, is_cancelled);
+    if result.is_ok() {
+        let resources = session
+            .take()
+            .expect("a successful recovery open retains one actor session")
+            .into_resources();
+        *session = Some(ActorSession::RecoverySelected {
+            resources,
+            selected_generation: generation_id,
+        });
+    }
+    result
 }
 
 fn execute_autosave<C>(
@@ -1148,6 +1189,19 @@ where
             *session = Some(ActorSession::Normal { resources, kind });
             result
         }
+        (
+            Some(ActorSession::RecoverySelected {
+                resources,
+                selected_generation,
+            }),
+            _,
+        ) => {
+            *session = Some(ActorSession::RecoverySelected {
+                resources,
+                selected_generation,
+            });
+            Err(lifecycle_fault("actor_recovery_selected"))
+        }
         (Some(other), _) => {
             *session = Some(other);
             Err(lifecycle_fault("autosave_destination"))
@@ -1184,9 +1238,9 @@ where
             });
             result
         }
-        Some(ActorSession::RecoveryOnly {
+        Some(ActorSession::RecoverySelected {
             mut resources,
-            selected_generation: Some(selected_generation),
+            selected_generation,
         }) => {
             let result = resources.save_as_selected_recovery(
                 selected_generation,
@@ -1202,9 +1256,9 @@ where
                     kind: NormalSessionKind::Established,
                 }
             } else {
-                ActorSession::RecoveryOnly {
+                ActorSession::RecoverySelected {
                     resources,
-                    selected_generation: Some(selected_generation),
+                    selected_generation,
                 }
             };
             *session = Some(next);
@@ -1350,21 +1404,12 @@ fn worker_main(
             Work::OpenRecovery {
                 request_id,
                 generation_id,
-            } => {
-                let result = any_session_mut(&mut session).and_then(|resources| {
-                    resources
-                        .open_recovery(generation_id, limits, || cancelled.load(Ordering::Acquire))
-                });
-                if result.is_ok()
-                    && let Some(ActorSession::RecoveryOnly {
-                        selected_generation,
-                        ..
-                    }) = &mut session
-                {
-                    *selected_generation = Some(generation_id);
-                }
-                ProjectStoreCompletion::RecoveryOpened { request_id, result }
-            }
+            } => ProjectStoreCompletion::RecoveryOpened {
+                request_id,
+                result: execute_open_recovery(&mut session, generation_id, limits, || {
+                    cancelled.load(Ordering::Acquire)
+                }),
+            },
             Work::Pin {
                 request_id,
                 checkpoint_id,
@@ -2462,11 +2507,14 @@ mod tests {
         let destination_parent = TestDirectory::new("public-recovery-save-as");
         let destination = destination_parent.destination("recovered.m4dproj");
         let new_project_id = ProjectId::from_bytes([0x42; 16]);
-        let recovered_projection = retarget_projection(
+        assert!(selected_projection.revision_high_water().sequence() > 0);
+        let recovered_projection = fresh_fork_projection(
             &selected,
             new_project_id,
             selected_projection.state().dataset().clone(),
         );
+        assert_eq!(recovered_projection.revision().sequence(), 0);
+        assert_eq!(recovered_projection.revision_high_water().sequence(), 0);
         let source_project_id = selected_projection.state().project_id();
         let rejected_destination =
             ProjectStorePath::new(source.path().join("rejected-recovery-save-as.m4dproj")).unwrap();
@@ -2496,7 +2544,7 @@ mod tests {
         assert!(!rejected_destination.as_path().exists());
         assert_eq!(file_tree(source.path()), source_before);
 
-        let (capture, _) = controlled_fixture_capture(
+        let (capture, capture_opens) = controlled_fixture_capture(
             "recoverable.m4dproj",
             &selected,
             recovered_projection,
@@ -2520,12 +2568,191 @@ mod tests {
             } if actual == request_id(6) => receipt.current_generation_id(),
             other => panic!("unexpected recovery Save As: {other:?}"),
         };
+        assert_eq!(capture_opens.load(Ordering::SeqCst), 0);
         assert_eq!(file_tree(source.path()), source_before);
         let destination_root = LocalStoreRoot::open(destination.as_path()).unwrap();
         let recovered =
             inspect_established_store(&destination_root, ProjectStoreLimits::default(), || false)
                 .unwrap();
         assert_eq!(recovered.manual().head.current(), recovered_id);
+        assert_eq!(
+            recovered.manual_generation().bindings(),
+            selected.bindings()
+        );
+        assert_eq!(
+            recovered.manual_generation().reachable_objects(),
+            selected.reachable_objects()
+        );
+        assert_eq!(
+            recovered.manual_generation().forked_from(),
+            Some((source_project_id, selected_id))
+        );
+
+        actor.try_submit(close_command(7)).unwrap();
+        public_recv_timeout(&actor);
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn public_actor_normal_recovery_selection_is_save_as_only() {
+        let source =
+            TestProject::extracted_store("public-normal-recovery-selection", "recoverable.m4dproj");
+        let source_before = file_tree(source.path());
+        let actor = ProjectStoreActor::start(Default::default()).unwrap();
+        actor
+            .try_submit(ProjectStoreCommand::Open {
+                request_id: request_id(1),
+                path: source.store_path(),
+                mode: ProjectOpenMode::PreferWritable,
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&actor),
+            ProjectStoreCompletion::Opened {
+                request_id: actual,
+                result: Ok(_),
+            } if actual == request_id(1)
+        ));
+
+        let selected_id = generation_id(RECOVERABLE_AUTOSAVE);
+        let selected = frozen_generation_in("recoverable.m4dproj", RECOVERABLE_AUTOSAVE);
+        actor
+            .try_submit(ProjectStoreCommand::OpenRecovery {
+                request_id: request_id(2),
+                generation_id: selected_id,
+            })
+            .unwrap();
+        let selected_projection = match public_recv_timeout(&actor) {
+            ProjectStoreCompletion::RecoveryOpened {
+                request_id: actual,
+                result: Ok((_session, projection)),
+            } if actual == request_id(2) => projection,
+            other => panic!("unexpected normal recovery selection: {other:?}"),
+        };
+        assert_eq!(selected_projection, *selected.projection());
+
+        let orphan = frozen_generation_in("recoverable.m4dproj", RECOVERABLE_ORPHAN);
+        let (manual_capture, manual_opens) = controlled_fixture_capture(
+            "recoverable.m4dproj",
+            &orphan,
+            orphan.projection().clone(),
+            orphan.parent_generation_id(),
+            orphan.base_manual_generation_id(),
+            orphan.forked_from(),
+            ControlledRead::Normal,
+        );
+        actor
+            .try_submit(ProjectStoreCommand::ManualSave {
+                request_id: request_id(3),
+                capture: manual_capture,
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&actor),
+            ProjectStoreCompletion::ManualSaved {
+                request_id: actual,
+                result: Err(ProjectStoreFault::Corruption {
+                    stage: "actor_recovery_selected"
+                }),
+            } if actual == request_id(3)
+        ));
+        assert_eq!(manual_opens.load(Ordering::SeqCst), 0);
+
+        let (autosave_capture, autosave_opens) = controlled_fixture_capture(
+            "recoverable.m4dproj",
+            &orphan,
+            orphan.projection().clone(),
+            Some(selected_id),
+            Some(generation_id(RECOVERABLE_G2)),
+            orphan.forked_from(),
+            ControlledRead::Normal,
+        );
+        actor
+            .try_submit(ProjectStoreCommand::Autosave {
+                request_id: request_id(4),
+                destination: None,
+                capture: autosave_capture,
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&actor),
+            ProjectStoreCompletion::Autosaved {
+                request_id: actual,
+                result: Err(ProjectStoreFault::Corruption {
+                    stage: "actor_recovery_selected"
+                }),
+            } if actual == request_id(4)
+        ));
+        assert_eq!(autosave_opens.load(Ordering::SeqCst), 0);
+        assert_eq!(file_tree(source.path()), source_before);
+
+        actor
+            .try_submit(ProjectStoreCommand::OpenRecovery {
+                request_id: request_id(5),
+                generation_id: generation_id(RECOVERABLE_ORPHAN),
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&actor),
+            ProjectStoreCompletion::RecoveryOpened {
+                request_id: actual,
+                result: Err(ProjectStoreFault::Corruption {
+                    stage: "recovery_selection"
+                }),
+            } if actual == request_id(5)
+        ));
+
+        let destination_parent = TestDirectory::new("public-normal-recovery-save-as");
+        let destination = destination_parent.destination("recovered.m4dproj");
+        let source_project_id = selected_projection.state().project_id();
+        assert!(selected_projection.revision_high_water().sequence() > 0);
+        let recovered_projection = fresh_fork_projection(
+            &selected,
+            ProjectId::from_bytes([0x43; 16]),
+            selected_projection.state().dataset().clone(),
+        );
+        assert_eq!(recovered_projection.revision().sequence(), 0);
+        assert_eq!(recovered_projection.revision_high_water().sequence(), 0);
+        let (capture, capture_opens) = controlled_fixture_capture(
+            "recoverable.m4dproj",
+            &selected,
+            recovered_projection,
+            None,
+            None,
+            Some((source_project_id, selected_id)),
+            ControlledRead::Normal,
+        );
+        actor
+            .try_submit(ProjectStoreCommand::SaveAs {
+                request_id: request_id(6),
+                destination: destination.clone(),
+                source_generation: selected_id,
+                capture,
+            })
+            .unwrap();
+        let recovered_id = match public_recv_timeout(&actor) {
+            ProjectStoreCompletion::SavedAs {
+                request_id: actual,
+                result: Ok(receipt),
+            } if actual == request_id(6) => receipt.current_generation_id(),
+            other => panic!("unexpected normal recovery Save As: {other:?}"),
+        };
+        assert_eq!(capture_opens.load(Ordering::SeqCst), 0);
+        assert_eq!(file_tree(source.path()), source_before);
+
+        let destination_root = LocalStoreRoot::open(destination.as_path()).unwrap();
+        let recovered =
+            inspect_established_store(&destination_root, ProjectStoreLimits::default(), || false)
+                .unwrap();
+        assert_eq!(recovered.manual().head.current(), recovered_id);
+        assert_eq!(
+            recovered.manual_generation().bindings(),
+            selected.bindings()
+        );
+        assert_eq!(
+            recovered.manual_generation().reachable_objects(),
+            selected.reachable_objects()
+        );
         assert_eq!(
             recovered.manual_generation().forked_from(),
             Some((source_project_id, selected_id))
@@ -2583,7 +2810,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_inspection_and_open_are_read_only_and_keep_current_save_authority() {
+    fn recovery_inspection_and_open_preserve_heads_and_bytes_across_session_modes() {
         let project = TestProject::extracted_store("recovery", "recoverable.m4dproj");
         let path = project.store_path();
         let before = file_tree(project.path());
@@ -2662,7 +2889,7 @@ mod tests {
         assert_eq!(file_tree(project.path()), before);
 
         let orphan = frozen_generation_in("recoverable.m4dproj", RECOVERABLE_ORPHAN);
-        let (capture, _) = controlled_fixture_capture(
+        let (capture, opens) = controlled_fixture_capture(
             "recoverable.m4dproj",
             &orphan,
             orphan.projection().clone(),
@@ -2681,10 +2908,13 @@ mod tests {
             actor.recv_timeout(TIMEOUT),
             Some(ProjectStoreCompletion::ManualSaved {
                 request_id: actual,
-                result: Ok(receipt),
+                result: Err(ProjectStoreFault::Corruption {
+                    stage: "actor_recovery_selected"
+                }),
             }) if actual == request_id(4)
-                && receipt.current_generation_id() == generation_id(RECOVERABLE_ORPHAN)
         ));
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        assert_eq!(file_tree(project.path()), before);
 
         actor.try_submit(close_command(5)).unwrap();
         assert!(matches!(
@@ -2773,7 +3003,9 @@ mod tests {
             reader.recv_timeout(TIMEOUT),
             Some(ProjectStoreCompletion::ManualSaved {
                 request_id: actual,
-                result: Err(ProjectStoreFault::ReadOnly),
+                result: Err(ProjectStoreFault::Corruption {
+                    stage: "actor_recovery_selected"
+                }),
             }) if actual == request_id(3)
         ));
         assert_eq!(file_tree(contended.path()), contended_before);
@@ -2892,6 +3124,215 @@ mod tests {
         actor.join().unwrap();
         drop(target_contender);
         let _target_writer = acquire_writer_eventually(&installed_root);
+    }
+
+    #[test]
+    fn public_actor_reopened_save_as_inherits_held_fork_for_manual_and_autosave() {
+        let source = TestProject::extracted_store(
+            "reopened-save-as-provenance-source",
+            "recoverable.m4dproj",
+        );
+        let destination_parent = TestDirectory::new("reopened-save-as-provenance-target");
+        let destination = destination_parent.destination("fork.m4dproj");
+        let initial = frozen_generation_in("divergent.m4dproj", DIVERGENT_INITIAL);
+        let expected_fork = Some((
+            initial.forked_from().unwrap().0,
+            generation_id(RECOVERABLE_G2),
+        ));
+
+        let actor = ProjectStoreActor::start(Default::default()).unwrap();
+        actor
+            .try_submit(ProjectStoreCommand::Open {
+                request_id: request_id(1),
+                path: source.store_path(),
+                mode: ProjectOpenMode::PreferWritable,
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&actor),
+            ProjectStoreCompletion::Opened {
+                request_id: actual,
+                result: Ok(_),
+            } if actual == request_id(1)
+        ));
+        let (capture, _) = controlled_fixture_capture(
+            "divergent.m4dproj",
+            &initial,
+            initial.projection().clone(),
+            None,
+            None,
+            expected_fork,
+            ControlledRead::Normal,
+        );
+        actor
+            .try_submit(ProjectStoreCommand::SaveAs {
+                request_id: request_id(2),
+                destination: destination.clone(),
+                source_generation: generation_id(RECOVERABLE_G2),
+                capture,
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&actor),
+            ProjectStoreCompletion::SavedAs {
+                request_id: actual,
+                result: Ok(_),
+            } if actual == request_id(2)
+        ));
+        actor.try_submit(close_command(3)).unwrap();
+        public_recv_timeout(&actor);
+        actor.join().unwrap();
+
+        let reopened = ProjectStoreActor::start(Default::default()).unwrap();
+        reopened
+            .try_submit(ProjectStoreCommand::Open {
+                request_id: request_id(1),
+                path: destination.clone(),
+                mode: ProjectOpenMode::PreferWritable,
+            })
+            .unwrap();
+        match public_recv_timeout(&reopened) {
+            ProjectStoreCompletion::Opened {
+                request_id: actual,
+                result: Ok((session, projection)),
+            } if actual == request_id(1) => {
+                assert_eq!(
+                    session.current_manual_generation(),
+                    Some(generation_id(DIVERGENT_INITIAL))
+                );
+                assert_eq!(projection, *initial.projection());
+            }
+            other => panic!("unexpected reopened Save As project: {other:?}"),
+        }
+
+        let next = frozen_generation_in("divergent.m4dproj", DIVERGENT_NEXT);
+        let wrong_fork = Some((
+            ProjectId::from_bytes([0x77; 16]),
+            generation_id(RECOVERABLE_G1),
+        ));
+        assert_ne!(wrong_fork, expected_fork);
+        let (wrong_capture, wrong_opens) = controlled_fixture_capture_with_all_sources(
+            "divergent.m4dproj",
+            &next,
+            next.projection().clone(),
+            next.parent_generation_id(),
+            next.base_manual_generation_id(),
+            wrong_fork,
+            ControlledRead::Normal,
+        );
+        assert!(wrong_capture.object_source_count() > 0);
+        let before_rejected_save = file_tree(destination.as_path());
+        reopened
+            .try_submit(ProjectStoreCommand::ManualSave {
+                request_id: request_id(2),
+                capture: wrong_capture,
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&reopened),
+            ProjectStoreCompletion::ManualSaved {
+                request_id: actual,
+                result: Err(ProjectStoreFault::Corruption {
+                    stage: "manual_generation_continuity"
+                }),
+            } if actual == request_id(2)
+        ));
+        assert_eq!(wrong_opens.load(Ordering::SeqCst), 0);
+        assert_eq!(file_tree(destination.as_path()), before_rejected_save);
+
+        let (manual_capture, _) = controlled_fixture_capture(
+            "divergent.m4dproj",
+            &next,
+            next.projection().clone(),
+            next.parent_generation_id(),
+            next.base_manual_generation_id(),
+            None,
+            ControlledRead::Normal,
+        );
+        reopened
+            .try_submit(ProjectStoreCommand::ManualSave {
+                request_id: request_id(3),
+                capture: manual_capture,
+            })
+            .unwrap();
+        let manual_id = match public_recv_timeout(&reopened) {
+            ProjectStoreCompletion::ManualSaved {
+                request_id: actual,
+                result: Ok(receipt),
+            } if actual == request_id(3) => receipt.current_generation_id(),
+            other => panic!("unexpected inherited-fork ManualSave: {other:?}"),
+        };
+
+        let autosave_projection = next_revision_projection(&next);
+        let (wrong_autosave_capture, wrong_autosave_opens) =
+            controlled_fixture_capture_with_all_sources(
+                "divergent.m4dproj",
+                &next,
+                autosave_projection.clone(),
+                None,
+                Some(manual_id),
+                wrong_fork,
+                ControlledRead::Normal,
+            );
+        assert!(wrong_autosave_capture.object_source_count() > 0);
+        let before_rejected_autosave = file_tree(destination.as_path());
+        reopened
+            .try_submit(ProjectStoreCommand::Autosave {
+                request_id: request_id(4),
+                destination: None,
+                capture: wrong_autosave_capture,
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&reopened),
+            ProjectStoreCompletion::Autosaved {
+                request_id: actual,
+                result: Err(ProjectStoreFault::Corruption {
+                    stage: "manual_generation_continuity"
+                }),
+            } if actual == request_id(4)
+        ));
+        assert_eq!(wrong_autosave_opens.load(Ordering::SeqCst), 0);
+        assert_eq!(file_tree(destination.as_path()), before_rejected_autosave);
+
+        let autosave_capture =
+            ProjectCommitCapture::new(autosave_projection, None, Some(manual_id), None, Vec::new())
+                .unwrap();
+        reopened
+            .try_submit(ProjectStoreCommand::Autosave {
+                request_id: request_id(5),
+                destination: None,
+                capture: autosave_capture,
+            })
+            .unwrap();
+        let autosave_id = match public_recv_timeout(&reopened) {
+            ProjectStoreCompletion::Autosaved {
+                request_id: actual,
+                result: Ok(receipt),
+            } if actual == request_id(5) => receipt.current_generation_id(),
+            other => panic!("unexpected inherited-fork Autosave: {other:?}"),
+        };
+
+        let root = LocalStoreRoot::open(destination.as_path()).unwrap();
+        let inspection =
+            inspect_established_store(&root, ProjectStoreLimits::default(), || false).unwrap();
+        assert_eq!(inspection.manual().head.current(), manual_id);
+        assert_eq!(inspection.manual_generation().forked_from(), expected_fork);
+        assert_eq!(
+            inspection.autosave().map(|lane| lane.head.current()),
+            Some(autosave_id)
+        );
+        assert_eq!(
+            inspection
+                .autosave_generation()
+                .expect("the inherited-fork autosave is current")
+                .forked_from(),
+            expected_fork
+        );
+
+        reopened.try_submit(close_command(6)).unwrap();
+        public_recv_timeout(&reopened);
+        reopened.join().unwrap();
     }
 
     #[test]
@@ -5414,14 +5855,62 @@ mod tests {
         forked_from: Option<(ProjectId, ProjectGenerationId)>,
         behavior: ControlledRead,
     ) -> (ProjectCommitCapture, Arc<AtomicUsize>) {
+        controlled_fixture_capture_inner(
+            store,
+            frozen,
+            projection,
+            expected_parent,
+            autosave_base,
+            forked_from,
+            behavior,
+            true,
+        )
+    }
+
+    fn controlled_fixture_capture_with_all_sources(
+        store: &str,
+        frozen: &GenerationDocument,
+        projection: ProjectGenerationProjection,
+        expected_parent: Option<ProjectGenerationId>,
+        autosave_base: Option<ProjectGenerationId>,
+        forked_from: Option<(ProjectId, ProjectGenerationId)>,
+        behavior: ControlledRead,
+    ) -> (ProjectCommitCapture, Arc<AtomicUsize>) {
+        controlled_fixture_capture_inner(
+            store,
+            frozen,
+            projection,
+            expected_parent,
+            autosave_base,
+            forked_from,
+            behavior,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn controlled_fixture_capture_inner(
+        store: &str,
+        frozen: &GenerationDocument,
+        projection: ProjectGenerationProjection,
+        expected_parent: Option<ProjectGenerationId>,
+        autosave_base: Option<ProjectGenerationId>,
+        forked_from: Option<(ProjectId, ProjectGenerationId)>,
+        behavior: ControlledRead,
+        omit_reusable: bool,
+    ) -> (ProjectCommitCapture, Arc<AtomicUsize>) {
         let opens = Arc::new(AtomicUsize::new(0));
         let mut sources: Vec<Box<dyn ProjectObjectSource>> = Vec::new();
         let authority = expected_parent
             .or(autosave_base)
             .or_else(|| forked_from.map(|(_, generation_id)| generation_id));
-        let reusable = authority
-            .map(|generation_id| fixture_authority_descriptors(frozen, generation_id))
-            .unwrap_or_default();
+        let reusable = if omit_reusable {
+            authority
+                .map(|generation_id| fixture_authority_descriptors(frozen, generation_id))
+                .unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
         for artifact in projection.state().artifacts() {
             if reusable.get(&artifact.object().digest()) == Some(artifact.object()) {
                 continue;
@@ -5529,6 +6018,28 @@ mod tests {
         ProjectGenerationProjection::new(
             ProjectRevisionId::new(project_id, old.revision().sequence()),
             ProjectRevisionHighWater::new(project_id, old.revision_high_water().sequence()),
+            state,
+        )
+        .unwrap()
+    }
+
+    fn fresh_fork_projection(
+        frozen: &GenerationDocument,
+        project_id: ProjectId,
+        dataset: DatasetReference,
+    ) -> ProjectGenerationProjection {
+        let old = frozen.projection();
+        let state = ProjectState::new(
+            project_id,
+            dataset,
+            old.state().view().clone(),
+            old.state().channel_presets().to_vec(),
+            old.state().artifacts().to_vec(),
+        )
+        .unwrap();
+        ProjectGenerationProjection::new(
+            ProjectRevisionId::initial(project_id),
+            ProjectRevisionHighWater::initial(project_id),
             state,
         )
         .unwrap()

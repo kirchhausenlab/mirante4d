@@ -136,11 +136,11 @@ device rename.
   comparison rather than prompting the user or becoming a permanent live root.
   The application integration owns the 30-second idle and 120-second maximum
   scheduling because it owns live revisions and capture creation; the store
-  actor publishes and coalesces submitted captures. The B3 candidate implements
-  that exact deadline with an injected monotonic clock in a private application
-  service, including edit-during-capture, failure/cancellation, and
-  `CommitIndeterminate` handling. The service remains product-unreachable until
-  B4.
+  actor publishes and coalesces submitted captures. B3 accepted that exact
+  deadline with an injected monotonic clock in the application service,
+  including edit-during-capture, failure/cancellation, and
+  `CommitIndeterminate` handling. The B4 candidate now makes that service the
+  sole product project route.
 - The normal recovery prompt is offered only for a newer same-base autosave.
   A changed-base autosave is labeled divergent. Manual previous, manual
   recovery, and manual generations found by bounded scan are labeled manual
@@ -233,11 +233,11 @@ release may bind an alternate exact package with the same science. A
 self-declared content-ID field alone is not trusted.
 
 WP-02 cut project v13 to the segmentation-free v14 predecessor. WP-07B deleted
-v14 and installed the private experimental project-v15 bridge. WP-10B
-hard-cuts that bridge to the owner-approved target store: no v13/v14/v15
-reader, in-place mutation, fallback branch, or converter remains. Existing
-disposable development projects are regenerated; a converter would require a
-separate explicit owner request.
+v14 and installed the private experimental project-v15 bridge. The WP-10B B4
+candidate hard-cuts that bridge to the owner-approved target store: no
+v13/v14/v15 reader, in-place mutation, fallback branch, or converter remains.
+Existing disposable development projects are regenerated; a converter would
+require a separate explicit owner request.
 
 ### Project Store Alternatives
 
@@ -297,11 +297,11 @@ commit `4a246a1bb7bfe099673ef10d6cb5951729b3ff37` (tree
 cut cases passed with zero harness retries. The sanitized report SHA-256 is
 `ced8c82c75c480810e7ebf81e2c032e579f89bbb28c1f854d1681a3ddad1f9e5`, and
 protected-main policy/Rust checks passed in GitHub Actions run 29273392030.
-This qualifies only that exact off-product B2 revision and ext4 tuple. The B3
-candidate adds actor-authenticated direct/paged reuse, destination-local Save As
-copy-and-rehash, and the private autosave service described above, but its
-public and real-display evidence is not yet accepted. B4 product activation,
-predecessor deletion, and product persistence validation remain pending.
+This qualifies only that exact off-product B2 revision and ext4 tuple. B3 is
+accepted at `8fdd94dc9c60406e8de8a96749d7148d38b1dc7a`. The B4 candidate activates
+the product service, deletes the predecessor, and implements the bounded
+three-launch product scenario. Its final clean public, trusted-local, and real-
+display evidence and protected-main acceptance remain pending.
 
 ### Identity And Project Resolution
 

@@ -143,15 +143,20 @@ all 120 hosted tests and 60 rootless-VM cuts passed with zero harness retries.
 The exhaustive hosted matrix took 85,683 ms and the VM evidence phase took
 340,235 ms. Protected-main policy and Rust checks also passed in
 [run 29273392030](https://github.com/kirchhausenlab/mirante4d/actions/runs/29273392030).
-This qualifies only the exact off-product B2 ext4 tuple and revision. The B3
-implementation candidate now adds bounded current-source D-009 verification,
-source-generation-aware promotion and invalidation, authenticated project-
-object reuse and Save As closure copying, and an injected-clock autosave
-service over the project-store actor. Source verification is product-reachable;
-the project-store service remains compile/test-only, and the private
-project-v15 route remains the sole product persistence path until B4. B3
-acceptance evidence and the B4 product cutover are still pending, so no
-successor product-persistence claim is made.
+This qualifies only the exact off-product B2 ext4 tuple and revision. B3 is
+accepted on protected main at
+`8fdd94dc9c60406e8de8a96749d7148d38b1dc7a`; it added bounded current-source
+D-009 verification, source-generation-aware promotion and invalidation,
+authenticated project-object reuse and Save As closure copying, and the
+revision-aware autosave service.
+
+The B4 implementation candidate makes that service and the accepted actor the
+sole product project-persistence route. New, Open, Save, Save As, autosave,
+recovery, dirty close, and joined shutdown are wired, while the project-v15
+bridge and `CurrentProjectRuntime` files are deleted. The fixed three-launch
+native automation is implemented. Final clean-revision public, trusted-local,
+and real-display evidence and protected-main acceptance remain pending; B4 and
+WP-10B are not yet accepted.
 
 Replacement, import/multiscale generation, and product activation remain
 incomplete.
@@ -173,9 +178,9 @@ See [testing](TESTING.md) for commands and claim language.
   `ScientificContentId` through the bounded B3 source scan. Project attach,
   open, and save reject at the typed identity gate until that scan succeeds,
   and observed source drift returns the source to the unverified state.
-- Dataset schema 1 and the private project-v15 bridge are experimental, not
-  target-format conformance claims.
-- The successor project-store crate exists off-product with its frozen API,
+- Dataset schema 1 and the project-store format are experimental, not stable-
+  format or target-dataset conformance claims.
+- The product project-store crate has its frozen API,
   control-record wire, typed generation/direct-and-paged closure, and
   generation-last immutable publication. Its crate-private transaction core
   can create the initial manual head and advance an established manual head
@@ -186,12 +191,11 @@ See [testing](TESTING.md) for commands and claim language.
   provisional Autosave and manual handoff, established-session work, explicit
   recovery selection, and authenticated Save As while retaining exact roots and
   leases. B2 durability qualification now passes for its exact off-product
-  revision. B3 adds actor-authenticated unchanged-object reuse, destination-
-  local Save As closure copying, and exact autosave scheduling in a private
-  application service. That service is not constructed or polled by the
-  product; product recovery, public/product garbage collection and Purge
-  wiring, and every successor product-persistence path remain unimplemented.
-  PlanCompaction
+  revision. B3 added actor-authenticated unchanged-object reuse, destination-
+  local Save As closure copying, and exact autosave scheduling. The B4
+  candidate constructs and polls that application service as the sole product
+  path for ordinary project persistence and recovery. Product maintenance and
+  Purge UI remain absent. PlanCompaction
   does not authorize Trash, expose a physical object/byte plan or reclaim
   estimate, or prove backup approval. Private FullVerify does not validate
   artifact scientific semantics, repair data, inspect trash, or establish a

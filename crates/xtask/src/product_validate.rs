@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    os::unix::{ffi::OsStrExt, fs::MetadataExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -38,6 +38,16 @@ const APP_GPU_TIMESTAMPS_ENV: &str = "MIRANTE4D_GPU_TIMESTAMPS";
 const GENERATED_FIXTURE_SCENARIO: &str = "generated_fixture_camera_smoke";
 const GENERATED_RENDER_MODES_SCENARIO: &str = "generated_fixture_render_modes";
 const B3_SOURCE_VERIFICATION_SCENARIO: &str = "b3_source_verification";
+const B4_PROJECT_PERSISTENCE_SCENARIO: &str = "b4_project_persistence";
+const B4_TRUSTED_REPORT_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_PROJECT_STORE_LIFECYCLE_REPORT";
+const B4_CHECKPOINT_SCHEMA: &str = "mirante4d-product-external-kill-checkpoint";
+const B4_CHECKPOINT_STAGE: &str = "after_real_autosave_before_external_kill";
+const B4_AUTOSAVE_MIN_ELAPSED_MS: u64 = 30_000;
+const B4_PHASE_TIMEOUT_SECS: u64 = 90;
+const B4_PRIMARY_CLIENT_WIDTH: u32 = 1280;
+const B4_PRIMARY_CLIENT_HEIGHT: u32 = 720;
+const B4_SECONDARY_CLIENT_WIDTH: u32 = 1920;
+const B4_SECONDARY_CLIENT_HEIGHT: u32 = 1080;
 const T5_QUAL_001_INTERACTION_MIP_SCENARIO: &str = "t5_qual_001_interaction_mip";
 const T5_QUAL_001_INTERACTION_RENDER_MODES_SCENARIO: &str = "t5_qual_001_interaction_render_modes";
 const T5_QUAL_001_INTERACTION_CONTINUOUS_SCENARIO: &str = "t5_qual_001_interaction_continuous";
@@ -282,6 +292,9 @@ fn product_validate_report_inner(
     package: Option<&Path>,
     scenario: &ProductValidationScenario,
 ) -> anyhow::Result<ProductValidationOutcome> {
+    if matches!(scenario, ProductValidationScenario::B4ProjectPersistence) {
+        return product_validate_b4_project_persistence(package, scenario);
+    }
     let started_at = Instant::now();
     let started_at_epoch_ms = epoch_ms();
     let gpu_timestamps_requested = product_validate_gpu_timestamps_requested();
@@ -607,6 +620,7 @@ enum ProductValidationScenario {
     GeneratedFixtureCameraSmoke,
     GeneratedFixtureRenderModes,
     B3SourceVerification,
+    B4ProjectPersistence,
     T5Qual001InteractionMip,
     T5Qual001InteractionRenderModes,
     T5Qual001InteractionContinuous,
@@ -624,6 +638,7 @@ impl ProductValidationScenario {
             Self::GeneratedFixtureCameraSmoke => GENERATED_FIXTURE_SCENARIO,
             Self::GeneratedFixtureRenderModes => GENERATED_RENDER_MODES_SCENARIO,
             Self::B3SourceVerification => B3_SOURCE_VERIFICATION_SCENARIO,
+            Self::B4ProjectPersistence => B4_PROJECT_PERSISTENCE_SCENARIO,
             Self::T5Qual001InteractionMip => T5_QUAL_001_INTERACTION_MIP_SCENARIO,
             Self::T5Qual001InteractionRenderModes => T5_QUAL_001_INTERACTION_RENDER_MODES_SCENARIO,
             Self::T5Qual001InteractionContinuous => T5_QUAL_001_INTERACTION_CONTINUOUS_SCENARIO,
@@ -663,6 +678,9 @@ impl ProductValidationScenario {
             B3_SOURCE_VERIFICATION_SCENARIO | "b3-source-verification" => {
                 Ok(Self::B3SourceVerification)
             }
+            B4_PROJECT_PERSISTENCE_SCENARIO | "b4-project-persistence" => {
+                Ok(Self::B4ProjectPersistence)
+            }
             T5_QUAL_001_INTERACTION_MIP_SCENARIO
             | "t5-qual-001-interaction-mip"
             | "T5-QUAL-001" => Ok(Self::T5Qual001InteractionMip),
@@ -696,7 +714,7 @@ impl ProductValidationScenario {
             other => bail!(
                 "unknown product validation scenario {other:?}; expected \
                  {GENERATED_FIXTURE_SCENARIO}, {GENERATED_RENDER_MODES_SCENARIO}, \
-                 {B3_SOURCE_VERIFICATION_SCENARIO}, \
+                 {B3_SOURCE_VERIFICATION_SCENARIO}, {B4_PROJECT_PERSISTENCE_SCENARIO}, \
                  {T5_QUAL_001_INTERACTION_MIP_SCENARIO}, {T5_QUAL_001_INTERACTION_RENDER_MODES_SCENARIO}, \
                  {T5_QUAL_001_INTERACTION_CONTINUOUS_SCENARIO}, {T5_QUAL_001_FOUR_PANEL_CROSS_SECTION_SCENARIO}, \
                  {T5_QUAL_001_FOUR_PANEL_FINE_SCALE_SCENARIO}, \
@@ -719,6 +737,8 @@ impl ProductValidationScenario {
                 | "render-modes"
                 | B3_SOURCE_VERIFICATION_SCENARIO
                 | "b3-source-verification"
+                | B4_PROJECT_PERSISTENCE_SCENARIO
+                | "b4-project-persistence"
                 | T5_QUAL_001_INTERACTION_MIP_SCENARIO
                 | "t5-qual-001-interaction-mip"
                 | "T5-QUAL-001"
@@ -758,6 +778,7 @@ impl ProductValidationScenario {
             | Self::GeneratedFixtureRenderModes
             | Self::B3SourceVerification
             | Self::CustomScript(_) => 60,
+            Self::B4ProjectPersistence => B4_PHASE_TIMEOUT_SECS * 3,
             Self::T5Qual001InteractionMip => 180,
             Self::T5Qual001InteractionRenderModes => 240,
             Self::T5Qual001InteractionContinuous => 300,
@@ -850,6 +871,506 @@ impl ProductValidationStatus {
     pub(crate) fn is_failure(self) -> bool {
         matches!(self, Self::Failed | Self::TimedOut)
     }
+}
+
+struct B4AggregateReport<'a> {
+    path: &'a Path,
+    status: ProductValidationStatus,
+    failure_reason: Option<String>,
+    started_at_epoch_ms: u128,
+    started_at: Instant,
+    package: &'a Path,
+    run_dir: &'a Path,
+    state_home: &'a Path,
+    original_project: &'a Path,
+    save_as_project: &'a Path,
+    scripts: &'a [Value],
+    attempts: &'a [Value],
+    revision_identity: &'a Value,
+    trusted_project_store_evidence: &'a Value,
+    display: DisplayClassification,
+    preflight_only: bool,
+}
+
+fn product_validate_b4_project_persistence(
+    package: Option<&Path>,
+    scenario: &ProductValidationScenario,
+) -> anyhow::Result<ProductValidationOutcome> {
+    let started_at = Instant::now();
+    let started_at_epoch_ms = epoch_ms();
+    let base_output_dir = PathBuf::from(OUTPUT_DIR);
+    fs::create_dir_all(&base_output_dir)
+        .with_context(|| format!("failed to create {}", base_output_dir.display()))?;
+    remove_legacy_root_product_validation_artifacts(&base_output_dir)?;
+    let output_dir = product_validation_output_dir(scenario);
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+    let run_dir = output_dir.join(format!("run-{}-{}", epoch_ms(), std::process::id()));
+    fs::create_dir(&run_dir).with_context(|| {
+        format!(
+            "failed to create unique B4 run directory {}",
+            run_dir.display()
+        )
+    })?;
+    let work_dir = run_dir.join("work");
+    let state_home = work_dir.join("xdg-state-home");
+    fs::create_dir_all(&state_home)
+        .with_context(|| format!("failed to create {}", state_home.display()))?;
+    let package = match package {
+        Some(package) => package.to_path_buf(),
+        None => generate_fixture(DEFAULT_FIXTURE)?,
+    };
+    let original_project = work_dir.join("original.m4dproj");
+    let save_as_project = work_dir.join("recovered-save-as.m4dproj");
+    let checkpoint = run_dir
+        .join("launch-1")
+        .join("external-kill-checkpoint.json");
+    let scripts = [
+        b4_launch_one_script(&package, &original_project, &checkpoint),
+        b4_launch_two_script(&package, &original_project, &save_as_project),
+        b4_launch_three_script(&package, &save_as_project),
+    ];
+    let phase_names = ["launch-1", "launch-2", "launch-3"];
+    let mut script_records = Vec::with_capacity(3);
+    for (phase, script) in phase_names.iter().zip(&scripts) {
+        validate_product_automation_script(script)
+            .with_context(|| format!("invalid fixed B4 automation script for {phase}"))?;
+        let phase_dir = run_dir.join(phase);
+        fs::create_dir_all(&phase_dir)
+            .with_context(|| format!("failed to create {}", phase_dir.display()))?;
+        let path = phase_dir.join("product-automation-script.json");
+        write_json_file(&path, script)?;
+        script_records.push(json!({
+            "phase": phase,
+            "path": path,
+            "scenario": script.get("scenario").and_then(Value::as_str),
+        }));
+    }
+    let report_path = run_dir.join("product-validation-report.json");
+    let display = display_status();
+    let preflight_only = env_flag(PREFLIGHT_ONLY_ENV);
+    let revision_identity = b4_revision_identity(false).unwrap_or_else(|err| {
+        json!({
+            "available": false,
+            "error": err.to_string(),
+        })
+    });
+    let mut trusted_project_store_evidence = Value::Null;
+    let mut attempts = Vec::new();
+
+    if preflight_only {
+        write_b4_aggregate_report(B4AggregateReport {
+            path: &report_path,
+            status: ProductValidationStatus::Unsupported,
+            failure_reason: Some(
+                "B4 preflight generated all three scripts without building or launching the app"
+                    .to_owned(),
+            ),
+            started_at_epoch_ms,
+            started_at,
+            package: &package,
+            run_dir: &run_dir,
+            state_home: &state_home,
+            original_project: &original_project,
+            save_as_project: &save_as_project,
+            scripts: &script_records,
+            attempts: &attempts,
+            revision_identity: &revision_identity,
+            trusted_project_store_evidence: &trusted_project_store_evidence,
+            display: DisplayClassification {
+                class: DisplayClass::Unsupported,
+                source: PREFLIGHT_ONLY_DISPLAY_SOURCE,
+            },
+            preflight_only,
+        })?;
+        return Ok(ProductValidationOutcome {
+            report_path,
+            status: ProductValidationStatus::Unsupported,
+        });
+    }
+
+    let setup = (|| -> anyhow::Result<(Value, Value)> {
+        if display.class != DisplayClass::RealDisplay || env::var_os("DISPLAY").is_none() {
+            bail!("B4 product validation requires a real X11 display");
+        }
+        require_b4_x11_tools()?;
+        let identity = b4_revision_identity(true)?;
+        let trusted_path = env::var_os(B4_TRUSTED_REPORT_ENV)
+            .map(PathBuf::from)
+            .with_context(|| {
+                format!(
+                    "B4 product validation requires {B4_TRUSTED_REPORT_ENV}=<same-revision verify-local project-store-lifecycle report>"
+                )
+            })?;
+        let trusted = load_b4_trusted_project_store_evidence(&trusted_path, &identity)?;
+        if !env_flag(SKIP_RELEASE_BUILD_ENV) {
+            run_cargo(["build", "--release", "-p", "mirante4d-app"])?;
+        }
+        if !release_app_binary().exists() {
+            bail!(
+                "release app binary does not exist at {}",
+                release_app_binary().display()
+            );
+        }
+        Ok((identity, trusted))
+    })();
+    let (identity, trusted) = match setup {
+        Ok(values) => values,
+        Err(err) => {
+            write_b4_aggregate_report(B4AggregateReport {
+                path: &report_path,
+                status: ProductValidationStatus::Failed,
+                failure_reason: Some(err.to_string()),
+                started_at_epoch_ms,
+                started_at,
+                package: &package,
+                run_dir: &run_dir,
+                state_home: &state_home,
+                original_project: &original_project,
+                save_as_project: &save_as_project,
+                scripts: &script_records,
+                attempts: &attempts,
+                revision_identity: &revision_identity,
+                trusted_project_store_evidence: &trusted_project_store_evidence,
+                display,
+                preflight_only,
+            })?;
+            return Ok(ProductValidationOutcome {
+                report_path,
+                status: ProductValidationStatus::Failed,
+            });
+        }
+    };
+    trusted_project_store_evidence = trusted;
+
+    let specs = [
+        B4AttemptSpec {
+            number: 1,
+            phase: "launch-1",
+            script: &script_records[0]["path"],
+            expected_client_width: B4_PRIMARY_CLIENT_WIDTH,
+            expected_client_height: B4_PRIMARY_CLIENT_HEIGHT,
+            expected_project: &original_project,
+            termination: B4Termination::ExternalSigkill {
+                checkpoint: &checkpoint,
+                expected_stage: B4_CHECKPOINT_STAGE,
+            },
+        },
+        B4AttemptSpec {
+            number: 2,
+            phase: "launch-2",
+            script: &script_records[1]["path"],
+            expected_client_width: B4_SECONDARY_CLIENT_WIDTH,
+            expected_client_height: B4_SECONDARY_CLIENT_HEIGHT,
+            expected_project: &save_as_project,
+            termination: B4Termination::Normal,
+        },
+        B4AttemptSpec {
+            number: 3,
+            phase: "launch-3",
+            script: &script_records[2]["path"],
+            expected_client_width: B4_SECONDARY_CLIENT_WIDTH,
+            expected_client_height: B4_SECONDARY_CLIENT_HEIGHT,
+            expected_project: &save_as_project,
+            termination: B4Termination::Normal,
+        },
+    ];
+
+    for spec in specs {
+        let attempt = run_b4_attempt(&release_app_binary(), &package, &state_home, &run_dir, spec);
+        let passed = attempt.get("status").and_then(Value::as_str) == Some("passed");
+        attempts.push(attempt);
+        let partial_failure = (!passed).then(|| {
+            attempts
+                .last()
+                .and_then(|attempt| attempt.get("failure_reason"))
+                .and_then(Value::as_str)
+                .unwrap_or("B4 phase failed")
+                .to_owned()
+        });
+        write_b4_aggregate_report(B4AggregateReport {
+            path: &report_path,
+            status: ProductValidationStatus::Failed,
+            failure_reason: partial_failure
+                .or_else(|| Some("B4 scenario is incomplete".to_owned())),
+            started_at_epoch_ms,
+            started_at,
+            package: &package,
+            run_dir: &run_dir,
+            state_home: &state_home,
+            original_project: &original_project,
+            save_as_project: &save_as_project,
+            scripts: &script_records,
+            attempts: &attempts,
+            revision_identity: &identity,
+            trusted_project_store_evidence: &trusted_project_store_evidence,
+            display: display.clone(),
+            preflight_only,
+        })?;
+        if !passed {
+            return Ok(ProductValidationOutcome {
+                report_path,
+                status: ProductValidationStatus::Failed,
+            });
+        }
+    }
+
+    let (status, failure_reason) = match validate_b4_aggregate_attempts(&attempts) {
+        Ok(()) => (ProductValidationStatus::Passed, None),
+        Err(err) => (ProductValidationStatus::Failed, Some(err.to_string())),
+    };
+    write_b4_aggregate_report(B4AggregateReport {
+        path: &report_path,
+        status,
+        failure_reason,
+        started_at_epoch_ms,
+        started_at,
+        package: &package,
+        run_dir: &run_dir,
+        state_home: &state_home,
+        original_project: &original_project,
+        save_as_project: &save_as_project,
+        scripts: &script_records,
+        attempts: &attempts,
+        revision_identity: &identity,
+        trusted_project_store_evidence: &trusted_project_store_evidence,
+        display,
+        preflight_only,
+    })?;
+    Ok(ProductValidationOutcome {
+        report_path,
+        status,
+    })
+}
+
+fn write_b4_aggregate_report(report: B4AggregateReport<'_>) -> anyhow::Result<()> {
+    let all_source_byte_identical = report.attempts.len() == 3
+        && report.attempts.iter().all(|attempt| {
+            attempt
+                .pointer("/source_closure_evidence/byte_identical")
+                .and_then(Value::as_bool)
+                == Some(true)
+        });
+    let value = json!({
+        "schema": PRODUCT_VALIDATION_SCHEMA,
+        "schema_version": PRODUCT_VALIDATION_SCHEMA_VERSION,
+        "command": "product-validate",
+        "status": report.status.name(),
+        "failure_reason": report.failure_reason,
+        "started_at_epoch_ms": report.started_at_epoch_ms,
+        "started_at_utc": unix_epoch_ms_to_utc_rfc3339(report.started_at_epoch_ms),
+        "finished_at_epoch_ms": epoch_ms(),
+        "duration_ms": duration_ms(report.started_at.elapsed()),
+        "revision": report.revision_identity,
+        "host": benchmark_host_context(),
+        "build_profile": "release",
+        "binary": release_app_binary(),
+        "dataset": dataset_context_json(report.package),
+        "scenario": {
+            "name": B4_PROJECT_PERSISTENCE_SCENARIO,
+            "kind": "fixed_three_launch_project_persistence_cutover",
+            "required_launches": 3,
+            "scripts": report.scripts,
+            "client_area_requirements": [
+                {"launch": 1, "width": B4_PRIMARY_CLIENT_WIDTH, "height": B4_PRIMARY_CLIENT_HEIGHT},
+                {"launch": 2, "width": B4_SECONDARY_CLIENT_WIDTH, "height": B4_SECONDARY_CLIENT_HEIGHT},
+                {"launch": 3, "width": B4_SECONDARY_CLIENT_WIDTH, "height": B4_SECONDARY_CLIENT_HEIGHT}
+            ]
+        },
+        "claim_boundary": {
+            "evidence_type": "native_multi_launch_internal_automation_with_external_x11_observation",
+            "real_display_required": true,
+            "externally_observed_client_pixels": true,
+            "external_sigkill": true,
+            "e4_product_open_satisfied": false,
+            "reason": "final E4 additionally requires frozen external OS input and pixel oracles"
+        },
+        "environment": {
+            "display_class": report.display.class.name(),
+            "display_class_source": report.display.source,
+            "display_env_present": env::var_os("DISPLAY").is_some(),
+            "isolated_xdg_state_home": report.state_home,
+            "preflight_only": report.preflight_only
+        },
+        "project_paths": {
+            "original": report.original_project,
+            "save_as": report.save_as_project
+        },
+        "retry_policy": {
+            "automatic_retries": 0,
+            "attempts_per_phase_max": 1,
+            "observed_retries": 0
+        },
+        "trusted_project_store_evidence": report.trusted_project_store_evidence,
+        "source_nonmutation": {
+            "required_per_launch": true,
+            "all_three_launches_byte_identical": all_source_byte_identical
+        },
+        "attempts": report.attempts,
+        "artifacts": {
+            "run_directory": report.run_dir,
+            "retention": "all_phase_scripts_logs_reports_and_checkpoint"
+        }
+    });
+    write_json_file(report.path, &value)
+}
+
+fn b4_revision_identity(require_clean: bool) -> anyhow::Result<Value> {
+    let commit = git_stdout(&["rev-parse", "HEAD"])?;
+    let tree = git_stdout(&["rev-parse", "HEAD^{tree}"])?;
+    let status = git_stdout(&["status", "--porcelain=v1", "--untracked-files=normal"])?;
+    let clean = status.is_empty();
+    if require_clean && !clean {
+        bail!("B4 product validation requires a clean committed worktree");
+    }
+    Ok(json!({
+        "available": true,
+        "commit": commit,
+        "tree": tree,
+        "clean": clean,
+    }))
+}
+
+fn git_stdout(args: &[&str]) -> anyhow::Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!("git {} failed with {}", args.join(" "), output.status);
+    }
+    String::from_utf8(output.stdout)
+        .context("git output was not UTF-8")
+        .map(|value| value.trim().to_owned())
+}
+
+fn load_b4_trusted_project_store_evidence(
+    path: &Path,
+    expected_identity: &Value,
+) -> anyhow::Result<Value> {
+    let report = read_json_file(path).with_context(|| {
+        format!(
+            "failed to read trusted project-store lifecycle report {}",
+            path.display()
+        )
+    })?;
+    if report.get("schema").and_then(Value::as_str) != Some("mirante4d-verification-run")
+        || report.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || report.get("group").and_then(Value::as_str) != Some("project-store-lifecycle")
+        || report.get("native_status").and_then(Value::as_str) != Some("passed")
+    {
+        bail!("trusted project-store report identity or result is not accepted");
+    }
+    let expected_commit = expected_identity
+        .get("commit")
+        .and_then(Value::as_str)
+        .context("current B4 identity lacks commit")?;
+    let expected_tree = expected_identity
+        .get("tree")
+        .and_then(Value::as_str)
+        .context("current B4 identity lacks tree")?;
+    let report_identity = report
+        .get("identity")
+        .context("trusted project-store report lacks identity")?;
+    if report_identity.get("commit").and_then(Value::as_str) != Some(expected_commit)
+        || report_identity.get("tree").and_then(Value::as_str) != Some(expected_tree)
+        || report_identity.get("clean").and_then(Value::as_bool) != Some(true)
+        || report_identity.get("qualifying").and_then(Value::as_bool) != Some(true)
+    {
+        bail!("trusted project-store report is not bound to this exact clean B4 revision");
+    }
+    let phases = report
+        .get("phases")
+        .and_then(Value::as_array)
+        .context("trusted project-store report lacks phases")?;
+    if phases.len() != 3
+        || !phases
+            .iter()
+            .all(|phase| phase.get("status").and_then(Value::as_str) == Some("passed"))
+    {
+        bail!("trusted project-store report does not retain three passing phases");
+    }
+    let lifecycle = report
+        .pointer("/evidence/wp10b_project_store_lifecycle")
+        .context("trusted project-store report lacks lifecycle evidence")?;
+    if lifecycle.get("schema").and_then(Value::as_str)
+        != Some("mirante4d-wp10b-project-store-lifecycle-evidence")
+        || lifecycle.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || lifecycle.get("result").and_then(Value::as_str) != Some("passed")
+        || !lifecycle
+            .get("failures")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        || lifecycle
+            .pointer("/identity/commit")
+            .and_then(Value::as_str)
+            != Some(expected_commit)
+        || lifecycle.pointer("/identity/tree").and_then(Value::as_str) != Some(expected_tree)
+        || lifecycle
+            .pointer("/identity/clean")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        bail!("trusted project-store lifecycle evidence identity or result drifted");
+    }
+    let counters = lifecycle
+        .get("counters")
+        .context("trusted project-store lifecycle evidence lacks counters")?;
+    let enqueue_poll_p99_ms = counters
+        .get("enqueue_poll_p99_ms")
+        .and_then(Value::as_f64)
+        .context("trusted project-store enqueue/poll p99 is missing")?;
+    let enqueue_poll_samples = counters
+        .get("enqueue_poll_samples")
+        .and_then(Value::as_u64)
+        .context("trusted project-store enqueue/poll sample count is missing")?;
+    let unchanged_bytes = counters
+        .get("incremental_unchanged_artifact_bytes_rewritten")
+        .and_then(Value::as_u64)
+        .context("trusted project-store unchanged-byte counter is missing")?;
+    let metadata_rss = counters
+        .get("post_open_or_save_metadata_rss_bytes")
+        .and_then(Value::as_u64)
+        .context("trusted project-store metadata RSS is missing")?;
+    if !(0.0..=5.0).contains(&enqueue_poll_p99_ms)
+        || enqueue_poll_samples < 1_000
+        || unchanged_bytes != 0
+        || metadata_rss > 100_663_296
+        || lifecycle
+            .pointer("/harness/retries")
+            .and_then(Value::as_u64)
+            != Some(0)
+    {
+        bail!("trusted project-store performance or zero-retry thresholds did not pass");
+    }
+    Ok(json!({
+        "source_report": path,
+        "binding": "explicit_path_exact_commit_tree_clean_identity",
+        "aggregate_identity": report_identity,
+        "lifecycle_evidence": lifecycle,
+        "performance_thresholds": {
+            "enqueue_poll_p99_ms_max": 5.0,
+            "enqueue_poll_samples_min": 1000,
+            "incremental_unchanged_artifact_bytes_rewritten_max": 0,
+            "post_open_or_save_metadata_rss_bytes_max": 100663296,
+            "retries": 0
+        },
+        "performance_result": "passed"
+    }))
+}
+
+fn require_b4_x11_tools() -> anyhow::Result<()> {
+    for (program, arg) in [
+        ("xdotool", "version"),
+        ("xwininfo", "-version"),
+        ("wmctrl", "-h"),
+    ] {
+        Command::new(program)
+            .arg(arg)
+            .output()
+            .with_context(|| format!("B4 product validation requires {program}"))?;
+    }
+    Ok(())
 }
 
 fn completed_product_validation_outcome(
@@ -1041,6 +1562,16 @@ fn product_validation_package_and_script(
                 None => generate_fixture(DEFAULT_FIXTURE)?,
             };
             let script = b3_source_verification_script(&package);
+            Ok((package, script))
+        }
+        ProductValidationScenario::B4ProjectPersistence => {
+            let package = match package {
+                Some(package) => package.to_path_buf(),
+                None => generate_fixture(DEFAULT_FIXTURE)?,
+            };
+            let placeholder = Path::new("target/b4-project-placeholder.m4dproj");
+            let checkpoint = Path::new("target/b4-checkpoint-placeholder.json");
+            let script = b4_launch_one_script(&package, placeholder, checkpoint);
             Ok((package, script))
         }
         ProductValidationScenario::T5Qual001InteractionMip => {
@@ -1265,6 +1796,128 @@ fn b3_source_verification_script(package: &Path) -> Value {
             { "command": "assert", "condition": { "render_target_pixels": { "width": B3_SECOND_VIEWPORT_WIDTH, "height": B3_SECOND_VIEWPORT_HEIGHT } } },
             { "command": "capture_screenshot", "name": "b3-after-success-1920x1080" },
             { "command": "copy_diagnostics" },
+            { "command": "quit" }
+        ]
+    })
+}
+
+fn b4_launch_one_script(package: &Path, project: &Path, checkpoint: &Path) -> Value {
+    json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "scenario": "b4_project_persistence_launch_1",
+        "limits": dataset_runtime_limits(128 * MIB, 128),
+        "commands": [
+            { "command": "open_dataset", "path": package },
+            { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
+            { "command": "set_mapped_client_pixels", "width": B4_PRIMARY_CLIENT_WIDTH, "height": B4_PRIMARY_CLIENT_HEIGHT },
+            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30000 },
+            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "new_project" },
+            { "command": "initial_save_with_edit", "path": project },
+            { "command": "wait_for", "condition": "project_store_idle", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "project_state": {
+                "bound": true,
+                "dirty": true,
+                "lifecycle": "established",
+                "can_save": true,
+                "can_save_as": true,
+                "manual": true,
+                "autosave": false
+            } } },
+            { "command": "wait_for", "condition": "project_autosaved", "timeout_ms": 45000 },
+            { "command": "assert", "condition": { "project_state": {
+                "bound": true,
+                "dirty": true,
+                "lifecycle": "established",
+                "can_save": true,
+                "can_save_as": true,
+                "manual": true,
+                "autosave": true
+            } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "name": "b4-launch-1-before-kill-1280x720" },
+            { "command": "write_external_kill_checkpoint", "path": checkpoint, "stage": B4_CHECKPOINT_STAGE },
+            { "command": "hold_for_external_kill" }
+        ]
+    })
+}
+
+fn b4_launch_two_script(package: &Path, original: &Path, save_as: &Path) -> Value {
+    json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "scenario": "b4_project_persistence_launch_2",
+        "limits": dataset_runtime_limits(128 * MIB, 128),
+        "commands": [
+            { "command": "open_dataset", "path": package },
+            { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
+            { "command": "set_mapped_client_pixels", "width": B4_SECONDARY_CLIENT_WIDTH, "height": B4_SECONDARY_CLIENT_HEIGHT },
+            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30000 },
+            { "command": "open_project", "path": original },
+            { "command": "wait_for", "condition": "recovery_review_required", "timeout_ms": 30000 },
+            { "command": "recover_automatic_autosave" },
+            { "command": "wait_for", "condition": "project_store_idle", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "project_state": {
+                "bound": true,
+                "dirty": true,
+                "lifecycle": "recovery_selected",
+                "can_save": false,
+                "can_save_as": true,
+                "manual": true,
+                "autosave": true
+            } } },
+            { "command": "save_project_as", "path": save_as },
+            { "command": "wait_for", "condition": "project_store_idle", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "project_state": {
+                "bound": true,
+                "dirty": false,
+                "lifecycle": "established",
+                "can_save": true,
+                "can_save_as": true,
+                "manual": true,
+                "autosave": false
+            } } },
+            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "name": "b4-launch-2-recovered-save-as-1920x1080" },
+            { "command": "close_project_store" },
+            { "command": "wait_for", "condition": "project_store_closed", "timeout_ms": 30000 },
+            { "command": "quit" }
+        ]
+    })
+}
+
+fn b4_launch_three_script(package: &Path, save_as: &Path) -> Value {
+    json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "scenario": "b4_project_persistence_launch_3",
+        "limits": dataset_runtime_limits(128 * MIB, 128),
+        "commands": [
+            { "command": "open_dataset", "path": package },
+            { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
+            { "command": "set_mapped_client_pixels", "width": B4_SECONDARY_CLIENT_WIDTH, "height": B4_SECONDARY_CLIENT_HEIGHT },
+            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30000 },
+            { "command": "open_project", "path": save_as },
+            { "command": "wait_for", "condition": "project_store_idle", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "project_state": {
+                "bound": true,
+                "dirty": false,
+                "lifecycle": "established",
+                "can_save": true,
+                "can_save_as": true,
+                "manual": true,
+                "autosave": false
+            } } },
+            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "name": "b4-launch-3-final-reopen-clean-1920x1080" },
+            { "command": "close_project_store" },
+            { "command": "wait_for", "condition": "project_store_closed", "timeout_ms": 30000 },
             { "command": "quit" }
         ]
     })
@@ -2041,13 +2694,12 @@ fn validate_product_automation_script(script: &Value) -> anyhow::Result<()> {
     if !has_open_dataset {
         bail!("automation script must include open_dataset");
     }
-    if commands
+    let terminal_command = commands
         .last()
         .and_then(|command| command.get("command"))
-        .and_then(Value::as_str)
-        != Some("quit")
-    {
-        bail!("automation script final command must be quit");
+        .and_then(Value::as_str);
+    if !matches!(terminal_command, Some("quit" | "hold_for_external_kill")) {
+        bail!("automation script final command must be quit or hold_for_external_kill");
     }
     validate_product_automation_limits(script)?;
     Ok(())
@@ -2116,6 +2768,645 @@ fn parse_linux_status_rss_bytes(status: &str) -> Option<u64> {
         .nth(1)
         .and_then(|value| value.parse::<u64>().ok())?;
     Some(kib * 1024)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum B4Termination<'a> {
+    Normal,
+    ExternalSigkill {
+        checkpoint: &'a Path,
+        expected_stage: &'a str,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct B4AttemptSpec<'a> {
+    number: u64,
+    phase: &'a str,
+    script: &'a Value,
+    expected_client_width: u32,
+    expected_client_height: u32,
+    expected_project: &'a Path,
+    termination: B4Termination<'a>,
+}
+
+#[derive(Debug)]
+struct B4ProcessStatus {
+    timed_out: bool,
+    exit_status: Option<String>,
+    exit_success: Option<bool>,
+    signal: Option<i32>,
+    external_sigkill_sent: bool,
+    checkpoint: Option<Value>,
+    observed_client_area_pixels: Option<Value>,
+    fullscreen_action: Option<Value>,
+    control_failure: Option<String>,
+}
+
+fn run_b4_attempt(
+    binary: &Path,
+    package: &Path,
+    state_home: &Path,
+    run_dir: &Path,
+    spec: B4AttemptSpec<'_>,
+) -> Value {
+    let phase_dir = run_dir.join(spec.phase);
+    let automation_report_path = phase_dir.join("product-automation-report.json");
+    let stdout_path = phase_dir.join("mirante4d-app.stdout.log");
+    let stderr_path = phase_dir.join("mirante4d-app.stderr.log");
+    let script_path = spec
+        .script
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| phase_dir.join("invalid-script-path"));
+    let source_before = SourceClosureSnapshot::capture(package);
+    let started_at_epoch_ms = epoch_ms();
+    let started_at = Instant::now();
+    let process_result = match &source_before {
+        Ok(_) => run_b4_product_process(B4ProductRun {
+            binary,
+            package,
+            script: &script_path,
+            automation_report: &automation_report_path,
+            stdout_path: &stdout_path,
+            stderr_path: &stderr_path,
+            state_home,
+            timeout: Duration::from_secs(B4_PHASE_TIMEOUT_SECS),
+            expected_client_width: spec.expected_client_width,
+            expected_client_height: spec.expected_client_height,
+            termination: spec.termination,
+        }),
+        Err(err) => Err(anyhow::anyhow!(err.to_string())),
+    };
+    let source_closure_evidence = source_before
+        .as_ref()
+        .map_err(|err| anyhow::anyhow!(err.to_string()))
+        .and_then(|before| before.compare_json(package))
+        .unwrap_or_else(|err| {
+            json!({
+                "required": true,
+                "byte_identical": Value::Null,
+                "error": err.to_string(),
+            })
+        });
+    let automation_report = if automation_report_path.exists() {
+        read_json_file(&automation_report_path).unwrap_or_else(|err| {
+            json!({
+                "status": "invalid_report",
+                "failure_reason": err.to_string(),
+            })
+        })
+    } else {
+        Value::Null
+    };
+    let process = match process_result {
+        Ok(process) => b4_process_status_json(process),
+        Err(err) => json!({
+            "timed_out": false,
+            "exit_status": Value::Null,
+            "exit_success": Value::Null,
+            "signal": Value::Null,
+            "external_sigkill_sent": false,
+            "checkpoint": Value::Null,
+            "observed_client_area_pixels": Value::Null,
+            "fullscreen_action": Value::Null,
+            "control_failure": format!("B4 process runner failed: {err}"),
+        }),
+    };
+    let mut attempt = json!({
+        "attempt": spec.number,
+        "phase": spec.phase,
+        "retry_index": 0,
+        "status": "pending",
+        "failure_reason": Value::Null,
+        "started_at_epoch_ms": started_at_epoch_ms,
+        "finished_at_epoch_ms": epoch_ms(),
+        "duration_ms": duration_ms(started_at.elapsed()),
+        "script": script_path,
+        "automation_report_path": automation_report_path,
+        "stdout": stdout_path,
+        "stderr": stderr_path,
+        "requested_client_area_pixels": {
+            "width": spec.expected_client_width,
+            "height": spec.expected_client_height,
+        },
+        "process": process,
+        "automation_report": automation_report,
+        "source_closure_evidence": source_closure_evidence,
+        "project_package_evidence": {
+            "path": spec.expected_project,
+            "exists": spec.expected_project.exists(),
+            "is_directory": spec.expected_project.is_dir(),
+        },
+    });
+    match validate_b4_attempt(&attempt, spec.number) {
+        Ok(()) => attempt["status"] = Value::String("passed".to_owned()),
+        Err(err) => {
+            attempt["status"] = Value::String("failed".to_owned());
+            attempt["failure_reason"] = Value::String(err.to_string());
+        }
+    }
+    attempt
+}
+
+fn b4_process_status_json(status: B4ProcessStatus) -> Value {
+    json!({
+        "timed_out": status.timed_out,
+        "exit_status": status.exit_status,
+        "exit_success": status.exit_success,
+        "signal": status.signal,
+        "external_sigkill_sent": status.external_sigkill_sent,
+        "checkpoint": status.checkpoint,
+        "observed_client_area_pixels": status.observed_client_area_pixels,
+        "fullscreen_action": status.fullscreen_action,
+        "control_failure": status.control_failure,
+    })
+}
+
+struct B4ProductRun<'a> {
+    binary: &'a Path,
+    package: &'a Path,
+    script: &'a Path,
+    automation_report: &'a Path,
+    stdout_path: &'a Path,
+    stderr_path: &'a Path,
+    state_home: &'a Path,
+    timeout: Duration,
+    expected_client_width: u32,
+    expected_client_height: u32,
+    termination: B4Termination<'a>,
+}
+
+fn run_b4_product_process(run: B4ProductRun<'_>) -> anyhow::Result<B4ProcessStatus> {
+    let stdout = fs::File::create(run.stdout_path)
+        .with_context(|| format!("failed to create {}", run.stdout_path.display()))?;
+    let stderr = fs::File::create(run.stderr_path)
+        .with_context(|| format!("failed to create {}", run.stderr_path.display()))?;
+    let mut command = Command::new(run.binary);
+    command
+        .env("MIRANTE4D_DEV_DATASET", run.package)
+        .env("MIRANTE4D_ENABLE_AUTOMATION", "1")
+        .env("MIRANTE4D_AUTOMATION_SCRIPT", run.script)
+        .env("MIRANTE4D_AUTOMATION_REPORT", run.automation_report)
+        .env("XDG_STATE_HOME", run.state_home)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    println!("running B4 product validation phase: {:?}", command);
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to launch native app product validation binary {}",
+            run.binary.display()
+        )
+    })?;
+    let deadline = Instant::now() + run.timeout;
+    let mut observed_client_area_pixels = None;
+    let mut fullscreen_action = None;
+    let mut checkpoint = None;
+    loop {
+        if observed_client_area_pixels.is_none() {
+            match probe_b4_x11_client_geometry(
+                child.id(),
+                run.expected_client_width,
+                run.expected_client_height,
+                &mut fullscreen_action,
+            ) {
+                Ok(observed) => observed_client_area_pixels = observed,
+                Err(err) => {
+                    if let Some(exit_status) = child
+                        .try_wait()
+                        .context("failed to poll B4 product child after geometry failure")?
+                    {
+                        return Ok(b4_finished_process_status(
+                            exit_status,
+                            false,
+                            false,
+                            checkpoint,
+                            observed_client_area_pixels,
+                            fullscreen_action,
+                            Some(format!("external X11 geometry observation failed: {err}")),
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let B4Termination::ExternalSigkill {
+            checkpoint: checkpoint_path,
+            expected_stage,
+        } = run.termination
+            && checkpoint.is_none()
+            && checkpoint_path.exists()
+        {
+            match read_json_file(checkpoint_path)
+                .and_then(|value| validate_b4_checkpoint(&value, expected_stage).map(|()| value))
+            {
+                Ok(value) => checkpoint = Some(value),
+                Err(err) => {
+                    let _ = child.kill();
+                    let exit_status = child
+                        .wait()
+                        .context("failed to reap B4 child after invalid checkpoint")?;
+                    return Ok(b4_finished_process_status(
+                        exit_status,
+                        false,
+                        true,
+                        None,
+                        observed_client_area_pixels,
+                        fullscreen_action,
+                        Some(format!("external kill checkpoint failed validation: {err}")),
+                    ));
+                }
+            }
+        }
+
+        if matches!(run.termination, B4Termination::ExternalSigkill { .. })
+            && checkpoint.is_some()
+            && observed_client_area_pixels.is_some()
+        {
+            child
+                .kill()
+                .context("failed to send external SIGKILL to B4 product child")?;
+            let exit_status = child
+                .wait()
+                .context("failed to reap externally killed B4 product child")?;
+            return Ok(b4_finished_process_status(
+                exit_status,
+                false,
+                true,
+                checkpoint,
+                observed_client_area_pixels,
+                fullscreen_action,
+                None,
+            ));
+        }
+
+        if let Some(exit_status) = child
+            .try_wait()
+            .context("failed to poll B4 product validation child")?
+        {
+            let early_exit = matches!(run.termination, B4Termination::ExternalSigkill { .. });
+            return Ok(b4_finished_process_status(
+                exit_status,
+                false,
+                false,
+                checkpoint,
+                observed_client_area_pixels,
+                fullscreen_action,
+                early_exit.then(|| {
+                    "native app exited before the synced checkpoint and external SIGKILL".to_owned()
+                }),
+            ));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let exit_status = child
+                .wait()
+                .context("failed to reap timed-out B4 product child")?;
+            return Ok(b4_finished_process_status(
+                exit_status,
+                true,
+                false,
+                checkpoint,
+                observed_client_area_pixels,
+                fullscreen_action,
+                Some(format!(
+                    "B4 product phase exceeded its {}-second timeout",
+                    run.timeout.as_secs()
+                )),
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn b4_finished_process_status(
+    exit_status: std::process::ExitStatus,
+    timed_out: bool,
+    external_sigkill_sent: bool,
+    checkpoint: Option<Value>,
+    observed_client_area_pixels: Option<Value>,
+    fullscreen_action: Option<Value>,
+    control_failure: Option<String>,
+) -> B4ProcessStatus {
+    B4ProcessStatus {
+        timed_out,
+        exit_status: Some(exit_status.to_string()),
+        exit_success: Some(exit_status.success()),
+        signal: exit_status.signal(),
+        external_sigkill_sent,
+        checkpoint,
+        observed_client_area_pixels,
+        fullscreen_action,
+        control_failure,
+    }
+}
+
+fn probe_b4_x11_client_geometry(
+    pid: u32,
+    expected_width: u32,
+    expected_height: u32,
+    fullscreen_action: &mut Option<Value>,
+) -> anyhow::Result<Option<Value>> {
+    let search = Command::new("xdotool")
+        .args(["search", "--onlyvisible", "--pid", &pid.to_string()])
+        .output()
+        .context("failed to run xdotool window search")?;
+    if !search.status.success() {
+        return Ok(None);
+    }
+    let window_ids = String::from_utf8(search.stdout).context("xdotool output was not UTF-8")?;
+    for raw_id in window_ids
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let Ok(window_id) = raw_id.parse::<u64>() else {
+            continue;
+        };
+        let id_hex = format!("0x{window_id:x}");
+        let info = Command::new("xwininfo")
+            .args(["-id", &id_hex])
+            .output()
+            .context("failed to run xwininfo")?;
+        if !info.status.success() {
+            continue;
+        }
+        let encoded = String::from_utf8(info.stdout).context("xwininfo output was not UTF-8")?;
+        let Some((width, height, is_viewable)) = parse_xwininfo_client_geometry(&encoded) else {
+            continue;
+        };
+        if width == expected_width && height == expected_height && is_viewable {
+            return Ok(Some(json!({
+                "width": width,
+                "height": height,
+                "window_id": id_hex,
+                "map_state": "is_viewable",
+                "observation": "xdotool_pid_search_plus_xwininfo_client_geometry",
+                "observed_at_epoch_ms": epoch_ms(),
+            })));
+        }
+        if expected_width == B4_SECONDARY_CLIENT_WIDTH
+            && expected_height == B4_SECONDARY_CLIENT_HEIGHT
+            && fullscreen_action.is_none()
+        {
+            let action = Command::new("wmctrl")
+                .args(["-i", "-r", &id_hex, "-b", "add,fullscreen"])
+                .output()
+                .context("failed to request external fullscreen through wmctrl")?;
+            if action.status.success() {
+                *fullscreen_action = Some(json!({
+                    "tool": "wmctrl",
+                    "window_id": id_hex,
+                    "action": "add_fullscreen",
+                    "status": "succeeded",
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn parse_xwininfo_client_geometry(output: &str) -> Option<(u32, u32, bool)> {
+    let width = output
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("Width:"))?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    let height = output
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("Height:"))?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    let is_viewable = output
+        .lines()
+        .map(str::trim)
+        .any(|line| line == "Map State: IsViewable");
+    Some((width, height, is_viewable))
+}
+
+fn validate_b4_checkpoint(checkpoint: &Value, expected_stage: &str) -> anyhow::Result<()> {
+    if checkpoint.get("schema").and_then(Value::as_str) != Some(B4_CHECKPOINT_SCHEMA)
+        || checkpoint.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || checkpoint.get("stage").and_then(Value::as_str) != Some(expected_stage)
+    {
+        bail!("B4 external-kill checkpoint identity or stage drifted");
+    }
+    let requested_pixels = checkpoint
+        .pointer("/viewport_evidence/requested_mapped_client_pixels")
+        .context("B4 checkpoint lacks requested mapped-client pixels")?;
+    if requested_pixels.get("width").and_then(Value::as_u64)
+        != Some(u64::from(B4_PRIMARY_CLIENT_WIDTH))
+        || requested_pixels.get("height").and_then(Value::as_u64)
+            != Some(u64::from(B4_PRIMARY_CLIENT_HEIGHT))
+    {
+        bail!("B4 checkpoint mapped-client request is not exact 1280x720");
+    }
+    let state = checkpoint
+        .get("project_state")
+        .context("B4 checkpoint lacks project state")?;
+    for (field, expected) in [
+        ("bound", true),
+        ("dirty", true),
+        ("can_save", true),
+        ("can_save_as", true),
+        ("manual", true),
+        ("autosave", true),
+    ] {
+        if state.get(field).and_then(Value::as_bool) != Some(expected) {
+            bail!("B4 checkpoint project_state.{field} drifted");
+        }
+    }
+    if state.get("lifecycle").and_then(Value::as_str) != Some("established")
+        || state.get("current_manual").is_none_or(Value::is_null)
+        || state.get("current_autosave").is_none_or(Value::is_null)
+    {
+        bail!("B4 checkpoint does not retain established manual and autosave heads");
+    }
+    let evidence = checkpoint
+        .get("project_evidence")
+        .context("B4 checkpoint lacks project evidence")?;
+    if evidence.get("autosave_wait_mode").and_then(Value::as_str)
+        != Some("scheduled_deadline_no_busy_poll")
+        || evidence
+            .get("autosave_elapsed_from_durable_edit_ms")
+            .and_then(Value::as_u64)
+            .is_none_or(|elapsed| elapsed < B4_AUTOSAVE_MIN_ELAPSED_MS)
+    {
+        bail!("B4 checkpoint does not prove a passive real 30-second autosave deadline");
+    }
+    let current = b4_revision_fact(state.get("current_revision"), "current revision")?;
+    let saved = b4_revision_fact(state.get("saved_revision"), "saved revision")?;
+    let initial = b4_revision_fact(
+        evidence.get("initial_save_captured_revision"),
+        "initial Save captured revision",
+    )?;
+    let autosave = b4_revision_fact(
+        evidence.get("latest_autosave_captured_revision"),
+        "latest autosave captured revision",
+    )?;
+    if saved != initial || current != autosave || current.0 != saved.0 || current.1 <= saved.1 {
+        bail!(
+            "B4 checkpoint does not prove initial captured Save, later dirty edit, and autosave of the current revision"
+        );
+    }
+    Ok(())
+}
+
+fn b4_revision_fact(value: Option<&Value>, context: &str) -> anyhow::Result<(String, u64)> {
+    let value = value.with_context(|| format!("B4 checkpoint lacks {context}"))?;
+    let project_id = value
+        .get("project_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("B4 checkpoint {context} lacks project_id"))?;
+    let sequence = value
+        .get("sequence")
+        .and_then(Value::as_u64)
+        .with_context(|| format!("B4 checkpoint {context} lacks sequence"))?;
+    Ok((project_id.to_owned(), sequence))
+}
+
+fn validate_b4_attempt(attempt: &Value, expected_number: u64) -> anyhow::Result<()> {
+    if attempt.get("attempt").and_then(Value::as_u64) != Some(expected_number)
+        || attempt.get("retry_index").and_then(Value::as_u64) != Some(0)
+    {
+        bail!("B4 attempt identity or retry index drifted");
+    }
+    if attempt
+        .pointer("/source_closure_evidence/byte_identical")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        bail!("B4 launch {expected_number} changed or failed to compare the source closure");
+    }
+    if attempt
+        .pointer("/project_package_evidence/exists")
+        .and_then(Value::as_bool)
+        != Some(true)
+        || attempt
+            .pointer("/project_package_evidence/is_directory")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        bail!("B4 launch {expected_number} did not retain its expected project package");
+    }
+    if attempt
+        .pointer("/process/timed_out")
+        .and_then(Value::as_bool)
+        != Some(false)
+        || !attempt
+            .pointer("/process/control_failure")
+            .is_some_and(Value::is_null)
+    {
+        bail!("B4 launch {expected_number} process control failed");
+    }
+    let requested = attempt
+        .get("requested_client_area_pixels")
+        .context("B4 attempt lacks requested client pixels")?;
+    let observed = attempt
+        .pointer("/process/observed_client_area_pixels")
+        .context("B4 attempt lacks externally observed client pixels")?;
+    if observed.get("width") != requested.get("width")
+        || observed.get("height") != requested.get("height")
+        || observed.get("map_state").and_then(Value::as_str) != Some("is_viewable")
+        || observed.get("observation").and_then(Value::as_str)
+            != Some("xdotool_pid_search_plus_xwininfo_client_geometry")
+    {
+        bail!("B4 launch {expected_number} mapped client geometry was not externally exact");
+    }
+
+    if expected_number == 1 {
+        if attempt
+            .pointer("/process/external_sigkill_sent")
+            .and_then(Value::as_bool)
+            != Some(true)
+            || attempt.pointer("/process/signal").and_then(Value::as_i64) != Some(9)
+            || attempt
+                .pointer("/process/exit_success")
+                .and_then(Value::as_bool)
+                != Some(false)
+        {
+            bail!("B4 launch 1 was not terminated by the parent's external SIGKILL signal 9");
+        }
+        let checkpoint = attempt
+            .pointer("/process/checkpoint")
+            .context("B4 launch 1 lacks the synced pre-kill checkpoint")?;
+        validate_b4_checkpoint(checkpoint, B4_CHECKPOINT_STAGE)?;
+        return Ok(());
+    }
+
+    if attempt
+        .pointer("/process/exit_success")
+        .and_then(Value::as_bool)
+        != Some(true)
+        || !attempt
+            .pointer("/process/signal")
+            .is_some_and(Value::is_null)
+    {
+        bail!("B4 launch {expected_number} did not exit normally");
+    }
+    let automation = attempt
+        .get("automation_report")
+        .context("B4 normal launch lacks its automation report")?;
+    if automation.get("status").and_then(Value::as_str) != Some("passed") {
+        bail!("B4 launch {expected_number} automation did not pass");
+    }
+    let expected_width = requested.get("width").and_then(Value::as_u64);
+    let expected_height = requested.get("height").and_then(Value::as_u64);
+    if automation
+        .pointer("/viewport_evidence/requested_mapped_client_pixels/width")
+        .and_then(Value::as_u64)
+        != expected_width
+        || automation
+            .pointer("/viewport_evidence/requested_mapped_client_pixels/height")
+            .and_then(Value::as_u64)
+            != expected_height
+    {
+        bail!("B4 launch {expected_number} app request and external client geometry disagree");
+    }
+    if !automation
+        .pointer("/viewport_evidence/observed_client_area_pixels")
+        .is_some_and(Value::is_null)
+    {
+        bail!("B4 app report must not claim the xtask-owned external client observation");
+    }
+    qualifying_nonblank_viewport_capture(Some(automation)).map_err(anyhow::Error::msg)?;
+    if automation
+        .pointer("/project_store_evidence/close_result/status")
+        .and_then(Value::as_str)
+        != Some("succeeded")
+        || automation
+            .pointer("/project_store_evidence/actor_join/status")
+            .and_then(Value::as_str)
+            != Some("succeeded")
+    {
+        bail!("B4 launch {expected_number} does not prove normal Close and actor join");
+    }
+    Ok(())
+}
+
+fn validate_b4_aggregate_attempts(attempts: &[Value]) -> anyhow::Result<()> {
+    if attempts.len() != 3 {
+        bail!("B4 aggregate requires exactly three retained launch attempts");
+    }
+    for (index, attempt) in attempts.iter().enumerate() {
+        let expected_number = u64::try_from(index + 1).expect("three attempts fit u64");
+        if attempt.get("status").and_then(Value::as_str) != Some("passed") {
+            bail!("B4 launch {expected_number} is not passed");
+        }
+        validate_b4_attempt(attempt, expected_number)?;
+    }
+    if attempts
+        .iter()
+        .any(|attempt| attempt.get("retry_index").and_then(Value::as_u64) != Some(0))
+    {
+        bail!("B4 aggregate observed a retry");
+    }
+    Ok(())
 }
 
 struct ProductAutomationRun<'a> {

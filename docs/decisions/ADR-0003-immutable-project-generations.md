@@ -6,12 +6,11 @@ Last reviewed: 2026-07-13
 Decision ID: D-010
 Implementation authorization: NONE INDEPENDENT; ACTIVE HANDOFF AND PACKAGE ENTRY ONLY
 
-This ADR records owner-approved target policy. It carries no independent
-implementation or project-format change. WP-02 cut project v13 to the
-segmentation-free v14 predecessor. WP-07B later deleted v14 and installed the
-private experimental `mirante4d-project-v15` bridge. Only WP-10B may replace
-that bridge with this store. No existing project gains the transaction or
-durability guarantees described here.
+This ADR records owner-approved policy and carries no independent
+implementation authority. WP-02 cut project v13 to the segmentation-free v14
+predecessor, and WP-07B later replaced v14 with the private experimental
+project-v15 bridge. The WP-10B B4 candidate now replaces that bridge with this
+store; final qualifying evidence and protected-main acceptance remain pending.
 
 ## Context
 
