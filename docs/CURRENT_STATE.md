@@ -185,11 +185,12 @@ WP-12 is accepted on protected main at
 `foundation-wp-12-exit-1`. The bounded exact analysis runtime is the sole
 product analysis route; its predecessor and segmentation code are deleted.
 
-The WP-10C candidate activates the sharded target package and importer as the
-sole product dataset path, retains responsive background verification, binds
-proved package and scientific identities to projects, and deletes the
-predecessor data, format, and import crates. Protected-main acceptance is the
-remaining checkpoint.
+WP-10C is accepted on protected main at
+`b9ac2a5f08101094933f80a0ce98fbdbdbe6c8d6`, tagged
+`foundation-wp-10c-exit-1`. The sharded target package and bounded importer are
+the sole product dataset path, verification remains responsive, proved package
+and scientific identities bind to projects, and the predecessor data, format,
+and import crates are deleted.
 
 ## Current Verification Boundary
 
