@@ -61,8 +61,8 @@ product uses `mirante4d-storage`, `mirante4d-import-pipeline`, and
 ## Application Composition
 
 `MiranteWorkbenchApp` holds `ApplicationState`, bounded
-`DatasetDemandState`, process diagnostics, two remaining temporary runtime
-owners, egui state owned by `mirante4d-ui-egui`, and narrow
+`DatasetDemandState`, process diagnostics, one remaining temporary runtime
+owner, egui state owned by `mirante4d-ui-egui`, and narrow
 project-store/settings/source-open handles. It is a
 composition root, not a second model.
 
@@ -70,14 +70,15 @@ The temporary owners and deletion gates are:
 
 | Owner | Scope | Gate |
 |---|---|---|
-| `CurrentRenderRuntime` | app-side successor status and presentation composition | WP-09C |
 | `CurrentValidationRuntime` | product-validation harness only | WP-14 |
 
-The private egui bridge translates UI input to `ApplicationCommand` and reads
-snapshots/events. `ProjectStoreApplicationService` is the sole product project
-I/O route; its actor owns project roots, sessions, leases, refs, recovery, and
-filesystem mutation. The project-v15 bridge and `CurrentProjectRuntime` are
-deleted, with no compatibility reader or fallback.
+The temporary egui bridge and render owner are deleted. The remaining visible
+workbench still calls `ApplicationState` directly while WP-09C moves its
+snapshot-to-command composition into `mirante4d-ui-egui`.
+`ProjectStoreApplicationService` is the sole product project I/O route; its
+actor owns project roots, sessions, leases, refs, recovery, and filesystem
+mutation. The project-v15 bridge and `CurrentProjectRuntime` are deleted, with
+no compatibility reader or fallback.
 
 The native `ImportWorkflow` owns TIFF worker cancellation, bounded terminal
 results, retry options, and explicit joining. It projects immutable import

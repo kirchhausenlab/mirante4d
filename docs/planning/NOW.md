@@ -18,10 +18,11 @@ paint through opaque presentation tokens. Import, analysis, project I/O,
 render coordination, worker lifetime, and WGPU resources will remain behind the
 application/composition boundary.
 
-Work proceeds in small cutovers: extract native presentation ownership, add the
-UI-only crate and command/snapshot surface, move the remaining workflow
-coordination, then delete the temporary UI/import/render owners and shell
-bridge. Acceptance is focused boundary testing plus one bounded native
-small-fixture scenario at 1280x720 with a short 1920x1080 check. Earlier
-durability, science, runtime, and GPU qualification is inherited rather than
-repeated.
+Native presentation ownership, the UI-only crate, the command/snapshot surface,
+and import/render coordination are in place. The temporary UI/import/render
+owners and shell bridge are deleted. The remaining cutover moves the visible
+workbench to one snapshot-in, typed-output-out UI entry point and shrinks the
+native app to process composition. Acceptance is focused boundary testing plus
+one bounded native small-fixture scenario at 1280x720 with a short 1920x1080
+check. Earlier durability, science, runtime, and GPU qualification is inherited
+rather than repeated.
