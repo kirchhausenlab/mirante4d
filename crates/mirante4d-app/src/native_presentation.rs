@@ -4,6 +4,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use eframe::egui;
 use mirante4d_render_api::PresentationToken;
+use mirante4d_ui_egui::EguiPresentationPaint;
 
 pub(crate) struct NativePresentationBridge {
     texture_renderer: Option<Arc<egui::mutex::RwLock<eframe::egui_wgpu::Renderer>>>,
@@ -34,6 +35,20 @@ impl NativePresentationBridge {
 
     pub(crate) fn texture_id(&self, token: PresentationToken) -> Option<egui::TextureId> {
         self.textures.get(&token).copied()
+    }
+
+    pub(crate) fn paint(
+        &self,
+        ui: &mut egui::Ui,
+        paint: EguiPresentationPaint,
+    ) -> anyhow::Result<()> {
+        let texture_id = self
+            .texture_id(paint.request().token())
+            .ok_or_else(|| anyhow::anyhow!("presentation token has no native texture"))?;
+        egui::Image::from_texture((texture_id, paint.rect().size()))
+            .fit_to_exact_size(paint.rect().size())
+            .paint_at(ui, paint.rect());
+        Ok(())
     }
 
     pub(crate) fn bind_texture(

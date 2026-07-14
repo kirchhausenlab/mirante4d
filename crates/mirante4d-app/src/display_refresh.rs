@@ -25,8 +25,8 @@ pub(crate) enum ViewportDisplayImage {
     UiBackground {
         size: egui::Vec2,
     },
-    Gpu {
-        texture_id: egui::TextureId,
+    Presentation {
+        slot: PresentationSlot,
         size: egui::Vec2,
     },
 }
@@ -70,7 +70,7 @@ impl ViewportDisplayImage {
     pub(crate) fn size_vec2(&self) -> egui::Vec2 {
         match self {
             Self::UiBackground { size } => *size,
-            Self::Gpu { size, .. } => *size,
+            Self::Presentation { size, .. } => *size,
         }
     }
 }
@@ -133,10 +133,9 @@ impl MiranteWorkbenchApp {
         &self,
         snapshot: &ApplicationSnapshot,
     ) -> ViewportDisplayImage {
-        if let Some((texture_id, extent)) = self.product_display(snapshot, PresentationSlot::ThreeD)
-        {
-            return ViewportDisplayImage::Gpu {
-                texture_id,
+        if let Some(extent) = self.product_display(snapshot, PresentationSlot::ThreeD) {
+            return ViewportDisplayImage::Presentation {
+                slot: PresentationSlot::ThreeD,
                 size: extent_size(extent),
             };
         }
@@ -156,9 +155,9 @@ impl MiranteWorkbenchApp {
             PanelId::Yz => PresentationSlot::Yz,
             PanelId::ThreeD => return None,
         };
-        let (texture_id, extent) = self.product_display(snapshot, slot)?;
-        Some(ViewportDisplayImage::Gpu {
-            texture_id,
+        let extent = self.product_display(snapshot, slot)?;
+        Some(ViewportDisplayImage::Presentation {
+            slot,
             size: extent_size(extent),
         })
     }
@@ -167,12 +166,9 @@ impl MiranteWorkbenchApp {
         &self,
         snapshot: &ApplicationSnapshot,
         slot: PresentationSlot,
-    ) -> Option<(egui::TextureId, RenderExtent)> {
+    ) -> Option<RenderExtent> {
         let frame = snapshot.presentations().get(slot)?.frame()?;
-        Some((
-            self.native_presentation.texture_id(frame.token())?,
-            frame.extent(),
-        ))
+        Some(frame.extent())
     }
 
     pub(crate) fn clear_3d_product_presentation(&mut self) {

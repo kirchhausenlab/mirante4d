@@ -407,10 +407,12 @@ impl MiranteWorkbenchApp {
                 );
                 response
             }
-            ViewportDisplayImage::Gpu { texture_id, size } => ui.add(
-                egui::Image::from_texture((texture_id, size))
-                    .fit_to_exact_size(image_size)
-                    .sense(egui::Sense::click_and_drag()),
+            ViewportDisplayImage::Presentation { slot, .. } => self.show_presentation(
+                ui,
+                snapshot,
+                slot,
+                image_size,
+                egui::Sense::click_and_drag(),
             ),
         };
         let hover = viewport_hover_from_response(snapshot, view, &self.render_runtime, &response);
@@ -488,7 +490,13 @@ impl MiranteWorkbenchApp {
             if image_size != egui::Vec2::ZERO {
                 Some(
                     ui.centered_and_justified(|ui| {
-                        self.show_cross_section_panel_image(ui, display_image, image_size, panel_id)
+                        self.show_cross_section_panel_image(
+                            ui,
+                            display_image,
+                            image_size,
+                            panel_id,
+                            snapshot,
+                        )
                     })
                     .inner,
                 )
@@ -545,6 +553,7 @@ impl MiranteWorkbenchApp {
         display_image: ViewportDisplayImage,
         image_size: egui::Vec2,
         panel_id: PanelId,
+        snapshot: &ApplicationSnapshot,
     ) -> egui::Response {
         let response = match display_image {
             ViewportDisplayImage::UiBackground { .. } => {
@@ -554,10 +563,12 @@ impl MiranteWorkbenchApp {
                     .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
                 response
             }
-            ViewportDisplayImage::Gpu { texture_id, size } => ui.add(
-                egui::Image::from_texture((texture_id, size))
-                    .fit_to_exact_size(image_size)
-                    .sense(egui::Sense::click_and_drag()),
+            ViewportDisplayImage::Presentation { slot, .. } => self.show_presentation(
+                ui,
+                snapshot,
+                slot,
+                image_size,
+                egui::Sense::click_and_drag(),
             ),
         };
         response.widget_info(|| {
@@ -567,6 +578,29 @@ impl MiranteWorkbenchApp {
                 format!("{} cross-section panel", panel_id.label()),
             )
         });
+        response
+    }
+
+    fn show_presentation(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: &ApplicationSnapshot,
+        slot: PresentationSlot,
+        image_size: egui::Vec2,
+        sense: egui::Sense,
+    ) -> egui::Response {
+        let surface = snapshot
+            .presentations()
+            .get(slot)
+            .expect("a displayed presentation belongs to a projected surface");
+        let (response, paint) = ui_kit::reserve_presentation(ui, slot, surface, image_size, sense);
+        ui.painter()
+            .rect_filled(response.rect, 0.0, ui.visuals().extreme_bg_color);
+        if let Some(paint) = paint
+            && let Err(error) = self.native_presentation.paint(ui, paint)
+        {
+            tracing::warn!(%error, ?slot, "native presentation request was rejected");
+        }
         response
     }
 

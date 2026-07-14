@@ -30,7 +30,8 @@ use mirante4d_project_model::{
     MAX_CHANNEL_PRESETS, MAX_TOTAL_CHANNEL_PRESET_ENTRIES, ProjectGenerationProjection, ProjectId,
     ProjectRevisionHighWater, ProjectRevisionId, ProjectState, ViewState,
 };
-use mirante4d_render_api::{PresentationPaintRequest, PresentationViewport, PresentedFrame};
+use mirante4d_render_api::PresentedFrame;
+pub use mirante4d_render_api::{PresentationPaintRequest, PresentationViewport};
 use mirante4d_settings::{RejectedFileDisposition, ResourcePolicy};
 
 /// Maximum number of project revisions retained for undo/redo.

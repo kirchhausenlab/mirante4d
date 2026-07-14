@@ -5,7 +5,10 @@
 use std::{fmt::Display, hash::Hash};
 
 use eframe::egui::{self, Color32, RichText};
-use mirante4d_application::{ApplicationEvent, OperationOutcome};
+use mirante4d_application::{
+    ApplicationEvent, OperationOutcome, PresentationPaintRequest, PresentationSlot,
+    PresentationSurface,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UiColors {
@@ -69,6 +72,40 @@ pub enum StatusTone {
     Ready,
     Warning,
     Error,
+}
+
+/// One egui rectangle reserved for a backend-neutral presentation request.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EguiPresentationPaint {
+    slot: PresentationSlot,
+    request: PresentationPaintRequest,
+    rect: egui::Rect,
+}
+
+impl EguiPresentationPaint {
+    pub const fn new(
+        slot: PresentationSlot,
+        request: PresentationPaintRequest,
+        rect: egui::Rect,
+    ) -> Self {
+        Self {
+            slot,
+            request,
+            rect,
+        }
+    }
+
+    pub const fn slot(self) -> PresentationSlot {
+        self.slot
+    }
+
+    pub const fn request(self) -> PresentationPaintRequest {
+        self.request
+    }
+
+    pub const fn rect(self) -> egui::Rect {
+        self.rect
+    }
 }
 
 impl Default for UiColors {
@@ -192,6 +229,20 @@ pub fn application_problem_message(event: Option<&ApplicationEvent>) -> Option<S
         )),
         _ => None,
     }
+}
+
+pub fn reserve_presentation(
+    ui: &mut egui::Ui,
+    slot: PresentationSlot,
+    surface: &PresentationSurface,
+    size: egui::Vec2,
+    sense: egui::Sense,
+) -> (egui::Response, Option<EguiPresentationPaint>) {
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    let paint = surface
+        .paint_request()
+        .map(|request| EguiPresentationPaint::new(slot, request, rect));
+    (response, paint)
 }
 
 pub fn section<R>(
@@ -334,7 +385,34 @@ pub fn layer_row(
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, rc::Rc};
+
     use super::*;
+    use mirante4d_application::{PresentationSurface, PresentationViewport};
+
+    #[test]
+    fn presentation_without_frame_reserves_ui_space_without_requesting_paint() {
+        use egui_kittest::Harness;
+
+        let emitted = Rc::new(Cell::new(true));
+        let observed = Rc::clone(&emitted);
+        let surface =
+            PresentationSurface::new(PresentationViewport::new(320.0, 240.0).unwrap(), None);
+        let _harness = Harness::builder()
+            .with_size(egui::vec2(400.0, 300.0))
+            .build_ui(move |ui| {
+                let (_, paint) = reserve_presentation(
+                    ui,
+                    PresentationSlot::ThreeD,
+                    &surface,
+                    egui::vec2(320.0, 240.0),
+                    egui::Sense::hover(),
+                );
+                observed.set(paint.is_some());
+            });
+
+        assert!(!emitted.get());
+    }
 
     #[test]
     fn workbench_layout_reserves_viewport_at_common_sizes() {
