@@ -102,30 +102,6 @@ impl FrameFidelityStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChannelFidelityWarning {
-    Hidden,
-    MixedFidelity,
-    Incomplete,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ChannelFidelityStatus {
-    pub layer_id: String,
-    pub layer_name: String,
-    pub visible: bool,
-    pub render_mode: mirante4d_domain::RenderMode,
-    pub displayed_scale_level: Option<u32>,
-    pub target_scale_level: u32,
-    pub completeness: FrameCompleteness,
-    pub reason: LodDecisionReason,
-    pub backend: RenderBackend,
-    pub resident_bricks: usize,
-    pub visible_bricks: usize,
-    pub missing_occupied_bricks: usize,
-    pub warning: Option<ChannelFidelityWarning>,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayerHistogramSummary {
     pub status: HistogramStatus,

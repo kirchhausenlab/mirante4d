@@ -8,9 +8,9 @@ use mirante4d_render_api::{
 use mirante4d_render_wgpu::{ValidationCapture, ValidationCaptureTicket, WgpuRenderRuntime};
 
 use crate::{
-    ChannelFidelityStatus, CrossSectionRuntime, DisplayRefreshTiming, FrameFidelityStatus,
-    LodScheduleState, RenderBackend, product_render_intent::ProductRenderRequest,
-    retained_leases::RetainedLeases, viewer_layout::PanelId,
+    CrossSectionRuntime, DisplayRefreshTiming, FrameFidelityStatus, LodScheduleState,
+    product_render_intent::ProductRenderRequest, retained_leases::RetainedLeases,
+    viewer_layout::PanelId,
 };
 
 pub(crate) struct ProductPresentationTarget {
@@ -54,14 +54,10 @@ impl ProductGpuRenderRuntime {
 pub(crate) struct CurrentRenderRuntime {
     pub(crate) presentation_viewport: PresentationViewport,
     pub(crate) render_viewport: RenderExtent,
-    pub(crate) render_backend: RenderBackend,
     pub(crate) frame_fidelity: FrameFidelityStatus,
-    pub(crate) channel_fidelity: Vec<ChannelFidelityStatus>,
     pub(crate) lod_schedule: LodScheduleState,
     pub(crate) lod_replan_pending: bool,
     pub(crate) playback_lod_downshift_active: bool,
-    pub(crate) visible_brick_count: usize,
-    pub(crate) visible_brick_plan_error: Option<String>,
     pub(crate) cross_section_runtime: CrossSectionRuntime,
     pub(crate) last_display_refresh_timing: Option<DisplayRefreshTiming>,
     pub(crate) retained_leases: RetainedLeases,
@@ -80,14 +76,10 @@ impl CurrentRenderRuntime {
         Self {
             presentation_viewport,
             render_viewport,
-            render_backend: RenderBackend::Loading,
             frame_fidelity,
-            channel_fidelity: Vec::new(),
             lod_schedule,
             lod_replan_pending: false,
             playback_lod_downshift_active: false,
-            visible_brick_count: 0,
-            visible_brick_plan_error: None,
             cross_section_runtime,
             last_display_refresh_timing: None,
             retained_leases: RetainedLeases::new(),

@@ -20,6 +20,7 @@ use crate::{
         SCOPE_ANALYSIS, SCOPE_CROSS_SECTION_XY, SCOPE_CROSS_SECTION_XZ, SCOPE_CROSS_SECTION_YZ,
         SCOPE_CURRENT_3D, SCOPE_PLAYBACK,
     },
+    display_refresh::render_backend_for_mode,
     product_render_intent::PRODUCT_RENDER_RESOURCE_LIMIT,
     viewer_layout::{
         CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
@@ -132,9 +133,6 @@ impl MiranteWorkbenchApp {
                 return VisibleBrickRequestOutcome::default();
             }
         };
-        self.render_runtime.visible_brick_count = visible_count;
-        self.render_runtime.visible_brick_plan_error =
-            cross_plan_error.as_ref().map(ToString::to_string);
         if let Some(error) = cross_plan_error.as_ref() {
             self.dataset.record_plan_error(error.to_string());
         }
@@ -174,7 +172,6 @@ impl MiranteWorkbenchApp {
             .replace_requirements(self.dataset.renderer_requirements())
         {
             self.dataset.record_plan_error(error.to_string());
-            self.render_runtime.visible_brick_plan_error = Some(error.to_string());
             self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Incomplete;
             return VisibleBrickRequestOutcome::default();
         }
@@ -419,6 +416,16 @@ impl MiranteWorkbenchApp {
             .map(|diagnostics| diagnostics.category_used_bytes(CpuLedgerCategory::DecodedResidency))
             .unwrap_or(0);
         let empty = self.dataset.scope_is_empty(SCOPE_CURRENT_3D);
+        let ready_backend = ready.then(|| {
+            let snapshot = self.application.snapshot();
+            let view = application_view(&snapshot);
+            let mode = view
+                .layer(view.active_layer())
+                .expect("the current view contains its active layer")
+                .render_state()
+                .mode();
+            render_backend_for_mode(mode)
+        });
         self.render_runtime.frame_fidelity.completeness = if empty || ready {
             FrameCompleteness::Complete
         } else {
@@ -426,8 +433,8 @@ impl MiranteWorkbenchApp {
         };
         self.render_runtime.frame_fidelity.backend = if empty {
             RenderBackend::Empty
-        } else if ready {
-            self.render_runtime.render_backend
+        } else if let Some(backend) = ready_backend {
+            backend
         } else {
             RenderBackend::Loading
         };
@@ -487,7 +494,6 @@ impl MiranteWorkbenchApp {
         }
         let message = fault.to_string();
         self.dataset.record_plan_error(message.clone());
-        self.render_runtime.visible_brick_plan_error = Some(message.clone());
         self.render_runtime.frame_fidelity.last_capacity_error = Some(message);
         self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Incomplete;
     }
@@ -498,7 +504,6 @@ impl MiranteWorkbenchApp {
             .downcast_ref::<DatasetDemandPlanCapacityError>()
             .is_some();
         self.dataset.record_plan_error(message.clone());
-        self.render_runtime.visible_brick_plan_error = Some(message.clone());
         self.render_runtime.frame_fidelity.last_failure_kind = Some(if capacity {
             FrameFailureKind::BudgetExceeded
         } else {

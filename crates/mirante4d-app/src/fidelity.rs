@@ -1,25 +1,11 @@
 use crate::{
-    ChannelFidelityStatus, ChannelFidelityWarning, FrameCompleteness, FrameFailureKind,
-    FrameFidelityStatus, LodDecisionReason, RenderBackend, application_view,
-    current_runtime::render::CurrentRenderRuntime, display_graph::DisplayGraph,
+    FrameCompleteness, FrameFailureKind, FrameFidelityStatus, LodDecisionReason, RenderBackend,
+    application_view, current_runtime::render::CurrentRenderRuntime, display_graph::DisplayGraph,
     state::DisplayedFrameFreshness, ui_kit,
 };
 use eframe::egui;
 use mirante4d_application::ApplicationSnapshot;
-use mirante4d_domain::{IsoShadingPolicy, RenderMode, SamplingPolicy};
-
-pub(crate) fn visible_channel_fidelity_is_mixed(channels: &[ChannelFidelityStatus]) -> bool {
-    let mut visible = channels.iter().filter(|channel| channel.visible);
-    let Some(first) = visible.next() else {
-        return false;
-    };
-    visible.any(|channel| {
-        channel.displayed_scale_level != first.displayed_scale_level
-            || channel.target_scale_level != first.target_scale_level
-            || channel.completeness != first.completeness
-            || channel.reason != first.reason
-    })
-}
+use mirante4d_domain::{IsoShadingPolicy, SamplingPolicy};
 
 pub(crate) fn show_frame_fidelity_property_rows(ui: &mut egui::Ui, fidelity: &FrameFidelityStatus) {
     ui_kit::property_row(ui, "scale", frame_fidelity_scale_label(fidelity));
@@ -100,47 +86,7 @@ pub(crate) fn composite_fidelity_label(
             .sampling_policy();
         label.push_str(render_sampling_policy_label(sampling));
     }
-    if visible_channel_fidelity_is_mixed(&render.channel_fidelity) {
-        label.push_str(" | mixed channel fidelity");
-    }
     label
-}
-
-pub(crate) fn channel_fidelity_label(channel: &ChannelFidelityStatus) -> String {
-    if !channel.visible {
-        return "hidden, no current-frame work".to_owned();
-    }
-    let mode = match channel.render_mode {
-        RenderMode::Mip => "MIP",
-        RenderMode::Isosurface => "ISO",
-        RenderMode::Dvr => "DVR",
-    };
-    let scale = match channel.displayed_scale_level {
-        Some(displayed) if displayed == channel.target_scale_level => {
-            format!("shown s{displayed}")
-        }
-        Some(displayed) => {
-            format!(
-                "shown s{} / target s{}",
-                displayed, channel.target_scale_level
-            )
-        }
-        None => format!("shown none / target s{}", channel.target_scale_level),
-    };
-    let warning = match channel.warning {
-        Some(ChannelFidelityWarning::MixedFidelity) => ", mixed fidelity",
-        Some(ChannelFidelityWarning::Incomplete) => ", incomplete",
-        Some(ChannelFidelityWarning::Hidden) | None => "",
-    };
-    format!(
-        "{} | {} {}, {} resident / {} visible{}",
-        mode,
-        scale,
-        frame_completeness_label(channel.completeness),
-        channel.resident_bricks,
-        channel.visible_bricks,
-        warning
-    )
 }
 
 pub(crate) fn frame_fidelity_scale_label(fidelity: &FrameFidelityStatus) -> String {

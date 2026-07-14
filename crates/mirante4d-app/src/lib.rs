@@ -64,9 +64,8 @@ pub use diagnostics::{StartupDiagnostics, collect_startup_diagnostics, default_l
 use display_refresh::{DisplayRefreshTiming, ViewportDisplayImage, duration_ms};
 use eframe::egui;
 use fidelity::{
-    channel_fidelity_label, composite_fidelity_label, iso_shading_policy_label,
-    render_sampling_policy_label, show_frame_fidelity_property_rows,
-    visible_channel_fidelity_is_mixed,
+    composite_fidelity_label, iso_shading_policy_label, render_sampling_policy_label,
+    show_frame_fidelity_property_rows,
 };
 #[cfg(test)]
 use fidelity::{
@@ -121,9 +120,8 @@ use product_automation::{ProductAutomationAppUpdateTiming, ProductAutomationCont
 use render_state::{set_presentation_viewport, set_render_viewport, take_lod_replan_pending};
 pub use smoke::{AppSmokeOptions, AppSmokeReport, PlaybackSmokeFrame, run_headless_smoke};
 pub use state::{
-    ChannelFidelityStatus, ChannelFidelityWarning, DisplayedFrameFreshness, FrameCompleteness,
-    FrameFailureKind, FrameFidelityStatus, HistogramStatus, LayerHistogramSummary,
-    LodDecisionReason, LodScheduleState, RenderBackend,
+    DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind, FrameFidelityStatus,
+    HistogramStatus, LayerHistogramSummary, LodDecisionReason, LodScheduleState, RenderBackend,
 };
 use tool_interactions::apply_viewport_tool_response;
 use transfer_presets::{
@@ -2595,7 +2593,6 @@ impl MiranteWorkbenchApp {
             Err(error) => {
                 tracing::error!(%error, "failed to reconcile the canonical view with current runtime");
                 self.dataset.record_plan_error(error.to_string());
-                self.render_runtime.visible_brick_plan_error = Some(error.to_string());
                 self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Incomplete;
                 false
             }
@@ -2620,7 +2617,6 @@ impl MiranteWorkbenchApp {
             if let Err(error) = self.rerender_display_state() {
                 tracing::error!(%error, "failed to render the accepted canonical view");
                 self.dataset.record_plan_error(error.to_string());
-                self.render_runtime.visible_brick_plan_error = Some(error.to_string());
                 self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Incomplete;
                 self.request_visible_bricks();
             } else {

@@ -604,8 +604,7 @@ impl MiranteWorkbenchApp {
             .expect("the current view contains its active layer")
             .render_state()
             .mode();
-        self.render_runtime.render_backend = render_backend_for_mode(mode);
-        self.render_runtime.frame_fidelity.backend = self.render_runtime.render_backend;
+        self.render_runtime.frame_fidelity.backend = render_backend_for_mode(mode);
         self.render_runtime.frame_fidelity.display_freshness = DisplayedFrameFreshness::Current;
         self.render_runtime.lod_schedule.displayed_scale_level =
             Some(self.dataset.current_scale().get());
@@ -648,7 +647,6 @@ impl MiranteWorkbenchApp {
         self.request_visible_bricks();
         if self.dataset.scope_is_empty(SCOPE_CURRENT_3D) {
             self.clear_3d_product_presentation();
-            self.render_runtime.render_backend = RenderBackend::Empty;
             self.render_runtime.frame_fidelity.backend = RenderBackend::Empty;
             self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Complete;
             self.render_runtime.frame_fidelity.reason = LodDecisionReason::NoVisibleData;
@@ -737,7 +735,7 @@ fn extent_size(extent: RenderExtent) -> egui::Vec2 {
     egui::vec2(extent.width_pixels() as f32, extent.height_pixels() as f32)
 }
 
-fn render_backend_for_mode(mode: RenderMode) -> RenderBackend {
+pub(crate) fn render_backend_for_mode(mode: RenderMode) -> RenderBackend {
     match mode {
         RenderMode::Mip => RenderBackend::GpuCameraMip,
         RenderMode::Isosurface => RenderBackend::GpuCameraIso,

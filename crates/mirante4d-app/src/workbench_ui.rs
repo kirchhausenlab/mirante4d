@@ -393,7 +393,7 @@ impl MiranteWorkbenchApp {
                     ui.allocate_exact_size(image_size, egui::Sense::click_and_drag());
                 ui.painter()
                     .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
-                let label = if self.render_runtime.render_backend == RenderBackend::Empty {
+                let label = if self.render_runtime.frame_fidelity.backend == RenderBackend::Empty {
                     "No visible data"
                 } else {
                     "Loading…"
@@ -1732,10 +1732,6 @@ impl eframe::App for MiranteWorkbenchApp {
                     });
                     ui_kit::section(ui, "Frame", |ui| {
                         show_frame_fidelity_property_rows(ui, &self.render_runtime.frame_fidelity);
-                        if visible_channel_fidelity_is_mixed(&self.render_runtime.channel_fidelity)
-                        {
-                            ui_kit::status_badge(ui, StatusTone::Warning, "mixed channel fidelity");
-                        }
                         ui_kit::property_row(
                             ui,
                             "pixels",
@@ -1748,13 +1744,6 @@ impl eframe::App for MiranteWorkbenchApp {
                         ui_kit::property_row(ui, "nonzero", "unavailable");
                         ui_kit::property_row(ui, "max", "unavailable");
                         ui_kit::property_row(ui, "mean", "unavailable");
-                        for channel in &self.render_runtime.channel_fidelity {
-                            ui_kit::property_row(
-                                ui,
-                                format!("{} fidelity", channel.layer_id),
-                                channel_fidelity_label(channel),
-                            );
-                        }
                     });
                     ui_kit::section(ui, "Viewer Tools", |ui| {
                         let mut active_tool = application_snapshot.transient().active_tool();
@@ -2214,9 +2203,6 @@ impl eframe::App for MiranteWorkbenchApp {
                             ui_kit::status_badge(ui, StatusTone::Error, &failure.message);
                         }
                         if let Some(error) = self.dataset.last_plan_error() {
-                            ui_kit::status_badge(ui, StatusTone::Error, error);
-                        }
-                        if let Some(error) = &self.render_runtime.visible_brick_plan_error {
                             ui_kit::status_badge(ui, StatusTone::Error, error);
                         }
                         if let Some(error) = &self.render_runtime.frame_fidelity.last_capacity_error

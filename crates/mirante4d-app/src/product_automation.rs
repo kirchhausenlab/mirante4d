@@ -2141,7 +2141,7 @@ impl ProductAutomationController {
             "render": {
                 "active_render_mode": format!("{:?}", view.layer(view.active_layer()).expect("active layer").render_state().mode()),
                 "projection": format!("{:?}", view.camera().projection()),
-                "backend": format!("{:?}", app.render_runtime.render_backend),
+                "backend": format!("{:?}", app.render_runtime.frame_fidelity.backend),
                 "adapter": app.startup_diagnostics.gpu_adapter.clone(),
                 "last_error": typed_render_error,
                 "gpu_display_frame_present": product_presentation(app, PanelId::ThreeD).is_some(),
