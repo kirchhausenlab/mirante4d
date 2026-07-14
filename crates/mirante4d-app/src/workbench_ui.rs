@@ -239,7 +239,7 @@ impl MiranteWorkbenchApp {
         let available = ui.available_size();
         let ctx = ui.ctx().clone();
         self.sync_3d_viewport_for_display_size(&ctx, available);
-        let display_image = self.viewport_display_image();
+        let display_image = self.viewport_display_image(snapshot);
         let image_size = fit_size(display_image.size_vec2(), available);
         ui.centered_and_justified(|ui| {
             self.show_3d_viewport_image(
@@ -356,7 +356,7 @@ impl MiranteWorkbenchApp {
         let ctx = ui.ctx().clone();
         self.record_four_panel_viewport(&ctx, PanelId::ThreeD, available);
         self.sync_3d_viewport_for_display_size(&ctx, available);
-        let display_image = self.viewport_display_image();
+        let display_image = self.viewport_display_image(snapshot);
         let image_size = fit_size(display_image.size_vec2(), available);
         ui.centered_and_justified(|ui| {
             self.show_3d_viewport_image(
@@ -481,28 +481,24 @@ impl MiranteWorkbenchApp {
                 );
             }
         }
-        let response =
-            if let Some(display_image) = self.cross_section_panel_display_image(panel_id) {
-                let image_size = fit_size(display_image.size_vec2(), available);
-                if image_size != egui::Vec2::ZERO {
-                    Some(
-                        ui.centered_and_justified(|ui| {
-                            self.show_cross_section_panel_image(
-                                ui,
-                                display_image,
-                                image_size,
-                                panel_id,
-                            )
-                        })
-                        .inner,
-                    )
-                } else {
-                    None
-                }
+        let response = if let Some(display_image) =
+            self.cross_section_panel_display_image(panel_id, snapshot)
+        {
+            let image_size = fit_size(display_image.size_vec2(), available);
+            if image_size != egui::Vec2::ZERO {
+                Some(
+                    ui.centered_and_justified(|ui| {
+                        self.show_cross_section_panel_image(ui, display_image, image_size, panel_id)
+                    })
+                    .inner,
+                )
             } else {
                 None
             }
-            .unwrap_or_else(|| self.show_cross_section_panel_placeholder(ui, panel_id, available));
+        } else {
+            None
+        }
+        .unwrap_or_else(|| self.show_cross_section_panel_placeholder(ui, panel_id, available));
 
         if let Some(presentation_viewport) = presentation_viewport
             && let Some(readout) = cross_section_hover_readout_for_response(
@@ -871,7 +867,7 @@ impl eframe::App for MiranteWorkbenchApp {
         self.drain_import_results(ui.ctx());
         let task_drain_ms = duration_ms(task_drain_started.elapsed());
 
-        let application_snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let application_snapshot = self.application_snapshot_for_ui();
         let view = application_view(&application_snapshot);
         let canonical_tool = viewer_tool_for_kind(application_snapshot.transient().active_tool());
         if self.ui_runtime.viewer_tools.active_tool != canonical_tool {

@@ -80,8 +80,61 @@ pub(crate) fn duration_ms(duration: Duration) -> f64 {
 }
 
 impl MiranteWorkbenchApp {
-    pub(crate) fn viewport_display_image(&self) -> ViewportDisplayImage {
-        if let Some((texture_id, extent)) = self.product_display(PanelId::ThreeD) {
+    pub(crate) fn application_snapshot_for_ui(&self) -> ApplicationSnapshot {
+        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let three_d = Some(self.presentation_surface(
+            PanelId::ThreeD,
+            self.render_runtime.presentation_viewport,
+            true,
+        ));
+        let (xy, xz, yz) =
+            if application_view(&snapshot).layout() == CanonicalViewerLayout::FourPanel {
+                (
+                    self.cross_section_presentation_surface(PanelId::Xy),
+                    self.cross_section_presentation_surface(PanelId::Xz),
+                    self.cross_section_presentation_surface(PanelId::Yz),
+                )
+            } else {
+                (None, None, None)
+            };
+        snapshot.with_presentations(PresentationSnapshot::new(three_d, xy, xz, yz))
+    }
+
+    fn cross_section_presentation_surface(&self, panel_id: PanelId) -> Option<PresentationSurface> {
+        let panel = self.render_runtime.cross_section_runtime.panel(panel_id)?;
+        Some(self.presentation_surface(
+            panel_id,
+            panel.presentation_viewport?,
+            panel.display_current(),
+        ))
+    }
+
+    fn presentation_surface(
+        &self,
+        panel_id: PanelId,
+        viewport: PresentationViewport,
+        frame_is_current: bool,
+    ) -> PresentationSurface {
+        let frame = frame_is_current
+            .then(|| {
+                self.render_runtime
+                    .product_gpu
+                    .as_ref()?
+                    .targets
+                    .get(&panel_id)?
+                    .presented
+                    .clone()
+            })
+            .flatten();
+        PresentationSurface::new(viewport, frame)
+    }
+
+    pub(crate) fn viewport_display_image(
+        &self,
+        snapshot: &ApplicationSnapshot,
+    ) -> ViewportDisplayImage {
+        if let Some((texture_id, extent)) = self.product_display(snapshot, PresentationSlot::ThreeD)
+        {
             return ViewportDisplayImage::Gpu {
                 texture_id,
                 size: extent_size(extent),
@@ -95,29 +148,30 @@ impl MiranteWorkbenchApp {
     pub(crate) fn cross_section_panel_display_image(
         &self,
         panel_id: PanelId,
+        snapshot: &ApplicationSnapshot,
     ) -> Option<ViewportDisplayImage> {
-        let panel = self.render_runtime.cross_section_runtime.panel(panel_id)?;
-        if !panel.display_current() {
-            return None;
-        }
-        let (texture_id, extent) = self.product_display(panel_id)?;
+        let slot = match panel_id {
+            PanelId::Xy => PresentationSlot::Xy,
+            PanelId::Xz => PresentationSlot::Xz,
+            PanelId::Yz => PresentationSlot::Yz,
+            PanelId::ThreeD => return None,
+        };
+        let (texture_id, extent) = self.product_display(snapshot, slot)?;
         Some(ViewportDisplayImage::Gpu {
             texture_id,
             size: extent_size(extent),
         })
     }
 
-    fn product_display(&self, panel_id: PanelId) -> Option<(egui::TextureId, RenderExtent)> {
-        let target = self
-            .render_runtime
-            .product_gpu
-            .as_ref()?
-            .targets
-            .get(&panel_id)?;
-        target.presented.as_ref()?;
+    fn product_display(
+        &self,
+        snapshot: &ApplicationSnapshot,
+        slot: PresentationSlot,
+    ) -> Option<(egui::TextureId, RenderExtent)> {
+        let frame = snapshot.presentations().get(slot)?.frame()?;
         Some((
-            self.native_presentation.texture_id(target.token)?,
-            target.extent,
+            self.native_presentation.texture_id(frame.token())?,
+            frame.extent(),
         ))
     }
 
@@ -575,8 +629,12 @@ impl MiranteWorkbenchApp {
             extent,
             &requirements,
         )?;
+        let displayed = self.product_display(
+            &self.application_snapshot_for_ui(),
+            PresentationSlot::ThreeD,
+        );
         Ok(DisplayRenderTiming {
-            path: if rendered || self.product_display(PanelId::ThreeD).is_some() {
+            path: if rendered || displayed.is_some() {
                 DisplayRefreshPath::GpuResidentDisplay
             } else {
                 DisplayRefreshPath::UiBackground

@@ -185,6 +185,32 @@ fn workbench_runtime_diagnostics_exposes_unified_runtime_bounds_and_leases() {
 }
 
 #[test]
+fn ui_snapshot_projects_visible_surfaces_without_native_handles() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let root = write_target_fixture(tempdir.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(root).unwrap();
+    let app = test_workbench_app_without_background_runtime(opened);
+
+    let snapshot = app.application_snapshot_for_ui();
+    let three_d = snapshot
+        .presentations()
+        .get(PresentationSlot::ThreeD)
+        .unwrap();
+    assert_eq!(
+        three_d.viewport(),
+        app.render_runtime.presentation_viewport
+    );
+    assert_eq!(three_d.frame(), None);
+    for slot in [
+        PresentationSlot::Xy,
+        PresentationSlot::Xz,
+        PresentationSlot::Yz,
+    ] {
+        assert!(snapshot.presentations().get(slot).is_none());
+    }
+}
+
+#[test]
 fn tiff_import_setup_state_is_visible_immediately_after_output_selection() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_target_fixture(tempdir.path()).unwrap();

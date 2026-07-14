@@ -88,9 +88,10 @@ use import_ui::{
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, ApplicationFault, ApplicationFaultCode,
     ApplicationSnapshot, ApplicationState, CommandEffect, OperationCompletion,
-    OperationFailureCode, OperationKind, OperationToken, ProjectRecoveryStoreLocator,
-    ProjectStoreApplicationService, ProjectStoreLifecycle, ProjectStoreServiceEvent,
-    SourceSessionGeneration, SourceVerificationSnapshot, SystemMonotonicClock, WorkspaceSnapshot,
+    OperationFailureCode, OperationKind, OperationToken, PresentationSlot, PresentationSnapshot,
+    PresentationSurface, ProjectRecoveryStoreLocator, ProjectStoreApplicationService,
+    ProjectStoreLifecycle, ProjectStoreServiceEvent, SourceSessionGeneration,
+    SourceVerificationSnapshot, SystemMonotonicClock, WorkspaceSnapshot,
 };
 use mirante4d_dataset::DatasetSourceId;
 use mirante4d_domain::{
