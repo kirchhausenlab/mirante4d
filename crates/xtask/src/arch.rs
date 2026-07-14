@@ -47,9 +47,6 @@ pub(crate) fn architecture_self_check() -> anyhow::Result<()> {
     let required = [
         "crates/mirante4d-analysis-core",
         "crates/mirante4d-analysis-runtime",
-        "crates/mirante4d-format",
-        "crates/mirante4d-import",
-        "crates/mirante4d-data",
         "crates/mirante4d-dataset",
         "crates/mirante4d-domain",
         "crates/mirante4d-identity",
@@ -66,12 +63,16 @@ pub(crate) fn architecture_self_check() -> anyhow::Result<()> {
             bail!("required crate directory is missing: {path}");
         }
     }
-    if Path::new("crates/mirante4d-analysis").exists() {
-        bail!("retired predecessor crate directory exists: crates/mirante4d-analysis");
-    }
-    for forbidden in ["crates/mirante4d-core", "crates/mirante4d-preprocess"] {
+    for forbidden in [
+        "crates/mirante4d-analysis",
+        "crates/mirante4d-core",
+        "crates/mirante4d-data",
+        "crates/mirante4d-format",
+        "crates/mirante4d-import",
+        "crates/mirante4d-preprocess",
+    ] {
         if Path::new(forbidden).exists() {
-            bail!("first milestone must not create empty future crate: {forbidden}");
+            bail!("retired or unowned crate directory exists: {forbidden}");
         }
     }
     wp08a::check_wp08a_subsystem_contract(Path::new("."))?;
@@ -863,11 +864,15 @@ fn check_wp07b_live_cutover(
             })
         })
         .collect::<BTreeSet<_>>();
+    let active_boundary_edges = expected_edges
+        .iter()
+        .copied()
+        .filter(|edge| *edge != ("xtask", "mirante4d-render-api"))
+        .collect::<BTreeSet<_>>();
     let live_foundation_edges = BTreeSet::from([
         ("mirante4d-analysis-core", "mirante4d-dataset"),
         ("mirante4d-analysis-runtime", "mirante4d-dataset"),
         ("mirante4d-application", "mirante4d-render-api"),
-        ("mirante4d-data", "mirante4d-dataset"),
         ("mirante4d-dataset-runtime", "mirante4d-dataset"),
         ("mirante4d-import-pipeline", "mirante4d-dataset"),
         ("mirante4d-render-api", "mirante4d-dataset"),
@@ -877,9 +882,8 @@ fn check_wp07b_live_cutover(
         ("mirante4d-render-wgpu", "mirante4d-render-api"),
         ("mirante4d-renderer", "mirante4d-dataset"),
         ("mirante4d-storage", "mirante4d-dataset"),
-        ("xtask", "mirante4d-dataset"),
     ]);
-    let live_expected_edges = expected_edges
+    let live_expected_edges = active_boundary_edges
         .union(&live_foundation_edges)
         .copied()
         .collect::<BTreeSet<_>>();
@@ -973,7 +977,7 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
             .and_then(serde_json::Value::as_u64)
             != Some(2)
         || ledger.get("status").and_then(serde_json::Value::as_str)
-            != Some("wp08b-unified-runtime-cutover")
+            != Some("wp10c-storage-runtime-cutover")
         || ledger
             .pointer("/predecessor/tag")
             .and_then(serde_json::Value::as_str)
@@ -983,17 +987,16 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
             .and_then(serde_json::Value::as_str)
             != Some("f2e520da891134d1b3f65d8fcac7afb4140579a2")
     {
-        bail!("{} is not the accepted WP-08B live ledger", path.display());
+        bail!("{} is not the current WP-10C live ledger", path.display());
     }
 
     let expected_dataset_authority = serde_json::json!({
         "runtime_owner": "mirante4d-dataset-runtime",
         "composition_state": "DatasetDemandState",
         "sole_poll_owner": "DatasetRequestDispatcher",
-        "source_bridge": {
-            "type": "CurrentDatasetSource",
-            "path": "crates/mirante4d-data/src/current_source_bridge.rs",
-            "expires": "WP-10C"
+        "source": {
+            "type": "LocalDatasetSource",
+            "path": "crates/mirante4d-storage/src/dataset_source.rs"
         },
         "renderer_bridge": {
             "type": "CurrentLeaseBridge",
@@ -1028,9 +1031,9 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
             "import",
             (
                 "crates/mirante4d-app/src/current_runtime/import.rs",
-                "CurrentImportRuntime",
+                "ImportRuntime",
                 "import_runtime",
-                "WP-10C",
+                "WP-09C",
             ),
         ),
         (
@@ -1204,13 +1207,13 @@ fn check_wp08b_dataset_dispatcher(
 }
 
 fn check_wp08b_bridges(repo_root: &Path, app_root: &Path) -> anyhow::Result<()> {
-    let source_bridge_path = repo_root.join("crates/mirante4d-data/src/current_source_bridge.rs");
-    let source_bridge = fs::read_to_string(&source_bridge_path)?;
-    if !rust_root_defined_item_names(&source_bridge)?.contains("CurrentDatasetSource")
-        || !public_root_api_names(&repo_root.join("crates/mirante4d-data/src/lib.rs"))?
-            .contains("CurrentDatasetSource")
+    let source_path = repo_root.join("crates/mirante4d-storage/src/dataset_source.rs");
+    let source = fs::read_to_string(&source_path)?;
+    if !rust_root_defined_item_names(&source)?.contains("LocalDatasetSource")
+        || !public_root_api_names(&repo_root.join("crates/mirante4d-storage/src/lib.rs"))?
+            .contains("LocalDatasetSource")
     {
-        bail!("the sole WP-08B current-storage source bridge is missing");
+        bail!("the WP-10C target dataset source is missing");
     }
     let mut source_open_routes = Vec::new();
     let mut source_open_calls = 0;
@@ -1221,16 +1224,16 @@ fn check_wp08b_bridges(repo_root: &Path, app_root: &Path) -> anyhow::Result<()> 
             continue;
         }
         let source = fs::read_to_string(&source_path)?;
-        let calls = source.matches("CurrentDatasetSource::open(").count();
+        let calls = source.matches("LocalDatasetSource::from_").count();
         if calls != 0 {
             source_open_routes.push(normalized);
             source_open_calls += calls;
         }
     }
-    if source_open_calls != 1
+    if source_open_calls != 2
         || source_open_routes != ["crates/mirante4d-app/src/unified_source_open.rs"]
     {
-        bail!("current source must open through one unified route: {source_open_routes:?}");
+        bail!("target source must open through one unified route: {source_open_routes:?}");
     }
 
     let lease_bridge_path = repo_root.join("crates/mirante4d-renderer/src/current_lease_bridge.rs");
@@ -1347,19 +1350,6 @@ fn check_wp08b_predecessor_absence(
                     );
                 }
             }
-        }
-    }
-    for source_path in collect_rust_source_files(&repo_root.join("crates/mirante4d-data/src"))? {
-        let normalized = normalize_repo_path(&source_path);
-        if normalized.contains("/tests/") || normalized.ends_with("/tests.rs") {
-            continue;
-        }
-        let source = fs::read_to_string(&source_path)?;
-        if source_contains_identifier(&source, "mpsc") {
-            bail!(
-                "old data-worker channel authority remains in {}",
-                source_path.display()
-            );
         }
     }
     Ok(())

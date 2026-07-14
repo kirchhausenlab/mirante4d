@@ -308,7 +308,7 @@ impl GpuRenderer {
                 kind: pick_hit_kind_for_scene_layer_kind(record.layer_kind),
                 layer_id: Some(record.layer_id.clone()),
                 object_id: Some(record.object_id.clone()),
-                source_layer_id: record.source_layer_id.clone(),
+                source_layer_id: record.source_layer_id,
                 timepoint: query.timepoint,
                 world_position: None,
                 grid_position: None,

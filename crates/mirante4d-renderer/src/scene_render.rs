@@ -1,11 +1,10 @@
 use glam::DVec3;
-use mirante4d_domain::Projection;
-use mirante4d_format::{CurrentGridToWorldExt, LayerId};
+use mirante4d_domain::{LogicalLayerKey, Projection};
 use mirante4d_render_api::CameraFrame;
 
 use crate::{
     CoordinateSpace, RenderError, RenderViewport, SceneColorRgba, SceneDrawList, SceneGeometry,
-    SceneLayerId, SceneLayerKind, SceneObjectId, SceneRenderPass,
+    SceneLayerId, SceneLayerKind, SceneObjectId, SceneRenderPass, transform::GridToWorldExt,
 };
 
 const EPSILON: f64 = 1.0e-9;
@@ -58,7 +57,7 @@ pub struct SceneRenderPickRecord {
     pub layer_id: SceneLayerId,
     pub object_id: SceneObjectId,
     pub layer_kind: SceneLayerKind,
-    pub source_layer_id: Option<LayerId>,
+    pub source_layer_id: Option<LogicalLayerKey>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -709,9 +708,11 @@ fn item_coordinate_space_supported(item: &crate::SceneDrawItem) -> bool {
     }
 }
 
-fn source_layer_id_for_coordinate_space(coordinate_space: &CoordinateSpace) -> Option<LayerId> {
+fn source_layer_id_for_coordinate_space(
+    coordinate_space: &CoordinateSpace,
+) -> Option<LogicalLayerKey> {
     match coordinate_space {
-        CoordinateSpace::Grid { layer_id } => Some(layer_id.clone()),
+        CoordinateSpace::Grid { layer_id } => Some(*layer_id),
         CoordinateSpace::World | CoordinateSpace::Plane { .. } | CoordinateSpace::Screen => None,
     }
 }
@@ -1052,7 +1053,6 @@ mod tests {
     };
     use glam::DMat4;
     use mirante4d_domain::TimeIndex;
-    use mirante4d_format::LayerId;
     use mirante4d_render_api::CameraFrame;
 
     fn camera() -> CameraFrame {
@@ -1325,7 +1325,7 @@ mod tests {
 
     #[test]
     fn command_extraction_projects_grid_space_with_registered_transform() {
-        let source_layer_id = LayerId::new("ch0").unwrap();
+        let source_layer_id = LogicalLayerKey::new(0);
         let layer = SceneLayer::new(
             SceneLayerId::new("grid-objects").unwrap(),
             SceneLayerKind::Annotation,
@@ -1333,7 +1333,7 @@ mod tests {
         .with_object(SceneObject::new(
             SceneObjectId::new("grid-point").unwrap(),
             CoordinateSpace::Grid {
-                layer_id: source_layer_id.clone(),
+                layer_id: source_layer_id,
             },
             crate::SceneTime::Static,
             OcclusionPolicy::VolumeDepthCued,
@@ -1346,7 +1346,7 @@ mod tests {
             &[layer],
             SceneFrameContext::new(TimeIndex::new(0)).with_grid_to_world(
                 source_layer_id,
-                mirante4d_format::grid_to_world_scale_um(2.0, 1.0, 1.0),
+                mirante4d_domain::GridToWorld::scale(2.0, 1.0, 1.0).unwrap(),
             ),
         );
         let commands = build_scene_render_commands(
@@ -1573,7 +1573,7 @@ mod tests {
 
     #[test]
     fn unsupported_coordinate_space_is_reported() {
-        let layer_id = mirante4d_format::LayerId::new("ch0").unwrap();
+        let layer_id = LogicalLayerKey::new(0);
         let layer = SceneLayer::new(
             SceneLayerId::new("grid-objects").unwrap(),
             SceneLayerKind::Annotation,

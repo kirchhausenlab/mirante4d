@@ -70,7 +70,7 @@ fn exact_analysis_controls_fit_both_supported_window_sizes() {
 
     for size in [egui::vec2(1280.0, 720.0), egui::vec2(1920.0, 1080.0)] {
         let temp = tempfile::tempdir().unwrap();
-        let root = write_fixture(FixtureKind::TimeU16_8Cube3T, temp.path()).unwrap();
+        let root = write_target_fixture(temp.path()).unwrap();
         let opened = open_dataset_and_render_first_frame(root).unwrap();
         let harness = Harness::builder()
             .with_size(size)

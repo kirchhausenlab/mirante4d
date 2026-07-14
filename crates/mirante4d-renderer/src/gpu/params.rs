@@ -1,13 +1,11 @@
 use glam::{DMat4, DVec3};
-use mirante4d_data::DenseVolumeU16;
 use mirante4d_domain::{GridToWorld, Projection};
-use mirante4d_format::CurrentGridToWorldExt;
 use mirante4d_render_api::CameraFrame;
 
 use super::GpuRenderError;
 use crate::{
     CameraRenderMode, CameraRenderModeF32, CameraRenderQuality, IntensitySamplingPolicy,
-    IsoShadingMode, RenderError, RenderViewport, ScalarDisplayTransfer,
+    IsoShadingMode, RenderError, RenderViewport, ScalarDisplayTransfer, transform::GridToWorldExt,
 };
 
 pub(super) const GPU_PARAM_SAMPLING_POLICY_INDEX: usize = 25;
@@ -57,14 +55,6 @@ pub(super) struct GpuModeParamsF32 {
     pub density_scale: f32,
     pub dvr_color_rgb: [f32; 3],
     pub dvr_alpha_multiplier: f32,
-}
-
-pub(super) fn camera_grid_params(
-    volume: &DenseVolumeU16,
-    camera: CameraFrame,
-    viewport: RenderViewport,
-) -> Result<[f32; GPU_CAMERA_PARAM_F32_COUNT], RenderError> {
-    camera_grid_params_for_transform(volume.grid_to_world, camera, viewport)
 }
 
 pub(super) fn camera_grid_params_for_transform(
@@ -165,13 +155,6 @@ pub(super) fn apply_gpu_quality_params(
         IsoShadingMode::Flat => 0.0,
         IsoShadingMode::GradientLighting => 1.0,
     };
-}
-
-pub(super) fn gpu_mode_params(
-    volume: &DenseVolumeU16,
-    mode: CameraRenderMode,
-) -> Result<GpuModeParams, GpuRenderError> {
-    gpu_mode_params_for_transform(volume.grid_to_world, mode)
 }
 
 pub(super) fn gpu_mode_params_for_transform(
@@ -283,17 +266,14 @@ fn normal_transform_grid_gradient_to_world(grid_to_world: GridToWorld) -> DMat4 
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
-    use mirante4d_domain::{DisplayWindow, Projection, Shape3D, TimeIndex, TransferCurve};
-    use mirante4d_format::{DatasetId, LayerId};
+    use mirante4d_domain::{DisplayWindow, Projection, TransferCurve};
 
     use super::*;
 
     #[test]
     fn maps_supported_gpu_modes() {
-        let volume = u16_test_volume();
-
         assert_eq!(
-            gpu_mode_params(&volume, CameraRenderMode::Mip).unwrap(),
+            gpu_mode_params_for_transform(GridToWorld::identity(), CameraRenderMode::Mip).unwrap(),
             GpuModeParams {
                 mode_code: 0,
                 iso_invert: 0,
@@ -307,8 +287,8 @@ mod tests {
         );
         let iso_parameters = iso_u16_threshold(123);
         assert_eq!(
-            gpu_mode_params(
-                &volume,
+            gpu_mode_params_for_transform(
+                GridToWorld::identity(),
                 CameraRenderMode::Isosurface {
                     parameters: iso_parameters
                 }
@@ -327,8 +307,8 @@ mod tests {
         );
         let dvr_params = dvr_parameters(0.0, f32::from(u16::MAX), 12.0, false);
         assert_eq!(
-            gpu_mode_params(
-                &volume,
+            gpu_mode_params_for_transform(
+                GridToWorld::identity(),
                 CameraRenderMode::Dvr {
                     parameters: dvr_params
                 }
@@ -349,12 +329,12 @@ mod tests {
 
     #[test]
     fn camera_grid_params_store_inverse_transpose_normal_transform() {
-        let grid_to_world = mirante4d_format::grid_to_world_from_dmat4(DMat4::from_cols_array(&[
-            2.0, 0.0, 0.0, 0.0, //
-            0.25, 3.0, 0.0, 0.0, //
-            0.0, 0.5, 4.0, 0.0, //
-            7.0, 11.0, 13.0, 1.0,
-        ]))
+        let grid_to_world = GridToWorld::from_row_major([
+            2.0, 0.25, 0.0, 7.0, //
+            0.0, 3.0, 0.5, 11.0, //
+            0.0, 0.0, 4.0, 13.0, //
+            0.0, 0.0, 0.0, 1.0,
+        ])
         .unwrap();
         let camera = crate::current_camera::frame_from_look_at(
             Projection::Orthographic,
@@ -384,19 +364,6 @@ mod tests {
         assert_abs_diff_eq!(actual.x, expected.x, epsilon = 1e-6);
         assert_abs_diff_eq!(actual.y, expected.y, epsilon = 1e-6);
         assert_abs_diff_eq!(actual.z, expected.z, epsilon = 1e-6);
-    }
-
-    fn u16_test_volume() -> DenseVolumeU16 {
-        DenseVolumeU16::new(
-            DatasetId::new("gpu-params").unwrap(),
-            LayerId::new("ch0").unwrap(),
-            0,
-            TimeIndex::new(0),
-            Shape3D::new(2, 2, 2).unwrap(),
-            GridToWorld::identity(),
-            vec![0; 8],
-        )
-        .unwrap()
     }
 
     fn iso_u16_threshold(threshold: u16) -> crate::IsoSurfaceParameters {

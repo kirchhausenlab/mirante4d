@@ -1,19 +1,18 @@
 pub mod brick_plan;
-pub mod brick_render;
 pub mod camera_mip;
-pub mod cpu;
 pub mod cross_section;
 mod current_camera;
 mod current_lease_bridge;
+mod diagnostics;
 pub mod gpu;
 pub mod resources;
 pub mod scene;
 pub mod scene_render;
 pub mod transfer;
+mod transform;
 
 use mirante4d_dataset::ResourceContractError;
 use mirante4d_domain::ShapeError;
-use mirante4d_format::CurrentTransformError;
 use mirante4d_render_api::RenderApiError;
 use thiserror::Error;
 
@@ -142,7 +141,7 @@ pub enum RenderError {
     #[error(transparent)]
     ResourceContract(#[from] ResourceContractError),
     #[error(transparent)]
-    Space(#[from] CurrentTransformError),
+    Space(#[from] TransformError),
     #[error(transparent)]
     Camera(#[from] RenderApiError),
 }
@@ -855,25 +854,13 @@ pub fn frame_diagnostics_f32(input_voxels: u64, pixels: &[f32]) -> FrameDiagnost
 }
 
 pub use brick_plan::{
-    BrickGridSpec, BrickPlanOptions, ResourcePlanLimits, SemanticRegionGridSpec,
+    BrickGridSpec, BrickPlanOptions, ResourcePlanLimits, SemanticRegionGridSpec, SpatialBrickIndex,
     plan_visible_bricks, plan_visible_resource_regions,
 };
-pub use brick_render::{
-    BrickFrameDiagnostics, BrickFrameDiagnosticsF32, BrickSkipDiagnostics, DvrResidentChannel,
-    ResidentBrickSetF32, ResidentBrickSetU8, ResidentBrickSetU16, render_camera_f32_from_bricks,
-    render_camera_f32_from_bricks_with_quality, render_camera_from_bricks,
-    render_camera_from_bricks_with_quality, render_camera_mip_from_bricks,
-    render_camera_u8_from_bricks_with_quality, render_dvr_channels_from_bricks_with_quality,
-};
 pub use camera_mip::{
-    CameraRenderMode, CameraRenderModeF32, CameraRenderQuality, CameraVolumePick,
-    CameraVolumePickF32, CameraVolumePickU8, DvrRenderParameters, DvrVolumeChannel,
-    IntensitySamplingPolicy, IsoShadingMode, IsoSurfaceParameters, pick_camera_volume,
-    pick_camera_volume_f32, pick_camera_volume_u8, render_camera, render_camera_f32,
-    render_camera_f32_with_quality, render_camera_mip, render_camera_mip_f32, render_camera_u8,
-    render_camera_u8_with_quality, render_camera_with_quality, render_dvr_channels_with_quality,
+    CameraRenderMode, CameraRenderModeF32, CameraRenderQuality, DvrRenderParameters,
+    IntensitySamplingPolicy, IsoShadingMode, IsoSurfaceParameters,
 };
-pub use cpu::{render_mip_z, render_mip_z_f32};
 pub use cross_section::{
     CrossSectionBasis, CrossSectionBrickPlan, CrossSectionChunkPlanePolygon,
     CrossSectionChunkPlaneVertex, CrossSectionPanel, CrossSectionPanelBounds, CrossSectionSlab,
@@ -885,11 +872,8 @@ pub use current_lease_bridge::{
     CurrentLeaseBridge, CurrentLeaseBridgeError, CurrentLeaseCohortStatus, CurrentLeaseResidentSet,
     CurrentLeaseResource, CurrentLeaseSample, CurrentLeaseVolume, MAX_CURRENT_LEASE_REQUIREMENTS,
 };
-pub use resources::{
-    BrickAtlasResourceKey, DenseVolumeResourceKey, RenderResourceKey, RenderResourceKind,
-    RendererResourceHandle, ResourceAuthority, ResourceGeneration, ResourceRepresentation,
-    TimeRangeKey, TrackLayerResourceId, TrackLayerResourceKey, TransformKey,
-};
+pub use diagnostics::{BrickFrameDiagnostics, BrickFrameDiagnosticsF32, BrickSkipDiagnostics};
+pub use resources::{BrickAtlasResourceKey, ResourceRepresentation, TransformKey};
 pub use scene::{
     CoordinateSpace, GridPosition, OcclusionPolicy, PickCompleteness, PickHit, PickHitKind,
     PickPolicy, PickPrimitive, PickQuery, PickValue, PlaneId, SceneColorRgba, SceneDrawItem,
@@ -909,3 +893,4 @@ pub use transfer::{
     composite_dvr_rgba_channels, composite_f32_intensity_channels, composite_intensity_channels,
     composite_iso_surface_channels, composite_iso_surface_f32_channels,
 };
+pub use transform::TransformError;

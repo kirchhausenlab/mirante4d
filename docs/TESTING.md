@@ -308,14 +308,15 @@ accepted on protected main at
 three-launch native scenario, exact-main public checks, and the already
 accepted durability evidence. No redundant power-cut rerun is required.
 
-Run the supporting B3 product scenario on the real display with:
+Run the bounded target-package verification scenario on the real display with:
 
 ```bash
-cargo xtask product-validate b3_source_verification
+cargo xtask product-validate target_source_verification
 ```
 
-The accepted B3 scenario uses a small generated T2 package and remains
-supporting E1 evidence.
+With no explicit package, this scenario extracts the small promoted target U16
+archive. It is a reusable, bounded product regression check for storage-source
+changes.
 
 The B4 automation remains available for future project-persistence changes,
 but ordinary foundation work does not rerun its accepted durability matrix.
@@ -326,17 +327,24 @@ bounded/restartable work, deterministic sharded output, cancellation and
 failure safety, multiscale edges, and atomic publication. An importer-produced
 package passed the independent target reader, and exact-main run
 [29330265968](https://github.com/kirchhausenlab/mirante4d/actions/runs/29330265968)
-passed 664 unit, 344 contract, and 124 UI cases with zero retries. Product
-activation remains WP-10C work.
+passed 664 unit, 344 contract, and 124 UI cases with zero retries. WP-10C later
+activated that pipeline in the product.
 
-WP-12 uses a small evidence set: hand-computed facts for its two exact retained
+WP-12 used a small evidence set: hand-computed facts for its two exact retained
 operations, focused scheduler/memory/cancellation tests, one atomic artifact
 save-and-reopen integration, and one supported-resolution product exercise.
 It makes no performance claim and does not require private or simulated huge
 data, a Cartesian oracle matrix, or a WP-10B KVM/power-cut rerun.
 
+WP-10C focused automation covers the target source adapter, fail-closed
+corruption and source-change behavior, and one TIFF import to product open,
+background verification, analysis, and project save/reopen integration.
+Accepted WP-10A, WP-10B, WP-11, and WP-12 evidence is inherited rather than
+rerun.
+
 The checked independent source report supports only the WP-03 source-TIFF
-archive. WP-10A is accepted off-product and its target authority is promoted.
+archive. WP-10A accepted and promoted the target authority off-product; WP-10C
+activates it in the application.
 `mirante4d-storage` is assigned to the existing contract leaf. Its lower-level
 tests prove profile, path, arithmetic, supporting exact-identity, scalar-wire,
 and restricted-JCS
@@ -356,8 +364,8 @@ closure counts, cancellation, extra-directory rejection, and post-open length-
 drift rejection, including same-length manifest-authority drift. These lower-
 level tests alone make no DS-specific admission, shard-payload, official-
 schema, complete-package, T1 conformance, independent-reader, lifecycle, or
-product-support claim. Current schema-1 packages remain non-authoritative T2
-support fixtures; the promoted target authority is separate and off-product.
+product-support claim. Product support is checked separately through the
+WP-10C integration and bounded product scenario.
 
 Address-planning tests prove 2D/3D grid, C-order ordinal, inner-slot, and edge-
 extent arithmetic plus the exact baseline catalog-derived paths and packed-
@@ -466,9 +474,9 @@ cargo xtask verify-local format-lifecycle
 
 That real local lane validates the promoted authority, runs the three positive
 and 15 negative production cases, and performs writer-to-pinned-reader
-readback. WP-10A remains off-product and EXPERIMENTAL; it makes no
-stable-format, generic OME-Zarr, importer, product-support, product-open, or
-product-activation claim.
+readback. It remains WP-10A off-product evidence; WP-10C product activation is
+checked separately. The format remains EXPERIMENTAL and makes no stable-format
+or generic OME-Zarr claim.
 
 The exact thresholds live in the
 [verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).

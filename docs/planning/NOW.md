@@ -4,69 +4,38 @@ Last updated: 2026-07-14
 
 ## Current Checkpoint
 
-WP-11 is accepted on protected main at
-`04987f64c309166caddf931be9c1ef4948010128` (tree
-`fd39e0be3a0883726972b25d037c916f0e3ca4c0`), tagged
-`foundation-wp-11-exit-1`. Main run
-[29330265968](https://github.com/kirchhausenlab/mirante4d/actions/runs/29330265968)
-passed policy and Rust checks. The accepted producer remains off-product;
-`mirante4d-import` stays the sole product route until WP-10C activates the
-replacement and deletes the predecessor.
+WP-12 is accepted on protected main at
+`5be750d060284d0a591ea6b5c0007bfeb136ac8d` (tree
+`d704f02e4dc530c8c144fc5a2f29c572012835a2`), tagged
+`foundation-wp-12-exit-1`. The exact analysis path now runs through the shared
+bounded scheduler and publishes table/plot pairs atomically through the project
+store. The predecessor analysis crate and segmentation code are deleted.
 
-WP-12 is an implemented acceptance candidate on `wp12-analysis-runtime`.
-Exact whole-layer time traces and current-timepoint numeric box statistics now
-run through the shared bounded scheduler and publish table/plot pairs atomically
-through the project store. The focused candidate checks pass; a clean commit
-and protected-main acceptance remain before WP-10C begins.
+WP-10C is active on `wp10c-storage-runtime-cutover`.
 
-## WP-12 Entry Note
+The candidate now uses target storage and import throughout the product,
+deletes the predecessor data/format/import crates and obsolete fuzz package,
+and passes the focused import-to-project-reopen integration. Remaining
+acceptance work is the supported-resolution product exercise and normal PR
+checks; inherited exhaustive suites are not rerun.
 
-Predecessor: clean `foundation-wp-11-exit-1` at the commit and tree above.
+## WP-10C Entry Note
 
-Outcome: one typed, bounded product analysis path for exact full-intensity
-summaries/time traces and axis-aligned box-ROI intensity statistics. Work uses
-the shared scheduler below interactive priority, supports progress and scoped
-cancellation, and makes a complete table/plot bundle visible only after the
-existing project store commits it.
+Outcome: make the accepted sharded target format and importer the only dataset
+path used by Mirante4D. Opening remains responsive while verification runs in
+the background; only fully proved package and scientific identities may be
+saved in a project.
 
-Inherited invariants: dataset access uses semantic scheduler requests and
-accounted leases; viewing remains responsive; source and accepted dataset
-packages are immutable; incomplete, failed, cancelled, or stale work cannot
-appear complete; artifact identity and provenance are reproducible; and
-segmentation remains absent.
+Work is deliberately small and serial: add the target storage adapter, switch
+open/verification and project binding, switch the importer, then remove
+`mirante4d-data`, `mirante4d-format`, and `mirante4d-import` plus their expired
+fixtures and branches. There is no compatibility reader or dual product route.
 
-Allowed scope: new `mirante4d-analysis-core` and
-`mirante4d-analysis-runtime` crates, focused changes to the accepted dataset
-runtime, application, project model/store, product shell, architecture checks,
-and owning documentation. WP-12 reuses those authorities rather than adding a
-second scheduler or persistence path.
+Evidence is limited to focused adapter tests on the existing small target
+archives, one import-to-reopen integration, one relevant corruption or
+source-change check, supported 720p/1080p product use, and a mechanical check
+that the old crates have no remaining dependents. Earlier storage, import,
+project, and analysis evidence is inherited rather than rerun.
 
-Scientific scope: the authoritative route is exact-only for `uint8`, `uint16`,
-and finite `float32`. It freezes validity handling, deterministic traversal and
-accumulation, and population-variance semantics against small hand-computed
-facts. Approximate and preview execution are rejected rather than partially
-implemented.
-
-Authority and deletion: WP-12 switches the sole product analysis route to the
-successor and deletes `CurrentAnalysisRuntime`, direct dataset scans, and the
-`mirante4d-analysis` predecessor without a compatibility facade. WP-10C later
-changes only the dataset-source binding beneath this contract.
-
-Non-goals: segmentation or tracking algorithms, additional scientific
-operations, percentile or approximate analysis, a general export redesign,
-performance claims, private or simulated huge datasets, KVM/power-cut reruns,
-GPU work, 4K requirements, and new evidence manifests or workflows.
-
-Risks and stop conditions: stop for owner review if the accepted dataset,
-identity, or project-store wire must change incompatibly, if table and plot
-artifacts cannot commit in one project generation, or if the runtime cannot
-remain bounded without a second scheduler/poller.
-
-Evidence: a few hand-computable scientific cases; focused scheduler-priority,
-memory, cancellation, stale-result, and failure tests; one atomic table/plot
-save-and-reopen integration; and one small product exercise covering cancel,
-complete, save, and reopen at the supported display sizes. Accepted WP-10B
-durability evidence is inherited and is not rerun.
-
-Rollback unit: the WP-12 branch/checkpoint; the predecessor is deleted only in
-the final product cutover commit.
+Non-goals: huge or simulated datasets, KVM or power-cut matrices, 4K,
+segmentation, performance claims, and new workflows, manifests, or ledgers.

@@ -42,7 +42,13 @@ const TARGET_CORPUS_SHA256: &str =
     "0b2bad3c976b431d83cda1e24fae1ff50524a9865d7c5b260ccfc0a7d84e2321";
 const STORAGE_CRATE: &str = "mirante4d-storage";
 const STORAGE_PATH: &str = "crates/mirante4d-storage";
-const STORAGE_ALLOWED_SUCCESSOR_DEPENDENTS: [&str; 1] = ["mirante4d-import-pipeline"];
+const STORAGE_ALLOWED_SUCCESSOR_DEPENDENTS: [&str; 3] =
+    ["mirante4d-app", "mirante4d-import-pipeline", "xtask"];
+const STORAGE_ALLOWED_SUCCESSOR_PUBLIC_API: [&str; 3] = [
+    "LocalDatasetSource",
+    "LocalDatasetSourceOpenError",
+    "PACKAGE_VALIDATION_WORKING_BYTES",
+];
 const DEPENDENCY_KINDS: [&str; 3] = ["normal", "dev", "build"];
 
 #[derive(Debug, Deserialize)]
@@ -911,11 +917,16 @@ fn validate_storage_package(
 }
 
 fn validate_storage_public_api(repo_root: &Path, contract: &StorageContract) -> anyhow::Result<()> {
-    let expected = unique_set(&contract.activation.public_api, "storage public API")?;
+    let mut expected = unique_set(&contract.activation.public_api, "storage public API")?;
+    expected.extend(
+        STORAGE_ALLOWED_SUCCESSOR_PUBLIC_API
+            .iter()
+            .map(|name| (*name).to_owned()),
+    );
     let actual = public_root_api_names(&repo_root.join(STORAGE_PATH).join("src/lib.rs"))?;
     if actual != expected {
         bail!(
-            "WP-10A storage public API drifted: missing={:?}, unexpected={:?}",
+            "WP-10A/WP-10C storage public API drifted: missing={:?}, unexpected={:?}",
             expected.difference(&actual).collect::<Vec<_>>(),
             actual.difference(&expected).collect::<Vec<_>>()
         );
@@ -1201,7 +1212,7 @@ fn validate_dependency_graph(
     );
     if actual_dependents != allowed_dependents {
         bail!(
-            "off-product storage workspace dependents drifted: expected={allowed_dependents:?}, actual={actual_dependents:?}"
+            "storage workspace dependents drifted: expected={allowed_dependents:?}, actual={actual_dependents:?}"
         );
     }
     Ok(())

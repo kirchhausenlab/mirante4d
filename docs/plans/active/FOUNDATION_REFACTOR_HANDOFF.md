@@ -2,13 +2,13 @@
 
 Status: ACTIVE PUBLIC-EPOCH PROGRAM
 Last reviewed: 2026-07-14
-Current technical sequence: WP-12, then the remaining packages below
+Current technical sequence: WP-10C, then the remaining packages below
 Public-data publication: deferred to a separate future handoff
-WP-12 predecessor: `foundation-wp-11-exit-1`
-Completed through: WP-11 at
-`04987f64c309166caddf931be9c1ef4948010128`
-Current checkpoint: WP-12 product analysis cutover acceptance candidate
-Next protected-branch checkpoint: accept the WP-12 product analysis cutover
+WP-10C predecessor: `foundation-wp-12-exit-1`
+Completed through: WP-12 at
+`5be750d060284d0a591ea6b5c0007bfeb136ac8d`
+Current checkpoint: WP-10C storage/runtime product cutover
+Next protected-branch checkpoint: accept the sole target-format product path
 
 ## Purpose
 
@@ -193,10 +193,11 @@ project route and its predecessor is deleted.
 WP-11 accepted the off-product bounded, restartable TIFF/OME-TIFF producer at
 `04987f64c309166caddf931be9c1ef4948010128`
 (`foundation-wp-11-exit-1`). Its focused checks and independent target readback
-passed. Product activation and deletion of the current importer remain WP-10C
-work. The WP-12 candidate implements the product analysis-runtime cutover and
-deletes its predecessor; protected-main acceptance remains before WP-10C
-begins.
+passed. WP-12 accepted the product analysis-runtime cutover at
+`5be750d060284d0a591ea6b5c0007bfeb136ac8d`
+(`foundation-wp-12-exit-1`) and deleted its predecessor and segmentation code.
+The WP-10C candidate activates target storage and import and deletes their
+predecessor crates; protected-main acceptance is the current checkpoint.
 
 ## Dataset And Fixture Boundary
 

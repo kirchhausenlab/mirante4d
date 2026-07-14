@@ -2585,6 +2585,41 @@ fn dataset_open_request_rejects_while_an_operation_is_active() {
 }
 
 #[test]
+fn import_completion_survives_unrelated_view_currentness_changes() {
+    let mut application = application();
+    application
+        .dispatch(ApplicationCommand::BeginOperation(OperationKind::Import))
+        .unwrap();
+    let token = started_token(&mut application, OperationKind::Import);
+
+    application
+        .dispatch(ApplicationCommand::SetTimepoint(TimeIndex::new(3)))
+        .unwrap();
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token: token.clone(),
+            completion: OperationCompletion::Succeeded,
+        })
+        .unwrap();
+
+    assert!(application.snapshot().active_operations().is_empty());
+    assert!(
+        application
+            .drain_events(MAX_PENDING_EVENTS)
+            .iter()
+            .any(|event| {
+                matches!(
+                    event,
+                    ApplicationEvent::OperationCompleted {
+                        token: completed,
+                        outcome: OperationOutcome::Succeeded,
+                    } if completed == &token
+                )
+            })
+    );
+}
+
+#[test]
 fn dataset_open_failure_is_typed_and_does_not_replace_the_source() {
     let mut application = application();
     application

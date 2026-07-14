@@ -19,14 +19,14 @@ use mirante4d_application::{
     OperationCompletion, OperationFailureCode, OperationKind, OperationToken,
     SourceSessionGeneration,
 };
-use mirante4d_data::{
-    CurrentDatasetSourceOpenError, CurrentSourceVerificationError, CurrentSourceVerificationPhase,
-    CurrentSourceVerificationProgress,
-};
-use mirante4d_dataset::{CpuByteLedger, DatasetCatalog, DatasetSourceId};
+use mirante4d_dataset::{CpuByteLedger, DatasetCatalog};
 use mirante4d_dataset_runtime::RuntimeFaultCode;
 use mirante4d_project_model::{DatasetLocatorHint, DatasetReference};
 use mirante4d_settings::ResourcePolicy;
+use mirante4d_storage::{
+    DirectoryInventoryError, LocalDatasetSourceOpenError, PackageAdmissionError, PackageReadError,
+    PackageValidationError, RangeReadError, ScientificPackageValidationError, StorageProfileError,
+};
 
 use crate::{
     dataset_requests::DatasetDemandState,
@@ -36,7 +36,7 @@ use crate::{
 const RESULT_CHANNEL_CAPACITY: usize = 1;
 const WORKER_NAME: &str = "mirante4d-current-source-verification";
 const PHASE_WORK_UNITS: u64 = 1_000_000;
-const TOTAL_WORK_UNITS: u64 = 5 * PHASE_WORK_UNITS;
+const TOTAL_WORK_UNITS: u64 = 4 * PHASE_WORK_UNITS;
 
 pub(crate) struct CurrentSourceVerificationService {
     active: Option<ActiveVerification>,
@@ -363,47 +363,27 @@ fn run_verification(
         return CurrentSourceVerificationOutcome::Cancelled;
     }
     let source_generation = token.source_session_generation();
-    let verification = match unified_source_open::verify_current_source(
+    let capability = match unified_source_open::verify_target_package(
         &path,
-        DatasetSourceId::new(source_generation.get()),
         scan_ledger,
         || is_cancelled(cancellation),
-        |reported| store_progress(progress.as_ref(), normalize_progress(reported)),
+        |stage| store_progress(progress.as_ref(), stage_progress(stage)),
     ) {
-        Ok(verification) => verification,
-        Err(unified_source_open::UnifiedCurrentSourceVerificationError::Verification(
-            CurrentSourceVerificationError::Cancelled,
-        )) => {
+        Ok(capability) => capability,
+        Err(error) if target_verification_cancelled(&error) => {
             return CurrentSourceVerificationOutcome::Cancelled;
         }
-        Err(unified_source_open::UnifiedCurrentSourceVerificationError::Open(error)) => {
-            return CurrentSourceVerificationOutcome::Failed(map_source_open_error(&error));
-        }
-        Err(unified_source_open::UnifiedCurrentSourceVerificationError::Verification(error)) => {
-            return CurrentSourceVerificationOutcome::Failed(map_verification_error(&error));
+        Err(error) => {
+            return CurrentSourceVerificationOutcome::Failed(map_target_verification_error(&error));
         }
     };
     if is_cancelled(cancellation) {
         return CurrentSourceVerificationOutcome::Cancelled;
     }
-    let scientific_content_id = verification.scientific_content_id();
-    let preparation_progress = Arc::clone(&progress);
-    let opened = match unified_source_open::open_verified(
-        &path,
-        resource_policy,
-        verification,
-        cancellation,
-        move |reported| {
-            store_progress(
-                preparation_progress.as_ref(),
-                normalize_preparation_progress(reported),
-            );
-        },
-    ) {
+    let scientific_content_id = capability.scientific_content_id();
+    let package_id = capability.package_id();
+    let opened = match unified_source_open::open_verified(&path, resource_policy, capability) {
         Ok(opened) => opened,
-        Err(UnifiedVerifiedSourceOpenError::Verification(
-            CurrentSourceVerificationError::Cancelled,
-        )) => return CurrentSourceVerificationOutcome::Cancelled,
         Err(error) => {
             return CurrentSourceVerificationOutcome::Failed(map_verified_open_error(&error));
         }
@@ -423,7 +403,8 @@ fn run_verification(
     let locator_hint = path
         .to_str()
         .and_then(|path| DatasetLocatorHint::new(path).ok());
-    let dataset_reference = DatasetReference::new(scientific_content_id, None, None, locator_hint);
+    let dataset_reference =
+        DatasetReference::new(scientific_content_id, Some(package_id), None, locator_hint);
     CurrentSourceVerificationOutcome::Prepared(Box::new(PreparedCurrentSourceVerification {
         dataset: opened.dataset,
         catalog: opened.catalog,
@@ -432,70 +413,18 @@ fn run_verification(
     }))
 }
 
-fn normalize_progress(progress: CurrentSourceVerificationProgress) -> CoalescedProgress {
-    normalize_progress_parts(
-        progress.phase(),
-        progress.completed_units(),
-        progress.total_units(),
-    )
-}
-
-fn normalize_progress_parts(
-    phase: CurrentSourceVerificationPhase,
-    completed_units: u64,
-    total_units: u64,
-) -> CoalescedProgress {
-    let phase_base = match phase {
-        CurrentSourceVerificationPhase::PreInventory => 0,
-        CurrentSourceVerificationPhase::ScientificScan => PHASE_WORK_UNITS,
-        CurrentSourceVerificationPhase::PostInventory => 2 * PHASE_WORK_UNITS,
-    };
-    let phase_completed = if total_units == 0 {
-        0
-    } else {
-        let completed = completed_units.min(total_units);
-        u64::try_from(
-            u128::from(completed) * u128::from(PHASE_WORK_UNITS) / u128::from(total_units),
-        )
-        .expect("normalized source-verification progress fits u64")
+fn stage_progress(stage: unified_source_open::TargetPackageVerificationStage) -> CoalescedProgress {
+    let completed_work = match stage {
+        unified_source_open::TargetPackageVerificationStage::MetadataOpened => PHASE_WORK_UNITS,
+        unified_source_open::TargetPackageVerificationStage::ExactPackageVerified => {
+            2 * PHASE_WORK_UNITS
+        }
+        unified_source_open::TargetPackageVerificationStage::ScientificContentVerified => {
+            3 * PHASE_WORK_UNITS
+        }
     };
     CoalescedProgress {
-        completed_work: phase_base + phase_completed,
-        total_work: TOTAL_WORK_UNITS,
-    }
-}
-
-fn normalize_preparation_progress(
-    progress: CurrentSourceVerificationProgress,
-) -> CoalescedProgress {
-    normalize_preparation_progress_parts(
-        progress.phase(),
-        progress.completed_units(),
-        progress.total_units(),
-    )
-}
-
-fn normalize_preparation_progress_parts(
-    phase: CurrentSourceVerificationPhase,
-    completed_units: u64,
-    total_units: u64,
-) -> CoalescedProgress {
-    let phase_base = match phase {
-        CurrentSourceVerificationPhase::PreInventory => 3 * PHASE_WORK_UNITS,
-        CurrentSourceVerificationPhase::PostInventory => 4 * PHASE_WORK_UNITS,
-        CurrentSourceVerificationPhase::ScientificScan => 3 * PHASE_WORK_UNITS,
-    };
-    let phase_completed = if total_units == 0 {
-        0
-    } else {
-        let completed = completed_units.min(total_units);
-        u64::try_from(
-            u128::from(completed) * u128::from(PHASE_WORK_UNITS) / u128::from(total_units),
-        )
-        .expect("normalized source-preparation progress fits u64")
-    };
-    CoalescedProgress {
-        completed_work: phase_base + phase_completed,
+        completed_work,
         total_work: TOTAL_WORK_UNITS,
     }
 }
@@ -511,49 +440,165 @@ fn is_cancelled(cancellation: &AtomicBool) -> bool {
     cancellation.load(Ordering::Acquire)
 }
 
-fn map_source_open_error(error: &CurrentDatasetSourceOpenError) -> OperationFailureCode {
+fn target_verification_cancelled(
+    error: &unified_source_open::TargetPackageVerificationError,
+) -> bool {
+    matches!(
+        error,
+        unified_source_open::TargetPackageVerificationError::Cancelled
+            | unified_source_open::TargetPackageVerificationError::Exact(
+                PackageValidationError::Cancelled,
+            )
+            | unified_source_open::TargetPackageVerificationError::Scientific(
+                ScientificPackageValidationError::Cancelled,
+            )
+    )
+}
+
+fn map_target_verification_error(
+    error: &unified_source_open::TargetPackageVerificationError,
+) -> OperationFailureCode {
     match error {
-        CurrentDatasetSourceOpenError::ManifestMetadata(_) => {
+        unified_source_open::TargetPackageVerificationError::Cancelled => {
             OperationFailureCode::SourceVerificationReadFailed
         }
-        CurrentDatasetSourceOpenError::MetadataAccountingOverflow
-        | CurrentDatasetSourceOpenError::MetadataAdmission(_)
-        | CurrentDatasetSourceOpenError::InvalidMetadataLease => {
+        unified_source_open::TargetPackageVerificationError::Reservation
+        | unified_source_open::TargetPackageVerificationError::InvalidReservation => {
             OperationFailureCode::SourceVerificationCapacityExceeded
         }
-        CurrentDatasetSourceOpenError::Dataset(_)
-        | CurrentDatasetSourceOpenError::Catalog(_)
-        | CurrentDatasetSourceOpenError::LayerOrdinalOverflow => {
-            OperationFailureCode::SourceVerificationInvalid
+        unified_source_open::TargetPackageVerificationError::Open(error) => {
+            map_storage_failure(error, OperationFailureCode::SourceVerificationInvalid)
         }
+        unified_source_open::TargetPackageVerificationError::Exact(error) => {
+            map_exact_failure(error)
+        }
+        unified_source_open::TargetPackageVerificationError::Scientific(error) => match error {
+            ScientificPackageValidationError::Cancelled => {
+                OperationFailureCode::SourceVerificationReadFailed
+            }
+            ScientificPackageValidationError::Exact(error) => map_exact_failure(error),
+            ScientificPackageValidationError::Read(PackageReadError::Cancelled) => {
+                OperationFailureCode::SourceVerificationReadFailed
+            }
+            ScientificPackageValidationError::ArithmeticOverflow { .. }
+            | ScientificPackageValidationError::PlatformLength { .. } => {
+                OperationFailureCode::SourceVerificationCapacityExceeded
+            }
+            ScientificPackageValidationError::Read(error) => {
+                map_storage_failure(error, OperationFailureCode::SourceVerificationInvalid)
+            }
+            _ => OperationFailureCode::SourceVerificationInvalid,
+        },
     }
 }
 
-fn map_verification_error(error: &CurrentSourceVerificationError) -> OperationFailureCode {
+fn map_exact_failure(error: &PackageValidationError) -> OperationFailureCode {
     match error {
-        CurrentSourceVerificationError::Cancelled => {
-            OperationFailureCode::SourceVerificationReadFailed
-        }
-        CurrentSourceVerificationError::SourceChanged => OperationFailureCode::SourceChanged,
-        CurrentSourceVerificationError::InventoryCapacity
-        | CurrentSourceVerificationError::Capacity(_)
-        | CurrentSourceVerificationError::InvalidLedgerLease => {
+        PackageValidationError::Cancelled => OperationFailureCode::SourceVerificationReadFailed,
+        PackageValidationError::AccountingOverflow { .. } => {
             OperationFailureCode::SourceVerificationCapacityExceeded
         }
-        CurrentSourceVerificationError::InventoryIo { .. } => {
+        PackageValidationError::ObjectLengthMismatch { .. }
+        | PackageValidationError::ObjectDigestMismatch { .. }
+        | PackageValidationError::StructuralObjectMissing { .. } => {
+            OperationFailureCode::SourceChanged
+        }
+        _ => map_storage_failure(error, OperationFailureCode::SourceVerificationInvalid),
+    }
+}
+
+fn map_storage_failure(
+    error: &(dyn std::error::Error + 'static),
+    default: OperationFailureCode,
+) -> OperationFailureCode {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(error) = error.downcast_ref::<RangeReadError>() {
+            return map_verification_range_failure(error, default);
+        }
+        if let Some(error) = error.downcast_ref::<DirectoryInventoryError>() {
+            return match error {
+                DirectoryInventoryError::ObjectCountExceeded { .. }
+                | DirectoryInventoryError::DirectoryCountExceeded { .. }
+                | DirectoryInventoryError::DirectoryFanOutExceeded { .. } => {
+                    OperationFailureCode::SourceVerificationCapacityExceeded
+                }
+                DirectoryInventoryError::Io { .. } => {
+                    OperationFailureCode::SourceVerificationReadFailed
+                }
+                DirectoryInventoryError::Range(error) => {
+                    map_verification_range_failure(error, default)
+                }
+                DirectoryInventoryError::ManifestAuthorityChanged
+                | DirectoryInventoryError::ObjectLengthMismatch { .. }
+                | DirectoryInventoryError::MissingFile { .. }
+                | DirectoryInventoryError::UnexpectedFile { .. }
+                | DirectoryInventoryError::UnexpectedDirectory { .. } => {
+                    OperationFailureCode::SourceChanged
+                }
+                _ => default,
+            };
+        }
+        if matches!(
+            error.downcast_ref::<PackageAdmissionError>(),
+            Some(PackageAdmissionError::NoSupportedProfile)
+        ) || matches!(
+            error.downcast_ref::<StorageProfileError>(),
+            Some(
+                StorageProfileError::ArithmeticOverflow { .. }
+                    | StorageProfileError::CeilingExceeded { .. }
+                    | StorageProfileError::ExactCountMismatch { .. }
+            )
+        ) {
+            return OperationFailureCode::SourceVerificationCapacityExceeded;
+        }
+        if let Some(error) = error.downcast_ref::<PackageReadError>()
+            && matches!(error, PackageReadError::ObjectLengthMismatch { .. })
+        {
+            return OperationFailureCode::SourceChanged;
+        }
+        current = error.source();
+    }
+    default
+}
+
+fn map_verification_range_failure(
+    error: &RangeReadError,
+    default: OperationFailureCode,
+) -> OperationFailureCode {
+    match error {
+        RangeReadError::RootChanged | RangeReadError::ObjectChanged { .. } => {
+            OperationFailureCode::SourceChanged
+        }
+        RangeReadError::ObjectTooLarge { .. }
+        | RangeReadError::InvalidObjectLimit { .. }
+        | RangeReadError::RangeOverflow
+        | RangeReadError::LengthOverflow => {
+            OperationFailureCode::SourceVerificationCapacityExceeded
+        }
+        RangeReadError::Io { .. } | RangeReadError::ShortRead { .. } => {
             OperationFailureCode::SourceVerificationReadFailed
         }
-        CurrentSourceVerificationError::UnsupportedDTypePair { .. }
-        | CurrentSourceVerificationError::InvalidSource
-        | CurrentSourceVerificationError::Identity(_) => {
-            OperationFailureCode::SourceVerificationInvalid
-        }
+        _ => default,
     }
 }
 
 fn map_verified_open_error(error: &UnifiedVerifiedSourceOpenError) -> OperationFailureCode {
     match error {
-        UnifiedVerifiedSourceOpenError::Verification(error) => map_verification_error(error),
+        UnifiedVerifiedSourceOpenError::Adapter(error) => match error {
+            LocalDatasetSourceOpenError::MetadataAccountingOverflow
+            | LocalDatasetSourceOpenError::MetadataAdmission(_)
+            | LocalDatasetSourceOpenError::InvalidMetadataLease => {
+                OperationFailureCode::SourceVerificationCapacityExceeded
+            }
+            LocalDatasetSourceOpenError::Admission(error) => {
+                map_storage_failure(error, OperationFailureCode::SourceVerificationInvalid)
+            }
+            LocalDatasetSourceOpenError::Catalog(_)
+            | LocalDatasetSourceOpenError::MetadataInvariant { .. } => {
+                OperationFailureCode::SourceVerificationInvalid
+            }
+        },
         UnifiedVerifiedSourceOpenError::RuntimeConfiguration(code) => match code {
             RuntimeFaultCode::InvalidConfiguration
             | RuntimeFaultCode::MinimumWorkUnitExceedsBudget
@@ -610,49 +655,32 @@ fn join_active(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mirante4d_dataset::DatasetSourceId;
 
     #[test]
-    fn phase_progress_maps_to_one_fixed_monotonic_scalar() {
+    fn verification_stages_map_to_one_fixed_monotonic_scalar() {
         assert_eq!(
-            normalize_progress_parts(CurrentSourceVerificationPhase::PreInventory, 5, 10),
+            stage_progress(unified_source_open::TargetPackageVerificationStage::MetadataOpened),
             CoalescedProgress {
-                completed_work: 500_000,
+                completed_work: PHASE_WORK_UNITS,
                 total_work: TOTAL_WORK_UNITS,
             }
         );
         assert_eq!(
-            normalize_progress_parts(CurrentSourceVerificationPhase::ScientificScan, 1, 4),
+            stage_progress(
+                unified_source_open::TargetPackageVerificationStage::ExactPackageVerified,
+            ),
             CoalescedProgress {
-                completed_work: 1_250_000,
+                completed_work: 2 * PHASE_WORK_UNITS,
                 total_work: TOTAL_WORK_UNITS,
             }
         );
         assert_eq!(
-            normalize_progress_parts(CurrentSourceVerificationPhase::PostInventory, 10, 10),
+            stage_progress(
+                unified_source_open::TargetPackageVerificationStage::ScientificContentVerified,
+            ),
             CoalescedProgress {
                 completed_work: 3 * PHASE_WORK_UNITS,
-                total_work: TOTAL_WORK_UNITS,
-            }
-        );
-        assert_eq!(
-            normalize_preparation_progress_parts(
-                CurrentSourceVerificationPhase::PreInventory,
-                1,
-                2,
-            ),
-            CoalescedProgress {
-                completed_work: 3_500_000,
-                total_work: TOTAL_WORK_UNITS,
-            }
-        );
-        assert_eq!(
-            normalize_preparation_progress_parts(
-                CurrentSourceVerificationPhase::PostInventory,
-                2,
-                2,
-            ),
-            CoalescedProgress {
-                completed_work: TOTAL_WORK_UNITS,
                 total_work: TOTAL_WORK_UNITS,
             }
         );
@@ -708,11 +736,7 @@ mod tests {
     #[test]
     fn cancellation_before_receive_wins_over_an_already_published_success() {
         let temp = tempfile::tempdir().unwrap();
-        let path = mirante4d_format::write_fixture(
-            mirante4d_format::FixtureKind::BasicU16_16Cube,
-            temp.path(),
-        )
-        .unwrap();
+        let path = crate::tests::write_target_fixture(temp.path()).unwrap();
         let opened = crate::unified_source_open::open(
             &path,
             mirante4d_settings::ResourcePolicy::default(),

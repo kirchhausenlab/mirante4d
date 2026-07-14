@@ -382,16 +382,6 @@ impl GpuRenderer {
                 .lock()
                 .map_err(|_| GpuRenderError::CachePoisoned)?
                 .residency_snapshot(key),
-            ResourceRepresentation::DenseU16
-            | ResourceRepresentation::DenseF32
-            | ResourceRepresentation::TrackPolyline => Ok(GpuBrickAtlasResidencySnapshot {
-                retained: false,
-                generation: None,
-                resident_pages: HashSet::new(),
-                active_pages: HashSet::new(),
-                bytes: 0,
-                slot_count: 0,
-            }),
         }
     }
 }

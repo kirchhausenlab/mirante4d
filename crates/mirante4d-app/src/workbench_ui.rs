@@ -892,6 +892,7 @@ impl eframe::App for MiranteWorkbenchApp {
         let mut start_pending_tiff_import = false;
         let mut cancel_pending_tiff_import = false;
         let mut dismiss_tiff_import_setup_error = false;
+        let mut reset_invalid_import_checkpoint = false;
         let layout = WorkbenchLayoutSpec::default();
         let playback_started = Instant::now();
         workbench_playback_runtime::enqueue_playback_command_if_due(
@@ -1045,9 +1046,25 @@ impl eframe::App for MiranteWorkbenchApp {
                     {
                         self.import_tiff_file_from_dialog(ui.ctx());
                     }
-                    if import_active && ui_kit::toolbar_button(ui, "Cancel Import", true).clicked()
-                    {
-                        self.cancel_import_task();
+                    if import_active {
+                        let cancellation_pending = self
+                            .import_runtime
+                            .import_task
+                            .as_ref()
+                            .is_some_and(|task| task.cancellation.is_cancelled());
+                        if ui_kit::toolbar_button(
+                            ui,
+                            if cancellation_pending {
+                                "Stopping Import"
+                            } else {
+                                "Cancel Import"
+                            },
+                            !cancellation_pending,
+                        )
+                        .clicked()
+                        {
+                            self.cancel_import_task();
+                        }
                     }
                     ui.separator();
                     ui_kit::elided_label(ui, application_snapshot.catalog().label(), 42);
@@ -1667,109 +1684,18 @@ impl eframe::App for MiranteWorkbenchApp {
                     } else if let Some(task) = &self.import_runtime.tiff_import_setup_task {
                         ui_kit::section(ui, "TIFF Import", |ui| {
                             ui_kit::status_badge(ui, StatusTone::Warning, "inspecting input");
-                            ui_kit::property_row(ui, "source", task.source.path().display());
-                            ui_kit::property_row(ui, "output", task.output_parent.display());
+                            ui_kit::property_row(ui, "source", task.source.path.display());
+                            ui_kit::property_row(ui, "destination", task.destination.display());
                         });
                     }
-                    if let Some(pending_import) = &mut self.import_runtime.pending_tiff_import {
+                    if let Some(pending) = &mut self.import_runtime.pending_tiff_import {
                         ui_kit::section(ui, "TIFF Import", |ui| {
-                            ui_kit::property_row(
-                                ui,
-                                "source",
-                                pending_import.options.source.path().display().to_string(),
-                            );
-                            ui_kit::property_row(
-                                ui,
-                                "output",
-                                pending_import.options.output_package.display().to_string(),
-                            );
-                            ui_kit::property_row(
-                                ui,
-                                "files",
-                                format!(
-                                    "{} file(s), {} channel(s), {} timepoint(s)",
-                                    pending_import.inspection.file_count,
-                                    pending_import.inspection.channel_count,
-                                    pending_import.inspection.timepoint_count
-                                ),
-                            );
-                            ui_kit::property_row(
-                                ui,
-                                "source profile",
-                                tiff_source_profile_label(pending_import.inspection.source_profile),
-                            );
-                            ui_kit::property_row(
-                                ui,
-                                "stack",
-                                format!(
-                                    "z{} y{} x{}",
-                                    pending_import.inspection.shape.z,
-                                    pending_import.inspection.shape.y,
-                                    pending_import.inspection.shape.x
-                                ),
-                            );
-                            ui_kit::property_row(
-                                ui,
-                                "source dtype",
-                                format!("{:?}", pending_import.inspection.source_dtype),
-                            );
-                            show_tiff_no_data_controls(ui, pending_import);
-                            ui_kit::property_row(
-                                ui,
-                                "spacing metadata",
-                                tiff_voxel_spacing_metadata_label(&pending_import.inspection),
-                            );
-                            ui_kit::property_row(
-                                ui,
-                                "storage estimate",
-                                tiff_import_storage_estimate_label(&pending_import.inspection),
-                            );
-                            ui.add(
-                                egui::TextEdit::singleline(
-                                    &mut pending_import.options.dataset_name,
-                                )
-                                .desired_width(180.0),
-                            );
-                            ui.horizontal(|ui| {
-                                ui.label("voxel um");
-                                ui.add(
-                                    egui::DragValue::new(
-                                        &mut pending_import.options.voxel_spacing_um[0],
-                                    )
-                                    .speed(0.01)
-                                    .prefix("x "),
-                                );
-                                ui.add(
-                                    egui::DragValue::new(
-                                        &mut pending_import.options.voxel_spacing_um[1],
-                                    )
-                                    .speed(0.01)
-                                    .prefix("y "),
-                                );
-                                ui.add(
-                                    egui::DragValue::new(
-                                        &mut pending_import.options.voxel_spacing_um[2],
-                                    )
-                                    .speed(0.01)
-                                    .prefix("z "),
-                                );
-                            });
-                            show_tiff_channel_metadata_controls(
-                                ui,
-                                &mut pending_import.options,
-                                &pending_import.inspection,
-                                140.0,
-                            );
-                            show_tiff_grouping_controls(ui, pending_import);
-                            ui.checkbox(
-                                &mut pending_import.voxel_spacing_confirmed,
-                                "voxel spacing reviewed",
-                            );
+                            show_pending_tiff_import_controls(ui, pending);
                             ui.horizontal(|ui| {
                                 if ui_kit::toolbar_button(
                                     ui,
                                     "Run Import",
-                                    pending_tiff_import_ready_to_start(pending_import),
+                                    pending_tiff_import_ready_to_start(pending),
                                 )
                                 .clicked()
                                 {
@@ -2338,6 +2264,7 @@ impl eframe::App for MiranteWorkbenchApp {
             &mut start_pending_tiff_import,
             &mut cancel_pending_tiff_import,
             &mut dismiss_tiff_import_setup_error,
+            &mut reset_invalid_import_checkpoint,
         );
         self.show_project_recovery_ui(ui.ctx());
         self.show_dirty_project_close_prompt(ui.ctx());
@@ -2368,12 +2295,17 @@ impl eframe::App for MiranteWorkbenchApp {
         let import_action_started = Instant::now();
         if dismiss_tiff_import_setup_error {
             self.import_runtime.tiff_import_setup_error = None;
+            self.import_runtime.checkpoint_retry_options = None;
+            self.import_runtime.checkpoint_reset_confirmed = false;
         }
         if cancel_pending_tiff_import {
             self.cancel_pending_tiff_import();
         }
         if start_pending_tiff_import {
             self.start_pending_tiff_import();
+        }
+        if reset_invalid_import_checkpoint {
+            self.reset_invalid_checkpoint_and_restart();
         }
         let import_action_ms = duration_ms(import_action_started.elapsed());
 

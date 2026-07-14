@@ -8,22 +8,20 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use mirante4d_format::load_and_validate_dataset_quick;
+use mirante4d_storage::{LocalPackageCatalog, PACKAGE_VALIDATION_WORKING_BYTES};
 use serde_json::{Value, json};
 
 use crate::{
-    fixtures::generate_fixture,
     host::benchmark_host_context,
     process::{run_cargo, with_heavy_benchmark_guard},
     reports::{read_json_file, write_json_file},
+    target_fixture::extract_target_u16_fixture,
 };
 
 const PRODUCT_VALIDATION_SCHEMA: &str = "mirante4d-product-validation-report";
 const PRODUCT_AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 const PRODUCT_AUTOMATION_SCHEMA_VERSION: u32 = 2;
 const PRODUCT_VALIDATION_SCHEMA_VERSION: u32 = 1;
-const DEFAULT_FIXTURE: &str = "basic-u16-16cube";
-const RENDER_MODES_FIXTURE: &str = "time-multichannel-u16-8cube-3t-2c";
 const OUTPUT_DIR: &str = "target/mirante4d/product-validation";
 const TIMEOUT_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_TIMEOUT_SECS";
 const ALLOW_NO_DISPLAY_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_ALLOW_NO_DISPLAY";
@@ -35,9 +33,9 @@ const PREFLIGHT_ONLY_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_PREFLIGHT_ONLY";
 const PRODUCT_VALIDATE_GPU_TIMESTAMPS_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_GPU_TIMESTAMPS";
 const PRODUCT_VALIDATE_MAX_RSS_BYTES_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_MAX_RSS_BYTES";
 const APP_GPU_TIMESTAMPS_ENV: &str = "MIRANTE4D_GPU_TIMESTAMPS";
-const GENERATED_FIXTURE_SCENARIO: &str = "generated_fixture_camera_smoke";
-const GENERATED_RENDER_MODES_SCENARIO: &str = "generated_fixture_render_modes";
-const B3_SOURCE_VERIFICATION_SCENARIO: &str = "b3_source_verification";
+const GENERATED_FIXTURE_SCENARIO: &str = "target_fixture_camera_smoke";
+const GENERATED_RENDER_MODES_SCENARIO: &str = "target_fixture_render_modes";
+const B3_SOURCE_VERIFICATION_SCENARIO: &str = "target_source_verification";
 const B4_PROJECT_PERSISTENCE_SCENARIO: &str = "b4_project_persistence";
 const B4_TRUSTED_REPORT_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_PROJECT_STORE_LIFECYCLE_REPORT";
 const B4_CHECKPOINT_SCHEMA: &str = "mirante4d-product-external-kill-checkpoint";
@@ -669,13 +667,13 @@ impl ProductValidationScenario {
             }
         }
         match requested.unwrap_or(GENERATED_FIXTURE_SCENARIO) {
-            GENERATED_FIXTURE_SCENARIO | "generated-fixture-camera-smoke" | "generated" => {
+            GENERATED_FIXTURE_SCENARIO | "target-fixture-camera-smoke" | "target" => {
                 Ok(Self::GeneratedFixtureCameraSmoke)
             }
-            GENERATED_RENDER_MODES_SCENARIO | "generated-fixture-render-modes" | "render-modes" => {
+            GENERATED_RENDER_MODES_SCENARIO | "target-fixture-render-modes" | "render-modes" => {
                 Ok(Self::GeneratedFixtureRenderModes)
             }
-            B3_SOURCE_VERIFICATION_SCENARIO | "b3-source-verification" => {
+            B3_SOURCE_VERIFICATION_SCENARIO | "target-source-verification" => {
                 Ok(Self::B3SourceVerification)
             }
             B4_PROJECT_PERSISTENCE_SCENARIO | "b4-project-persistence" => {
@@ -730,13 +728,13 @@ impl ProductValidationScenario {
         matches!(
             name,
             GENERATED_FIXTURE_SCENARIO
-                | "generated-fixture-camera-smoke"
-                | "generated"
+                | "target-fixture-camera-smoke"
+                | "target"
                 | GENERATED_RENDER_MODES_SCENARIO
-                | "generated-fixture-render-modes"
+                | "target-fixture-render-modes"
                 | "render-modes"
                 | B3_SOURCE_VERIFICATION_SCENARIO
-                | "b3-source-verification"
+                | "target-source-verification"
                 | B4_PROJECT_PERSISTENCE_SCENARIO
                 | "b4-project-persistence"
                 | T5_QUAL_001_INTERACTION_MIP_SCENARIO
@@ -918,7 +916,7 @@ fn product_validate_b4_project_persistence(
         .with_context(|| format!("failed to create {}", state_home.display()))?;
     let package = match package {
         Some(package) => package.to_path_buf(),
-        None => generate_fixture(DEFAULT_FIXTURE)?,
+        None => default_target_fixture()?,
     };
     let original_project = work_dir.join("original.m4dproj");
     let save_as_project = work_dir.join("recovered-save-as.m4dproj");
@@ -1543,31 +1541,31 @@ fn product_validation_package_and_script(
         ProductValidationScenario::GeneratedFixtureCameraSmoke => {
             let package = match package {
                 Some(package) => package.to_path_buf(),
-                None => generate_fixture(DEFAULT_FIXTURE)?,
+                None => default_target_fixture()?,
             };
-            let script = generated_fixture_camera_smoke_script(&package);
+            let script = target_fixture_camera_smoke_script(&package);
             Ok((package, script))
         }
         ProductValidationScenario::GeneratedFixtureRenderModes => {
             let package = match package {
                 Some(package) => package.to_path_buf(),
-                None => generate_fixture(RENDER_MODES_FIXTURE)?,
+                None => default_target_fixture()?,
             };
-            let script = generated_fixture_render_modes_script(&package);
+            let script = target_fixture_render_modes_script(&package);
             Ok((package, script))
         }
         ProductValidationScenario::B3SourceVerification => {
             let package = match package {
                 Some(package) => package.to_path_buf(),
-                None => generate_fixture(DEFAULT_FIXTURE)?,
+                None => default_target_fixture()?,
             };
-            let script = b3_source_verification_script(&package);
+            let script = target_source_verification_script(&package);
             Ok((package, script))
         }
         ProductValidationScenario::B4ProjectPersistence => {
             let package = match package {
                 Some(package) => package.to_path_buf(),
-                None => generate_fixture(DEFAULT_FIXTURE)?,
+                None => default_target_fixture()?,
             };
             let placeholder = Path::new("target/b4-project-placeholder.m4dproj");
             let checkpoint = Path::new("target/b4-checkpoint-placeholder.json");
@@ -1652,11 +1650,14 @@ fn product_validation_package_and_script(
 }
 
 fn dataset_runtime_limits(max_cpu_total_bytes: u64, max_resident_resources: u64) -> Value {
+    let max_cpu_in_flight_decode_bytes = (max_cpu_total_bytes / 8)
+        .saturating_add(PACKAGE_VALIDATION_WORKING_BYTES)
+        .min(max_cpu_total_bytes);
     json!({
         "max_cpu_total_bytes": max_cpu_total_bytes,
         "max_cpu_decoded_residency_bytes": max_cpu_total_bytes / 2,
         "max_cpu_upload_staging_bytes": max_cpu_total_bytes / 8,
-        "max_cpu_in_flight_decode_bytes": max_cpu_total_bytes / 8,
+        "max_cpu_in_flight_decode_bytes": max_cpu_in_flight_decode_bytes,
         "max_cpu_metadata_and_indexes_bytes": max_cpu_total_bytes / 10,
         "max_cpu_queues_and_results_bytes": max_cpu_total_bytes / 20,
         "max_cpu_prefetch_bytes": max_cpu_total_bytes / 20,
@@ -1668,7 +1669,11 @@ fn dataset_runtime_limits(max_cpu_total_bytes: u64, max_resident_resources: u64)
     })
 }
 
-fn generated_fixture_camera_smoke_script(package: &Path) -> Value {
+fn default_target_fixture() -> anyhow::Result<PathBuf> {
+    extract_target_u16_fixture(Path::new("target/mirante4d/fixtures"))
+}
+
+fn target_fixture_camera_smoke_script(package: &Path) -> Value {
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
@@ -1698,7 +1703,7 @@ fn generated_fixture_camera_smoke_script(package: &Path) -> Value {
     })
 }
 
-fn generated_fixture_render_modes_script(package: &Path) -> Value {
+fn target_fixture_render_modes_script(package: &Path) -> Value {
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
@@ -1747,7 +1752,7 @@ fn generated_fixture_render_modes_script(package: &Path) -> Value {
     })
 }
 
-fn b3_source_verification_script(package: &Path) -> Value {
+fn target_source_verification_script(package: &Path) -> Value {
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
@@ -4083,27 +4088,32 @@ fn script_commands(script: &Value) -> Option<&Vec<Value>> {
 }
 
 fn dataset_context_json(package: &Path) -> Value {
-    match load_and_validate_dataset_quick(package) {
-        Ok(dataset) => {
-            let manifest = dataset.manifest;
-            let active_layer = manifest.layers.first().map(|layer| {
+    match LocalPackageCatalog::open(package) {
+        Ok(catalog) => {
+            let active_layer = catalog.science().layers().first().map(|layer| {
+                let shape = layer.base_shape();
+                let scale_count = catalog
+                    .profile()
+                    .images()
+                    .iter()
+                    .find(|image| {
+                        image
+                            .logical_layers()
+                            .iter()
+                            .any(|candidate| candidate.logical_layer() == layer.logical_layer())
+                    })
+                    .map_or(0, |image| image.levels().len());
                 json!({
-                    "id": layer.id,
-                    "name": layer.name,
-                    "kind": layer.kind,
+                    "logical_layer": layer.logical_layer().ordinal(),
                     "shape": {
-                        "t": layer.shape.t(),
-                        "z": layer.shape.z(),
-                        "y": layer.shape.y(),
-                        "x": layer.shape.x(),
+                        "t": shape.t(),
+                        "z": shape.z(),
+                        "y": shape.y(),
+                        "x": shape.x(),
                     },
-                    "dtype": {
-                        "source": format!("{:?}", layer.dtype.source),
-                        "stored": format!("{:?}", layer.dtype.stored),
-                        "conversion": layer.dtype.conversion,
-                    },
-                    "scale_count": layer.scales.len(),
-                    "timepoint_count": layer.shape.t(),
+                    "dtype": format!("{:?}", layer.dtype()),
+                    "scale_count": scale_count,
+                    "timepoint_count": shape.t(),
                 })
             });
             let timepoint_count = active_layer
@@ -4113,11 +4123,11 @@ fn dataset_context_json(package: &Path) -> Value {
             json!({
                 "package_path": package,
                 "manifest_status": "loaded",
-                "format": manifest.format,
-                "schema_version": manifest.schema_version,
-                "id": manifest.dataset.id,
-                "name": manifest.dataset.name,
-                "layer_count": manifest.layers.len(),
+                "format_family": mirante4d_storage::PROFILE.format_family,
+                "semantic_schema": mirante4d_storage::PROFILE.semantic_schema,
+                "package_id": catalog.declared_package_id().to_string(),
+                "scientific_content_id": catalog.science().scientific_content_id().to_string(),
+                "layer_count": catalog.science().layers().len(),
                 "active_layer": active_layer,
                 "timepoint_count": timepoint_count,
             })

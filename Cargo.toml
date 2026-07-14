@@ -4,13 +4,10 @@ members = [
     "crates/mirante4d-analysis-runtime",
     "crates/mirante4d-app",
     "crates/mirante4d-application",
-    "crates/mirante4d-data",
     "crates/mirante4d-dataset",
     "crates/mirante4d-dataset-runtime",
     "crates/mirante4d-domain",
-    "crates/mirante4d-format",
     "crates/mirante4d-identity",
-    "crates/mirante4d-import",
     "crates/mirante4d-import-pipeline",
     "crates/mirante4d-project-model",
     "crates/mirante4d-project-store",
@@ -22,7 +19,7 @@ members = [
     "crates/mirante4d-storage",
     "crates/xtask",
 ]
-exclude = ["fuzz", "vendor/wayland-scanner"]
+exclude = ["vendor/wayland-scanner"]
 resolver = "3"
 
 [workspace.package]
@@ -34,14 +31,12 @@ repository = "https://github.com/kirchhausenlab/mirante4d"
 [workspace.dependencies]
 anyhow = "1.0.103"
 approx = "0.5.1"
-blake3 = "1.8.2"
 bytemuck = "1.25.0"
 crc32c = "=0.6.8"
 eframe = { version = "0.34.3", default-features = false, features = ["accesskit", "default_fonts", "wayland", "web_screen_reader", "wgpu", "x11"] }
 egui_kittest = { version = "0.34.3", default-features = false }
 glam = { version = "0.30.9", features = ["serde"] }
 insta = { version = "1.48.0", default-features = false }
-ndarray = "0.16.1"
 pollster = "0.4.0"
 proptest = "1.11.0"
 quick-xml = "0.41.0"
@@ -62,7 +57,6 @@ uuid = { version = "1.23.3", features = ["v4"] }
 wgpu = "29.0.3"
 winit = { version = "0.30.13", default-features = false, features = ["wayland-csd-adwaita-notitle", "wayland-dlopen"] }
 yaml-rust2 = "0.11.0"
-zarrs = { version = "0.23.13", default-features = false, features = ["crc32c", "filesystem", "ndarray", "sharding", "zstd"] }
 zarrs_metadata = "=0.7.5"
 zstd = { version = "=0.13.3", default-features = false }
 
@@ -70,13 +64,10 @@ mirante4d-app = { path = "crates/mirante4d-app" }
 mirante4d-analysis-core = { path = "crates/mirante4d-analysis-core" }
 mirante4d-analysis-runtime = { path = "crates/mirante4d-analysis-runtime" }
 mirante4d-application = { path = "crates/mirante4d-application" }
-mirante4d-data = { path = "crates/mirante4d-data" }
 mirante4d-dataset = { path = "crates/mirante4d-dataset" }
 mirante4d-dataset-runtime = { path = "crates/mirante4d-dataset-runtime" }
 mirante4d-domain = { path = "crates/mirante4d-domain" }
-mirante4d-format = { path = "crates/mirante4d-format" }
 mirante4d-identity = { path = "crates/mirante4d-identity" }
-mirante4d-import = { path = "crates/mirante4d-import" }
 mirante4d-import-pipeline = { path = "crates/mirante4d-import-pipeline" }
 mirante4d-project-model = { path = "crates/mirante4d-project-model" }
 mirante4d-project-store = { path = "crates/mirante4d-project-store" }

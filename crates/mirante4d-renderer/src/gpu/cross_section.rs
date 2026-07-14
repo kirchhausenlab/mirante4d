@@ -3,7 +3,6 @@ use std::{collections::HashMap, time::Instant};
 use bytemuck::cast_slice;
 use mirante4d_dataset::{CpuByteLedger, ResourceRegion};
 use mirante4d_domain::Shape3D;
-use mirante4d_format::CurrentGridToWorldExt;
 use mirante4d_render_api::PresentationViewport;
 use wgpu::util::DeviceExt;
 
@@ -24,7 +23,7 @@ use super::{
 };
 use crate::{
     CrossSectionPanelBounds, CrossSectionView, CurrentLeaseVolume, IntensityTransfer, RenderError,
-    RenderViewport,
+    RenderViewport, transform::GridToWorldExt,
 };
 
 const CROSS_SECTION_PARAMS_U32_WORDS: usize = 17;

@@ -10,7 +10,7 @@ use mirante4d_identity::{
     SCIENTIFIC_TILE_SHAPE_TZYX, ScientificDatasetHasher, ScientificLayerDescriptor,
     ScientificLayerHasher, ScientificTemporalCalibration, ScientificTile,
 };
-use mirante4d_storage::PackedIndexRecord;
+use mirante4d_storage::{PackedIndexRecord, ProfileKind};
 
 use crate::{
     ImportCancellation, ImportError, ImportEvent, ImportOptions, ImportReceipt, ImportStatistics,
@@ -28,6 +28,23 @@ use crate::{
 
 pub fn inspect_tiff(source: TiffSource) -> Result<TiffInspection, ImportError> {
     crate::source::inspect(source)
+}
+
+/// Inspects a TIFF source while allowing a background caller to stop bounded work.
+pub fn inspect_tiff_cancellable(
+    source: TiffSource,
+    cancellation: &ImportCancellation,
+) -> Result<TiffInspection, ImportError> {
+    crate::source::inspect_cancellable(source, cancellation)
+}
+
+/// Chooses the first storage profile whose complete import plan is supported.
+///
+/// The fixed order is an internal storage decision; callers do not need to
+/// present the DS profile codes as a user choice. `import_tiff` continues to
+/// accept an explicit profile for focused tests and diagnostics.
+pub fn select_supported_profile(options: &ImportOptions) -> Result<ProfileKind, ImportError> {
+    crate::plan::select_supported_profile(options)
 }
 
 pub fn import_tiff(

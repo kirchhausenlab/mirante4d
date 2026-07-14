@@ -1,11 +1,198 @@
-use std::{fs, time::Duration};
+use std::{
+    collections::HashSet,
+    fs,
+    io::Write,
+    path::{Component, Path, PathBuf},
+    time::Duration,
+};
 
+use anyhow::{Context, bail};
 use eframe::egui;
-use mirante4d_format::{FixtureKind, write_fixture};
+
+const TARGET_FIXTURE_ARCHIVE: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../fixtures/target/archives/m4d-t1-u16-3d-multiscale.tar"
+));
+const SOURCE_FIXTURE_ARCHIVE: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../fixtures/source/mirante4d-source-tiff-fixtures-v1.tar"
+));
+const TARGET_FIXTURE_NAME: &str = "m4d-t1-u16-3d-multiscale";
+const USTAR_BLOCK_BYTES: usize = 512;
+const TARGET_FIXTURE_ARCHIVE_BYTES_MAX: usize = 512 * 1024;
+const TARGET_FIXTURE_ENTRY_COUNT_MAX: usize = 128;
+const TARGET_FIXTURE_PATH_BYTES_MAX: usize = 240;
 
 const TEST_INITIAL_RENDER_VIEWPORT_SIDE: u64 = 32;
 
 use super::*;
+
+pub(crate) fn write_target_fixture(output_root: &Path) -> anyhow::Result<PathBuf> {
+    if TARGET_FIXTURE_ARCHIVE.is_empty()
+        || TARGET_FIXTURE_ARCHIVE.len() > TARGET_FIXTURE_ARCHIVE_BYTES_MAX
+        || !TARGET_FIXTURE_ARCHIVE
+            .len()
+            .is_multiple_of(USTAR_BLOCK_BYTES)
+    {
+        bail!("target fixture archive has an invalid bounded length");
+    }
+
+    fs::create_dir_all(output_root)
+        .with_context(|| format!("failed to create {}", output_root.display()))?;
+    let package = output_root.join(TARGET_FIXTURE_NAME);
+    fs::create_dir(&package).with_context(|| format!("failed to create {}", package.display()))?;
+    if let Err(error) = extract_target_fixture(TARGET_FIXTURE_ARCHIVE, &package) {
+        let _ = fs::remove_dir_all(&package);
+        return Err(error);
+    }
+    Ok(package)
+}
+
+pub(crate) fn write_source_time_series_fixture(output_root: &Path) -> anyhow::Result<PathBuf> {
+    if SOURCE_FIXTURE_ARCHIVE.is_empty()
+        || SOURCE_FIXTURE_ARCHIVE.len() > TARGET_FIXTURE_ARCHIVE_BYTES_MAX
+        || !SOURCE_FIXTURE_ARCHIVE
+            .len()
+            .is_multiple_of(USTAR_BLOCK_BYTES)
+    {
+        bail!("source fixture archive has an invalid bounded length");
+    }
+    let fixture_root = output_root.join("source-tiff-fixtures");
+    fs::create_dir(&fixture_root)
+        .with_context(|| format!("failed to create {}", fixture_root.display()))?;
+    if let Err(error) = extract_target_fixture(SOURCE_FIXTURE_ARCHIVE, &fixture_root) {
+        let _ = fs::remove_dir_all(&fixture_root);
+        return Err(error);
+    }
+    Ok(fixture_root.join("spec-002"))
+}
+
+fn extract_target_fixture(archive: &[u8], root: &Path) -> anyhow::Result<()> {
+    let mut offset = 0_usize;
+    let mut paths = HashSet::new();
+    while offset + USTAR_BLOCK_BYTES <= archive.len() {
+        let header = &archive[offset..offset + USTAR_BLOCK_BYTES];
+        offset += USTAR_BLOCK_BYTES;
+        if header.iter().all(|byte| *byte == 0) {
+            if archive[offset..].iter().any(|byte| *byte != 0) {
+                bail!("target fixture archive has bytes after its terminator");
+            }
+            return Ok(());
+        }
+        if paths.len() >= TARGET_FIXTURE_ENTRY_COUNT_MAX {
+            bail!("target fixture archive exceeds its entry bound");
+        }
+        if &header[257..263] != b"ustar\0" {
+            bail!("target fixture archive is not USTAR");
+        }
+
+        let relative = target_fixture_member_path(header)?;
+        if !paths.insert(relative.clone()) {
+            bail!("target fixture archive contains a duplicate path");
+        }
+        let destination = root.join(&relative);
+        let size = usize::try_from(parse_ustar_octal(&header[124..136])?)
+            .context("target fixture member is too large")?;
+        let padded_size = size
+            .checked_add(USTAR_BLOCK_BYTES - 1)
+            .context("target fixture member size overflowed")?
+            / USTAR_BLOCK_BYTES
+            * USTAR_BLOCK_BYTES;
+        let end = offset
+            .checked_add(padded_size)
+            .context("target fixture member range overflowed")?;
+        let data_end = offset
+            .checked_add(size)
+            .context("target fixture member range overflowed")?;
+        if end > archive.len() || data_end > archive.len() {
+            bail!("target fixture member extends past the archive");
+        }
+
+        match header[156] {
+            b'5' => {
+                if size != 0 {
+                    bail!("target fixture directory contains a payload");
+                }
+                fs::create_dir_all(&destination).with_context(|| {
+                    format!(
+                        "failed to create fixture directory {}",
+                        destination.display()
+                    )
+                })?;
+            }
+            0 | b'0' => {
+                let parent = destination
+                    .parent()
+                    .context("target fixture file has no parent")?;
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create fixture directory {}", parent.display())
+                })?;
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&destination)
+                    .with_context(|| {
+                        format!("failed to create fixture file {}", destination.display())
+                    })?;
+                file.write_all(&archive[offset..data_end])
+                    .with_context(|| {
+                        format!("failed to write fixture file {}", destination.display())
+                    })?;
+            }
+            kind => bail!("target fixture archive contains unsupported member type {kind}"),
+        }
+        offset = end;
+    }
+    bail!("target fixture archive has no terminator")
+}
+
+fn target_fixture_member_path(header: &[u8]) -> anyhow::Result<PathBuf> {
+    let name = ustar_string_field(&header[0..100])?;
+    let prefix = ustar_string_field(&header[345..500])?;
+    let encoded = if prefix.is_empty() {
+        name
+    } else {
+        format!("{prefix}/{name}")
+    };
+    if encoded.is_empty() || encoded.len() > TARGET_FIXTURE_PATH_BYTES_MAX {
+        bail!("target fixture archive contains an invalid path length");
+    }
+    let path = PathBuf::from(encoded);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("target fixture archive contains an unsafe path");
+    }
+    Ok(path)
+}
+
+fn ustar_string_field(field: &[u8]) -> anyhow::Result<String> {
+    let end = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(field.len());
+    let value = &field[..end];
+    if value.iter().any(|byte| !byte.is_ascii() || *byte == b'\\') {
+        bail!("target fixture archive contains a non-portable path");
+    }
+    String::from_utf8(value.to_vec()).context("target fixture archive path is not UTF-8")
+}
+
+fn parse_ustar_octal(field: &[u8]) -> anyhow::Result<u64> {
+    let value = field
+        .iter()
+        .copied()
+        .take_while(|byte| *byte != 0)
+        .filter(|byte| *byte != b' ')
+        .collect::<Vec<_>>();
+    if value.is_empty() || value.iter().any(|byte| !(b'0'..=b'7').contains(byte)) {
+        bail!("target fixture archive contains an invalid octal size");
+    }
+    let value = std::str::from_utf8(&value).context("target fixture size is not ASCII")?;
+    u64::from_str_radix(value, 8).context("target fixture size overflowed")
+}
 
 #[test]
 fn noninteractive_project_paths_are_consumed_once() {
@@ -192,7 +379,7 @@ fn test_workbench_app_without_background_runtime(
         dataset,
         render_runtime,
         ui_runtime,
-        import_runtime: current_runtime::import::CurrentImportRuntime::idle(),
+        import_runtime: current_runtime::import::ImportRuntime::idle(),
         analysis_runtime,
         validation_runtime: current_runtime::validation::CurrentValidationRuntime {
             product_automation: None,

@@ -82,10 +82,11 @@ MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
 
 This lane is local-only and is not a GitHub Actions requirement.
 
-The accepted B3 current-source verification support scenario remains available:
+The bounded target-package open and verification scenario is retained as a
+small regression check for storage-source changes:
 
 ```bash
-cargo xtask product-validate b3_source_verification
+cargo xtask product-validate target_source_verification
 ```
 
 The B4 native automation is likewise retained for future changes to product

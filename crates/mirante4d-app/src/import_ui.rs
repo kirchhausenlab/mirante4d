@@ -1,320 +1,380 @@
 use std::{
-    collections::BTreeMap,
+    fs,
     path::{Path, PathBuf},
     sync::mpsc::Receiver,
+    thread::JoinHandle,
 };
 
 use eframe::egui;
 use mirante4d_application::{ApplicationSnapshot, OperationToken, WorkspaceSnapshot};
 use mirante4d_dataset::ResourceValidity;
 use mirante4d_domain::{IntensityDType, ScaleLevel};
-use mirante4d_format::ExistingPackagePolicy;
-use mirante4d_import::{
-    ImportCancellationToken, ImportError, ImportProgressEvent, TiffDirectoryImportReport,
-    TiffDirectoryInspection, TiffImportSource, TiffImportStorageEstimate, TiffNoDataPolicyReview,
-    TiffReviewedImportPlan, TiffSourceImportOptions, TiffSourceProfile, TiffValueRangeSummary,
-    TiffVoxelSpacingMetadataSource, TiffVoxelSpacingMetadataStatus,
-    accepted_tiff_reviewed_import_plan, default_tiff_channel_metadata_override,
-    estimate_tiff_import_storage, inspect_tiff_source_for_review,
-    inspect_tiff_source_with_grouping,
+use mirante4d_import_pipeline::{
+    ImportCancellation, ImportError, ImportEvent, ImportOptions, ImportReceipt, NoDataPolicy,
+    SourceLayout, SpatialCalibration, TiffInspection, TiffSource, select_supported_profile,
 };
+use mirante4d_storage::ProfileKind;
 
-use crate::ui_kit::{self, StatusTone};
+use crate::ui_kit;
+
+const MIB: u64 = 1024 * 1024;
+const DEFAULT_IMPORT_WORKING_MEMORY_BYTES: u64 = 256 * MIB;
+const IMPORT_WORKING_MEMORY_CHOICES: [u64; 4] = [128 * MIB, 256 * MIB, 512 * MIB, 1024 * MIB];
 
 pub(crate) struct TiffImportSetupTask {
-    pub(crate) source: TiffImportSource,
-    pub(crate) output_parent: PathBuf,
+    pub(crate) source: TiffSource,
+    pub(crate) destination: PathBuf,
+    pub(crate) cancellation: ImportCancellation,
     pub(crate) receiver: Receiver<TiffImportSetupTaskMessage>,
+    pub(crate) worker: Option<JoinHandle<()>>,
+}
+
+impl Drop for TiffImportSetupTask {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            tracing::error!("TIFF inspection worker panicked");
+        }
+    }
 }
 
 pub(crate) enum TiffImportSetupTaskMessage {
-    Finished(Result<(TiffSourceImportOptions, TiffDirectoryInspection), String>),
+    Finished(Result<TiffInspection, ImportError>),
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingTiffImport {
-    pub(crate) options: TiffSourceImportOptions,
-    pub(crate) inspection: TiffDirectoryInspection,
-    pub(crate) voxel_spacing_confirmed: bool,
-    pub(crate) grouping_confirmed: bool,
+    pub(crate) source: TiffSource,
+    pub(crate) inspection: TiffInspection,
+    pub(crate) destination: PathBuf,
+    pub(crate) calibration: SpatialCalibration,
+    pub(crate) calibration_confirmed: bool,
+    pub(crate) time_step_seconds: Option<f64>,
+    pub(crate) no_data_sentinel: Option<u8>,
+    pub(crate) working_memory_bytes: u64,
+}
+
+impl PendingTiffImport {
+    pub(crate) fn from_inspection(
+        source: TiffSource,
+        inspection: TiffInspection,
+        destination: PathBuf,
+    ) -> Self {
+        let calibration =
+            SpatialCalibration::new(inspection.ome_spacing_zyx_um.unwrap_or([1.0, 1.0, 1.0]));
+        Self {
+            source,
+            inspection,
+            destination,
+            calibration,
+            calibration_confirmed: false,
+            time_step_seconds: None,
+            no_data_sentinel: None,
+            working_memory_bytes: DEFAULT_IMPORT_WORKING_MEMORY_BYTES,
+        }
+    }
 }
 
 pub(crate) struct ImportTask {
     pub(crate) token: OperationToken,
-    pub(crate) cancellation: ImportCancellationToken,
+    pub(crate) destination: PathBuf,
+    pub(crate) cancellation: ImportCancellation,
     pub(crate) receiver: Receiver<ImportTaskMessage>,
-    pub(crate) latest_event: Option<ImportProgressEvent>,
+    pub(crate) latest_event: Option<ImportEvent>,
+    pub(crate) retry_options: Option<ImportOptions>,
+    pub(crate) worker: Option<JoinHandle<()>>,
 }
 
 impl Drop for ImportTask {
     fn drop(&mut self) {
         self.cancellation.cancel();
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            tracing::error!("TIFF import worker panicked");
+        }
     }
 }
 
 pub(crate) enum ImportTaskMessage {
-    Progress(ImportProgressEvent),
-    Finished(Result<TiffDirectoryImportReport, ImportError>),
+    Progress(ImportEvent),
+    Finished(Result<ImportReceipt, ImportError>),
 }
 
-pub(crate) fn tiff_source_profile_label(profile: TiffSourceProfile) -> &'static str {
-    match profile {
-        TiffSourceProfile::StackSeriesMovie => "stack-series movie",
-        TiffSourceProfile::PlaneSeriesVolume => "plane-series volume",
-    }
-}
-
-pub(crate) fn tiff_voxel_spacing_metadata_label(inspection: &TiffDirectoryInspection) -> String {
-    match inspection.source_metadata.voxel_spacing_status {
-        TiffVoxelSpacingMetadataStatus::Complete => {
-            let spacing = inspection
-                .source_metadata
-                .voxel_spacing_um
-                .expect("complete TIFF voxel metadata includes spacing");
-            let source = match inspection.source_metadata.voxel_spacing_source {
-                Some(TiffVoxelSpacingMetadataSource::OmeXml) => "OME-XML",
-                None => "metadata",
-            };
-            format!(
-                "{source} x {:.4} y {:.4} z {:.4} um",
-                spacing[0], spacing[1], spacing[2]
-            )
-        }
-        TiffVoxelSpacingMetadataStatus::Missing => "missing".to_owned(),
-        TiffVoxelSpacingMetadataStatus::Incomplete => "incomplete".to_owned(),
-        TiffVoxelSpacingMetadataStatus::Conflicting => "conflicting".to_owned(),
-    }
-}
-
-pub(crate) fn tiff_import_storage_estimate_label(inspection: &TiffDirectoryInspection) -> String {
-    match estimate_tiff_import_storage(inspection) {
-        Ok(estimate) => format_tiff_import_storage_estimate(estimate),
-        Err(err) => format!("unavailable: {err}"),
-    }
-}
-
-pub(crate) fn format_tiff_value_range(range: TiffValueRangeSummary) -> String {
-    format!("{:.6} to {:.6}", range.min, range.max)
-}
-
-fn format_tiff_import_storage_estimate(estimate: TiffImportStorageEstimate) -> String {
-    format!(
-        "{} package, {} peak stack",
-        format_byte_quantity(estimate.estimated_total_bytes),
-        format_byte_quantity(estimate.peak_working_stack_bytes)
-    )
-}
-
-fn format_byte_quantity(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = 1024.0 * KIB;
-    const GIB: f64 = 1024.0 * MIB;
-    let bytes_f = bytes as f64;
-    if bytes_f >= GIB {
-        format!("{:.2} GiB", bytes_f / GIB)
-    } else if bytes_f >= MIB {
-        format!("{:.2} MiB", bytes_f / MIB)
-    } else if bytes_f >= KIB {
-        format!("{:.1} KiB", bytes_f / KIB)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-pub(crate) fn prepare_tiff_source_import(
-    source: TiffImportSource,
-    output_parent: &Path,
-) -> anyhow::Result<(TiffSourceImportOptions, TiffDirectoryInspection)> {
-    let mut options = import_tiff_source_options(source, output_parent)?;
-    let inspection = inspect_tiff_source_for_review(&options.source)?;
-    if let Some(voxel_spacing_um) = inspection.source_metadata.voxel_spacing_um {
-        options.voxel_spacing_um = voxel_spacing_um;
-    }
-    if inspection.source_profile == TiffSourceProfile::StackSeriesMovie {
-        options.file_grouping = Some(inspection.files.clone());
-    }
-    for channel in &inspection.channels {
-        options
-            .channel_metadata
-            .entry(channel.channel)
-            .or_insert_with(|| default_tiff_channel_metadata_override(channel.channel));
-    }
-    Ok((options, inspection))
-}
-
-pub(crate) fn import_tiff_source_options(
-    source: TiffImportSource,
-    output_parent: &Path,
-) -> anyhow::Result<TiffSourceImportOptions> {
-    let dataset_name = source
-        .path()
+pub(crate) fn tiff_destination(source: &TiffSource, output_parent: &Path) -> PathBuf {
+    let name = source
+        .path
         .file_stem()
-        .or_else(|| source.path().file_name())
+        .or_else(|| source.path.file_name())
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
-        .unwrap_or("imported-dataset")
-        .to_owned();
-    let dataset_id = dataset_name
+        .unwrap_or("imported-dataset");
+    let slug = name
         .chars()
         .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
                 character.to_ascii_lowercase()
             } else {
                 '-'
             }
         })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_owned();
-    let dataset_id = if dataset_id.is_empty() {
-        "imported-dataset".to_owned()
+        .collect::<String>();
+    let slug = slug.trim_matches('-');
+    let slug = if slug.is_empty() {
+        "imported-dataset"
     } else {
-        dataset_id
+        slug
     };
-    Ok(TiffSourceImportOptions {
-        source,
-        output_package: output_parent.join(format!("{dataset_id}.m4d")),
-        dataset_id,
-        dataset_name,
-        voxel_spacing_um: [1.0, 1.0, 1.0],
-        channel_metadata: BTreeMap::new(),
-        file_grouping: None,
-        existing_policy: ExistingPackagePolicy::Fail,
-        storage: Default::default(),
-        reviewed_plan: TiffReviewedImportPlan::pending(),
-    })
+    output_parent.join(format!("{slug}.m4d"))
 }
 
-pub(crate) fn validate_tiff_import_options(
-    options: &TiffSourceImportOptions,
-) -> anyhow::Result<()> {
-    if options.dataset_name.trim().is_empty() {
-        anyhow::bail!("dataset name must not be empty");
+pub(crate) fn build_import_options(pending: &PendingTiffImport) -> anyhow::Result<ImportOptions> {
+    validate_pending_tiff_import(pending)?;
+    let mut options = ImportOptions {
+        inspection: pending.inspection.clone(),
+        destination: pending.destination.clone(),
+        checkpoint_directory: checkpoint_directory(&pending.destination)?,
+        profile: ProfileKind::Ds0,
+        calibration: pending.calibration,
+        time_step_seconds: pending.time_step_seconds,
+        no_data: pending.no_data_sentinel.map(NoDataPolicy::U8Sentinel),
+        working_memory_bytes: pending.working_memory_bytes,
+    };
+    options.profile = select_supported_profile(&options)?;
+    Ok(options)
+}
+
+fn checkpoint_directory(destination: &Path) -> anyhow::Result<PathBuf> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("the import destination needs a parent directory"))?;
+    let name = destination
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("the import destination needs a package name"))?
+        .to_string_lossy();
+    Ok(parent.join(format!(".{name}.import-checkpoint")))
+}
+
+pub(crate) fn reset_checkpoint_directory(path: &Path) -> anyhow::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        anyhow::bail!("the checkpoint path is not a real directory");
     }
-    for (axis, spacing) in [
-        ("x", options.voxel_spacing_um[0]),
-        ("y", options.voxel_spacing_um[1]),
-        ("z", options.voxel_spacing_um[2]),
-    ] {
-        if !spacing.is_finite() || spacing <= 0.0 {
-            anyhow::bail!("voxel spacing {axis} must be positive and finite");
+
+    let allowed = ["header", "journal", "payload"];
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("the checkpoint contains a non-UTF-8 entry"))?;
+        if !allowed.contains(&name.as_str()) {
+            anyhow::bail!("the checkpoint contains an unrelated entry: {name}");
         }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            anyhow::bail!("checkpoint entry {name} is not a regular file");
+        }
+        entries.push(entry.path());
     }
-    for (channel, metadata) in &options.channel_metadata {
-        if metadata.name.trim().is_empty() {
-            anyhow::bail!("channel {channel} name must not be empty");
-        }
-        if !metadata
-            .color_rgba
-            .iter()
-            .all(|component| component.is_finite() && (0.0..=1.0).contains(component))
-        {
-            anyhow::bail!("channel {channel} color components must be finite values in [0, 1]");
-        }
+    for entry in entries {
+        fs::remove_file(entry)?;
     }
+    fs::remove_dir(path)?;
     Ok(())
 }
 
 pub(crate) fn validate_pending_tiff_import(pending: &PendingTiffImport) -> anyhow::Result<()> {
-    validate_tiff_import_options(&pending.options)?;
-    if !pending.voxel_spacing_confirmed {
+    if !pending.calibration_confirmed {
+        anyhow::bail!("review the spatial calibration before starting the import");
+    }
+    for (axis, spacing) in ["z", "y", "x"]
+        .into_iter()
+        .zip(pending.calibration.spacing_zyx_um)
+    {
+        if !spacing.is_finite() || spacing <= 0.0 {
+            anyhow::bail!("{axis} spacing must be positive and finite");
+        }
+    }
+    if pending
+        .time_step_seconds
+        .is_some_and(|value| !value.is_finite() || value <= 0.0)
+    {
+        anyhow::bail!("the time step must be positive and finite");
+    }
+    if pending.no_data_sentinel.is_some() && pending.inspection.dtype != IntensityDType::Uint8 {
+        anyhow::bail!("a no-data sentinel is supported only for uint8 TIFF input");
+    }
+    if !IMPORT_WORKING_MEMORY_CHOICES.contains(&pending.working_memory_bytes) {
+        anyhow::bail!("select one of the offered import memory limits");
+    }
+    if pending.destination.try_exists()? {
         anyhow::bail!(
-            "voxel spacing must be reviewed before import; enter calibrated spacing or explicitly accept the current values"
+            "the destination already exists; imports create a new package and never replace one"
         );
-    }
-    if !pending.grouping_confirmed {
-        anyhow::bail!("TIFF source layout must be reviewed before import");
-    }
-    if let Some(file_grouping) = &pending.options.file_grouping {
-        let inspection = inspect_tiff_source_with_grouping(&pending.options.source, file_grouping)?;
-        if inspection.source_profile != pending.inspection.source_profile {
-            anyhow::bail!("TIFF source profile changed during import review");
-        }
-    } else {
-        let inspection = inspect_tiff_source_for_review(&pending.options.source)?;
-        if inspection.source_profile != pending.inspection.source_profile {
-            anyhow::bail!("TIFF source profile changed during import review");
-        }
     }
     Ok(())
 }
 
 pub(crate) fn pending_tiff_import_ready_to_start(pending: &PendingTiffImport) -> bool {
-    pending.voxel_spacing_confirmed && pending.grouping_confirmed
+    pending.calibration_confirmed
+        && pending
+            .calibration
+            .spacing_zyx_um
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0)
+        && pending
+            .time_step_seconds
+            .is_none_or(|value| value.is_finite() && value > 0.0)
+        && (pending.no_data_sentinel.is_none() || pending.inspection.dtype == IntensityDType::Uint8)
+        && IMPORT_WORKING_MEMORY_CHOICES.contains(&pending.working_memory_bytes)
 }
 
-pub(crate) fn accepted_reviewed_plan_for_pending_tiff_import(
-    pending: &PendingTiffImport,
-) -> TiffReviewedImportPlan {
-    let no_data_policy = pending.options.reviewed_plan.no_data_policy;
-    let mut reviewed_plan = accepted_tiff_reviewed_import_plan(
-        &pending.inspection,
-        pending.options.voxel_spacing_um,
-        pending.grouping_confirmed,
+pub(crate) fn show_pending_tiff_import_controls(
+    ui: &mut egui::Ui,
+    pending: &mut PendingTiffImport,
+) {
+    ui_kit::property_row(ui, "source", pending.source.path.display());
+    ui_kit::property_row(ui, "destination", pending.destination.display());
+    ui_kit::property_row(
+        ui,
+        "layout",
+        match pending.inspection.layout {
+            SourceLayout::Auto => "automatic",
+            SourceLayout::MultipageStacks => "multipage stacks",
+            SourceLayout::ChannelFoldersOfPlanes => "channel folders of planes",
+        },
     );
-    reviewed_plan.no_data_policy = no_data_policy;
-    reviewed_plan
-}
+    ui_kit::property_row(
+        ui,
+        "shape",
+        format!(
+            "t{} c{} z{} y{} x{}",
+            pending.inspection.shape.t(),
+            pending.inspection.channels,
+            pending.inspection.shape.z(),
+            pending.inspection.shape.y(),
+            pending.inspection.shape.x()
+        ),
+    );
+    ui_kit::property_row(
+        ui,
+        "source dtype",
+        format!("{:?}", pending.inspection.dtype),
+    );
+    ui_kit::property_row(
+        ui,
+        "source size",
+        format_byte_quantity(pending.inspection.source_bytes),
+    );
+    ui_kit::property_row(
+        ui,
+        "calibration metadata",
+        match pending.inspection.ome_spacing_zyx_um {
+            Some(spacing) => format!(
+                "OME z {:.4}, y {:.4}, x {:.4} micrometers",
+                spacing[0], spacing[1], spacing[2]
+            ),
+            None => "not present; enter calibrated values".to_owned(),
+        },
+    );
 
-fn tiff_no_data_policy_supported(inspection: &TiffDirectoryInspection) -> bool {
-    inspection.source_dtype == IntensityDType::Uint8
-}
-
-pub(crate) fn set_pending_tiff_no_data_policy(pending: &mut PendingTiffImport, enabled: bool) {
-    pending.options.reviewed_plan.no_data_policy =
-        if enabled && tiff_no_data_policy_supported(&pending.inspection) {
-            Some(TiffNoDataPolicyReview {
-                source_dtype: IntensityDType::Uint8,
-                source_value_uint8: 255,
-            })
-        } else {
-            None
-        };
-}
-
-pub(crate) fn normalize_pending_tiff_no_data_policy(pending: &mut PendingTiffImport) {
-    if !tiff_no_data_policy_supported(&pending.inspection) {
-        pending.options.reviewed_plan.no_data_policy = None;
-        return;
-    }
-    if let Some(policy) = pending.options.reviewed_plan.no_data_policy
-        && (policy.source_dtype != pending.inspection.source_dtype
-            || policy.source_value_uint8 != 255)
-    {
-        pending.options.reviewed_plan.no_data_policy = None;
-    }
-}
-
-pub(crate) fn show_tiff_no_data_controls(ui: &mut egui::Ui, pending: &mut PendingTiffImport) {
-    normalize_pending_tiff_no_data_policy(pending);
     ui.add_space(6.0);
-    ui.label("no-data mask");
-    let supported = tiff_no_data_policy_supported(&pending.inspection);
-    let mut enabled = pending.options.reviewed_plan.no_data_policy.is_some();
-    let response = ui.add_enabled(
-        supported,
-        egui::Checkbox::new(&mut enabled, "enable value 255 no-data mask"),
-    );
-    if response.changed() {
-        set_pending_tiff_no_data_policy(pending, enabled);
-    }
-    if !supported {
-        ui_kit::property_row(ui, "status", "disabled for non-uint8 sources");
-        ui_kit::property_row(ui, "supported policy", "uint8 value 255");
-        return;
-    }
-    if pending.options.reviewed_plan.no_data_policy.is_some() {
-        ui_kit::property_row(ui, "value", "255");
-        ui_kit::property_row(ui, "dtype", "uint8");
-        ui_kit::property_row(ui, "visibility", "invisible with 1 voxel invalid dilation");
-        ui_kit::property_row(
-            ui,
-            "scope",
-            "display statistics, multiscales, rendering, default analysis",
+    ui.label("spatial calibration (micrometers)");
+    ui.horizontal_wrapped(|ui| {
+        ui.add(
+            egui::DragValue::new(&mut pending.calibration.spacing_zyx_um[0])
+                .speed(0.01)
+                .prefix("z "),
         );
-    } else {
-        ui_kit::property_row(ui, "status", "disabled");
+        ui.add(
+            egui::DragValue::new(&mut pending.calibration.spacing_zyx_um[1])
+                .speed(0.01)
+                .prefix("y "),
+        );
+        ui.add(
+            egui::DragValue::new(&mut pending.calibration.spacing_zyx_um[2])
+                .speed(0.01)
+                .prefix("x "),
+        );
+    });
+    ui.checkbox(
+        &mut pending.calibration_confirmed,
+        "spatial calibration reviewed",
+    );
+
+    ui.add_space(6.0);
+    let mut time_step_enabled = pending.time_step_seconds.is_some();
+    if ui
+        .checkbox(&mut time_step_enabled, "regular time step")
+        .changed()
+    {
+        pending.time_step_seconds = time_step_enabled.then_some(1.0);
     }
+    if let Some(time_step) = pending.time_step_seconds.as_mut() {
+        ui.horizontal(|ui| {
+            ui.label("seconds per timepoint");
+            ui.add(egui::DragValue::new(time_step).speed(0.01));
+        });
+    }
+
+    ui.add_space(6.0);
+    let sentinel_supported = pending.inspection.dtype == IntensityDType::Uint8;
+    if !sentinel_supported {
+        pending.no_data_sentinel = None;
+    }
+    let mut sentinel_enabled = pending.no_data_sentinel.is_some();
+    if ui
+        .add_enabled(
+            sentinel_supported,
+            egui::Checkbox::new(&mut sentinel_enabled, "uint8 no-data sentinel"),
+        )
+        .changed()
+    {
+        pending.no_data_sentinel = sentinel_enabled.then_some(255);
+    }
+    if let Some(sentinel) = pending.no_data_sentinel.as_mut() {
+        let mut value = u16::from(*sentinel);
+        ui.horizontal(|ui| {
+            ui.label("sentinel value");
+            if ui
+                .add(egui::DragValue::new(&mut value).range(0..=255))
+                .changed()
+            {
+                *sentinel = value as u8;
+            }
+        });
+    } else if !sentinel_supported {
+        ui_kit::property_row(ui, "no-data sentinel", "available only for uint8 sources");
+    }
+
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label("working memory");
+        egui::ComboBox::from_id_salt("tiff-import-working-memory")
+            .selected_text(format_byte_quantity(pending.working_memory_bytes))
+            .show_ui(ui, |ui| {
+                for bytes in IMPORT_WORKING_MEMORY_CHOICES {
+                    ui.selectable_value(
+                        &mut pending.working_memory_bytes,
+                        bytes,
+                        format_byte_quantity(bytes),
+                    );
+                }
+            });
+    });
+    ui_kit::property_row(
+        ui,
+        "publication",
+        "create new package; never replace source or output",
+    );
 }
 
 pub(crate) fn active_layer_no_data_policy_label(snapshot: &ApplicationSnapshot) -> Option<String> {
@@ -332,177 +392,130 @@ pub(crate) fn active_layer_no_data_policy_label(snapshot: &ApplicationSnapshot) 
     }
 }
 
-pub(crate) fn show_tiff_grouping_controls(ui: &mut egui::Ui, pending: &mut PendingTiffImport) {
-    let Some(file_grouping) = pending.options.file_grouping.as_mut() else {
-        if pending.inspection.source_profile == TiffSourceProfile::PlaneSeriesVolume {
-            ui.add_space(6.0);
-            ui.label("source layout");
-            ui.label(format!(
-                "{} channel folder(s), {} z plane(s), lexicographic order",
-                pending.inspection.channel_count, pending.inspection.shape.z
-            ));
-            ui.checkbox(
-                &mut pending.grouping_confirmed,
-                "plane-series layout reviewed",
-            );
-        }
-        return;
-    };
-    if file_grouping.len() <= 1 {
-        return;
-    }
-
-    ui.add_space(6.0);
-    ui.label("file grouping");
-    let mut changed = false;
-    egui::ScrollArea::vertical()
-        .max_height(160.0)
-        .show(ui, |ui| {
-            for grouping in file_grouping {
-                ui.horizontal_wrapped(|ui| {
-                    let file_name = grouping
-                        .path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("<unnamed>");
-                    ui.label(file_name);
-                    let mut channel = i64::from(grouping.channel);
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut channel)
-                                .range(0..=1024)
-                                .prefix("ch "),
-                        )
-                        .changed()
-                    {
-                        grouping.channel = channel as u32;
-                        changed = true;
-                    }
-                    let mut stack_index = grouping.stack_index.min(1_000_000) as i64;
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut stack_index)
-                                .range(0..=1_000_000)
-                                .prefix("t "),
-                        )
-                        .changed()
-                    {
-                        grouping.stack_index = stack_index as u64;
-                        changed = true;
-                    }
-                });
-            }
-        });
-
-    if changed {
-        pending.grouping_confirmed = false;
-        match refresh_pending_tiff_grouping(pending) {
-            Ok(()) => {}
-            Err(err) => ui_kit::status_badge(ui, StatusTone::Error, err.to_string()),
-        }
-    }
-    ui.checkbox(
-        &mut pending.grouping_confirmed,
-        "filename grouping reviewed",
-    );
-}
-
-pub(crate) fn refresh_pending_tiff_grouping(pending: &mut PendingTiffImport) -> anyhow::Result<()> {
-    let Some(file_grouping) = &pending.options.file_grouping else {
-        return Ok(());
-    };
-    let inspection = inspect_tiff_source_with_grouping(&pending.options.source, file_grouping)?;
-    for channel in &inspection.channels {
-        pending
-            .options
-            .channel_metadata
-            .entry(channel.channel)
-            .or_insert_with(|| default_tiff_channel_metadata_override(channel.channel));
-    }
-    pending.inspection = inspection;
-    normalize_pending_tiff_no_data_policy(pending);
-    Ok(())
-}
-
-pub(crate) fn show_tiff_channel_metadata_controls(
-    ui: &mut egui::Ui,
-    options: &mut TiffSourceImportOptions,
-    inspection: &TiffDirectoryInspection,
-    name_width: f32,
-) {
-    ui.add_space(6.0);
-    ui.label("channels");
-    for channel in &inspection.channels {
-        let metadata = options
-            .channel_metadata
-            .entry(channel.channel)
-            .or_insert_with(|| default_tiff_channel_metadata_override(channel.channel));
-        ui.horizontal_wrapped(|ui| {
-            let channel_scope = if inspection.source_profile == TiffSourceProfile::PlaneSeriesVolume
-            {
-                format!("{} z", inspection.shape.z)
-            } else {
-                format!("{} t", channel.timepoint_count)
-            };
-            ui.label(format!("ch{} ({channel_scope})", channel.channel));
-            ui.color_edit_button_rgba_unmultiplied(&mut metadata.color_rgba);
-            ui.add(egui::TextEdit::singleline(&mut metadata.name).desired_width(name_width));
-        });
-    }
-}
-
 pub(crate) fn import_task_status_text(task: &ImportTask) -> String {
+    if task.cancellation.is_cancelled() {
+        return "Stopping import".to_owned();
+    }
     task.latest_event
         .as_ref()
         .map(import_progress_message)
         .unwrap_or_else(|| "Preparing import".to_owned())
 }
 
-pub(crate) fn import_progress_message(event: &ImportProgressEvent) -> String {
+pub(crate) fn import_progress_message(event: &ImportEvent) -> String {
     match event {
-        ImportProgressEvent::DiscoveredInput { file_count } => {
-            format!("Discovered {file_count} TIFF file(s)")
-        }
-        ImportProgressEvent::EstimatedStorage { estimate } => {
-            format!(
-                "Estimated native package size {}",
-                format_byte_quantity(estimate.estimated_total_bytes)
-            )
-        }
-        ImportProgressEvent::ReadStack {
-            completed, total, ..
-        } => {
-            format!("Reading TIFF stack {completed}/{total}")
-        }
-        ImportProgressEvent::BuiltScale { channel, level } => {
-            format!("Built channel {channel} scale s{level}")
-        }
-        ImportProgressEvent::WritingPackage { output_package } => {
-            format!("Writing {}", output_package.display())
-        }
-        ImportProgressEvent::Finished { output_package } => {
-            format!("Finished {}", output_package.display())
-        }
+        ImportEvent::Producing {
+            completed_work_units,
+            total_work_units,
+        } => format!("Building package {completed_work_units}/{total_work_units}"),
+        ImportEvent::HashingScience => "Checking scientific content".to_owned(),
+        ImportEvent::Publishing => "Validating and publishing package".to_owned(),
+        ImportEvent::Finished => "Import finished".to_owned(),
     }
 }
 
-pub(crate) fn import_progress_fraction(event: Option<&ImportProgressEvent>) -> Option<f32> {
+pub(crate) fn import_progress_fraction(event: Option<&ImportEvent>) -> Option<f32> {
     match event? {
-        ImportProgressEvent::DiscoveredInput { .. } => Some(0.02),
-        ImportProgressEvent::EstimatedStorage { .. } => Some(0.04),
-        ImportProgressEvent::ReadStack {
-            completed, total, ..
+        ImportEvent::Producing {
+            completed_work_units,
+            total_work_units,
         } => {
-            if *total == 0 {
+            if *total_work_units == 0 {
                 None
             } else {
-                Some((0.05 + 0.55 * (*completed as f32 / *total as f32)).clamp(0.0, 0.60))
+                Some(
+                    (0.05 + 0.70 * (*completed_work_units as f32 / *total_work_units as f32))
+                        .clamp(0.05, 0.75),
+                )
             }
         }
-        ImportProgressEvent::BuiltScale { level, .. } => {
-            Some((0.60 + 0.05 * *level as f32).clamp(0.60, 0.85))
+        ImportEvent::HashingScience => Some(0.80),
+        ImportEvent::Publishing => Some(0.90),
+        ImportEvent::Finished => Some(1.0),
+    }
+}
+
+fn format_byte_quantity(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB_F: f64 = 1024.0 * KIB;
+    const GIB: f64 = 1024.0 * MIB_F;
+    let bytes_f = bytes as f64;
+    if bytes_f >= GIB {
+        format!("{:.2} GiB", bytes_f / GIB)
+    } else if bytes_f >= MIB_F {
+        format!("{:.2} MiB", bytes_f / MIB_F)
+    } else if bytes_f >= KIB {
+        format!("{:.1} KiB", bytes_f / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn destination_is_a_create_only_package_name_under_the_selected_parent() {
+        let source = TiffSource::auto("/source/My Cells.ome.tiff");
+        let destination = tiff_destination(&source, Path::new("/output"));
+
+        assert_eq!(destination, Path::new("/output/my-cells-ome.m4d"));
+        assert_eq!(
+            checkpoint_directory(&destination).unwrap(),
+            Path::new("/output/.my-cells-ome.m4d.import-checkpoint")
+        );
+        assert!(
+            !checkpoint_directory(&destination)
+                .unwrap()
+                .starts_with(&destination)
+        );
+    }
+
+    #[test]
+    fn progress_is_coarse_and_monotonic() {
+        let producing = ImportEvent::Producing {
+            completed_work_units: 5,
+            total_work_units: 10,
+        };
+        assert_eq!(import_progress_fraction(Some(&producing)), Some(0.4));
+        assert!(
+            import_progress_fraction(Some(&ImportEvent::HashingScience))
+                < import_progress_fraction(Some(&ImportEvent::Publishing))
+        );
+        assert_eq!(
+            import_progress_fraction(Some(&ImportEvent::Finished)),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn checkpoint_reset_removes_only_the_known_checkpoint_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkpoint = temp.path().join(".cells.m4d.import-checkpoint");
+        fs::create_dir(&checkpoint).unwrap();
+        for name in ["header", "journal", "payload"] {
+            fs::write(checkpoint.join(name), name).unwrap();
         }
-        ImportProgressEvent::WritingPackage { .. } => Some(0.90),
-        ImportProgressEvent::Finished { .. } => Some(1.0),
+
+        reset_checkpoint_directory(&checkpoint).unwrap();
+
+        assert!(!checkpoint.exists());
+    }
+
+    #[test]
+    fn checkpoint_reset_preserves_a_directory_with_unrelated_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkpoint = temp.path().join(".cells.m4d.import-checkpoint");
+        fs::create_dir(&checkpoint).unwrap();
+        fs::write(checkpoint.join("header"), b"checkpoint").unwrap();
+        fs::write(checkpoint.join("notes.txt"), b"unrelated").unwrap();
+
+        assert!(reset_checkpoint_directory(&checkpoint).is_err());
+        assert_eq!(fs::read(checkpoint.join("header")).unwrap(), b"checkpoint");
+        assert_eq!(
+            fs::read(checkpoint.join("notes.txt")).unwrap(),
+            b"unrelated"
+        );
     }
 }

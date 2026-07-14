@@ -18,13 +18,15 @@ use mirante4d_application::{
     OperationCompletion, OperationFailureCode, OperationKind, OperationToken,
     SourceSessionGeneration, UnboundWorkspace,
 };
-use mirante4d_data::DataError;
 use mirante4d_dataset::{DatasetCatalog, DatasetSourceId};
 use mirante4d_dataset_runtime::{RuntimeFault, RuntimeFaultCode};
 use mirante4d_domain::ShapeError;
-use mirante4d_format::FormatError;
 use mirante4d_renderer::RenderError;
 use mirante4d_settings::ResourcePolicy;
+use mirante4d_storage::{
+    ControlError, DirectoryInventoryError, LocalDatasetSourceOpenError, PackageAdmissionError,
+    RangeReadError, StorageProfileError,
+};
 
 use crate::{
     current_runtime::{analysis::AnalysisProductRuntime, render::CurrentRenderRuntime},
@@ -331,13 +333,22 @@ fn map_open_failure(error: &anyhow::Error, path: &Path) -> OperationFailureCode 
         if let Some(error) = cause.downcast_ref::<io::Error>() {
             return map_io_kind(error.kind());
         }
-        if let Some(error) = cause.downcast_ref::<FormatError>() {
-            return map_format_error(error);
+        if let Some(error) = cause.downcast_ref::<LocalDatasetSourceOpenError>() {
+            return map_source_adapter_error(error);
         }
-        if let Some(error) = cause.downcast_ref::<DataError>()
-            && let Some(code) = map_data_error(error)
+        if let Some(error) = cause.downcast_ref::<RangeReadError>() {
+            return map_range_error(error);
+        }
+        if let Some(error) = cause.downcast_ref::<ControlError>()
+            && matches!(
+                error,
+                ControlError::InvalidControlObject {
+                    reason: "the profile fixed schema, compatibility, capability, or path values are invalid",
+                    ..
+                }
+            )
         {
-            return code;
+            return OperationFailureCode::DatasetUnsupported;
         }
         if let Some(error) = cause.downcast_ref::<RenderError>() {
             return map_render_error(error);
@@ -370,35 +381,54 @@ fn map_io_kind(kind: io::ErrorKind) -> OperationFailureCode {
     }
 }
 
-fn map_format_error(error: &FormatError) -> OperationFailureCode {
+fn map_source_adapter_error(error: &LocalDatasetSourceOpenError) -> OperationFailureCode {
     match error {
-        FormatError::ReadManifest { source, .. } | FormatError::WriteManifest { source, .. } => {
-            map_io_kind(source.kind())
-        }
-        FormatError::UnsupportedFormat(_)
-        | FormatError::UnsupportedSchemaVersion(_)
-        | FormatError::UnsupportedZarrCodec { .. } => OperationFailureCode::DatasetUnsupported,
-        FormatError::InvalidShape(ShapeError::ElementCountOverflow) => {
+        LocalDatasetSourceOpenError::MetadataAccountingOverflow
+        | LocalDatasetSourceOpenError::MetadataAdmission(_)
+        | LocalDatasetSourceOpenError::InvalidMetadataLease => {
             OperationFailureCode::DatasetCapacityExceeded
         }
-        FormatError::ZarrStorage { .. } => OperationFailureCode::DatasetReadFailed,
+        LocalDatasetSourceOpenError::Admission(error) => map_admission_error(error),
+        LocalDatasetSourceOpenError::Catalog(_)
+        | LocalDatasetSourceOpenError::MetadataInvariant { .. } => {
+            OperationFailureCode::DatasetInvalid
+        }
+    }
+}
+
+fn map_admission_error(error: &PackageAdmissionError) -> OperationFailureCode {
+    match error {
+        PackageAdmissionError::NoSupportedProfile => OperationFailureCode::DatasetCapacityExceeded,
+        PackageAdmissionError::Inventory(error) => match error {
+            DirectoryInventoryError::ObjectCountExceeded { .. }
+            | DirectoryInventoryError::DirectoryCountExceeded { .. }
+            | DirectoryInventoryError::DirectoryFanOutExceeded { .. } => {
+                OperationFailureCode::DatasetCapacityExceeded
+            }
+            DirectoryInventoryError::Io { kind, .. } => map_io_kind(*kind),
+            DirectoryInventoryError::Range(error) => map_range_error(error),
+            _ => OperationFailureCode::DatasetInvalid,
+        },
+        PackageAdmissionError::Profile(
+            StorageProfileError::ArithmeticOverflow { .. }
+            | StorageProfileError::CeilingExceeded { .. }
+            | StorageProfileError::ExactCountMismatch { .. },
+        ) => OperationFailureCode::DatasetCapacityExceeded,
+        PackageAdmissionError::Profile(_) => OperationFailureCode::DatasetInvalid,
         _ => OperationFailureCode::DatasetInvalid,
     }
 }
 
-fn map_data_error(error: &DataError) -> Option<OperationFailureCode> {
+fn map_range_error(error: &RangeReadError) -> OperationFailureCode {
     match error {
-        DataError::Format(_) => None,
-        DataError::UnsupportedLayerKind { .. } | DataError::UnsupportedDType { .. } => {
-            Some(OperationFailureCode::DatasetUnsupported)
-        }
-        DataError::InvalidShape(ShapeError::ElementCountOverflow) | DataError::WorkerQueueFull => {
-            Some(OperationFailureCode::DatasetCapacityExceeded)
-        }
-        DataError::ReadFailed { .. } | DataError::WorkerQueueClosed | DataError::CachePoisoned => {
-            Some(OperationFailureCode::DatasetReadFailed)
-        }
-        _ => Some(OperationFailureCode::DatasetInvalid),
+        RangeReadError::UnsupportedPlatform => OperationFailureCode::DatasetUnsupported,
+        RangeReadError::ObjectTooLarge { .. }
+        | RangeReadError::InvalidObjectLimit { .. }
+        | RangeReadError::RangeOverflow
+        | RangeReadError::LengthOverflow => OperationFailureCode::DatasetCapacityExceeded,
+        RangeReadError::Io { kind, .. } => map_io_kind(*kind),
+        RangeReadError::ShortRead { .. } => OperationFailureCode::DatasetReadFailed,
+        _ => OperationFailureCode::DatasetInvalid,
     }
 }
 

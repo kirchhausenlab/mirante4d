@@ -7,7 +7,7 @@ use std::{
 use mirante4d_dataset::{CpuByteLease, CpuByteLedger, CpuLedgerCategory, CpuLedgerError};
 use mirante4d_import_pipeline::{
     ImportCancellation, ImportEvent, ImportOptions, NoDataPolicy, SpatialCalibration, TiffSource,
-    import_tiff, inspect_tiff,
+    import_tiff, inspect_tiff, inspect_tiff_cancellable,
 };
 use mirante4d_storage::{
     LocalPackageCatalog, OmeLevelTransform, PackagePath, PackedIndexCoordinates, ProfileKind,
@@ -63,6 +63,24 @@ impl CpuByteLedger for TestLedger {
         }
         Ok(Box::new(TestLease { bytes }))
     }
+}
+
+#[test]
+fn cancellable_inspection_stops_before_source_work() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.tif");
+    fs::write(
+        &source,
+        ustar_regular_file(SOURCE_ARCHIVE, "spec-004/u8-no-data-corner.tif"),
+    )
+    .unwrap();
+    let cancellation = ImportCancellation::new();
+    cancellation.cancel();
+
+    assert!(matches!(
+        inspect_tiff_cancellable(TiffSource::auto(source), &cancellation),
+        Err(mirante4d_import_pipeline::ImportError::Cancelled)
+    ));
 }
 
 #[test]

@@ -1,49 +1,20 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, env, path::Path};
 
 use anyhow::{Context, bail};
 use serde_json::Value;
 
 use crate::reports::read_json_file;
 
-mod config;
-mod import_sample;
-mod native;
-mod phase11;
-mod phase13;
-mod samples;
-mod smoke;
-
-pub(crate) use config::{
-    BENCHMARK_PRESENTATION_POINTS, PHASE11_DEFAULT_MAX_RESPONSIVE_VISIBLE_BRICKS,
-    benchmark_camera_for_shape, benchmark_camera_for_volume, benchmark_camera_frame,
-    benchmark_camera_orbit, benchmark_camera_pan, benchmark_camera_world_per_screen_point,
-    benchmark_camera_zoom, env_f64, env_u64, phase11_benchmark_viewport_for_shape,
-    phase11_brick_pixel_stride, phase11_gpu_brick_cache_budget_bytes,
-    phase11_gpu_volume_cache_budget_bytes, phase11_interaction_steps_per_scenario,
-    phase11_max_decoded_bytes, phase11_max_visible_bricks,
-};
-pub(crate) use import_sample::{bench_import_sample, bench_import_sample_with_limit};
-pub(crate) use native::{
-    NativePackageBenchmarkOverrides, bench_native_package, bench_native_package_with_overrides,
-    bench_runtime_stress,
-};
-pub(crate) use phase11::{
-    Phase11InteractionBenchmarkOptions, Phase11LodPlan, Phase11LodPlanningInput,
-    Phase11ResidentBrickSet, Phase11ResidentReadInput, bench_phase11_interaction,
-    bench_phase11_large_view, bench_phase11_synthetic_matrix, bench_phase11_viewport_matrix,
-    phase11_interaction_report, phase11_read_resident_for_layer, phase11_select_lod_plan,
-    phase11_stored_dtype_for_layer, phase11_viewport_matrix_for_shape,
-    phase11_visible_bricks_at_scale,
-};
-pub(crate) use phase13::{
-    Phase13RendererBenchmarkOptions, bench_phase13_renderer, bench_phase13_viewport_matrix,
-    phase13_renderer_report,
-};
-pub(crate) use samples::{
-    benchmark_sample_source, list_direct_child_dirs, list_direct_tiff_files, list_tiff_files,
-    sample_import_file_limit, tiff_has_multiple_images,
-};
-pub(crate) use smoke::bench_smoke;
+fn env_f64(name: &str) -> anyhow::Result<Option<f64>> {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .parse::<f64>()
+                .with_context(|| format!("{name} must be a number"))
+        })
+        .transpose()
+}
 
 pub(crate) fn bench_check(current_path: &Path, baseline_path: &Path) -> anyhow::Result<()> {
     let current = read_json_file(current_path)?;

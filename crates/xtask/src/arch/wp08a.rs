@@ -55,7 +55,12 @@ const SUCCESSOR_OWNED_WORKSPACE_CRATES: [&str; 7] = [
     "mirante4d-render-wgpu",
     "mirante4d-storage",
 ];
-const RETIRED_WORKSPACE_CRATES: [&str; 1] = ["mirante4d-analysis"];
+const RETIRED_WORKSPACE_CRATES: [&str; 4] = [
+    "mirante4d-analysis",
+    "mirante4d-data",
+    "mirante4d-format",
+    "mirante4d-import",
+];
 
 // Keep the frozen WP-08A predecessor matrix unchanged while checking the
 // exact dependency changes made by accepted successor cutovers.
@@ -67,22 +72,39 @@ pub(super) fn accepted_successor_normal_dependency_additions(
             "mirante4d-analysis-core",
             "mirante4d-analysis-runtime",
             "mirante4d-dataset-runtime",
+            "mirante4d-import-pipeline",
             "mirante4d-project-store",
+            "mirante4d-storage",
         ],
         "mirante4d-application" => &["mirante4d-project-store"],
-        "mirante4d-data" => &["blake3", "mirante4d-dataset", "mirante4d-identity"],
         "mirante4d-renderer" => &["mirante4d-dataset"],
         "mirante4d-identity" => &["mirante4d-domain", "sha2", "unicode-normalization"],
         "mirante4d-project-store" => &["mirante4d-domain"],
-        "xtask" => &["mirante4d-dataset", "mirante4d-dataset-runtime"],
+        "xtask" => &["mirante4d-storage"],
         _ => &[],
     }
 }
 
 fn accepted_successor_normal_dependency_removals(crate_name: &str) -> &'static [&'static str] {
     match crate_name {
-        "mirante4d-app" => &["mirante4d-analysis", "mirante4d-identity"],
-        "xtask" => &["mirante4d-analysis"],
+        "mirante4d-app" => &[
+            "mirante4d-analysis",
+            "mirante4d-data",
+            "mirante4d-format",
+            "mirante4d-identity",
+            "mirante4d-import",
+        ],
+        "mirante4d-renderer" => &["mirante4d-data", "mirante4d-format"],
+        "xtask" => &[
+            "glam",
+            "mirante4d-analysis",
+            "mirante4d-data",
+            "mirante4d-domain",
+            "mirante4d-format",
+            "mirante4d-import",
+            "mirante4d-render-api",
+            "mirante4d-renderer",
+        ],
         _ => &[],
     }
 }
@@ -532,15 +554,11 @@ fn validate_transitional_edges(
 }
 
 fn accepted_expired_transitional_edge(edge: &TransitionalEdge) -> bool {
-    let retired_analysis_edge = (edge.from == "mirante4d-analysis"
-        || edge.to == "mirante4d-analysis")
-        && edge.kind == "normal"
-        && matches!(edge.expiry_gate.as_str(), "WP-10C" | "WP-12" | "WP-14");
-    (edge.from == "mirante4d-app"
-        && edge.to == "mirante4d-identity"
-        && edge.kind == "normal"
-        && edge.expiry_gate == "WP-09C")
-        || retired_analysis_edge
+    RETIRED_WORKSPACE_CRATES.contains(&edge.from.as_str())
+        || RETIRED_WORKSPACE_CRATES.contains(&edge.to.as_str())
+        || (edge.kind == "normal"
+            && accepted_successor_normal_dependency_removals(&edge.from)
+                .contains(&edge.to.as_str()))
 }
 
 fn validate_normal_edge_closure(
@@ -619,6 +637,9 @@ fn validate_side_effect_capabilities(
 
         let mut current_crates = BTreeSet::new();
         for owner in &capability.owners {
+            if RETIRED_WORKSPACE_CRATES.contains(&owner.crate_name.as_str()) {
+                continue;
+            }
             if !current_crates.insert(&owner.crate_name) {
                 bail!(
                     "WP-08A side-effect capability {} repeats current crate {}",
@@ -638,6 +659,9 @@ fn validate_side_effect_capabilities(
         for exception in &capability.current_exceptions {
             require_nonempty("side-effect exception reason", &exception.reason)?;
             validate_expiry_gate(&exception.expiry_gate)?;
+            if RETIRED_WORKSPACE_CRATES.contains(&exception.crate_name.as_str()) {
+                continue;
+            }
             let expired_at_wp08b = capability.capability == "dataset-demand-and-open-workers"
                 && exception.crate_name == "mirante4d-data"
                 && exception.expiry_gate == "WP-08B";
@@ -650,7 +674,10 @@ fn validate_side_effect_capabilities(
                 "project-package-filesystem" | "project-store-background-worker"
             ) && exception.crate_name == "mirante4d-app"
                 && exception.expiry_gate == "WP-10B";
-            if expired_at_wp08b || retired_at_wp12 || expired_at_wp10b {
+            let expired_at_wp10c = capability.capability == "source-import-background-workers"
+                && exception.crate_name == "mirante4d-app"
+                && exception.expiry_gate == "WP-10C";
+            if expired_at_wp08b || retired_at_wp12 || expired_at_wp10b || expired_at_wp10c {
                 continue;
             }
             if !current_crates.insert(&exception.crate_name) {
@@ -690,6 +717,25 @@ fn validate_side_effect_capabilities(
                 &capability.capability,
                 &capability.target_owner,
             )?;
+        }
+        if matches!(
+            capability.capability.as_str(),
+            "dataset-package-filesystem-and-codecs" | "source-import-and-staging-filesystem"
+        ) {
+            if !metadata
+                .declared_dependency_kinds_by_name
+                .contains_key(&capability.target_owner)
+            {
+                bail!(
+                    "WP-08A activated side-effect target owner {} is not a workspace crate",
+                    capability.target_owner
+                );
+            }
+            current_crates.insert(&capability.target_owner);
+        }
+        if capability.capability == "source-import-background-workers" {
+            current_crates.insert(&capability.target_owner);
+            validate_wp10c_import_worker_owner(repo_root, &capability.target_owner)?;
         }
         if current_crates.is_empty()
             && !matches!(
@@ -734,6 +780,37 @@ fn validate_wp10b_project_store_side_effect_owner(
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     if !source.contains(marker) {
         bail!("WP-10B B4 target owner {target_owner} lacks {capability} evidence {marker:?}");
+    }
+    Ok(())
+}
+
+fn validate_wp10c_import_worker_owner(repo_root: &Path, target_owner: &str) -> anyhow::Result<()> {
+    if target_owner != "mirante4d-import-pipeline" {
+        bail!("WP-10C import worker target owner drifted: {target_owner}");
+    }
+
+    let worker_path = repo_root.join("crates/mirante4d-import-pipeline/src/worker.rs");
+    let worker_source = fs::read_to_string(&worker_path)
+        .with_context(|| format!("failed to read {}", worker_path.display()))?;
+    if !source_creates_thread(&worker_path, &worker_source)? {
+        bail!("WP-10C import pipeline worker owner creates no production thread");
+    }
+    for marker in ["spawn_tiff_inspection_worker", "spawn_tiff_import_worker"] {
+        if !worker_source.contains(marker) {
+            bail!("WP-10C import pipeline worker owner lacks {marker}");
+        }
+    }
+
+    let app_path = repo_root.join("crates/mirante4d-app/src/workbench_import.rs");
+    let app_source = fs::read_to_string(&app_path)
+        .with_context(|| format!("failed to read {}", app_path.display()))?;
+    if source_creates_thread(&app_path, &app_source)? {
+        bail!("WP-10C app import module still creates a production thread");
+    }
+    for marker in ["spawn_tiff_inspection_worker", "spawn_tiff_import_worker"] {
+        if !app_source.contains(marker) {
+            bail!("WP-10C app import module does not use target worker {marker}");
+        }
     }
     Ok(())
 }
@@ -2223,6 +2300,42 @@ fn private(_: NativeManifest) -> Vec<u8> { unreachable!() }
                 .unwrap_err()
                 .to_string()
                 .contains("no worker-capability owner")
+        );
+    }
+
+    #[test]
+    fn wp10c_import_workers_are_created_only_by_the_pipeline() {
+        let temp = tempfile::tempdir().unwrap();
+        let pipeline_root = temp.path().join("crates/mirante4d-import-pipeline/src");
+        let app_root = temp.path().join("crates/mirante4d-app/src");
+        fs::create_dir_all(&pipeline_root).unwrap();
+        fs::create_dir_all(&app_root).unwrap();
+        fs::write(
+            pipeline_root.join("worker.rs"),
+            r#"
+pub fn spawn_tiff_inspection_worker() { let _ = std::thread::spawn(|| {}); }
+pub fn spawn_tiff_import_worker() { let _ = std::thread::spawn(|| {}); }
+"#,
+        )
+        .unwrap();
+        fs::write(
+            app_root.join("workbench_import.rs"),
+            "fn start() { spawn_tiff_inspection_worker(); spawn_tiff_import_worker(); }",
+        )
+        .unwrap();
+
+        validate_wp10c_import_worker_owner(temp.path(), "mirante4d-import-pipeline").unwrap();
+
+        fs::write(
+            app_root.join("workbench_import.rs"),
+            "fn start() { spawn_tiff_inspection_worker(); spawn_tiff_import_worker(); let _ = std::thread::spawn(|| {}); }",
+        )
+        .unwrap();
+        assert!(
+            validate_wp10c_import_worker_owner(temp.path(), "mirante4d-import-pipeline")
+                .unwrap_err()
+                .to_string()
+                .contains("app import module still creates")
         );
     }
 

@@ -50,10 +50,6 @@ pub(crate) struct ReleaseAppSmokeOptions {
     pub(crate) timeout_secs: Option<u64>,
 }
 
-pub(crate) fn run_release_app_smoke(dataset: &Path, output_path: &Path) -> anyhow::Result<Value> {
-    run_release_app_smoke_with_options(dataset, output_path, ReleaseAppSmokeOptions::default())
-}
-
 pub(crate) fn run_release_app_smoke_with_options(
     dataset: &Path,
     output_path: &Path,

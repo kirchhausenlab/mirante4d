@@ -276,18 +276,18 @@ mod tests {
 
     #[test]
     fn heavy_benchmark_opt_in_rejects_unset_command_before_locking() {
-        let error = require_heavy_benchmark_opt_in_value("bench-native-package", None)
+        let error = require_heavy_benchmark_opt_in_value("t5-product-validation", None)
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("bench-native-package is a heavyweight local benchmark"));
+        assert!(error.contains("t5-product-validation is a heavyweight local benchmark"));
         assert!(error.contains(HEAVY_BENCHMARK_OPT_IN_ENV));
         assert!(error.contains("disabled by default"));
     }
 
     #[test]
     fn heavy_benchmark_opt_in_allows_enabled_command() {
-        require_heavy_benchmark_opt_in_value("bench-native-package", Some("1")).unwrap();
+        require_heavy_benchmark_opt_in_value("t5-product-validation", Some("1")).unwrap();
     }
 
     #[test]
@@ -296,25 +296,27 @@ mod tests {
         let lock_path = tempdir.path().join("heavy.lock");
         {
             let _guard =
-                HeavyBenchmarkGuard::acquire_at(lock_path.clone(), "bench-native-package").unwrap();
+                HeavyBenchmarkGuard::acquire_at(lock_path.clone(), "t5-product-validation")
+                    .unwrap();
 
-            let err = HeavyBenchmarkGuard::acquire_at(lock_path.clone(), "phase20-extreme-audit")
-                .unwrap_err()
-                .to_string();
+            let err =
+                HeavyBenchmarkGuard::acquire_at(lock_path.clone(), "other-product-validation")
+                    .unwrap_err()
+                    .to_string();
 
             assert!(err.contains("another heavyweight xtask benchmark/evidence command"));
-            assert!(err.contains("bench-native-package"));
+            assert!(err.contains("t5-product-validation"));
             assert!(lock_path.exists());
         }
 
         assert!(!lock_path.exists());
-        HeavyBenchmarkGuard::acquire_at(lock_path.clone(), "bench-native-package").unwrap();
+        HeavyBenchmarkGuard::acquire_at(lock_path.clone(), "t5-product-validation").unwrap();
     }
 
     #[test]
     fn heavy_benchmark_lock_pid_parses_holder_pid() {
         assert_eq!(
-            heavy_benchmark_lock_pid("command=bench-native-package\npid=12345\n"),
+            heavy_benchmark_lock_pid("command=t5-product-validation\npid=12345\n"),
             Some(12345)
         );
         assert_eq!(heavy_benchmark_lock_pid("command=missing-pid\n"), None);
@@ -326,13 +328,17 @@ mod tests {
     fn heavy_benchmark_guard_removes_stale_dead_pid_lock() {
         let tempdir = tempfile::tempdir().unwrap();
         let lock_path = tempdir.path().join("heavy.lock");
-        fs::write(&lock_path, "command=bench-native-package\npid=4294967295\n").unwrap();
+        fs::write(
+            &lock_path,
+            "command=t5-product-validation\npid=4294967295\n",
+        )
+        .unwrap();
 
-        let _guard = HeavyBenchmarkGuard::acquire_at(lock_path.clone(), "bench-native-package")
+        let _guard = HeavyBenchmarkGuard::acquire_at(lock_path.clone(), "t5-product-validation")
             .expect("dead pid lock should be treated as stale");
 
         let holder = fs::read_to_string(&lock_path).unwrap();
-        assert!(holder.contains("command=bench-native-package"));
+        assert!(holder.contains("command=t5-product-validation"));
         assert!(holder.contains(&format!("pid={}", std::process::id())));
     }
 }

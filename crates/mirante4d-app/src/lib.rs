@@ -83,15 +83,11 @@ use histogram::{
     auto_dvr_opacity_transfer_from_histogram, auto_signal_window_from_histogram,
     histogram_bins_label, histogram_can_auto_window, histogram_status_label,
 };
-pub use image_compositing::mip_to_color_image;
 use import_ui::{
     ImportTask, ImportTaskMessage, PendingTiffImport, TiffImportSetupTask,
-    TiffImportSetupTaskMessage, accepted_reviewed_plan_for_pending_tiff_import,
-    active_layer_no_data_policy_label, format_tiff_value_range, import_progress_fraction,
-    import_task_status_text, pending_tiff_import_ready_to_start, prepare_tiff_source_import,
-    show_tiff_channel_metadata_controls, show_tiff_grouping_controls, show_tiff_no_data_controls,
-    tiff_import_storage_estimate_label, tiff_source_profile_label,
-    tiff_voxel_spacing_metadata_label, validate_pending_tiff_import,
+    TiffImportSetupTaskMessage, active_layer_no_data_policy_label, build_import_options,
+    import_progress_fraction, import_task_status_text, pending_tiff_import_ready_to_start,
+    reset_checkpoint_directory, show_pending_tiff_import_controls, tiff_destination,
 };
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, ApplicationFault, ApplicationFaultCode,
@@ -109,9 +105,9 @@ use mirante4d_domain::{
 };
 #[cfg(test)]
 use mirante4d_domain::{IntensityDType, RenderMode, Shape3D, TimeIndex};
-use mirante4d_import::{
-    ImportCancellationToken, ImportError, TiffDirectoryImportReport, TiffImportSource,
-    TiffSourceImportOptions, import_tiff_source_with_progress,
+use mirante4d_import_pipeline::{
+    ImportCancellation, ImportError, ImportOptions, ImportReceipt, TiffInspection, TiffSource,
+    spawn_tiff_import_worker, spawn_tiff_inspection_worker,
 };
 use mirante4d_project_model::{
     ChannelPreset, LayerViewState, ProjectId, ProjectRevisionId, ViewState,
@@ -504,7 +500,7 @@ pub struct MiranteWorkbenchApp {
     dataset: dataset_requests::DatasetDemandState,
     render_runtime: current_runtime::render::CurrentRenderRuntime,
     ui_runtime: current_runtime::ui::CurrentUiRuntime,
-    import_runtime: current_runtime::import::CurrentImportRuntime,
+    import_runtime: current_runtime::import::ImportRuntime,
     analysis_runtime: current_runtime::analysis::AnalysisProductRuntime,
     validation_runtime: current_runtime::validation::CurrentValidationRuntime,
     project_store: Option<ProjectStoreApplicationService<SystemMonotonicClock>>,
@@ -604,7 +600,7 @@ impl MiranteWorkbenchApp {
             dataset,
             render_runtime,
             ui_runtime,
-            import_runtime: current_runtime::import::CurrentImportRuntime::idle(),
+            import_runtime: current_runtime::import::ImportRuntime::idle(),
             analysis_runtime,
             validation_runtime:
                 current_runtime::validation::CurrentValidationRuntime::from_environment(),
@@ -1336,15 +1332,6 @@ impl MiranteWorkbenchApp {
         }
     }
 
-    fn cancel_background_operation(&mut self, token: &OperationToken) {
-        if let Err(fault) = current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::CancelOperation(token.operation_id()),
-        ) {
-            tracing::warn!(?fault, "background operation cancellation was rejected");
-        }
-    }
-
     fn poll_project_store(&mut self) {
         let snapshot = current_egui_shell_bridge::snapshot(&self.application);
         let result = self
@@ -2062,11 +2049,23 @@ impl MiranteWorkbenchApp {
         else {
             return;
         };
+        if let Err(error) = self.open_or_queue_dataset_path(path, Some(ctx)) {
+            tracing::warn!(%error, "dataset open request was rejected");
+        }
+    }
+
+    fn open_or_queue_dataset_path(
+        &mut self,
+        path: PathBuf,
+        ctx: Option<&egui::Context>,
+    ) -> anyhow::Result<bool> {
         if self.project_dirty() {
             self.pending_dataset_open_path = Some(path);
             self.ui_runtime.close_prompt_open = true;
-        } else if let Err(error) = self.replace_state_from_dataset_path(path, Some(ctx)) {
-            tracing::warn!(%error, "dataset open request was rejected");
+            Ok(false)
+        } else {
+            self.replace_state_from_dataset_path(path, ctx)?;
+            Ok(true)
         }
     }
 
@@ -2503,7 +2502,7 @@ impl MiranteWorkbenchApp {
         self.pending_analysis_artifact_load = None;
         let old_import_runtime = std::mem::replace(
             &mut self.import_runtime,
-            current_runtime::import::CurrentImportRuntime::idle(),
+            current_runtime::import::ImportRuntime::idle(),
         );
         self.ui_runtime.viewer_tools = ViewerToolState::default();
         self.ui_runtime.analysis_plot_view = None;

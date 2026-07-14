@@ -1,15 +1,26 @@
 use std::collections::HashSet;
 
 use glam::DVec3;
-use mirante4d_data::SpatialBrickIndex;
 use mirante4d_dataset::{ResourceContractError, ResourceRegion};
 use mirante4d_domain::{GridToWorld, Projection, Shape3D};
-use mirante4d_format::CurrentGridToWorldExt;
 use mirante4d_render_api::CameraFrame;
 
-use crate::{RenderError, RenderViewport, ResourcePlanCapacityKind};
+use crate::{RenderError, RenderViewport, ResourcePlanCapacityKind, transform::GridToWorldExt};
 
 const EPSILON: f64 = 1.0e-9;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SpatialBrickIndex {
+    pub z: u64,
+    pub y: u64,
+    pub x: u64,
+}
+
+impl SpatialBrickIndex {
+    pub const fn new(z: u64, y: u64, x: u64) -> Self {
+        Self { z, y, x }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BrickGridSpec {
@@ -884,7 +895,7 @@ mod tests {
             SemanticRegionGridSpec {
                 volume_shape: Shape3D::new(5, 5, 5).unwrap(),
                 resource_shape: Shape3D::new(4, 4, 4).unwrap(),
-                grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
+                grid_to_world: GridToWorld::scale(1.0, 1.0, 1.0).unwrap(),
             },
             BrickPlanOptions::default(),
             ResourcePlanLimits::new(64, 64),
@@ -917,7 +928,7 @@ mod tests {
             SemanticRegionGridSpec {
                 volume_shape: shape,
                 resource_shape: Shape3D::new(64, 64, 64).unwrap(),
-                grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
+                grid_to_world: GridToWorld::scale(1.0, 1.0, 1.0).unwrap(),
             },
             BrickPlanOptions::default(),
             ResourcePlanLimits::new(16, 16),
@@ -947,7 +958,7 @@ mod tests {
             SemanticRegionGridSpec {
                 volume_shape: shape,
                 resource_shape: Shape3D::new(1, 64, 64).unwrap(),
-                grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
+                grid_to_world: GridToWorld::scale(1.0, 1.0, 1.0).unwrap(),
             },
             BrickPlanOptions::default(),
             ResourcePlanLimits::new(16, 16),
@@ -961,7 +972,7 @@ mod tests {
         BrickGridSpec {
             volume_shape: Shape3D::new(4, 4, 4).unwrap(),
             brick_shape: Shape3D::new(2, 2, 2).unwrap(),
-            grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 1.0),
+            grid_to_world: GridToWorld::scale(1.0, 1.0, 1.0).unwrap(),
         }
     }
 

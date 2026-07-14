@@ -1,5 +1,4 @@
 use super::*;
-use mirante4d_format::{FixtureKind, write_fixture};
 
 fn assert_dataset_runtime_limits(script: &Value, total_bytes: u64, resident_resources: u64) {
     assert_eq!(script["schema_version"], PRODUCT_AUTOMATION_SCHEMA_VERSION);
@@ -7,6 +6,12 @@ fn assert_dataset_runtime_limits(script: &Value, total_bytes: u64, resident_reso
     assert_eq!(
         script["limits"]["max_cpu_decoded_residency_bytes"],
         total_bytes / 2
+    );
+    assert_eq!(
+        script["limits"]["max_cpu_in_flight_decode_bytes"],
+        (total_bytes / 8)
+            .saturating_add(PACKAGE_VALIDATION_WORKING_BYTES)
+            .min(total_bytes)
     );
     assert_eq!(script["limits"]["max_runtime_queued_requests"], 1_024);
     assert_eq!(script["limits"]["max_runtime_in_flight_decodes"], 8);
@@ -180,8 +185,8 @@ fn b4_valid_attempt(number: u64) -> Value {
 }
 
 #[test]
-fn generated_fixture_product_automation_script_uses_semantic_commands() {
-    let script = generated_fixture_camera_smoke_script(Path::new("/tmp/demo.m4d"));
+fn target_fixture_product_automation_script_uses_semantic_commands() {
+    let script = target_fixture_camera_smoke_script(Path::new("/tmp/demo.m4d"));
     let commands = script["commands"].as_array().unwrap();
 
     assert_eq!(script["schema"], PRODUCT_AUTOMATION_SCRIPT_SCHEMA);
@@ -211,8 +216,8 @@ fn generated_fixture_product_automation_script_uses_semantic_commands() {
 }
 
 #[test]
-fn generated_fixture_render_modes_script_switches_supported_modes() {
-    let script = generated_fixture_render_modes_script(Path::new("/tmp/demo.m4d"));
+fn target_fixture_render_modes_script_switches_supported_modes() {
+    let script = target_fixture_render_modes_script(Path::new("/tmp/demo.m4d"));
     let commands = script["commands"].as_array().unwrap();
     let command_names: Vec<_> = commands
         .iter()
@@ -321,8 +326,8 @@ fn generated_fixture_render_modes_script_switches_supported_modes() {
 }
 
 #[test]
-fn b3_source_verification_script_proves_cancel_progress_success_and_both_sizes() {
-    let script = b3_source_verification_script(Path::new("/tmp/demo.m4d"));
+fn target_source_verification_script_proves_cancel_progress_success_and_both_sizes() {
+    let script = target_source_verification_script(Path::new("/tmp/demo.m4d"));
     let commands = script["commands"].as_array().unwrap();
 
     assert_eq!(script["scenario"], B3_SOURCE_VERIFICATION_SCENARIO);
@@ -1747,8 +1752,8 @@ fn unix_epoch_ms_to_utc_rfc3339_formats_report_timestamps() {
 #[test]
 fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
     let tempdir = tempfile::tempdir().unwrap();
-    let package = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
-    let script = generated_fixture_camera_smoke_script(&package);
+    let package = extract_target_u16_fixture(tempdir.path()).unwrap();
+    let script = target_fixture_camera_smoke_script(&package);
     let automation_report = json!({
         "status": "passed",
         "viewport_evidence": {
@@ -1993,7 +1998,12 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
     });
 
     assert_eq!(report["dataset"]["manifest_status"], "loaded");
-    assert_eq!(report["dataset"]["id"], "fixture-basic-u16-16cube");
+    assert!(
+        report["dataset"]["package_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("m4d-package-v1-sha256:")
+    );
     assert_eq!(
         report["artifacts"]["automation_artifacts"][0]["kind"],
         "viewport_capture"
@@ -2209,7 +2219,7 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
 #[test]
 fn wrapper_report_marks_preflight_as_non_launch_unsupported_evidence() {
     let tempdir = tempfile::tempdir().unwrap();
-    let package = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
+    let package = extract_target_u16_fixture(tempdir.path()).unwrap();
     let script = t5_qual_001_interaction_mip_script(&package);
     let wrapper_path = tempdir.path().join("product-validation-report.json");
     let script_path = tempdir.path().join("product-automation-script.json");

@@ -21,6 +21,8 @@ pub enum ImportError {
     UnsupportedSource(String),
     #[error("invalid import request: {0}")]
     InvalidRequest(&'static str),
+    #[error("the inspected source does not fit any supported Mirante4D storage profile")]
+    NoSupportedProfile,
     #[error("source changed after inspection: {0}")]
     SourceChanged(PathBuf),
     #[error("checkpoint is corrupt or belongs to different inputs: {0}")]

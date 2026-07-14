@@ -15,6 +15,13 @@ use crate::{
 };
 
 const SPACE_OVERHEAD_BYTES: u64 = 4 * 1024 * 1024;
+const SUPPORTED_PROFILE_ORDER: [ProfileKind; 5] = [
+    ProfileKind::Ds0,
+    ProfileKind::Ds1,
+    ProfileKind::Ds2,
+    ProfileKind::Ds3,
+    ProfileKind::Ds4,
+];
 
 #[derive(Clone, Debug)]
 pub(crate) struct ImportPlan {
@@ -145,6 +152,24 @@ impl ImportPlan {
             free_space_required,
         })
     }
+}
+
+pub(crate) fn select_supported_profile(
+    options: &ImportOptions,
+) -> Result<ProfileKind, ImportError> {
+    for profile in SUPPORTED_PROFILE_ORDER {
+        let mut candidate = options.clone();
+        candidate.profile = profile;
+        match ImportPlan::new(&candidate) {
+            Ok(_) => return Ok(profile),
+            Err(ImportError::Storage(
+                StorageProfileError::CeilingExceeded { .. }
+                | StorageProfileError::ExactCountMismatch { .. },
+            )) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(ImportError::NoSupportedProfile)
 }
 
 fn validate_request(options: &ImportOptions) -> Result<(), ImportError> {
@@ -541,6 +566,37 @@ mod tests {
         options.profile = ProfileKind::Ds4;
         let plan = ImportPlan::new(&options).unwrap();
         assert_eq!(plan.shapes.len(), 4);
+    }
+
+    #[test]
+    fn supported_profile_selection_uses_the_first_complete_plan() {
+        // This volume is just above DS-0's logical-byte ceiling, while DS-1
+        // admits its small number of spatial shards and four natural scales.
+        let mut options = options(Shape4D::new(1, 513, 256, 256).unwrap());
+        options.profile = ProfileKind::Ds4;
+
+        assert!(matches!(
+            ImportPlan::new(&ImportOptions {
+                profile: ProfileKind::Ds0,
+                ..options.clone()
+            }),
+            Err(ImportError::Storage(
+                StorageProfileError::CeilingExceeded { .. }
+            ))
+        ));
+        assert_eq!(
+            select_supported_profile(&options).unwrap(),
+            ProfileKind::Ds1
+        );
+    }
+
+    #[test]
+    fn supported_profile_selection_rejects_an_unbounded_plan() {
+        let options = options(Shape4D::new(100_000, 1, 256, 256).unwrap());
+        assert!(matches!(
+            select_supported_profile(&options),
+            Err(ImportError::NoSupportedProfile)
+        ));
     }
 
     #[test]
