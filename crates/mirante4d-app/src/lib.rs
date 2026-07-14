@@ -33,6 +33,7 @@ mod layer_state;
 mod lod_scheduler;
 mod playback;
 mod product_automation;
+mod product_render_intent;
 mod render_state;
 mod resident_rendering;
 mod retained_leases;

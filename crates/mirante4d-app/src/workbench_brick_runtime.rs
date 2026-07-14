@@ -20,6 +20,7 @@ use crate::{
         SCOPE_ANALYSIS, SCOPE_CROSS_SECTION_XY, SCOPE_CROSS_SECTION_XZ, SCOPE_CROSS_SECTION_YZ,
         SCOPE_CURRENT_3D, SCOPE_PLAYBACK,
     },
+    product_render_intent::PRODUCT_RENDER_RESOURCE_LIMIT,
     viewer_layout::{
         CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
         CrossSectionPanelScheduleStatus, PanelId,
@@ -74,7 +75,7 @@ impl MiranteWorkbenchApp {
         let current_limits = DatasetDemandPlanLimits::new(
             SEMANTIC_PLAN_CANDIDATES_PER_LAYER,
             budget_share_usize(
-                MAX_RENDER_REQUIREMENTS,
+                PRODUCT_RENDER_RESOURCE_LIMIT,
                 current_share_numerator,
                 demand_cohorts,
             ),
@@ -364,7 +365,7 @@ impl MiranteWorkbenchApp {
             };
             let limits = DatasetDemandPlanLimits::new(
                 SEMANTIC_PLAN_CANDIDATES_PER_LAYER,
-                MAX_RENDER_REQUIREMENTS
+                PRODUCT_RENDER_RESOURCE_LIMIT
                     .saturating_sub(union.len())
                     .checked_div(remaining_panels)
                     .unwrap_or(0),
