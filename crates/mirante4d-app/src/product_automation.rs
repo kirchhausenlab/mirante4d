@@ -279,9 +279,7 @@ impl PendingCrossSectionLatencySample {
         if displayed_generation < self.target_generation {
             return None;
         }
-        if product_presentation(app, self.panel_id).is_none() {
-            return None;
-        }
+        product_presentation(app, self.panel_id)?;
         let schedule = panel.cross_section_schedule;
         Some(ProductAutomationCrossSectionLatencySample {
             command_index: self.command_index,

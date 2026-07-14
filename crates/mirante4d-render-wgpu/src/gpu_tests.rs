@@ -629,18 +629,28 @@ impl Counters {
     }
 }
 
+struct ComparisonInput<'a> {
+    catalog: &'a DatasetCatalog,
+    intent: &'a RenderIntent,
+    requirements: &'a RenderRequirements,
+    leases: &'a [&'a dyn ResourceLease],
+}
+
 fn execute_and_compare(
     gpu: &mut WgpuRenderRuntime,
     presentation: PresentationToken,
-    catalog: &DatasetCatalog,
-    intent: &RenderIntent,
-    requirements: &RenderRequirements,
-    leases: &[&dyn ResourceLease],
+    input: ComparisonInput<'_>,
     deadline: Instant,
     counters: &mut Counters,
 ) -> (ValidationCapture, u8) {
     let report = gpu
-        .execute_frame(presentation, catalog, intent, requirements, leases)
+        .execute_frame(
+            presentation,
+            input.catalog,
+            input.intent,
+            input.requirements,
+            input.leases,
+        )
         .expect("semantic GPU frame executes");
     counters.record(&report);
     let ticket = report
@@ -648,7 +658,7 @@ fn execute_and_compare(
         .expect("qualification enables asynchronous validation capture");
     let capture = poll_capture(gpu, ticket, deadline);
     let reference = ReferenceRenderer::new()
-        .render(catalog, intent, leases)
+        .render(input.catalog, input.intent, input.leases)
         .expect("independent CPU reference renders fixture leases");
     let max_delta = compare_reference(&capture, &reference);
     (capture, max_delta)
@@ -825,10 +835,12 @@ fn qualification() {
     let (_, delta) = execute_and_compare(
         &mut gpu,
         presentation,
-        &catalog,
-        &mip,
-        &mip_requirements,
-        &u8_leases,
+        ComparisonInput {
+            catalog: &catalog,
+            intent: &mip,
+            requirements: &mip_requirements,
+            leases: &u8_leases,
+        },
         deadline,
         &mut counters,
     );
@@ -855,10 +867,12 @@ fn qualification() {
     let (_, delta) = execute_and_compare(
         &mut gpu,
         presentation,
-        &catalog,
-        &dvr,
-        &dvr_requirements,
-        &u16_leases,
+        ComparisonInput {
+            catalog: &catalog,
+            intent: &dvr,
+            requirements: &dvr_requirements,
+            leases: &u16_leases,
+        },
         deadline,
         &mut counters,
     );
@@ -879,10 +893,12 @@ fn qualification() {
     let (_, delta) = execute_and_compare(
         &mut gpu,
         presentation,
-        &catalog,
-        &iso,
-        &iso_requirements,
-        &f32_leases,
+        ComparisonInput {
+            catalog: &catalog,
+            intent: &iso,
+            requirements: &iso_requirements,
+            leases: &f32_leases,
+        },
         deadline,
         &mut counters,
     );
@@ -899,10 +915,12 @@ fn qualification() {
     let (section_capture, delta) = execute_and_compare(
         &mut gpu,
         presentation,
-        &catalog,
-        &section,
-        &section_requirements,
-        &u8_leases,
+        ComparisonInput {
+            catalog: &catalog,
+            intent: &section,
+            requirements: &section_requirements,
+            leases: &u8_leases,
+        },
         deadline,
         &mut counters,
     );

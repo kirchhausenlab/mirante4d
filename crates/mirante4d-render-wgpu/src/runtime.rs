@@ -1857,10 +1857,12 @@ mod tests {
 
     #[test]
     fn existing_device_preflight_requires_the_renderer_limits() {
-        let mut limits = wgpu::Limits::default();
-        limits.max_buffer_size = MIN_BUFFER_LIMIT_BYTES;
-        limits.max_storage_buffer_binding_size = MIN_STORAGE_BINDING_LIMIT_BYTES;
-        limits.max_storage_buffers_per_shader_stage = MIN_STORAGE_BUFFERS_PER_STAGE;
+        let mut limits = wgpu::Limits {
+            max_buffer_size: MIN_BUFFER_LIMIT_BYTES,
+            max_storage_buffer_binding_size: MIN_STORAGE_BINDING_LIMIT_BYTES,
+            max_storage_buffers_per_shader_stage: MIN_STORAGE_BUFFERS_PER_STAGE,
+            ..wgpu::Limits::default()
+        };
         assert_eq!(validate_device_limits(&limits), Ok(()));
 
         limits.max_storage_buffer_binding_size = MIN_STORAGE_BINDING_LIMIT_BYTES - 1;
