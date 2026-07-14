@@ -26,7 +26,7 @@ use mirante4d_storage::{
 
 use crate::{
     CrossSectionRuntime, FrameCompleteness, FrameFidelityStatus, LodDecisionReason,
-    LodScheduleState, StartupDiagnostics, collect_startup_diagnostics,
+    StartupDiagnostics, collect_startup_diagnostics,
     current_runtime::{analysis::AnalysisProductRuntime, render::CurrentRenderRuntime},
     dataset_requests::DatasetDemandState,
     transfer_presets::default_channel_presets,
@@ -303,7 +303,6 @@ fn initial_runtime_state(
         presentation,
         viewport,
         fidelity,
-        LodScheduleState::new(None),
         CrossSectionRuntime::default(),
     );
     let mut analysis = AnalysisProductRuntime::new();

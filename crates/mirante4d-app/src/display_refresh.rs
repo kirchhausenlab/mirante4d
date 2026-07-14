@@ -608,10 +608,8 @@ impl MiranteWorkbenchApp {
             .mode();
         self.render_runtime.frame_fidelity.backend = render_backend_for_mode(mode);
         self.render_runtime.frame_fidelity.display_freshness = DisplayedFrameFreshness::Current;
-        self.render_runtime.lod_schedule.displayed_scale_level =
-            Some(self.dataset.current_scale().get());
         self.render_runtime.frame_fidelity.displayed_scale_level =
-            self.render_runtime.lod_schedule.displayed_scale_level;
+            Some(self.dataset.current_scale().get());
     }
 
     pub(crate) fn render_current_product_frame(&mut self) -> anyhow::Result<DisplayRenderTiming> {

@@ -136,8 +136,6 @@ impl MiranteWorkbenchApp {
         if let Some(error) = cross_plan_error.as_ref() {
             self.dataset.record_plan_error(error.to_string());
         }
-        self.render_runtime.lod_schedule.target_scale_level = scale.get();
-        self.render_runtime.lod_schedule.pending_scale_level = Some(scale.get());
         self.render_runtime.frame_fidelity.target_scale_level = scale.get();
         self.render_runtime.frame_fidelity.visible_bricks = visible_count;
 
@@ -412,10 +410,8 @@ impl MiranteWorkbenchApp {
         } else {
             RenderBackend::Loading
         };
-        self.render_runtime.lod_schedule.displayed_scale_level =
-            (empty || ready).then_some(self.dataset.current_scale().get());
         self.render_runtime.frame_fidelity.displayed_scale_level =
-            self.render_runtime.lod_schedule.displayed_scale_level;
+            (empty || ready).then_some(self.dataset.current_scale().get());
         if empty {
             self.render_runtime.frame_fidelity.reason = LodDecisionReason::NoVisibleData;
         }

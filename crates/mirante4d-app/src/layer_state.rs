@@ -55,8 +55,5 @@ fn mark_preserved_frame_stale(render: &mut CurrentRenderRuntime) {
     render.frame_fidelity.frame_time_ms = None;
     render.frame_fidelity.last_failure_kind = None;
     render.frame_fidelity.last_capacity_error = None;
-    render.lod_schedule.pending_scale_level = None;
-    render.lod_schedule.hard_failed_scale_level = None;
-    render.lod_schedule.hard_failure_reason = None;
     render.lod_replan_pending = true;
 }

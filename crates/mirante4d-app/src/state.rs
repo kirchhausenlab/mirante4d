@@ -119,26 +119,3 @@ pub enum HistogramStatus {
     Pending { reason: String },
     Unavailable { reason: String },
 }
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LodScheduleState {
-    pub target_scale_level: u32,
-    pub displayed_scale_level: Option<u32>,
-    pub fallback_scale_level: Option<u32>,
-    pub pending_scale_level: Option<u32>,
-    pub hard_failed_scale_level: Option<u32>,
-    pub hard_failure_reason: Option<LodDecisionReason>,
-}
-
-impl LodScheduleState {
-    pub(crate) fn new(displayed_scale_level: Option<u32>) -> Self {
-        Self {
-            target_scale_level: displayed_scale_level.unwrap_or(0),
-            displayed_scale_level,
-            fallback_scale_level: None,
-            pending_scale_level: displayed_scale_level,
-            hard_failed_scale_level: None,
-            hard_failure_reason: None,
-        }
-    }
-}

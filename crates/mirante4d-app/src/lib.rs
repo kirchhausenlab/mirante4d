@@ -121,7 +121,7 @@ use render_state::{set_presentation_viewport, set_render_viewport, take_lod_repl
 pub use smoke::{AppSmokeOptions, AppSmokeReport, PlaybackSmokeFrame, run_headless_smoke};
 pub use state::{
     DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind, FrameFidelityStatus,
-    HistogramStatus, LayerHistogramSummary, LodDecisionReason, LodScheduleState, RenderBackend,
+    HistogramStatus, LayerHistogramSummary, LodDecisionReason, RenderBackend,
 };
 use tool_interactions::apply_viewport_tool_response;
 use transfer_presets::{
@@ -2515,9 +2515,9 @@ impl MiranteWorkbenchApp {
             .expect("application view closes over the dataset catalog");
         let scale = ScaleLevel::new(
             self.render_runtime
-                .lod_schedule
+                .frame_fidelity
                 .displayed_scale_level
-                .unwrap_or(self.render_runtime.lod_schedule.target_scale_level),
+                .unwrap_or(self.dataset.current_scale().get()),
         );
         active_layer_histogram_summary(
             self.dataset.retained_leases(),
@@ -2542,10 +2542,16 @@ impl MiranteWorkbenchApp {
     ) -> Result<CommandEffect, ApplicationFault> {
         let before = current_egui_shell_bridge::snapshot(&self.application);
         let previous_view = application_view(&before).clone();
+        let previous_playback_active = before.transient().playback_active();
         let effect = current_egui_shell_bridge::dispatch(&mut self.application, command)?;
         if effect == CommandEffect::Changed {
             let after = current_egui_shell_bridge::snapshot(&self.application);
-            self.reconcile_application_change(&previous_view, &after, ctx);
+            self.reconcile_application_change(
+                &previous_view,
+                previous_playback_active,
+                &after,
+                ctx,
+            );
             if let Err(error) = self.reconcile_analysis_currentness() {
                 tracing::warn!(%error, "stale analysis could not be retired");
             }
@@ -2557,14 +2563,13 @@ impl MiranteWorkbenchApp {
     fn reconcile_application_change(
         &mut self,
         previous_view: &ViewState,
+        previous_playback_active: bool,
         snapshot: &ApplicationSnapshot,
         ctx: &egui::Context,
     ) {
         let next_view = application_view(snapshot);
-        let playback_lod_downshift_active = snapshot.transient().playback_active();
         let playback_lod_changed =
-            self.render_runtime.playback_lod_downshift_active != playback_lod_downshift_active;
-        self.render_runtime.playback_lod_downshift_active = playback_lod_downshift_active;
+            previous_playback_active != snapshot.transient().playback_active();
         if previous_view == next_view && !playback_lod_changed {
             return;
         }

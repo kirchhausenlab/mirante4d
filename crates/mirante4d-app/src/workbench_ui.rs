@@ -939,9 +939,7 @@ impl eframe::App for MiranteWorkbenchApp {
         let playback_started = Instant::now();
         workbench_playback_runtime::enqueue_playback_command_if_due(
             &application_snapshot,
-            view,
             &self.dataset,
-            &mut self.render_runtime,
             &mut application_commands,
             ui.ctx(),
         );

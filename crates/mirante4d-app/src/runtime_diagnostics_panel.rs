@@ -105,10 +105,9 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
         ui,
         "LOD",
         format!(
-            "shown {:?}, target s{}, pending {:?}",
-            app.render_runtime.lod_schedule.displayed_scale_level,
-            app.render_runtime.lod_schedule.target_scale_level,
-            app.render_runtime.lod_schedule.pending_scale_level
+            "shown {:?}, target s{}",
+            app.render_runtime.frame_fidelity.displayed_scale_level,
+            app.render_runtime.frame_fidelity.target_scale_level,
         ),
     );
     ui_kit::property_row(

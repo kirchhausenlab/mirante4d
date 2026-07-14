@@ -289,7 +289,6 @@ fn application_playback_commands_reconcile_transient_state_and_timepoint() {
     let snapshot = app.application.snapshot();
     assert!(snapshot.transient().playback_active());
     assert_eq!(snapshot.transient().last_playback_tick(), None);
-    assert!(app.render_runtime.playback_lod_downshift_active);
     assert_eq!(
         playback_status_label(
             snapshot.transient().playback_active(),
@@ -327,7 +326,6 @@ fn application_playback_commands_reconcile_transient_state_and_timepoint() {
     let snapshot = app.application.snapshot();
     assert!(!snapshot.transient().playback_active());
     assert_eq!(snapshot.transient().last_playback_tick(), None);
-    assert!(!app.render_runtime.playback_lod_downshift_active);
     assert_eq!(
         playback_status_label(
             snapshot.transient().playback_active(),

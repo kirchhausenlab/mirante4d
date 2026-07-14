@@ -1,7 +1,6 @@
 use eframe::egui;
 use mirante4d_application::{ApplicationCommand, ApplicationSnapshot, OperationKind};
 use mirante4d_domain::ViewerLayout;
-use mirante4d_project_model::ViewState;
 
 use crate::{
     BACKGROUND_WORK_REPAINT_INTERVAL,
@@ -82,9 +81,7 @@ pub(crate) const fn source_verification_polling_required(
 
 pub(crate) fn enqueue_playback_command_if_due(
     snapshot: &ApplicationSnapshot,
-    _view: &ViewState,
     dataset: &DatasetDemandState,
-    render: &mut CurrentRenderRuntime,
     commands: &mut Vec<ApplicationCommand>,
     ctx: &egui::Context,
 ) {
@@ -94,7 +91,6 @@ pub(crate) fn enqueue_playback_command_if_due(
 
     let timepoint_count = catalog_timepoint_count(snapshot);
     if timepoint_count <= 1 {
-        render.playback_lod_downshift_active = false;
         commands.push(ApplicationCommand::SetPlaybackActive(false));
         return;
     }
