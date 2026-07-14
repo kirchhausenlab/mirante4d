@@ -99,8 +99,8 @@
       "fixture_tier": "T1-or-T2",
       "capability": "hosted-cpu",
       "hosted_required": true,
-      "packages": ["mirante4d-format", "mirante4d-import", "mirante4d-project-store", "mirante4d-storage"],
-      "selector": "package(mirante4d-format) | package(mirante4d-import) | package(mirante4d-project-store) | package(mirante4d-storage)",
+      "packages": ["mirante4d-format", "mirante4d-import", "mirante4d-import-pipeline", "mirante4d-project-store", "mirante4d-storage"],
+      "selector": "package(mirante4d-format) | package(mirante4d-import) | package(mirante4d-import-pipeline) | package(mirante4d-project-store) | package(mirante4d-storage)",
       "warn_ms": 5000,
       "terminate_ms": 20000,
       "aggregate_timeout_secs": 720
