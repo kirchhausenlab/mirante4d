@@ -30,7 +30,7 @@ use mirante4d_project_model::{
     MAX_CHANNEL_PRESETS, MAX_TOTAL_CHANNEL_PRESET_ENTRIES, ProjectGenerationProjection, ProjectId,
     ProjectRevisionHighWater, ProjectRevisionId, ProjectState, ViewState,
 };
-use mirante4d_render_api::PresentedFrame;
+use mirante4d_render_api::{PresentationPaintRequest, PresentationViewport, PresentedFrame};
 use mirante4d_settings::{RejectedFileDisposition, ResourcePolicy};
 
 /// Maximum number of project revisions retained for undo/redo.
@@ -1324,7 +1324,7 @@ impl ApplicationState {
             pending_settings_change: self.pending_settings_change,
             pending_event_count: self.events.len(),
             latest_problem: self.latest_problem.clone(),
-            presentation: None,
+            presentations: PresentationSnapshot::default(),
         }
     }
 
@@ -3078,6 +3078,86 @@ pub enum WorkspaceSnapshot {
     },
 }
 
+/// One of the viewer's fixed presentation surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PresentationSlot {
+    ThreeD,
+    Xy,
+    Xz,
+    Yz,
+}
+
+impl PresentationSlot {
+    pub const ALL: [Self; 4] = [Self::ThreeD, Self::Xy, Self::Xz, Self::Yz];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::ThreeD => 0,
+            Self::Xy => 1,
+            Self::Xz => 2,
+            Self::Yz => 3,
+        }
+    }
+}
+
+/// Backend-neutral facts needed to paint one viewer surface.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PresentationSurface {
+    viewport: PresentationViewport,
+    frame: Option<PresentedFrame>,
+}
+
+impl PresentationSurface {
+    pub const fn new(viewport: PresentationViewport, frame: Option<PresentedFrame>) -> Self {
+        Self { viewport, frame }
+    }
+
+    pub const fn viewport(&self) -> PresentationViewport {
+        self.viewport
+    }
+
+    pub const fn frame(&self) -> Option<&PresentedFrame> {
+        self.frame.as_ref()
+    }
+
+    pub fn paint_request(&self) -> Option<PresentationPaintRequest> {
+        self.frame
+            .as_ref()
+            .map(|frame| PresentationPaintRequest::new(frame.token(), self.viewport))
+    }
+}
+
+/// The fixed 3D and linked cross-section presentation projection.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PresentationSnapshot {
+    surfaces: [Option<PresentationSurface>; 4],
+}
+
+impl PresentationSnapshot {
+    /// Constructs the four fixed slots directly, so a slot cannot appear
+    /// twice in one snapshot.
+    pub const fn new(
+        three_d: Option<PresentationSurface>,
+        xy: Option<PresentationSurface>,
+        xz: Option<PresentationSurface>,
+        yz: Option<PresentationSurface>,
+    ) -> Self {
+        Self {
+            surfaces: [three_d, xy, xz, yz],
+        }
+    }
+
+    pub fn get(&self, slot: PresentationSlot) -> Option<&PresentationSurface> {
+        self.surfaces[slot.index()].as_ref()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (PresentationSlot, &PresentationSurface)> {
+        PresentationSlot::ALL
+            .into_iter()
+            .filter_map(|slot| self.get(slot).map(|surface| (slot, surface)))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApplicationSnapshot {
     source_generation: SourceSessionGeneration,
@@ -3091,7 +3171,7 @@ pub struct ApplicationSnapshot {
     pending_settings_change: Option<SettingsChangeToken>,
     pending_event_count: usize,
     latest_problem: Option<ApplicationEvent>,
-    presentation: Option<PresentedFrame>,
+    presentations: PresentationSnapshot,
 }
 
 impl ApplicationSnapshot {
@@ -3146,17 +3226,16 @@ impl ApplicationSnapshot {
         self.latest_problem.as_ref()
     }
 
-    /// Returns the renderer-owned frame projection carried only by its opaque
-    /// presentation token and backend-neutral frame facts.
-    pub const fn presentation(&self) -> Option<&PresentedFrame> {
-        self.presentation.as_ref()
+    /// Returns the backend-neutral projection of the viewer's fixed surfaces.
+    pub const fn presentations(&self) -> &PresentationSnapshot {
+        &self.presentations
     }
 
     /// Composition attaches the current presentation projection after taking
     /// an immutable application snapshot. This does not mutate application or
     /// durable project state.
-    pub fn with_presentation(mut self, presentation: Option<PresentedFrame>) -> Self {
-        self.presentation = presentation;
+    pub fn with_presentations(mut self, presentations: PresentationSnapshot) -> Self {
+        self.presentations = presentations;
         self
     }
 

@@ -123,6 +123,9 @@ pub(super) fn accepted_successor_public_root_additions(
         "mirante4d-application" => &[
             "LoadedAnalysisDescriptorBundle",
             "MonotonicClock",
+            "PresentationSlot",
+            "PresentationSnapshot",
+            "PresentationSurface",
             "ProjectRecoveryStoreLocator",
             "ProjectStoreApplicationService",
             "ProjectStoreLifecycle",

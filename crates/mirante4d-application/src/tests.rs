@@ -19,17 +19,19 @@ use mirante4d_project_model::{
 };
 use mirante4d_render_api::{
     FrameCompleteness, FrameCoverage, FrameIdentity, FrameProgress, LayerRenderIntent,
-    PresentationToken, PresentationViewport, PresentedFrame, RenderExtent, RenderIntent,
-    RenderRequirement, RenderRequirementRole, RenderRequirements, RenderViewIntent,
+    PresentationPaintRequest, PresentationToken, PresentationViewport, PresentedFrame,
+    RenderExtent, RenderIntent, RenderRequirement, RenderRequirementRole, RenderRequirements,
+    RenderViewIntent,
 };
 use mirante4d_settings::{GIB, RejectedFileDisposition};
 
 use super::*;
 
 #[test]
-fn snapshot_carries_only_an_optional_backend_neutral_presentation_projection() {
+fn snapshot_carries_four_fixed_backend_neutral_presentation_slots() {
     let snapshot = application().snapshot();
-    assert_eq!(snapshot.presentation(), None);
+    assert_eq!(snapshot.presentations(), &PresentationSnapshot::default());
+    assert_eq!(snapshot.presentations().iter().count(), 0);
 
     let resource_identity = DatasetResourceIdentity::Verified(
         ScientificContentId::parse(&format!(
@@ -69,18 +71,58 @@ fn snapshot_carries_only_an_optional_backend_neutral_presentation_projection() {
         )],
     )
     .unwrap();
-    let presented = PresentedFrame::new(
-        PresentationToken::new(1).unwrap(),
-        extent,
-        FrameProgress::new(
-            FrameCoverage::from_available(&requirements, &[key]).unwrap(),
-            FrameCompleteness::Exact,
-            None,
+    let progress = FrameProgress::new(
+        FrameCoverage::from_available(&requirements, &[key]).unwrap(),
+        FrameCompleteness::Exact,
+        None,
+    )
+    .unwrap();
+    let viewport = PresentationViewport::new(32.0, 24.0).unwrap();
+    let surface = |token| {
+        PresentationSurface::new(
+            viewport,
+            Some(PresentedFrame::new(
+                PresentationToken::new(token).unwrap(),
+                extent,
+                progress.clone(),
+            )),
         )
-        .unwrap(),
+    };
+    let presentations = PresentationSnapshot::new(
+        Some(surface(1)),
+        Some(surface(2)),
+        Some(surface(3)),
+        Some(surface(4)),
     );
-    let projected = snapshot.with_presentation(Some(presented.clone()));
-    assert_eq!(projected.presentation(), Some(&presented));
+    let projected = snapshot.with_presentations(presentations);
+
+    assert_eq!(
+        projected
+            .presentations()
+            .iter()
+            .map(|(slot, _)| slot)
+            .collect::<Vec<_>>(),
+        PresentationSlot::ALL
+    );
+    for (index, slot) in PresentationSlot::ALL.into_iter().enumerate() {
+        let surface = projected.presentations().get(slot).unwrap();
+        let token = PresentationToken::new(u64::try_from(index + 1).unwrap()).unwrap();
+        assert_eq!(surface.frame().unwrap().token(), token);
+        assert_eq!(
+            surface.paint_request(),
+            Some(PresentationPaintRequest::new(token, viewport))
+        );
+    }
+}
+
+#[test]
+fn presentation_surface_without_a_frame_has_no_paint_request() {
+    let viewport = PresentationViewport::new(32.0, 24.0).unwrap();
+    let surface = PresentationSurface::new(viewport, None);
+
+    assert_eq!(surface.viewport(), viewport);
+    assert_eq!(surface.frame(), None);
+    assert_eq!(surface.paint_request(), None);
 }
 
 #[test]
