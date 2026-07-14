@@ -1,14 +1,13 @@
 use glam::{DQuat, DVec2, DVec3};
-use mirante4d_data::SpatialBrickIndex;
 use mirante4d_dataset::ResourceRegion;
 use mirante4d_domain::{GridToWorld, Shape3D};
-use mirante4d_format::CurrentGridToWorldExt;
 use mirante4d_render_api::PresentationViewport;
 
 use crate::{
     BrickGridSpec, RenderError, ResourcePlanCapacityKind, ResourcePlanLimits,
     SemanticRegionGridSpec,
-    brick_plan::{planning_capacity_error, semantic_region},
+    brick_plan::{SpatialBrickIndex, planning_capacity_error, semantic_region},
+    transform::GridToWorldExt,
 };
 
 const EPSILON: f64 = 1.0e-9;
@@ -689,7 +688,6 @@ fn normalized_orientation_or_identity(orientation: DQuat) -> DQuat {
 mod tests {
     use approx::assert_abs_diff_eq;
     use glam::{DQuat, DVec2, DVec3};
-    use mirante4d_data::SpatialBrickIndex;
     use mirante4d_domain::{GridToWorld, Shape3D};
     use mirante4d_render_api::PresentationViewport;
 
@@ -1094,7 +1092,7 @@ mod tests {
         let spec = BrickGridSpec {
             volume_shape: Shape3D::new(32, 32, 32).unwrap(),
             brick_shape: Shape3D::new(4, 4, 4).unwrap(),
-            grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.5, 2.0),
+            grid_to_world: GridToWorld::scale(1.0, 1.5, 2.0).unwrap(),
         };
         let view = CrossSectionView::new(
             DVec3::new(15.5, 22.5, 31.0),
@@ -1167,7 +1165,7 @@ mod tests {
         let spec = BrickGridSpec {
             volume_shape: Shape3D::new(8, 8, 8).unwrap(),
             brick_shape: Shape3D::new(4, 4, 4).unwrap(),
-            grid_to_world: mirante4d_format::grid_to_world_scale_um(1.0, 1.0, 4.0),
+            grid_to_world: GridToWorld::scale(1.0, 1.0, 4.0).unwrap(),
         };
         let view = CrossSectionView::new(
             DVec3::new(3.5, 3.5, 7.0),

@@ -1,8 +1,7 @@
 use std::fmt;
 
 use glam::{DMat4, DVec3};
-use mirante4d_domain::{GridToWorld, TimeIndex};
-use mirante4d_format::LayerId;
+use mirante4d_domain::{GridToWorld, LogicalLayerKey, TimeIndex};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
@@ -42,7 +41,7 @@ pub enum SceneLayerKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CoordinateSpace {
     World,
-    Grid { layer_id: LayerId },
+    Grid { layer_id: LogicalLayerKey },
     Plane { plane_id: PlaneId },
     Screen,
 }
@@ -151,7 +150,7 @@ pub struct PickHit {
     pub kind: PickHitKind,
     pub layer_id: Option<SceneLayerId>,
     pub object_id: Option<SceneObjectId>,
-    pub source_layer_id: Option<LayerId>,
+    pub source_layer_id: Option<LogicalLayerKey>,
     pub timepoint: TimeIndex,
     pub world_position: Option<DVec3>,
     pub grid_position: Option<GridPosition>,
@@ -163,7 +162,7 @@ pub struct PickHit {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VolumePickProbe {
-    pub source_layer_id: LayerId,
+    pub source_layer_id: LogicalLayerKey,
     pub timepoint: TimeIndex,
     pub screen_position: ScreenPosition,
     pub world_position: Option<DVec3>,
@@ -257,7 +256,7 @@ pub struct SceneFrameContext {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SceneGridTransform {
-    pub layer_id: LayerId,
+    pub layer_id: LogicalLayerKey,
     pub grid_to_world: GridToWorld,
 }
 
@@ -291,7 +290,11 @@ impl SceneFrameContext {
         }
     }
 
-    pub fn with_grid_to_world(mut self, layer_id: LayerId, grid_to_world: GridToWorld) -> Self {
+    pub fn with_grid_to_world(
+        mut self,
+        layer_id: LogicalLayerKey,
+        grid_to_world: GridToWorld,
+    ) -> Self {
         self.grid_transforms.push(SceneGridTransform {
             layer_id,
             grid_to_world,
@@ -307,10 +310,10 @@ impl SceneFrameContext {
         self
     }
 
-    fn grid_to_world(&self, layer_id: &LayerId) -> Option<GridToWorld> {
+    fn grid_to_world(&self, layer_id: LogicalLayerKey) -> Option<GridToWorld> {
         self.grid_transforms
             .iter()
-            .find(|transform| &transform.layer_id == layer_id)
+            .find(|transform| transform.layer_id == layer_id)
             .map(|transform| transform.grid_to_world)
     }
 
@@ -747,7 +750,7 @@ pub fn extract_scene_draw_list(layers: &[SceneLayer], context: SceneFrameContext
                 pass: render_pass_for(layer.kind, object.occlusion),
                 coordinate_space: object.coordinate_space.clone(),
                 grid_to_world: match &object.coordinate_space {
-                    CoordinateSpace::Grid { layer_id } => context.grid_to_world(layer_id),
+                    CoordinateSpace::Grid { layer_id } => context.grid_to_world(*layer_id),
                     CoordinateSpace::World
                     | CoordinateSpace::Plane { .. }
                     | CoordinateSpace::Screen => None,
@@ -824,9 +827,11 @@ fn validate_pick_radius(kind: &'static str, value: f32) -> Result<(), SceneError
     }
 }
 
-fn source_layer_id_for_coordinate_space(coordinate_space: &CoordinateSpace) -> Option<LayerId> {
+fn source_layer_id_for_coordinate_space(
+    coordinate_space: &CoordinateSpace,
+) -> Option<LogicalLayerKey> {
     match coordinate_space {
-        CoordinateSpace::Grid { layer_id } => Some(layer_id.clone()),
+        CoordinateSpace::Grid { layer_id } => Some(*layer_id),
         CoordinateSpace::World | CoordinateSpace::Plane { .. } | CoordinateSpace::Screen => None,
     }
 }
@@ -1005,11 +1010,11 @@ mod tests {
 
     #[test]
     fn extraction_preserves_coordinate_space_occlusion_and_selectability() {
-        let source_layer = LayerId::new("ch0").unwrap();
+        let source_layer = LogicalLayerKey::new(0);
         let object = SceneObject::new(
             SceneObjectId::new("roi").unwrap(),
             CoordinateSpace::Grid {
-                layer_id: source_layer.clone(),
+                layer_id: source_layer,
             },
             SceneTime::Static,
             OcclusionPolicy::DepthTestGeometry,
@@ -1045,7 +1050,7 @@ mod tests {
             kind: PickHitKind::Voxel,
             layer_id: None,
             object_id: None,
-            source_layer_id: Some(LayerId::new("ch0").unwrap()),
+            source_layer_id: Some(LogicalLayerKey::new(0)),
             timepoint: TimeIndex::new(12),
             world_position: Some(DVec3::new(1.0, 2.0, 3.0)),
             grid_position: Some(GridPosition {
@@ -1118,7 +1123,7 @@ mod tests {
     fn uint8_voxel_pick_hit_preserves_source_value_and_metadata() {
         let hit = voxel_pick_hit_u8(
             VolumePickProbe {
-                source_layer_id: LayerId::new("u8-ch0").unwrap(),
+                source_layer_id: LogicalLayerKey::new(7),
                 timepoint: TimeIndex::new(6),
                 screen_position: ScreenPosition::new(3.0, 4.0),
                 world_position: Some(DVec3::new(1.25, 2.5, 3.75)),
@@ -1134,7 +1139,7 @@ mod tests {
         );
 
         assert_eq!(hit.kind, PickHitKind::Voxel);
-        assert_eq!(hit.source_layer_id.unwrap().as_str(), "u8-ch0");
+        assert_eq!(hit.source_layer_id.unwrap().ordinal(), 7);
         assert_eq!(hit.timepoint, TimeIndex::new(6));
         assert_eq!(hit.value, Some(PickValue::IntensityU8(u8::MAX)));
         assert_eq!(hit.policy, PickPolicy::MipArgmax);
@@ -1146,7 +1151,7 @@ mod tests {
     fn float32_voxel_pick_hit_preserves_source_value_and_metadata() {
         let hit = voxel_pick_hit_f32(
             VolumePickProbe {
-                source_layer_id: LayerId::new("float-ch0").unwrap(),
+                source_layer_id: LogicalLayerKey::new(9),
                 timepoint: TimeIndex::new(5),
                 screen_position: ScreenPosition::new(3.0, 4.0),
                 world_position: Some(DVec3::new(1.25, 2.5, 3.75)),
@@ -1162,7 +1167,7 @@ mod tests {
         );
 
         assert_eq!(hit.kind, PickHitKind::Voxel);
-        assert_eq!(hit.source_layer_id.unwrap().as_str(), "float-ch0");
+        assert_eq!(hit.source_layer_id.unwrap().ordinal(), 9);
         assert_eq!(hit.timepoint, TimeIndex::new(5));
         assert_eq!(hit.value, Some(PickValue::IntensityF32(-2.5)));
         assert_eq!(hit.policy, PickPolicy::MipArgmax);

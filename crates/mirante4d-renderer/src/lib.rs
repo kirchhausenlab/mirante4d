@@ -9,10 +9,10 @@ pub mod resources;
 pub mod scene;
 pub mod scene_render;
 pub mod transfer;
+mod transform;
 
 use mirante4d_dataset::ResourceContractError;
 use mirante4d_domain::ShapeError;
-use mirante4d_format::CurrentTransformError;
 use mirante4d_render_api::RenderApiError;
 use thiserror::Error;
 
@@ -141,7 +141,7 @@ pub enum RenderError {
     #[error(transparent)]
     ResourceContract(#[from] ResourceContractError),
     #[error(transparent)]
-    Space(#[from] CurrentTransformError),
+    Space(#[from] TransformError),
     #[error(transparent)]
     Camera(#[from] RenderApiError),
 }
@@ -854,7 +854,7 @@ pub fn frame_diagnostics_f32(input_voxels: u64, pixels: &[f32]) -> FrameDiagnost
 }
 
 pub use brick_plan::{
-    BrickGridSpec, BrickPlanOptions, ResourcePlanLimits, SemanticRegionGridSpec,
+    BrickGridSpec, BrickPlanOptions, ResourcePlanLimits, SemanticRegionGridSpec, SpatialBrickIndex,
     plan_visible_bricks, plan_visible_resource_regions,
 };
 pub use camera_mip::{
@@ -893,3 +893,4 @@ pub use transfer::{
     composite_dvr_rgba_channels, composite_f32_intensity_channels, composite_intensity_channels,
     composite_iso_surface_channels, composite_iso_surface_f32_channels,
 };
+pub use transform::TransformError;

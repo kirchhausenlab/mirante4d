@@ -1,12 +1,11 @@
 use glam::{DMat4, DVec3};
 use mirante4d_domain::{GridToWorld, Projection};
-use mirante4d_format::CurrentGridToWorldExt;
 use mirante4d_render_api::CameraFrame;
 
 use super::GpuRenderError;
 use crate::{
     CameraRenderMode, CameraRenderModeF32, CameraRenderQuality, IntensitySamplingPolicy,
-    IsoShadingMode, RenderError, RenderViewport, ScalarDisplayTransfer,
+    IsoShadingMode, RenderError, RenderViewport, ScalarDisplayTransfer, transform::GridToWorldExt,
 };
 
 pub(super) const GPU_PARAM_SAMPLING_POLICY_INDEX: usize = 25;
@@ -330,12 +329,12 @@ mod tests {
 
     #[test]
     fn camera_grid_params_store_inverse_transpose_normal_transform() {
-        let grid_to_world = mirante4d_format::grid_to_world_from_dmat4(DMat4::from_cols_array(&[
-            2.0, 0.0, 0.0, 0.0, //
-            0.25, 3.0, 0.0, 0.0, //
-            0.0, 0.5, 4.0, 0.0, //
-            7.0, 11.0, 13.0, 1.0,
-        ]))
+        let grid_to_world = GridToWorld::from_row_major([
+            2.0, 0.25, 0.0, 7.0, //
+            0.0, 3.0, 0.5, 11.0, //
+            0.0, 0.0, 4.0, 13.0, //
+            0.0, 0.0, 0.0, 1.0,
+        ])
         .unwrap();
         let camera = crate::current_camera::frame_from_look_at(
             Projection::Orthographic,

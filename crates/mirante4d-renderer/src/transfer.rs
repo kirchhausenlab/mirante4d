@@ -824,12 +824,45 @@ fn map_curve(curve: TransferCurve, value: f32) -> f32 {
 mod tests {
     use glam::DVec3;
     use mirante4d_domain::{DisplayWindow, IsoLightState, Projection, RgbColor, TransferCurve};
-    use mirante4d_format::LayerDisplay;
     use mirante4d_render_api::CameraAxes;
 
     use crate::{IsoSurfaceFrameF32, IsoSurfaceFrameU16, IsoSurfaceNormal, PixelCoverage};
 
     use super::*;
+
+    struct LayerDisplay {
+        visible: bool,
+        window: DisplayWindow,
+        opacity: Opacity,
+    }
+
+    impl LayerDisplay {
+        fn new(
+            visible: bool,
+            window: DisplayWindow,
+            opacity: f32,
+        ) -> Result<Self, mirante4d_domain::DisplayError> {
+            Ok(Self {
+                visible,
+                window,
+                opacity: Opacity::new(opacity)?,
+            })
+        }
+
+        fn visible(&self) -> bool {
+            self.visible
+        }
+
+        fn layer_transfer(&self, color: RgbColor) -> LayerTransfer {
+            LayerTransfer::new(
+                self.window,
+                color,
+                self.opacity,
+                TransferCurve::linear(),
+                false,
+            )
+        }
+    }
 
     fn default_iso_light() -> (IsoLightState, CameraAxes) {
         let camera = crate::current_camera::frame_from_look_at(
