@@ -367,7 +367,7 @@ fn test_workbench_app_without_background_runtime(
         analysis_runtime,
     } = opened;
     let resource_policy = ResourcePolicy::default();
-    let ui_runtime = current_runtime::ui::CurrentUiRuntime::new(resource_policy, None, None);
+    let ui_runtime = current_runtime::ui::CurrentUiRuntime::new(resource_policy);
     let (mut settings_connection, _) =
         current_settings_connection::CurrentSettingsConnection::start();
     settings_connection
@@ -379,6 +379,7 @@ fn test_workbench_app_without_background_runtime(
         startup_diagnostics,
         dataset,
         render_runtime,
+        native_presentation: native_presentation::NativePresentationBridge::unavailable(),
         ui_runtime,
         import_runtime: current_runtime::import::ImportRuntime::idle(),
         analysis_runtime,

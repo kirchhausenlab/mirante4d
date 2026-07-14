@@ -26,6 +26,7 @@ mod histogram;
 mod import_ui;
 mod layer_state;
 mod lod_scheduler;
+mod native_presentation;
 mod playback;
 mod product_automation;
 mod product_render_intent;
@@ -487,6 +488,7 @@ pub struct MiranteWorkbenchApp {
     startup_diagnostics: StartupDiagnostics,
     dataset: dataset_requests::DatasetDemandState,
     render_runtime: current_runtime::render::CurrentRenderRuntime,
+    native_presentation: native_presentation::NativePresentationBridge,
     ui_runtime: current_runtime::ui::CurrentUiRuntime,
     import_runtime: current_runtime::import::ImportRuntime,
     analysis_runtime: current_runtime::analysis::AnalysisProductRuntime,
@@ -553,7 +555,10 @@ impl MiranteWorkbenchApp {
             .wgpu_render_state
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("the interactive viewer requires the WGPU renderer"))?;
-        let wgpu_texture_renderer = Some(render_state.renderer.clone());
+        let native_presentation = native_presentation::NativePresentationBridge::new(
+            render_state.renderer.clone(),
+            render_state.device.clone(),
+        );
         let validation_runtime =
             current_runtime::validation::CurrentValidationRuntime::from_environment();
         let validation_capture = validation_runtime.product_automation.is_some();
@@ -575,11 +580,7 @@ impl MiranteWorkbenchApp {
         render_runtime.product_gpu = Some(current_runtime::render::ProductGpuRenderRuntime::new(
             product_renderer,
         ));
-        let ui_runtime = current_runtime::ui::CurrentUiRuntime::new(
-            resource_policy,
-            wgpu_texture_renderer,
-            Some(render_state.device.clone()),
-        );
+        let ui_runtime = current_runtime::ui::CurrentUiRuntime::new(resource_policy);
         let (project_recovery_root, recovery_root_warning) =
             initialize_project_recovery_root(dataset.selected_path());
         let (project_store, discovery_warning) =
@@ -591,6 +592,7 @@ impl MiranteWorkbenchApp {
             startup_diagnostics,
             dataset,
             render_runtime,
+            native_presentation,
             ui_runtime,
             import_runtime: current_runtime::import::ImportRuntime::idle(),
             analysis_runtime,

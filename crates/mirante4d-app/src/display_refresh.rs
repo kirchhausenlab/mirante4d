@@ -507,32 +507,9 @@ impl MiranteWorkbenchApp {
         let token = target.token;
         let existing = target.texture_id;
         let view = product.renderer.presentation_texture_view(token)?;
-        let Some(texture_renderer) = self.ui_runtime.wgpu_texture_renderer.as_ref() else {
-            #[cfg(test)]
-            if existing.is_some() {
-                return Ok(());
-            }
-            anyhow::bail!("wgpu texture renderer is unavailable");
-        };
-        let device = self
-            .ui_runtime
-            .wgpu_device
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("wgpu device is unavailable"))?;
-        let mut texture_renderer = texture_renderer.write();
-        let texture_id = if let Some(texture_id) = existing {
-            if extent_changed {
-                texture_renderer.update_egui_texture_from_wgpu_texture(
-                    device,
-                    view,
-                    gpu_display_texture_filter(),
-                    texture_id,
-                );
-            }
-            texture_id
-        } else {
-            texture_renderer.register_native_texture(device, view, gpu_display_texture_filter())
-        };
+        let texture_id = self
+            .native_presentation
+            .bind_texture(view, existing, extent_changed)?;
         self.render_runtime
             .product_gpu
             .as_mut()
@@ -715,22 +692,5 @@ fn render_backend_for_mode(mode: RenderMode) -> RenderBackend {
         RenderMode::Mip => RenderBackend::GpuCameraMip,
         RenderMode::Isosurface => RenderBackend::GpuCameraIso,
         RenderMode::Dvr => RenderBackend::GpuCameraDvr,
-    }
-}
-
-fn gpu_display_texture_filter() -> eframe::wgpu::FilterMode {
-    eframe::wgpu::FilterMode::Linear
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn gpu_display_texture_handoff_uses_linear_filtering() {
-        assert_eq!(
-            gpu_display_texture_filter(),
-            eframe::wgpu::FilterMode::Linear
-        );
     }
 }
