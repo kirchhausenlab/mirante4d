@@ -302,10 +302,11 @@ Protected-main policy and Rust checks also passed in
 [run 29273392030](https://github.com/kirchhausenlab/mirante4d/actions/runs/29273392030).
 This qualifies only the exact B2 off-product ext4 tuple and revision. B3 is
 accepted on protected main at
-`8fdd94dc9c60406e8de8a96749d7148d38b1dc7a`. The B4 candidate adds focused
-coverage for the sole product service route, predecessor absence, project
-lifecycle semantics, and the fixed three-launch native scenario. Its final
-clean-revision evidence and protected-main acceptance remain pending.
+`8fdd94dc9c60406e8de8a96749d7148d38b1dc7a`. B4 and WP-10B are accepted at
+`8257f8c5bdc011651c8e74ab85dfdc86717b82d6`, tagged
+`foundation-wp-10b-exit-1`, after the focused product-persistence checks, the
+three-launch native scenario, exact-main public checks, and the already
+accepted durability evidence. No redundant power-cut rerun is required.
 
 Run the supporting B3 product scenario on the real display with:
 
@@ -316,23 +317,16 @@ cargo xtask product-validate b3_source_verification
 The accepted B3 scenario uses a small generated T2 package and remains
 supporting E1 evidence.
 
-On one exact clean committed revision, first produce the trusted project-store
-report, then run the B4 candidate on a real X11 display:
+The B4 automation remains available for future project-persistence changes,
+but ordinary foundation work does not rerun its accepted durability matrix.
 
-```bash
-MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
-  cargo xtask verify-local project-store-lifecycle
-
-MIRANTE4D_PRODUCT_VALIDATE_PROJECT_STORE_LIFECYCLE_REPORT=<report.json> \
-  cargo xtask product-validate b4_project_persistence
-```
-
-The second command requires the first report to name the same clean commit and
-tree. It retains three zero-retry launches: initial Save, edit-during-save,
-real 30-second autosave and external `SIGKILL`; relaunch, recovery and Save As;
-then clean final reopen and joined close. It externally observes exact mapped
-client sizes of 1280x720 and 1920x1080 and compares the source closure around
-every launch. The automation exists, but no qualifying B4 run is claimed here.
+The current WP-11 exit candidate passes focused importer unit, contract, and
+integration checks for supported source admission, bounded/restartable work,
+deterministic sharded output, cancellation and failure safety, multiscale edge
+behavior, and atomic publication. An importer-produced package also passed the
+existing independent target reader. This is off-product automated evidence;
+protected-main acceptance and the create-once exit tag remain pending, and
+product activation belongs to WP-10C. WP-12 has not started.
 
 The checked independent source report supports only the WP-03 source-TIFF
 archive. WP-10A is accepted off-product and its target authority is promoted.

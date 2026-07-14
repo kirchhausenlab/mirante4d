@@ -105,14 +105,12 @@ OD-018 and D-007 are resolved: production arrays use Zarr v3 indexed sharding:
   the test is specifically about that layout. Import output, product fixtures,
   representative benchmarks, and public data never do.
 
-Import preflight reports estimated logical-brick count, shard count, total
-physical object count, maximum objects in one directory, minimum-read bytes,
-and expected metadata/index objects. WP-10A must set per-profile object-count
-and directory-fan-out limits before the first target-profile production write
-or candidate and no later than WP-10C entry; DS-0 through DS-4 acceptance then
-verifies actual counts. Any plan that maps logical bricks to individual files,
-creates per-brick sidecars, or exceeds the approved physical object/fan-out
-limit is rejected before writing payloads.
+Import preflight derives checked logical-brick, shard, physical-object,
+directory-fan-out, minimum-read, and metadata/index counts. Small fixtures
+verify derived versus actual counts; large-profile limits use checked
+arithmetic without materializing large packages. Any plan that maps logical
+bricks to individual files, creates per-brick sidecars, or exceeds an approved
+physical object or fan-out limit is rejected before writing payloads.
 
 Illustratively, the approved `DS-3` boundary has about `94,710` logical bricks
 at `s0`; grouping `4 x 4 x 4` spatial bricks per shard yields about `1,683`

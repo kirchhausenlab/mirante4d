@@ -392,28 +392,33 @@ Exit proof and deletion gate:
 
 ### WP-11 — Import Pipeline Rebuild
 
-Goal: turn import into a bounded, resumable, reproducible producer for the new
-format and public-data workflow before that format becomes the sole product
-source.
+Goal: build one bounded, resumable, reproducible off-product importer for the
+accepted target format. Product activation remains WP-10C work; public-data
+release remains a later open-data workflow.
 
 Required work:
 
-- Define explicit inspect, decode, transform, statistics, hash, multiscale,
-  write, verify, and commit stages.
-- Fuse redundant source passes where correctness permits.
-- Bound memory and I/O in bytes; avoid materializing complete large timepoints
-  or all scale levels.
-- Journal progress and define cancellation/restart semantics.
-- Calculate checksums/statistics during production and avoid duplicate full
-  validation passes.
-- Produce machine-readable provenance sufficient to reproduce public derived
-  packages.
-- Preserve source immutability and safe staged/backup commit behavior.
-- Promote independently governed source TIFF/OME-TIFF bytes and scientific/
-  calibration facts before importer acceptance. Independently read back the
-  produced target package and compare those facts; report actual package-wide
-  shard/object/directory counts and one-brick storage/decode amplification, not
-  only writer-to-reader agreement.
+- Implement a clear bounded flow from source inspection through streamed
+  decoding, transformation, statistics and scientific hashing, multiscale
+  production, validation, and commit. Combine passes where safe.
+- Bound memory, queues, and I/O in bytes. Never materialize a complete large
+  timepoint or all scale levels.
+- Persist only the minimal bounded checkpoint state needed to validate and
+  resume completed work units; otherwise clean the owned stage and restart.
+- Calculate checksums and statistics while data is already flowing and avoid a
+  duplicate full validation pass.
+- Record canonical source, recipe, and derivation facts sufficient to reproduce
+  the import. Rights, citation, release, DOI, and publication records remain
+  deferred.
+- Never modify source input. Write into an owned sibling stage, validate it,
+  and atomically publish only to a previously absent destination. Collision,
+  cancellation, or precommit failure leaves source and existing destinations
+  unchanged.
+- Reuse the accepted source-TIFF fixture and expected facts. Read importer
+  output with the existing independent target reader and compare scientific
+  values, validity, axes, calibration, and transforms. Verify actual shard,
+  object, and fan-out bounds on the small output plus one focused one-brick
+  amplification case.
 - Complete the replacement package producer off-product. The current importer
   remains the sole reachable product importer until WP-10C atomically activates
   the replacement and deletes the predecessor; no temporary old-format output,
@@ -421,15 +426,15 @@ Required work:
 
 Exit proof:
 
-- Peak RSS, throughput, cancellation latency, restart, disk-space, corruption,
-  and transaction tests pass for named fixtures/datasets.
-- A clean environment can reproduce the approved small public native fixture
-  from its declared source and pipeline inputs. Representative private T5
-  imports validate the same bounded pipeline with sanitized evidence; the
-  follow-on WP-13A later assigns and freezes full release-candidate digests.
-- The replacement contains none of the old full-decode review, redundant
-  execute/inspection scan, duplicate validation route, or unbounded timepoint/
-  scale materialization paths. Deletion of the still-reachable current importer
+- Focused tests cover source grouping and rejection, bounded buffers and
+  queues, deterministic two-run output, cancellation cleanup, one interrupted
+  restart, free-space refusal, corrupt checkpoint/output rejection,
+  destination collision, and atomic publication.
+- One clean end-to-end run imports the accepted small source corpus, proves
+  source bytes unchanged, and passes independent target readback. A practical
+  local real-data import may be diagnostic but is not an exit requirement.
+- The replacement contains no full-timepoint or all-scale materialization and
+  no duplicate product route. Deletion of the still-reachable current importer
   belongs exclusively to WP-10C.
 
 ### WP-12 — Analysis Runtime Rebuild

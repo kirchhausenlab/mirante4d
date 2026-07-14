@@ -10,6 +10,7 @@ members = [
     "crates/mirante4d-format",
     "crates/mirante4d-identity",
     "crates/mirante4d-import",
+    "crates/mirante4d-import-pipeline",
     "crates/mirante4d-project-model",
     "crates/mirante4d-project-store",
     "crates/mirante4d-render-api",
@@ -74,6 +75,7 @@ mirante4d-domain = { path = "crates/mirante4d-domain" }
 mirante4d-format = { path = "crates/mirante4d-format" }
 mirante4d-identity = { path = "crates/mirante4d-identity" }
 mirante4d-import = { path = "crates/mirante4d-import" }
+mirante4d-import-pipeline = { path = "crates/mirante4d-import-pipeline" }
 mirante4d-project-model = { path = "crates/mirante4d-project-model" }
 mirante4d-project-store = { path = "crates/mirante4d-project-store" }
 mirante4d-render-api = { path = "crates/mirante4d-render-api" }

@@ -14,10 +14,11 @@ use crate::shard::encode_shard_index_tail;
 use crate::{
     ControlError, DatasetProfileAdmission, DisplayDefaults, LocalPackageCatalog, ManifestRoot,
     OmeImageGroupMetadata, PackageObjectDescriptor, PackageObjectKind, PackageOpenError,
-    PackagePath, PackageStructureError, PortableRecord, ProfileHeader, ProfileKind, RangeReadError,
-    ScienceDescriptor, ShardCodecError, ShardProfileKind, StorageProfileError, ZarrArrayMetadata,
-    ZarrGroupMetadata, ZarrMetadataError, encode_inner_payload, manifest_page_path,
-    pack_manifest_pages, profile_limits,
+    PackagePath, PackageStructureError, PackageValidationError, PortableRecord, ProfileHeader,
+    ProfileKind, RangeReadError, ScienceDescriptor, ScientificPackageValidationError,
+    ShardCodecError, ShardProfileKind, StorageProfileError, ZarrArrayMetadata, ZarrGroupMetadata,
+    ZarrMetadataError, encode_inner_payload, manifest_page_path, pack_manifest_pages,
+    profile_limits,
 };
 
 const PROFILE_PATH: &str = "m4d/profile.json";
@@ -173,6 +174,10 @@ pub enum PackageWriteError {
     #[error(transparent)]
     Structure(#[from] PackageStructureError),
     #[error(transparent)]
+    ExactValidation(PackageValidationError),
+    #[error(transparent)]
+    ScientificValidation(ScientificPackageValidationError),
+    #[error(transparent)]
     Range(#[from] RangeReadError),
     #[error(transparent)]
     Profile(#[from] StorageProfileError),
@@ -182,6 +187,12 @@ pub enum PackageWriteError {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalPackageWriter;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StagedValidation {
+    Structure,
+    Scientific,
+}
+
 impl LocalPackageWriter {
     /// Writes, validates, and atomically publishes one previously absent
     /// package directory.
@@ -189,6 +200,42 @@ impl LocalPackageWriter {
         destination: impl AsRef<Path>,
         input: PackageWriteInput<I>,
         mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<PackageWriteReceipt, PackageWriteError>
+    where
+        I: IntoIterator<Item = PackageShardInput>,
+    {
+        Self::write_new_with_validation(
+            destination,
+            input,
+            &mut is_cancelled,
+            StagedValidation::Structure,
+        )
+    }
+
+    /// Writes a new package, proves its exact-byte closure and declared
+    /// scientific identity while it is staged, and publishes it atomically
+    /// only after both validations succeed.
+    pub fn write_new_scientifically_validated<I>(
+        destination: impl AsRef<Path>,
+        input: PackageWriteInput<I>,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<PackageWriteReceipt, PackageWriteError>
+    where
+        I: IntoIterator<Item = PackageShardInput>,
+    {
+        Self::write_new_with_validation(
+            destination,
+            input,
+            &mut is_cancelled,
+            StagedValidation::Scientific,
+        )
+    }
+
+    fn write_new_with_validation<I>(
+        destination: impl AsRef<Path>,
+        input: PackageWriteInput<I>,
+        mut is_cancelled: &mut impl FnMut() -> bool,
+        staged_validation: StagedValidation,
     ) -> Result<PackageWriteReceipt, PackageWriteError>
     where
         I: IntoIterator<Item = PackageShardInput>,
@@ -212,6 +259,8 @@ impl LocalPackageWriter {
             &ome_images,
             arrays,
         )?;
+        drop((science, display_defaults, portable_records, ome_images));
+        let PreparedMetadata { objects, arrays } = prepared;
         let limits = profile_limits(profile_kind);
         let shard_input_limit = limits
             .pixel_shards
@@ -228,7 +277,7 @@ impl LocalPackageWriter {
         let mut snapshots = Vec::new();
         let mut written_paths = BTreeSet::new();
 
-        for object in prepared.objects {
+        for object in objects {
             check_cancelled(&mut is_cancelled)?;
             require_descriptor_capacity(descriptors.len(), limits.total_physical_objects)?;
             require_new_path(&mut written_paths, &object.path)?;
@@ -239,7 +288,10 @@ impl LocalPackageWriter {
         }
 
         let mut shard_inputs_seen = 0_u64;
-        for shard in shards {
+        let mut shards = shards.into_iter();
+        // A `for` loop would consume and drop the iterator before validation.
+        #[allow(clippy::while_let_on_iterator)]
+        while let Some(shard) = shards.next() {
             check_cancelled(&mut is_cancelled)?;
             shard_inputs_seen =
                 shard_inputs_seen
@@ -250,13 +302,11 @@ impl LocalPackageWriter {
             if shard_inputs_seen > shard_input_limit {
                 return invalid_input("shard inputs exceed the selected profile bound");
             }
-            let array =
-                prepared
-                    .arrays
-                    .get(&shard.array_path)
-                    .ok_or(PackageWriteError::InvalidInput {
-                        reason: "a shard names an array outside the profile",
-                    })?;
+            let array = arrays
+                .get(&shard.array_path)
+                .ok_or(PackageWriteError::InvalidInput {
+                    reason: "a shard names an array outside the profile",
+                })?;
             let expected_coordinates = match array.shard_kind {
                 PackageObjectKind::PackedIndexShard => 2,
                 PackageObjectKind::PixelShard | PackageObjectKind::ValidityShard => 5,
@@ -302,6 +352,7 @@ impl LocalPackageWriter {
         }
 
         check_cancelled(&mut is_cancelled)?;
+        drop((arrays, written_paths));
         let pages = pack_manifest_pages(descriptors)?;
         let root = ManifestRoot::new(&pages)?;
         for (ordinal, page) in pages.iter().enumerate() {
@@ -313,7 +364,9 @@ impl LocalPackageWriter {
             let snapshot = write_authority_bytes(&mut publication, path, &page.canonical_bytes()?)?;
             snapshots.push(snapshot);
         }
+        drop(pages);
         let root_path = profile.manifest_root_path().clone();
+        drop(profile);
         let root_snapshot =
             write_authority_bytes(&mut publication, root_path, &root.canonical_bytes()?)?;
         snapshots.push(root_snapshot);
@@ -337,7 +390,25 @@ impl LocalPackageWriter {
             check_cancelled(&mut is_cancelled)?;
             catalog.reader().revalidate_snapshot(snapshot)?;
         }
+        drop(snapshots);
         check_cancelled(&mut is_cancelled)?;
+
+        if staged_validation == StagedValidation::Scientific {
+            let exact = catalog
+                .validate_exact_package(profile_kind, &mut is_cancelled)
+                .map_err(map_exact_validation_error)?;
+            if exact.package_id() != package_id || exact.admission() != admission {
+                return invalid_input("staged exact validation disagrees with writer admission");
+            }
+            exact
+                .validate_scientific_content(&mut is_cancelled)
+                .map_err(map_scientific_validation_error)?;
+            check_cancelled(&mut is_cancelled)?;
+        }
+
+        // Some lazy producers retain the final bounded-memory lease in their
+        // iterator. Keep that lease alive through staged validation.
+        drop(shards);
 
         publication
             .commit(package_id)
@@ -767,6 +838,22 @@ fn map_structure_error(error: PackageStructureError) -> PackageWriteError {
     }
 }
 
+fn map_exact_validation_error(error: PackageValidationError) -> PackageWriteError {
+    if matches!(error, PackageValidationError::Cancelled) {
+        PackageWriteError::Cancelled
+    } else {
+        PackageWriteError::ExactValidation(error)
+    }
+}
+
+fn map_scientific_validation_error(error: ScientificPackageValidationError) -> PackageWriteError {
+    if matches!(error, ScientificPackageValidationError::Cancelled) {
+        PackageWriteError::Cancelled
+    } else {
+        PackageWriteError::ScientificValidation(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -952,6 +1039,58 @@ mod tests {
     }
 
     #[test]
+    fn scientific_writer_validates_the_stage_before_publication() {
+        let root = TestDirectory::new("scientific-stage-validation");
+        let mismatch = root.0.join("mismatch.m4d");
+        let computed = match LocalPackageWriter::write_new_scientifically_validated(
+            &mismatch,
+            fixture_input(BrickMode::PixelPresent, false),
+            || false,
+        )
+        .unwrap_err()
+        {
+            PackageWriteError::ScientificValidation(
+                ScientificPackageValidationError::ScientificContentMismatch { computed, .. },
+            ) => computed,
+            other => panic!("unexpected staged-validation error: {other}"),
+        };
+        assert!(!mismatch.exists());
+
+        let validated = root.0.join("validated.m4d");
+        let receipt = LocalPackageWriter::write_new_scientifically_validated(
+            &validated,
+            fixture_input_with_scientific_id(BrickMode::PixelPresent, false, computed),
+            || false,
+        )
+        .unwrap();
+        let capability = LocalPackageCatalog::open(&validated)
+            .unwrap()
+            .validate_exact_package(ProfileKind::Ds0, || false)
+            .unwrap()
+            .validate_scientific_content(|| false)
+            .unwrap();
+        assert_eq!(capability.package_id(), receipt.package_id());
+        assert_eq!(capability.scientific_content_id(), computed);
+
+        let cancelled = root.0.join("cancelled.m4d");
+        let error = LocalPackageWriter::write_new_scientifically_validated(
+            &cancelled,
+            fixture_input_with_scientific_id(BrickMode::PixelPresent, false, computed),
+            || true,
+        )
+        .unwrap_err();
+        assert!(matches!(error, PackageWriteError::Cancelled));
+        assert!(!cancelled.exists());
+        assert!(!fs::read_dir(&root.0).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".mirante4d-stage-")
+        }));
+    }
+
+    #[test]
     fn lazy_shard_input_stops_at_the_selected_profile_bound() {
         let root = TestDirectory::new("input-bound");
         let destination = root.0.join("bounded.m4d");
@@ -1009,6 +1148,14 @@ mod tests {
     }
 
     fn fixture_input(mode: BrickMode, reverse: bool) -> PackageWriteInput<Vec<PackageShardInput>> {
+        fixture_input_with_scientific_id(mode, reverse, scientific_id())
+    }
+
+    fn fixture_input_with_scientific_id(
+        mode: BrickMode,
+        reverse: bool,
+        scientific_id: ScientificContentId,
+    ) -> PackageWriteInput<Vec<PackageShardInput>> {
         let temporal = ScienceTemporalCalibration::regular(bits64("3ff0000000000000")).unwrap();
         let explicit = matches!(
             mode,
@@ -1027,7 +1174,7 @@ mod tests {
         )
         .unwrap();
         let profile = ProfileHeader::new(
-            scientific_id(),
+            scientific_id,
             vec![image.clone()],
             0,
             if explicit {
@@ -1038,7 +1185,7 @@ mod tests {
         )
         .unwrap();
         let science = ScienceDescriptor::new(
-            scientific_id(),
+            scientific_id,
             vec![
                 ScienceLayer::new(
                     LogicalLayerKey::new(0),

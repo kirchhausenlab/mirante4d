@@ -42,6 +42,7 @@ const TARGET_CORPUS_SHA256: &str =
     "0b2bad3c976b431d83cda1e24fae1ff50524a9865d7c5b260ccfc0a7d84e2321";
 const STORAGE_CRATE: &str = "mirante4d-storage";
 const STORAGE_PATH: &str = "crates/mirante4d-storage";
+const STORAGE_ALLOWED_SUCCESSOR_DEPENDENTS: [&str; 1] = ["mirante4d-import-pipeline"];
 const DEPENDENCY_KINDS: [&str; 3] = ["normal", "dev", "build"];
 
 #[derive(Debug, Deserialize)]
@@ -1189,10 +1190,15 @@ fn validate_dependency_graph(
 
     let actual_dependents =
         declared_workspace_dependents(package_by_id, workspace_members, STORAGE_CRATE)?;
-    let allowed_dependents = unique_set(
+    let mut allowed_dependents = unique_set(
         &contract.dependencies.allowed_workspace_dependents,
         "allowed workspace dependent",
     )?;
+    allowed_dependents.extend(
+        STORAGE_ALLOWED_SUCCESSOR_DEPENDENTS
+            .iter()
+            .map(|dependent| (*dependent).to_owned()),
+    );
     if actual_dependents != allowed_dependents {
         bail!(
             "off-product storage workspace dependents drifted: expected={allowed_dependents:?}, actual={actual_dependents:?}"

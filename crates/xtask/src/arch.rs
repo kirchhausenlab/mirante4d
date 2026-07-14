@@ -863,6 +863,7 @@ fn check_wp07b_live_cutover(
         ("mirante4d-application", "mirante4d-render-api"),
         ("mirante4d-data", "mirante4d-dataset"),
         ("mirante4d-dataset-runtime", "mirante4d-dataset"),
+        ("mirante4d-import-pipeline", "mirante4d-dataset"),
         ("mirante4d-render-api", "mirante4d-dataset"),
         ("mirante4d-render-reference", "mirante4d-dataset"),
         ("mirante4d-render-reference", "mirante4d-render-api"),

@@ -2101,7 +2101,7 @@ fn verify_pr_rust() -> anyhow::Result<()> {
     let audit_ok = if discovery_ok {
         phases.run(
             "discovery-audit",
-            "in-process exact discovery audit",
+            "in-process lane-assignment discovery audit",
             || {
                 discovered_counts = registry::audit_discovery(&discovery_path, &registry)?;
                 for (lane, count) in &discovered_counts {

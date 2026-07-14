@@ -8,7 +8,7 @@ import/preprocessing workflows.
 
 ## Workspace Boundaries
 
-The workspace has nineteen packages (eighteen `mirante4d-*` crates plus
+The workspace has twenty packages (nineteen `mirante4d-*` crates plus
 `xtask`):
 
 - `mirante4d-domain`: validated framework-neutral geometry, view, transfer,
@@ -40,6 +40,9 @@ The workspace has nineteen packages (eighteen `mirante4d-*` crates plus
   portable package paths, bounded local validation/reads, an exact-package
   capability, and a deterministic create-only local writer; currently no
   product authority.
+- `mirante4d-import-pipeline`: off-product bounded, cancellable, restartable
+  TIFF/OME-TIFF producer for validated sharded target packages; WP-10C owns its
+  future product activation.
 - `mirante4d-data`, `mirante4d-format`, `mirante4d-import`,
   `mirante4d-analysis`, and `mirante4d-renderer`: current storage/runtime,
   format, import, analysis, and rendering implementations.
@@ -49,9 +52,10 @@ The workspace has nineteen packages (eighteen `mirante4d-*` crates plus
 `mirante4d-core` and the predecessor application/session/preferences models
 do not exist. Lower crates do not depend on the app/UI layer; the renderer
 does not read files; format code does not own viewer state.
-No product crate depends on `mirante4d-storage`, `mirante4d-render-reference`,
-or `mirante4d-render-wgpu`. WP-10C owns the storage cutover and WP-09B owns the
-render cutover.
+No product crate depends on `mirante4d-storage`,
+`mirante4d-import-pipeline`, `mirante4d-render-reference`, or
+`mirante4d-render-wgpu`. WP-10C owns the storage/import cutover and WP-09B owns
+the render cutover.
 
 ## Application Composition
 
@@ -232,8 +236,8 @@ lane. Save As copies and rehashes that authenticated closure into destination-
 local staging. The application service implements the injected-monotonic-
 clock 30-second-idle/120-second-maximum autosave schedule over the real actor,
 including edit-during-capture, failure, cancellation, and indeterminate-write
-semantics. The B4 candidate constructs and polls it as the sole product project
-route and deletes the project-v15 bridge and `CurrentProjectRuntime`. New,
+semantics. The accepted B4 cutover constructs and polls it as the sole product
+project route and deletes the project-v15 bridge and `CurrentProjectRuntime`. New,
 Open, Save, Save As, recovery selection, dirty close, source replacement, and
 application exit all pass through the service and joined actor lifecycle.
 

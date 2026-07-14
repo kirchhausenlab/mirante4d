@@ -71,9 +71,9 @@ MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
   cargo xtask verify-local trusted-gpu
 ```
 
-Run the WP-10B project-store power-cut qualification only on the trusted Linux
-machine, from a clean revision with the pinned KVM/QEMU environment. The lane
-downloads, verifies, and extracts its exact nbdkit package without root access:
+The accepted WP-10B project-store power-cut qualification remains available
+only for future changes to that durability boundary. Do not rerun it for
+unrelated foundation work:
 
 ```bash
 MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
@@ -88,20 +88,8 @@ The accepted B3 current-source verification support scenario remains available:
 cargo xtask product-validate b3_source_verification
 ```
 
-For the B4 candidate, run both commands from the same clean committed revision
-on the trusted Linux/X11 workstation:
-
-```bash
-MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
-  cargo xtask verify-local project-store-lifecycle
-
-MIRANTE4D_PRODUCT_VALIDATE_PROJECT_STORE_LIFECYCLE_REPORT=<report.json> \
-  cargo xtask product-validate b4_project_persistence
-```
-
-Replace `<report.json>` with the aggregate emitted by the first command. The
-validator requires that report's exact clean commit and tree, a real X11
-display, and the externally observed 1280x720 and 1920x1080 client sizes.
+The B4 native automation is likewise retained for future changes to product
+project persistence, not as a recurring acceptance ritual.
 
 ## Working Rules
 
