@@ -244,7 +244,7 @@ fn target_fixture_render_modes_script_switches_supported_modes() {
             .iter()
             .filter(|&&name| name == "set_render_mode")
             .count(),
-        3
+        4
     );
     assert!(commands.iter().any(|command| {
         command["command"] == "set_layer_window"
@@ -273,7 +273,7 @@ fn target_fixture_render_modes_script_switches_supported_modes() {
             .iter()
             .filter(|&&name| name == "set_layer_render_mode")
             .count(),
-        3
+        4
     );
     assert!(commands.iter().any(|command| {
         command["command"] == "set_layer_render_mode"
@@ -317,6 +317,18 @@ fn target_fixture_render_modes_script_switches_supported_modes() {
             .iter()
             .any(|command| command["name"] == "generated-iso")
     );
+    assert!(commands.iter().any(|command| {
+        command["condition"]["viewer_layout"]["layout"].as_str() == Some("four_panel")
+    }));
+    assert!(commands.iter().any(|command| {
+        command["condition"]["cross_section_panel_schedule"]["panel"].as_str() == Some("xz")
+    }));
+    assert!(commands.iter().any(|command| {
+        command["condition"]["render_target_pixels"]["width"].as_u64()
+            == Some(u64::from(GENERATED_RESIZED_VIEWPORT_WIDTH))
+            && command["condition"]["render_target_pixels"]["height"].as_u64()
+                == Some(u64::from(GENERATED_RESIZED_VIEWPORT_HEIGHT))
+    }));
     assert!(
         commands
             .iter()

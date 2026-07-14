@@ -85,11 +85,13 @@ stay in local resolvers and never enter the public tree or hosted logs. The
 package-capability lane is registered as pending; WP-06 does not invent a
 passing package claim before an honest unsupported-GPU command exists.
 
-WP-09A adds one ignored aggregate successor case to this lane while retaining
-the 34 predecessor GPU cases. It starts the real Vulkan runtime once per
-logical ledger, consumes only dataset-runtime-issued leases, and covers the
-semantic-small, 8-MiB upload, and 128-resource work boundaries. The verifier
-refuses dirty revisions and requires exactly one sanitized
+The trusted lane now contains the accepted WP-09A successor aggregate; the
+predecessor GPU cases were retired with the deleted renderer crate. The
+aggregate starts the real Vulkan runtime once per logical ledger, consumes
+only dataset-runtime-issued leases, and covers the semantic-small, 8-MiB
+upload, and 128-resource work boundaries. Its accepted evidence is inherited
+for WP-09B rather than rerun. The verifier refuses dirty revisions and requires
+exactly one sanitized
 `wp09a-evidence-json` record. That record keeps the main and small-capacity
 ledgers separate, validates the exact case facts and per-frame maxima, and
 includes a render after every dataset lease is released. This is off-product
@@ -125,10 +127,12 @@ WP-10A is accepted at `foundation-wp-10a-exit-1`
 policy, Rust, and local format-lifecycle evidence.
 WP-09A is accepted at `foundation-wp-09a-exit-1`
 (`1b1e7d5534f29b010cc346d434811a3906fb40e1`) after exact protected-main
-policy/Rust and trusted-Vulkan evidence. Its owner-approved product-open
-deferral applies only to this deliberately unreachable successor; WP-09B still
-owns the real-viewer cutover gate.
-Internal automation remains supporting evidence, not product-open proof.
+policy/Rust and trusted-Vulkan evidence. The WP-09B candidate activates that
+renderer as the sole product route. Its bounded real-display scenario exercises
+MIP, DVR, ISO, linked panels with a 1280x720 render target, and a current
+1920x1080 render-target resize without repeating the inherited trusted-GPU
+matrix. Internal automation remains supporting evidence, not product-open
+proof.
 
 WP-10B's independent project-store wire authority is checked in the public
 policy group with `python3 tools/project-fixtures/validate.py --manifest
@@ -317,6 +321,15 @@ cargo xtask product-validate target_source_verification
 With no explicit package, this scenario extracts the small promoted target U16
 archive. It is a reusable, bounded product regression check for storage-source
 changes.
+
+Run the bounded product-render scenario with:
+
+```bash
+cargo xtask product-validate target_fixture_render_modes
+```
+
+It uses the same small fixture and covers the current MIP, DVR, ISO, linked
+panel, progressive-frame, 1280x720, and 1920x1080 product render-target path.
 
 The B4 automation remains available for future project-persistence changes,
 but ordinary foundation work does not rerun its accepted durability matrix.

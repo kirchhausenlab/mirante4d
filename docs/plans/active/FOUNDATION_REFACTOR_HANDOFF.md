@@ -199,7 +199,9 @@ passed. WP-12 accepted the product analysis-runtime cutover at
 WP-10C accepted the target storage/import product cutover at
 `b9ac2a5f08101094933f80a0ce98fbdbdbe6c8d6`
 (`foundation-wp-10c-exit-1`). The predecessor data, format, and import crates
-are deleted. WP-09B is the current checkpoint.
+are deleted. The WP-09B candidate now uses only `mirante4d-render-wgpu` in the
+product and deletes its predecessor; focused checks and the bounded real-display
+product scenario pass. Protected-main acceptance remains the current checkpoint.
 
 ## Dataset And Fixture Boundary
 

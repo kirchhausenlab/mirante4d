@@ -22,16 +22,14 @@ public release or public full microscopy dataset yet.
 - Linux release-directory, tarball, and AppImage build paths.
 - No segmentation or derived-label subsystem.
 
-The workspace has eighteen packages: seventeen `mirante4d-*` crates plus
+The workspace has seventeen packages: sixteen `mirante4d-*` crates plus
 `xtask`. `mirante4d-storage` owns the active package catalog, bounded
 validation and reads, and create-only package publication.
 `mirante4d-import-pipeline` is the active bounded, cancellable, restartable
 TIFF/OME-TIFF producer. The predecessor `mirante4d-data`, `mirante4d-format`,
-and `mirante4d-import` crates are deleted. The new `mirante4d-render-wgpu`
-successor and unpublished
-`mirante4d-render-reference` oracle are accepted off-product and remain
-deliberately unreachable; `mirante4d-renderer` remains the only product render
-route until WP-09B.
+and `mirante4d-import` crates are deleted. `mirante4d-render-wgpu` is the sole
+product renderer. The unpublished `mirante4d-render-reference` CPU oracle is
+test-only, and the predecessor `mirante4d-renderer` crate is deleted.
 
 `mirante4d-analysis-core` owns exact `uint8`, `uint16`, and finite `float32`
 intensity statistics and artifact payloads. `mirante4d-analysis-runtime` runs
@@ -138,8 +136,7 @@ WP-09A accepted the bounded off-product progressive Vulkan runtime and
 independent CPU reference at
 `1b1e7d5534f29b010cc346d434811a3906fb40e1`, tagged
 `foundation-wp-09a-exit-1`. Exact protected-main policy/Rust and trusted Vulkan
-evidence passed; product activation and product-open validation remain WP-09B
-work. WP-10B B1 froze the successor project-store wire, limits, public boundary,
+evidence passed. WP-10B B1 froze the successor project-store wire, limits, public boundary,
 transition inventory, and independent fixture. B2 implemented the off-product
 transactional store: immutable direct/paged object closure and generations,
 manual and autosave refs, leases, Create/Open/Save As/recovery, bounded
@@ -191,6 +188,13 @@ WP-10C is accepted on protected main at
 the sole product dataset path, verification remains responsive, proved package
 and scientific identities bind to projects, and the predecessor data, format,
 and import crates are deleted.
+
+The WP-09B candidate makes `mirante4d-render-wgpu` the sole product render
+route, presents progressive frames without complete-residency gating, and
+deletes the predecessor renderer and CPU placeholder rendering. Its focused
+checks and one real-display small-package scenario cover MIP, DVR, ISO, linked
+panels, a 1280x720 render target, and a current 1920x1080 render-target resize.
+Protected-main acceptance is the remaining bookkeeping step before WP-09C.
 
 ## Current Verification Boundary
 
@@ -248,10 +252,10 @@ See [testing](TESTING.md) for commands and claim language.
   instead computes exact source-voxel statistics for a whole layer over time or
   a numeric box at the current timepoint; loading placeholders are never
   reported as scientific zeros.
-- The off-product WP-09A successor qualification is limited to voxel-exact
-  sampling, flat ISO shading, one semantic scale per layer, 256 requirement
-  records, and 128 supplied leases per call. Unsupported cases fail explicitly.
-  Product support remains a WP-09B decision.
+- Product rendering currently supports voxel-exact sampling, flat ISO shading,
+  one semantic scale per layer, 256 requirement records, and 128 supplied
+  leases per call. Unsupported cases fail explicitly instead of silently
+  changing the scientific display request.
 - Windows and macOS are not qualified targets. 4K is intentionally out of
   scope.
 - Current persisted formats have no compatibility promise.

@@ -8,7 +8,7 @@ import/preprocessing workflows.
 
 ## Workspace Boundaries
 
-The workspace has eighteen packages (seventeen `mirante4d-*` crates plus
+The workspace has seventeen packages (sixteen `mirante4d-*` crates plus
 `xtask`):
 
 - `mirante4d-domain`: validated framework-neutral geometry, view, transfer,
@@ -37,24 +37,23 @@ The workspace has eighteen packages (seventeen `mirante4d-*` crates plus
   frame status, opaque presentation lifecycle, and camera math.
 - `mirante4d-render-reference`: unpublished, bounded CPU oracle for renderer
   correctness; it owns no product route or GPU authority.
-- `mirante4d-render-wgpu`: off-product progressive GPU successor built only
-  against dataset leases and render contracts; WP-09B owns its future product
-  activation.
+- `mirante4d-render-wgpu`: sole product renderer, with bounded progressive GPU
+  residency and presentation built only against dataset leases and render
+  contracts.
 - `mirante4d-storage`: active target-profile catalog, checked ceilings,
   portable package paths, bounded local validation/reads, exact and scientific
   capabilities, dataset source, and deterministic create-only local writer.
 - `mirante4d-import-pipeline`: active bounded, cancellable, restartable
   TIFF/OME-TIFF producer for validated sharded target packages.
-- `mirante4d-renderer`: current product rendering implementation until WP-09B.
 - `mirante4d-app`: native composition and egui shell.
 - `xtask`: developer and verification tooling, never a product mode.
 
 `mirante4d-core` and the predecessor application/session/preferences models
 do not exist. Lower crates do not depend on the app/UI layer; the renderer
 does not read files; format code does not own viewer state.
-The predecessor data, format, and import crates do not exist. The product uses
-`mirante4d-storage` and `mirante4d-import-pipeline`; the reference and successor
-renderers remain off-product until WP-09B.
+The predecessor data, format, import, and renderer crates do not exist. The
+product uses `mirante4d-storage`, `mirante4d-import-pipeline`, and
+`mirante4d-render-wgpu`; the CPU reference renderer is test-only.
 
 ## Application Composition
 
@@ -67,7 +66,7 @@ The temporary owners and deletion gates are:
 
 | Owner | Scope | Gate |
 |---|---|---|
-| `CurrentRenderRuntime` | render status, frames, GPU and presentation resources | WP-09B |
+| `CurrentRenderRuntime` | app-side successor status and presentation composition | WP-09C |
 | `CurrentUiRuntime` | egui-local drafts and interaction facts | WP-09C |
 | `ImportRuntime` | UI-owned task handling around the target import pipeline | WP-09C |
 | `CurrentValidationRuntime` | product-validation harness only | WP-14 |
@@ -82,10 +81,9 @@ deleted, with no compatibility reader or fallback.
 bounded request correlation and cancellation generations; decoded allocations
 remain owned and byte-accounted by `mirante4d-dataset-runtime`.
 `mirante4d-storage::LocalDatasetSource` is the sole product dataset source.
-`CurrentLeaseBridge` retains runtime leases without copying their
-payloads and is the one temporary current-renderer bridge until WP-09B. There
-is no alternate reader, scheduler, CPU display fallback, or app-owned payload
-map.
+The app retains exact runtime lease handles without copying their payloads and
+passes borrowed semantic views to `mirante4d-render-wgpu`. There is no alternate
+reader, scheduler, CPU display fallback, or app-owned payload map.
 
 `AnalysisProductRuntime` is the narrow product bridge to the analysis
 runtime. It uses the shared dispatcher below interactive priority and keeps at
@@ -109,7 +107,7 @@ native package
   -> semantic 3D / linked-panel / playback demand
   -> one bounded scheduler and CPU byte ledger
   -> immutable accounted leases
-  -> current lease renderer bridge and GPU residency
+  -> bounded render-wgpu residency and progressive frame execution
   -> renderer-owned GPU target
   -> egui-wgpu presentation and diagnostics
 ```
@@ -120,16 +118,14 @@ architecture. Missing occupied data is loading/incomplete, never empty.
 An explicit zero-resource plan means the view is outside selected data (or no
 layer is visible); it is terminal and distinct from missing occupied data.
 
-The WP-09A successor is deliberately outside this product flow. It owns one
-bounded WGPU arena, progressive residency, current-frame suppression, and
-asynchronous validation capture; the independent CPU oracle owns expected
-RGBA, coverage, and validity facts. The current `mirante4d-renderer` remains
-the only reachable product renderer until WP-09B. WP-09A qualification covers
-voxel-exact sampling, flat ISO shading, and one semantic scale per layer; other
-intent variants are rejected explicitly rather than silently approximated.
-Its fixed input ceilings are 256 requirement records and 128 supplied leases
-per call. Resident-resource metadata is capped at 256; GPU control and reported
-coverage include at most 128 resources.
+The product renderer owns one bounded WGPU arena, progressive residency,
+current-frame suppression, and automation-only asynchronous validation
+capture; the independent CPU oracle owns expected RGBA, coverage, and validity
+facts. Qualification covers voxel-exact sampling, flat ISO shading, and one
+semantic scale per layer; other intent variants are rejected explicitly rather
+than silently approximated. Fixed input ceilings are 256 requirement records
+and 128 supplied leases per call. Resident-resource metadata is capped at 256;
+GPU control and reported coverage include at most 128 resources.
 
 ## Persistence And Settings
 
@@ -262,7 +258,7 @@ The frozen subsystem boundary remains in
 [`architecture/wp08a-subsystem-contract.json`](../architecture/wp08a-subsystem-contract.json).
 The accepted off-product storage successor boundary is
 [`architecture/wp10a-storage-contract.json`](../architecture/wp10a-storage-contract.json).
-The accepted off-product render successor boundary is
+The accepted WP-09A render contract boundary is
 [`architecture/wp09a-render-contract.json`](../architecture/wp09a-render-contract.json).
 Within that successor, `mirante4d-storage::PackagePath` is the sole package-path
 authority. `mirante4d-identity` owns raw typed object facts and exact hashing,
