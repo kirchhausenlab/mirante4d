@@ -2,9 +2,7 @@ use super::*;
 
 impl MiranteWorkbenchApp {
     pub(super) fn import_tiff_directory_from_dialog(&mut self, ctx: &egui::Context) {
-        if self.import_runtime.import_task.is_some()
-            || self.import_runtime.tiff_import_setup_task.is_some()
-        {
+        if self.import_workers.status().is_active() {
             tracing::info!("TIFF import workflow is already running");
             return;
         }
@@ -24,9 +22,7 @@ impl MiranteWorkbenchApp {
     }
 
     pub(super) fn import_tiff_file_from_dialog(&mut self, ctx: &egui::Context) {
-        if self.import_runtime.import_task.is_some()
-            || self.import_runtime.tiff_import_setup_task.is_some()
-        {
+        if self.import_workers.status().is_active() {
             tracing::info!("TIFF import workflow is already running");
             return;
         }
@@ -53,88 +49,52 @@ impl MiranteWorkbenchApp {
         ctx: &egui::Context,
     ) {
         let destination = tiff_destination(&source, &output_parent);
-        let task_source = source.clone();
-        let worker_source = source.clone();
-        let worker_destination = destination.clone();
-        let cancellation = ImportCancellation::new();
-        let worker_cancellation = cancellation.clone();
-        let repaint_ctx = ctx.clone();
-        let (sender, receiver) = mpsc::channel();
-        let worker =
-            spawn_tiff_inspection_worker(worker_source, worker_cancellation, move |result| {
-                let _ = sender.send(TiffImportSetupTaskMessage::Finished(result));
-                request_background_work_repaint(&repaint_ctx);
-            });
-
-        self.enter_tiff_import_setup_waiting_state(
-            source,
-            destination,
-            cancellation,
-            receiver,
-            Some(worker),
-        );
-        tracing::info!(
-            source = %task_source.path.display(),
-            destination = %worker_destination.display(),
-            "started TIFF inspection"
-        );
-        request_background_work_repaint(ctx);
+        if let Err(error) = self.enter_tiff_import_setup_waiting_state(source, destination) {
+            self.import_runtime.tiff_import_setup_error = Some(error.to_string());
+            tracing::error!(%error, "TIFF inspection could not start");
+        } else {
+            request_background_work_repaint(ctx);
+        }
     }
 
     pub(super) fn enter_tiff_import_setup_waiting_state(
         &mut self,
         source: TiffSource,
         destination: PathBuf,
-        cancellation: ImportCancellation,
-        receiver: Receiver<TiffImportSetupTaskMessage>,
-        worker: Option<thread::JoinHandle<()>>,
-    ) {
+    ) -> Result<(), import_worker_service::ImportWorkerBusy> {
         self.import_runtime.pending_tiff_import = None;
         self.import_runtime.tiff_import_setup_error = None;
         self.import_runtime.checkpoint_retry_options = None;
         self.import_runtime.checkpoint_reset_confirmed = false;
-        self.import_runtime.tiff_import_setup_task = Some(TiffImportSetupTask {
-            source,
-            destination,
-            cancellation,
-            receiver,
-            worker,
-        });
+        let source_path = source.path.clone();
+        let logged_destination = destination.clone();
+        self.import_workers.start_inspection(source, destination)?;
+        tracing::info!(
+            source = %source_path.display(),
+            destination = %logged_destination.display(),
+            "started TIFF inspection"
+        );
+        Ok(())
     }
 
     pub(super) fn drain_tiff_import_setup_results(&mut self, ctx: &egui::Context) {
-        enum SetupCompletion {
-            Finished(Result<TiffInspection, ImportError>),
-            WorkerStopped,
+        if !self.import_workers.status().is_inspecting() {
+            return;
         }
-
-        let Some(completion) = self
-            .import_runtime
-            .tiff_import_setup_task
-            .as_ref()
-            .and_then(|task| match task.receiver.try_recv() {
-                Ok(TiffImportSetupTaskMessage::Finished(result)) => {
-                    Some(SetupCompletion::Finished(result))
-                }
-                Err(mpsc::TryRecvError::Empty) => None,
-                Err(mpsc::TryRecvError::Disconnected) => Some(SetupCompletion::WorkerStopped),
-            })
+        let Some(ImportWorkerCompletion::Inspection(completion)) =
+            self.import_workers.poll_completion()
         else {
             return;
         };
+        let import_worker_service::InspectionWorkerCompletion {
+            source,
+            destination,
+            cancellation_requested,
+            outcome,
+        } = *completion;
 
-        let task = self
-            .import_runtime
-            .tiff_import_setup_task
-            .take()
-            .expect("an inspection completion has an active task");
-        let source = task.source.clone();
-        let destination = task.destination.clone();
-        let cancelled = task.cancellation.is_cancelled();
-        drop(task);
-
-        match completion {
-            SetupCompletion::Finished(Ok(inspection)) if !cancelled => {
+        match outcome {
+            ImportWorkerOutcome::Finished(Ok(inspection)) if !cancellation_requested => {
                 self.import_runtime.pending_tiff_import = Some(PendingTiffImport::from_inspection(
                     source,
                     inspection,
@@ -142,17 +102,17 @@ impl MiranteWorkbenchApp {
                 ));
                 self.import_runtime.tiff_import_setup_error = None;
             }
-            SetupCompletion::Finished(Err(ImportError::Cancelled))
-            | SetupCompletion::Finished(Ok(_)) => {
+            ImportWorkerOutcome::Finished(Err(ImportError::Cancelled))
+            | ImportWorkerOutcome::Finished(Ok(_)) => {
                 self.import_runtime.pending_tiff_import = None;
                 self.import_runtime.tiff_import_setup_error = None;
             }
-            SetupCompletion::Finished(Err(error)) => {
+            ImportWorkerOutcome::Finished(Err(error)) => {
                 self.import_runtime.pending_tiff_import = None;
                 self.import_runtime.tiff_import_setup_error = Some(error.to_string());
                 tracing::error!(%error, "failed to inspect TIFF input");
             }
-            SetupCompletion::WorkerStopped => {
+            ImportWorkerOutcome::WorkerStopped => {
                 self.import_runtime.pending_tiff_import = None;
                 self.import_runtime.tiff_import_setup_error =
                     Some("TIFF inspection worker stopped unexpectedly".to_owned());
@@ -179,9 +139,7 @@ impl MiranteWorkbenchApp {
     }
 
     pub(super) fn cancel_pending_tiff_import(&mut self) {
-        if let Some(task) = self.import_runtime.tiff_import_setup_task.as_ref() {
-            task.cancellation.cancel();
-        }
+        self.import_workers.cancel_inspection();
         self.import_runtime.pending_tiff_import = None;
         self.import_runtime.tiff_import_setup_error = None;
         self.import_runtime.checkpoint_retry_options = None;
@@ -196,139 +154,92 @@ impl MiranteWorkbenchApp {
         self.import_runtime.checkpoint_retry_options = None;
         self.import_runtime.checkpoint_reset_confirmed = false;
         let ledger = self.dataset.cpu_ledger_arc();
-        let cancellation = ImportCancellation::new();
-        let worker_cancellation = cancellation.clone();
-        let progress_cancellation = cancellation.clone();
-        let (sender, receiver) = mpsc::channel();
-        let progress_sender = sender.clone();
-        let worker_options = options.clone();
-        let worker = spawn_tiff_import_worker(
-            worker_options,
-            ledger,
-            worker_cancellation,
-            move |event| {
-                if progress_sender
-                    .send(ImportTaskMessage::Progress(event))
-                    .is_err()
-                {
-                    progress_cancellation.cancel();
-                }
-            },
-            move |result| {
-                let _ = sender.send(ImportTaskMessage::Finished(result));
-            },
-        );
-        self.import_runtime.import_task = Some(ImportTask {
-            token,
-            destination: destination.clone(),
-            cancellation,
-            receiver,
-            latest_event: None,
-            retry_options: Some(options),
-            worker: Some(worker),
-        });
-        tracing::info!(destination = %destination.display(), "started TIFF import");
+        match self
+            .import_workers
+            .start_import(token.clone(), options, ledger)
+        {
+            Ok(()) => {
+                tracing::info!(destination = %destination.display(), "started TIFF import");
+            }
+            Err(error) => {
+                self.complete_background_operation(
+                    token,
+                    OperationCompletion::Failed(OperationFailureCode::ImportExecutionFailed),
+                );
+                self.import_runtime.tiff_import_setup_error = Some(error.to_string());
+                tracing::error!(%error, "TIFF import could not start");
+            }
+        }
     }
 
     pub(super) fn cancel_import_task(&mut self) {
-        if let Some(task) = self.import_runtime.import_task.as_ref() {
-            task.cancellation.cancel();
-        }
+        self.import_workers.cancel_import();
     }
 
     pub(super) fn drain_import_results(&mut self, ctx: &egui::Context) {
-        enum ImportCompletion {
-            Finished(Result<ImportReceipt, ImportError>),
-            WorkerStopped,
+        if !self.import_workers.status().is_importing() {
+            return;
         }
-
-        let mut completion = None;
-        let mut saw_progress = false;
-        if let Some(task) = self.import_runtime.import_task.as_mut() {
-            loop {
-                match task.receiver.try_recv() {
-                    Ok(ImportTaskMessage::Progress(event)) => {
-                        task.latest_event = Some(event);
-                        saw_progress = true;
-                    }
-                    Ok(ImportTaskMessage::Finished(result)) => {
-                        completion = Some(ImportCompletion::Finished(result));
-                    }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        if completion.is_none() {
-                            completion = Some(ImportCompletion::WorkerStopped);
-                        }
-                        break;
-                    }
+        let Some(ImportWorkerCompletion::Import(completion)) =
+            self.import_workers.poll_completion()
+        else {
+            return;
+        };
+        let import_worker_service::ImportExecutionCompletion {
+            token,
+            destination,
+            retry_options,
+            outcome,
+        } = *completion;
+        match outcome {
+            ImportWorkerOutcome::Finished(Ok(receipt)) => {
+                self.import_runtime.checkpoint_retry_options = None;
+                self.import_runtime.checkpoint_reset_confirmed = false;
+                if self.complete_background_operation(token, OperationCompletion::Succeeded) {
+                    self.finish_successful_import(receipt, destination, ctx);
                 }
             }
-        }
-
-        if let Some(completion) = completion {
-            let mut task = self
-                .import_runtime
-                .import_task
-                .take()
-                .expect("an import completion has an active task");
-            let token = task.token.clone();
-            let destination = task.destination.clone();
-            let retry_options = task.retry_options.take();
-            drop(task);
-            match completion {
-                ImportCompletion::Finished(Ok(receipt)) => {
-                    self.import_runtime.checkpoint_retry_options = None;
-                    self.import_runtime.checkpoint_reset_confirmed = false;
-                    if self.complete_background_operation(token, OperationCompletion::Succeeded) {
-                        self.finish_successful_import(receipt, destination, ctx);
-                    }
-                }
-                ImportCompletion::Finished(Err(ImportError::Cancelled)) => {
-                    self.complete_background_operation(token, OperationCompletion::Cancelled);
-                    self.import_runtime.tiff_import_setup_error = None;
-                    self.import_runtime.checkpoint_retry_options = None;
-                    self.import_runtime.checkpoint_reset_confirmed = false;
-                }
-                ImportCompletion::Finished(Err(ImportError::InvalidCheckpoint(reason))) => {
-                    self.complete_background_operation(
-                        token,
-                        OperationCompletion::Failed(OperationFailureCode::ImportInvalidInput),
-                    );
-                    self.import_runtime.tiff_import_setup_error = Some(format!(
-                        "The saved import checkpoint is corrupt or belongs to different inputs: {reason}. Confirm Reset and Restart below to remove only that checkpoint and retry."
-                    ));
-                    self.import_runtime.checkpoint_retry_options = retry_options;
-                    self.import_runtime.checkpoint_reset_confirmed = false;
-                    tracing::error!(%reason, "failed to reuse TIFF import checkpoint");
-                }
-                ImportCompletion::Finished(Err(error)) => {
-                    self.complete_background_operation(
-                        token,
-                        OperationCompletion::Failed(import_failure_code(&error)),
-                    );
-                    self.import_runtime.tiff_import_setup_error = Some(error.to_string());
-                    self.import_runtime.checkpoint_retry_options = None;
-                    self.import_runtime.checkpoint_reset_confirmed = false;
-                    tracing::error!(%error, "failed to import TIFF input");
-                }
-                ImportCompletion::WorkerStopped => {
-                    self.complete_background_operation(
-                        token,
-                        OperationCompletion::Failed(OperationFailureCode::ImportExecutionFailed),
-                    );
-                    self.import_runtime.tiff_import_setup_error =
-                        Some("TIFF import worker stopped unexpectedly".to_owned());
-                    self.import_runtime.checkpoint_retry_options = None;
-                    self.import_runtime.checkpoint_reset_confirmed = false;
-                    tracing::error!("TIFF import worker stopped unexpectedly");
-                }
+            ImportWorkerOutcome::Finished(Err(ImportError::Cancelled)) => {
+                self.complete_background_operation(token, OperationCompletion::Cancelled);
+                self.import_runtime.tiff_import_setup_error = None;
+                self.import_runtime.checkpoint_retry_options = None;
+                self.import_runtime.checkpoint_reset_confirmed = false;
             }
-            saw_progress = true;
+            ImportWorkerOutcome::Finished(Err(ImportError::InvalidCheckpoint(reason))) => {
+                self.complete_background_operation(
+                    token,
+                    OperationCompletion::Failed(OperationFailureCode::ImportInvalidInput),
+                );
+                self.import_runtime.tiff_import_setup_error = Some(format!(
+                    "The saved import checkpoint is corrupt or belongs to different inputs: {reason}. Confirm Reset and Restart below to remove only that checkpoint and retry."
+                ));
+                self.import_runtime.checkpoint_retry_options = retry_options;
+                self.import_runtime.checkpoint_reset_confirmed = false;
+                tracing::error!(%reason, "failed to reuse TIFF import checkpoint");
+            }
+            ImportWorkerOutcome::Finished(Err(error)) => {
+                self.complete_background_operation(
+                    token,
+                    OperationCompletion::Failed(import_failure_code(&error)),
+                );
+                self.import_runtime.tiff_import_setup_error = Some(error.to_string());
+                self.import_runtime.checkpoint_retry_options = None;
+                self.import_runtime.checkpoint_reset_confirmed = false;
+                tracing::error!(%error, "failed to import TIFF input");
+            }
+            ImportWorkerOutcome::WorkerStopped => {
+                self.complete_background_operation(
+                    token,
+                    OperationCompletion::Failed(OperationFailureCode::ImportExecutionFailed),
+                );
+                self.import_runtime.tiff_import_setup_error =
+                    Some("TIFF import worker stopped unexpectedly".to_owned());
+                self.import_runtime.checkpoint_retry_options = None;
+                self.import_runtime.checkpoint_reset_confirmed = false;
+                tracing::error!("TIFF import worker stopped unexpectedly");
+            }
         }
-
-        if saw_progress {
-            ctx.request_repaint();
-        }
+        ctx.request_repaint();
     }
 
     pub(super) fn finish_successful_import(
@@ -398,7 +309,8 @@ impl MiranteWorkbenchApp {
         dismiss_setup_error: &mut bool,
         reset_invalid_checkpoint: &mut bool,
     ) {
-        if self.import_runtime.tiff_import_setup_task.is_none()
+        let worker_status = self.import_workers.status();
+        if !worker_status.is_inspecting()
             && self.import_runtime.pending_tiff_import.is_none()
             && self.import_runtime.tiff_import_setup_error.is_none()
         {
@@ -411,26 +323,31 @@ impl MiranteWorkbenchApp {
             .default_width(560.0)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
-                if let Some(task) = &self.import_runtime.tiff_import_setup_task {
+                if let ImportWorkerStatus::Inspecting {
+                    source,
+                    destination,
+                    cancellation_requested,
+                } = &worker_status
+                {
                     ui.horizontal(|ui| {
                         ui.add(egui::Spinner::new());
                         ui_kit::status_badge(
                             ui,
                             StatusTone::Warning,
-                            if task.cancellation.is_cancelled() {
+                            if *cancellation_requested {
                                 "stopping inspection"
                             } else {
                                 "inspecting input"
                             },
                         );
                     });
-                    ui_kit::property_row(ui, "source", task.source.path.display());
-                    ui_kit::property_row(ui, "destination", task.destination.display());
+                    ui_kit::property_row(ui, "source", source.path.display());
+                    ui_kit::property_row(ui, "destination", destination.display());
                     ui.add_space(8.0);
                     if ui_kit::toolbar_button(
                         ui,
                         "Cancel Inspection",
-                        !task.cancellation.is_cancelled(),
+                        !cancellation_requested,
                     )
                     .clicked()
                     {

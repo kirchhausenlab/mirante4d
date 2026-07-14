@@ -1,17 +1,15 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::mpsc::Receiver,
-    thread::JoinHandle,
 };
 
 use eframe::egui;
-use mirante4d_application::{ApplicationSnapshot, OperationToken, WorkspaceSnapshot};
+use mirante4d_application::{ApplicationSnapshot, WorkspaceSnapshot};
 use mirante4d_dataset::ResourceValidity;
 use mirante4d_domain::{IntensityDType, ScaleLevel};
 use mirante4d_import_pipeline::{
-    ImportCancellation, ImportError, ImportEvent, ImportOptions, ImportReceipt, NoDataPolicy,
-    SourceLayout, SpatialCalibration, TiffInspection, TiffSource, select_supported_profile,
+    ImportEvent, ImportOptions, NoDataPolicy, SourceLayout, SpatialCalibration, TiffInspection,
+    TiffSource, select_supported_profile,
 };
 use mirante4d_storage::ProfileKind;
 
@@ -20,29 +18,6 @@ use crate::ui_kit;
 const MIB: u64 = 1024 * 1024;
 const DEFAULT_IMPORT_WORKING_MEMORY_BYTES: u64 = 256 * MIB;
 const IMPORT_WORKING_MEMORY_CHOICES: [u64; 4] = [128 * MIB, 256 * MIB, 512 * MIB, 1024 * MIB];
-
-pub(crate) struct TiffImportSetupTask {
-    pub(crate) source: TiffSource,
-    pub(crate) destination: PathBuf,
-    pub(crate) cancellation: ImportCancellation,
-    pub(crate) receiver: Receiver<TiffImportSetupTaskMessage>,
-    pub(crate) worker: Option<JoinHandle<()>>,
-}
-
-impl Drop for TiffImportSetupTask {
-    fn drop(&mut self) {
-        self.cancellation.cancel();
-        if let Some(worker) = self.worker.take()
-            && worker.join().is_err()
-        {
-            tracing::error!("TIFF inspection worker panicked");
-        }
-    }
-}
-
-pub(crate) enum TiffImportSetupTaskMessage {
-    Finished(Result<TiffInspection, ImportError>),
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingTiffImport {
@@ -75,32 +50,6 @@ impl PendingTiffImport {
             working_memory_bytes: DEFAULT_IMPORT_WORKING_MEMORY_BYTES,
         }
     }
-}
-
-pub(crate) struct ImportTask {
-    pub(crate) token: OperationToken,
-    pub(crate) destination: PathBuf,
-    pub(crate) cancellation: ImportCancellation,
-    pub(crate) receiver: Receiver<ImportTaskMessage>,
-    pub(crate) latest_event: Option<ImportEvent>,
-    pub(crate) retry_options: Option<ImportOptions>,
-    pub(crate) worker: Option<JoinHandle<()>>,
-}
-
-impl Drop for ImportTask {
-    fn drop(&mut self) {
-        self.cancellation.cancel();
-        if let Some(worker) = self.worker.take()
-            && worker.join().is_err()
-        {
-            tracing::error!("TIFF import worker panicked");
-        }
-    }
-}
-
-pub(crate) enum ImportTaskMessage {
-    Progress(ImportEvent),
-    Finished(Result<ImportReceipt, ImportError>),
 }
 
 pub(crate) fn tiff_destination(source: &TiffSource, output_parent: &Path) -> PathBuf {
@@ -392,12 +341,14 @@ pub(crate) fn active_layer_no_data_policy_label(snapshot: &ApplicationSnapshot) 
     }
 }
 
-pub(crate) fn import_task_status_text(task: &ImportTask) -> String {
-    if task.cancellation.is_cancelled() {
+pub(crate) fn import_task_status_text(
+    cancellation_requested: bool,
+    latest_event: Option<&ImportEvent>,
+) -> String {
+    if cancellation_requested {
         return "Stopping import".to_owned();
     }
-    task.latest_event
-        .as_ref()
+    latest_event
         .map(import_progress_message)
         .unwrap_or_else(|| "Preparing import".to_owned())
 }

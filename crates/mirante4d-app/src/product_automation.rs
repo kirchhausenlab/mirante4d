@@ -1683,7 +1683,7 @@ impl ProductAutomationController {
             ProductAutomationWaitCondition::RuntimeIdle => {
                 !crate::workbench_playback_runtime::background_work_active(
                     &snapshot,
-                    &app.import_runtime,
+                    &app.import_workers,
                     &app.analysis_runtime,
                     &app.dataset,
                     &app.render_runtime,
@@ -1805,7 +1805,7 @@ impl ProductAutomationController {
             ProductAutomationAssertCondition::RuntimeIdle => {
                 if crate::workbench_playback_runtime::background_work_active(
                     &snapshot,
-                    &app.import_runtime,
+                    &app.import_workers,
                     &app.analysis_runtime,
                     &app.dataset,
                     &app.render_runtime,
@@ -2397,7 +2397,7 @@ impl ProductAutomationController {
                 },
                 background_work_active: crate::workbench_playback_runtime::background_work_active(
                     &snapshot,
-                    &app.import_runtime,
+                    &app.import_workers,
                     &app.analysis_runtime,
                     &app.dataset,
                     &app.render_runtime,

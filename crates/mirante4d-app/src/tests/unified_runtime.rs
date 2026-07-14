@@ -93,34 +93,44 @@ fn app_dispatches_and_drains_visible_demand_through_one_runtime() {
 fn import_cancellation_waits_for_the_worker_terminal_result() {
     let temp = tempfile::tempdir().unwrap();
     let package = write_target_fixture(temp.path()).unwrap();
+    let source = write_source_time_series_fixture(temp.path()).unwrap();
+    let inspection = mirante4d_import_pipeline::inspect_tiff(TiffSource::auto(&source)).unwrap();
+    let mut pending = PendingTiffImport::from_inspection(
+        TiffSource::auto(&source),
+        inspection,
+        temp.path().join("cancelled-import.m4d"),
+    );
+    pending.calibration_confirmed = true;
+    pending.time_step_seconds = Some(1.0);
     let opened = open_dataset_and_render_first_frame(&package).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
+    app.start_import_task(build_import_options(&pending).unwrap());
     let token = app
-        .begin_background_operation(OperationKind::Import)
-        .unwrap();
-    let cancellation = ImportCancellation::new();
-    let (_sender, receiver) = mpsc::channel();
-    app.import_runtime.import_task = Some(ImportTask {
-        token: token.clone(),
-        destination: temp.path().join("imported.m4d"),
-        cancellation: cancellation.clone(),
-        receiver,
-        latest_event: None,
-        retry_options: None,
-        worker: None,
-    });
+        .application
+        .snapshot()
+        .active_operations()
+        .iter()
+        .find(|token| token.kind() == OperationKind::Import)
+        .unwrap()
+        .clone();
 
     app.cancel_import_task();
 
-    assert!(cancellation.is_cancelled());
+    assert!(matches!(
+        app.import_workers.status(),
+        ImportWorkerStatus::Importing {
+            cancellation_requested: true,
+            ..
+        }
+    ));
     assert!(
         app.application
             .snapshot()
             .active_operations()
             .contains(&token)
     );
-    app.import_runtime.import_task = None;
-    assert!(app.complete_background_operation(token, OperationCompletion::Succeeded));
+    app.import_workers.shutdown();
+    assert!(app.complete_background_operation(token, OperationCompletion::Cancelled));
     app.dataset.request_shutdown().unwrap();
 }
 

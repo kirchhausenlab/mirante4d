@@ -384,6 +384,7 @@ fn test_workbench_app_without_background_runtime(
         render_runtime,
         native_presentation: native_presentation::NativePresentationBridge::unavailable(),
         egui_ui,
+        import_workers: ImportWorkerService::new(),
         import_runtime: current_runtime::import::ImportRuntime::idle(),
         analysis_runtime,
         validation_runtime: current_runtime::validation::CurrentValidationRuntime {

@@ -824,15 +824,15 @@ fn validate_wp10c_import_worker_owner(repo_root: &Path, target_owner: &str) -> a
         }
     }
 
-    let app_path = repo_root.join("crates/mirante4d-app/src/workbench_import.rs");
+    let app_path = repo_root.join("crates/mirante4d-app/src/import_worker_service.rs");
     let app_source = fs::read_to_string(&app_path)
         .with_context(|| format!("failed to read {}", app_path.display()))?;
     if source_creates_thread(&app_path, &app_source)? {
-        bail!("WP-10C app import module still creates a production thread");
+        bail!("WP-10C app import worker bridge still creates a production thread");
     }
     for marker in ["spawn_tiff_inspection_worker", "spawn_tiff_import_worker"] {
         if !app_source.contains(marker) {
-            bail!("WP-10C app import module does not use target worker {marker}");
+            bail!("WP-10C app import worker bridge does not use target worker {marker}");
         }
     }
     Ok(())
@@ -2342,7 +2342,7 @@ pub fn spawn_tiff_import_worker() { let _ = std::thread::spawn(|| {}); }
         )
         .unwrap();
         fs::write(
-            app_root.join("workbench_import.rs"),
+            app_root.join("import_worker_service.rs"),
             "fn start() { spawn_tiff_inspection_worker(); spawn_tiff_import_worker(); }",
         )
         .unwrap();
@@ -2350,7 +2350,7 @@ pub fn spawn_tiff_import_worker() { let _ = std::thread::spawn(|| {}); }
         validate_wp10c_import_worker_owner(temp.path(), "mirante4d-import-pipeline").unwrap();
 
         fs::write(
-            app_root.join("workbench_import.rs"),
+            app_root.join("import_worker_service.rs"),
             "fn start() { spawn_tiff_inspection_worker(); spawn_tiff_import_worker(); let _ = std::thread::spawn(|| {}); }",
         )
         .unwrap();
@@ -2358,7 +2358,7 @@ pub fn spawn_tiff_import_worker() { let _ = std::thread::spawn(|| {}); }
             validate_wp10c_import_worker_owner(temp.path(), "mirante4d-import-pipeline")
                 .unwrap_err()
                 .to_string()
-                .contains("app import module still creates")
+                .contains("app import worker bridge still creates")
         );
     }
 

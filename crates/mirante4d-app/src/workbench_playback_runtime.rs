@@ -5,24 +5,22 @@ use mirante4d_project_model::ViewState;
 
 use crate::{
     BACKGROUND_WORK_REPAINT_INTERVAL,
-    current_runtime::{
-        analysis::AnalysisProductRuntime, import::ImportRuntime, render::CurrentRenderRuntime,
-    },
+    current_runtime::{analysis::AnalysisProductRuntime, render::CurrentRenderRuntime},
     dataset_requests::{DatasetDemandState, SCOPE_CURRENT_3D},
+    import_worker_service::ImportWorkerService,
     playback::{PLAYBACK_FRAME_INTERVAL, playback_tick_for_ui_time},
     viewer_layout::CrossSectionPanelScheduleStatus,
 };
 
 pub(crate) fn background_work_active(
     snapshot: &ApplicationSnapshot,
-    import: &ImportRuntime,
+    import: &ImportWorkerService,
     _analysis: &AnalysisProductRuntime,
     dataset: &DatasetDemandState,
     render: &CurrentRenderRuntime,
 ) -> bool {
     application_service_work_active(snapshot)
-        || import.tiff_import_setup_task.is_some()
-        || import.import_task.is_some()
+        || import.status().is_active()
         || snapshot.transient().playback_active()
         || dataset.dispatcher().has_pending_work()
         || render.product_gpu.as_ref().is_some_and(|product| {

@@ -1,8 +1,6 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
-    thread,
     time::{Duration, Instant},
 };
 
@@ -24,6 +22,7 @@ mod display_refresh;
 mod fidelity;
 mod histogram;
 mod import_ui;
+mod import_worker_service;
 mod layer_state;
 mod lod_scheduler;
 mod native_presentation;
@@ -79,10 +78,12 @@ use histogram::{
     histogram_bins_label, histogram_can_auto_window, histogram_status_label,
 };
 use import_ui::{
-    ImportTask, ImportTaskMessage, PendingTiffImport, TiffImportSetupTask,
-    TiffImportSetupTaskMessage, active_layer_no_data_policy_label, build_import_options,
+    PendingTiffImport, active_layer_no_data_policy_label, build_import_options,
     import_progress_fraction, import_task_status_text, pending_tiff_import_ready_to_start,
     reset_checkpoint_directory, show_pending_tiff_import_controls, tiff_destination,
+};
+use import_worker_service::{
+    ImportWorkerCompletion, ImportWorkerOutcome, ImportWorkerService, ImportWorkerStatus,
 };
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, ApplicationFault, ApplicationFaultCode,
@@ -102,10 +103,9 @@ use mirante4d_domain::{
 };
 #[cfg(test)]
 use mirante4d_domain::{IntensityDType, Shape3D, TimeIndex};
-use mirante4d_import_pipeline::{
-    ImportCancellation, ImportError, ImportOptions, ImportReceipt, TiffInspection, TiffSource,
-    spawn_tiff_import_worker, spawn_tiff_inspection_worker,
-};
+#[cfg(test)]
+use mirante4d_import_pipeline::ImportCancellation;
+use mirante4d_import_pipeline::{ImportError, ImportOptions, ImportReceipt, TiffSource};
 use mirante4d_project_model::{
     ChannelPreset, LayerViewState, ProjectId, ProjectRevisionId, ViewState,
 };
@@ -492,6 +492,7 @@ pub struct MiranteWorkbenchApp {
     render_runtime: current_runtime::render::CurrentRenderRuntime,
     native_presentation: native_presentation::NativePresentationBridge,
     egui_ui: ui_kit::EguiUiState,
+    import_workers: ImportWorkerService,
     import_runtime: current_runtime::import::ImportRuntime,
     analysis_runtime: current_runtime::analysis::AnalysisProductRuntime,
     validation_runtime: current_runtime::validation::CurrentValidationRuntime,
@@ -599,6 +600,7 @@ impl MiranteWorkbenchApp {
             render_runtime,
             native_presentation,
             egui_ui,
+            import_workers: ImportWorkerService::new(),
             import_runtime: current_runtime::import::ImportRuntime::idle(),
             analysis_runtime,
             validation_runtime,
@@ -2494,10 +2496,8 @@ impl MiranteWorkbenchApp {
         let old_render_runtime = std::mem::replace(&mut self.render_runtime, render_runtime);
         let old_analysis_runtime = std::mem::replace(&mut self.analysis_runtime, analysis_runtime);
         self.pending_analysis_artifact_load = None;
-        let old_import_runtime = std::mem::replace(
-            &mut self.import_runtime,
-            current_runtime::import::ImportRuntime::idle(),
-        );
+        self.import_workers.shutdown();
+        self.import_runtime = current_runtime::import::ImportRuntime::idle();
         self.egui_ui.viewer_tools = ViewerToolState::default();
         self.egui_ui.analysis_plot_view = None;
         self.egui_ui.analysis_filter.clear();
@@ -2513,12 +2513,7 @@ impl MiranteWorkbenchApp {
         self.request_opened_state_visible_work(None);
 
         std::thread::spawn(move || {
-            drop((
-                old_dataset,
-                old_render_runtime,
-                old_analysis_runtime,
-                old_import_runtime,
-            ));
+            drop((old_dataset, old_render_runtime, old_analysis_runtime));
         });
     }
 

@@ -71,7 +71,7 @@ The temporary owners and deletion gates are:
 | Owner | Scope | Gate |
 |---|---|---|
 | `CurrentRenderRuntime` | app-side successor status and presentation composition | WP-09C |
-| `ImportRuntime` | UI-owned task handling around the target import pipeline | WP-09C |
+| `ImportRuntime` | remaining import review and retry draft | WP-09C |
 | `CurrentValidationRuntime` | product-validation harness only | WP-14 |
 
 The private egui bridge translates UI input to `ApplicationCommand` and reads
@@ -79,6 +79,10 @@ snapshots/events. `ProjectStoreApplicationService` is the sole product project
 I/O route; its actor owns project roots, sessions, leases, refs, recovery, and
 filesystem mutation. The project-v15 bridge and `CurrentProjectRuntime` are
 deleted, with no compatibility reader or fallback.
+
+`ImportWorkerService` owns TIFF worker cancellation, bounded terminal results,
+latest-only progress, and explicit joining. Egui reads its status but owns no
+worker channel or thread handle.
 
 `DatasetRequestDispatcher` is the sole application poll owner. It keeps only
 bounded request correlation and cancellation generations; decoded allocations

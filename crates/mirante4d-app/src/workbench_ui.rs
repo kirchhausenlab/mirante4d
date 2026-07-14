@@ -911,8 +911,9 @@ impl eframe::App for MiranteWorkbenchApp {
         let mut rerender_requested = false;
         let mut texture_refresh_requested = false;
         let mut application_commands = Vec::new();
-        let import_active = self.import_runtime.import_task.is_some();
-        let import_setup_active = self.import_runtime.tiff_import_setup_task.is_some()
+        let import_worker_status = self.import_workers.status();
+        let import_active = import_worker_status.is_importing();
+        let import_setup_active = import_worker_status.is_inspecting()
             || self.import_runtime.pending_tiff_import.is_some();
         let dataset_open_active = application_snapshot
             .active_operations()
@@ -1077,11 +1078,13 @@ impl eframe::App for MiranteWorkbenchApp {
                         self.import_tiff_file_from_dialog(ui.ctx());
                     }
                     if import_active {
-                        let cancellation_pending = self
-                            .import_runtime
-                            .import_task
-                            .as_ref()
-                            .is_some_and(|task| task.cancellation.is_cancelled());
+                        let cancellation_pending = matches!(
+                            &import_worker_status,
+                            ImportWorkerStatus::Importing {
+                                cancellation_requested: true,
+                                ..
+                            }
+                        );
                         if ui_kit::toolbar_button(
                             ui,
                             if cancellation_pending {
@@ -1207,13 +1210,21 @@ impl eframe::App for MiranteWorkbenchApp {
                         }
                     });
                     ui_kit::section(ui, "Status", |ui| {
-                        if let Some(task) = &self.import_runtime.import_task {
+                        if let ImportWorkerStatus::Importing {
+                            latest_event,
+                            cancellation_requested,
+                            ..
+                        } = &import_worker_status
+                        {
                             ui_kit::status_badge(
                                 ui,
                                 StatusTone::Warning,
-                                import_task_status_text(task),
+                                import_task_status_text(
+                                    *cancellation_requested,
+                                    latest_event.as_ref(),
+                                ),
                             );
-                        } else if self.import_runtime.tiff_import_setup_task.is_some() {
+                        } else if import_worker_status.is_inspecting() {
                             ui_kit::status_badge(ui, StatusTone::Warning, "inspecting TIFF input");
                         } else if self.import_runtime.pending_tiff_import.is_some() {
                             ui_kit::status_badge(
@@ -1698,24 +1709,37 @@ impl eframe::App for MiranteWorkbenchApp {
                             format!("{}/{}", view.timepoint().get() + 1, timepoint_count),
                         );
                     });
-                    if let Some(task) = &self.import_runtime.import_task {
+                    if let ImportWorkerStatus::Importing {
+                        destination,
+                        latest_event,
+                        cancellation_requested,
+                    } = &import_worker_status
+                    {
                         ui_kit::section(ui, "Import", |ui| {
                             ui_kit::status_badge(
                                 ui,
                                 StatusTone::Warning,
-                                import_task_status_text(task),
+                                import_task_status_text(
+                                    *cancellation_requested,
+                                    latest_event.as_ref(),
+                                ),
                             );
-                            if let Some(progress) =
-                                import_progress_fraction(task.latest_event.as_ref())
+                            ui_kit::property_row(ui, "destination", destination.display());
+                            if let Some(progress) = import_progress_fraction(latest_event.as_ref())
                             {
                                 ui.add(egui::ProgressBar::new(progress).show_percentage());
                             }
                         });
-                    } else if let Some(task) = &self.import_runtime.tiff_import_setup_task {
+                    } else if let ImportWorkerStatus::Inspecting {
+                        source,
+                        destination,
+                        ..
+                    } = &import_worker_status
+                    {
                         ui_kit::section(ui, "TIFF Import", |ui| {
                             ui_kit::status_badge(ui, StatusTone::Warning, "inspecting input");
-                            ui_kit::property_row(ui, "source", task.source.path.display());
-                            ui_kit::property_row(ui, "destination", task.destination.display());
+                            ui_kit::property_row(ui, "source", source.path.display());
+                            ui_kit::property_row(ui, "destination", destination.display());
                         });
                     }
                     if let Some(pending) = &mut self.import_runtime.pending_tiff_import {
@@ -2345,7 +2369,7 @@ impl eframe::App for MiranteWorkbenchApp {
             .is_some_and(ProjectStoreApplicationService::has_pending_work);
         if workbench_playback_runtime::background_work_active(
             &snapshot,
-            &self.import_runtime,
+            &self.import_workers,
             &self.analysis_runtime,
             &self.dataset,
             &self.render_runtime,
@@ -2387,6 +2411,7 @@ impl eframe::App for MiranteWorkbenchApp {
     }
 
     fn on_exit(&mut self) {
+        self.import_workers.shutdown();
         if let Err(error) = self.dataset.request_shutdown() {
             tracing::warn!(%error, "dataset runtime shutdown request failed");
         }

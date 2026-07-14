@@ -218,7 +218,6 @@ fn tiff_import_setup_state_is_visible_immediately_after_output_selection() {
     let source = tempdir.path().join("raw.tif");
     let output_parent = tempdir.path().join("output");
     fs::create_dir(&output_parent).unwrap();
-    let (_sender, receiver) = mpsc::channel();
     let mut app = test_workbench_app_without_background_runtime(opened);
     let tiff_source = TiffSource::auto(source.clone());
     let destination = tiff_destination(&tiff_source, &output_parent);
@@ -226,14 +225,18 @@ fn tiff_import_setup_state_is_visible_immediately_after_output_selection() {
     app.enter_tiff_import_setup_waiting_state(
         tiff_source,
         destination.clone(),
-        ImportCancellation::new(),
-        receiver,
-        None,
-    );
+    )
+    .unwrap();
 
-    let task = app.import_runtime.tiff_import_setup_task.as_ref().unwrap();
-    assert_eq!(task.source.path, source);
-    assert_eq!(task.destination, destination);
+    assert!(matches!(
+        app.import_workers.status(),
+        ImportWorkerStatus::Inspecting {
+            source: active_source,
+            destination: active_destination,
+            ..
+        } if active_source.path == source && active_destination == destination
+    ));
     assert!(app.import_runtime.pending_tiff_import.is_none());
     assert!(app.import_runtime.tiff_import_setup_error.is_none());
+    app.import_workers.shutdown();
 }

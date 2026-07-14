@@ -26,7 +26,9 @@ The workspace has eighteen packages: seventeen `mirante4d-*` crates plus
 `xtask`. `mirante4d-storage` owns the active package catalog, bounded
 validation and reads, and create-only package publication.
 `mirante4d-import-pipeline` is the active bounded, cancellable, restartable
-TIFF/OME-TIFF producer. The predecessor `mirante4d-data`, `mirante4d-format`,
+TIFF/OME-TIFF producer. Native composition now owns its bounded worker results,
+latest-only progress, cancellation, and explicit shutdown; egui owns no import
+thread or channel. The predecessor `mirante4d-data`, `mirante4d-format`,
 and `mirante4d-import` crates are deleted. `mirante4d-ui-egui` now owns shared
 egui visuals, application-problem presentation, and transient UI drafts and
 interaction state. `mirante4d-render-wgpu` is
