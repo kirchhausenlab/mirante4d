@@ -1,6 +1,11 @@
+//! Egui presentation components for Mirante4D.
+
+#![forbid(unsafe_code)]
+
 use std::{fmt::Display, hash::Hash};
 
 use eframe::egui::{self, Color32, RichText};
+use mirante4d_application::{ApplicationEvent, OperationOutcome};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UiColors {
@@ -171,6 +176,22 @@ pub fn configure_visuals(ctx: &egui::Context) {
     visuals.selection.bg_fill = tokens.colors.accent.linear_multiply(0.55);
     visuals.selection.stroke.color = tokens.colors.accent;
     ctx.set_visuals(visuals);
+}
+
+pub fn application_problem_message(event: Option<&ApplicationEvent>) -> Option<String> {
+    match event? {
+        ApplicationEvent::OperationCompleted {
+            token,
+            outcome: OperationOutcome::Failed(code),
+        } => Some(format!(
+            "{:?} failed ({code:?}); correct the input, permissions, or resource limit and retry",
+            token.kind()
+        )),
+        ApplicationEvent::ResourcePolicyRejected { reason, .. } => Some(format!(
+            "settings save failed ({reason:?}); correct the settings file or permissions and retry"
+        )),
+        _ => None,
+    }
 }
 
 pub fn section<R>(

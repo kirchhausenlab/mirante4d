@@ -8,7 +8,7 @@ import/preprocessing workflows.
 
 ## Workspace Boundaries
 
-The workspace has seventeen packages (sixteen `mirante4d-*` crates plus
+The workspace has eighteen packages (seventeen `mirante4d-*` crates plus
 `xtask`):
 
 - `mirante4d-domain`: validated framework-neutral geometry, view, transfer,
@@ -45,7 +45,9 @@ The workspace has seventeen packages (sixteen `mirante4d-*` crates plus
   capabilities, dataset source, and deterministic create-only local writer.
 - `mirante4d-import-pipeline`: active bounded, cancellable, restartable
   TIFF/OME-TIFF producer for validated sharded target packages.
-- `mirante4d-app`: native composition and egui shell.
+- `mirante4d-ui-egui`: active egui visual components and UI-facing message
+  projection; its only Mirante dependency is `mirante4d-application`.
+- `mirante4d-app`: native composition and the remaining shell during WP-09C.
 - `xtask`: developer and verification tooling, never a product mode.
 
 `mirante4d-core` and the predecessor application/session/preferences models

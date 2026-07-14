@@ -40,7 +40,6 @@ mod state;
 mod tool_interactions;
 mod tools;
 mod transfer_presets;
-mod ui_kit;
 mod unified_source_open;
 mod viewer_layout;
 mod viewport;
@@ -116,6 +115,7 @@ use mirante4d_project_store::{
 use mirante4d_render_api::PresentationViewport;
 use mirante4d_render_wgpu::{WgpuRenderRuntime, WgpuRenderRuntimeConfig};
 use mirante4d_settings::{RejectedFileDisposition, ResourcePolicy, recommended_for_current_system};
+use mirante4d_ui_egui as ui_kit;
 use playback::playback_status_label;
 #[cfg(test)]
 use playback::stepped_timepoint;

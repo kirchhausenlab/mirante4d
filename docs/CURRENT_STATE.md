@@ -22,14 +22,15 @@ public release or public full microscopy dataset yet.
 - Linux release-directory, tarball, and AppImage build paths.
 - No segmentation or derived-label subsystem.
 
-The workspace has seventeen packages: sixteen `mirante4d-*` crates plus
+The workspace has eighteen packages: seventeen `mirante4d-*` crates plus
 `xtask`. `mirante4d-storage` owns the active package catalog, bounded
 validation and reads, and create-only package publication.
 `mirante4d-import-pipeline` is the active bounded, cancellable, restartable
 TIFF/OME-TIFF producer. The predecessor `mirante4d-data`, `mirante4d-format`,
-and `mirante4d-import` crates are deleted. `mirante4d-render-wgpu` is the sole
-product renderer. The unpublished `mirante4d-render-reference` CPU oracle is
-test-only, and the predecessor `mirante4d-renderer` crate is deleted.
+and `mirante4d-import` crates are deleted. `mirante4d-ui-egui` now owns shared
+egui visuals and application-problem presentation. `mirante4d-render-wgpu` is
+the sole product renderer. The unpublished `mirante4d-render-reference` CPU
+oracle is test-only, and the predecessor `mirante4d-renderer` crate is deleted.
 
 `mirante4d-analysis-core` owns exact `uint8`, `uint16`, and finite `float32`
 intensity statistics and artifact payloads. `mirante4d-analysis-runtime` runs

@@ -2182,9 +2182,9 @@ impl eframe::App for MiranteWorkbenchApp {
                         }
                     });
                     ui_kit::section(ui, "Messages", |ui| {
-                        if let Some(message) =
-                            application_problem_message(application_snapshot.latest_problem())
-                        {
+                        if let Some(message) = ui_kit::application_problem_message(
+                            application_snapshot.latest_problem(),
+                        ) {
                             ui_kit::status_badge(ui, StatusTone::Error, message);
                         }
                         if let Some(error) = &self.import_runtime.tiff_import_setup_error {
@@ -2386,22 +2386,6 @@ impl eframe::App for MiranteWorkbenchApp {
                 tracing::warn!(?error, "project-store actor join failed during exit");
             }
         }
-    }
-}
-
-fn application_problem_message(event: Option<&ApplicationEvent>) -> Option<String> {
-    match event? {
-        ApplicationEvent::OperationCompleted {
-            token,
-            outcome: mirante4d_application::OperationOutcome::Failed(code),
-        } => Some(format!(
-            "{:?} failed ({code:?}); correct the input, permissions, or resource limit and retry",
-            token.kind()
-        )),
-        ApplicationEvent::ResourcePolicyRejected { reason, .. } => Some(format!(
-            "settings save failed ({reason:?}); correct the settings file or permissions and retry"
-        )),
-        _ => None,
     }
 }
 

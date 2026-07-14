@@ -114,8 +114,9 @@ fn source_architecture_violations(path: &Path, source: &str) -> Vec<String> {
         return violations;
     }
     violations.extend(axis_aligned_2d_chunk_dependency_violations(path, source));
-    let app_or_app_test = normalized.starts_with("crates/mirante4d-app/");
-    if !app_or_app_test {
+    let ui_layer = normalized.starts_with("crates/mirante4d-app/")
+        || normalized.starts_with("crates/mirante4d-ui-egui/");
+    if !ui_layer {
         violations.extend(source_pattern_violations(
             path,
             source,
@@ -126,7 +127,7 @@ fn source_architecture_violations(path: &Path, source: &str) -> Vec<String> {
                 "mirante4d_app",
                 "rfd::",
             ],
-            "non-app crate must not import UI/app layer",
+            "non-UI crate must not import UI/app layer",
         ));
     }
     if normalized.starts_with("crates/mirante4d-render-wgpu/src/") {
@@ -881,6 +882,7 @@ fn check_wp07b_live_cutover(
         ("mirante4d-application", "mirante4d-render-api"),
         ("mirante4d-dataset-runtime", "mirante4d-dataset"),
         ("mirante4d-import-pipeline", "mirante4d-dataset"),
+        ("mirante4d-ui-egui", "mirante4d-application"),
         ("mirante4d-render-api", "mirante4d-dataset"),
         ("mirante4d-render-reference", "mirante4d-dataset"),
         ("mirante4d-render-reference", "mirante4d-render-api"),
@@ -2607,14 +2609,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_architecture_policy_rejects_ui_imports_outside_app_crate() {
+    fn source_architecture_policy_rejects_ui_imports_outside_ui_layer() {
         let violations = source_architecture_violations(
             Path::new("crates/mirante4d-data/src/lib.rs"),
             "use egui::Context;\n",
         );
 
         assert_eq!(violations.len(), 1);
-        assert!(violations[0].contains("non-app crate must not import UI/app layer"));
+        assert!(violations[0].contains("non-UI crate must not import UI/app layer"));
     }
 
     #[test]
@@ -2622,6 +2624,16 @@ mod tests {
         let violations = source_architecture_violations(
             Path::new("crates/mirante4d-app/src/lib.rs"),
             "use egui::Context;\nuse rfd::FileDialog;\n",
+        );
+
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn source_architecture_policy_allows_ui_imports_inside_ui_crate() {
+        let violations = source_architecture_violations(
+            Path::new("crates/mirante4d-ui-egui/src/lib.rs"),
+            "use egui::Context;\n",
         );
 
         assert!(violations.is_empty());

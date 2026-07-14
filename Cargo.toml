@@ -16,6 +16,7 @@ members = [
     "crates/mirante4d-render-wgpu",
     "crates/mirante4d-settings",
     "crates/mirante4d-storage",
+    "crates/mirante4d-ui-egui",
     "crates/xtask",
 ]
 exclude = ["vendor/wayland-scanner"]
@@ -74,6 +75,7 @@ mirante4d-render-reference = { path = "crates/mirante4d-render-reference" }
 mirante4d-render-wgpu = { path = "crates/mirante4d-render-wgpu" }
 mirante4d-settings = { path = "crates/mirante4d-settings" }
 mirante4d-storage = { path = "crates/mirante4d-storage" }
+mirante4d-ui-egui = { path = "crates/mirante4d-ui-egui" }
 
 [patch.crates-io]
 wayland-scanner = { path = "vendor/wayland-scanner" }

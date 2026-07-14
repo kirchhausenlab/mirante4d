@@ -46,7 +46,7 @@ const TARGET_CRATES: [&str; 17] = [
     "mirante4d-storage",
     "mirante4d-ui-egui",
 ];
-const SUCCESSOR_OWNED_WORKSPACE_CRATES: [&str; 7] = [
+const SUCCESSOR_OWNED_WORKSPACE_CRATES: [&str; 8] = [
     "mirante4d-analysis-core",
     "mirante4d-analysis-runtime",
     "mirante4d-import-pipeline",
@@ -54,6 +54,7 @@ const SUCCESSOR_OWNED_WORKSPACE_CRATES: [&str; 7] = [
     "mirante4d-render-reference",
     "mirante4d-render-wgpu",
     "mirante4d-storage",
+    "mirante4d-ui-egui",
 ];
 const RETIRED_WORKSPACE_CRATES: [&str; 5] = [
     "mirante4d-analysis",
@@ -77,6 +78,7 @@ pub(super) fn accepted_successor_normal_dependency_additions(
             "mirante4d-project-store",
             "mirante4d-render-wgpu",
             "mirante4d-storage",
+            "mirante4d-ui-egui",
         ],
         "mirante4d-application" => &["mirante4d-project-store"],
         "mirante4d-renderer" => &["mirante4d-dataset"],
