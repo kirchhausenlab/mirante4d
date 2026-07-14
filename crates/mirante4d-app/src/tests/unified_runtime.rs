@@ -1,7 +1,7 @@
 #[test]
 fn unified_source_open_starts_with_no_owned_interactive_payloads() {
     let temp = tempfile::tempdir().unwrap();
-    let package = write_fixture(FixtureKind::TimeMultiChannelU16_8Cube3T2C, temp.path()).unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(&package).unwrap();
 
     assert_eq!(opened.render_runtime.lease_bridge.required_len(), 0);
@@ -24,7 +24,7 @@ fn semantic_tile_shape_is_storage_independent_and_clips_edges() {
 #[test]
 fn unified_demand_plan_uses_semantic_keys_for_every_visible_layer() {
     let temp = tempfile::tempdir().unwrap();
-    let package = write_fixture(FixtureKind::TimeMultiChannelU16_8Cube3T2C, temp.path()).unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(&package).unwrap();
     let application = test_application_for_opened_source(&opened);
     let snapshot = application.snapshot();
@@ -64,7 +64,7 @@ fn unified_demand_plan_uses_semantic_keys_for_every_visible_layer() {
 #[test]
 fn app_dispatches_and_drains_visible_demand_through_one_runtime() {
     let temp = tempfile::tempdir().unwrap();
-    let package = write_fixture(FixtureKind::BasicU16_16Cube, temp.path()).unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(&package).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
     let outcome = app.request_visible_bricks();
@@ -94,7 +94,7 @@ fn app_dispatches_and_drains_visible_demand_through_one_runtime() {
 #[test]
 fn exact_analyses_cancel_save_and_reopen_atomically() {
     let temp = tempfile::tempdir().unwrap();
-    let package = write_fixture(FixtureKind::TimeU16_8Cube3T, temp.path()).unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
     let project_path = temp.path().join("analysis-result.m4dproj");
     let context = egui::Context::default();
 
@@ -245,7 +245,7 @@ fn exact_analyses_cancel_save_and_reopen_atomically() {
 #[test]
 fn analysis_only_source_failure_invalidates_the_verified_source() {
     let temp = tempfile::tempdir().unwrap();
-    let package = write_fixture(FixtureKind::TimeU16_8Cube3T, temp.path()).unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
     let project_path = temp.path().join("analysis-source-failure.m4dproj");
     let context = egui::Context::default();
     let opened = open_dataset_and_render_first_frame(&package).unwrap();
@@ -395,7 +395,7 @@ fn close_test_project_store(app: &mut MiranteWorkbenchApp) {
 #[test]
 fn terminal_decode_failure_is_stable_until_the_scope_changes() {
     let temp = tempfile::tempdir().unwrap();
-    let package = write_fixture(FixtureKind::BasicU16_16Cube, temp.path()).unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(&package).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
     fs::remove_dir_all(&package).unwrap();
@@ -439,7 +439,7 @@ fn terminal_decode_failure_is_stable_until_the_scope_changes() {
 #[test]
 fn observed_source_fault_invalidates_then_retry_restores_runtime_identity_coherence() {
     let temp = tempfile::tempdir().unwrap();
-    let package = write_fixture(FixtureKind::BasicU16_16Cube, temp.path()).unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(&package).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
     app.source_verification_service = Some(
@@ -588,7 +588,7 @@ fn observed_source_fault_invalidates_then_retry_restores_runtime_identity_cohere
 #[test]
 fn automatic_source_verification_waits_for_the_previous_worker_to_retire() {
     let temp = tempfile::tempdir().unwrap();
-    let package = write_fixture(FixtureKind::BasicU16_16Cube, temp.path()).unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(&package).unwrap();
     let replacement = crate::unified_source_open::open(
         &package,
@@ -777,7 +777,7 @@ fn automatic_source_verification_waits_for_the_previous_worker_to_retire() {
 #[test]
 fn playback_prefetch_readiness_is_backed_by_retained_accounted_leases() {
     let temp = tempfile::tempdir().unwrap();
-    let package = write_fixture(FixtureKind::TimeU16_8Cube3T, temp.path()).unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(&package).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
     let context = egui::Context::default();
@@ -809,7 +809,7 @@ fn playback_prefetch_readiness_is_backed_by_retained_accounted_leases() {
 #[test]
 fn four_panel_playback_demand_shares_one_aggregate_resource_and_byte_budget() {
     let temp = tempfile::tempdir().unwrap();
-    let package = write_fixture(FixtureKind::TimeMultiChannelU16_8Cube3T2C, temp.path()).unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(&package).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
     let context = egui::Context::default();

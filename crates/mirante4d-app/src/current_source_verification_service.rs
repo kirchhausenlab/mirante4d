@@ -735,11 +735,7 @@ mod tests {
     #[test]
     fn cancellation_before_receive_wins_over_an_already_published_success() {
         let temp = tempfile::tempdir().unwrap();
-        let path = mirante4d_format::write_fixture(
-            mirante4d_format::FixtureKind::BasicU16_16Cube,
-            temp.path(),
-        )
-        .unwrap();
+        let path = crate::tests::write_target_fixture(temp.path()).unwrap();
         let opened = crate::unified_source_open::open(
             &path,
             mirante4d_settings::ResourcePolicy::default(),

@@ -100,7 +100,7 @@ fn workbench_shell_exposes_channel_display_controls() {
     use egui_kittest::{Harness, kittest::Queryable};
 
     let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::TimeMultiChannelU16_8Cube3T2C, tempdir.path()).unwrap();
+    let root = write_target_fixture(tempdir.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(root).unwrap();
 
     let harness = Harness::builder()
@@ -226,7 +226,7 @@ fn workbench_shell_exposes_histogram_and_auto_window_controls() {
     use egui_kittest::{Harness, kittest::Queryable};
 
     let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
+    let root = write_target_fixture(tempdir.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(root).unwrap();
 
     let harness = Harness::builder()
@@ -281,7 +281,7 @@ fn histogram_bins_label_is_plain_product_text_not_ascii_art() {
 #[test]
 fn application_playback_commands_reconcile_transient_state_and_timepoint() {
     let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::TimeMultiChannelU16_8Cube3T2C, tempdir.path()).unwrap();
+    let root = write_target_fixture(tempdir.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(root).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
     let ctx = egui::Context::default();
@@ -345,7 +345,7 @@ fn application_playback_commands_reconcile_transient_state_and_timepoint() {
 #[test]
 fn timepoint_command_dirties_cross_section_panels_without_dirtying_3d_panel() {
     let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::TimeMultiChannelU16_8Cube3T2C, tempdir.path()).unwrap();
+    let root = write_target_fixture(tempdir.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(root).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
     let ctx = egui::Context::default();
@@ -420,7 +420,7 @@ fn workbench_shell_exposes_playback_controls_for_time_series() {
     use egui_kittest::{Harness, kittest::Queryable};
 
     let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::TimeMultiChannelU16_8Cube3T2C, tempdir.path()).unwrap();
+    let root = write_target_fixture(tempdir.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(root).unwrap();
 
     let harness = Harness::builder()

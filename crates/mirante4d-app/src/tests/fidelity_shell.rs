@@ -135,7 +135,7 @@ fn workbench_shell_exposes_primary_regions_at_high_dpi() {
     use egui_kittest::{Harness, kittest::Queryable};
 
     let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
+    let root = write_target_fixture(tempdir.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(root).unwrap();
 
     let harness = Harness::builder()
@@ -165,7 +165,7 @@ fn workbench_runtime_diagnostics_exposes_unified_runtime_bounds_and_leases() {
     use egui_kittest::{Harness, kittest::Queryable};
 
     let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
+    let root = write_target_fixture(tempdir.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(root).unwrap();
     let app = test_workbench_app_without_background_runtime(opened);
 
@@ -197,7 +197,7 @@ fn workbench_runtime_diagnostics_exposes_unified_runtime_bounds_and_leases() {
 #[test]
 fn tiff_import_setup_state_is_visible_immediately_after_output_selection() {
     let tempdir = tempfile::tempdir().unwrap();
-    let root = write_fixture(FixtureKind::BasicU16_16Cube, tempdir.path()).unwrap();
+    let root = write_target_fixture(tempdir.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(root).unwrap();
     let source = tempdir.path().join("raw.tif");
     let output_parent = tempdir.path().join("output");
