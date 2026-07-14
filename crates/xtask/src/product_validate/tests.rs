@@ -7,6 +7,12 @@ fn assert_dataset_runtime_limits(script: &Value, total_bytes: u64, resident_reso
         script["limits"]["max_cpu_decoded_residency_bytes"],
         total_bytes / 2
     );
+    assert_eq!(
+        script["limits"]["max_cpu_in_flight_decode_bytes"],
+        (total_bytes / 8)
+            .saturating_add(PACKAGE_VALIDATION_WORKING_BYTES)
+            .min(total_bytes)
+    );
     assert_eq!(script["limits"]["max_runtime_queued_requests"], 1_024);
     assert_eq!(script["limits"]["max_runtime_in_flight_decodes"], 8);
     assert_eq!(script["limits"]["max_runtime_pending_completions"], 1_024);

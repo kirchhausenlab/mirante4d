@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use mirante4d_storage::LocalPackageCatalog;
+use mirante4d_storage::{LocalPackageCatalog, PACKAGE_VALIDATION_WORKING_BYTES};
 use serde_json::{Value, json};
 
 use crate::{
@@ -1650,11 +1650,14 @@ fn product_validation_package_and_script(
 }
 
 fn dataset_runtime_limits(max_cpu_total_bytes: u64, max_resident_resources: u64) -> Value {
+    let max_cpu_in_flight_decode_bytes = (max_cpu_total_bytes / 8)
+        .saturating_add(PACKAGE_VALIDATION_WORKING_BYTES)
+        .min(max_cpu_total_bytes);
     json!({
         "max_cpu_total_bytes": max_cpu_total_bytes,
         "max_cpu_decoded_residency_bytes": max_cpu_total_bytes / 2,
         "max_cpu_upload_staging_bytes": max_cpu_total_bytes / 8,
-        "max_cpu_in_flight_decode_bytes": max_cpu_total_bytes / 8,
+        "max_cpu_in_flight_decode_bytes": max_cpu_in_flight_decode_bytes,
         "max_cpu_metadata_and_indexes_bytes": max_cpu_total_bytes / 10,
         "max_cpu_queues_and_results_bytes": max_cpu_total_bytes / 20,
         "max_cpu_prefetch_bytes": max_cpu_total_bytes / 20,
