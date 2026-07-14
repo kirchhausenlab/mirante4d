@@ -3,24 +3,68 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use eframe::egui;
-use mirante4d_render_api::PresentationToken;
+use mirante4d_render_api::{FrameIdentity, PresentationToken, PresentedFrame, RenderExtent};
+use mirante4d_render_wgpu::{ValidationCapture, ValidationCaptureTicket, WgpuRenderRuntime};
 use mirante4d_ui_egui::EguiPresentationPaint;
+
+use crate::{product_render_intent::ProductRenderRequest, viewer_layout::PanelId};
+
+pub(crate) struct ProductPresentationTarget {
+    pub(crate) token: PresentationToken,
+    pub(crate) extent: RenderExtent,
+    pub(crate) request: Option<ProductRenderRequest>,
+    pub(crate) presented: Option<PresentedFrame>,
+    pub(crate) pending_capture: Option<(PresentedFrame, ValidationCaptureTicket)>,
+    pub(crate) completed_capture: Option<(PresentedFrame, ValidationCapture)>,
+    pub(crate) partial_seen: bool,
+}
+
+pub(crate) struct ProductGpuRenderRuntime {
+    pub(crate) renderer: WgpuRenderRuntime,
+    pub(crate) targets: BTreeMap<PanelId, ProductPresentationTarget>,
+    next_frame_identity: u64,
+    pub(crate) current_partial_frames_presented: u64,
+    pub(crate) partial_to_settled_transitions: u64,
+    pub(crate) stale_frames_rejected: u64,
+}
+
+impl ProductGpuRenderRuntime {
+    pub(crate) fn new(renderer: WgpuRenderRuntime) -> Self {
+        Self {
+            renderer,
+            targets: BTreeMap::new(),
+            next_frame_identity: 1,
+            current_partial_frames_presented: 0,
+            partial_to_settled_transitions: 0,
+            stale_frames_rejected: 0,
+        }
+    }
+
+    pub(crate) fn allocate_frame_identity(&mut self) -> FrameIdentity {
+        let frame = FrameIdentity::new(self.next_frame_identity);
+        self.next_frame_identity = self.next_frame_identity.saturating_add(1);
+        frame
+    }
+}
 
 pub(crate) struct NativePresentationBridge {
     texture_renderer: Option<Arc<egui::mutex::RwLock<eframe::egui_wgpu::Renderer>>>,
     device: Option<eframe::wgpu::Device>,
     textures: BTreeMap<PresentationToken, egui::TextureId>,
+    pub(crate) product_gpu: Option<ProductGpuRenderRuntime>,
 }
 
 impl NativePresentationBridge {
     pub(crate) fn new(
         texture_renderer: Arc<egui::mutex::RwLock<eframe::egui_wgpu::Renderer>>,
         device: eframe::wgpu::Device,
+        product_renderer: WgpuRenderRuntime,
     ) -> Self {
         Self {
             texture_renderer: Some(texture_renderer),
             device: Some(device),
             textures: BTreeMap::new(),
+            product_gpu: Some(ProductGpuRenderRuntime::new(product_renderer)),
         }
     }
 
@@ -30,6 +74,7 @@ impl NativePresentationBridge {
             texture_renderer: None,
             device: None,
             textures: BTreeMap::new(),
+            product_gpu: None,
         }
     }
 

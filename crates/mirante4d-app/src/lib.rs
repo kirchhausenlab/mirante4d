@@ -537,7 +537,7 @@ impl MiranteWorkbenchApp {
             catalog,
             workspace,
             dataset,
-            mut render_runtime,
+            render_runtime,
             analysis_runtime,
         } = opened;
         let provisional_project_id = workspace.provisional_project_id();
@@ -552,10 +552,6 @@ impl MiranteWorkbenchApp {
             .wgpu_render_state
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("the interactive viewer requires the WGPU renderer"))?;
-        let native_presentation = native_presentation::NativePresentationBridge::new(
-            render_state.renderer.clone(),
-            render_state.device.clone(),
-        );
         let validation_runtime =
             current_runtime::validation::CurrentValidationRuntime::from_environment();
         let validation_capture = validation_runtime.product_automation.is_some();
@@ -574,9 +570,11 @@ impl MiranteWorkbenchApp {
             renderer_diagnostics.adapter_name(),
             renderer_diagnostics.driver(),
         ));
-        render_runtime.product_gpu = Some(current_runtime::render::ProductGpuRenderRuntime::new(
+        let native_presentation = native_presentation::NativePresentationBridge::new(
+            render_state.renderer.clone(),
+            render_state.device.clone(),
             product_renderer,
-        ));
+        );
         let egui_ui = ui_kit::EguiUiState::new(
             resource_policy.cpu_dataset_budget_bytes(),
             resource_policy.gpu_budget_bytes(),
@@ -2480,11 +2478,10 @@ impl MiranteWorkbenchApp {
     ) {
         let current_source_open_service::CurrentSourceRuntimeTransfer {
             dataset,
-            mut render_runtime,
+            render_runtime,
             analysis_runtime,
         } = transfer;
         self.clear_product_presentations();
-        render_runtime.product_gpu = self.render_runtime.product_gpu.take();
         let old_dataset = std::mem::replace(&mut self.dataset, dataset);
         let old_render_runtime = std::mem::replace(&mut self.render_runtime, render_runtime);
         let old_analysis_runtime = std::mem::replace(&mut self.analysis_runtime, analysis_runtime);

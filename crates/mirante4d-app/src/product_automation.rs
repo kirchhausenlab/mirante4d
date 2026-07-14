@@ -66,7 +66,7 @@ fn product_presentation(
     app: &MiranteWorkbenchApp,
     panel: PanelId,
 ) -> Option<&mirante4d_render_api::PresentedFrame> {
-    app.render_runtime
+    app.native_presentation
         .product_gpu
         .as_ref()?
         .targets
@@ -1687,6 +1687,7 @@ impl ProductAutomationController {
                     &app.analysis_runtime,
                     &app.dataset,
                     &app.render_runtime,
+                    &app.native_presentation,
                 )
             }
             ProductAutomationWaitCondition::FrameFreshnessCurrent => {
@@ -1809,6 +1810,7 @@ impl ProductAutomationController {
                     &app.analysis_runtime,
                     &app.dataset,
                     &app.render_runtime,
+                    &app.native_presentation,
                 ) {
                     Err("background work is still active".to_owned())
                 } else {
@@ -2158,7 +2160,7 @@ impl ProductAutomationController {
                 "display_refresh_timing": app
                     .render_runtime.last_display_refresh_timing
                     .map(display_refresh_timing_json),
-                "progressive_presentation": app.render_runtime.product_gpu.as_ref().map(|product| json!({
+                "progressive_presentation": app.native_presentation.product_gpu.as_ref().map(|product| json!({
                     "current_partial_frames_presented": product.current_partial_frames_presented,
                     "partial_to_settled_transitions": product.partial_to_settled_transitions,
                     "stale_frames_rejected": product.stale_frames_rejected,
@@ -2179,7 +2181,7 @@ impl ProductAutomationController {
             "retained_leases": retained_leases_diagnostics_json(app),
             "cross_section": cross_section_diagnostics_json(app),
             "gpu_adapter": app
-                .render_runtime.product_gpu
+                .native_presentation.product_gpu
                 .as_ref()
                 .map(|product| gpu_adapter_diagnostics_json(product.renderer.diagnostics())),
             "gpu_timestamp_timing": gpu_timestamp_timing_json(),
@@ -2401,6 +2403,7 @@ impl ProductAutomationController {
                     &app.analysis_runtime,
                     &app.dataset,
                     &app.render_runtime,
+                    &app.native_presentation,
                 ),
                 active_timepoint: view.timepoint().get(),
                 render_mode,
@@ -2953,7 +2956,7 @@ fn assert_cross_section_retired(app: &MiranteWorkbenchApp) -> Result<(), String>
         }
     }
     let active_targets = app
-        .render_runtime
+        .native_presentation
         .product_gpu
         .as_ref()
         .map_or(0, |product| {
@@ -3004,7 +3007,7 @@ fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
                 }),
                 "schedule": panel.cross_section_schedule.map(panel_schedule_json),
                 "display_frame": app
-                    .render_runtime
+                    .native_presentation
                     .product_gpu
                     .as_ref()
                     .and_then(|product| product.targets.get(&panel.panel_id))

@@ -130,7 +130,7 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
             );
         }
     }
-    if let Some(product) = app.render_runtime.product_gpu.as_ref() {
+    if let Some(product) = app.native_presentation.product_gpu.as_ref() {
         let diagnostics = product.renderer.diagnostics();
         ui_kit::property_row(
             ui,

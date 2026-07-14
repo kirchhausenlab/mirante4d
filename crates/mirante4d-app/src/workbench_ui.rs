@@ -2315,6 +2315,7 @@ impl eframe::App for MiranteWorkbenchApp {
             &self.analysis_runtime,
             &self.dataset,
             &self.render_runtime,
+            &self.native_presentation,
         ) || workbench_playback_runtime::source_verification_polling_required(
             self.pending_automatic_source_verification.is_some(),
             self.source_verification_service

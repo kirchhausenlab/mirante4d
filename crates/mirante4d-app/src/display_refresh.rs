@@ -10,6 +10,7 @@ use crate::{
     dataset_requests::{
         SCOPE_CROSS_SECTION_XY, SCOPE_CROSS_SECTION_XZ, SCOPE_CROSS_SECTION_YZ, SCOPE_CURRENT_3D,
     },
+    native_presentation::ProductPresentationTarget,
     product_render_intent::{ProductRenderRequest, cross_section_request, volume_request},
     viewer_layout::PanelId,
 };
@@ -119,7 +120,7 @@ impl MiranteWorkbenchApp {
     ) -> PresentationSurface {
         let frame = frame_is_current
             .then(|| {
-                self.render_runtime
+                self.native_presentation
                     .product_gpu
                     .as_ref()?
                     .targets
@@ -174,7 +175,7 @@ impl MiranteWorkbenchApp {
     }
 
     pub(crate) fn clear_3d_product_presentation(&mut self) {
-        if let Some(product) = self.render_runtime.product_gpu.as_mut()
+        if let Some(product) = self.native_presentation.product_gpu.as_mut()
             && let Some(target) = product.targets.get_mut(&PanelId::ThreeD)
         {
             target.request = None;
@@ -187,7 +188,7 @@ impl MiranteWorkbenchApp {
     }
 
     pub(crate) fn clear_cross_section_product_presentations(&mut self) {
-        if let Some(product) = self.render_runtime.product_gpu.as_mut() {
+        if let Some(product) = self.native_presentation.product_gpu.as_mut() {
             for panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
                 if let Some(target) = product.targets.get_mut(&panel) {
                     target.request = None;
@@ -207,7 +208,7 @@ impl MiranteWorkbenchApp {
     }
 
     pub(crate) fn clear_product_presentations(&mut self) {
-        if let Some(product) = self.render_runtime.product_gpu.as_mut() {
+        if let Some(product) = self.native_presentation.product_gpu.as_mut() {
             for target in product.targets.values_mut() {
                 target.request = None;
                 target.presented = None;
@@ -224,7 +225,7 @@ impl MiranteWorkbenchApp {
             return false;
         };
         let target_is_progressive = self
-            .render_runtime
+            .native_presentation
             .product_gpu
             .as_ref()
             .and_then(|product| product.targets.get(&panel_id))
@@ -250,7 +251,7 @@ impl MiranteWorkbenchApp {
         let view = application_view(&snapshot);
         let scope = cross_section_scope(panel_id)?;
         let requirements = self.dataset.scope_requirements(scope).to_vec();
-        let gpu_available = self.render_runtime.product_gpu.is_some();
+        let gpu_available = self.native_presentation.product_gpu.is_some();
         let schedule = schedule_cross_section_panel(
             &mut self.render_runtime,
             CrossSectionScheduleInput {
@@ -332,7 +333,7 @@ impl MiranteWorkbenchApp {
     ) -> anyhow::Result<bool> {
         self.ensure_product_target(target_id, extent)?;
         let current_frame = self
-            .render_runtime
+            .native_presentation
             .product_gpu
             .as_ref()
             .and_then(|product| product.targets.get(&target_id))
@@ -347,7 +348,7 @@ impl MiranteWorkbenchApp {
             resources,
         )?;
         let changed = self
-            .render_runtime
+            .native_presentation
             .product_gpu
             .as_ref()
             .and_then(|product| product.targets.get(&target_id))
@@ -355,7 +356,7 @@ impl MiranteWorkbenchApp {
             != next.as_ref();
         if changed {
             let frame = self
-                .render_runtime
+                .native_presentation
                 .product_gpu
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("progressive GPU renderer is unavailable"))?
@@ -369,7 +370,7 @@ impl MiranteWorkbenchApp {
                 resources,
             )?;
             let target = self
-                .render_runtime
+                .native_presentation
                 .product_gpu
                 .as_mut()
                 .and_then(|product| product.targets.get_mut(&target_id))
@@ -385,7 +386,7 @@ impl MiranteWorkbenchApp {
             return Ok(false);
         }
         let Some(request) = self
-            .render_runtime
+            .native_presentation
             .product_gpu
             .as_ref()
             .and_then(|product| product.targets.get(&target_id))
@@ -405,7 +406,7 @@ impl MiranteWorkbenchApp {
             .map(|lease| Arc::as_ref(lease) as &dyn ResourceLease)
             .collect::<Vec<_>>();
         let product = self
-            .render_runtime
+            .native_presentation
             .product_gpu
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("progressive GPU renderer is unavailable"))?;
@@ -477,7 +478,7 @@ impl MiranteWorkbenchApp {
         extent: RenderExtent,
     ) -> anyhow::Result<()> {
         let product = self
-            .render_runtime
+            .native_presentation
             .product_gpu
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("progressive GPU renderer is unavailable"))?;
@@ -487,7 +488,7 @@ impl MiranteWorkbenchApp {
         let registration = product.renderer.register_presentation(extent)?;
         product.targets.insert(
             target_id,
-            current_runtime::render::ProductPresentationTarget {
+            ProductPresentationTarget {
                 token: registration.token(),
                 extent,
                 request: None,
@@ -502,7 +503,7 @@ impl MiranteWorkbenchApp {
 
     pub(crate) fn poll_product_validation_captures(&mut self) -> anyhow::Result<()> {
         let pending = self
-            .render_runtime
+            .native_presentation
             .product_gpu
             .as_ref()
             .into_iter()
@@ -517,7 +518,7 @@ impl MiranteWorkbenchApp {
 
     fn poll_product_target_validation_capture(&mut self, panel: PanelId) -> anyhow::Result<bool> {
         let pending = self
-            .render_runtime
+            .native_presentation
             .product_gpu
             .as_ref()
             .and_then(|product| product.targets.get(&panel))
@@ -526,7 +527,7 @@ impl MiranteWorkbenchApp {
             return Ok(true);
         };
         let product = self
-            .render_runtime
+            .native_presentation
             .product_gpu
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("progressive GPU renderer is unavailable"))?;
@@ -550,7 +551,7 @@ impl MiranteWorkbenchApp {
         extent_changed: bool,
     ) -> anyhow::Result<()> {
         let product = self
-            .render_runtime
+            .native_presentation
             .product_gpu
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("progressive GPU renderer is unavailable"))?;
@@ -559,9 +560,9 @@ impl MiranteWorkbenchApp {
             .get(&target_id)
             .ok_or_else(|| anyhow::anyhow!("product presentation target is unavailable"))?;
         let token = target.token;
-        let view = product.renderer.presentation_texture_view(token)?;
+        let view = product.renderer.presentation_texture_view(token)?.clone();
         self.native_presentation
-            .bind_texture(token, view, extent_changed)?;
+            .bind_texture(token, &view, extent_changed)?;
         Ok(())
     }
 

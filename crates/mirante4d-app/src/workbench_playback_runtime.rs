@@ -8,6 +8,7 @@ use crate::{
     current_runtime::{analysis::AnalysisProductRuntime, render::CurrentRenderRuntime},
     dataset_requests::{DatasetDemandState, SCOPE_CURRENT_3D},
     import_worker_service::ImportWorkerService,
+    native_presentation::NativePresentationBridge,
     playback::{PLAYBACK_FRAME_INTERVAL, playback_tick_for_ui_time},
     viewer_layout::CrossSectionPanelScheduleStatus,
 };
@@ -18,12 +19,13 @@ pub(crate) fn background_work_active(
     _analysis: &AnalysisProductRuntime,
     dataset: &DatasetDemandState,
     render: &CurrentRenderRuntime,
+    presentation: &NativePresentationBridge,
 ) -> bool {
     application_service_work_active(snapshot)
         || import.status().is_active()
         || snapshot.transient().playback_active()
         || dataset.dispatcher().has_pending_work()
-        || render.product_gpu.as_ref().is_some_and(|product| {
+        || presentation.product_gpu.as_ref().is_some_and(|product| {
             product.targets.values().any(|target| {
                 (target.request.is_some() && target.presented.is_none())
                     || target.presented.as_ref().is_some_and(|frame| {
