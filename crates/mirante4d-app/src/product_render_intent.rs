@@ -140,24 +140,16 @@ fn build_request(
 }
 
 fn supported_render_state(state: RenderState) -> anyhow::Result<RenderState> {
-    if state.mip_parameters().is_some() {
-        return Ok(RenderState::mip(SamplingPolicy::VoxelExact));
+    if state.sampling_policy() != SamplingPolicy::VoxelExact {
+        anyhow::bail!("the product renderer supports only voxel-exact sampling");
     }
-    if let Some(parameters) = state.dvr_parameters() {
-        return Ok(RenderState::dvr(
-            SamplingPolicy::VoxelExact,
-            parameters.opacity_transfer(),
-            parameters.density_scale(),
-        )?);
-    }
-    let parameters = state
+    if state
         .iso_parameters()
-        .ok_or_else(|| anyhow::anyhow!("unsupported product render mode"))?;
-    Ok(RenderState::iso(
-        SamplingPolicy::VoxelExact,
-        IsoShadingPolicy::Flat,
-        parameters.display_level(),
-    )?)
+        .is_some_and(|parameters| parameters.shading_policy() != IsoShadingPolicy::Flat)
+    {
+        anyhow::bail!("the product renderer supports only flat ISO shading");
+    }
+    Ok(state)
 }
 
 fn panel_relative_orientation(panel: PanelId) -> Option<DQuat> {
@@ -186,12 +178,12 @@ mod tests {
     use super::supported_render_state;
 
     #[test]
-    fn product_modes_use_the_successor_supported_sampling_and_shading() {
-        let mip = supported_render_state(RenderState::mip(SamplingPolicy::SmoothLinear)).unwrap();
+    fn product_modes_preserve_supported_state_and_reject_unsupported_quality() {
+        let mip = supported_render_state(RenderState::mip(SamplingPolicy::VoxelExact)).unwrap();
         assert_eq!(mip.sampling_policy(), SamplingPolicy::VoxelExact);
 
         let dvr = RenderState::dvr(
-            SamplingPolicy::SmoothLinear,
+            SamplingPolicy::VoxelExact,
             DvrOpacityTransfer::new(
                 DisplayWindow::new(0.0, 1.0).unwrap(),
                 TransferCurve::linear(),
@@ -203,12 +195,8 @@ mod tests {
         assert_eq!(dvr.sampling_policy(), SamplingPolicy::VoxelExact);
         assert_eq!(dvr.dvr_parameters().unwrap().density_scale(), 2.0);
 
-        let iso = RenderState::iso(
-            SamplingPolicy::SmoothLinear,
-            IsoShadingPolicy::GradientLighting,
-            0.4,
-        )
-        .unwrap();
+        let iso =
+            RenderState::iso(SamplingPolicy::VoxelExact, IsoShadingPolicy::Flat, 0.4).unwrap();
         let iso = supported_render_state(iso).unwrap();
         assert_eq!(iso.sampling_policy(), SamplingPolicy::VoxelExact);
         assert_eq!(
@@ -216,5 +204,14 @@ mod tests {
             IsoShadingPolicy::Flat
         );
         assert_eq!(iso.iso_parameters().unwrap().display_level(), 0.4);
+
+        assert!(supported_render_state(RenderState::mip(SamplingPolicy::SmoothLinear)).is_err());
+        let unsupported_iso = RenderState::iso(
+            SamplingPolicy::VoxelExact,
+            IsoShadingPolicy::GradientLighting,
+            0.4,
+        )
+        .unwrap();
+        assert!(supported_render_state(unsupported_iso).is_err());
     }
 }

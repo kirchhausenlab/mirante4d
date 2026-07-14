@@ -136,7 +136,10 @@ impl MiranteWorkbenchApp {
         if let Some(product) = self.render_runtime.product_gpu.as_mut()
             && let Some(target) = product.targets.get_mut(&PanelId::ThreeD)
         {
+            target.request = None;
             target.presented = None;
+            target.pending_capture = None;
+            target.completed_capture = None;
         }
         self.render_runtime.frame_fidelity.display_freshness = DisplayedFrameFreshness::Unknown;
     }
@@ -149,7 +152,10 @@ impl MiranteWorkbenchApp {
         if let Some(product) = self.render_runtime.product_gpu.as_mut() {
             for panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
                 if let Some(target) = product.targets.get_mut(&panel) {
+                    target.request = None;
                     target.presented = None;
+                    target.pending_capture = None;
+                    target.completed_capture = None;
                 }
             }
         }
@@ -159,6 +165,18 @@ impl MiranteWorkbenchApp {
         self.render_runtime
             .cross_section_runtime
             .mark_cross_section_panels_dirty();
+    }
+
+    pub(crate) fn clear_product_presentations(&mut self) {
+        if let Some(product) = self.render_runtime.product_gpu.as_mut() {
+            for target in product.targets.values_mut() {
+                target.request = None;
+                target.presented = None;
+                target.pending_capture = None;
+                target.completed_capture = None;
+            }
+        }
+        self.render_runtime.frame_fidelity.display_freshness = DisplayedFrameFreshness::Unknown;
     }
 
     pub(crate) fn free_retired_gpu_display_textures(&mut self) {
@@ -179,9 +197,18 @@ impl MiranteWorkbenchApp {
         let Some(panel) = self.render_runtime.cross_section_runtime.panel(panel_id) else {
             return false;
         };
+        let target_is_progressive = self
+            .render_runtime
+            .product_gpu
+            .as_ref()
+            .and_then(|product| product.targets.get(&panel_id))
+            .and_then(|target| target.presented.as_ref())
+            .is_some_and(|frame| {
+                frame.progress().completeness() == RenderFrameCompleteness::Progressive
+            });
         panel_id.cross_section_panel().is_some()
             && panel.render_failure.is_none()
-            && !panel.display_current()
+            && (!panel.display_current() || target_is_progressive)
     }
 
     pub(crate) fn render_cross_section_panel_for_display_if_needed(
@@ -324,6 +351,13 @@ impl MiranteWorkbenchApp {
                 .expect("the product target was registered before request construction");
             target.request = next;
             target.presented = None;
+            target.pending_capture = None;
+            target.completed_capture = None;
+        } else if !self.poll_product_target_validation_capture(target_id)? {
+            if target_id == PanelId::ThreeD {
+                self.render_runtime.lod_replan_pending = true;
+            }
+            return Ok(false);
         }
         let Some(request) = self
             .render_runtime
@@ -365,11 +399,15 @@ impl MiranteWorkbenchApp {
             Ok(report) => report,
             Err(error @ WgpuRenderRuntimeError::StaleFrame { .. }) => {
                 product.stale_frames_rejected = product.stale_frames_rejected.saturating_add(1);
-                return Err(error.into());
+                tracing::debug!(%error, "stale product frame was rejected");
+                return Ok(false);
             }
             Err(error) => return Err(error.into()),
         };
         let Some(presented) = report.presentation().cloned() else {
+            if target_id == PanelId::ThreeD && report.uploaded_resources() > 0 {
+                self.render_runtime.lod_replan_pending = true;
+            }
             return Ok(false);
         };
         let previous = product
@@ -403,6 +441,13 @@ impl MiranteWorkbenchApp {
         let extent_changed = target.extent != presented.extent();
         target.extent = presented.extent();
         target.presented = Some(presented.clone());
+        if let Some(ticket) = report.validation_capture() {
+            target.pending_capture = Some((presented.clone(), ticket));
+            target.completed_capture = None;
+        }
+        if target_id == PanelId::ThreeD && current_is_partial {
+            self.render_runtime.lod_replan_pending = true;
+        }
         self.bind_product_texture(target_id, extent_changed)?;
         if target_id == PanelId::ThreeD {
             self.record_product_frame(&presented);
@@ -431,10 +476,56 @@ impl MiranteWorkbenchApp {
                 extent,
                 request: None,
                 presented: None,
+                pending_capture: None,
+                completed_capture: None,
                 texture_id: None,
             },
         );
         Ok(())
+    }
+
+    pub(crate) fn poll_product_validation_captures(&mut self) -> anyhow::Result<()> {
+        let pending = self
+            .render_runtime
+            .product_gpu
+            .as_ref()
+            .into_iter()
+            .flat_map(|product| product.targets.iter())
+            .filter_map(|(panel, target)| target.pending_capture.as_ref().map(|_| *panel))
+            .collect::<Vec<_>>();
+        for panel in pending {
+            self.poll_product_target_validation_capture(panel)?;
+        }
+        Ok(())
+    }
+
+    fn poll_product_target_validation_capture(&mut self, panel: PanelId) -> anyhow::Result<bool> {
+        let pending = self
+            .render_runtime
+            .product_gpu
+            .as_ref()
+            .and_then(|product| product.targets.get(&panel))
+            .and_then(|target| target.pending_capture.clone());
+        let Some((presentation, ticket)) = pending else {
+            return Ok(true);
+        };
+        let product = self
+            .render_runtime
+            .product_gpu
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("progressive GPU renderer is unavailable"))?;
+        let Some(capture) = product.renderer.poll_validation_capture(ticket)? else {
+            return Ok(false);
+        };
+        let target = product
+            .targets
+            .get_mut(&panel)
+            .expect("a pending capture belongs to a registered target");
+        target.pending_capture = None;
+        if target.presented.as_ref() == Some(&presentation) {
+            target.completed_capture = Some((presentation, capture));
+        }
+        Ok(true)
     }
 
     fn bind_product_texture(

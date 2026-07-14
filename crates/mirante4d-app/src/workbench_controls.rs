@@ -4,7 +4,7 @@ use eframe::egui;
 use mirante4d_application::{ApplicationCommand, ApplicationSnapshot};
 use mirante4d_domain::{
     CameraView, DvrOpacityTransfer, IsoShadingPolicy, Projection, RenderMode, RenderState,
-    TimeIndex, TransferCurve,
+    SamplingPolicy, TimeIndex, TransferCurve,
 };
 use mirante4d_project_model::{LayerViewState, ViewState};
 
@@ -161,18 +161,15 @@ pub(crate) fn projection_selector(
 
 fn render_state_for_mode(layer: &LayerViewState, mode: RenderMode) -> RenderState {
     let current = *layer.render_state();
-    let sampling = current.sampling_policy();
+    let sampling = SamplingPolicy::VoxelExact;
     match mode {
         RenderMode::Mip => RenderState::mip(sampling),
         RenderMode::Isosurface => {
-            let (shading, display_level) = current
+            let display_level = current
                 .iso_parameters()
-                .map(|parameters| (parameters.shading_policy(), parameters.display_level()))
-                .unwrap_or((
-                    IsoShadingPolicy::GradientLighting,
-                    DEFAULT_ISO_DISPLAY_LEVEL,
-                ));
-            RenderState::iso(sampling, shading, display_level)
+                .map(|parameters| parameters.display_level())
+                .unwrap_or(DEFAULT_ISO_DISPLAY_LEVEL);
+            RenderState::iso(sampling, IsoShadingPolicy::Flat, display_level)
                 .expect("the retained or default ISO parameters are valid")
         }
         RenderMode::Dvr => {

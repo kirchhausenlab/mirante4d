@@ -79,7 +79,7 @@ mod tests {
             channels: vec![
                 DisplayGraphChannel {
                     layer: LogicalLayerKey::new(0),
-                    render_state: RenderState::mip(SamplingPolicy::SmoothLinear),
+                    render_state: RenderState::mip(SamplingPolicy::VoxelExact),
                 },
                 DisplayGraphChannel {
                     layer: LogicalLayerKey::new(1),

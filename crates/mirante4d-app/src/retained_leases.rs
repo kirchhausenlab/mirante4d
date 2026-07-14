@@ -6,13 +6,13 @@ use std::{
     sync::Arc,
 };
 
+use crate::product_render_intent::PRODUCT_RENDER_RESOURCE_LIMIT;
 use mirante4d_dataset::{
     DatasetResourceIdentity, DatasetResourceKey, ResourceLease, ResourcePayloadView,
 };
 use mirante4d_domain::{IntensityDType, LogicalLayerKey, ScaleLevel, TimeIndex};
-use mirante4d_render_api::MAX_RENDER_REQUIREMENTS;
 
-pub(crate) const MAX_RETAINED_LEASE_REQUIREMENTS: usize = MAX_RENDER_REQUIREMENTS;
+pub(crate) const MAX_RETAINED_LEASE_REQUIREMENTS: usize = PRODUCT_RENDER_RESOURCE_LIMIT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RetainedLeaseError {
@@ -629,6 +629,16 @@ mod tests {
             retained.retained_lease(retained_key).unwrap(),
             &retained_lease
         ));
+
+        let too_many = (0..=MAX_RETAINED_LEASE_REQUIREMENTS as u64).map(key);
+        assert_eq!(
+            retained.replace_requirements(too_many),
+            Err(RetainedLeaseError::TooManyRequirements {
+                actual: MAX_RETAINED_LEASE_REQUIREMENTS + 1,
+                maximum: MAX_RETAINED_LEASE_REQUIREMENTS,
+            })
+        );
+        assert!(retained.requires(retained_key));
     }
 
     #[test]

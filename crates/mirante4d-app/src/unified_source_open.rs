@@ -340,7 +340,7 @@ fn workspace_from_catalog(catalog: &DatasetCatalog) -> anyhow::Result<UnboundWor
             layer.key(),
             true,
             default_transfer(layer.dtype(), index)?,
-            RenderState::mip(SamplingPolicy::SmoothLinear),
+            RenderState::mip(SamplingPolicy::VoxelExact),
         ));
     }
     let active = first.key();

@@ -84,7 +84,7 @@ impl CrossSectionPanelScheduleState {
     }
 
     pub(crate) fn is_renderable(self) -> bool {
-        let has_current_partial = self.occupied_selected_bricks > self.missing_occupied_bricks;
+        let has_current_partial = self.occupied_selected_bricks > 0;
         (matches!(
             self.status,
             CrossSectionPanelScheduleStatus::Ready | CrossSectionPanelScheduleStatus::Coarse
@@ -170,5 +170,23 @@ mod tests {
             Some(CrossSectionPanel::Yz)
         );
         assert_eq!(PanelId::ThreeD.cross_section_panel(), None);
+    }
+
+    #[test]
+    fn one_retained_resource_is_enough_to_attempt_a_useful_partial_panel() {
+        let schedule = CrossSectionPanelScheduleState {
+            generation: 1,
+            target_scale_level: Some(0),
+            render_scale_level: Some(0),
+            fallback_scale_level: None,
+            selected_bricks: 4,
+            occupied_selected_bricks: 1,
+            missing_occupied_bricks: 3,
+            estimated_decoded_bytes: 0,
+            decoded_budget_bytes: 0,
+            status: CrossSectionPanelScheduleStatus::Loading,
+            reason: CrossSectionPanelScheduleReason::MissingSelectedBricks,
+        };
+        assert!(schedule.is_renderable());
     }
 }

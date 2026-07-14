@@ -393,7 +393,7 @@ mod tests {
                 LogicalLayerKey::new(0),
                 true,
                 transfer,
-                RenderState::mip(SamplingPolicy::SmoothLinear),
+                RenderState::mip(SamplingPolicy::VoxelExact),
             )],
             LogicalLayerKey::new(0),
             TimeIndex::new(0),

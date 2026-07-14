@@ -14,15 +14,12 @@ use mirante4d_application::{
 };
 use mirante4d_domain::{
     CrossSectionView as CanonicalCrossSectionView, DisplayWindow, DvrOpacityTransfer,
-    IsoShadingPolicy, LayerTransfer, Opacity, RenderMode, RenderState, TimeIndex, UnitQuaternion,
-    ViewerLayout, WorldPoint3,
+    IsoShadingPolicy, LayerTransfer, Opacity, RenderMode, RenderState, SamplingPolicy, TimeIndex,
+    UnitQuaternion, ViewerLayout, WorldPoint3,
 };
 use mirante4d_project_model::{LayerViewState, ProjectRevisionId};
 use mirante4d_render_api::PresentationViewport;
-use mirante4d_renderer::{
-    RenderViewport,
-    gpu::{GpuDisplayFrame, GpuRenderer},
-};
+use mirante4d_renderer::RenderViewport;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -44,8 +41,8 @@ mod timing;
 
 use capture::{
     ProductAutomationArtifact, ProductAutomationImageStats, capture_color_image,
-    color_image_from_rgba, current_display_image_stats, sanitize_artifact_label,
-    write_color_image_ppm,
+    color_image_from_rgba, current_display_image_stats, product_target_capture,
+    sanitize_artifact_label, write_color_image_ppm,
 };
 use diagnostics::{
     dataset_runtime_diagnostics_json, gpu_adapter_diagnostics_json, gpu_timestamp_timing_json,
@@ -64,6 +61,48 @@ use timing::{
 const ENABLE_AUTOMATION_ENV: &str = "MIRANTE4D_ENABLE_AUTOMATION";
 const AUTOMATION_SCRIPT_ENV: &str = "MIRANTE4D_AUTOMATION_SCRIPT";
 const AUTOMATION_REPORT_ENV: &str = "MIRANTE4D_AUTOMATION_REPORT";
+
+fn product_presentation(
+    app: &MiranteWorkbenchApp,
+    panel: PanelId,
+) -> Option<&mirante4d_render_api::PresentedFrame> {
+    app.render_runtime
+        .product_gpu
+        .as_ref()?
+        .targets
+        .get(&panel)?
+        .presented
+        .as_ref()
+}
+
+fn product_presentations_ready(
+    app: &mut MiranteWorkbenchApp,
+    panels: &[PanelId],
+) -> Result<bool, String> {
+    app.poll_product_validation_captures()
+        .map_err(|error| format!("failed to poll GPU validation capture: {error}"))?;
+    Ok(panels
+        .iter()
+        .all(|panel| product_target_capture(app, *panel).is_some()))
+}
+
+fn assertion_capture_panels(
+    condition: &ProductAutomationAssertCondition,
+) -> Result<Vec<PanelId>, String> {
+    Ok(match condition {
+        ProductAutomationAssertCondition::NonblankFrame => vec![PanelId::ThreeD],
+        ProductAutomationAssertCondition::CrossSectionPanelNonblank { panel, .. } => {
+            vec![automation_cross_section_panel_id(*panel)?]
+        }
+        ProductAutomationAssertCondition::CrossSectionPanelImagesDistinct { .. } => {
+            vec![PanelId::Xy, PanelId::Xz, PanelId::Yz]
+        }
+        ProductAutomationAssertCondition::FourPanelImagesDistinct { .. } => {
+            vec![PanelId::ThreeD, PanelId::Xy, PanelId::Xz, PanelId::Yz]
+        }
+        _ => Vec::new(),
+    })
+}
 const AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 const AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
 const AUTOMATION_SCHEMA_VERSION: u32 = 2;
@@ -105,15 +144,16 @@ fn render_state_for_mode(
     transfer: &LayerTransfer,
     mode: RenderMode,
 ) -> Result<RenderState, String> {
-    let sampling = current.sampling_policy();
+    let sampling = SamplingPolicy::VoxelExact;
     match mode {
         RenderMode::Mip => Ok(RenderState::mip(sampling)),
         RenderMode::Isosurface => {
-            let (shading, level) = current
+            let level = current
                 .iso_parameters()
-                .map(|parameters| (parameters.shading_policy(), parameters.display_level()))
-                .unwrap_or((IsoShadingPolicy::GradientLighting, 0.5));
-            RenderState::iso(sampling, shading, level).map_err(|error| error.to_string())
+                .map(|parameters| parameters.display_level())
+                .unwrap_or(0.5);
+            RenderState::iso(sampling, IsoShadingPolicy::Flat, level)
+                .map_err(|error| error.to_string())
         }
         RenderMode::Dvr => {
             let (opacity_transfer, density) = current
@@ -256,11 +296,7 @@ impl PendingCrossSectionLatencySample {
         if displayed_generation < self.target_generation {
             return None;
         }
-        let displayed_frame = app
-            .render_runtime
-            .cross_section_gpu_display_frames
-            .get(&self.panel_id)?;
-        if displayed_frame.generation < self.target_generation {
+        if product_presentation(app, self.panel_id).is_none() {
             return None;
         }
         let schedule = panel.cross_section_schedule;
@@ -1386,6 +1422,9 @@ impl ProductAutomationController {
                 Ok(CommandProgress::Done(diagnostics))
             }
             ProductAutomationCommand::CaptureScreenshot { name } => {
+                if !product_presentations_ready(app, &[PanelId::ThreeD])? {
+                    return Ok(CommandProgress::Waiting);
+                }
                 let artifact = self.capture_viewport_artifact(app, name.as_deref())?;
                 if artifact.pixel_stats.is_blank() {
                     return Err(format!(
@@ -1399,6 +1438,11 @@ impl ProductAutomationController {
                 Ok(CommandProgress::Done(artifact.json()))
             }
             ProductAutomationCommand::Assert { condition } => {
+                let capture_panels = assertion_capture_panels(condition)?;
+                if !capture_panels.is_empty() && !product_presentations_ready(app, &capture_panels)?
+                {
+                    return Ok(CommandProgress::Waiting);
+                }
                 self.assert_condition(app, condition)?;
                 Ok(CommandProgress::Done(json!({
                     "condition": condition.name(),
@@ -1652,7 +1696,7 @@ impl ProductAutomationController {
                     .frame_fidelity
                     .displayed_scale_level
                     .is_some()
-                    || app.render_runtime.gpu_display_frame.is_some()
+                    || product_presentation(app, PanelId::ThreeD).is_some()
                     || app.render_runtime.diagnostics.output_pixels > 0
             }
             ProductAutomationWaitCondition::RuntimeIdle => {
@@ -1684,7 +1728,7 @@ impl ProductAutomationController {
                         .is_none()
             }
             ProductAutomationWaitCondition::GpuFramePresented => {
-                app.render_runtime.gpu_display_frame.is_some()
+                product_presentation(app, PanelId::ThreeD).is_some()
             }
             ProductAutomationWaitCondition::SourceVerificationRequired => {
                 matches!(snapshot.source(), SourceVerificationSnapshot::Required)
@@ -2028,19 +2072,21 @@ impl ProductAutomationController {
                 }
             }
             ProductAutomationAssertCondition::RenderTargetPixels { width, height } => {
-                let frame = app
-                    .render_runtime
-                    .gpu_display_frame
-                    .as_ref()
-                    .ok_or_else(|| {
-                        "no GPU display frame exists for exact-size assertion".to_owned()
-                    })?;
-                if frame.viewport.width == *width && frame.viewport.height == *height {
+                let frame = product_presentation(app, PanelId::ThreeD).ok_or_else(|| {
+                    "no GPU display frame exists for exact-size assertion".to_owned()
+                })?;
+                let extent = frame.extent();
+                if u64::from(extent.width_pixels()) == *width
+                    && u64::from(extent.height_pixels()) == *height
+                {
                     Ok(())
                 } else {
                     Err(format!(
                         "GPU render target is {}x{}, expected exact {}x{} pixels",
-                        frame.viewport.width, frame.viewport.height, width, height
+                        extent.width_pixels(),
+                        extent.height_pixels(),
+                        width,
+                        height
                     ))
                 }
             }
@@ -2117,7 +2163,7 @@ impl ProductAutomationController {
                 "backend": format!("{:?}", app.render_runtime.render_backend),
                 "adapter": app.startup_diagnostics.gpu_adapter.clone(),
                 "last_error": typed_render_error,
-                "gpu_display_frame_present": app.render_runtime.gpu_display_frame.is_some(),
+                "gpu_display_frame_present": product_presentation(app, PanelId::ThreeD).is_some(),
                 "frame_fidelity": {
                     "target_scale_level": app.render_runtime.frame_fidelity.target_scale_level,
                     "displayed_scale_level": app.render_runtime.frame_fidelity.displayed_scale_level,
@@ -2147,13 +2193,10 @@ impl ProductAutomationController {
             "retained_leases": retained_leases_diagnostics_json(app),
             "cross_section": cross_section_diagnostics_json(app),
             "gpu_adapter": app
-                .render_runtime.gpu_renderer
+                .render_runtime.product_gpu
                 .as_ref()
-                .map(|renderer| gpu_adapter_diagnostics_json(renderer.adapter_diagnostics())),
-            "gpu_timestamp_timing": app
-                .render_runtime.gpu_renderer
-                .as_ref()
-                .map(|renderer| gpu_timestamp_timing_json(renderer.adapter_diagnostics())),
+                .map(|product| gpu_adapter_diagnostics_json(product.renderer.diagnostics())),
+            "gpu_timestamp_timing": gpu_timestamp_timing_json(),
             "presentation_timing": presentation_timing_json(),
             "camera": {
                 "projection": format!("{:?}", view.camera().projection()),
@@ -2817,28 +2860,9 @@ fn assert_cross_section_panel_images_distinct(
     app: &MiranteWorkbenchApp,
     min_different_pixels: usize,
 ) -> Result<(), String> {
-    let renderer = app
-        .render_runtime
-        .gpu_renderer
-        .as_deref()
-        .ok_or_else(|| "GPU renderer is unavailable for panel image readback".to_owned())?;
     let mut images = Vec::new();
     for panel_id in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
-        let displayed = app
-            .render_runtime
-            .cross_section_gpu_display_frames
-            .get(&panel_id)
-            .ok_or_else(|| {
-                format!(
-                    "panel {} has no displayed cross-section frame",
-                    panel_id.label()
-                )
-            })?;
-        images.push(read_gpu_display_frame_image(
-            renderer,
-            panel_id.label(),
-            &displayed.frame,
-        )?);
+        images.push(read_product_target_image(app, panel_id.label(), panel_id)?);
     }
     assert_gpu_display_images_distinct("cross-section panels", &images, min_different_pixels)
 }
@@ -2848,23 +2872,7 @@ fn assert_cross_section_panel_nonblank(
     panel_id: PanelId,
     min_nonzero_rgb_pixels: usize,
 ) -> Result<(), String> {
-    let renderer = app
-        .render_runtime
-        .gpu_renderer
-        .as_deref()
-        .ok_or_else(|| "GPU renderer is unavailable for panel image readback".to_owned())?;
-    let displayed = app
-        .render_runtime
-        .cross_section_gpu_display_frames
-        .get(&panel_id)
-        .ok_or_else(|| {
-            format!(
-                "panel {} has no displayed cross-section frame",
-                panel_id.label()
-            )
-        })?;
-    let (label, width, height, rgba) =
-        read_gpu_display_frame_image(renderer, panel_id.label(), &displayed.frame)?;
+    let (label, width, height, rgba) = read_product_target_image(app, panel_id.label(), panel_id)?;
     let image = color_image_from_rgba(width, height, &rgba)?;
     let stats = ProductAutomationImageStats::from_color_image(&image);
     if stats.nonzero_rgb_pixels < min_nonzero_rgb_pixels || stats.max_rgb == 0 {
@@ -2880,59 +2888,26 @@ fn assert_four_panel_images_distinct(
     app: &MiranteWorkbenchApp,
     min_different_pixels: usize,
 ) -> Result<(), String> {
-    let renderer = app
-        .render_runtime
-        .gpu_renderer
-        .as_deref()
-        .ok_or_else(|| "GPU renderer is unavailable for panel image readback".to_owned())?;
     let mut images = Vec::new();
-    let frame = app
-        .render_runtime
-        .gpu_display_frame
-        .as_ref()
-        .ok_or_else(|| "3D panel has no displayed GPU frame".to_owned())?;
-    images.push(read_gpu_display_frame_image(renderer, "3D", frame)?);
+    images.push(read_product_target_image(app, "3D", PanelId::ThreeD)?);
     for panel_id in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
-        let displayed = app
-            .render_runtime
-            .cross_section_gpu_display_frames
-            .get(&panel_id)
-            .ok_or_else(|| {
-                format!(
-                    "panel {} has no displayed cross-section frame",
-                    panel_id.label()
-                )
-            })?;
-        images.push(read_gpu_display_frame_image(
-            renderer,
-            panel_id.label(),
-            &displayed.frame,
-        )?);
+        images.push(read_product_target_image(app, panel_id.label(), panel_id)?);
     }
     assert_gpu_display_images_distinct("four-panel frames", &images, min_different_pixels)
 }
 
-fn read_gpu_display_frame_image(
-    renderer: &GpuRenderer,
+fn read_product_target_image(
+    app: &MiranteWorkbenchApp,
     label: &str,
-    frame: &GpuDisplayFrame,
+    panel: PanelId,
 ) -> Result<(String, usize, usize, Vec<u8>), String> {
-    let width = usize::try_from(frame.viewport.width).map_err(|_| {
-        format!(
-            "{label} frame width {} does not fit in usize",
-            frame.viewport.width
-        )
-    })?;
-    let height = usize::try_from(frame.viewport.height).map_err(|_| {
-        format!(
-            "{label} frame height {} does not fit in usize",
-            frame.viewport.height
-        )
-    })?;
-    let rgba = renderer
-        .read_display_frame_rgba_for_diagnostics(frame)
-        .map_err(|err| format!("failed to read {label} GPU frame: {err}"))?;
-    Ok((label.to_owned(), width, height, rgba))
+    let capture = product_target_capture(app, panel)
+        .ok_or_else(|| format!("{label} has no current GPU validation capture"))?;
+    let width = usize::try_from(capture.extent().width_pixels())
+        .map_err(|_| format!("{label} frame width does not fit in usize"))?;
+    let height = usize::try_from(capture.extent().height_pixels())
+        .map_err(|_| format!("{label} frame height does not fit in usize"))?;
+    Ok((label.to_owned(), width, height, capture.rgba8().to_vec()))
 }
 
 fn assert_gpu_display_images_distinct(
@@ -2991,14 +2966,26 @@ fn assert_cross_section_retired(app: &MiranteWorkbenchApp) -> Result<(), String>
             ));
         }
     }
-    if !app
+    let active_targets = app
         .render_runtime
-        .cross_section_gpu_display_frames
-        .is_empty()
-    {
+        .product_gpu
+        .as_ref()
+        .map_or(0, |product| {
+            [PanelId::Xy, PanelId::Xz, PanelId::Yz]
+                .into_iter()
+                .filter(|panel| {
+                    product
+                        .targets
+                        .get(panel)
+                        .and_then(|target| target.presented.as_ref())
+                        .is_some()
+                })
+                .count()
+        });
+    if active_targets != 0 {
         return Err(format!(
             "cross-section display frames are still active: {}",
-            app.render_runtime.cross_section_gpu_display_frames.len()
+            active_targets
         ));
     }
     Ok(())
@@ -3032,23 +3019,30 @@ fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
                 "schedule": panel.cross_section_schedule.map(panel_schedule_json),
                 "display_frame": app
                     .render_runtime
-                    .cross_section_gpu_display_frames
-                    .get(&panel.panel_id)
+                    .product_gpu
+                    .as_ref()
+                    .and_then(|product| product.targets.get(&panel.panel_id))
+                    .and_then(|target| target.presented.as_ref())
                     .map(|displayed| {
-                        let diagnostics = displayed.frame.diagnostics;
+                        let progress = displayed.progress();
+                        let coverage = progress.coverage();
                         json!({
-                            "generation": displayed.generation,
-                            "channels": diagnostics.channels,
-                            "output_bytes": diagnostics.output_bytes,
-                            "accumulator_bytes": diagnostics.accumulator_bytes,
-                            "texture_bytes": diagnostics.texture_bytes,
-                            "draw_calls": diagnostics.draw_calls,
-                            "vertex_count": diagnostics.vertex_count,
+                            "frame": displayed.frame().get(),
+                            "width": displayed.extent().width_pixels(),
+                            "height": displayed.extent().height_pixels(),
+                            "completeness": format!("{:?}", progress.completeness()),
+                            "limitation": progress.limitation().map(|value| format!("{value:?}")),
+                            "available_requirements": coverage.available_requirements(),
+                            "total_requirements": coverage.total_requirements(),
                         })
                     }),
             })
         })
         .collect::<Vec<_>>();
+    let display_frame_count = [PanelId::Xy, PanelId::Xz, PanelId::Yz]
+        .into_iter()
+        .filter(|panel| product_presentation(app, *panel).is_some())
+        .count();
     json!({
         "schema": "mirante4d-cross-section-panel-diagnostics",
         "schema_version": 1,
@@ -3058,8 +3052,8 @@ fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
             .active_cross_section_panel()
             .map(PanelId::from_application_panel)
             .map(|panel_id| panel_id.label().to_owned()),
-        "display_frame_count": app.render_runtime.cross_section_gpu_display_frames.len(),
-        "product_display_path": "unified_dataset_leases_to_gpu_renderer",
+        "display_frame_count": display_frame_count,
+        "product_display_path": "unified_dataset_leases_to_render_wgpu",
         "demand_scopes": {
             "xy": app.dataset.scope_requirements(crate::dataset_requests::SCOPE_CROSS_SECTION_XY).len(),
             "xz": app.dataset.scope_requirements(crate::dataset_requests::SCOPE_CROSS_SECTION_XZ).len(),

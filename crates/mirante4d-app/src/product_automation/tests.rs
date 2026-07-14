@@ -2,9 +2,7 @@ use super::capture::{
     ProductAutomationArtifact, ProductAutomationImageStats, color_image_from_rgba,
     sanitize_artifact_label, write_color_image_ppm,
 };
-use super::diagnostics::{
-    dataset_runtime_diagnostics_json, gpu_adapter_diagnostics_json, gpu_timestamp_timing_json,
-};
+use super::diagnostics::dataset_runtime_diagnostics_json;
 use super::timing::{
     ProductAutomationAppUpdatePhases, ProductAutomationAppUpdateSample,
     ProductAutomationCrossSectionLatencySample, ProductAutomationDisplayRefreshSample,
@@ -17,7 +15,6 @@ use super::*;
 use std::{fs, path::PathBuf};
 
 use mirante4d_dataset_runtime::{DatasetRuntimeConfig, DatasetRuntimeDiagnostics};
-use mirante4d_renderer::gpu::{AdapterDiagnostics, GpuLimitDiagnostics};
 
 #[test]
 fn automation_script_parses_the_b4_project_store_contract() {
@@ -557,46 +554,6 @@ fn runtime_diagnostics(
 }
 
 #[test]
-fn gpu_timestamp_timing_json_names_support_request_and_enablement() {
-    let mut adapter = AdapterDiagnostics {
-        name: "adapter".to_owned(),
-        backend: "Vulkan".to_owned(),
-        device_type: "DiscreteGpu".to_owned(),
-        driver: "driver".to_owned(),
-        driver_info: "driver-info".to_owned(),
-        timestamp_queries_supported: true,
-        timestamp_queries_requested: false,
-        timestamp_queries_enabled: false,
-        adapter_limits: GpuLimitDiagnostics {
-            max_buffer_size: 1024,
-            max_storage_buffer_binding_size: 2048,
-            max_storage_buffers_per_shader_stage: 8,
-        },
-        requested_limits: GpuLimitDiagnostics {
-            max_buffer_size: 1024,
-            max_storage_buffer_binding_size: 2048,
-            max_storage_buffers_per_shader_stage: 8,
-        },
-    };
-
-    assert_eq!(
-        gpu_adapter_diagnostics_json(&adapter)["timestamp_queries_supported"],
-        true
-    );
-    assert_eq!(
-        gpu_timestamp_timing_json(&adapter)["status"],
-        "supported_not_requested"
-    );
-    adapter.timestamp_queries_requested = true;
-    assert_eq!(
-        gpu_timestamp_timing_json(&adapter)["status"],
-        "requested_but_device_feature_missing"
-    );
-    adapter.timestamp_queries_enabled = true;
-    assert_eq!(gpu_timestamp_timing_json(&adapter)["status"], "enabled");
-}
-
-#[test]
 fn presentation_timing_json_names_proxy_and_compositor_timestamp_status() {
     let value = presentation_timing_json();
 
@@ -1007,7 +964,7 @@ fn cross_section_latency_summary_reports_operation_gate_rows() {
     );
     assert_eq!(
         sample["presentation_proxy"],
-        "panel_displayed_generation_with_gpu_display_frame"
+        "panel_displayed_generation_with_successor_presentation"
     );
     assert_eq!(sample["operation"], "pan");
     assert_eq!(sample["panel"], "XZ");

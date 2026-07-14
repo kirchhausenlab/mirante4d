@@ -403,12 +403,17 @@ impl MiranteWorkbenchApp {
     fn update_dataset_fidelity(&mut self, ready: bool) {
         let snapshot = self.application.snapshot();
         let view = application_view(&snapshot);
-        let status = self.render_runtime.retained_leases.cohort_status(
-            snapshot.catalog().scientific_identity().resource_identity(),
-            view.active_layer(),
-            view.timepoint(),
-            self.dataset.current_scale(),
-        );
+        let status = self
+            .render_runtime
+            .retained_leases
+            .resident_subset(
+                self.dataset.scope_requirements(SCOPE_CURRENT_3D),
+                snapshot.catalog().scientific_identity().resource_identity(),
+                view.active_layer(),
+                view.timepoint(),
+                self.dataset.current_scale(),
+            )
+            .status();
         self.render_runtime.frame_fidelity.resident_bricks = status.retained;
         self.render_runtime.frame_fidelity.missing_occupied_bricks = status.missing;
         self.render_runtime.frame_fidelity.cpu_cache_bytes = self

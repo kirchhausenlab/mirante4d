@@ -6,7 +6,7 @@ use eframe::egui;
 use mirante4d_render_api::{
     FrameIdentity, PresentationToken, PresentationViewport, PresentedFrame, RenderExtent,
 };
-use mirante4d_render_wgpu::WgpuRenderRuntime;
+use mirante4d_render_wgpu::{ValidationCapture, ValidationCaptureTicket, WgpuRenderRuntime};
 use mirante4d_renderer::{
     FrameDiagnostics, MipImageF32, MipImageU16, RenderViewport,
     gpu::{GpuDisplayFrame, GpuRenderer},
@@ -24,6 +24,8 @@ pub(crate) struct ProductPresentationTarget {
     pub(crate) extent: RenderExtent,
     pub(crate) request: Option<ProductRenderRequest>,
     pub(crate) presented: Option<PresentedFrame>,
+    pub(crate) pending_capture: Option<(PresentedFrame, ValidationCaptureTicket)>,
+    pub(crate) completed_capture: Option<(PresentedFrame, ValidationCapture)>,
     pub(crate) texture_id: Option<egui::TextureId>,
 }
 

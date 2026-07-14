@@ -740,18 +740,15 @@ fn layer_render_state_for_mode(
     mode: mirante4d_domain::RenderMode,
 ) -> Result<CanonicalRenderState, String> {
     let current = *layer.render_state();
-    let sampling = current.sampling_policy();
+    let sampling = SamplingPolicy::VoxelExact;
     match mode {
         mirante4d_domain::RenderMode::Mip => Ok(CanonicalRenderState::mip(sampling)),
         mirante4d_domain::RenderMode::Isosurface => {
-            let (shading, display_level) = current
+            let display_level = current
                 .iso_parameters()
-                .map(|parameters| (parameters.shading_policy(), parameters.display_level()))
-                .unwrap_or((
-                    IsoShadingPolicy::GradientLighting,
-                    DEFAULT_ISO_DISPLAY_LEVEL,
-                ));
-            CanonicalRenderState::iso(sampling, shading, display_level)
+                .map(|parameters| parameters.display_level())
+                .unwrap_or(DEFAULT_ISO_DISPLAY_LEVEL);
+            CanonicalRenderState::iso(sampling, IsoShadingPolicy::Flat, display_level)
                 .map_err(|error| error.to_string())
         }
         mirante4d_domain::RenderMode::Dvr => {
@@ -1891,11 +1888,6 @@ impl eframe::App for MiranteWorkbenchApp {
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(
                                     &mut sampling_policy,
-                                    SamplingPolicy::SmoothLinear,
-                                    render_sampling_policy_label(SamplingPolicy::SmoothLinear),
-                                );
-                                ui.selectable_value(
-                                    &mut sampling_policy,
                                     SamplingPolicy::VoxelExact,
                                     render_sampling_policy_label(SamplingPolicy::VoxelExact),
                                 );
@@ -1957,11 +1949,6 @@ impl eframe::App for MiranteWorkbenchApp {
                                 egui::ComboBox::from_label("ISO shading")
                                     .selected_text(iso_shading_policy_label(iso_shading_policy))
                                     .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut iso_shading_policy,
-                                            IsoShadingPolicy::GradientLighting,
-                                            "Gradient lighting",
-                                        );
                                         ui.selectable_value(
                                             &mut iso_shading_policy,
                                             IsoShadingPolicy::Flat,

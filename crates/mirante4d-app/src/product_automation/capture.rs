@@ -7,7 +7,21 @@ use eframe::egui;
 use serde_json::{Value, json};
 
 use crate::image_compositing::color_image_for_snapshot;
-use crate::{MiranteWorkbenchApp, current_egui_shell_bridge};
+use crate::{MiranteWorkbenchApp, current_egui_shell_bridge, viewer_layout::PanelId};
+
+pub(crate) fn product_target_capture(
+    app: &MiranteWorkbenchApp,
+    panel: PanelId,
+) -> Option<&mirante4d_render_wgpu::ValidationCapture> {
+    let target = app
+        .render_runtime
+        .product_gpu
+        .as_ref()?
+        .targets
+        .get(&panel)?;
+    let (presentation, capture) = target.completed_capture.as_ref()?;
+    (target.presented.as_ref() == Some(presentation)).then_some(capture)
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProductAutomationArtifact {
@@ -113,31 +127,25 @@ pub(crate) fn capture_color_image(
     app: &mut MiranteWorkbenchApp,
 ) -> Result<(&'static str, egui::ColorImage), String> {
     let snapshot = current_egui_shell_bridge::snapshot(&app.application);
-    if let (Some(renderer), Some(frame)) = (
-        app.render_runtime.gpu_renderer.as_deref(),
-        app.render_runtime.gpu_display_frame.as_ref(),
-    ) {
-        let rgba = renderer
-            .read_display_frame_rgba_for_diagnostics(frame)
-            .map_err(|err| {
-                format!("failed to read GPU display frame for viewport capture: {err}")
-            })?;
-        let width = usize::try_from(frame.viewport.width).map_err(|_| {
-            format!(
-                "GPU display frame width {} does not fit in usize",
-                frame.viewport.width
-            )
-        })?;
-        let height = usize::try_from(frame.viewport.height).map_err(|_| {
-            format!(
-                "GPU display frame height {} does not fit in usize",
-                frame.viewport.height
-            )
-        })?;
+    if let Some(capture) = product_target_capture(app, PanelId::ThreeD) {
+        let width = usize::try_from(capture.extent().width_pixels())
+            .map_err(|_| "GPU display frame width does not fit in usize".to_owned())?;
+        let height = usize::try_from(capture.extent().height_pixels())
+            .map_err(|_| "GPU display frame height does not fit in usize".to_owned())?;
         return Ok((
             "gpu_display_frame_readback",
-            color_image_from_rgba(width, height, &rgba)?,
+            color_image_from_rgba(width, height, capture.rgba8())?,
         ));
+    }
+    if app
+        .render_runtime
+        .product_gpu
+        .as_ref()
+        .and_then(|product| product.targets.get(&PanelId::ThreeD))
+        .and_then(|target| target.presented.as_ref())
+        .is_some()
+    {
+        return Err("current GPU validation capture is still pending".to_owned());
     }
     Ok((
         "loading_reference_color_image",
@@ -149,32 +157,26 @@ pub(crate) fn current_display_image_stats(
     app: &MiranteWorkbenchApp,
 ) -> Result<(&'static str, ProductAutomationImageStats), String> {
     let snapshot = current_egui_shell_bridge::snapshot(&app.application);
-    if let (Some(renderer), Some(frame)) = (
-        app.render_runtime.gpu_renderer.as_deref(),
-        app.render_runtime.gpu_display_frame.as_ref(),
-    ) {
-        let rgba = renderer
-            .read_display_frame_rgba_for_diagnostics(frame)
-            .map_err(|err| {
-                format!("failed to read GPU display frame for nonblank assertion: {err}")
-            })?;
-        let width = usize::try_from(frame.viewport.width).map_err(|_| {
-            format!(
-                "GPU display frame width {} does not fit in usize",
-                frame.viewport.width
-            )
-        })?;
-        let height = usize::try_from(frame.viewport.height).map_err(|_| {
-            format!(
-                "GPU display frame height {} does not fit in usize",
-                frame.viewport.height
-            )
-        })?;
-        let image = color_image_from_rgba(width, height, &rgba)?;
+    if let Some(capture) = product_target_capture(app, PanelId::ThreeD) {
+        let width = usize::try_from(capture.extent().width_pixels())
+            .map_err(|_| "GPU display frame width does not fit in usize".to_owned())?;
+        let height = usize::try_from(capture.extent().height_pixels())
+            .map_err(|_| "GPU display frame height does not fit in usize".to_owned())?;
+        let image = color_image_from_rgba(width, height, capture.rgba8())?;
         return Ok((
             "gpu_display_frame_readback",
             ProductAutomationImageStats::from_color_image(&image),
         ));
+    }
+    if app
+        .render_runtime
+        .product_gpu
+        .as_ref()
+        .and_then(|product| product.targets.get(&PanelId::ThreeD))
+        .and_then(|target| target.presented.as_ref())
+        .is_some()
+    {
+        return Err("current GPU validation capture is still pending".to_owned());
     }
     Ok((
         "loading_reference_color_image",

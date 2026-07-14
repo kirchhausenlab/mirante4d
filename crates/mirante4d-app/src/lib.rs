@@ -72,8 +72,8 @@ use display_identity::GpuDisplayedFrameIdentity;
 use display_refresh::{DisplayRefreshTiming, ViewportDisplayImage, duration_ms};
 use eframe::egui;
 use fidelity::{
-    channel_fidelity_label, composite_fidelity_label, format_adapter_summary,
-    iso_shading_policy_label, render_sampling_policy_label, show_frame_fidelity_property_rows,
+    channel_fidelity_label, composite_fidelity_label, iso_shading_policy_label,
+    render_sampling_policy_label, show_frame_fidelity_property_rows,
     visible_channel_fidelity_is_mixed,
 };
 #[cfg(test)]
@@ -572,26 +572,24 @@ impl MiranteWorkbenchApp {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("the interactive viewer requires the WGPU renderer"))?;
         let wgpu_texture_renderer = Some(render_state.renderer.clone());
-        let gpu_renderer_result = GpuRenderer::from_existing_device_with_cache_budgets(
-            &render_state.adapter,
-            render_state.device.clone(),
-            render_state.queue.clone(),
-            runtime_policy.gpu_dense_cache_budget_bytes(),
-            runtime_policy.gpu_brick_cache_budget_bytes(),
-        );
-        let renderer = gpu_renderer_result
-            .map_err(|error| anyhow::anyhow!("a working GPU renderer is required: {error}"))?;
-        let adapter_summary = format_adapter_summary(&renderer);
-        startup_diagnostics.gpu_adapter = Some(adapter_summary);
-        let gpu_renderer = Arc::new(renderer);
-        render_runtime.gpu_renderer = Some(Arc::clone(&gpu_renderer));
+        let validation_runtime =
+            current_runtime::validation::CurrentValidationRuntime::from_environment();
+        let validation_capture = validation_runtime.product_automation.is_some();
         let product_renderer = WgpuRenderRuntime::from_existing_device(
             &render_state.adapter,
             render_state.device.clone(),
             render_state.queue.clone(),
-            WgpuRenderRuntimeConfig::new(resource_policy.gpu_budget_bytes())?,
+            WgpuRenderRuntimeConfig::new(resource_policy.gpu_budget_bytes())?
+                .with_validation_capture(validation_capture),
         )
         .map_err(|error| anyhow::anyhow!("the progressive GPU renderer is required: {error}"))?;
+        let renderer_diagnostics = product_renderer.diagnostics();
+        startup_diagnostics.gpu_adapter = Some(format!(
+            "{} {} driver={}",
+            renderer_diagnostics.backend(),
+            renderer_diagnostics.adapter_name(),
+            renderer_diagnostics.driver(),
+        ));
         render_runtime.product_gpu = Some(current_runtime::render::ProductGpuRenderRuntime::new(
             product_renderer,
         ));
@@ -614,8 +612,7 @@ impl MiranteWorkbenchApp {
             ui_runtime,
             import_runtime: current_runtime::import::ImportRuntime::idle(),
             analysis_runtime,
-            validation_runtime:
-                current_runtime::validation::CurrentValidationRuntime::from_environment(),
+            validation_runtime,
             project_store,
             project_recovery_root,
             project_recovery_candidates: Vec::new(),
@@ -2256,6 +2253,7 @@ impl MiranteWorkbenchApp {
             tracing::warn!(%error, "invalidated dataset demand cancellation failed");
         }
         let retired_leases = std::mem::take(&mut self.render_runtime.retained_leases);
+        self.clear_product_presentations();
         self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Loading;
         self.render_runtime.frame_fidelity.reason = LodDecisionReason::LoadingTargetScale;
         self.render_runtime.frame_fidelity.backend = RenderBackend::Loading;
@@ -2504,11 +2502,9 @@ impl MiranteWorkbenchApp {
             mut render_runtime,
             analysis_runtime,
         } = transfer;
+        self.clear_product_presentations();
         render_runtime.gpu_renderer = self.render_runtime.gpu_renderer.clone();
         render_runtime.product_gpu = self.render_runtime.product_gpu.take();
-        self.clear_gpu_display_frame();
-        self.retire_gpu_display_texture_id();
-        self.retire_cross_section_gpu_display_texture_ids();
         let old_dataset = std::mem::replace(&mut self.dataset, dataset);
         let old_render_runtime = std::mem::replace(&mut self.render_runtime, render_runtime);
         let old_analysis_runtime = std::mem::replace(&mut self.analysis_runtime, analysis_runtime);
