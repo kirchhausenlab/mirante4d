@@ -92,6 +92,14 @@ enum DirectoryLayout {
 }
 
 pub(crate) fn inspect(source: TiffSource) -> Result<TiffInspection, ImportError> {
+    inspect_cancellable(source, &ImportCancellation::new())
+}
+
+pub(crate) fn inspect_cancellable(
+    source: TiffSource,
+    cancellation: &ImportCancellation,
+) -> Result<TiffInspection, ImportError> {
+    check_cancelled(cancellation)?;
     let metadata = match fs::symlink_metadata(&source.path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -119,7 +127,7 @@ pub(crate) fn inspect(source: TiffSource) -> Result<TiffInspection, ImportError>
                 "channel-folder layout requires a directory source".to_owned(),
             ));
         }
-        return inspect_single_file(source);
+        return inspect_single_file(source, cancellation);
     }
 
     if !metadata.is_dir() {
@@ -128,15 +136,15 @@ pub(crate) fn inspect(source: TiffSource) -> Result<TiffInspection, ImportError>
         ));
     }
 
-    let discovered = discover_directory_layout(&source.path)?;
+    let discovered = discover_directory_layout(&source.path, cancellation)?;
     match (source.layout, discovered) {
         (SourceLayout::Auto | SourceLayout::MultipageStacks, DirectoryLayout::Direct(paths)) => {
-            inspect_direct_stacks(source, paths)
+            inspect_direct_stacks(source, paths, cancellation)
         }
         (
             SourceLayout::Auto | SourceLayout::ChannelFoldersOfPlanes,
             DirectoryLayout::ChannelFolders(folders),
-        ) => inspect_channel_folders(source, folders),
+        ) => inspect_channel_folders(source, folders, cancellation),
         (SourceLayout::MultipageStacks, DirectoryLayout::ChannelFolders(_)) => {
             Err(ImportError::UnsupportedSource(
                 "multipage-stack layout does not accept channel folders".to_owned(),
@@ -150,9 +158,13 @@ pub(crate) fn inspect(source: TiffSource) -> Result<TiffInspection, ImportError>
     }
 }
 
-fn inspect_single_file(source: TiffSource) -> Result<TiffInspection, ImportError> {
+fn inspect_single_file(
+    source: TiffSource,
+    cancellation: &ImportCancellation,
+) -> Result<TiffInspection, ImportError> {
+    check_cancelled(cancellation)?;
     let relative_name = relative_name_for_file(&source.path, &source.path)?;
-    let facts = inspect_file(&source.path)?;
+    let facts = inspect_file(&source.path, cancellation)?;
     let shape = shape4d(1, facts.pages, facts.height, facts.width)?;
     let files = vec![InspectedSourceFile {
         path: source.path.clone(),
@@ -164,6 +176,7 @@ fn inspect_single_file(source: TiffSource) -> Result<TiffInspection, ImportError
         bytes: facts.bytes,
         sha256: facts.sha256,
     }];
+    check_cancelled(cancellation)?;
     finish_inspection(
         source,
         SourceLayout::MultipageStacks,
@@ -179,9 +192,11 @@ fn inspect_single_file(source: TiffSource) -> Result<TiffInspection, ImportError
 fn inspect_direct_stacks(
     source: TiffSource,
     paths: Vec<PathBuf>,
+    cancellation: &ImportCancellation,
 ) -> Result<TiffInspection, ImportError> {
     let mut candidates = Vec::with_capacity(paths.len());
     for path in paths {
+        check_cancelled(cancellation)?;
         let relative_name = relative_name_for_file(&source.path, &path)?;
         let filename = path
             .file_stem()
@@ -266,7 +281,8 @@ fn inspect_direct_stacks(
     let mut maximum_decoded_chunk_bytes = 0;
     let mut files = Vec::with_capacity(assigned.len());
     for (channel, timepoint, candidate) in assigned {
-        let facts = inspect_file(&candidate.path)?;
+        check_cancelled(cancellation)?;
+        let facts = inspect_file(&candidate.path, cancellation)?;
         check_common_stack_facts(
             &candidate.relative_name,
             &mut common,
@@ -291,6 +307,7 @@ fn inspect_direct_stacks(
     }
     let (width, height, pages, dtype) = common.expect("directory discovery rejects no files");
     let shape = shape4d(timepoints, pages, height, width)?;
+    check_cancelled(cancellation)?;
     finish_inspection(
         source,
         SourceLayout::MultipageStacks,
@@ -306,6 +323,7 @@ fn inspect_direct_stacks(
 fn inspect_channel_folders(
     source: TiffSource,
     mut folders: Vec<(PathBuf, Vec<PathBuf>)>,
+    cancellation: &ImportCancellation,
 ) -> Result<TiffInspection, ImportError> {
     folders.sort_by(|left, right| {
         relative_name_for_directory(&source.path, &left.0)
@@ -315,6 +333,7 @@ fn inspect_channel_folders(
 
     let mut folder_records = Vec::with_capacity(folders.len());
     for (folder, mut planes) in folders {
+        check_cancelled(cancellation)?;
         let relative_folder = relative_name_for_directory(&source.path, &folder)?;
         let folder_name = folder
             .file_name()
@@ -381,6 +400,7 @@ fn inspect_channel_folders(
     let mut files = Vec::new();
     for (folder_index, (_relative_folder, label, planes)) in folder_records.into_iter().enumerate()
     {
+        check_cancelled(cancellation)?;
         let channel_label =
             label.unwrap_or(u64::try_from(folder_index).map_err(|_| ImportError::Overflow)?);
         let channel = *channel_ordinals
@@ -398,8 +418,9 @@ fn inspect_channel_folders(
         }
 
         for (z, path) in planes.into_iter().enumerate() {
+            check_cancelled(cancellation)?;
             let relative_name = relative_name_for_file(&source.path, &path)?;
-            let facts = inspect_file(&path)?;
+            let facts = inspect_file(&path, cancellation)?;
             if facts.pages != 1 {
                 return Err(ImportError::UnsupportedSource(format!(
                     "channel-folder TIFF {relative_name:?} has {} pages; every plane file must contain exactly one page",
@@ -437,6 +458,7 @@ fn inspect_channel_folders(
     let (width, height, dtype) = common_plane.expect("directory discovery rejects no files");
     let z = expected_planes.expect("directory discovery rejects empty channel folders");
     let shape = shape4d(1, z, height, width)?;
+    check_cancelled(cancellation)?;
     finish_inspection(
         source,
         SourceLayout::ChannelFoldersOfPlanes,
@@ -491,7 +513,7 @@ pub(crate) fn revalidate(
     cancellation: &ImportCancellation,
 ) -> Result<(), ImportError> {
     check_cancelled(cancellation)?;
-    let current_files = enumerate_accepted_layout_files(inspection)?;
+    let current_files = enumerate_accepted_layout_files(inspection, cancellation)?;
     let recorded = inspection
         .files
         .iter()
@@ -1008,7 +1030,11 @@ fn destination_row_range(
     )
 }
 
-fn inspect_file(path: &Path) -> Result<TiffFileFacts, ImportError> {
+fn inspect_file(
+    path: &Path,
+    cancellation: &ImportCancellation,
+) -> Result<TiffFileFacts, ImportError> {
+    check_cancelled(cancellation)?;
     ensure_regular_tiff_file(path)?;
     let before = fs::metadata(path)
         .map_err(|source| io_error("stat source before inspection", path, source))?;
@@ -1025,6 +1051,7 @@ fn inspect_file(path: &Path) -> Result<TiffFileFacts, ImportError> {
     let mut pages = 0_u64;
     let mut maximum_decoded_chunk_bytes = 0_u64;
     loop {
+        check_cancelled(cancellation)?;
         pages = pages.checked_add(1).ok_or(ImportError::Overflow)?;
         if pages > MAX_PAGES_PER_FILE {
             return Err(ImportError::UnsupportedSource(format!(
@@ -1072,6 +1099,7 @@ fn inspect_file(path: &Path) -> Result<TiffFileFacts, ImportError> {
             .and_then(|value| value.checked_mul(u64::from(dtype.bytes_per_sample())))
             .ok_or(ImportError::Overflow)?;
         maximum_decoded_chunk_bytes = maximum_decoded_chunk_bytes.max(maximum_chunk);
+        check_cancelled(cancellation)?;
         if decoder.more_images() {
             decoder
                 .next_image()
@@ -1082,7 +1110,8 @@ fn inspect_file(path: &Path) -> Result<TiffFileFacts, ImportError> {
     }
     drop(decoder);
 
-    let (bytes, sha256) = hash_file(path)?;
+    let (bytes, sha256) = hash_file_cancellable(path, cancellation)?;
+    check_cancelled(cancellation)?;
     let after = fs::metadata(path)
         .map_err(|source| io_error("stat source after inspection", path, source))?;
     if before.len() != bytes || after.len() != bytes {
@@ -1148,22 +1177,26 @@ fn validate_current_page<R: Read + Seek>(
     Ok(())
 }
 
-fn hash_file(path: &Path) -> Result<(u64, Sha256Digest), ImportError> {
-    hash_file_cancellable(path, &ImportCancellation::new())
-}
-
 fn hash_file_cancellable(
     path: &Path,
     cancellation: &ImportCancellation,
 ) -> Result<(u64, Sha256Digest), ImportError> {
-    let mut file =
+    let file =
         File::open(path).map_err(|source| io_error("open source for hashing", path, source))?;
+    hash_reader_cancellable(path, file, cancellation)
+}
+
+fn hash_reader_cancellable(
+    path: &Path,
+    mut reader: impl Read,
+    cancellation: &ImportCancellation,
+) -> Result<(u64, Sha256Digest), ImportError> {
     let mut buffer = [0_u8; HASH_READ_BYTES];
     let mut bytes = 0_u64;
     let mut hasher = Sha256Hasher::new();
     loop {
         check_cancelled(cancellation)?;
-        let read = file
+        let read = reader
             .read(&mut buffer)
             .map_err(|source| io_error("hash source", path, source))?;
         check_cancelled(cancellation)?;
@@ -1178,10 +1211,14 @@ fn hash_file_cancellable(
     Ok((bytes, hasher.finalize()))
 }
 
-fn discover_directory_layout(root: &Path) -> Result<DirectoryLayout, ImportError> {
+fn discover_directory_layout(
+    root: &Path,
+    cancellation: &ImportCancellation,
+) -> Result<DirectoryLayout, ImportError> {
     let mut direct = Vec::new();
     let mut folders = Vec::new();
-    for entry in read_directory(root)? {
+    for entry in read_directory(root, cancellation)? {
+        check_cancelled(cancellation)?;
         let file_type = entry
             .file_type()
             .map_err(|source| io_error("inspect source entry", &entry.path(), source))?;
@@ -1229,8 +1266,10 @@ fn discover_directory_layout(root: &Path) -> Result<DirectoryLayout, ImportError
     let mut total = 0_usize;
     let mut channel_folders = Vec::with_capacity(folders.len());
     for folder in folders {
+        check_cancelled(cancellation)?;
         let mut planes = Vec::new();
-        for entry in read_directory(&folder)? {
+        for entry in read_directory(&folder, cancellation)? {
+            check_cancelled(cancellation)?;
             let path = entry.path();
             let file_type = entry
                 .file_type()
@@ -1265,17 +1304,31 @@ fn discover_directory_layout(root: &Path) -> Result<DirectoryLayout, ImportError
     Ok(DirectoryLayout::ChannelFolders(channel_folders))
 }
 
-fn read_directory(path: &Path) -> Result<Vec<fs::DirEntry>, ImportError> {
-    let entries = fs::read_dir(path)
-        .map_err(|source| io_error("list source directory", path, source))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| io_error("read source directory entry", path, source))?;
+fn read_directory(
+    path: &Path,
+    cancellation: &ImportCancellation,
+) -> Result<Vec<fs::DirEntry>, ImportError> {
+    let directory =
+        fs::read_dir(path).map_err(|source| io_error("list source directory", path, source))?;
+    let mut entries = Vec::new();
+    for entry in directory {
+        check_cancelled(cancellation)?;
+        entries
+            .push(entry.map_err(|source| io_error("read source directory entry", path, source))?);
+        if entries.len() > MAX_SOURCE_FILES {
+            return Err(ImportError::UnsupportedSource(format!(
+                "source directory contains more than {MAX_SOURCE_FILES} entries"
+            )));
+        }
+    }
     Ok(entries)
 }
 
 fn enumerate_accepted_layout_files(
     inspection: &TiffInspection,
+    cancellation: &ImportCancellation,
 ) -> Result<BTreeMap<String, PathBuf>, ImportError> {
+    check_cancelled(cancellation)?;
     let root_metadata = fs::symlink_metadata(&inspection.source.path)
         .map_err(|_| ImportError::SourceChanged(inspection.source.path.clone()))?;
     if root_metadata.file_type().is_symlink() {
@@ -1292,8 +1345,11 @@ fn enumerate_accepted_layout_files(
     if !root_metadata.is_dir() {
         return Err(ImportError::SourceChanged(inspection.source.path.clone()));
     }
-    let discovered = discover_directory_layout(&inspection.source.path)
-        .map_err(|_| ImportError::SourceChanged(inspection.source.path.clone()))?;
+    let discovered = match discover_directory_layout(&inspection.source.path, cancellation) {
+        Ok(discovered) => discovered,
+        Err(ImportError::Cancelled) => return Err(ImportError::Cancelled),
+        Err(_) => return Err(ImportError::SourceChanged(inspection.source.path.clone())),
+    };
     let paths = match (inspection.layout, discovered) {
         (SourceLayout::MultipageStacks, DirectoryLayout::Direct(paths)) => paths,
         (SourceLayout::ChannelFoldersOfPlanes, DirectoryLayout::ChannelFolders(folders)) => {
@@ -1303,6 +1359,7 @@ fn enumerate_accepted_layout_files(
     };
     let mut files = BTreeMap::new();
     for path in paths {
+        check_cancelled(cancellation)?;
         let relative = relative_name_for_file(&inspection.source.path, &path)
             .map_err(|_| ImportError::SourceChanged(path.clone()))?;
         if files.insert(relative, path.clone()).is_some() {
@@ -2130,7 +2187,7 @@ impl<R: Seek> Seek for CountingReader<R> {
 mod tests {
     use std::{
         fs::{self, File, OpenOptions},
-        io::Write,
+        io::{Cursor, Write},
         path::Path,
     };
 
@@ -2141,6 +2198,34 @@ mod tests {
     };
 
     use super::*;
+
+    struct CancelAfterFirstRead {
+        source: Cursor<Vec<u8>>,
+        cancellation: ImportCancellation,
+    }
+
+    impl std::io::Read for CancelAfterFirstRead {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let read = std::io::Read::read(&mut self.source, buffer)?;
+            if read > 0 {
+                self.cancellation.cancel();
+            }
+            Ok(read)
+        }
+    }
+
+    #[test]
+    fn source_hashing_stops_between_bounded_reads() {
+        let cancellation = ImportCancellation::new();
+        let reader = CancelAfterFirstRead {
+            source: Cursor::new(vec![7; HASH_READ_BYTES * 2]),
+            cancellation: cancellation.clone(),
+        };
+        assert!(matches!(
+            hash_reader_cancellable(Path::new("source.tif"), reader, &cancellation),
+            Err(ImportError::Cancelled)
+        ));
+    }
 
     #[test]
     fn single_stack_inspection_and_strip_bounded_region_are_exact() {
@@ -2157,7 +2242,12 @@ mod tests {
         assert_eq!(inspection.files[0].planes, 2);
         assert_eq!(inspection.source_bytes, fs::metadata(&path).unwrap().len());
         assert_eq!(inspection.maximum_decoded_chunk_bytes, 8);
-        assert_eq!(inspection.files[0].sha256, hash_file(&path).unwrap().1);
+        assert_eq!(
+            inspection.files[0].sha256,
+            hash_file_cancellable(&path, &ImportCancellation::new())
+                .unwrap()
+                .1
+        );
         revalidate(&inspection, &ImportCancellation::new()).unwrap();
 
         let cancellation = ImportCancellation::new();
