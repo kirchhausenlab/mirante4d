@@ -81,16 +81,19 @@ fn workbench_runtime_diagnostics_exposes_unified_runtime_bounds_and_leases() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_target_fixture(tempdir.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(root).unwrap();
-    let app = test_workbench_app_without_background_runtime(opened);
-
-    let harness = Harness::builder()
+    let mut harness = Harness::builder()
         .with_size(egui::vec2(1440.0, 900.0))
         .with_pixels_per_point(1.0)
-        .build_ui(|ui| {
-            ui_kit::configure_visuals(ui.ctx());
-            let view = runtime_diagnostics_panel::runtime_diagnostics_view(&app);
-            ui_kit::show_runtime_diagnostics_body(&view, ui, &mut Vec::new());
-        });
+        .build_eframe(|cc| test_workbench_app_for_ui_harness(cc, opened));
+
+    harness
+        .get_by_label("Runtime Diagnostics")
+        .scroll_to_me();
+    harness.step();
+    harness
+        .get_by_label("Runtime Diagnostics")
+        .click_accesskit();
+    harness.step();
 
     for label in [
         "dataset CPU",

@@ -23,7 +23,7 @@ const TABLE_COLUMNS: [(&str, &str); 9] = [
     ("variance", "variance"),
 ];
 
-pub fn show_analysis_workspace_window(
+pub(crate) fn show_analysis_workspace_window(
     ctx: &egui::Context,
     view: &AnalysisWorkspaceSnapshot,
     egui_ui: &mut EguiUiState,
@@ -50,7 +50,7 @@ pub fn show_analysis_workspace_window(
     commands
 }
 
-pub fn show_analysis_workspace(
+pub(crate) fn show_analysis_workspace(
     ui: &mut egui::Ui,
     view: &AnalysisWorkspaceSnapshot,
     egui_ui: &mut EguiUiState,

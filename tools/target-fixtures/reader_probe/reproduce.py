@@ -140,7 +140,6 @@ def reproduce(work_root: Path) -> dict[str, object]:
         "schema_version": 1,
         "status": "diagnostic-pass",
         "case": "hand-built-2d-uint8-selected-zarr-shard-subset",
-        "entry_sha256": sha256_file(ROOT / "architecture" / "wp10a-c-authority-entry.json"),
         "standards_manifest_sha256": sha256_file(
             ROOT / "architecture" / "wp10a-normative-standards.json"
         ),

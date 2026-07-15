@@ -60,8 +60,7 @@ cargo xtask --help
 ```
 
 `verify-pr policy` and `verify-pr rust` run one public group. The protected
-repository requires the matching `PR / policy` and `PR / rust` checks; the
-transitional Bootstrap command and workflow have been removed.
+repository requires the matching `PR / policy` and `PR / rust` checks.
 
 Trusted GPU verification is separate and requires the designated Vulkan
 workstation:
@@ -71,9 +70,8 @@ MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
   cargo xtask verify-local trusted-gpu
 ```
 
-The accepted WP-10B project-store power-cut qualification remains available
-only for future changes to that durability boundary. Do not rerun it for
-unrelated foundation work:
+The project-store power-cut check is reserved for changes to its qualified
+durability boundary. Do not rerun it for unrelated work:
 
 ```bash
 MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
@@ -89,15 +87,15 @@ small regression check for storage-source changes:
 cargo xtask product-validate target_source_verification
 ```
 
-The B4 native automation is likewise retained for future changes to product
-project persistence, not as a recurring acceptance ritual.
+Native project-persistence automation is retained for changes to that product
+path, not as a recurring acceptance ritual.
 
 ## Working Rules
 
 - Keep generated packages, private microscopy data, logs, and evidence under
   ignored local paths, never in the repository.
-- Use focused checks while iterating, then run every gate required by the
-  owning work package.
+- Use focused checks while iterating, then run the checks relevant to the
+  affected boundary.
 - Add a dependency only for a clear current need. Run
   `cargo xtask verify-deps`; exact exceptions live only in the
   [exception ledger](DEPENDENCY_EXCEPTIONS.md).

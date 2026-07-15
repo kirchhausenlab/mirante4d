@@ -1,7 +1,7 @@
 # Target-profile T1 authority
 
-This directory contains the independent, off-product WP-10A-C authority
-tooling. It never imports Mirante4D production crates.
+This directory contains independent target-profile authority tooling. It never
+imports Mirante4D production crates.
 
 - `cases-v1.tsv` is the shared declarative value input.
 - `fact_oracle/` computes scientific facts without opening package bytes.
@@ -13,8 +13,8 @@ tooling. It never imports Mirante4D production crates.
 - `validate.py` checks the promoted authority offline and fail-closed.
 - `reproduce.py` assembles the candidate authority twice and compares bytes.
 
-The reviewed C4 checkpoint promotes the exact `target-m4d-v1` authority under
-`fixtures/target`. Generation still writes only below
+The reviewed `target-m4d-v1` authority lives under `fixtures/target`.
+Generation writes only below
 `target/mirante4d/fixture-candidates`; the reproducer never writes tracked
 authority files.
 

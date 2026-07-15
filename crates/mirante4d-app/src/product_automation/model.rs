@@ -6,7 +6,7 @@ use mirante4d_domain::{RenderMode, ViewerLayout};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{CrossSectionPanelScheduleStatus, viewer_layout::PanelId};
+use crate::viewer_layout::PanelId;
 
 use super::{AUTOMATION_SCHEMA_VERSION, AUTOMATION_SCRIPT_SCHEMA};
 
@@ -252,15 +252,6 @@ pub(super) enum ProductAutomationCommand {
     SetViewerLayout {
         layout: ProductAutomationViewerLayout,
     },
-    SetTimepoint {
-        timepoint: u64,
-    },
-    StepTimepoint {
-        delta: i64,
-    },
-    SetPlayback {
-        playing: bool,
-    },
     SetRenderMode {
         mode: ProductAutomationRenderMode,
     },
@@ -274,10 +265,6 @@ pub(super) enum ProductAutomationCommand {
     SetDvrDensityScale {
         density_scale: f64,
     },
-    SetChannelVisibility {
-        layer_index: usize,
-        visible: bool,
-    },
     SetLayerOpacity {
         layer_index: usize,
         opacity: f32,
@@ -288,54 +275,16 @@ pub(super) enum ProductAutomationCommand {
         high: f32,
     },
     CameraFitData,
-    CameraReset,
     CameraOrbit {
         yaw_points: f32,
         pitch_points: f32,
-        viewport_height_points: Option<f32>,
     },
     CameraPan {
         x_points: f32,
         y_points: f32,
-        viewport_height_points: Option<f32>,
     },
     CameraZoom {
         scroll_y_points: f32,
-    },
-    CrossSectionPan {
-        panel: ProductAutomationPanelId,
-        x_points: f32,
-        y_points: f32,
-        probe_after: Option<ProductAutomationPanelHoverProbe>,
-    },
-    CrossSectionSliceStep {
-        panel: ProductAutomationPanelId,
-        notches: f64,
-        #[serde(default)]
-        fast: bool,
-    },
-    CrossSectionZoom {
-        panel: ProductAutomationPanelId,
-        x_fraction: f32,
-        y_fraction: f32,
-        scroll_y_points: f32,
-    },
-    CrossSectionRotate {
-        panel: ProductAutomationPanelId,
-        x_points: f32,
-        y_points: f32,
-    },
-    ProbePanelHover {
-        panel: ProductAutomationPanelId,
-        x_fraction: f32,
-        y_fraction: f32,
-        expected_status: Option<ProductAutomationCrossSectionHoverStatus>,
-        expect_value: Option<bool>,
-        expected_generation_status: Option<ProductAutomationCrossSectionGenerationStatus>,
-        expected_display_current: Option<bool>,
-        expected_target_generation: Option<u64>,
-        expected_displayed_generation: Option<u64>,
-        expected_schedule_generation: Option<u64>,
     },
     ProbeHover {
         x_fraction: f32,
@@ -348,9 +297,8 @@ pub(super) enum ProductAutomationCommand {
     Assert {
         condition: ProductAutomationAssertCondition,
     },
-    SleepOrFrames {
-        millis: Option<u64>,
-        frames: Option<u32>,
+    SleepFrames {
+        frames: u32,
     },
     Quit,
 }
@@ -374,31 +322,21 @@ impl ProductAutomationCommand {
             Self::SetMappedClientPixels { .. } => "set_mapped_client_pixels",
             Self::SetRenderTargetSize { .. } => "set_render_target_size",
             Self::SetViewerLayout { .. } => "set_viewer_layout",
-            Self::SetTimepoint { .. } => "set_timepoint",
-            Self::StepTimepoint { .. } => "step_timepoint",
-            Self::SetPlayback { .. } => "set_playback",
             Self::SetRenderMode { .. } => "set_render_mode",
             Self::SetLayerRenderMode { .. } => "set_layer_render_mode",
             Self::SetIsoDisplayLevel { .. } => "set_iso_display_level",
             Self::SetDvrDensityScale { .. } => "set_dvr_density_scale",
-            Self::SetChannelVisibility { .. } => "set_channel_visibility",
             Self::SetLayerOpacity { .. } => "set_layer_opacity",
             Self::SetLayerWindow { .. } => "set_layer_window",
             Self::CameraFitData => "camera_fit_data",
-            Self::CameraReset => "camera_reset",
             Self::CameraOrbit { .. } => "camera_orbit",
             Self::CameraPan { .. } => "camera_pan",
             Self::CameraZoom { .. } => "camera_zoom",
-            Self::CrossSectionPan { .. } => "cross_section_pan",
-            Self::CrossSectionSliceStep { .. } => "cross_section_slice_step",
-            Self::CrossSectionZoom { .. } => "cross_section_zoom",
-            Self::CrossSectionRotate { .. } => "cross_section_rotate",
-            Self::ProbePanelHover { .. } => "probe_panel_hover",
             Self::ProbeHover { .. } => "probe_hover",
             Self::CopyDiagnostics => "copy_diagnostics",
             Self::CaptureScreenshot { .. } => "capture_screenshot",
             Self::Assert { .. } => "assert",
-            Self::SleepOrFrames { .. } => "sleep_or_frames",
+            Self::SleepFrames { .. } => "sleep_frames",
             Self::Quit => "quit",
         }
     }
@@ -411,8 +349,6 @@ pub(super) enum ProductAutomationWaitCondition {
     FirstFrame,
     RuntimeIdle,
     FrameFreshnessCurrent,
-    NoRenderError,
-    GpuFramePresented,
     SourceVerificationRequired,
     SourceVerificationVerified,
     ProjectStoreIdle,
@@ -428,8 +364,6 @@ impl ProductAutomationWaitCondition {
             Self::FirstFrame => "first_frame",
             Self::RuntimeIdle => "runtime_idle",
             Self::FrameFreshnessCurrent => "frame_freshness_current",
-            Self::NoRenderError => "no_render_error",
-            Self::GpuFramePresented => "gpu_frame_presented",
             Self::SourceVerificationRequired => "source_verification_required",
             Self::SourceVerificationVerified => "source_verification_verified",
             Self::ProjectStoreIdle => "project_store_idle",
@@ -455,48 +389,16 @@ impl ProductAutomationWaitCondition {
 pub(super) enum ProductAutomationAssertCondition {
     NonblankFrame,
     NoRenderError,
-    FrameFreshnessCurrent,
-    RuntimeIdle,
     RenderMode {
         mode: ProductAutomationRenderMode,
     },
     ViewerLayout {
         layout: ProductAutomationViewerLayout,
     },
-    ActiveTimepoint {
-        timepoint: u64,
-    },
-    ObservedTimepoints {
-        min_distinct: usize,
-    },
-    Playback {
-        playing: bool,
-    },
-    CrossSectionActivePanel {
-        panel: Option<ProductAutomationPanelId>,
-    },
     CrossSectionPanelSchedule {
         panel: ProductAutomationPanelId,
-        status: Option<ProductAutomationCrossSectionScheduleStatus>,
         min_generation: Option<u64>,
-        target_scale_level: Option<u32>,
-        render_scale_level: Option<u32>,
         min_selected_resources: Option<usize>,
-        max_missing_occupied_resources: Option<usize>,
-        display_current: Option<bool>,
-    },
-    ActiveLeaseCohort {
-        min_required: Option<usize>,
-        min_retained: Option<usize>,
-        max_missing: Option<usize>,
-        complete: Option<bool>,
-    },
-    CrossSectionPanelNonblank {
-        panel: ProductAutomationPanelId,
-        min_nonzero_rgb_pixels: Option<usize>,
-    },
-    CrossSectionPanelImagesDistinct {
-        min_different_pixels: Option<usize>,
     },
     FourPanelImagesDistinct {
         min_different_pixels: Option<usize>,
@@ -527,18 +429,9 @@ impl ProductAutomationAssertCondition {
         match self {
             Self::NonblankFrame => "nonblank_frame",
             Self::NoRenderError => "no_render_error",
-            Self::FrameFreshnessCurrent => "frame_freshness_current",
-            Self::RuntimeIdle => "runtime_idle",
             Self::RenderMode { .. } => "render_mode",
             Self::ViewerLayout { .. } => "viewer_layout",
-            Self::ActiveTimepoint { .. } => "active_timepoint",
-            Self::ObservedTimepoints { .. } => "observed_timepoints",
-            Self::Playback { .. } => "playback",
-            Self::CrossSectionActivePanel { .. } => "cross_section_active_panel",
             Self::CrossSectionPanelSchedule { .. } => "cross_section_panel_schedule",
-            Self::ActiveLeaseCohort { .. } => "active_lease_cohort",
-            Self::CrossSectionPanelNonblank { .. } => "cross_section_panel_nonblank",
-            Self::CrossSectionPanelImagesDistinct { .. } => "cross_section_panel_images_distinct",
             Self::FourPanelImagesDistinct { .. } => "four_panel_images_distinct",
             Self::CrossSectionRetired => "cross_section_retired",
             Self::SourceVerificationEvidence { .. } => "source_verification_evidence",
@@ -550,10 +443,7 @@ impl ProductAutomationAssertCondition {
     pub(super) fn is_cross_section_condition(&self) -> bool {
         matches!(
             self,
-            Self::CrossSectionActivePanel { .. }
-                | Self::CrossSectionPanelSchedule { .. }
-                | Self::CrossSectionPanelNonblank { .. }
-                | Self::CrossSectionPanelImagesDistinct { .. }
+            Self::CrossSectionPanelSchedule { .. }
                 | Self::FourPanelImagesDistinct { .. }
                 | Self::CrossSectionRetired
         )
@@ -563,25 +453,15 @@ impl ProductAutomationAssertCondition {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ProductAutomationProjectStoreLifecycle {
-    Unbound,
-    Provisional,
     Established,
-    RecoveryOnly,
     RecoverySelected,
-    Closing,
-    Closed,
 }
 
 impl ProductAutomationProjectStoreLifecycle {
     pub(super) const fn name(self) -> &'static str {
         match self {
-            Self::Unbound => "unbound",
-            Self::Provisional => "provisional",
             Self::Established => "established",
-            Self::RecoveryOnly => "recovery_only",
             Self::RecoverySelected => "recovery_selected",
-            Self::Closing => "closing",
-            Self::Closed => "closed",
         }
     }
 }
@@ -589,7 +469,6 @@ impl ProductAutomationProjectStoreLifecycle {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ProductAutomationViewerLayout {
-    #[serde(alias = "single_3d")]
     Single3d,
     FourPanel,
 }
@@ -615,121 +494,13 @@ impl From<ProductAutomationViewerLayout> for ViewerLayout {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ProductAutomationPanelId {
-    Xy,
     Xz,
-    #[serde(rename = "3d", alias = "three_d")]
-    ThreeD,
-    Yz,
-}
-
-impl ProductAutomationPanelId {
-    pub(super) fn name(self) -> &'static str {
-        match self {
-            Self::Xy => "xy",
-            Self::Xz => "xz",
-            Self::ThreeD => "3d",
-            Self::Yz => "yz",
-        }
-    }
 }
 
 impl From<ProductAutomationPanelId> for PanelId {
     fn from(value: ProductAutomationPanelId) -> Self {
         match value {
-            ProductAutomationPanelId::Xy => Self::Xy,
             ProductAutomationPanelId::Xz => Self::Xz,
-            ProductAutomationPanelId::ThreeD => Self::ThreeD,
-            ProductAutomationPanelId::Yz => Self::Yz,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct ProductAutomationPanelHoverProbe {
-    pub(super) x_fraction: f32,
-    pub(super) y_fraction: f32,
-    pub(super) expected_status: Option<ProductAutomationCrossSectionHoverStatus>,
-    pub(super) expect_value: Option<bool>,
-    pub(super) expected_generation_status: Option<ProductAutomationCrossSectionGenerationStatus>,
-    pub(super) expected_display_current: Option<bool>,
-    pub(super) expected_target_generation: Option<u64>,
-    pub(super) expected_displayed_generation: Option<u64>,
-    pub(super) expected_schedule_generation: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum ProductAutomationCrossSectionHoverStatus {
-    Value,
-    Loading,
-    Stale,
-    Incomplete,
-    Unavailable,
-    InvalidNoData,
-    Outside,
-}
-
-impl ProductAutomationCrossSectionHoverStatus {
-    pub(super) fn name(self) -> &'static str {
-        match self {
-            Self::Value => "value",
-            Self::Loading => "loading",
-            Self::Stale => "stale",
-            Self::Incomplete => "incomplete",
-            Self::Unavailable => "unavailable",
-            Self::InvalidNoData => "invalid_no_data",
-            Self::Outside => "outside",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum ProductAutomationCrossSectionGenerationStatus {
-    CurrentDisplayed,
-    CurrentUndisplayed,
-    RetainedStale,
-    Unavailable,
-}
-
-impl ProductAutomationCrossSectionGenerationStatus {
-    pub(super) fn name(self) -> &'static str {
-        match self {
-            Self::CurrentDisplayed => "current_displayed",
-            Self::CurrentUndisplayed => "current_undisplayed",
-            Self::RetainedStale => "retained_stale",
-            Self::Unavailable => "unavailable",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum ProductAutomationCrossSectionScheduleStatus {
-    MissingViewport,
-    Loading,
-    Empty,
-    Ready,
-    Current,
-    Coarse,
-    Incomplete,
-    BudgetLimited,
-    Unavailable,
-}
-
-impl From<ProductAutomationCrossSectionScheduleStatus> for CrossSectionPanelScheduleStatus {
-    fn from(value: ProductAutomationCrossSectionScheduleStatus) -> Self {
-        match value {
-            ProductAutomationCrossSectionScheduleStatus::MissingViewport => Self::MissingViewport,
-            ProductAutomationCrossSectionScheduleStatus::Loading => Self::Loading,
-            ProductAutomationCrossSectionScheduleStatus::Empty => Self::Empty,
-            ProductAutomationCrossSectionScheduleStatus::Ready => Self::Ready,
-            ProductAutomationCrossSectionScheduleStatus::Current => Self::Current,
-            ProductAutomationCrossSectionScheduleStatus::Coarse => Self::Coarse,
-            ProductAutomationCrossSectionScheduleStatus::Incomplete => Self::Incomplete,
-            ProductAutomationCrossSectionScheduleStatus::BudgetLimited => Self::BudgetLimited,
-            ProductAutomationCrossSectionScheduleStatus::Unavailable => Self::Unavailable,
         }
     }
 }
@@ -740,7 +511,6 @@ pub(super) enum ProductAutomationRenderMode {
     Mip,
     Dvr,
     Iso,
-    Isosurface,
 }
 
 impl ProductAutomationRenderMode {
@@ -748,7 +518,7 @@ impl ProductAutomationRenderMode {
         match self {
             Self::Mip => "mip",
             Self::Dvr => "dvr",
-            Self::Iso | Self::Isosurface => "iso",
+            Self::Iso => "iso",
         }
     }
 }
@@ -758,9 +528,7 @@ impl From<ProductAutomationRenderMode> for RenderMode {
         match value {
             ProductAutomationRenderMode::Mip => Self::Mip,
             ProductAutomationRenderMode::Dvr => Self::Dvr,
-            ProductAutomationRenderMode::Iso | ProductAutomationRenderMode::Isosurface => {
-                Self::Isosurface
-            }
+            ProductAutomationRenderMode::Iso => Self::Isosurface,
         }
     }
 }

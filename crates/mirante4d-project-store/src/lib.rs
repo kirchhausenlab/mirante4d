@@ -1,8 +1,7 @@
 //! Bounded public boundary for the experimental Mirante4D project store.
 //!
-//! WP-10B keeps this crate off-product while its transactional implementation
-//! and durability evidence are built. Persistence wire types and filesystem
-//! machinery remain private to the crate.
+//! This is the product's project-storage implementation. Persistence wire
+//! types and filesystem machinery remain private to the crate.
 
 #![forbid(unsafe_code)]
 

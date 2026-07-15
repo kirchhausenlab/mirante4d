@@ -2,7 +2,7 @@
 
 Status: ACCEPTED AND IMPLEMENTED BY WP-07A
 Accepted: 2026-07-11
-Last reviewed: 2026-07-11
+Last reviewed: 2026-07-14
 Owning package: WP-07A
 Product authority cutover: WP-07B
 
@@ -52,13 +52,10 @@ predecessor-field disposition before any product authority moves.
   effective durable change, leave no-ops and transient changes clean, and admit
   asynchronous results only when typed identity and currentness still match.
 
-The machine-checked root API, dependency, side-effect, state-class, and semantic
-invariant allowlists are frozen in
-[`architecture/model-contract.json`](../../architecture/model-contract.json).
-The immutable WP-07A/WP-07B exit revisions remain the exact historical Rust
-signature, variant, and predecessor-field disposition authority. The current
-owner and deletion state is recorded without brittle field counts in
-[`architecture/current-state-field-ledger.json`](../../architecture/current-state-field-ledger.json).
+Current dependency, side-effect, state-class, and semantic invariants live in
+the code and [current architecture](../ARCHITECTURE.md). Git history and the
+immutable exit tags preserve the exact cutover signatures and predecessor
+disposition.
 
 ## Consequences
 
@@ -88,6 +85,3 @@ parsing an identity string is not a T1 conformance claim.
 ## Owning Documents
 
 - [Current Architecture](../ARCHITECTURE.md)
-- [Foundation Refactor Handoff](../plans/active/FOUNDATION_REFACTOR_HANDOFF.md)
-- [Technical Cutover Work Packages](../plans/active/foundation-refactor/TECHNICAL_CUTOVER_WORK_PACKAGES.md)
-- [Workspace Architecture Brief](../plans/active/foundation-refactor/WORKSPACE_ARCHITECTURE_BRIEF.md)

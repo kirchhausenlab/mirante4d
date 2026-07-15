@@ -5,10 +5,10 @@ use std::{
 };
 
 mod analysis_product;
+mod analysis_session;
 mod analysis_workspace;
 mod cross_section_readout;
 mod cross_section_scheduler;
-mod current_runtime;
 mod current_settings_connection;
 mod current_source_open_service;
 mod current_source_verification_service;
@@ -49,7 +49,6 @@ use analysis_workspace::{
 };
 use cross_section_readout::cross_section_hover_readout_for_panel_point;
 pub use diagnostics::{StartupDiagnostics, collect_startup_diagnostics, default_log_path};
-use display_refresh::duration_ms;
 use eframe::egui;
 use fidelity::composite_fidelity_label;
 use histogram::active_layer_histogram_summary;
@@ -96,7 +95,7 @@ use mirante4d_render_api::PresentationViewport;
 use mirante4d_render_wgpu::{WgpuRenderRuntime, WgpuRenderRuntimeConfig};
 use mirante4d_settings::{RejectedFileDisposition, ResourcePolicy, recommended_for_current_system};
 use mirante4d_ui_egui as ui_kit;
-use product_automation::{ProductAutomationAppUpdateTiming, ProductAutomationController};
+use product_automation::ProductAutomationController;
 use render_state::set_render_viewport;
 pub use smoke::{AppSmokeOptions, AppSmokeReport, PlaybackSmokeFrame, run_headless_smoke};
 use ui_kit::{
@@ -105,7 +104,7 @@ use ui_kit::{
     WorkbenchUiAction, WorkbenchUiOutput,
 };
 #[cfg(test)]
-use ui_kit::{WorkbenchLayoutSpec, histogram_bins_label, playback_status_label};
+use ui_kit::{histogram_bins_label, playback_status_label};
 use workbench_controls::{
     dataset_path_status_label, request_background_work_repaint,
     request_background_work_repaint_after,
@@ -443,7 +442,7 @@ pub struct MiranteWorkbenchApp {
     native_presentation: native_presentation::NativePresentationBridge,
     egui_ui: ui_kit::EguiUiState,
     import: ImportWorkflow,
-    analysis_runtime: current_runtime::analysis::AnalysisProductRuntime,
+    analysis_runtime: analysis_session::AnalysisProductRuntime,
     product_automation: Option<ProductAutomationController>,
     #[cfg(test)]
     test_render_viewport_max_side: Option<usize>,

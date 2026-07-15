@@ -1,6 +1,5 @@
 {
   "case": "hand-built-2d-uint8-selected-zarr-shard-subset",
-  "entry_sha256": "040dc8c85524d77ee0660c4ae541df9bd5878508c3c1682d6d5158402aef046d",
   "non_claims": [
     "not a T1 fixture or authority promotion",
     "not OME metadata or official-schema evidence",
@@ -89,10 +88,10 @@
   "sources": {
     "producer_sha256": "76d92b68b03ac353befa76f6fdd216352cf8a886cf734e0c048a33683559ceed",
     "reader_sha256": "30da083dbc996d81f7a576779573c5550fa83c3e5c76c95e30aa30af54365212",
-    "reproducer_sha256": "aae3efda1c0fb42714595761d08c47ec47c0775dfab11cc9307e6636ce2ea662",
+    "reproducer_sha256": "02355e4ece8d84add53d9959d18bfbdff4541e7185d7ca3adeb0c6c3587b6ad4",
     "requirements_lock_sha256": "20e3d7b96a8ed722bfb4cbb1e14028fc3cd33f825e566b7af5de8e565f1572ef"
   },
-  "standards_manifest_sha256": "28021b100e855b86ad29c0f69e5249115de2a39ddc68e980ae7e5ea67bc65e4e",
+  "standards_manifest_sha256": "efbe92d6a419191b1deff9a632fce71b91b378dfb8abe0580c830cdcb455eca7",
   "status": "diagnostic-pass",
   "tools": {
     "platform": "Linux x86_64",

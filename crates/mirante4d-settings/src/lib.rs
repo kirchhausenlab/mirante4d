@@ -165,15 +165,6 @@ impl ResourcePolicy {
     pub const fn gpu_budget_bytes(self) -> u64 {
         self.gpu_budget_bytes
     }
-
-    pub const fn current_runtime_adapter(self) -> CurrentRuntimeResourcePolicy {
-        CurrentRuntimeResourcePolicy {
-            cpu_brick_cache_budget_bytes: self.cpu_dataset_budget_bytes / 2,
-            cpu_whole_volume_cache_budget_bytes: self.cpu_dataset_budget_bytes / 8,
-            gpu_brick_cache_budget_bytes: ((self.gpu_budget_bytes as u128 * 65) / 100) as u64,
-            gpu_dense_cache_budget_bytes: self.gpu_budget_bytes / 10,
-        }
-    }
 }
 
 impl Default for ResourcePolicy {
@@ -235,32 +226,6 @@ fn recommended_gpu_budget_bytes(dedicated_gpu_memory_bytes: u64) -> u64 {
     MAX_GPU_BUDGET_BYTES
         .min(dedicated_gpu_memory_bytes / 2)
         .min(dedicated_gpu_memory_bytes.saturating_sub(2 * GIB))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CurrentRuntimeResourcePolicy {
-    cpu_brick_cache_budget_bytes: u64,
-    cpu_whole_volume_cache_budget_bytes: u64,
-    gpu_brick_cache_budget_bytes: u64,
-    gpu_dense_cache_budget_bytes: u64,
-}
-
-impl CurrentRuntimeResourcePolicy {
-    pub const fn cpu_brick_cache_budget_bytes(self) -> u64 {
-        self.cpu_brick_cache_budget_bytes
-    }
-
-    pub const fn cpu_whole_volume_cache_budget_bytes(self) -> u64 {
-        self.cpu_whole_volume_cache_budget_bytes
-    }
-
-    pub const fn gpu_brick_cache_budget_bytes(self) -> u64 {
-        self.gpu_brick_cache_budget_bytes
-    }
-
-    pub const fn gpu_dense_cache_budget_bytes(self) -> u64 {
-        self.gpu_dense_cache_budget_bytes
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

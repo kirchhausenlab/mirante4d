@@ -171,7 +171,7 @@
       "owner": "mirante4d-render-wgpu",
       "capability": "trusted-hw2-vulkan",
       "requirements": ["D-022-trusted-gpu-separation"],
-      "fixture_tier": "T2-or-T5",
+      "fixture_tier": "T2",
       "timeout_secs": 900,
       "evidence_level": "E2-E3",
       "trigger": "manual clean-worktree trusted HW-2",

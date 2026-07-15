@@ -1,16 +1,12 @@
 # Architecture Decision Records
 
-Program version: 0.21
-Last updated: 2026-07-11
+Last updated: 2026-07-14
 
-These ADRs record accepted decisions for the foundation program. Most remain
-targets; implementation notes say when an owning package completed one. None
-independently authorizes implementation or replaces
-`docs/CURRENT_STATE.md` as the authority for current facts. The
-[foundation implementation handoff](../plans/active/FOUNDATION_REFACTOR_HANDOFF.md)
-owns program status, sequencing, promotion, and the same-version brief bundle.
+These ADRs preserve the decisions behind the completed foundation refactor.
+They explain rationale but do not replace `docs/CURRENT_STATE.md` as the
+authority for current facts.
 
-| ADR | Target decision | Decision IDs |
+| ADR | Decision | Decision IDs |
 | --- | --- | --- |
 | [ADR-0001](ADR-0001-foundation-program-and-hard-cutovers.md) | Deep foundation program with staged hard cutovers and no compatibility debris | OD-001–OD-008; PRG-001/002/003/008/015 |
 | [ADR-0002](ADR-0002-strict-m4d-format-lifecycle-and-identity.md) | Strict M4D/OME-NGFF profile, lifecycle, sharding, and identity families | D-007/D-008/D-009 |
@@ -22,9 +18,6 @@ owns program status, sequencing, promotion, and the same-version brief bundle.
 | [ADR-0008](ADR-0008-contribution-governance.md) | Maintainer-led MIT contributions with no CLA/DCO initially | D-003 |
 | [ADR-0009](ADR-0009-canonical-model-contract.md) | Pure canonical domain, identity, and project model before the product hard cutover | WP-07A |
 
-D-003 contribution governance is implemented and operational in the public
-repository; WP-04 applied and read back its remote controls. ADR-0009 was
-implemented and accepted by WP-07A at `foundation-wp-07a-exit-1`; its model
-is now the live authority through the WP-07B-B hard cutover. D-011 through
-D-014 and D-020 belong only to the deferred open-data follow-on. New ADRs must
-not convert a later-gated decision into implementation authority.
+D-003 contribution governance is operational in the public repository.
+ADR-0009's canonical model is the live authority. D-011 through D-014 and
+D-020 belong only to the deferred open-data follow-on.

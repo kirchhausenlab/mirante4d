@@ -1,7 +1,8 @@
 # Target-format authority tooling
 
-This directory is isolated verification tooling for WP-10A-C. It does not
-import Mirante4D production crates and is not reachable from the product.
+This directory contains isolated verification tooling for the native target
+profile. It does not import Mirante4D production crates and is not reachable
+from the product.
 
 Verify the checked offline standards mirror:
 

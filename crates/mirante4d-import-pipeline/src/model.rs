@@ -73,7 +73,7 @@ pub(crate) struct InspectedSourceFile {
     pub sha256: Sha256Digest,
 }
 
-/// One complete off-product import request.
+/// One complete product import request.
 #[derive(Clone, Debug)]
 pub struct ImportOptions {
     pub inspection: TiffInspection,

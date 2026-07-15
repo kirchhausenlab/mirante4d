@@ -47,7 +47,7 @@ pub struct InspectorWorkbenchView<'a> {
     pub messages: &'a [String],
 }
 
-pub fn show_workbench_inspector(
+pub(crate) fn show_workbench_inspector(
     ui: &mut egui::Ui,
     view: InspectorWorkbenchView<'_>,
     state: &mut EguiUiState,
@@ -453,9 +453,6 @@ fn show_viewer_tools(
             "crosshair",
             format!("x{:.0} y{:.0} {:?}", screen.x, screen.y, crosshair.kind),
         );
-    }
-    if let Some(selection) = &state.viewer_tools.selection {
-        property_row(ui, "selection", format!("{selection:?}"));
     }
 }
 

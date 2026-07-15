@@ -1,7 +1,7 @@
-//! Bounded asynchronous bridge for opening the current M4D dataset profile.
+//! Bounded asynchronous service for opening the active M4D dataset profile.
 //!
-//! This is an interim WP-07B composition service. It owns no durable source
-//! identity and retains no path after its single active operation completes.
+//! It owns no durable source identity and retains no path after its single
+//! active operation completes.
 
 use std::{
     fmt, io,
@@ -27,7 +27,7 @@ use mirante4d_storage::{
 };
 
 use crate::{
-    current_runtime::analysis::AnalysisProductRuntime,
+    analysis_session::AnalysisProductRuntime,
     dataset_requests::DatasetDemandState,
     unified_source_open::{self, UnifiedOpenedSource},
 };

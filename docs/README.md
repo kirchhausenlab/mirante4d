@@ -22,16 +22,12 @@ Agents must also follow the [agent guide](AGENTS.md). Dependency-policy
 exceptions have one separate tool-owned
 [ledger](DEPENDENCY_EXCEPTIONS.md).
 
-## Plans
+## Deferred Plans
 
-The [foundation handoff](plans/active/FOUNDATION_REFACTOR_HANDOFF.md) owns the
-approved package order and links its active technical contracts. These are
-targets until the current-state authority says they are implemented.
-
-Two future outcomes are deliberately separate:
+Two future outcomes remain deliberately separate from ordinary development:
 
 - [public microscopy data](plans/deferred/OPEN_DATA_FOLLOW_ON.md);
-- [possible post-foundation segmentation](plans/deferred/SEGMENTATION.md).
+- [possible segmentation](plans/deferred/SEGMENTATION.md).
 
 ## Documentation Rules
 

@@ -2479,7 +2479,7 @@ fn source_replacement_is_central_generation_guarded_and_resets_bound_transients(
         .dispatch(ApplicationCommand::SetPlaybackActive(true))
         .unwrap();
     application
-        .dispatch(ApplicationCommand::SetActiveTool(ToolKind::MeasureDistance))
+        .dispatch(ApplicationCommand::SetActiveTool(ToolKind::Crosshair))
         .unwrap();
     application
         .dispatch(ApplicationCommand::RequestDatasetOpen)

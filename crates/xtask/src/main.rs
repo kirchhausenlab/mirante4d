@@ -2,34 +2,24 @@ use std::{env, path::Path};
 
 use anyhow::{Context, bail};
 
-use crate::command_audit::command_audit;
 use crate::product_validate::{is_product_validation_scenario_name, product_validate};
-use crate::smoke::app_smoke;
 use crate::workflow_audit::workflow_audit;
 
 const PRODUCT_VALIDATE_USAGE: &str = "usage: cargo xtask product-validate [target-package] \
-     [target_fixture_camera_smoke|target_fixture_render_modes|target_source_verification|b4_project_persistence|\
-      t5_qual_001_interaction_mip|t5_qual_001_interaction_render_modes|t5_qual_001_interaction_continuous|\
-      t5_qual_001_four_panel_cross_section|t5_qual_001_four_panel_fine_scale|\
-      t5_qual_001_four_panel_continuous_cross_section|t5_qual_002_four_panel_timepoint|t5_qual_002_four_panel_autoplay|custom_script]";
+     [target_fixture_camera_smoke|target_fixture_render_modes|target_source_verification|b4_project_persistence]";
 
 mod arch;
-mod command_audit;
 mod deps;
 mod dev;
 mod documentation;
 mod host;
-mod ids;
 mod package;
 mod process;
 mod product_validate;
 mod reports;
-mod smoke;
 mod target_fixture;
 mod verification;
 mod workflow_audit;
-
-pub(crate) use ids::stable_id_from_name;
 
 fn main() -> anyhow::Result<()> {
     let mut args = env::args().skip(1);
@@ -70,18 +60,8 @@ fn main() -> anyhow::Result<()> {
             verification::verification_sync(option.as_deref() == Some("--check"))
         }
         "verify-deps" => deps::verify_deps(),
-        "package-dev" => package::package_dev().map(|path| println!("{}", path.display())),
         "package-linux-release" => {
             package::package_linux_release().map(|path| println!("{}", path.display()))
-        }
-        "app-smoke" => {
-            let package = args
-                .next()
-                .context("usage: cargo xtask app-smoke <target-package>")?;
-            if args.next().is_some() {
-                bail!("usage: cargo xtask app-smoke <target-package>");
-            }
-            app_smoke(Path::new(&package)).map(|path| println!("{}", path.display()))
         }
         "product-validate" => match product_validate_args(args.collect())? {
             ProductValidateArgs::Help => {
@@ -95,7 +75,6 @@ fn main() -> anyhow::Result<()> {
         },
         "workflow-audit" => workflow_audit().map(|path| println!("{}", path.display())),
         "docs-check" => documentation::docs_check(),
-        "command-audit" => command_audit().map(|path| println!("{}", path.display())),
         "run-dev" => dev::run_dev(),
         "help" | "--help" | "-h" => {
             print_help();
@@ -150,9 +129,9 @@ under target/mirante4d/product-validation/. With no package argument, the
 bounded promoted target U16 fixture is extracted locally.
 
 The ordinary bounded scenarios are target_fixture_camera_smoke,
-target_fixture_render_modes, and target_source_verification. The T5 scenarios
-require an explicit local package and the heavy-work opt-in. Use custom_script
-with MIRANTE4D_PRODUCT_VALIDATE_SCRIPT=<script.json> for a reviewed script.
+target_fixture_render_modes, and target_source_verification. The retained
+b4_project_persistence scenario checks project save, recovery, and reopen
+behavior across three application launches.
 
 Useful controls:
   MIRANTE4D_PRODUCT_VALIDATE_TIMEOUT_SECS=<seconds>
@@ -173,13 +152,10 @@ Mirante4D developer tasks
   cargo xtask verify-local <format-lifecycle|project-store-lifecycle|trusted-gpu>
   cargo xtask verification-sync [--check]
   cargo xtask verify-deps
-  cargo xtask package-dev
   cargo xtask package-linux-release
-  cargo xtask app-smoke <target-package>
   cargo xtask product-validate [target-package] [scenario]
   cargo xtask workflow-audit
   cargo xtask docs-check
-  cargo xtask command-audit
   cargo xtask run-dev
 
 Run cargo xtask product-validate --help for scenario details."
@@ -218,13 +194,6 @@ mod tests {
             ProductValidateArgs::Run {
                 package: None,
                 scenario: Some("b4_project_persistence".to_owned())
-            }
-        );
-        assert_eq!(
-            product_validate_args(args(&["sample.m4d", "t5_qual_001_interaction_mip"])).unwrap(),
-            ProductValidateArgs::Run {
-                package: Some("sample.m4d".to_owned()),
-                scenario: Some("t5_qual_001_interaction_mip".to_owned())
             }
         );
     }

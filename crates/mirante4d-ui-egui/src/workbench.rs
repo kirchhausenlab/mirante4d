@@ -58,8 +58,6 @@ fn synchronize_viewer_tool(
         mirante4d_application::ToolKind::Navigate => ViewerTool::Navigate,
         mirante4d_application::ToolKind::Inspect => ViewerTool::Inspect,
         mirante4d_application::ToolKind::Crosshair => ViewerTool::Crosshair,
-        mirante4d_application::ToolKind::RoiBox => ViewerTool::RoiBox,
-        mirante4d_application::ToolKind::MeasureDistance => ViewerTool::MeasureDistance,
     };
     if state.viewer_tools.active_tool != canonical {
         state.viewer_tools.set_active_tool(canonical);

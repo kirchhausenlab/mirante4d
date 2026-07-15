@@ -8,7 +8,7 @@ use mirante4d_application::{
 
 use crate::property_row;
 
-pub fn show_frame_fidelity_property_rows(ui: &mut egui::Ui, fidelity: &FrameFidelityStatus) {
+pub(crate) fn show_frame_fidelity_property_rows(ui: &mut egui::Ui, fidelity: &FrameFidelityStatus) {
     property_row(ui, "scale", frame_fidelity_scale_label(fidelity));
     property_row(ui, "state", frame_completeness_label(fidelity.completeness));
     property_row(ui, "reason", frame_reason_label(fidelity.reason));

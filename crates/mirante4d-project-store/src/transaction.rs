@@ -138,7 +138,7 @@ impl UnreferencedGenerationPublication {
 /// Why a new package receives its first manual generation.
 ///
 /// Keeping this private prevents callers from installing arbitrary fork
-/// provenance while Create and Save As are still off-product.
+/// provenance for Create and Save As.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InitialPackageMode {
     Create,

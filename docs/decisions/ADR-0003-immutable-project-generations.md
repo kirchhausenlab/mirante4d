@@ -1,16 +1,13 @@
 # ADR-0003 — Immutable Content-Addressed Project Generations
 
-Status: ACCEPTED TARGET DECISION
+Status: ACCEPTED AND IMPLEMENTED
 Accepted: 2026-07-09
-Last reviewed: 2026-07-13
+Last reviewed: 2026-07-14
 Decision ID: D-010
-Implementation authorization: NONE INDEPENDENT; ACTIVE HANDOFF AND PACKAGE ENTRY ONLY
 
-This ADR records owner-approved policy and carries no independent
-implementation authority. WP-02 cut project v13 to the segmentation-free v14
-predecessor, and WP-07B later replaced v14 with the private experimental
-project-v15 bridge. The WP-10B B4 candidate now replaces that bridge with this
-store; final qualifying evidence and protected-main acceptance remain pending.
+WP-10B implemented this store as the sole product persistence route and
+deleted the project-v15 bridge. [Current State](../CURRENT_STATE.md) owns the
+current product facts.
 
 ## Context
 
@@ -119,11 +116,10 @@ fallback, or converter is included afterward.
   persistence; WP-10B remains the project save/open authority.
 - No mutable artifact authority, hybrid database/blob commit, UI-thread file
   transaction, silent merge, auto-repair, or legacy project reader may be added
-  without a new owner-approved ADR and handoff change.
-- Implementation follows the active handoff and begins only when the owning
-  execution brief is revision-stamped and authorized.
+  without a new owner-approved ADR and current-document update.
 
 ## Owning Documents
 
-- [Foundation Refactor Implementation Handoff](../plans/active/FOUNDATION_REFACTOR_HANDOFF.md)
-- [Project Store And Durability Brief](../plans/active/foundation-refactor/PROJECT_STORE_DURABILITY_BRIEF.md)
+- [Current Architecture](../ARCHITECTURE.md)
+- [Data Format](../DATA_FORMAT.md)
+- [Current State](../CURRENT_STATE.md)

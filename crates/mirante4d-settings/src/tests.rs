@@ -108,27 +108,6 @@ fn known_gpu_below_the_explicit_minimum_is_rejected_not_silently_clamped() {
 }
 
 #[test]
-fn temporary_runtime_adapter_uses_the_frozen_percentages() {
-    let policy = ResourcePolicy::new(16 * GIB, 8 * GIB).unwrap();
-    let adapter = policy.current_runtime_adapter();
-    assert_eq!(adapter.cpu_brick_cache_budget_bytes(), 8 * GIB);
-    assert_eq!(adapter.cpu_whole_volume_cache_budget_bytes(), 2 * GIB);
-    assert_eq!(
-        adapter.gpu_brick_cache_budget_bytes(),
-        (8_u64 * GIB) * 65 / 100
-    );
-    assert_eq!(adapter.gpu_dense_cache_budget_bytes(), 8 * GIB / 10);
-    assert_eq!(
-        adapter.cpu_brick_cache_budget_bytes() + adapter.cpu_whole_volume_cache_budget_bytes(),
-        10 * GIB
-    );
-    assert!(
-        adapter.gpu_brick_cache_budget_bytes() + adapter.gpu_dense_cache_budget_bytes()
-            <= (8_u64 * GIB) * 75 / 100
-    );
-}
-
-#[test]
 fn settings_document_has_the_exact_closed_shape_and_round_trips() {
     let document = SettingsDocument::new(ResourcePolicy::new(12 * GIB, 6 * GIB).unwrap());
     let encoded = document.to_json_pretty().unwrap();

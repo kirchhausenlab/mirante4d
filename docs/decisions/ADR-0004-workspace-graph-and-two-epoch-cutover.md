@@ -1,9 +1,8 @@
 # ADR-0004 — Ownership DAG And Gated Trunk
 
-Status: ACCEPTED TARGET DECISION
+Status: ACCEPTED AND IMPLEMENTED
 Accepted: 2026-07-09
-Last reviewed: 2026-07-11
-Implementation authorization: NONE INDEPENDENT; ACTIVE HANDOFF AND PACKAGE ENTRY ONLY
+Last reviewed: 2026-07-14
 
 ## Context
 
@@ -29,13 +28,11 @@ failures.
 
 ## Consequences
 
-The program incurs deliberate crate/API/deletion work instead of cosmetic file
-movement. Missing a bridge deletion or allowing a duplicate authority reopens
-the owning work package. Architecture checks use Cargo dependency metadata,
-public API/side-effect/resource ownership, and predecessor deletion—not source
-line limits.
+The refactor incurred deliberate crate/API/deletion work instead of cosmetic
+file movement. Architecture checks use Cargo dependency metadata, public
+API/side-effect/resource ownership, and predecessor deletion—not source line
+limits.
 
 ## Owning Documents
 
-- [Foundation handoff](../plans/active/FOUNDATION_REFACTOR_HANDOFF.md)
-- [Workspace architecture brief](../plans/active/foundation-refactor/WORKSPACE_ARCHITECTURE_BRIEF.md)
+- [Current Architecture](../ARCHITECTURE.md)

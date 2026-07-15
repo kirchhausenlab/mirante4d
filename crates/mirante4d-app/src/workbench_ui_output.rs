@@ -3,13 +3,6 @@
 use super::*;
 use crate::viewer_layout::PanelId;
 
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct WorkbenchUiApplyTiming {
-    pub(crate) command_apply_ms: f64,
-    pub(crate) display_refresh_trigger_ms: f64,
-    pub(crate) import_action_ms: f64,
-}
-
 fn apply_viewport_observations(
     render_coordination: &mut RenderCoordinationState,
     observations: impl IntoIterator<Item = ViewportObservation>,
@@ -33,7 +26,7 @@ impl MiranteWorkbenchApp {
         &mut self,
         ui: &mut egui::Ui,
         output: WorkbenchUiOutput,
-    ) -> WorkbenchUiApplyTiming {
+    ) {
         let WorkbenchUiOutput {
             application_commands,
             import_commands,
@@ -47,7 +40,6 @@ impl MiranteWorkbenchApp {
             repaint_after,
         } = output;
 
-        let command_apply_started = Instant::now();
         if !cross_section_readout_requests.is_empty() {
             let snapshot = self.application.snapshot();
             let view = application_view(&snapshot);
@@ -258,8 +250,9 @@ impl MiranteWorkbenchApp {
                     let slot = panel_id.presentation_slot();
                     let before = self.render_coordination.surface(slot).clone();
                     match self.render_cross_section_panel_for_display_if_needed(panel_id) {
-                        Ok(timing) => {
-                            if timing.is_some() || self.render_coordination.surface(slot) != &before
+                        Ok(refresh) => {
+                            if refresh.is_some()
+                                || self.render_coordination.surface(slot) != &before
                             {
                                 ui.ctx().request_repaint();
                             }
@@ -293,27 +286,14 @@ impl MiranteWorkbenchApp {
                 tracing::warn!(?fault, "UI application command rejected");
             }
         }
-        let command_apply_ms = duration_ms(command_apply_started.elapsed());
-
-        let display_refresh_trigger_started = Instant::now();
         rerender_requested |= self.render_coordination.take_refresh_request();
         if rerender_requested {
             self.refresh_frame(ui.ctx());
         } else if texture_refresh_requested {
             self.refresh_texture_only(ui.ctx());
         }
-        let display_refresh_trigger_ms = duration_ms(display_refresh_trigger_started.elapsed());
-
-        let import_action_started = Instant::now();
         for command in import_commands {
             self.apply_import_command(command, ui.ctx());
-        }
-        let import_action_ms = duration_ms(import_action_started.elapsed());
-
-        WorkbenchUiApplyTiming {
-            command_apply_ms,
-            display_refresh_trigger_ms,
-            import_action_ms,
         }
     }
 }

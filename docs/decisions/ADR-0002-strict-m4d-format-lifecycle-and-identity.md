@@ -1,17 +1,14 @@
 # ADR-0002 — Strict M4D Format, Lifecycle, Sharding, And Identity
 
-Status: ACCEPTED TARGET DECISION
+Status: ACCEPTED AND IMPLEMENTED
 Accepted: 2026-07-09
-Last reviewed: 2026-07-11
+Last reviewed: 2026-07-14
 Decision IDs: D-007, D-008, D-009
-Implementation authorization: NONE INDEPENDENT; ACTIVE HANDOFF AND PACKAGE ENTRY ONLY
 
-This ADR records owner-approved target policy. It carries no independent
-implementation or persisted-format change. The current `mirante4d-v1` schema-1
-package, reader/writer behavior, project identity, and existing identity fields
-remain the factual implementation until an approved work package hard-cuts
-them. No current persisted contract becomes OME-NGFF-compatible, candidate, or
-stable merely because this ADR is accepted.
+WP-10A implemented the strict package contract and WP-10C made it the sole
+product dataset path. [Data Format](../DATA_FORMAT.md) and
+[Current State](../CURRENT_STATE.md) own the current facts. Acceptance of this
+ADR alone does not make an experimental format stable.
 
 ## Context
 
@@ -107,11 +104,10 @@ scheme rather than reinterpreting an old digest.
   reader agreement alone is insufficient.
 - Unknown required capabilities and unsupported identities fail clearly. No
   dual reader, unsharded production path, per-brick file layout, or bare digest
-  may be introduced without a new owner-approved ADR and handoff change.
-- Implementation follows the active handoff and begins only when the owning
-  execution brief is revision-stamped and authorized.
+  may be introduced without a new owner-approved ADR and current-document
+  update.
 
 ## Owning Documents
 
-- [Foundation Refactor Implementation Handoff](../plans/active/FOUNDATION_REFACTOR_HANDOFF.md)
-- [Data Format, Lifecycle, And Identity Brief](../plans/active/foundation-refactor/DATA_FORMAT_IDENTITY_BRIEF.md)
+- [Data Format](../DATA_FORMAT.md)
+- [Current State](../CURRENT_STATE.md)

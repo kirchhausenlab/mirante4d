@@ -1,20 +1,17 @@
 # ADR-0007 — Use A Profile-Based Linux/GPU Foundation Envelope
 
-Status: ACCEPTED TARGET DECISION
+Status: ACCEPTED AND IMPLEMENTED
 Accepted: 2026-07-09
-Last reviewed: 2026-07-11
+Last reviewed: 2026-07-14
 Decision IDs: D-004, D-005, D-006, D-015, D-016
-Implementation authorization: NONE INDEPENDENT; ACTIVE HANDOFF AND PACKAGE ENTRY ONLY
 
-This ADR fixes target policy only. Current product behavior and support evidence
-remain factual until approved work packages change and validate them. WP-02
-removed the segmentation prototype, and segmentation is absent. Current CPU
-fallback behavior, current formats, and existing diagnostics are not changed or
-qualified by this ADR.
+The foundation packages implemented this bounded product envelope. Current
+facts and support claims live in [Product](../PRODUCT.md),
+[Current State](../CURRENT_STATE.md), and [Release](../RELEASE.md).
 
 ## Context
 
-The foundation needs a truthful, measurable workload and hardware boundary.
+The product needs a truthful, measurable workload and hardware boundary.
 Combining every observed maximum would imply an untested dataset, storing a
 nominal 1 TiB test would be wasteful, broad platform and 4K claims would exceed
 available evidence, and a silent CPU product fallback would hide unsupported
@@ -28,15 +25,14 @@ foundations that are now being replaced.
 3. Claim broad Linux, Windows, and macOS support and include 4K qualification.
 4. Preserve a silent CPU interactive fallback when no qualifying GPU exists.
 5. Retain or repair segmentation during the foundation refactor.
-6. Use separately qualified workload profiles, one measured Linux/Vulkan GPU
-   reference, a lazy structural scale simulator, and remove segmentation first.
+6. Use separately qualified practical workload profiles, one measured
+   Linux/Vulkan GPU reference, and remove segmentation first.
 
 ## Decision
 
-- Support is the union of named `DS-0` through `DS-4` profiles, never a Cartesian
-  product of their maxima. `DS-X` is a deterministic lazy structural simulator;
-  it advertises large logical scale without storing the payload or per-key table,
-  and its own disk footprint is capped at 64 MiB.
+- Support is the union of named practical profiles, never a Cartesian product
+  of their maxima. Qualification does not require a stored or simulated TiB
+  dataset.
 - Distinguish representable, functionally supported, usable, and
   performance-qualified claims. Public wording may use only the strongest level
   proved for the exact profile, machine, viewport, build, and revision.
@@ -47,13 +43,13 @@ foundations that are now being replaced.
   adapters receive an explicit pre-viewer diagnostic. CPU rendering remains
   available only for reference, testing, diagnostics, and export, never as a
   silent product fallback.
-- Linux x86_64/Vulkan is the sole foundation release claim. Windows and macOS
+- Linux x86_64/Vulkan is the sole current package boundary. Windows and macOS
   remain portability work until separately approved and validated.
 - Qualify product viewports at 1280x720 and through a 1920x1080 exercise. Do not
-  spend foundation work on 4K/3840-wide benchmarks, optimization, or claims.
+  add 4K/3840-wide benchmarks, optimization, or claims.
 - WP-02 deleted the segmentation prototype as a vertical hard cut. Keep
-  segmentation absent for the rest of the foundation program; any return
-  requires a separate post-foundation capability decision.
+  segmentation absent; any return requires a separately approved capability
+  decision.
 - Use the approved CPU and GPU byte-ledger formulas as measured seed policy.
   Calibration may tune implementation details but may not silently broaden the
   support boundary or create another resource authority.
@@ -62,14 +58,13 @@ foundations that are now being replaced.
 
 - The release claim is deliberately narrower and evidence-backed. A broader
   platform, GPU class, viewport, or profile requires explicit new acceptance.
-- No 1 TiB allocation, storage purchase, 4K display, or new hardware purchase is
-  required for foundation closure.
+- No TiB-scale dataset or 4K display is required for qualification.
 - Machines without a qualifying GPU fail clearly before interactive viewing;
   correctness is not weakened through an undisclosed degraded route.
 - Extreme spatial and temporal workloads remain independently qualified, and
   private evidence cannot be generalized to combinations that were never run.
-- Segmentation functionality is temporarily absent rather than preserved on top
-  of superseded model, storage, runtime, and verification foundations.
+- Segmentation remains deliberately absent rather than preserved on top of
+  superseded model, storage, runtime, and verification foundations.
 
 ## Enforcement
 
@@ -89,6 +84,7 @@ foundations that are now being replaced.
 
 ## Owning Documents
 
-- [Foundation Refactor Implementation Handoff](../plans/active/FOUNDATION_REFACTOR_HANDOFF.md)
-- [Dataset And Hardware Envelope Brief](../plans/active/foundation-refactor/DATASET_HARDWARE_ENVELOPE_BRIEF.md)
-- [Foundation Entry Work Packages](../plans/active/foundation-refactor/FOUNDATION_ENTRY_WORK_PACKAGES.md)
+- [Product](../PRODUCT.md)
+- [Current State](../CURRENT_STATE.md)
+- [Release](../RELEASE.md)
+- [Deferred segmentation capability](../plans/deferred/SEGMENTATION.md)

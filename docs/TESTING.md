@@ -1,6 +1,6 @@
 # Testing And Evidence
 
-Last updated: 2026-07-13
+Last updated: 2026-07-14
 
 ## Claim Language
 
@@ -15,9 +15,12 @@ Do not collapse these claims. Unit tests, smoke tests, virtual/no-display
 automation, snapshots, benchmarks, preflight runs, and render readbacks are
 supporting evidence, not product validation.
 
-## WP-06 Checks
+Tests should be proportionate to the change: focused unit and contract tests,
+a few useful integrations, and understandable product-level checks.
 
-This revision exposes six independently selectable leaves:
+## Public Checks
+
+The public test surface has six independently selectable leaves:
 
 ```bash
 cargo xtask verify-leaf policy
@@ -34,10 +37,10 @@ Run both public groups locally with:
 cargo xtask verify-pr
 ```
 
-`verify-pr policy` and `verify-pr rust` select one group when focused feedback
-is useful. The Rust group performs one discovery/build, checks exact ownership,
-then runs the unit/contract/UI union once before doctests. Tests are never
-retried.
+`verify-pr policy` and `verify-pr rust` select one group when focused
+feedback is useful. The Rust group shares one test-binary build across the
+unit, contract, and UI leaves before running doctests. Tests are never
+automatically retried.
 
 The generated selectors and Nextest configuration must match their registry:
 
@@ -45,455 +48,121 @@ The generated selectors and Nextest configuration must match their registry:
 cargo xtask verification-sync --check
 ```
 
-The live test inventory is discovered and assigned by the verification
-registry; generated selectors must not be hand-edited. The old recursive
-aggregates, `verify-fast`, and target-directory `report-audit` are not live
-authorities.
-
 Documentation alone can be checked with:
 
 ```bash
 cargo xtask docs-check
 ```
 
-That command validates the exact documentation inventory, authority ownership,
-navigation, local links, and heading anchors. Command discovery is owned by
-`cargo xtask --help`; this document does not duplicate the full command list.
-
-## Hosted And Trusted-Local Boundary
-
 The protected repository requires exactly `PR / policy` and `PR / rust`.
 Matching non-required `Main / policy` and `Main / rust` jobs run on protected
-main. The twenty-attempt cache-free calibration passed before the required-
-context list was replaced and read back; the transitional Bootstrap bridge is
-no longer part of the repository.
+main. Hosted verification uses standard public runners with a hard `$0`
+budget, no public self-hosted workstation, no private data, no automatic
+retry, and no cache or artifact storage.
 
-Hosted verification has a hard `$0` budget, no public self-hosted workstation,
-no private data, no automatic retry, and no cache or artifact storage.
+Test discovery and exact case ownership live in the verification registry and
+test source. This document does not duplicate their inventories.
 
-GPU and subsystem lifecycle checks are separate local tools. The current GPU
-command is deliberately local-only:
+## Change-Specific Local Checks
+
+Run these only when their boundary changes. They are not a recurring release
+ritual, and accepted foundation evidence does not need to be reproduced for
+unrelated work.
+
+### GPU And Runtime
+
+Renderer, GPU-resource, or dataset-runtime changes use the trusted local
+Vulkan check on the designated clean workstation:
 
 ```bash
 MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
   cargo xtask verify-local trusted-gpu
 ```
 
-Run it only on the designated clean Vulkan workstation. Private dataset paths
-stay out of the public tree and hosted logs. Linux packaging and the small
-packaged-viewer scenario are local commands, not hosted lanes.
+This is component evidence. It does not replace opening the viewer when the
+visible product path changed.
 
-The trusted lane now contains the accepted WP-09A successor aggregate; the
-predecessor GPU cases were retired with the deleted renderer crate. The
-aggregate starts the real Vulkan runtime once per logical ledger, consumes
-only dataset-runtime-issued leases, and covers the semantic-small, 8-MiB
-upload, and 128-resource work boundaries. Its accepted evidence is inherited
-for WP-09B rather than rerun. The verifier refuses dirty revisions and requires
-exactly one sanitized
-`wp09a-evidence-json` record. That record keeps the main and small-capacity
-ledgers separate, validates the exact case facts and per-frame maxima, and
-includes a render after every dataset lease is released. This is off-product
-component evidence, not viewer or performance validation.
+### Format And Storage
 
-WP-14 makes no performance claim and keeps no benchmark-baseline command or
-repository baseline.
-
-## Product Validation
-
-Rendering, viewport, GPU, data-loading, interaction, and large-dataset changes
-are incomplete until the actual viewer is opened on a real display with the
-relevant dataset and hardware, unless the user explicitly waives the gate.
-Validation must exercise the changed workflow, confirm the app remains alive
-without a hidden fallback or repeated GPU error, and inspect the resulting
-logs and evidence. Packaging or release changes use the packaged application.
-
-## Current Boundaries
-
-WP-06 is complete: its exact protected-main revision passed the real Vulkan
-viewer exercise at 1280x720 and 1920x1080 before
-`foundation-wp-06-exit-1` was created. WP-07A is accepted at
-`foundation-wp-07a-exit-1` (`5383cbb93c13c59e6f035bfa551356c75fb426dc`).
-WP-07B is accepted at `foundation-wp-07b-exit-1`. WP-08A's corrected contract
-is accepted at `foundation-wp-08a-exit-2`
-(`f2e520da891134d1b3f65d8fcac7afb4140579a2`). WP-08B is accepted at
-`foundation-wp-08b-exit-1`
-(`0e3bdb0f5257c820841cee215cee38747efbda75`) after exact-main public,
-trusted-GPU, source-nonmutation, and real-display 1280x720 T2 product checks.
-WP-10A is accepted at `foundation-wp-10a-exit-1`
-(`9b3a81d79a50027c0a8ddedc535021809a99d928`) after exact protected-main
-policy, Rust, and local format-lifecycle evidence.
-WP-09A is accepted at `foundation-wp-09a-exit-1`
-(`1b1e7d5534f29b010cc346d434811a3906fb40e1`) after exact protected-main
-policy/Rust and trusted-Vulkan evidence. WP-09B accepted that renderer as the
-sole product route. WP-09C is accepted at `foundation-wp-09c-exit-1`
-(`d33276b6de0287da7f225da278ee016aac26358a`) after the bounded real-display
-scenario exercised MIP, DVR, ISO, linked panels at 1280x720, and a short
-1920x1080 resize without repeating the inherited trusted-GPU matrix. Internal
-automation remains supporting evidence, not product-open proof.
-
-WP-10B's independent project-store wire authority is checked in the public
-policy group with `python3 tools/project-fixtures/validate.py --manifest
-fixtures/project/manifest.json --self-test`. It proves exact canonical bytes,
-refs, object/page closure, recovery classification, and declared corruptions;
-its self-test accepts manual and autosave recovery-ahead states both with and
-without `head.previous`, and rejects unrelated same-lane recovery targets. It
-does not independently conform repeated reuse of one physical page within a
-generation and does not claim filesystem durability or product save/open
-support.
-
-The `mirante4d-project-store` crate is assigned to the hosted contract lane.
-Its current tests cover the frozen API/limits, corrected loaded
-Open/OpenRecovery result shape, distinct manual-branch classification, canonical
-envelope/ref identities, typed canonical generations, direct and deterministic
-paged closure, held-descriptor traversal, bounded immutable object and
-generation-last publication, process lease contention, and exact reproduction
-of the fixture's initial and established manual refs. Established-manual cases
-cover exact g1-to-g2 recovery-before-head bytes, sequence derivation across an
-autosave head, zero immutable rewrites on full reuse, rejection before source
-reads, exact global-entry/fan-out capacity rejection without a ref change,
-cancellation/retry through recovery-ahead, retry after either recovery sync
-leg fails, and either final head sync-leg failure as write-suspending
-`CommitIndeterminate`. Established-autosave cases reproduce the independent
-first and advancing autosave generations and refs, replace a divergent lane
-against the current manual base, accept a lower revision with a non-regressing
-high-water mark, reject stale parent/base and invalid recovery/capacity state,
-retry an exact recovery-ahead cancellation, and distinguish recovery-sync
-failure from write-suspending head indeterminacy. The actor suite exercises the
-real established manual/autosave primitives under one worker and
-prove exact request correlation, the request/completion bounds, queued-autosave
-coalescing,
-active and queued cancellation, close rejection, writer-lease lifetime, and
-joined or nonblocking shutdown. They also prove authenticated Save As session
-and lease transfer, rejection before source reads, and preservation of the old
-session across collision, source failure, and cancellation. Four of those cases
-exercise the public unbound lifecycle: fresh Create, healthy established and
-provisional Open, first and advancing provisional Autosave followed by manual
-handoff, invalid state/destination combinations, and corrupt-head recovery-only
-selection followed by exact-provenance Save As without changing the source.
-Recovery cases also cover exact InspectRecovery/OpenRecovery correlation, corrupt-head
-startup, read-only writer contention, actual session heads, fresh explicit
-selection, and unchanged refs/resources before a later ordinary save. Ten
-inspection cases cover the three promoted
-established-store states, exact heads and autosave classification, read-only and
-writer-contention modes, recovery-ahead without mutation, metadata-only payload
-validation, deferred payload digests, the exact provisional state, canonical
-generation/object namespace enumeration, exact live-root/orphan partitioning,
-candidate caps, and fail-closed cancellation, capacity, symlink, hardlink,
-length, provenance, and control corruption. Recovery-specific inspection also
-proves all four fixture classifications, manual/autosave fallback, corrupt-head
-and corrupt-target scan, per-lane exhaustion, valid-candidate caps, mixed-lineage
-and wrong-provenance rejection, delayed cancellation, orphan-autosave
-classification, fresh selection, and byte-identical no-repair behavior. The
-graph remains read-only preparation for recovery/compaction, not a trash plan.
-Six pin cases prove create/replace/unpin, exact checkpoint grammar, target and
-pin caps, prospective orphan caps with duplicate-root semantics, cancellation,
-read-only rejection, linked-file rejection, idempotence, and write-suspending
-directory-sync uncertainty. The added core matrix supplies 16 exact before/
-after cases across all seven frozen Pin/Unpin transitions, including both Pin
-directory-sync occurrences, pre-mutation cleanup, post-mutation indeterminacy,
-and fresh retry. One actor case proves correlated Pin/Unpin graph effects and
-read-only faults, while the shared cancellation case covers both queued
-completion variants. A second actor case performs the same 16 points with
-actual `SIGKILL`, fresh-process reopen, exact retry, and an idempotent second
-retry while unrelated authority remains unchanged. This is process-crash
-evidence only: it does not simulate power loss or establish filesystem
-durability. Ten focused staging-cleanup cases now prove the exact nonzero-PID
-grammar, complete bounded preflight, cancellation without mutation, hostile-
-entry and capacity rejection, bytewise ordered cleanup, read-only preservation,
-validation-before-cleanup, zero-removal sync retry, final re-inventory, and all
-eight before/after occurrences of the three frozen transitions. The existing
-16-case Pin/Unpin process-kill matrix now additionally proves that all 11
-writer-private crash residues are removed on fresh writable reopen. This does
-not simulate a cleanup-transition process kill, power loss, or filesystem
-durability.
-Two FullVerify cases prove a bounded stable snapshot of every active generation
-and object outside staging and trash, exact physical-object hashing, paged
-logical reconstruction, cancellation, snapshot-drift rejection, and
-byte-identical no-mutation behavior. One actor case proves correlated and
-cancellable execution remains available in a writer-contended read-only
-session. This evidence does not validate artifact scientific semantics, repair
-data, verify trash, establish durability, or wire a product path.
-One inspection case proves PlanCompaction returns every fixture-exact orphan as
-a deterministic bounded recovery-review candidate, including ordered manual
-and autosave classifications, rejects injected snapshot drift, and changes no
-bytes. One actor case proves correlated planning remains available in a
-writer-contended read-only session; the shared cancellation case covers queued
-PlanCompaction. This is not
-Trash authorization, a physical object/byte plan, a reclaim estimate, backup
-approval, mutation, durability evidence, or public/product wiring.
-The accepted Trash safety correction freezes the later quarantine subset for
-generations declaring zero non-regenerable artifacts and its exact transition
-names, including an honest `ConfirmationRequired` outcome otherwise. This
-checkpoint now has three focused private-core cases: one proves mirrored
-generation quarantine, shared/anonymous-object retention, exact
-retry/deduplication, collision byte accounting, and cancellation after a synced
-directory-only batch; the other proves unsafe selection, non-regenerable
-content, symlinked inventory, and foreign-lineage retries add no mutation. The
-third proves before/after injection for all ten frozen transitions, a nonzero
-occurrence selector, pre-mutation immutability, post-mutation indeterminacy, and
-bounded sync-only retry. One actor case proves bounded selection admission,
-exact correlation, active cancellation without mutation, writer-contended
-read-only rejection, and successful quarantine diagnostics; the shared
-cancellation case covers queued Trash. A second proves maintenance-restore loss
-terminates the session while preserving every accepted completion. A 34-case
-actor subprocess matrix kills before and after every frozen Trash transition,
-including repeated observed occurrences, then reopens in a fresh process and
-proves exact retry plus a zero-mutation sync retry. This is process-crash
-evidence only: it does not simulate power loss or establish filesystem
-durability.
-The accepted Purge subset now has four focused cases. One proves strict whole-
-trash and zero-non-regenerable preflight, object-first bounded deletion while
-generation records remain, the synced empty-object barrier, generation-last
-removal, retained active copies and directories, cancellation/retry, and a
-zero-removal sync retry. A second supplies 16 exact before/after callback cases
-across the four-transition Purge execution, including maintenance upgrade/
-restore and every observed remove and directory-sync occurrence, pre-unlink
-immutability, post-unlink indeterminacy, and sync recovery. One actor case
-proves exact correlation, active and queued cancellation, writer-contended
-read-only rejection, successful diagnostics, and indeterminate-session
-handling. A 16-case actor subprocess matrix performs actual `SIGKILL`, fresh-
-process reopen, exact retry, and zero-removal sync retry. This proves logic and
-process-crash recovery only; it does not simulate power loss, qualify a
-filesystem, establish durability, or expose public/product Purge.
-The existing process-lease case now also proves failed in-place maintenance
-upgrade restoration, contended exclusive acquisition, explicit and drop-based
-downgrade, cancellation, writer retention, and read-only rejection. It does
-not by itself establish power-loss durability.
-
-The accepted provisional-autosave correction now fixes the base-less first and
-advancing publication, receipt, cancellation, collision, and fresh-retry
-requirements. Four focused private-transaction cases now reproduce the exact
-first provisional fixture, clean a cancelled sibling stage, preserve a racing
-destination, adopt only an exact fully verified uncertain install, reject
-invalid advance facts before source reads, allow lower revision with a
-non-regressing high-water mark, preserve the base-less lane, and retry exactly
-across pre-recovery cancellation, recovery-ahead cancellation, and final-head
-sync uncertainty. By itself this is not exhaustive transition or process-kill
-evidence, dead-writer staging cleanup, power-loss/filesystem qualification,
-timer scheduling, or product wiring.
-
-Four initial-package cases
-cover exact Create facts and caller-bound Save As fork encoding, retained root/
-lease validity, exact descriptor admission, existing directory/file/symlink
-refusal before source reads, a final no-clobber race, populated-stage
-cancellation cleanup, and post-rename parent-sync indeterminacy without deleting
-the visible package. The public actor lifecycle cases add Create, Open,
-provisional Autosave/handoff, and recovery-selected Save As execution. Neither
-set claims timers, product garbage collection, the exhaustive fault matrix,
-power-cut durability, product reachability, or product-open validation.
-
-The accepted durability-qualification correction freezes the B2 evidence
-target. Hosted injection remains exhaustive
-across every named before/after occurrence. Fresh-process kills cover mutations
-and writer-private residue; pure reads and comparisons prove byte-identical no
-mutation. Rootless VM cuts are limited to the distinct post-sync,
-publish/replace, package-install, remove/move, and directory-sync boundaries
-listed by the contract, with equivalent adjacent before states deduplicated.
-The only writable tuple is Linux ext4 magic `0xef53` with normalized VFS
-options `[rw,relatime]` and super options `[rw]`; unmatched existing stores open
-read-only and unmatched new destinations fail before source reads or mutation.
-The runtime gate, hostile fixture, hosted/process matrices, trusted-local lane,
-bounded power-cut harness, and performance probes are implemented. On clean
-protected-main commit `4a246a1bb7bfe099673ef10d6cb5951729b3ff37`
-(tree `af5531d8ffbda0c13b342a0b4df47a894e7f99fb`), the trusted-local
-`project-store-lifecycle` group passed all 120 hosted tests and 60/60 rootless
-VM cuts with zero harness retries. Its sanitized report has SHA-256
-`ced8c82c75c480810e7ebf81e2c032e579f89bbb28c1f854d1681a3ddad1f9e5`.
-Protected-main policy and Rust checks also passed in
-[run 29273392030](https://github.com/kirchhausenlab/mirante4d/actions/runs/29273392030).
-This qualifies only the exact B2 off-product ext4 tuple and revision. B3 is
-accepted on protected main at
-`8fdd94dc9c60406e8de8a96749d7148d38b1dc7a`. B4 and WP-10B are accepted at
-`8257f8c5bdc011651c8e74ab85dfdc86717b82d6`, tagged
-`foundation-wp-10b-exit-1`, after the focused product-persistence checks, the
-three-launch native scenario, exact-main public checks, and the already
-accepted durability evidence. No redundant power-cut rerun is required.
-
-Run the bounded target-package verification scenario on the real display with:
-
-```bash
-cargo xtask product-validate target_source_verification
-```
-
-With no explicit package, this scenario extracts the small promoted target U16
-archive. It is a reusable, bounded product regression check for storage-source
-changes.
-
-Run the bounded product-render scenario with:
-
-```bash
-cargo xtask product-validate target_fixture_render_modes
-```
-
-It uses the same small fixture and covers the current MIP, DVR, ISO, linked
-panel, progressive-frame, 1280x720, and 1920x1080 product render-target path.
-
-The B4 automation remains available for future project-persistence changes,
-but ordinary foundation work does not rerun its accepted durability matrix.
-
-WP-11 is accepted at `foundation-wp-11-exit-1`. Focused importer unit,
-contract, and integration checks cover supported source admission,
-bounded/restartable work, deterministic sharded output, cancellation and
-failure safety, multiscale edges, and atomic publication. An importer-produced
-package passed the independent target reader, and exact-main run
-[29330265968](https://github.com/kirchhausenlab/mirante4d/actions/runs/29330265968)
-passed 664 unit, 344 contract, and 124 UI cases with zero retries. WP-10C later
-activated that pipeline in the product.
-
-WP-12 used a small evidence set: hand-computed facts for its two exact retained
-operations, focused scheduler/memory/cancellation tests, one atomic artifact
-save-and-reopen integration, and one supported-resolution product exercise.
-It makes no performance claim and does not require private or simulated huge
-data, a Cartesian oracle matrix, or a WP-10B KVM/power-cut rerun.
-
-WP-10C focused automation covers the target source adapter, fail-closed
-corruption and source-change behavior, and one TIFF import to product open,
-background verification, analysis, and project save/reopen integration.
-Accepted WP-10A, WP-10B, WP-11, and WP-12 evidence is inherited rather than
-rerun.
-
-The checked independent source report supports only the WP-03 source-TIFF
-archive. WP-10A accepted and promoted the target authority off-product; WP-10C
-activates it in the application.
-`mirante4d-storage` is assigned to the existing contract leaf. Its lower-level
-tests prove profile, path, arithmetic, supporting exact-identity, scalar-wire,
-and restricted-JCS
-contracts, including the closed profile, canonical-value, scientific, and
-display-defaults grammars, verified recipe payloads, and exact manifest
-descriptor/page/root bytes. Closed portable-record tests prove structural
-canonical bytes; derivation and detached-release tests additionally prove typed
-identity verification. Packed-index and shard-codec tests prove the closed
-record layout, bounded zstd/CRC32C pipeline, exact end-index sizes, and strict
-structural rejection. Storage-metadata and range-read tests prove the nine
-closed Zarr rows, the closed OME axes/transform projection, semantic JSON
-validation, exact range bounds, and rejection of symlink, hardlink, and non-
-regular objects. Catalog tests additionally prove canonical manifest-page
-authentication, exact opening-metadata bytes, and initial cross-object layer
-and storage-shape rejection. The directory-inventory test proves exact positive
-closure counts, cancellation, extra-directory rejection, and post-open length-
-drift rejection, including same-length manifest-authority drift. These lower-
-level tests alone make no DS-specific admission, shard-payload, official-
-schema, complete-package, T1 conformance, independent-reader, lifecycle, or
-product-support claim. Product support is checked separately through the
-WP-10C integration and bounded product scenario.
-
-Address-planning tests prove 2D/3D grid, C-order ordinal, inner-slot, and edge-
-extent arithmetic plus the exact baseline catalog-derived paths and packed-
-record offset. They also prove coordinate/overflow rejection, mandatory packed-
-index descriptors, and optional fill-elided pixel descriptors. They read no
-shard bytes and make no payload-integrity claim.
-
-The bounded brick-core test covers 2D uint8 pixel-present, all-fill, and
-explicit-validity cases with exact two-, four-, and six-request accounting.
-It also checks edge extent, required descriptor/inner failures, packed-record
-cross-checks, length drift, and selected packed-index/pixel corruption. A
-focused boundary test accepts each exact absolute amplification ceiling and
-rejects one unit above it. These core tests alone do not prove 3D,
-incompressible, whole-object SHA-256, DS admission, complete-package, or
-PackageId-attributed reads.
-
-Dataset-profile admission tests prove explicit profile selection, exact
-logical/addressed/actual counts for tiny 2D pixel, all-fill, and explicit-
-validity fixtures, zero-file pixel elision, packed-index coverage, shard-grid
-rejection, cancellation, and per-image rather than summed scale rules. They do
-not materialize advertised keys; a pure admission-arithmetic test directly
-reproduces every frozen 3D/multiscale logical-brick, addressed-shard, and
-logical-S0 boundary vector. These tests do not qualify an exact DS fixture or
-validate packed records, payload digests, or scientific identity.
-
-The package-wide structural reconciliation test covers pixel-present, all-
-fill, explicit-validity, and explicit-all-invalid packages. It rejects record
-coordinate/validity drift, missing or extra packed slots, nonzero final packed
-padding, missing/extra pixel and validity payload slots, all-missing shard
-objects, out-of-grid payload slots, packed-index digest drift, mid-pass/final-
-sweep cancellation, and same-length replacement before the last snapshot
-gate. A focused arithmetic test covers nondivisible edge capacities, C-order
-slot masks, and packed records 255/256 and 16383/16384. The pass reads packed-
-index shards completely and only pixel/validity shard tails, so it does not
-validate pixel/validity payload digests or values, prove the declared PackageId
-closure, recompute scientific identity, or qualify an exact DS fixture.
-
-The exact-package validation test composes explicit DS admission and structural
-reconciliation with fixed-buffer streaming SHA-256 over the root, every page,
-and every descriptor object. It proves digest-drift rejection for opening and
-shard objects, phase-coherent snapshots, immediate and final-sweep
-cancellation, final inventory, mutation rejection before capability issuance,
-and PackageId-attributed pixel/validity reads. The range-I/O test separately
-proves multi-buffer hashing and mid-stream cancellation. Capability freshness
-tests reject replaced consumed shards and exercise the explicit complete-
-snapshot sweep without imposing an all-object scan on every brick. The sweep
-is deliberately a sequential mutation check, not an atomic snapshot of a
-concurrently writable directory. This is exact package-byte integrity only: it
-does not parse lazy portable-record semantics, recompute ScientificContentId,
-qualify IO-3 or independent T1, make a product/performance claim, or implement
-an importer.
-
-The consuming scientific validator adds one bounded, cancellable base-scale
-scan after exact validation. Its stronger capability exposes the independently
-matched ScientificContentId and layer roots plus exact tile, brick, voxel,
-canonical-byte, and validity-byte work counters. The target integration reads
-every brick in all three promoted packages and matches every full-array and
-per-layer raw/canonical/validity digest, selected value, brick statistic,
-addressed/actual shard count, object/depth/fan-out count, and observed
-one-brick amplification maximum. The production mutation suite rejects all 15
-promoted cases at typed boundaries. A separate subprocess test opens
-2,750/5,500/11,000-descriptor catalogs and enforces fixed linear metadata-work
-bounds. The largest case also enforces 10-second and 64-MiB post-open RSS stop
-ceilings; these are contract limits, not product benchmark claims.
-
-Writer tests prove byte-identical package trees and PackageId values across
-different parents and reversed input order, then reopen output through full
-exact validation and PackageId-attributed brick reads. They cover pixel-
-present, all-fill, explicit-validity, and explicit-all-invalid storage, plus
-cancellation cleanup, create-only collision safety, source nonmutation,
-private mode-0700 staging, no-replace symlink races, precommit cleanup, and
-post-rename durability-indeterminate handling. A selected-profile limit-plus-
-one case proves that the writer stops consuming a lazy shard input and
-publishes nothing. This is a T2 writer/reader component proof, not independent
-T1 conformance, import, replacement, product support, or a performance claim.
-Separately, the production writer reconstructs all three T1 cases and the
-hash-locked zarr-python reader compares their complete semantic image and
-scientific facts with the promoted authority. Encoded shard bytes and exact
-PackageId may differ without weakening the semantic comparison.
-
-The WP-10A-C standards check verifies an exact 12-file, 162,831-byte offline
-mirror against immutable OME and Zarr revisions, lengths, and SHA-256 values.
-The diagnostic external-reader probe builds the same tiny shard twice without
-Mirante code and observes its exact shape, chunk/shard geometry, dtype, and
-values through a hash-locked zarr-python 3.2.1 environment. That older probe
-remains only a selected-codec feasibility result; the separate promoted corpus
-carries the target T1 authority.
-
-Validate the promoted authority with:
+Validate the small independent target fixtures with:
 
 ```bash
 python3 tools/target-fixtures/t1/validate.py \
   --manifest fixtures/target/manifest.json --self-test
 ```
 
-`target-m4d-v1` proves bounded archive safety and exact closure, independent
-lineage bindings and expected facts, full-array readback, pinned OME-schema
-results, critical identity vectors, exact rejection of 15 mutations, and
-byte-identical two-run reproduction for the frozen EXPERIMENTAL profile.
-
-Re-run the accepted WP-10A evidence with:
+Changes to the native package format, storage reader/writer, identities, or
+independent conformance boundary use:
 
 ```bash
 cargo xtask verify-local format-lifecycle
 ```
 
-That real local lane validates the promoted authority, runs the three positive
-and 15 negative production cases, and performs writer-to-pinned-reader
-readback. It remains WP-10A off-product evidence; WP-10C product activation is
-checked separately. The format remains EXPERIMENTAL and makes no stable-format
-or generic OME-Zarr claim.
+These checks use bounded repository fixtures. They make no stable-format,
+generic OME-Zarr, huge-dataset, or product-performance claim.
 
-The exact thresholds live in the
-[verification brief](plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md).
+### Project Persistence
+
+Validate the independent project fixture with:
+
+```bash
+python3 tools/project-fixtures/validate.py \
+  --manifest fixtures/project/manifest.json --self-test
+```
+
+Only changes to the qualified project-store durability boundary use the
+trusted local lifecycle check:
+
+```bash
+MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
+  cargo xtask verify-local project-store-lifecycle
+```
+
+Do not rerun its exhaustive fault or power-cut coverage for unrelated changes.
+The fixture validator checks canonical examples and recovery classification;
+it does not by itself establish filesystem durability or product save/open
+behavior.
+
+### Product Scenarios
+
+Storage-source and verification changes use the bounded viewer scenario:
+
+```bash
+cargo xtask product-validate target_source_verification
+```
+
+Rendering, linked-panel, or packaged-viewer changes use:
+
+```bash
+cargo xtask product-validate target_fixture_render_modes
+```
+
+Both use promoted small fixtures and preserve their source packages. The
+render scenario covers MIP, DVR, ISO, linked panels, 1280x720, and a short
+1920x1080 exercise. There is no 4K or simulated TiB requirement. Packaging
+changes run the scenario against the packaged executable as described in
+[Release](RELEASE.md).
+
+## Product Validation
+
+Rendering, viewport, GPU, data-loading, interaction, and large-dataset changes
+are incomplete until the actual viewer is opened on a real display with the
+relevant dataset and hardware, unless the user explicitly waives that check.
+Exercise the changed workflow, confirm the application remains alive without a
+hidden fallback or repeated GPU error, and inspect the resulting logs. Use the
+packaged application when packaging or release behavior changed.
+
+Scientific checks should use independent expected facts where correctness is
+in question. Storage and import checks must prove source nonmutation, bounded
+and cancellable work, atomic publication, and sharded output without
+file-per-brick growth. Exact cases belong in focused tests, not a copied matrix
+in this guide.
+
+Historical foundation acceptances remain available in Git history and
+create-once tags.
 
 ## Reporting
 
-Completion reports name the revision, commands, fixtures or datasets,
-hardware/display where relevant, results, failures, skipped checks, waivers,
-and remaining risk. Performance claims also name the workload, metric,
-sampling method, and threshold.
+Report the meaningful commands and results, the real dataset/display/hardware
+when relevant, important skips or waivers, and remaining risk. A performance
+claim must also name its workload, metric, sampling method, and threshold.

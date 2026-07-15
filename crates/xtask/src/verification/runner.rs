@@ -1971,9 +1971,6 @@ fn run_policy_phases(phases: &mut PhaseCollector) {
     phases.run("workflow", "cargo xtask workflow-audit", || {
         crate::workflow_audit::workflow_audit().map(drop)
     });
-    phases.run("command-surface", "cargo xtask command-audit", || {
-        crate::command_audit::command_audit().map(drop)
-    });
 }
 
 fn run_lint() -> anyhow::Result<()> {

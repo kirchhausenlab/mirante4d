@@ -1,13 +1,9 @@
-//! Strict off-product storage profile for Mirante4D datasets.
+//! Strict active storage profile for Mirante4D datasets.
 //!
-//! This crate is not reachable from the application before WP-10C. The first
-//! WP-10A-B owns immutable profile facts, strict control primitives, checked
-//! preflight arithmetic, portable package paths, packed-index records, the
-//! in-memory shard codec, strict Zarr/OME storage metadata, an authenticated
-//! local metadata catalog, a bounded exact directory inventory, and root-
-//! confined read-only range I/O with descriptor-derived brick address plans,
-//! full SHA-256 closure, an owning exact-package capability, and a deterministic
-//! create-only local package writer. It makes no product target-package claim.
+//! This crate owns immutable profile facts, strict control primitives, checked
+//! limits, portable package paths, packed indexes and shards, strict Zarr/OME
+//! metadata, authenticated bounded catalog and range reads, exact-package and
+//! scientific verification, and create-only local publication.
 
 #![forbid(unsafe_code)]
 

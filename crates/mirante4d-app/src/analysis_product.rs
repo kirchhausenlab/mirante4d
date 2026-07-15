@@ -1,4 +1,4 @@
-//! Product orchestration for the two exact WP-12 analysis operations.
+//! Product orchestration for the two exact intensity-analysis operations.
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use mirante4d_analysis_core::AnalysisDefinition;

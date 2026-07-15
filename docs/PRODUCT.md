@@ -40,8 +40,8 @@ and Linux packaging.
 [Current state](CURRENT_STATE.md) is the sole authority for exact implemented
 behavior and limitations.
 
-Segmentation is not part of the current product or foundation program. Any
-future return requires a separately approved post-foundation design.
+Segmentation is not part of the current product. Any future return requires a
+separately approved capability design.
 
 ## Non-Goals
 
@@ -52,7 +52,7 @@ future return requires a separately approved post-foundation design.
 - Stable persisted-format compatibility during pre-alpha development.
 - Paid hosted CI or a public self-hosted runner.
 - Platform claims beyond qualified Linux x86_64/Vulkan work.
-- 4K foundation qualification.
+- 4K qualification.
 
 Mirante4D carries forward useful product ideas from
 [llsm_viewer](https://github.com/kirchhausenlab/llsm_viewer) while replacing

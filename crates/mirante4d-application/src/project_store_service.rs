@@ -1,4 +1,4 @@
-//! Product-facing WP-10B project-store orchestration.
+//! Product-facing project-store orchestration.
 //!
 //! The pure reducer owns live project revisions. This service owns the single
 //! project-store actor, its session facts, request correlation, autosave

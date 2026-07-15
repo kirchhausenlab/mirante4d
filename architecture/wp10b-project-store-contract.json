@@ -1,60 +1,8 @@
 {
   "schema": "mirante4d-wp10b-project-store-contract",
   "schema_version": 1,
-  "status": "accepted-wire-authority",
+  "status": "active-experimental-product-authority",
   "bindings": {
-    "entry": {
-      "path": "architecture/wp10b-project-store-entry.json",
-      "sha256": "b5a189658d0f0d40f7ca0023bd3a688b3ca7926d28e028bb19acdc764920c793"
-    },
-    "dependency_correction": {
-      "path": "architecture/wp10b-project-store-entry-correction.json",
-      "sha256": "e9fdbca7e78bdb34eca3533e28c5caa811c6cc0d8e71d8e40324a8b896eefa79"
-    },
-    "quaternion_correction": {
-      "path": "architecture/wp10b-project-store-quaternion-correction.json",
-      "sha256": "f2ec1d537e90536e8e67212d663e49823edac5eee30d0d45fccd0fb8e5d6876f"
-    },
-    "recovery_ahead_correction": {
-      "path": "architecture/wp10b-project-store-recovery-ahead-correction.json",
-      "sha256": "dcc908615da8ba94c937fa4ae6745651734caf56f7583ef2638f9e9cc90a6aa1"
-    },
-    "recovery_api_correction": {
-      "path": "architecture/wp10b-project-store-recovery-api-correction.json",
-      "sha256": "48957fd7c36a34cd916f659cd3becaf8b54c497ab55ad2ed120af8ac2e384e73"
-    },
-    "maintenance_transition_correction": {
-      "path": "architecture/wp10b-project-store-maintenance-transition-correction.json",
-      "sha256": "778ac85e7c40c1327f6ce6f1854cf7f2cc3a1d631df2da007d0906d819eafac1"
-    },
-    "trash_safety_correction": {
-      "path": "architecture/wp10b-project-store-trash-safety-correction.json",
-      "sha256": "1eb60a85cdaf13f458826dace05ba548559b4fe30bd70616fe97af21f2ed7ee5"
-    },
-    "purge_safety_correction": {
-      "path": "architecture/wp10b-project-store-purge-safety-correction.json",
-      "sha256": "7e7a0e47ae085c2684b9ae9c465eb5568e3555882c7540ef581cce594fff0278"
-    },
-    "provisional_autosave_correction": {
-      "path": "architecture/wp10b-project-store-provisional-autosave-correction.json",
-      "sha256": "2eb9df2cd56472dba37ed9d321b680b2a2a76274210dd7e57aca10be31466e9a"
-    },
-    "staging_cleanup_correction": {
-      "path": "architecture/wp10b-project-store-staging-cleanup-correction.json",
-      "sha256": "890f405df832e895da229ba26515efb734fcbe0ccc098f61c7674798a4222324"
-    },
-    "public_actor_lifecycle_correction": {
-      "path": "architecture/wp10b-project-store-public-actor-lifecycle-correction.json",
-      "sha256": "ac1a7804655af4dab8110f7a584a7bf990ac25a9b03799da9d03638e3d787bbc"
-    },
-    "durability_qualification_correction": {
-      "path": "architecture/wp10b-project-store-durability-qualification-correction.json",
-      "sha256": "6b4bbc23115115e36a449209810764cbce2738ca693a985275f5e6513d4252e6"
-    },
-    "b3_integration_correction": {
-      "path": "architecture/wp10b-project-store-b3-integration-correction.json",
-      "sha256": "227b3ff385fdf8d7021758b8013ae6ce98f8fb0d742aadeb2fb6e16e4d5199eb"
-    },
     "protected_main": {
       "commit": "b6e0267802f8ac2d0d49a0f04302fd321ef2f617",
       "tree": "b20b598603b47fdbe7c85c3b6d1cba8c78fd433e",
@@ -66,9 +14,8 @@
     "crate_name": "mirante4d-project-store",
     "crate_path": "crates/mirante4d-project-store",
     "lifecycle": "EXPERIMENTAL",
-    "product_status": "off-product-through-B3",
-    "product_activation_checkpoint": "B4",
-    "product_reachability": false
+    "product_status": "active",
+    "product_reachability": true
   },
   "dependencies": {
     "normal_workspace": [

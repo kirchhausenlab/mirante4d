@@ -1,4 +1,4 @@
-//! Small deterministic CPU oracle for the off-product progressive renderer.
+//! Small deterministic CPU oracle for the product rendering contract.
 //!
 //! The implementation deliberately borrows runtime-issued dataset leases. It
 //! owns no scheduler, payload, GPU object, filesystem access, or product path.

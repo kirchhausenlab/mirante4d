@@ -1,8 +1,7 @@
-//! Off-product progressive WGPU rendering runtime.
+//! Progressive WGPU product-rendering runtime.
 //!
-//! This crate owns successor GPU resources and consumes only semantic dataset
-//! leases and backend-neutral render contracts. It is deliberately unreachable
-//! from the product until the WP-09B cutover.
+//! This crate owns product GPU resources and consumes only semantic dataset
+//! leases and backend-neutral render contracts.
 
 #![forbid(unsafe_code)]
 
@@ -71,7 +70,7 @@ impl FrameBudget {
     }
 }
 
-/// Configuration for one off-product GPU authority.
+/// Configuration for the product GPU runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WgpuRenderRuntimeConfig {
     gpu_budget_bytes: u64,
@@ -110,7 +109,7 @@ impl WgpuRenderRuntimeConfig {
     }
 }
 
-/// Stable counters and sanitized adapter facts for the successor runtime.
+/// Stable counters and sanitized adapter facts for the product runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WgpuRenderRuntimeDiagnostics {
     adapter_name: String,
@@ -330,7 +329,7 @@ impl FrameExecutionReport {
     }
 }
 
-/// Typed, backend-neutral failures from the successor GPU runtime.
+/// Typed, backend-neutral failures from the product GPU runtime.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum WgpuRenderRuntimeError {
     #[error("the WGPU runtime configuration is invalid")]
@@ -341,7 +340,7 @@ pub enum WgpuRenderRuntimeError {
     SoftwareAdapter,
     #[error("the interactive renderer requires a Vulkan adapter")]
     UnsupportedBackend,
-    #[error("the adapter does not satisfy the accepted WP-09A limits")]
+    #[error("the adapter does not satisfy the accepted renderer limits")]
     AdapterLimitsInsufficient,
     #[error("the existing WGPU device was created below the renderer limits")]
     DeviceLimitsInsufficient,
@@ -359,17 +358,17 @@ pub enum WgpuRenderRuntimeError {
     #[error("the requirement set changed within one frame generation")]
     RequirementSetChanged,
     #[error(
-        "the render requirement set contains {actual} resources, exceeding the successor limit of {maximum}"
+        "the render requirement set contains {actual} resources, exceeding the renderer limit of {maximum}"
     )]
     RequirementCapacityExceeded { actual: usize, maximum: usize },
-    #[error("the successor renderer reached its limit of {maximum} presentation targets")]
+    #[error("the renderer reached its limit of {maximum} presentation targets")]
     PresentationCapacityExceeded { maximum: usize },
     #[error("presentation token {token:?} is not registered in this renderer")]
     PresentationNotRegistered { token: PresentationToken },
-    #[error("the successor renderer exhausted its presentation token space")]
+    #[error("the renderer exhausted its presentation token space")]
     PresentationTokenExhausted,
     #[error(
-        "the supplied lease set contains {actual} resources, exceeding the successor limit of {maximum}"
+        "the supplied lease set contains {actual} resources, exceeding the renderer limit of {maximum}"
     )]
     LeaseCapacityExceeded { actual: usize, maximum: usize },
     #[error("one render layer requests more than one semantic scale in the same frame")]
@@ -390,7 +389,7 @@ pub enum WgpuRenderRuntimeError {
     UnsupportedIsoShading,
     #[error("semantic coordinates exceed the bounded GPU metadata representation")]
     CoordinateLimitExceeded,
-    #[error("one qualification ray may exceed the 16,384-sample WP-09A ceiling")]
+    #[error("one qualification ray may exceed the 16,384-sample ceiling")]
     RaySampleLimitExceeded,
     #[error("frame control metadata exceeds its 64-KiB ceiling")]
     ControlCapacityExceeded,
@@ -402,7 +401,7 @@ pub enum WgpuRenderRuntimeError {
         requested_bytes: u64,
         available_bytes: u64,
     },
-    #[error("backend validation rejected successor render work")]
+    #[error("backend validation rejected render work")]
     BackendValidation,
     #[error("validation capture does not belong to this runtime")]
     UnknownValidationCapture,
@@ -414,7 +413,7 @@ pub enum WgpuRenderRuntimeError {
     FrameProgressContract,
 }
 
-/// Checks whether an adapter can run the interactive successor renderer.
+/// Checks whether an adapter can run the interactive product renderer.
 ///
 /// Product startup uses this before asking WGPU to create the window device,
 /// so unsupported software, non-Vulkan, and undersized adapters fail before
@@ -423,7 +422,7 @@ pub fn qualify_adapter(adapter: &wgpu::Adapter) -> Result<(), WgpuRenderRuntimeE
     runtime::validate_adapter(adapter)
 }
 
-/// Builds the device request used by the interactive successor renderer.
+/// Builds the device request used by the interactive product renderer.
 ///
 /// The requested features and limits are the same fixed set used by
 /// [`WgpuRenderRuntime::new`].
@@ -434,20 +433,20 @@ pub fn renderer_device_descriptor(
     runtime::renderer_device_descriptor(adapter, label)
 }
 
-/// Sole off-product owner of successor WGPU resources.
+/// Sole product owner of WGPU resources.
 pub struct WgpuRenderRuntime {
     inner: runtime::Runtime,
 }
 
 impl WgpuRenderRuntime {
-    /// Creates a real Vulkan device and the offscreen successor pipeline.
+    /// Creates a real Vulkan device and the offscreen rendering pipeline.
     pub async fn new(config: WgpuRenderRuntimeConfig) -> Result<Self, WgpuRenderRuntimeError> {
         Ok(Self {
             inner: runtime::Runtime::new(config).await?,
         })
     }
 
-    /// Builds the successor around the device already selected for the native
+    /// Builds the runtime around the device already selected for the native
     /// window. The runtime retains its own handles and remains the owner of all
     /// Mirante4D render resources created on that device.
     pub fn from_existing_device(

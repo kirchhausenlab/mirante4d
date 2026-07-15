@@ -292,14 +292,8 @@ fn validate_t2(record: &Value, references: &mut Vec<FileReference>) -> anyhow::R
     )?;
     string(record, "license")?;
     false_field(record, "target_format_conformance", id)?;
-    string(record, "expiry").context("T2 fixtures require a non-empty expiry")?;
-    match record.get("deletion_gate") {
-        Some(Value::String(value)) if !value.trim().is_empty() => {}
-        Some(Value::Null)
-            if string(record, "authority_state")? != "non-authoritative-generated" => {}
-        Some(Value::Null) => bail!("generated T2 fixture {id:?} requires a deletion gate"),
-        _ => bail!("T2 fixture {id:?} deletion_gate must be a non-empty string or null"),
-    }
+    null_field(record, "expiry", id)?;
+    null_field(record, "deletion_gate", id)?;
     reference(record, "path", "sha256", id, "fixture", references)?;
     object(record, "limits")?;
 
@@ -825,15 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_nonopaque_t5_and_malformed_promotions() {
-        let mut value = registry();
-        record_mut(&mut value, "T5-QUAL-001")["path"] = Value::String("private/data".into());
-        assert!(validate_registry_document(&value).is_err());
-
-        let mut value = registry();
-        record_mut(&mut value, "T5-QUAL-001")["lineages"] = serde_json::json!([{}]);
-        assert!(validate_registry_document(&value).is_err());
-
+    fn rejects_malformed_promotions() {
         let mut value = registry();
         value["promotions"][0]["changed_bytes_or_facts_require_new_version"] =
             Value::String("true".into());
