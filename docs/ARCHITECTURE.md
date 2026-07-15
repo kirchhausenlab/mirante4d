@@ -8,7 +8,7 @@ import/preprocessing workflows.
 
 ## Workspace Boundaries
 
-The workspace has seventeen packages (sixteen `mirante4d-*` crates plus
+The workspace has eighteen packages (seventeen `mirante4d-*` crates plus
 `xtask`):
 
 - `mirante4d-domain`: validated framework-neutral geometry, view, transfer,
@@ -45,7 +45,11 @@ The workspace has seventeen packages (sixteen `mirante4d-*` crates plus
   capabilities, dataset source, and deterministic create-only local writer.
 - `mirante4d-import-pipeline`: active bounded, cancellable, restartable
   TIFF/OME-TIFF producer for validated sharded target packages.
-- `mirante4d-app`: native composition and egui shell.
+- `mirante4d-ui-egui`: active egui visual components, UI-facing message
+  projection, and transient egui interaction state; its only Mirante
+  dependency is `mirante4d-application`.
+- `mirante4d-app`: native process/service composition and presentation-token
+  resolution.
 - `xtask`: developer and verification tooling, never a product mode.
 
 `mirante4d-core` and the predecessor application/session/preferences models
@@ -57,33 +61,40 @@ product uses `mirante4d-storage`, `mirante4d-import-pipeline`, and
 
 ## Application Composition
 
-`MiranteWorkbenchApp` holds `ApplicationState`, payload-free
-`DatasetDemandState`, process diagnostics, four remaining temporary runtime
-owners, and narrow project-store/settings/source-open handles. It is a
+`MiranteWorkbenchApp` holds `ApplicationState`, bounded
+`DatasetDemandState`, process diagnostics, one remaining temporary runtime
+owner, egui state owned by `mirante4d-ui-egui`, and narrow
+project-store/settings/source-open handles. It is a
 composition root, not a second model.
 
 The temporary owners and deletion gates are:
 
 | Owner | Scope | Gate |
 |---|---|---|
-| `CurrentRenderRuntime` | app-side successor status and presentation composition | WP-09C |
-| `CurrentUiRuntime` | egui-local drafts and interaction facts | WP-09C |
-| `ImportRuntime` | UI-owned task handling around the target import pipeline | WP-09C |
 | `CurrentValidationRuntime` | product-validation harness only | WP-14 |
 
-The private egui bridge translates UI input to `ApplicationCommand` and reads
-snapshots/events. `ProjectStoreApplicationService` is the sole product project
-I/O route; its actor owns project roots, sessions, leases, refs, recovery, and
-filesystem mutation. The project-v15 bridge and `CurrentProjectRuntime` are
-deleted, with no compatibility reader or fallback.
+The temporary egui bridge and render owner are deleted. The native app projects
+one immutable workbench view, calls `mirante4d-ui-egui` once, and resolves the
+returned typed commands, service requests, and opaque presentation paints.
+Widget layout and interaction state do not have a second native path.
+`ProjectStoreApplicationService` is the sole product project I/O route; its
+actor owns project roots, sessions, leases, refs, recovery, and filesystem
+mutation. The project-v15 bridge and `CurrentProjectRuntime` are deleted, with
+no compatibility reader or fallback.
+
+The native `ImportWorkflow` owns TIFF worker cancellation, bounded terminal
+results, retry options, and explicit joining. It projects immutable import
+facts through `ApplicationSnapshot`; egui owns only the editable review draft
+and returns ID-checked import commands. Egui owns no path, TIFF inspection,
+worker channel, or thread handle.
 
 `DatasetRequestDispatcher` is the sole application poll owner. It keeps only
 bounded request correlation and cancellation generations; decoded allocations
 remain owned and byte-accounted by `mirante4d-dataset-runtime`.
 `mirante4d-storage::LocalDatasetSource` is the sole product dataset source.
-The app retains exact runtime lease handles without copying their payloads and
-passes borrowed semantic views to `mirante4d-render-wgpu`. There is no alternate
-reader, scheduler, CPU display fallback, or app-owned payload map.
+`DatasetDemandState` retains exact runtime lease handles without copying their
+payloads and passes borrowed semantic views to `mirante4d-render-wgpu`. There is
+no alternate reader, scheduler, CPU display fallback, or app-owned payload map.
 
 `AnalysisProductRuntime` is the narrow product bridge to the analysis
 runtime. It uses the shared dispatcher below interactive priority and keeps at

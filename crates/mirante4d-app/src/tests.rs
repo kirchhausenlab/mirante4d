@@ -363,11 +363,14 @@ fn test_workbench_app_without_background_runtime(
         catalog: _,
         workspace: _,
         dataset,
-        render_runtime,
+        render_coordination,
         analysis_runtime,
     } = opened;
     let resource_policy = ResourcePolicy::default();
-    let ui_runtime = current_runtime::ui::CurrentUiRuntime::new(resource_policy, None, None);
+    let egui_ui = ui_kit::EguiUiState::new(
+        resource_policy.cpu_dataset_budget_bytes(),
+        resource_policy.gpu_budget_bytes(),
+    );
     let (mut settings_connection, _) =
         current_settings_connection::CurrentSettingsConnection::start();
     settings_connection
@@ -378,9 +381,10 @@ fn test_workbench_app_without_background_runtime(
         application,
         startup_diagnostics,
         dataset,
-        render_runtime,
-        ui_runtime,
-        import_runtime: current_runtime::import::ImportRuntime::idle(),
+        render_coordination,
+        native_presentation: native_presentation::NativePresentationBridge::unavailable(),
+        egui_ui,
+        import: ImportWorkflow::new(),
         analysis_runtime,
         validation_runtime: current_runtime::validation::CurrentValidationRuntime {
             product_automation: None,

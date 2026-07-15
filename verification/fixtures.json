@@ -297,18 +297,18 @@
       "tier": "T2",
       "claim_scope": "deterministic-ui-token-text",
       "authority_state": "reviewed-snapshot",
-      "owner": "mirante4d-app UI tests",
+      "owner": "mirante4d-ui-egui UI tests",
       "capability": "public-cpu-headless",
       "publication": "public-safe-generated-text",
       "license": "MIT",
-      "path": "crates/mirante4d-app/src/snapshots/mirante4d_app__ui_kit__tests__mirante4d_ui_tokens.snap",
+      "path": "crates/mirante4d-ui-egui/src/snapshots/mirante4d_ui_egui__tests__mirante4d_ui_tokens.snap",
       "sha256": "8e4ea8502f37bbf01f8e7100942fc24e2e3d189c0dd47d13f5a1b102e12d40b0",
       "lineages": [],
       "limits": {
         "max_bytes": 65536,
         "requires_gpu": false
       },
-      "validation_command": "cargo test -p mirante4d-app ui_kit::tests::design_tokens_have_stable_snapshot --frozen",
+      "validation_command": "cargo test -p mirante4d-ui-egui tests::design_tokens_have_stable_snapshot --frozen",
       "promotion": {
         "authority": "reviewed-source-change",
         "changed_authority_requires_new_version": true

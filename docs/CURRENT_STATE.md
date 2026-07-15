@@ -22,14 +22,18 @@ public release or public full microscopy dataset yet.
 - Linux release-directory, tarball, and AppImage build paths.
 - No segmentation or derived-label subsystem.
 
-The workspace has seventeen packages: sixteen `mirante4d-*` crates plus
+The workspace has eighteen packages: seventeen `mirante4d-*` crates plus
 `xtask`. `mirante4d-storage` owns the active package catalog, bounded
 validation and reads, and create-only package publication.
 `mirante4d-import-pipeline` is the active bounded, cancellable, restartable
-TIFF/OME-TIFF producer. The predecessor `mirante4d-data`, `mirante4d-format`,
-and `mirante4d-import` crates are deleted. `mirante4d-render-wgpu` is the sole
-product renderer. The unpublished `mirante4d-render-reference` CPU oracle is
-test-only, and the predecessor `mirante4d-renderer` crate is deleted.
+TIFF/OME-TIFF producer. Native composition now owns its bounded worker results,
+latest-only progress, cancellation, and explicit shutdown; egui owns no import
+thread or channel. The predecessor `mirante4d-data`, `mirante4d-format`,
+and `mirante4d-import` crates are deleted. `mirante4d-ui-egui` now owns shared
+egui visuals, application-problem presentation, and transient UI drafts and
+interaction state. `mirante4d-render-wgpu` is
+the sole product renderer. The unpublished `mirante4d-render-reference` CPU
+oracle is test-only, and the predecessor `mirante4d-renderer` crate is deleted.
 
 `mirante4d-analysis-core` owns exact `uint8`, `uint16`, and finite `float32`
 intensity statistics and artifact payloads. `mirante4d-analysis-runtime` runs
@@ -189,12 +193,14 @@ the sole product dataset path, verification remains responsive, proved package
 and scientific identities bind to projects, and the predecessor data, format,
 and import crates are deleted.
 
-The WP-09B candidate makes `mirante4d-render-wgpu` the sole product render
-route, presents progressive frames without complete-residency gating, and
-deletes the predecessor renderer and CPU placeholder rendering. Its focused
-checks and one real-display small-package scenario cover MIP, DVR, ISO, linked
-panels, a 1280x720 render target, and a current 1920x1080 render-target resize.
-Protected-main acceptance is the remaining bookkeeping step before WP-09C.
+WP-09B is accepted on protected main at
+`b73dd86fed8cc3ac7b34f75f20dcd8bb8ac85672`, tagged
+`foundation-wp-09b-exit-1`. `mirante4d-render-wgpu` is the sole product render
+route; the predecessor renderer and CPU placeholder route are deleted. The
+WP-09C candidate gives the visible egui workbench one snapshot-in,
+typed-output-out entry. UI layout and interaction live in `mirante4d-ui-egui`;
+the native app retains process/service composition and presentation-token
+resolution without a second widget path.
 
 ## Current Verification Boundary
 

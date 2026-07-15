@@ -13,8 +13,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mirante4d_application::{ApplicationCommand, ApplicationState, SourceSessionGeneration};
-use mirante4d_dataset::{CpuLedgerCategory, ResourceLease, ResourcePayloadView};
+use mirante4d_application::{
+    ApplicationCommand, ApplicationState, SourceSessionGeneration, stepped_timepoint,
+};
+use mirante4d_dataset::{CpuLedgerCategory, ResourcePayloadView};
 use mirante4d_dataset_runtime::RequestPriority;
 use mirante4d_domain::IntensityDType;
 use mirante4d_render_api::MAX_RENDER_REQUIREMENTS;
@@ -27,7 +29,6 @@ use crate::{
         DatasetDemandPlanLimits, plan_current_3d, render_extent_from_dimensions,
     },
     dataset_requests::SCOPE_CURRENT_3D,
-    playback::stepped_timepoint,
     unified_source_open,
 };
 
@@ -98,8 +99,7 @@ pub fn run_headless_smoke(
     };
 
     load_current_requirements(&application, &mut opened, options.timeout)?;
-    let (nonzero_pixels, max_value) =
-        retained_sample_summary(&opened.render_runtime.retained_leases)?;
+    let (nonzero_pixels, max_value) = retained_sample_summary(opened.dataset.retained_leases())?;
     if nonzero_pixels == 0 {
         anyhow::bail!("unified runtime smoke decoded only zero or invalid visible samples");
     }
@@ -124,7 +124,7 @@ pub fn run_headless_smoke(
         let started = Instant::now();
         load_current_requirements(&application, &mut opened, options.timeout)?;
         let (nonzero_pixels, max_value) =
-            retained_sample_summary(&opened.render_runtime.retained_leases)?;
+            retained_sample_summary(opened.dataset.retained_leases())?;
         if nonzero_pixels == 0 {
             anyhow::bail!(
                 "unified runtime smoke decoded a blank timepoint {}",
@@ -151,8 +151,8 @@ pub fn run_headless_smoke(
     let report = AppSmokeReport {
         dataset_label: snapshot.catalog().label().to_owned(),
         layer_count: snapshot.catalog().len(),
-        frame_width: u64::from(opened.render_runtime.render_viewport.width_pixels()),
-        frame_height: u64::from(opened.render_runtime.render_viewport.height_pixels()),
+        frame_width: u64::from(opened.render_coordination.render_viewport.width_pixels()),
+        frame_height: u64::from(opened.render_coordination.render_viewport.height_pixels()),
         nonzero_pixels,
         max_value,
         displayed_scale_level: Some(opened.dataset.current_scale().get()),
@@ -224,10 +224,10 @@ fn load_current_requirements(
     let plan = plan_current_3d(
         snapshot.catalog(),
         application_view(&snapshot),
-        opened.render_runtime.presentation_viewport,
+        opened.render_coordination.presentation_viewport,
         render_extent_from_dimensions(
-            u64::from(opened.render_runtime.render_viewport.width_pixels()),
-            u64::from(opened.render_runtime.render_viewport.height_pixels()),
+            u64::from(opened.render_coordination.render_viewport.width_pixels()),
+            u64::from(opened.render_coordination.render_viewport.height_pixels()),
         )?,
         DatasetDemandPlanLimits::new(
             MAX_RENDER_REQUIREMENTS,
@@ -237,40 +237,24 @@ fn load_current_requirements(
         false,
     )?;
     opened.dataset.install_current_plan(plan, false)?;
+    opened.dataset.refresh_retained_requirements()?;
     opened
-        .render_runtime
-        .retained_leases
-        .replace_requirements(opened.dataset.renderer_requirements())?;
-    opened.dataset.submit_scope(
-        SCOPE_CURRENT_3D,
-        RequestPriority::CurrentView,
-        &opened.render_runtime.retained_leases,
-    )?;
+        .dataset
+        .submit_scope(SCOPE_CURRENT_3D, RequestPriority::CurrentView)?;
 
     let deadline = Instant::now() + timeout;
-    while !opened
-        .dataset
-        .scope_complete(SCOPE_CURRENT_3D, &opened.render_runtime.retained_leases)
-    {
+    while !opened.dataset.scope_complete(SCOPE_CURRENT_3D) {
         if Instant::now() >= deadline {
+            let retained = opened.dataset.retained_leases();
             anyhow::bail!(
                 "timed out waiting for unified runtime leases: {} retained, {} missing",
-                opened.render_runtime.retained_leases.retained_len(),
-                opened.render_runtime.retained_leases.missing_len()
+                retained.retained_len(),
+                retained.missing_len()
             );
         }
-        let (dataset, render) = (&mut opened.dataset, &mut opened.render_runtime);
-        let bridge = &mut render.retained_leases;
-        dataset.dispatcher_mut().drain(32, |ticket, outcome| {
-            if let mirante4d_dataset_runtime::RuntimeOutcome::Ready(lease) = outcome
-                && bridge.requires(ticket.resource())
-            {
-                let lease: Arc<dyn ResourceLease> = Arc::new(lease);
-                bridge
-                    .install(lease)
-                    .expect("a current smoke completion matches its installed requirements");
-            }
-        })?;
+        opened
+            .dataset
+            .drain_runtime_results(32, |_ticket, _outcome| {})?;
         std::thread::yield_now();
     }
     Ok(())

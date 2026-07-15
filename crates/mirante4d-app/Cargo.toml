@@ -23,6 +23,7 @@ mirante4d-render-api.workspace = true
 mirante4d-render-wgpu.workspace = true
 mirante4d-settings.workspace = true
 mirante4d-storage.workspace = true
+mirante4d-ui-egui.workspace = true
 rfd.workspace = true
 serde.workspace = true
 serde_json.workspace = true

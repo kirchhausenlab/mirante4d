@@ -1,17 +1,13 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
-    thread,
     time::{Duration, Instant},
 };
 
 mod analysis_product;
 mod analysis_workspace;
 mod cross_section_readout;
-mod cross_section_runtime;
 mod cross_section_scheduler;
-mod current_egui_shell_bridge;
 mod current_runtime;
 mod current_settings_connection;
 mod current_source_open_service;
@@ -23,9 +19,10 @@ mod display_graph;
 mod display_refresh;
 mod fidelity;
 mod histogram;
-mod import_ui;
+mod import_worker_service;
+mod import_workflow;
 mod layer_state;
-mod lod_scheduler;
+mod native_presentation;
 mod playback;
 mod product_automation;
 mod product_render_intent;
@@ -35,11 +32,7 @@ mod runtime_diagnostics_panel;
 mod semantic_demand;
 mod semantic_tiles;
 mod smoke;
-mod state;
-mod tool_interactions;
-mod tools;
 mod transfer_presets;
-mod ui_kit;
 mod unified_source_open;
 mod viewer_layout;
 mod viewport;
@@ -48,66 +41,53 @@ mod workbench_controls;
 mod workbench_import;
 mod workbench_playback_runtime;
 mod workbench_ui;
+mod workbench_ui_output;
 
-#[cfg(test)]
 use analysis_workspace::{
-    AnalysisPlotBounds, analysis_plot_bounds, analysis_plot_visible_bounds,
-    analysis_table_preview_rows, nearest_analysis_plot_point,
-    normalize_analysis_plot_view_for_plot, pan_analysis_plot_view, plot_screen_position,
-    zoom_analysis_plot_view,
+    AnalysisTableExportInput, AnalysisWorkspaceSnapshotInput, analysis_workspace_snapshot,
+    export_selected_analysis_table,
 };
-use analysis_workspace::{
-    AnalysisPlotViewRange, AnalysisTableExportInput, AnalysisTableSort, AnalysisWorkspaceViewInput,
-    export_selected_analysis_table, show_analysis_workspace, show_analysis_workspace_window,
-};
-use cross_section_readout::cross_section_hover_readout_for_response;
-use cross_section_runtime::CrossSectionRuntime;
+use cross_section_readout::cross_section_hover_readout_for_panel_point;
 pub use diagnostics::{StartupDiagnostics, collect_startup_diagnostics, default_log_path};
-use display_refresh::{DisplayRefreshTiming, ViewportDisplayImage, duration_ms};
+use display_refresh::duration_ms;
 use eframe::egui;
-use fidelity::{
-    channel_fidelity_label, composite_fidelity_label, iso_shading_policy_label,
-    render_sampling_policy_label, show_frame_fidelity_property_rows,
-    visible_channel_fidelity_is_mixed,
-};
+use fidelity::composite_fidelity_label;
+use histogram::active_layer_histogram_summary;
 #[cfg(test)]
-use fidelity::{
-    frame_completeness_label, frame_failure_kind_label, frame_fidelity_label, frame_reason_label,
-};
-use histogram::{
-    active_layer_histogram_summary, auto_dense_window_from_histogram,
-    auto_dvr_opacity_transfer_from_histogram, auto_signal_window_from_histogram,
-    histogram_bins_label, histogram_can_auto_window, histogram_status_label,
-};
-use import_ui::{
-    ImportTask, ImportTaskMessage, PendingTiffImport, TiffImportSetupTask,
-    TiffImportSetupTaskMessage, active_layer_no_data_policy_label, build_import_options,
-    import_progress_fraction, import_task_status_text, pending_tiff_import_ready_to_start,
-    reset_checkpoint_directory, show_pending_tiff_import_controls, tiff_destination,
-};
+use import_worker_service::ImportWorkerStatus;
+use import_worker_service::{ImportWorkerCompletion, ImportWorkerOutcome};
+use import_workflow::{ImportWorkflow, reset_checkpoint_directory, tiff_destination};
+use mirante4d_application::LayerHistogramSummary;
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, ApplicationFault, ApplicationFaultCode,
-    ApplicationSnapshot, ApplicationState, CommandEffect, OperationCompletion,
-    OperationFailureCode, OperationKind, OperationToken, ProjectRecoveryStoreLocator,
+    ApplicationSnapshot, ApplicationState, CommandEffect, DisplayRefreshPath, DisplayRefreshTiming,
+    OperationCompletion, OperationFailureCode, OperationKind, OperationToken, PresentationSlot,
+    PresentationSnapshot, PresentationSurface, ProjectRecoveryStoreLocator,
     ProjectStoreApplicationService, ProjectStoreLifecycle, ProjectStoreServiceEvent,
-    SourceSessionGeneration, SourceVerificationSnapshot, SystemMonotonicClock, WorkspaceSnapshot,
+    RenderCoordinationState, ResidentRenderFailureStatus, SourceSessionGeneration,
+    SourceVerificationSnapshot, SystemMonotonicClock, WorkspaceSnapshot,
+    import_workflow::{ImportCommand, ImportReviewId},
+    viewer_tools::ViewerToolState,
+    viewport_interaction::default_camera_for_shape,
 };
-use mirante4d_dataset::DatasetSourceId;
-use mirante4d_domain::{
-    CameraView, CrossSectionView, DisplayWindow, DvrOpacityTransfer as CanonicalDvrOpacityTransfer,
-    IsoLightState, IsoShadingPolicy, LayerTransfer, RenderState as CanonicalRenderState, RgbColor,
-    SamplingPolicy, ScaleLevel, TRANSFER_GAMMA_MAX, TRANSFER_GAMMA_MIN, TransferCurve,
-    UnitQuaternion, ViewerLayout as CanonicalViewerLayout,
+pub use mirante4d_application::{
+    CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
+    CrossSectionPanelScheduleStatus, DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind,
+    FrameFidelityStatus, LodDecisionReason, RenderBackend,
 };
 #[cfg(test)]
+use mirante4d_application::{
+    HistogramStatus, auto_dense_window_from_histogram, auto_signal_window_from_histogram,
+    histogram_can_auto_window, import_workflow::ImportWorkflowSnapshot, stepped_timepoint,
+};
+use mirante4d_dataset::{DatasetSourceId, ResourceValidity};
+#[cfg(test)]
 use mirante4d_domain::{IntensityDType, Shape3D, TimeIndex};
-use mirante4d_import_pipeline::{
-    ImportCancellation, ImportError, ImportOptions, ImportReceipt, TiffInspection, TiffSource,
-    spawn_tiff_import_worker, spawn_tiff_inspection_worker,
-};
-use mirante4d_project_model::{
-    ChannelPreset, LayerViewState, ProjectId, ProjectRevisionId, ViewState,
-};
+use mirante4d_domain::{ScaleLevel, ViewerLayout as CanonicalViewerLayout};
+#[cfg(test)]
+use mirante4d_import_pipeline::ImportCancellation;
+use mirante4d_import_pipeline::{ImportError, ImportOptions, ImportReceipt, TiffSource};
+use mirante4d_project_model::{ProjectId, ProjectRevisionId, ViewState};
 use mirante4d_project_store::{
     ProjectGenerationId, ProjectOpenMode, ProjectRecoveryCandidate, ProjectStoreConfig,
     ProjectStoreFault, ProjectStorePath, ProjectStoreRequestId,
@@ -115,59 +95,32 @@ use mirante4d_project_store::{
 use mirante4d_render_api::PresentationViewport;
 use mirante4d_render_wgpu::{WgpuRenderRuntime, WgpuRenderRuntimeConfig};
 use mirante4d_settings::{RejectedFileDisposition, ResourcePolicy, recommended_for_current_system};
-use playback::playback_status_label;
-#[cfg(test)]
-use playback::stepped_timepoint;
+use mirante4d_ui_egui as ui_kit;
 use product_automation::{ProductAutomationAppUpdateTiming, ProductAutomationController};
-use render_state::{set_presentation_viewport, set_render_viewport, take_lod_replan_pending};
+use render_state::set_render_viewport;
 pub use smoke::{AppSmokeOptions, AppSmokeReport, PlaybackSmokeFrame, run_headless_smoke};
-pub use state::{
-    ChannelFidelityStatus, ChannelFidelityWarning, DisplayedFrameFreshness, FrameCompleteness,
-    FrameFailureKind, FrameFidelityStatus, HistogramStatus, LayerHistogramSummary,
-    LodDecisionReason, LodScheduleState, RenderBackend, ViewportHover, ViewportIntensity,
+use ui_kit::{
+    DirtyProjectCloseView, DirtyProjectSaveAction, ProjectRecoveryCandidateView,
+    ProjectRecoveryView, RenderUiRequest, ViewportObservation, WorkbenchAnalysisKind,
+    WorkbenchUiAction, WorkbenchUiOutput,
 };
-use tool_interactions::apply_viewport_tool_response;
-use tools::{ViewerTool, ViewerToolState};
-use transfer_presets::{
-    built_in_transfer_preset_curve, built_in_transfer_preset_label, built_in_transfer_presets,
-    channel_preset_from_current_view, next_user_channel_preset_id,
-};
-use ui_kit::{StatusTone, WorkbenchLayoutSpec};
-use viewport::{
-    default_camera_for_shape, fit_camera_to_shape_preserving_view, fit_size,
-    presentation_viewport_for_display_size, render_viewport_for_display_size,
-    viewport_hover_from_response, viewport_interaction_commands,
-};
+#[cfg(test)]
+use ui_kit::{WorkbenchLayoutSpec, histogram_bins_label, playback_status_label};
 use workbench_controls::{
-    dataset_path_status_label, projection_selector, render_mode_label, render_mode_selector,
-    request_background_work_repaint, request_background_work_repaint_after, show_playback_controls,
+    dataset_path_status_label, request_background_work_repaint,
+    request_background_work_repaint_after,
 };
 
 const BACKGROUND_WORK_REPAINT_INTERVAL: Duration = Duration::from_millis(50);
 pub(crate) const CROSS_SECTION_INTERACTION_SETTLE_DURATION: Duration = Duration::from_millis(120);
 const DVR_DENSITY_SCALE_MIN: f64 = 0.1;
 const DVR_DENSITY_SCALE_MAX: f64 = 64.0;
-const DEFAULT_DVR_DENSITY_SCALE: f64 = 12.0;
-const DEFAULT_ISO_DISPLAY_LEVEL: f32 = 0.5;
-const DEFAULT_DVR_OPACITY_GAMMA: f32 = 0.25;
 const CROSS_SECTION_FAST_SLICE_MULTIPLIER: f64 = 10.0;
 const CROSS_SECTION_ROTATE_RADIANS_PER_POINT: f64 = 0.005;
-const MIB: u64 = 1024 * 1024;
 const PROJECT_RECOVERY_ROOT_ENTRIES_MAX: usize = 64;
 
-fn bytes_to_mib_rounded(bytes: u64) -> u64 {
-    (bytes.saturating_add(MIB / 2) / MIB).max(1)
-}
-
-fn mib_to_bytes(mib: u64) -> u64 {
-    mib.saturating_mul(MIB)
-}
-
 fn application_view(snapshot: &ApplicationSnapshot) -> &ViewState {
-    match snapshot.workspace() {
-        WorkspaceSnapshot::Unbound { workspace } => workspace.view(),
-        WorkspaceSnapshot::Bound { project, .. } => project.view(),
-    }
+    snapshot.view()
 }
 
 fn project_failure_code(
@@ -486,9 +439,10 @@ pub struct MiranteWorkbenchApp {
     application: ApplicationState,
     startup_diagnostics: StartupDiagnostics,
     dataset: dataset_requests::DatasetDemandState,
-    render_runtime: current_runtime::render::CurrentRenderRuntime,
-    ui_runtime: current_runtime::ui::CurrentUiRuntime,
-    import_runtime: current_runtime::import::ImportRuntime,
+    render_coordination: RenderCoordinationState,
+    native_presentation: native_presentation::NativePresentationBridge,
+    egui_ui: ui_kit::EguiUiState,
+    import: ImportWorkflow,
     analysis_runtime: current_runtime::analysis::AnalysisProductRuntime,
     validation_runtime: current_runtime::validation::CurrentValidationRuntime,
     project_store: Option<ProjectStoreApplicationService<SystemMonotonicClock>>,
@@ -538,7 +492,7 @@ impl MiranteWorkbenchApp {
             catalog,
             workspace,
             dataset,
-            mut render_runtime,
+            render_coordination,
             analysis_runtime,
         } = opened;
         let provisional_project_id = workspace.provisional_project_id();
@@ -553,7 +507,6 @@ impl MiranteWorkbenchApp {
             .wgpu_render_state
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("the interactive viewer requires the WGPU renderer"))?;
-        let wgpu_texture_renderer = Some(render_state.renderer.clone());
         let validation_runtime =
             current_runtime::validation::CurrentValidationRuntime::from_environment();
         let validation_capture = validation_runtime.product_automation.is_some();
@@ -572,13 +525,14 @@ impl MiranteWorkbenchApp {
             renderer_diagnostics.adapter_name(),
             renderer_diagnostics.driver(),
         ));
-        render_runtime.product_gpu = Some(current_runtime::render::ProductGpuRenderRuntime::new(
+        let native_presentation = native_presentation::NativePresentationBridge::new(
+            render_state.renderer.clone(),
+            render_state.device.clone(),
             product_renderer,
-        ));
-        let ui_runtime = current_runtime::ui::CurrentUiRuntime::new(
-            resource_policy,
-            wgpu_texture_renderer,
-            Some(render_state.device.clone()),
+        );
+        let egui_ui = ui_kit::EguiUiState::new(
+            resource_policy.cpu_dataset_budget_bytes(),
+            resource_policy.gpu_budget_bytes(),
         );
         let (project_recovery_root, recovery_root_warning) =
             initialize_project_recovery_root(dataset.selected_path());
@@ -590,9 +544,10 @@ impl MiranteWorkbenchApp {
             application,
             startup_diagnostics,
             dataset,
-            render_runtime,
-            ui_runtime,
-            import_runtime: current_runtime::import::ImportRuntime::idle(),
+            render_coordination,
+            native_presentation,
+            egui_ui,
+            import: ImportWorkflow::new(),
             analysis_runtime,
             validation_runtime,
             project_store,
@@ -625,98 +580,20 @@ impl MiranteWorkbenchApp {
         Ok(app)
     }
 
-    fn show_runtime_diagnostics_body(&self, ui: &mut egui::Ui) {
-        runtime_diagnostics_panel::show_runtime_diagnostics_body(self, ui);
-    }
-
     fn diagnostics_summary_text(&self) -> String {
         runtime_diagnostics_panel::diagnostics_summary_text(self)
     }
 
-    fn show_settings_body(&mut self, ui: &mut egui::Ui) {
-        let mut cpu_dataset_mib = bytes_to_mib_rounded(
-            self.ui_runtime
-                .settings_runtime_draft
-                .cpu_dataset_budget_bytes,
-        );
-        if ui
-            .add(
-                egui::DragValue::new(&mut cpu_dataset_mib)
-                    .range(2_048..=32_768)
-                    .speed(64)
-                    .suffix(" MiB"),
-            )
-            .on_hover_text("total CPU dataset ledger")
-            .changed()
-        {
-            self.ui_runtime
-                .settings_runtime_draft
-                .cpu_dataset_budget_bytes = mib_to_bytes(cpu_dataset_mib);
-        }
-        ui_kit::property_row(ui, "CPU dataset MiB", cpu_dataset_mib.to_string());
-
-        let mut gpu_mib =
-            bytes_to_mib_rounded(self.ui_runtime.settings_runtime_draft.gpu_budget_bytes);
-        if ui
-            .add(
-                egui::DragValue::new(&mut gpu_mib)
-                    .range(1_024..=8_192)
-                    .speed(256)
-                    .suffix(" MiB"),
-            )
-            .on_hover_text("total GPU ledger")
-            .changed()
-        {
-            self.ui_runtime.settings_runtime_draft.gpu_budget_bytes = mib_to_bytes(gpu_mib);
-        }
-        ui_kit::property_row(ui, "GPU MiB", gpu_mib.to_string());
-
-        let policy = ResourcePolicy::new(
-            self.ui_runtime
-                .settings_runtime_draft
-                .cpu_dataset_budget_bytes,
-            self.ui_runtime.settings_runtime_draft.gpu_budget_bytes,
-        )
-        .ok();
+    fn settings_ui_view(&self) -> ui_kit::SettingsUiView {
         let pending = self.settings_connection.pending().is_some();
-        ui.horizontal(|ui| {
-            if ui_kit::toolbar_button(ui, "Save Settings", policy.is_some() && !pending).clicked()
-                && let Some(policy) = policy
-            {
-                self.request_resource_policy_change(policy, RejectedFileDisposition::Preserve);
-            }
-            if ui_kit::toolbar_button(ui, "Recommended", !pending).clicked()
-                && let Ok(policy) = recommended_for_current_system(None)
-            {
-                self.ui_runtime.settings_runtime_draft = policy.into();
-            }
-        });
-        if self.settings_connection.rejected_file_present()
-            && ui_kit::toolbar_button(
-                ui,
-                "Replace Rejected Settings",
-                policy.is_some() && !pending,
-            )
-            .clicked()
-            && let Some(policy) = policy
-        {
-            self.request_resource_policy_change(policy, RejectedFileDisposition::ReplaceExplicitly);
-        }
-        ui_kit::property_row(
-            ui,
-            "settings status",
-            if pending {
+        ui_kit::SettingsUiView {
+            pending,
+            rejected_file_present: self.settings_connection.rejected_file_present(),
+            status_text: if pending {
                 "saving; restart required when complete".to_owned()
             } else {
                 format!("{:?}", self.settings_connection.startup_status())
             },
-        );
-        if policy.is_none() {
-            ui_kit::status_badge(
-                ui,
-                StatusTone::Error,
-                "resource budget is outside valid bounds",
-            );
         }
     }
 
@@ -725,13 +602,13 @@ impl MiranteWorkbenchApp {
         policy: ResourcePolicy,
         rejected_file_disposition: RejectedFileDisposition,
     ) {
-        if let Err(fault) = current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::RequestResourcePolicyChange {
-                policy,
-                rejected_file_disposition,
-            },
-        ) {
+        if let Err(fault) =
+            self.application
+                .dispatch(ApplicationCommand::RequestResourcePolicyChange {
+                    policy,
+                    rejected_file_disposition,
+                })
+        {
             tracing::warn!(?fault, "resource policy command rejected");
         }
         self.pump_application_services();
@@ -740,7 +617,7 @@ impl MiranteWorkbenchApp {
     fn pump_application_services(&mut self) {
         for _ in 0..4 {
             let mut completion_commands = self.settings_connection.poll();
-            let events = current_egui_shell_bridge::drain_events(&mut self.application, 256);
+            let events = self.application.drain_events(256);
             for event in &events {
                 if let Some(command) = self.settings_connection.observe_application_event(event) {
                     completion_commands.push(command);
@@ -751,9 +628,7 @@ impl MiranteWorkbenchApp {
             }
             let had_completion_commands = !completion_commands.is_empty();
             for command in completion_commands {
-                if let Err(fault) =
-                    current_egui_shell_bridge::dispatch(&mut self.application, command)
-                {
+                if let Err(fault) = self.application.dispatch(command) {
                     tracing::warn!(?fault, "application service completion rejected");
                 }
             }
@@ -765,7 +640,7 @@ impl MiranteWorkbenchApp {
             self.try_start_pending_automatic_source_verification();
             if events.is_empty()
                 && !had_completion_commands
-                && current_egui_shell_bridge::snapshot(&self.application).pending_event_count() == 0
+                && self.application.snapshot().pending_event_count() == 0
             {
                 break;
             }
@@ -973,7 +848,7 @@ impl MiranteWorkbenchApp {
                     .and_then(|service| {
                         service
                             .submit_save_as(
-                                &current_egui_shell_bridge::snapshot(&self.application),
+                                &self.application.snapshot(),
                                 token.clone(),
                                 path,
                                 projection.as_ref().clone(),
@@ -1042,13 +917,13 @@ impl MiranteWorkbenchApp {
             {
                 if self.project_dirty() {
                     self.close_after_project_save = false;
-                    self.ui_runtime.close_prompt_open = true;
+                    self.egui_ui.close_prompt_open = true;
                     self.project_status_message =
                         Some("Project changed while saving; save again before closing.".to_owned());
                 } else {
                     self.close_after_project_save = false;
                     if let Some(path) = self.pending_dataset_open_path.take() {
-                        self.ui_runtime.close_prompt_open = false;
+                        self.egui_ui.close_prompt_open = false;
                         if let Err(error) = self.replace_state_from_dataset_path(path, None) {
                             self.project_status_message =
                                 Some(format!("Dataset open could not start: {error}"));
@@ -1071,7 +946,7 @@ impl MiranteWorkbenchApp {
                     ) =>
             {
                 self.close_after_project_save = false;
-                self.ui_runtime.close_prompt_open = true;
+                self.egui_ui.close_prompt_open = true;
             }
             ApplicationEvent::CurrentSourceReplaced { .. } => {
                 self.project_recovery_candidates.clear();
@@ -1097,8 +972,7 @@ impl MiranteWorkbenchApp {
         match event {
             ApplicationEvent::SourceVerificationRequested { token } => {
                 let path = self.dataset.selected_path().to_path_buf();
-                let resource_policy =
-                    current_egui_shell_bridge::snapshot(&self.application).resource_policy();
+                let resource_policy = self.application.snapshot().resource_policy();
                 let scan_ledger = self.dataset.cpu_ledger_arc();
                 let request = self
                     .source_verification_service
@@ -1125,7 +999,7 @@ impl MiranteWorkbenchApp {
                 }
             }
             ApplicationEvent::SourceVerificationInvalidated { source_generation } => {
-                let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+                let snapshot = self.application.snapshot();
                 if *source_generation == snapshot.source_generation()
                     && self.dataset.resource_identity()
                         != snapshot.catalog().scientific_identity().resource_identity()
@@ -1173,18 +1047,18 @@ impl MiranteWorkbenchApp {
         completion: OperationCompletion,
     ) -> bool {
         let operation_id = token.operation_id();
-        match current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::CompleteOperation { token, completion },
-        ) {
+        match self
+            .application
+            .dispatch(ApplicationCommand::CompleteOperation { token, completion })
+        {
             Ok(_) => true,
             Err(fault) if fault.code() == ApplicationFaultCode::OperationNotFound => false,
             Err(fault) => {
                 tracing::warn!(?fault, "source operation completion was rejected");
-                match current_egui_shell_bridge::dispatch(
-                    &mut self.application,
-                    ApplicationCommand::CancelOperation(operation_id),
-                ) {
+                match self
+                    .application
+                    .dispatch(ApplicationCommand::CancelOperation(operation_id))
+                {
                     Ok(_) => {}
                     Err(cancel_fault)
                         if cancel_fault.code() == ApplicationFaultCode::OperationNotFound => {}
@@ -1206,18 +1080,18 @@ impl MiranteWorkbenchApp {
         completion: OperationCompletion,
     ) -> bool {
         let operation_id = token.operation_id();
-        match current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::CompleteOperation { token, completion },
-        ) {
+        match self
+            .application
+            .dispatch(ApplicationCommand::CompleteOperation { token, completion })
+        {
             Ok(_) => true,
             Err(fault) if fault.code() == ApplicationFaultCode::OperationNotFound => false,
             Err(fault) => {
                 tracing::warn!(?fault, "project persistence completion was rejected");
-                match current_egui_shell_bridge::dispatch(
-                    &mut self.application,
-                    ApplicationCommand::CancelOperation(operation_id),
-                ) {
+                match self
+                    .application
+                    .dispatch(ApplicationCommand::CancelOperation(operation_id))
+                {
                     Ok(_) => {}
                     Err(cancel_fault)
                         if cancel_fault.code() == ApplicationFaultCode::OperationNotFound => {}
@@ -1243,7 +1117,7 @@ impl MiranteWorkbenchApp {
                 .to_owned(),
         );
         if matches!(
-            current_egui_shell_bridge::snapshot(&self.application).workspace(),
+            self.application.snapshot().workspace(),
             WorkspaceSnapshot::Unbound { .. }
         ) {
             self.request_project_store_restart();
@@ -1282,19 +1156,22 @@ impl MiranteWorkbenchApp {
     }
 
     fn begin_background_operation(&mut self, kind: OperationKind) -> Option<OperationToken> {
-        let before = current_egui_shell_bridge::snapshot(&self.application)
+        let before = self
+            .application
+            .snapshot()
             .active_operations()
             .iter()
             .map(OperationToken::operation_id)
             .collect::<Vec<_>>();
-        if let Err(fault) = current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::BeginOperation(kind),
-        ) {
+        if let Err(fault) = self
+            .application
+            .dispatch(ApplicationCommand::BeginOperation(kind))
+        {
             tracing::warn!(?fault, ?kind, "background operation was rejected");
             return None;
         }
-        current_egui_shell_bridge::snapshot(&self.application)
+        self.application
+            .snapshot()
             .active_operations()
             .iter()
             .find(|token| token.kind() == kind && !before.contains(&token.operation_id()))
@@ -1307,24 +1184,23 @@ impl MiranteWorkbenchApp {
         completion: OperationCompletion,
     ) -> bool {
         let operation_id = token.operation_id();
-        match current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::CompleteOperation { token, completion },
-        ) {
+        match self
+            .application
+            .dispatch(ApplicationCommand::CompleteOperation { token, completion })
+        {
             Ok(_) => true,
             Err(fault) => {
                 tracing::warn!(?fault, "background operation completion was rejected");
-                let _ = current_egui_shell_bridge::dispatch(
-                    &mut self.application,
-                    ApplicationCommand::CancelOperation(operation_id),
-                );
+                let _ = self
+                    .application
+                    .dispatch(ApplicationCommand::CancelOperation(operation_id));
                 false
             }
         }
     }
 
     fn poll_project_store(&mut self) {
-        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let snapshot = self.application.snapshot();
         let result = self
             .project_store
             .as_mut()
@@ -1540,7 +1416,7 @@ impl MiranteWorkbenchApp {
                 self.pending_analysis_artifact_load = None;
                 match result {
                     Ok(artifacts) => {
-                        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+                        let snapshot = self.application.snapshot();
                         let expected_source = match snapshot.source() {
                             SourceVerificationSnapshot::Verified(source) => Some(source.clone()),
                             SourceVerificationSnapshot::Required
@@ -1555,20 +1431,20 @@ impl MiranteWorkbenchApp {
                                     .stage_authenticated_bundles(artifacts, &source)
                             })
                             .and_then(|bundles| {
-                                current_egui_shell_bridge::dispatch(
-                                    &mut self.application,
-                                    ApplicationCommand::InstallLoadedAnalysisDescriptors {
-                                        project_id,
-                                        revision,
-                                        currentness,
-                                        bundles,
-                                    },
-                                )
-                                .map_err(|fault| {
-                                    anyhow::anyhow!(
-                                        "saved analysis descriptors were rejected: {fault:?}"
+                                self.application
+                                    .dispatch(
+                                        ApplicationCommand::InstallLoadedAnalysisDescriptors {
+                                            project_id,
+                                            revision,
+                                            currentness,
+                                            bundles,
+                                        },
                                     )
-                                })?;
+                                    .map_err(|fault| {
+                                        anyhow::anyhow!(
+                                            "saved analysis descriptors were rejected: {fault:?}"
+                                        )
+                                    })?;
                                 self.analysis_runtime.finish_authenticated_bundles()
                             });
                         if let Err(error) = staged {
@@ -1672,223 +1548,77 @@ impl MiranteWorkbenchApp {
     }
 
     fn project_dirty(&self) -> bool {
-        current_egui_shell_bridge::snapshot(&self.application)
-            .dirty()
-            .unwrap_or(false)
+        self.application.snapshot().dirty().unwrap_or(false)
     }
 
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         if self.pending_viewport_close {
             self.pending_viewport_close = false;
-            self.ui_runtime.allow_close_without_prompt = true;
+            self.egui_ui.allow_close_without_prompt = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
         if !ctx.input(|input| input.viewport().close_requested()) {
             return;
         }
-        if self.ui_runtime.allow_close_without_prompt {
+        if self.egui_ui.allow_close_without_prompt {
             return;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         if self.project_dirty() {
-            self.ui_runtime.close_prompt_open = true;
+            self.egui_ui.close_prompt_open = true;
         } else {
             self.request_project_store_close_for_exit();
         }
     }
 
-    fn show_dirty_project_close_prompt(&mut self, ctx: &egui::Context) {
-        if !self.ui_runtime.close_prompt_open {
-            return;
-        }
-        egui::Window::new("Unsaved Project")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.label(if self.pending_dataset_open_path.is_some() {
-                    "Project changes have not been saved. Save or discard them before opening another dataset."
-                } else {
-                    "Project changes have not been saved."
-                });
-                ui.horizontal(|ui| {
-                    let (save_available, save_as_required) = self
-                        .project_store
-                        .as_ref()
-                        .map(|service| {
-                            let can_save = service.can_save();
-                            let can_save_as = service.can_save_as();
-                            (can_save || can_save_as, !can_save && can_save_as)
-                        })
-                        .unwrap_or((false, false));
-                    let save_label = if save_as_required { "Save As" } else { "Save" };
-                    if ui_kit::toolbar_button(ui, save_label, save_available).clicked() {
-                        self.close_after_project_save = true;
-                        let started = if save_as_required {
-                            self.save_current_project_as()
-                        } else {
-                            self.save_current_project()
-                        };
-                        if started && self.close_after_project_save {
-                            self.ui_runtime.close_prompt_open = false;
-                        } else if !started {
-                            self.close_after_project_save = false;
-                        }
-                    }
-                    if ui_kit::toolbar_button(ui, "Discard", true).clicked() {
-                        self.ui_runtime.close_prompt_open = false;
-                        self.close_after_project_save = false;
-                        if let Some(path) = self.pending_dataset_open_path.take() {
-                            if let Err(error) = self.replace_state_from_dataset_path(path, None) {
-                                self.project_status_message =
-                                    Some(format!("Dataset open could not start: {error}"));
-                            }
-                        } else {
-                            self.request_project_store_close_for_exit();
-                        }
-                    }
-                    if ui_kit::toolbar_button(ui, "Cancel", true).clicked() {
-                        self.ui_runtime.close_prompt_open = false;
-                        self.ui_runtime.allow_close_without_prompt = false;
-                        self.close_after_project_save = false;
-                        self.pending_dataset_open_path = None;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                    }
-                });
-            });
+    fn dirty_project_close_ui(&self) -> DirtyProjectCloseView {
+        let save_action = self
+            .project_store
+            .as_ref()
+            .map(
+                |service| match (service.can_save(), service.can_save_as()) {
+                    (true, _) => DirtyProjectSaveAction::Save,
+                    (false, true) => DirtyProjectSaveAction::SaveAs,
+                    (false, false) => DirtyProjectSaveAction::Unavailable,
+                },
+            )
+            .unwrap_or(DirtyProjectSaveAction::Unavailable);
+        DirtyProjectCloseView::new(
+            self.egui_ui.close_prompt_open,
+            self.pending_dataset_open_path.is_some(),
+            save_action,
+        )
     }
 
-    fn show_project_recovery_ui(&mut self, ctx: &egui::Context) {
-        #[derive(Clone, Copy)]
-        enum ReviewAction {
-            Recover(ProjectGenerationId),
-            OpenSaved,
-        }
-
-        let review = self
-            .project_recovery_review
-            .as_ref()
-            .map(|review| review.automatic_newer);
-        let mut review_action = None;
-        if let Some(automatic_newer) = review {
-            egui::Window::new("Recover autosaved project?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.label(
-                        "A newer autosave was found for the saved project. Recovery opens it as an unsaved branch that must be saved with Save As.",
-                    );
-                    ui.horizontal(|ui| {
-                        if ui_kit::toolbar_button(ui, "Recover Autosave", true).clicked() {
-                            review_action = Some(ReviewAction::Recover(automatic_newer));
-                        }
-                        if ui_kit::toolbar_button(ui, "Open Saved Project", true).clicked() {
-                            review_action = Some(ReviewAction::OpenSaved);
-                        }
-                    });
-                });
-        }
-        match review_action {
-            Some(ReviewAction::Recover(generation_id)) => {
-                self.recover_project_candidate(generation_id);
-            }
-            Some(ReviewAction::OpenSaved) => self.accept_saved_project_after_recovery_review(),
-            None => {}
-        }
-
-        if !self.project_recovery_panel_open {
-            return;
-        }
-        let candidates = self.project_recovery_candidates.clone();
-        let locators = self
-            .project_store
-            .as_ref()
-            .map(|service| service.recovery_store_project_ids().collect::<Vec<_>>())
-            .unwrap_or_default();
-        let can_open_locator = self
-            .project_store
-            .as_ref()
-            .is_some_and(ProjectStoreApplicationService::can_open);
-        let mut panel_open = true;
-        let mut selected = None;
-        let mut selected_locator = None;
-        egui::Window::new("Project Recovery")
-            .open(&mut panel_open)
-            .resizable(true)
-            .default_width(520.0)
-            .show(ctx, |ui| {
-                if candidates.is_empty() && locators.is_empty() {
-                    ui.label("No validated recovery branches are available.");
-                    return;
-                }
-                ui.label(
-                    "Recovery never changes the stored project. A selected branch opens dirty and must be saved with Save As.",
-                );
-                ui.separator();
-                if !locators.is_empty() {
-                    ui.heading("Unsaved projects from earlier launches");
-                    for project_id in &locators {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(format!("Project {project_id}"));
-                            if ui_kit::toolbar_button(
-                                ui,
-                                "Inspect and Recover",
-                                can_open_locator,
-                            )
-                            .on_hover_text("Validated by the project-store actor before opening")
-                            .clicked()
-                            {
-                                selected_locator = Some(*project_id);
-                            }
-                        });
-                    }
-                    if !candidates.is_empty() {
-                        ui.separator();
-                    }
-                }
-                if !candidates.is_empty() {
-                    ui.heading("Branches in the selected project");
-                }
-                egui::ScrollArea::vertical()
-                    .max_height(320.0)
-                    .show(ui, |ui| {
-                        for candidate in &candidates {
-                            ui.group(|ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(format!(
-                                        "{} · {} · revision {}",
-                                        candidate.classification(),
-                                        candidate.origin(),
-                                        candidate.revision_sequence()
-                                    ));
-                                    if ui_kit::toolbar_button(ui, "Open Recovery", true).clicked()
-                                    {
-                                        selected = Some(candidate.generation_id());
-                                    }
-                                });
-                                ui_kit::muted_label(
-                                    ui,
-                                    format!(
-                                        "generation {} · artifacts {} ({} non-regenerable)",
-                                        candidate.generation_sequence(),
-                                        candidate.artifact_count(),
-                                        candidate.non_regenerable_artifact_count()
-                                    ),
-                                );
-                            });
-                        }
-                    });
-            });
-        self.project_recovery_panel_open = panel_open;
-        if let Some(generation_id) = selected {
-            self.project_recovery_panel_open = false;
-            self.recover_project_candidate(generation_id);
-        } else if let Some(project_id) = selected_locator {
-            self.project_recovery_panel_open = false;
-            self.open_recovery_locator(project_id);
-        }
+    fn project_recovery_ui(&self) -> ProjectRecoveryView {
+        ProjectRecoveryView::new(
+            self.project_recovery_review
+                .as_ref()
+                .map(|review| review.automatic_newer),
+            self.project_recovery_panel_open,
+            self.project_recovery_candidates
+                .iter()
+                .map(|candidate| {
+                    ProjectRecoveryCandidateView::new(
+                        candidate.generation_id(),
+                        candidate.classification().to_owned(),
+                        candidate.origin().to_owned(),
+                        candidate.revision_sequence(),
+                        candidate.generation_sequence(),
+                        candidate.artifact_count(),
+                        candidate.non_regenerable_artifact_count(),
+                    )
+                })
+                .collect(),
+            self.project_store
+                .as_ref()
+                .map(|service| service.recovery_store_project_ids().collect())
+                .unwrap_or_default(),
+            self.project_store
+                .as_ref()
+                .is_some_and(ProjectStoreApplicationService::can_open),
+        )
     }
 
     fn open_project_recovery_panel(&mut self) {
@@ -1927,7 +1657,7 @@ impl MiranteWorkbenchApp {
 
     fn request_project_store_close_for_exit(&mut self) {
         self.exit_after_project_close = true;
-        self.ui_runtime.close_prompt_open = false;
+        self.egui_ui.close_prompt_open = false;
         match self.project_store.as_mut() {
             Some(service) if service.status().lifecycle() != ProjectStoreLifecycle::Closed => {
                 if let Err(error) = service.close()
@@ -1983,7 +1713,7 @@ impl MiranteWorkbenchApp {
     }
 
     fn restart_unbound_project_store(&mut self) {
-        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let snapshot = self.application.snapshot();
         let WorkspaceSnapshot::Unbound { workspace } = snapshot.workspace() else {
             self.project_status_message = Some(
                 "Project storage is unavailable for the bound project; reopen the application before saving again."
@@ -2009,10 +1739,10 @@ impl MiranteWorkbenchApp {
     }
 
     fn open_session_from_dialog(&mut self, _ctx: &egui::Context) {
-        if let Err(fault) = current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::RequestProjectOpen,
-        ) {
+        if let Err(fault) = self
+            .application
+            .dispatch(ApplicationCommand::RequestProjectOpen)
+        {
             tracing::info!(?fault, "project open is unavailable for the current source");
         }
         self.pump_application_services();
@@ -2020,10 +1750,10 @@ impl MiranteWorkbenchApp {
 
     fn open_recovery_locator(&mut self, project_id: ProjectId) {
         self.pending_project_open_locator = Some(project_id);
-        if let Err(fault) = current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::RequestProjectOpen,
-        ) {
+        if let Err(fault) = self
+            .application
+            .dispatch(ApplicationCommand::RequestProjectOpen)
+        {
             self.pending_project_open_locator = None;
             self.project_status_message = Some(format!(
                 "Recovery cannot open for the current dataset: {fault:?}"
@@ -2052,7 +1782,7 @@ impl MiranteWorkbenchApp {
     ) -> anyhow::Result<bool> {
         if self.project_dirty() {
             self.pending_dataset_open_path = Some(path);
-            self.ui_runtime.close_prompt_open = true;
+            self.egui_ui.close_prompt_open = true;
             Ok(false)
         } else {
             self.replace_state_from_dataset_path(path, ctx)?;
@@ -2065,12 +1795,10 @@ impl MiranteWorkbenchApp {
         path: PathBuf,
         ctx: Option<&egui::Context>,
     ) -> anyhow::Result<()> {
-        current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::RequestDatasetOpen,
-        )
-        .map_err(|fault| anyhow::anyhow!("dataset open command rejected: {fault:?}"))?;
-        let events = current_egui_shell_bridge::drain_events(&mut self.application, 256);
+        self.application
+            .dispatch(ApplicationCommand::RequestDatasetOpen)
+            .map_err(|fault| anyhow::anyhow!("dataset open command rejected: {fault:?}"))?;
+        let events = self.application.drain_events(256);
         let token = events
             .iter()
             .find_map(|event| match event {
@@ -2078,8 +1806,7 @@ impl MiranteWorkbenchApp {
                 _ => None,
             })
             .ok_or_else(|| anyhow::anyhow!("dataset open request emitted no operation token"))?;
-        let resource_policy =
-            current_egui_shell_bridge::snapshot(&self.application).resource_policy();
+        let resource_policy = self.application.snapshot().resource_policy();
         let Some(service) = self.source_open_service.as_mut() else {
             self.complete_source_operation(
                 token,
@@ -2106,10 +1833,10 @@ impl MiranteWorkbenchApp {
     }
 
     fn save_current_project(&mut self) -> bool {
-        if let Err(fault) = current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::RequestProjectSave,
-        ) {
+        if let Err(fault) = self
+            .application
+            .dispatch(ApplicationCommand::RequestProjectSave)
+        {
             tracing::info!(?fault, "project save is unavailable for the current source");
             return false;
         }
@@ -2119,10 +1846,10 @@ impl MiranteWorkbenchApp {
 
     fn save_current_project_as(&mut self) -> bool {
         let new_project_id = ProjectId::from_bytes(*uuid::Uuid::new_v4().as_bytes());
-        if let Err(fault) = current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::RequestProjectSaveAs { new_project_id },
-        ) {
+        if let Err(fault) = self
+            .application
+            .dispatch(ApplicationCommand::RequestProjectSaveAs { new_project_id })
+        {
             tracing::info!(
                 ?fault,
                 "project Save As is unavailable for the current source"
@@ -2134,10 +1861,10 @@ impl MiranteWorkbenchApp {
     }
 
     fn new_current_project(&mut self) {
-        if let Err(fault) = current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::AttachVerifiedDataset,
-        ) {
+        if let Err(fault) = self
+            .application
+            .dispatch(ApplicationCommand::AttachVerifiedDataset)
+        {
             tracing::info!(?fault, "new project is unavailable for the current source");
         }
         self.pump_application_services();
@@ -2179,10 +1906,10 @@ impl MiranteWorkbenchApp {
             return;
         }
         self.pending_recovery_selection = Some(generation_id);
-        if let Err(fault) = current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::RequestProjectRecovery,
-        ) {
+        if let Err(fault) = self
+            .application
+            .dispatch(ApplicationCommand::RequestProjectRecovery)
+        {
             self.pending_recovery_selection = None;
             tracing::info!(?fault, "project recovery is unavailable");
         }
@@ -2190,10 +1917,10 @@ impl MiranteWorkbenchApp {
     }
 
     fn request_current_source_verification(&mut self) {
-        if let Err(fault) = current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::RequestSourceVerification,
-        ) {
+        if let Err(fault) = self
+            .application
+            .dispatch(ApplicationCommand::RequestSourceVerification)
+        {
             tracing::warn!(?fault, "source verification request was rejected");
         }
     }
@@ -2202,7 +1929,7 @@ impl MiranteWorkbenchApp {
         let Some(pending_generation) = self.pending_automatic_source_verification else {
             return;
         };
-        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let snapshot = self.application.snapshot();
         if snapshot.source_generation() != pending_generation
             || !matches!(snapshot.source(), SourceVerificationSnapshot::Required)
         {
@@ -2217,10 +1944,10 @@ impl MiranteWorkbenchApp {
             return;
         }
 
-        match current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::RequestSourceVerification,
-        ) {
+        match self
+            .application
+            .dispatch(ApplicationCommand::RequestSourceVerification)
+        {
             Ok(_) => self.pending_automatic_source_verification = None,
             Err(fault) if fault.code() == ApplicationFaultCode::OperationConflict => {}
             Err(fault) => {
@@ -2234,11 +1961,11 @@ impl MiranteWorkbenchApp {
         if let Err(error) = self.dataset.cancel_and_clear_interactive_demand() {
             tracing::warn!(%error, "invalidated dataset demand cancellation failed");
         }
-        let retired_leases = std::mem::take(&mut self.render_runtime.retained_leases);
+        let retired_leases = self.dataset.take_retained_leases();
         self.clear_product_presentations();
-        self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Loading;
-        self.render_runtime.frame_fidelity.reason = LodDecisionReason::LoadingTargetScale;
-        self.render_runtime.frame_fidelity.backend = RenderBackend::Loading;
+        self.render_coordination.frame_fidelity.completeness = FrameCompleteness::Loading;
+        self.render_coordination.frame_fidelity.reason = LodDecisionReason::LoadingTargetScale;
+        self.render_coordination.frame_fidelity.backend = RenderBackend::Loading;
         std::thread::spawn(move || drop(retired_leases));
     }
 
@@ -2269,7 +1996,9 @@ impl MiranteWorkbenchApp {
         match result.outcome {
             current_source_open_service::CurrentSourceOpenOutcome::Prepared(prepared) => {
                 let (runtime, completion) = prepared.into_runtime_and_completion();
-                let token_is_current = current_egui_shell_bridge::snapshot(&self.application)
+                let token_is_current = self
+                    .application
+                    .snapshot()
                     .active_operations()
                     .iter()
                     .any(|active| active == &token);
@@ -2329,7 +2058,7 @@ impl MiranteWorkbenchApp {
         };
         if self.complete_source_operation(pending.token, pending.completion) {
             self.install_current_source_runtime(pending.runtime);
-            let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+            let snapshot = self.application.snapshot();
             let WorkspaceSnapshot::Unbound { workspace } = snapshot.workspace() else {
                 tracing::error!("new source did not produce an unbound project workspace");
                 return;
@@ -2393,8 +2122,7 @@ impl MiranteWorkbenchApp {
 
         match progress {
             Ok(Some(progress)) => {
-                match current_egui_shell_bridge::dispatch(
-                    &mut self.application,
+                match self.application.dispatch(
                     ApplicationCommand::UpdateSourceVerificationProgress {
                         token: progress.token,
                         completed_work: progress.completed_work,
@@ -2466,13 +2194,12 @@ impl MiranteWorkbenchApp {
         &mut self,
         transfer: current_source_verification_service::CurrentSourceVerificationRuntimeTransfer,
     ) {
-        let retired_leases = std::mem::take(&mut self.render_runtime.retained_leases);
         let old_dataset = std::mem::replace(&mut self.dataset, transfer.dataset);
         if let Err(error) = old_dataset.request_shutdown() {
             tracing::warn!(%error, "unverified dataset runtime shutdown request failed");
         }
         self.request_opened_state_visible_work(None);
-        std::thread::spawn(move || drop((old_dataset, retired_leases)));
+        std::thread::spawn(move || drop(old_dataset));
     }
 
     fn install_current_source_runtime(
@@ -2481,59 +2208,50 @@ impl MiranteWorkbenchApp {
     ) {
         let current_source_open_service::CurrentSourceRuntimeTransfer {
             dataset,
-            mut render_runtime,
+            render_coordination,
             analysis_runtime,
         } = transfer;
         self.clear_product_presentations();
-        render_runtime.product_gpu = self.render_runtime.product_gpu.take();
         let old_dataset = std::mem::replace(&mut self.dataset, dataset);
-        let old_render_runtime = std::mem::replace(&mut self.render_runtime, render_runtime);
+        let old_render_coordination =
+            std::mem::replace(&mut self.render_coordination, render_coordination);
         let old_analysis_runtime = std::mem::replace(&mut self.analysis_runtime, analysis_runtime);
         self.pending_analysis_artifact_load = None;
-        let old_import_runtime = std::mem::replace(
-            &mut self.import_runtime,
-            current_runtime::import::ImportRuntime::idle(),
-        );
-        self.ui_runtime.viewer_tools = ViewerToolState::default();
-        self.ui_runtime.analysis_plot_view = None;
-        self.ui_runtime.analysis_filter.clear();
-        self.ui_runtime.analysis_sort = None;
-        self.ui_runtime.hovered_pixel = None;
-        self.ui_runtime.hovered_source_readout = None;
+        self.import.clear_for_source_replacement();
+        self.egui_ui.viewer_tools = ViewerToolState::default();
+        self.egui_ui.analysis_plot_view = None;
+        self.egui_ui.analysis_filter.clear();
+        self.egui_ui.analysis_sort = None;
+        self.egui_ui.hovered_pixel = None;
+        self.egui_ui.hovered_source_readout = None;
         if let Err(error) = old_dataset.request_shutdown() {
             tracing::warn!(%error, "replaced dataset runtime shutdown request failed");
         }
         self.pending_automatic_source_verification =
-            Some(current_egui_shell_bridge::snapshot(&self.application).source_generation());
+            Some(self.application.snapshot().source_generation());
         self.try_start_pending_automatic_source_verification();
         self.request_opened_state_visible_work(None);
 
         std::thread::spawn(move || {
-            drop((
-                old_dataset,
-                old_render_runtime,
-                old_analysis_runtime,
-                old_import_runtime,
-            ));
+            drop((old_dataset, old_render_coordination, old_analysis_runtime));
         });
     }
 
-    fn active_histogram_summary(&mut self) -> LayerHistogramSummary {
-        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
-        let view = application_view(&snapshot);
+    fn active_histogram_summary(&self, snapshot: &ApplicationSnapshot) -> LayerHistogramSummary {
+        let view = application_view(snapshot);
         let active_key = view.active_layer();
         let layer = snapshot
             .catalog()
             .layer(active_key)
             .expect("application view closes over the dataset catalog");
         let scale = ScaleLevel::new(
-            self.render_runtime
-                .lod_schedule
+            self.render_coordination
+                .frame_fidelity
                 .displayed_scale_level
-                .unwrap_or(self.render_runtime.lod_schedule.target_scale_level),
+                .unwrap_or(self.dataset.current_scale().get()),
         );
         active_layer_histogram_summary(
-            &self.render_runtime.retained_leases,
+            self.dataset.retained_leases(),
             histogram::ActiveLayerHistogramInput {
                 requirements: self
                     .dataset
@@ -2553,12 +2271,18 @@ impl MiranteWorkbenchApp {
         command: ApplicationCommand,
         ctx: &egui::Context,
     ) -> Result<CommandEffect, ApplicationFault> {
-        let before = current_egui_shell_bridge::snapshot(&self.application);
+        let before = self.application.snapshot();
         let previous_view = application_view(&before).clone();
-        let effect = current_egui_shell_bridge::dispatch(&mut self.application, command)?;
+        let previous_playback_active = before.transient().playback_active();
+        let effect = self.application.dispatch(command)?;
         if effect == CommandEffect::Changed {
-            let after = current_egui_shell_bridge::snapshot(&self.application);
-            self.reconcile_application_change(&previous_view, &after, ctx);
+            let after = self.application.snapshot();
+            self.reconcile_application_change(
+                &previous_view,
+                previous_playback_active,
+                &after,
+                ctx,
+            );
             if let Err(error) = self.reconcile_analysis_currentness() {
                 tracing::warn!(%error, "stale analysis could not be retired");
             }
@@ -2570,14 +2294,13 @@ impl MiranteWorkbenchApp {
     fn reconcile_application_change(
         &mut self,
         previous_view: &ViewState,
+        previous_playback_active: bool,
         snapshot: &ApplicationSnapshot,
         ctx: &egui::Context,
     ) {
         let next_view = application_view(snapshot);
-        let playback_lod_downshift_active = snapshot.transient().playback_active();
         let playback_lod_changed =
-            self.render_runtime.playback_lod_downshift_active != playback_lod_downshift_active;
-        self.render_runtime.playback_lod_downshift_active = playback_lod_downshift_active;
+            previous_playback_active != snapshot.transient().playback_active();
         if previous_view == next_view && !playback_lod_changed {
             return;
         }
@@ -2595,27 +2318,25 @@ impl MiranteWorkbenchApp {
             previous_view,
             snapshot,
             &mut self.dataset,
-            &mut self.render_runtime,
+            &mut self.render_coordination,
             &mut self.analysis_runtime,
         ) {
             Ok(changed) => changed,
             Err(error) => {
                 tracing::error!(%error, "failed to reconcile the canonical view with current runtime");
                 self.dataset.record_plan_error(error.to_string());
-                self.render_runtime.visible_brick_plan_error = Some(error.to_string());
-                self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Incomplete;
+                self.render_coordination.frame_fidelity.completeness =
+                    FrameCompleteness::Incomplete;
                 false
             }
         };
         if previous_view.layout() != next_view.layout() {
-            self.ui_runtime.hovered_pixel = None;
-            self.ui_runtime.hovered_source_readout = None;
-            self.ui_runtime.viewport_orbit_drag = None;
+            self.egui_ui.hovered_pixel = None;
+            self.egui_ui.hovered_source_readout = None;
+            self.egui_ui.viewport_orbit_drag = None;
             if next_view.layout() == CanonicalViewerLayout::Single3d {
                 self.clear_cross_section_product_presentations();
-                self.render_runtime
-                    .cross_section_runtime
-                    .mark_cross_section_panels_dirty();
+                self.render_coordination.invalidate_cross_sections();
             }
         }
         if source_selection_changed {
@@ -2627,8 +2348,8 @@ impl MiranteWorkbenchApp {
             if let Err(error) = self.rerender_display_state() {
                 tracing::error!(%error, "failed to render the accepted canonical view");
                 self.dataset.record_plan_error(error.to_string());
-                self.render_runtime.visible_brick_plan_error = Some(error.to_string());
-                self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Incomplete;
+                self.render_coordination.frame_fidelity.completeness =
+                    FrameCompleteness::Incomplete;
                 self.request_visible_bricks();
             } else {
                 self.request_visible_bricks();

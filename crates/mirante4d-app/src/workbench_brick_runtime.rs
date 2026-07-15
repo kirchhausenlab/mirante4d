@@ -1,11 +1,14 @@
 //! Unified interactive dataset demand and completion delivery.
 
-use std::{collections::BTreeSet, sync::Arc, time::Instant};
+use std::{collections::BTreeSet, time::Instant};
 
 use eframe::egui;
-use mirante4d_application::ApplicationCommand;
-use mirante4d_dataset::{CpuLedgerCategory, DatasetCatalog, DatasetResourceKey, ResourceLease};
-use mirante4d_dataset_runtime::{RequestPriority, RuntimeFault, RuntimeFaultCode, RuntimeOutcome};
+use mirante4d_application::{
+    ApplicationCommand, CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
+    CrossSectionPanelScheduleStatus,
+};
+use mirante4d_dataset::{CpuLedgerCategory, DatasetCatalog, DatasetResourceKey};
+use mirante4d_dataset_runtime::{RequestPriority, RuntimeFault, RuntimeFaultCode};
 use mirante4d_domain::{TimeIndex, ViewerLayout};
 use mirante4d_render_api::MAX_RENDER_REQUIREMENTS;
 
@@ -20,11 +23,9 @@ use crate::{
         SCOPE_ANALYSIS, SCOPE_CROSS_SECTION_XY, SCOPE_CROSS_SECTION_XZ, SCOPE_CROSS_SECTION_YZ,
         SCOPE_CURRENT_3D, SCOPE_PLAYBACK,
     },
+    display_refresh::render_backend_for_mode,
     product_render_intent::PRODUCT_RENDER_RESOURCE_LIMIT,
-    viewer_layout::{
-        CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
-        CrossSectionPanelScheduleStatus, PanelId,
-    },
+    viewer_layout::PanelId,
 };
 
 const SEMANTIC_PLAN_CANDIDATES_PER_LAYER: usize = MAX_RENDER_REQUIREMENTS;
@@ -54,9 +55,9 @@ impl MiranteWorkbenchApp {
         if self.dataset.resource_identity()
             != snapshot.catalog().scientific_identity().resource_identity()
         {
-            self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Loading;
-            self.render_runtime.frame_fidelity.reason = LodDecisionReason::LoadingTargetScale;
-            self.render_runtime.frame_fidelity.backend = RenderBackend::Loading;
+            self.render_coordination.frame_fidelity.completeness = FrameCompleteness::Loading;
+            self.render_coordination.frame_fidelity.reason = LodDecisionReason::LoadingTargetScale;
+            self.render_coordination.frame_fidelity.backend = RenderBackend::Loading;
             return VisibleBrickRequestOutcome::default();
         }
         let view = application_view(&snapshot);
@@ -81,11 +82,11 @@ impl MiranteWorkbenchApp {
             ),
             budget_share_u64(decoded_capacity, current_share_numerator, demand_cohorts),
         );
-        let render_viewport = self.render_runtime.render_viewport;
+        let render_viewport = self.render_coordination.render_viewport;
         let plan = match plan_current_3d(
             snapshot.catalog(),
             view,
-            self.render_runtime.presentation_viewport,
+            self.render_coordination.presentation_viewport,
             render_viewport,
             current_limits,
             playback_active,
@@ -132,16 +133,11 @@ impl MiranteWorkbenchApp {
                 return VisibleBrickRequestOutcome::default();
             }
         };
-        self.render_runtime.visible_brick_count = visible_count;
-        self.render_runtime.visible_brick_plan_error =
-            cross_plan_error.as_ref().map(ToString::to_string);
         if let Some(error) = cross_plan_error.as_ref() {
             self.dataset.record_plan_error(error.to_string());
         }
-        self.render_runtime.lod_schedule.target_scale_level = scale.get();
-        self.render_runtime.lod_schedule.pending_scale_level = Some(scale.get());
-        self.render_runtime.frame_fidelity.target_scale_level = scale.get();
-        self.render_runtime.frame_fidelity.visible_bricks = visible_count;
+        self.render_coordination.frame_fidelity.target_scale_level = scale.get();
+        self.render_coordination.frame_fidelity.visible_bricks = visible_count;
 
         if let Err(fault) = self
             .dataset
@@ -161,21 +157,14 @@ impl MiranteWorkbenchApp {
             }
         }
         if cross_requirements_changed || cross_plan_error.is_some() {
-            self.render_runtime
-                .cross_section_runtime
-                .mark_cross_section_panels_dirty();
+            self.render_coordination.invalidate_cross_sections();
         }
         if let Some(error) = cross_plan_error.as_ref() {
             self.mark_cross_section_plan_failure(error);
         }
-        if let Err(error) = self
-            .render_runtime
-            .retained_leases
-            .replace_requirements(self.dataset.renderer_requirements())
-        {
+        if let Err(error) = self.dataset.refresh_retained_requirements() {
             self.dataset.record_plan_error(error.to_string());
-            self.render_runtime.visible_brick_plan_error = Some(error.to_string());
-            self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Incomplete;
+            self.render_coordination.frame_fidelity.completeness = FrameCompleteness::Incomplete;
             return VisibleBrickRequestOutcome::default();
         }
         self.dataset.begin_submission_pass();
@@ -190,10 +179,7 @@ impl MiranteWorkbenchApp {
             if scope != SCOPE_CURRENT_3D && scope != SCOPE_PLAYBACK && !four_panel {
                 continue;
             }
-            if let Err(fault) =
-                self.dataset
-                    .submit_scope(scope, priority, &self.render_runtime.retained_leases)
-            {
+            if let Err(fault) = self.dataset.submit_scope(scope, priority) {
                 submission_fault = Some(fault);
                 break;
             }
@@ -202,9 +188,7 @@ impl MiranteWorkbenchApp {
             self.record_dataset_fault(&fault);
         }
 
-        let ready = self
-            .dataset
-            .scope_complete(SCOPE_CURRENT_3D, &self.render_runtime.retained_leases);
+        let ready = self.dataset.scope_complete(SCOPE_CURRENT_3D);
         self.update_dataset_fidelity(ready);
         VisibleBrickRequestOutcome {
             current_changed,
@@ -234,35 +218,20 @@ impl MiranteWorkbenchApp {
             }
             return;
         }
-        let (dataset, render, analysis) = (
-            &mut self.dataset,
-            &mut self.render_runtime,
-            &mut self.analysis_runtime,
-        );
-        let bridge = &mut render.retained_leases;
-        let mut installed = false;
+        let (dataset, analysis) = (&mut self.dataset, &mut self.analysis_runtime);
         let mut analysis_events = Vec::new();
         let mut analysis_errors = Vec::new();
-        let drained = dataset.dispatcher_mut().drain(RESULT_DRAIN_LIMIT, |ticket, outcome| {
-            if ticket.generation().scope() == SCOPE_ANALYSIS {
-                if let Some(token) = analysis.active_token().cloned() {
-                    match analysis.accept_completion(ticket, outcome) {
-                        Ok(event) => analysis_events.push((token, event)),
-                        Err(error) => analysis_errors.push((token, error)),
-                    }
-                }
-            } else if let RuntimeOutcome::Ready(lease) = outcome
-                && bridge.requires(ticket.resource())
-            {
-                let lease: Arc<dyn ResourceLease> = Arc::new(lease);
-                match bridge.install(lease) {
-                    Ok(newly_installed) => installed |= newly_installed,
-                    Err(error) => tracing::error!(%error, "runtime lease delivery violated the renderer bridge contract"),
+        let drained = dataset.drain_runtime_results(RESULT_DRAIN_LIMIT, |ticket, outcome| {
+            debug_assert_eq!(ticket.generation().scope(), SCOPE_ANALYSIS);
+            if let Some(token) = analysis.active_token().cloned() {
+                match analysis.accept_completion(ticket, outcome) {
+                    Ok(event) => analysis_events.push((token, event)),
+                    Err(error) => analysis_errors.push((token, error)),
                 }
             }
         });
-        let drained = match drained {
-            Ok(drained) => drained,
+        let (drained, installed) = match drained {
+            Ok(outcome) => outcome,
             Err(fault) => {
                 self.record_dataset_fault(&fault);
                 return;
@@ -295,17 +264,15 @@ impl MiranteWorkbenchApp {
             );
         }
 
-        let ready = self
-            .dataset
-            .scope_complete(SCOPE_CURRENT_3D, &self.render_runtime.retained_leases);
+        let ready = self.dataset.scope_complete(SCOPE_CURRENT_3D);
         self.update_dataset_fidelity(ready);
         if completion_drain_needs_replan(
             installed,
             drained,
             self.dataset.dispatcher().admission_blocked(),
         ) {
-            self.render_runtime.lod_replan_pending = true;
-            self.render_runtime.frame_fidelity.frame_time_ms =
+            self.render_coordination.request_refresh();
+            self.render_coordination.frame_fidelity.frame_time_ms =
                 Some(started.elapsed().as_secs_f64() * 1_000.0);
             ctx.request_repaint();
         } else if analysis_changed || drained > 0 || self.dataset.dispatcher().has_pending_work() {
@@ -336,10 +303,9 @@ impl MiranteWorkbenchApp {
             (
                 scope,
                 panel_id,
-                self.render_runtime
-                    .cross_section_runtime
-                    .panel(panel_id)
-                    .and_then(|panel| panel.presentation_viewport),
+                self.render_coordination
+                    .surface(panel_id.presentation_slot())
+                    .presentation_viewport(),
             )
         });
         let mut remaining_panels = presentations
@@ -400,8 +366,8 @@ impl MiranteWorkbenchApp {
         let snapshot = self.application.snapshot();
         let view = application_view(&snapshot);
         let status = self
-            .render_runtime
-            .retained_leases
+            .dataset
+            .retained_leases()
             .resident_subset(
                 self.dataset.scope_requirements(SCOPE_CURRENT_3D),
                 snapshot.catalog().scientific_identity().resource_identity(),
@@ -410,33 +376,44 @@ impl MiranteWorkbenchApp {
                 self.dataset.current_scale(),
             )
             .status();
-        self.render_runtime.frame_fidelity.resident_bricks = status.retained;
-        self.render_runtime.frame_fidelity.missing_occupied_bricks = status.missing;
-        self.render_runtime.frame_fidelity.cpu_cache_bytes = self
+        self.render_coordination.frame_fidelity.resident_bricks = status.retained;
+        self.render_coordination
+            .frame_fidelity
+            .missing_occupied_bricks = status.missing;
+        self.render_coordination.frame_fidelity.cpu_cache_bytes = self
             .dataset
             .dispatcher()
             .diagnostics()
             .map(|diagnostics| diagnostics.category_used_bytes(CpuLedgerCategory::DecodedResidency))
             .unwrap_or(0);
         let empty = self.dataset.scope_is_empty(SCOPE_CURRENT_3D);
-        self.render_runtime.frame_fidelity.completeness = if empty || ready {
+        let ready_backend = ready.then(|| {
+            let snapshot = self.application.snapshot();
+            let view = application_view(&snapshot);
+            let mode = view
+                .layer(view.active_layer())
+                .expect("the current view contains its active layer")
+                .render_state()
+                .mode();
+            render_backend_for_mode(mode)
+        });
+        self.render_coordination.frame_fidelity.completeness = if empty || ready {
             FrameCompleteness::Complete
         } else {
             FrameCompleteness::Loading
         };
-        self.render_runtime.frame_fidelity.backend = if empty {
+        self.render_coordination.frame_fidelity.backend = if empty {
             RenderBackend::Empty
-        } else if ready {
-            self.render_runtime.render_backend
+        } else if let Some(backend) = ready_backend {
+            backend
         } else {
             RenderBackend::Loading
         };
-        self.render_runtime.lod_schedule.displayed_scale_level =
-            (empty || ready).then_some(self.dataset.current_scale().get());
-        self.render_runtime.frame_fidelity.displayed_scale_level =
-            self.render_runtime.lod_schedule.displayed_scale_level;
+        self.render_coordination
+            .frame_fidelity
+            .displayed_scale_level = (empty || ready).then_some(self.dataset.current_scale().get());
         if empty {
-            self.render_runtime.frame_fidelity.reason = LodDecisionReason::NoVisibleData;
+            self.render_coordination.frame_fidelity.reason = LodDecisionReason::NoVisibleData;
         }
     }
 
@@ -447,10 +424,9 @@ impl MiranteWorkbenchApp {
         tracing::warn!(%error, "cross-section demand planning failed");
         for panel_id in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
             let generation = self
-                .render_runtime
-                .cross_section_runtime
-                .panel(panel_id)
-                .map_or(0, |panel| panel.generation);
+                .render_coordination
+                .surface(panel_id.presentation_slot())
+                .generation();
             let mut schedule = CrossSectionPanelScheduleState::missing_viewport(generation);
             schedule.status = if capacity {
                 CrossSectionPanelScheduleStatus::BudgetLimited
@@ -462,9 +438,8 @@ impl MiranteWorkbenchApp {
             } else {
                 CrossSectionPanelScheduleReason::PlanningFailed
             };
-            self.render_runtime
-                .cross_section_runtime
-                .set_panel_schedule(panel_id, schedule);
+            self.render_coordination
+                .set_cross_section_schedule(panel_id.presentation_slot(), schedule);
         }
     }
 
@@ -472,12 +447,11 @@ impl MiranteWorkbenchApp {
         if runtime_fault_invalidates_verified_source(fault.code()) {
             let snapshot = self.application.snapshot();
             if snapshot.catalog().scientific_identity().is_verified()
-                && let Err(application_fault) = crate::current_egui_shell_bridge::dispatch(
-                    &mut self.application,
-                    ApplicationCommand::InvalidateSourceVerification {
-                        source_generation: snapshot.source_generation(),
-                    },
-                )
+                && let Err(application_fault) =
+                    self.application
+                        .dispatch(ApplicationCommand::InvalidateSourceVerification {
+                            source_generation: snapshot.source_generation(),
+                        })
             {
                 tracing::warn!(
                     ?application_fault,
@@ -487,9 +461,8 @@ impl MiranteWorkbenchApp {
         }
         let message = fault.to_string();
         self.dataset.record_plan_error(message.clone());
-        self.render_runtime.visible_brick_plan_error = Some(message.clone());
-        self.render_runtime.frame_fidelity.last_capacity_error = Some(message);
-        self.render_runtime.frame_fidelity.completeness = FrameCompleteness::Incomplete;
+        self.render_coordination.frame_fidelity.last_capacity_error = Some(message);
+        self.render_coordination.frame_fidelity.completeness = FrameCompleteness::Incomplete;
     }
 
     fn record_dataset_plan_error(&mut self, error: &anyhow::Error) {
@@ -498,19 +471,18 @@ impl MiranteWorkbenchApp {
             .downcast_ref::<DatasetDemandPlanCapacityError>()
             .is_some();
         self.dataset.record_plan_error(message.clone());
-        self.render_runtime.visible_brick_plan_error = Some(message.clone());
-        self.render_runtime.frame_fidelity.last_failure_kind = Some(if capacity {
+        self.render_coordination.frame_fidelity.last_failure_kind = Some(if capacity {
             FrameFailureKind::BudgetExceeded
         } else {
             FrameFailureKind::InvalidModeParameter
         });
-        self.render_runtime.frame_fidelity.last_capacity_error = Some(message);
-        self.render_runtime.frame_fidelity.completeness = if capacity {
+        self.render_coordination.frame_fidelity.last_capacity_error = Some(message);
+        self.render_coordination.frame_fidelity.completeness = if capacity {
             FrameCompleteness::BudgetLimited
         } else {
             FrameCompleteness::Incomplete
         };
-        self.render_runtime.frame_fidelity.reason = if capacity {
+        self.render_coordination.frame_fidelity.reason = if capacity {
             LodDecisionReason::CpuBudgetLimited
         } else {
             LodDecisionReason::BackendLimit

@@ -246,12 +246,20 @@ Required work:
 
 Exit proof and deletion gate:
 
-- UI cannot directly read storage, mutate residency, join workers, submit
-  unbounded GPU work, or execute project/import/analysis transactions.
-- The spread `MiranteWorkbenchApp` orchestration and remaining god-state runtime
-  fields plus the application-to-current-egui-shell bridge are deleted.
-- Real product validation covers responsive open/save/switch/import/analysis
-  and continuous interaction.
+- Focused contract tests prove that UI output is limited to typed commands and
+  paint requests, while backend storage/runtime/WGPU resources remain outside
+  the UI crate.
+- Focused integration tests cover import cancellation/progress, presentation
+  token resolution, and orderly shutdown through the application boundary.
+- The spread `MiranteWorkbenchApp` orchestration, temporary UI/import/render
+  owners, and application-to-current-egui-shell bridge are deleted.
+- One bounded native small-fixture scenario covers open/save/switch,
+  import/analysis, and useful interaction during background work at 1280x720,
+  with a short 1920x1080 presentation check.
+- WP-10B durability, WP-11 import, WP-12 science, WP-08B runtime, and WP-09A/B
+  GPU evidence is inherited. This package does not repeat their exhaustive
+  matrices, add performance claims, introduce 4K or huge-data simulations, or
+  create new evidence machinery.
 
 ### WP-10A — Dataset Schema, Storage, Index, And Identity
 

@@ -1,45 +1,13 @@
-use mirante4d_render_api::{PresentationViewport, RenderExtent};
+use mirante4d_render_api::RenderExtent;
 use mirante4d_render_wgpu::WgpuRenderRuntimeError;
 
-use crate::{FrameFailureKind, current_runtime::render::CurrentRenderRuntime};
+use crate::{FrameFailureKind, RenderCoordinationState, ResidentRenderFailureStatus};
 
 pub(crate) fn set_render_viewport(
-    render: &mut CurrentRenderRuntime,
+    render: &mut RenderCoordinationState,
     viewport: RenderExtent,
 ) -> bool {
-    if render.render_viewport == viewport {
-        return false;
-    }
-    render.render_viewport = viewport;
-    render.frame_fidelity.viewport = viewport;
-    true
-}
-
-pub(crate) fn set_presentation_viewport(
-    render: &mut CurrentRenderRuntime,
-    viewport: PresentationViewport,
-) -> bool {
-    if render.presentation_viewport == viewport {
-        return false;
-    }
-    render.presentation_viewport = viewport;
-    render.frame_fidelity.presentation_viewport = viewport;
-    true
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ResidentRenderFailureStatus {
-    pub(crate) kind: FrameFailureKind,
-    pub(crate) message: String,
-}
-
-impl ResidentRenderFailureStatus {
-    pub(crate) fn new(kind: FrameFailureKind, message: impl Into<String>) -> Self {
-        Self {
-            kind,
-            message: message.into(),
-        }
-    }
+    render.set_render_viewport(viewport)
 }
 
 pub(crate) fn render_failure_status(error: &anyhow::Error) -> ResidentRenderFailureStatus {
@@ -90,12 +58,6 @@ pub(crate) fn frame_failure_kind_for_successor_error(
         | Error::UnsupportedIsoShading
         | Error::FrameProgressContract => FrameFailureKind::InvalidModeParameter,
     }
-}
-
-pub(crate) fn take_lod_replan_pending(render: &mut CurrentRenderRuntime) -> bool {
-    let pending = render.lod_replan_pending;
-    render.lod_replan_pending = false;
-    pending
 }
 
 #[cfg(test)]

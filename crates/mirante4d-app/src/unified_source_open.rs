@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use mirante4d_application::UnboundWorkspace;
+use mirante4d_application::{RenderCoordinationState, UnboundWorkspace};
 use mirante4d_dataset::{
     CpuByteLedger, CpuLedgerCategory, DatasetCatalog, DatasetSource, DatasetSourceId,
 };
@@ -25,14 +25,13 @@ use mirante4d_storage::{
 };
 
 use crate::{
-    CrossSectionRuntime, FrameCompleteness, FrameFidelityStatus, LodDecisionReason,
-    LodScheduleState, StartupDiagnostics, collect_startup_diagnostics,
-    current_runtime::{analysis::AnalysisProductRuntime, render::CurrentRenderRuntime},
+    FrameCompleteness, FrameFidelityStatus, LodDecisionReason, StartupDiagnostics,
+    collect_startup_diagnostics,
+    current_runtime::analysis::AnalysisProductRuntime,
     dataset_requests::DatasetDemandState,
+    default_camera_for_shape,
     transfer_presets::default_channel_presets,
-    viewport::{
-        default_camera_for_shape, default_presentation_viewport, default_render_viewport_for_shape,
-    },
+    viewport::{default_presentation_viewport, default_render_viewport_for_shape},
 };
 
 const REQUEST_QUEUE_LIMIT: usize = 1_024;
@@ -43,7 +42,7 @@ pub(crate) struct UnifiedOpenedSource {
     pub(crate) dataset: DatasetDemandState,
     pub(crate) catalog: Arc<DatasetCatalog>,
     pub(crate) workspace: UnboundWorkspace,
-    pub(crate) render_runtime: CurrentRenderRuntime,
+    pub(crate) render_coordination: RenderCoordinationState,
     pub(crate) analysis_runtime: AnalysisProductRuntime,
     pub(crate) startup_diagnostics: StartupDiagnostics,
 }
@@ -130,14 +129,15 @@ pub(crate) fn open(
         .ok_or_else(|| anyhow::anyhow!("unified runtime did not supply its CPU ledger"))?;
 
     let workspace = workspace_from_catalog(catalog.as_ref())?;
-    let (render_runtime, analysis_runtime) = initial_runtime_state(catalog.as_ref(), &workspace)?;
+    let (render_coordination, analysis_runtime) =
+        initial_runtime_state(catalog.as_ref(), &workspace)?;
     let resource_identity = catalog.scientific_identity().resource_identity();
     let dataset = DatasetDemandState::new(runtime, cpu_ledger, resource_identity, selected_path);
     Ok(UnifiedOpenedSource {
         dataset,
         catalog,
         workspace,
-        render_runtime,
+        render_coordination,
         analysis_runtime,
         startup_diagnostics: collect_startup_diagnostics(),
     })
@@ -289,7 +289,7 @@ fn runtime_config(
 fn initial_runtime_state(
     catalog: &DatasetCatalog,
     workspace: &UnboundWorkspace,
-) -> anyhow::Result<(CurrentRenderRuntime, AnalysisProductRuntime)> {
+) -> anyhow::Result<(RenderCoordinationState, AnalysisProductRuntime)> {
     let view = workspace.view();
     let active = catalog
         .layer(view.active_layer())
@@ -299,13 +299,7 @@ fn initial_runtime_state(
     let mut fidelity = FrameFidelityStatus::new_with_presentation(viewport, presentation);
     fidelity.completeness = FrameCompleteness::Loading;
     fidelity.reason = LodDecisionReason::ExactS0;
-    let render = CurrentRenderRuntime::opened(
-        presentation,
-        viewport,
-        fidelity,
-        LodScheduleState::new(None),
-        CrossSectionRuntime::default(),
-    );
+    let render = RenderCoordinationState::new(fidelity);
     let mut analysis = AnalysisProductRuntime::new();
     analysis.set_roi([0; 3], active.shape().spatial().dimensions())?;
     Ok((render, analysis))

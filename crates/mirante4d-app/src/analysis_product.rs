@@ -12,10 +12,7 @@ use mirante4d_dataset_runtime::{RequestPriority, RuntimeFault, RuntimeFaultCode}
 use mirante4d_domain::Shape3D;
 use mirante4d_project_model::ArtifactSchema;
 
-use crate::{
-    MiranteWorkbenchApp, application_view, current_egui_shell_bridge,
-    dataset_requests::SCOPE_ANALYSIS,
-};
+use crate::{MiranteWorkbenchApp, application_view, dataset_requests::SCOPE_ANALYSIS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProductAnalysisScope {
@@ -28,7 +25,7 @@ impl MiranteWorkbenchApp {
         if self.analysis_runtime.active_token().is_some() {
             return Some("An analysis is already running or being saved.".to_owned());
         }
-        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let snapshot = self.application.snapshot();
         if !matches!(snapshot.source(), SourceVerificationSnapshot::Verified(_)) {
             return Some("Verify the microscopy source before analyzing it.".to_owned());
         }
@@ -67,7 +64,7 @@ impl MiranteWorkbenchApp {
         if let Some(reason) = self.analysis_start_unavailable_reason() {
             bail!(reason);
         }
-        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let snapshot = self.application.snapshot();
         let view = application_view(&snapshot);
         let layer = snapshot
             .catalog()
@@ -143,11 +140,9 @@ impl MiranteWorkbenchApp {
             .active_token()
             .context("no analysis is active")?
             .clone();
-        current_egui_shell_bridge::dispatch(
-            &mut self.application,
-            ApplicationCommand::CancelOperation(token.operation_id()),
-        )
-        .map_err(|fault| anyhow!("analysis cancellation was rejected: {fault:?}"))?;
+        self.application
+            .dispatch(ApplicationCommand::CancelOperation(token.operation_id()))
+            .map_err(|fault| anyhow!("analysis cancellation was rejected: {fault:?}"))?;
         self.pump_application_services();
         Ok(())
     }
@@ -169,7 +164,7 @@ impl MiranteWorkbenchApp {
                         return;
                     }
                 };
-                let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+                let snapshot = self.application.snapshot();
                 if let WorkspaceSnapshot::Bound { project, .. } = snapshot.workspace() {
                     sources.retain(|source| {
                         !project
@@ -220,7 +215,7 @@ impl MiranteWorkbenchApp {
     pub(crate) fn request_current_analysis_artifacts(&mut self) {
         self.cancel_pending_analysis_artifact_load();
         self.analysis_runtime.clear_loaded();
-        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let snapshot = self.application.snapshot();
         let WorkspaceSnapshot::Bound { project, .. } = snapshot.workspace() else {
             return;
         };
@@ -328,16 +323,14 @@ impl MiranteWorkbenchApp {
                     .stage_pending_commit()
                     .and_then(|stage| {
                         ensure!(stage.token == token, "analysis staging token changed");
-                        current_egui_shell_bridge::dispatch(
-                            &mut self.application,
-                            ApplicationCommand::StageAnalysisBundle {
+                        self.application
+                            .dispatch(ApplicationCommand::StageAnalysisBundle {
                                 token: stage.token,
                                 artifacts: stage.references,
-                            },
-                        )
-                        .map_err(|fault| {
-                            anyhow!("analysis result staging was rejected: {fault:?}")
-                        })?;
+                            })
+                            .map_err(|fault| {
+                                anyhow!("analysis result staging was rejected: {fault:?}")
+                            })?;
                         Ok(())
                     });
                 if let Err(error) = result {
@@ -375,7 +368,7 @@ impl MiranteWorkbenchApp {
         let Some(token) = self.analysis_runtime.active_token().cloned() else {
             return Ok(());
         };
-        let snapshot = current_egui_shell_bridge::snapshot(&self.application);
+        let snapshot = self.application.snapshot();
         let token_registered = snapshot
             .active_operations()
             .iter()
@@ -398,10 +391,9 @@ impl MiranteWorkbenchApp {
             self.analysis_runtime.cancel(next)?;
         }
         if token_registered {
-            let _ = current_egui_shell_bridge::dispatch(
-                &mut self.application,
-                ApplicationCommand::CancelOperation(token.operation_id()),
-            );
+            let _ = self
+                .application
+                .dispatch(ApplicationCommand::CancelOperation(token.operation_id()));
         }
         Ok(())
     }

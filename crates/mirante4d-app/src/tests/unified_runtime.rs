@@ -4,8 +4,8 @@ fn unified_source_open_starts_with_no_owned_interactive_payloads() {
     let package = write_target_fixture(temp.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(&package).unwrap();
 
-    assert_eq!(opened.render_runtime.retained_leases.required_len(), 0);
-    assert_eq!(opened.render_runtime.retained_leases.retained_len(), 0);
+    assert_eq!(opened.dataset.retained_leases().required_len(), 0);
+    assert_eq!(opened.dataset.retained_leases().retained_len(), 0);
     assert!(!opened.dataset.dispatcher().has_pending_work());
     assert_eq!(opened.dataset.current_scale(), ScaleLevel::BASE);
     opened.dataset.request_shutdown().unwrap();
@@ -32,8 +32,8 @@ fn unified_demand_plan_uses_semantic_keys_for_every_visible_layer() {
     let plan = dataset_demand_plan::plan_current_3d(
         snapshot.catalog(),
         application_view(&snapshot),
-        opened.render_runtime.presentation_viewport,
-        opened.render_runtime.render_viewport,
+        opened.render_coordination.presentation_viewport,
+        opened.render_coordination.render_viewport,
         dataset_demand_plan::DatasetDemandPlanLimits::new(
             mirante4d_render_api::MAX_RENDER_REQUIREMENTS,
             mirante4d_render_api::MAX_RENDER_REQUIREMENTS,
@@ -70,18 +70,18 @@ fn app_dispatches_and_drains_visible_demand_through_one_runtime() {
 
     let context = egui::Context::default();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !app.dataset.scope_complete(
-        dataset_requests::SCOPE_CURRENT_3D,
-        &app.render_runtime.retained_leases,
-    ) {
+    while !app
+        .dataset
+        .scope_complete(dataset_requests::SCOPE_CURRENT_3D)
+    {
         assert!(std::time::Instant::now() < deadline);
         app.drain_brick_results(&context);
         std::thread::yield_now();
     }
 
     assert_eq!(
-        app.render_runtime.retained_leases.required_len(),
-        app.render_runtime.retained_leases.retained_len()
+        app.dataset.retained_leases().required_len(),
+        app.dataset.retained_leases().retained_len()
     );
     let diagnostics = app.dataset.dispatcher().diagnostics().unwrap();
     assert!(diagnostics.resident_resources() > 0);
@@ -89,38 +89,140 @@ fn app_dispatches_and_drains_visible_demand_through_one_runtime() {
     app.dataset.request_shutdown().unwrap();
 }
 
+fn reviewed_import_options(
+    source: TiffSource,
+    inspection: mirante4d_import_pipeline::TiffInspection,
+    destination: PathBuf,
+) -> (ImportReviewId, ImportOptions) {
+    let mut workflow = ImportWorkflow::new();
+    let review_id = workflow
+        .install_review(source, inspection, destination)
+        .unwrap();
+    let mut draft = workflow.pending_review.as_ref().unwrap().initial_draft;
+    draft.calibration_confirmed = true;
+    draft.time_step_seconds = Some(1.0);
+    let options = workflow.start_options(review_id, draft).unwrap().unwrap();
+    (review_id, options)
+}
+
+#[test]
+fn inspection_review_and_typed_start_form_one_import_workflow() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let source = write_source_time_series_fixture(temp.path()).unwrap();
+    let destination = temp.path().join("typed-import.m4d");
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let context = egui::Context::default();
+
+    app.enter_tiff_import_setup_waiting_state(TiffSource::auto(&source), destination)
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        app.drain_tiff_import_setup_results(&context);
+        if matches!(
+            app.application_snapshot_for_ui().import_workflow(),
+            ImportWorkflowSnapshot::Review(_)
+        ) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+
+    let ImportWorkflowSnapshot::Review(review) = app.import.snapshot() else {
+        panic!("inspection must produce an import review");
+    };
+    let mut draft = review.initial_draft;
+    app.apply_import_command(
+        ImportCommand::Start {
+            review_id: review.review_id,
+            draft,
+        },
+        &context,
+    );
+    assert!(matches!(app.import.snapshot(), ImportWorkflowSnapshot::Failed(_)));
+    assert!(app.import.pending_review.is_some());
+    app.apply_import_command(ImportCommand::DismissProblem, &context);
+
+    draft.calibration_confirmed = true;
+    draft.time_step_seconds = Some(1.0);
+    let stale_id = ImportReviewId::new(review.review_id.get() + 1);
+    app.apply_import_command(
+        ImportCommand::Start {
+            review_id: stale_id,
+            draft,
+        },
+        &context,
+    );
+    assert!(matches!(app.import.snapshot(), ImportWorkflowSnapshot::Review(_)));
+
+    app.apply_import_command(
+        ImportCommand::Start {
+            review_id: review.review_id,
+            draft,
+        },
+        &context,
+    );
+    assert!(matches!(
+        app.import.snapshot(),
+        ImportWorkflowSnapshot::Importing(_)
+    ));
+    assert!(app.import.pending_review.is_none());
+
+    let token = app
+        .application
+        .snapshot()
+        .active_operations()
+        .iter()
+        .find(|token| token.kind() == OperationKind::Import)
+        .unwrap()
+        .clone();
+    app.import.workers.shutdown();
+    assert!(app.complete_background_operation(token, OperationCompletion::Cancelled));
+    app.dataset.request_shutdown().unwrap();
+}
+
 #[test]
 fn import_cancellation_waits_for_the_worker_terminal_result() {
     let temp = tempfile::tempdir().unwrap();
     let package = write_target_fixture(temp.path()).unwrap();
+    let source = write_source_time_series_fixture(temp.path()).unwrap();
+    let inspection = mirante4d_import_pipeline::inspect_tiff(TiffSource::auto(&source)).unwrap();
+    let (review_id, options) = reviewed_import_options(
+        TiffSource::auto(&source),
+        inspection,
+        temp.path().join("cancelled-import.m4d"),
+    );
     let opened = open_dataset_and_render_first_frame(&package).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
+    assert!(app.start_import_task(review_id, options));
     let token = app
-        .begin_background_operation(OperationKind::Import)
-        .unwrap();
-    let cancellation = ImportCancellation::new();
-    let (_sender, receiver) = mpsc::channel();
-    app.import_runtime.import_task = Some(ImportTask {
-        token: token.clone(),
-        destination: temp.path().join("imported.m4d"),
-        cancellation: cancellation.clone(),
-        receiver,
-        latest_event: None,
-        retry_options: None,
-        worker: None,
-    });
+        .application
+        .snapshot()
+        .active_operations()
+        .iter()
+        .find(|token| token.kind() == OperationKind::Import)
+        .unwrap()
+        .clone();
 
-    app.cancel_import_task();
+    app.apply_import_command(ImportCommand::CancelImport, &egui::Context::default());
 
-    assert!(cancellation.is_cancelled());
+    assert!(matches!(
+        app.import.workers.status(),
+        ImportWorkerStatus::Importing {
+            cancellation_requested: true,
+            ..
+        }
+    ));
     assert!(
         app.application
             .snapshot()
             .active_operations()
             .contains(&token)
     );
-    app.import_runtime.import_task = None;
-    assert!(app.complete_background_operation(token, OperationCompletion::Succeeded));
+    app.import.workers.shutdown();
+    assert!(app.complete_background_operation(token, OperationCompletion::Cancelled));
     app.dataset.request_shutdown().unwrap();
 }
 
@@ -143,7 +245,7 @@ fn imported_dataset_uses_the_existing_dirty_project_open_handoff() {
     );
 
     assert_eq!(app.pending_dataset_open_path.as_ref(), Some(&imported));
-    assert!(app.ui_runtime.close_prompt_open);
+    assert!(app.egui_ui.close_prompt_open);
     assert!(
         app.application
             .snapshot()
@@ -206,12 +308,10 @@ fn import_verify_analyze_save_and_reopen_atomically() {
     let context = egui::Context::default();
 
     let inspection = mirante4d_import_pipeline::inspect_tiff(TiffSource::auto(&source)).unwrap();
-    let mut pending =
-        PendingTiffImport::from_inspection(TiffSource::auto(&source), inspection, package.clone());
-    pending.calibration_confirmed = true;
-    pending.time_step_seconds = Some(1.0);
+    let (_, options) =
+        reviewed_import_options(TiffSource::auto(&source), inspection, package.clone());
     mirante4d_import_pipeline::import_tiff(
-        build_import_options(&pending).unwrap(),
+        options,
         &TestImportLedger,
         &ImportCancellation::new(),
         |_| {},
@@ -595,7 +695,7 @@ fn terminal_decode_failure_is_stable_until_the_scope_changes() {
         submitted
     );
     assert!(
-        app.render_runtime
+        app.render_coordination
             .frame_fidelity
             .last_capacity_error
             .is_some()
@@ -640,7 +740,7 @@ fn observed_source_fault_invalidates_then_retry_restores_runtime_identity_cohere
         .scientific_identity()
         .resource_identity();
     assert_eq!(app.dataset.resource_identity(), verified_identity);
-    assert!(app.render_runtime.retained_leases.required_len() > 0);
+    assert!(app.dataset.retained_leases().required_len() > 0);
     let completion_deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let diagnostics = app.dataset.dispatcher().diagnostics().unwrap();
@@ -660,8 +760,8 @@ fn observed_source_fault_invalidates_then_retry_restores_runtime_identity_cohere
         app.application.snapshot().source(),
         SourceVerificationSnapshot::Required
     ));
-    assert_eq!(app.render_runtime.retained_leases.required_len(), 0);
-    assert_eq!(app.render_runtime.retained_leases.retained_len(), 0);
+    assert_eq!(app.dataset.retained_leases().required_len(), 0);
+    assert_eq!(app.dataset.retained_leases().retained_len(), 0);
     assert!(app.dataset.renderer_requirements().is_empty());
     for scope in [
         dataset_requests::SCOPE_CURRENT_3D,
@@ -720,8 +820,8 @@ fn observed_source_fault_invalidates_then_retry_restores_runtime_identity_cohere
             .pending_completions(),
         0
     );
-    assert_eq!(app.render_runtime.retained_leases.required_len(), 0);
-    assert_eq!(app.render_runtime.retained_leases.retained_len(), 0);
+    assert_eq!(app.dataset.retained_leases().required_len(), 0);
+    assert_eq!(app.dataset.retained_leases().retained_len(), 0);
 
     app.apply_application_command(ApplicationCommand::RequestSourceVerification, &context)
         .unwrap();
@@ -863,7 +963,7 @@ fn automatic_source_verification_waits_for_the_previous_worker_to_retire() {
         dataset,
         catalog,
         workspace,
-        render_runtime,
+        render_coordination,
         analysis_runtime,
         startup_diagnostics: _,
     } = replacement;
@@ -879,7 +979,7 @@ fn automatic_source_verification_waits_for_the_previous_worker_to_retire() {
         .unwrap();
     app.install_current_source_runtime(current_source_open_service::CurrentSourceRuntimeTransfer {
         dataset,
-        render_runtime,
+        render_coordination,
         analysis_runtime,
     });
 
@@ -960,10 +1060,10 @@ fn playback_prefetch_readiness_is_backed_by_retained_accounted_leases() {
     app.request_visible_bricks();
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !app.dataset.scope_complete(
-        dataset_requests::SCOPE_PLAYBACK,
-        &app.render_runtime.retained_leases,
-    ) {
+    while !app
+        .dataset
+        .scope_complete(dataset_requests::SCOPE_PLAYBACK)
+    {
         assert!(std::time::Instant::now() < deadline);
         app.drain_brick_results(&context);
         std::thread::yield_now();
@@ -975,7 +1075,7 @@ fn playback_prefetch_readiness_is_backed_by_retained_accounted_leases() {
     assert!(
         playback
             .iter()
-            .all(|key| app.render_runtime.retained_leases.payload(*key).is_some())
+            .all(|key| app.dataset.retained_leases().payload(*key).is_some())
     );
     app.dataset.request_shutdown().unwrap();
 }
@@ -999,9 +1099,8 @@ fn four_panel_playback_demand_shares_one_aggregate_resource_and_byte_budget() {
     let presentation = PresentationViewport::new(64.0, 64.0).unwrap();
     let render = mirante4d_render_api::RenderExtent::new(64, 64).unwrap();
     for panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
-        app.render_runtime
-            .cross_section_runtime
-            .record_panel_viewports(panel, presentation, render);
+        app.render_coordination
+            .record_viewports(panel.presentation_slot(), presentation, render);
     }
     app.apply_application_command(ApplicationCommand::SetPlaybackActive(true), &context)
         .unwrap();

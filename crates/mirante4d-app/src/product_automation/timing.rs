@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use mirante4d_domain::RenderMode;
 use serde_json::{Map, Value, json};
 
-use crate::display_refresh::DisplayRefreshTiming;
+use crate::DisplayRefreshTiming;
 use crate::viewer_layout::PanelId;
 use crate::{DisplayedFrameFreshness, MiranteWorkbenchApp};
 
@@ -97,7 +97,9 @@ impl ProductAutomationInputToPresentSample {
             "event_epoch_ms": self.event_epoch_ms,
             "latency_ms": self.latency_ms,
             "presentation_proxy": "app_display_refresh_complete",
-            "display_refresh_path": self.display_refresh_timing.path.label(),
+            "display_refresh_path": crate::display_refresh::display_refresh_path_label(
+                self.display_refresh_timing.path,
+            ),
             "display_refresh_timing": display_refresh_timing_json(self.display_refresh_timing),
         })
     }
@@ -179,7 +181,7 @@ fn latest_new_display_refresh_timing(
     app: &MiranteWorkbenchApp,
     previous_display_refresh_timing: Option<DisplayRefreshTiming>,
 ) -> Option<DisplayRefreshTiming> {
-    let timing = app.render_runtime.last_display_refresh_timing?;
+    let timing = app.render_coordination.last_display_refresh_timing?;
     (Some(timing) != previous_display_refresh_timing).then_some(timing)
 }
 
@@ -377,7 +379,7 @@ pub(crate) fn display_refresh_timing_json(timing: DisplayRefreshTiming) -> Value
         "phase_measurement_scopes": display_refresh_phase_measurement_scopes_json(),
         "gpu_upload_timing_status": if timing.gpu_upload_ms.is_some() { "measured" } else { "not_reported_for_sample" },
         "gpu_compute_timing_status": if timing.gpu_compute_ms.is_some() { "measured" } else { "not_reported_for_sample" },
-        "path": timing.path.label(),
+        "path": crate::display_refresh::display_refresh_path_label(timing.path),
         "dominant_non_total_phase": dominant_display_refresh_phase(timing),
         "phases_ms": {
             "render": timing.render_ms,
@@ -416,8 +418,8 @@ pub(crate) fn display_refresh_timing_summary_json(
         visible_brick_request.push(timing.visible_brick_request_ms);
         total_refresh.push(timing.total_ms);
         match timing.path {
-            crate::display_refresh::DisplayRefreshPath::GpuResidentDisplay => gpu_path_samples += 1,
-            crate::display_refresh::DisplayRefreshPath::UiBackground => ui_background_samples += 1,
+            crate::DisplayRefreshPath::GpuResidentDisplay => gpu_path_samples += 1,
+            crate::DisplayRefreshPath::UiBackground => ui_background_samples += 1,
         }
         let dominant = dominant_display_refresh_phase(timing);
         let current = dominant_counts
@@ -496,8 +498,8 @@ pub(crate) fn input_to_present_timing_summary_json(
     for sample in samples {
         latency.push(sample.latency_ms);
         match sample.display_refresh_timing.path {
-            crate::display_refresh::DisplayRefreshPath::GpuResidentDisplay => gpu_path_samples += 1,
-            crate::display_refresh::DisplayRefreshPath::UiBackground => ui_background_samples += 1,
+            crate::DisplayRefreshPath::GpuResidentDisplay => gpu_path_samples += 1,
+            crate::DisplayRefreshPath::UiBackground => ui_background_samples += 1,
         }
         let current = command_counts
             .get(sample.command)

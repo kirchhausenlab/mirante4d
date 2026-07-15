@@ -6,12 +6,34 @@
 
 #![forbid(unsafe_code)]
 
+mod analysis_workspace;
+mod histogram;
+pub mod import_workflow;
 mod project_store_service;
+pub mod render_coordination;
+pub mod viewer_tools;
+pub mod viewport_interaction;
 
+pub use analysis_workspace::{
+    AnalysisPlotSnapshot, AnalysisTableSnapshot, AnalysisWorkspaceSnapshot,
+};
+pub use histogram::{
+    DEFAULT_DVR_OPACITY_GAMMA, HistogramAutoError, HistogramStatus, LayerHistogramSummary,
+    auto_dense_window_from_histogram, auto_dvr_opacity_transfer_from_histogram,
+    auto_signal_window_from_histogram, histogram_can_auto_window,
+};
+pub use mirante4d_analysis_core::{AnalysisPlot, AnalysisTable, IntensityStatistics};
 pub use project_store_service::{
     MonotonicClock, ProjectRecoveryStoreLocator, ProjectStoreApplicationService,
     ProjectStoreLifecycle, ProjectStoreServiceError, ProjectStoreServiceEvent,
     ProjectStoreServiceStatus, SystemMonotonicClock,
+};
+pub use render_coordination::{
+    CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
+    CrossSectionPanelScheduleStatus, DisplayRefreshPath, DisplayRefreshTiming,
+    DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind, FrameFidelityStatus,
+    LodDecisionReason, RenderBackend, RenderCoordinationState, RenderSurfaceState,
+    ResidentRenderFailureStatus,
 };
 
 use std::{
@@ -20,18 +42,28 @@ use std::{
 };
 
 use mirante4d_dataset::{DatasetCatalog, DatasetSourceId, ScientificIdentityStatus};
-use mirante4d_domain::{
-    CameraView, CrossSectionView, IsoLightState, LogicalLayerKey, TimeIndex, ToolKind, ViewerLayout,
+use mirante4d_domain::LogicalLayerKey;
+pub use mirante4d_domain::{
+    CameraView, CrossSectionView, DisplayWindow, DvrOpacityTransfer, IsoLightState,
+    IsoShadingPolicy, LayerTransfer, Opacity, Projection, RenderMode, RenderState, RgbColor,
+    SamplingPolicy, TRANSFER_GAMMA_MAX, TRANSFER_GAMMA_MIN, TimeIndex, ToolKind, TransferCurve,
+    ViewerLayout,
 };
 use mirante4d_identity::ScientificContentId;
 use mirante4d_project_model::{
     ArtifactCompleteness, ArtifactHandleId, ArtifactRecoverability, ArtifactReference,
-    ArtifactSchema, ChannelPreset, ChannelPresetId, DatasetReference, LayerViewState,
-    MAX_CHANNEL_PRESETS, MAX_TOTAL_CHANNEL_PRESET_ENTRIES, ProjectGenerationProjection, ProjectId,
-    ProjectRevisionHighWater, ProjectRevisionId, ProjectState, ViewState,
+    ArtifactSchema, DatasetReference, MAX_CHANNEL_PRESETS, MAX_TOTAL_CHANNEL_PRESET_ENTRIES,
+    ProjectGenerationProjection, ProjectModelError, ProjectRevisionHighWater, ProjectRevisionId,
+    ProjectState,
 };
+pub use mirante4d_project_model::{
+    ChannelPreset, ChannelPresetEntry, ChannelPresetId, LayerViewState, ProjectId, ViewState,
+};
+pub use mirante4d_project_store::ProjectGenerationId;
 use mirante4d_render_api::PresentedFrame;
-use mirante4d_settings::{RejectedFileDisposition, ResourcePolicy};
+pub use mirante4d_render_api::{PresentationPaintRequest, PresentationViewport, RenderExtent};
+use mirante4d_settings::RejectedFileDisposition;
+pub use mirante4d_settings::ResourcePolicy;
 
 /// Maximum number of project revisions retained for undo/redo.
 pub const MAX_HISTORY_ENTRIES: usize = 128;
@@ -47,6 +79,55 @@ pub const MAX_ANALYSIS_PLOTS: usize = 1_024;
 pub const MAX_ANALYSIS_PLOT_SERIES: usize = 1_024;
 /// Maximum number of points described by one transient analysis plot.
 pub const MAX_ANALYSIS_PLOT_POINTS: u64 = 16_777_216;
+
+pub fn channel_preset_from_view(
+    view: &ViewState,
+    preset_id: ChannelPresetId,
+    label: impl AsRef<str>,
+) -> Result<ChannelPreset, ProjectModelError> {
+    ChannelPreset::new(
+        preset_id,
+        label,
+        view.layers()
+            .iter()
+            .map(|layer| {
+                ChannelPresetEntry::new(
+                    layer.layer_key(),
+                    layer.visible(),
+                    layer.transfer().clone(),
+                    *layer.render_state(),
+                )
+            })
+            .collect(),
+    )
+}
+
+pub fn next_user_channel_preset_id(presets: &[ChannelPreset]) -> ChannelPresetId {
+    let mut index = 1usize;
+    loop {
+        let candidate = format!("user_display_{index}");
+        if presets
+            .iter()
+            .all(|preset| preset.id().as_str() != candidate.as_str())
+        {
+            return ChannelPresetId::new(candidate)
+                .expect("generated user channel preset ID is valid");
+        }
+        index = index
+            .checked_add(1)
+            .expect("user channel preset counter exhausted");
+    }
+}
+
+pub fn stepped_timepoint(current: TimeIndex, count: u64, delta: i64) -> TimeIndex {
+    if count == 0 {
+        return TimeIndex::new(0);
+    }
+    let count_i128 = i128::from(count);
+    let current_i128 = i128::from(current.get().min(count - 1));
+    let wrapped = (current_i128 + i128::from(delta)).rem_euclid(count_i128);
+    TimeIndex::new(wrapped as u64)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SourceSessionGeneration(u64);
@@ -1324,7 +1405,8 @@ impl ApplicationState {
             pending_settings_change: self.pending_settings_change,
             pending_event_count: self.events.len(),
             latest_problem: self.latest_problem.clone(),
-            presentation: None,
+            presentations: PresentationSnapshot::default(),
+            import_workflow: import_workflow::ImportWorkflowSnapshot::default(),
         }
     }
 
@@ -2303,6 +2385,14 @@ impl ApplicationState {
         &mut self,
         kind: OperationKind,
     ) -> Result<OperationToken, ApplicationFaultCode> {
+        if kind == OperationKind::Import
+            && self
+                .operations
+                .values()
+                .any(|operation| operation.token.kind() == OperationKind::DatasetOpen)
+        {
+            return Err(ApplicationFaultCode::OperationConflict);
+        }
         let token = self.create_operation(kind)?;
         self.push_event(ApplicationEvent::OperationStarted {
             token: token.clone(),
@@ -3078,6 +3168,90 @@ pub enum WorkspaceSnapshot {
     },
 }
 
+/// One of the viewer's fixed presentation surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PresentationSlot {
+    ThreeD,
+    Xy,
+    Xz,
+    Yz,
+}
+
+impl PresentationSlot {
+    pub const ALL: [Self; 4] = [Self::ThreeD, Self::Xy, Self::Xz, Self::Yz];
+
+    pub const fn is_cross_section(self) -> bool {
+        !matches!(self, Self::ThreeD)
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::ThreeD => 0,
+            Self::Xy => 1,
+            Self::Xz => 2,
+            Self::Yz => 3,
+        }
+    }
+}
+
+/// Backend-neutral facts needed to paint one viewer surface.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PresentationSurface {
+    viewport: PresentationViewport,
+    frame: Option<PresentedFrame>,
+}
+
+impl PresentationSurface {
+    pub const fn new(viewport: PresentationViewport, frame: Option<PresentedFrame>) -> Self {
+        Self { viewport, frame }
+    }
+
+    pub const fn viewport(&self) -> PresentationViewport {
+        self.viewport
+    }
+
+    pub const fn frame(&self) -> Option<&PresentedFrame> {
+        self.frame.as_ref()
+    }
+
+    pub fn paint_request(&self) -> Option<PresentationPaintRequest> {
+        self.frame
+            .as_ref()
+            .map(|frame| PresentationPaintRequest::new(frame.token(), self.viewport))
+    }
+}
+
+/// The fixed 3D and linked cross-section presentation projection.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PresentationSnapshot {
+    surfaces: [Option<PresentationSurface>; 4],
+}
+
+impl PresentationSnapshot {
+    /// Constructs the four fixed slots directly, so a slot cannot appear
+    /// twice in one snapshot.
+    pub const fn new(
+        three_d: Option<PresentationSurface>,
+        xy: Option<PresentationSurface>,
+        xz: Option<PresentationSurface>,
+        yz: Option<PresentationSurface>,
+    ) -> Self {
+        Self {
+            surfaces: [three_d, xy, xz, yz],
+        }
+    }
+
+    pub fn get(&self, slot: PresentationSlot) -> Option<&PresentationSurface> {
+        self.surfaces[slot.index()].as_ref()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (PresentationSlot, &PresentationSurface)> {
+        PresentationSlot::ALL
+            .into_iter()
+            .filter_map(|slot| self.get(slot).map(|surface| (slot, surface)))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApplicationSnapshot {
     source_generation: SourceSessionGeneration,
@@ -3091,7 +3265,8 @@ pub struct ApplicationSnapshot {
     pending_settings_change: Option<SettingsChangeToken>,
     pending_event_count: usize,
     latest_problem: Option<ApplicationEvent>,
-    presentation: Option<PresentedFrame>,
+    presentations: PresentationSnapshot,
+    import_workflow: import_workflow::ImportWorkflowSnapshot,
 }
 
 impl ApplicationSnapshot {
@@ -3109,6 +3284,28 @@ impl ApplicationSnapshot {
 
     pub fn workspace(&self) -> &WorkspaceSnapshot {
         &self.workspace
+    }
+
+    pub fn view(&self) -> &ViewState {
+        match &self.workspace {
+            WorkspaceSnapshot::Unbound { workspace } => workspace.view(),
+            WorkspaceSnapshot::Bound { project, .. } => project.view(),
+        }
+    }
+
+    pub fn channel_presets(&self) -> &[ChannelPreset] {
+        match &self.workspace {
+            WorkspaceSnapshot::Unbound { workspace } => workspace.channel_presets(),
+            WorkspaceSnapshot::Bound { project, .. } => project.channel_presets(),
+        }
+    }
+
+    pub fn timepoint_count(&self) -> u64 {
+        self.catalog
+            .layers()
+            .map(|layer| layer.shape().t())
+            .min()
+            .expect("DatasetCatalog is non-empty by construction")
     }
 
     pub fn transient(&self) -> &TransientApplicationState {
@@ -3146,17 +3343,30 @@ impl ApplicationSnapshot {
         self.latest_problem.as_ref()
     }
 
-    /// Returns the renderer-owned frame projection carried only by its opaque
-    /// presentation token and backend-neutral frame facts.
-    pub const fn presentation(&self) -> Option<&PresentedFrame> {
-        self.presentation.as_ref()
+    /// Returns the backend-neutral projection of the viewer's fixed surfaces.
+    pub const fn presentations(&self) -> &PresentationSnapshot {
+        &self.presentations
+    }
+
+    /// Returns native import facts projected for framework UI code.
+    pub const fn import_workflow(&self) -> &import_workflow::ImportWorkflowSnapshot {
+        &self.import_workflow
     }
 
     /// Composition attaches the current presentation projection after taking
     /// an immutable application snapshot. This does not mutate application or
     /// durable project state.
-    pub fn with_presentation(mut self, presentation: Option<PresentedFrame>) -> Self {
-        self.presentation = presentation;
+    pub fn with_presentations(mut self, presentations: PresentationSnapshot) -> Self {
+        self.presentations = presentations;
+        self
+    }
+
+    /// Composition attaches native import facts without mutating canonical state.
+    pub fn with_import_workflow(
+        mut self,
+        workflow: import_workflow::ImportWorkflowSnapshot,
+    ) -> Self {
+        self.import_workflow = workflow;
         self
     }
 

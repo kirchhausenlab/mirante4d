@@ -13,7 +13,7 @@ pub(crate) fn product_target_capture(
     panel: PanelId,
 ) -> Option<&mirante4d_render_wgpu::ValidationCapture> {
     let target = app
-        .render_runtime
+        .native_presentation
         .product_gpu
         .as_ref()?
         .targets
@@ -136,7 +136,7 @@ pub(crate) fn capture_color_image(
         ));
     }
     if app
-        .render_runtime
+        .native_presentation
         .product_gpu
         .as_ref()
         .and_then(|product| product.targets.get(&PanelId::ThreeD))
@@ -163,7 +163,7 @@ pub(crate) fn current_display_image_stats(
         ));
     }
     if app
-        .render_runtime
+        .native_presentation
         .product_gpu
         .as_ref()
         .and_then(|product| product.targets.get(&PanelId::ThreeD))

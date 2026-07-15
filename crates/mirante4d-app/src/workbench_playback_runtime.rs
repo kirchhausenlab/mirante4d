@@ -1,31 +1,31 @@
 use eframe::egui;
-use mirante4d_application::{ApplicationCommand, ApplicationSnapshot, OperationKind};
+use mirante4d_application::{
+    ApplicationCommand, ApplicationSnapshot, CrossSectionPanelScheduleStatus, OperationKind,
+};
 use mirante4d_domain::ViewerLayout;
-use mirante4d_project_model::ViewState;
 
 use crate::{
-    BACKGROUND_WORK_REPAINT_INTERVAL,
-    current_runtime::{
-        analysis::AnalysisProductRuntime, import::ImportRuntime, render::CurrentRenderRuntime,
-    },
+    BACKGROUND_WORK_REPAINT_INTERVAL, RenderCoordinationState,
+    current_runtime::analysis::AnalysisProductRuntime,
     dataset_requests::{DatasetDemandState, SCOPE_CURRENT_3D},
+    import_worker_service::ImportWorkerService,
+    native_presentation::NativePresentationBridge,
     playback::{PLAYBACK_FRAME_INTERVAL, playback_tick_for_ui_time},
-    viewer_layout::CrossSectionPanelScheduleStatus,
 };
 
 pub(crate) fn background_work_active(
     snapshot: &ApplicationSnapshot,
-    import: &ImportRuntime,
+    import: &ImportWorkerService,
     _analysis: &AnalysisProductRuntime,
     dataset: &DatasetDemandState,
-    render: &CurrentRenderRuntime,
+    render: &RenderCoordinationState,
+    presentation: &NativePresentationBridge,
 ) -> bool {
     application_service_work_active(snapshot)
-        || import.tiff_import_setup_task.is_some()
-        || import.import_task.is_some()
+        || import.status().is_active()
         || snapshot.transient().playback_active()
         || dataset.dispatcher().has_pending_work()
-        || render.product_gpu.as_ref().is_some_and(|product| {
+        || presentation.product_gpu.as_ref().is_some_and(|product| {
             product.targets.values().any(|target| {
                 (target.request.is_some() && target.presented.is_none())
                     || target.presented.as_ref().is_some_and(|frame| {
@@ -35,8 +35,8 @@ pub(crate) fn background_work_active(
             })
         })
         || (crate::application_view(snapshot).layout() == ViewerLayout::FourPanel
-            && render.cross_section_runtime.panels().any(|panel| {
-                panel.cross_section_schedule.is_some_and(|schedule| {
+            && render.iter().any(|(_, panel)| {
+                panel.cross_section_schedule().is_some_and(|schedule| {
                     matches!(
                         schedule.status,
                         CrossSectionPanelScheduleStatus::Loading
@@ -82,9 +82,7 @@ pub(crate) const fn source_verification_polling_required(
 
 pub(crate) fn enqueue_playback_command_if_due(
     snapshot: &ApplicationSnapshot,
-    _view: &ViewState,
     dataset: &DatasetDemandState,
-    render: &mut CurrentRenderRuntime,
     commands: &mut Vec<ApplicationCommand>,
     ctx: &egui::Context,
 ) {
@@ -94,13 +92,12 @@ pub(crate) fn enqueue_playback_command_if_due(
 
     let timepoint_count = catalog_timepoint_count(snapshot);
     if timepoint_count <= 1 {
-        render.playback_lod_downshift_active = false;
         commands.push(ApplicationCommand::SetPlaybackActive(false));
         return;
     }
 
     if snapshot.transient().last_playback_tick().is_some()
-        && !dataset.scope_complete(SCOPE_CURRENT_3D, &render.retained_leases)
+        && !dataset.scope_complete(SCOPE_CURRENT_3D)
     {
         ctx.request_repaint_after(BACKGROUND_WORK_REPAINT_INTERVAL);
         return;
@@ -118,12 +115,7 @@ pub(crate) fn enqueue_playback_command_if_due(
 }
 
 pub(crate) fn catalog_timepoint_count(snapshot: &ApplicationSnapshot) -> u64 {
-    snapshot
-        .catalog()
-        .layers()
-        .map(|layer| layer.shape().t())
-        .min()
-        .expect("DatasetCatalog is non-empty by construction")
+    snapshot.timepoint_count()
 }
 
 #[cfg(test)]

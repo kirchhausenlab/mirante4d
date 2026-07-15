@@ -16,7 +16,7 @@ use std::{
 
 use mirante4d_application::{
     OperationCompletion, OperationFailureCode, OperationKind, OperationToken,
-    SourceSessionGeneration, UnboundWorkspace,
+    RenderCoordinationState, SourceSessionGeneration, UnboundWorkspace,
 };
 use mirante4d_dataset::{DatasetCatalog, DatasetSourceId};
 use mirante4d_dataset_runtime::{RuntimeFault, RuntimeFaultCode};
@@ -27,7 +27,7 @@ use mirante4d_storage::{
 };
 
 use crate::{
-    current_runtime::{analysis::AnalysisProductRuntime, render::CurrentRenderRuntime},
+    current_runtime::analysis::AnalysisProductRuntime,
     dataset_requests::DatasetDemandState,
     unified_source_open::{self, UnifiedOpenedSource},
 };
@@ -62,7 +62,7 @@ pub(crate) enum CurrentSourceOpenOutcome {
 /// No input path or broad application state is retained here.
 pub(crate) struct PreparedCurrentSourceOpen {
     pub(crate) dataset: DatasetDemandState,
-    pub(crate) render_runtime: CurrentRenderRuntime,
+    pub(crate) render_coordination: RenderCoordinationState,
     pub(crate) analysis_runtime: AnalysisProductRuntime,
     pub(crate) catalog: Arc<DatasetCatalog>,
     pub(crate) workspace: UnboundWorkspace,
@@ -73,7 +73,7 @@ pub(crate) struct PreparedCurrentSourceOpen {
 /// the matching `DatasetOpened` completion.
 pub(crate) struct CurrentSourceRuntimeTransfer {
     pub(crate) dataset: DatasetDemandState,
-    pub(crate) render_runtime: CurrentRenderRuntime,
+    pub(crate) render_coordination: RenderCoordinationState,
     pub(crate) analysis_runtime: AnalysisProductRuntime,
 }
 
@@ -241,7 +241,7 @@ impl PreparedCurrentSourceOpen {
     ) -> (CurrentSourceRuntimeTransfer, OperationCompletion) {
         let runtime = CurrentSourceRuntimeTransfer {
             dataset: self.dataset,
-            render_runtime: self.render_runtime,
+            render_coordination: self.render_coordination,
             analysis_runtime: self.analysis_runtime,
         };
         let completion = OperationCompletion::DatasetOpened {
@@ -304,13 +304,13 @@ fn run_open(
         catalog,
         workspace,
         dataset,
-        render_runtime,
+        render_coordination,
         analysis_runtime,
     } = opened;
 
     CurrentSourceOpenOutcome::Prepared(Box::new(PreparedCurrentSourceOpen {
         dataset,
-        render_runtime,
+        render_coordination,
         analysis_runtime,
         catalog,
         workspace,

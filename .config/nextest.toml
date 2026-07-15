@@ -35,7 +35,7 @@ test-group = 'contract'
 slow-timeout = { period = "5s", terminate-after = 4 }
 
 [[profile.default.overrides]]
-filter = 'package(mirante4d-app)'
+filter = 'package(mirante4d-app) | package(mirante4d-ui-egui)'
 test-group = 'ui'
 slow-timeout = { period = "2s", terminate-after = 5 }
 

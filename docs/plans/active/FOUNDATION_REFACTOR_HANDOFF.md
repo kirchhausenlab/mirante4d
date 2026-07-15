@@ -2,13 +2,13 @@
 
 Status: ACTIVE PUBLIC-EPOCH PROGRAM
 Last reviewed: 2026-07-14
-Current technical sequence: WP-09B, then the remaining packages below
+Current technical sequence: WP-09C, WP-14, then WP-15
 Public-data publication: deferred to a separate future handoff
-WP-09B predecessor: `foundation-wp-10c-exit-1`
-Completed through: WP-10C at
-`b9ac2a5f08101094933f80a0ce98fbdbdbe6c8d6`
-Current checkpoint: WP-09B product render hard cutover
-Next protected-branch checkpoint: accept the sole progressive product renderer
+WP-09C predecessor: `foundation-wp-09b-exit-1`
+Completed through: WP-09B at
+`b73dd86fed8cc3ac7b34f75f20dcd8bb8ac85672`
+Current checkpoint: WP-09C UI and composition-root candidate
+Next protected-branch checkpoint: accept the command/snapshot UI boundary
 
 ## Purpose
 
@@ -199,9 +199,12 @@ passed. WP-12 accepted the product analysis-runtime cutover at
 WP-10C accepted the target storage/import product cutover at
 `b9ac2a5f08101094933f80a0ce98fbdbdbe6c8d6`
 (`foundation-wp-10c-exit-1`). The predecessor data, format, and import crates
-are deleted. The WP-09B candidate now uses only `mirante4d-render-wgpu` in the
-product and deletes its predecessor; focused checks and the bounded real-display
-product scenario pass. Protected-main acceptance remains the current checkpoint.
+are deleted. WP-09B accepted the sole progressive product renderer at
+`b73dd86fed8cc3ac7b34f75f20dcd8bb8ac85672`
+(`foundation-wp-09b-exit-1`); its predecessor and fallback routes are deleted.
+The WP-09C candidate now routes the complete visible workbench through one
+snapshot-in, typed-output-out `mirante4d-ui-egui` entry while the native app
+retains only process/service composition and presentation resolution.
 
 ## Dataset And Fixture Boundary
 

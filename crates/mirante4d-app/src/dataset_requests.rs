@@ -1,7 +1,7 @@
-//! Sole composition-side dispatcher for the unified dataset runtime.
+//! Sole composition-side owner of unified dataset demand.
 //!
-//! It owns only bounded ticket correlation and cancellation generations. Pixel
-//! payloads move directly from runtime completions into the renderer bridge.
+//! It owns bounded ticket correlation, cancellation generations, and the
+//! runtime-issued lease handles retained for current interactive demand.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -9,7 +9,9 @@ use std::{
     sync::Arc,
 };
 
-use mirante4d_dataset::{CpuByteLedger, DatasetResourceIdentity, DatasetResourceKey};
+use mirante4d_dataset::{
+    CpuByteLedger, DatasetResourceIdentity, DatasetResourceKey, ResourceLease,
+};
 use mirante4d_dataset_runtime::{
     AccountedCpuLease, CancellationGeneration, DatasetRuntime, DatasetRuntimeDiagnostics,
     RequestPriority, RequestTicket, ResourceRequest, RuntimeFault, RuntimeFaultCode,
@@ -17,7 +19,10 @@ use mirante4d_dataset_runtime::{
 };
 use mirante4d_domain::ScaleLevel;
 
-use crate::{dataset_demand_plan::DatasetDemandPlan, retained_leases::RetainedLeases};
+use crate::{
+    dataset_demand_plan::DatasetDemandPlan,
+    retained_leases::{RetainedLeaseError, RetainedLeases},
+};
 
 pub(crate) const SCOPE_CURRENT_3D: u64 = 1;
 pub(crate) const SCOPE_CROSS_SECTION_XY: u64 = 2;
@@ -52,9 +57,10 @@ pub(crate) struct DatasetRequestDispatcher {
     last_fault: Option<RuntimeFault>,
 }
 
-/// Small, payload-free composition state for one opened source.
+/// Bounded demand and retained-resource state for one opened source.
 pub(crate) struct DatasetDemandState {
     dispatcher: DatasetRequestDispatcher,
+    retained_leases: RetainedLeases,
     cpu_ledger: Arc<dyn CpuByteLedger>,
     resource_identity: DatasetResourceIdentity,
     selected_path: PathBuf,
@@ -220,6 +226,7 @@ impl DatasetDemandState {
     ) -> Self {
         Self {
             dispatcher: DatasetRequestDispatcher::new(runtime),
+            retained_leases: RetainedLeases::new(),
             cpu_ledger,
             resource_identity,
             selected_path,
@@ -249,6 +256,19 @@ impl DatasetDemandState {
 
     pub(crate) fn dispatcher_mut(&mut self) -> &mut DatasetRequestDispatcher {
         &mut self.dispatcher
+    }
+
+    pub(crate) fn retained_leases(&self) -> &RetainedLeases {
+        &self.retained_leases
+    }
+
+    pub(crate) fn refresh_retained_requirements(&mut self) -> Result<usize, RetainedLeaseError> {
+        let requirements = self.renderer_requirements();
+        self.retained_leases.replace_requirements(requirements)
+    }
+
+    pub(crate) fn take_retained_leases(&mut self) -> RetainedLeases {
+        std::mem::take(&mut self.retained_leases)
     }
 
     pub(crate) const fn current_scale(&self) -> ScaleLevel {
@@ -348,7 +368,6 @@ impl DatasetDemandState {
         &mut self,
         scope: u64,
         priority: RequestPriority,
-        leases: &RetainedLeases,
     ) -> Result<usize, RuntimeFault> {
         if let Some(fault) = self.dispatcher.scope_failure(scope) {
             return Err(fault.clone());
@@ -360,7 +379,7 @@ impl DatasetDemandState {
             .unwrap_or_default();
         let mut submitted = 0;
         for resource in resources.iter().copied() {
-            let already_ready = leases.payload(resource).is_some();
+            let already_ready = self.retained_leases.payload(resource).is_some();
             match self
                 .dispatcher
                 .submit_if_missing(scope, resource, priority, already_ready)
@@ -375,6 +394,33 @@ impl DatasetDemandState {
             }
         }
         Ok(submitted)
+    }
+
+    pub(crate) fn drain_runtime_results(
+        &mut self,
+        maximum: usize,
+        mut accept_analysis: impl FnMut(RequestTicket, RuntimeOutcome),
+    ) -> Result<(usize, bool), RuntimeFault> {
+        let dispatcher = &mut self.dispatcher;
+        let retained_leases = &mut self.retained_leases;
+        let mut newly_installed = false;
+        let drained = dispatcher.drain(maximum, |ticket, outcome| {
+            if ticket.generation().scope() == SCOPE_ANALYSIS {
+                accept_analysis(ticket, outcome);
+            } else if let RuntimeOutcome::Ready(lease) = outcome
+                && retained_leases.requires(ticket.resource())
+            {
+                let lease: Arc<dyn ResourceLease> = Arc::new(lease);
+                match retained_leases.install(lease) {
+                    Ok(installed) => newly_installed |= installed,
+                    Err(error) => tracing::error!(
+                        %error,
+                        "runtime lease delivery violated retained-demand requirements"
+                    ),
+                }
+            }
+        })?;
+        Ok((drained, newly_installed))
     }
 
     pub(crate) fn begin_submission_pass(&mut self) {
@@ -406,12 +452,12 @@ impl DatasetDemandState {
         }
     }
 
-    pub(crate) fn scope_complete(&self, scope: u64, leases: &RetainedLeases) -> bool {
+    pub(crate) fn scope_complete(&self, scope: u64) -> bool {
         scope_requirements_complete(
             self.requirements_by_scope
                 .get(&scope)
                 .map(|resources| resources.as_ref()),
-            |resource| leases.payload(resource).is_some(),
+            |resource| self.retained_leases.payload(resource).is_some(),
         )
     }
 

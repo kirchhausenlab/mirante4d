@@ -14,7 +14,7 @@ fn frame_fidelity_label_names_currently_shown_lod() {
     fidelity.display_freshness = DisplayedFrameFreshness::Current;
     fidelity.frame_time_ms = Some(12.5);
 
-    let label = frame_fidelity_label(&fidelity);
+    let label = ui_kit::frame_fidelity_label(&fidelity);
 
     assert!(label.contains("shown s2 / target s0"));
     assert!(label.contains("budget-limited"));
@@ -39,85 +39,9 @@ fn frame_fidelity_label_keeps_exact_source_lod_concise() {
     fidelity.backend = RenderBackend::GpuCameraMip;
 
     assert_eq!(
-        frame_fidelity_label(&fidelity),
+        ui_kit::frame_fidelity_label(&fidelity),
         "shown s0 exact | GPU MIP | 998x1024 px; 512x512 pt | render pending"
     );
-}
-
-#[test]
-fn frame_fidelity_labels_cover_status_reason_and_failure_vocabularies() {
-    for (value, expected) in [
-        (FrameCompleteness::Exact, "exact"),
-        (FrameCompleteness::Complete, "complete"),
-        (FrameCompleteness::Loading, "loading"),
-        (FrameCompleteness::Incomplete, "incomplete"),
-        (FrameCompleteness::BudgetLimited, "budget-limited"),
-    ] {
-        assert_eq!(frame_completeness_label(value), expected);
-    }
-    for (value, expected) in [
-        (LodDecisionReason::ExactS0, "exact s0"),
-        (
-            LodDecisionReason::ScreenEquivalentCoarserScale,
-            "screen-equivalent LOD",
-        ),
-        (LodDecisionReason::PlaybackDownshift, "playback LOD"),
-        (LodDecisionReason::LoadingTargetScale, "loading target LOD"),
-        (LodDecisionReason::NoVisibleData, "outside selected data"),
-        (LodDecisionReason::FrameBudgetLimited, "frame budget"),
-        (LodDecisionReason::GpuBudgetLimited, "GPU budget"),
-        (LodDecisionReason::CpuBudgetLimited, "CPU budget"),
-        (LodDecisionReason::BackendLimit, "backend limit"),
-        (LodDecisionReason::AllocationFailed, "allocation failed"),
-        (
-            LodDecisionReason::IncompleteResidency,
-            "incomplete residency",
-        ),
-        (
-            LodDecisionReason::InvalidModeParameter,
-            "invalid mode parameter",
-        ),
-        (LodDecisionReason::UnsupportedDtype, "unsupported dtype"),
-        (LodDecisionReason::InvalidTransform, "invalid transform"),
-    ] {
-        assert_eq!(frame_reason_label(value), expected);
-    }
-    for (value, expected) in [
-        (FrameFailureKind::BudgetExceeded, "budget exceeded"),
-        (FrameFailureKind::BackendLimit, "backend limit"),
-        (FrameFailureKind::AllocationFailed, "allocation failed"),
-        (
-            FrameFailureKind::IncompleteResidency,
-            "incomplete residency",
-        ),
-        (
-            FrameFailureKind::InvalidModeParameter,
-            "invalid mode parameter",
-        ),
-        (FrameFailureKind::UnsupportedDtype, "unsupported dtype"),
-        (FrameFailureKind::InvalidTransform, "invalid transform"),
-    ] {
-        assert_eq!(frame_failure_kind_label(value), expected);
-    }
-    assert_eq!(
-        crate::fidelity::render_backend_label(RenderBackend::Empty),
-        "empty"
-    );
-}
-
-#[test]
-fn display_size_maps_to_physical_render_viewport_and_clamps_aspect() {
-    assert_eq!(
-        render_viewport_for_display_size(egui::vec2(640.2, 360.2), 2.0, 2048).unwrap(),
-        RenderExtent::new(1280, 720).unwrap()
-    );
-    assert_eq!(
-        render_viewport_for_display_size(egui::vec2(1000.0, 2000.0), 2.0, 2048).unwrap(),
-        RenderExtent::new(1024, 2048).unwrap()
-    );
-    assert!(render_viewport_for_display_size(egui::Vec2::ZERO, 2.0, 2048).is_none());
-    assert!(render_viewport_for_display_size(egui::vec2(640.0, 360.0), 0.0, 2048).is_none());
-    assert!(render_viewport_for_display_size(egui::vec2(640.0, 360.0), 2.0, 0).is_none());
 }
 
 #[test]
@@ -164,7 +88,8 @@ fn workbench_runtime_diagnostics_exposes_unified_runtime_bounds_and_leases() {
         .with_pixels_per_point(1.0)
         .build_ui(|ui| {
             ui_kit::configure_visuals(ui.ctx());
-            app.show_runtime_diagnostics_body(ui);
+            let view = runtime_diagnostics_panel::runtime_diagnostics_view(&app);
+            ui_kit::show_runtime_diagnostics_body(&view, ui, &mut Vec::new());
         });
 
     for label in [
@@ -185,6 +110,32 @@ fn workbench_runtime_diagnostics_exposes_unified_runtime_bounds_and_leases() {
 }
 
 #[test]
+fn ui_snapshot_projects_visible_surfaces_without_native_handles() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let root = write_target_fixture(tempdir.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(root).unwrap();
+    let app = test_workbench_app_without_background_runtime(opened);
+
+    let snapshot = app.application_snapshot_for_ui();
+    let three_d = snapshot
+        .presentations()
+        .get(PresentationSlot::ThreeD)
+        .unwrap();
+    assert_eq!(
+        three_d.viewport(),
+        app.render_coordination.presentation_viewport
+    );
+    assert_eq!(three_d.frame(), None);
+    for slot in [
+        PresentationSlot::Xy,
+        PresentationSlot::Xz,
+        PresentationSlot::Yz,
+    ] {
+        assert!(snapshot.presentations().get(slot).is_none());
+    }
+}
+
+#[test]
 fn tiff_import_setup_state_is_visible_immediately_after_output_selection() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_target_fixture(tempdir.path()).unwrap();
@@ -192,7 +143,6 @@ fn tiff_import_setup_state_is_visible_immediately_after_output_selection() {
     let source = tempdir.path().join("raw.tif");
     let output_parent = tempdir.path().join("output");
     fs::create_dir(&output_parent).unwrap();
-    let (_sender, receiver) = mpsc::channel();
     let mut app = test_workbench_app_without_background_runtime(opened);
     let tiff_source = TiffSource::auto(source.clone());
     let destination = tiff_destination(&tiff_source, &output_parent);
@@ -200,14 +150,18 @@ fn tiff_import_setup_state_is_visible_immediately_after_output_selection() {
     app.enter_tiff_import_setup_waiting_state(
         tiff_source,
         destination.clone(),
-        ImportCancellation::new(),
-        receiver,
-        None,
-    );
+    )
+    .unwrap();
 
-    let task = app.import_runtime.tiff_import_setup_task.as_ref().unwrap();
-    assert_eq!(task.source.path, source);
-    assert_eq!(task.destination, destination);
-    assert!(app.import_runtime.pending_tiff_import.is_none());
-    assert!(app.import_runtime.tiff_import_setup_error.is_none());
+    assert!(matches!(
+        app.import.workers.status(),
+        ImportWorkerStatus::Inspecting {
+            source: active_source,
+            destination: active_destination,
+            ..
+        } if active_source.path == source && active_destination == destination
+    ));
+    assert!(app.import.pending_review.is_none());
+    assert!(app.import.problem.is_none());
+    app.import.workers.shutdown();
 }

@@ -2109,6 +2109,7 @@ dependencies = [
  "mirante4d-render-wgpu",
  "mirante4d-settings",
  "mirante4d-storage",
+ "mirante4d-ui-egui",
  "rfd",
  "serde",
  "serde_json",
@@ -2124,6 +2125,8 @@ dependencies = [
 name = "mirante4d-application"
 version = "0.1.0"
 dependencies = [
+ "glam",
+ "mirante4d-analysis-core",
  "mirante4d-dataset",
  "mirante4d-domain",
  "mirante4d-identity",
@@ -2267,6 +2270,17 @@ dependencies = [
  "thiserror 2.0.17",
  "zarrs_metadata",
  "zstd",
+]
+
+[[package]]
+name = "mirante4d-ui-egui"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "egui_kittest",
+ "insta",
+ "mirante4d-application",
+ "tracing",
 ]
 
 [[package]]

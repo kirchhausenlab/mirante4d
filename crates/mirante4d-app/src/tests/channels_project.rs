@@ -120,6 +120,254 @@ fn workbench_shell_exposes_channel_display_controls() {
 }
 
 #[test]
+fn extracted_workbench_chrome_returns_exact_typed_outputs() {
+    use egui_kittest::{Harness, kittest::Queryable};
+
+    struct ChromeHarnessState {
+        snapshot: ApplicationSnapshot,
+        egui_ui: ui_kit::EguiUiState,
+        output: WorkbenchUiOutput,
+    }
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let root = write_target_fixture(tempdir.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(root).unwrap();
+    let snapshot = test_application_for_opened_source(&opened).snapshot();
+    let second_layer_key = snapshot.view().layers()[1].layer_key();
+    let second_layer_label = snapshot
+        .catalog()
+        .layer(second_layer_key)
+        .unwrap()
+        .label()
+        .to_owned();
+    let first_preset_id = snapshot.channel_presets()[0].id().clone();
+    let policy = snapshot.resource_policy();
+
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1280.0, 720.0))
+        .with_pixels_per_point(1.0)
+        .build_ui_state(
+            |ui, state: &mut ChromeHarnessState| {
+                state.output = WorkbenchUiOutput::default();
+                ui_kit::show_top_toolbar(
+                    ui,
+                    ui_kit::TopToolbarView {
+                        application: &state.snapshot,
+                        project: ui_kit::ProjectControlsView {
+                            status_message: None,
+                            dataset_open_pending: false,
+                            project_store_idle: true,
+                            can_new: false,
+                            can_open: false,
+                            can_save: false,
+                            can_save_as: false,
+                            recovery_available: false,
+                        },
+                        presentation_viewport: PresentationViewport::new(640.0, 480.0).unwrap(),
+                    },
+                    &mut state.output,
+                );
+                ui_kit::show_left_workbench_panel(
+                    ui,
+                    ui_kit::LeftWorkbenchView {
+                        application: &state.snapshot,
+                        source_verification_available: true,
+                        composite_fidelity: "test fidelity",
+                        dataset_path: "test dataset",
+                    },
+                    &state.egui_ui,
+                    WorkbenchLayoutSpec::default(),
+                    &mut state.output,
+                );
+            },
+            ChromeHarnessState {
+                snapshot,
+                egui_ui: ui_kit::EguiUiState::new(
+                    policy.cpu_dataset_budget_bytes(),
+                    policy.gpu_budget_bytes(),
+                ),
+                output: WorkbenchUiOutput::default(),
+            },
+        );
+
+    harness.get_by_label("Open").click();
+    harness.step();
+    assert_eq!(
+        harness.state().output,
+        WorkbenchUiOutput {
+            actions: vec![WorkbenchUiAction::OpenDatasetDialog],
+            ..WorkbenchUiOutput::default()
+        }
+    );
+
+    harness.get_by_label("Next").click();
+    harness.step();
+    assert_eq!(
+        harness.state().output,
+        WorkbenchUiOutput {
+            application_commands: vec![ApplicationCommand::SetTimepoint(TimeIndex::new(1))],
+            ..WorkbenchUiOutput::default()
+        }
+    );
+
+    harness.get_by_label(&second_layer_label).click();
+    harness.step();
+    assert_eq!(
+        harness.state().output,
+        WorkbenchUiOutput {
+            application_commands: vec![ApplicationCommand::SetActiveLayer(second_layer_key)],
+            ..WorkbenchUiOutput::default()
+        }
+    );
+
+    harness.get_by_label("Apply").click();
+    harness.step();
+    assert_eq!(
+        harness.state().output,
+        WorkbenchUiOutput {
+            application_commands: vec![ApplicationCommand::ApplyChannelPreset(first_preset_id)],
+            ..WorkbenchUiOutput::default()
+        }
+    );
+}
+
+#[test]
+fn extracted_workbench_inspector_returns_exact_typed_outputs() {
+    use egui_kittest::{Harness, kittest::Queryable};
+
+    struct InspectorHarnessState {
+        snapshot: ApplicationSnapshot,
+        histogram: LayerHistogramSummary,
+        fidelity: FrameFidelityStatus,
+        analysis: mirante4d_application::AnalysisWorkspaceSnapshot,
+        settings: ui_kit::SettingsUiView,
+        diagnostics: ui_kit::RuntimeDiagnosticsView,
+        egui_ui: ui_kit::EguiUiState,
+        output: WorkbenchUiOutput,
+    }
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let root = write_target_fixture(tempdir.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(root).unwrap();
+    let snapshot = test_application_for_opened_source(&opened).snapshot();
+    let active_layer = snapshot
+        .view()
+        .layer(snapshot.view().active_layer())
+        .unwrap();
+    let toggled_layer = mirante4d_project_model::LayerViewState::new(
+        active_layer.layer_key(),
+        !active_layer.visible(),
+        active_layer.transfer().clone(),
+        *active_layer.render_state(),
+    );
+    let policy = snapshot.resource_policy();
+    let render_viewport = mirante4d_render_api::RenderExtent::new(640, 480).unwrap();
+    let presentation_viewport = PresentationViewport::new(640.0, 480.0).unwrap();
+    let fidelity = FrameFidelityStatus::new_with_presentation(
+        render_viewport,
+        presentation_viewport,
+    );
+    let diagnostics = ui_kit::RuntimeDiagnosticsView::new(Vec::new(), fidelity.clone());
+
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1920.0, 1080.0))
+        .with_pixels_per_point(1.0)
+        .build_ui_state(
+            |ui, state: &mut InspectorHarnessState| {
+                state.output = WorkbenchUiOutput::default();
+                ui_kit::show_workbench_inspector(
+                    ui,
+                    ui_kit::InspectorWorkbenchView {
+                        application: &state.snapshot,
+                        histogram: &state.histogram,
+                        frame_fidelity: &state.fidelity,
+                        render_viewport,
+                        dvr_density_scale_range: [
+                            DVR_DENSITY_SCALE_MIN,
+                            DVR_DENSITY_SCALE_MAX,
+                        ],
+                        no_data_policy_label: None,
+                        analysis: ui_kit::AnalysisControlsView {
+                            start_unavailable_reason: None,
+                            active: false,
+                            roi_origin: [0, 0, 0],
+                            roi_shape: [1, 1, 1],
+                            workspace: &state.analysis,
+                        },
+                        settings: &state.settings,
+                        runtime_diagnostics: &state.diagnostics,
+                        camera: ui_kit::CameraInspectorView {
+                            forward: None,
+                            world_per_screen_point: None,
+                        },
+                        messages: &[],
+                    },
+                    &mut state.egui_ui,
+                    WorkbenchLayoutSpec::default(),
+                    &mut state.output,
+                );
+            },
+            InspectorHarnessState {
+                snapshot,
+                histogram: LayerHistogramSummary {
+                    status: HistogramStatus::Exact,
+                    bin_count: 2,
+                    sample_count: 2,
+                    min_value: 0.0,
+                    max_value: 1.0,
+                    bins: vec![1, 1],
+                },
+                fidelity,
+                analysis: mirante4d_application::AnalysisWorkspaceSnapshot::new(
+                    "ready".to_owned(),
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                settings: ui_kit::SettingsUiView {
+                    pending: false,
+                    rejected_file_present: false,
+                    status_text: "ready".to_owned(),
+                },
+                diagnostics,
+                egui_ui: ui_kit::EguiUiState::new(
+                    policy.cpu_dataset_budget_bytes(),
+                    policy.gpu_budget_bytes(),
+                ),
+                output: WorkbenchUiOutput::default(),
+            },
+        );
+
+    harness.get_by_label("channel visible").click();
+    harness.step();
+    assert_eq!(
+        harness.state().output,
+        WorkbenchUiOutput {
+            application_commands: vec![ApplicationCommand::SetLayerView(toggled_layer)],
+            ..WorkbenchUiOutput::default()
+        }
+    );
+
+    harness.get_by_label("Analyze Time").scroll_to_me();
+    harness.step();
+    harness.get_by_label("Analyze Time").click();
+    harness.step();
+    assert_eq!(
+        harness.state().output,
+        WorkbenchUiOutput {
+            actions: vec![WorkbenchUiAction::StartAnalysis(
+                WorkbenchAnalysisKind::FullTimeTrace,
+            )],
+            ..WorkbenchUiOutput::default()
+        }
+    );
+}
+
+#[test]
 fn active_layer_histogram_reads_only_valid_lease_samples_and_keeps_valid_zero() {
     let key = histogram_key(0, 0, 0, 0, 4);
     let mut bridge = RetainedLeases::new();
@@ -289,7 +537,12 @@ fn application_playback_commands_reconcile_transient_state_and_timepoint() {
     let snapshot = app.application.snapshot();
     assert!(snapshot.transient().playback_active());
     assert_eq!(snapshot.transient().last_playback_tick(), None);
-    assert!(app.render_runtime.playback_lod_downshift_active);
+    assert!(
+        !app
+            .dataset
+            .scope_requirements(dataset_requests::SCOPE_PLAYBACK)
+            .is_empty()
+    );
     assert_eq!(
         playback_status_label(
             snapshot.transient().playback_active(),
@@ -327,7 +580,11 @@ fn application_playback_commands_reconcile_transient_state_and_timepoint() {
     let snapshot = app.application.snapshot();
     assert!(!snapshot.transient().playback_active());
     assert_eq!(snapshot.transient().last_playback_tick(), None);
-    assert!(!app.render_runtime.playback_lod_downshift_active);
+    assert!(
+        app.dataset
+            .scope_requirements(dataset_requests::SCOPE_PLAYBACK)
+            .is_empty()
+    );
     assert_eq!(
         playback_status_label(
             snapshot.transient().playback_active(),
@@ -358,31 +615,29 @@ fn timepoint_command_dirties_cross_section_panels_without_dirtying_3d_panel() {
         &ctx,
     )
     .unwrap();
-    for panel_id in [PanelId::Xy, PanelId::Xz, PanelId::ThreeD, PanelId::Yz] {
+    for panel_id in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
         assert!(
-            app.render_runtime
-                .cross_section_runtime
-                .record_panel_viewports(panel_id, presentation, render)
+            app.render_coordination
+                .record_viewports(panel_id.presentation_slot(), presentation, render)
         );
         let generation = app
-            .render_runtime
-            .cross_section_runtime
-            .panel(panel_id)
-            .unwrap()
-            .generation;
+            .render_coordination
+            .surface(panel_id.presentation_slot())
+            .generation();
         assert!(
-            app.render_runtime
-                .cross_section_runtime
-                .mark_panel_displayed(panel_id, generation)
+            app.render_coordination
+                .record_cross_section_presentation(
+                    panel_id.presentation_slot(),
+                    generation,
+                    CrossSectionPanelScheduleState::missing_viewport(generation),
+                )
         );
     }
     let generations_before =
         [PanelId::Xy, PanelId::Xz, PanelId::ThreeD, PanelId::Yz].map(|panel_id| {
-            app.render_runtime
-                .cross_section_runtime
-                .panel(panel_id)
-                .unwrap()
-                .generation
+            app.render_coordination
+                .surface(panel_id.presentation_slot())
+                .generation()
         });
 
     app.apply_application_command(ApplicationCommand::SetTimepoint(TimeIndex::new(1)), &ctx)
@@ -392,23 +647,22 @@ fn timepoint_command_dirties_cross_section_panels_without_dirtying_3d_panel() {
         application_view(&app.application.snapshot()).timepoint(),
         TimeIndex::new(1)
     );
-    let runtime = &app.render_runtime.cross_section_runtime;
+    let runtime = &app.render_coordination;
     for (panel_id, generation_before) in [PanelId::Xy, PanelId::Xz, PanelId::Yz].into_iter().zip([
         generations_before[0],
         generations_before[1],
         generations_before[3],
     ]) {
-        let panel = runtime.panel(panel_id).unwrap();
-        assert!(panel.generation > generation_before);
+        let panel = runtime.surface(panel_id.presentation_slot());
+        assert!(panel.generation() > generation_before);
         assert!(
             !panel.display_current(),
             "{} should be dirty after a timepoint change",
             panel_id.label()
         );
     }
-    let three_d = runtime.panel(PanelId::ThreeD).unwrap();
-    assert_eq!(three_d.generation, generations_before[2]);
-    assert!(three_d.display_current());
+    let three_d = runtime.surface(PanelId::ThreeD.presentation_slot());
+    assert_eq!(three_d.generation(), generations_before[2]);
 }
 
 #[test]

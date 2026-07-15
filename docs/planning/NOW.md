@@ -4,26 +4,24 @@ Last updated: 2026-07-14
 
 ## Current Checkpoint
 
-WP-10C is accepted on protected main at
-`b9ac2a5f08101094933f80a0ce98fbdbdbe6c8d6`, tagged
-`foundation-wp-10c-exit-1`. The sharded target package and bounded importer are
-the sole product storage/import route; the predecessor crates are deleted.
+WP-09B is accepted on protected main at
+`b73dd86fed8cc3ac7b34f75f20dcd8bb8ac85672`, tagged
+`foundation-wp-09b-exit-1`. `mirante4d-render-wgpu` is the viewer's only
+renderer; the predecessor renderer, complete-residency gate, old display
+identity, and CPU placeholder route are deleted.
 
-WP-09B is a completed candidate on `wp09b-product-render-cutover`.
+## WP-09C Candidate
 
-## WP-09B Candidate
+The visible workbench now enters `mirante4d-ui-egui` once with an immutable
+application snapshot and small projected facts. The UI owns layout and
+interaction, then returns typed commands, requests, and opaque presentation
+paints. The native app pumps services and resolves that output; it no longer
+draws or merges individual workbench regions.
 
-`mirante4d-render-wgpu` is now the viewer's only renderer. It presents useful
-partial/current frames, shares the window WGPU device, and owns the GPU targets.
-The predecessor crate, complete-residency gate, old display identity, and CPU
-placeholder rendering are deleted.
-
-Focused app, renderer, and policy checks pass. The existing small-package
-product scenario passes on a real Vulkan display for MIP, DVR, ISO, linked
-panels with a 1280x720 render target, and a current nonblank 1920x1080
-render-target resize. It records a useful partial frame and zero WGPU
-validation errors. WP-09A qualification is inherited; its trusted-GPU matrix
-was not repeated.
-
-Remaining work is the normal review/protected-main acceptance and create-once
-`foundation-wp-09b-exit-1` tag. WP-09C follows.
+Focused UI/app tests and strict linting pass. The normal release viewer also
+opened the bounded target fixture on the mapped Vulkan display, exercised the
+render modes and four-panel layout at 1280x720, and remained usable at
+1920x1080. Earlier project durability, import, analysis, runtime, and GPU
+qualification is inherited rather than repeated. The candidate still needs the
+ordinary PR checks, protected-main acceptance, and its create-once exit tag;
+WP-14 follows.

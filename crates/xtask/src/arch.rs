@@ -114,8 +114,9 @@ fn source_architecture_violations(path: &Path, source: &str) -> Vec<String> {
         return violations;
     }
     violations.extend(axis_aligned_2d_chunk_dependency_violations(path, source));
-    let app_or_app_test = normalized.starts_with("crates/mirante4d-app/");
-    if !app_or_app_test {
+    let ui_layer = normalized.starts_with("crates/mirante4d-app/")
+        || normalized.starts_with("crates/mirante4d-ui-egui/");
+    if !ui_layer {
         violations.extend(source_pattern_violations(
             path,
             source,
@@ -126,7 +127,7 @@ fn source_architecture_violations(path: &Path, source: &str) -> Vec<String> {
                 "mirante4d_app",
                 "rfd::",
             ],
-            "non-app crate must not import UI/app layer",
+            "non-UI crate must not import UI/app layer",
         ));
     }
     if normalized.starts_with("crates/mirante4d-render-wgpu/src/") {
@@ -723,6 +724,8 @@ fn check_wp07b_boundary_contract(repo_root: &Path) -> anyhow::Result<()> {
         // first, owns these narrowly superseding dependency/API additions.
         let wp08a_normal_additions = match name {
             "mirante4d-application" => BTreeSet::from([
+                "glam".to_owned(),
+                "mirante4d-analysis-core".to_owned(),
                 "mirante4d-project-store".to_owned(),
                 "mirante4d-render-api".to_owned(),
             ]),
@@ -881,6 +884,7 @@ fn check_wp07b_live_cutover(
         ("mirante4d-application", "mirante4d-render-api"),
         ("mirante4d-dataset-runtime", "mirante4d-dataset"),
         ("mirante4d-import-pipeline", "mirante4d-dataset"),
+        ("mirante4d-ui-egui", "mirante4d-application"),
         ("mirante4d-render-api", "mirante4d-dataset"),
         ("mirante4d-render-reference", "mirante4d-dataset"),
         ("mirante4d-render-reference", "mirante4d-render-api"),
@@ -982,23 +986,27 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
             .and_then(serde_json::Value::as_u64)
             != Some(2)
         || ledger.get("status").and_then(serde_json::Value::as_str)
-            != Some("wp09b-product-render-cutover")
+            != Some("wp09c-ui-composition-cutover")
         || ledger
             .pointer("/predecessor/tag")
             .and_then(serde_json::Value::as_str)
-            != Some("foundation-wp-10c-exit-1")
+            != Some("foundation-wp-09b-exit-1")
         || ledger
             .pointer("/predecessor/revision")
             .and_then(serde_json::Value::as_str)
-            != Some("b9ac2a5f08101094933f80a0ce98fbdbdbe6c8d6")
+            != Some("b73dd86fed8cc3ac7b34f75f20dcd8bb8ac85672")
     {
-        bail!("{} is not the current WP-09B live ledger", path.display());
+        bail!("{} is not the current WP-09C live ledger", path.display());
     }
 
     let expected_dataset_authority = serde_json::json!({
         "runtime_owner": "mirante4d-dataset-runtime",
         "composition_state": "DatasetDemandState",
         "sole_poll_owner": "DatasetRequestDispatcher",
+        "lease_retention": {
+            "type": "RetainedLeases",
+            "path": "crates/mirante4d-app/src/retained_leases.rs"
+        },
         "source": {
             "type": "LocalDatasetSource",
             "path": "crates/mirante4d-storage/src/dataset_source.rs"
@@ -1010,79 +1018,55 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
 
     let expected_render_authority = serde_json::json!({
         "runtime_owner": "mirante4d-render-wgpu",
-        "contract_owner": "mirante4d-render-api",
-        "lease_retention": {
-            "type": "RetainedLeases",
-            "path": "crates/mirante4d-app/src/retained_leases.rs"
-        }
+        "contract_owner": "mirante4d-render-api"
     });
     if ledger.get("render_authority") != Some(&expected_render_authority) {
         bail!("WP-09B render authority ledger drifted");
     }
 
-    let expected_owners = BTreeMap::from([
+    let expected_owners = BTreeMap::from([(
+        "validation",
         (
-            "ui",
-            (
-                "crates/mirante4d-app/src/current_runtime/ui.rs",
-                "CurrentUiRuntime",
-                "ui_runtime",
-                "WP-09C",
-            ),
+            "crates/mirante4d-app/src/current_runtime/validation.rs",
+            "CurrentValidationRuntime",
+            "validation_runtime",
+            "WP-14",
         ),
-        (
-            "import",
-            (
-                "crates/mirante4d-app/src/current_runtime/import.rs",
-                "ImportRuntime",
-                "import_runtime",
-                "WP-09C",
-            ),
-        ),
-        (
-            "validation",
-            (
-                "crates/mirante4d-app/src/current_runtime/validation.rs",
-                "CurrentValidationRuntime",
-                "validation_runtime",
-                "WP-14",
-            ),
-        ),
-    ]);
+    )]);
     let owner_entries = ledger
         .get("temporary_owners")
         .and_then(serde_json::Value::as_array)
-        .context("WP-09B temporary_owners must be an array")?;
+        .context("WP-09C temporary_owners must be an array")?;
     let mut observed_owners = BTreeMap::new();
     for owner in owner_entries {
         let module = owner
             .get("module")
             .and_then(serde_json::Value::as_str)
-            .context("WP-09B temporary owner must name its module")?;
+            .context("WP-09C temporary owner must name its module")?;
         let facts = (
             owner
                 .get("path")
                 .and_then(serde_json::Value::as_str)
-                .context("WP-09B temporary owner must name its path")?,
+                .context("WP-09C temporary owner must name its path")?,
             owner
                 .get("type")
                 .and_then(serde_json::Value::as_str)
-                .context("WP-09B temporary owner must name its type")?,
+                .context("WP-09C temporary owner must name its type")?,
             owner
                 .get("composition_field")
                 .and_then(serde_json::Value::as_str)
-                .context("WP-09B temporary owner must name its composition field")?,
+                .context("WP-09C temporary owner must name its composition field")?,
             owner
                 .get("expires")
                 .and_then(serde_json::Value::as_str)
-                .context("WP-09B temporary owner must name its expiry")?,
+                .context("WP-09C temporary owner must name its expiry")?,
         );
         if observed_owners.insert(module, facts).is_some() {
-            bail!("WP-09B temporary owner {module} is repeated");
+            bail!("WP-09C temporary owner {module} is repeated");
         }
     }
     if observed_owners != expected_owners {
-        bail!("WP-09B temporary owner ledger drifted");
+        bail!("WP-09C temporary owner ledger drifted");
     }
 
     let app_root = repo_root.join("crates/mirante4d-app/src");
@@ -1092,6 +1076,22 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
         || app_fields.contains_key("dataset_runtime")
     {
         bail!("MiranteWorkbenchApp must compose DatasetDemandState without CurrentDatasetRuntime");
+    }
+    if app_fields.get("egui_ui").map(String::as_str) != Some("EguiUiState")
+        || app_fields.contains_key("ui_runtime")
+        || repo_root
+            .join("crates/mirante4d-app/src/current_runtime/ui.rs")
+            .exists()
+    {
+        bail!("egui-local state must be owned by mirante4d-ui-egui after the WP-09C cutover");
+    }
+    if app_fields.get("import").map(String::as_str) != Some("ImportWorkflow")
+        || app_fields.contains_key("import_runtime")
+        || repo_root
+            .join("crates/mirante4d-app/src/current_runtime/import.rs")
+            .exists()
+    {
+        bail!("native import composition must use ImportWorkflow without ImportRuntime");
     }
     let mut owner_type_names = expected_owners
         .values()
@@ -1113,7 +1113,7 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
         .collect::<BTreeMap<_, _>>();
     if actual_composition != expected_composition {
         bail!(
-            "post-WP-09B temporary-owner composition drifted: expected={expected_composition:?}, actual={actual_composition:?}"
+            "WP-09C temporary-owner composition drifted: expected={expected_composition:?}, actual={actual_composition:?}"
         );
     }
     for (relative_path, type_name, _, expiry) in expected_owners.values() {
@@ -1149,6 +1149,22 @@ fn check_wp08b_dataset_dispatcher(
         || app_fields.get("dataset").map(String::as_str) != Some("DatasetDemandState")
     {
         bail!("the WP-08B runtime/dispatcher/composition ownership chain drifted");
+    }
+    let demand_fields = rust_struct_field_names(&dispatcher_source, "DatasetDemandState")?;
+    if !demand_fields.iter().any(|field| field == "retained_leases") {
+        bail!("DatasetDemandState must own retained dataset leases");
+    }
+    let current_render_path = app_root.join("current_runtime/render.rs");
+    if current_render_path.exists() {
+        let current_render_source = fs::read_to_string(&current_render_path)?;
+        let current_render_fields =
+            rust_struct_field_names(&current_render_source, "CurrentRenderRuntime")?;
+        if current_render_fields
+            .iter()
+            .any(|field| field == "retained_leases")
+        {
+            bail!("CurrentRenderRuntime must not own retained dataset leases");
+        }
     }
     if dispatcher_source.matches(".runtime.poll(").count() != 1 {
         bail!("DatasetRequestDispatcher must contain the sole DatasetRuntime poll call");
@@ -1227,7 +1243,7 @@ fn check_wp09b_render_cutover(repo_root: &Path, ledger: &serde_json::Value) -> a
     let retained_path = repo_root.join("crates/mirante4d-app/src/retained_leases.rs");
     let retained_source = fs::read_to_string(&retained_path)?;
     if !rust_root_defined_item_names(&retained_source)?.contains("RetainedLeases") {
-        bail!("WP-09B app-owned lease retention is missing");
+        bail!("dataset-demand lease retention is missing");
     }
 
     let metadata = workspace_dependency_metadata(repo_root)?;
@@ -1419,43 +1435,29 @@ fn check_wp07b_private_bridges(
                 .map_err(Into::into)
         })
         .collect::<anyhow::Result<BTreeSet<_>>>()?;
-    let expected_bridge_paths =
-        BTreeSet::from(["crates/mirante4d-app/src/current_egui_shell_bridge.rs".to_owned()]);
-    if bridge_paths != expected_bridge_paths {
-        bail!(
-            "the live app must retain only its current egui bridge: expected={expected_bridge_paths:?}, actual={bridge_paths:?}"
-        );
+    if !bridge_paths.is_empty() {
+        bail!("the live app must not retain private bridge files: actual={bridge_paths:?}");
     }
 
     let app_source = fs::read_to_string(app_source_root.join("lib.rs"))?;
     let private_modules = private_root_module_names(&app_source)?;
-    if !private_modules.contains("current_egui_shell_bridge") {
-        bail!("the current egui bridge module must remain private");
+    let private_bridge_modules = private_modules
+        .iter()
+        .filter(|name| name.ends_with("_bridge"))
+        .collect::<BTreeSet<_>>();
+    if !private_bridge_modules.is_empty() {
+        bail!("the live app must not retain private bridge modules: {private_bridge_modules:?}");
     }
     let app_fields = rust_struct_field_terminal_type_names(&app_source, "MiranteWorkbenchApp")?;
     if app_fields.get("application").map(String::as_str) != Some("ApplicationState") {
         bail!("MiranteWorkbenchApp canonical application route drifted");
     }
-
-    let egui_path = app_source_root.join("current_egui_shell_bridge.rs");
-    let egui_source = fs::read_to_string(&egui_path)?;
-    if !egui_source.contains("until\n//! WP-09C.") && !egui_source.contains("WP-09C") {
-        bail!("current egui shell bridge must retain its WP-09C expiry");
-    }
-    let egui_items = rust_root_defined_item_names(&egui_source)?;
-    let expected_egui_items = BTreeSet::from([
-        "dispatch".to_owned(),
-        "drain_events".to_owned(),
-        "snapshot".to_owned(),
-    ]);
-    if egui_items != expected_egui_items || !public_root_api_names(&egui_path)?.is_empty() {
-        bail!("current egui shell bridge API or privacy drifted");
-    }
-    if !egui_source.contains("application.dispatch(command)")
-        || !app_source.contains("current_egui_shell_bridge::dispatch")
+    if !app_source.contains("self.application.dispatch(")
+        || !app_source.contains("self.application.snapshot()")
+        || !app_source.contains("self.application.drain_events(")
         || !app_source.contains("fn apply_application_command")
     {
-        bail!("current egui shell mutation route no longer closes through the application bridge");
+        bail!("the egui shell must route directly through ApplicationState");
     }
 
     Ok(())
@@ -2607,14 +2609,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_architecture_policy_rejects_ui_imports_outside_app_crate() {
+    fn source_architecture_policy_rejects_ui_imports_outside_ui_layer() {
         let violations = source_architecture_violations(
             Path::new("crates/mirante4d-data/src/lib.rs"),
             "use egui::Context;\n",
         );
 
         assert_eq!(violations.len(), 1);
-        assert!(violations[0].contains("non-app crate must not import UI/app layer"));
+        assert!(violations[0].contains("non-UI crate must not import UI/app layer"));
     }
 
     #[test]
@@ -2622,6 +2624,16 @@ mod tests {
         let violations = source_architecture_violations(
             Path::new("crates/mirante4d-app/src/lib.rs"),
             "use egui::Context;\nuse rfd::FileDialog;\n",
+        );
+
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn source_architecture_policy_allows_ui_imports_inside_ui_crate() {
+        let violations = source_architecture_violations(
+            Path::new("crates/mirante4d-ui-egui/src/lib.rs"),
+            "use egui::Context;\n",
         );
 
         assert!(violations.is_empty());

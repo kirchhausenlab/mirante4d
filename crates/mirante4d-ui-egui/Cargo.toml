@@ -1,0 +1,16 @@
+[package]
+name = "mirante4d-ui-egui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+eframe.workspace = true
+mirante4d-application.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+egui_kittest.workspace = true
+insta.workspace = true

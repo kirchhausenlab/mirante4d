@@ -46,7 +46,7 @@ const TARGET_CRATES: [&str; 17] = [
     "mirante4d-storage",
     "mirante4d-ui-egui",
 ];
-const SUCCESSOR_OWNED_WORKSPACE_CRATES: [&str; 7] = [
+const SUCCESSOR_OWNED_WORKSPACE_CRATES: [&str; 8] = [
     "mirante4d-analysis-core",
     "mirante4d-analysis-runtime",
     "mirante4d-import-pipeline",
@@ -54,6 +54,7 @@ const SUCCESSOR_OWNED_WORKSPACE_CRATES: [&str; 7] = [
     "mirante4d-render-reference",
     "mirante4d-render-wgpu",
     "mirante4d-storage",
+    "mirante4d-ui-egui",
 ];
 const RETIRED_WORKSPACE_CRATES: [&str; 5] = [
     "mirante4d-analysis",
@@ -77,8 +78,10 @@ pub(super) fn accepted_successor_normal_dependency_additions(
             "mirante4d-project-store",
             "mirante4d-render-wgpu",
             "mirante4d-storage",
+            "mirante4d-ui-egui",
         ],
-        "mirante4d-application" => &["mirante4d-project-store"],
+        "mirante4d-application" => &["glam", "mirante4d-analysis-core", "mirante4d-project-store"],
+        "mirante4d-ui-egui" => &["tracing"],
         "mirante4d-renderer" => &["mirante4d-dataset"],
         "mirante4d-identity" => &["mirante4d-domain", "sha2", "unicode-normalization"],
         "mirante4d-project-store" => &["mirante4d-domain"],
@@ -119,15 +122,83 @@ pub(super) fn accepted_successor_public_root_additions(
 ) -> &'static [&'static str] {
     match crate_name {
         "mirante4d-application" => &[
+            "AnalysisPlot",
+            "AnalysisPlotSnapshot",
+            "AnalysisTable",
+            "AnalysisTableSnapshot",
+            "AnalysisWorkspaceSnapshot",
+            "CameraView",
+            "ChannelPreset",
+            "ChannelPresetEntry",
+            "ChannelPresetId",
+            "CrossSectionPanelScheduleReason",
+            "CrossSectionPanelScheduleState",
+            "CrossSectionPanelScheduleStatus",
+            "CrossSectionView",
+            "DEFAULT_DVR_OPACITY_GAMMA",
+            "DisplayRefreshPath",
+            "DisplayRefreshTiming",
+            "DisplayWindow",
+            "DvrOpacityTransfer",
+            "IsoLightState",
+            "IsoShadingPolicy",
+            "LayerTransfer",
+            "LayerViewState",
+            "Opacity",
+            "Projection",
+            "RenderCoordinationState",
+            "RenderState",
+            "RenderSurfaceState",
+            "ResidentRenderFailureStatus",
+            "RgbColor",
+            "SamplingPolicy",
             "LoadedAnalysisDescriptorBundle",
             "MonotonicClock",
+            "PresentationPaintRequest",
+            "PresentationSlot",
+            "PresentationSnapshot",
+            "PresentationSurface",
+            "PresentationViewport",
             "ProjectRecoveryStoreLocator",
+            "ProjectGenerationId",
+            "ProjectId",
             "ProjectStoreApplicationService",
             "ProjectStoreLifecycle",
             "ProjectStoreServiceError",
             "ProjectStoreServiceEvent",
             "ProjectStoreServiceStatus",
+            "RenderMode",
+            "DisplayedFrameFreshness",
+            "FrameCompleteness",
+            "FrameFailureKind",
+            "FrameFidelityStatus",
+            "HistogramAutoError",
+            "HistogramStatus",
+            "IntensityStatistics",
+            "LayerHistogramSummary",
+            "LodDecisionReason",
+            "RenderBackend",
+            "RenderExtent",
+            "ResourcePolicy",
             "SystemMonotonicClock",
+            "TRANSFER_GAMMA_MAX",
+            "TRANSFER_GAMMA_MIN",
+            "TimeIndex",
+            "ToolKind",
+            "TransferCurve",
+            "ViewState",
+            "ViewerLayout",
+            "auto_dense_window_from_histogram",
+            "auto_dvr_opacity_transfer_from_histogram",
+            "auto_signal_window_from_histogram",
+            "channel_preset_from_view",
+            "histogram_can_auto_window",
+            "render_coordination",
+            "stepped_timepoint",
+            "viewer_tools",
+            "viewport_interaction",
+            "import_workflow",
+            "next_user_channel_preset_id",
         ],
         _ => &[],
     }
@@ -815,15 +886,15 @@ fn validate_wp10c_import_worker_owner(repo_root: &Path, target_owner: &str) -> a
         }
     }
 
-    let app_path = repo_root.join("crates/mirante4d-app/src/workbench_import.rs");
+    let app_path = repo_root.join("crates/mirante4d-app/src/import_worker_service.rs");
     let app_source = fs::read_to_string(&app_path)
         .with_context(|| format!("failed to read {}", app_path.display()))?;
     if source_creates_thread(&app_path, &app_source)? {
-        bail!("WP-10C app import module still creates a production thread");
+        bail!("WP-10C app import worker bridge still creates a production thread");
     }
     for marker in ["spawn_tiff_inspection_worker", "spawn_tiff_import_worker"] {
         if !app_source.contains(marker) {
-            bail!("WP-10C app import module does not use target worker {marker}");
+            bail!("WP-10C app import worker bridge does not use target worker {marker}");
         }
     }
     Ok(())
@@ -2333,7 +2404,7 @@ pub fn spawn_tiff_import_worker() { let _ = std::thread::spawn(|| {}); }
         )
         .unwrap();
         fs::write(
-            app_root.join("workbench_import.rs"),
+            app_root.join("import_worker_service.rs"),
             "fn start() { spawn_tiff_inspection_worker(); spawn_tiff_import_worker(); }",
         )
         .unwrap();
@@ -2341,7 +2412,7 @@ pub fn spawn_tiff_import_worker() { let _ = std::thread::spawn(|| {}); }
         validate_wp10c_import_worker_owner(temp.path(), "mirante4d-import-pipeline").unwrap();
 
         fs::write(
-            app_root.join("workbench_import.rs"),
+            app_root.join("import_worker_service.rs"),
             "fn start() { spawn_tiff_inspection_worker(); spawn_tiff_import_worker(); let _ = std::thread::spawn(|| {}); }",
         )
         .unwrap();
@@ -2349,7 +2420,7 @@ pub fn spawn_tiff_import_worker() { let _ = std::thread::spawn(|| {}); }
             validate_wp10c_import_worker_owner(temp.path(), "mirante4d-import-pipeline")
                 .unwrap_err()
                 .to_string()
-                .contains("app import module still creates")
+                .contains("app import worker bridge still creates")
         );
     }
 
