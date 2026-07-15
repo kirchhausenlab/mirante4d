@@ -1831,6 +1831,12 @@ struct ProcessObservation {
     mapped_window: Option<Value>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ProcessRssPoll<T> {
+    Exited(T),
+    Sample(u64),
+}
+
 fn run_app_process(run: AppRun<'_>) -> anyhow::Result<ProcessObservation> {
     let stdout = OpenOptions::new()
         .write(true)
@@ -1865,11 +1871,26 @@ fn run_app_process(run: AppRun<'_>) -> anyhow::Result<ProcessObservation> {
     let mut mapped_window = None;
     let mut next_geometry_probe = Instant::now();
     loop {
-        if let Some(rss_bytes) = read_process_rss_bytes(pid)? {
-            rss_samples.push(RssSample {
+        if let Some(status) = child.try_wait()? {
+            return Ok(ProcessObservation {
+                exit_success: status.success(),
+                rss_samples,
+                mapped_window,
+            });
+        }
+        let rss_result = read_process_rss_bytes(pid);
+        match reconcile_process_rss_poll(rss_result, child.try_wait()?)? {
+            ProcessRssPoll::Exited(status) => {
+                return Ok(ProcessObservation {
+                    exit_success: status.success(),
+                    rss_samples,
+                    mapped_window,
+                });
+            }
+            ProcessRssPoll::Sample(rss_bytes) => rss_samples.push(RssSample {
                 epoch_ms: epoch_ms(),
                 rss_bytes,
-            });
+            }),
         }
         if mapped_window.is_none() && Instant::now() >= next_geometry_probe {
             mapped_window = probe_x11_client_geometry(pid, MAPPED_WIDTH, MAPPED_HEIGHT)?;
@@ -1891,6 +1912,18 @@ fn run_app_process(run: AppRun<'_>) -> anyhow::Result<ProcessObservation> {
     }
 }
 
+fn reconcile_process_rss_poll<T>(
+    rss_result: anyhow::Result<Option<u64>>,
+    exit_status: Option<T>,
+) -> anyhow::Result<ProcessRssPoll<T>> {
+    if let Some(status) = exit_status {
+        return Ok(ProcessRssPoll::Exited(status));
+    }
+    rss_result?
+        .map(ProcessRssPoll::Sample)
+        .context("Linux process RSS status disappeared while the T5 child remained live")
+}
+
 fn read_process_rss_bytes(pid: u32) -> anyhow::Result<Option<u64>> {
     let path = PathBuf::from(format!("/proc/{pid}/status"));
     let status = match fs::read_to_string(&path) {
@@ -1898,12 +1931,25 @@ fn read_process_rss_bytes(pid: u32) -> anyhow::Result<Option<u64>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let Some(kib) = status.lines().find_map(|line| {
-        let value = line.strip_prefix("VmRSS:")?;
-        value.split_ascii_whitespace().next()?.parse::<u64>().ok()
-    }) else {
-        bail!("Linux process status omitted VmRSS during T5 sampling");
+    parse_process_rss_bytes(&status)
+}
+
+fn parse_process_rss_bytes(status: &str) -> anyhow::Result<Option<u64>> {
+    let Some(value) = status.lines().find_map(|line| line.strip_prefix("VmRSS:")) else {
+        // Linux zombie status documents and a process that exits while its
+        // procfs file is read legitimately omit VmRSS. The caller accepts
+        // this only when a second wait confirms that the child exited.
+        return Ok(None);
     };
+    let mut fields = value.split_ascii_whitespace();
+    let kib = fields
+        .next()
+        .context("Linux VmRSS omitted its numeric value during T5 sampling")?
+        .parse::<u64>()
+        .context("Linux VmRSS was not an unsigned integer during T5 sampling")?;
+    if fields.next() != Some("kB") || fields.next().is_some() {
+        bail!("Linux VmRSS did not use the exact `<integer> kB` form during T5 sampling");
+    }
     Ok(Some(
         kib.checked_mul(1024)
             .context("T5 RSS byte count overflowed")?,
@@ -3180,6 +3226,50 @@ mod tests {
             classify_rss_samples(&samples, 10, 12).unwrap(),
             (100, 180, 80)
         );
+    }
+
+    #[test]
+    fn linux_rss_parser_and_exit_reconciliation_reject_malformed_live_status() {
+        assert_eq!(
+            parse_process_rss_bytes("Name:\tapp\nVmRSS:\t123 kB\n").unwrap(),
+            Some(125_952)
+        );
+        assert_eq!(
+            parse_process_rss_bytes("Name:\tapp\nState:\tZ (zombie)\n").unwrap(),
+            None
+        );
+        for malformed in [
+            "VmRSS:\n",
+            "VmRSS:\tnot-a-number kB\n",
+            "VmRSS:\t123 bytes\n",
+            "VmRSS:\t123 kB trailing\n",
+            "VmRSS:\t18446744073709551615 kB\n",
+        ] {
+            assert!(parse_process_rss_bytes(malformed).is_err());
+        }
+
+        assert_eq!(
+            reconcile_process_rss_poll(Ok(None), Some("exited")).unwrap(),
+            ProcessRssPoll::Exited("exited")
+        );
+        assert_eq!(
+            reconcile_process_rss_poll(Ok(Some(42)), Some("exited")).unwrap(),
+            ProcessRssPoll::Exited("exited")
+        );
+        assert_eq!(
+            reconcile_process_rss_poll(Ok(Some(42)), None::<&str>).unwrap(),
+            ProcessRssPoll::Sample(42)
+        );
+        assert!(reconcile_process_rss_poll(Ok(None), None::<&str>).is_err());
+        assert_eq!(
+            reconcile_process_rss_poll(Err(anyhow::anyhow!("terminal race")), Some("exited"))
+                .unwrap(),
+            ProcessRssPoll::Exited("exited")
+        );
+        let live_error =
+            reconcile_process_rss_poll::<&str>(Err(anyhow::anyhow!("malformed live status")), None)
+                .unwrap_err();
+        assert_eq!(live_error.to_string(), "malformed live status");
     }
 
     #[test]
