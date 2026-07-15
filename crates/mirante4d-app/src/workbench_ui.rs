@@ -230,439 +230,430 @@ impl MiranteWorkbenchApp {
                 .and_then(ProductAutomationController::render_target_override),
         }
     }
+}
 
-    fn show_viewer_layout(
-        &mut self,
-        ui: &mut egui::Ui,
-        snapshot: &ApplicationSnapshot,
-        view: &ViewState,
-        viewer: &ViewerUiSnapshot,
-        output: &mut WorkbenchUiOutput,
-    ) {
-        match view.layout() {
-            CanonicalViewerLayout::Single3d => {
-                self.show_single_3d_viewport(ui, snapshot, view, viewer, output)
-            }
-            CanonicalViewerLayout::FourPanel => {
-                self.show_four_panel_viewport(ui, snapshot, view, viewer, output)
-            }
+fn show_viewer_layout(
+    ui: &mut egui::Ui,
+    snapshot: &ApplicationSnapshot,
+    view: &ViewState,
+    viewer: &ViewerUiSnapshot,
+    egui_ui: &mut ui_kit::EguiUiState,
+    output: &mut WorkbenchUiOutput,
+) {
+    match view.layout() {
+        CanonicalViewerLayout::Single3d => {
+            show_single_3d_viewport(ui, snapshot, view, viewer, egui_ui, output)
+        }
+        CanonicalViewerLayout::FourPanel => {
+            show_four_panel_viewport(ui, snapshot, view, viewer, egui_ui, output)
         }
     }
+}
 
-    fn observe_3d_viewport_for_display_size(
-        &self,
-        ctx: &egui::Context,
-        display_size_points: egui::Vec2,
-        viewer: &ViewerUiSnapshot,
-        output: &mut WorkbenchUiOutput,
-    ) {
-        let max_texture_side =
-            viewer.render_viewport_max_side(ctx.input(|input| input.max_texture_side));
-        let Some(presentation_viewport) =
-            presentation_viewport_for_display_size(display_size_points)
-        else {
-            return;
-        };
-        let Some(render_viewport) = viewer.automation_render_target.or_else(|| {
-            render_viewport_for_display_size(
-                display_size_points,
-                ctx.pixels_per_point(),
-                max_texture_side,
-            )
-        }) else {
-            return;
-        };
-        output.viewport_observations.push(ViewportObservation::new(
-            PresentationSlot::ThreeD,
-            presentation_viewport,
-            render_viewport,
-        ));
-    }
-
-    fn observe_four_panel_viewport(
-        &self,
-        ctx: &egui::Context,
-        panel_id: PanelId,
-        display_size_points: egui::Vec2,
-        viewer: &ViewerUiSnapshot,
-        output: &mut WorkbenchUiOutput,
-    ) -> Option<PresentationViewport> {
-        let presentation_viewport = presentation_viewport_for_display_size(display_size_points)?;
-        let max_texture_side =
-            viewer.render_viewport_max_side(ctx.input(|input| input.max_texture_side));
-        let render_viewport = render_viewport_for_display_size(
+fn observe_3d_viewport_for_display_size(
+    ctx: &egui::Context,
+    display_size_points: egui::Vec2,
+    viewer: &ViewerUiSnapshot,
+    output: &mut WorkbenchUiOutput,
+) {
+    let max_texture_side =
+        viewer.render_viewport_max_side(ctx.input(|input| input.max_texture_side));
+    let Some(presentation_viewport) = presentation_viewport_for_display_size(display_size_points)
+    else {
+        return;
+    };
+    let Some(render_viewport) = viewer.automation_render_target.or_else(|| {
+        render_viewport_for_display_size(
             display_size_points,
             ctx.pixels_per_point(),
             max_texture_side,
-        )?;
-        output.viewport_observations.push(ViewportObservation::new(
-            panel_id.presentation_slot(),
-            presentation_viewport,
-            render_viewport,
-        ));
-        Some(presentation_viewport)
-    }
+        )
+    }) else {
+        return;
+    };
+    output.viewport_observations.push(ViewportObservation::new(
+        PresentationSlot::ThreeD,
+        presentation_viewport,
+        render_viewport,
+    ));
+}
 
-    fn show_single_3d_viewport(
-        &mut self,
-        ui: &mut egui::Ui,
-        snapshot: &ApplicationSnapshot,
-        view: &ViewState,
-        viewer: &ViewerUiSnapshot,
-        output: &mut WorkbenchUiOutput,
-    ) {
-        let available = ui.available_size();
-        let ctx = ui.ctx().clone();
-        self.observe_3d_viewport_for_display_size(&ctx, available, viewer, output);
-        let display_image = viewer.three_d_display.clone();
-        let image_size = fit_size(display_image.size_vec2(), available);
-        ui.centered_and_justified(|ui| {
-            self.show_3d_viewport_image(
-                ui,
-                display_image,
-                image_size,
-                snapshot,
-                view,
-                viewer,
-                output,
-            );
-        });
-    }
+fn observe_four_panel_viewport(
+    ctx: &egui::Context,
+    panel_id: PanelId,
+    display_size_points: egui::Vec2,
+    viewer: &ViewerUiSnapshot,
+    output: &mut WorkbenchUiOutput,
+) -> Option<PresentationViewport> {
+    let presentation_viewport = presentation_viewport_for_display_size(display_size_points)?;
+    let max_texture_side =
+        viewer.render_viewport_max_side(ctx.input(|input| input.max_texture_side));
+    let render_viewport = render_viewport_for_display_size(
+        display_size_points,
+        ctx.pixels_per_point(),
+        max_texture_side,
+    )?;
+    output.viewport_observations.push(ViewportObservation::new(
+        panel_id.presentation_slot(),
+        presentation_viewport,
+        render_viewport,
+    ));
+    Some(presentation_viewport)
+}
 
-    fn show_four_panel_viewport(
-        &mut self,
-        ui: &mut egui::Ui,
-        snapshot: &ApplicationSnapshot,
-        view: &ViewState,
-        viewer: &ViewerUiSnapshot,
-        output: &mut WorkbenchUiOutput,
-    ) {
-        let available = ui.available_size();
-        let gap = 6.0;
-        let cell_size = egui::vec2(
-            ((available.x - gap) * 0.5).max(1.0),
-            ((available.y - gap) * 0.5).max(1.0),
+fn show_single_3d_viewport(
+    ui: &mut egui::Ui,
+    snapshot: &ApplicationSnapshot,
+    view: &ViewState,
+    viewer: &ViewerUiSnapshot,
+    egui_ui: &mut ui_kit::EguiUiState,
+    output: &mut WorkbenchUiOutput,
+) {
+    let available = ui.available_size();
+    let ctx = ui.ctx().clone();
+    observe_3d_viewport_for_display_size(&ctx, available, viewer, output);
+    let display_image = viewer.three_d_display.clone();
+    let image_size = fit_size(display_image.size_vec2(), available);
+    ui.centered_and_justified(|ui| {
+        show_3d_viewport_image(
+            ui,
+            display_image,
+            image_size,
+            snapshot,
+            view,
+            viewer,
+            egui_ui,
+            output,
         );
-        let panels = [PanelId::Xy, PanelId::Xz, PanelId::ThreeD, PanelId::Yz];
+    });
+}
 
-        self.egui_ui.hovered_pixel = None;
-        self.egui_ui.hovered_source_readout = None;
+fn show_four_panel_viewport(
+    ui: &mut egui::Ui,
+    snapshot: &ApplicationSnapshot,
+    view: &ViewState,
+    viewer: &ViewerUiSnapshot,
+    egui_ui: &mut ui_kit::EguiUiState,
+    output: &mut WorkbenchUiOutput,
+) {
+    let available = ui.available_size();
+    let gap = 6.0;
+    let cell_size = egui::vec2(
+        ((available.x - gap) * 0.5).max(1.0),
+        ((available.y - gap) * 0.5).max(1.0),
+    );
+    let panels = [PanelId::Xy, PanelId::Xz, PanelId::ThreeD, PanelId::Yz];
 
-        ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
-        ui.vertical(|ui| {
-            for row in panels.chunks_exact(2) {
-                ui.horizontal(|ui| {
-                    for panel_id in row {
-                        self.show_four_panel_cell(
-                            ui, *panel_id, cell_size, snapshot, view, viewer, output,
+    egui_ui.hovered_pixel = None;
+    egui_ui.hovered_source_readout = None;
+
+    ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
+    ui.vertical(|ui| {
+        for row in panels.chunks_exact(2) {
+            ui.horizontal(|ui| {
+                for panel_id in row {
+                    show_four_panel_cell(
+                        ui, *panel_id, cell_size, snapshot, view, viewer, egui_ui, output,
+                    );
+                }
+            });
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn show_four_panel_cell(
+    ui: &mut egui::Ui,
+    panel_id: PanelId,
+    cell_size: egui::Vec2,
+    snapshot: &ApplicationSnapshot,
+    view: &ViewState,
+    viewer: &ViewerUiSnapshot,
+    egui_ui: &mut ui_kit::EguiUiState,
+    output: &mut WorkbenchUiOutput,
+) {
+    let tokens = ui_kit::UiTokens::default();
+    ui.allocate_ui_with_layout(cell_size, egui::Layout::top_down(egui::Align::Min), |ui| {
+        ui.set_min_size(cell_size);
+        egui::Frame::new()
+            .fill(tokens.colors.viewport_background)
+            .stroke(egui::Stroke::new(1.0, tokens.colors.border))
+            .corner_radius(egui::CornerRadius::same(3))
+            .inner_margin(egui::Margin::same(6))
+            .show(ui, |ui| {
+                ui.set_min_size((cell_size - egui::vec2(12.0, 12.0)).max(egui::Vec2::ZERO));
+                ui.label(egui::RichText::new(panel_id.label()).strong());
+                ui.add_space(4.0);
+                match panel_id {
+                    PanelId::ThreeD => {
+                        show_embedded_3d_panel(ui, snapshot, view, viewer, egui_ui, output)
+                    }
+                    PanelId::Xy | PanelId::Xz | PanelId::Yz => {
+                        show_cross_section_panel(
+                            ui, panel_id, snapshot, view, viewer, egui_ui, output,
                         );
                     }
-                });
-            }
-        });
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn show_four_panel_cell(
-        &mut self,
-        ui: &mut egui::Ui,
-        panel_id: PanelId,
-        cell_size: egui::Vec2,
-        snapshot: &ApplicationSnapshot,
-        view: &ViewState,
-        viewer: &ViewerUiSnapshot,
-        output: &mut WorkbenchUiOutput,
-    ) {
-        let tokens = ui_kit::UiTokens::default();
-        ui.allocate_ui_with_layout(cell_size, egui::Layout::top_down(egui::Align::Min), |ui| {
-            ui.set_min_size(cell_size);
-            egui::Frame::new()
-                .fill(tokens.colors.viewport_background)
-                .stroke(egui::Stroke::new(1.0, tokens.colors.border))
-                .corner_radius(egui::CornerRadius::same(3))
-                .inner_margin(egui::Margin::same(6))
-                .show(ui, |ui| {
-                    ui.set_min_size((cell_size - egui::vec2(12.0, 12.0)).max(egui::Vec2::ZERO));
-                    ui.label(egui::RichText::new(panel_id.label()).strong());
-                    ui.add_space(4.0);
-                    match panel_id {
-                        PanelId::ThreeD => {
-                            self.show_embedded_3d_panel(ui, snapshot, view, viewer, output)
-                        }
-                        PanelId::Xy | PanelId::Xz | PanelId::Yz => {
-                            self.show_cross_section_panel(
-                                ui, panel_id, snapshot, view, viewer, output,
-                            );
-                        }
-                    }
-                });
-        });
-    }
-
-    fn show_embedded_3d_panel(
-        &mut self,
-        ui: &mut egui::Ui,
-        snapshot: &ApplicationSnapshot,
-        view: &ViewState,
-        viewer: &ViewerUiSnapshot,
-        output: &mut WorkbenchUiOutput,
-    ) {
-        let available = ui.available_size();
-        let ctx = ui.ctx().clone();
-        self.observe_3d_viewport_for_display_size(&ctx, available, viewer, output);
-        let display_image = viewer.three_d_display.clone();
-        let image_size = fit_size(display_image.size_vec2(), available);
-        ui.centered_and_justified(|ui| {
-            self.show_3d_viewport_image(
-                ui,
-                display_image,
-                image_size,
-                snapshot,
-                view,
-                viewer,
-                output,
-            );
-        });
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn show_3d_viewport_image(
-        &mut self,
-        ui: &mut egui::Ui,
-        display_image: ViewportDisplayImage,
-        image_size: egui::Vec2,
-        snapshot: &ApplicationSnapshot,
-        view: &ViewState,
-        viewer: &ViewerUiSnapshot,
-        output: &mut WorkbenchUiOutput,
-    ) {
-        if image_size == egui::Vec2::ZERO {
-            return;
-        }
-        let response = match display_image {
-            ViewportDisplayImage::UiBackground { .. } => {
-                let (rect, response) =
-                    ui.allocate_exact_size(image_size, egui::Sense::click_and_drag());
-                ui.painter()
-                    .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
-                let label = if viewer.frame_fidelity.backend == RenderBackend::Empty {
-                    "No visible data"
-                } else {
-                    "Loading…"
-                };
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    label,
-                    egui::FontId::proportional(18.0),
-                    ui.visuals().weak_text_color(),
-                );
-                response
-            }
-            ViewportDisplayImage::Presentation { slot, .. } => self.show_presentation(
-                ui,
-                snapshot,
-                slot,
-                image_size,
-                egui::Sense::click_and_drag(),
-                output,
-            ),
-        };
-        let hover = viewport_hover_from_response(snapshot, view, &response);
-        if response.hovered() || view.layout() == CanonicalViewerLayout::Single3d {
-            self.egui_ui.hovered_pixel = hover;
-            self.egui_ui.hovered_source_readout = None;
-        }
-        match apply_viewport_tool_response(
-            snapshot,
-            &mut self.egui_ui,
-            viewer.frame_fidelity.completeness,
-            &response,
-            hover,
-        ) {
-            Ok(outcome) => {
-                output.texture_refresh_requested |= outcome.texture_refresh_requested;
-                output.rerender_requested |= outcome.rerender_requested;
-            }
-            Err(err) => {
-                tracing::warn!(%err, "viewer tool interaction rejected");
-            }
-        }
-        if matches!(
-            self.egui_ui.viewer_tools.active_tool,
-            ViewerTool::Navigate | ViewerTool::Inspect
-        ) {
-            output
-                .application_commands
-                .extend(viewport_interaction_commands(
-                    &mut self.egui_ui,
-                    view,
-                    &response,
-                    image_size,
-                ));
-        }
-    }
-
-    fn show_cross_section_panel(
-        &mut self,
-        ui: &mut egui::Ui,
-        panel_id: PanelId,
-        snapshot: &ApplicationSnapshot,
-        view: &ViewState,
-        viewer: &ViewerUiSnapshot,
-        output: &mut WorkbenchUiOutput,
-    ) {
-        let available = ui.available_size();
-        let ctx = ui.ctx().clone();
-        let presentation_viewport =
-            self.observe_four_panel_viewport(&ctx, panel_id, available, viewer, output);
-        let application_panel = application_cross_section_panel_id(panel_id)
-            .expect("a cross-section widget has a cross-section panel ID");
-        output
-            .render_requests
-            .push(RenderUiRequest::EnsureCrossSectionCurrent {
-                panel: application_panel,
+                }
             });
-        let response = if let Some(display_image) = viewer.display_for_panel(panel_id) {
-            let image_size = fit_size(display_image.size_vec2(), available);
-            if image_size != egui::Vec2::ZERO {
-                Some(
-                    ui.centered_and_justified(|ui| {
-                        self.show_cross_section_panel_image(
-                            ui,
-                            display_image,
-                            image_size,
-                            panel_id,
-                            snapshot,
-                            output,
-                        )
-                    })
-                    .inner,
-                )
+    });
+}
+
+fn show_embedded_3d_panel(
+    ui: &mut egui::Ui,
+    snapshot: &ApplicationSnapshot,
+    view: &ViewState,
+    viewer: &ViewerUiSnapshot,
+    egui_ui: &mut ui_kit::EguiUiState,
+    output: &mut WorkbenchUiOutput,
+) {
+    let available = ui.available_size();
+    let ctx = ui.ctx().clone();
+    observe_3d_viewport_for_display_size(&ctx, available, viewer, output);
+    let display_image = viewer.three_d_display.clone();
+    let image_size = fit_size(display_image.size_vec2(), available);
+    ui.centered_and_justified(|ui| {
+        show_3d_viewport_image(
+            ui,
+            display_image,
+            image_size,
+            snapshot,
+            view,
+            viewer,
+            egui_ui,
+            output,
+        );
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn show_3d_viewport_image(
+    ui: &mut egui::Ui,
+    display_image: ViewportDisplayImage,
+    image_size: egui::Vec2,
+    snapshot: &ApplicationSnapshot,
+    view: &ViewState,
+    viewer: &ViewerUiSnapshot,
+    egui_ui: &mut ui_kit::EguiUiState,
+    output: &mut WorkbenchUiOutput,
+) {
+    if image_size == egui::Vec2::ZERO {
+        return;
+    }
+    let response = match display_image {
+        ViewportDisplayImage::UiBackground { .. } => {
+            let (rect, response) =
+                ui.allocate_exact_size(image_size, egui::Sense::click_and_drag());
+            ui.painter()
+                .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+            let label = if viewer.frame_fidelity.backend == RenderBackend::Empty {
+                "No visible data"
             } else {
-                None
-            }
+                "Loading…"
+            };
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(18.0),
+                ui.visuals().weak_text_color(),
+            );
+            response
+        }
+        ViewportDisplayImage::Presentation { slot, .. } => show_presentation(
+            ui,
+            snapshot,
+            slot,
+            image_size,
+            egui::Sense::click_and_drag(),
+            output,
+        ),
+    };
+    let hover = viewport_hover_from_response(snapshot, view, &response);
+    if response.hovered() || view.layout() == CanonicalViewerLayout::Single3d {
+        egui_ui.hovered_pixel = hover;
+        egui_ui.hovered_source_readout = None;
+    }
+    match apply_viewport_tool_response(
+        snapshot,
+        egui_ui,
+        viewer.frame_fidelity.completeness,
+        &response,
+        hover,
+    ) {
+        Ok(outcome) => {
+            output.texture_refresh_requested |= outcome.texture_refresh_requested;
+            output.rerender_requested |= outcome.rerender_requested;
+        }
+        Err(err) => {
+            tracing::warn!(%err, "viewer tool interaction rejected");
+        }
+    }
+    if matches!(
+        egui_ui.viewer_tools.active_tool,
+        ViewerTool::Navigate | ViewerTool::Inspect
+    ) {
+        output
+            .application_commands
+            .extend(viewport_interaction_commands(
+                egui_ui, view, &response, image_size,
+            ));
+    }
+}
+
+fn show_cross_section_panel(
+    ui: &mut egui::Ui,
+    panel_id: PanelId,
+    snapshot: &ApplicationSnapshot,
+    view: &ViewState,
+    viewer: &ViewerUiSnapshot,
+    egui_ui: &mut ui_kit::EguiUiState,
+    output: &mut WorkbenchUiOutput,
+) {
+    let available = ui.available_size();
+    let ctx = ui.ctx().clone();
+    let presentation_viewport =
+        observe_four_panel_viewport(&ctx, panel_id, available, viewer, output);
+    let application_panel = application_cross_section_panel_id(panel_id)
+        .expect("a cross-section widget has a cross-section panel ID");
+    output
+        .render_requests
+        .push(RenderUiRequest::EnsureCrossSectionCurrent {
+            panel: application_panel,
+        });
+    let response = if let Some(display_image) = viewer.display_for_panel(panel_id) {
+        let image_size = fit_size(display_image.size_vec2(), available);
+        if image_size != egui::Vec2::ZERO {
+            Some(
+                ui.centered_and_justified(|ui| {
+                    show_cross_section_panel_image(
+                        ui,
+                        display_image,
+                        image_size,
+                        panel_id,
+                        snapshot,
+                        output,
+                    )
+                })
+                .inner,
+            )
         } else {
             None
         }
-        .unwrap_or_else(|| {
-            self.show_cross_section_panel_placeholder(ui, panel_id, available, viewer)
-        });
+    } else {
+        None
+    }
+    .unwrap_or_else(|| show_cross_section_panel_placeholder(ui, panel_id, available, viewer));
 
-        if let Some(presentation_viewport) = presentation_viewport
-            && let Some(request) = CrossSectionReadoutRequest::from_response(
-                application_panel,
-                presentation_viewport,
-                &response,
-            )
-        {
-            output.cross_section_readout_requests.push(request);
-        }
+    if let Some(presentation_viewport) = presentation_viewport
+        && let Some(request) = CrossSectionReadoutRequest::from_response(
+            application_panel,
+            presentation_viewport,
+            &response,
+        )
+    {
+        output.cross_section_readout_requests.push(request);
+    }
 
-        if matches!(
-            self.egui_ui.viewer_tools.active_tool,
-            ViewerTool::Navigate | ViewerTool::Inspect
-        ) && let Some(presentation_viewport) = presentation_viewport
-        {
-            match cross_section_interaction_commands(
-                snapshot,
-                view,
-                panel_id,
-                presentation_viewport,
-                &response,
-            ) {
-                Ok(commands) if !commands.is_empty() => {
-                    output.application_commands.extend(commands);
-                    output.request_repaint_after(CROSS_SECTION_INTERACTION_SETTLE_DURATION);
-                }
-                Ok(_) => {}
-                Err(error) => tracing::warn!(%error, "cross-section interaction rejected"),
+    if matches!(
+        egui_ui.viewer_tools.active_tool,
+        ViewerTool::Navigate | ViewerTool::Inspect
+    ) && let Some(presentation_viewport) = presentation_viewport
+    {
+        match cross_section_interaction_commands(
+            snapshot,
+            view,
+            panel_id,
+            presentation_viewport,
+            &response,
+        ) {
+            Ok(commands) if !commands.is_empty() => {
+                output.application_commands.extend(commands);
+                output.request_repaint_after(CROSS_SECTION_INTERACTION_SETTLE_DURATION);
             }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "cross-section interaction rejected"),
         }
     }
+}
 
-    fn show_cross_section_panel_image(
-        &mut self,
-        ui: &mut egui::Ui,
-        display_image: ViewportDisplayImage,
-        image_size: egui::Vec2,
-        panel_id: PanelId,
-        snapshot: &ApplicationSnapshot,
-        output: &mut WorkbenchUiOutput,
-    ) -> egui::Response {
-        let response = match display_image {
-            ViewportDisplayImage::UiBackground { .. } => {
-                let (rect, response) =
-                    ui.allocate_exact_size(image_size, egui::Sense::click_and_drag());
-                ui.painter()
-                    .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
-                response
-            }
-            ViewportDisplayImage::Presentation { slot, .. } => self.show_presentation(
-                ui,
-                snapshot,
-                slot,
-                image_size,
-                egui::Sense::click_and_drag(),
-                output,
-            ),
-        };
-        response.widget_info(|| {
-            egui::WidgetInfo::labeled(
-                egui::WidgetType::Other,
-                ui.is_enabled(),
-                format!("{} cross-section panel", panel_id.label()),
-            )
-        });
-        response
-    }
-
-    fn show_presentation(
-        &mut self,
-        ui: &mut egui::Ui,
-        snapshot: &ApplicationSnapshot,
-        slot: PresentationSlot,
-        image_size: egui::Vec2,
-        sense: egui::Sense,
-        output: &mut WorkbenchUiOutput,
-    ) -> egui::Response {
-        let surface = snapshot
-            .presentations()
-            .get(slot)
-            .expect("a displayed presentation belongs to a projected surface");
-        let (response, paint) = ui_kit::reserve_presentation(ui, slot, surface, image_size, sense);
-        ui.painter()
-            .rect_filled(response.rect, 0.0, ui.visuals().extreme_bg_color);
-        if let Some(paint) = paint {
-            output.presentation_paints.push(paint);
+fn show_cross_section_panel_image(
+    ui: &mut egui::Ui,
+    display_image: ViewportDisplayImage,
+    image_size: egui::Vec2,
+    panel_id: PanelId,
+    snapshot: &ApplicationSnapshot,
+    output: &mut WorkbenchUiOutput,
+) -> egui::Response {
+    let response = match display_image {
+        ViewportDisplayImage::UiBackground { .. } => {
+            let (rect, response) =
+                ui.allocate_exact_size(image_size, egui::Sense::click_and_drag());
+            ui.painter()
+                .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+            response
         }
-        response
-    }
+        ViewportDisplayImage::Presentation { slot, .. } => show_presentation(
+            ui,
+            snapshot,
+            slot,
+            image_size,
+            egui::Sense::click_and_drag(),
+            output,
+        ),
+    };
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Other,
+            ui.is_enabled(),
+            format!("{} cross-section panel", panel_id.label()),
+        )
+    });
+    response
+}
 
-    fn show_cross_section_panel_placeholder(
-        &mut self,
-        ui: &mut egui::Ui,
-        panel_id: PanelId,
-        available: egui::Vec2,
-        viewer: &ViewerUiSnapshot,
-    ) -> egui::Response {
-        let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
-        response.widget_info(|| {
-            egui::WidgetInfo::labeled(
-                egui::WidgetType::Other,
-                ui.is_enabled(),
-                format!("{} cross-section panel", panel_id.label()),
-            )
-        });
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            viewer.placeholder_for_panel(panel_id),
-            egui::FontId::proportional(18.0),
-            ui.visuals().weak_text_color(),
-        );
-        response
+fn show_presentation(
+    ui: &mut egui::Ui,
+    snapshot: &ApplicationSnapshot,
+    slot: PresentationSlot,
+    image_size: egui::Vec2,
+    sense: egui::Sense,
+    output: &mut WorkbenchUiOutput,
+) -> egui::Response {
+    let surface = snapshot
+        .presentations()
+        .get(slot)
+        .expect("a displayed presentation belongs to a projected surface");
+    let (response, paint) = ui_kit::reserve_presentation(ui, slot, surface, image_size, sense);
+    ui.painter()
+        .rect_filled(response.rect, 0.0, ui.visuals().extreme_bg_color);
+    if let Some(paint) = paint {
+        output.presentation_paints.push(paint);
     }
+    response
+}
+
+fn show_cross_section_panel_placeholder(
+    ui: &mut egui::Ui,
+    panel_id: PanelId,
+    available: egui::Vec2,
+    viewer: &ViewerUiSnapshot,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Other,
+            ui.is_enabled(),
+            format!("{} cross-section panel", panel_id.label()),
+        )
+    });
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        viewer.placeholder_for_panel(panel_id),
+        egui::FontId::proportional(18.0),
+        ui.visuals().weak_text_color(),
+    );
+    response
 }
 
 fn cross_section_interaction_commands(
@@ -2220,11 +2211,12 @@ impl eframe::App for MiranteWorkbenchApp {
 
         let mut viewer_output = WorkbenchUiOutput::default();
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            self.show_viewer_layout(
+            show_viewer_layout(
                 ui,
                 &application_snapshot,
                 view,
                 &viewer_ui_snapshot,
+                &mut self.egui_ui,
                 &mut viewer_output,
             );
         });
