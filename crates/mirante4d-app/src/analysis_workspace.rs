@@ -37,6 +37,78 @@ pub(crate) struct AnalysisWorkspaceViewInput<'a> {
     pub(crate) selected_plot_point: Option<AnalysisPlotPointSelection>,
 }
 
+#[derive(Debug)]
+pub(crate) struct AnalysisWorkspaceView<'a> {
+    status_text: &'a str,
+    progress_blocks: Option<(u64, u64)>,
+    tables: Vec<AnalysisTableView<'a>>,
+    plots: Vec<AnalysisPlotView<'a>>,
+    selected_table: Option<AnalysisTableId>,
+    selected_plot: Option<AnalysisPlotId>,
+    selected_plot_point: Option<AnalysisPlotPointSelection>,
+    last_export_csv_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AnalysisTableView<'a> {
+    id: AnalysisTableId,
+    table: Option<&'a AnalysisTable>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AnalysisPlotView<'a> {
+    id: AnalysisPlotId,
+    plot: Option<&'a AnalysisPlot>,
+}
+
+impl<'a> AnalysisWorkspaceView<'a> {
+    pub(crate) fn new(
+        analysis: &'a AnalysisProductRuntime,
+        input: AnalysisWorkspaceViewInput<'_>,
+    ) -> Self {
+        Self {
+            status_text: analysis.status_text(),
+            progress_blocks: analysis
+                .progress()
+                .map(|progress| (progress.completed_blocks(), progress.total_blocks())),
+            tables: input
+                .table_descriptors
+                .iter()
+                .map(|descriptor| AnalysisTableView {
+                    id: descriptor.id(),
+                    table: analysis.table(descriptor.id()),
+                })
+                .collect(),
+            plots: input
+                .plot_descriptors
+                .iter()
+                .map(|descriptor| AnalysisPlotView {
+                    id: descriptor.id(),
+                    plot: analysis.plot(descriptor.id()),
+                })
+                .collect(),
+            selected_table: input.selected_table,
+            selected_plot: input.selected_plot,
+            selected_plot_point: input.selected_plot_point,
+            last_export_csv_bytes: analysis.last_export_csv().map(str::len),
+        }
+    }
+
+    fn table(&self, id: AnalysisTableId) -> Option<&'a AnalysisTable> {
+        self.tables
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.table)
+    }
+
+    fn plot(&self, id: AnalysisPlotId) -> Option<&'a AnalysisPlot> {
+        self.plots
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.plot)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AnalysisTableExportInput<'a> {
     pub(crate) table_descriptors: &'a [AnalysisTableDescriptor],
@@ -45,9 +117,8 @@ pub(crate) struct AnalysisTableExportInput<'a> {
 
 pub(crate) fn show_analysis_workspace_window(
     ctx: &egui::Context,
-    analysis: &AnalysisProductRuntime,
+    view: &AnalysisWorkspaceView<'_>,
     egui_ui: &mut EguiUiState,
-    input: AnalysisWorkspaceViewInput<'_>,
 ) -> Vec<ApplicationCommand> {
     if !egui_ui.analysis_workspace_open {
         return Vec::new();
@@ -64,7 +135,7 @@ pub(crate) fn show_analysis_workspace_window(
                 .id_salt("analysis-workspace-scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    commands.extend(show_analysis_workspace(ui, analysis, egui_ui, input));
+                    commands.extend(show_analysis_workspace(ui, view, egui_ui));
                 });
         });
     egui_ui.analysis_workspace_open = open;
@@ -73,46 +144,31 @@ pub(crate) fn show_analysis_workspace_window(
 
 pub(crate) fn show_analysis_workspace(
     ui: &mut egui::Ui,
-    analysis: &AnalysisProductRuntime,
+    view: &AnalysisWorkspaceView<'_>,
     egui_ui: &mut EguiUiState,
-    input: AnalysisWorkspaceViewInput<'_>,
 ) -> Vec<ApplicationCommand> {
     let mut commands = Vec::new();
-    let tone = if analysis.status_text().contains("failed") {
+    let tone = if view.status_text.contains("failed") {
         StatusTone::Error
-    } else if analysis.status_text().contains("cancelled") {
+    } else if view.status_text.contains("cancelled") {
         StatusTone::Warning
     } else {
         StatusTone::Ready
     };
-    ui_kit::status_badge(ui, tone, analysis.status_text());
-    ui_kit::property_row(
-        ui,
-        "saved tables",
-        input.table_descriptors.len().to_string(),
-    );
-    ui_kit::property_row(ui, "saved plots", input.plot_descriptors.len().to_string());
-    if let Some(progress) = analysis.progress() {
+    ui_kit::status_badge(ui, tone, view.status_text);
+    ui_kit::property_row(ui, "saved tables", view.tables.len().to_string());
+    ui_kit::property_row(ui, "saved plots", view.plots.len().to_string());
+    if let Some((completed_blocks, total_blocks)) = view.progress_blocks {
         ui_kit::property_row(
             ui,
             "progress",
-            format!(
-                "{} / {} blocks",
-                progress.completed_blocks(),
-                progress.total_blocks()
-            ),
+            format!("{completed_blocks} / {total_blocks} blocks"),
         );
     }
 
-    show_analysis_result_browser(
-        ui,
-        analysis,
-        input,
-        &mut egui_ui.analysis_plot_view,
-        &mut commands,
-    );
-    if let Some(table_id) = input.selected_table {
-        if let Some(table) = analysis.table(table_id) {
+    show_analysis_result_browser(ui, view, &mut egui_ui.analysis_plot_view, &mut commands);
+    if let Some(table_id) = view.selected_table {
+        if let Some(table) = view.table(table_id) {
             ui.add_space(8.0);
             ui_kit::property_row(ui, "selected table", table.name());
             ui_kit::property_row(ui, "rows", table.rows().len().to_string());
@@ -135,12 +191,12 @@ pub(crate) fn show_analysis_workspace(
             ui_kit::status_badge(ui, StatusTone::Warning, "selected table is not loaded");
         }
     }
-    if let Some(plot_id) = input.selected_plot {
-        if let Some(plot) = analysis.plot(plot_id) {
-            let plot_index = input
-                .plot_descriptors
+    if let Some(plot_id) = view.selected_plot {
+        if let Some(plot) = view.plot(plot_id) {
+            let plot_index = view
+                .plots
                 .iter()
-                .position(|descriptor| descriptor.id() == plot_id)
+                .position(|entry| entry.id == plot_id)
                 .unwrap_or_default();
             ui.add_space(8.0);
             ui_kit::property_row(ui, "selected plot", plot.name());
@@ -150,7 +206,7 @@ pub(crate) fn show_analysis_workspace(
                 plot,
                 plot_index,
                 plot_id,
-                input.selected_plot_point,
+                view.selected_plot_point,
                 &mut egui_ui.analysis_plot_view,
                 &mut commands,
             );
@@ -158,20 +214,19 @@ pub(crate) fn show_analysis_workspace(
             ui_kit::status_badge(ui, StatusTone::Warning, "selected plot is not loaded");
         }
     }
-    if let Some(csv) = analysis.last_export_csv() {
-        ui_kit::property_row(ui, "last CSV", format!("{} bytes", csv.len()));
+    if let Some(bytes) = view.last_export_csv_bytes {
+        ui_kit::property_row(ui, "last CSV", format!("{bytes} bytes"));
     }
     commands
 }
 
 fn show_analysis_result_browser(
     ui: &mut egui::Ui,
-    analysis: &AnalysisProductRuntime,
-    input: AnalysisWorkspaceViewInput<'_>,
+    view: &AnalysisWorkspaceView<'_>,
     plot_view: &mut Option<AnalysisPlotViewRange>,
     commands: &mut Vec<ApplicationCommand>,
 ) {
-    if input.table_descriptors.is_empty() && input.plot_descriptors.is_empty() {
+    if view.tables.is_empty() && view.plots.is_empty() {
         ui_kit::status_badge(ui, StatusTone::Ready, "no saved analysis results");
         return;
     }
@@ -183,8 +238,8 @@ fn show_analysis_result_browser(
                 .id_salt("analysis-table-browser")
                 .max_height(92.0)
                 .show(ui, |ui| {
-                    for (index, descriptor) in input.table_descriptors.iter().enumerate() {
-                        let label = analysis.table(descriptor.id()).map_or_else(
+                    for (index, entry) in view.tables.iter().enumerate() {
+                        let label = entry.table.map_or_else(
                             || format!("{:02} saved table (loading)", index + 1),
                             |table| {
                                 format!(
@@ -196,12 +251,10 @@ fn show_analysis_result_browser(
                             },
                         );
                         if ui
-                            .selectable_label(input.selected_table == Some(descriptor.id()), label)
+                            .selectable_label(view.selected_table == Some(entry.id), label)
                             .clicked()
                         {
-                            commands.push(ApplicationCommand::SelectAnalysisTable(Some(
-                                descriptor.id(),
-                            )));
+                            commands.push(ApplicationCommand::SelectAnalysisTable(Some(entry.id)));
                         }
                     }
                 });
@@ -212,8 +265,8 @@ fn show_analysis_result_browser(
                 .id_salt("analysis-plot-browser")
                 .max_height(92.0)
                 .show(ui, |ui| {
-                    for (index, descriptor) in input.plot_descriptors.iter().enumerate() {
-                        let label = analysis.plot(descriptor.id()).map_or_else(
+                    for (index, entry) in view.plots.iter().enumerate() {
+                        let label = entry.plot.map_or_else(
                             || format!("{:02} saved plot (loading)", index + 1),
                             |plot| {
                                 format!(
@@ -225,12 +278,10 @@ fn show_analysis_result_browser(
                             },
                         );
                         if ui
-                            .selectable_label(input.selected_plot == Some(descriptor.id()), label)
+                            .selectable_label(view.selected_plot == Some(entry.id), label)
                             .clicked()
                         {
-                            commands.push(ApplicationCommand::SelectAnalysisPlot(Some(
-                                descriptor.id(),
-                            )));
+                            commands.push(ApplicationCommand::SelectAnalysisPlot(Some(entry.id)));
                             *plot_view = None;
                         }
                     }

@@ -54,8 +54,8 @@ use analysis_workspace::{
     zoom_analysis_plot_view,
 };
 use analysis_workspace::{
-    AnalysisTableExportInput, AnalysisWorkspaceViewInput, export_selected_analysis_table,
-    show_analysis_workspace, show_analysis_workspace_window,
+    AnalysisTableExportInput, AnalysisWorkspaceView, AnalysisWorkspaceViewInput,
+    export_selected_analysis_table, show_analysis_workspace, show_analysis_workspace_window,
 };
 use cross_section_readout::cross_section_hover_readout_for_panel_point;
 pub use diagnostics::{StartupDiagnostics, collect_startup_diagnostics, default_log_path};

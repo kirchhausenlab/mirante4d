@@ -1770,10 +1770,8 @@ impl eframe::App for MiranteWorkbenchApp {
                         if let Some(reason) = analysis_start_unavailable_reason.as_deref() {
                             ui_kit::status_badge(ui, StatusTone::Warning, reason);
                         }
-                        let commands = show_analysis_workspace(
-                            ui,
+                        let analysis_workspace_view = AnalysisWorkspaceView::new(
                             &self.analysis_runtime,
-                            &mut self.egui_ui,
                             AnalysisWorkspaceViewInput {
                                 table_descriptors: transient.analysis_tables(),
                                 plot_descriptors: transient.analysis_plots(),
@@ -1781,6 +1779,11 @@ impl eframe::App for MiranteWorkbenchApp {
                                 selected_plot: transient.selected_analysis_plot(),
                                 selected_plot_point: transient.selected_analysis_plot_point(),
                             },
+                        );
+                        let commands = show_analysis_workspace(
+                            ui,
+                            &analysis_workspace_view,
+                            &mut self.egui_ui,
                         );
                         application_commands.extend(commands);
                     });
@@ -2133,10 +2136,8 @@ impl eframe::App for MiranteWorkbenchApp {
         texture_refresh_requested |= viewer_output.texture_refresh_requested;
 
         let transient = application_snapshot.transient();
-        let commands = show_analysis_workspace_window(
-            ui.ctx(),
+        let analysis_workspace_view = AnalysisWorkspaceView::new(
             &self.analysis_runtime,
-            &mut self.egui_ui,
             AnalysisWorkspaceViewInput {
                 table_descriptors: transient.analysis_tables(),
                 plot_descriptors: transient.analysis_plots(),
@@ -2145,6 +2146,8 @@ impl eframe::App for MiranteWorkbenchApp {
                 selected_plot_point: transient.selected_analysis_plot_point(),
             },
         );
+        let commands =
+            show_analysis_workspace_window(ui.ctx(), &analysis_workspace_view, &mut self.egui_ui);
         application_commands.extend(commands);
 
         import_commands.extend(ui_kit::show_import_workflow_window(
