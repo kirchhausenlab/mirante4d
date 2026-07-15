@@ -11,28 +11,30 @@ mod workbench_chrome;
 mod workbench_inspector;
 mod workbench_viewer;
 
-pub use analysis_workspace::{show_analysis_workspace, show_analysis_workspace_window};
-pub use fidelity::{
-    frame_fidelity_label, iso_shading_policy_label, render_sampling_policy_label,
-    show_frame_fidelity_property_rows,
-};
+pub(crate) use analysis_workspace::{show_analysis_workspace, show_analysis_workspace_window};
+pub(crate) use fidelity::show_frame_fidelity_property_rows;
+pub use fidelity::{frame_fidelity_label, iso_shading_policy_label, render_sampling_policy_label};
 pub use project_dialogs::{
     DirtyProjectCloseView, DirtyProjectSaveAction, ProjectRecoveryCandidateView,
-    ProjectRecoveryView, show_dirty_project_close_prompt, show_project_recovery_ui,
+    ProjectRecoveryView,
 };
-pub use runtime_diagnostics::{RuntimeDiagnosticsView, show_runtime_diagnostics_body};
+pub(crate) use project_dialogs::{show_dirty_project_close_prompt, show_project_recovery_ui};
+pub use runtime_diagnostics::RuntimeDiagnosticsView;
+pub(crate) use runtime_diagnostics::show_runtime_diagnostics_body;
 pub use workbench::{WorkbenchView, show_workbench};
 pub use workbench_chrome::{
     LeftWorkbenchView, ProjectControlsView, TopToolbarView, playback_status_label,
-    show_left_workbench_panel, show_top_toolbar, viewport_hover_status_label,
+    viewport_hover_status_label,
 };
+pub(crate) use workbench_chrome::{show_left_workbench_panel, show_top_toolbar};
+pub(crate) use workbench_inspector::show_workbench_inspector;
 pub use workbench_inspector::{
     AnalysisControlsView, CameraInspectorView, InspectorWorkbenchView, histogram_bins_label,
-    histogram_status_label, show_workbench_inspector,
+    histogram_status_label,
 };
+pub(crate) use workbench_viewer::show_workbench_viewer;
 pub use workbench_viewer::{
     ViewerInteractionConfig, ViewerWorkbenchView, render_viewport_for_display_size,
-    show_workbench_viewer,
 };
 
 use std::{fmt::Display, hash::Hash, time::Duration};
@@ -264,7 +266,7 @@ pub enum WorkbenchUiAction {
     CopyDiagnostics,
 }
 
-pub fn show_settings_body(
+pub(crate) fn show_settings_body(
     ui: &mut egui::Ui,
     draft: &mut ResourcePolicyDraft,
     view: &SettingsUiView,
@@ -619,7 +621,7 @@ pub fn application_problem_message(event: Option<&ApplicationEvent>) -> Option<S
 }
 
 /// Presents the current import workflow and returns only framework-neutral commands.
-pub fn show_import_workflow_window(
+pub(crate) fn show_import_workflow_window(
     ctx: &egui::Context,
     state: &mut EguiUiState,
     snapshot: &ImportWorkflowSnapshot,
@@ -1002,7 +1004,7 @@ fn format_byte_quantity(bytes: u64) -> String {
     }
 }
 
-pub fn reserve_presentation(
+pub(crate) fn reserve_presentation(
     ui: &mut egui::Ui,
     slot: PresentationSlot,
     surface: &PresentationSurface,
@@ -1016,7 +1018,7 @@ pub fn reserve_presentation(
     (response, paint)
 }
 
-pub fn section<R>(
+pub(crate) fn section<R>(
     ui: &mut egui::Ui,
     title: impl Into<String>,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
@@ -1034,7 +1036,7 @@ pub fn section<R>(
     output
 }
 
-pub fn panel_scroll<R>(
+pub(crate) fn panel_scroll<R>(
     ui: &mut egui::Ui,
     id_salt: impl Hash,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
@@ -1047,7 +1049,7 @@ pub fn panel_scroll<R>(
         .inner
 }
 
-pub fn property_row(ui: &mut egui::Ui, label: impl Display, value: impl Display) {
+pub(crate) fn property_row(ui: &mut egui::Ui, label: impl Display, value: impl Display) {
     let tokens = UiTokens::default();
     ui.horizontal_top(|ui| {
         ui.set_min_height(tokens.spacing.control_height);
@@ -1067,12 +1069,12 @@ pub fn property_row(ui: &mut egui::Ui, label: impl Display, value: impl Display)
     });
 }
 
-pub fn muted_label(ui: &mut egui::Ui, text: impl Display) {
+pub(crate) fn muted_label(ui: &mut egui::Ui, text: impl Display) {
     let tokens = UiTokens::default();
     ui.label(RichText::new(text.to_string()).color(tokens.colors.text_muted));
 }
 
-pub fn elided_label(ui: &mut egui::Ui, text: impl Display, max_chars: usize) {
+pub(crate) fn elided_label(ui: &mut egui::Ui, text: impl Display, max_chars: usize) {
     let full = text.to_string();
     let elided = elide_middle(&full, max_chars);
     ui.label(elided).on_hover_text(full);
@@ -1098,7 +1100,7 @@ pub fn elide_middle(text: &str, max_chars: usize) -> String {
     format!("{prefix}...{suffix}")
 }
 
-pub fn status_badge(ui: &mut egui::Ui, tone: StatusTone, label: impl Display) {
+pub(crate) fn status_badge(ui: &mut egui::Ui, tone: StatusTone, label: impl Display) {
     let tokens = UiTokens::default();
     let color = match tone {
         StatusTone::Ready => tokens.colors.status_ready,
@@ -1117,7 +1119,7 @@ pub fn status_badge(ui: &mut egui::Ui, tone: StatusTone, label: impl Display) {
         });
 }
 
-pub fn toolbar_button(
+pub(crate) fn toolbar_button(
     ui: &mut egui::Ui,
     label: impl Into<String>,
     enabled: bool,
@@ -1129,7 +1131,7 @@ pub fn toolbar_button(
     )
 }
 
-pub fn layer_row(
+pub(crate) fn layer_row(
     ui: &mut egui::Ui,
     selected: bool,
     visible: bool,

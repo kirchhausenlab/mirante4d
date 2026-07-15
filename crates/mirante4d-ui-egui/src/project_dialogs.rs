@@ -100,7 +100,7 @@ impl ProjectRecoveryView {
     }
 }
 
-pub fn show_dirty_project_close_prompt(
+pub(crate) fn show_dirty_project_close_prompt(
     ctx: &egui::Context,
     input: DirtyProjectCloseView,
     actions: &mut Vec<WorkbenchUiAction>,
@@ -142,7 +142,7 @@ pub fn show_dirty_project_close_prompt(
         });
 }
 
-pub fn show_project_recovery_ui(
+pub(crate) fn show_project_recovery_ui(
     ctx: &egui::Context,
     input: &ProjectRecoveryView,
     actions: &mut Vec<WorkbenchUiAction>,

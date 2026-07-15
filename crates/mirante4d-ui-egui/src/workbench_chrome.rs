@@ -44,7 +44,7 @@ pub struct LeftWorkbenchView<'a> {
     pub dataset_path: &'a str,
 }
 
-pub fn show_top_toolbar(
+pub(crate) fn show_top_toolbar(
     ui: &mut egui::Ui,
     view: TopToolbarView<'_>,
     output: &mut WorkbenchUiOutput,
@@ -187,7 +187,7 @@ pub fn show_top_toolbar(
     });
 }
 
-pub fn show_left_workbench_panel(
+pub(crate) fn show_left_workbench_panel(
     ui: &mut egui::Ui,
     view: LeftWorkbenchView<'_>,
     state: &EguiUiState,

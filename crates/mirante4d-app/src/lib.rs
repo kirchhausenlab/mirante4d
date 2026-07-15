@@ -105,7 +105,7 @@ use ui_kit::{
     WorkbenchUiAction, WorkbenchUiOutput,
 };
 #[cfg(test)]
-use ui_kit::{WorkbenchLayoutSpec, histogram_bins_label, playback_status_label};
+use ui_kit::{histogram_bins_label, playback_status_label};
 use workbench_controls::{
     dataset_path_status_label, request_background_work_repaint,
     request_background_work_repaint_after,

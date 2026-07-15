@@ -18,7 +18,7 @@ impl RuntimeDiagnosticsView {
     }
 }
 
-pub fn show_runtime_diagnostics_body(
+pub(crate) fn show_runtime_diagnostics_body(
     view: &RuntimeDiagnosticsView,
     ui: &mut egui::Ui,
     actions: &mut Vec<WorkbenchUiAction>,

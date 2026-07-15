@@ -144,7 +144,7 @@ impl PanelId {
     }
 }
 
-pub fn show_workbench_viewer(
+pub(crate) fn show_workbench_viewer(
     ui: &mut egui::Ui,
     viewer: &ViewerWorkbenchView<'_>,
     egui_ui: &mut EguiUiState,

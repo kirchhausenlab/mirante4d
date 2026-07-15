@@ -47,7 +47,7 @@ pub struct InspectorWorkbenchView<'a> {
     pub messages: &'a [String],
 }
 
-pub fn show_workbench_inspector(
+pub(crate) fn show_workbench_inspector(
     ui: &mut egui::Ui,
     view: InspectorWorkbenchView<'_>,
     state: &mut EguiUiState,
