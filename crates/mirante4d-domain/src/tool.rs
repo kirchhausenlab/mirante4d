@@ -4,8 +4,6 @@ pub enum ToolKind {
     Navigate,
     Inspect,
     Crosshair,
-    RoiBox,
-    MeasureDistance,
 }
 
 #[cfg(test)]

@@ -385,21 +385,13 @@ fn show_3d_viewport_image(
         egui_ui.hovered_pixel = hover;
         egui_ui.hovered_source_readout = None;
     }
-    match apply_viewport_tool_response(
+    apply_viewport_tool_response(
         snapshot,
         egui_ui,
         viewer.frame_fidelity.completeness,
         &response,
         hover,
-    ) {
-        Ok(outcome) => {
-            output.texture_refresh_requested |= outcome.texture_refresh_requested;
-            output.rerender_requested |= outcome.rerender_requested;
-        }
-        Err(err) => {
-            tracing::warn!(%err, "viewer tool interaction rejected");
-        }
-    }
+    );
     if matches!(
         egui_ui.viewer_tools.active_tool,
         ViewerTool::Navigate | ViewerTool::Inspect
@@ -832,77 +824,52 @@ fn viewport_scroll_command(camera: CameraView, scroll_y_points: f32) -> Option<A
     Some(ApplicationCommand::SetCamera(camera))
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ToolInteractionOutcome {
-    texture_refresh_requested: bool,
-    rerender_requested: bool,
-}
-
 fn apply_viewport_tool_response(
     snapshot: &ApplicationSnapshot,
     egui_ui: &mut EguiUiState,
     frame_completeness: FrameCompleteness,
     response: &egui::Response,
     hover: Option<ViewportHover>,
-) -> Result<ToolInteractionOutcome, String> {
-    let hit = hover
-        .map(|hover| pick_hit_from_viewport_hover(snapshot, frame_completeness, hover))
-        .transpose()?;
+) {
+    let hit = hover.map(|hover| pick_hit_from_viewport_hover(snapshot, frame_completeness, hover));
     let mut commands = egui_ui
         .viewer_tools
         .handle_event(ViewerToolEvent::Hover(hit.clone()));
-    if response
-        .ctx
-        .input(|input| input.key_pressed(egui::Key::Escape))
+    if let Some(hit) = hit
+        && response.clicked_by(egui::PointerButton::Primary)
     {
-        commands.extend(egui_ui.viewer_tools.handle_event(ViewerToolEvent::Cancel));
+        commands.extend(
+            egui_ui
+                .viewer_tools
+                .handle_event(ViewerToolEvent::PrimaryClick(hit)),
+        );
     }
-    if let Some(hit) = hit {
-        if response.clicked_by(egui::PointerButton::Primary) {
-            commands.extend(
-                egui_ui
-                    .viewer_tools
-                    .handle_event(ViewerToolEvent::PrimaryClick(hit.clone())),
-            );
-        }
-        if response.dragged_by(egui::PointerButton::Primary) {
-            commands.extend(
-                egui_ui
-                    .viewer_tools
-                    .handle_event(ViewerToolEvent::PrimaryDrag(hit.clone())),
-            );
-        }
-        if response.drag_stopped_by(egui::PointerButton::Primary) {
-            commands.extend(
-                egui_ui
-                    .viewer_tools
-                    .handle_event(ViewerToolEvent::PrimaryRelease(hit)),
-            );
-        }
-    }
-    apply_viewer_tool_commands(egui_ui, commands)
+    apply_viewer_tool_commands(egui_ui, commands);
 }
 
 fn pick_hit_from_viewport_hover(
     snapshot: &ApplicationSnapshot,
     frame_completeness: FrameCompleteness,
     hover: ViewportHover,
-) -> Result<PickHit, String> {
+) -> PickHit {
     let view = snapshot.view();
     let screen_position = ScreenPosition::new(hover.x as f32, hover.y as f32);
     let active_layer = view
         .layer(view.active_layer())
         .expect("application view has an active layer");
+    let policy = pick_policy_for_render_mode(active_layer.render_state().mode());
     if !active_layer.visible() {
-        return Ok(empty_pick_hit(PickQuery {
-            timepoint: view.timepoint(),
-            screen_position,
-        }));
+        return empty_pick_hit(
+            PickQuery {
+                timepoint: view.timepoint(),
+                screen_position,
+            },
+            policy,
+        );
     }
 
-    Ok(PickHit {
+    PickHit {
         kind: PickHitKind::Voxel,
-        object_id: None,
         timepoint: view.timepoint(),
         screen_position: Some(screen_position),
         value: Some(match hover.intensity {
@@ -910,9 +877,9 @@ fn pick_hit_from_viewport_hover(
             ViewportIntensity::U16(value) => PickValue::IntensityU16(value),
             ViewportIntensity::F32(value) => PickValue::IntensityF32(value),
         }),
-        policy: pick_policy_for_render_mode(active_layer.render_state().mode()),
+        policy,
         completeness: pick_completeness_for_frame(frame_completeness),
-    })
+    }
 }
 
 fn pick_policy_for_render_mode(mode: RenderMode) -> PickPolicy {
@@ -934,35 +901,15 @@ fn pick_completeness_for_frame(completeness: FrameCompleteness) -> PickCompleten
     }
 }
 
-fn apply_viewer_tool_commands(
-    egui_ui: &mut EguiUiState,
-    commands: Vec<ViewerToolCommand>,
-) -> Result<ToolInteractionOutcome, String> {
+fn apply_viewer_tool_commands(egui_ui: &mut EguiUiState, commands: Vec<ViewerToolCommand>) {
     for command in commands {
         match command {
             ViewerToolCommand::SetHover(hit) => egui_ui.viewer_tools.hover = hit,
-            ViewerToolCommand::Select(selection) => egui_ui.viewer_tools.selection = selection,
             ViewerToolCommand::SetCrosshair(hit) => {
                 egui_ui.viewer_tools.crosshair = Some(hit);
             }
-            ViewerToolCommand::BeginRoi { .. }
-            | ViewerToolCommand::PreviewRoi { .. }
-            | ViewerToolCommand::CommitRoi { .. }
-            | ViewerToolCommand::BeginMeasurement { .. }
-            | ViewerToolCommand::PreviewMeasurement { .. }
-            | ViewerToolCommand::CommitMeasurement { .. }
-            | ViewerToolCommand::BeginSceneHandleDrag { .. }
-            | ViewerToolCommand::DragSceneHandle { .. }
-            | ViewerToolCommand::CommitSceneHandleDrag { .. } => {
-                return Err(
-                    "ROI drawing, measurement, and scene editing are not part of the current foundation scope."
-                        .to_owned(),
-                );
-            }
-            ViewerToolCommand::CancelTransientToolState => {}
         }
     }
-    Ok(ToolInteractionOutcome::default())
 }
 
 #[cfg(test)]

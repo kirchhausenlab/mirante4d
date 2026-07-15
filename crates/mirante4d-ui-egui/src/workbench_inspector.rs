@@ -454,9 +454,6 @@ fn show_viewer_tools(
             format!("x{:.0} y{:.0} {:?}", screen.x, screen.y, crosshair.kind),
         );
     }
-    if let Some(selection) = &state.viewer_tools.selection {
-        property_row(ui, "selection", format!("{selection:?}"));
-    }
 }
 
 fn show_analysis_controls(
