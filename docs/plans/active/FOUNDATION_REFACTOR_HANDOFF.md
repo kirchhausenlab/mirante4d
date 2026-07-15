@@ -2,13 +2,13 @@
 
 Status: ACTIVE PUBLIC-EPOCH PROGRAM
 Last reviewed: 2026-07-14
-Current technical sequence: WP-09C, WP-14, then WP-15
+Current technical sequence: WP-14, then WP-15
 Public-data publication: deferred to a separate future handoff
-WP-09C predecessor: `foundation-wp-09b-exit-1`
-Completed through: WP-09B at
-`b73dd86fed8cc3ac7b34f75f20dcd8bb8ac85672`
-Current checkpoint: WP-09C UI and composition-root candidate
-Next protected-branch checkpoint: accept the command/snapshot UI boundary
+WP-14 predecessor: `foundation-wp-09c-exit-1`
+Completed through: WP-09C at
+`d33276b6de0287da7f225da278ee016aac26358a`
+Current checkpoint: WP-14 practical release and contributor hardening
+Next protected-branch checkpoint: accept the local Linux package and clean-clone boundary
 
 ## Purpose
 
@@ -112,9 +112,10 @@ The order is dependency authority, not a menu:
 14. **WP-09C — UI and composition-root cutover.** Make the UI depend only on
     the accepted application/subsystem APIs and delete the old composition
     root.
-15. **WP-14 — Verification, release, and contributor hardening.** Qualify one
-    evidence set across tests, GPU, packaged E2E, performance, scientific
-    checks, clean-clone contribution, release, and zero-cost settings.
+15. **WP-14 — Verification, release, and contributor hardening.** Rehearse one
+    clean clone, qualify the existing local Linux package with the small public
+    fixture at the two supported display sizes, keep CI at zero cost, and
+    remove expired verification scaffolding.
 16. **WP-15 — Final deletion audit and technical foundation milestone.** Prove
     that no predecessor, duplicate authority, compatibility path, stale active
     document, or unowned requirement remains.
@@ -202,9 +203,11 @@ WP-10C accepted the target storage/import product cutover at
 are deleted. WP-09B accepted the sole progressive product renderer at
 `b73dd86fed8cc3ac7b34f75f20dcd8bb8ac85672`
 (`foundation-wp-09b-exit-1`); its predecessor and fallback routes are deleted.
-The WP-09C candidate now routes the complete visible workbench through one
-snapshot-in, typed-output-out `mirante4d-ui-egui` entry while the native app
-retains only process/service composition and presentation resolution.
+WP-09C accepted the complete visible workbench through one snapshot-in,
+typed-output-out `mirante4d-ui-egui` entry at
+`d33276b6de0287da7f225da278ee016aac26358a`
+(`foundation-wp-09c-exit-1`). The native app retains only process/service
+composition and presentation resolution.
 
 ## Dataset And Fixture Boundary
 
