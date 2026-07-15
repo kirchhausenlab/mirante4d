@@ -2,10 +2,6 @@
   "schema": "mirante4d-wp09a-render-successor-contract",
   "schema_version": 1,
   "status": "accepted-off-product",
-  "entry": {
-    "path": "architecture/wp09a-progressive-render-entry.json",
-    "sha256": "db991cbb9c96bb4e5e8a791aafff0495ba762a43862c78db136865fa495c53af"
-  },
   "predecessor": {
     "path": "architecture/wp08a-subsystem-contract.json",
     "sha256": "0500c27c9c4e13ce2eb0d833534a865c01efb0eabfea34df30015cf9af416cd3"
