@@ -845,6 +845,10 @@ impl eframe::App for MiranteWorkbenchApp {
 
         let application_snapshot = self.application_snapshot_for_ui();
         let view = application_view(&application_snapshot);
+        let analysis_start_unavailable_reason = self.analysis_start_unavailable_reason();
+        let analysis_active = self.analysis_runtime.active_token().is_some();
+        let analysis_roi_origin = self.analysis_runtime.roi_origin();
+        let analysis_roi_shape = self.analysis_runtime.roi_shape();
         let canonical_tool = viewer_tool_for_kind(application_snapshot.transient().active_tool());
         if self.egui_ui.viewer_tools.active_tool != canonical_tool {
             self.egui_ui.viewer_tools.set_active_tool(canonical_tool);
@@ -1692,10 +1696,8 @@ impl eframe::App for MiranteWorkbenchApp {
                         }
                     });
                     ui_kit::section(ui, "Analysis", |ui| {
-                        let snapshot = self.application.snapshot();
-                        let transient = snapshot.transient();
-                        let start_reason = self.analysis_start_unavailable_reason();
-                        let can_start = start_reason.is_none();
+                        let transient = application_snapshot.transient();
+                        let can_start = analysis_start_unavailable_reason.is_none();
                         let mut start_time = false;
                         let mut start_box = false;
                         ui.horizontal_wrapped(|ui| {
@@ -1703,13 +1705,7 @@ impl eframe::App for MiranteWorkbenchApp {
                                 ui_kit::toolbar_button(ui, "Analyze Time", can_start).clicked();
                             start_box =
                                 ui_kit::toolbar_button(ui, "Analyze Box", can_start).clicked();
-                            if ui_kit::toolbar_button(
-                                ui,
-                                "Cancel",
-                                self.analysis_runtime.active_token().is_some(),
-                            )
-                            .clicked()
-                            {
+                            if ui_kit::toolbar_button(ui, "Cancel", analysis_active).clicked() {
                                 actions.push(WorkbenchUiAction::CancelAnalysis);
                             }
                             if ui_kit::toolbar_button(ui, "Workspace", true).clicked() {
@@ -1725,15 +1721,15 @@ impl eframe::App for MiranteWorkbenchApp {
                                 actions.push(WorkbenchUiAction::CopySelectedAnalysisCsv);
                             }
                         });
-                        let layer_shape = snapshot
+                        let layer_shape = application_snapshot
                             .catalog()
-                            .layer(application_view(&snapshot).active_layer())
+                            .layer(view.active_layer())
                             .expect("the active layer closes over the catalog")
                             .shape()
                             .spatial()
                             .dimensions();
-                        let mut roi_origin = self.analysis_runtime.roi_origin();
-                        let mut roi_shape = self.analysis_runtime.roi_shape();
+                        let mut roi_origin = analysis_roi_origin;
+                        let mut roi_shape = analysis_roi_shape;
                         ui.label("Box coordinates (z, y, x voxels)");
                         ui.small("Analyze Box uses the current timepoint.");
                         ui.horizontal_wrapped(|ui| {
@@ -1761,9 +1757,7 @@ impl eframe::App for MiranteWorkbenchApp {
                             roi_shape[axis] = roi_shape[axis]
                                 .clamp(1, layer_shape[axis].saturating_sub(roi_origin[axis]));
                         }
-                        if roi_origin != self.analysis_runtime.roi_origin()
-                            || roi_shape != self.analysis_runtime.roi_shape()
-                        {
+                        if roi_origin != analysis_roi_origin || roi_shape != analysis_roi_shape {
                             actions.push(WorkbenchUiAction::SetAnalysisRoi {
                                 origin: roi_origin,
                                 shape: roi_shape,
@@ -1779,7 +1773,7 @@ impl eframe::App for MiranteWorkbenchApp {
                                 WorkbenchAnalysisKind::CurrentTimepointBox,
                             ));
                         }
-                        if let Some(reason) = start_reason {
+                        if let Some(reason) = analysis_start_unavailable_reason.as_deref() {
                             ui_kit::status_badge(ui, StatusTone::Warning, reason);
                         }
                         let commands = show_analysis_workspace(
@@ -2143,8 +2137,7 @@ impl eframe::App for MiranteWorkbenchApp {
         rerender_requested |= viewer_output.rerender_requested;
         texture_refresh_requested |= viewer_output.texture_refresh_requested;
 
-        let snapshot = self.application.snapshot();
-        let transient = snapshot.transient();
+        let transient = application_snapshot.transient();
         let commands = show_analysis_workspace_window(
             ui.ctx(),
             &self.analysis_runtime,
