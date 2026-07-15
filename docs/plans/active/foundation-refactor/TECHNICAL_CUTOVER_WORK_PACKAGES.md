@@ -547,35 +547,35 @@ Exit proof:
 
 ### WP-15 — Final Deletion Audit And Technical Foundation Milestone
 
-Goal: audit that every prior hard cutover already deleted its old authority and
-close the technical foundation without compatibility debris.
+Goal: remove demonstrated foundation leftovers and leave one small, current
+product and contributor surface.
 
 Required work:
 
-- Re-run architecture/dependency ownership audits against the final graph.
-- Confirm no old/new dual path remains without an explicit approved reason.
-- Audit for dense product runtime, duplicate mirrors/pools, string-only workflow
-  errors, obsolete report/audit machinery, phase commands, stale specs, aliases,
-  and transitional adapters that prior packages were required to delete.
-- If a major old authority remains, reopen its owning work package; WP-15 must
-  not become a late cleanup bucket that carries two architectures to the end.
-- Remove only incidental stray dead material whose deletion does not hide a
-  missed architectural cutover.
-- Update current-state, current-work, backlog, release, format, testing, and
-  contributor docs.
-- Archive the final handoff and execution evidence after concise active
-  contracts absorb the result.
+- Delete accepted-work-package replay validators, stale commands, aliases, and
+  adapters that have no current product or contributor purpose. Retain direct
+  checks of the current crate graph, dependency direction, filesystem safety,
+  renderer boundary, and sharded-storage rules.
+- Reduce product validation to the four retained small public scenarios:
+  camera/render modes, source verification, and project persistence. Remove
+  private T5, free-form script, performance, RSS, and speculative timing
+  machinery without changing those retained scenarios.
+- Remove demonstrated dead parameters and transitional namespaces, and expose
+  only the accepted UI composition entry outside the UI crate.
+- Make current-state, contributor, testing, format, release, backlog, and
+  deferred-feature docs describe the resulting repository. Delete completed
+  active-plan prose; Git history is its archive. Keep schemas used by live
+  fixture validators.
+- Do not add a replacement evidence system or rerun accepted storage,
+  durability, import, GPU, science, KVM, or power-cut matrices.
 
 Exit proof:
 
-- Source and docs audits find no superseded product path or active historical
-  authority.
-- Every approved requirement has its designated passing evidence. Requirements
-  classified for automation are automated-verified; human product, legal,
-  institutional, data-rights, and owner-acceptance requirements use their
-  explicitly assigned evidence/approval class.
-- Required real application workflows and technical validation datasets are
-  product-validated. Full public-release dataset workflows belong only to the
-  separately approved WP-13A/V/B follow-on.
-- The owner accepts any explicit remaining limitations for the foundation
-  milestone.
+- A focused source/docs audit finds no live predecessor route, duplicate
+  authority, expired adapter, or stale foundation command.
+- Focused tests, the ordinary `$0` PR gate, and the retained small-fixture
+  render-mode scenario pass at 1280x720 with its short 1920x1080 check.
+- Source microscopy remains byte-identical, target storage remains sharded,
+  and the current project/format lifecycle contracts remain unchanged.
+- Current docs state the remaining pre-alpha limitations and defer public-data
+  publication and segmentation without creating a new gate.

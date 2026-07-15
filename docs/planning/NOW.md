@@ -1,21 +1,21 @@
 # Current Work
 
-Last updated: 2026-07-14
+Last updated: 2026-07-15
 
 ## Current Checkpoint
 
-WP-09C is accepted on protected main at
-`d33276b6de0287da7f225da278ee016aac26358a`, tagged
-`foundation-wp-09c-exit-1`. The visible workbench enters
-`mirante4d-ui-egui` once with an immutable application snapshot and returns
-typed output to the native composition shell.
+WP-14 is accepted on protected main at
+`b925ae58cb879ca630f050cbf755ea5f641542f3`, tagged
+`foundation-wp-14-exit-1`. A clean clone passes the ordinary checks, and the
+local Linux release directory, tarball, and AppImage open the promoted small
+fixture. The packaged viewer was checked at 1280x720 and 1920x1080.
 
-## WP-14 Active
+## WP-15 Active
 
-WP-14 is limited to practical release and contributor readiness: correct the
-existing local Linux package, run the existing small-fixture viewer scenario
-against its packaged executable at 1280x720 and 1920x1080, rehearse the normal
-checks from one clean clone, and remove the last temporary validation owner.
-Existing `$0` CI and accepted subsystem evidence are reused. No new workflow,
-evidence manifest, private-data matrix, performance program, or 4K requirement
-is being added.
+WP-15 removes demonstrated leftovers from the completed cutovers: private and
+free-form validation scenarios, speculative performance reporting, accepted-WP
+replay validators, stale command aliases, dead adapters, and active foundation
+plan prose. It preserves the four useful product scenarios and direct current
+architecture rules. One ordinary PR gate and one small-fixture render-mode
+check are sufficient; no private-data, 4K, KVM, power-cut, or performance
+matrix is being added or repeated.

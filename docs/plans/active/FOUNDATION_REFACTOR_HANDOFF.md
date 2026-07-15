@@ -1,14 +1,14 @@
 # Mirante4D Foundation Refactor Handoff
 
-Status: ACTIVE PUBLIC-EPOCH PROGRAM
-Last reviewed: 2026-07-14
-Current technical sequence: WP-14, then WP-15
+Status: ACTIVE FINAL PACKAGE
+Last reviewed: 2026-07-15
+Current technical sequence: WP-15
 Public-data publication: deferred to a separate future handoff
-WP-14 predecessor: `foundation-wp-09c-exit-1`
-Completed through: WP-09C at
-`d33276b6de0287da7f225da278ee016aac26358a`
-Current checkpoint: WP-14 practical release and contributor hardening
-Next protected-branch checkpoint: accept the local Linux package and clean-clone boundary
+WP-15 predecessor: `foundation-wp-14-exit-1`
+Completed through: WP-14 at
+`b925ae58cb879ca630f050cbf755ea5f641542f3`
+Current checkpoint: WP-15 final deletion and documentation closeout
+Next protected-branch checkpoint: accept the completed technical foundation
 
 ## Purpose
 

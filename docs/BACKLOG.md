@@ -5,7 +5,7 @@ contains unresolved work only.
 
 ## Foundation Program
 
-- Complete WP-14 and WP-15 in the order stated by the
+- Complete WP-15 as stated by the
   [foundation handoff](plans/active/FOUNDATION_REFACTOR_HANDOFF.md).
 - Expose packaged unsaved-autosave recovery in its owning application package.
 - Repair the inherited clean-state X11/Winit shutdown panic in its owning
