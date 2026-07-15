@@ -71,9 +71,8 @@ no longer part of the repository.
 Hosted verification has a hard `$0` budget, no public self-hosted workstation,
 no private data, no automatic retry, and no cache or artifact storage.
 
-GPU, product E1-E4, packaged E2E, performance, stress, private T5, and
-scientific evidence are separate trusted-local lanes. The current GPU command
-is deliberately local-only:
+GPU and subsystem lifecycle checks are separate local tools. The current GPU
+command is deliberately local-only:
 
 ```bash
 MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
@@ -81,9 +80,8 @@ MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
 ```
 
 Run it only on the designated clean Vulkan workstation. Private dataset paths
-stay in local resolvers and never enter the public tree or hosted logs. The
-package-capability lane is registered as pending; WP-06 does not invent a
-passing package claim before an honest unsupported-GPU command exists.
+stay out of the public tree and hosted logs. Linux packaging and the small
+packaged-viewer scenario are local commands, not hosted lanes.
 
 The trusted lane now contains the accepted WP-09A successor aggregate; the
 predecessor GPU cases were retired with the deleted renderer crate. The
@@ -126,12 +124,12 @@ WP-10A is accepted at `foundation-wp-10a-exit-1`
 policy, Rust, and local format-lifecycle evidence.
 WP-09A is accepted at `foundation-wp-09a-exit-1`
 (`1b1e7d5534f29b010cc346d434811a3906fb40e1`) after exact protected-main
-policy/Rust and trusted-Vulkan evidence. The WP-09B candidate activates that
-renderer as the sole product route. Its bounded real-display scenario exercises
-MIP, DVR, ISO, linked panels with a 1280x720 render target, and a current
-1920x1080 render-target resize without repeating the inherited trusted-GPU
-matrix. Internal automation remains supporting evidence, not product-open
-proof.
+policy/Rust and trusted-Vulkan evidence. WP-09B accepted that renderer as the
+sole product route. WP-09C is accepted at `foundation-wp-09c-exit-1`
+(`d33276b6de0287da7f225da278ee016aac26358a`) after the bounded real-display
+scenario exercised MIP, DVR, ISO, linked panels at 1280x720, and a short
+1920x1080 resize without repeating the inherited trusted-GPU matrix. Internal
+automation remains supporting evidence, not product-open proof.
 
 WP-10B's independent project-store wire authority is checked in the public
 policy group with `python3 tools/project-fixtures/validate.py --manifest

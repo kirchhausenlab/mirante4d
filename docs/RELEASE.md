@@ -37,3 +37,17 @@ Application logs default to
 
 WP-14 validates this local package path. It does not create a supported public
 release or change the platform boundary above.
+
+After packaging, run the existing small-fixture viewer check against the
+unpacked packaged executable:
+
+```bash
+MIRANTE4D_PRODUCT_VALIDATE_APP_BINARY=target/mirante4d/dist/\
+mirante4d-0.1.0-linux-x86_64-release/mirante4d-app \
+MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display \
+  cargo xtask product-validate target_fixture_render_modes
+```
+
+This exercises MIP, DVR, ISO, linked panels, 1280x720, and a short
+1920x1080 resize with the promoted small fixture. It is a local product check,
+not a supported-release claim.

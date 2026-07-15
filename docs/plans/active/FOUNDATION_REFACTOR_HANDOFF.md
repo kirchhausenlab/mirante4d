@@ -151,14 +151,10 @@ unit/contract/UI test-binary build may be shared. The accepted twenty-attempt
 cache-free Main window passed the declared targets and hard ceilings. The
 transitional Bootstrap bridge was then removed.
 
-The live inventory remains owned exactly once across the public CPU and trusted
-GPU lanes. Package capability remains pending. WP-06 makes no target-format T1
-claim.
-
-Trusted local lanes own GPU, package, E0-E4, performance, stress, private T5,
-and scientific evidence. E4 means the packaged application, OS-level input,
-external window/pixel/state observation, a real mapped display, and a relevant
-dataset. Internal automation is useful support but cannot close E4.
+The live public inventory remains owned exactly once across the six CPU leaves.
+Concrete local commands cover format, project-store, GPU, Linux packaging, and
+small product scenarios. Planned performance, private-data, and E-level
+pseudo-lanes are not part of the foundation exit.
 
 Evidence is bound to one immutable commit/tree, executable or package digest,
 fixture/dataset identity, toolchain, hardware/display facts, commands, and
@@ -260,8 +256,8 @@ The technical foundation is complete only when:
 
 - every invariant is implemented and directly enforced;
 - every superseded product path and active historical authority is absent;
-- one exact evidence set passes the required automated, GPU, packaged E2E,
-  performance, stress, scientific, and product-open gates;
+- the ordinary automated checks, local Linux package, clean-clone rehearsal,
+  and affected small product workflow pass;
 - format/project lifecycle claims match the code;
 - documentation is concise, current, navigable, and sufficient for a new
   contributor; and

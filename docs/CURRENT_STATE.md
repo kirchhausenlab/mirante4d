@@ -196,18 +196,20 @@ and import crates are deleted.
 WP-09B is accepted on protected main at
 `b73dd86fed8cc3ac7b34f75f20dcd8bb8ac85672`, tagged
 `foundation-wp-09b-exit-1`. `mirante4d-render-wgpu` is the sole product render
-route; the predecessor renderer and CPU placeholder route are deleted. The
-WP-09C candidate gives the visible egui workbench one snapshot-in,
-typed-output-out entry. UI layout and interaction live in `mirante4d-ui-egui`;
-the native app retains process/service composition and presentation-token
-resolution without a second widget path.
+route; the predecessor renderer and CPU placeholder route are deleted. WP-09C
+is accepted at `d33276b6de0287da7f225da278ee016aac26358a`, tagged
+`foundation-wp-09c-exit-1`. The visible egui workbench has one snapshot-in,
+typed-output-out entry. UI layout and interaction live in
+`mirante4d-ui-egui`; the native app retains process/service composition and
+presentation-token resolution without a second widget path.
 
 ## Current Verification Boundary
 
 The public repository requires exactly `PR / policy` and `PR / rust` on pull
 requests, with matching non-required `Main / policy` and `Main / rust` checks.
 Hosted jobs use free public runners without caches or artifacts. GPU,
-performance, packaged, scientific, and private-data evidence remains local.
+format, project-store, packaging, and product checks remain explicit local
+commands used only when their boundaries change.
 
 See [testing](TESTING.md) for commands and claim language.
 
@@ -247,8 +249,8 @@ See [testing](TESTING.md) for commands and claim language.
   execution. The current API cannot authorize removal of non-regenerable
   artifacts; supporting that later needs separately approved snapshot-bound
   itemized confirmation and verified-backup proof.
-- The package-capability lane remains pending until there is an honest
-  unsupported-GPU package command.
+- Linux release candidates are local x86_64 artifacts, not a supported public
+  release.
 - Packaged runtime does not expose unsaved-autosave recovery.
 - Direct X11 close of a clean project can hit an inherited Winit shutdown
   panic; the dirty-project save/discard/cancel route exits cleanly.
