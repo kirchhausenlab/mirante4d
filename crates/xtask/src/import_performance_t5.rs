@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     fs::{File, OpenOptions},
     io::{Read, Write},
     os::unix::{
@@ -807,11 +809,7 @@ fn require_standard_app_build_environment(
     }
     for (name, value) in env::vars_os() {
         let name = name.to_string_lossy();
-        if !value.is_empty()
-            && (name == "RUSTFLAGS"
-                || name.ends_with("_RUSTFLAGS")
-                || name.starts_with("CARGO_PROFILE_RELEASE_"))
-        {
+        if is_compiler_or_profile_override(&name, &value, provenance.custom_rustflags) {
             bail!("T5 release app build rejects compiler/profile override {name}");
         }
         if !value.is_empty()
@@ -843,6 +841,31 @@ fn require_standard_app_build_environment(
         bail!("T5 release app and xtask must use the same recorded compiler");
     }
     Ok(())
+}
+
+fn is_compiler_or_profile_override(
+    name: &str,
+    value: &OsStr,
+    embedded_custom_rustflags: bool,
+) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    // Cargo exposes `cargo:rustc-env` values to a `cargo run` child. This
+    // exact matching value is immutable xtask provenance, not a user build
+    // flag; the embedded boolean is checked independently before any app build.
+    let matching_provenance_marker = name == "MIRANTE4D_XTASK_BUILD_CUSTOM_RUSTFLAGS"
+        && value
+            == OsStr::new(if embedded_custom_rustflags {
+                "true"
+            } else {
+                "false"
+            });
+    !matching_provenance_marker
+        && (name == "RUSTC"
+            || name == "RUSTFLAGS"
+            || name.ends_with("_RUSTFLAGS")
+            || name.starts_with("CARGO_PROFILE_RELEASE_"))
 }
 
 fn require_no_external_cargo_configuration(repository_root: &Path) -> anyhow::Result<()> {
@@ -3069,6 +3092,58 @@ mod tests {
             .samples,
             2
         );
+    }
+
+    #[test]
+    fn build_environment_filter_exempts_only_matching_embedded_rustflags_provenance() {
+        assert!(!is_compiler_or_profile_override(
+            "MIRANTE4D_XTASK_BUILD_CUSTOM_RUSTFLAGS",
+            OsStr::new("false"),
+            false,
+        ));
+        assert!(!is_compiler_or_profile_override(
+            "MIRANTE4D_XTASK_BUILD_CUSTOM_RUSTFLAGS",
+            OsStr::new("true"),
+            true,
+        ));
+        assert!(is_compiler_or_profile_override(
+            "MIRANTE4D_XTASK_BUILD_CUSTOM_RUSTFLAGS",
+            OsStr::new("true"),
+            false,
+        ));
+        assert!(is_compiler_or_profile_override(
+            "MIRANTE4D_XTASK_BUILD_CUSTOM_RUSTFLAGS",
+            OsStr::new("false"),
+            true,
+        ));
+        for variable in [
+            "RUSTC",
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+            "PRIVATE_RUSTFLAGS",
+            "CARGO_PROFILE_RELEASE_OPT_LEVEL",
+        ] {
+            assert!(
+                is_compiler_or_profile_override(variable, OsStr::new("set"), false),
+                "{variable} must remain rejected"
+            );
+            assert!(!is_compiler_or_profile_override(
+                variable,
+                OsStr::new(""),
+                false,
+            ));
+        }
+        for variable in [
+            "MIRANTE4D_XTASK_BUILD_GIT_HEAD",
+            "MIRANTE4D_XTASK_BUILD_RUSTC_WRAPPER",
+            "CARGO_PROFILE_DEV_OPT_LEVEL",
+        ] {
+            assert!(
+                !is_compiler_or_profile_override(variable, OsStr::new("set"), false),
+                "{variable} is not a release compiler/profile override"
+            );
+        }
     }
 
     #[test]
