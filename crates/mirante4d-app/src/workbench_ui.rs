@@ -854,6 +854,11 @@ impl eframe::App for MiranteWorkbenchApp {
             },
         );
         let dirty_project_close_ui = self.dirty_project_close_ui();
+        let settings_ui_view = self.settings_ui_view();
+        let source_verification_available = self
+            .source_verification_service
+            .as_ref()
+            .is_some_and(|service| service.active_token().is_none());
         let canonical_tool = viewer_tool_for_kind(application_snapshot.transient().active_tool());
         if self.egui_ui.viewer_tools.active_tool != canonical_tool {
             self.egui_ui.viewer_tools.set_active_tool(canonical_tool);
@@ -1147,9 +1152,7 @@ impl eframe::App for MiranteWorkbenchApp {
                         ) && ui_kit::toolbar_button(
                             ui,
                             "Verify Source",
-                            self.source_verification_service
-                                .as_ref()
-                                .is_some_and(|service| service.active_token().is_none()),
+                            source_verification_available,
                         )
                         .clicked()
                         {
@@ -1789,7 +1792,12 @@ impl eframe::App for MiranteWorkbenchApp {
                         application_commands.extend(commands);
                     });
                     ui_kit::section(ui, "Settings", |ui| {
-                        self.show_settings_body(ui, &mut actions);
+                        Self::show_settings_body(
+                            ui,
+                            &mut self.egui_ui.settings_runtime_draft,
+                            &settings_ui_view,
+                            &mut actions,
+                        );
                     });
                     egui::CollapsingHeader::new("Runtime Diagnostics")
                         .default_open(false)

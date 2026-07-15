@@ -173,6 +173,13 @@ struct ProjectRecoveryUi {
     can_open_locator: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SettingsUiView {
+    pending: bool,
+    rejected_file_present: bool,
+    status_text: String,
+}
+
 fn bytes_to_mib_rounded(bytes: u64) -> u64 {
     (bytes.saturating_add(MIB / 2) / MIB).max(1)
 }
@@ -653,9 +660,26 @@ impl MiranteWorkbenchApp {
         runtime_diagnostics_panel::diagnostics_summary_text(self)
     }
 
-    fn show_settings_body(&mut self, ui: &mut egui::Ui, actions: &mut Vec<WorkbenchUiAction>) {
-        let mut cpu_dataset_mib =
-            bytes_to_mib_rounded(self.egui_ui.settings_runtime_draft.cpu_dataset_budget_bytes);
+    fn settings_ui_view(&self) -> SettingsUiView {
+        let pending = self.settings_connection.pending().is_some();
+        SettingsUiView {
+            pending,
+            rejected_file_present: self.settings_connection.rejected_file_present(),
+            status_text: if pending {
+                "saving; restart required when complete".to_owned()
+            } else {
+                format!("{:?}", self.settings_connection.startup_status())
+            },
+        }
+    }
+
+    fn show_settings_body(
+        ui: &mut egui::Ui,
+        draft: &mut ui_kit::ResourcePolicyDraft,
+        view: &SettingsUiView,
+        actions: &mut Vec<WorkbenchUiAction>,
+    ) {
+        let mut cpu_dataset_mib = bytes_to_mib_rounded(draft.cpu_dataset_budget_bytes);
         if ui
             .add(
                 egui::DragValue::new(&mut cpu_dataset_mib)
@@ -666,13 +690,11 @@ impl MiranteWorkbenchApp {
             .on_hover_text("total CPU dataset ledger")
             .changed()
         {
-            self.egui_ui.settings_runtime_draft.cpu_dataset_budget_bytes =
-                mib_to_bytes(cpu_dataset_mib);
+            draft.cpu_dataset_budget_bytes = mib_to_bytes(cpu_dataset_mib);
         }
         ui_kit::property_row(ui, "CPU dataset MiB", cpu_dataset_mib.to_string());
 
-        let mut gpu_mib =
-            bytes_to_mib_rounded(self.egui_ui.settings_runtime_draft.gpu_budget_bytes);
+        let mut gpu_mib = bytes_to_mib_rounded(draft.gpu_budget_bytes);
         if ui
             .add(
                 egui::DragValue::new(&mut gpu_mib)
@@ -683,40 +705,33 @@ impl MiranteWorkbenchApp {
             .on_hover_text("total GPU ledger")
             .changed()
         {
-            self.egui_ui.settings_runtime_draft.gpu_budget_bytes = mib_to_bytes(gpu_mib);
+            draft.gpu_budget_bytes = mib_to_bytes(gpu_mib);
         }
         ui_kit::property_row(ui, "GPU MiB", gpu_mib.to_string());
 
-        let draft = self.egui_ui.settings_runtime_draft;
-        let policy_valid = ResourcePolicy::new(
-            self.egui_ui.settings_runtime_draft.cpu_dataset_budget_bytes,
-            self.egui_ui.settings_runtime_draft.gpu_budget_bytes,
-        )
-        .is_ok();
-        let pending = self.settings_connection.pending().is_some();
+        let current_draft = *draft;
+        let policy_valid =
+            ResourcePolicy::new(draft.cpu_dataset_budget_bytes, draft.gpu_budget_bytes).is_ok();
         ui.horizontal(|ui| {
-            if ui_kit::toolbar_button(ui, "Save Settings", policy_valid && !pending).clicked() {
-                actions.push(WorkbenchUiAction::SaveSettings(draft));
+            if ui_kit::toolbar_button(ui, "Save Settings", policy_valid && !view.pending).clicked()
+            {
+                actions.push(WorkbenchUiAction::SaveSettings(current_draft));
             }
-            if ui_kit::toolbar_button(ui, "Recommended", !pending).clicked() {
+            if ui_kit::toolbar_button(ui, "Recommended", !view.pending).clicked() {
                 actions.push(WorkbenchUiAction::UseRecommendedSettings);
             }
         });
-        if self.settings_connection.rejected_file_present()
-            && ui_kit::toolbar_button(ui, "Replace Rejected Settings", policy_valid && !pending)
-                .clicked()
+        if view.rejected_file_present
+            && ui_kit::toolbar_button(
+                ui,
+                "Replace Rejected Settings",
+                policy_valid && !view.pending,
+            )
+            .clicked()
         {
-            actions.push(WorkbenchUiAction::ReplaceRejectedSettings(draft));
+            actions.push(WorkbenchUiAction::ReplaceRejectedSettings(current_draft));
         }
-        ui_kit::property_row(
-            ui,
-            "settings status",
-            if pending {
-                "saving; restart required when complete".to_owned()
-            } else {
-                format!("{:?}", self.settings_connection.startup_status())
-            },
-        );
+        ui_kit::property_row(ui, "settings status", &view.status_text);
         if !policy_valid {
             ui_kit::status_badge(
                 ui,
