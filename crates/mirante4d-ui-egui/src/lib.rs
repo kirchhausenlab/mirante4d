@@ -187,13 +187,20 @@ pub struct EguiPresentationPaint {
     rect: egui::Rect,
 }
 
-/// Native shell work requested by a workbench widget.
+/// Analysis operation requested by a workbench widget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkbenchAnalysisKind {
+    FullTimeTrace,
+    CurrentTimepointBox,
+}
+
+/// Work requested by a workbench widget.
 ///
 /// These actions contain no filesystem paths, service handles, or backend
-/// resources. The process composition root performs the native dialog or
-/// clipboard operation after egui has finished building the workbench.
+/// resources. The process composition root performs them after egui has
+/// finished building the workbench.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NativeWorkbenchAction {
+pub enum WorkbenchUiAction {
     OpenDatasetDialog,
     NewProject,
     OpenProjectDialog,
@@ -203,6 +210,9 @@ pub enum NativeWorkbenchAction {
     ImportTiffDirectoryDialog,
     ImportTiffFileDialog,
     CopySelectedAnalysisCsv,
+    CancelAnalysis,
+    SetAnalysisRoi { origin: [u64; 3], shape: [u64; 3] },
+    StartAnalysis(WorkbenchAnalysisKind),
 }
 
 /// One validated viewport measurement observed while egui lays out a panel.
@@ -255,14 +265,14 @@ impl RenderUiRequest {
 
 /// Typed results emitted while egui builds one visible workbench frame.
 ///
-/// Commands retain their existing post-build batching behavior. Native shell
-/// actions and backend-neutral paint requests are likewise resolved only by
-/// the process composition root.
+/// Commands retain their existing post-build batching behavior. Actions and
+/// backend-neutral paint requests are likewise resolved only by the process
+/// composition root.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct WorkbenchUiOutput {
     pub application_commands: Vec<ApplicationCommand>,
     pub import_commands: Vec<ImportCommand>,
-    pub native_actions: Vec<NativeWorkbenchAction>,
+    pub actions: Vec<WorkbenchUiAction>,
     pub viewport_observations: Vec<ViewportObservation>,
     pub render_requests: Vec<RenderUiRequest>,
     pub presentation_paints: Vec<EguiPresentationPaint>,
@@ -1045,9 +1055,15 @@ mod tests {
         let output = WorkbenchUiOutput {
             application_commands: vec![ApplicationCommand::SetPlaybackActive(true)],
             import_commands: vec![ImportCommand::CancelImport],
-            native_actions: vec![
-                NativeWorkbenchAction::OpenDatasetDialog,
-                NativeWorkbenchAction::CopySelectedAnalysisCsv,
+            actions: vec![
+                WorkbenchUiAction::OpenDatasetDialog,
+                WorkbenchUiAction::CopySelectedAnalysisCsv,
+                WorkbenchUiAction::CancelAnalysis,
+                WorkbenchUiAction::SetAnalysisRoi {
+                    origin: [1, 2, 3],
+                    shape: [4, 5, 6],
+                },
+                WorkbenchUiAction::StartAnalysis(WorkbenchAnalysisKind::CurrentTimepointBox),
             ],
             viewport_observations: Vec::new(),
             render_requests: Vec::new(),
@@ -1062,10 +1078,16 @@ mod tests {
         );
         assert_eq!(output.import_commands, vec![ImportCommand::CancelImport]);
         assert_eq!(
-            output.native_actions,
+            output.actions,
             vec![
-                NativeWorkbenchAction::OpenDatasetDialog,
-                NativeWorkbenchAction::CopySelectedAnalysisCsv,
+                WorkbenchUiAction::OpenDatasetDialog,
+                WorkbenchUiAction::CopySelectedAnalysisCsv,
+                WorkbenchUiAction::CancelAnalysis,
+                WorkbenchUiAction::SetAnalysisRoi {
+                    origin: [1, 2, 3],
+                    shape: [4, 5, 6],
+                },
+                WorkbenchUiAction::StartAnalysis(WorkbenchAnalysisKind::CurrentTimepointBox),
             ]
         );
         assert!(output.presentation_paints.is_empty());

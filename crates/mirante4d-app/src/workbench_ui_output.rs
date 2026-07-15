@@ -38,7 +38,7 @@ impl MiranteWorkbenchApp {
         let WorkbenchUiOutput {
             application_commands,
             import_commands,
-            native_actions,
+            actions,
             viewport_observations,
             render_requests,
             presentation_paints,
@@ -47,31 +47,31 @@ impl MiranteWorkbenchApp {
         } = output;
 
         let command_apply_started = Instant::now();
-        for action in native_actions {
+        for action in actions {
             match action {
-                NativeWorkbenchAction::OpenDatasetDialog => {
+                WorkbenchUiAction::OpenDatasetDialog => {
                     self.open_native_from_dialog(ui.ctx());
                 }
-                NativeWorkbenchAction::NewProject => self.new_current_project(),
-                NativeWorkbenchAction::OpenProjectDialog => {
+                WorkbenchUiAction::NewProject => self.new_current_project(),
+                WorkbenchUiAction::OpenProjectDialog => {
                     self.open_session_from_dialog(ui.ctx());
                 }
-                NativeWorkbenchAction::SaveProject => {
+                WorkbenchUiAction::SaveProject => {
                     self.save_current_project();
                 }
-                NativeWorkbenchAction::SaveProjectAs => {
+                WorkbenchUiAction::SaveProjectAs => {
                     self.save_current_project_as();
                 }
-                NativeWorkbenchAction::OpenProjectRecovery => {
+                WorkbenchUiAction::OpenProjectRecovery => {
                     self.open_project_recovery_panel();
                 }
-                NativeWorkbenchAction::ImportTiffDirectoryDialog => {
+                WorkbenchUiAction::ImportTiffDirectoryDialog => {
                     self.import_tiff_directory_from_dialog(ui.ctx());
                 }
-                NativeWorkbenchAction::ImportTiffFileDialog => {
+                WorkbenchUiAction::ImportTiffFileDialog => {
                     self.import_tiff_file_from_dialog(ui.ctx());
                 }
-                NativeWorkbenchAction::CopySelectedAnalysisCsv => {
+                WorkbenchUiAction::CopySelectedAnalysisCsv => {
                     let snapshot = self.application.snapshot();
                     let transient = snapshot.transient();
                     match export_selected_analysis_table(
@@ -89,6 +89,31 @@ impl MiranteWorkbenchApp {
                         Err(error) => {
                             tracing::warn!(%error, "analysis table export rejected");
                         }
+                    }
+                }
+                WorkbenchUiAction::CancelAnalysis => {
+                    if let Err(error) = self.request_analysis_cancel() {
+                        self.project_status_message =
+                            Some(format!("Analysis could not be cancelled: {error}"));
+                    }
+                }
+                WorkbenchUiAction::SetAnalysisRoi { origin, shape } => {
+                    if let Err(error) = self.analysis_runtime.set_roi(origin, shape) {
+                        tracing::warn!(%error, "analysis box was rejected");
+                    }
+                }
+                WorkbenchUiAction::StartAnalysis(kind) => {
+                    let scope = match kind {
+                        WorkbenchAnalysisKind::FullTimeTrace => {
+                            analysis_product::ProductAnalysisScope::FullTimeTrace
+                        }
+                        WorkbenchAnalysisKind::CurrentTimepointBox => {
+                            analysis_product::ProductAnalysisScope::CurrentTimepointBox
+                        }
+                    };
+                    if let Err(error) = self.start_product_analysis(scope) {
+                        self.project_status_message =
+                            Some(format!("Analysis could not start: {error}"));
                     }
                 }
             }

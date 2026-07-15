@@ -853,7 +853,7 @@ impl eframe::App for MiranteWorkbenchApp {
         let mut rerender_requested = false;
         let mut texture_refresh_requested = false;
         let mut application_commands = Vec::new();
-        let mut native_actions = Vec::new();
+        let mut actions = Vec::new();
         let mut viewport_observations = Vec::new();
         let mut render_requests = Vec::new();
         let mut presentation_paints = Vec::new();
@@ -952,13 +952,13 @@ impl eframe::App for MiranteWorkbenchApp {
                     )
                     .clicked()
                     {
-                        native_actions.push(NativeWorkbenchAction::OpenDatasetDialog);
+                        actions.push(WorkbenchUiAction::OpenDatasetDialog);
                     }
                     if ui_kit::toolbar_button(ui, "New Project", !workflow_busy && can_new_project)
                         .on_hover_text("Start an unsaved project for the verified dataset")
                         .clicked()
                     {
-                        native_actions.push(NativeWorkbenchAction::NewProject);
+                        actions.push(WorkbenchUiAction::NewProject);
                     }
                     if ui_kit::toolbar_button(
                         ui,
@@ -968,7 +968,7 @@ impl eframe::App for MiranteWorkbenchApp {
                     .on_hover_text("Requires a verified scientific dataset identity")
                     .clicked()
                     {
-                        native_actions.push(NativeWorkbenchAction::OpenProjectDialog);
+                        actions.push(WorkbenchUiAction::OpenProjectDialog);
                     }
                     if ui_kit::toolbar_button(
                         ui,
@@ -978,7 +978,7 @@ impl eframe::App for MiranteWorkbenchApp {
                     .on_hover_text("Requires a verified scientific dataset identity")
                     .clicked()
                     {
-                        native_actions.push(NativeWorkbenchAction::SaveProject);
+                        actions.push(WorkbenchUiAction::SaveProject);
                     }
                     if ui_kit::toolbar_button(
                         ui,
@@ -988,7 +988,7 @@ impl eframe::App for MiranteWorkbenchApp {
                     .on_hover_text("Save a new project identity with exact fork provenance")
                     .clicked()
                     {
-                        native_actions.push(NativeWorkbenchAction::SaveProjectAs);
+                        actions.push(WorkbenchUiAction::SaveProjectAs);
                     }
                     if ui_kit::toolbar_button(
                         ui,
@@ -1003,19 +1003,19 @@ impl eframe::App for MiranteWorkbenchApp {
                     .on_hover_text("List validated autosave and manual recovery branches")
                     .clicked()
                     {
-                        native_actions.push(NativeWorkbenchAction::OpenProjectRecovery);
+                        actions.push(WorkbenchUiAction::OpenProjectRecovery);
                     }
                     if ui_kit::toolbar_button(ui, "Import Dir", !workflow_busy)
                         .on_hover_text("Import TIFF directory")
                         .clicked()
                     {
-                        native_actions.push(NativeWorkbenchAction::ImportTiffDirectoryDialog);
+                        actions.push(WorkbenchUiAction::ImportTiffDirectoryDialog);
                     }
                     if ui_kit::toolbar_button(ui, "Import File", !workflow_busy)
                         .on_hover_text("Import TIFF file")
                         .clicked()
                     {
-                        native_actions.push(NativeWorkbenchAction::ImportTiffFileDialog);
+                        actions.push(WorkbenchUiAction::ImportTiffFileDialog);
                     }
                     if import_active {
                         let cancellation_pending = matches!(
@@ -1721,10 +1721,8 @@ impl eframe::App for MiranteWorkbenchApp {
                                 self.analysis_runtime.active_token().is_some(),
                             )
                             .clicked()
-                                && let Err(error) = self.request_analysis_cancel()
                             {
-                                self.project_status_message =
-                                    Some(format!("Analysis could not be cancelled: {error}"));
+                                actions.push(WorkbenchUiAction::CancelAnalysis);
                             }
                             if ui_kit::toolbar_button(ui, "Workspace", true).clicked() {
                                 self.egui_ui.analysis_workspace_open = true;
@@ -1736,7 +1734,7 @@ impl eframe::App for MiranteWorkbenchApp {
                             )
                             .clicked()
                             {
-                                native_actions.push(NativeWorkbenchAction::CopySelectedAnalysisCsv);
+                                actions.push(WorkbenchUiAction::CopySelectedAnalysisCsv);
                             }
                         });
                         let layer_shape = snapshot
@@ -1775,27 +1773,23 @@ impl eframe::App for MiranteWorkbenchApp {
                             roi_shape[axis] = roi_shape[axis]
                                 .clamp(1, layer_shape[axis].saturating_sub(roi_origin[axis]));
                         }
-                        if (roi_origin != self.analysis_runtime.roi_origin()
-                            || roi_shape != self.analysis_runtime.roi_shape())
-                            && let Err(error) = self.analysis_runtime.set_roi(roi_origin, roi_shape)
+                        if roi_origin != self.analysis_runtime.roi_origin()
+                            || roi_shape != self.analysis_runtime.roi_shape()
                         {
-                            tracing::warn!(%error, "analysis box was rejected");
+                            actions.push(WorkbenchUiAction::SetAnalysisRoi {
+                                origin: roi_origin,
+                                shape: roi_shape,
+                            });
                         }
-                        if start_time
-                            && let Err(error) = self.start_product_analysis(
-                                analysis_product::ProductAnalysisScope::FullTimeTrace,
-                            )
-                        {
-                            self.project_status_message =
-                                Some(format!("Analysis could not start: {error}"));
+                        if start_time {
+                            actions.push(WorkbenchUiAction::StartAnalysis(
+                                WorkbenchAnalysisKind::FullTimeTrace,
+                            ));
                         }
-                        if start_box
-                            && let Err(error) = self.start_product_analysis(
-                                analysis_product::ProductAnalysisScope::CurrentTimepointBox,
-                            )
-                        {
-                            self.project_status_message =
-                                Some(format!("Analysis could not start: {error}"));
+                        if start_box {
+                            actions.push(WorkbenchUiAction::StartAnalysis(
+                                WorkbenchAnalysisKind::CurrentTimepointBox,
+                            ));
                         }
                         if let Some(reason) = start_reason {
                             ui_kit::status_badge(ui, StatusTone::Warning, reason);
@@ -2162,7 +2156,7 @@ impl eframe::App for MiranteWorkbenchApp {
         });
         application_commands.append(&mut viewer_output.application_commands);
         import_commands.append(&mut viewer_output.import_commands);
-        native_actions.append(&mut viewer_output.native_actions);
+        actions.append(&mut viewer_output.actions);
         viewport_observations.append(&mut viewer_output.viewport_observations);
         render_requests.append(&mut viewer_output.render_requests);
         presentation_paints.append(&mut viewer_output.presentation_paints);
@@ -2198,7 +2192,7 @@ impl eframe::App for MiranteWorkbenchApp {
             WorkbenchUiOutput {
                 application_commands,
                 import_commands,
-                native_actions,
+                actions,
                 viewport_observations,
                 render_requests,
                 presentation_paints,

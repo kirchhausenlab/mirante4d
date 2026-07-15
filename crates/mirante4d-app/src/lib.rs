@@ -125,8 +125,8 @@ use transfer_presets::{
 #[cfg(test)]
 use ui_kit::{AnalysisPlotViewRange, AnalysisTableSort, ViewportIntensity};
 use ui_kit::{
-    NativeWorkbenchAction, RenderUiRequest, StatusTone, ViewportHover, ViewportObservation,
-    WorkbenchLayoutSpec, WorkbenchUiOutput,
+    RenderUiRequest, StatusTone, ViewportHover, ViewportObservation, WorkbenchAnalysisKind,
+    WorkbenchLayoutSpec, WorkbenchUiAction, WorkbenchUiOutput,
 };
 use viewport::{
     default_camera_for_shape, fit_camera_to_shape_preserving_view, fit_size,
