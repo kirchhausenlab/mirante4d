@@ -333,7 +333,7 @@ impl ProductAutomationController {
         ctx: &egui::Context,
         update_timing: ProductAutomationAppUpdateTiming,
     ) {
-        let Some(mut automation) = app.validation_runtime.product_automation.take() else {
+        let Some(mut automation) = app.product_automation.take() else {
             return;
         };
         let automation_started = Instant::now();
@@ -373,7 +373,7 @@ impl ProductAutomationController {
                 automation.write_report_and_close(app, ctx, "failed", Some(reason));
             }
         }
-        app.validation_runtime.product_automation = Some(automation);
+        app.product_automation = Some(automation);
     }
 
     fn load_from_env() -> anyhow::Result<Self> {
@@ -796,10 +796,12 @@ impl ProductAutomationController {
                 let viewport = RenderExtent::new(*width, *height)
                     .map_err(|error| format!("invalid automation render target: {error}"))?;
                 let context_max = ctx.input(|input| input.max_texture_side);
+                #[cfg(test)]
                 let maximum = app
-                    .validation_runtime
                     .test_render_viewport_max_side
                     .map_or(context_max, |test_max| context_max.min(test_max));
+                #[cfg(not(test))]
+                let maximum = context_max;
                 if usize::try_from(viewport.width_pixels())
                     .ok()
                     .is_none_or(|width| width > maximum)

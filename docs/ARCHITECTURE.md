@@ -62,16 +62,14 @@ product uses `mirante4d-storage`, `mirante4d-import-pipeline`, and
 ## Application Composition
 
 `MiranteWorkbenchApp` holds `ApplicationState`, bounded
-`DatasetDemandState`, process diagnostics, one remaining temporary runtime
-owner, egui state owned by `mirante4d-ui-egui`, and narrow
+`DatasetDemandState`, process diagnostics, egui state owned by
+`mirante4d-ui-egui`, the opt-in product-validation controller, and narrow
 project-store/settings/source-open handles. It is a
 composition root, not a second model.
 
-The temporary owners and deletion gates are:
-
-| Owner | Scope | Gate |
-|---|---|---|
-| `CurrentValidationRuntime` | product-validation harness only | WP-14 |
+There are no remaining temporary runtime owners. The former
+`CurrentValidationRuntime` wrapper is deleted; product automation is composed
+directly and its render-size override exists only in test builds.
 
 The temporary egui bridge and render owner are deleted. The native app projects
 one immutable workbench view, calls `mirante4d-ui-egui` once, and resolves the
