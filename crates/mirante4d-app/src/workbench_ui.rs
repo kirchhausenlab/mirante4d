@@ -742,7 +742,9 @@ fn cross_section_interaction_commands(
     if !edited {
         return Ok(Vec::new());
     }
-    let cross_section = cross_section.into_canonical()?;
+    let cross_section = cross_section
+        .into_canonical()
+        .map_err(|error| error.to_string())?;
     Ok(vec![
         ApplicationCommand::SetActiveCrossSectionPanel(Some(application_panel)),
         ApplicationCommand::SetLayout {

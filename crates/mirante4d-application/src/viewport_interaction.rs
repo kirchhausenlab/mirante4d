@@ -2,7 +2,8 @@
 
 use glam::{DQuat, DVec3};
 use mirante4d_domain::{
-    CameraView, CrossSectionView, GridToWorld, Projection, UnitQuaternion, WorldPoint3,
+    CameraView, CrossSectionView, GeometryError, GridToWorld, Projection, UnitQuaternion,
+    ViewError, WorldPoint3,
 };
 use mirante4d_render_api::{CameraFrame, DEFAULT_PRESENTATION_VIEWPORT, PresentationViewport};
 
@@ -36,6 +37,35 @@ pub struct CrossSectionViewState {
     orientation: DQuat,
     scale_world_per_screen_point: f64,
     depth_world: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CrossSectionInteractionError {
+    Geometry(GeometryError),
+    View(ViewError),
+}
+
+impl std::fmt::Display for CrossSectionInteractionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Geometry(error) => write!(formatter, "invalid cross-section geometry: {error}"),
+            Self::View(error) => write!(formatter, "invalid cross-section view: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CrossSectionInteractionError {}
+
+impl From<GeometryError> for CrossSectionInteractionError {
+    fn from(error: GeometryError) -> Self {
+        Self::Geometry(error)
+    }
+}
+
+impl From<ViewError> for CrossSectionInteractionError {
+    fn from(error: ViewError) -> Self {
+        Self::View(error)
+    }
 }
 
 impl CrossSectionPanel {
@@ -80,16 +110,16 @@ impl CrossSectionViewState {
         }
     }
 
-    pub fn into_canonical(self) -> Result<CrossSectionView, String> {
+    pub fn into_canonical(self) -> Result<CrossSectionView, CrossSectionInteractionError> {
         let [x, y, z] = self.center_world.to_array();
         let [qx, qy, qz, qw] = self.orientation.to_array();
         CrossSectionView::new(
-            WorldPoint3::new(x, y, z).map_err(|error| error.to_string())?,
-            UnitQuaternion::new_xyzw(qx, qy, qz, qw).map_err(|error| error.to_string())?,
+            WorldPoint3::new(x, y, z)?,
+            UnitQuaternion::new_xyzw(qx, qy, qz, qw)?,
             self.scale_world_per_screen_point,
             self.depth_world,
         )
-        .map_err(|error| error.to_string())
+        .map_err(Into::into)
     }
 
     pub fn view(self, panel: CrossSectionPanel) -> CrossSectionPanelView {
@@ -354,4 +384,125 @@ fn arcball_vector(
         0.0
     };
     Some(DVec3::new(x, y, z).normalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn camera(projection: Projection) -> CameraView {
+        CameraView::new(
+            projection,
+            WorldPoint3::origin(),
+            UnitQuaternion::identity(),
+            2.0,
+            400.0,
+            100.0,
+        )
+        .unwrap()
+    }
+
+    fn assert_point_close(actual: [f64; 3], expected: [f64; 3]) {
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() <= 1.0e-10,
+                "{actual} != {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn camera_pan_and_orbit_preserve_unedited_camera_facts() {
+        let original = camera(Projection::Orthographic);
+        let panned = pan_camera(original, [5.0, -3.0]);
+        assert_ne!(panned.target(), original.target());
+        assert_eq!(panned.orientation(), original.orientation());
+        assert_eq!(panned.projection(), original.projection());
+
+        let unchanged = orbit_camera(original, [100.0, 100.0], [100.0, 100.0], [400.0, 300.0]);
+        assert_eq!(unchanged, original);
+        let orbited = orbit_camera(original, [200.0, 150.0], [230.0, 130.0], [400.0, 300.0]);
+        assert_eq!(orbited.target(), original.target());
+        assert_ne!(orbited.orientation(), original.orientation());
+    }
+
+    #[test]
+    fn camera_zoom_uses_the_projection_specific_scale() {
+        let orthographic = camera(Projection::Orthographic);
+        let orthographic_zoomed = zoom_camera(orthographic, 120.0);
+        assert!(
+            orthographic_zoomed.orthographic_world_per_screen_point()
+                < orthographic.orthographic_world_per_screen_point()
+        );
+        assert_eq!(
+            orthographic_zoomed.perspective_focal_length_screen_points(),
+            orthographic.perspective_focal_length_screen_points()
+        );
+
+        let perspective = camera(Projection::Perspective);
+        let perspective_zoomed = zoom_camera(perspective, 120.0);
+        assert_eq!(
+            perspective_zoomed.orthographic_world_per_screen_point(),
+            perspective.orthographic_world_per_screen_point()
+        );
+        assert!(
+            perspective_zoomed.perspective_focal_length_screen_points()
+                > perspective.perspective_focal_length_screen_points()
+        );
+    }
+
+    #[test]
+    fn cross_section_panel_bases_follow_canonical_axes() {
+        let canonical =
+            CrossSectionView::new(WorldPoint3::origin(), UnitQuaternion::identity(), 1.0, 1.0)
+                .unwrap();
+        let state = CrossSectionViewState::from_canonical(canonical);
+        let viewport = PresentationViewport::new(2.0, 2.0).unwrap();
+
+        assert_point_close(
+            state
+                .view(CrossSectionPanel::Xy)
+                .world_point_for_panel_point(2.0, 2.0, viewport),
+            [1.0, 1.0, 0.0],
+        );
+        assert_point_close(
+            state
+                .view(CrossSectionPanel::Xz)
+                .world_point_for_panel_point(2.0, 2.0, viewport),
+            [1.0, 0.0, 1.0],
+        );
+        assert_point_close(
+            state
+                .view(CrossSectionPanel::Yz)
+                .world_point_for_panel_point(2.0, 2.0, viewport),
+            [0.0, 1.0, -1.0],
+        );
+    }
+
+    #[test]
+    fn cross_section_zoom_keeps_the_pointer_anchor_and_round_trips() {
+        let canonical = CrossSectionView::new(
+            WorldPoint3::new(4.0, 5.0, 6.0).unwrap(),
+            UnitQuaternion::identity(),
+            0.5,
+            2.0,
+        )
+        .unwrap();
+        let viewport = PresentationViewport::new(640.0, 360.0).unwrap();
+        let mut state = CrossSectionViewState::from_canonical(canonical);
+        let before = state
+            .view(CrossSectionPanel::Xy)
+            .world_point_for_panel_point(410.0, 120.0, viewport);
+
+        state.zoom_around_panel_point(CrossSectionPanel::Xy, viewport, 410.0, 120.0, 1.75);
+
+        let after = state
+            .view(CrossSectionPanel::Xy)
+            .world_point_for_panel_point(410.0, 120.0, viewport);
+        assert_point_close(after, before);
+        let restored = state.into_canonical().unwrap();
+        assert_eq!(restored.depth_world(), canonical.depth_world());
+        assert_eq!(restored.orientation(), canonical.orientation());
+        assert!(restored.scale_world_per_screen_point() > canonical.scale_world_per_screen_point());
+    }
 }

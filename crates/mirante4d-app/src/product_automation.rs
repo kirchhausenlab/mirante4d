@@ -201,7 +201,9 @@ fn apply_cross_section_edit(
             .expect("validated cross-section panel"),
     );
     let layout = view.layout();
-    let cross_section = cross_section.into_canonical()?;
+    let cross_section = cross_section
+        .into_canonical()
+        .map_err(|error| error.to_string())?;
     dispatch_application_command(
         app,
         ctx,
