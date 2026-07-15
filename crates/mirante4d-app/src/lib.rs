@@ -147,7 +147,6 @@ const DEFAULT_ISO_DISPLAY_LEVEL: f32 = 0.5;
 const DEFAULT_DVR_OPACITY_GAMMA: f32 = 0.25;
 const CROSS_SECTION_FAST_SLICE_MULTIPLIER: f64 = 10.0;
 const CROSS_SECTION_ROTATE_RADIANS_PER_POINT: f64 = 0.005;
-const MIB: u64 = 1024 * 1024;
 const PROJECT_RECOVERY_ROOT_ENTRIES_MAX: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,21 +170,6 @@ struct ProjectRecoveryUi {
     candidates: Vec<ProjectRecoveryCandidate>,
     locators: Vec<ProjectId>,
     can_open_locator: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SettingsUiView {
-    pending: bool,
-    rejected_file_present: bool,
-    status_text: String,
-}
-
-fn bytes_to_mib_rounded(bytes: u64) -> u64 {
-    (bytes.saturating_add(MIB / 2) / MIB).max(1)
-}
-
-fn mib_to_bytes(mib: u64) -> u64 {
-    mib.saturating_mul(MIB)
 }
 
 fn application_view(snapshot: &ApplicationSnapshot) -> &ViewState {
@@ -656,9 +640,9 @@ impl MiranteWorkbenchApp {
         runtime_diagnostics_panel::diagnostics_summary_text(self)
     }
 
-    fn settings_ui_view(&self) -> SettingsUiView {
+    fn settings_ui_view(&self) -> ui_kit::SettingsUiView {
         let pending = self.settings_connection.pending().is_some();
-        SettingsUiView {
+        ui_kit::SettingsUiView {
             pending,
             rejected_file_present: self.settings_connection.rejected_file_present(),
             status_text: if pending {
@@ -666,74 +650,6 @@ impl MiranteWorkbenchApp {
             } else {
                 format!("{:?}", self.settings_connection.startup_status())
             },
-        }
-    }
-
-    fn show_settings_body(
-        ui: &mut egui::Ui,
-        draft: &mut ui_kit::ResourcePolicyDraft,
-        view: &SettingsUiView,
-        actions: &mut Vec<WorkbenchUiAction>,
-    ) {
-        let mut cpu_dataset_mib = bytes_to_mib_rounded(draft.cpu_dataset_budget_bytes);
-        if ui
-            .add(
-                egui::DragValue::new(&mut cpu_dataset_mib)
-                    .range(2_048..=32_768)
-                    .speed(64)
-                    .suffix(" MiB"),
-            )
-            .on_hover_text("total CPU dataset ledger")
-            .changed()
-        {
-            draft.cpu_dataset_budget_bytes = mib_to_bytes(cpu_dataset_mib);
-        }
-        ui_kit::property_row(ui, "CPU dataset MiB", cpu_dataset_mib.to_string());
-
-        let mut gpu_mib = bytes_to_mib_rounded(draft.gpu_budget_bytes);
-        if ui
-            .add(
-                egui::DragValue::new(&mut gpu_mib)
-                    .range(1_024..=8_192)
-                    .speed(256)
-                    .suffix(" MiB"),
-            )
-            .on_hover_text("total GPU ledger")
-            .changed()
-        {
-            draft.gpu_budget_bytes = mib_to_bytes(gpu_mib);
-        }
-        ui_kit::property_row(ui, "GPU MiB", gpu_mib.to_string());
-
-        let current_draft = *draft;
-        let policy_valid =
-            ResourcePolicy::new(draft.cpu_dataset_budget_bytes, draft.gpu_budget_bytes).is_ok();
-        ui.horizontal(|ui| {
-            if ui_kit::toolbar_button(ui, "Save Settings", policy_valid && !view.pending).clicked()
-            {
-                actions.push(WorkbenchUiAction::SaveSettings(current_draft));
-            }
-            if ui_kit::toolbar_button(ui, "Recommended", !view.pending).clicked() {
-                actions.push(WorkbenchUiAction::UseRecommendedSettings);
-            }
-        });
-        if view.rejected_file_present
-            && ui_kit::toolbar_button(
-                ui,
-                "Replace Rejected Settings",
-                policy_valid && !view.pending,
-            )
-            .clicked()
-        {
-            actions.push(WorkbenchUiAction::ReplaceRejectedSettings(current_draft));
-        }
-        ui_kit::property_row(ui, "settings status", &view.status_text);
-        if !policy_valid {
-            ui_kit::status_badge(
-                ui,
-                StatusTone::Error,
-                "resource budget is outside valid bounds",
-            );
         }
     }
 

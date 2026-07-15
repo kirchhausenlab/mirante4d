@@ -45,7 +45,8 @@ use mirante4d_project_model::{
 pub use mirante4d_project_store::ProjectGenerationId;
 use mirante4d_render_api::PresentedFrame;
 pub use mirante4d_render_api::{PresentationPaintRequest, PresentationViewport, RenderExtent};
-use mirante4d_settings::{RejectedFileDisposition, ResourcePolicy};
+use mirante4d_settings::RejectedFileDisposition;
+pub use mirante4d_settings::ResourcePolicy;
 
 /// Maximum number of project revisions retained for undo/redo.
 pub const MAX_HISTORY_ENTRIES: usize = 128;

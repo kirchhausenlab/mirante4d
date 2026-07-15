@@ -1895,7 +1895,7 @@ impl eframe::App for MiranteWorkbenchApp {
                         application_commands.extend(commands);
                     });
                     ui_kit::section(ui, "Settings", |ui| {
-                        Self::show_settings_body(
+                        ui_kit::show_settings_body(
                             ui,
                             &mut self.egui_ui.settings_runtime_draft,
                             &settings_ui_view,

@@ -12,7 +12,7 @@ use eframe::egui::{self, Color32, RichText};
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, CrossSectionPanelId, OperationOutcome,
     PresentationPaintRequest, PresentationSlot, PresentationSurface, PresentationViewport,
-    ProjectGenerationId, ProjectId, RenderExtent,
+    ProjectGenerationId, ProjectId, RenderExtent, ResourcePolicy,
     import_workflow::{
         ImportCommand, ImportProgressSnapshot, ImportReviewDraft, ImportReviewId,
         ImportReviewSnapshot, ImportSourceDtype, ImportSourceLayout, ImportWorkflowSnapshot,
@@ -74,6 +74,13 @@ struct ImportReviewUiState {
 pub struct ResourcePolicyDraft {
     pub cpu_dataset_budget_bytes: u64,
     pub gpu_budget_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsUiView {
+    pub pending: bool,
+    pub rejected_file_present: bool,
+    pub status_text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +233,75 @@ pub enum WorkbenchUiAction {
     OpenRecoveryCandidate(ProjectGenerationId),
     OpenRecoveryLocator(ProjectId),
     CopyDiagnostics,
+}
+
+pub fn show_settings_body(
+    ui: &mut egui::Ui,
+    draft: &mut ResourcePolicyDraft,
+    view: &SettingsUiView,
+    actions: &mut Vec<WorkbenchUiAction>,
+) {
+    const MIB: u64 = 1024 * 1024;
+
+    let mut cpu_dataset_mib = (draft.cpu_dataset_budget_bytes.saturating_add(MIB / 2) / MIB).max(1);
+    if ui
+        .add(
+            egui::DragValue::new(&mut cpu_dataset_mib)
+                .range(2_048..=32_768)
+                .speed(64)
+                .suffix(" MiB"),
+        )
+        .on_hover_text("total CPU dataset ledger")
+        .changed()
+    {
+        draft.cpu_dataset_budget_bytes = cpu_dataset_mib.saturating_mul(MIB);
+    }
+    property_row(ui, "CPU dataset MiB", cpu_dataset_mib.to_string());
+
+    let mut gpu_mib = (draft.gpu_budget_bytes.saturating_add(MIB / 2) / MIB).max(1);
+    if ui
+        .add(
+            egui::DragValue::new(&mut gpu_mib)
+                .range(1_024..=8_192)
+                .speed(256)
+                .suffix(" MiB"),
+        )
+        .on_hover_text("total GPU ledger")
+        .changed()
+    {
+        draft.gpu_budget_bytes = gpu_mib.saturating_mul(MIB);
+    }
+    property_row(ui, "GPU MiB", gpu_mib.to_string());
+
+    let current_draft = *draft;
+    let policy_valid =
+        ResourcePolicy::new(draft.cpu_dataset_budget_bytes, draft.gpu_budget_bytes).is_ok();
+    ui.horizontal(|ui| {
+        if toolbar_button(ui, "Save Settings", policy_valid && !view.pending).clicked() {
+            actions.push(WorkbenchUiAction::SaveSettings(current_draft));
+        }
+        if toolbar_button(ui, "Recommended", !view.pending).clicked() {
+            actions.push(WorkbenchUiAction::UseRecommendedSettings);
+        }
+    });
+    if view.rejected_file_present
+        && toolbar_button(
+            ui,
+            "Replace Rejected Settings",
+            policy_valid && !view.pending,
+        )
+        .clicked()
+    {
+        actions.push(WorkbenchUiAction::ReplaceRejectedSettings(current_draft));
+    }
+    property_row(ui, "settings status", &view.status_text);
+    if !policy_valid {
+        status_badge(
+            ui,
+            StatusTone::Error,
+            "resource budget is outside valid bounds",
+        );
+    }
 }
 
 /// One validated viewport measurement observed while egui lays out a panel.
