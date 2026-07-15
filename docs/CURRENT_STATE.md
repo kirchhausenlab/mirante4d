@@ -1,6 +1,6 @@
 # Current State
 
-Last reviewed: 2026-07-15
+Last reviewed: 2026-07-14
 
 Mirante4D is public, pre-alpha academic research software. Persisted formats
 and APIs can change through explicit hard cutovers; there is no supported
@@ -76,34 +76,19 @@ See [testing](TESTING.md) for commands and claim language.
   drift invalidates that result and requires verification again.
 - The target dataset profile and project-store format are experimental and
   carry no compatibility promise.
-- The product project-store crate has its frozen API,
-  control-record wire, typed generation/direct-and-paged closure, and
-  generation-last immutable publication. Its crate-private transaction core
-  can create the initial manual head and advance an established manual head
-  under held leases, and can create or advance an established-project autosave
-  head. It can also install a new initial package privately with exact Create
-  facts or a caller-bound Save As fork tuple, without replacing an existing
-  destination. Its public unbound actor now executes fresh Create, healthy Open,
-  provisional Autosave and manual handoff, established-session work, explicit
-  recovery selection, and authenticated Save As while retaining exact roots and
-  leases. B2 durability qualification now passes for its exact off-product
-  revision. B3 added actor-authenticated unchanged-object reuse, destination-
-  local Save As closure copying, and exact autosave scheduling. The application
-  service is the sole product path for ordinary project persistence and
-  recovery. Product maintenance and
-  Purge UI remain absent. PlanCompaction
-  does not authorize Trash, expose a physical object/byte plan or reclaim
-  estimate, or prove backup approval. Private FullVerify does not validate
-  artifact scientific semantics, repair data, inspect trash, or establish a
-  durability claim.
-- Private actor-routed Trash is covered only for its bounded authorized subset;
-  its callback and process-crash matrix does not simulate power loss or qualify
-  filesystem durability. Private actor-routed Purge is likewise limited to its
-  strict zero-non-regenerable subset; its callback and process-crash matrices
-  do not simulate power loss, qualify a filesystem, or expose public/product
-  execution. The current API cannot authorize removal of non-regenerable
-  artifacts; supporting that later needs separately approved snapshot-bound
-  itemized confirmation and verified-backup proof.
+- The project store uses immutable objects and generations, bounded direct or
+  paged closure, atomic refs, held leases, and generation-last publication.
+  Its application service is the sole product route for Create, Open, Save,
+  Save As, autosave, recovery selection, dirty close, and joined shutdown.
+  Writable durability is qualified only for the accepted Linux ext4 tuple.
+- Project maintenance and Purge UI remain absent. Full verification does not
+  validate artifact scientific semantics, repair data, inspect trash, or
+  broaden the durability claim. Compaction planning does not authorize Trash,
+  expose a physical object/byte plan or reclaim estimate, or prove backup
+  approval. Private Trash and Purge accept only bounded
+  zero-non-regenerable subsets; their process-crash checks do not simulate
+  power loss, and the API cannot authorize removal of non-regenerable
+  artifacts.
 - Linux release candidates are local x86_64 artifacts, not a supported public
   release.
 - Packaged runtime does not expose unsaved-autosave recovery.

@@ -2,7 +2,7 @@
 
 Status: ACCEPTED AND IMPLEMENTED
 Date accepted: 2026-07-10
-Last reviewed: 2026-07-15
+Last reviewed: 2026-07-14
 Decision IDs: D-022, D-023
 Current-state effect: SIX-LEAF TOPOLOGY AND TWO ZERO-COST CHECKS ACTIVE
 

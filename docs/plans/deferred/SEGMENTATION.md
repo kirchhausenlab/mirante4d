@@ -1,7 +1,7 @@
 # Deferred Derived-Label Capability
 
 Status: DEFERRED
-Last updated: 2026-07-15
+Last updated: 2026-07-14
 
 Mirante4D has no segmentation product, persistence, renderer, or automation
 surface. A previous prototype was removed during WP-02 rather than carried

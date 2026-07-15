@@ -2,7 +2,7 @@
 
 Status: ACCEPTED AND IMPLEMENTED
 Accepted: 2026-07-09
-Last reviewed: 2026-07-15
+Last reviewed: 2026-07-14
 Decision source: OD-001 through OD-008 and PRG-001/002/003/008/015
 
 ## Context

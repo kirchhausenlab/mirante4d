@@ -71,6 +71,9 @@ Save, Save As, autosave, and recovery. Project I/O is identity-gated and the
 project format remains experimental.
 
 The active dataset profile does not promise backward compatibility, stable
-public release support, or generic OME-Zarr compatibility. Its frozen technical
-contract and independent target corpus are recorded in
-[`architecture/wp10a-storage-contract.json`](../architecture/wp10a-storage-contract.json).
+public release support, or generic OME-Zarr compatibility. Its exact normative
+standards are recorded in
+[`architecture/wp10a-normative-standards.json`](../architecture/wp10a-normative-standards.json).
+The closed control wire is implemented by `mirante4d-storage` and described
+above. The bounded independent corpus is
+[`fixtures/target/manifest.json`](../fixtures/target/manifest.json).

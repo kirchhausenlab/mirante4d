@@ -2,7 +2,7 @@
 
 Status: ACCEPTED
 Accepted: 2026-07-09
-Last reviewed: 2026-07-15
+Last reviewed: 2026-07-14
 Current-state effect: WP-04 PUBLIC CUTOVER COMPLETE
 
 WP-04 completed the clean-root publication cutover. The public repository is

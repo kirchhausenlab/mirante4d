@@ -1,7 +1,7 @@
 {
   "schema": "mirante4d-wp10b-project-store-contract",
   "schema_version": 1,
-  "status": "accepted-wire-authority",
+  "status": "active-experimental-product-authority",
   "bindings": {
     "protected_main": {
       "commit": "b6e0267802f8ac2d0d49a0f04302fd321ef2f617",
@@ -14,9 +14,8 @@
     "crate_name": "mirante4d-project-store",
     "crate_path": "crates/mirante4d-project-store",
     "lifecycle": "EXPERIMENTAL",
-    "product_status": "off-product-through-B3",
-    "product_activation_checkpoint": "B4",
-    "product_reachability": false
+    "product_status": "active",
+    "product_reachability": true
   },
   "dependencies": {
     "normal_workspace": [

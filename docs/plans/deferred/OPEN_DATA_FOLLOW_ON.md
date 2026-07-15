@@ -1,7 +1,7 @@
 # Mirante4D Open Data — Deferred Follow-On Plan
 
 Status: DEFERRED under D-021
-Last updated: 2026-07-15
+Last updated: 2026-07-14
 Scope source: D-021
 Entry gate: separate explicit owner approval for a concrete data-release effort
 

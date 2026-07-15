@@ -2,7 +2,7 @@
 
 Status: ACCEPTED AND IMPLEMENTED
 Accepted: 2026-07-09
-Last reviewed: 2026-07-15
+Last reviewed: 2026-07-14
 Decision IDs: D-004, D-005, D-006, D-015, D-016
 
 The foundation packages implemented this bounded product envelope. Current

@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-Last updated: 2026-07-15
+Last updated: 2026-07-14
 
 These ADRs preserve the decisions behind the completed foundation refactor.
 They explain rationale but do not replace `docs/CURRENT_STATE.md` as the

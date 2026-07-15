@@ -2,7 +2,7 @@
 
 Status: ACCEPTED AND IMPLEMENTED
 Accepted: 2026-07-10
-Last reviewed: 2026-07-15
+Last reviewed: 2026-07-14
 Public contribution intake: OPERATIONAL
 Decision ID: D-003
 Current-state effect: PUBLIC SOURCE POLICY AND REMOTE CONTROLS OPERATIONAL
