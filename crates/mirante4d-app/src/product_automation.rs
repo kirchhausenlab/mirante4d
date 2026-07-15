@@ -12,7 +12,8 @@ use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, CommandEffect, CrossSectionPanelId,
     ProjectStoreLifecycle, SourceVerificationSnapshot, WorkspaceSnapshot,
     viewport_interaction::{
-        CrossSectionPanel, CrossSectionViewState, orbit_camera, pan_camera,
+        CrossSectionPanel, CrossSectionViewState, default_camera_for_shape,
+        fit_camera_to_shape_preserving_view, orbit_camera, pan_camera,
         representative_voxel_world_size, zoom_camera,
     },
 };
@@ -886,7 +887,8 @@ impl ProductAutomationController {
                     .expect("application view closes over the dataset catalog")
                     .shape()
                     .t();
-                let next = crate::playback::stepped_timepoint(view.timepoint(), count, *delta);
+                let next =
+                    mirante4d_application::stepped_timepoint(view.timepoint(), count, *delta);
                 dispatch_application_command(app, ctx, ApplicationCommand::SetTimepoint(next))?;
                 let active_timepoint = application_view(&app.application.snapshot())
                     .timepoint()
@@ -1137,7 +1139,7 @@ impl ProductAutomationController {
                     .catalog()
                     .layer(view.active_layer())
                     .expect("application view closes over the dataset catalog");
-                let camera = crate::viewport::fit_camera_to_shape_preserving_view(
+                let camera = fit_camera_to_shape_preserving_view(
                     *view.camera(),
                     layer.shape().spatial(),
                     layer.grid_to_world(),
@@ -1157,10 +1159,8 @@ impl ProductAutomationController {
                     .catalog()
                     .layer(view.active_layer())
                     .expect("application view closes over the dataset catalog");
-                let camera = crate::viewport::default_camera_for_shape(
-                    layer.shape().spatial(),
-                    layer.grid_to_world(),
-                );
+                let camera =
+                    default_camera_for_shape(layer.shape().spatial(), layer.grid_to_world());
                 dispatch_application_command(app, ctx, ApplicationCommand::SetCamera(camera))?;
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,

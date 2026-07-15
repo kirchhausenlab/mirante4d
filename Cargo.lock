@@ -2280,6 +2280,7 @@ dependencies = [
  "egui_kittest",
  "insta",
  "mirante4d-application",
+ "tracing",
 ]
 
 [[package]]

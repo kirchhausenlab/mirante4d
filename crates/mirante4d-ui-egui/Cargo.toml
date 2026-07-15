@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 eframe.workspace = true
 mirante4d-application.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 egui_kittest.workspace = true

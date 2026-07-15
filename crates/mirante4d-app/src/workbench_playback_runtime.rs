@@ -115,12 +115,7 @@ pub(crate) fn enqueue_playback_command_if_due(
 }
 
 pub(crate) fn catalog_timepoint_count(snapshot: &ApplicationSnapshot) -> u64 {
-    snapshot
-        .catalog()
-        .layers()
-        .map(|layer| layer.shape().t())
-        .min()
-        .expect("DatasetCatalog is non-empty by construction")
+    snapshot.timepoint_count()
 }
 
 #[cfg(test)]

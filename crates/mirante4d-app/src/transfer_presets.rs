@@ -1,8 +1,7 @@
 use mirante4d_dataset::DatasetCatalog;
-use mirante4d_domain::{LayerTransfer, RenderState, RgbColor, TransferCurve};
+use mirante4d_domain::{LayerTransfer, RgbColor, TransferCurve};
 use mirante4d_project_model::{
-    ChannelPreset, ChannelPresetEntry, ChannelPresetId, LayerViewState, ProjectModelError,
-    ViewState,
+    ChannelPreset, ChannelPresetEntry, ChannelPresetId, ProjectModelError, ViewState,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,56 +123,6 @@ pub(crate) fn default_channel_presets(
         )?);
     }
     Ok(presets)
-}
-
-pub(crate) fn channel_preset_from_current_view(
-    view: &ViewState,
-    preset_id: ChannelPresetId,
-    label: impl AsRef<str>,
-) -> Result<ChannelPreset, ProjectModelError> {
-    ChannelPreset::new(
-        preset_id,
-        label,
-        view.layers()
-            .iter()
-            .map(channel_preset_entry_from_layer)
-            .collect(),
-    )
-}
-
-pub(crate) fn next_user_channel_preset_id(presets: &[ChannelPreset]) -> ChannelPresetId {
-    let mut index = 1usize;
-    loop {
-        let candidate = format!("user_display_{index}");
-        if presets
-            .iter()
-            .all(|preset| preset.id().as_str() != candidate.as_str())
-        {
-            return ChannelPresetId::new(candidate)
-                .expect("generated user channel preset ID is valid");
-        }
-        index = index
-            .checked_add(1)
-            .expect("user channel preset counter exhausted");
-    }
-}
-
-fn channel_preset_entry_from_layer(layer: &LayerViewState) -> ChannelPresetEntry {
-    channel_preset_entry(
-        layer,
-        layer.visible(),
-        layer.transfer().clone(),
-        *layer.render_state(),
-    )
-}
-
-fn channel_preset_entry(
-    layer: &LayerViewState,
-    visible: bool,
-    transfer: LayerTransfer,
-    render_state: RenderState,
-) -> ChannelPresetEntry {
-    ChannelPresetEntry::new(layer.layer_key(), visible, transfer, render_state)
 }
 
 #[cfg(test)]

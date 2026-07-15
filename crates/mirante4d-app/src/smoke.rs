@@ -13,7 +13,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mirante4d_application::{ApplicationCommand, ApplicationState, SourceSessionGeneration};
+use mirante4d_application::{
+    ApplicationCommand, ApplicationState, SourceSessionGeneration, stepped_timepoint,
+};
 use mirante4d_dataset::{CpuLedgerCategory, ResourcePayloadView};
 use mirante4d_dataset_runtime::RequestPriority;
 use mirante4d_domain::IntensityDType;
@@ -27,7 +29,6 @@ use crate::{
         DatasetDemandPlanLimits, plan_current_3d, render_extent_from_dimensions,
     },
     dataset_requests::SCOPE_CURRENT_3D,
-    playback::stepped_timepoint,
     unified_source_open,
 };
 

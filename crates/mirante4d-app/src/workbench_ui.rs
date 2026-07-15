@@ -100,33 +100,6 @@ fn show_iso_light_controls(
     }
 }
 
-fn layout_selector(
-    ui: &mut egui::Ui,
-    current: CanonicalViewerLayout,
-    cross_section: CrossSectionView,
-    application_commands: &mut Vec<ApplicationCommand>,
-) {
-    ui_kit::muted_label(ui, "Layout");
-    if ui
-        .selectable_label(current == CanonicalViewerLayout::Single3d, "3D")
-        .clicked()
-    {
-        application_commands.push(ApplicationCommand::SetLayout {
-            layout: CanonicalViewerLayout::Single3d,
-            cross_section,
-        });
-    }
-    if ui
-        .selectable_label(current == CanonicalViewerLayout::FourPanel, "4 Panel")
-        .clicked()
-    {
-        application_commands.push(ApplicationCommand::SetLayout {
-            layout: CanonicalViewerLayout::FourPanel,
-            cross_section,
-        });
-    }
-}
-
 const CROSS_SECTION_SCROLL_POINTS_PER_NOTCH: f32 = 120.0;
 const CROSS_SECTION_SCROLL_ZOOM_FACTOR_SCALE: f32 = 0.001;
 
@@ -771,13 +744,6 @@ fn scroll_y_points_from_zoom_delta(zoom_delta: f32) -> Option<f32> {
     scroll_y.is_finite().then_some(scroll_y)
 }
 
-fn workspace_channel_presets(snapshot: &ApplicationSnapshot) -> &[ChannelPreset] {
-    match snapshot.workspace() {
-        WorkspaceSnapshot::Unbound { workspace } => workspace.channel_presets(),
-        WorkspaceSnapshot::Bound { project, .. } => project.channel_presets(),
-    }
-}
-
 fn active_layer_no_data_policy_label(snapshot: &ApplicationSnapshot) -> Option<&'static str> {
     let active_layer = match snapshot.workspace() {
         WorkspaceSnapshot::Unbound { workspace } => workspace.view().active_layer(),
@@ -805,39 +771,6 @@ fn layer_view_command(
         transfer,
         render_state,
     ))
-}
-
-fn layer_render_state_for_mode(
-    layer: &LayerViewState,
-    mode: mirante4d_domain::RenderMode,
-) -> Result<CanonicalRenderState, String> {
-    let current = *layer.render_state();
-    let sampling = SamplingPolicy::VoxelExact;
-    match mode {
-        mirante4d_domain::RenderMode::Mip => Ok(CanonicalRenderState::mip(sampling)),
-        mirante4d_domain::RenderMode::Isosurface => {
-            let display_level = current
-                .iso_parameters()
-                .map(|parameters| parameters.display_level())
-                .unwrap_or(DEFAULT_ISO_DISPLAY_LEVEL);
-            CanonicalRenderState::iso(sampling, IsoShadingPolicy::Flat, display_level)
-                .map_err(|error| error.to_string())
-        }
-        mirante4d_domain::RenderMode::Dvr => {
-            let (opacity_transfer, density_scale) = current
-                .dvr_parameters()
-                .map(|parameters| (parameters.opacity_transfer(), parameters.density_scale()))
-                .unwrap_or((
-                    CanonicalDvrOpacityTransfer::new(
-                        layer.transfer().window(),
-                        layer.transfer().curve(),
-                    ),
-                    DEFAULT_DVR_DENSITY_SCALE,
-                ));
-            CanonicalRenderState::dvr(sampling, opacity_transfer, density_scale)
-                .map_err(|error| error.to_string())
-        }
-    }
 }
 
 fn render_state_with_sampling(
@@ -879,53 +812,6 @@ pub(crate) fn viewer_tool_for_kind(tool: ToolKind) -> ViewerTool {
         ToolKind::RoiBox => ViewerTool::RoiBox,
         ToolKind::MeasureDistance => ViewerTool::MeasureDistance,
     }
-}
-
-fn reset_view_command(
-    snapshot: &ApplicationSnapshot,
-    view: &ViewState,
-    presentation_viewport: PresentationViewport,
-) -> Result<ApplicationCommand, String> {
-    let layer = snapshot
-        .catalog()
-        .layer(view.active_layer())
-        .ok_or_else(|| "active layer is absent from the dataset catalog".to_owned())?;
-    let default_camera = default_camera_for_shape(layer.shape().spatial(), layer.grid_to_world());
-    let camera = CameraView::new(
-        view.camera().projection(),
-        default_camera.target(),
-        default_camera.orientation(),
-        default_camera.orthographic_world_per_screen_point(),
-        default_camera.perspective_focal_length_screen_points(),
-        default_camera.perspective_view_distance_world(),
-    )
-    .map_err(|error| error.to_string())?;
-    let camera = fit_camera_to_shape_preserving_view(
-        camera,
-        layer.shape().spatial(),
-        layer.grid_to_world(),
-        presentation_viewport,
-    );
-    let cross_section = CrossSectionView::new(
-        camera.target(),
-        UnitQuaternion::identity(),
-        camera.orthographic_world_per_screen_point(),
-        mirante4d_application::viewport_interaction::representative_voxel_world_size(
-            layer.grid_to_world(),
-        ),
-    )
-    .map_err(|error| error.to_string())?;
-    let next = ViewState::new(
-        view.layers().to_vec(),
-        view.active_layer(),
-        view.timepoint(),
-        camera,
-        view.layout(),
-        cross_section,
-        *view.iso_light(),
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(ApplicationCommand::ReplaceView(next))
 }
 
 impl eframe::App for MiranteWorkbenchApp {
@@ -983,13 +869,6 @@ impl eframe::App for MiranteWorkbenchApp {
         let mut render_requests = Vec::new();
         let mut presentation_paints = Vec::new();
         let import_snapshot = application_snapshot.import_workflow();
-        let import_active = matches!(import_snapshot, ImportWorkflowSnapshot::Importing(_));
-        let dataset_open_active = application_snapshot
-            .active_operations()
-            .iter()
-            .any(|token| token.kind() == OperationKind::DatasetOpen);
-        let workflow_busy =
-            !matches!(import_snapshot, ImportWorkflowSnapshot::Idle) || dataset_open_active;
         let mut import_commands = Vec::new();
         let layout = WorkbenchLayoutSpec::default();
         let playback_started = Instant::now();
@@ -1068,427 +947,49 @@ impl eframe::App for MiranteWorkbenchApp {
         let timepoint_count =
             workbench_playback_runtime::catalog_timepoint_count(&application_snapshot);
 
-        egui::Panel::top("top-toolbar").show_inside(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.heading("Mirante4D");
-                    ui.separator();
-                    if ui_kit::toolbar_button(
-                        ui,
-                        "Open",
-                        !workflow_busy && project_store_idle && !dataset_open_pending,
-                    )
-                    .clicked()
-                    {
-                        actions.push(WorkbenchUiAction::OpenDatasetDialog);
-                    }
-                    if ui_kit::toolbar_button(ui, "New Project", !workflow_busy && can_new_project)
-                        .on_hover_text("Start an unsaved project for the verified dataset")
-                        .clicked()
-                    {
-                        actions.push(WorkbenchUiAction::NewProject);
-                    }
-                    if ui_kit::toolbar_button(
-                        ui,
-                        "Open Project",
-                        !workflow_busy && can_open_project,
-                    )
-                    .on_hover_text("Requires a verified scientific dataset identity")
-                    .clicked()
-                    {
-                        actions.push(WorkbenchUiAction::OpenProjectDialog);
-                    }
-                    if ui_kit::toolbar_button(
-                        ui,
-                        "Save Project",
-                        !workflow_busy && can_save_project,
-                    )
-                    .on_hover_text("Requires a verified scientific dataset identity")
-                    .clicked()
-                    {
-                        actions.push(WorkbenchUiAction::SaveProject);
-                    }
-                    if ui_kit::toolbar_button(
-                        ui,
-                        "Save Project As",
-                        !workflow_busy && can_save_project_as,
-                    )
-                    .on_hover_text("Save a new project identity with exact fork provenance")
-                    .clicked()
-                    {
-                        actions.push(WorkbenchUiAction::SaveProjectAs);
-                    }
-                    if ui_kit::toolbar_button(
-                        ui,
-                        "Recovery",
-                        !workflow_busy && project_recovery_available,
-                    )
-                    .on_hover_text("List validated autosave and manual recovery branches")
-                    .clicked()
-                    {
-                        actions.push(WorkbenchUiAction::OpenProjectRecovery);
-                    }
-                    if ui_kit::toolbar_button(ui, "Import Dir", !workflow_busy)
-                        .on_hover_text("Import TIFF directory")
-                        .clicked()
-                    {
-                        actions.push(WorkbenchUiAction::ImportTiffDirectoryDialog);
-                    }
-                    if ui_kit::toolbar_button(ui, "Import File", !workflow_busy)
-                        .on_hover_text("Import TIFF file")
-                        .clicked()
-                    {
-                        actions.push(WorkbenchUiAction::ImportTiffFileDialog);
-                    }
-                    if import_active {
-                        let cancellation_pending = matches!(
-                            import_snapshot,
-                            ImportWorkflowSnapshot::Importing(execution)
-                                if execution.cancellation_requested
-                        );
-                        if ui_kit::toolbar_button(
-                            ui,
-                            if cancellation_pending {
-                                "Stopping Import"
-                            } else {
-                                "Cancel Import"
-                            },
-                            !cancellation_pending,
-                        )
-                        .clicked()
-                        {
-                            import_commands.push(ImportCommand::CancelImport);
-                        }
-                    }
-                    ui.separator();
-                    ui_kit::elided_label(ui, application_snapshot.catalog().label(), 42);
-                });
-                if let Some(message) = project_status_message.as_deref() {
-                    ui_kit::muted_label(ui, message);
-                }
-                ui.horizontal_wrapped(|ui| {
-                    layout_selector(
-                        ui,
-                        view.layout(),
-                        *view.cross_section(),
-                        &mut application_commands,
-                    );
-                    ui.separator();
-                    ui_kit::muted_label(ui, "Render");
-                    if let Some(command) = render_mode_selector(ui, view) {
-                        application_commands.push(command);
-                    }
-                    ui.separator();
-                    ui_kit::muted_label(ui, "Camera");
-                    if let Some(command) = projection_selector(ui, *view.camera()) {
-                        application_commands.push(command);
-                    }
-                    if ui.button("Fit Data").clicked() {
-                        application_commands.push(ApplicationCommand::SetCamera(
-                            fit_camera_to_shape_preserving_view(
-                                *view.camera(),
-                                active_catalog_layer.shape().spatial(),
-                                active_catalog_layer.grid_to_world(),
-                                viewer_ui_snapshot.presentation_viewport,
-                            ),
-                        ));
-                    }
-                    if ui.button("Reset View").clicked() {
-                        match reset_view_command(
-                            &application_snapshot,
-                            view,
-                            viewer_ui_snapshot.presentation_viewport,
-                        ) {
-                            Ok(command) => application_commands.push(command),
-                            Err(error) => tracing::warn!(%error, "view reset rejected"),
-                        }
-                    }
-                });
-            });
-        });
-
-        egui::Panel::left("layers-panel")
-            .resizable(true)
-            .default_size(layout.left_panel_width)
-            .size_range(layout.left_width_range())
-            .show_inside(ui, |ui| {
-                ui_kit::panel_scroll(ui, "layers-panel-scroll", |ui| {
-                    ui_kit::section(ui, "Dataset", |ui| {
-                        ui_kit::property_row(ui, "name", application_snapshot.catalog().label());
-                        ui_kit::property_row(
-                            ui,
-                            "layers",
-                            application_snapshot.catalog().len().to_string(),
-                        );
-                        ui_kit::property_row(
-                            ui,
-                            "timepoints",
-                            timepoint_count.to_string(),
-                        );
-                        ui_kit::property_row(
-                            ui,
-                            "scientific identity",
-                            match application_snapshot.source() {
-                                SourceVerificationSnapshot::Required => {
-                                    "verification required; project open/save unavailable"
-                                        .to_owned()
-                                }
-                                SourceVerificationSnapshot::Verifying {
-                                    completed_work,
-                                    total_work,
-                                    ..
-                                } => (*completed_work)
-                                    .saturating_mul(100)
-                                    .checked_div(*total_work)
-                                    .map_or_else(
-                                        || "verifying".to_owned(),
-                                        |percent| format!("verifying ({percent}%)"),
-                                    ),
-                                SourceVerificationSnapshot::Verified(_) => "verified".to_owned(),
-                            },
-                        );
-                        if let SourceVerificationSnapshot::Verifying { operation_id, .. } =
-                            application_snapshot.source()
-                            && ui_kit::toolbar_button(ui, "Cancel Verification", true).clicked()
-                        {
-                            application_commands
-                                .push(ApplicationCommand::CancelOperation(*operation_id));
-                        }
-                        if matches!(
-                            application_snapshot.source(),
-                            SourceVerificationSnapshot::Required
-                        ) && ui_kit::toolbar_button(
-                            ui,
-                            "Verify Source",
-                            source_verification_available,
-                        )
-                        .clicked()
-                        {
-                            application_commands
-                                .push(ApplicationCommand::RequestSourceVerification);
-                        }
-                    });
-                    ui_kit::section(ui, "Status", |ui| {
-                        match import_snapshot {
-                            ImportWorkflowSnapshot::Importing(execution) => {
-                                ui_kit::status_badge(
-                                    ui,
-                                    StatusTone::Warning,
-                                    if execution.cancellation_requested {
-                                        "stopping TIFF import"
-                                    } else {
-                                        "importing TIFF"
-                                    },
-                                );
-                            }
-                            ImportWorkflowSnapshot::Inspecting(_) => {
-                                ui_kit::status_badge(
-                                    ui,
-                                    StatusTone::Warning,
-                                    "inspecting TIFF input",
-                                );
-                            }
-                            ImportWorkflowSnapshot::Review(_) => {
-                                ui_kit::status_badge(
-                                    ui,
-                                    StatusTone::Warning,
-                                    "review TIFF import settings",
-                                );
-                            }
-                            ImportWorkflowSnapshot::Failed(_) => {
-                                ui_kit::status_badge(
-                                    ui,
-                                    StatusTone::Error,
-                                    "TIFF import needs attention",
-                                );
-                            }
-                            ImportWorkflowSnapshot::Idle => {
-                                ui_kit::status_badge(ui, StatusTone::Ready, "ready");
-                            }
-                        }
-                        ui_kit::property_row(
-                            ui,
-                            "fidelity",
-                            &viewer_ui_snapshot.composite_fidelity,
-                        );
-                        if let Some(hover) = self.egui_ui.hovered_pixel {
-                            ui_kit::property_row(ui, "hover", viewport_hover_status_label(hover));
-                        }
-                        if let Some(readout) = &self.egui_ui.hovered_source_readout {
-                            ui_kit::property_row(ui, "readout", readout);
-                        }
-                        ui_kit::property_row(
-                            ui,
-                            "playback",
-                            playback_status_label(
-                                application_snapshot.transient().playback_active(),
-                                view.timepoint(),
-                                timepoint_count,
-                            ),
-                        );
-                        ui_kit::property_row(
-                            ui,
-                            "path",
-                            &viewer_ui_snapshot.dataset_path,
-                        );
-                        ui.horizontal_wrapped(|ui| {
-                            show_playback_controls(
-                                ui,
-                                &application_snapshot,
-                                view,
-                                workflow_busy,
-                                &mut application_commands,
-                            );
-                        });
-                    });
-                    ui_kit::section(ui, "Layers", |ui| {
-                        for layer in view.layers() {
-                            let catalog_layer = application_snapshot
-                                .catalog()
-                                .layer(layer.layer_key())
-                                .expect("application view closes over the dataset catalog");
-                            let selected = layer.layer_key() == view.active_layer();
-                            let detail = format!(
-                                "{} {:?} t{} z{} y{} x{}",
-                                layer.layer_key().ordinal(),
-                                catalog_layer.dtype(),
-                                catalog_layer.shape().t(),
-                                catalog_layer.shape().z(),
-                                catalog_layer.shape().y(),
-                                catalog_layer.shape().x()
-                            );
-                            ui.horizontal(|ui| {
-                                let mut visible = layer.visible();
-                                if ui
-                                    .checkbox(&mut visible, "")
-                                    .on_hover_text(format!("Show {}", catalog_layer.label()))
-                                    .changed()
-                                {
-                                    application_commands.push(layer_view_command(
-                                        layer,
-                                        visible,
-                                        layer.transfer().clone(),
-                                        *layer.render_state(),
-                                    ));
-                                }
-                                if ui_kit::layer_row(
-                                    ui,
-                                    selected,
-                                    layer.visible(),
-                                    catalog_layer.label(),
-                                    &detail,
-                                )
-                                .clicked()
-                                    && !selected
-                                {
-                                    application_commands.push(ApplicationCommand::SetActiveLayer(
-                                        layer.layer_key(),
-                                    ));
-                                }
-                                let mut mode = layer.render_state().mode();
-                                egui::ComboBox::from_id_salt(format!(
-                                    "layer-render-mode-{}",
-                                    layer.layer_key().ordinal()
-                                ))
-                                .selected_text(render_mode_label(mode))
-                                .width(72.0)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut mode,
-                                        mirante4d_domain::RenderMode::Mip,
-                                        "MIP",
-                                    );
-                                    ui.selectable_value(
-                                        &mut mode,
-                                        mirante4d_domain::RenderMode::Isosurface,
-                                        "ISO",
-                                    );
-                                    ui.selectable_value(
-                                        &mut mode,
-                                        mirante4d_domain::RenderMode::Dvr,
-                                        "DVR",
-                                    );
-                                });
-                                if mode != layer.render_state().mode() {
-                                    match layer_render_state_for_mode(layer, mode) {
-                                        Ok(render_state) => application_commands.push(
-                                            layer_view_command(
-                                                layer,
-                                                layer.visible(),
-                                                layer.transfer().clone(),
-                                                render_state,
-                                            ),
-                                        ),
-                                        Err(error) => tracing::warn!(%error, "render mode change rejected"),
-                                    }
-                                }
-                            });
-                        }
-                        let active_id = view.active_layer().ordinal().to_string();
-                        ui_kit::property_row(ui, "active ID", active_id);
-                    });
-                    ui_kit::section(ui, "Channel Presets", |ui| {
-                        let presets = workspace_channel_presets(&application_snapshot);
-                        if presets.is_empty() {
-                            ui_kit::status_badge(ui, StatusTone::Warning, "no channel presets");
-                        } else {
-                            let selected = application_snapshot
-                                .transient()
-                                .selected_channel_preset()
-                                .and_then(|id| presets.iter().find(|preset| preset.id() == id))
-                                .unwrap_or(&presets[0]);
-                            egui::ComboBox::from_label("channel preset")
-                                .selected_text(selected.label())
-                                .show_ui(ui, |ui| {
-                                    for preset in presets {
-                                        if ui
-                                            .selectable_label(
-                                                preset.id() == selected.id(),
-                                                preset.label(),
-                                            )
-                                            .clicked()
-                                        {
-                                            application_commands.push(
-                                                ApplicationCommand::ApplyChannelPreset(
-                                                    preset.id().clone(),
-                                                ),
-                                            );
-                                        }
-                                    }
-                                });
-                            ui.horizontal_wrapped(|ui| {
-                                if ui_kit::toolbar_button(ui, "Apply", true).clicked() {
-                                    application_commands.push(
-                                        ApplicationCommand::ApplyChannelPreset(
-                                            selected.id().clone(),
-                                        ),
-                                    );
-                                }
-                                if ui_kit::toolbar_button(ui, "Save Current", true).clicked() {
-                                    let id = next_user_channel_preset_id(presets);
-                                    let label = format!("Display {}", presets.len() + 1);
-                                    match channel_preset_from_current_view(view, id, label) {
-                                        Ok(preset) => application_commands
-                                            .push(ApplicationCommand::UpsertChannelPreset(preset)),
-                                        Err(error) => tracing::warn!(%error, "channel preset creation rejected"),
-                                    }
-                                }
-                                if ui_kit::toolbar_button(ui, "Update", true).clicked() {
-                                    match channel_preset_from_current_view(
-                                        view,
-                                        selected.id().clone(),
-                                        selected.label(),
-                                    ) {
-                                        Ok(preset) => application_commands
-                                            .push(ApplicationCommand::UpsertChannelPreset(preset)),
-                                        Err(error) => tracing::warn!(%error, "channel preset update rejected"),
-                                    }
-                                }
-                            });
-                        }
-                    });
-                });
-            });
+        let mut chrome_output = WorkbenchUiOutput::default();
+        ui_kit::show_top_toolbar(
+            ui,
+            ui_kit::TopToolbarView {
+                application: &application_snapshot,
+                project: ui_kit::ProjectControlsView {
+                    status_message: project_status_message.as_deref(),
+                    dataset_open_pending,
+                    project_store_idle,
+                    can_new: can_new_project,
+                    can_open: can_open_project,
+                    can_save: can_save_project,
+                    can_save_as: can_save_project_as,
+                    recovery_available: project_recovery_available,
+                },
+                presentation_viewport: viewer_ui_snapshot.presentation_viewport,
+            },
+            &mut chrome_output,
+        );
+        ui_kit::show_left_workbench_panel(
+            ui,
+            ui_kit::LeftWorkbenchView {
+                application: &application_snapshot,
+                source_verification_available,
+                composite_fidelity: &viewer_ui_snapshot.composite_fidelity,
+                dataset_path: &viewer_ui_snapshot.dataset_path,
+            },
+            &self.egui_ui,
+            layout,
+            &mut chrome_output,
+        );
+        application_commands.append(&mut chrome_output.application_commands);
+        import_commands.append(&mut chrome_output.import_commands);
+        actions.append(&mut chrome_output.actions);
+        viewport_observations.append(&mut chrome_output.viewport_observations);
+        cross_section_readout_requests.append(&mut chrome_output.cross_section_readout_requests);
+        render_requests.append(&mut chrome_output.render_requests);
+        presentation_paints.append(&mut chrome_output.presentation_paints);
+        rerender_requested |= chrome_output.rerender_requested;
+        texture_refresh_requested |= chrome_output.texture_refresh_requested;
+        if let Some(delay) = chrome_output.repaint_after {
+            repaint_after = Some(repaint_after.map_or(delay, |current| current.min(delay)));
+        }
 
         egui::Panel::right("inspector-panel")
             .resizable(true)
@@ -2362,28 +1863,9 @@ impl eframe::App for MiranteWorkbenchApp {
     }
 }
 
-pub(crate) fn viewport_hover_status_label(hover: ViewportHover) -> String {
-    format!(
-        "hover x{} y{} intensity {}",
-        hover.x, hover.y, hover.intensity
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn viewport_hover_status_label_exposes_pixel_intensity() {
-        assert_eq!(
-            viewport_hover_status_label(ViewportHover {
-                x: 12,
-                y: 34,
-                intensity: ViewportIntensity::U16(567),
-            }),
-            "hover x12 y34 intensity 567"
-        );
-    }
 
     #[test]
     fn cross_section_zoom_delta_converts_to_existing_scroll_units() {

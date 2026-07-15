@@ -29,10 +29,9 @@ use crate::{
     collect_startup_diagnostics,
     current_runtime::analysis::AnalysisProductRuntime,
     dataset_requests::DatasetDemandState,
+    default_camera_for_shape,
     transfer_presets::default_channel_presets,
-    viewport::{
-        default_camera_for_shape, default_presentation_viewport, default_render_viewport_for_shape,
-    },
+    viewport::{default_presentation_viewport, default_render_viewport_for_shape},
 };
 
 const REQUEST_QUEUE_LIMIT: usize = 1_024;
