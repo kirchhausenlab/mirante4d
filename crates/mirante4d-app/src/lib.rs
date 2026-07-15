@@ -164,6 +164,15 @@ struct DirtyProjectCloseUi {
     save_action: DirtyProjectSaveAction,
 }
 
+#[derive(Debug, Clone)]
+struct ProjectRecoveryUi {
+    review_generation: Option<ProjectGenerationId>,
+    panel_open: bool,
+    candidates: Vec<ProjectRecoveryCandidate>,
+    locators: Vec<ProjectId>,
+    can_open_locator: bool,
+}
+
 fn bytes_to_mib_rounded(bytes: u64) -> u64 {
     (bytes.saturating_add(MIB / 2) / MIB).max(1)
 }
@@ -1753,19 +1762,32 @@ impl MiranteWorkbenchApp {
             });
     }
 
-    fn show_project_recovery_ui(&mut self, ctx: &egui::Context) {
-        #[derive(Clone, Copy)]
-        enum ReviewAction {
-            Recover(ProjectGenerationId),
-            OpenSaved,
+    fn project_recovery_ui(&self) -> ProjectRecoveryUi {
+        ProjectRecoveryUi {
+            review_generation: self
+                .project_recovery_review
+                .as_ref()
+                .map(|review| review.automatic_newer),
+            panel_open: self.project_recovery_panel_open,
+            candidates: self.project_recovery_candidates.clone(),
+            locators: self
+                .project_store
+                .as_ref()
+                .map(|service| service.recovery_store_project_ids().collect())
+                .unwrap_or_default(),
+            can_open_locator: self
+                .project_store
+                .as_ref()
+                .is_some_and(ProjectStoreApplicationService::can_open),
         }
+    }
 
-        let review = self
-            .project_recovery_review
-            .as_ref()
-            .map(|review| review.automatic_newer);
-        let mut review_action = None;
-        if let Some(automatic_newer) = review {
+    fn show_project_recovery_ui(
+        ctx: &egui::Context,
+        input: &ProjectRecoveryUi,
+        actions: &mut Vec<WorkbenchUiAction>,
+    ) {
+        if let Some(automatic_newer) = input.review_generation {
             egui::Window::new("Recover autosaved project?")
                 .collapsible(false)
                 .resizable(false)
@@ -1776,35 +1798,21 @@ impl MiranteWorkbenchApp {
                     );
                     ui.horizontal(|ui| {
                         if ui_kit::toolbar_button(ui, "Recover Autosave", true).clicked() {
-                            review_action = Some(ReviewAction::Recover(automatic_newer));
+                            actions.push(WorkbenchUiAction::RecoverReviewedAutosave(
+                                automatic_newer,
+                            ));
                         }
                         if ui_kit::toolbar_button(ui, "Open Saved Project", true).clicked() {
-                            review_action = Some(ReviewAction::OpenSaved);
+                            actions
+                                .push(WorkbenchUiAction::AcceptSavedProjectAfterRecoveryReview);
                         }
                     });
                 });
         }
-        match review_action {
-            Some(ReviewAction::Recover(generation_id)) => {
-                self.recover_project_candidate(generation_id);
-            }
-            Some(ReviewAction::OpenSaved) => self.accept_saved_project_after_recovery_review(),
-            None => {}
-        }
 
-        if !self.project_recovery_panel_open {
+        if !input.panel_open {
             return;
         }
-        let candidates = self.project_recovery_candidates.clone();
-        let locators = self
-            .project_store
-            .as_ref()
-            .map(|service| service.recovery_store_project_ids().collect::<Vec<_>>())
-            .unwrap_or_default();
-        let can_open_locator = self
-            .project_store
-            .as_ref()
-            .is_some_and(ProjectStoreApplicationService::can_open);
         let mut panel_open = true;
         let mut selected = None;
         let mut selected_locator = None;
@@ -1813,7 +1821,7 @@ impl MiranteWorkbenchApp {
             .resizable(true)
             .default_width(520.0)
             .show(ctx, |ui| {
-                if candidates.is_empty() && locators.is_empty() {
+                if input.candidates.is_empty() && input.locators.is_empty() {
                     ui.label("No validated recovery branches are available.");
                     return;
                 }
@@ -1821,15 +1829,15 @@ impl MiranteWorkbenchApp {
                     "Recovery never changes the stored project. A selected branch opens dirty and must be saved with Save As.",
                 );
                 ui.separator();
-                if !locators.is_empty() {
+                if !input.locators.is_empty() {
                     ui.heading("Unsaved projects from earlier launches");
-                    for project_id in &locators {
+                    for project_id in &input.locators {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(format!("Project {project_id}"));
                             if ui_kit::toolbar_button(
                                 ui,
                                 "Inspect and Recover",
-                                can_open_locator,
+                                input.can_open_locator,
                             )
                             .on_hover_text("Validated by the project-store actor before opening")
                             .clicked()
@@ -1838,17 +1846,17 @@ impl MiranteWorkbenchApp {
                             }
                         });
                     }
-                    if !candidates.is_empty() {
+                    if !input.candidates.is_empty() {
                         ui.separator();
                     }
                 }
-                if !candidates.is_empty() {
+                if !input.candidates.is_empty() {
                     ui.heading("Branches in the selected project");
                 }
                 egui::ScrollArea::vertical()
                     .max_height(320.0)
                     .show(ui, |ui| {
-                        for candidate in &candidates {
+                        for candidate in &input.candidates {
                             ui.group(|ui| {
                                 ui.horizontal_wrapped(|ui| {
                                     ui.label(format!(
@@ -1875,13 +1883,13 @@ impl MiranteWorkbenchApp {
                         }
                     });
             });
-        self.project_recovery_panel_open = panel_open;
+        if !panel_open {
+            actions.push(WorkbenchUiAction::CloseProjectRecoveryPanel);
+        }
         if let Some(generation_id) = selected {
-            self.project_recovery_panel_open = false;
-            self.recover_project_candidate(generation_id);
+            actions.push(WorkbenchUiAction::OpenRecoveryCandidate(generation_id));
         } else if let Some(project_id) = selected_locator {
-            self.project_recovery_panel_open = false;
-            self.open_recovery_locator(project_id);
+            actions.push(WorkbenchUiAction::OpenRecoveryLocator(project_id));
         }
     }
 

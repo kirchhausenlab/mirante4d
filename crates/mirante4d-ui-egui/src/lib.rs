@@ -12,7 +12,7 @@ use eframe::egui::{self, Color32, RichText};
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, CrossSectionPanelId, OperationOutcome,
     PresentationPaintRequest, PresentationSlot, PresentationSurface, PresentationViewport,
-    RenderExtent,
+    ProjectGenerationId, ProjectId, RenderExtent,
     import_workflow::{
         ImportCommand, ImportProgressSnapshot, ImportReviewDraft, ImportReviewId,
         ImportReviewSnapshot, ImportSourceDtype, ImportSourceLayout, ImportWorkflowSnapshot,
@@ -220,6 +220,11 @@ pub enum WorkbenchUiAction {
     SaveDirtyProjectAs,
     DiscardDirtyProject,
     CancelDirtyProjectClose,
+    RecoverReviewedAutosave(ProjectGenerationId),
+    AcceptSavedProjectAfterRecoveryReview,
+    CloseProjectRecoveryPanel,
+    OpenRecoveryCandidate(ProjectGenerationId),
+    OpenRecoveryLocator(ProjectId),
 }
 
 /// One validated viewport measurement observed while egui lays out a panel.

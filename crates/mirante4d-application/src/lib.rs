@@ -35,12 +35,14 @@ use mirante4d_domain::{
     CameraView, CrossSectionView, IsoLightState, LogicalLayerKey, TimeIndex, ToolKind, ViewerLayout,
 };
 use mirante4d_identity::ScientificContentId;
+pub use mirante4d_project_model::ProjectId;
 use mirante4d_project_model::{
     ArtifactCompleteness, ArtifactHandleId, ArtifactRecoverability, ArtifactReference,
     ArtifactSchema, ChannelPreset, ChannelPresetId, DatasetReference, LayerViewState,
-    MAX_CHANNEL_PRESETS, MAX_TOTAL_CHANNEL_PRESET_ENTRIES, ProjectGenerationProjection, ProjectId,
+    MAX_CHANNEL_PRESETS, MAX_TOTAL_CHANNEL_PRESET_ENTRIES, ProjectGenerationProjection,
     ProjectRevisionHighWater, ProjectRevisionId, ProjectState, ViewState,
 };
+pub use mirante4d_project_store::ProjectGenerationId;
 use mirante4d_render_api::PresentedFrame;
 pub use mirante4d_render_api::{PresentationPaintRequest, PresentationViewport, RenderExtent};
 use mirante4d_settings::{RejectedFileDisposition, ResourcePolicy};

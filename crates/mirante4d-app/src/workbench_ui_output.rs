@@ -218,6 +218,23 @@ impl MiranteWorkbenchApp {
                     ui.ctx()
                         .send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 }
+                WorkbenchUiAction::RecoverReviewedAutosave(generation_id) => {
+                    self.recover_project_candidate(generation_id);
+                }
+                WorkbenchUiAction::AcceptSavedProjectAfterRecoveryReview => {
+                    self.accept_saved_project_after_recovery_review();
+                }
+                WorkbenchUiAction::CloseProjectRecoveryPanel => {
+                    self.project_recovery_panel_open = false;
+                }
+                WorkbenchUiAction::OpenRecoveryCandidate(generation_id) => {
+                    self.project_recovery_panel_open = false;
+                    self.recover_project_candidate(generation_id);
+                }
+                WorkbenchUiAction::OpenRecoveryLocator(project_id) => {
+                    self.project_recovery_panel_open = false;
+                    self.open_recovery_locator(project_id);
+                }
             }
         }
 

@@ -137,6 +137,8 @@ pub(super) fn accepted_successor_public_root_additions(
             "PresentationSurface",
             "PresentationViewport",
             "ProjectRecoveryStoreLocator",
+            "ProjectGenerationId",
+            "ProjectId",
             "ProjectStoreApplicationService",
             "ProjectStoreLifecycle",
             "ProjectStoreServiceError",
