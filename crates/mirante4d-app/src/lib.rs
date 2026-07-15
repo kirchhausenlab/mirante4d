@@ -150,6 +150,20 @@ const CROSS_SECTION_ROTATE_RADIANS_PER_POINT: f64 = 0.005;
 const MIB: u64 = 1024 * 1024;
 const PROJECT_RECOVERY_ROOT_ENTRIES_MAX: usize = 64;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirtyProjectSaveAction {
+    Unavailable,
+    Save,
+    SaveAs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirtyProjectCloseUi {
+    open: bool,
+    pending_dataset_open: bool,
+    save_action: DirtyProjectSaveAction,
+}
+
 fn bytes_to_mib_rounded(bytes: u64) -> u64 {
     (bytes.saturating_add(MIB / 2) / MIB).max(1)
 }
@@ -1678,8 +1692,31 @@ impl MiranteWorkbenchApp {
         }
     }
 
-    fn show_dirty_project_close_prompt(&mut self, ctx: &egui::Context) {
-        if !self.egui_ui.close_prompt_open {
+    fn dirty_project_close_ui(&self) -> DirtyProjectCloseUi {
+        let save_action = self
+            .project_store
+            .as_ref()
+            .map(
+                |service| match (service.can_save(), service.can_save_as()) {
+                    (true, _) => DirtyProjectSaveAction::Save,
+                    (false, true) => DirtyProjectSaveAction::SaveAs,
+                    (false, false) => DirtyProjectSaveAction::Unavailable,
+                },
+            )
+            .unwrap_or(DirtyProjectSaveAction::Unavailable);
+        DirtyProjectCloseUi {
+            open: self.egui_ui.close_prompt_open,
+            pending_dataset_open: self.pending_dataset_open_path.is_some(),
+            save_action,
+        }
+    }
+
+    fn show_dirty_project_close_prompt(
+        ctx: &egui::Context,
+        input: DirtyProjectCloseUi,
+        actions: &mut Vec<WorkbenchUiAction>,
+    ) {
+        if !input.open {
             return;
         }
         egui::Window::new("Unsaved Project")
@@ -1687,53 +1724,30 @@ impl MiranteWorkbenchApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.label(if self.pending_dataset_open_path.is_some() {
+                ui.label(if input.pending_dataset_open {
                     "Project changes have not been saved. Save or discard them before opening another dataset."
                 } else {
                     "Project changes have not been saved."
                 });
                 ui.horizontal(|ui| {
-                    let (save_available, save_as_required) = self
-                        .project_store
-                        .as_ref()
-                        .map(|service| {
-                            let can_save = service.can_save();
-                            let can_save_as = service.can_save_as();
-                            (can_save || can_save_as, !can_save && can_save_as)
-                        })
-                        .unwrap_or((false, false));
-                    let save_label = if save_as_required { "Save As" } else { "Save" };
+                    let save_available = input.save_action != DirtyProjectSaveAction::Unavailable;
+                    let save_label = if input.save_action == DirtyProjectSaveAction::SaveAs {
+                        "Save As"
+                    } else {
+                        "Save"
+                    };
                     if ui_kit::toolbar_button(ui, save_label, save_available).clicked() {
-                        self.close_after_project_save = true;
-                        let started = if save_as_required {
-                            self.save_current_project_as()
+                        actions.push(if input.save_action == DirtyProjectSaveAction::SaveAs {
+                            WorkbenchUiAction::SaveDirtyProjectAs
                         } else {
-                            self.save_current_project()
-                        };
-                        if started && self.close_after_project_save {
-                            self.egui_ui.close_prompt_open = false;
-                        } else if !started {
-                            self.close_after_project_save = false;
-                        }
+                            WorkbenchUiAction::SaveDirtyProject
+                        });
                     }
                     if ui_kit::toolbar_button(ui, "Discard", true).clicked() {
-                        self.egui_ui.close_prompt_open = false;
-                        self.close_after_project_save = false;
-                        if let Some(path) = self.pending_dataset_open_path.take() {
-                            if let Err(error) = self.replace_state_from_dataset_path(path, None) {
-                                self.project_status_message =
-                                    Some(format!("Dataset open could not start: {error}"));
-                            }
-                        } else {
-                            self.request_project_store_close_for_exit();
-                        }
+                        actions.push(WorkbenchUiAction::DiscardDirtyProject);
                     }
                     if ui_kit::toolbar_button(ui, "Cancel", true).clicked() {
-                        self.egui_ui.close_prompt_open = false;
-                        self.egui_ui.allow_close_without_prompt = false;
-                        self.close_after_project_save = false;
-                        self.pending_dataset_open_path = None;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                        actions.push(WorkbenchUiAction::CancelDirtyProjectClose);
                     }
                 });
             });

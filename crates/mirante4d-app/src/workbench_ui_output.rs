@@ -160,6 +160,39 @@ impl MiranteWorkbenchApp {
                         }
                     }
                 }
+                WorkbenchUiAction::SaveDirtyProject | WorkbenchUiAction::SaveDirtyProjectAs => {
+                    self.close_after_project_save = true;
+                    let started = if action == WorkbenchUiAction::SaveDirtyProjectAs {
+                        self.save_current_project_as()
+                    } else {
+                        self.save_current_project()
+                    };
+                    if started && self.close_after_project_save {
+                        self.egui_ui.close_prompt_open = false;
+                    } else if !started {
+                        self.close_after_project_save = false;
+                    }
+                }
+                WorkbenchUiAction::DiscardDirtyProject => {
+                    self.egui_ui.close_prompt_open = false;
+                    self.close_after_project_save = false;
+                    if let Some(path) = self.pending_dataset_open_path.take() {
+                        if let Err(error) = self.replace_state_from_dataset_path(path, None) {
+                            self.project_status_message =
+                                Some(format!("Dataset open could not start: {error}"));
+                        }
+                    } else {
+                        self.request_project_store_close_for_exit();
+                    }
+                }
+                WorkbenchUiAction::CancelDirtyProjectClose => {
+                    self.egui_ui.close_prompt_open = false;
+                    self.egui_ui.allow_close_without_prompt = false;
+                    self.close_after_project_save = false;
+                    self.pending_dataset_open_path = None;
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                }
             }
         }
 

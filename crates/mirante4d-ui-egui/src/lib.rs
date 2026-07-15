@@ -216,6 +216,10 @@ pub enum WorkbenchUiAction {
     SaveSettings(ResourcePolicyDraft),
     ReplaceRejectedSettings(ResourcePolicyDraft),
     UseRecommendedSettings,
+    SaveDirtyProject,
+    SaveDirtyProjectAs,
+    DiscardDirtyProject,
+    CancelDirtyProjectClose,
 }
 
 /// One validated viewport measurement observed while egui lays out a panel.

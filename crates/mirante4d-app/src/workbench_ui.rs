@@ -849,6 +849,7 @@ impl eframe::App for MiranteWorkbenchApp {
         let analysis_active = self.analysis_runtime.active_token().is_some();
         let analysis_roi_origin = self.analysis_runtime.roi_origin();
         let analysis_roi_shape = self.analysis_runtime.roi_shape();
+        let dirty_project_close_ui = self.dirty_project_close_ui();
         let canonical_tool = viewer_tool_for_kind(application_snapshot.transient().active_tool());
         if self.egui_ui.viewer_tools.active_tool != canonical_tool {
             self.egui_ui.viewer_tools.set_active_tool(canonical_tool);
@@ -2158,7 +2159,7 @@ impl eframe::App for MiranteWorkbenchApp {
             application_snapshot.import_workflow(),
         ));
         self.show_project_recovery_ui(ui.ctx());
-        self.show_dirty_project_close_prompt(ui.ctx());
+        Self::show_dirty_project_close_prompt(ui.ctx(), dirty_project_close_ui, &mut actions);
         let ui_build_ms = duration_ms(ui_build_started.elapsed());
         let apply_timing = self.apply_workbench_ui_output(
             ui,
@@ -2271,7 +2272,14 @@ pub(crate) fn viewport_hover_status_label(hover: ViewportHover) -> String {
 
 #[cfg(test)]
 mod tests {
+    use egui_kittest::{Harness, kittest::Queryable};
+
     use super::*;
+
+    struct DirtyCloseHarnessState {
+        input: DirtyProjectCloseUi,
+        actions: Vec<WorkbenchUiAction>,
+    }
 
     #[test]
     fn viewport_hover_status_label_exposes_pixel_intensity() {
@@ -2295,5 +2303,48 @@ mod tests {
         assert!(zoom_out_scroll > 0.0);
         let reconstructed = (-zoom_in_scroll * CROSS_SECTION_SCROLL_ZOOM_FACTOR_SCALE).exp();
         assert!((reconstructed - 1.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dirty_project_prompt_returns_ordered_choices_without_app_side_effects() {
+        let mut harness = Harness::builder().build_ui_state(
+            |ui, state: &mut DirtyCloseHarnessState| {
+                state.actions.clear();
+                MiranteWorkbenchApp::show_dirty_project_close_prompt(
+                    ui.ctx(),
+                    state.input,
+                    &mut state.actions,
+                );
+            },
+            DirtyCloseHarnessState {
+                input: DirtyProjectCloseUi {
+                    open: true,
+                    pending_dataset_open: true,
+                    save_action: DirtyProjectSaveAction::SaveAs,
+                },
+                actions: Vec::new(),
+            },
+        );
+
+        harness.get_by_label("Save As").click();
+        harness.step();
+        assert_eq!(
+            harness.state().actions,
+            vec![WorkbenchUiAction::SaveDirtyProjectAs]
+        );
+
+        harness.get_by_label("Discard").click();
+        harness.step();
+        assert_eq!(
+            harness.state().actions,
+            vec![WorkbenchUiAction::DiscardDirtyProject]
+        );
+
+        harness.get_by_label("Cancel").click();
+        harness.step();
+        assert_eq!(
+            harness.state().actions,
+            vec![WorkbenchUiAction::CancelDirtyProjectClose]
+        );
     }
 }
