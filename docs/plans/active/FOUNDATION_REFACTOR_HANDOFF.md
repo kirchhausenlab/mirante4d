@@ -2,13 +2,13 @@
 
 Status: ACTIVE PUBLIC-EPOCH PROGRAM
 Last reviewed: 2026-07-14
-Current technical sequence: WP-09C, WP-14, then WP-15
+Current technical sequence: WP-14, then WP-15
 Public-data publication: deferred to a separate future handoff
-WP-09C predecessor: `foundation-wp-09b-exit-1`
-Completed through: WP-09B at
-`b73dd86fed8cc3ac7b34f75f20dcd8bb8ac85672`
-Current checkpoint: WP-09C UI and composition-root candidate
-Next protected-branch checkpoint: accept the command/snapshot UI boundary
+WP-14 predecessor: `foundation-wp-09c-exit-1`
+Completed through: WP-09C at
+`d33276b6de0287da7f225da278ee016aac26358a`
+Current checkpoint: WP-14 practical release and contributor hardening
+Next protected-branch checkpoint: accept the local Linux package and clean-clone boundary
 
 ## Purpose
 
@@ -112,9 +112,10 @@ The order is dependency authority, not a menu:
 14. **WP-09C — UI and composition-root cutover.** Make the UI depend only on
     the accepted application/subsystem APIs and delete the old composition
     root.
-15. **WP-14 — Verification, release, and contributor hardening.** Qualify one
-    evidence set across tests, GPU, packaged E2E, performance, scientific
-    checks, clean-clone contribution, release, and zero-cost settings.
+15. **WP-14 — Verification, release, and contributor hardening.** Rehearse one
+    clean clone, qualify the existing local Linux package with the small public
+    fixture at the two supported display sizes, keep CI at zero cost, and
+    remove expired verification scaffolding.
 16. **WP-15 — Final deletion audit and technical foundation milestone.** Prove
     that no predecessor, duplicate authority, compatibility path, stale active
     document, or unowned requirement remains.
@@ -150,14 +151,10 @@ unit/contract/UI test-binary build may be shared. The accepted twenty-attempt
 cache-free Main window passed the declared targets and hard ceilings. The
 transitional Bootstrap bridge was then removed.
 
-The live inventory remains owned exactly once across the public CPU and trusted
-GPU lanes. Package capability remains pending. WP-06 makes no target-format T1
-claim.
-
-Trusted local lanes own GPU, package, E0-E4, performance, stress, private T5,
-and scientific evidence. E4 means the packaged application, OS-level input,
-external window/pixel/state observation, a real mapped display, and a relevant
-dataset. Internal automation is useful support but cannot close E4.
+The live public inventory remains owned exactly once across the six CPU leaves.
+Concrete local commands cover format, project-store, GPU, Linux packaging, and
+small product scenarios. Planned performance, private-data, and E-level
+pseudo-lanes are not part of the foundation exit.
 
 Evidence is bound to one immutable commit/tree, executable or package digest,
 fixture/dataset identity, toolchain, hardware/display facts, commands, and
@@ -202,9 +199,11 @@ WP-10C accepted the target storage/import product cutover at
 are deleted. WP-09B accepted the sole progressive product renderer at
 `b73dd86fed8cc3ac7b34f75f20dcd8bb8ac85672`
 (`foundation-wp-09b-exit-1`); its predecessor and fallback routes are deleted.
-The WP-09C candidate now routes the complete visible workbench through one
-snapshot-in, typed-output-out `mirante4d-ui-egui` entry while the native app
-retains only process/service composition and presentation resolution.
+WP-09C accepted the complete visible workbench through one snapshot-in,
+typed-output-out `mirante4d-ui-egui` entry at
+`d33276b6de0287da7f225da278ee016aac26358a`
+(`foundation-wp-09c-exit-1`). The native app retains only process/service
+composition and presentation resolution.
 
 ## Dataset And Fixture Boundary
 
@@ -257,8 +256,8 @@ The technical foundation is complete only when:
 
 - every invariant is implemented and directly enforced;
 - every superseded product path and active historical authority is absent;
-- one exact evidence set passes the required automated, GPU, packaged E2E,
-  performance, stress, scientific, and product-open gates;
+- the ordinary automated checks, local Linux package, clean-clone rehearsal,
+  and affected small product workflow pass;
 - format/project lifecycle claims match the code;
 - documentation is concise, current, navigable, and sufficient for a new
   contributor; and

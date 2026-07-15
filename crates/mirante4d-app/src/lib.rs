@@ -444,7 +444,9 @@ pub struct MiranteWorkbenchApp {
     egui_ui: ui_kit::EguiUiState,
     import: ImportWorkflow,
     analysis_runtime: current_runtime::analysis::AnalysisProductRuntime,
-    validation_runtime: current_runtime::validation::CurrentValidationRuntime,
+    product_automation: Option<ProductAutomationController>,
+    #[cfg(test)]
+    test_render_viewport_max_side: Option<usize>,
     project_store: Option<ProjectStoreApplicationService<SystemMonotonicClock>>,
     project_recovery_root: Option<PathBuf>,
     project_recovery_candidates: Vec<ProjectRecoveryCandidate>,
@@ -507,9 +509,8 @@ impl MiranteWorkbenchApp {
             .wgpu_render_state
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("the interactive viewer requires the WGPU renderer"))?;
-        let validation_runtime =
-            current_runtime::validation::CurrentValidationRuntime::from_environment();
-        let validation_capture = validation_runtime.product_automation.is_some();
+        let product_automation = ProductAutomationController::from_env();
+        let validation_capture = product_automation.is_some();
         let product_renderer = WgpuRenderRuntime::from_existing_device(
             &render_state.adapter,
             render_state.device.clone(),
@@ -549,7 +550,9 @@ impl MiranteWorkbenchApp {
             egui_ui,
             import: ImportWorkflow::new(),
             analysis_runtime,
-            validation_runtime,
+            product_automation,
+            #[cfg(test)]
+            test_render_viewport_max_side: None,
             project_store,
             project_recovery_root,
             project_recovery_candidates: Vec::new(),

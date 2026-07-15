@@ -62,9 +62,17 @@ impl MiranteWorkbenchApp {
             xy_placeholder: panel_placeholder(PanelId::Xy),
             xz_placeholder: panel_placeholder(PanelId::Xz),
             yz_placeholder: panel_placeholder(PanelId::Yz),
-            test_render_viewport_max_side: self.validation_runtime.test_render_viewport_max_side,
+            test_render_viewport_max_side: {
+                #[cfg(test)]
+                {
+                    self.test_render_viewport_max_side
+                }
+                #[cfg(not(test))]
+                {
+                    None
+                }
+            },
             automation_render_target: self
-                .validation_runtime
                 .product_automation
                 .as_ref()
                 .and_then(ProductAutomationController::render_target_override),

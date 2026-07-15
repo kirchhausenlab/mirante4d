@@ -1,10 +1,10 @@
 {
   "schema": "mirante4d-current-state-field-ledger",
   "schema_version": 2,
-  "status": "wp09c-ui-composition-cutover",
+  "status": "wp14-release-contributor-hardening",
   "predecessor": {
-    "tag": "foundation-wp-09b-exit-1",
-    "revision": "b73dd86fed8cc3ac7b34f75f20dcd8bb8ac85672"
+    "tag": "foundation-wp-09c-exit-1",
+    "revision": "d33276b6de0287da7f225da278ee016aac26358a"
   },
   "dataset_authority": {
     "runtime_owner": "mirante4d-dataset-runtime",
@@ -23,15 +23,7 @@
     "runtime_owner": "mirante4d-render-wgpu",
     "contract_owner": "mirante4d-render-api"
   },
-  "temporary_owners": [
-    {
-      "module": "validation",
-      "path": "crates/mirante4d-app/src/current_runtime/validation.rs",
-      "type": "CurrentValidationRuntime",
-      "composition_field": "validation_runtime",
-      "expires": "WP-14"
-    }
-  ],
+  "temporary_owners": [],
   "deleted_predecessors": {
     "paths": [
       "crates/mirante4d-app/src/current_runtime/dataset.rs",
@@ -40,12 +32,14 @@
       "crates/mirante4d-app/src/cross_section_read_queue.rs",
       "crates/mirante4d-app/src/cross_section_streaming.rs",
       "crates/mirante4d-app/src/analysis_jobs.rs",
+      "crates/mirante4d-app/src/current_runtime/validation.rs",
       "crates/mirante4d-app/src/dataset_opening.rs",
       "crates/mirante4d-data/src/worker.rs",
       "crates/mirante4d-data/src/worker/tests.rs"
     ],
     "types": [
       "CurrentDatasetRuntime",
+      "CurrentValidationRuntime",
       "DataRequestId",
       "DataGenerationId",
       "CancellationToken",

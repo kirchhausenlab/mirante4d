@@ -8,7 +8,7 @@ Mirante4D currently develops and packages on Linux x86_64.
 
    ```bash
    sudo apt-get update
-   sudo apt-get install -y build-essential pkg-config libgtk-3-dev \
+   sudo apt-get install -y build-essential pkg-config python3 libgtk-3-dev \
      libudev-dev libxcb-render0-dev libxcb-shape0-dev \
      libxcb-xfixes0-dev libxkbcommon-dev
    ```

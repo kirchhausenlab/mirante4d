@@ -74,12 +74,6 @@
       "listed_in": "docs/README.md"
     },
     {
-      "path": "docs/benchmarks/baselines/README.md",
-      "truth_scope": "reference",
-      "authorities": [],
-      "listed_in": "docs/TESTING.md"
-    },
-    {
       "path": "docs/decisions/ADR-0001-foundation-program-and-hard-cutovers.md",
       "truth_scope": "target",
       "authorities": [],

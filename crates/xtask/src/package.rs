@@ -8,10 +8,9 @@ use anyhow::{Context, bail};
 use serde_json::{Value, json};
 
 use crate::{
-    deps::{CargoMetadata, cargo_metadata},
+    deps::{self, CargoMetadata, cargo_metadata},
     process::{run_cargo, run_command},
     target_fixture::extract_target_u16_fixture,
-    verify,
 };
 
 const DIST_ROOT: &str = "target/mirante4d/dist";
@@ -26,6 +25,32 @@ struct LinuxReleaseArtifacts {
     tarball_path: PathBuf,
     appimage_path: PathBuf,
     contents_report_path: PathBuf,
+    release_dir_smoke_log_path: PathBuf,
+    appimage_smoke_log_path: PathBuf,
+    tarball_smoke_log_path: PathBuf,
+}
+
+impl LinuxReleaseArtifacts {
+    fn under(dist_root: &Path, package_id: String) -> Self {
+        Self {
+            package_root: dist_root.join(&package_id),
+            appdir_root: dist_root.join(format!("{package_id}.AppDir")),
+            tarball_path: dist_root.join(format!("{package_id}.tar.gz")),
+            appimage_path: dist_root.join(format!("{package_id}.AppImage")),
+            contents_report_path: dist_root.join(format!("{package_id}-contents.json")),
+            release_dir_smoke_log_path: dist_root
+                .join(format!("{package_id}-smoke-release-dir.log")),
+            appimage_smoke_log_path: dist_root.join(format!("{package_id}-smoke-appimage.log")),
+            tarball_smoke_log_path: dist_root.join(format!("{package_id}-smoke-tarball.log")),
+            package_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitSourceIdentity {
+    commit: String,
+    tree: String,
 }
 
 pub(crate) fn package_dev() -> anyhow::Result<PathBuf> {
@@ -44,7 +69,8 @@ fn build_linux_release_package() -> anyhow::Result<LinuxReleaseArtifacts> {
         );
     }
 
-    verify::verify_deps()?;
+    let source_identity = require_clean_committed_worktree()?;
+    deps::verify_deps()?;
     run_cargo(["build", "--release", "-p", "mirante4d-app"])?;
 
     let metadata = cargo_metadata()?;
@@ -55,19 +81,15 @@ fn build_linux_release_package() -> anyhow::Result<LinuxReleaseArtifacts> {
     fs::create_dir_all(&dist_root)
         .with_context(|| format!("failed to create {}", dist_root.display()))?;
 
-    let artifacts = LinuxReleaseArtifacts {
-        package_root: dist_root.join(&package_id),
-        appdir_root: dist_root.join(format!("{package_id}.AppDir")),
-        tarball_path: dist_root.join(format!("{package_id}.tar.gz")),
-        appimage_path: dist_root.join(format!("{package_id}.AppImage")),
-        contents_report_path: dist_root.join(format!("{package_id}-contents.json")),
-        package_id,
-    };
+    let artifacts = LinuxReleaseArtifacts::under(&dist_root, package_id);
     remove_path_if_exists(&artifacts.package_root)?;
     remove_path_if_exists(&artifacts.appdir_root)?;
     remove_path_if_exists(&artifacts.tarball_path)?;
     remove_path_if_exists(&artifacts.appimage_path)?;
     remove_path_if_exists(&artifacts.contents_report_path)?;
+    remove_path_if_exists(&artifacts.release_dir_smoke_log_path)?;
+    remove_path_if_exists(&artifacts.appimage_smoke_log_path)?;
+    remove_path_if_exists(&artifacts.tarball_smoke_log_path)?;
 
     let binary_name = linux_binary_name();
     let source_binary = PathBuf::from("target").join("release").join(binary_name);
@@ -102,14 +124,6 @@ fn build_linux_release_package() -> anyhow::Result<LinuxReleaseArtifacts> {
         &artifacts.package_root.join("runtime-dependencies.txt"),
     )?;
 
-    let fixture = extract_target_u16_fixture(Path::new("target/mirante4d/fixtures"))?;
-    let release_dir_smoke = run_package_smoke_test(
-        &packaged_binary,
-        &fixture,
-        &app_version,
-        &artifacts.package_root.join("smoke-test-release-dir.log"),
-    )?;
-
     write_release_manifest(
         &artifacts.package_root,
         &artifacts.package_id,
@@ -119,11 +133,19 @@ fn build_linux_release_package() -> anyhow::Result<LinuxReleaseArtifacts> {
     )?;
     create_linux_appdir(&artifacts, binary_name)?;
     build_appimage(&artifacts.appdir_root, &artifacts.appimage_path)?;
+
+    let fixture = extract_target_u16_fixture(Path::new("target/mirante4d/fixtures"))?;
+    let release_dir_smoke = run_package_smoke_test(
+        &packaged_binary,
+        &fixture,
+        &app_version,
+        &artifacts.release_dir_smoke_log_path,
+    )?;
     let appimage_smoke = run_package_smoke_test(
         &artifacts.appimage_path,
         &fixture,
         &app_version,
-        &artifacts.package_root.join("smoke-test-appimage.log"),
+        &artifacts.appimage_smoke_log_path,
     )?;
     create_tarball(&dist_root, &artifacts.package_id, &artifacts.tarball_path)?;
     let tarball_smoke = smoke_linux_tarball(&artifacts, &fixture, &app_version)?;
@@ -135,22 +157,13 @@ fn build_linux_release_package() -> anyhow::Result<LinuxReleaseArtifacts> {
         release_dir_smoke,
         appimage_smoke,
         tarball_smoke,
+        &source_identity,
     )?;
     let report_text = format!("{}\n", serde_json::to_string_pretty(&report)?);
     fs::write(&artifacts.contents_report_path, &report_text).with_context(|| {
         format!(
             "failed to write {}",
             artifacts.contents_report_path.display()
-        )
-    })?;
-    fs::write(
-        artifacts.package_root.join("release-report.json"),
-        report_text,
-    )
-    .with_context(|| {
-        format!(
-            "failed to write {}",
-            artifacts.package_root.join("release-report.json").display()
         )
     })?;
     Ok(artifacts)
@@ -282,10 +295,7 @@ fn write_release_manifest(
         "asset_provenance": "ASSET_PROVENANCE.md",
         "third_party_notices": "THIRD_PARTY_NOTICES.md",
         "platform_support": "PLATFORM_SUPPORT.md",
-        "runtime_dependency_audit": "runtime-dependencies.txt",
-        "release_dir_smoke_log": "smoke-test-release-dir.log",
-        "appimage_smoke_log": "smoke-test-appimage.log",
-        "tarball_smoke_log": "smoke-test-tarball.log"
+        "runtime_dependency_audit": "runtime-dependencies.txt"
     });
     fs::write(
         package_root.join("manifest.json"),
@@ -584,7 +594,7 @@ fn smoke_linux_tarball(
         &binary,
         fixture,
         app_version,
-        &artifacts.package_root.join("smoke-test-tarball.log"),
+        &artifacts.tarball_smoke_log_path,
     )
 }
 
@@ -595,6 +605,7 @@ fn linux_release_contents_report(
     release_dir_smoke: Value,
     appimage_smoke: Value,
     tarball_smoke: Value,
+    source_identity: &GitSourceIdentity,
 ) -> anyhow::Result<Value> {
     let package_files = list_relative_files(&artifacts.package_root)?;
     let appdir_files = list_relative_files(&artifacts.appdir_root)?;
@@ -610,11 +621,12 @@ fn linux_release_contents_report(
     let tarball_hash = file_sha256(&artifacts.tarball_path)?;
     let appimage_hash = file_sha256(&artifacts.appimage_path)?;
     Ok(json!({
-        "artifact_schema_version": 1,
+        "artifact_schema_version": 2,
         "package_kind": RELEASE_PACKAGE_KIND,
         "package_id": artifacts.package_id,
         "app_version": app_version,
-        "git_revision": git_revision().unwrap_or_else(|| "unknown".to_owned()),
+        "git_commit": source_identity.commit,
+        "git_tree": source_identity.tree,
         "platform": "linux",
         "architecture": arch,
         "build_profile": RELEASE_BUILD_PROFILE,
@@ -659,9 +671,6 @@ fn linux_release_contents_report(
             "icon": package_files.contains(&"share/icons/hicolor/scalable/apps/mirante4d.svg".to_owned()),
             "appstream_metadata": package_files.contains(&"share/metainfo/org.kirchhausenlab.Mirante4D.appdata.xml".to_owned()),
             "runtime_dependency_audit": package_files.contains(&"runtime-dependencies.txt".to_owned()),
-            "release_dir_smoke_log": package_files.contains(&"smoke-test-release-dir.log".to_owned()),
-            "appimage_smoke_log": package_files.contains(&"smoke-test-appimage.log".to_owned()),
-            "tarball_smoke_log": package_files.contains(&"smoke-test-tarball.log".to_owned()),
         },
         "sample_data_absent": true,
         "smoke_tests": {
@@ -740,15 +749,44 @@ fn file_size(path: &Path) -> anyhow::Result<u64> {
         .map(|metadata| metadata.len())
 }
 
-fn git_revision() -> Option<String> {
+fn require_clean_committed_worktree() -> anyhow::Result<GitSourceIdentity> {
+    let status = git_stdout(&["status", "--porcelain=v1", "--untracked-files=normal"])?;
+    let commit = git_stdout(&["rev-parse", "--verify", "HEAD^{commit}"])?;
+    let tree = git_stdout(&["rev-parse", "--verify", "HEAD^{tree}"])?;
+    validate_git_source_identity(commit, tree, &status)
+}
+
+fn git_stdout(args: &[&str]) -> anyhow::Result<String> {
     let output = Command::new("git")
-        .args(["rev-parse", "--short=12", "HEAD"])
+        .args(args)
         .output()
-        .ok()?;
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
     if !output.status.success() {
-        return None;
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn validate_git_source_identity(
+    commit: String,
+    tree: String,
+    worktree_status: &str,
+) -> anyhow::Result<GitSourceIdentity> {
+    if !worktree_status.is_empty() {
+        bail!(
+            "release packaging requires a clean committed worktree; commit or stash these changes first:\n{worktree_status}"
+        );
+    }
+    for (label, value) in [("commit", &commit), ("tree", &tree)] {
+        if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("git {label} must be a full 40-character object ID, got {value:?}");
+        }
+    }
+    Ok(GitSourceIdentity { commit, tree })
 }
 
 #[cfg(test)]
@@ -781,6 +819,40 @@ mod tests {
         assert_eq!(manifest["license"], "LICENSE");
         assert_eq!(manifest["asset_provenance"], "ASSET_PROVENANCE.md");
         assert_eq!(manifest["third_party_notices"], "THIRD_PARTY_NOTICES.md");
+        assert!(manifest.get("release_dir_smoke_log").is_none());
+    }
+
+    #[test]
+    fn release_evidence_files_are_siblings_of_distributable_artifacts() {
+        let artifacts = LinuxReleaseArtifacts::under(
+            Path::new("target/mirante4d/dist"),
+            "mirante4d-test-linux-x86_64-release".to_owned(),
+        );
+
+        for evidence_path in [
+            &artifacts.contents_report_path,
+            &artifacts.release_dir_smoke_log_path,
+            &artifacts.appimage_smoke_log_path,
+            &artifacts.tarball_smoke_log_path,
+        ] {
+            assert_eq!(evidence_path.parent(), artifacts.package_root.parent());
+            assert!(!evidence_path.starts_with(&artifacts.package_root));
+        }
+    }
+
+    #[test]
+    fn source_identity_requires_clean_status_and_full_object_ids() {
+        let commit = "1".repeat(40);
+        let tree = "a".repeat(40);
+        assert_eq!(
+            validate_git_source_identity(commit.clone(), tree.clone(), "").unwrap(),
+            GitSourceIdentity {
+                commit: commit.clone(),
+                tree: tree.clone(),
+            }
+        );
+        assert!(validate_git_source_identity(commit.clone(), tree, " M README.md").is_err());
+        assert!(validate_git_source_identity("1".repeat(12), commit, "").is_err());
     }
 
     #[test]

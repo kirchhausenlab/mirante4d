@@ -386,10 +386,8 @@ fn test_workbench_app_without_background_runtime(
         egui_ui,
         import: ImportWorkflow::new(),
         analysis_runtime,
-        validation_runtime: current_runtime::validation::CurrentValidationRuntime {
-            product_automation: None,
-            test_render_viewport_max_side: None,
-        },
+        product_automation: None,
+        test_render_viewport_max_side: None,
         project_store: None,
         project_recovery_root: None,
         project_recovery_candidates: Vec::new(),
@@ -420,8 +418,7 @@ fn test_workbench_app_for_ui_harness(
 ) -> MiranteWorkbenchApp {
     ui_kit::configure_visuals(&cc.egui_ctx);
     let mut app = test_workbench_app_without_background_runtime(opened);
-    app.validation_runtime.test_render_viewport_max_side =
-        Some(TEST_INITIAL_RENDER_VIEWPORT_SIDE as usize);
+    app.test_render_viewport_max_side = Some(TEST_INITIAL_RENDER_VIEWPORT_SIDE as usize);
     app
 }
 

@@ -986,17 +986,17 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
             .and_then(serde_json::Value::as_u64)
             != Some(2)
         || ledger.get("status").and_then(serde_json::Value::as_str)
-            != Some("wp09c-ui-composition-cutover")
+            != Some("wp14-release-contributor-hardening")
         || ledger
             .pointer("/predecessor/tag")
             .and_then(serde_json::Value::as_str)
-            != Some("foundation-wp-09b-exit-1")
+            != Some("foundation-wp-09c-exit-1")
         || ledger
             .pointer("/predecessor/revision")
             .and_then(serde_json::Value::as_str)
-            != Some("b73dd86fed8cc3ac7b34f75f20dcd8bb8ac85672")
+            != Some("d33276b6de0287da7f225da278ee016aac26358a")
     {
-        bail!("{} is not the current WP-09C live ledger", path.display());
+        bail!("{} is not the current WP-14 live ledger", path.display());
     }
 
     let expected_dataset_authority = serde_json::json!({
@@ -1024,49 +1024,12 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
         bail!("WP-09B render authority ledger drifted");
     }
 
-    let expected_owners = BTreeMap::from([(
-        "validation",
-        (
-            "crates/mirante4d-app/src/current_runtime/validation.rs",
-            "CurrentValidationRuntime",
-            "validation_runtime",
-            "WP-14",
-        ),
-    )]);
     let owner_entries = ledger
         .get("temporary_owners")
         .and_then(serde_json::Value::as_array)
-        .context("WP-09C temporary_owners must be an array")?;
-    let mut observed_owners = BTreeMap::new();
-    for owner in owner_entries {
-        let module = owner
-            .get("module")
-            .and_then(serde_json::Value::as_str)
-            .context("WP-09C temporary owner must name its module")?;
-        let facts = (
-            owner
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .context("WP-09C temporary owner must name its path")?,
-            owner
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .context("WP-09C temporary owner must name its type")?,
-            owner
-                .get("composition_field")
-                .and_then(serde_json::Value::as_str)
-                .context("WP-09C temporary owner must name its composition field")?,
-            owner
-                .get("expires")
-                .and_then(serde_json::Value::as_str)
-                .context("WP-09C temporary owner must name its expiry")?,
-        );
-        if observed_owners.insert(module, facts).is_some() {
-            bail!("WP-09C temporary owner {module} is repeated");
-        }
-    }
-    if observed_owners != expected_owners {
-        bail!("WP-09C temporary owner ledger drifted");
+        .context("WP-14 temporary_owners must be an array")?;
+    if !owner_entries.is_empty() {
+        bail!("WP-14 live ledger must not retain temporary runtime owners");
     }
 
     let app_root = repo_root.join("crates/mirante4d-app/src");
@@ -1093,19 +1056,27 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
     {
         bail!("native import composition must use ImportWorkflow without ImportRuntime");
     }
-    let mut owner_type_names = expected_owners
-        .values()
-        .map(|(_, type_name, _, _)| *type_name)
-        .collect::<BTreeSet<_>>();
-    owner_type_names.insert("AnalysisProductRuntime");
-    let mut expected_composition = expected_owners
-        .values()
-        .map(|(_, type_name, field, _)| ((*field).to_owned(), (*type_name).to_owned()))
-        .collect::<BTreeMap<_, _>>();
-    expected_composition.insert(
+    if app_fields.get("product_automation").map(String::as_str)
+        != Some("ProductAutomationController")
+        || app_fields.contains_key("validation_runtime")
+        || app_root.join("current_runtime/validation.rs").exists()
+    {
+        bail!("WP-14 must compose product automation directly without CurrentValidationRuntime");
+    }
+    for source_path in collect_rust_source_files(&app_root)? {
+        let source = fs::read_to_string(&source_path)?;
+        if source_contains_identifier(&source, "CurrentValidationRuntime") {
+            bail!(
+                "WP-14 validation wrapper remains in {}",
+                source_path.display()
+            );
+        }
+    }
+    let owner_type_names = BTreeSet::from(["AnalysisProductRuntime"]);
+    let expected_composition = BTreeMap::from([(
         "analysis_runtime".to_owned(),
         "AnalysisProductRuntime".to_owned(),
-    );
+    )]);
     let actual_composition = app_fields
         .iter()
         .filter(|(_, type_name)| owner_type_names.contains(type_name.as_str()))
@@ -1113,15 +1084,8 @@ fn check_current_state_field_ledger(repo_root: &Path) -> anyhow::Result<()> {
         .collect::<BTreeMap<_, _>>();
     if actual_composition != expected_composition {
         bail!(
-            "WP-09C temporary-owner composition drifted: expected={expected_composition:?}, actual={actual_composition:?}"
+            "WP-14 runtime composition drifted: expected={expected_composition:?}, actual={actual_composition:?}"
         );
-    }
-    for (relative_path, type_name, _, expiry) in expected_owners.values() {
-        let source = fs::read_to_string(repo_root.join(relative_path))?;
-        rust_struct_field_names(&source, type_name)?;
-        if !source.contains(expiry) {
-            bail!("{relative_path} does not declare its deletion gate {expiry}");
-        }
     }
 
     check_wp08b_dataset_dispatcher(repo_root, &app_root, &app_fields)?;
@@ -1296,6 +1260,7 @@ fn check_wp08b_predecessor_absence(
         "crates/mirante4d-app/src/cross_section_read_queue.rs".to_owned(),
         "crates/mirante4d-app/src/cross_section_streaming.rs".to_owned(),
         "crates/mirante4d-app/src/current_runtime/dataset.rs".to_owned(),
+        "crates/mirante4d-app/src/current_runtime/validation.rs".to_owned(),
         "crates/mirante4d-app/src/dataset_opening.rs".to_owned(),
         "crates/mirante4d-data/src/worker.rs".to_owned(),
         "crates/mirante4d-data/src/worker/tests.rs".to_owned(),
@@ -1315,6 +1280,7 @@ fn check_wp08b_predecessor_absence(
         "CrossSectionChunkReadPool".to_owned(),
         "CrossSectionChunkReadSpec".to_owned(),
         "CurrentDatasetRuntime".to_owned(),
+        "CurrentValidationRuntime".to_owned(),
         "DataGenerationId".to_owned(),
         "DataRequestId".to_owned(),
     ]);

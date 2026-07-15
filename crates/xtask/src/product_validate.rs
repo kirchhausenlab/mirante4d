@@ -26,6 +26,7 @@ const OUTPUT_DIR: &str = "target/mirante4d/product-validation";
 const TIMEOUT_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_TIMEOUT_SECS";
 const ALLOW_NO_DISPLAY_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_ALLOW_NO_DISPLAY";
 const SKIP_RELEASE_BUILD_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_SKIP_RELEASE_BUILD";
+const APP_BINARY_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_APP_BINARY";
 const DISPLAY_CLASS_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS";
 const SCENARIO_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_SCENARIO";
 const CUSTOM_SCRIPT_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_SCRIPT";
@@ -298,6 +299,7 @@ fn product_validate_report_inner(
     let started_at = Instant::now();
     let started_at_epoch_ms = epoch_ms();
     let gpu_timestamps_requested = product_validate_gpu_timestamps_requested();
+    let binary = ProductValidationAppBinary::from_environment()?;
     let base_output_dir = PathBuf::from(OUTPUT_DIR);
     fs::create_dir_all(&base_output_dir)
         .with_context(|| format!("failed to create {}", base_output_dir.display()))?;
@@ -345,6 +347,7 @@ fn product_validate_report_inner(
             duration_ms: duration_ms(started_at.elapsed()),
             timeout_secs: timeout_seconds,
             package: &package,
+            binary: binary.path(),
             script: &script_path,
             script_value: &script,
             automation_report: &automation_report_path,
@@ -386,6 +389,7 @@ fn product_validate_report_inner(
             duration_ms: duration_ms(started_at.elapsed()),
             timeout_secs: timeout_seconds,
             package: &package,
+            binary: binary.path(),
             script: &script_path,
             script_value: &script,
             automation_report: &automation_report_path,
@@ -409,7 +413,7 @@ fn product_validate_report_inner(
         });
     }
 
-    if !env_flag(SKIP_RELEASE_BUILD_ENV)
+    if binary.should_build_default_release()
         && let Err(err) = run_cargo(["build", "--release", "-p", "mirante4d-app"])
     {
         write_wrapper_report(WrapperReport {
@@ -421,6 +425,7 @@ fn product_validate_report_inner(
             duration_ms: duration_ms(started_at.elapsed()),
             timeout_secs: timeout_seconds,
             package: &package,
+            binary: binary.path(),
             script: &script_path,
             script_value: &script,
             automation_report: &automation_report_path,
@@ -441,16 +446,10 @@ fn product_validate_report_inner(
         return Err(err);
     }
 
-    let binary = release_app_binary();
-    if !binary.exists() {
-        bail!(
-            "release app binary does not exist at {}; run cargo build --release -p mirante4d-app",
-            binary.display()
-        );
-    }
+    binary.validate_for_launch()?;
     let timeout = Duration::from_secs(timeout_seconds);
     let status = run_product_automation(ProductAutomationRun {
-        binary: &binary,
+        binary: binary.path(),
         package: &package,
         script: &script_path,
         automation_report: &automation_report_path,
@@ -483,6 +482,7 @@ fn product_validate_report_inner(
             duration_ms: duration_ms(started_at.elapsed()),
             timeout_secs: timeout_seconds,
             package: &package,
+            binary: binary.path(),
             script: &script_path,
             script_value: &script,
             automation_report: &automation_report_path,
@@ -523,6 +523,7 @@ fn product_validate_report_inner(
             duration_ms: duration_ms(started_at.elapsed()),
             timeout_secs: timeout_seconds,
             package: &package,
+            binary: binary.path(),
             script: &script_path,
             script_value: &script,
             automation_report: &automation_report_path,
@@ -591,6 +592,7 @@ fn product_validate_report_inner(
         duration_ms: duration_ms(started_at.elapsed()),
         timeout_secs: timeout_seconds,
         package: &package,
+        binary: binary.path(),
         script: &script_path,
         script_value: &script,
         automation_report: &automation_report_path,
@@ -875,6 +877,7 @@ impl ProductValidationStatus {
 
 struct B4AggregateReport<'a> {
     path: &'a Path,
+    binary: &'a Path,
     status: ProductValidationStatus,
     failure_reason: Option<String>,
     started_at_epoch_ms: u128,
@@ -898,6 +901,7 @@ fn product_validate_b4_project_persistence(
 ) -> anyhow::Result<ProductValidationOutcome> {
     let started_at = Instant::now();
     let started_at_epoch_ms = epoch_ms();
+    let binary = ProductValidationAppBinary::from_environment()?;
     let base_output_dir = PathBuf::from(OUTPUT_DIR);
     fs::create_dir_all(&base_output_dir)
         .with_context(|| format!("failed to create {}", base_output_dir.display()))?;
@@ -961,6 +965,7 @@ fn product_validate_b4_project_persistence(
     if preflight_only {
         write_b4_aggregate_report(B4AggregateReport {
             path: &report_path,
+            binary: binary.path(),
             status: ProductValidationStatus::Unsupported,
             failure_reason: Some(
                 "B4 preflight generated all three scripts without building or launching the app"
@@ -1003,15 +1008,10 @@ fn product_validate_b4_project_persistence(
                 )
             })?;
         let trusted = load_b4_trusted_project_store_evidence(&trusted_path, &identity)?;
-        if !env_flag(SKIP_RELEASE_BUILD_ENV) {
+        if binary.should_build_default_release() {
             run_cargo(["build", "--release", "-p", "mirante4d-app"])?;
         }
-        if !release_app_binary().exists() {
-            bail!(
-                "release app binary does not exist at {}",
-                release_app_binary().display()
-            );
-        }
+        binary.validate_for_launch()?;
         Ok((identity, trusted))
     })();
     let (identity, trusted) = match setup {
@@ -1019,6 +1019,7 @@ fn product_validate_b4_project_persistence(
         Err(err) => {
             write_b4_aggregate_report(B4AggregateReport {
                 path: &report_path,
+                binary: binary.path(),
                 status: ProductValidationStatus::Failed,
                 failure_reason: Some(err.to_string()),
                 started_at_epoch_ms,
@@ -1077,7 +1078,7 @@ fn product_validate_b4_project_persistence(
     ];
 
     for spec in specs {
-        let attempt = run_b4_attempt(&release_app_binary(), &package, &state_home, &run_dir, spec);
+        let attempt = run_b4_attempt(binary.path(), &package, &state_home, &run_dir, spec);
         let passed = attempt.get("status").and_then(Value::as_str) == Some("passed");
         attempts.push(attempt);
         let partial_failure = (!passed).then(|| {
@@ -1090,6 +1091,7 @@ fn product_validate_b4_project_persistence(
         });
         write_b4_aggregate_report(B4AggregateReport {
             path: &report_path,
+            binary: binary.path(),
             status: ProductValidationStatus::Failed,
             failure_reason: partial_failure
                 .or_else(|| Some("B4 scenario is incomplete".to_owned())),
@@ -1121,6 +1123,7 @@ fn product_validate_b4_project_persistence(
     };
     write_b4_aggregate_report(B4AggregateReport {
         path: &report_path,
+        binary: binary.path(),
         status,
         failure_reason,
         started_at_epoch_ms,
@@ -1164,7 +1167,7 @@ fn write_b4_aggregate_report(report: B4AggregateReport<'_>) -> anyhow::Result<()
         "revision": report.revision_identity,
         "host": benchmark_host_context(),
         "build_profile": "release",
-        "binary": release_app_binary(),
+        "binary": report.binary,
         "dataset": dataset_context_json(report.package),
         "scenario": {
             "name": B4_PROJECT_PERSISTENCE_SCENARIO,
@@ -3559,6 +3562,7 @@ struct WrapperReport<'a> {
     duration_ms: f64,
     timeout_secs: u64,
     package: &'a Path,
+    binary: &'a Path,
     script: &'a Path,
     script_value: &'a Value,
     automation_report: &'a Path,
@@ -3764,7 +3768,7 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
         "git_commit": git_commit,
         "dirty_worktree": dirty_worktree,
         "build_profile": "release",
-        "binary": release_app_binary(),
+        "binary": report.binary,
         "host": host,
         "gpu_adapter": gpu_adapter,
         "gpu_timestamp_timing": gpu_timestamp_timing.clone(),
@@ -4182,6 +4186,66 @@ fn dataset_context_json(package: &Path) -> Value {
             "error": err.to_string(),
         }),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProductValidationAppBinary {
+    path: PathBuf,
+    overridden: bool,
+}
+
+impl ProductValidationAppBinary {
+    fn from_environment() -> anyhow::Result<Self> {
+        Self::resolve(env::var_os(APP_BINARY_ENV).map(PathBuf::from))
+    }
+
+    fn resolve(override_path: Option<PathBuf>) -> anyhow::Result<Self> {
+        match override_path {
+            Some(path) => {
+                validate_app_binary_file(&path, APP_BINARY_ENV)?;
+                Ok(Self {
+                    path,
+                    overridden: true,
+                })
+            }
+            None => Ok(Self {
+                path: release_app_binary(),
+                overridden: false,
+            }),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn should_build_default_release(&self) -> bool {
+        !self.overridden && !env_flag(SKIP_RELEASE_BUILD_ENV)
+    }
+
+    fn validate_for_launch(&self) -> anyhow::Result<()> {
+        let description = if self.overridden {
+            APP_BINARY_ENV
+        } else {
+            "release app binary"
+        };
+        validate_app_binary_file(&self.path, description).with_context(|| {
+            if self.overridden {
+                format!("set {APP_BINARY_ENV} to an existing packaged executable")
+            } else {
+                "run cargo build --release -p mirante4d-app".to_owned()
+            }
+        })
+    }
+}
+
+fn validate_app_binary_file(path: &Path, description: &str) -> anyhow::Result<()> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to inspect {description} at {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{description} is not a file at {}", path.display());
+    }
+    Ok(())
 }
 
 fn release_app_binary() -> PathBuf {

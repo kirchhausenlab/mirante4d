@@ -9,6 +9,13 @@ Authority scope: D-022/D-023 verification mechanics, fixtures/oracles, E0-E4, pe
 
 This brief cannot override program scope/status, the canonical D-018 repository sequence, D-022's public CI rollout, the work-package dependency graph, or handoff activation gates. A conflict or program-version mismatch blocks work and must be reconciled through the parent handoff. This brief carries no independent implementation authorization.
 
+WP-14 uses only the practical acceptance boundary in the technical cutover
+package: ordinary public checks, one clean-clone rehearsal, the existing local
+Linux packager, and one small-fixture packaged viewer exercise at 1280x720 plus
+1920x1080. The broader evidence-set, private-data, performance, coverage, fuzz,
+mutation, and external-E4 designs below are not foundation-exit requirements
+and remain unactivated future options.
+
 The canonical trusted-local, public-runner, branch-protection, and zero-cost rollout sequence is owned by the parent handoff and referenced as `CI-001` through `CI-005`.
 
 ## Verification Architecture
@@ -137,11 +144,9 @@ OA-003-approved PH-00 public-safe T5 role set (approved 2026-07-10):
 | `T5-QUAL-002` | Temporal-extreme open/playback/cancellation/resource workflow | `internal_lab_data` | Same; exact identity exists only in the private resolver/evidence manifest |
 | `T5-QUAL-003` | Ordinary/multichannel scientific and HW-2 calibration workflow | `internal_lab_data` | Same; it cannot become a public T1/T3/T4 fixture by relabeling |
 
-The role set authorizes no access, copy, mutation, upload, or public claim.
-WP-14 private evidence may resolve exact identities only after the owner grants
-access for that run. If a role has no eligible private dataset, the related
-private qualification remains incomplete; the agent does not substitute a
-different dataset silently.
+The role set authorizes no access, copy, mutation, upload, or public claim. Any
+future private evidence may resolve exact identities only after the owner
+grants access for that run. Private qualification is not part of WP-14.
 
 ## Approved Verification And Zero-Cost CI Boundary
 
@@ -267,55 +272,13 @@ semantics](https://docs.github.com/en/repositories/configuring-branches-and-merg
 rather than assuming the hosting UI fails closed.
 
 The same two checks and six leaves run on exact protected-`main` revisions under
-unique `Main / policy` and `Main / rust` job names. Additional non-PR lanes are:
-
-| Lane | Trigger and execution | Role |
-| --- | --- | --- |
-| `Main / package-capability` | One standard public Linux job/build, protected `main` | Build/install/layout/headless smoke plus black-box unsupported-GPU diagnosis against the same package; no viewer E3/product-open claim |
-| `Deep / code-coverage` | Manual until activation during WP-14; bounded rotation thereafter | Instrumented code-gap discovery and approved ratchet; distinct from requirement coverage |
-| `Deep / fuzz-N` | Manual/rotating standard public Linux shard | Seeded parser/state/crash discovery with corpus promotion |
-| `Deep / mutation-N` | Manual/rotating standard public Linux shard | Requirement-test strength; bounded owner-specific shards |
-| `Portability / windows` and `Portability / macos` | Manual or explicitly approved portability change | Non-required compile/portable-contract evidence; no support claim |
-| `Format / lifecycle` | Target-format change and release candidate; public standard CPU plus T1 | Current profile/converter-if-approved acceptance and rejection matrix |
-| `Scientific / acceptance` | Applicable milestone/release; local `HW-2` plus T1/T5 | Independent scientific facts and reviewed tolerance evidence |
-| Trusted GPU/E3/E4/product/performance | Manual local `HW-2` clean worktree | Required by applicable work-package/milestone claims |
-| Release | Accepted protected tag on standard public Linux and/or local `HW-2` | Package, SBOM, provenance, checksum, and evidence-set publication |
-
-Total lane budgets include setup and apply per scenario/shard where the row is
-parameterized:
-
-| Lane/profile | p95 target | Hard ceiling |
-| --- | ---: | ---: |
-| Main package plus unsupported-GPU capability flow | `12 min` | `20 min` |
-| Trusted GPU correctness | `10 min` | `15 min` |
-| Trusted small-fixture E3 | `10 min` | `15 min` |
-| Portability per OS | `8 min` | `12 min` |
-| Format lifecycle | `10 min` | `15 min` |
-| Code coverage | `12 min` | `20 min` |
-| Each fuzz shard | `5 min` fuzzing | `8 min` total |
-| Rotating mutation shard | `15 min` | `25 min` |
-| Medium pressure/stress scenario | `20 min` | `30 min` |
-| Fixed-HW performance scenario | `30 min` | `45 min` |
-| Small-fixture `HW-2` E4 | `10 min` | `15 min` |
-| DS-1/DS-2 E4 scenario | `15 min` | `20 min` |
-| DS-3/DS-4 E4/performance scenario | `30 min` | `45 min` |
-| Scientific T1 acceptance | `10 min` | `15 min` |
-| Scientific T5 acceptance scenario | `30 min` | `45 min` |
-| Release assembly/publication | `20 min` | `30 min` |
-
-Calibration uses a fixed consecutive window of at least twenty valid
-non-infrastructure attempts on clean revisions and reports cold and warm/cache
-state separately. Functional failures and timeout-censored attempts remain in
-the duration window; excluding them would create survivor bias. Hard ceilings
-apply from the first implementation, and a censored ceiling event is a
-violation. Percentile enforcement begins when the fixed window is complete.
-The WP-06 window completed with twenty valid first-attempt successes, no
-infrastructure invalidations, caches, artifacts, or censored timeouts.
-
-No cron is enabled until the corresponding lane has a measured duration,
-output size, owner, and approved cadence. Main evidence runs are not cancelled
-once started; superseded PR runs use per-PR concurrency with
-`cancel-in-progress: true`.
+unique `Main / policy` and `Main / rust` job names. The only active local lanes
+are the five concrete commands in `verification/registry.json`: contributor
+feedback, format lifecycle, project-store lifecycle, trusted GPU, and Linux
+release packaging. Coverage, fuzz, mutation, private-data, performance,
+portability, and publication workflows are not activated by the foundation
+program; a future concrete need must justify any such addition. No cron is
+enabled.
 
 ### D-023 Selected Fixture, Oracle, E2E, And Evidence Policy
 
@@ -510,10 +473,9 @@ E4-equivalent deletion-regression checklist on the real display with a
 rights-cleared small current/generated input before the final E4 harness and
 target-profile T1 authority existed. That transitional evidence closed only
 WP-02's product-open regression obligation; it does not satisfy the final
-T1-backed E4 requirement. Current internal product automation remains E1 and
-cannot close the final obligation by itself. WP-14 must close final product
-evidence with the frozen harness and at least one authoritative T1-backed E4
-workflow.
+T1-backed E4 requirement. Current internal product automation remains E1. A
+future supported-release or public-data handoff may define stronger external
+product evidence; WP-14 does not build that harness.
 
 #### Performance And Resource Statistics
 
@@ -606,8 +568,7 @@ new candidate passes independent acceptance.
   blocks closure from day one unless an already-passing independent replacement
   proves the same requirement; fourteen days is only the remediation deadline,
   never a grace period for missing proof. Expiry additionally blocks all
-  milestone/release promotion. WP-14 closes with zero orphan ignored/special/
-  quarantined release-relevant cases.
+  milestone/release promotion. This policy does not activate a new WP-14 lane.
 - Every invocation writes into a unique run-ID directory. Each case records
   requirement/case/owner/lane, exact tree and executable/package, oracle and
   fixture identities, assertions, raw result, environment, artifact digests,
@@ -621,10 +582,10 @@ new candidate passes independent acceptance.
 Code coverage and requirement coverage are separate. Requirement coverage maps
 passed assertion IDs to approved requirements and is a closure gate. Code
 coverage is instrumented source line/region/function reachability used to find
-gaps; a percentage cannot prove a requirement. Before `Deep / code-coverage`
-becomes ratcheted at WP-14, freeze the exact tool/version/command, crate and
-target scope, reviewed generated/vendor/platform exclusions, clean baseline,
-per-crate metrics, changed-code policy, allowed noise, and no-regression ratchet.
+gaps; a percentage cannot prove a requirement. If `Deep / code-coverage` is
+activated by a future concrete need, first freeze the exact tool/version/command,
+crate and target scope, reviewed generated/vendor/platform exclusions, clean
+baseline, per-crate metrics, changed-code policy, allowed noise, and no-regression ratchet.
 The command must reproduce from the registry and must not silently include
 Criterion, GPU, E3/E4, or T5 cases in a CPU number.
 

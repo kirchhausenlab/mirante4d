@@ -512,90 +512,38 @@ people other than its original author.
 
 Required work:
 
-- Complete all technical-foundation verification lanes and explicit evidence-set
-  flow. Full-dataset reproducibility/candidate lanes are excluded by resolved
-  D-021 and run later under WP-13V; this handoff still proves the data-ready
-  contracts and small approved public fixtures. Native CI/process conclusions
-  are authoritative; JSON reports add diagnostics and measurements and may
-  never turn a failed/skipped job into passed evidence.
-- Bind trusted scheduled outputs explicitly into a release evidence-set
-  manifest rather than requiring an impossible single invocation or scanning
-  storage. Produce a private exact manifest that may bind T5 identities and a
-  public sanitized companion that contains exact digests only for approved
-  public T1/T2 (and later T3/T4) artifacts, uses opaque T5 IDs, and states only
-  `privately qualified; public reproducibility pending` where applicable. Both
-  identify the exact commit/tree, build/package digest, eligible dataset
-  release/candidate identity, lane run/job/attempt IDs, freshness, artifacts,
-  and approved waivers without leaking private paths or digests.
-- Establish a named performance metric registry and regenerate baselines on
-  fixed declared hardware using D-023's sampling/confidence/freshness rules.
-- Add seeded fuzz corpora, crash minimization/promotion, and rotating mutation
-  shards. Before activating the code-coverage ratchet during WP-14, freeze its
-  tool/version/command, registry-derived crate/target scope, reviewed generated/
-  vendor/platform exclusions, clean baseline, per-crate and changed-code
-  metrics, allowed noise, and no-regression rule; code coverage remains distinct
-  from requirement/assertion coverage.
-- Exercise a black-box packaged process through OS-level keyboard/mouse/window
-  events, OS-observed mapped-window output, save/terminate/relaunch, and
-  resulting durable state. Internal command injection, renderer readback, and
-  offscreen capture remain integration evidence, not product E2E.
-- Freeze the external E4 harness/assertions before the candidate; require at
-  least one authoritative T1-backed workflow, externally observed physical
-  client/render pixels, the 720p gate plus 1080p exercise, and observable
-  pixel/landmark/durable-state facts rather than mapped/nonblank output alone.
-- Keep persistent public-repository self-hosted runners absent. Trusted local
-  E4/GPU/performance/T5 execution binds immutable commits and uses a separate
-  post-run evidence assembly step that never exposes an upload credential to
-  tested code.
-- Make packages reproducible where practical and publish checksums, SBOM, build
-  provenance, and release notes. Build and test with read-only credentials;
-  publish only through a separate sanitized local maintainer operation or a
-  credential-only no-checkout job that executes no candidate-controlled code.
-- Validate contribution/bootstrap docs with external contributors or a clean
-  room rehearsal.
-- Define supported-platform, security response, deprecation, and maintenance
-  policies.
-- Enforce zero orphan ignored/special/GPU tests and a requirement/scenario/
-  hardware matrix for the trusted GPU lane.
-- Separate short-lived diagnostic artifacts from durable signed release
-  evidence, SBOMs, provenance, fixture manifests, and public-data validation.
-- Enforce D-022's initial cache-free/artifact-free default, seven-day repository
-  retention, release-asset boundary, standard-runner-only policy, and
-  organization `$0` stop-usage control. Any cache is a separately ratified,
-  measured exception with the approved enforceable `2 GB`/two-day bounds; any
-  hosted failure bundle is separately activated only after pre-upload and
-  shared-headroom controls prove its `25/50/200 MiB` limits. Local unique-run
-  diagnostics remain available without Actions storage.
-- Define waiver schema: requirement/scope, reason, alternate proof, approver,
-  issue/owner, expiry, and release applicability.
-- Delete recursive gate composition, hard-coded test-name allowlists, arbitrary
-  `target/` report scanning, completion-waiver/report-presence closure
-  machinery, phase-numbered commands, and obsolete baselines after their
-  approved replacements are active.
+- Keep the existing six public verification leaves and two required GitHub
+  Actions jobs unchanged and at `$0`; do not add a release, deep, private-data,
+  performance, fuzz, mutation, or coverage workflow.
+- Make the existing Linux release-directory, tarball, and AppImage command
+  produce self-consistent artifacts bound to a clean full commit and tree, with
+  checksums and the notices already shipped by the project.
+- Reuse the existing small promoted fixture and render-mode scenario against
+  the packaged executable. Exercise 1280x720 and briefly 1920x1080 on the real
+  display; do not add 4K, private microscopy data, or a broad product matrix.
+- Rehearse the documented contributor setup and ordinary PR checks from one
+  clean clone. Correct only concrete setup or release-documentation gaps found
+  by that rehearsal.
+- Delete the final temporary validation runtime wrapper and other clearly
+  obsolete verification helpers. Retain useful focused tests and opt-in
+  subsystem checks for future changes to their own boundaries.
+- Inherit the accepted storage, durability, import, analysis, GPU, and science
+  results. Do not rerun exhaustive matrices whose implementation did not
+  change.
+- Keep release support honest: WP-14 qualifies a local Linux pre-alpha release
+  candidate, not a supported public release or public-data publication.
 
 Exit proof:
 
-- Public required checks are fast, non-duplicative, and green on the release
-  candidate.
-- The frozen code-coverage command reproduces its scoped baseline/ratchet, and
-  the separate requirement-coverage audit derives closure only from passed
-  registered assertions.
-- Trusted GPU, performance, stress, real-data, and product-open gates pass.
-- Final E4 evidence uses the frozen external harness and authoritative T1 facts;
-  WP-02's transitional manual deletion-regression run cannot substitute for it.
-- Performance results use an implementable registry containing measurement
-  boundaries, clock/source, submitted-versus-presented meaning, unit/direction,
-  scenario/viewport/dataset digest, build profile, warmups, repetitions,
-  statistic/confidence rule, noise floor, absolute/relative thresholds,
-  environment fingerprint, runner calibration/drift, promotion, and waiver
-  policy. Any presentation proxy is named honestly.
-- A new contributor can make and verify a scoped change without private tribal
-  knowledge.
-- Final settings/API and billing/storage readback after representative deep and
-  release operations proves the selected-actions/token/fork-approval/retention
-  policy still holds; no self-hosted/larger runner can target the repository;
-  net Actions billing is zero; and caches/artifacts are absent or exactly within
-  the separately approved bounded exception.
+- The ordinary public checks pass on the candidate without new paid or
+  self-hosted CI.
+- One clean clone can build and run the documented PR checks.
+- The local Linux package command produces and smoke-checks its three artifact
+  forms, and its report identifies the exact clean source and checksums.
+- The packaged viewer opens the small fixture, exercises MIP/DVR/ISO and linked
+  panels at 1280x720, and remains usable during the short 1920x1080 check.
+- No temporary validation owner or obviously obsolete WP-14 verification
+  machinery remains.
 
 ### WP-15 — Final Deletion Audit And Technical Foundation Milestone
 

@@ -185,6 +185,38 @@ fn b4_valid_attempt(number: u64) -> Value {
 }
 
 #[test]
+fn product_validation_binary_override_selects_existing_file_and_skips_build() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let packaged_binary = tempdir.path().join("mirante4d-app");
+    fs::write(&packaged_binary, b"packaged executable").unwrap();
+
+    let resolved = ProductValidationAppBinary::resolve(Some(packaged_binary.clone())).unwrap();
+
+    assert_eq!(resolved.path(), packaged_binary);
+    assert!(resolved.overridden);
+    assert!(!resolved.should_build_default_release());
+    resolved.validate_for_launch().unwrap();
+}
+
+#[test]
+fn product_validation_binary_override_rejects_missing_or_directory_paths() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let missing = tempdir.path().join("missing-mirante4d-app");
+
+    let missing_error = ProductValidationAppBinary::resolve(Some(missing))
+        .unwrap_err()
+        .to_string();
+    assert!(missing_error.contains(APP_BINARY_ENV));
+    assert!(missing_error.contains("failed to inspect"));
+
+    let directory_error = ProductValidationAppBinary::resolve(Some(tempdir.path().to_path_buf()))
+        .unwrap_err()
+        .to_string();
+    assert!(directory_error.contains(APP_BINARY_ENV));
+    assert!(directory_error.contains("is not a file"));
+}
+
+#[test]
 fn target_fixture_product_automation_script_uses_semantic_commands() {
     let script = target_fixture_camera_smoke_script(Path::new("/tmp/demo.m4d"));
     let commands = script["commands"].as_array().unwrap();
@@ -1988,6 +2020,7 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
         duration_ms: 1.0,
         timeout_secs: 60,
         package: &package,
+        binary: Path::new("/tmp/packaged-mirante4d-app"),
         script: &script_path,
         script_value: &script,
         automation_report: &automation_report_path,
@@ -2010,6 +2043,7 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
     });
 
     assert_eq!(report["dataset"]["manifest_status"], "loaded");
+    assert_eq!(report["binary"], "/tmp/packaged-mirante4d-app");
     assert!(
         report["dataset"]["package_id"]
             .as_str()
@@ -2197,6 +2231,7 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
         duration_ms: 1.0,
         timeout_secs: 60,
         package: &package,
+        binary: Path::new("/tmp/packaged-mirante4d-app"),
         script: &script_path,
         script_value: &script,
         automation_report: &automation_report_path,
@@ -2248,6 +2283,7 @@ fn wrapper_report_marks_preflight_as_non_launch_unsupported_evidence() {
         duration_ms: 1.0,
         timeout_secs: 180,
         package: &package,
+        binary: Path::new("/tmp/packaged-mirante4d-app"),
         script: &script_path,
         script_value: &script,
         automation_report: &automation_report_path,
