@@ -2,6 +2,7 @@
 
 use std::{collections::BTreeMap, error::Error, fmt};
 
+use mirante4d_application::viewport_interaction::representative_voxel_world_size;
 use mirante4d_dataset::{DatasetCatalog, DatasetResourceKey, ResourceRegion};
 use mirante4d_domain::{LogicalLayerKey, RenderMode, ScaleLevel, Shape3D};
 use mirante4d_project_model::ViewState;
@@ -448,14 +449,6 @@ pub(crate) fn semantic_resource_shape(volume: Shape3D) -> Shape3D {
         volume.x().min(SEMANTIC_TILE_SIDE),
     )
     .expect("a semantic resource clipped to a non-empty volume is non-empty")
-}
-
-fn representative_voxel_world_size(grid_to_world: mirante4d_domain::GridToWorld) -> f64 {
-    let matrix = grid_to_world.row_major();
-    let x = (matrix[0] * matrix[0] + matrix[4] * matrix[4] + matrix[8] * matrix[8]).sqrt();
-    let y = (matrix[1] * matrix[1] + matrix[5] * matrix[5] + matrix[9] * matrix[9]).sqrt();
-    let z = (matrix[2] * matrix[2] + matrix[6] * matrix[6] + matrix[10] * matrix[10]).sqrt();
-    x.max(y).max(z).max(f64::EPSILON)
 }
 
 #[cfg(test)]

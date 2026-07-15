@@ -37,16 +37,17 @@ use std::{
 
 use mirante4d_dataset::{DatasetCatalog, DatasetSourceId, ScientificIdentityStatus};
 use mirante4d_domain::{
-    CameraView, CrossSectionView, IsoLightState, LogicalLayerKey, TimeIndex, ToolKind, ViewerLayout,
+    CameraView, CrossSectionView, IsoLightState, LogicalLayerKey, TimeIndex, ToolKind,
 };
+pub use mirante4d_domain::{RenderMode, ViewerLayout};
 use mirante4d_identity::ScientificContentId;
-pub use mirante4d_project_model::ProjectId;
 use mirante4d_project_model::{
     ArtifactCompleteness, ArtifactHandleId, ArtifactRecoverability, ArtifactReference,
     ArtifactSchema, ChannelPreset, ChannelPresetId, DatasetReference, LayerViewState,
     MAX_CHANNEL_PRESETS, MAX_TOTAL_CHANNEL_PRESET_ENTRIES, ProjectGenerationProjection,
-    ProjectRevisionHighWater, ProjectRevisionId, ProjectState, ViewState,
+    ProjectRevisionHighWater, ProjectRevisionId, ProjectState,
 };
+pub use mirante4d_project_model::{ProjectId, ViewState};
 pub use mirante4d_project_store::ProjectGenerationId;
 use mirante4d_render_api::PresentedFrame;
 pub use mirante4d_render_api::{PresentationPaintRequest, PresentationViewport, RenderExtent};
@@ -3223,6 +3224,13 @@ impl ApplicationSnapshot {
 
     pub fn workspace(&self) -> &WorkspaceSnapshot {
         &self.workspace
+    }
+
+    pub fn view(&self) -> &ViewState {
+        match &self.workspace {
+            WorkspaceSnapshot::Unbound { workspace } => workspace.view(),
+            WorkspaceSnapshot::Bound { project, .. } => project.view(),
+        }
     }
 
     pub fn transient(&self) -> &TransientApplicationState {

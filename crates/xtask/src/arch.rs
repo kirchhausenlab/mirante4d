@@ -724,6 +724,7 @@ fn check_wp07b_boundary_contract(repo_root: &Path) -> anyhow::Result<()> {
         // first, owns these narrowly superseding dependency/API additions.
         let wp08a_normal_additions = match name {
             "mirante4d-application" => BTreeSet::from([
+                "glam".to_owned(),
                 "mirante4d-analysis-core".to_owned(),
                 "mirante4d-project-store".to_owned(),
                 "mirante4d-render-api".to_owned(),

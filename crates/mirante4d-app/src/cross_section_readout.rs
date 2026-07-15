@@ -1,6 +1,7 @@
 use glam::{DMat4, DVec3};
 use mirante4d_application::{
     CrossSectionPanelScheduleStatus, RenderCoordinationState, RenderSurfaceState,
+    viewport_interaction::CrossSectionViewState,
 };
 use mirante4d_dataset::DatasetCatalog;
 use mirante4d_domain::{GridToWorld, LogicalLayerKey, ScaleLevel, Shape3D, ViewerLayout};
@@ -9,9 +10,7 @@ use mirante4d_render_api::PresentationViewport;
 
 use crate::{
     retained_leases::{RetainedLeaseSample, RetainedLeases},
-    viewer_layout::{
-        PanelId, cross_section_schedule_status_label, render_cross_section_view_state,
-    },
+    viewer_layout::{PanelId, cross_section_schedule_status_label},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -157,8 +156,12 @@ pub(crate) fn cross_section_hover_readout_for_panel_point(
         }
     };
 
-    let view = render_cross_section_view_state(*input.view.cross_section()).view(panel);
-    let world = view.world_point_for_panel_point(x_points, y_points, presentation_viewport);
+    let view = CrossSectionViewState::from_canonical(*input.view.cross_section()).view(panel);
+    let world = DVec3::from_array(view.world_point_for_panel_point(
+        x_points,
+        y_points,
+        presentation_viewport,
+    ));
     let grid = world_to_grid.transform_point3(world);
     let Some(index) = nearest_grid_index(grid, scale_shape) else {
         return Some(mapped_status_readout(

@@ -8,15 +8,13 @@ use std::time::Instant;
 use mirante4d_application::{
     CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
     CrossSectionPanelScheduleStatus, RenderCoordinationState,
+    viewport_interaction::representative_voxel_world_size,
 };
 use mirante4d_dataset::{DatasetCatalog, DatasetResourceKey};
 use mirante4d_domain::{LogicalLayerKey, ScaleLevel, ViewerLayout};
 use mirante4d_project_model::ViewState;
 
-use crate::{
-    lod_scheduler::representative_voxel_world_size, retained_leases::RetainedLeases,
-    viewer_layout::PanelId,
-};
+use crate::{retained_leases::RetainedLeases, viewer_layout::PanelId};
 
 pub(crate) const CROSS_SECTION_PANEL_SCHEDULER_CPU_BUDGET_MS: f64 = 1.0;
 pub(crate) const CROSS_SECTION_PANEL_RENDER_SUBMISSIONS_PER_PANEL_REFRESH: usize = 1;

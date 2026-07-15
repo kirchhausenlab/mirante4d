@@ -11,6 +11,10 @@ use eframe::egui;
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, CommandEffect, CrossSectionPanelId,
     ProjectStoreLifecycle, SourceVerificationSnapshot, WorkspaceSnapshot,
+    viewport_interaction::{
+        CrossSectionPanel, CrossSectionViewState, orbit_camera, pan_camera,
+        representative_voxel_world_size, zoom_camera,
+    },
 };
 use mirante4d_domain::{
     DisplayWindow, DvrOpacityTransfer, IsoShadingPolicy, LayerTransfer, Opacity, RenderMode,
@@ -28,10 +32,7 @@ use crate::cross_section_readout::{
 };
 use crate::{
     DVR_DENSITY_SCALE_MAX, DVR_DENSITY_SCALE_MIN, DisplayedFrameFreshness, FrameCompleteness,
-    MiranteWorkbenchApp, application_view, set_render_viewport,
-    viewer_layout::{
-        CrossSectionPanel, CrossSectionViewState, PanelId, render_cross_section_view_state,
-    },
+    MiranteWorkbenchApp, application_view, set_render_viewport, viewer_layout::PanelId,
 };
 
 mod capture;
@@ -192,7 +193,7 @@ fn apply_cross_section_edit(
     )?;
     let snapshot = app.application.snapshot();
     let view = application_view(&snapshot);
-    let mut cross_section = render_cross_section_view_state(*view.cross_section());
+    let mut cross_section = CrossSectionViewState::from_canonical(*view.cross_section());
     edit(
         &mut cross_section,
         panel_id
@@ -1171,18 +1172,12 @@ impl ProductAutomationController {
                 viewport_height_points,
             } => {
                 let viewport_side = viewport_height_points.unwrap_or(800.0);
-                let start = egui::pos2(viewport_side * 0.5, viewport_side * 0.5);
-                let current = start + egui::vec2(*yaw_points, *pitch_points);
+                let start = [viewport_side * 0.5, viewport_side * 0.5];
+                let current = [start[0] + *yaw_points, start[1] + *pitch_points];
                 let snapshot = app.application.snapshot();
                 let start_camera = *application_view(&snapshot).camera();
-                let mut camera = start_camera;
-                crate::viewport::apply_camera_orbit(
-                    &mut camera,
-                    start_camera,
-                    start,
-                    current,
-                    egui::vec2(viewport_side, viewport_side),
-                );
+                let camera =
+                    orbit_camera(start_camera, start, current, [viewport_side, viewport_side]);
                 dispatch_application_command(app, ctx, ApplicationCommand::SetCamera(camera))?;
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
@@ -1199,8 +1194,10 @@ impl ProductAutomationController {
                 viewport_height_points,
             } => {
                 let snapshot = app.application.snapshot();
-                let mut camera = *application_view(&snapshot).camera();
-                crate::viewport::apply_camera_pan(&mut camera, egui::vec2(*x_points, *y_points));
+                let camera = pan_camera(
+                    *application_view(&snapshot).camera(),
+                    [*x_points, *y_points],
+                );
                 dispatch_application_command(app, ctx, ApplicationCommand::SetCamera(camera))?;
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
@@ -1214,8 +1211,7 @@ impl ProductAutomationController {
             }
             ProductAutomationCommand::CameraZoom { scroll_y_points } => {
                 let snapshot = app.application.snapshot();
-                let mut camera = *application_view(&snapshot).camera();
-                crate::viewport::apply_camera_zoom(&mut camera, *scroll_y_points);
+                let camera = zoom_camera(*application_view(&snapshot).camera(), *scroll_y_points);
                 dispatch_application_command(app, ctx, ApplicationCommand::SetCamera(camera))?;
                 Ok(CommandProgress::Done(details_with_display_refresh_timing(
                     app,
@@ -1282,7 +1278,7 @@ impl ProductAutomationController {
                 let panel_id = automation_cross_section_panel_id(*panel)?;
                 let snapshot = app.application.snapshot();
                 let view = application_view(&snapshot);
-                let voxel_size = crate::lod_scheduler::representative_voxel_world_size(
+                let voxel_size = representative_voxel_world_size(
                     snapshot
                         .catalog()
                         .layer(view.active_layer())
@@ -3187,8 +3183,7 @@ fn initial_save_with_durable_edit(
     }
 
     let snapshot = app.application.snapshot();
-    let mut camera = *application_view(&snapshot).camera();
-    crate::viewport::apply_camera_pan(&mut camera, egui::vec2(8.0, -4.0));
+    let camera = pan_camera(*application_view(&snapshot).camera(), [8.0, -4.0]);
     let durable_edit_started_at = Instant::now();
     app.project_store_product_evidence.durable_edit_started_at = Some(durable_edit_started_at);
     let effect = app

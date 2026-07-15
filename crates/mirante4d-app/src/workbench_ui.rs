@@ -668,7 +668,10 @@ fn cross_section_interaction_commands(
         .ok_or_else(|| "3D is not a cross-section interaction target".to_owned())?;
     let application_panel = application_cross_section_panel_id(panel_id)
         .ok_or_else(|| "3D is not a cross-section interaction target".to_owned())?;
-    let mut cross_section = viewer_layout::render_cross_section_view_state(*view.cross_section());
+    let mut cross_section =
+        mirante4d_application::viewport_interaction::CrossSectionViewState::from_canonical(
+            *view.cross_section(),
+        );
     let mut edited = false;
     let modifiers = response.ctx.input(|input| input.modifiers);
     if response.dragged() {
@@ -722,7 +725,9 @@ fn cross_section_interaction_commands(
                     .layer(view.active_layer())
                     .ok_or_else(|| "active layer is absent from the dataset catalog".to_owned())?;
                 let voxel_size =
-                    lod_scheduler::representative_voxel_world_size(layer.grid_to_world());
+                    mirante4d_application::viewport_interaction::representative_voxel_world_size(
+                        layer.grid_to_world(),
+                    );
                 let multiplier = if modifiers.shift {
                     CROSS_SECTION_FAST_SLICE_MULTIPLIER
                 } else {
@@ -903,7 +908,9 @@ fn reset_view_command(
         camera.target(),
         UnitQuaternion::identity(),
         camera.orthographic_world_per_screen_point(),
-        lod_scheduler::representative_voxel_world_size(layer.grid_to_world()),
+        mirante4d_application::viewport_interaction::representative_voxel_world_size(
+            layer.grid_to_world(),
+        ),
     )
     .map_err(|error| error.to_string())?;
     let next = ViewState::new(

@@ -1,10 +1,10 @@
 use eframe::egui;
 use glam::{DQuat, DVec3};
 use mirante4d_application::{
-    ApplicationCommand, ApplicationSnapshot, viewport_interaction::ViewportOrbitDrag,
+    ApplicationCommand, ApplicationSnapshot, ViewState,
+    viewport_interaction::{ViewportOrbitDrag, orbit_camera, pan_camera, zoom_camera},
 };
 use mirante4d_domain::{CameraView, GridToWorld, Projection, Shape3D, UnitQuaternion, WorldPoint3};
-use mirante4d_project_model::ViewState;
 use mirante4d_render_api::{
     CameraFrame, DEFAULT_PRESENTATION_VIEWPORT, PresentationViewport, RenderExtent,
 };
@@ -284,8 +284,7 @@ pub(crate) fn viewport_drag_command(
         if !motion_points.x.is_finite() || !motion_points.y.is_finite() {
             return None;
         }
-        let mut camera = camera;
-        apply_camera_pan(&mut camera, motion_points);
+        let camera = pan_camera(camera, [motion_points.x, motion_points.y]);
         return Some(ApplicationCommand::SetCamera(camera));
     }
 
@@ -303,13 +302,11 @@ pub(crate) fn viewport_drag_command(
         .get_or_insert(ViewportOrbitDrag::new(camera));
     let current_position_points = current_pointer - response.rect.min.to_vec2();
     let start_position_points = current_position_points - total_drag_delta;
-    let mut camera = drag_state.start_camera();
-    apply_camera_orbit(
-        &mut camera,
+    let camera = orbit_camera(
         drag_state.start_camera(),
-        start_position_points,
-        current_position_points,
-        viewport_size_points,
+        [start_position_points.x, start_position_points.y],
+        [current_position_points.x, current_position_points.y],
+        [viewport_size_points.x, viewport_size_points.y],
     );
     Some(ApplicationCommand::SetCamera(camera))
 }
@@ -321,86 +318,8 @@ pub(crate) fn viewport_scroll_command(
     if scroll_y_points == 0.0 || !scroll_y_points.is_finite() {
         return None;
     }
-    let mut camera = camera;
-    apply_camera_zoom(&mut camera, scroll_y_points);
+    let camera = zoom_camera(camera, scroll_y_points);
     Some(ApplicationCommand::SetCamera(camera))
-}
-
-pub(crate) fn apply_camera_pan(camera: &mut CameraView, motion_points: egui::Vec2) {
-    let world_per_point = match camera.projection() {
-        Projection::Orthographic => camera.orthographic_world_per_screen_point(),
-        Projection::Perspective => {
-            camera.perspective_view_distance_world()
-                / camera.perspective_focal_length_screen_points()
-        }
-    };
-    let frame = CameraFrame::new(*camera, DEFAULT_PRESENTATION_VIEWPORT)
-        .expect("validated camera has finite axes");
-    let axes = frame.axes();
-    let target = dvec3(camera.target())
-        + DVec3::from_array(axes.right()) * (-f64::from(motion_points.x) * world_per_point)
-        + DVec3::from_array(axes.up()) * (f64::from(motion_points.y) * world_per_point);
-    *camera = CameraView::new(
-        camera.projection(),
-        world_point(target),
-        camera.orientation(),
-        camera.orthographic_world_per_screen_point(),
-        camera.perspective_focal_length_screen_points(),
-        camera.perspective_view_distance_world(),
-    )
-    .expect("pan preserves validated camera invariants");
-}
-
-pub(crate) fn apply_camera_orbit(
-    camera: &mut CameraView,
-    start_camera: CameraView,
-    start_position_points: egui::Pos2,
-    current_position_points: egui::Pos2,
-    viewport_size_points: egui::Vec2,
-) {
-    let Some(delta) = arcball_delta(
-        f64::from(start_position_points.x),
-        f64::from(start_position_points.y),
-        f64::from(current_position_points.x),
-        f64::from(current_position_points.y),
-        f64::from(viewport_size_points.x),
-        f64::from(viewport_size_points.y),
-    ) else {
-        return;
-    };
-    let orientation = dquat(start_camera.orientation()) * delta;
-    *camera = CameraView::new(
-        start_camera.projection(),
-        start_camera.target(),
-        unit_quaternion(orientation),
-        start_camera.orthographic_world_per_screen_point(),
-        start_camera.perspective_focal_length_screen_points(),
-        start_camera.perspective_view_distance_world(),
-    )
-    .expect("orbit preserves validated camera invariants");
-}
-
-pub(crate) fn apply_camera_zoom(camera: &mut CameraView, scroll_y_points: f32) {
-    let factor = (-f64::from(scroll_y_points) * 0.001).exp();
-    let (orthographic_scale, focal_length) = match camera.projection() {
-        Projection::Orthographic => (
-            (camera.orthographic_world_per_screen_point() * factor).max(1.0e-9),
-            camera.perspective_focal_length_screen_points(),
-        ),
-        Projection::Perspective => (
-            camera.orthographic_world_per_screen_point(),
-            (camera.perspective_focal_length_screen_points() / factor).max(1.0e-9),
-        ),
-    };
-    *camera = CameraView::new(
-        camera.projection(),
-        camera.target(),
-        camera.orientation(),
-        orthographic_scale,
-        focal_length,
-        camera.perspective_view_distance_world(),
-    )
-    .expect("zoom preserves validated camera invariants");
 }
 
 fn dvec3(point: WorldPoint3) -> DVec3 {
@@ -419,63 +338,6 @@ fn unit_quaternion(quaternion: DQuat) -> UnitQuaternion {
     let [x, y, z, w] = quaternion.to_array();
     UnitQuaternion::new_xyzw(x, y, z, w)
         .expect("interaction math produced a finite nonzero quaternion")
-}
-
-fn arcball_delta(
-    start_x_points: f64,
-    start_y_points: f64,
-    current_x_points: f64,
-    current_y_points: f64,
-    viewport_width_points: f64,
-    viewport_height_points: f64,
-) -> Option<DQuat> {
-    let start = arcball_vector(
-        start_x_points,
-        start_y_points,
-        viewport_width_points,
-        viewport_height_points,
-    )?;
-    let current = arcball_vector(
-        current_x_points,
-        current_y_points,
-        viewport_width_points,
-        viewport_height_points,
-    )?;
-    if start.abs_diff_eq(current, 1.0e-12) {
-        None
-    } else {
-        Some(DQuat::from_rotation_arc(current, start).normalize())
-    }
-}
-
-fn arcball_vector(
-    x_points: f64,
-    y_points: f64,
-    width_points: f64,
-    height_points: f64,
-) -> Option<DVec3> {
-    if !x_points.is_finite()
-        || !y_points.is_finite()
-        || !width_points.is_finite()
-        || !height_points.is_finite()
-        || width_points <= 0.0
-        || height_points <= 0.0
-    {
-        return None;
-    }
-    let radius = width_points.min(height_points) * 0.5;
-    let mut x = (2.0 * x_points - width_points) / (2.0 * radius);
-    let mut y = (height_points - 2.0 * y_points) / (2.0 * radius);
-    let length_squared = x * x + y * y;
-    let z = if length_squared <= 1.0 {
-        (1.0 - length_squared).sqrt()
-    } else {
-        let inverse_length = length_squared.sqrt().recip();
-        x *= inverse_length;
-        y *= inverse_length;
-        0.0
-    };
-    Some(DVec3::new(x, y, z).normalize())
 }
 
 pub(crate) fn fit_size(image_size: egui::Vec2, available: egui::Vec2) -> egui::Vec2 {

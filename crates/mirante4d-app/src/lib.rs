@@ -22,7 +22,6 @@ mod histogram;
 mod import_worker_service;
 mod import_workflow;
 mod layer_state;
-mod lod_scheduler;
 mod native_presentation;
 mod playback;
 mod product_automation;
@@ -146,10 +145,7 @@ const CROSS_SECTION_ROTATE_RADIANS_PER_POINT: f64 = 0.005;
 const PROJECT_RECOVERY_ROOT_ENTRIES_MAX: usize = 64;
 
 fn application_view(snapshot: &ApplicationSnapshot) -> &ViewState {
-    match snapshot.workspace() {
-        WorkspaceSnapshot::Unbound { workspace } => workspace.view(),
-        WorkspaceSnapshot::Bound { project, .. } => project.view(),
-    }
+    snapshot.view()
 }
 
 fn project_failure_code(
