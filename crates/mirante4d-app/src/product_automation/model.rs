@@ -472,7 +472,6 @@ impl ProductAutomationProjectStoreLifecycle {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ProductAutomationViewerLayout {
-    #[serde(alias = "single_3d")]
     Single3d,
     FourPanel,
 }

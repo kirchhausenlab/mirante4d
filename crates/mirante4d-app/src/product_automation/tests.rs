@@ -271,6 +271,30 @@ fn automation_script_parses_retained_four_panel_assertions() {
 }
 
 #[test]
+fn automation_script_rejects_removed_model_spellings() {
+    for command in [
+        json!({ "command": "set_viewer_layout", "layout": "single_3d" }),
+        json!({
+            "command": "assert",
+            "condition": { "cross_section_panel_schedule": {
+                "panel": "three_d",
+                "min_generation": 1,
+                "min_selected_resources": 1
+            } }
+        }),
+        json!({ "command": "set_render_mode", "mode": "isosurface" }),
+    ] {
+        let script = json!({
+            "schema": AUTOMATION_SCRIPT_SCHEMA,
+            "schema_version": AUTOMATION_SCHEMA_VERSION,
+            "scenario": "removed_model_spelling",
+            "commands": [command]
+        });
+        assert!(serde_json::from_value::<ProductAutomationScript>(script).is_err());
+    }
+}
+
+#[test]
 fn automation_script_rejects_wrong_schema_version() {
     let script = ProductAutomationScript {
         schema: AUTOMATION_SCRIPT_SCHEMA.to_owned(),

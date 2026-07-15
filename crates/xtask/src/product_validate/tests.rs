@@ -654,28 +654,45 @@ fn product_validation_scenario_resolution_is_strict() {
         ProductValidationScenario::resolve(None, None).unwrap(),
         ProductValidationScenario::GeneratedFixtureCameraSmoke
     );
-    assert_eq!(
-        ProductValidationScenario::resolve(Some("render-modes"), None).unwrap(),
-        ProductValidationScenario::GeneratedFixtureRenderModes
-    );
-    assert_eq!(
-        ProductValidationScenario::resolve(Some("target-source-verification"), None).unwrap(),
-        ProductValidationScenario::B3SourceVerification
-    );
-    assert_eq!(
-        ProductValidationScenario::resolve(Some("b4-project-persistence"), None).unwrap(),
-        ProductValidationScenario::B4ProjectPersistence
-    );
+    for (name, expected) in [
+        (
+            GENERATED_FIXTURE_SCENARIO,
+            ProductValidationScenario::GeneratedFixtureCameraSmoke,
+        ),
+        (
+            GENERATED_RENDER_MODES_SCENARIO,
+            ProductValidationScenario::GeneratedFixtureRenderModes,
+        ),
+        (
+            B3_SOURCE_VERIFICATION_SCENARIO,
+            ProductValidationScenario::B3SourceVerification,
+        ),
+        (
+            B4_PROJECT_PERSISTENCE_SCENARIO,
+            ProductValidationScenario::B4ProjectPersistence,
+        ),
+    ] {
+        assert_eq!(
+            ProductValidationScenario::resolve(Some(name), None).unwrap(),
+            expected
+        );
+        assert!(ProductValidationScenario::is_named_scenario(name));
+    }
     assert_eq!(
         ProductValidationScenario::resolve(None, Some(B3_SOURCE_VERIFICATION_SCENARIO)).unwrap(),
         ProductValidationScenario::B3SourceVerification
     );
-    assert!(
-        ProductValidationScenario::resolve(Some("unknown"), None)
-            .unwrap_err()
-            .to_string()
-            .contains("unknown product validation scenario")
-    );
+    for removed_alias in [
+        "target-fixture-camera-smoke",
+        "target",
+        "target-fixture-render-modes",
+        "render-modes",
+        "target-source-verification",
+        "b4-project-persistence",
+    ] {
+        assert!(ProductValidationScenario::resolve(Some(removed_alias), None).is_err());
+        assert!(!ProductValidationScenario::is_named_scenario(removed_alias));
+    }
 }
 
 #[test]
@@ -696,29 +713,6 @@ fn product_validation_output_dirs_are_scenario_scoped() {
         product_validation_output_dir(&ProductValidationScenario::B4ProjectPersistence),
         Path::new(OUTPUT_DIR).join(B4_PROJECT_PERSISTENCE_SCENARIO)
     );
-}
-
-#[test]
-fn product_validation_cleanup_removes_legacy_root_artifacts_only() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let base = tempdir.path();
-    for artifact in LEGACY_ROOT_PRODUCT_VALIDATION_ARTIFACTS {
-        fs::write(base.join(artifact), "stale").unwrap();
-    }
-    let scenario_dir = base.join(GENERATED_FIXTURE_SCENARIO);
-    fs::create_dir(&scenario_dir).unwrap();
-    let scenario_report = scenario_dir.join("product-validation-report.json");
-    fs::write(&scenario_report, "current").unwrap();
-
-    remove_legacy_root_product_validation_artifacts(base).unwrap();
-
-    for artifact in LEGACY_ROOT_PRODUCT_VALIDATION_ARTIFACTS {
-        assert!(
-            !base.join(artifact).exists(),
-            "{artifact} should be removed"
-        );
-    }
-    assert_eq!(fs::read_to_string(scenario_report).unwrap(), "current");
 }
 
 #[test]

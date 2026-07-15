@@ -55,13 +55,6 @@ const B3_PRIMARY_E1_CAPTURE: &str = "b3-after-success-1280x720";
 const B3_SECONDARY_E1_CAPTURE: &str = "b3-after-success-1920x1080";
 const MIB: u64 = 1024 * 1024;
 const PREFLIGHT_ONLY_DISPLAY_SOURCE: &str = "preflight_only";
-const LEGACY_ROOT_PRODUCT_VALIDATION_ARTIFACTS: &[&str] = &[
-    "product-automation-script.json",
-    "product-automation-report.json",
-    "product-validation-report.json",
-    "mirante4d-app.stdout.log",
-    "mirante4d-app.stderr.log",
-];
 const SOURCE_CLOSURE_EVIDENCE_ENTRY_MAX: usize = 131_072;
 const SOURCE_CLOSURE_EVIDENCE_BYTES_MAX: u64 = 256 * MIB;
 
@@ -269,10 +262,6 @@ fn product_validate_report_inner(
     let started_at = Instant::now();
     let started_at_epoch_ms = epoch_ms();
     let binary = ProductValidationAppBinary::from_environment()?;
-    let base_output_dir = PathBuf::from(OUTPUT_DIR);
-    fs::create_dir_all(&base_output_dir)
-        .with_context(|| format!("failed to create {}", base_output_dir.display()))?;
-    remove_legacy_root_product_validation_artifacts(&base_output_dir)?;
     let output_dir = product_validation_output_dir(scenario);
     fs::create_dir_all(&output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
@@ -543,18 +532,10 @@ impl ProductValidationScenario {
     fn resolve(explicit: Option<&str>, env_value: Option<&str>) -> anyhow::Result<Self> {
         let requested = explicit.or(env_value);
         match requested.unwrap_or(GENERATED_FIXTURE_SCENARIO) {
-            GENERATED_FIXTURE_SCENARIO | "target-fixture-camera-smoke" | "target" => {
-                Ok(Self::GeneratedFixtureCameraSmoke)
-            }
-            GENERATED_RENDER_MODES_SCENARIO | "target-fixture-render-modes" | "render-modes" => {
-                Ok(Self::GeneratedFixtureRenderModes)
-            }
-            B3_SOURCE_VERIFICATION_SCENARIO | "target-source-verification" => {
-                Ok(Self::B3SourceVerification)
-            }
-            B4_PROJECT_PERSISTENCE_SCENARIO | "b4-project-persistence" => {
-                Ok(Self::B4ProjectPersistence)
-            }
+            GENERATED_FIXTURE_SCENARIO => Ok(Self::GeneratedFixtureCameraSmoke),
+            GENERATED_RENDER_MODES_SCENARIO => Ok(Self::GeneratedFixtureRenderModes),
+            B3_SOURCE_VERIFICATION_SCENARIO => Ok(Self::B3SourceVerification),
+            B4_PROJECT_PERSISTENCE_SCENARIO => Ok(Self::B4ProjectPersistence),
             other => bail!(
                 "unknown product validation scenario {other:?}; expected \
                  {GENERATED_FIXTURE_SCENARIO}, {GENERATED_RENDER_MODES_SCENARIO}, \
@@ -567,15 +548,9 @@ impl ProductValidationScenario {
         matches!(
             name,
             GENERATED_FIXTURE_SCENARIO
-                | "target-fixture-camera-smoke"
-                | "target"
                 | GENERATED_RENDER_MODES_SCENARIO
-                | "target-fixture-render-modes"
-                | "render-modes"
                 | B3_SOURCE_VERIFICATION_SCENARIO
-                | "target-source-verification"
                 | B4_PROJECT_PERSISTENCE_SCENARIO
-                | "b4-project-persistence"
         )
     }
 
@@ -591,17 +566,6 @@ impl ProductValidationScenario {
 
 fn product_validation_output_dir(scenario: &ProductValidationScenario) -> PathBuf {
     Path::new(OUTPUT_DIR).join(scenario.name())
-}
-
-fn remove_legacy_root_product_validation_artifacts(base_output_dir: &Path) -> anyhow::Result<()> {
-    for artifact in LEGACY_ROOT_PRODUCT_VALIDATION_ARTIFACTS {
-        let path = base_output_dir.join(artifact);
-        if path.is_file() {
-            fs::remove_file(&path)
-                .with_context(|| format!("failed to remove stale {}", path.display()))?;
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -660,10 +624,6 @@ fn product_validate_b4_project_persistence(
     let started_at = Instant::now();
     let started_at_epoch_ms = epoch_ms();
     let binary = ProductValidationAppBinary::from_environment()?;
-    let base_output_dir = PathBuf::from(OUTPUT_DIR);
-    fs::create_dir_all(&base_output_dir)
-        .with_context(|| format!("failed to create {}", base_output_dir.display()))?;
-    remove_legacy_root_product_validation_artifacts(&base_output_dir)?;
     let output_dir = product_validation_output_dir(scenario);
     fs::create_dir_all(&output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
