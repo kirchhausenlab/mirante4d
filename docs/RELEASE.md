@@ -5,8 +5,9 @@ local Linux x86_64 release candidate for validation.
 
 ## Build
 
-Install `cargo-deny`, `appimagetool`, `tar`, and `ldd` (`libc-bin` on
-Ubuntu/Debian), then run:
+Start from a clean committed checkout. Install `cargo-deny`, `appimagetool`,
+`appstreamcli`, `tar`, `sha256sum`, and `ldd` (`libc-bin` on Ubuntu/Debian),
+then run:
 
 ```bash
 MIRANTE4D_APPIMAGETOOL=/path/to/appimagetool-x86_64.AppImage \
@@ -14,8 +15,11 @@ MIRANTE4D_APPIMAGETOOL=/path/to/appimagetool-x86_64.AppImage \
 ```
 
 Outputs under `target/mirante4d/dist/` include an AppImage, tarball, unpacked
-release directory, contents report, and smoke evidence. The command runs the
-dependency-policy check before building; a missing checker is a hard failure.
+release directory, contents report, and three smoke logs. The report and smoke
+logs sit beside the distributable artifacts; they are not packaged inside
+them. The command runs the dependency-policy check before building, and records
+the full source commit and tree in the report. A dirty checkout or missing
+checker is a hard failure.
 
 ## Current Boundary
 
@@ -24,15 +28,12 @@ dependency-policy check before building; a missing checker is a hard failure.
   support window.
 - A successful build or packaging smoke is not a supported release and is not
   product validation.
-- Release claims bind the exact source revision, package digest, dependency
-  result, integrity result, packaged-product run, and evidence set.
+- The contents report records the exact source commit and tree, artifact
+  digests, dependency result, and the three package smoke results.
 
 Application logs default to
 `$XDG_STATE_HOME/mirante4d/mirante4d.log` or
 `~/.local/state/mirante4d/mirante4d.log`.
 
-The final release and contributor gates belong to WP-14. Their approved target
-is in the [foundation handoff](plans/active/FOUNDATION_REFACTOR_HANDOFF.md).
-The WP-06 verification cutover does not change release support or qualify the
-package-capability lane; that lane remains pending until it has an honest
-unsupported-GPU diagnostic command.
+WP-14 validates this local package path. It does not create a supported public
+release or change the platform boundary above.
