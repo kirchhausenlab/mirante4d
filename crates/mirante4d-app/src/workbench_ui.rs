@@ -433,20 +433,13 @@ impl MiranteWorkbenchApp {
         .unwrap_or_else(|| self.show_cross_section_panel_placeholder(ui, panel_id, available));
 
         if let Some(presentation_viewport) = presentation_viewport
-            && let Some(readout) = cross_section_hover_readout_for_response(
-                &self.render_coordination,
-                self.dataset.retained_leases(),
-                cross_section_readout::CrossSectionReadoutInput {
-                    view,
-                    catalog: snapshot.catalog(),
-                },
-                panel_id,
+            && let Some(request) = CrossSectionReadoutRequest::from_response(
+                application_panel,
                 presentation_viewport,
                 &response,
             )
         {
-            self.egui_ui.hovered_pixel = None;
-            self.egui_ui.hovered_source_readout = Some(readout.text);
+            output.cross_section_readout_requests.push(request);
         }
 
         if matches!(
@@ -860,6 +853,7 @@ impl eframe::App for MiranteWorkbenchApp {
         let mut application_commands = Vec::new();
         let mut actions = Vec::new();
         let mut viewport_observations = Vec::new();
+        let mut cross_section_readout_requests = Vec::new();
         let mut render_requests = Vec::new();
         let mut presentation_paints = Vec::new();
         let import_snapshot = application_snapshot.import_workflow();
@@ -2133,6 +2127,7 @@ impl eframe::App for MiranteWorkbenchApp {
         import_commands.append(&mut viewer_output.import_commands);
         actions.append(&mut viewer_output.actions);
         viewport_observations.append(&mut viewer_output.viewport_observations);
+        cross_section_readout_requests.append(&mut viewer_output.cross_section_readout_requests);
         render_requests.append(&mut viewer_output.render_requests);
         presentation_paints.append(&mut viewer_output.presentation_paints);
         rerender_requested |= viewer_output.rerender_requested;
@@ -2168,6 +2163,7 @@ impl eframe::App for MiranteWorkbenchApp {
                 import_commands,
                 actions,
                 viewport_observations,
+                cross_section_readout_requests,
                 render_requests,
                 presentation_paints,
                 rerender_requested,

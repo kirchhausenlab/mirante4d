@@ -270,6 +270,66 @@ impl RenderUiRequest {
     }
 }
 
+/// One hovered cross-section point to resolve against retained source data.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CrossSectionReadoutRequest {
+    panel: CrossSectionPanelId,
+    presentation: PresentationViewport,
+    normalized_point: [f64; 2],
+}
+
+impl CrossSectionReadoutRequest {
+    pub fn new(
+        panel: CrossSectionPanelId,
+        presentation: PresentationViewport,
+        normalized_point: [f64; 2],
+    ) -> Option<Self> {
+        normalized_point
+            .into_iter()
+            .all(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+            .then_some(Self {
+                panel,
+                presentation,
+                normalized_point,
+            })
+    }
+
+    pub fn from_response(
+        panel: CrossSectionPanelId,
+        presentation: PresentationViewport,
+        response: &egui::Response,
+    ) -> Option<Self> {
+        if !response.hovered() || response.rect.width() <= 0.0 || response.rect.height() <= 0.0 {
+            return None;
+        }
+        let position = response.hover_pos()?;
+        if !response.rect.contains(position) {
+            return None;
+        }
+        let normalized_x =
+            ((position.x - response.rect.min.x) / response.rect.width()).clamp(0.0, 1.0);
+        let normalized_y =
+            ((position.y - response.rect.min.y) / response.rect.height()).clamp(0.0, 1.0);
+        Self::new(
+            panel,
+            presentation,
+            [f64::from(normalized_x), f64::from(normalized_y)],
+        )
+    }
+
+    pub const fn panel(self) -> CrossSectionPanelId {
+        self.panel
+    }
+
+    pub const fn presentation(self) -> PresentationViewport {
+        self.presentation
+    }
+
+    pub const fn normalized_point(self) -> [f64; 2] {
+        self.normalized_point
+    }
+}
+
 /// Typed results emitted while egui builds one visible workbench frame.
 ///
 /// Commands retain their existing post-build batching behavior. Actions and
@@ -281,6 +341,7 @@ pub struct WorkbenchUiOutput {
     pub import_commands: Vec<ImportCommand>,
     pub actions: Vec<WorkbenchUiAction>,
     pub viewport_observations: Vec<ViewportObservation>,
+    pub cross_section_readout_requests: Vec<CrossSectionReadoutRequest>,
     pub render_requests: Vec<RenderUiRequest>,
     pub presentation_paints: Vec<EguiPresentationPaint>,
     pub rerender_requested: bool,
@@ -994,6 +1055,22 @@ mod tests {
             panel: CrossSectionPanelId::Yz,
         };
         assert_eq!(request.cross_section_panel(), CrossSectionPanelId::Yz);
+        let readout =
+            CrossSectionReadoutRequest::new(CrossSectionPanelId::Xy, presentation, [0.25, 0.75])
+                .unwrap();
+        assert_eq!(readout.panel(), CrossSectionPanelId::Xy);
+        assert_eq!(readout.presentation(), presentation);
+        assert_eq!(readout.normalized_point(), [0.25, 0.75]);
+        assert!(CrossSectionReadoutRequest::new(
+            CrossSectionPanelId::Xy,
+            presentation,
+            [f64::NAN, 0.5],
+        )
+        .is_none());
+        assert!(
+            CrossSectionReadoutRequest::new(CrossSectionPanelId::Xy, presentation, [1.01, 0.5],)
+                .is_none()
+        );
     }
 
     fn import_draft(spacing: f64) -> ImportReviewDraft {
@@ -1082,6 +1159,7 @@ mod tests {
                 WorkbenchUiAction::UseRecommendedSettings,
             ],
             viewport_observations: Vec::new(),
+            cross_section_readout_requests: Vec::new(),
             render_requests: Vec::new(),
             presentation_paints: Vec::new(),
             rerender_requested: true,

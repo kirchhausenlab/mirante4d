@@ -1,4 +1,3 @@
-use eframe::egui;
 use glam::{DMat4, DVec3};
 use mirante4d_application::{
     CrossSectionPanelScheduleStatus, RenderCoordinationState, RenderSurfaceState,
@@ -71,35 +70,6 @@ pub(crate) struct CrossSectionHoverReadout {
     pub(crate) nearest_grid_index: Option<CrossSectionGridIndex>,
     pub(crate) value: Option<CrossSectionHoverValue>,
     pub(crate) status: CrossSectionHoverStatus,
-}
-
-pub(crate) fn cross_section_hover_readout_for_response(
-    coordination: &RenderCoordinationState,
-    leases: &RetainedLeases,
-    input: CrossSectionReadoutInput<'_>,
-    panel_id: PanelId,
-    presentation_viewport: PresentationViewport,
-    response: &egui::Response,
-) -> Option<CrossSectionHoverReadout> {
-    if !response.hovered() || response.rect.width() <= 0.0 || response.rect.height() <= 0.0 {
-        return None;
-    }
-    let position = response.hover_pos()?;
-    if !response.rect.contains(position) {
-        return None;
-    }
-    let normalized_x = ((position.x - response.rect.min.x) / response.rect.width()).clamp(0.0, 1.0);
-    let normalized_y =
-        ((position.y - response.rect.min.y) / response.rect.height()).clamp(0.0, 1.0);
-    cross_section_hover_readout_for_panel_point(
-        coordination,
-        leases,
-        input,
-        panel_id,
-        f64::from(normalized_x) * presentation_viewport.width_points(),
-        f64::from(normalized_y) * presentation_viewport.height_points(),
-        presentation_viewport,
-    )
 }
 
 pub(crate) fn cross_section_hover_readout_for_panel_point(

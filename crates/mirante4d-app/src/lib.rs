@@ -57,7 +57,7 @@ use analysis_workspace::{
     AnalysisTableExportInput, AnalysisWorkspaceViewInput, export_selected_analysis_table,
     show_analysis_workspace, show_analysis_workspace_window,
 };
-use cross_section_readout::cross_section_hover_readout_for_response;
+use cross_section_readout::cross_section_hover_readout_for_panel_point;
 pub use diagnostics::{StartupDiagnostics, collect_startup_diagnostics, default_log_path};
 use display_refresh::{ViewportDisplayImage, duration_ms};
 use eframe::egui;
@@ -125,8 +125,8 @@ use transfer_presets::{
 #[cfg(test)]
 use ui_kit::{AnalysisPlotViewRange, AnalysisTableSort, ViewportIntensity};
 use ui_kit::{
-    RenderUiRequest, StatusTone, ViewportHover, ViewportObservation, WorkbenchAnalysisKind,
-    WorkbenchLayoutSpec, WorkbenchUiAction, WorkbenchUiOutput,
+    CrossSectionReadoutRequest, RenderUiRequest, StatusTone, ViewportHover, ViewportObservation,
+    WorkbenchAnalysisKind, WorkbenchLayoutSpec, WorkbenchUiAction, WorkbenchUiOutput,
 };
 use viewport::{
     default_camera_for_shape, fit_camera_to_shape_preserving_view, fit_size,

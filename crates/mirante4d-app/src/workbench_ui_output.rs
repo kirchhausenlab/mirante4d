@@ -40,6 +40,7 @@ impl MiranteWorkbenchApp {
             import_commands,
             actions,
             viewport_observations,
+            cross_section_readout_requests,
             render_requests,
             presentation_paints,
             mut rerender_requested,
@@ -47,6 +48,30 @@ impl MiranteWorkbenchApp {
         } = output;
 
         let command_apply_started = Instant::now();
+        if !cross_section_readout_requests.is_empty() {
+            let snapshot = self.application.snapshot();
+            let view = application_view(&snapshot);
+            for request in cross_section_readout_requests {
+                let panel_id = PanelId::from_application_panel(request.panel());
+                let presentation = request.presentation();
+                let [normalized_x, normalized_y] = request.normalized_point();
+                if let Some(readout) = cross_section_hover_readout_for_panel_point(
+                    &self.render_coordination,
+                    self.dataset.retained_leases(),
+                    cross_section_readout::CrossSectionReadoutInput {
+                        view,
+                        catalog: snapshot.catalog(),
+                    },
+                    panel_id,
+                    normalized_x * presentation.width_points(),
+                    normalized_y * presentation.height_points(),
+                    presentation,
+                ) {
+                    self.egui_ui.hovered_pixel = None;
+                    self.egui_ui.hovered_source_readout = Some(readout.text);
+                }
+            }
+        }
         for action in actions {
             match action {
                 WorkbenchUiAction::OpenDatasetDialog => {
