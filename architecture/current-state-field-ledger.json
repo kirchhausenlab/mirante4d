@@ -1,11 +1,7 @@
 {
   "schema": "mirante4d-current-state-field-ledger",
   "schema_version": 2,
-  "status": "wp14-release-contributor-hardening",
-  "predecessor": {
-    "tag": "foundation-wp-09c-exit-1",
-    "revision": "d33276b6de0287da7f225da278ee016aac26358a"
-  },
+  "status": "foundation-complete",
   "dataset_authority": {
     "runtime_owner": "mirante4d-dataset-runtime",
     "composition_state": "DatasetDemandState",
@@ -24,47 +20,6 @@
     "contract_owner": "mirante4d-render-api"
   },
   "temporary_owners": [],
-  "deleted_predecessors": {
-    "paths": [
-      "crates/mirante4d-app/src/current_runtime/dataset.rs",
-      "crates/mirante4d-app/src/brick_streaming.rs",
-      "crates/mirante4d-app/src/brick_streaming_plan.rs",
-      "crates/mirante4d-app/src/cross_section_read_queue.rs",
-      "crates/mirante4d-app/src/cross_section_streaming.rs",
-      "crates/mirante4d-app/src/analysis_jobs.rs",
-      "crates/mirante4d-app/src/current_runtime/validation.rs",
-      "crates/mirante4d-app/src/dataset_opening.rs",
-      "crates/mirante4d-data/src/worker.rs",
-      "crates/mirante4d-data/src/worker/tests.rs"
-    ],
-    "types": [
-      "CurrentDatasetRuntime",
-      "CurrentValidationRuntime",
-      "DataRequestId",
-      "DataGenerationId",
-      "CancellationToken",
-      "BrickReadPool",
-      "CrossSectionChunkReadPool",
-      "BrickReadTicket",
-      "BrickReadOutcome",
-      "BrickRequestPriority",
-      "BrickHistogramSample",
-      "BrickReadMetrics",
-      "BrickReadQueueDiagnostics",
-      "BrickReadSpec",
-      "CrossSectionChunkReadSpec",
-      "BrickReadStatus",
-      "BrickReadPayload"
-    ],
-    "app_owned_payload_types": [
-      "DenseVolumeU8",
-      "DenseVolumeU16",
-      "DenseVolumeF32",
-      "VolumeBrickU8",
-      "VolumeBrickU16",
-      "VolumeBrickF32"
-    ]
-  },
   "invariants": [
     "No exact field count is an architecture contract.",
     "The application owns bounded payload-free request correlation, not decoded pixels.",
