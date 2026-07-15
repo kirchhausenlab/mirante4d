@@ -7,8 +7,6 @@ MIRANTE4D_APPIMAGETOOL=/path/to/appimagetool-x86_64.AppImage \
   cargo xtask package-linux-release
 ```
 
-`cargo xtask package-dev` is retained as an alias that returns the release directory path.
-
 ## Linux
 
 Status: current release-candidate package target for x86_64 artifacts. There is

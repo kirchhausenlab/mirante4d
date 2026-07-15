@@ -53,10 +53,6 @@ struct GitSourceIdentity {
     tree: String,
 }
 
-pub(crate) fn package_dev() -> anyhow::Result<PathBuf> {
-    Ok(build_linux_release_package()?.package_root)
-}
-
 pub(crate) fn package_linux_release() -> anyhow::Result<PathBuf> {
     Ok(build_linux_release_package()?.contents_report_path)
 }

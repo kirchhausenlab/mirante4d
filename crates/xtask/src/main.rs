@@ -2,31 +2,24 @@ use std::{env, path::Path};
 
 use anyhow::{Context, bail};
 
-use crate::command_audit::command_audit;
 use crate::product_validate::{is_product_validation_scenario_name, product_validate};
-use crate::smoke::app_smoke;
 use crate::workflow_audit::workflow_audit;
 
 const PRODUCT_VALIDATE_USAGE: &str = "usage: cargo xtask product-validate [target-package] \
      [target_fixture_camera_smoke|target_fixture_render_modes|target_source_verification|b4_project_persistence]";
 
 mod arch;
-mod command_audit;
 mod deps;
 mod dev;
 mod documentation;
 mod host;
-mod ids;
 mod package;
 mod process;
 mod product_validate;
 mod reports;
-mod smoke;
 mod target_fixture;
 mod verification;
 mod workflow_audit;
-
-pub(crate) use ids::stable_id_from_name;
 
 fn main() -> anyhow::Result<()> {
     let mut args = env::args().skip(1);
@@ -67,18 +60,8 @@ fn main() -> anyhow::Result<()> {
             verification::verification_sync(option.as_deref() == Some("--check"))
         }
         "verify-deps" => deps::verify_deps(),
-        "package-dev" => package::package_dev().map(|path| println!("{}", path.display())),
         "package-linux-release" => {
             package::package_linux_release().map(|path| println!("{}", path.display()))
-        }
-        "app-smoke" => {
-            let package = args
-                .next()
-                .context("usage: cargo xtask app-smoke <target-package>")?;
-            if args.next().is_some() {
-                bail!("usage: cargo xtask app-smoke <target-package>");
-            }
-            app_smoke(Path::new(&package)).map(|path| println!("{}", path.display()))
         }
         "product-validate" => match product_validate_args(args.collect())? {
             ProductValidateArgs::Help => {
@@ -92,7 +75,6 @@ fn main() -> anyhow::Result<()> {
         },
         "workflow-audit" => workflow_audit().map(|path| println!("{}", path.display())),
         "docs-check" => documentation::docs_check(),
-        "command-audit" => command_audit().map(|path| println!("{}", path.display())),
         "run-dev" => dev::run_dev(),
         "help" | "--help" | "-h" => {
             print_help();
@@ -170,13 +152,10 @@ Mirante4D developer tasks
   cargo xtask verify-local <format-lifecycle|project-store-lifecycle|trusted-gpu>
   cargo xtask verification-sync [--check]
   cargo xtask verify-deps
-  cargo xtask package-dev
   cargo xtask package-linux-release
-  cargo xtask app-smoke <target-package>
   cargo xtask product-validate [target-package] [scenario]
   cargo xtask workflow-audit
   cargo xtask docs-check
-  cargo xtask command-audit
   cargo xtask run-dev
 
 Run cargo xtask product-validate --help for scenario details."
