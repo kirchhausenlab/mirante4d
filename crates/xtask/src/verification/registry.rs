@@ -117,8 +117,6 @@ pub(super) struct SelectorAdapter {
     capability: String,
     matches: Vec<SelectorMatch>,
     expected_ignored_cases: u64,
-    expiry: String,
-    deletion_gate: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -367,8 +365,6 @@ fn validate_registry(registry: &Registry) -> anyhow::Result<()> {
             || adapter.capability.trim().is_empty()
             || adapter.matches.is_empty()
             || adapter.expected_ignored_cases == 0
-            || adapter.expiry.trim().is_empty()
-            || adapter.deletion_gate.trim().is_empty()
         {
             bail!(
                 "selector adapter {:?} has incomplete or duplicate metadata",

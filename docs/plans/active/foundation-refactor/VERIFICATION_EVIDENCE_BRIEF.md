@@ -272,55 +272,13 @@ semantics](https://docs.github.com/en/repositories/configuring-branches-and-merg
 rather than assuming the hosting UI fails closed.
 
 The same two checks and six leaves run on exact protected-`main` revisions under
-unique `Main / policy` and `Main / rust` job names. Additional non-PR lanes are:
-
-| Lane | Trigger and execution | Role |
-| --- | --- | --- |
-| `Main / package-capability` | One standard public Linux job/build, protected `main` | Build/install/layout/headless smoke plus black-box unsupported-GPU diagnosis against the same package; no viewer E3/product-open claim |
-| `Deep / code-coverage` | Unactivated future option | Instrumented code-gap discovery only if a later concrete need justifies it |
-| `Deep / fuzz-N` | Manual/rotating standard public Linux shard | Seeded parser/state/crash discovery with corpus promotion |
-| `Deep / mutation-N` | Manual/rotating standard public Linux shard | Requirement-test strength; bounded owner-specific shards |
-| `Portability / windows` and `Portability / macos` | Manual or explicitly approved portability change | Non-required compile/portable-contract evidence; no support claim |
-| `Format / lifecycle` | Target-format change and release candidate; public standard CPU plus T1 | Current profile/converter-if-approved acceptance and rejection matrix |
-| `Scientific / acceptance` | Applicable milestone/release; local `HW-2` plus T1/T5 | Independent scientific facts and reviewed tolerance evidence |
-| Trusted GPU/E3/E4/product/performance | Manual local `HW-2` clean worktree | Required by applicable work-package/milestone claims |
-| Release | Accepted protected tag on standard public Linux and/or local `HW-2` | Package, SBOM, provenance, checksum, and evidence-set publication |
-
-Total lane budgets include setup and apply per scenario/shard where the row is
-parameterized:
-
-| Lane/profile | p95 target | Hard ceiling |
-| --- | ---: | ---: |
-| Main package plus unsupported-GPU capability flow | `12 min` | `20 min` |
-| Trusted GPU correctness | `10 min` | `15 min` |
-| Trusted small-fixture E3 | `10 min` | `15 min` |
-| Portability per OS | `8 min` | `12 min` |
-| Format lifecycle | `10 min` | `15 min` |
-| Code coverage | `12 min` | `20 min` |
-| Each fuzz shard | `5 min` fuzzing | `8 min` total |
-| Rotating mutation shard | `15 min` | `25 min` |
-| Medium pressure/stress scenario | `20 min` | `30 min` |
-| Fixed-HW performance scenario | `30 min` | `45 min` |
-| Small-fixture `HW-2` E4 | `10 min` | `15 min` |
-| DS-1/DS-2 E4 scenario | `15 min` | `20 min` |
-| DS-3/DS-4 E4/performance scenario | `30 min` | `45 min` |
-| Scientific T1 acceptance | `10 min` | `15 min` |
-| Scientific T5 acceptance scenario | `30 min` | `45 min` |
-| Release assembly/publication | `20 min` | `30 min` |
-
-Calibration uses a fixed consecutive window of at least twenty valid
-non-infrastructure attempts on clean revisions and reports cold and warm/cache
-state separately. Functional failures and timeout-censored attempts remain in
-the duration window; excluding them would create survivor bias. Hard ceilings
-apply from the first implementation, and a censored ceiling event is a
-violation. Percentile enforcement begins when the fixed window is complete.
-The WP-06 window completed with twenty valid first-attempt successes, no
-infrastructure invalidations, caches, artifacts, or censored timeouts.
-
-No cron is enabled until the corresponding lane has a measured duration,
-output size, owner, and approved cadence. Main evidence runs are not cancelled
-once started; superseded PR runs use per-PR concurrency with
-`cancel-in-progress: true`.
+unique `Main / policy` and `Main / rust` job names. The only active local lanes
+are the five concrete commands in `verification/registry.json`: contributor
+feedback, format lifecycle, project-store lifecycle, trusted GPU, and Linux
+release packaging. Coverage, fuzz, mutation, private-data, performance,
+portability, and publication workflows are not activated by the foundation
+program; a future concrete need must justify any such addition. No cron is
+enabled.
 
 ### D-023 Selected Fixture, Oracle, E2E, And Evidence Policy
 

@@ -197,7 +197,7 @@
       "owner": "linux-package",
       "capability": "local-linux-x86_64",
       "requirements": ["WP-14-linux-package"],
-      "fixture_tier": "none",
+      "fixture_tier": "T1-target",
       "timeout_secs": 1800,
       "evidence_level": "E2",
       "trigger": "manual clean release candidate",
@@ -223,9 +223,7 @@
           "test_prefix": "gpu_tests::"
         }
       ],
-      "expected_ignored_cases": 1,
-      "expiry": "WP-14",
-      "deletion_gate": "WP-14-verification-hardening"
+      "expected_ignored_cases": 1
     },
     {
       "id": "WP10A-ADAPTER-FORMAT-LIFECYCLE-SCALABILITY",
@@ -240,9 +238,7 @@
           "test_prefix": "package_catalog::tests::representative_large_manifest_open_stays_inside_the_metadata_working_set"
         }
       ],
-      "expected_ignored_cases": 1,
-      "expiry": "WP-14",
-      "deletion_gate": "WP-14-verification-hardening"
+      "expected_ignored_cases": 1
     },
     {
       "id": "WP10B-ADAPTER-PROJECT-STORE-LIFECYCLE",
@@ -259,9 +255,7 @@
           "test_prefix": "actor::tests::durability_tests::project_store_vm_guest_driver"
         }
       ],
-      "expected_ignored_cases": 1,
-      "expiry": "WP-14",
-      "deletion_gate": "WP-14-verification-hardening"
+      "expected_ignored_cases": 1
     }
   ]
 }
