@@ -8,27 +8,21 @@ use std::{
 
 use eframe::egui;
 use mirante4d_application::{
-    ApplicationCommand, ApplicationEvent, CommandEffect, CrossSectionPanelId,
-    ProjectStoreLifecycle, SourceVerificationSnapshot, WorkspaceSnapshot,
+    ApplicationCommand, ApplicationEvent, CommandEffect, ProjectStoreLifecycle,
+    SourceVerificationSnapshot, WorkspaceSnapshot,
     viewport_interaction::{
-        CrossSectionPanel, CrossSectionViewState, default_camera_for_shape,
-        fit_camera_to_shape_preserving_view, orbit_camera, pan_camera,
-        representative_voxel_world_size, zoom_camera,
+        fit_camera_to_shape_preserving_view, orbit_camera, pan_camera, zoom_camera,
     },
 };
 use mirante4d_domain::{
     DisplayWindow, DvrOpacityTransfer, IsoShadingPolicy, LayerTransfer, Opacity, RenderMode,
-    RenderState, SamplingPolicy, TimeIndex, ViewerLayout,
+    RenderState, SamplingPolicy, ViewerLayout,
 };
 use mirante4d_project_model::{LayerViewState, ProjectRevisionId};
-use mirante4d_render_api::{PresentationViewport, RenderExtent};
+use mirante4d_render_api::RenderExtent;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::cross_section_readout::{
-    CrossSectionHoverGenerationStatus, CrossSectionHoverReadout, CrossSectionHoverStatus,
-    CrossSectionHoverValue, CrossSectionReadoutInput, cross_section_hover_readout_for_panel_point,
-};
 use crate::{
     DVR_DENSITY_SCALE_MAX, DVR_DENSITY_SCALE_MIN, DisplayedFrameFreshness, FrameCompleteness,
     MiranteWorkbenchApp, application_view, set_render_viewport, viewer_layout::PanelId,
@@ -40,8 +34,8 @@ mod model;
 
 use capture::{
     ProductAutomationArtifact, ProductAutomationImageStats, capture_color_image,
-    color_image_from_rgba, current_display_image_stats, product_target_capture,
-    sanitize_artifact_label, write_color_image_ppm,
+    current_display_image_stats, product_target_capture, sanitize_artifact_label,
+    write_color_image_ppm,
 };
 use diagnostics::{dataset_runtime_diagnostics_json, gpu_adapter_diagnostics_json};
 use model::*;
@@ -74,22 +68,14 @@ fn product_presentations_ready(
         .all(|panel| product_target_capture(app, *panel).is_some()))
 }
 
-fn assertion_capture_panels(
-    condition: &ProductAutomationAssertCondition,
-) -> Result<Vec<PanelId>, String> {
-    Ok(match condition {
+fn assertion_capture_panels(condition: &ProductAutomationAssertCondition) -> Vec<PanelId> {
+    match condition {
         ProductAutomationAssertCondition::NonblankFrame => vec![PanelId::ThreeD],
-        ProductAutomationAssertCondition::CrossSectionPanelNonblank { panel, .. } => {
-            vec![automation_cross_section_panel_id(*panel)?]
-        }
-        ProductAutomationAssertCondition::CrossSectionPanelImagesDistinct { .. } => {
-            vec![PanelId::Xy, PanelId::Xz, PanelId::Yz]
-        }
         ProductAutomationAssertCondition::FourPanelImagesDistinct { .. } => {
             vec![PanelId::ThreeD, PanelId::Xy, PanelId::Xz, PanelId::Yz]
         }
         _ => Vec::new(),
-    })
+    }
 }
 const AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 const AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
@@ -154,53 +140,6 @@ fn render_state_for_mode(
             RenderState::dvr(sampling, opacity_transfer, density).map_err(|error| error.to_string())
         }
     }
-}
-
-fn application_cross_section_panel_id(panel_id: PanelId) -> Option<CrossSectionPanelId> {
-    match panel_id {
-        PanelId::Xy => Some(CrossSectionPanelId::Xy),
-        PanelId::Xz => Some(CrossSectionPanelId::Xz),
-        PanelId::Yz => Some(CrossSectionPanelId::Yz),
-        PanelId::ThreeD => None,
-    }
-}
-
-fn apply_cross_section_edit(
-    app: &mut MiranteWorkbenchApp,
-    ctx: &egui::Context,
-    panel_id: PanelId,
-    edit: impl FnOnce(&mut CrossSectionViewState, CrossSectionPanel),
-) -> Result<(), String> {
-    let application_panel = application_cross_section_panel_id(panel_id)
-        .ok_or_else(|| "3D is not a cross-section panel".to_owned())?;
-    dispatch_application_command(
-        app,
-        ctx,
-        ApplicationCommand::SetActiveCrossSectionPanel(Some(application_panel)),
-    )?;
-    let snapshot = app.application.snapshot();
-    let view = application_view(&snapshot);
-    let mut cross_section = CrossSectionViewState::from_canonical(*view.cross_section());
-    edit(
-        &mut cross_section,
-        panel_id
-            .cross_section_panel()
-            .expect("validated cross-section panel"),
-    );
-    let layout = view.layout();
-    let cross_section = cross_section
-        .into_canonical()
-        .map_err(|error| error.to_string())?;
-    dispatch_application_command(
-        app,
-        ctx,
-        ApplicationCommand::SetLayout {
-            layout,
-            cross_section,
-        },
-    )?;
-    ctx.request_repaint_after(crate::CROSS_SECTION_INTERACTION_SETTLE_DURATION);
-    Ok(())
 }
 
 pub(crate) struct ProductAutomationController {
@@ -686,68 +625,6 @@ impl ProductAutomationController {
                     "layout": layout.name(),
                 })))
             }
-            ProductAutomationCommand::SetTimepoint { timepoint } => {
-                let snapshot = app.application.snapshot();
-                let view = application_view(&snapshot);
-                let timepoint_count = snapshot
-                    .catalog()
-                    .layer(view.active_layer())
-                    .expect("application view closes over the dataset catalog")
-                    .shape()
-                    .t();
-                if *timepoint >= timepoint_count {
-                    return Err(format!(
-                        "timepoint {timepoint} is out of range for {} timepoint(s)",
-                        timepoint_count
-                    ));
-                }
-                dispatch_application_command(
-                    app,
-                    ctx,
-                    ApplicationCommand::SetTimepoint(TimeIndex::new(*timepoint)),
-                )?;
-                let active_timepoint = application_view(&app.application.snapshot())
-                    .timepoint()
-                    .get();
-                Ok(CommandProgress::Done(json!({
-                    "timepoint": timepoint,
-                    "active_timepoint": active_timepoint,
-                })))
-            }
-            ProductAutomationCommand::StepTimepoint { delta } => {
-                let snapshot = app.application.snapshot();
-                let view = application_view(&snapshot);
-                let count = snapshot
-                    .catalog()
-                    .layer(view.active_layer())
-                    .expect("application view closes over the dataset catalog")
-                    .shape()
-                    .t();
-                let next =
-                    mirante4d_application::stepped_timepoint(view.timepoint(), count, *delta);
-                dispatch_application_command(app, ctx, ApplicationCommand::SetTimepoint(next))?;
-                let active_timepoint = application_view(&app.application.snapshot())
-                    .timepoint()
-                    .get();
-                Ok(CommandProgress::Done(json!({
-                    "delta": delta,
-                    "active_timepoint": active_timepoint,
-                })))
-            }
-            ProductAutomationCommand::SetPlayback { playing } => {
-                dispatch_application_command(
-                    app,
-                    ctx,
-                    ApplicationCommand::SetPlaybackActive(*playing),
-                )?;
-                let active_timepoint = application_view(&app.application.snapshot())
-                    .timepoint()
-                    .get();
-                Ok(CommandProgress::Done(json!({
-                    "playing": playing,
-                    "active_timepoint": active_timepoint,
-                })))
-            }
             ProductAutomationCommand::SetRenderMode { mode } => {
                 let render_mode: RenderMode = (*mode).into();
                 let layer_index = active_layer_index(app);
@@ -852,24 +729,6 @@ impl ProductAutomationController {
                     "density_scale": density_scale,
                 })))
             }
-            ProductAutomationCommand::SetChannelVisibility {
-                layer_index,
-                visible,
-            } => {
-                let command = layer_command(app, *layer_index, |layer| {
-                    Ok(LayerViewState::new(
-                        layer.layer_key(),
-                        *visible,
-                        layer.transfer().clone(),
-                        *layer.render_state(),
-                    ))
-                })?;
-                dispatch_application_command(app, ctx, command)?;
-                Ok(CommandProgress::Done(json!({
-                    "layer_index": layer_index,
-                    "visible": visible,
-                })))
-            }
             ProductAutomationCommand::SetLayerOpacity {
                 layer_index,
                 opacity,
@@ -948,18 +807,6 @@ impl ProductAutomationController {
                 dispatch_application_command(app, ctx, ApplicationCommand::SetCamera(camera))?;
                 Ok(CommandProgress::Done(json!({})))
             }
-            ProductAutomationCommand::CameraReset => {
-                let snapshot = app.application.snapshot();
-                let view = application_view(&snapshot);
-                let layer = snapshot
-                    .catalog()
-                    .layer(view.active_layer())
-                    .expect("application view closes over the dataset catalog");
-                let camera =
-                    default_camera_for_shape(layer.shape().spatial(), layer.grid_to_world());
-                dispatch_application_command(app, ctx, ApplicationCommand::SetCamera(camera))?;
-                Ok(CommandProgress::Done(json!({})))
-            }
             ProductAutomationCommand::CameraOrbit {
                 yaw_points,
                 pitch_points,
@@ -1003,167 +850,6 @@ impl ProductAutomationController {
                     "scroll_y_points": scroll_y_points,
                 })))
             }
-            ProductAutomationCommand::CrossSectionPan {
-                panel,
-                x_points,
-                y_points,
-                probe_after,
-            } => {
-                ensure_finite_pair("cross_section_pan motion", *x_points, *y_points)?;
-                let panel_id = automation_cross_section_panel_id(*panel)?;
-                apply_cross_section_edit(app, ctx, panel_id, |cross_section, panel| {
-                    cross_section.pan_by_panel_points(
-                        panel,
-                        f64::from(*x_points),
-                        f64::from(*y_points),
-                    );
-                })?;
-                let probe_after = if let Some(probe) = probe_after {
-                    match self.probe_panel_hover(
-                        app,
-                        *panel,
-                        probe.x_fraction,
-                        probe.y_fraction,
-                        probe.expected_status,
-                        probe.expect_value,
-                        probe.expected_generation_status,
-                        probe.expected_display_current,
-                        probe.expected_target_generation,
-                        probe.expected_displayed_generation,
-                        probe.expected_schedule_generation,
-                    )? {
-                        CommandProgress::Done(details) => Some(details),
-                        CommandProgress::Waiting | CommandProgress::PassiveWaiting(_) => {
-                            return Err(
-                                "cross_section_pan probe_after unexpectedly waited".to_owned()
-                            );
-                        }
-                    }
-                } else {
-                    None
-                };
-                Ok(CommandProgress::Done(json!({
-                    "panel": panel.name(),
-                    "x_points": x_points,
-                    "y_points": y_points,
-                    "probe_after": probe_after,
-                })))
-            }
-            ProductAutomationCommand::CrossSectionSliceStep {
-                panel,
-                notches,
-                fast,
-            } => {
-                if !notches.is_finite() {
-                    return Err("cross_section_slice_step notches must be finite".to_owned());
-                }
-                let panel_id = automation_cross_section_panel_id(*panel)?;
-                let snapshot = app.application.snapshot();
-                let view = application_view(&snapshot);
-                let voxel_size = representative_voxel_world_size(
-                    snapshot
-                        .catalog()
-                        .layer(view.active_layer())
-                        .expect("application view closes over the dataset catalog")
-                        .grid_to_world(),
-                );
-                let multiplier = if *fast {
-                    crate::CROSS_SECTION_FAST_SLICE_MULTIPLIER
-                } else {
-                    1.0
-                };
-                apply_cross_section_edit(app, ctx, panel_id, |cross_section, panel| {
-                    cross_section
-                        .slice_by_world_distance(panel, *notches * voxel_size * multiplier);
-                })?;
-                Ok(CommandProgress::Done(json!({
-                    "panel": panel.name(),
-                    "notches": notches,
-                    "fast": fast,
-                })))
-            }
-            ProductAutomationCommand::CrossSectionZoom {
-                panel,
-                x_fraction,
-                y_fraction,
-                scroll_y_points,
-            } => {
-                ensure_fraction("cross_section_zoom x_fraction", *x_fraction)?;
-                ensure_fraction("cross_section_zoom y_fraction", *y_fraction)?;
-                if !scroll_y_points.is_finite() {
-                    return Err("cross_section_zoom scroll_y_points must be finite".to_owned());
-                }
-                let panel_id = automation_cross_section_panel_id(*panel)?;
-                let presentation_viewport =
-                    cross_section_panel_presentation_viewport(app, panel_id)?;
-                let pointer_position_points = egui::pos2(
-                    (presentation_viewport.width_points() as f32) * *x_fraction,
-                    (presentation_viewport.height_points() as f32) * *y_fraction,
-                );
-                let factor = (-f64::from(*scroll_y_points) * 0.001).exp();
-                apply_cross_section_edit(app, ctx, panel_id, |cross_section, panel| {
-                    cross_section.zoom_around_panel_point(
-                        panel,
-                        presentation_viewport,
-                        f64::from(pointer_position_points.x),
-                        f64::from(pointer_position_points.y),
-                        factor,
-                    );
-                })?;
-                Ok(CommandProgress::Done(json!({
-                    "panel": panel.name(),
-                    "x_fraction": x_fraction,
-                    "y_fraction": y_fraction,
-                    "scroll_y_points": scroll_y_points,
-                    "viewport_width_points": presentation_viewport.width_points(),
-                    "viewport_height_points": presentation_viewport.height_points(),
-                })))
-            }
-            ProductAutomationCommand::CrossSectionRotate {
-                panel,
-                x_points,
-                y_points,
-            } => {
-                ensure_finite_pair("cross_section_rotate motion", *x_points, *y_points)?;
-                let panel_id = automation_cross_section_panel_id(*panel)?;
-                apply_cross_section_edit(app, ctx, panel_id, |cross_section, panel| {
-                    cross_section.rotate_oblique_by_panel_drag(
-                        panel,
-                        f64::from(*x_points),
-                        f64::from(*y_points),
-                        crate::CROSS_SECTION_ROTATE_RADIANS_PER_POINT,
-                    );
-                })?;
-                Ok(CommandProgress::Done(json!({
-                    "panel": panel.name(),
-                    "x_points": x_points,
-                    "y_points": y_points,
-                })))
-            }
-            ProductAutomationCommand::ProbePanelHover {
-                panel,
-                x_fraction,
-                y_fraction,
-                expected_status,
-                expect_value,
-                expected_generation_status,
-                expected_display_current,
-                expected_target_generation,
-                expected_displayed_generation,
-                expected_schedule_generation,
-            } => self.probe_panel_hover(
-                app,
-                *panel,
-                *x_fraction,
-                *y_fraction,
-                *expected_status,
-                *expect_value,
-                *expected_generation_status,
-                *expected_display_current,
-                *expected_target_generation,
-                *expected_displayed_generation,
-                *expected_schedule_generation,
-            ),
             ProductAutomationCommand::ProbeHover {
                 x_fraction,
                 y_fraction,
@@ -1190,7 +876,7 @@ impl ProductAutomationController {
                 Ok(CommandProgress::Done(artifact.json()))
             }
             ProductAutomationCommand::Assert { condition } => {
-                let capture_panels = assertion_capture_panels(condition)?;
+                let capture_panels = assertion_capture_panels(condition);
                 if !capture_panels.is_empty() && !product_presentations_ready(app, &capture_panels)?
                 {
                     return Ok(CommandProgress::Waiting);
@@ -1267,150 +953,6 @@ impl ProductAutomationController {
             .unwrap_or_else(|| PathBuf::from("target/mirante4d/product-automation-artifacts"))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn probe_panel_hover(
-        &self,
-        app: &mut MiranteWorkbenchApp,
-        panel: ProductAutomationPanelId,
-        x_fraction: f32,
-        y_fraction: f32,
-        expected_status: Option<ProductAutomationCrossSectionHoverStatus>,
-        expect_value: Option<bool>,
-        expected_generation_status: Option<ProductAutomationCrossSectionGenerationStatus>,
-        expected_display_current: Option<bool>,
-        expected_target_generation: Option<u64>,
-        expected_displayed_generation: Option<u64>,
-        expected_schedule_generation: Option<u64>,
-    ) -> Result<CommandProgress, String> {
-        ensure_fraction("probe_panel_hover x_fraction", x_fraction)?;
-        ensure_fraction("probe_panel_hover y_fraction", y_fraction)?;
-        let panel_id = automation_cross_section_panel_id(panel)?;
-        let presentation_viewport = cross_section_panel_presentation_viewport(app, panel_id)?;
-        let x_points = f64::from(x_fraction) * presentation_viewport.width_points();
-        let y_points = f64::from(y_fraction) * presentation_viewport.height_points();
-        let before = panel_hover_readout_side_effect_snapshot(app);
-        let snapshot = app.application.snapshot();
-        let view = application_view(&snapshot);
-        let readout = cross_section_hover_readout_for_panel_point(
-            &app.render_coordination,
-            app.dataset.retained_leases(),
-            CrossSectionReadoutInput {
-                view,
-                catalog: snapshot.catalog(),
-            },
-            panel_id,
-            x_points,
-            y_points,
-            presentation_viewport,
-        )
-        .ok_or_else(|| {
-            format!(
-                "probe_panel_hover could not map panel {} at ({x_fraction:.3}, {y_fraction:.3})",
-                panel_id.label()
-            )
-        })?;
-        let after = panel_hover_readout_side_effect_snapshot(app);
-        if after != before {
-            return Err(format!(
-                "probe_panel_hover mutated data/stream state; before={before} after={after}"
-            ));
-        }
-        if let Some(expected_status) = expected_status {
-            let expected: CrossSectionHoverStatus = expected_status.into();
-            if readout.status != expected {
-                return Err(format!(
-                    "probe_panel_hover status for panel {} is {}, expected {}",
-                    panel_id.label(),
-                    cross_section_hover_status_name(readout.status),
-                    expected_status.name()
-                ));
-            }
-        }
-        if let Some(expect_value) = expect_value
-            && readout.value.is_some() != expect_value
-        {
-            return Err(format!(
-                "probe_panel_hover value presence for panel {} is {}, expected {}",
-                panel_id.label(),
-                readout.value.is_some(),
-                expect_value
-            ));
-        }
-        if let Some(expected_generation_status) = expected_generation_status {
-            let expected: CrossSectionHoverGenerationStatus = expected_generation_status.into();
-            if readout.generation_status != expected {
-                return Err(format!(
-                    "probe_panel_hover generation status for panel {} is {}, expected {}",
-                    panel_id.label(),
-                    cross_section_hover_generation_status_name(readout.generation_status),
-                    expected_generation_status.name()
-                ));
-            }
-        }
-        if let Some(expected_display_current) = expected_display_current
-            && readout.display_current != expected_display_current
-        {
-            return Err(format!(
-                "probe_panel_hover display_current for panel {} is {}, expected {}",
-                panel_id.label(),
-                readout.display_current,
-                expected_display_current
-            ));
-        }
-        if let Some(expected_target_generation) = expected_target_generation
-            && readout.target_generation != expected_target_generation
-        {
-            return Err(format!(
-                "probe_panel_hover target generation for panel {} is {}, expected {}",
-                panel_id.label(),
-                readout.target_generation,
-                expected_target_generation
-            ));
-        }
-        if let Some(expected_displayed_generation) = expected_displayed_generation
-            && readout.displayed_generation != Some(expected_displayed_generation)
-        {
-            return Err(format!(
-                "probe_panel_hover displayed generation for panel {} is {:?}, expected {}",
-                panel_id.label(),
-                readout.displayed_generation,
-                expected_displayed_generation
-            ));
-        }
-        if let Some(expected_schedule_generation) = expected_schedule_generation
-            && readout.schedule_generation != Some(expected_schedule_generation)
-        {
-            return Err(format!(
-                "probe_panel_hover schedule generation for panel {} is {:?}, expected {}",
-                panel_id.label(),
-                readout.schedule_generation,
-                expected_schedule_generation
-            ));
-        }
-        app.egui_ui.hovered_pixel = None;
-        app.egui_ui.hovered_source_readout = Some(readout.text.clone());
-        Ok(CommandProgress::Done(json!({
-            "panel": panel.name(),
-            "x_fraction": x_fraction,
-            "y_fraction": y_fraction,
-            "x_points": x_points,
-            "y_points": y_points,
-            "viewport_width_points": presentation_viewport.width_points(),
-            "viewport_height_points": presentation_viewport.height_points(),
-            "expected_status": expected_status.map(ProductAutomationCrossSectionHoverStatus::name),
-            "expect_value": expect_value,
-            "expected_generation_status": expected_generation_status.map(ProductAutomationCrossSectionGenerationStatus::name),
-            "expected_display_current": expected_display_current,
-            "expected_target_generation": expected_target_generation,
-            "expected_displayed_generation": expected_displayed_generation,
-            "expected_schedule_generation": expected_schedule_generation,
-            "readout": cross_section_hover_readout_json(&readout),
-            "no_synchronous_source_read": true,
-            "side_effect_snapshot_before": before,
-            "side_effect_snapshot_after": after,
-        })))
-    }
-
     fn probe_hover(
         &self,
         app: &mut MiranteWorkbenchApp,
@@ -1467,20 +1009,6 @@ impl ProductAutomationController {
                         app.render_coordination.frame_fidelity.completeness,
                         FrameCompleteness::Exact | FrameCompleteness::Complete
                     )
-            }
-            ProductAutomationWaitCondition::NoRenderError => {
-                app.render_coordination
-                    .frame_fidelity
-                    .last_failure_kind
-                    .is_none()
-                    && app
-                        .render_coordination
-                        .frame_fidelity
-                        .last_capacity_error
-                        .is_none()
-            }
-            ProductAutomationWaitCondition::GpuFramePresented => {
-                product_presentation(app, PanelId::ThreeD).is_some()
             }
             ProductAutomationWaitCondition::SourceVerificationRequired => {
                 matches!(snapshot.source(), SourceVerificationSnapshot::Required)
@@ -1561,32 +1089,6 @@ impl ProductAutomationController {
                     Ok(())
                 }
             }
-            ProductAutomationAssertCondition::FrameFreshnessCurrent => {
-                if self
-                    .wait_condition_met(app, ProductAutomationWaitCondition::FrameFreshnessCurrent)
-                {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "frame is not current: {:?}",
-                        app.render_coordination.frame_fidelity.display_freshness
-                    ))
-                }
-            }
-            ProductAutomationAssertCondition::RuntimeIdle => {
-                if crate::workbench_playback_runtime::background_work_active(
-                    &snapshot,
-                    &app.import.workers,
-                    &app.analysis_runtime,
-                    &app.dataset,
-                    &app.render_coordination,
-                    &app.native_presentation,
-                ) {
-                    Err("background work is still active".to_owned())
-                } else {
-                    Ok(())
-                }
-            }
             ProductAutomationAssertCondition::RenderMode { mode } => {
                 let expected: RenderMode = (*mode).into();
                 let actual = view
@@ -1615,56 +1117,12 @@ impl ProductAutomationController {
                     ))
                 }
             }
-            ProductAutomationAssertCondition::ActiveTimepoint { timepoint } => {
-                if view.timepoint().get() == *timepoint {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "active timepoint is {}, expected {}",
-                        view.timepoint().get(),
-                        timepoint
-                    ))
-                }
-            }
-            ProductAutomationAssertCondition::Playback { playing } => {
-                let actual = snapshot.transient().playback_active();
-                if actual == *playing {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "playback playing is {}, expected {}",
-                        actual, playing
-                    ))
-                }
-            }
-            ProductAutomationAssertCondition::CrossSectionActivePanel { panel } => {
-                let expected = match panel {
-                    Some(panel) => application_cross_section_panel_id(
-                        automation_cross_section_panel_id(*panel)?,
-                    ),
-                    None => None,
-                };
-                let actual = snapshot.transient().active_cross_section_panel();
-                if actual == expected {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "active cross-section panel is {:?}, expected {:?}",
-                        actual, expected
-                    ))
-                }
-            }
             ProductAutomationAssertCondition::CrossSectionPanelSchedule {
                 panel,
-                status,
                 min_generation,
-                target_scale_level,
-                render_scale_level,
                 min_selected_resources,
-                max_missing_occupied_resources,
-                display_current,
             } => {
-                let panel_id = automation_cross_section_panel_id(*panel)?;
+                let panel_id: PanelId = (*panel).into();
                 if view.layout() != ViewerLayout::FourPanel {
                     return Err("four-panel runtime is not active".to_owned());
                 }
@@ -1674,17 +1132,6 @@ impl ProductAutomationController {
                 let schedule = panel_state.cross_section_schedule().ok_or_else(|| {
                     format!("panel {} has no cross-section schedule", panel_id.label())
                 })?;
-                if let Some(expected_status) = status {
-                    let expected_status = (*expected_status).into();
-                    if schedule.status != expected_status {
-                        return Err(format!(
-                            "panel {} schedule status is {:?}, expected {:?}",
-                            panel_id.label(),
-                            schedule.status,
-                            expected_status
-                        ));
-                    }
-                }
                 if let Some(min_generation) = min_generation
                     && schedule.generation < *min_generation
                 {
@@ -1693,26 +1140,6 @@ impl ProductAutomationController {
                         panel_id.label(),
                         schedule.generation,
                         min_generation
-                    ));
-                }
-                if let Some(target_scale_level) = target_scale_level
-                    && schedule.target_scale_level != Some(*target_scale_level)
-                {
-                    return Err(format!(
-                        "panel {} target scale is {:?}, expected s{}",
-                        panel_id.label(),
-                        schedule.target_scale_level,
-                        target_scale_level
-                    ));
-                }
-                if let Some(render_scale_level) = render_scale_level
-                    && schedule.render_scale_level != Some(*render_scale_level)
-                {
-                    return Err(format!(
-                        "panel {} render scale is {:?}, expected s{}",
-                        panel_id.label(),
-                        schedule.render_scale_level,
-                        render_scale_level
                     ));
                 }
                 if let Some(min_selected_resources) = min_selected_resources
@@ -1725,54 +1152,8 @@ impl ProductAutomationController {
                         min_selected_resources
                     ));
                 }
-                if let Some(max_missing_occupied_resources) = max_missing_occupied_resources
-                    && schedule.missing_occupied_bricks > *max_missing_occupied_resources
-                {
-                    return Err(format!(
-                        "panel {} missing {} occupied resources, expected at most {}",
-                        panel_id.label(),
-                        schedule.missing_occupied_bricks,
-                        max_missing_occupied_resources
-                    ));
-                }
-                if let Some(display_current) = display_current
-                    && panel_state.display_current() != *display_current
-                {
-                    return Err(format!(
-                        "panel {} display_current is {}, expected {}",
-                        panel_id.label(),
-                        panel_state.display_current(),
-                        display_current
-                    ));
-                }
                 Ok(())
             }
-            ProductAutomationAssertCondition::ActiveLeaseCohort {
-                min_required,
-                min_retained,
-                max_missing,
-                complete,
-            } => assert_active_lease_cohort(
-                app,
-                *min_required,
-                *min_retained,
-                *max_missing,
-                *complete,
-            ),
-            ProductAutomationAssertCondition::CrossSectionPanelNonblank {
-                panel,
-                min_nonzero_rgb_pixels,
-            } => {
-                let panel_id = automation_cross_section_panel_id(*panel)?;
-                assert_cross_section_panel_nonblank(
-                    app,
-                    panel_id,
-                    min_nonzero_rgb_pixels.unwrap_or(1),
-                )
-            }
-            ProductAutomationAssertCondition::CrossSectionPanelImagesDistinct {
-                min_different_pixels,
-            } => assert_cross_section_panel_images_distinct(app, min_different_pixels.unwrap_or(1)),
             ProductAutomationAssertCondition::FourPanelImagesDistinct {
                 min_different_pixels,
             } => assert_four_panel_images_distinct(app, min_different_pixels.unwrap_or(1)),
@@ -2083,196 +1464,6 @@ impl ProductAutomationController {
     }
 }
 
-fn automation_cross_section_panel_id(panel: ProductAutomationPanelId) -> Result<PanelId, String> {
-    let panel_id: PanelId = panel.into();
-    if panel_id.cross_section_panel().is_some() {
-        Ok(panel_id)
-    } else {
-        Err(format!(
-            "panel {} is not a cross-section automation target",
-            panel.name()
-        ))
-    }
-}
-
-fn ensure_finite_pair(name: &str, x: f32, y: f32) -> Result<(), String> {
-    if x.is_finite() && y.is_finite() {
-        Ok(())
-    } else {
-        Err(format!("{name} values must be finite"))
-    }
-}
-
-fn ensure_fraction(name: &str, value: f32) -> Result<(), String> {
-    if value.is_finite() && (0.0..=1.0).contains(&value) {
-        Ok(())
-    } else {
-        Err(format!("{name} must be finite and between 0.0 and 1.0"))
-    }
-}
-
-fn cross_section_panel_presentation_viewport(
-    app: &MiranteWorkbenchApp,
-    panel_id: PanelId,
-) -> Result<PresentationViewport, String> {
-    app.render_coordination
-        .surface(panel_id.presentation_slot())
-        .presentation_viewport()
-        .ok_or_else(|| {
-            format!(
-                "panel {} has no recorded presentation viewport; wait for the four-panel UI before zooming",
-                panel_id.label()
-            )
-        })
-}
-
-impl From<ProductAutomationCrossSectionHoverStatus> for CrossSectionHoverStatus {
-    fn from(value: ProductAutomationCrossSectionHoverStatus) -> Self {
-        match value {
-            ProductAutomationCrossSectionHoverStatus::Value => Self::Value,
-            ProductAutomationCrossSectionHoverStatus::Loading => Self::Loading,
-            ProductAutomationCrossSectionHoverStatus::Stale => Self::Stale,
-            ProductAutomationCrossSectionHoverStatus::Incomplete => Self::Incomplete,
-            ProductAutomationCrossSectionHoverStatus::Unavailable => Self::Unavailable,
-            ProductAutomationCrossSectionHoverStatus::InvalidNoData => Self::InvalidNoData,
-            ProductAutomationCrossSectionHoverStatus::Outside => Self::Outside,
-        }
-    }
-}
-
-impl From<ProductAutomationCrossSectionGenerationStatus> for CrossSectionHoverGenerationStatus {
-    fn from(value: ProductAutomationCrossSectionGenerationStatus) -> Self {
-        match value {
-            ProductAutomationCrossSectionGenerationStatus::CurrentDisplayed => {
-                Self::CurrentDisplayed
-            }
-            ProductAutomationCrossSectionGenerationStatus::CurrentUndisplayed => {
-                Self::CurrentUndisplayed
-            }
-            ProductAutomationCrossSectionGenerationStatus::RetainedStale => Self::RetainedStale,
-            ProductAutomationCrossSectionGenerationStatus::Unavailable => Self::Unavailable,
-        }
-    }
-}
-
-fn cross_section_hover_status_name(status: CrossSectionHoverStatus) -> &'static str {
-    match status {
-        CrossSectionHoverStatus::Value => "value",
-        CrossSectionHoverStatus::Loading => "loading",
-        CrossSectionHoverStatus::Stale => "stale",
-        CrossSectionHoverStatus::Incomplete => "incomplete",
-        CrossSectionHoverStatus::Unavailable => "unavailable",
-        CrossSectionHoverStatus::InvalidNoData => "invalid_no_data",
-        CrossSectionHoverStatus::Outside => "outside",
-    }
-}
-
-fn cross_section_hover_generation_status_name(
-    status: crate::cross_section_readout::CrossSectionHoverGenerationStatus,
-) -> &'static str {
-    match status {
-        crate::cross_section_readout::CrossSectionHoverGenerationStatus::CurrentDisplayed => {
-            "current_displayed"
-        }
-        crate::cross_section_readout::CrossSectionHoverGenerationStatus::CurrentUndisplayed => {
-            "current_undisplayed"
-        }
-        crate::cross_section_readout::CrossSectionHoverGenerationStatus::RetainedStale => {
-            "retained_stale"
-        }
-        crate::cross_section_readout::CrossSectionHoverGenerationStatus::Unavailable => {
-            "unavailable"
-        }
-    }
-}
-
-fn cross_section_hover_readout_json(readout: &CrossSectionHoverReadout) -> Value {
-    json!({
-        "text": readout.text.clone(),
-        "panel_id": readout.panel_id.label(),
-        "logical_layer_id": readout.layer_id.clone(),
-        "timepoint": readout.timepoint,
-        "scale_level": readout.scale_level,
-        "target_generation": readout.target_generation,
-        "displayed_generation": readout.displayed_generation,
-        "schedule_generation": readout.schedule_generation,
-        "display_current": readout.display_current,
-        "generation_status": cross_section_hover_generation_status_name(readout.generation_status),
-        "world_position": readout.world_position.map(vec3_json),
-        "grid_position": readout.grid_position.map(vec3_json),
-        "nearest_grid_index": readout.nearest_grid_index.map(|index| {
-            json!({
-                "x": index.x,
-                "y": index.y,
-                "z": index.z,
-            })
-        }),
-        "value": readout.value.map(cross_section_hover_value_json),
-        "status": cross_section_hover_status_name(readout.status),
-    })
-}
-
-fn cross_section_hover_value_json(value: CrossSectionHoverValue) -> Value {
-    match value {
-        CrossSectionHoverValue::U8(value) => json!({
-            "dtype": "u8",
-            "value": value,
-        }),
-        CrossSectionHoverValue::U16(value) => json!({
-            "dtype": "u16",
-            "value": value,
-        }),
-        CrossSectionHoverValue::F32(value) => json!({
-            "dtype": "f32",
-            "value": finite_f32_json(value),
-        }),
-    }
-}
-
-fn finite_f32_json(value: f32) -> Value {
-    serde_json::Number::from_f64(f64::from(value))
-        .map(Value::Number)
-        .unwrap_or_else(|| {
-            json!({
-                "non_finite": value.to_string(),
-            })
-        })
-}
-
-fn vec3_json(value: glam::DVec3) -> Value {
-    json!({
-        "x": value.x,
-        "y": value.y,
-        "z": value.z,
-    })
-}
-
-fn panel_hover_readout_side_effect_snapshot(app: &MiranteWorkbenchApp) -> Value {
-    let panels = app
-        .render_coordination
-        .iter()
-        .map(|(slot, panel)| {
-            let panel_id = PanelId::from_presentation_slot(slot);
-            json!({
-                "panel_id": panel_id.label(),
-                "generation": panel.generation(),
-                "displayed_generation": panel.displayed_generation(),
-                "schedule": panel.cross_section_schedule().map(panel_schedule_json),
-            })
-        })
-        .collect::<Vec<_>>();
-    json!({
-        "current_scale_level": app.dataset.current_scale().get(),
-        "current_requirement_count": app
-            .dataset
-            .scope_requirements(crate::dataset_requests::SCOPE_CURRENT_3D)
-            .len(),
-        "retained_leases_required": app.dataset.retained_leases().required_len(),
-        "retained_leases_resident": app.dataset.retained_leases().retained_len(),
-        "panels": panels,
-    })
-}
-
 fn active_lease_cohort_status(
     app: &MiranteWorkbenchApp,
 ) -> Option<crate::retained_leases::RetainedLeaseStatus> {
@@ -2309,74 +1500,6 @@ fn retained_leases_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
         "complete": bridge.is_complete(),
         "active_cohort": active_lease_cohort_status(app).map(lease_cohort_status_json),
     })
-}
-
-fn assert_active_lease_cohort(
-    app: &MiranteWorkbenchApp,
-    min_required: Option<usize>,
-    min_retained: Option<usize>,
-    max_missing: Option<usize>,
-    complete: Option<bool>,
-) -> Result<(), String> {
-    let status = active_lease_cohort_status(app)
-        .ok_or_else(|| "the active dataset lease cohort has no requirements".to_owned())?;
-    if min_required.is_some_and(|minimum| status.required < minimum) {
-        return Err(format!(
-            "active lease cohort requires {} resources, expected at least {}",
-            status.required,
-            min_required.expect("checked Some")
-        ));
-    }
-    if min_retained.is_some_and(|minimum| status.retained < minimum) {
-        return Err(format!(
-            "active lease cohort retains {} resources, expected at least {}",
-            status.retained,
-            min_retained.expect("checked Some")
-        ));
-    }
-    if max_missing.is_some_and(|maximum| status.missing > maximum) {
-        return Err(format!(
-            "active lease cohort is missing {} resources, expected at most {}",
-            status.missing,
-            max_missing.expect("checked Some")
-        ));
-    }
-    if complete.is_some_and(|expected| status.is_complete() != expected) {
-        return Err(format!(
-            "active lease cohort completeness is {}, expected {}",
-            status.is_complete(),
-            complete.expect("checked Some")
-        ));
-    }
-    Ok(())
-}
-
-fn assert_cross_section_panel_images_distinct(
-    app: &MiranteWorkbenchApp,
-    min_different_pixels: usize,
-) -> Result<(), String> {
-    let mut images = Vec::new();
-    for panel_id in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
-        images.push(read_product_target_image(app, panel_id.label(), panel_id)?);
-    }
-    assert_gpu_display_images_distinct("cross-section panels", &images, min_different_pixels)
-}
-
-fn assert_cross_section_panel_nonblank(
-    app: &MiranteWorkbenchApp,
-    panel_id: PanelId,
-    min_nonzero_rgb_pixels: usize,
-) -> Result<(), String> {
-    let (label, width, height, rgba) = read_product_target_image(app, panel_id.label(), panel_id)?;
-    let image = color_image_from_rgba(width, height, &rgba)?;
-    let stats = ProductAutomationImageStats::from_color_image(&image);
-    if stats.nonzero_rgb_pixels < min_nonzero_rgb_pixels || stats.max_rgb == 0 {
-        return Err(format!(
-            "{label} cross-section panel is blank: nonzero_rgb_pixels={}, max_rgb={}, expected at least {} nonzero pixels",
-            stats.nonzero_rgb_pixels, stats.max_rgb, min_nonzero_rgb_pixels
-        ));
-    }
-    Ok(())
 }
 
 fn assert_four_panel_images_distinct(
@@ -2873,15 +1996,10 @@ fn project_store_lifecycle(
     lifecycle: ProductAutomationProjectStoreLifecycle,
 ) -> ProjectStoreLifecycle {
     match lifecycle {
-        ProductAutomationProjectStoreLifecycle::Unbound => ProjectStoreLifecycle::Unbound,
-        ProductAutomationProjectStoreLifecycle::Provisional => ProjectStoreLifecycle::Provisional,
         ProductAutomationProjectStoreLifecycle::Established => ProjectStoreLifecycle::Established,
-        ProductAutomationProjectStoreLifecycle::RecoveryOnly => ProjectStoreLifecycle::RecoveryOnly,
         ProductAutomationProjectStoreLifecycle::RecoverySelected => {
             ProjectStoreLifecycle::RecoverySelected
         }
-        ProductAutomationProjectStoreLifecycle::Closing => ProjectStoreLifecycle::Closing,
-        ProductAutomationProjectStoreLifecycle::Closed => ProjectStoreLifecycle::Closed,
     }
 }
 

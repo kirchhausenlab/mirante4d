@@ -140,39 +140,6 @@ fn external_kill_checkpoint_writer_syncs_once_without_replacement() {
 }
 
 #[test]
-fn cross_section_hover_readout_json_records_generation_semantics() {
-    let readout = CrossSectionHoverReadout {
-        text: "XY ch0 t0 s0 stale".to_owned(),
-        panel_id: PanelId::Xy,
-        layer_id: "ch0".to_owned(),
-        timepoint: 0,
-        scale_level: Some(0),
-        target_generation: 2,
-        displayed_generation: Some(1),
-        schedule_generation: Some(2),
-        display_current: false,
-        generation_status:
-            crate::cross_section_readout::CrossSectionHoverGenerationStatus::RetainedStale,
-        world_position: None,
-        grid_position: None,
-        nearest_grid_index: None,
-        value: None,
-        status: CrossSectionHoverStatus::Stale,
-    };
-
-    let json = cross_section_hover_readout_json(&readout);
-
-    assert_eq!(json["target_generation"], 2);
-    assert_eq!(json["displayed_generation"], 1);
-    assert_eq!(json["schedule_generation"], 2);
-    assert_eq!(json["display_current"], false);
-    assert_eq!(json["generation_status"], "retained_stale");
-    assert_eq!(json["status"], "stale");
-    assert_eq!(json["logical_layer_id"], "ch0");
-    assert!(json.get("layer_id").is_none());
-}
-
-#[test]
 fn automation_script_parses_semantic_camera_commands() {
     let raw = r#"
         {
@@ -260,7 +227,7 @@ fn automation_script_parses_source_verification_evidence_workflow() {
 }
 
 #[test]
-fn automation_script_parses_four_panel_cross_section_commands_and_assertions() {
+fn automation_script_parses_retained_four_panel_assertions() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
@@ -268,35 +235,11 @@ fn automation_script_parses_four_panel_cross_section_commands_and_assertions() {
           "scenario": "unit_four_panel",
           "commands": [
             { "command": "set_viewer_layout", "layout": "four_panel" },
-            { "command": "cross_section_pan", "panel": "xy", "x_points": 12.0, "y_points": -4.0 },
-            { "command": "cross_section_slice_step", "panel": "xz", "notches": 2.0, "fast": true },
-            { "command": "cross_section_zoom", "panel": "yz", "x_fraction": 0.25, "y_fraction": 0.75, "scroll_y_points": -80.0 },
-            { "command": "cross_section_rotate", "panel": "xy", "x_points": 5.0, "y_points": 3.0 },
-            { "command": "probe_panel_hover", "panel": "xz", "x_fraction": 0.5, "y_fraction": 0.5, "expected_status": "value", "expect_value": true },
             { "command": "assert", "condition": { "viewer_layout": { "layout": "four_panel" } } },
-            { "command": "assert", "condition": { "cross_section_active_panel": { "panel": "xy" } } },
             { "command": "assert", "condition": { "cross_section_panel_schedule": {
-              "panel": "xy",
-              "status": "loading",
-              "min_generation": 1,
-              "target_scale_level": 0,
-              "render_scale_level": 1,
-              "min_selected_resources": 1,
-              "max_missing_occupied_resources": 8,
-              "display_current": false
-            } } },
-            { "command": "assert", "condition": { "active_lease_cohort": {
-              "min_required": 1,
-              "min_retained": 1,
-              "max_missing": 0,
-              "complete": true
-            } } },
-            { "command": "assert", "condition": { "cross_section_panel_nonblank": {
               "panel": "xz",
-              "min_nonzero_rgb_pixels": 1
-            } } },
-            { "command": "assert", "condition": { "cross_section_panel_images_distinct": {
-              "min_different_pixels": 1
+              "min_generation": 1,
+              "min_selected_resources": 1
             } } },
             { "command": "assert", "condition": { "four_panel_images_distinct": {
               "min_different_pixels": 1
@@ -310,128 +253,21 @@ fn automation_script_parses_four_panel_cross_section_commands_and_assertions() {
     let script: ProductAutomationScript = serde_json::from_str(raw).unwrap();
 
     script.validate().unwrap();
-    assert_eq!(script.commands.len(), 16);
-    assert_eq!(script.commands[0].name(), "set_viewer_layout");
-    assert_eq!(script.commands[1].name(), "cross_section_pan");
-    assert_eq!(script.commands[2].name(), "cross_section_slice_step");
-    assert_eq!(script.commands[3].name(), "cross_section_zoom");
-    assert_eq!(script.commands[4].name(), "cross_section_rotate");
-    assert_eq!(script.commands[5].name(), "probe_panel_hover");
-    let ProductAutomationCommand::Assert { condition } = &script.commands[6] else {
-        panic!("expected viewer layout assertion");
-    };
-    assert_eq!(condition.name(), "viewer_layout");
-    let ProductAutomationCommand::Assert { condition } = &script.commands[9] else {
-        panic!("expected lease cohort assertion");
-    };
-    assert_eq!(condition.name(), "active_lease_cohort");
-    let ProductAutomationCommand::Assert { condition } = &script.commands[10] else {
-        panic!("expected panel nonblank assertion");
-    };
-    assert_eq!(condition.name(), "cross_section_panel_nonblank");
-    let ProductAutomationCommand::Assert { condition } = &script.commands[11] else {
-        panic!("expected panel image distinctness assertion");
-    };
-    assert_eq!(condition.name(), "cross_section_panel_images_distinct");
-    let ProductAutomationCommand::Assert { condition } = &script.commands[12] else {
-        panic!("expected four-panel image distinctness assertion");
-    };
-    assert_eq!(condition.name(), "four_panel_images_distinct");
-    let ProductAutomationCommand::Assert { condition } = &script.commands[14] else {
-        panic!("expected retired assertion");
-    };
-    assert_eq!(condition.name(), "cross_section_retired");
-}
-
-#[test]
-fn automation_script_rejects_removed_label_probe_fields() {
-    let direct_probe = r#"
-        {
-          "schema": "mirante4d-product-automation-script",
-          "schema_version": 2,
-          "scenario": "removed_direct_probe_field",
-          "commands": [
-            {
-              "command": "probe_panel_hover",
-              "panel": "xz",
-              "x_fraction": 0.5,
-              "y_fraction": 0.5,
-              "expected_label": 7
-            }
-          ]
-        }"#;
-    let nested_probe = r#"
-        {
-          "schema": "mirante4d-product-automation-script",
-          "schema_version": 2,
-          "scenario": "removed_nested_probe_field",
-          "commands": [
-            {
-              "command": "cross_section_pan",
-              "panel": "xy",
-              "x_points": 1.0,
-              "y_points": 1.0,
-              "probe_after": {
-                "x_fraction": 0.5,
-                "y_fraction": 0.5,
-                "expect_label": true,
-                "expected_label_status": "value"
-              }
-            }
-          ]
-        }"#;
-
-    for (raw, removed_field) in [
-        (direct_probe, "expected_label"),
-        (nested_probe, "expect_label"),
-    ] {
-        let error = serde_json::from_str::<ProductAutomationScript>(raw).unwrap_err();
-        assert!(error.to_string().contains(removed_field), "{error}");
-    }
-}
-
-#[test]
-fn automation_script_parses_timepoint_commands_and_assertion() {
-    let raw = r#"
-        {
-          "schema": "mirante4d-product-automation-script",
-          "schema_version": 2,
-          "scenario": "unit_timepoint",
-          "commands": [
-            { "command": "set_timepoint", "timepoint": 1 },
-            { "command": "step_timepoint", "delta": -1 },
-            { "command": "set_playback", "playing": true },
-            { "command": "assert", "condition": { "active_timepoint": { "timepoint": 0 } } },
-            { "command": "assert", "condition": { "playback": { "playing": true } } },
-            { "command": "assert", "condition": { "active_lease_cohort": {
-              "min_required": 1,
-              "min_retained": 1,
-              "max_missing": 0,
-              "complete": true
-            } } },
-            { "command": "quit" }
-          ]
-        }"#;
-
-    let script: ProductAutomationScript = serde_json::from_str(raw).unwrap();
-
-    script.validate().unwrap();
     assert_eq!(script.commands.len(), 7);
-    assert_eq!(script.commands[0].name(), "set_timepoint");
-    assert_eq!(script.commands[1].name(), "step_timepoint");
-    assert_eq!(script.commands[2].name(), "set_playback");
-    let ProductAutomationCommand::Assert { condition } = &script.commands[3] else {
-        panic!("expected active timepoint assertion");
-    };
-    assert_eq!(condition.name(), "active_timepoint");
-    let ProductAutomationCommand::Assert { condition } = &script.commands[4] else {
-        panic!("expected playback assertion");
-    };
-    assert_eq!(condition.name(), "playback");
-    let ProductAutomationCommand::Assert { condition } = &script.commands[5] else {
-        panic!("expected active lease cohort assertion");
-    };
-    assert_eq!(condition.name(), "active_lease_cohort");
+    assert_eq!(script.commands[0].name(), "set_viewer_layout");
+    for (index, expected) in [
+        (1, "viewer_layout"),
+        (2, "cross_section_panel_schedule"),
+        (3, "four_panel_images_distinct"),
+        (5, "cross_section_retired"),
+    ] {
+        let ProductAutomationCommand::Assert { condition } = &script.commands[index] else {
+            panic!("command {index} is not an assertion");
+        };
+        assert_eq!(condition.name(), expected);
+    }
+    assert_eq!(script.commands[4].name(), "set_viewer_layout");
+    assert_eq!(script.commands[6].name(), "quit");
 }
 
 #[test]
