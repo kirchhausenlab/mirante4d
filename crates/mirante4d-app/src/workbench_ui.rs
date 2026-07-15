@@ -961,6 +961,8 @@ impl eframe::App for MiranteWorkbenchApp {
         );
         let dirty_project_close_ui = self.dirty_project_close_ui();
         let settings_ui_view = self.settings_ui_view();
+        let dataset_open_pending = self.pending_dataset_open_path.is_some();
+        let project_status_message = self.project_status_message.clone();
         let source_verification_available = self
             .source_verification_service
             .as_ref()
@@ -1074,9 +1076,7 @@ impl eframe::App for MiranteWorkbenchApp {
                     if ui_kit::toolbar_button(
                         ui,
                         "Open",
-                        !workflow_busy
-                            && project_store_idle
-                            && self.pending_dataset_open_path.is_none(),
+                        !workflow_busy && project_store_idle && !dataset_open_pending,
                     )
                     .clicked()
                     {
@@ -1163,7 +1163,7 @@ impl eframe::App for MiranteWorkbenchApp {
                     ui.separator();
                     ui_kit::elided_label(ui, application_snapshot.catalog().label(), 42);
                 });
-                if let Some(message) = self.project_status_message.as_deref() {
+                if let Some(message) = project_status_message.as_deref() {
                     ui_kit::muted_label(ui, message);
                 }
                 ui.horizontal_wrapped(|ui| {
