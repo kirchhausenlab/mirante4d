@@ -359,7 +359,6 @@ impl MiranteWorkbenchApp {
         }
         match apply_viewport_tool_response(
             snapshot,
-            &mut self.analysis_runtime,
             &mut self.egui_ui,
             &self.render_coordination,
             &response,

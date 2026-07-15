@@ -9,10 +9,7 @@ use mirante4d_application::{
 use mirante4d_domain::RenderMode;
 use mirante4d_ui_egui::{EguiUiState, ViewportHover, ViewportIntensity};
 
-use crate::{
-    FrameCompleteness, RenderCoordinationState, application_view,
-    current_runtime::analysis::AnalysisProductRuntime,
-};
+use crate::{FrameCompleteness, RenderCoordinationState, application_view};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ToolInteractionOutcome {
@@ -22,7 +19,6 @@ pub(crate) struct ToolInteractionOutcome {
 
 pub(crate) fn apply_viewport_tool_response(
     snapshot: &ApplicationSnapshot,
-    analysis: &mut AnalysisProductRuntime,
     egui_ui: &mut EguiUiState,
     render: &RenderCoordinationState,
     response: &egui::Response,
@@ -63,7 +59,7 @@ pub(crate) fn apply_viewport_tool_response(
             );
         }
     }
-    apply_viewer_tool_commands(snapshot, analysis, egui_ui, commands)
+    apply_viewer_tool_commands(egui_ui, commands)
 }
 
 /// Converts a value from an explicit CPU/reference frame into a hover hit.
@@ -121,8 +117,6 @@ fn pick_completeness_for_frame(completeness: FrameCompleteness) -> PickCompleten
 }
 
 pub(crate) fn apply_viewer_tool_commands(
-    _snapshot: &ApplicationSnapshot,
-    _analysis: &mut AnalysisProductRuntime,
     egui_ui: &mut EguiUiState,
     commands: Vec<ViewerToolCommand>,
 ) -> anyhow::Result<ToolInteractionOutcome> {
