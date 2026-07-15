@@ -652,10 +652,6 @@ impl MiranteWorkbenchApp {
         Ok(app)
     }
 
-    fn show_runtime_diagnostics_body(&self, ui: &mut egui::Ui) {
-        runtime_diagnostics_panel::show_runtime_diagnostics_body(self, ui);
-    }
-
     fn diagnostics_summary_text(&self) -> String {
         runtime_diagnostics_panel::diagnostics_summary_text(self)
     }

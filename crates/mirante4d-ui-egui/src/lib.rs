@@ -225,6 +225,7 @@ pub enum WorkbenchUiAction {
     CloseProjectRecoveryPanel,
     OpenRecoveryCandidate(ProjectGenerationId),
     OpenRecoveryLocator(ProjectId),
+    CopyDiagnostics,
 }
 
 /// One validated viewport measurement observed while egui lays out a panel.

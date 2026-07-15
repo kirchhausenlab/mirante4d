@@ -14,51 +14,50 @@ const CPU_CATEGORIES: [(CpuLedgerCategory, &str); 7] = [
     (CpuLedgerCategory::ImportWorkingSet, "import working set"),
 ];
 
-pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut egui::Ui) {
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RuntimeDiagnosticsView {
+    rows: Vec<(String, String)>,
+    frame_fidelity: mirante4d_application::FrameFidelityStatus,
+}
+
+pub(crate) fn runtime_diagnostics_view(app: &MiranteWorkbenchApp) -> RuntimeDiagnosticsView {
     let snapshot = app.application.snapshot();
-    if ui_kit::toolbar_button(ui, "Copy Diagnostics", true).clicked() {
-        ui.ctx().copy_text(app.diagnostics_summary_text());
-    }
-    ui_kit::property_row(
-        ui,
-        "logs",
+    let mut rows = Vec::new();
+    rows.push((
+        "logs".to_owned(),
         app.startup_diagnostics
             .logs_path
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "stderr/stdout".to_owned()),
-    );
-    ui_kit::property_row(
-        ui,
-        "source",
+    ));
+    rows.push((
+        "source".to_owned(),
         app.dataset.selected_path().display().to_string(),
-    );
+    ));
 
     match app.dataset.dispatcher().diagnostics() {
         Ok(diagnostics) => {
-            ui_kit::property_row(
-                ui,
-                "dataset CPU",
+            rows.push((
+                "dataset CPU".to_owned(),
                 format!(
                     "{} / {} bytes",
                     diagnostics.total_used_bytes(),
                     diagnostics.total_cap_bytes()
                 ),
-            );
+            ));
             for (category, label) in CPU_CATEGORIES {
-                ui_kit::property_row(
-                    ui,
-                    label,
+                rows.push((
+                    label.to_owned(),
                     format!(
                         "{} / {} bytes",
                         diagnostics.category_used_bytes(category),
                         diagnostics.category_cap_bytes(category)
                     ),
-                );
+                ));
             }
-            ui_kit::property_row(
-                ui,
-                "requests",
+            rows.push((
+                "requests".to_owned(),
                 format!(
                     "{} queued, {} decoding, {} completions; {} submitted, {} ready, {} cancelled, {} failed",
                     diagnostics.queued_requests(),
@@ -69,66 +68,60 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
                     diagnostics.cancelled_requests(),
                     diagnostics.failed_requests()
                 ),
-            );
-            ui_kit::property_row(
-                ui,
-                "queue bounds",
+            ));
+            rows.push((
+                "queue bounds".to_owned(),
                 format!(
                     "requests {}, completions {}, workers {}",
                     diagnostics.request_queue_limit(),
                     diagnostics.completion_queue_limit(),
                     diagnostics.worker_limit()
                 ),
-            );
-            ui_kit::property_row(
-                ui,
-                "resident resources",
+            ));
+            rows.push((
+                "resident resources".to_owned(),
                 diagnostics.resident_resources().to_string(),
-            );
+            ));
         }
-        Err(error) => ui_kit::property_row(ui, "dataset runtime", error.to_string()),
+        Err(error) => rows.push(("dataset runtime".to_owned(), error.to_string())),
     }
 
-    ui_kit::property_row(
-        ui,
-        "renderer leases",
+    rows.push((
+        "renderer leases".to_owned(),
         format!(
             "{} / {} retained, {} missing",
             app.dataset.retained_leases().retained_len(),
             app.dataset.retained_leases().required_len(),
             app.dataset.retained_leases().missing_len()
         ),
-    );
-    ui_kit::property_row(
-        ui,
-        "LOD",
+    ));
+    rows.push((
+        "LOD".to_owned(),
         format!(
             "shown {:?}, target s{}",
             app.render_coordination.frame_fidelity.displayed_scale_level,
             app.render_coordination.frame_fidelity.target_scale_level,
         ),
-    );
-    ui_kit::property_row(
-        ui,
-        "active 2D panel",
+    ));
+    rows.push((
+        "active 2D panel".to_owned(),
         snapshot
             .transient()
             .active_cross_section_panel()
             .map(PanelId::from_application_panel)
             .map(|panel| panel.label().to_owned())
             .unwrap_or_else(|| "none".to_owned()),
-    );
+    ));
     for (slot, panel) in app.render_coordination.iter() {
         if slot.is_cross_section() {
             let panel_id = PanelId::from_presentation_slot(slot);
-            ui_kit::property_row(ui, format!("2D {}", panel_id.label()), panel_summary(panel));
+            rows.push((format!("2D {}", panel_id.label()), panel_summary(panel)));
         }
     }
     if let Some(product) = app.native_presentation.product_gpu.as_ref() {
         let diagnostics = product.renderer.diagnostics();
-        ui_kit::property_row(
-            ui,
-            "GPU residency",
+        rows.push((
+            "GPU residency".to_owned(),
             format!(
                 "{} / {} bytes, {} frames, {} submissions",
                 diagnostics.resident_payload_bytes(),
@@ -136,22 +129,20 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
                 diagnostics.frames_executed(),
                 diagnostics.queue_submissions(),
             ),
-        );
-        ui_kit::property_row(
-            ui,
-            "progressive frames",
+        ));
+        rows.push((
+            "progressive frames".to_owned(),
             format!(
                 "{} partial, {} settled, {} stale rejected",
                 product.current_partial_frames_presented,
                 product.partial_to_settled_transitions,
                 product.stale_frames_rejected,
             ),
-        );
+        ));
     }
     if let Some(timing) = app.render_coordination.last_display_refresh_timing {
-        ui_kit::property_row(
-            ui,
-            "display timing",
+        rows.push((
+            "display timing".to_owned(),
             format!(
                 "{}: render {:.2} ms, GPU upload {}, GPU compute {}, total {:.2} ms",
                 crate::display_refresh::display_refresh_path_label(timing.path),
@@ -160,9 +151,26 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
                 optional_ms(timing.gpu_compute_ms),
                 timing.total_ms
             ),
-        );
+        ));
     }
-    ui_kit::show_frame_fidelity_property_rows(ui, &app.render_coordination.frame_fidelity);
+    RuntimeDiagnosticsView {
+        rows,
+        frame_fidelity: app.render_coordination.frame_fidelity.clone(),
+    }
+}
+
+pub(crate) fn show_runtime_diagnostics_body(
+    view: &RuntimeDiagnosticsView,
+    ui: &mut egui::Ui,
+    actions: &mut Vec<ui_kit::WorkbenchUiAction>,
+) {
+    if ui_kit::toolbar_button(ui, "Copy Diagnostics", true).clicked() {
+        actions.push(ui_kit::WorkbenchUiAction::CopyDiagnostics);
+    }
+    for (label, value) in &view.rows {
+        ui_kit::property_row(ui, label, value);
+    }
+    ui_kit::show_frame_fidelity_property_rows(ui, &view.frame_fidelity);
 }
 
 pub(crate) fn diagnostics_summary_text(app: &MiranteWorkbenchApp) -> String {

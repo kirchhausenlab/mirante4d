@@ -235,6 +235,9 @@ impl MiranteWorkbenchApp {
                     self.project_recovery_panel_open = false;
                     self.open_recovery_locator(project_id);
                 }
+                WorkbenchUiAction::CopyDiagnostics => {
+                    ui.ctx().copy_text(self.diagnostics_summary_text());
+                }
             }
         }
 

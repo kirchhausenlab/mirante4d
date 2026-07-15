@@ -859,6 +859,7 @@ impl eframe::App for MiranteWorkbenchApp {
             .source_verification_service
             .as_ref()
             .is_some_and(|service| service.active_token().is_none());
+        let runtime_diagnostics_view = runtime_diagnostics_panel::runtime_diagnostics_view(self);
         let canonical_tool = viewer_tool_for_kind(application_snapshot.transient().active_tool());
         if self.egui_ui.viewer_tools.active_tool != canonical_tool {
             self.egui_ui.viewer_tools.set_active_tool(canonical_tool);
@@ -1801,7 +1802,13 @@ impl eframe::App for MiranteWorkbenchApp {
                     });
                     egui::CollapsingHeader::new("Runtime Diagnostics")
                         .default_open(false)
-                        .show(ui, |ui| self.show_runtime_diagnostics_body(ui));
+                        .show(ui, |ui| {
+                            runtime_diagnostics_panel::show_runtime_diagnostics_body(
+                                &runtime_diagnostics_view,
+                                ui,
+                                &mut actions,
+                            );
+                        });
                     ui_kit::section(ui, "Render Settings", |ui| {
                         let current_render = *active_layer.render_state();
                         let mut sampling_policy = current_render.sampling_policy();
