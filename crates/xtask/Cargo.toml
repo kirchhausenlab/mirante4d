@@ -8,9 +8,14 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+mirante4d-dataset.workspace = true
+mirante4d-domain.workspace = true
+mirante4d-identity.workspace = true
+mirante4d-import-pipeline.workspace = true
 mirante4d-storage.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rustix.workspace = true
 syn.workspace = true
 tiff.workspace = true
 toml.workspace = true

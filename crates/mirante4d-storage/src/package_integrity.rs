@@ -52,6 +52,10 @@ impl ExactPackageCapability {
         &self.catalog
     }
 
+    pub(crate) const fn catalog_mut(&mut self) -> &mut LocalPackageCatalog {
+        &mut self.catalog
+    }
+
     pub const fn objects_hashed(&self) -> u64 {
         self.proof.objects_hashed
     }

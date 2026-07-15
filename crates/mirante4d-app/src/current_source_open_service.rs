@@ -20,16 +20,18 @@ use mirante4d_application::{
 };
 use mirante4d_dataset::{DatasetCatalog, DatasetSourceId};
 use mirante4d_dataset_runtime::{RuntimeFault, RuntimeFaultCode};
+use mirante4d_project_model::{DatasetLocatorHint, DatasetReference};
 use mirante4d_settings::ResourcePolicy;
 use mirante4d_storage::{
     ControlError, DirectoryInventoryError, LocalDatasetSourceOpenError, PackageAdmissionError,
-    RangeReadError, StorageProfileError,
+    PublishedScientificPackageTransfer, RangeReadError, ScientificPublicationTransferEvidence,
+    StorageProfileError,
 };
 
 use crate::{
     analysis_session::AnalysisProductRuntime,
     dataset_requests::DatasetDemandState,
-    unified_source_open::{self, UnifiedOpenedSource},
+    unified_source_open::{self, UnifiedOpenedSource, UnifiedVerifiedSourceOpenError},
 };
 
 const RESULT_CHANNEL_CAPACITY: usize = 1;
@@ -37,6 +39,56 @@ const WORKER_NAME: &str = "mirante4d-current-source-open";
 
 pub(crate) struct CurrentSourceOpenService {
     active: Option<ActiveOpen>,
+    completed_imported_publication_transfer: Option<CompletedImportedPublicationTransferEvidence>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompletedImportedPublicationTransferEvidence {
+    destination: PathBuf,
+    execution: ScientificPublicationTransferEvidence,
+}
+
+impl CompletedImportedPublicationTransferEvidence {
+    pub(crate) fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    pub(crate) const fn execution(&self) -> ScientificPublicationTransferEvidence {
+        self.execution
+    }
+}
+
+/// A linear request to replace the current source.
+///
+/// External paths deliberately retain the provisional-open/full-verification
+/// route. Imported packages carry the publication-bound verified authority;
+/// that variant can never degrade into an external path request.
+pub(crate) enum CurrentSourceOpenRequest {
+    External(PathBuf),
+    ImportedVerified(Box<PublishedScientificPackageTransfer>),
+}
+
+impl CurrentSourceOpenRequest {
+    const fn origin(&self) -> CurrentSourceOpenOrigin {
+        match self {
+            Self::External(_) => CurrentSourceOpenOrigin::External,
+            Self::ImportedVerified(_) => CurrentSourceOpenOrigin::ImportedVerified,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_path(&self) -> &Path {
+        match self {
+            Self::External(path) => path,
+            Self::ImportedVerified(transfer) => transfer.destination(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CurrentSourceOpenOrigin {
+    External,
+    ImportedVerified,
 }
 
 struct ActiveOpen {
@@ -48,6 +100,7 @@ struct ActiveOpen {
 
 pub(crate) struct CurrentSourceOpenResult {
     pub(crate) token: OperationToken,
+    pub(crate) origin: CurrentSourceOpenOrigin,
     pub(crate) outcome: CurrentSourceOpenOutcome,
 }
 
@@ -67,6 +120,8 @@ pub(crate) struct PreparedCurrentSourceOpen {
     pub(crate) catalog: Arc<DatasetCatalog>,
     pub(crate) workspace: UnboundWorkspace,
     source_generation: SourceSessionGeneration,
+    verified_dataset: Option<DatasetReference>,
+    imported_publication_transfer: Option<CompletedImportedPublicationTransferEvidence>,
 }
 
 /// Current-runtime values installed only after the application reducer accepts
@@ -114,17 +169,26 @@ impl std::error::Error for CurrentSourceOpenServiceError {}
 
 impl CurrentSourceOpenService {
     pub(crate) const fn new() -> Self {
-        Self { active: None }
+        Self {
+            active: None,
+            completed_imported_publication_transfer: None,
+        }
     }
 
     pub(crate) fn active_token(&self) -> Option<&OperationToken> {
         self.active.as_ref().map(|active| &active.token)
     }
 
+    pub(crate) fn completed_imported_publication_transfer(
+        &self,
+    ) -> Option<&CompletedImportedPublicationTransferEvidence> {
+        self.completed_imported_publication_transfer.as_ref()
+    }
+
     pub(crate) fn request_open(
         &mut self,
         token: OperationToken,
-        path: PathBuf,
+        request: CurrentSourceOpenRequest,
         resource_policy: ResourcePolicy,
     ) -> Result<(), CurrentSourceOpenServiceError> {
         if self.active.is_some() {
@@ -133,10 +197,12 @@ impl CurrentSourceOpenService {
         if token.kind() != OperationKind::DatasetOpen {
             return Err(CurrentSourceOpenServiceError::InvalidOperationKind);
         }
+        self.completed_imported_publication_transfer = None;
 
         let cancellation = Arc::new(AtomicBool::new(false));
         let worker_cancellation = Arc::clone(&cancellation);
         let worker_token = token.clone();
+        let origin = request.origin();
         let (result_sender, results) = mpsc::sync_channel(RESULT_CHANNEL_CAPACITY);
         let worker = thread::Builder::new()
             .name(WORKER_NAME.to_owned())
@@ -144,7 +210,7 @@ impl CurrentSourceOpenService {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_open(
                         &worker_token,
-                        path,
+                        request,
                         resource_policy,
                         worker_cancellation.as_ref(),
                     )
@@ -161,6 +227,7 @@ impl CurrentSourceOpenService {
                 };
                 let _ = result_sender.send(CurrentSourceOpenResult {
                     token: worker_token,
+                    origin,
                     outcome,
                 });
             })
@@ -200,6 +267,14 @@ impl CurrentSourceOpenService {
         match receive {
             Ok(result) => {
                 join_active(self.active.take())?;
+                self.completed_imported_publication_transfer = match &result.outcome {
+                    CurrentSourceOpenOutcome::Prepared(prepared) => {
+                        prepared.imported_publication_transfer.clone()
+                    }
+                    CurrentSourceOpenOutcome::Cancelled | CurrentSourceOpenOutcome::Failed(_) => {
+                        None
+                    }
+                };
                 Ok(Some(result))
             }
             Err(TryRecvError::Empty) => Ok(None),
@@ -244,10 +319,18 @@ impl PreparedCurrentSourceOpen {
             render_coordination: self.render_coordination,
             analysis_runtime: self.analysis_runtime,
         };
-        let completion = OperationCompletion::DatasetOpened {
-            source_generation: self.source_generation,
-            catalog: self.catalog,
-            workspace: Box::new(self.workspace),
+        let completion = match self.verified_dataset {
+            Some(dataset) => OperationCompletion::VerifiedDatasetOpened {
+                source_generation: self.source_generation,
+                catalog: self.catalog,
+                workspace: Box::new(self.workspace),
+                dataset,
+            },
+            None => OperationCompletion::DatasetOpened {
+                source_generation: self.source_generation,
+                catalog: self.catalog,
+                workspace: Box::new(self.workspace),
+            },
         };
         (runtime, completion)
     }
@@ -269,7 +352,7 @@ fn join_active(active: Option<ActiveOpen>) -> Result<(), CurrentSourceOpenServic
 
 fn run_open(
     token: &OperationToken,
-    path: PathBuf,
+    request: CurrentSourceOpenRequest,
     resource_policy: ResourcePolicy,
     cancellation: &AtomicBool,
 ) -> CurrentSourceOpenOutcome {
@@ -285,14 +368,63 @@ fn run_open(
         return CurrentSourceOpenOutcome::Cancelled;
     }
 
-    let opened = match unified_source_open::open(
-        &path,
-        resource_policy,
-        DatasetSourceId::new(next_generation.get()),
-    ) {
-        Ok(opened) => opened,
-        Err(error) => {
-            return CurrentSourceOpenOutcome::Failed(map_open_failure(&error, &path));
+    let (opened, verified_dataset, imported_publication_transfer) = match request {
+        CurrentSourceOpenRequest::External(path) => {
+            let opened = match unified_source_open::open(
+                &path,
+                resource_policy,
+                DatasetSourceId::new(next_generation.get()),
+            ) {
+                Ok(opened) => opened,
+                Err(error) => {
+                    return CurrentSourceOpenOutcome::Failed(map_open_failure(&error, &path));
+                }
+            };
+            (opened, None, None)
+        }
+        CurrentSourceOpenRequest::ImportedVerified(transfer) => {
+            let destination = transfer.destination().to_path_buf();
+            let (capability, execution) = match (*transfer).consume(|| is_cancelled(cancellation)) {
+                Ok(consumed) => consumed,
+                Err(_) if is_cancelled(cancellation) => {
+                    return CurrentSourceOpenOutcome::Cancelled;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, destination = %destination.display(), "published package capability transfer was rejected");
+                    return CurrentSourceOpenOutcome::Failed(OperationFailureCode::DatasetInvalid);
+                }
+            };
+            let package_id = capability.package_id();
+            let scientific_content_id = capability.scientific_content_id();
+            let verified = match unified_source_open::open_verified(resource_policy, capability) {
+                Ok(opened) => opened,
+                Err(error) => {
+                    return CurrentSourceOpenOutcome::Failed(map_verified_open_failure(&error));
+                }
+            };
+            let opened = match unified_source_open::prepare_verified_current_source(verified) {
+                Ok(opened) => opened,
+                Err(error) => {
+                    tracing::warn!(%error, destination = %destination.display(), "verified imported source state preparation failed");
+                    return CurrentSourceOpenOutcome::Failed(OperationFailureCode::DatasetInvalid);
+                }
+            };
+            if normalize_existing_path(opened.dataset.selected_path())
+                != normalize_existing_path(&destination)
+            {
+                let _ = opened.dataset.request_shutdown();
+                return CurrentSourceOpenOutcome::Failed(OperationFailureCode::DatasetInvalid);
+            }
+            let locator_hint = destination
+                .to_str()
+                .and_then(|path| DatasetLocatorHint::new(path).ok());
+            let dataset =
+                DatasetReference::new(scientific_content_id, Some(package_id), None, locator_hint);
+            let imported_publication_transfer = CompletedImportedPublicationTransferEvidence {
+                destination,
+                execution,
+            };
+            (opened, Some(dataset), Some(imported_publication_transfer))
         }
     };
     if is_cancelled(cancellation) {
@@ -315,7 +447,13 @@ fn run_open(
         catalog,
         workspace,
         source_generation: next_generation,
+        verified_dataset,
+        imported_publication_transfer,
     }))
+}
+
+fn normalize_existing_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn is_cancelled(cancellation: &AtomicBool) -> bool {
@@ -353,6 +491,35 @@ fn map_open_failure(error: &anyhow::Error, path: &Path) -> OperationFailureCode 
         }
     }
     OperationFailureCode::DatasetReadFailed
+}
+
+fn map_verified_open_failure(error: &UnifiedVerifiedSourceOpenError) -> OperationFailureCode {
+    match error {
+        UnifiedVerifiedSourceOpenError::RuntimeConfiguration(
+            RuntimeFaultCode::InvalidConfiguration
+            | RuntimeFaultCode::MinimumWorkUnitExceedsBudget
+            | RuntimeFaultCode::CapacityExceeded { .. },
+        )
+        | UnifiedVerifiedSourceOpenError::MissingCpuLedger => {
+            OperationFailureCode::DatasetCapacityExceeded
+        }
+        UnifiedVerifiedSourceOpenError::Adapter(
+            LocalDatasetSourceOpenError::MetadataAccountingOverflow
+            | LocalDatasetSourceOpenError::MetadataAdmission(_)
+            | LocalDatasetSourceOpenError::InvalidMetadataLease,
+        ) => OperationFailureCode::DatasetCapacityExceeded,
+        UnifiedVerifiedSourceOpenError::Adapter(
+            LocalDatasetSourceOpenError::Catalog(_)
+            | LocalDatasetSourceOpenError::MetadataInvariant { .. },
+        ) => OperationFailureCode::DatasetInvalid,
+        UnifiedVerifiedSourceOpenError::Adapter(LocalDatasetSourceOpenError::Admission(error)) => {
+            map_admission_error(error)
+        }
+        UnifiedVerifiedSourceOpenError::Runtime(error) => map_runtime_fault(error),
+        UnifiedVerifiedSourceOpenError::RuntimeConfiguration(_) => {
+            OperationFailureCode::DatasetReadFailed
+        }
+    }
 }
 
 fn map_runtime_fault(error: &RuntimeFault) -> OperationFailureCode {

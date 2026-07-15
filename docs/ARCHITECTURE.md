@@ -1,6 +1,6 @@
 # Architecture
 
-Last updated: 2026-07-14
+Last updated: 2026-07-15
 
 Mirante4D is a native Rust desktop viewer and analysis workbench. It opens
 strict `.m4d` packages; source microscopy data enters through explicit
@@ -80,6 +80,114 @@ facts through `ApplicationSnapshot`; egui owns only the editable review draft
 and returns ID-checked import commands. Egui owns no path, TIFF inspection,
 worker channel, or thread handle.
 
+The import pipeline has one source-native authority. It captures the reviewed
+inventory, traverses each admitted TIFF strip/tile once, and writes canonical
+little-endian `[c,t,z,y,x]` planes to a fixed two-file cache. Source admission
+is deliberately closed to uncompressed, LZW, current/old Deflate, and PackBits
+grayscale `uint8`, `uint16`, or finite `float32` pages. JPEG, WebP,
+Zstd-in-TIFF, fax, and other unaudited decoder workspaces fail as unsupported
+sources rather than selecting another path. Inspection, native decode, and the
+final SHA-256 pass bind reads to the opened descriptor's generation as well as
+guarding the source path before and after use; ingest and final revalidation
+also compare the reviewed generation. Before decoder construction, a bounded
+positional-read preflight walks the primary IFD chain, rejects oversized or
+duplicate eager fields and more than 65,536 pages, and charges retained
+multipage decoder state separately from one-plane parallel workers.
+
+The canonical cache is opened relative to the spool-held checkpoint directory
+descriptor with no-follow semantics. It retains the exact data/state
+descriptors, shares descriptor-bound positional readers across workers, and
+removes a checkpoint name only when it still resolves to the retained file
+identity. The four-file spool applies the same fixed-name and descriptor-owned
+authority to canonical encoded logical chunks. Canonical batch triggers are 16
+completed planes, 64 MiB of pending plane bytes, and a 15-second age check;
+spool triggers are 512 work units, 64 MiB of pending encoded payload, and the
+same age check. Stage boundaries and entry into a serialized decoder interval
+may commit earlier. A canonical plane above 64 MiB is rejected before ingest;
+the byte ceiling is not expanded for a large plane. Recovery accepts only
+checksummed, binding-matched durable prefixes, discards at most one bounded
+incomplete batch, and has no predecessor-schema reader.
+
+CPU work is admitted by the shared byte ledger and bounded by cores and
+per-task allocation ceilings. Eligible single-plane source decodes,
+normalization, downsampling, scientific-tile preparation, and inner encoding
+run concurrently; multipage or over-task-ceiling TIFFs use one streaming
+decoder. The calling owner alone advances checkpoint state and commits
+canonical order. Canonical and spool positional readers are shared, so worker
+tasks add no per-task checkpoint descriptors.
+
+Publication streams those validated inner encodings into indexed outer shards
+without decoding and re-encoding pixel or validity chunks. The storage writer
+then performs structure, exact, and locality-aware scientific validation before
+create-only atomic rename. Scientific validation prepares the four `z=16`
+identity leaves intersecting a `z=64` brick while that brick is resident, so
+each present base brick is decoded once per scan. The scientific writer keeps
+the resulting non-cloneable capability, seals it to the private stage's
+filesystem identity, and rebinds it only when `RENAME_NOREPLACE` publishes that
+same directory. Within the cooperative local destination-parent namespace
+assumed by this contract, an inventory/snapshot/inventory sandwich before
+rename and again when the product consumes the transfer detects extra paths,
+missing paths, object mutation, and root replacement without hashing payloads
+or decoding scientific bricks again. This proof is observational rather than
+adversarial namespace isolation: a hostile actor able to rename or unlink
+entries in the destination parent is outside the contract because Unix cannot
+atomically bind a source name to an already-open directory descriptor. Failure
+within the contract is terminal for automatic import opening; it never falls
+back to the external-package verifier.
+
+Staged-validation object-read evidence counts every successful strict-reader
+object open, including whole reads, ranges, hashes, and snapshot-only
+revalidations, and reports structure, exact, and scientific components plus
+their checked sum. Directory-only metadata inspection is not an object read.
+Codec operation/time evidence distinguishes checkpoint inner encoding and
+checkpoint-dependent decoding from package-construction encoding and
+staged-validation decoding. Durability operation/time
+evidence covers canonical-cache and spool file/directory synchronization,
+every staged package object, every staged directory, and the destination
+parent synchronization after rename.
+
+The one-shot published-capability consumer returns a storage-issued execution
+receipt for its closed inventory/snapshot/inventory route. The receipt splits
+strict object-open deltas across both inventory passes and the intervening
+complete snapshot sweep, binds the expected snapshot count to the retained
+exact-package proof, reconciles the phase sum to the total, and records codec
+decode calls. Storage and the T2, T5, and product validators require matching
+inventory deltas, an observed snapshot delta equal to that independent
+expected count, an exact phase sum, and zero codec decodes. A storage source
+architecture test separately forbids exact-package hashing, scientific
+validation, or brick-read calls in this transfer route. The workspace
+architecture check also requires the imported verified-dataset completion to
+have exactly one production constructor, in the current-source-open adapter.
+These are structural call-path and observed-I/O facts; they are not
+self-declared zero pass counts.
+
+On the qualified Linux path, one low-overhead sampler observes descriptors
+throughout the primary import clock across all worker threads. It attributes
+source, checkpoint, destination, and private-stage paths every 5 ms rather than
+using an end-of-stage process-wide snapshot. This is path attribution, so an
+unrelated descriptor to the exact same scoped path is conservatively included.
+Because an open shorter than the sampling interval can be missed, evidence also
+reports a structural descriptor bound tied to the maximum admitted source
+workers, fixed checkpoint handles, shared worker readers, writer handles, and
+validation transients. The enforced gate value is the greater of that bound and
+the sampled peak. The current deliberately phase-summed structural bound is 35,
+below the gate of 64.
+
+```text
+reviewed TIFF inventory
+  -> source-native decode-once traversal
+  -> fixed canonical base cache
+  -> bounded ordered base/pyramid workers
+  -> batched encoded spool
+  -> encoded shard publication
+  -> staged structure + exact + scientific validation
+  -> metadata-only stage currentness proof
+  -> atomic create-only rename
+  -> destination-bound verified capability transfer
+  -> metadata-only publication currentness proof
+  -> verified product runtime open
+```
+
 `DatasetRequestDispatcher` is the sole application poll owner. It keeps only
 bounded request correlation and cancellation generations; decoded allocations
 remain owned and byte-accounted by `mirante4d-dataset-runtime`.
@@ -136,7 +244,11 @@ Target packages open provisionally through `LocalPackageCatalog` and
 `LocalDatasetSource`. Background exact-package and scientific-content
 verification promotes the same source generation. Project attach, open, and
 save remain identity-gated, and observed source drift invalidates the verified
-state.
+state. This is the external-open route. A package produced by the active
+importer instead arrives with the linear publication capability described
+above and is installed through one atomic `VerifiedDatasetOpened` reducer
+completion. Dirty-project deferral retains that exact capability until Save,
+Discard, or Cancel; it is never reduced to a path-only request.
 
 `mirante4d-project-store` is the sole project-storage authority, reached by
 the product only through `ProjectStoreApplicationService`. Its directory-backed

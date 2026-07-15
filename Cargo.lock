@@ -2111,6 +2111,7 @@ dependencies = [
  "mirante4d-storage",
  "mirante4d-ui-egui",
  "rfd",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "tempfile",
@@ -4908,7 +4909,12 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "mirante4d-dataset",
+ "mirante4d-domain",
+ "mirante4d-identity",
+ "mirante4d-import-pipeline",
  "mirante4d-storage",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "syn",

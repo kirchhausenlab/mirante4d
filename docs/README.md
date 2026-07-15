@@ -22,7 +22,11 @@ Agents must also follow the [agent guide](AGENTS.md). Dependency-policy
 exceptions have one separate tool-owned
 [ledger](DEPENDENCY_EXCEPTIONS.md).
 
-## Deferred Plans
+## Plans
+
+The [import and preprocessing performance
+handoff](plans/active/IMPORT_PREPROCESSING_PERFORMANCE_HANDOFF.md) is the active
+approved target. Current authorities continue to own implemented behavior.
 
 Two future outcomes remain deliberately separate from ordinary development:
 

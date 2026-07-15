@@ -6,7 +6,7 @@ use crate::{
     BrickAddressError, ELIDED_ALL_FILL_AMPLIFICATION, LocalBrickAddressPlan, LocalPackageReader,
     OneBrickAmplification, PackageObjectDescriptor, PackageObjectKind, PackagePath,
     PackedIndexError, PackedIndexRecord, RangeReadError, ShardCodecError, ShardProfileKind,
-    amplification_2d, amplification_3d, decode_inner_payload,
+    amplification_2d, amplification_3d,
 };
 
 /// CRC-checked storage payloads and packed facts for one logical brick.
@@ -280,17 +280,18 @@ fn read_component(
             descriptor.raw().byte_length(),
         )
         .map_err(|error| map_chunk_error(descriptor.path(), error))?;
-    decode_component(kind, raw)
+    decode_component(reader, kind, raw)
 }
 
 fn decode_component(
+    reader: &LocalPackageReader,
     kind: ShardProfileKind,
     raw: LocalShardChunkBytes,
 ) -> Result<DecodedComponent, PackageReadError> {
     let payload = raw
         .encoded
         .as_deref()
-        .map(|encoded| decode_inner_payload(kind, encoded))
+        .map(|encoded| reader.decode_inner_payload_accounted(kind, encoded))
         .transpose()?;
     let payload_bytes = payload.as_ref().map_or(0, Vec::len);
     let decoded_bytes = raw

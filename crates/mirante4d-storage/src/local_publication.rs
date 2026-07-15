@@ -17,7 +17,7 @@ use std::{
     io,
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use mirante4d_identity::PackageId;
@@ -31,7 +31,9 @@ use rustix::{
 };
 use thiserror::Error;
 
-use crate::PackagePath;
+use crate::package_science::PreparedScientificPublication;
+use crate::range_io::PublishedPackageRootBinding;
+use crate::{PackagePath, VerifiedScientificPackageCapability};
 
 const STAGE_CREATE_ATTEMPTS: u64 = 128;
 static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -52,6 +54,7 @@ const FILE_CREATE_FLAGS: OFlags = OFlags::WRONLY
 /// explicit. This filesystem primitive does not serialize that identity.
 pub(crate) struct LocalPublication {
     parent: OwnedFd,
+    destination_path: PathBuf,
     destination_name: OsString,
     stage_path: PathBuf,
     stage_name: OsString,
@@ -94,9 +97,27 @@ struct DirectoryIdentity {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PublicationCheckpoint {
+pub(crate) enum PublicationCheckpoint {
     BeforeRename,
     AfterRenameBeforeParentSync,
+}
+
+/// Successful directory durability operations performed by one publication
+/// phase. Nanosecond accounting saturates only at the `u64` evidence ceiling;
+/// the filesystem operation itself is never made fallible by diagnostics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PublicationSyncReport {
+    pub(crate) calls: u64,
+    pub(crate) time_ns: u64,
+}
+
+impl PublicationSyncReport {
+    fn record(&mut self, elapsed: Duration) {
+        self.calls = self.calls.saturating_add(1);
+        self.time_ns = self
+            .time_ns
+            .saturating_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+    }
 }
 
 impl LocalPublication {
@@ -150,6 +171,7 @@ impl LocalPublication {
                     };
                     return Ok(Self {
                         parent,
+                        destination_path: destination,
                         destination_name,
                         stage_path,
                         stage_name,
@@ -229,7 +251,8 @@ impl LocalPublication {
     pub(crate) fn sync_directories(
         &self,
         mut is_cancelled: impl FnMut() -> bool,
-    ) -> Result<(), LocalPublicationError> {
+    ) -> Result<PublicationSyncReport, LocalPublicationError> {
+        let mut report = PublicationSyncReport::default();
         let mut directories = self.created_directories.iter().cloned().collect::<Vec<_>>();
         directories.sort_by(|left, right| {
             right
@@ -243,24 +266,107 @@ impl LocalPublication {
                 return Err(LocalPublicationError::Cancelled);
             }
             let directory = self.open_created_directory(&relative)?;
+            let started = Instant::now();
             fsync(&directory)
                 .map_err(|error| io_error("synchronize a staging directory", error))?;
+            report.record(started.elapsed());
         }
         if is_cancelled() {
             return Err(LocalPublicationError::Cancelled);
         }
-        Ok(())
+        Ok(report)
     }
 
-    pub(crate) fn commit(self, package_id: PackageId) -> Result<(), LocalPublicationError> {
+    pub(crate) fn commit(
+        self,
+        package_id: PackageId,
+    ) -> Result<PublicationSyncReport, LocalPublicationError> {
         self.commit_with_hook(package_id, |_, _| Ok(()))
+    }
+
+    /// Atomically publishes the exact directory owned by a prepared scientific
+    /// capability, rebinds that capability to the destination, and returns it
+    /// only after the destination parent is durable.
+    pub(crate) fn commit_verified(
+        mut self,
+        package_id: PackageId,
+        prepared: PreparedScientificPublication,
+        is_cancelled: &mut impl FnMut() -> bool,
+        mut hook: impl FnMut(PublicationCheckpoint, PackageId) -> io::Result<()>,
+    ) -> Result<(PublicationSyncReport, VerifiedScientificPackageCapability), LocalPublicationError>
+    {
+        if prepared.package_id() != package_id
+            || !prepared.root_matches(self.stage_identity.device, self.stage_identity.inode)
+        {
+            return Err(invalid_input(
+                "the scientific capability is not bound to this publication stage",
+            ));
+        }
+        hook(PublicationCheckpoint::BeforeRename, package_id).map_err(|source| {
+            LocalPublicationError::Io {
+                operation: "complete the verified pre-commit checkpoint",
+                source,
+            }
+        })?;
+        if !self
+            .stage_name_still_owned()
+            .map_err(|error| io_error("revalidate the owned staging directory", error))?
+        {
+            return Err(LocalPublicationError::Io {
+                operation: "revalidate the owned staging directory",
+                source: io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "the staging name no longer identifies the directory created by this publication",
+                ),
+            });
+        }
+        // This is the final cancellable point. Once the atomic rename below
+        // succeeds, publication is visible and must run through root rebinding
+        // and parent durability rather than report a false prepublication
+        // cancellation.
+        if is_cancelled() {
+            return Err(LocalPublicationError::Cancelled);
+        }
+
+        if let Err(error) = renameat_with(
+            &self.parent,
+            self.stage_name.as_os_str(),
+            &self.parent,
+            self.destination_name.as_os_str(),
+            RenameFlags::NOREPLACE,
+        ) {
+            return Err(classify_rename_error(error));
+        }
+        self.owns_stage = false;
+        hook(
+            PublicationCheckpoint::AfterRenameBeforeParentSync,
+            package_id,
+        )
+        .map_err(|source| LocalPublicationError::CommitIndeterminate { source })?;
+
+        let binding = self
+            .prove_published_root(&prepared)
+            .map_err(|source| LocalPublicationError::CommitIndeterminate { source })?;
+        let capability = prepared
+            .rebind_after_publication(binding)
+            .map_err(|error| LocalPublicationError::CommitIndeterminate {
+                source: io::Error::other(error),
+            })?;
+
+        let started = Instant::now();
+        fsync(&self.parent).map_err(|error| LocalPublicationError::CommitIndeterminate {
+            source: io::Error::from(error),
+        })?;
+        let mut report = PublicationSyncReport::default();
+        report.record(started.elapsed());
+        Ok((report, capability))
     }
 
     fn commit_with_hook(
         mut self,
         package_id: PackageId,
         mut hook: impl FnMut(PublicationCheckpoint, PackageId) -> io::Result<()>,
-    ) -> Result<(), LocalPublicationError> {
+    ) -> Result<PublicationSyncReport, LocalPublicationError> {
         hook(PublicationCheckpoint::BeforeRename, package_id).map_err(|source| {
             LocalPublicationError::Io {
                 operation: "complete the pre-commit checkpoint",
@@ -299,10 +405,13 @@ impl LocalPublication {
             package_id,
         )
         .map_err(|source| LocalPublicationError::CommitIndeterminate { source })?;
+        let started = Instant::now();
         fsync(&self.parent).map_err(|error| LocalPublicationError::CommitIndeterminate {
             source: io::Error::from(error),
         })?;
-        Ok(())
+        let mut report = PublicationSyncReport::default();
+        report.record(started.elapsed());
+        Ok(report)
     }
 
     fn open_created_directory(&self, relative: &Path) -> Result<OwnedFd, LocalPublicationError> {
@@ -335,6 +444,43 @@ impl LocalPublication {
             FileType::from_raw_mode(current.st_mode) == FileType::Directory
                 && DirectoryIdentity::from_stat(current) == self.stage_identity,
         )
+    }
+
+    fn prove_published_root(
+        &self,
+        prepared: &PreparedScientificPublication,
+    ) -> io::Result<PublishedPackageRootBinding> {
+        let held = fstat(&self.stage).map_err(io::Error::from)?;
+        let named = statat(
+            &self.parent,
+            self.destination_name.as_os_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(io::Error::from)?;
+        let opened = openat(
+            &self.parent,
+            self.destination_name.as_os_str(),
+            DIRECTORY_OPEN_FLAGS,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        let opened = fstat(&opened).map_err(io::Error::from)?;
+        let held_identity = DirectoryIdentity::from_stat(held);
+        let named_identity = DirectoryIdentity::from_stat(named);
+        let opened_identity = DirectoryIdentity::from_stat(opened);
+        if FileType::from_raw_mode(named.st_mode) != FileType::Directory
+            || FileType::from_raw_mode(opened.st_mode) != FileType::Directory
+            || held_identity != self.stage_identity
+            || named_identity != self.stage_identity
+            || opened_identity != self.stage_identity
+            || !prepared.root_matches(held_identity.device, held_identity.inode)
+        {
+            return Err(io::Error::other(
+                "the published destination does not name the validated staging directory",
+            ));
+        }
+        PublishedPackageRootBinding::open(&self.destination_path, prepared.root_seal())
+            .map_err(io::Error::other)
     }
 }
 

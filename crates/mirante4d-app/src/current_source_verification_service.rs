@@ -45,8 +45,12 @@ pub(crate) struct CurrentSourceVerificationService {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CurrentSourceVerificationDiagnostics {
+    /// Workers successfully spawned by the ordinary verifier service.
+    pub(crate) started_runs: u64,
     pub(crate) accepted_progress_updates: u64,
     pub(crate) cancelled_runs: u64,
+    /// Started workers that returned a failure or lost their result/join path.
+    pub(crate) failed_runs: u64,
     pub(crate) accepted_successes: u64,
 }
 
@@ -137,8 +141,10 @@ impl CurrentSourceVerificationService {
         Self {
             active: None,
             diagnostics: CurrentSourceVerificationDiagnostics {
+                started_runs: 0,
                 accepted_progress_updates: 0,
                 cancelled_runs: 0,
+                failed_runs: 0,
                 accepted_successes: 0,
             },
         }
@@ -169,6 +175,10 @@ impl CurrentSourceVerificationService {
 
     pub(crate) fn note_cancelled_run(&mut self) {
         self.diagnostics.cancelled_runs = self.diagnostics.cancelled_runs.saturating_add(1);
+    }
+
+    fn note_failed_run(&mut self) {
+        self.diagnostics.failed_runs = self.diagnostics.failed_runs.saturating_add(1);
     }
 
     pub(crate) fn note_accepted_success(&mut self) {
@@ -236,6 +246,7 @@ impl CurrentSourceVerificationService {
             results,
             worker: Some(worker),
         });
+        self.diagnostics.started_runs = self.diagnostics.started_runs.saturating_add(1);
         Ok(())
     }
 
@@ -291,7 +302,10 @@ impl CurrentSourceVerificationService {
                     .active
                     .as_ref()
                     .is_some_and(|active| active.cancellation.load(Ordering::Acquire));
-                join_active(self.active.take())?;
+                if let Err(error) = join_active(self.active.take()) {
+                    self.note_failed_run();
+                    return Err(error);
+                }
                 if cancelled {
                     let outcome = std::mem::replace(
                         &mut result.outcome,
@@ -299,11 +313,16 @@ impl CurrentSourceVerificationService {
                     );
                     dispose_outcome(outcome);
                 }
+                if matches!(&result.outcome, CurrentSourceVerificationOutcome::Failed(_)) {
+                    self.note_failed_run();
+                }
                 Ok(Some(result))
             }
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => {
-                join_active(self.active.take())?;
+                let join = join_active(self.active.take());
+                self.note_failed_run();
+                join?;
                 Err(CurrentSourceVerificationServiceError::ResultChannelDisconnected)
             }
         }
@@ -382,7 +401,7 @@ fn run_verification(
     }
     let scientific_content_id = capability.scientific_content_id();
     let package_id = capability.package_id();
-    let opened = match unified_source_open::open_verified(&path, resource_policy, capability) {
+    let opened = match unified_source_open::open_verified(resource_policy, capability) {
         Ok(opened) => opened,
         Err(error) => {
             return CurrentSourceVerificationOutcome::Failed(map_verified_open_error(&error));
@@ -717,12 +736,15 @@ mod tests {
         let mut service = CurrentSourceVerificationService::new();
         service.note_accepted_progress();
         service.note_cancelled_run();
+        service.note_failed_run();
         service.note_accepted_success();
         assert_eq!(
             service.diagnostics(),
             CurrentSourceVerificationDiagnostics {
+                started_runs: 0,
                 accepted_progress_updates: 1,
                 cancelled_runs: 1,
+                failed_runs: 1,
                 accepted_successes: 1,
             }
         );
@@ -731,6 +753,63 @@ mod tests {
             service.diagnostics(),
             CurrentSourceVerificationDiagnostics::default()
         );
+    }
+
+    #[test]
+    fn started_worker_failure_is_counted_once_by_the_service() {
+        let temp = tempfile::tempdir().unwrap();
+        let startup_path = crate::tests::write_target_fixture(temp.path()).unwrap();
+        let opened = crate::unified_source_open::open(
+            &startup_path,
+            mirante4d_settings::ResourcePolicy::default(),
+            DatasetSourceId::new(1),
+        )
+        .unwrap();
+        let mut application = mirante4d_application::ApplicationState::new_unbound(
+            SourceSessionGeneration::new(1),
+            opened.catalog.as_ref().clone(),
+            opened.workspace.clone(),
+            mirante4d_settings::ResourcePolicy::default(),
+        )
+        .unwrap();
+        application
+            .dispatch(mirante4d_application::ApplicationCommand::RequestSourceVerification)
+            .unwrap();
+        let token = application
+            .drain_events(16)
+            .into_iter()
+            .find_map(|event| match event {
+                mirante4d_application::ApplicationEvent::SourceVerificationRequested { token } => {
+                    Some(token)
+                }
+                _ => None,
+            })
+            .unwrap();
+
+        let mut service = CurrentSourceVerificationService::new();
+        service
+            .request_verification(
+                token,
+                temp.path().join("missing-target.m4d"),
+                mirante4d_settings::ResourcePolicy::default(),
+                opened.dataset.cpu_ledger_arc(),
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let result = loop {
+            if let Some(result) = service.try_recv().unwrap() {
+                break result;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        assert!(matches!(
+            result.outcome,
+            CurrentSourceVerificationOutcome::Failed(_)
+        ));
+        assert_eq!(service.diagnostics().started_runs, 1);
+        assert_eq!(service.diagnostics().failed_runs, 1);
+        opened.dataset.request_shutdown().unwrap();
     }
 
     #[test]
@@ -773,6 +852,7 @@ mod tests {
                 opened.dataset.cpu_ledger_arc(),
             )
             .unwrap();
+        assert_eq!(service.diagnostics().started_runs, 1);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !service
             .active

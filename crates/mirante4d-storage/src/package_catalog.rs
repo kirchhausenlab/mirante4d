@@ -359,6 +359,10 @@ impl LocalPackageCatalog {
         &self.reader
     }
 
+    pub(crate) const fn reader_mut(&mut self) -> &mut LocalPackageReader {
+        &mut self.reader
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn validate_package_structure(
         &self,

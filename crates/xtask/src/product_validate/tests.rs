@@ -375,6 +375,10 @@ fn target_source_verification_script_proves_cancel_progress_success_and_both_siz
         .iter()
         .position(|command| command["command"] == "cancel_source_verification")
         .unwrap();
+    let retry = commands
+        .iter()
+        .position(|command| command["command"] == "request_source_verification")
+        .unwrap();
     assert!(initial_verified_wait < cancellation);
     assert!(
         commands
@@ -419,8 +423,10 @@ fn target_source_verification_script_proves_cancel_progress_success_and_both_siz
             && command["width"] == B3_SECOND_VIEWPORT_WIDTH
             && command["height"] == B3_SECOND_VIEWPORT_HEIGHT
     }));
-    assert!(commands.iter().any(|command| {
-        command["command"] == "capture_screenshot" && command["name"] == "b3-after-cancel-1280x720"
+    assert!(commands[cancellation + 1..retry].iter().all(|command| {
+        command["command"] != "capture_screenshot"
+            && command["condition"] != "nonblank_frame"
+            && command["condition"].get("render_target_pixels").is_none()
     }));
     assert!(commands.iter().any(|command| {
         command["command"] == "capture_screenshot"
@@ -428,6 +434,150 @@ fn target_source_verification_script_proves_cancel_progress_success_and_both_siz
     }));
     assert_eq!(commands.last().unwrap()["command"], "quit");
     validate_product_automation_script(&script).unwrap();
+}
+
+#[test]
+fn import_preprocessing_script_uses_normal_cancel_resume_open_ready_path() {
+    let script = import_preprocessing_script(
+        Path::new("/tmp/startup.m4d"),
+        Path::new("/tmp/source"),
+        Path::new("/tmp/output"),
+        Path::new("/tmp/output/source.m4d"),
+    );
+    let commands = script["commands"].as_array().unwrap();
+    assert_eq!(script["scenario"], IMPORT_PREPROCESSING_SCENARIO);
+    validate_product_automation_script(&script).unwrap();
+
+    let starts = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| {
+            (command["command"] == "start_reviewed_import").then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 2);
+    let progress = commands
+        .iter()
+        .position(|command| command["command"] == "wait_for_import_progress")
+        .unwrap();
+    let cancel = commands
+        .iter()
+        .position(|command| command["command"] == "cancel_import")
+        .unwrap();
+    let open_ready = commands
+        .iter()
+        .position(|command| command["command"] == "wait_for_imported_open_ready")
+        .unwrap();
+    assert!(starts[0] < progress && progress < cancel && cancel < starts[1]);
+    assert!(starts[1] < open_ready);
+    assert!(
+        commands[open_ready + 1..]
+            .iter()
+            .all(|command| command["command"] != "open_dataset"),
+        "the imported verified source must render directly without an external reopen"
+    );
+    assert_eq!(
+        commands[progress]["minimum_completed_work_units"],
+        IMPORT_DURABLE_PREFIX_WORK_UNITS
+    );
+    assert!(commands.iter().any(|command| {
+        command["condition"]["import_workflow_evidence"]["required_stage_names"]
+            .as_array()
+            .is_some_and(|stages| stages.iter().any(|stage| stage == "commit"))
+            && command["condition"]["import_workflow_evidence"]["min_cancelled_runs"] == 1
+            && command["condition"]["import_workflow_evidence"]["min_successful_runs"] == 1
+            && command["condition"]["import_workflow_evidence"]["min_resumed_work_units"]
+                == IMPORT_DURABLE_PREFIX_WORK_UNITS
+            && command["condition"]["import_workflow_evidence"]["min_projected_elapsed_ms"] == 1
+    }));
+    assert!(commands.iter().any(|command| {
+        command["command"] == "capture_screenshot"
+            && command["name"] == "import-preprocessing-open-ready-navigation"
+    }));
+    assert_eq!(commands.last().unwrap()["command"], "quit");
+}
+
+#[test]
+fn import_preprocessing_evidence_requires_named_progress_resume_and_open_ready() {
+    let report = json!({
+        "schema": PRODUCT_AUTOMATION_REPORT_SCHEMA,
+        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "import_workflow_evidence": {
+            "worker_emitted_stage_names": [
+                "planning-and-preflight",
+                "source-revalidation",
+                "checkpoint-open-or-resume",
+                "base-production",
+                "pyramid-production",
+                "source-scientific-identity",
+                "shard-publication",
+                "staged-structure-validation",
+                "staged-exact-validation",
+                "staged-scientific-validation",
+                "commit"
+            ],
+            "projected_named_stage_observations": ["base-production", "pyramid-production"],
+            "cancelled_runs": 1,
+            "successful_runs": 1,
+            "failed_runs": 0,
+            "published_events": 1,
+            "maximum_resumed_work_units": IMPORT_DURABLE_PREFIX_WORK_UNITS,
+            "maximum_peak_working_bytes": IMPORT_WORKING_MEMORY_BYTES,
+            "maximum_elapsed_ms": 2,
+            "maximum_projected_elapsed_ms": 1,
+            "publication_to_open_ready_clock": {
+                "transfer_mode": "staged_verified_capability",
+                "included_in_primary_clock": true,
+                "publication_currentness_execution": {
+                    "contract_id": PUBLICATION_CURRENTNESS_CONTRACT_ID,
+                    "expected_snapshot_object_reads": 7,
+                    "first_inventory_object_reads": 11,
+                    "observed_snapshot_object_reads": 7,
+                    "second_inventory_object_reads": 11,
+                    "observed_total_object_reads": 29,
+                    "observed_codec_decode_calls": 0
+                },
+                "source_verification_started_runs": 0,
+                "source_verification_progress_updates": 0,
+                "source_verification_cancelled_runs": 0,
+                "source_verification_failed_runs": 0,
+                "source_verification_successes": 0
+            }
+        },
+        "events": [{
+            "command": "wait_for_imported_open_ready",
+            "status": "passed",
+            "details": {
+                "verified": true,
+                "normal_product_open_path": true
+            }
+        }]
+    });
+    assert!(import_preprocessing_evidence(Some(&report)).is_ok());
+
+    let mut unexpected_verifier = report.clone();
+    unexpected_verifier["import_workflow_evidence"]["publication_to_open_ready_clock"]["source_verification_successes"] =
+        json!(1);
+    assert!(import_preprocessing_evidence(Some(&unexpected_verifier)).is_err());
+
+    let mut hidden_object_work = report.clone();
+    hidden_object_work["import_workflow_evidence"]["publication_to_open_ready_clock"]["publication_currentness_execution"]
+        ["observed_snapshot_object_reads"] = json!(14);
+    hidden_object_work["import_workflow_evidence"]["publication_to_open_ready_clock"]["publication_currentness_execution"]
+        ["observed_total_object_reads"] = json!(36);
+    assert!(import_preprocessing_evidence(Some(&hidden_object_work)).is_err());
+
+    let mut hidden_decode_work = report.clone();
+    hidden_decode_work["import_workflow_evidence"]["publication_to_open_ready_clock"]["publication_currentness_execution"]
+        ["observed_codec_decode_calls"] = json!(1);
+    assert!(import_preprocessing_evidence(Some(&hidden_decode_work)).is_err());
+
+    let mut missing_commit = report;
+    missing_commit["import_workflow_evidence"]["worker_emitted_stage_names"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|stage| stage != "commit");
+    assert!(import_preprocessing_evidence(Some(&missing_commit)).is_err());
 }
 
 #[test]
@@ -668,6 +818,10 @@ fn product_validation_scenario_resolution_is_strict() {
             ProductValidationScenario::B3SourceVerification,
         ),
         (
+            IMPORT_PREPROCESSING_SCENARIO,
+            ProductValidationScenario::ImportPreprocessing,
+        ),
+        (
             B4_PROJECT_PERSISTENCE_SCENARIO,
             ProductValidationScenario::B4ProjectPersistence,
         ),
@@ -710,6 +864,10 @@ fn product_validation_output_dirs_are_scenario_scoped() {
         Path::new(OUTPUT_DIR).join(B3_SOURCE_VERIFICATION_SCENARIO)
     );
     assert_eq!(
+        product_validation_output_dir(&ProductValidationScenario::ImportPreprocessing),
+        Path::new(OUTPUT_DIR).join(IMPORT_PREPROCESSING_SCENARIO)
+    );
+    assert_eq!(
         product_validation_output_dir(&ProductValidationScenario::B4ProjectPersistence),
         Path::new(OUTPUT_DIR).join(B4_PROJECT_PERSISTENCE_SCENARIO)
     );
@@ -746,7 +904,7 @@ fn fixed_product_automation_script_validation_rejects_wrong_schema() {
         validate_product_automation_script(&old_version)
             .unwrap_err()
             .to_string()
-            .contains("schema_version must be 2")
+            .contains("schema_version must be 3")
     );
 }
 

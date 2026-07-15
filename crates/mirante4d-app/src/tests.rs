@@ -68,6 +68,14 @@ pub(crate) fn write_source_time_series_fixture(output_root: &Path) -> anyhow::Re
     Ok(fixture_root.join("spec-002"))
 }
 
+pub(crate) fn write_source_single_ome_fixture(output_root: &Path) -> anyhow::Result<PathBuf> {
+    let time_series = write_source_time_series_fixture(output_root)?;
+    let fixture_root = time_series
+        .parent()
+        .context("source fixture root is missing")?;
+    Ok(fixture_root.join("spec-001/ome-u16-anisotropic.ome.tif"))
+}
+
 fn extract_target_fixture(archive: &[u8], root: &Path) -> anyhow::Result<()> {
     let mut offset = 0_usize;
     let mut paths = HashSet::new();
@@ -398,7 +406,8 @@ fn test_workbench_app_without_background_runtime(
         pending_analysis_artifact_load: None,
         project_store_noninteractive_paths: ProjectStoreNoninteractivePaths::default(),
         project_store_product_evidence: ProjectStoreProductEvidence::default(),
-        pending_dataset_open_path: None,
+        pending_dataset_open: None,
+        dataset_open_project_close: DatasetOpenProjectCloseState::NotRequested,
         project_status_message: None,
         close_after_project_save: false,
         exit_after_project_close: false,

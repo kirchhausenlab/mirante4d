@@ -2,6 +2,8 @@ use std::{
     fs::{self, File, Metadata},
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
@@ -11,8 +13,8 @@ use thiserror::Error;
 use mirante4d_identity::{ExactBytesFacts, ExactBytesHasher, IdentityHashError};
 
 use crate::{
-    GLOBAL_ENCODED_OUTER_SHARD_BYTES_MAX, PackagePath, ShardCodecError, ShardProfileKind,
-    decode_shard_index_tail,
+    GLOBAL_ENCODED_OUTER_SHARD_BYTES_MAX, PackagePath, ShardCodecError, ShardIndex,
+    ShardProfileKind, decode_inner_payload, decode_shard_index_tail,
 };
 
 pub const SHARD_INDEX_RANGE_READ_BYTES_MAX: u64 = 4_096;
@@ -40,6 +42,27 @@ pub(crate) struct LocalObjectSnapshot {
     path: PackagePath,
     bytes: u64,
     identity: FileIdentity,
+}
+
+/// Opaque identity of the package-root directory that owns a validated local
+/// package capability.
+///
+/// Directory rename preserves this node identity. Publication uses it to prove
+/// that the create-only destination names the same directory that was
+/// validated privately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LocalPackageRootSeal {
+    device: u64,
+    inode: u64,
+}
+
+/// Fully checked destination binding produced only after the publication
+/// namespace names the sealed package-root directory.
+#[derive(Debug)]
+pub(crate) struct PublishedPackageRootBinding {
+    root: PathBuf,
+    root_identity: FileIdentity,
+    seal: LocalPackageRootSeal,
 }
 
 impl LocalObjectSnapshot {
@@ -111,6 +134,13 @@ impl LocalObjectInfo {
 pub struct LocalPackageReader {
     root: PathBuf,
     root_identity: FileIdentity,
+    /// Successful OS opens of package objects through this reader. This is an
+    /// operation count rather than a distinct-path count: whole-object reads,
+    /// range reads, hashes, and snapshot-only revalidations each open and
+    /// count the object they access.
+    object_open_operations: AtomicU64,
+    codec_decode_operations: AtomicU64,
+    codec_decode_time_ns: AtomicU64,
 }
 
 impl LocalPackageReader {
@@ -143,8 +173,100 @@ impl LocalPackageReader {
             Ok(Self {
                 root: canonical,
                 root_identity: FileIdentity::from_metadata(&canonical_metadata),
+                object_open_operations: AtomicU64::new(0),
+                codec_decode_operations: AtomicU64::new(0),
+                codec_decode_time_ns: AtomicU64::new(0),
             })
         }
+    }
+
+    pub(crate) fn object_open_operations(&self) -> u64 {
+        self.object_open_operations.load(Ordering::Relaxed)
+    }
+
+    /// Seals the current reader root for a create-only atomic publication.
+    ///
+    /// The expected path must resolve to this reader's exact canonical root at
+    /// the time of the call. The returned value contains no path and cannot be
+    /// redirected to another directory.
+    pub(crate) fn seal_root_for_publication(
+        &self,
+        expected_root: &Path,
+    ) -> Result<LocalPackageRootSeal, RangeReadError> {
+        self.validate_root_identity()?;
+        let canonical = fs::canonicalize(expected_root)
+            .map_err(|error| io_error("canonicalize publication stage", "<root>", error))?;
+        if canonical != self.root {
+            return Err(RangeReadError::RootChanged);
+        }
+        let metadata = symlink_metadata(&canonical, "reinspect publication stage", "<root>")?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(RangeReadError::RootNotDirectory);
+        }
+        let identity = FileIdentity::from_metadata(&metadata);
+        if !identity.same_node(self.root_identity) {
+            return Err(RangeReadError::RootChanged);
+        }
+        Ok(LocalPackageRootSeal::from_identity(identity))
+    }
+
+    /// Rebinds this reader from its private staging name to a checked published
+    /// name for the exact same directory node.
+    pub(crate) fn rebind_published_root(
+        &mut self,
+        binding: PublishedPackageRootBinding,
+    ) -> Result<(), RangeReadError> {
+        if !binding.seal.matches_identity(self.root_identity) {
+            return Err(RangeReadError::RootChanged);
+        }
+        self.root = binding.root;
+        self.root_identity = binding.root_identity;
+        self.validate_root_identity()
+    }
+
+    pub(crate) fn codec_decode_operations(&self) -> u64 {
+        self.codec_decode_operations.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn codec_decode_time_ns(&self) -> u64 {
+        self.codec_decode_time_ns.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn decode_shard_index_tail_accounted(
+        &self,
+        kind: ShardProfileKind,
+        tail: &[u8],
+        payload_bytes: u64,
+    ) -> Result<ShardIndex, ShardCodecError> {
+        let started = Instant::now();
+        let result = decode_shard_index_tail(kind, tail, payload_bytes);
+        self.record_codec_decode(started.elapsed());
+        result
+    }
+
+    pub(crate) fn decode_inner_payload_accounted(
+        &self,
+        kind: ShardProfileKind,
+        encoded: &[u8],
+    ) -> Result<Vec<u8>, ShardCodecError> {
+        let started = Instant::now();
+        let result = decode_inner_payload(kind, encoded);
+        self.record_codec_decode(started.elapsed());
+        result
+    }
+
+    fn record_codec_decode(&self, elapsed: Duration) {
+        let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let _ = self.codec_decode_operations.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |calls| Some(calls.saturating_add(1)),
+        );
+        let _ =
+            self.codec_decode_time_ns
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |time| {
+                    Some(time.saturating_add(elapsed_ns))
+                });
     }
 
     pub fn object_info(
@@ -361,7 +483,8 @@ impl LocalPackageReader {
             let payload_bytes = checked.bytes - tail_bytes;
             let tail = read_exact_at(&mut checked.file, path, payload_bytes, tail_bytes)
                 .map_err(LocalShardChunkReadError::Range)?;
-            let index = decode_shard_index_tail(kind, &tail, payload_bytes)
+            let index = self
+                .decode_shard_index_tail_accounted(kind, &tail, payload_bytes)
                 .map_err(LocalShardChunkReadError::Shard)?;
             let entry = index
                 .entry(chunk_index)
@@ -445,6 +568,7 @@ impl LocalPackageReader {
 
         let file = File::open(&full_path)
             .map_err(|error| io_error("open object", path.as_str(), error))?;
+        self.object_open_operations.fetch_add(1, Ordering::Relaxed);
         let opened = file
             .metadata()
             .map_err(|error| io_error("inspect opened object", path.as_str(), error))?;
@@ -564,6 +688,58 @@ impl LocalPackageReader {
         _checked: &CheckedObject,
     ) -> Result<(), RangeReadError> {
         Err(RangeReadError::UnsupportedPlatform)
+    }
+}
+
+impl LocalPackageRootSeal {
+    const fn from_identity(identity: FileIdentity) -> Self {
+        Self {
+            device: identity.device,
+            inode: identity.inode,
+        }
+    }
+
+    pub(crate) const fn matches_node(self, device: u64, inode: u64) -> bool {
+        self.device == device && self.inode == inode
+    }
+
+    const fn matches_identity(self, identity: FileIdentity) -> bool {
+        self.matches_node(identity.device, identity.inode)
+    }
+}
+
+impl PublishedPackageRootBinding {
+    /// Opens and checks the path-form destination after its descriptor-relative
+    /// publication proof has succeeded.
+    pub(crate) fn open(
+        destination: &Path,
+        seal: LocalPackageRootSeal,
+    ) -> Result<Self, RangeReadError> {
+        let metadata = symlink_metadata(destination, "inspect published package root", "<root>")?;
+        if metadata.file_type().is_symlink() {
+            return Err(RangeReadError::Symlink {
+                path: "<root>".to_owned(),
+            });
+        }
+        if !metadata.is_dir() {
+            return Err(RangeReadError::RootNotDirectory);
+        }
+        let canonical = fs::canonicalize(destination)
+            .map_err(|error| io_error("canonicalize published package root", "<root>", error))?;
+        let canonical_metadata =
+            symlink_metadata(&canonical, "reinspect published package root", "<root>")?;
+        if canonical_metadata.file_type().is_symlink() || !canonical_metadata.is_dir() {
+            return Err(RangeReadError::RootNotDirectory);
+        }
+        let root_identity = FileIdentity::from_metadata(&canonical_metadata);
+        if !seal.matches_identity(root_identity) {
+            return Err(RangeReadError::RootChanged);
+        }
+        Ok(Self {
+            root: canonical,
+            root_identity,
+            seal,
+        })
     }
 }
 
@@ -785,6 +961,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(reader.object_open_operations(), 0);
         assert_eq!(reader.object_info(&path, 8_192).unwrap().bytes(), 8_192);
         reader.revalidate_snapshot(&write_time_snapshot).unwrap();
         assert_eq!(
@@ -807,6 +984,7 @@ mod tests {
             reader.revalidate_snapshot(&write_time_snapshot),
             Err(RangeReadError::ObjectChanged { .. })
         ));
+        assert_eq!(reader.object_open_operations(), 7);
     }
 
     #[test]

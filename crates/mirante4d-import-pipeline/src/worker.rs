@@ -3,7 +3,7 @@ use std::{sync::Arc, thread};
 use mirante4d_dataset::CpuByteLedger;
 
 use crate::{
-    ImportCancellation, ImportError, ImportEvent, ImportOptions, ImportReceipt, TiffInspection,
+    ImportCancellation, ImportError, ImportEvent, ImportOptions, PublishedImport, TiffInspection,
     TiffSource, import_tiff, inspect_tiff_cancellable,
 };
 
@@ -25,7 +25,7 @@ pub fn spawn_tiff_import_worker(
     ledger: Arc<dyn CpuByteLedger>,
     cancellation: ImportCancellation,
     progress: impl FnMut(ImportEvent) + Send + 'static,
-    completion: impl FnOnce(Result<ImportReceipt, ImportError>) + Send + 'static,
+    completion: impl FnOnce(Result<PublishedImport, ImportError>) + Send + 'static,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name("mirante4d-tiff-import".to_owned())

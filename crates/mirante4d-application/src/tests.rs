@@ -2673,6 +2673,170 @@ fn dataset_open_request_rejects_while_an_operation_is_active() {
 }
 
 #[test]
+fn verified_dataset_open_atomically_replaces_and_verifies_the_source() {
+    let mut application = bound_application();
+    application.drain_events(MAX_PENDING_EVENTS);
+    application
+        .dispatch(ApplicationCommand::SetPlaybackActive(true))
+        .unwrap();
+    application
+        .dispatch(ApplicationCommand::SetActiveTool(ToolKind::Crosshair))
+        .unwrap();
+    application
+        .dispatch(ApplicationCommand::RequestDatasetOpen)
+        .unwrap();
+    let token = dataset_open_token(&mut application);
+    let dataset = dataset_reference_at('7', "imported.m4d");
+    let scientific_content_id = *dataset.scientific_content_id();
+    let catalog = verified_catalog(&catalog_for_source(4, 2), &dataset);
+    let provisional_project_id = project_id(9);
+
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token: token.clone(),
+                completion: OperationCompletion::VerifiedDatasetOpened {
+                    source_generation: SourceSessionGeneration::new(2),
+                    catalog,
+                    workspace: Box::new(unbound_workspace(provisional_project_id)),
+                    dataset: dataset.clone(),
+                },
+            })
+            .unwrap(),
+        CommandEffect::Changed
+    );
+
+    let snapshot = application.snapshot();
+    assert_eq!(
+        snapshot.source_generation(),
+        SourceSessionGeneration::new(2)
+    );
+    assert_eq!(
+        snapshot.source(),
+        &SourceVerificationSnapshot::Verified(dataset)
+    );
+    assert_eq!(snapshot.catalog().label(), "catalog-4");
+    assert_eq!(
+        snapshot.catalog().scientific_identity().verified_id(),
+        Some(&scientific_content_id)
+    );
+    assert_eq!(snapshot.transient(), &TransientApplicationState::default());
+    let WorkspaceSnapshot::Unbound { workspace } = snapshot.workspace() else {
+        panic!("verified dataset open did not install an unbound workspace");
+    };
+    assert_eq!(workspace.provisional_project_id(), provisional_project_id);
+    assert!(snapshot.active_operations().is_empty());
+
+    let events = application.drain_events(MAX_PENDING_EVENTS);
+    assert_eq!(events.len(), 3);
+    assert!(matches!(
+        &events[0],
+        ApplicationEvent::CurrentSourceReplaced {
+            source_generation,
+            provisional_project_id: event_project_id,
+        } if *source_generation == SourceSessionGeneration::new(2)
+            && *event_project_id == provisional_project_id
+    ));
+    assert!(matches!(
+        &events[1],
+        ApplicationEvent::SourceVerified {
+            source_generation,
+            scientific_content_id: event_identity,
+        } if *source_generation == SourceSessionGeneration::new(2)
+            && *event_identity == scientific_content_id
+    ));
+    assert!(matches!(
+        &events[2],
+        ApplicationEvent::OperationCompleted {
+            token: completed,
+            outcome: OperationOutcome::VerifiedDatasetOpened,
+        } if completed == &token
+    ));
+
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::RequestSourceVerification)
+            .unwrap(),
+        CommandEffect::NoChange
+    );
+    assert!(application.drain_events(MAX_PENDING_EVENTS).is_empty());
+}
+
+#[test]
+fn verified_dataset_open_rejects_identity_drift_atomically_and_can_retry() {
+    let mut application = application();
+    application
+        .dispatch(ApplicationCommand::RequestDatasetOpen)
+        .unwrap();
+    let token = dataset_open_token(&mut application);
+    let dataset = dataset_reference_at('7', "imported.m4d");
+    let catalog = verified_catalog(&catalog_for_source(4, 2), &dataset);
+    let before = application.fork_for_dispatch();
+
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token: token.clone(),
+                completion: OperationCompletion::VerifiedDatasetOpened {
+                    source_generation: SourceSessionGeneration::new(2),
+                    catalog: Arc::clone(&catalog),
+                    workspace: Box::new(unbound_workspace(project_id(9))),
+                    dataset: dataset_reference_at('8', "imported.m4d"),
+                },
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::DatasetIdentityMismatch
+    );
+    assert_eq!(application, before);
+
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::VerifiedDatasetOpened {
+                source_generation: SourceSessionGeneration::new(2),
+                catalog,
+                workspace: Box::new(unbound_workspace(project_id(9))),
+                dataset,
+            },
+        })
+        .unwrap();
+    assert!(matches!(
+        application.snapshot().source(),
+        SourceVerificationSnapshot::Verified(_)
+    ));
+}
+
+#[test]
+fn verified_dataset_open_completion_is_valid_only_for_dataset_open() {
+    let mut application = application();
+    application
+        .dispatch(ApplicationCommand::BeginOperation(OperationKind::Import))
+        .unwrap();
+    let token = started_token(&mut application, OperationKind::Import);
+    let dataset = dataset_reference_at('7', "imported.m4d");
+    let catalog = verified_catalog(&catalog_for_source(4, 2), &dataset);
+    let before = application.fork_for_dispatch();
+
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token,
+                completion: OperationCompletion::VerifiedDatasetOpened {
+                    source_generation: SourceSessionGeneration::new(2),
+                    catalog,
+                    workspace: Box::new(unbound_workspace(project_id(9))),
+                    dataset,
+                },
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::InvalidOperationCompletion
+    );
+    assert_eq!(application, before);
+}
+
+#[test]
 fn import_completion_survives_unrelated_view_currentness_changes() {
     let mut application = application();
     application

@@ -1,22 +1,24 @@
 //! Constant-file resumable import spool.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::{
     ffi::OsStr,
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use mirante4d_identity::{Sha256Digest, Sha256Hasher};
+#[cfg(test)]
+use mirante4d_storage::encode_inner_payload;
 use mirante4d_storage::{
-    PackedIndexCoordinates, PackedIndexRecord, ShardProfileKind, decode_inner_payload,
-    encode_inner_payload,
+    CanonicalEncodedInner, PackedIndexCoordinates, PackedIndexRecord, ShardProfileKind,
+    decode_inner_payload,
 };
 use rustix::{
     fd::OwnedFd,
-    fs::{AtFlags, CWD, FileType, Mode, OFlags, fstat, fsync, openat, statat},
+    fs::{AtFlags, CWD, FileType, Mode, OFlags, fstat, fsync, openat, statat, unlinkat},
     io::Errno,
 };
 
@@ -25,16 +27,27 @@ use crate::ImportError;
 const HEADER_FILE: &str = "header";
 const JOURNAL_FILE: &str = "journal";
 const PAYLOAD_FILE: &str = "payload";
-const SPOOL_SCHEMA: &[u8] = b"mirante4d-import-spool-1\n";
+const WATERMARK_FILE: &str = "watermark";
+const SPOOL_SCHEMA: &[u8] = b"mirante4d-import-spool-2\n";
 const HEADER_BYTES: usize = SPOOL_SCHEMA.len() + 32 + 32;
 
 const JOURNAL_RECORD_BYTES: usize = 160;
 const JOURNAL_BODY_BYTES: usize = 128;
+const WATERMARK_RECORD_BYTES: usize = 96;
+const WATERMARK_BODY_BYTES: usize = 64;
 const PACKED_INDEX_BYTES: usize = 64;
 const FLAG_PIXEL_PRESENT: u8 = 1 << 0;
 const FLAG_VALIDITY_PRESENT: u8 = 1 << 1;
 const KNOWN_FLAGS: u8 = FLAG_PIXEL_PRESENT | FLAG_VALIDITY_PRESENT;
 const MISSING_OFFSET: u64 = u64::MAX;
+
+// One lost process may force at most one of these bounded batches to be
+// recomputed. The byte ceiling is deliberately below one outer float32 shard,
+// while the work and age ceilings keep sparse or highly-compressible batches
+// bounded independently of payload size.
+const DURABILITY_BATCH_WORK_UNITS_MAX: u64 = 512;
+const DURABILITY_BATCH_PAYLOAD_BYTES_MAX: u64 = 64 * 1024 * 1024;
+const DURABILITY_BATCH_AGE_MAX: Duration = Duration::from_secs(15);
 
 const DIRECTORY_OPEN_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
@@ -117,6 +130,7 @@ impl SpoolWorkUnitKey {
         )
     }
 
+    #[cfg(test)]
     pub(crate) const fn from_coordinates(coordinates: PackedIndexCoordinates) -> Self {
         Self::new(
             coordinates.image_ordinal(),
@@ -131,15 +145,30 @@ impl SpoolWorkUnitKey {
 }
 
 /// One decoded inner chunk supplied to the spool.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SpoolChunkInput<'a> {
     pub(crate) kind: ShardProfileKind,
     pub(crate) decoded: &'a [u8],
 }
 
+#[cfg(test)]
 impl<'a> SpoolChunkInput<'a> {
     pub(crate) const fn new(kind: ShardProfileKind, decoded: &'a [u8]) -> Self {
         Self { kind, decoded }
+    }
+}
+
+/// One already codec-validated canonical inner chunk supplied by a CPU
+/// worker. The spool preserves these exact bytes and does not encode again.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SpoolEncodedChunkInput<'a> {
+    pub(crate) inner: &'a CanonicalEncodedInner,
+}
+
+impl<'a> SpoolEncodedChunkInput<'a> {
+    pub(crate) const fn new(inner: &'a CanonicalEncodedInner) -> Self {
+        Self { inner }
     }
 }
 
@@ -159,15 +188,79 @@ pub(crate) struct SpoolWorkUnit {
     pub(crate) packed_index: [u8; PACKED_INDEX_BYTES],
 }
 
-/// Three-file, append-only checkpoint spool.
+/// Immutable journal facts needed to recover one work unit through
+/// positional payload reads in a CPU worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SpoolWorkUnitDescriptor {
+    key: SpoolWorkUnitKey,
+    pixel: Option<SpoolChunkDescriptor>,
+    validity: Option<SpoolChunkDescriptor>,
+    packed_index: [u8; PACKED_INDEX_BYTES],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SpoolChunkDescriptor {
+    kind: ShardProfileKind,
+    offset: u64,
+    encoded_bytes: u64,
+}
+
+/// Read-only payload snapshot shared by pyramid workers.
+///
+/// The append owner may extend the payload while workers read immutable prior
+/// ranges. `read_at` avoids sharing the append handle's file position.
+pub(crate) struct SpoolPayloadReader {
+    payload_path: PathBuf,
+    payload: File,
+    snapshot_bytes: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct SpoolDecodedWorkUnit {
+    pub(crate) unit: SpoolWorkUnit,
+    pub(crate) codec_decode_calls: u64,
+    pub(crate) codec_decode_time_ns: u64,
+}
+
+/// Diagnostics for the current checkpoint and this process's durability calls.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SpoolDiagnostics {
+    pub(crate) checkpoint_payload_bytes: u64,
+    pub(crate) checkpoint_journal_bytes: u64,
+    pub(crate) checkpoint_watermark_bytes: u64,
+    pub(crate) checkpoint_durable_work_units: u64,
+    pub(crate) checkpoint_pending_work_units: u64,
+    pub(crate) checkpoint_committed_batches: u64,
+    pub(crate) codec_encode_calls: u64,
+    pub(crate) codec_encode_time_ns: u64,
+    pub(crate) codec_decode_calls: u64,
+    pub(crate) codec_decode_time_ns: u64,
+    pub(crate) sync_calls: u64,
+    pub(crate) sync_time_ns: u64,
+}
+
+/// Four-file, append-only checkpoint spool with a separately durable prefix.
 pub(crate) struct ImportSpool {
     directory_path: PathBuf,
     _directory: OwnedFd,
+    header: File,
     journal: File,
     payload: File,
+    watermark: File,
     records: Vec<JournalRecord>,
+    maximum_records: u64,
     payload_bytes: u64,
+    durable_records: u64,
+    durable_payload_bytes: u64,
+    committed_batches: u64,
+    last_watermark_digest: [u8; 32],
+    pending_started: Option<Instant>,
+    batch_policy: DurabilityBatchPolicy,
+    codec_metrics: CodecMetrics,
+    sync_metrics: SyncMetrics,
     writable: bool,
+    #[cfg(test)]
+    failpoint: Option<SpoolFailpoint>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,23 +278,167 @@ struct ChunkRecord {
     encoded_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DurablePrefix {
+    sequence: u64,
+    record_count: u64,
+    journal_bytes: u64,
+    payload_bytes: u64,
+    previous_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DurabilityBatchPolicy {
+    work_units_max: u64,
+    payload_bytes_max: u64,
+    age_max: Duration,
+}
+
+impl DurabilityBatchPolicy {
+    const PRODUCTION: Self = Self {
+        work_units_max: DURABILITY_BATCH_WORK_UNITS_MAX,
+        payload_bytes_max: DURABILITY_BATCH_PAYLOAD_BYTES_MAX,
+        age_max: DURABILITY_BATCH_AGE_MAX,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SyncMetrics {
+    calls: u64,
+    elapsed_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CodecMetrics {
+    encode_calls: u64,
+    encode_elapsed_ns: u64,
+    decode_calls: u64,
+    decode_elapsed_ns: u64,
+}
+
+struct RecoveredSpool {
+    records: Vec<JournalRecord>,
+    payload_bytes: u64,
+    durable_records: u64,
+    committed_batches: u64,
+    last_watermark_digest: [u8; 32],
+    codec_metrics: CodecMetrics,
+}
+
+struct RecoveryMetrics<'a> {
+    codec: &'a mut CodecMetrics,
+    sync: &'a mut SyncMetrics,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpoolFailpoint {
+    AfterPayloadAppend,
+    AfterJournalAppend,
+    BeforePayloadSync,
+    AfterPayloadSync,
+    BeforeJournalSync,
+    AfterJournalSync,
+    AfterWatermarkAppend,
+    BeforeWatermarkSync,
+    AfterWatermarkSync,
+}
+
 impl ImportSpool {
-    /// Opens an exact matching checkpoint or creates the three fixed files in
+    pub(crate) const fn directory_fd(&self) -> &OwnedFd {
+        &self._directory
+    }
+
+    pub(crate) fn commit_expired(&mut self) -> Result<(), ImportError> {
+        if self
+            .pending_started
+            .is_some_and(|started| started.elapsed() >= self.batch_policy.age_max)
+        {
+            self.commit_pending()?;
+        }
+        Ok(())
+    }
+
+    /// Best-effort successful-import cleanup that unlinks only names still
+    /// bound to the exact spool file descriptors opened by this instance.
+    pub(crate) fn cleanup_owned_files(&self) {
+        for (name, file) in [
+            (HEADER_FILE, &self.header),
+            (JOURNAL_FILE, &self.journal),
+            (PAYLOAD_FILE, &self.payload),
+            (WATERMARK_FILE, &self.watermark),
+        ] {
+            let _ = unlink_if_owned(&self._directory, name, file);
+        }
+    }
+
+    /// Removes the now-empty checkpoint directory only when its pathname still
+    /// resolves to the exact held directory descriptor. A renamed/replaced
+    /// path is deliberately left untouched.
+    pub(crate) fn cleanup_owned_directory(&self) {
+        let Ok(held) = fstat(&self._directory) else {
+            return;
+        };
+        let Ok(named) = statat(
+            CWD,
+            self.directory_path.as_path(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        ) else {
+            return;
+        };
+        if held.st_dev != named.st_dev
+            || held.st_ino != named.st_ino
+            || FileType::from_raw_mode(named.st_mode) != FileType::Directory
+        {
+            return;
+        }
+        let _ = unlinkat(CWD, self.directory_path.as_path(), AtFlags::REMOVEDIR);
+    }
+
+    /// Opens an exact matching checkpoint or creates the four fixed files in
     /// an existing caller-owned directory.
     pub(crate) fn open_or_create(
         directory: &Path,
         binding: SpoolBinding,
         maximum_records: u64,
+        is_cancelled: impl FnMut() -> bool,
+    ) -> Result<Self, ImportError> {
+        Self::open_or_create_with_policy(
+            directory,
+            binding,
+            maximum_records,
+            DurabilityBatchPolicy::PRODUCTION,
+            is_cancelled,
+        )
+    }
+
+    fn open_or_create_with_policy(
+        directory: &Path,
+        binding: SpoolBinding,
+        maximum_records: u64,
+        batch_policy: DurabilityBatchPolicy,
         mut is_cancelled: impl FnMut() -> bool,
     ) -> Result<Self, ImportError> {
+        if batch_policy.work_units_max == 0
+            || batch_policy.work_units_max > DURABILITY_BATCH_WORK_UNITS_MAX
+            || batch_policy.payload_bytes_max == 0
+            || batch_policy.payload_bytes_max > DURABILITY_BATCH_PAYLOAD_BYTES_MAX
+            || batch_policy.age_max > DURABILITY_BATCH_AGE_MAX
+        {
+            return Err(ImportError::InvalidRequest(
+                "the checkpoint durability-batch policy exceeds its fixed bounds",
+            ));
+        }
         let directory_path = directory.to_path_buf();
         let directory_fd = openat(CWD, directory, DIRECTORY_OPEN_FLAGS, Mode::empty())
             .map_err(|source| io_error("open checkpoint directory", &directory_path, source))?;
+        let mut sync_metrics = SyncMetrics::default();
+        let mut codec_metrics = CodecMetrics::default();
 
         let states = [
             entry_state(&directory_fd, HEADER_FILE)?,
             entry_state(&directory_fd, JOURNAL_FILE)?,
             entry_state(&directory_fd, PAYLOAD_FILE)?,
+            entry_state(&directory_fd, WATERMARK_FILE)?,
         ];
         let all_absent = states.iter().all(|state| *state == EntryState::Absent);
         let all_present = states.iter().all(|state| *state == EntryState::RegularFile);
@@ -209,11 +446,11 @@ impl ImportSpool {
             return invalid_checkpoint("the fixed spool file set is incomplete");
         }
 
-        let (journal, payload) = if all_absent {
-            create_files(&directory_fd, &directory_path, binding)?
+        let (header, journal, payload, watermark) = if all_absent {
+            create_files(&directory_fd, &directory_path, binding, &mut sync_metrics)?
         } else {
-            validate_header(&directory_fd, &directory_path, binding)?;
             (
+                validate_header(&directory_fd, &directory_path, binding)?,
                 open_file(
                     &directory_fd,
                     &directory_path,
@@ -228,24 +465,52 @@ impl ImportSpool {
                     FILE_APPEND_FLAGS,
                     "open checkpoint payload",
                 )?,
+                open_file(
+                    &directory_fd,
+                    &directory_path,
+                    WATERMARK_FILE,
+                    FILE_APPEND_FLAGS,
+                    "open checkpoint watermark",
+                )?,
             )
         };
 
-        let (records, payload_bytes) = validate_records(
-            &directory_path,
-            &journal,
-            &payload,
-            maximum_records,
-            &mut is_cancelled,
-        )?;
+        let recovered = {
+            let mut recovery_metrics = RecoveryMetrics {
+                codec: &mut codec_metrics,
+                sync: &mut sync_metrics,
+            };
+            recover_durable_prefix(
+                &directory_path,
+                &journal,
+                &payload,
+                &watermark,
+                maximum_records,
+                &mut is_cancelled,
+                &mut recovery_metrics,
+            )?
+        };
         Ok(Self {
             directory_path,
             _directory: directory_fd,
+            header,
             journal,
             payload,
-            records,
-            payload_bytes,
+            watermark,
+            records: recovered.records,
+            maximum_records,
+            payload_bytes: recovered.payload_bytes,
+            durable_records: recovered.durable_records,
+            durable_payload_bytes: recovered.payload_bytes,
+            committed_batches: recovered.committed_batches,
+            last_watermark_digest: recovered.last_watermark_digest,
+            pending_started: None,
+            batch_policy,
+            codec_metrics: recovered.codec_metrics,
+            sync_metrics,
             writable: true,
+            #[cfg(test)]
+            failpoint: None,
         })
     }
 
@@ -253,6 +518,7 @@ impl ImportSpool {
         self.records.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
@@ -265,8 +531,32 @@ impl ImportSpool {
         self.records.iter().map(|record| record.key)
     }
 
-    /// Encodes and durably appends a new work unit. Existing keys are a no-op.
-    /// New keys must follow the canonical order.
+    pub(crate) fn diagnostics(&self) -> SpoolDiagnostics {
+        let record_count = u64::try_from(self.records.len()).expect("record count was bounded");
+        SpoolDiagnostics {
+            checkpoint_payload_bytes: self.payload_bytes,
+            checkpoint_journal_bytes: record_count
+                .checked_mul(JOURNAL_RECORD_BYTES as u64)
+                .expect("record count was bounded"),
+            checkpoint_watermark_bytes: self
+                .committed_batches
+                .checked_mul(WATERMARK_RECORD_BYTES as u64)
+                .expect("watermark count was bounded"),
+            checkpoint_durable_work_units: self.durable_records,
+            checkpoint_pending_work_units: record_count - self.durable_records,
+            checkpoint_committed_batches: self.committed_batches,
+            codec_encode_calls: self.codec_metrics.encode_calls,
+            codec_encode_time_ns: self.codec_metrics.encode_elapsed_ns,
+            codec_decode_calls: self.codec_metrics.decode_calls,
+            codec_decode_time_ns: self.codec_metrics.decode_elapsed_ns,
+            sync_calls: self.sync_metrics.calls,
+            sync_time_ns: self.sync_metrics.elapsed_ns,
+        }
+    }
+
+    /// Encodes and appends a new work unit to the current bounded durability
+    /// batch. Existing keys are a no-op. New keys must follow canonical order.
+    #[cfg(test)]
     pub(crate) fn append_if_absent(
         &mut self,
         key: SpoolWorkUnitKey,
@@ -274,6 +564,70 @@ impl ImportSpool {
         validity: Option<SpoolChunkInput<'_>>,
         packed_index: PackedIndexRecord,
     ) -> Result<bool, ImportError> {
+        if !self.validate_new_key(key)? {
+            return Ok(false);
+        }
+        validate_input(key, pixel, validity, packed_index)?;
+
+        // Complete every fallible codec operation before touching the files.
+        let encoded_pixel = pixel
+            .map(|chunk| {
+                timed_codec_encode(&mut self.codec_metrics, || {
+                    encode_inner_payload(chunk.kind, chunk.decoded)
+                })
+            })
+            .transpose()?;
+        let encoded_validity = validity
+            .map(|chunk| {
+                timed_codec_encode(&mut self.codec_metrics, || {
+                    encode_inner_payload(chunk.kind, chunk.decoded)
+                })
+            })
+            .transpose()?;
+        self.append_encoded_bytes(
+            key,
+            pixel.map(|chunk| (chunk.kind, encoded_pixel.as_deref().unwrap())),
+            validity.map(|chunk| (chunk.kind, encoded_validity.as_deref().unwrap())),
+            packed_index,
+        )
+    }
+
+    /// Appends codec-validated worker output without decoding or encoding it
+    /// again. New keys retain the same canonical order and v2 journal schema.
+    pub(crate) fn append_encoded_if_absent(
+        &mut self,
+        key: SpoolWorkUnitKey,
+        pixel: Option<SpoolEncodedChunkInput<'_>>,
+        validity: Option<SpoolEncodedChunkInput<'_>>,
+        packed_index: PackedIndexRecord,
+        codec_encode_calls: u64,
+        codec_encode_time_ns: u64,
+    ) -> Result<bool, ImportError> {
+        if !self.validate_new_key(key)? {
+            return Ok(false);
+        }
+        let pixel_kind = pixel.map(|chunk| chunk.inner.kind());
+        let validity_kind = validity.map(|chunk| chunk.inner.kind());
+        validate_input_kinds(key, pixel_kind, validity_kind, packed_index)?;
+        self.codec_metrics.encode_calls = self
+            .codec_metrics
+            .encode_calls
+            .checked_add(codec_encode_calls)
+            .ok_or(ImportError::Overflow)?;
+        self.codec_metrics.encode_elapsed_ns = self
+            .codec_metrics
+            .encode_elapsed_ns
+            .checked_add(codec_encode_time_ns)
+            .ok_or(ImportError::Overflow)?;
+        self.append_encoded_bytes(
+            key,
+            pixel.map(|chunk| (chunk.inner.kind(), chunk.inner.bytes())),
+            validity.map(|chunk| (chunk.inner.kind(), chunk.inner.bytes())),
+            packed_index,
+        )
+    }
+
+    fn validate_new_key(&self, key: SpoolWorkUnitKey) -> Result<bool, ImportError> {
         if self.contains(key) {
             return Ok(false);
         }
@@ -287,23 +641,46 @@ impl ImportSpool {
                 "checkpoint work units must be appended in canonical order",
             ));
         }
-        validate_input(key, pixel, validity, packed_index)?;
+        if u64::try_from(self.records.len()).map_err(|_| ImportError::Overflow)?
+            >= self.maximum_records
+        {
+            return Err(ImportError::InvalidRequest(
+                "checkpoint work units exceed the import plan's record bound",
+            ));
+        }
+        Ok(true)
+    }
 
-        // Complete every fallible codec operation before touching the files.
-        let encoded_pixel = pixel
-            .map(|chunk| encode_inner_payload(chunk.kind, chunk.decoded))
-            .transpose()?;
-        let encoded_validity = validity
-            .map(|chunk| encode_inner_payload(chunk.kind, chunk.decoded))
-            .transpose()?;
+    fn append_encoded_bytes(
+        &mut self,
+        key: SpoolWorkUnitKey,
+        pixel: Option<(ShardProfileKind, &[u8])>,
+        validity: Option<(ShardProfileKind, &[u8])>,
+        packed_index: PackedIndexRecord,
+    ) -> Result<bool, ImportError> {
+        if self.pending_batch_expired() {
+            self.commit_pending()?;
+        }
+        let encoded_bytes = pixel
+            .map_or(0_u64, |chunk| chunk.1.len() as u64)
+            .checked_add(validity.map_or(0_u64, |chunk| chunk.1.len() as u64))
+            .ok_or(ImportError::Overflow)?;
+        if encoded_bytes > DURABILITY_BATCH_PAYLOAD_BYTES_MAX {
+            return Err(ImportError::InvalidRequest(
+                "one checkpoint work unit exceeds the durability-batch byte bound",
+            ));
+        }
+        if self.should_commit_before(encoded_bytes)? {
+            self.commit_pending()?;
+        }
         let (pixel_record, after_pixel) = plan_chunk(
-            pixel.map(|chunk| chunk.kind),
-            encoded_pixel.as_deref(),
+            pixel.map(|chunk| chunk.0),
+            pixel.map(|chunk| chunk.1),
             self.payload_bytes,
         )?;
         let (validity_record, after_validity) = plan_chunk(
-            validity.map(|chunk| chunk.kind),
-            encoded_validity.as_deref(),
+            validity.map(|chunk| chunk.0),
+            validity.map(|chunk| chunk.1),
             after_pixel,
         )?;
         let record = JournalRecord {
@@ -314,35 +691,118 @@ impl ImportSpool {
         };
         let journal_bytes = encode_journal_record(record);
 
-        // Once bytes are appended, any failure poisons this handle. Reopen
-        // will either validate the complete unit or reject the checkpoint.
+        // Once bytes are appended, any failure poisons this handle. Recovery
+        // trusts only the separately synchronized watermark prefix and drops
+        // this bounded suffix.
         self.writable = false;
         append_all(
             &mut self.payload,
-            encoded_pixel
-                .as_deref()
+            pixel
+                .map(|chunk| chunk.1)
                 .into_iter()
-                .chain(encoded_validity.as_deref()),
+                .chain(validity.map(|chunk| chunk.1)),
         )
         .map_err(|source| self.io("append checkpoint payload", PAYLOAD_FILE, source))?;
-        self.payload
-            .sync_all()
-            .map_err(|source| self.io("synchronize checkpoint payload", PAYLOAD_FILE, source))?;
+        self.inject_failure(SpoolFailpoint::AfterPayloadAppend)
+            .map_err(|source| self.io("append checkpoint payload", PAYLOAD_FILE, source))?;
 
         self.journal
             .write_all(&journal_bytes)
             .map_err(|source| self.io("append checkpoint journal", JOURNAL_FILE, source))?;
-        self.journal
-            .sync_all()
-            .map_err(|source| self.io("synchronize checkpoint journal", JOURNAL_FILE, source))?;
+        self.inject_failure(SpoolFailpoint::AfterJournalAppend)
+            .map_err(|source| self.io("append checkpoint journal", JOURNAL_FILE, source))?;
 
         self.records.push(record);
         self.payload_bytes = after_validity;
+        self.pending_started.get_or_insert_with(Instant::now);
         self.writable = true;
+        if self.should_commit_after()? {
+            self.commit_pending()?;
+        }
         Ok(true)
     }
 
+    /// Synchronizes the current batch and publishes its prefix watermark.
+    /// A failure poisons this handle because durability is then indeterminate;
+    /// reopening resolves it from the last complete valid watermark.
+    pub(crate) fn commit_pending(&mut self) -> Result<(), ImportError> {
+        let record_count = u64::try_from(self.records.len()).map_err(|_| ImportError::Overflow)?;
+        if record_count == self.durable_records {
+            return Ok(());
+        }
+        if !self.writable {
+            return Err(ImportError::InvalidRequest(
+                "the checkpoint spool is unusable after an incomplete append",
+            ));
+        }
+
+        self.writable = false;
+        self.inject_failure(SpoolFailpoint::BeforePayloadSync)
+            .map_err(|source| {
+                self.durability_error("synchronize checkpoint payload", PAYLOAD_FILE, source)
+            })?;
+        timed_sync_file(&self.payload, &mut self.sync_metrics).map_err(|source| {
+            self.durability_error("synchronize checkpoint payload", PAYLOAD_FILE, source)
+        })?;
+        self.inject_failure(SpoolFailpoint::AfterPayloadSync)
+            .map_err(|source| {
+                self.durability_error("synchronize checkpoint payload", PAYLOAD_FILE, source)
+            })?;
+
+        self.inject_failure(SpoolFailpoint::BeforeJournalSync)
+            .map_err(|source| {
+                self.durability_error("synchronize checkpoint journal", JOURNAL_FILE, source)
+            })?;
+        timed_sync_file(&self.journal, &mut self.sync_metrics).map_err(|source| {
+            self.durability_error("synchronize checkpoint journal", JOURNAL_FILE, source)
+        })?;
+        self.inject_failure(SpoolFailpoint::AfterJournalSync)
+            .map_err(|source| {
+                self.durability_error("synchronize checkpoint journal", JOURNAL_FILE, source)
+            })?;
+
+        let prefix = DurablePrefix {
+            sequence: self
+                .committed_batches
+                .checked_add(1)
+                .ok_or(ImportError::Overflow)?,
+            record_count,
+            journal_bytes: record_count
+                .checked_mul(JOURNAL_RECORD_BYTES as u64)
+                .ok_or(ImportError::Overflow)?,
+            payload_bytes: self.payload_bytes,
+            previous_digest: self.last_watermark_digest,
+        };
+        let watermark_bytes = encode_watermark_record(prefix);
+        self.watermark
+            .write_all(&watermark_bytes)
+            .map_err(|source| self.io("append checkpoint watermark", WATERMARK_FILE, source))?;
+        self.inject_failure(SpoolFailpoint::AfterWatermarkAppend)
+            .map_err(|source| self.io("append checkpoint watermark", WATERMARK_FILE, source))?;
+        self.inject_failure(SpoolFailpoint::BeforeWatermarkSync)
+            .map_err(|source| {
+                self.durability_error("synchronize checkpoint watermark", WATERMARK_FILE, source)
+            })?;
+        timed_sync_file(&self.watermark, &mut self.sync_metrics).map_err(|source| {
+            self.durability_error("synchronize checkpoint watermark", WATERMARK_FILE, source)
+        })?;
+        self.inject_failure(SpoolFailpoint::AfterWatermarkSync)
+            .map_err(|source| {
+                self.durability_error("synchronize checkpoint watermark", WATERMARK_FILE, source)
+            })?;
+
+        self.durable_records = record_count;
+        self.durable_payload_bytes = self.payload_bytes;
+        self.committed_batches = prefix.sequence;
+        self.last_watermark_digest
+            .copy_from_slice(&watermark_bytes[WATERMARK_BODY_BYTES..WATERMARK_RECORD_BYTES]);
+        self.pending_started = None;
+        self.writable = true;
+        Ok(())
+    }
+
     /// Looks up and checksum-verifies one completed work unit.
+    #[cfg(test)]
     pub(crate) fn read_work_unit(
         &mut self,
         key: SpoolWorkUnitKey,
@@ -352,8 +812,18 @@ impl ImportSpool {
             Err(_) => return Ok(None),
         };
         let record = self.records[index];
-        let pixel = read_chunk(&self.directory_path, &mut self.payload, record.pixel)?;
-        let validity = read_chunk(&self.directory_path, &mut self.payload, record.validity)?;
+        let pixel = read_chunk(
+            &self.directory_path,
+            &mut self.payload,
+            record.pixel,
+            &mut self.codec_metrics,
+        )?;
+        let validity = read_chunk(
+            &self.directory_path,
+            &mut self.payload,
+            record.validity,
+            &mut self.codec_metrics,
+        )?;
         Ok(Some(SpoolWorkUnit {
             key,
             pixel,
@@ -362,25 +832,75 @@ impl ImportSpool {
         }))
     }
 
-    pub(crate) fn read_component(
+    pub(crate) fn payload_reader(&self) -> Result<SpoolPayloadReader, ImportError> {
+        Ok(SpoolPayloadReader {
+            payload_path: self.directory_path.join(PAYLOAD_FILE),
+            payload: self
+                .payload
+                .try_clone()
+                .map_err(|source| self.io("clone checkpoint payload", PAYLOAD_FILE, source))?,
+            snapshot_bytes: self.payload_bytes,
+        })
+    }
+
+    pub(crate) fn work_unit_descriptor(
+        &self,
+        key: SpoolWorkUnitKey,
+    ) -> Option<SpoolWorkUnitDescriptor> {
+        self.find(key).ok().map(|index| {
+            let record = self.records[index];
+            SpoolWorkUnitDescriptor {
+                key,
+                pixel: record.pixel.map(SpoolChunkDescriptor::from),
+                validity: record.validity.map(SpoolChunkDescriptor::from),
+                packed_index: record.packed_index,
+            }
+        })
+    }
+
+    pub(crate) fn record_worker_codec_decodes(
+        &mut self,
+        calls: u64,
+        elapsed_ns: u64,
+    ) -> Result<(), ImportError> {
+        self.codec_metrics.decode_calls = self
+            .codec_metrics
+            .decode_calls
+            .checked_add(calls)
+            .ok_or(ImportError::Overflow)?;
+        self.codec_metrics.decode_elapsed_ns = self
+            .codec_metrics
+            .decode_elapsed_ns
+            .checked_add(elapsed_ns)
+            .ok_or(ImportError::Overflow)?;
+        Ok(())
+    }
+
+    /// Reads one already-encoded component through the storage crate's typed
+    /// checksum/frame boundary. Publication can then assemble the outer shard
+    /// without decoding and encoding the same inner payload again.
+    pub(crate) fn read_encoded_component(
         &mut self,
         key: SpoolWorkUnitKey,
         validity: bool,
-    ) -> Result<Option<SpoolChunk>, ImportError> {
+    ) -> Result<Option<CanonicalEncodedInner>, ImportError> {
         let index = match self.find(key) {
             Ok(index) => index,
             Err(_) => return Ok(None),
         };
-        let record = self.records[index];
-        read_chunk(
-            &self.directory_path,
-            &mut self.payload,
-            if validity {
-                record.validity
-            } else {
-                record.pixel
-            },
-        )
+        let record = if validity {
+            self.records[index].validity
+        } else {
+            self.records[index].pixel
+        };
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let encoded = read_encoded(&self.directory_path, &mut self.payload, record)?;
+        let validated = timed_codec_decode(&mut self.codec_metrics, || {
+            CanonicalEncodedInner::validate(record.kind, encoded)
+        })?;
+        Ok(Some(validated))
     }
 
     pub(crate) fn read_packed_index(
@@ -396,6 +916,48 @@ impl ImportSpool {
         self.records.binary_search_by_key(&key, |record| record.key)
     }
 
+    fn should_commit_before(&self, next_payload_bytes: u64) -> Result<bool, ImportError> {
+        let pending_work_units = u64::try_from(self.records.len())
+            .map_err(|_| ImportError::Overflow)?
+            .checked_sub(self.durable_records)
+            .ok_or(ImportError::Overflow)?;
+        if pending_work_units == 0 {
+            return Ok(false);
+        }
+        let pending_payload_bytes = self
+            .payload_bytes
+            .checked_sub(self.durable_payload_bytes)
+            .ok_or(ImportError::Overflow)?;
+        let next_work_units = pending_work_units
+            .checked_add(1)
+            .ok_or(ImportError::Overflow)?;
+        let next_batch_bytes = pending_payload_bytes
+            .checked_add(next_payload_bytes)
+            .ok_or(ImportError::Overflow)?;
+        Ok(next_work_units > self.batch_policy.work_units_max
+            || next_batch_bytes > self.batch_policy.payload_bytes_max
+            || self.pending_batch_expired())
+    }
+
+    fn should_commit_after(&self) -> Result<bool, ImportError> {
+        let pending_work_units = u64::try_from(self.records.len())
+            .map_err(|_| ImportError::Overflow)?
+            .checked_sub(self.durable_records)
+            .ok_or(ImportError::Overflow)?;
+        let pending_payload_bytes = self
+            .payload_bytes
+            .checked_sub(self.durable_payload_bytes)
+            .ok_or(ImportError::Overflow)?;
+        Ok(pending_work_units >= self.batch_policy.work_units_max
+            || pending_payload_bytes >= self.batch_policy.payload_bytes_max
+            || self.pending_batch_expired())
+    }
+
+    fn pending_batch_expired(&self) -> bool {
+        self.pending_started
+            .is_some_and(|started| started.elapsed() >= self.batch_policy.age_max)
+    }
+
     fn io(&self, operation: &'static str, file_name: &str, source: io::Error) -> ImportError {
         ImportError::Io {
             operation,
@@ -403,6 +965,148 @@ impl ImportSpool {
             source,
         }
     }
+
+    fn durability_error(
+        &self,
+        operation: &'static str,
+        file_name: &str,
+        source: io::Error,
+    ) -> ImportError {
+        ImportError::CheckpointDurabilityIndeterminate {
+            operation,
+            path: self.directory_path.join(file_name),
+            source,
+        }
+    }
+
+    fn inject_failure(&mut self, point: SpoolFailpoint) -> Result<(), io::Error> {
+        #[cfg(test)]
+        if self.failpoint == Some(point) {
+            self.failpoint = None;
+            return Err(io::Error::other(format!(
+                "injected checkpoint failure at {point:?}"
+            )));
+        }
+        #[cfg(not(test))]
+        let _ = point;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_failpoint(&mut self, point: SpoolFailpoint) {
+        self.failpoint = Some(point);
+    }
+}
+
+impl From<ChunkRecord> for SpoolChunkDescriptor {
+    fn from(record: ChunkRecord) -> Self {
+        Self {
+            kind: record.kind,
+            offset: record.offset,
+            encoded_bytes: record.encoded_bytes,
+        }
+    }
+}
+
+impl SpoolPayloadReader {
+    pub(crate) fn read_work_unit(
+        &self,
+        descriptor: SpoolWorkUnitDescriptor,
+    ) -> Result<SpoolDecodedWorkUnit, ImportError> {
+        let mut codec_decode_calls = 0_u64;
+        let mut codec_decode_time_ns = 0_u64;
+        let pixel = self.read_chunk(
+            descriptor.pixel,
+            &mut codec_decode_calls,
+            &mut codec_decode_time_ns,
+        )?;
+        let validity = self.read_chunk(
+            descriptor.validity,
+            &mut codec_decode_calls,
+            &mut codec_decode_time_ns,
+        )?;
+        Ok(SpoolDecodedWorkUnit {
+            unit: SpoolWorkUnit {
+                key: descriptor.key,
+                pixel,
+                validity,
+                packed_index: descriptor.packed_index,
+            },
+            codec_decode_calls,
+            codec_decode_time_ns,
+        })
+    }
+
+    fn read_chunk(
+        &self,
+        descriptor: Option<SpoolChunkDescriptor>,
+        codec_decode_calls: &mut u64,
+        codec_decode_time_ns: &mut u64,
+    ) -> Result<Option<SpoolChunk>, ImportError> {
+        let Some(descriptor) = descriptor else {
+            return Ok(None);
+        };
+        let end = descriptor
+            .offset
+            .checked_add(descriptor.encoded_bytes)
+            .ok_or(ImportError::Overflow)?;
+        if end > self.snapshot_bytes {
+            return Err(ImportError::InvalidCheckpoint(
+                "a worker payload descriptor exceeds its immutable snapshot".to_owned(),
+            ));
+        }
+        let length = usize::try_from(descriptor.encoded_bytes).map_err(|_| {
+            ImportError::InvalidCheckpoint("a payload range is too large".to_owned())
+        })?;
+        let mut encoded = vec![0_u8; length];
+        read_exact_at(
+            &self.payload,
+            &mut encoded,
+            descriptor.offset,
+            &self.payload_path,
+        )?;
+        let started = Instant::now();
+        let decoded = decode_inner_payload(descriptor.kind, &encoded).map_err(|error| {
+            ImportError::InvalidCheckpoint(format!("an encoded chunk is invalid: {error}"))
+        })?;
+        *codec_decode_calls = codec_decode_calls
+            .checked_add(1)
+            .ok_or(ImportError::Overflow)?;
+        *codec_decode_time_ns = codec_decode_time_ns
+            .checked_add(elapsed_ns(started.elapsed()))
+            .ok_or(ImportError::Overflow)?;
+        Ok(Some(SpoolChunk {
+            kind: descriptor.kind,
+            decoded,
+        }))
+    }
+}
+
+fn read_exact_at(
+    file: &File,
+    mut destination: &mut [u8],
+    mut offset: u64,
+    path: &Path,
+) -> Result<(), ImportError> {
+    while !destination.is_empty() {
+        let read = file
+            .read_at(destination, offset)
+            .map_err(|source| ImportError::Io {
+                operation: "read checkpoint payload",
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            return Err(ImportError::InvalidCheckpoint(
+                "checkpoint payload is truncated".to_owned(),
+            ));
+        }
+        offset = offset
+            .checked_add(u64::try_from(read).map_err(|_| ImportError::Overflow)?)
+            .ok_or(ImportError::Overflow)?;
+        destination = &mut destination[read..];
+    }
+    Ok(())
 }
 
 pub(crate) fn record_memory_bytes(maximum_records: u64) -> Result<u64, ImportError> {
@@ -421,7 +1125,8 @@ fn create_files(
     directory: &OwnedFd,
     directory_path: &Path,
     binding: SpoolBinding,
-) -> Result<(File, File), ImportError> {
+    sync_metrics: &mut SyncMetrics,
+) -> Result<(File, File, File, File), ImportError> {
     let mut header = create_file(
         directory,
         directory_path,
@@ -435,10 +1140,12 @@ fn create_files(
             path: directory_path.join(HEADER_FILE),
             source,
         })?;
-    header.sync_all().map_err(|source| ImportError::Io {
-        operation: "synchronize spool header",
-        path: directory_path.join(HEADER_FILE),
-        source,
+    timed_sync_file(&header, sync_metrics).map_err(|source| {
+        ImportError::CheckpointDurabilityIndeterminate {
+            operation: "synchronize spool header",
+            path: directory_path.join(HEADER_FILE),
+            source,
+        }
     })?;
 
     let journal = create_file(
@@ -447,10 +1154,12 @@ fn create_files(
         JOURNAL_FILE,
         "create spool journal",
     )?;
-    journal.sync_all().map_err(|source| ImportError::Io {
-        operation: "synchronize spool journal",
-        path: directory_path.join(JOURNAL_FILE),
-        source,
+    timed_sync_file(&journal, sync_metrics).map_err(|source| {
+        ImportError::CheckpointDurabilityIndeterminate {
+            operation: "synchronize spool journal",
+            path: directory_path.join(JOURNAL_FILE),
+            source,
+        }
     })?;
     let payload = create_file(
         directory,
@@ -458,21 +1167,41 @@ fn create_files(
         PAYLOAD_FILE,
         "create spool payload",
     )?;
-    payload.sync_all().map_err(|source| ImportError::Io {
-        operation: "synchronize spool payload",
-        path: directory_path.join(PAYLOAD_FILE),
-        source,
+    timed_sync_file(&payload, sync_metrics).map_err(|source| {
+        ImportError::CheckpointDurabilityIndeterminate {
+            operation: "synchronize spool payload",
+            path: directory_path.join(PAYLOAD_FILE),
+            source,
+        }
     })?;
-    fsync(directory)
-        .map_err(|source| io_error("synchronize checkpoint directory", directory_path, source))?;
-    Ok((journal, payload))
+    let watermark = create_file(
+        directory,
+        directory_path,
+        WATERMARK_FILE,
+        "create spool watermark",
+    )?;
+    timed_sync_file(&watermark, sync_metrics).map_err(|source| {
+        ImportError::CheckpointDurabilityIndeterminate {
+            operation: "synchronize spool watermark",
+            path: directory_path.join(WATERMARK_FILE),
+            source,
+        }
+    })?;
+    timed_sync_directory(directory, sync_metrics).map_err(|source| {
+        ImportError::CheckpointDurabilityIndeterminate {
+            operation: "synchronize checkpoint directory",
+            path: directory_path.to_path_buf(),
+            source,
+        }
+    })?;
+    Ok((header, journal, payload, watermark))
 }
 
 fn validate_header(
     directory: &OwnedFd,
     directory_path: &Path,
     binding: SpoolBinding,
-) -> Result<(), ImportError> {
+) -> Result<File, ImportError> {
     let mut file = open_file(
         directory,
         directory_path,
@@ -498,7 +1227,7 @@ fn validate_header(
     if actual != header_bytes(binding) {
         return invalid_checkpoint("the spool header does not match this plan and source");
     }
-    Ok(())
+    Ok(file)
 }
 
 fn header_bytes(binding: SpoolBinding) -> [u8; HEADER_BYTES] {
@@ -511,22 +1240,44 @@ fn header_bytes(binding: SpoolBinding) -> [u8; HEADER_BYTES] {
     bytes
 }
 
-fn validate_records(
+fn recover_durable_prefix(
     directory_path: &Path,
     journal: &File,
     payload: &File,
+    watermark: &File,
     maximum_records: u64,
     is_cancelled: &mut impl FnMut() -> bool,
-) -> Result<(Vec<JournalRecord>, u64), ImportError> {
+    metrics: &mut RecoveryMetrics<'_>,
+) -> Result<RecoveredSpool, ImportError> {
     let journal_bytes = regular_file_length(journal, "journal")?;
     let payload_bytes = regular_file_length(payload, "payload")?;
-    let record_bytes = u64::try_from(JOURNAL_RECORD_BYTES).map_err(|_| ImportError::Overflow)?;
-    let complete_journal_bytes = journal_bytes - journal_bytes % record_bytes;
-    let mut validated_journal_bytes = complete_journal_bytes;
-    let record_count = complete_journal_bytes / record_bytes;
-    if record_count > maximum_records {
-        return invalid_checkpoint("the journal exceeds this import plan's work-unit bound");
+    let watermark_bytes = regular_file_length(watermark, "watermark")?;
+    let (prefix, canonical_watermark_bytes, last_watermark_digest) = validate_watermarks(
+        directory_path,
+        watermark,
+        watermark_bytes,
+        maximum_records,
+        is_cancelled,
+    )?;
+    if prefix.journal_bytes > journal_bytes {
+        return invalid_checkpoint("the durable watermark exceeds the checkpoint journal");
     }
+    if prefix.payload_bytes > payload_bytes {
+        return invalid_checkpoint("the durable watermark exceeds the checkpoint payload");
+    }
+
+    let journal_suffix_bytes = journal_bytes - prefix.journal_bytes;
+    let maximum_journal_suffix = DURABILITY_BATCH_WORK_UNITS_MAX
+        .checked_mul(JOURNAL_RECORD_BYTES as u64)
+        .ok_or(ImportError::Overflow)?;
+    if journal_suffix_bytes > maximum_journal_suffix {
+        return invalid_checkpoint("the uncommitted journal suffix exceeds one durability batch");
+    }
+    let payload_suffix_bytes = payload_bytes - prefix.payload_bytes;
+    if payload_suffix_bytes > DURABILITY_BATCH_PAYLOAD_BYTES_MAX {
+        return invalid_checkpoint("the uncommitted payload suffix exceeds one durability batch");
+    }
+
     let capacity = usize::try_from(maximum_records)
         .map_err(|_| ImportError::InvalidCheckpoint("the journal is too large".to_owned()))?;
     let mut records = Vec::new();
@@ -554,7 +1305,7 @@ fn validate_records(
 
     let mut expected_payload_offset = 0_u64;
     let mut previous_key = None;
-    for record_index in 0..record_count {
+    for _ in 0..prefix.record_count {
         if is_cancelled() {
             return Err(ImportError::Cancelled);
         }
@@ -566,23 +1317,13 @@ fn validate_records(
                 path: directory_path.join(JOURNAL_FILE),
                 source,
             })?;
-        let digest = Sha256Hasher::digest(&bytes[..JOURNAL_BODY_BYTES]);
-        if digest.as_bytes() != &bytes[JOURNAL_BODY_BYTES..] {
-            if record_index + 1 == record_count {
-                validated_journal_bytes = record_index
-                    .checked_mul(record_bytes)
-                    .ok_or(ImportError::Overflow)?;
-                break;
-            }
-            return invalid_checkpoint("a non-final journal record has an invalid checksum");
-        }
         let (record, next_offset) =
-            decode_journal_record(&bytes, expected_payload_offset, payload_bytes)?;
+            decode_journal_record(&bytes, expected_payload_offset, prefix.payload_bytes)?;
         if previous_key.is_some_and(|previous| record.key <= previous) {
             return invalid_checkpoint("journal work-unit keys are not unique and ordered");
         }
-        verify_chunk(directory_path, &mut payload, record.pixel)?;
-        verify_chunk(directory_path, &mut payload, record.validity)?;
+        verify_chunk(directory_path, &mut payload, record.pixel, metrics.codec)?;
+        verify_chunk(directory_path, &mut payload, record.validity, metrics.codec)?;
         expected_payload_offset = next_offset;
         previous_key = Some(record.key);
         records.push(record);
@@ -590,39 +1331,181 @@ fn validate_records(
     if is_cancelled() {
         return Err(ImportError::Cancelled);
     }
+    if expected_payload_offset != prefix.payload_bytes {
+        return invalid_checkpoint("the journal does not end at its durable payload watermark");
+    }
 
-    // Payload is synchronized before its journal record. A process loss can
-    // therefore leave an incomplete journal row or an unreferenced payload
-    // tail. Once the durable prefix has validated, discard only those tails.
-    if validated_journal_bytes != journal_bytes {
-        journal
-            .set_len(validated_journal_bytes)
-            .map_err(|source| ImportError::Io {
-                operation: "truncate interrupted checkpoint journal append",
-                path: directory_path.join(JOURNAL_FILE),
-                source,
-            })?;
-        journal.sync_all().map_err(|source| ImportError::Io {
-            operation: "synchronize recovered checkpoint journal",
-            path: directory_path.join(JOURNAL_FILE),
+    // Journal and payload bytes beyond the separately synchronized watermark
+    // are one bounded uncommitted batch. They are never parsed or accepted.
+    if prefix.journal_bytes != journal_bytes {
+        truncate_and_sync(
+            &journal,
+            prefix.journal_bytes,
+            directory_path,
+            JOURNAL_FILE,
+            "truncate uncommitted checkpoint journal suffix",
+            "synchronize recovered checkpoint journal",
+            metrics.sync,
+        )?;
+    }
+    if prefix.payload_bytes != payload_bytes {
+        truncate_and_sync(
+            &payload,
+            prefix.payload_bytes,
+            directory_path,
+            PAYLOAD_FILE,
+            "truncate uncommitted checkpoint payload suffix",
+            "synchronize recovered checkpoint payload",
+            metrics.sync,
+        )?;
+    }
+    if canonical_watermark_bytes != watermark_bytes {
+        truncate_and_sync(
+            watermark,
+            canonical_watermark_bytes,
+            directory_path,
+            WATERMARK_FILE,
+            "truncate interrupted checkpoint watermark append",
+            "synchronize recovered checkpoint watermark",
+            metrics.sync,
+        )?;
+    }
+    Ok(RecoveredSpool {
+        records,
+        payload_bytes: prefix.payload_bytes,
+        durable_records: prefix.record_count,
+        committed_batches: prefix.sequence,
+        last_watermark_digest,
+        codec_metrics: *metrics.codec,
+    })
+}
+
+fn validate_watermarks(
+    directory_path: &Path,
+    watermark: &File,
+    watermark_bytes: u64,
+    maximum_records: u64,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<(DurablePrefix, u64, [u8; 32]), ImportError> {
+    let record_bytes = WATERMARK_RECORD_BYTES as u64;
+    let maximum_bytes = maximum_records
+        .checked_mul(record_bytes)
+        .and_then(|value| value.checked_add(record_bytes - 1))
+        .ok_or(ImportError::Overflow)?;
+    if watermark_bytes > maximum_bytes {
+        return invalid_checkpoint("the watermark exceeds this import plan's batch bound");
+    }
+    let complete_records = watermark_bytes / record_bytes;
+    let mut canonical_bytes = complete_records
+        .checked_mul(record_bytes)
+        .ok_or(ImportError::Overflow)?;
+    let mut file = watermark.try_clone().map_err(|source| ImportError::Io {
+        operation: "duplicate checkpoint watermark",
+        path: directory_path.join(WATERMARK_FILE),
+        source,
+    })?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| ImportError::Io {
+            operation: "seek checkpoint watermark",
+            path: directory_path.join(WATERMARK_FILE),
             source,
         })?;
-    }
-    if expected_payload_offset < payload_bytes {
-        payload
-            .set_len(expected_payload_offset)
+
+    let mut previous = DurablePrefix {
+        sequence: 0,
+        record_count: 0,
+        journal_bytes: 0,
+        payload_bytes: 0,
+        previous_digest: [0; 32],
+    };
+    let mut previous_digest = [0_u8; 32];
+    for index in 0..complete_records {
+        if is_cancelled() {
+            return Err(ImportError::Cancelled);
+        }
+        let mut bytes = [0_u8; WATERMARK_RECORD_BYTES];
+        file.read_exact(&mut bytes)
             .map_err(|source| ImportError::Io {
-                operation: "truncate interrupted checkpoint payload append",
-                path: directory_path.join(PAYLOAD_FILE),
+                operation: "read checkpoint watermark",
+                path: directory_path.join(WATERMARK_FILE),
                 source,
             })?;
-        payload.sync_all().map_err(|source| ImportError::Io {
-            operation: "synchronize recovered checkpoint payload",
-            path: directory_path.join(PAYLOAD_FILE),
-            source,
-        })?;
+        if !watermark_checksum_matches(&bytes) {
+            if index + 1 == complete_records {
+                canonical_bytes = index
+                    .checked_mul(record_bytes)
+                    .ok_or(ImportError::Overflow)?;
+                break;
+            }
+            return invalid_checkpoint("a non-final watermark record has an invalid checksum");
+        }
+        let current = decode_watermark_record(&bytes)?;
+        let expected_sequence = previous
+            .sequence
+            .checked_add(1)
+            .ok_or(ImportError::Overflow)?;
+        if current.sequence != expected_sequence || current.previous_digest != previous_digest {
+            return invalid_checkpoint("watermark records are not a canonical digest chain");
+        }
+        let expected_journal_bytes = current
+            .record_count
+            .checked_mul(JOURNAL_RECORD_BYTES as u64)
+            .ok_or(ImportError::Overflow)?;
+        if current.journal_bytes != expected_journal_bytes {
+            return invalid_checkpoint("a watermark journal length is noncanonical");
+        }
+        if current.record_count > maximum_records
+            || current.record_count <= previous.record_count
+            || current.record_count - previous.record_count > DURABILITY_BATCH_WORK_UNITS_MAX
+        {
+            return invalid_checkpoint("a watermark work-unit prefix is outside its batch bounds");
+        }
+        if current.payload_bytes < previous.payload_bytes
+            || current.payload_bytes - previous.payload_bytes > DURABILITY_BATCH_PAYLOAD_BYTES_MAX
+        {
+            return invalid_checkpoint("a watermark payload prefix is outside its batch bounds");
+        }
+        previous = current;
+        previous_digest.copy_from_slice(&bytes[WATERMARK_BODY_BYTES..WATERMARK_RECORD_BYTES]);
     }
-    Ok((records, expected_payload_offset))
+    if is_cancelled() {
+        return Err(ImportError::Cancelled);
+    }
+    Ok((previous, canonical_bytes, previous_digest))
+}
+
+fn encode_watermark_record(prefix: DurablePrefix) -> [u8; WATERMARK_RECORD_BYTES] {
+    let mut bytes = [0_u8; WATERMARK_RECORD_BYTES];
+    bytes[0..8].copy_from_slice(&prefix.sequence.to_le_bytes());
+    bytes[8..16].copy_from_slice(&prefix.record_count.to_le_bytes());
+    bytes[16..24].copy_from_slice(&prefix.journal_bytes.to_le_bytes());
+    bytes[24..32].copy_from_slice(&prefix.payload_bytes.to_le_bytes());
+    bytes[32..64].copy_from_slice(&prefix.previous_digest);
+    let digest = Sha256Hasher::digest(&bytes[..WATERMARK_BODY_BYTES]);
+    bytes[WATERMARK_BODY_BYTES..].copy_from_slice(digest.as_bytes());
+    bytes
+}
+
+fn decode_watermark_record(
+    bytes: &[u8; WATERMARK_RECORD_BYTES],
+) -> Result<DurablePrefix, ImportError> {
+    if !watermark_checksum_matches(bytes) {
+        return invalid_checkpoint("a watermark-record checksum does not match");
+    }
+    let mut previous_digest = [0_u8; 32];
+    previous_digest.copy_from_slice(&bytes[32..64]);
+    Ok(DurablePrefix {
+        sequence: read_u64(bytes, 0),
+        record_count: read_u64(bytes, 8),
+        journal_bytes: read_u64(bytes, 16),
+        payload_bytes: read_u64(bytes, 24),
+        previous_digest,
+    })
+}
+
+fn watermark_checksum_matches(bytes: &[u8; WATERMARK_RECORD_BYTES]) -> bool {
+    Sha256Hasher::digest(&bytes[..WATERMARK_BODY_BYTES]).as_bytes()
+        == &bytes[WATERMARK_BODY_BYTES..]
 }
 
 fn encode_journal_record(record: JournalRecord) -> [u8; JOURNAL_RECORD_BYTES] {
@@ -690,10 +1573,25 @@ fn decode_journal_record(
     ))
 }
 
+#[cfg(test)]
 fn validate_input(
     key: SpoolWorkUnitKey,
     pixel: Option<SpoolChunkInput<'_>>,
     validity: Option<SpoolChunkInput<'_>>,
+    packed_index: PackedIndexRecord,
+) -> Result<(), ImportError> {
+    validate_input_kinds(
+        key,
+        pixel.map(|chunk| chunk.kind),
+        validity.map(|chunk| chunk.kind),
+        packed_index,
+    )
+}
+
+fn validate_input_kinds(
+    key: SpoolWorkUnitKey,
+    pixel: Option<ShardProfileKind>,
+    validity: Option<ShardProfileKind>,
     packed_index: PackedIndexRecord,
 ) -> Result<(), ImportError> {
     if key.coordinates() != packed_index.coordinates() {
@@ -711,19 +1609,19 @@ fn validate_input(
             "a validity payload requires explicit validity in the packed-index record",
         ));
     }
-    if pixel.is_some_and(|chunk| !is_pixel_kind(chunk.kind)) {
+    if pixel.is_some_and(|kind| !is_pixel_kind(kind)) {
         return Err(ImportError::InvalidRequest(
             "a spool pixel chunk must use a pixel storage kind",
         ));
     }
-    if validity.is_some_and(|chunk| !is_validity_kind(chunk.kind)) {
+    if validity.is_some_and(|kind| !is_validity_kind(kind)) {
         return Err(ImportError::InvalidRequest(
             "a spool validity chunk must use a validity storage kind",
         ));
     }
     if pixel
         .zip(validity)
-        .is_some_and(|(pixel, validity)| is_2d(pixel.kind) != is_2d(validity.kind))
+        .is_some_and(|(pixel, validity)| is_2d(pixel) != is_2d(validity))
     {
         return Err(ImportError::InvalidRequest(
             "pixel and validity chunks must use the same dimensionality",
@@ -804,27 +1702,36 @@ fn verify_chunk(
     directory_path: &Path,
     payload: &mut File,
     record: Option<ChunkRecord>,
+    codec_metrics: &mut CodecMetrics,
 ) -> Result<(), ImportError> {
     let Some(record) = record else {
         return Ok(());
     };
     let encoded = read_encoded(directory_path, payload, record)?;
-    decode_inner_payload(record.kind, &encoded).map_err(|error| {
+    timed_codec_decode(codec_metrics, || {
+        decode_inner_payload(record.kind, &encoded)
+    })
+    .map_err(|error| {
         ImportError::InvalidCheckpoint(format!("an encoded chunk is invalid: {error}"))
     })?;
     Ok(())
 }
 
+#[cfg(test)]
 fn read_chunk(
     directory_path: &Path,
     payload: &mut File,
     record: Option<ChunkRecord>,
+    codec_metrics: &mut CodecMetrics,
 ) -> Result<Option<SpoolChunk>, ImportError> {
     let Some(record) = record else {
         return Ok(None);
     };
     let encoded = read_encoded(directory_path, payload, record)?;
-    let decoded = decode_inner_payload(record.kind, &encoded).map_err(|error| {
+    let decoded = timed_codec_decode(codec_metrics, || {
+        decode_inner_payload(record.kind, &encoded)
+    })
+    .map_err(|error| {
         ImportError::InvalidCheckpoint(format!("an encoded chunk is invalid: {error}"))
     })?;
     Ok(Some(SpoolChunk {
@@ -860,6 +1767,80 @@ fn append_all<'a>(
         file.write_all(chunk)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn timed_codec_encode<T, E>(
+    metrics: &mut CodecMetrics,
+    operation: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let started = Instant::now();
+    let result = operation();
+    metrics.encode_calls = metrics.encode_calls.saturating_add(1);
+    metrics.encode_elapsed_ns = metrics
+        .encode_elapsed_ns
+        .saturating_add(elapsed_ns(started.elapsed()));
+    result
+}
+
+fn timed_codec_decode<T, E>(
+    metrics: &mut CodecMetrics,
+    operation: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let started = Instant::now();
+    let result = operation();
+    metrics.decode_calls = metrics.decode_calls.saturating_add(1);
+    metrics.decode_elapsed_ns = metrics
+        .decode_elapsed_ns
+        .saturating_add(elapsed_ns(started.elapsed()));
+    result
+}
+
+fn timed_sync_file(file: &File, metrics: &mut SyncMetrics) -> Result<(), io::Error> {
+    let started = Instant::now();
+    let result = file.sync_all();
+    record_sync(metrics, started.elapsed());
+    result
+}
+
+fn timed_sync_directory(directory: &OwnedFd, metrics: &mut SyncMetrics) -> Result<(), io::Error> {
+    let started = Instant::now();
+    let result = fsync(directory).map_err(io::Error::from);
+    record_sync(metrics, started.elapsed());
+    result
+}
+
+fn record_sync(metrics: &mut SyncMetrics, elapsed: Duration) {
+    metrics.calls = metrics.calls.saturating_add(1);
+    metrics.elapsed_ns = metrics.elapsed_ns.saturating_add(elapsed_ns(elapsed));
+}
+
+fn elapsed_ns(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn truncate_and_sync(
+    file: &File,
+    length: u64,
+    directory_path: &Path,
+    file_name: &str,
+    truncate_operation: &'static str,
+    sync_operation: &'static str,
+    sync_metrics: &mut SyncMetrics,
+) -> Result<(), ImportError> {
+    file.set_len(length).map_err(|source| ImportError::Io {
+        operation: truncate_operation,
+        path: directory_path.join(file_name),
+        source,
+    })?;
+    timed_sync_file(file, sync_metrics).map_err(|source| {
+        ImportError::CheckpointDurabilityIndeterminate {
+            operation: sync_operation,
+            path: directory_path.join(file_name),
+            source,
+        }
+    })
 }
 
 fn encode_key(key: SpoolWorkUnitKey, bytes: &mut [u8]) {
@@ -1050,6 +2031,22 @@ fn open_file(
     Ok(File::from(descriptor))
 }
 
+fn unlink_if_owned(directory: &OwnedFd, name: &str, file: &File) -> Result<(), ImportError> {
+    let held = fstat(file)
+        .map_err(|source| io_error("inspect owned checkpoint file", Path::new(name), source))?;
+    let named = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|source| io_error("inspect named checkpoint file", Path::new(name), source))?;
+    if held.st_dev != named.st_dev
+        || held.st_ino != named.st_ino
+        || FileType::from_raw_mode(named.st_mode) != FileType::RegularFile
+        || named.st_nlink != 1
+    {
+        return invalid_checkpoint("checkpoint name no longer identifies its owned spool file");
+    }
+    unlinkat(directory, name, AtFlags::empty())
+        .map_err(|source| io_error("remove owned checkpoint file", Path::new(name), source))
+}
+
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("four bytes"))
 }
@@ -1101,6 +2098,21 @@ mod tests {
         ImportSpool::open_or_create(checkpoint, binding, 16, || false)
     }
 
+    fn open_with_policy(
+        checkpoint: &Path,
+        binding: SpoolBinding,
+        maximum_records: u64,
+        batch_policy: DurabilityBatchPolicy,
+    ) -> Result<ImportSpool, ImportError> {
+        ImportSpool::open_or_create_with_policy(
+            checkpoint,
+            binding,
+            maximum_records,
+            batch_policy,
+            || false,
+        )
+    }
+
     fn packed(
         key: SpoolWorkUnitKey,
         valid: u64,
@@ -1127,8 +2139,76 @@ mod tests {
         vec![fill; kind.decoded_inner_bytes()]
     }
 
+    fn key(x: u32) -> SpoolWorkUnitKey {
+        SpoolWorkUnitKey::new(0, 0, 0, 0, 0, 0, x)
+    }
+
+    fn append_elided(spool: &mut ImportSpool, key: SpoolWorkUnitKey) {
+        spool
+            .append_if_absent(key, None, None, packed(key, 6, 0, false, false))
+            .unwrap();
+    }
+
+    fn append_pixel(
+        spool: &mut ImportSpool,
+        key: SpoolWorkUnitKey,
+        kind: ShardProfileKind,
+        bytes: &[u8],
+    ) {
+        spool
+            .append_if_absent(
+                key,
+                Some(SpoolChunkInput::new(kind, bytes)),
+                None,
+                packed(key, 6, 1, true, false),
+            )
+            .unwrap();
+    }
+
     #[test]
-    fn creates_three_files_and_resumes_ordered_complete_work() {
+    fn appends_validated_worker_encoding_without_a_second_codec_call() {
+        let (_temporary, checkpoint) = checkpoint();
+        let mut spool = open(&checkpoint, binding(2)).unwrap();
+        let key = key(0);
+        let kind = ShardProfileKind::Pixel2dUint8;
+        let decoded = decoded(kind, 11);
+        let canonical = CanonicalEncodedInner::encode(kind, &decoded).unwrap();
+
+        assert!(
+            spool
+                .append_encoded_if_absent(
+                    key,
+                    Some(SpoolEncodedChunkInput::new(&canonical)),
+                    None,
+                    packed(key, 6, 1, true, false),
+                    1,
+                    42,
+                )
+                .unwrap()
+        );
+        let diagnostics = spool.diagnostics();
+        assert_eq!(diagnostics.codec_encode_calls, 1);
+        assert_eq!(diagnostics.codec_encode_time_ns, 42);
+        let persisted = spool.read_encoded_component(key, false).unwrap().unwrap();
+        assert_eq!(persisted.kind(), kind);
+        assert_eq!(persisted.bytes(), canonical.bytes());
+        let diagnostics = spool.diagnostics();
+        assert_eq!(diagnostics.codec_decode_calls, 1);
+        assert!(diagnostics.codec_decode_time_ns > 0);
+        assert_eq!(
+            spool
+                .read_work_unit(key)
+                .unwrap()
+                .unwrap()
+                .pixel
+                .unwrap()
+                .decoded,
+            decoded
+        );
+    }
+
+    #[test]
+    fn creates_four_files_and_resumes_only_the_durable_ordered_prefix() {
         let (_temporary, checkpoint) = checkpoint();
         let binding = binding(3);
         let pixel_kind = ShardProfileKind::Pixel2dUint8;
@@ -1175,10 +2255,22 @@ mod tests {
                 .append_if_absent(first, None, None, packed(first, 6, 0, false, false))
                 .unwrap()
         );
+        let pending = spool.diagnostics();
+        assert_eq!(pending.checkpoint_pending_work_units, 3);
+        assert_eq!(pending.checkpoint_durable_work_units, 0);
+        spool.commit_pending().unwrap();
+        let committed = spool.diagnostics();
+        assert_eq!(committed.checkpoint_pending_work_units, 0);
+        assert_eq!(committed.checkpoint_durable_work_units, 3);
+        assert_eq!(committed.checkpoint_committed_batches, 1);
+        assert_eq!(committed.checkpoint_watermark_bytes, 96);
+        assert_eq!(committed.codec_encode_calls, 3);
+        assert_eq!(committed.codec_decode_calls, 0);
+        assert_eq!(committed.sync_calls, 8);
         drop(spool);
 
         let entries = fs::read_dir(&checkpoint).unwrap().count();
-        assert_eq!(entries, 3);
+        assert_eq!(entries, 4);
         assert_eq!(
             fs::read(checkpoint.join(HEADER_FILE)).unwrap(),
             header_bytes(binding)
@@ -1202,6 +2294,7 @@ mod tests {
         let elided = resumed.read_work_unit(second).unwrap().unwrap();
         assert!(elided.pixel.is_none());
         assert!(elided.validity.is_none());
+        assert_eq!(resumed.diagnostics().codec_decode_calls, 5);
     }
 
     #[test]
@@ -1242,6 +2335,7 @@ mod tests {
                 packed(key, 6, 1, true, false),
             )
             .unwrap();
+        spool.commit_pending().unwrap();
         drop(spool);
 
         let path = checkpoint.join(PAYLOAD_FILE);
@@ -1269,34 +2363,27 @@ mod tests {
         let kind = ShardProfileKind::Pixel2dUint8;
         let bytes = decoded(kind, 5);
         let mut spool = open(&checkpoint, binding).unwrap();
-        for key in [first, second] {
-            spool
-                .append_if_absent(
-                    key,
-                    Some(SpoolChunkInput::new(kind, &bytes)),
-                    None,
-                    packed(key, 6, 1, true, false),
-                )
-                .unwrap();
-        }
+        spool
+            .append_if_absent(
+                first,
+                Some(SpoolChunkInput::new(kind, &bytes)),
+                None,
+                packed(first, 6, 1, true, false),
+            )
+            .unwrap();
+        spool.commit_pending().unwrap();
+        let first_payload_bytes = spool.diagnostics().checkpoint_payload_bytes;
+        spool
+            .append_if_absent(
+                second,
+                Some(SpoolChunkInput::new(kind, &bytes)),
+                None,
+                packed(second, 6, 1, true, false),
+            )
+            .unwrap();
         drop(spool);
 
-        let first_payload_bytes = {
-            let journal = fs::read(checkpoint.join(JOURNAL_FILE)).unwrap();
-            let first: [u8; JOURNAL_RECORD_BYTES] =
-                journal[..JOURNAL_RECORD_BYTES].try_into().unwrap();
-            decode_journal_record(
-                &first,
-                0,
-                fs::metadata(checkpoint.join(PAYLOAD_FILE)).unwrap().len(),
-            )
-            .unwrap()
-            .1
-        };
         let journal_path = checkpoint.join(JOURNAL_FILE);
-        let mut journal = fs::read(&journal_path).unwrap();
-        journal.pop();
-        fs::write(&journal_path, journal).unwrap();
         let payload_path = checkpoint.join(PAYLOAD_FILE);
         let mut payload = fs::OpenOptions::new()
             .append(true)
@@ -1331,6 +2418,7 @@ mod tests {
             spool
                 .append_if_absent(second, None, None, packed(second, 6, 0, false, false))
                 .unwrap();
+            spool.commit_pending().unwrap();
             drop(spool);
 
             let path = checkpoint.join(JOURNAL_FILE);
@@ -1361,11 +2449,13 @@ mod tests {
         let first = SpoolWorkUnitKey::new(0, 0, 0, 0, 0, 0, 0);
         let second = SpoolWorkUnitKey::new(0, 0, 0, 0, 0, 0, 1);
         let mut spool = open(&checkpoint, binding).unwrap();
-        for key in [first, second] {
-            spool
-                .append_if_absent(key, None, None, packed(key, 6, 0, false, false))
-                .unwrap();
-        }
+        spool
+            .append_if_absent(first, None, None, packed(first, 6, 0, false, false))
+            .unwrap();
+        spool.commit_pending().unwrap();
+        spool
+            .append_if_absent(second, None, None, packed(second, 6, 0, false, false))
+            .unwrap();
         drop(spool);
 
         let journal_path = checkpoint.join(JOURNAL_FILE);
@@ -1393,6 +2483,7 @@ mod tests {
                 .append_if_absent(key, None, None, packed(key, 6, 0, false, false))
                 .unwrap();
         }
+        spool.commit_pending().unwrap();
         drop(spool);
 
         assert!(matches!(
@@ -1403,6 +2494,367 @@ mod tests {
             ImportSpool::open_or_create(&checkpoint, binding, 2, || true),
             Err(ImportError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn predecessor_three_file_checkpoint_is_rejected_without_migration() {
+        let (_temporary, checkpoint) = checkpoint();
+        fs::write(checkpoint.join(HEADER_FILE), b"mirante4d-import-spool-1\n").unwrap();
+        fs::write(checkpoint.join(JOURNAL_FILE), []).unwrap();
+        fs::write(checkpoint.join(PAYLOAD_FILE), []).unwrap();
+
+        assert!(matches!(
+            open(&checkpoint, binding(55)),
+            Err(ImportError::InvalidCheckpoint(message))
+                if message.contains("fixed spool file set")
+        ));
+        assert!(!checkpoint.join(WATERMARK_FILE).exists());
+    }
+
+    #[test]
+    fn append_never_grows_past_the_plan_record_bound() {
+        let (_temporary, checkpoint) = checkpoint();
+        let mut spool = ImportSpool::open_or_create(&checkpoint, binding(56), 1, || false).unwrap();
+        append_elided(&mut spool, key(0));
+        assert!(matches!(
+            spool.append_if_absent(key(1), None, None, packed(key(1), 6, 0, false, false)),
+            Err(ImportError::InvalidRequest(_))
+        ));
+        assert_eq!(spool.len(), 1);
+        assert_eq!(
+            fs::metadata(checkpoint.join(JOURNAL_FILE)).unwrap().len(),
+            JOURNAL_RECORD_BYTES as u64
+        );
+    }
+
+    #[test]
+    fn work_byte_and_age_bounds_commit_without_per_unit_syncs() {
+        for (name, policy, pixel) in [
+            (
+                "work",
+                DurabilityBatchPolicy {
+                    work_units_max: 2,
+                    payload_bytes_max: DURABILITY_BATCH_PAYLOAD_BYTES_MAX,
+                    age_max: DURABILITY_BATCH_AGE_MAX,
+                },
+                false,
+            ),
+            (
+                "age",
+                DurabilityBatchPolicy {
+                    work_units_max: DURABILITY_BATCH_WORK_UNITS_MAX,
+                    payload_bytes_max: DURABILITY_BATCH_PAYLOAD_BYTES_MAX,
+                    age_max: Duration::ZERO,
+                },
+                false,
+            ),
+            (
+                "bytes",
+                DurabilityBatchPolicy {
+                    work_units_max: DURABILITY_BATCH_WORK_UNITS_MAX,
+                    payload_bytes_max: u64::try_from(
+                        encode_inner_payload(
+                            ShardProfileKind::Pixel2dUint8,
+                            &decoded(ShardProfileKind::Pixel2dUint8, 7),
+                        )
+                        .unwrap()
+                        .len(),
+                    )
+                    .unwrap(),
+                    age_max: DURABILITY_BATCH_AGE_MAX,
+                },
+                true,
+            ),
+        ] {
+            let (_temporary, checkpoint) = checkpoint();
+            let binding = binding(match name {
+                "work" => 61,
+                "age" => 62,
+                "bytes" => 63,
+                _ => unreachable!(),
+            });
+            let mut spool = open_with_policy(&checkpoint, binding, 16, policy).unwrap();
+            if pixel {
+                let kind = ShardProfileKind::Pixel2dUint8;
+                append_pixel(&mut spool, key(0), kind, &decoded(kind, 7));
+            } else {
+                append_elided(&mut spool, key(0));
+                if name == "work" {
+                    assert_eq!(spool.diagnostics().checkpoint_durable_work_units, 0);
+                    append_elided(&mut spool, key(1));
+                }
+            }
+            let diagnostics = spool.diagnostics();
+            assert_eq!(diagnostics.checkpoint_committed_batches, 1, "{name}");
+            assert_eq!(diagnostics.checkpoint_pending_work_units, 0, "{name}");
+            // Five create-time syncs plus exactly one three-sync batch.
+            assert_eq!(diagnostics.sync_calls, 8, "{name}");
+        }
+    }
+
+    #[test]
+    fn owner_tick_commits_an_expired_idle_batch() {
+        let (_temporary, checkpoint) = checkpoint();
+        let mut spool = open_with_policy(
+            &checkpoint,
+            binding(73),
+            4,
+            DurabilityBatchPolicy {
+                work_units_max: 4,
+                payload_bytes_max: DURABILITY_BATCH_PAYLOAD_BYTES_MAX,
+                age_max: Duration::from_millis(1),
+            },
+        )
+        .unwrap();
+        append_elided(&mut spool, key(0));
+        assert_eq!(spool.diagnostics().checkpoint_pending_work_units, 1);
+        std::thread::sleep(Duration::from_millis(3));
+        spool.commit_expired().unwrap();
+        assert_eq!(spool.diagnostics().checkpoint_pending_work_units, 0);
+        assert_eq!(spool.diagnostics().checkpoint_durable_work_units, 1);
+    }
+
+    #[test]
+    fn cleanup_does_not_unlink_a_replaced_spool_name() {
+        let (_temporary, checkpoint) = checkpoint();
+        let spool = open(&checkpoint, binding(74)).unwrap();
+        let payload = checkpoint.join(PAYLOAD_FILE);
+        let displaced = checkpoint.join("displaced-payload");
+        fs::rename(&payload, &displaced).unwrap();
+        fs::write(&payload, b"replacement").unwrap();
+
+        spool.cleanup_owned_files();
+
+        assert_eq!(fs::read(payload).unwrap(), b"replacement");
+        assert!(displaced.exists());
+        assert!(!checkpoint.join(HEADER_FILE).exists());
+        assert!(!checkpoint.join(JOURNAL_FILE).exists());
+        assert!(!checkpoint.join(WATERMARK_FILE).exists());
+    }
+
+    #[test]
+    fn cleanup_does_not_remove_a_replaced_checkpoint_directory() {
+        let (temporary, checkpoint) = checkpoint();
+        let spool = open(&checkpoint, binding(75)).unwrap();
+        let displaced = temporary.path().join("displaced-checkpoint");
+        fs::rename(&checkpoint, &displaced).unwrap();
+        fs::create_dir(&checkpoint).unwrap();
+
+        spool.cleanup_owned_files();
+        spool.cleanup_owned_directory();
+
+        assert!(checkpoint.is_dir());
+        assert!(displaced.is_dir());
+        assert_eq!(fs::read_dir(displaced).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn every_append_and_commit_crash_boundary_recovers_an_exact_prefix() {
+        let append_failpoints = [
+            SpoolFailpoint::AfterPayloadAppend,
+            SpoolFailpoint::AfterJournalAppend,
+        ];
+        for (ordinal, failpoint) in append_failpoints.into_iter().enumerate() {
+            let (_temporary, checkpoint) = checkpoint();
+            let binding = binding(70 + ordinal as u8);
+            let kind = ShardProfileKind::Pixel2dUint8;
+            let bytes = decoded(kind, 9);
+            let mut spool = open(&checkpoint, binding).unwrap();
+            append_pixel(&mut spool, key(0), kind, &bytes);
+            spool.commit_pending().unwrap();
+            spool.set_failpoint(failpoint);
+            assert!(matches!(
+                spool.append_if_absent(
+                    key(1),
+                    Some(SpoolChunkInput::new(kind, &bytes)),
+                    None,
+                    packed(key(1), 6, 1, true, false),
+                ),
+                Err(ImportError::Io { .. })
+            ));
+            drop(spool);
+
+            let resumed = open(&checkpoint, binding).unwrap();
+            assert_eq!(resumed.keys().collect::<Vec<_>>(), vec![key(0)]);
+            assert_eq!(resumed.diagnostics().checkpoint_pending_work_units, 0);
+        }
+
+        let commit_failpoints = [
+            (SpoolFailpoint::BeforePayloadSync, 1),
+            (SpoolFailpoint::AfterPayloadSync, 1),
+            (SpoolFailpoint::BeforeJournalSync, 1),
+            (SpoolFailpoint::AfterJournalSync, 1),
+            (SpoolFailpoint::AfterWatermarkAppend, 2),
+            (SpoolFailpoint::BeforeWatermarkSync, 2),
+            (SpoolFailpoint::AfterWatermarkSync, 2),
+        ];
+        for (ordinal, (failpoint, expected_records)) in commit_failpoints.into_iter().enumerate() {
+            let (_temporary, checkpoint) = checkpoint();
+            let binding = binding(80 + ordinal as u8);
+            let mut spool = open(&checkpoint, binding).unwrap();
+            append_elided(&mut spool, key(0));
+            spool.commit_pending().unwrap();
+            append_elided(&mut spool, key(1));
+            spool.set_failpoint(failpoint);
+            let error = spool.commit_pending().unwrap_err();
+            if matches!(
+                failpoint,
+                SpoolFailpoint::BeforePayloadSync
+                    | SpoolFailpoint::AfterPayloadSync
+                    | SpoolFailpoint::BeforeJournalSync
+                    | SpoolFailpoint::AfterJournalSync
+                    | SpoolFailpoint::BeforeWatermarkSync
+                    | SpoolFailpoint::AfterWatermarkSync
+            ) {
+                assert!(matches!(
+                    error,
+                    ImportError::CheckpointDurabilityIndeterminate { .. }
+                ));
+            } else {
+                assert!(matches!(error, ImportError::Io { .. }));
+            }
+            drop(spool);
+
+            let resumed = open(&checkpoint, binding).unwrap();
+            let expected = if expected_records == 1 {
+                vec![key(0)]
+            } else {
+                vec![key(0), key(1)]
+            };
+            assert_eq!(
+                resumed.keys().collect::<Vec<_>>(),
+                expected,
+                "{failpoint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncation_and_watermark_corruption_never_admit_ambiguous_bytes() {
+        for mutation in [
+            "journal_truncated",
+            "payload_truncated",
+            "watermark_truncated",
+            "final_watermark_checksum",
+            "nonfinal_watermark_checksum",
+            "watermark_reordered",
+        ] {
+            let (_temporary, checkpoint) = checkpoint();
+            let binding = binding(100);
+            let kind = ShardProfileKind::Pixel2dUint8;
+            let bytes = decoded(kind, 3);
+            let mut spool = open(&checkpoint, binding).unwrap();
+            append_pixel(&mut spool, key(0), kind, &bytes);
+            spool.commit_pending().unwrap();
+            let first_payload_bytes = spool.durable_payload_bytes;
+            append_pixel(&mut spool, key(1), kind, &bytes);
+            spool.commit_pending().unwrap();
+            drop(spool);
+
+            match mutation {
+                "journal_truncated" => {
+                    let path = checkpoint.join(JOURNAL_FILE);
+                    let length = fs::metadata(&path).unwrap().len();
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                        .set_len(length - 1)
+                        .unwrap();
+                }
+                "payload_truncated" => {
+                    let path = checkpoint.join(PAYLOAD_FILE);
+                    let length = fs::metadata(&path).unwrap().len();
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                        .set_len(length - 1)
+                        .unwrap();
+                }
+                "watermark_truncated" => {
+                    let path = checkpoint.join(WATERMARK_FILE);
+                    let length = fs::metadata(&path).unwrap().len();
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                        .set_len(length - 1)
+                        .unwrap();
+                }
+                "final_watermark_checksum" => {
+                    let path = checkpoint.join(WATERMARK_FILE);
+                    let mut content = fs::read(&path).unwrap();
+                    content[WATERMARK_RECORD_BYTES + WATERMARK_BODY_BYTES] ^= 1;
+                    fs::write(path, content).unwrap();
+                }
+                "nonfinal_watermark_checksum" => {
+                    let path = checkpoint.join(WATERMARK_FILE);
+                    let mut content = fs::read(&path).unwrap();
+                    content[WATERMARK_BODY_BYTES] ^= 1;
+                    fs::write(path, content).unwrap();
+                }
+                "watermark_reordered" => {
+                    let path = checkpoint.join(WATERMARK_FILE);
+                    let mut content = fs::read(&path).unwrap();
+                    let (first, second) = content.split_at_mut(WATERMARK_RECORD_BYTES);
+                    first.swap_with_slice(second);
+                    fs::write(path, content).unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            match mutation {
+                "watermark_truncated" | "final_watermark_checksum" => {
+                    let resumed = open(&checkpoint, binding).unwrap();
+                    assert_eq!(resumed.keys().collect::<Vec<_>>(), vec![key(0)]);
+                    assert_eq!(
+                        fs::metadata(checkpoint.join(PAYLOAD_FILE)).unwrap().len(),
+                        first_payload_bytes
+                    );
+                    assert_eq!(
+                        fs::metadata(checkpoint.join(WATERMARK_FILE)).unwrap().len(),
+                        WATERMARK_RECORD_BYTES as u64
+                    );
+                }
+                _ => assert!(matches!(
+                    open(&checkpoint, binding),
+                    Err(ImportError::InvalidCheckpoint(_))
+                )),
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_suffixes_larger_than_one_declared_batch() {
+        for file_name in [JOURNAL_FILE, PAYLOAD_FILE] {
+            let (_temporary, checkpoint) = checkpoint();
+            let binding = binding(if file_name == JOURNAL_FILE { 120 } else { 121 });
+            let mut spool = open(&checkpoint, binding).unwrap();
+            append_elided(&mut spool, key(0));
+            spool.commit_pending().unwrap();
+            let durable = if file_name == JOURNAL_FILE {
+                spool.diagnostics().checkpoint_journal_bytes
+            } else {
+                spool.diagnostics().checkpoint_payload_bytes
+            };
+            drop(spool);
+            let maximum_suffix = if file_name == JOURNAL_FILE {
+                DURABILITY_BATCH_WORK_UNITS_MAX * JOURNAL_RECORD_BYTES as u64
+            } else {
+                DURABILITY_BATCH_PAYLOAD_BYTES_MAX
+            };
+            fs::OpenOptions::new()
+                .write(true)
+                .open(checkpoint.join(file_name))
+                .unwrap()
+                .set_len(durable + maximum_suffix + 1)
+                .unwrap();
+            assert!(matches!(
+                open(&checkpoint, binding),
+                Err(ImportError::InvalidCheckpoint(_))
+            ));
+        }
     }
 
     #[test]

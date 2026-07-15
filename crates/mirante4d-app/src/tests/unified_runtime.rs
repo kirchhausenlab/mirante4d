@@ -244,7 +244,12 @@ fn imported_dataset_uses_the_existing_dirty_project_open_handoff() {
             .unwrap()
     );
 
-    assert_eq!(app.pending_dataset_open_path.as_ref(), Some(&imported));
+    assert_eq!(
+        app.pending_dataset_open
+            .as_ref()
+            .map(current_source_open_service::CurrentSourceOpenRequest::selected_path),
+        Some(imported.as_path())
+    );
     assert!(app.egui_ui.close_prompt_open);
     assert!(
         app.application
@@ -259,6 +264,375 @@ fn imported_dataset_uses_the_existing_dirty_project_open_handoff() {
         .unwrap()
         .shutdown()
         .unwrap();
+}
+
+#[test]
+fn invalid_external_open_does_not_close_the_current_project_store() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    app.source_open_service = Some(current_source_open_service::CurrentSourceOpenService::new());
+    install_test_project_store(&mut app);
+    assert!(!app.project_dirty());
+    let original_path = app.dataset.selected_path().canonicalize().unwrap();
+    let original_lifecycle = app.project_store.as_ref().unwrap().status().lifecycle();
+
+    assert!(
+        app.open_or_queue_dataset_path(temp.path().join("missing-external.m4d"), None)
+            .unwrap()
+    );
+    assert!(app.pending_dataset_open.is_none());
+    assert_eq!(
+        app.dataset_open_project_close,
+        DatasetOpenProjectCloseState::NotRequested
+    );
+    assert_eq!(
+        app.project_store.as_ref().unwrap().status().lifecycle(),
+        original_lifecycle
+    );
+    assert!(
+        app.source_open_service
+            .as_ref()
+            .unwrap()
+            .active_token()
+            .is_some()
+    );
+
+    wait_for_test_app(&mut app, |app| {
+        app.source_open_service
+            .as_ref()
+            .is_some_and(|service| service.active_token().is_none())
+    });
+    assert_eq!(
+        app.dataset.selected_path().canonicalize().unwrap(),
+        original_path
+    );
+    assert_eq!(
+        app.project_store.as_ref().unwrap().status().lifecycle(),
+        original_lifecycle
+    );
+
+    close_test_project_store(&mut app);
+    app.source_open_service.take().unwrap().shutdown().unwrap();
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
+fn imported_publication_waits_for_project_close_then_installs_without_normal_verifier() {
+    let temp = tempfile::tempdir().unwrap();
+    let current_package = write_target_fixture(temp.path()).unwrap();
+    let source = write_source_single_ome_fixture(temp.path()).unwrap();
+    let destination = temp.path().join("direct-verified-import.m4d");
+    let inspection = mirante4d_import_pipeline::inspect_tiff(TiffSource::auto(&source)).unwrap();
+    let (_, options) = reviewed_import_options(
+        TiffSource::auto(&source),
+        inspection,
+        destination.clone(),
+    );
+    let published = mirante4d_import_pipeline::import_tiff(
+        options,
+        &TestImportLedger,
+        &ImportCancellation::new(),
+        |_| {},
+    )
+    .unwrap();
+    let receipt = published.receipt().clone();
+
+    let opened = open_dataset_and_render_first_frame(&current_package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    app.source_open_service = Some(current_source_open_service::CurrentSourceOpenService::new());
+    install_test_project_store(&mut app);
+    verify_test_source(&mut app);
+    app.apply_application_command(
+        ApplicationCommand::AttachVerifiedDataset,
+        &egui::Context::default(),
+    )
+    .unwrap();
+    assert!(app.project_dirty());
+    let diagnostics_before = app
+        .source_verification_service
+        .as_ref()
+        .unwrap()
+        .diagnostics();
+
+    assert!(!app.open_or_queue_imported_dataset(published, None).unwrap());
+    assert!(matches!(
+        app.pending_dataset_open.as_ref(),
+        Some(current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(_))
+    ));
+    assert_eq!(
+        app.dataset_open_project_close,
+        DatasetOpenProjectCloseState::NotRequested
+    );
+    app.egui_ui.close_prompt_open = false;
+    app.close_project_store_before_pending_dataset_open(None)
+        .unwrap();
+    assert_eq!(
+        app.dataset_open_project_close,
+        DatasetOpenProjectCloseState::Waiting
+    );
+    assert!(matches!(
+        app.pending_dataset_open.as_ref(),
+        Some(current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(_))
+    ));
+    assert!(
+        app.source_open_service
+            .as_ref()
+            .unwrap()
+            .active_token()
+            .is_none(),
+        "the imported capability must remain undispatched until project close succeeds"
+    );
+    assert_eq!(
+        app.project_store.as_ref().unwrap().status().lifecycle(),
+        ProjectStoreLifecycle::Closing
+    );
+
+    wait_for_test_app(&mut app, |app| {
+        app.dataset.selected_path().canonicalize().unwrap()
+            == destination.canonicalize().unwrap()
+            && matches!(
+                app.application.snapshot().source(),
+                SourceVerificationSnapshot::Verified(_)
+            )
+            && app.pending_dataset_open.is_none()
+            && app
+                .source_open_service
+                .as_ref()
+                .is_some_and(|service| service.active_token().is_none())
+    });
+    let snapshot = app.application.snapshot();
+    assert_eq!(
+        snapshot
+            .catalog()
+            .scientific_identity()
+            .verified_id()
+            .copied(),
+        Some(receipt.scientific_content_id)
+    );
+
+    let verification = app.source_verification_service.as_ref().unwrap();
+    assert_eq!(verification.diagnostics(), diagnostics_before);
+    assert!(verification.active_token().is_none());
+    assert!(app.pending_automatic_source_verification.is_none());
+
+    if app.project_store.is_some() {
+        close_test_project_store(&mut app);
+    }
+    app.source_open_service.take().unwrap().shutdown().unwrap();
+    app.source_verification_service
+        .take()
+        .unwrap()
+        .shutdown()
+        .unwrap();
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
+fn failed_project_close_retains_imported_authority_without_verifier_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let current_package = write_target_fixture(temp.path()).unwrap();
+    let source = write_source_single_ome_fixture(temp.path()).unwrap();
+    let destination = temp.path().join("retained-after-close-failure.m4d");
+    let inspection = mirante4d_import_pipeline::inspect_tiff(TiffSource::auto(&source)).unwrap();
+    let (_, options) = reviewed_import_options(
+        TiffSource::auto(&source),
+        inspection,
+        destination.clone(),
+    );
+    let published = mirante4d_import_pipeline::import_tiff(
+        options,
+        &TestImportLedger,
+        &ImportCancellation::new(),
+        |_| {},
+    )
+    .unwrap();
+
+    let opened = open_dataset_and_render_first_frame(&current_package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    app.source_open_service = Some(current_source_open_service::CurrentSourceOpenService::new());
+    install_test_project_store(&mut app);
+    verify_test_source(&mut app);
+    app.apply_application_command(
+        ApplicationCommand::AttachVerifiedDataset,
+        &egui::Context::default(),
+    )
+    .unwrap();
+    assert!(app.project_dirty());
+    let original_path = app.dataset.selected_path().canonicalize().unwrap();
+    let verification_before = app
+        .source_verification_service
+        .as_ref()
+        .unwrap()
+        .diagnostics();
+
+    assert!(!app.open_or_queue_imported_dataset(published, None).unwrap());
+    app.egui_ui.close_prompt_open = false;
+    app.close_project_store_before_pending_dataset_open(None)
+        .unwrap();
+    assert_eq!(
+        app.dataset_open_project_close,
+        DatasetOpenProjectCloseState::Waiting
+    );
+    assert!(
+        app.source_open_service
+            .as_ref()
+            .unwrap()
+            .active_token()
+            .is_none()
+    );
+
+    app.handle_project_store_event(ProjectStoreServiceEvent::Closed {
+        request_id: ProjectStoreRequestId::new(1).unwrap(),
+        result: Err(ProjectStoreFault::Corruption {
+            stage: "test_project_close_failure",
+        }),
+    });
+
+    assert_eq!(
+        app.dataset_open_project_close,
+        DatasetOpenProjectCloseState::Failed
+    );
+    assert!(app.egui_ui.close_prompt_open);
+    assert!(app
+        .project_status_message
+        .as_deref()
+        .is_some_and(|message| message.contains("verified import handoff remains retained")));
+    assert!(matches!(
+        app.pending_dataset_open.as_ref(),
+        Some(current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(
+            transfer
+        )) if transfer.destination() == destination
+    ));
+    assert_eq!(
+        app.dataset.selected_path().canonicalize().unwrap(),
+        original_path
+    );
+    assert!(
+        app.application
+            .snapshot()
+            .active_operations()
+            .iter()
+            .all(|operation| operation.kind() != OperationKind::DatasetOpen)
+    );
+    assert!(
+        app.source_open_service
+            .as_ref()
+            .unwrap()
+            .active_token()
+            .is_none()
+    );
+    let verification = app.source_verification_service.as_ref().unwrap();
+    assert_eq!(verification.diagnostics(), verification_before);
+    assert!(verification.active_token().is_none());
+    assert!(app
+        .open_or_queue_dataset_path(temp.path().join("must-not-replace-retained.m4d"), None)
+        .is_err());
+    assert!(matches!(
+        app.pending_dataset_open.as_ref(),
+        Some(current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(_))
+    ));
+
+    app.egui_ui.close_prompt_open = false;
+    assert!(
+        app.close_project_store_before_pending_dataset_open(None)
+            .is_err()
+    );
+    assert!(app.egui_ui.close_prompt_open);
+    app.cancel_pending_dataset_open();
+    assert!(app.pending_dataset_open.is_none());
+    assert_eq!(
+        app.dataset_open_project_close,
+        DatasetOpenProjectCloseState::NotRequested
+    );
+
+    app.source_open_service.take().unwrap().shutdown().unwrap();
+    app.source_verification_service
+        .take()
+        .unwrap()
+        .shutdown()
+        .unwrap();
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
+fn imported_transfer_drift_fails_closed_without_external_open_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let current_package = write_target_fixture(temp.path()).unwrap();
+    let source = write_source_single_ome_fixture(temp.path()).unwrap();
+    let destination = temp.path().join("drifted-import.m4d");
+    let inspection = mirante4d_import_pipeline::inspect_tiff(TiffSource::auto(&source)).unwrap();
+    let (_, options) = reviewed_import_options(
+        TiffSource::auto(&source),
+        inspection,
+        destination.clone(),
+    );
+    let published = mirante4d_import_pipeline::import_tiff(
+        options,
+        &TestImportLedger,
+        &ImportCancellation::new(),
+        |_| {},
+    )
+    .unwrap();
+    fs::write(destination.join("unlisted-after-publication.bin"), b"foreign").unwrap();
+
+    let opened = open_dataset_and_render_first_frame(&current_package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    app.source_open_service = Some(current_source_open_service::CurrentSourceOpenService::new());
+    install_test_project_store(&mut app);
+    app.source_verification_service = Some(
+        current_source_verification_service::CurrentSourceVerificationService::new(),
+    );
+    let original_path = app.dataset.selected_path().canonicalize().unwrap();
+
+    assert!(app.open_or_queue_imported_dataset(published, None).unwrap());
+    assert_eq!(
+        app.dataset_open_project_close,
+        DatasetOpenProjectCloseState::Waiting
+    );
+    wait_for_test_app(&mut app, |app| {
+        app.source_open_service
+            .as_ref()
+            .is_some_and(|service| service.active_token().is_none())
+            && app.project_store.is_some()
+            && app.project_status_message.as_deref().is_some_and(|message| {
+                message.contains("current dataset and its project storage remain available")
+            })
+    });
+
+    assert_eq!(
+        app.dataset.selected_path().canonicalize().unwrap(),
+        original_path
+    );
+    assert_eq!(app.application.snapshot().source_generation().get(), 1);
+    assert!(app.application.snapshot().active_operations().is_empty());
+    assert_eq!(
+        app.project_status_message.as_deref(),
+        Some(
+            "The package was created and remains on disk, but Mirante4D could not complete its verified imported open; the current dataset and its project storage remain available."
+        )
+    );
+    assert_eq!(
+        app.dataset_open_project_close,
+        DatasetOpenProjectCloseState::NotRequested
+    );
+    assert_eq!(
+        app.project_store.as_ref().unwrap().status().lifecycle(),
+        ProjectStoreLifecycle::Unbound
+    );
+    let verification = app.source_verification_service.as_ref().unwrap();
+    assert_eq!(verification.diagnostics(), Default::default());
+    assert!(verification.active_token().is_none());
+
+    close_test_project_store(&mut app);
+    app.source_open_service.take().unwrap().shutdown().unwrap();
+    app.source_verification_service
+        .take()
+        .unwrap()
+        .shutdown()
+        .unwrap();
+    app.dataset.request_shutdown().unwrap();
 }
 
 struct TestImportLease {
@@ -310,13 +684,16 @@ fn import_verify_analyze_save_and_reopen_atomically() {
     let inspection = mirante4d_import_pipeline::inspect_tiff(TiffSource::auto(&source)).unwrap();
     let (_, options) =
         reviewed_import_options(TiffSource::auto(&source), inspection, package.clone());
-    mirante4d_import_pipeline::import_tiff(
+    let published = mirante4d_import_pipeline::import_tiff(
         options,
         &TestImportLedger,
         &ImportCancellation::new(),
         |_| {},
     )
     .unwrap();
+    // This test intentionally exercises a later independent external open;
+    // the direct verified-import handoff is covered separately above.
+    drop(published);
     assert!(package.is_dir());
     assert_eq!(
         fs::read_dir(&source)

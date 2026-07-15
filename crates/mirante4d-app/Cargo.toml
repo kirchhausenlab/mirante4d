@@ -25,6 +25,7 @@ mirante4d-settings.workspace = true
 mirante4d-storage.workspace = true
 mirante4d-ui-egui.workspace = true
 rfd.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

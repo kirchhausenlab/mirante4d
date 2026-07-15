@@ -9,11 +9,91 @@ use std::{fs, path::PathBuf};
 use mirante4d_dataset_runtime::{DatasetRuntimeConfig, DatasetRuntimeDiagnostics};
 
 #[test]
+fn import_raw_evidence_serializes_the_complete_statistics_surface() {
+    let statistics = ImportStatistics::default();
+    let evidence = import_statistics_json(&statistics);
+
+    for field in [
+        "source_bytes_read",
+        "source_revalidation_bytes_read",
+        "native_decoded_bytes",
+        "base_native_decoded_bytes",
+        "scientific_identity_native_decoded_bytes",
+        "tiff_open_count",
+        "native_chunk_decode_count",
+        "logical_output_bytes",
+        "checkpoint_payload_bytes",
+        "checkpoint_journal_bytes",
+        "checkpoint_watermark_bytes",
+        "checkpoint_durable_work_units",
+        "checkpoint_pending_work_units",
+        "checkpoint_committed_batches",
+        "codec_encode_calls",
+        "codec_encode_time_ns",
+        "codec_decode_calls",
+        "codec_decode_time_ns",
+        "sync_calls",
+        "sync_time_ns",
+        "scientific_brick_reads",
+        "staged_structure_object_reads",
+        "staged_exact_object_reads",
+        "scientific_object_reads",
+        "scientific_payload_object_reads",
+        "scientific_range_requests",
+        "scientific_encoded_bytes_read",
+        "scientific_decoded_bytes",
+        "object_reads",
+        "sampled_peak_open_file_descriptors",
+        "open_file_descriptor_structural_bound",
+        "peak_open_file_descriptors",
+        "preflight_temporary_bytes_bound",
+        "peak_temporary_bytes",
+        "peak_checkpoint_regular_files",
+        "peak_working_bytes",
+        "peak_process_rss_bytes",
+        "resumed_work_units",
+        "produced_work_units",
+        "primary_wall_time_ns",
+        "primary_cpu_time_ns",
+        "stages",
+    ] {
+        assert!(evidence.get(field).is_some(), "missing raw field {field}");
+    }
+
+    let primary = import_primary_measurement_json(Some(ImportPrimaryMeasurement {
+        started_at_epoch_ms: 10,
+        open_ready_at_epoch_ms: 20,
+        wall_time_ns: 30,
+        process_cpu_time_ns: 40,
+    }));
+    assert_eq!(primary["wall_time_ns"], 30);
+    assert_eq!(
+        primary["end_boundary"],
+        "published_destination_verified_and_open_ready_for_normal_product_use"
+    );
+
+    let inspection = import_pre_start_measurement_json(Some(ImportPreStartMeasurement {
+        started_at_epoch_ms: 1,
+        start_command_at_epoch_ms: 2,
+        wall_time_ns: 3,
+        process_cpu_time_ns: 4,
+    }));
+    assert_eq!(inspection["wall_time_ns"], 3);
+    assert_eq!(inspection["process_cpu_time_ns"], 4);
+    assert_eq!(inspection["excluded_from_primary_clock"], true);
+
+    let build = t5_build_provenance_json();
+    for field in ["repository_revision", "profile", "compiler", "target_mode"] {
+        assert!(build.get(field).is_some(), "missing build field {field}");
+    }
+}
+
+#[test]
 fn automation_script_parses_the_b4_project_store_contract() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 2,
+          "schema_version": 3,
           "scenario": "b4_project_store",
           "commands": [
             { "command": "set_mapped_client_pixels", "width": 1280, "height": 720 },
@@ -144,7 +224,7 @@ fn automation_script_parses_semantic_camera_commands() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 2,
+          "schema_version": 3,
           "scenario": "unit",
           "limits": {
             "max_cpu_total_bytes": 1024,
@@ -189,7 +269,7 @@ fn automation_script_parses_source_verification_evidence_workflow() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 2,
+          "schema_version": 3,
           "scenario": "b3_source_verification",
           "commands": [
             { "command": "set_render_target_size", "width": 1280, "height": 720 },
@@ -227,11 +307,53 @@ fn automation_script_parses_source_verification_evidence_workflow() {
 }
 
 #[test]
+fn automation_script_parses_normal_import_cancel_resume_workflow() {
+    let raw = r#"
+        {
+          "schema": "mirante4d-product-automation-script",
+          "schema_version": 3,
+          "scenario": "import_preprocessing",
+          "commands": [
+            { "command": "begin_tiff_import_setup", "source": "/tmp/source", "output_parent": "/tmp/output" },
+            { "command": "wait_for", "condition": "import_review_ready", "timeout_ms": 1000 },
+            { "command": "start_reviewed_import", "spacing_zyx_um": [0.4, 0.2, 0.1], "time_step_seconds": null, "no_data_sentinel": 255, "working_memory_bytes": 268435456 },
+            { "command": "wait_for_import_progress", "stage": "base-production", "minimum_completed_work_units": 512, "timeout_ms": 1000 },
+            { "command": "cancel_import" },
+            { "command": "wait_for", "condition": "import_idle", "timeout_ms": 1000 },
+            { "command": "wait_for_imported_open_ready", "path": "/tmp/output/source.m4d", "timeout_ms": 1000 },
+            { "command": "assert", "condition": { "import_workflow_evidence": {
+              "required_stage_names": ["base-production", "commit"],
+              "min_projected_named_stages": 1,
+              "min_cancelled_runs": 1,
+              "min_successful_runs": 1,
+              "min_resumed_work_units": 512,
+              "min_elapsed_ms": 1,
+              "min_projected_elapsed_ms": 1,
+              "max_peak_working_bytes": 268435456
+            } } },
+            { "command": "quit" }
+          ]
+        }"#;
+
+    let script: ProductAutomationScript = serde_json::from_str(raw).unwrap();
+    script.validate().unwrap();
+    assert_eq!(script.commands[0].name(), "begin_tiff_import_setup");
+    assert_eq!(script.commands[2].name(), "start_reviewed_import");
+    assert_eq!(script.commands[3].name(), "wait_for_import_progress");
+    assert_eq!(script.commands[4].name(), "cancel_import");
+    assert_eq!(script.commands[6].name(), "wait_for_imported_open_ready");
+    let ProductAutomationCommand::Assert { condition } = &script.commands[7] else {
+        panic!("expected import evidence assertion");
+    };
+    assert_eq!(condition.name(), "import_workflow_evidence");
+}
+
+#[test]
 fn automation_script_parses_retained_four_panel_assertions() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 2,
+          "schema_version": 3,
           "scenario": "unit_four_panel",
           "commands": [
             { "command": "set_viewer_layout", "layout": "four_panel" },

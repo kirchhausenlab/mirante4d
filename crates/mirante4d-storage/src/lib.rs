@@ -21,6 +21,7 @@ mod package_integrity;
 mod package_read;
 mod package_science;
 mod package_structure;
+mod package_validation_reads;
 mod package_write;
 mod packed_index;
 mod paths;
@@ -66,13 +67,16 @@ pub use package_catalog::{LocalPackageCatalog, PackageOpenError};
 pub use package_integrity::{ExactPackageCapability, PackageValidationError};
 pub use package_read::{LocalBrickRead, PackageReadError};
 pub use package_science::{
-    ScientificPackageValidationError, ScientificValidationReport,
-    VerifiedScientificPackageCapability,
+    SCIENTIFIC_PUBLICATION_CURRENTNESS_CONTRACT_ID, ScientificPackageValidationError,
+    ScientificPublicationTransferError, ScientificPublicationTransferEvidence,
+    ScientificValidationReport, VerifiedScientificPackageCapability,
 };
 pub use package_structure::PackageStructureError;
+pub use package_validation_reads::{PackageCodecReport, PackageValidationReadReport};
 pub use package_write::{
-    LocalPackageWriter, PackageArrayInput, PackageShardInput, PackageWriteError, PackageWriteInput,
-    PackageWriteReceipt,
+    LocalPackageWriter, PackageArrayInput, PackageShardInput, PackageWriteError, PackageWriteEvent,
+    PackageWriteInput, PackageWriteReceipt, PackageWriteStage, PackageWriteStageTiming,
+    PublishedScientificPackageTransfer,
 };
 pub use packed_index::{
     PackedIndexCoordinates, PackedIndexError, PackedIndexRecord, PackedIndexStatistics,
@@ -89,8 +93,9 @@ pub use range_io::{
     LocalObjectInfo, LocalPackageReader, RangeReadError, SHARD_INDEX_RANGE_READ_BYTES_MAX,
 };
 pub use shard::{
-    ShardCodecError, ShardIndex, ShardIndexEntry, ShardProfileKind, decode_inner_payload,
-    decode_shard_index_tail, encode_inner_payload,
+    CanonicalEncodedInner, INNER_CODEC_WORKING_BYTES_MAX, ShardCodecError, ShardIndex,
+    ShardIndexEntry, ShardProfileKind, decode_inner_payload, decode_shard_index_tail,
+    encode_inner_payload,
 };
 pub use zarr_metadata::{
     MAX_ZARR_METADATA_BYTES, ZarrArrayMetadata, ZarrGroupMetadata, ZarrMetadataError,

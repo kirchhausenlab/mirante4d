@@ -6,13 +6,15 @@ use crate::product_validate::{is_product_validation_scenario_name, product_valid
 use crate::workflow_audit::workflow_audit;
 
 const PRODUCT_VALIDATE_USAGE: &str = "usage: cargo xtask product-validate [target-package] \
-     [target_fixture_camera_smoke|target_fixture_render_modes|target_source_verification|b4_project_persistence]";
+     [target_fixture_camera_smoke|target_fixture_render_modes|target_source_verification|import_preprocessing|b4_project_persistence]";
 
 mod arch;
 mod deps;
 mod dev;
 mod documentation;
 mod host;
+mod import_performance;
+mod import_performance_t5;
 mod package;
 mod process;
 mod product_validate;
@@ -74,6 +76,13 @@ fn main() -> anyhow::Result<()> {
             }
         },
         "workflow-audit" => workflow_audit().map(|path| println!("{}", path.display())),
+        "import-performance-t2" => {
+            import_performance::run(args.collect()).map(|path| println!("{}", path.display()))
+        }
+        "import-performance-t5" => {
+            import_performance_t5::run(args.collect()).map(|path| println!("{}", path.display()))
+        }
+        "__import-performance-t2-worker" => import_performance::run_worker(args.collect()),
         "docs-check" => documentation::docs_check(),
         "run-dev" => dev::run_dev(),
         "help" | "--help" | "-h" => {
@@ -129,9 +138,12 @@ under target/mirante4d/product-validation/. With no package argument, the
 bounded promoted target U16 fixture is extracted locally.
 
 The ordinary bounded scenarios are target_fixture_camera_smoke,
-target_fixture_render_modes, and target_source_verification. The retained
-b4_project_persistence scenario checks project save, recovery, and reopen
-behavior across three application launches.
+target_fixture_render_modes, target_source_verification, and
+import_preprocessing. The import scenario generates a bounded public TIFF
+fixture, cancels and resumes preprocessing, waits for verified publication,
+then renders the imported package. The retained b4_project_persistence
+scenario checks project save, recovery, and reopen behavior across three
+application launches.
 
 Useful controls:
   MIRANTE4D_PRODUCT_VALIDATE_TIMEOUT_SECS=<seconds>
@@ -155,8 +167,13 @@ Mirante4D developer tasks
   cargo xtask package-linux-release
   cargo xtask product-validate [target-package] [scenario]
   cargo xtask workflow-audit
+  cargo run --release -p xtask -- import-performance-t2 [--samples 5] [--qualification-profile PATH]
+  cargo run --release -p xtask -- import-performance-t5 --config /absolute/private/config.json [--diagnostic]
   cargo xtask docs-check
   cargo xtask run-dev
+
+T2 and T5 qualification require matching local, non-repository qualification profiles.
+T5 also requires an owner-pinned private configuration; --diagnostic never qualifies.
 
 Run cargo xtask product-validate --help for scenario details."
     );
@@ -194,6 +211,13 @@ mod tests {
             ProductValidateArgs::Run {
                 package: None,
                 scenario: Some("b4_project_persistence".to_owned())
+            }
+        );
+        assert_eq!(
+            product_validate_args(args(&["import_preprocessing"])).unwrap(),
+            ProductValidateArgs::Run {
+                package: None,
+                scenario: Some("import_preprocessing".to_owned())
             }
         );
     }

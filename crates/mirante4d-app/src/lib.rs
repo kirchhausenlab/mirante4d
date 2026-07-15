@@ -85,7 +85,7 @@ use mirante4d_domain::{IntensityDType, Shape3D, TimeIndex};
 use mirante4d_domain::{ScaleLevel, ViewerLayout as CanonicalViewerLayout};
 #[cfg(test)]
 use mirante4d_import_pipeline::ImportCancellation;
-use mirante4d_import_pipeline::{ImportError, ImportOptions, ImportReceipt, TiffSource};
+use mirante4d_import_pipeline::{ImportError, ImportOptions, PublishedImport, TiffSource};
 use mirante4d_project_model::{ProjectId, ProjectRevisionId, ViewState};
 use mirante4d_project_store::{
     ProjectGenerationId, ProjectOpenMode, ProjectRecoveryCandidate, ProjectStoreConfig,
@@ -224,6 +224,16 @@ struct PendingSourceInstall {
     token: OperationToken,
     runtime: current_source_open_service::CurrentSourceRuntimeTransfer,
     completion: OperationCompletion,
+}
+
+/// Pre-dispatch project-close phase used only by an imported verified request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DatasetOpenProjectCloseState {
+    #[default]
+    NotRequested,
+    Waiting,
+    ClosedForImportedOpen,
+    Failed,
 }
 
 #[derive(Default)]
@@ -456,7 +466,8 @@ pub struct MiranteWorkbenchApp {
     pending_analysis_artifact_load: Option<ProjectStoreRequestId>,
     project_store_noninteractive_paths: ProjectStoreNoninteractivePaths,
     project_store_product_evidence: ProjectStoreProductEvidence,
-    pending_dataset_open_path: Option<PathBuf>,
+    pending_dataset_open: Option<current_source_open_service::CurrentSourceOpenRequest>,
+    dataset_open_project_close: DatasetOpenProjectCloseState,
     project_status_message: Option<String>,
     close_after_project_save: bool,
     exit_after_project_close: bool,
@@ -562,7 +573,8 @@ impl MiranteWorkbenchApp {
             pending_analysis_artifact_load: None,
             project_store_noninteractive_paths: ProjectStoreNoninteractivePaths::default(),
             project_store_product_evidence: ProjectStoreProductEvidence::default(),
-            pending_dataset_open_path: None,
+            pending_dataset_open: None,
+            dataset_open_project_close: DatasetOpenProjectCloseState::NotRequested,
             project_status_message,
             close_after_project_save: false,
             exit_after_project_close: false,
@@ -924,11 +936,13 @@ impl MiranteWorkbenchApp {
                         Some("Project changed while saving; save again before closing.".to_owned());
                 } else {
                     self.close_after_project_save = false;
-                    if let Some(path) = self.pending_dataset_open_path.take() {
+                    if self.pending_dataset_open.is_some() {
                         self.egui_ui.close_prompt_open = false;
-                        if let Err(error) = self.replace_state_from_dataset_path(path, None) {
+                        if let Err(error) =
+                            self.continue_pending_dataset_open_after_project_decision(None)
+                        {
                             self.project_status_message =
-                                Some(format!("Dataset open could not start: {error}"));
+                                Some(format!("Dataset open could not begin: {error}"));
                         }
                     } else {
                         self.request_project_store_close_for_exit();
@@ -960,7 +974,8 @@ impl MiranteWorkbenchApp {
                 self.project_store_noninteractive_paths =
                     ProjectStoreNoninteractivePaths::default();
                 self.project_store_product_evidence = ProjectStoreProductEvidence::default();
-                self.pending_dataset_open_path = None;
+                self.pending_dataset_open = None;
+                self.dataset_open_project_close = DatasetOpenProjectCloseState::NotRequested;
                 self.project_status_message = self.project_recovery_root.is_none().then(|| {
                     "Project recovery is unavailable for this source; provisional autosave is disabled."
                         .to_owned()
@@ -1494,7 +1509,7 @@ impl MiranteWorkbenchApp {
             },
             ProjectStoreServiceEvent::CancellationAcknowledged { .. } => {}
             ProjectStoreServiceEvent::Closed { result, .. } => {
-                let close_succeeded = result.is_ok();
+                let close_result_succeeded = result.is_ok();
                 self.project_store_product_evidence.close_result = Some(match result {
                     Ok(()) => ProjectStoreRecordedResult::Succeeded,
                     Err(fault) => {
@@ -1502,19 +1517,26 @@ impl MiranteWorkbenchApp {
                         ProjectStoreRecordedResult::Failed(fault.to_string())
                     }
                 });
-                self.project_store_product_evidence.actor_join =
-                    Some(match self.project_store.take() {
-                        Some(service) => match service.join() {
-                            Ok(()) => ProjectStoreRecordedResult::Succeeded,
-                            Err(error) => {
-                                tracing::warn!(?error, "project-store actor join failed");
-                                ProjectStoreRecordedResult::Failed(format!("{error:?}"))
-                            }
-                        },
-                        None => ProjectStoreRecordedResult::Failed(
+                let (actor_join, actor_join_succeeded) = match self.project_store.take() {
+                    Some(service) => match service.join() {
+                        Ok(()) => (ProjectStoreRecordedResult::Succeeded, true),
+                        Err(error) => {
+                            tracing::warn!(?error, "project-store actor join failed");
+                            (
+                                ProjectStoreRecordedResult::Failed(format!("{error:?}")),
+                                false,
+                            )
+                        }
+                    },
+                    None => (
+                        ProjectStoreRecordedResult::Failed(
                             "project-store actor was unavailable at close completion".to_owned(),
                         ),
-                    });
+                        false,
+                    ),
+                };
+                self.project_store_product_evidence.actor_join = Some(actor_join);
+                let imported_preclose_succeeded = close_result_succeeded && actor_join_succeeded;
                 if self.exit_after_project_close {
                     self.exit_after_project_close = false;
                     self.restart_project_store_after_close = false;
@@ -1525,7 +1547,31 @@ impl MiranteWorkbenchApp {
                         std::thread::spawn(move || drop(pending.runtime));
                     }
                     self.pending_viewport_close = true;
-                } else if self.pending_source_install.is_some() && close_succeeded {
+                } else if self.dataset_open_project_close == DatasetOpenProjectCloseState::Waiting {
+                    if imported_preclose_succeeded {
+                        self.dataset_open_project_close =
+                            DatasetOpenProjectCloseState::ClosedForImportedOpen;
+                        if let Err(error) = self.dispatch_pending_dataset_open(None) {
+                            self.project_status_message =
+                                Some(format!("Dataset open could not start: {error}"));
+                        }
+                    } else {
+                        self.dataset_open_project_close = DatasetOpenProjectCloseState::Failed;
+                        self.egui_ui.close_prompt_open = true;
+                        self.project_status_message = Some(match self.pending_dataset_open.as_ref() {
+                            Some(
+                                current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(_),
+                            ) => "The current project storage could not close cleanly, so the imported package was not opened. Its verified import handoff remains retained; cancel the dataset open, or choose Discard to retry if project storage remains available."
+                                .to_owned(),
+                            Some(current_source_open_service::CurrentSourceOpenRequest::External(_)) => {
+                                "The current project storage could not close cleanly, so the new dataset was not opened. Cancel the dataset open, or choose Discard to retry if project storage remains available."
+                                    .to_owned()
+                            }
+                            None => "The current project storage could not close cleanly."
+                                .to_owned(),
+                        });
+                    }
+                } else if self.pending_source_install.is_some() && close_result_succeeded {
                     self.finish_pending_source_install();
                 } else if self.pending_source_install.is_some() {
                     self.abort_pending_source_install(
@@ -1588,7 +1634,7 @@ impl MiranteWorkbenchApp {
             .unwrap_or(DirtyProjectSaveAction::Unavailable);
         DirtyProjectCloseView::new(
             self.egui_ui.close_prompt_open,
-            self.pending_dataset_open_path.is_some(),
+            self.pending_dataset_open.is_some(),
             save_action,
         )
     }
@@ -1740,6 +1786,17 @@ impl MiranteWorkbenchApp {
         }
     }
 
+    fn restore_project_store_after_failed_imported_open(&mut self) -> bool {
+        if self.dataset_open_project_close != DatasetOpenProjectCloseState::ClosedForImportedOpen {
+            return self.project_store.is_some();
+        }
+        self.dataset_open_project_close = DatasetOpenProjectCloseState::NotRequested;
+        if self.project_store.is_none() {
+            self.restart_unbound_project_store();
+        }
+        self.project_store.is_some()
+    }
+
     fn open_session_from_dialog(&mut self, _ctx: &egui::Context) {
         if let Err(fault) = self
             .application
@@ -1782,21 +1839,198 @@ impl MiranteWorkbenchApp {
         path: PathBuf,
         ctx: Option<&egui::Context>,
     ) -> anyhow::Result<bool> {
+        self.open_or_queue_dataset_request(
+            current_source_open_service::CurrentSourceOpenRequest::External(path),
+            ctx,
+        )
+    }
+
+    fn open_or_queue_imported_dataset(
+        &mut self,
+        published: PublishedImport,
+        ctx: Option<&egui::Context>,
+    ) -> anyhow::Result<bool> {
+        let (_receipt, transfer) = published.into_parts();
+        self.open_or_queue_dataset_request(
+            current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(Box::new(
+                transfer,
+            )),
+            ctx,
+        )
+    }
+
+    fn open_or_queue_dataset_request(
+        &mut self,
+        request: current_source_open_service::CurrentSourceOpenRequest,
+        ctx: Option<&egui::Context>,
+    ) -> anyhow::Result<bool> {
+        if self.pending_dataset_open.is_some() {
+            anyhow::bail!("another dataset-open request is already retained");
+        }
         if self.project_dirty() {
-            self.pending_dataset_open_path = Some(path);
+            self.pending_dataset_open = Some(request);
+            self.dataset_open_project_close = DatasetOpenProjectCloseState::NotRequested;
             self.egui_ui.close_prompt_open = true;
             Ok(false)
+        } else if matches!(
+            &request,
+            current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(_)
+        ) {
+            self.pending_dataset_open = Some(request);
+            self.dataset_open_project_close = DatasetOpenProjectCloseState::NotRequested;
+            self.close_project_store_before_pending_dataset_open(ctx)?;
+            Ok(true)
         } else {
-            self.replace_state_from_dataset_path(path, ctx)?;
+            self.replace_state_from_dataset_request(request, ctx)?;
             Ok(true)
         }
     }
 
-    fn replace_state_from_dataset_path(
+    fn continue_pending_dataset_open_after_project_decision(
         &mut self,
-        path: PathBuf,
         ctx: Option<&egui::Context>,
     ) -> anyhow::Result<()> {
+        match self.pending_dataset_open.as_ref() {
+            Some(current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(_)) => {
+                self.close_project_store_before_pending_dataset_open(ctx)
+            }
+            Some(current_source_open_service::CurrentSourceOpenRequest::External(_)) => {
+                if self.dataset_open_project_close != DatasetOpenProjectCloseState::NotRequested {
+                    anyhow::bail!("an external dataset open entered imported-close state");
+                }
+                let request = self
+                    .pending_dataset_open
+                    .take()
+                    .expect("the retained external request was just observed");
+                self.replace_state_from_dataset_request(request, ctx)
+            }
+            None => anyhow::bail!("no dataset-open request is retained"),
+        }
+    }
+
+    /// Retains the exact linear open request until the current project-store
+    /// actor reports a successful close and joins successfully.
+    fn close_project_store_before_pending_dataset_open(
+        &mut self,
+        ctx: Option<&egui::Context>,
+    ) -> anyhow::Result<()> {
+        if !matches!(
+            self.pending_dataset_open.as_ref(),
+            Some(current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(_))
+        ) {
+            anyhow::bail!("no imported verified dataset-open request is retained");
+        }
+        if self.dataset_open_project_close == DatasetOpenProjectCloseState::Waiting {
+            if let Some(ctx) = ctx {
+                request_background_work_repaint_after(ctx);
+            }
+            return Ok(());
+        }
+
+        let lifecycle = self
+            .project_store
+            .as_ref()
+            .map(|service| service.status().lifecycle());
+        match lifecycle {
+            None if self.dataset_open_project_close == DatasetOpenProjectCloseState::Failed => {
+                self.egui_ui.close_prompt_open = true;
+                anyhow::bail!(
+                    "current project storage is unavailable after its failed close; cancel the retained dataset open"
+                );
+            }
+            None => return self.dispatch_pending_dataset_open(ctx),
+            Some(ProjectStoreLifecycle::Closed)
+                if self.dataset_open_project_close == DatasetOpenProjectCloseState::Failed =>
+            {
+                self.egui_ui.close_prompt_open = true;
+                anyhow::bail!(
+                    "current project storage is closed after its failed close; cancel the retained dataset open"
+                );
+            }
+            Some(ProjectStoreLifecycle::Closed) => {
+                let service = self
+                    .project_store
+                    .take()
+                    .expect("the closed project-store lifecycle was just observed");
+                if let Err(error) = service.join() {
+                    self.dataset_open_project_close = DatasetOpenProjectCloseState::Failed;
+                    self.egui_ui.close_prompt_open = true;
+                    anyhow::bail!("project-store actor join failed: {error:?}");
+                }
+                self.dataset_open_project_close =
+                    DatasetOpenProjectCloseState::ClosedForImportedOpen;
+                return self.dispatch_pending_dataset_open(ctx);
+            }
+            Some(ProjectStoreLifecycle::Closing) => {
+                self.dataset_open_project_close = DatasetOpenProjectCloseState::Waiting;
+            }
+            Some(_) => {
+                let close = self
+                    .project_store
+                    .as_mut()
+                    .expect("the active project-store lifecycle was just observed")
+                    .close();
+                match close {
+                    Ok(_) => {
+                        self.dataset_open_project_close = DatasetOpenProjectCloseState::Waiting;
+                    }
+                    Err(mirante4d_application::ProjectStoreServiceError::Closing) => {
+                        self.dataset_open_project_close = DatasetOpenProjectCloseState::Waiting;
+                    }
+                    Err(error) => {
+                        self.dataset_open_project_close = DatasetOpenProjectCloseState::Failed;
+                        self.egui_ui.close_prompt_open = true;
+                        anyhow::bail!("current project storage could not close: {error:?}");
+                    }
+                }
+            }
+        }
+        if let Some(ctx) = ctx {
+            request_background_work_repaint_after(ctx);
+        }
+        Ok(())
+    }
+
+    fn dispatch_pending_dataset_open(&mut self, ctx: Option<&egui::Context>) -> anyhow::Result<()> {
+        if self.project_store.is_some() {
+            anyhow::bail!("current project storage is not fully closed");
+        }
+        if !matches!(
+            self.pending_dataset_open.as_ref(),
+            Some(current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(_))
+        ) {
+            anyhow::bail!("the retained request is not an imported verified open");
+        }
+        let request = self
+            .pending_dataset_open
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no dataset-open request is retained"))?;
+        if let Err(error) = self.replace_state_from_dataset_request(request, ctx) {
+            self.restore_project_store_after_failed_imported_open();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn cancel_pending_dataset_open(&mut self) {
+        self.pending_dataset_open = None;
+        self.dataset_open_project_close = DatasetOpenProjectCloseState::NotRequested;
+    }
+
+    fn replace_state_from_dataset_request(
+        &mut self,
+        request: current_source_open_service::CurrentSourceOpenRequest,
+        ctx: Option<&egui::Context>,
+    ) -> anyhow::Result<()> {
+        if matches!(
+            &request,
+            current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(_)
+        ) && self.project_store.is_some()
+        {
+            anyhow::bail!(
+                "current project storage must close before imported dataset-open dispatch"
+            );
+        }
         self.application
             .dispatch(ApplicationCommand::RequestDatasetOpen)
             .map_err(|fault| anyhow::anyhow!("dataset open command rejected: {fault:?}"))?;
@@ -1816,7 +2050,7 @@ impl MiranteWorkbenchApp {
             );
             anyhow::bail!("dataset open service is unavailable");
         };
-        if let Err(error) = service.request_open(token.clone(), path, resource_policy) {
+        if let Err(error) = service.request_open(token.clone(), request, resource_policy) {
             self.complete_source_operation(
                 token,
                 OperationCompletion::Failed(OperationFailureCode::DatasetReadFailed),
@@ -1986,6 +2220,18 @@ impl MiranteWorkbenchApp {
             Err(error) => {
                 tracing::error!(%error, "dataset open worker failed");
                 if let Some(token) = active_token {
+                    if self.dataset_open_project_close
+                        == DatasetOpenProjectCloseState::ClosedForImportedOpen
+                    {
+                        let restored_project_store =
+                            self.restore_project_store_after_failed_imported_open();
+                        if restored_project_store {
+                            self.project_status_message = Some(
+                                "The verified imported open worker failed; the current dataset and its project storage remain available."
+                                    .to_owned(),
+                            );
+                        }
+                    }
                     self.complete_source_operation(
                         token,
                         OperationCompletion::Failed(OperationFailureCode::DatasetReadFailed),
@@ -1995,6 +2241,7 @@ impl MiranteWorkbenchApp {
             }
         };
         let token = result.token;
+        let origin = result.origin;
         match result.outcome {
             current_source_open_service::CurrentSourceOpenOutcome::Prepared(prepared) => {
                 let (runtime, completion) = prepared.into_runtime_and_completion();
@@ -2010,6 +2257,7 @@ impl MiranteWorkbenchApp {
                         tracing::warn!(%error, "stale dataset runtime shutdown request failed");
                     }
                     std::thread::spawn(move || drop(runtime));
+                    self.restore_project_store_after_failed_imported_open();
                     return;
                 }
                 let pending = PendingSourceInstall {
@@ -2041,9 +2289,25 @@ impl MiranteWorkbenchApp {
                 }
             }
             current_source_open_service::CurrentSourceOpenOutcome::Cancelled => {
+                if origin == current_source_open_service::CurrentSourceOpenOrigin::ImportedVerified
+                {
+                    self.restore_project_store_after_failed_imported_open();
+                }
                 self.complete_source_operation(token, OperationCompletion::Cancelled);
             }
             current_source_open_service::CurrentSourceOpenOutcome::Failed(code) => {
+                if origin == current_source_open_service::CurrentSourceOpenOrigin::ImportedVerified
+                {
+                    let restored_project_store =
+                        self.restore_project_store_after_failed_imported_open();
+                    self.project_status_message = Some(if restored_project_store {
+                        "The package was created and remains on disk, but Mirante4D could not complete its verified imported open; the current dataset and its project storage remain available."
+                            .to_owned()
+                    } else {
+                        "The package was created and remains on disk, but Mirante4D could not complete its verified imported open; it was not installed as the current dataset. Project storage remains unavailable, so reopen the application before saving again."
+                            .to_owned()
+                    });
+                }
                 self.complete_source_operation(token, OperationCompletion::Failed(code));
             }
         }
@@ -2086,10 +2350,14 @@ impl MiranteWorkbenchApp {
             }
         } else {
             tracing::warn!("stale dataset open result was suppressed");
-            self.project_status_message = Some(
+            let restored_project_store = self.restore_project_store_after_failed_imported_open();
+            self.project_status_message = Some(if restored_project_store {
+                "The prepared dataset became stale; the current dataset and its project storage remain available."
+                    .to_owned()
+            } else {
                 "The prepared dataset became stale; the current project remains closed and the application must be reopened before saving again."
-                    .to_owned(),
-            );
+                    .to_owned()
+            });
             if let Err(error) = pending.runtime.dataset.request_shutdown() {
                 tracing::warn!(%error, "stale dataset runtime shutdown request failed");
             }
@@ -2229,9 +2497,13 @@ impl MiranteWorkbenchApp {
         if let Err(error) = old_dataset.request_shutdown() {
             tracing::warn!(%error, "replaced dataset runtime shutdown request failed");
         }
+        let snapshot = self.application.snapshot();
         self.pending_automatic_source_verification =
-            Some(self.application.snapshot().source_generation());
-        self.try_start_pending_automatic_source_verification();
+            matches!(snapshot.source(), SourceVerificationSnapshot::Required)
+                .then(|| snapshot.source_generation());
+        if self.pending_automatic_source_verification.is_some() {
+            self.try_start_pending_automatic_source_verification();
+        }
         self.request_opened_state_visible_work(None);
 
         std::thread::spawn(move || {

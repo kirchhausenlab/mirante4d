@@ -10,6 +10,7 @@ use mirante4d_storage::{
 use crate::{
     ImportError, ImportOptions, NoDataPolicy,
     chunk::{chunk_grid, pixel_kind, validity_kind},
+    cpu_chunk::{base_task_charge_bytes, pyramid_task_charge_bytes, scientific_task_charge_bytes},
     publish::{PUBLICATION_VALIDATION_BYTES_MAX, publication_shard_bytes},
     pyramid::pyramid_shapes,
 };
@@ -31,7 +32,10 @@ pub(crate) struct ImportPlan {
     pub pixel_kind: ShardProfileKind,
     pub validity_kind: ShardProfileKind,
     pub work_units: u64,
+    pub logical_output_bytes: u64,
     pub spool_record_bytes: u64,
+    pub source_index_working_bytes: u64,
+    pub resident_working_bytes: u64,
     pub logical_bricks_by_scale: Vec<u64>,
     pub plan_digest: Sha256Digest,
     pub free_space_required: u64,
@@ -45,6 +49,14 @@ impl ImportPlan {
         let explicit_validity = options.no_data.is_some();
         let pixel_kind = pixel_kind(options.inspection.dtype, is_2d);
         let validity_kind = validity_kind(is_2d);
+        let canonical_base_bytes = checked_product([
+            options.inspection.shape.t(),
+            u64::from(options.inspection.channels),
+            options.inspection.shape.z(),
+            options.inspection.shape.y(),
+            options.inspection.shape.x(),
+            u64::from(options.inspection.dtype.bytes_per_sample()),
+        ])?;
 
         let mut logical_bricks_by_scale = Vec::with_capacity(shapes.len());
         let mut work_units = 0_u64;
@@ -116,12 +128,16 @@ impl ImportPlan {
         )?;
 
         let spool_record_bytes = crate::spool::record_memory_bytes(work_units)?;
+        let source_index_working_bytes = options.inspection.source_index_working_bytes;
+        let resident_working_bytes = spool_record_bytes
+            .checked_add(source_index_working_bytes)
+            .ok_or(ImportError::Overflow)?;
         let working_memory_required = working_memory_required(
             options,
             pixel_kind,
             validity_kind,
             is_2d,
-            spool_record_bytes,
+            resident_working_bytes,
         )?;
         if options.working_memory_bytes < working_memory_required {
             return Err(ImportError::WorkingMemoryExceeded {
@@ -132,12 +148,16 @@ impl ImportPlan {
 
         let free_space_required = free_space_required(
             work_units,
+            canonical_base_bytes,
             logical_pixel_bytes,
             logical_validity_bytes,
             addressed_pixel_shards,
             addressed_packed_shards,
         )?;
         let plan_digest = plan_digest(options, &shapes);
+        let logical_output_bytes = logical_pixel_bytes
+            .checked_add(logical_validity_bytes)
+            .ok_or(ImportError::Overflow)?;
 
         Ok(Self {
             shapes,
@@ -146,7 +166,10 @@ impl ImportPlan {
             pixel_kind,
             validity_kind,
             work_units,
+            logical_output_bytes,
             spool_record_bytes,
+            source_index_working_bytes,
+            resident_working_bytes,
             logical_bricks_by_scale,
             plan_digest,
             free_space_required,
@@ -182,6 +205,24 @@ fn validate_request(options: &ImportOptions) -> Result<(), ImportError> {
         return Err(ImportError::InvalidRequest(
             "inspection must declare a positive decoded TIFF chunk bound",
         ));
+    }
+    if options.inspection.maximum_encoded_chunk_bytes == 0 {
+        return Err(ImportError::InvalidRequest(
+            "inspection must declare a positive encoded TIFF chunk bound",
+        ));
+    }
+    let canonical_plane_bytes = options
+        .inspection
+        .shape
+        .y()
+        .checked_mul(options.inspection.shape.x())
+        .and_then(|value| value.checked_mul(u64::from(options.inspection.dtype.bytes_per_sample())))
+        .ok_or(ImportError::Overflow)?;
+    if canonical_plane_bytes > crate::canonical_cache::CANONICAL_PLANE_BYTES_MAX {
+        return Err(ImportError::UnsupportedSource(format!(
+            "one canonical TIFF plane requires {canonical_plane_bytes} bytes, exceeding the fixed {}-byte checkpoint work-unit bound",
+            crate::canonical_cache::CANONICAL_PLANE_BYTES_MAX
+        )));
     }
     if options
         .calibration
@@ -359,7 +400,7 @@ fn working_memory_required(
     pixel: ShardProfileKind,
     validity: ShardProfileKind,
     is_2d: bool,
-    spool_record_bytes: u64,
+    resident_working_bytes: u64,
 ) -> Result<u64, ImportError> {
     let pixel_inner =
         u64::try_from(pixel.decoded_inner_bytes()).map_err(|_| ImportError::Overflow)?;
@@ -385,40 +426,44 @@ fn working_memory_required(
             }
         })
         .ok_or(ImportError::Overflow)?;
-    let source_phase = options
+    let row_bytes = options
+        .inspection
+        .shape
+        .x()
+        .checked_mul(u64::from(options.inspection.dtype.bytes_per_sample()))
+        .ok_or(ImportError::Overflow)?;
+    let maximum_file_pages = options
+        .inspection
+        .files
+        .iter()
+        .map(|file| file.planes)
+        .max()
+        .unwrap_or(1);
+    let common_source_bytes = options
         .inspection
         .maximum_decoded_chunk_bytes
-        .checked_add(crate::source::SOURCE_DECODE_OVERHEAD_BYTES_MAX)
-        .and_then(|value| value.checked_add(pixel_inner.checked_mul(2)?))
-        .and_then(|value| value.checked_add(pixel_encoded))
-        .and_then(|value| {
-            if options.no_data.is_some() {
-                value
-                    .checked_add(pixel_inner)?
-                    .checked_add(validity_inner)?
-                    .checked_add(validity_encoded)
-            } else {
-                Some(value)
-            }
-        })
+        .checked_add(options.inspection.maximum_encoded_chunk_bytes)
+        .and_then(|value| value.checked_add(crate::source::SOURCE_DECODE_FIXED_OVERHEAD_BYTES_MAX))
         .ok_or(ImportError::Overflow)?;
-    let identity_phase = options
-        .inspection
-        .maximum_decoded_chunk_bytes
-        .checked_add(crate::source::SOURCE_DECODE_OVERHEAD_BYTES_MAX)
-        .and_then(|value| {
-            value.checked_add(
-                16_u64
-                    .checked_mul(256)
-                    .and_then(|value| value.checked_mul(256))
-                    .and_then(|value| {
-                        value.checked_mul(u64::from(options.inspection.dtype.bytes_per_sample()))
-                    })?,
-            )
-        })
-        .and_then(|value| value.checked_add(16 * 256 * 256))
-        .and_then(|value| value.checked_add((16 * 256 * 256) / 8))
+    let serial_transition_bytes = if maximum_file_pages > 1 {
+        crate::source::SOURCE_SERIAL_TRANSITION_BYTES_MAX
+    } else {
+        0
+    };
+    let serial_source_phase = common_source_bytes
+        .checked_add(
+            crate::source::retained_decoder_bytes(maximum_file_pages)
+                .ok_or(ImportError::Overflow)?,
+        )
+        .and_then(|value| value.checked_add(serial_transition_bytes))
+        .and_then(|value| value.checked_add(row_bytes))
+        .and_then(|value| value.checked_add(crate::source::SOURCE_TASK_METADATA_BYTES_MAX))
         .ok_or(ImportError::Overflow)?;
+    // Full-plane materialization is an optional acceleration. Runtime falls
+    // back to this mandatory row-streaming phase when the parallel task does
+    // not fit, so admission must not make the optimization compulsory.
+    let source_phase = serial_source_phase;
+    let identity_phase = scientific_task_charge_bytes(options.inspection.dtype)?;
     let publication_phase = publication_shard_bytes(pixel)?
         .max(if options.no_data.is_some() {
             publication_shard_bytes(validity)?
@@ -426,18 +471,33 @@ fn working_memory_required(
             0
         })
         .max(publication_shard_bytes(ShardProfileKind::PackedIndex)?);
+    let worker_phase = base_task_charge_bytes(
+        options.inspection.dtype,
+        pixel,
+        validity,
+        options.no_data.is_some(),
+    )?
+    .max(pyramid_task_charge_bytes(
+        options.inspection.dtype,
+        pixel,
+        validity,
+        is_2d,
+        options.no_data.is_some(),
+    )?);
     let transient = source_phase
         .max(pyramid_phase)
         .max(identity_phase)
         .max(publication_phase)
+        .max(worker_phase)
         .max(PUBLICATION_VALIDATION_BYTES_MAX);
-    spool_record_bytes
+    resident_working_bytes
         .checked_add(transient)
         .ok_or(ImportError::Overflow)
 }
 
 fn free_space_required(
     work_units: u64,
+    canonical_base_bytes: u64,
     logical_pixel_bytes: u64,
     logical_validity_bytes: u64,
     pixel_shards: u64,
@@ -466,7 +526,8 @@ fn free_space_required(
         .and_then(|value| value.checked_mul(1_028))
         .ok_or(ImportError::Overflow)?;
     two_encoded_copies
-        .checked_add(work_overhead)
+        .checked_add(canonical_base_bytes)
+        .and_then(|value| value.checked_add(work_overhead))
         .and_then(|value| value.checked_add(tails))
         .and_then(|value| value.checked_add(SPACE_OVERHEAD_BYTES))
         .ok_or(ImportError::Overflow)
@@ -474,7 +535,7 @@ fn free_space_required(
 
 fn plan_digest(options: &ImportOptions, shapes: &[Shape4D]) -> Sha256Digest {
     let mut hasher = Sha256Hasher::new();
-    hasher.update(b"MIRANTE4D-WP11-IMPORT-PLAN-V1\0");
+    hasher.update(b"MIRANTE4D-IMPORT-PLAN-V2\0");
     hasher.update(options.inspection.source_fingerprint.as_bytes());
     hasher.update(options.profile.name().as_bytes());
     hasher.update([match options.inspection.dtype {
@@ -531,6 +592,7 @@ mod tests {
             inspection: TiffInspection {
                 source: TiffSource::auto("source.tif"),
                 files: Vec::new(),
+                source_index_working_bytes: 1,
                 layout: SourceLayout::MultipageStacks,
                 shape,
                 channels: 1,
@@ -539,6 +601,7 @@ mod tests {
                 source_bytes: 1,
                 source_fingerprint: Sha256Digest::parse(&"1".repeat(64)).unwrap(),
                 maximum_decoded_chunk_bytes: 65_536,
+                maximum_encoded_chunk_bytes: 65_536,
             },
             destination: PathBuf::from("output.m4d"),
             checkpoint_directory: PathBuf::from("checkpoint"),
@@ -614,7 +677,7 @@ mod tests {
         let mut options = options(Shape4D::new(1, 1, 2, 2).unwrap());
         let baseline = ImportPlan::new(&options).unwrap();
         let required = baseline
-            .spool_record_bytes
+            .resident_working_bytes
             .checked_add(PUBLICATION_VALIDATION_BYTES_MAX)
             .unwrap();
 

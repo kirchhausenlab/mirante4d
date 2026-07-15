@@ -10,6 +10,9 @@ use eframe::egui;
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, CommandEffect, ProjectStoreLifecycle,
     SourceVerificationSnapshot, WorkspaceSnapshot,
+    import_workflow::{
+        ImportCommand, ImportProgressSnapshot, ImportReviewDraft, ImportWorkflowSnapshot,
+    },
     viewport_interaction::{
         fit_camera_to_shape_preserving_view, orbit_camera, pan_camera, zoom_camera,
     },
@@ -18,14 +21,18 @@ use mirante4d_domain::{
     DisplayWindow, DvrOpacityTransfer, IsoShadingPolicy, LayerTransfer, Opacity, RenderMode,
     RenderState, SamplingPolicy, ViewerLayout,
 };
+use mirante4d_import_pipeline::{ImportReceipt, ImportStatistics, TiffSource};
 use mirante4d_project_model::{LayerViewState, ProjectRevisionId};
 use mirante4d_render_api::RenderExtent;
+use mirante4d_storage::ScientificPublicationTransferEvidence;
+use rustix::time::{ClockId, clock_gettime};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::{
     DVR_DENSITY_SCALE_MAX, DVR_DENSITY_SCALE_MIN, DisplayedFrameFreshness, FrameCompleteness,
-    MiranteWorkbenchApp, application_view, set_render_viewport, viewer_layout::PanelId,
+    MiranteWorkbenchApp, application_view, import_worker_service::ImportWorkerTimingOrigin,
+    set_render_viewport, viewer_layout::PanelId,
 };
 
 mod capture;
@@ -79,7 +86,7 @@ fn assertion_capture_panels(condition: &ProductAutomationAssertCondition) -> Vec
 }
 const AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 const AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-const AUTOMATION_SCHEMA_VERSION: u32 = 2;
+const AUTOMATION_SCHEMA_VERSION: u32 = 3;
 
 fn dispatch_application_command(
     app: &mut MiranteWorkbenchApp,
@@ -157,7 +164,55 @@ pub(crate) struct ProductAutomationController {
     limit_observations: ProductAutomationLimitObservations,
     render_target_override: Option<RenderExtent>,
     requested_mapped_client_pixels: Option<(u32, u32)>,
+    projected_import_stages: Vec<&'static str>,
+    maximum_projected_import_elapsed_ms: u64,
+    active_import_pre_start_origin: Option<ImportPreStartOrigin>,
+    completed_import_pre_start_measurement: Option<ImportPreStartMeasurement>,
+    active_import_timing_origin: Option<ImportWorkerTimingOrigin>,
+    active_import_verification_diagnostics_origin:
+        Option<crate::current_source_verification_service::CurrentSourceVerificationDiagnostics>,
+    completed_import_primary_measurement: Option<ImportPrimaryMeasurement>,
+    completed_publication_to_open_ready_measurement:
+        Option<ImportPublicationToOpenReadyMeasurement>,
     report_written: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImportPrimaryMeasurement {
+    started_at_epoch_ms: u128,
+    open_ready_at_epoch_ms: u128,
+    wall_time_ns: u64,
+    process_cpu_time_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImportPublicationToOpenReadyMeasurement {
+    published_at_epoch_ms: u128,
+    open_ready_at_epoch_ms: u128,
+    wall_time_ns: u64,
+    process_cpu_time_ns: u64,
+    publication_currentness: ScientificPublicationTransferEvidence,
+    source_verification_started_runs: u64,
+    source_verification_progress_updates: u64,
+    source_verification_cancelled_runs: u64,
+    source_verification_failed_runs: u64,
+    source_verification_successes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ImportPreStartOrigin {
+    started_at_epoch_ms: u128,
+    started_at: Instant,
+    process_cpu_time_ns: u64,
+    destination: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImportPreStartMeasurement {
+    started_at_epoch_ms: u128,
+    start_command_at_epoch_ms: u128,
+    wall_time_ns: u64,
+    process_cpu_time_ns: u64,
 }
 
 impl ProductAutomationController {
@@ -225,6 +280,14 @@ impl ProductAutomationController {
             limit_observations: ProductAutomationLimitObservations::default(),
             render_target_override: None,
             requested_mapped_client_pixels: None,
+            projected_import_stages: Vec::new(),
+            maximum_projected_import_elapsed_ms: 0,
+            active_import_pre_start_origin: None,
+            completed_import_pre_start_measurement: None,
+            active_import_timing_origin: None,
+            active_import_verification_diagnostics_origin: None,
+            completed_import_primary_measurement: None,
+            completed_publication_to_open_ready_measurement: None,
             report_written: false,
         }
     }
@@ -270,6 +333,7 @@ impl ProductAutomationController {
         let command = self.script.commands[self.command_index].clone();
         let command_index = self.command_index;
         let command_started = Instant::now();
+        self.observe_import_projection(app);
         let result = self.execute_command(app, ctx, &command);
         if let Err(reason) = self.observe_and_enforce_limits(app) {
             self.events.push(ProductAutomationEvent::failed(
@@ -502,6 +566,383 @@ impl ProductAutomationController {
                 Ok(CommandProgress::Done(json!({
                     "requested": true,
                 })))
+            }
+            ProductAutomationCommand::BeginTiffImportSetup {
+                source,
+                output_parent,
+            } => {
+                if app.import.workers.status().is_active() {
+                    return Err("an import or TIFF inspection is already active".to_owned());
+                }
+                if !source.exists() {
+                    return Err(format!(
+                        "TIFF import source does not exist: {}",
+                        source.display()
+                    ));
+                }
+                if !output_parent.is_dir() {
+                    return Err(format!(
+                        "TIFF import output parent is not a directory: {}",
+                        output_parent.display()
+                    ));
+                }
+                let tiff_source = TiffSource::auto(source);
+                let destination =
+                    crate::import_workflow::tiff_destination(&tiff_source, output_parent);
+                self.active_import_pre_start_origin = Some(ImportPreStartOrigin {
+                    started_at_epoch_ms: epoch_ms(),
+                    process_cpu_time_ns: process_cpu_time_ns(),
+                    started_at: Instant::now(),
+                    destination: destination.clone(),
+                });
+                self.completed_import_pre_start_measurement = None;
+                app.start_tiff_import_setup_task(tiff_source, output_parent.clone(), ctx);
+                if let Some(problem) = app.import.problem.as_ref() {
+                    return Err(format!("TIFF inspection could not start: {problem}"));
+                }
+                Ok(CommandProgress::Done(json!({
+                    "source": source.display().to_string(),
+                    "destination": destination.display().to_string(),
+                    "normal_setup_and_inspection_path": true,
+                })))
+            }
+            ProductAutomationCommand::StartReviewedImport {
+                spacing_zyx_um,
+                time_step_seconds,
+                no_data_sentinel,
+                working_memory_bytes,
+            } => {
+                let ImportWorkflowSnapshot::Review(review) = app.import.snapshot() else {
+                    return Err("no completed TIFF review is ready to start".to_owned());
+                };
+                let draft = ImportReviewDraft {
+                    spacing_zyx_um: *spacing_zyx_um,
+                    calibration_confirmed: true,
+                    time_step_seconds: *time_step_seconds,
+                    no_data_sentinel: *no_data_sentinel,
+                    working_memory_bytes: *working_memory_bytes,
+                };
+                let pre_start_origin =
+                    self.active_import_pre_start_origin
+                        .as_ref()
+                        .ok_or_else(|| {
+                            "reviewed TIFF import has no exact pre-start timing origin".to_owned()
+                        })?;
+                if normalize_path(&pre_start_origin.destination)
+                    != normalize_path(Path::new(&review.destination))
+                {
+                    return Err(
+                        "reviewed TIFF import differs from its pre-start timing origin".to_owned(),
+                    );
+                }
+                let start_command_at_epoch_ms = epoch_ms();
+                let pre_start_wall_time_ns =
+                    u64::try_from(pre_start_origin.started_at.elapsed().as_nanos())
+                        .map_err(|_| "pre-start import wall time overflowed u64".to_owned())?;
+                let pre_start_process_cpu_time_ns = process_cpu_time_ns()
+                    .checked_sub(pre_start_origin.process_cpu_time_ns)
+                    .ok_or_else(|| {
+                        "pre-start import process CPU time moved backwards".to_owned()
+                    })?;
+                let pre_start_measurement = ImportPreStartMeasurement {
+                    started_at_epoch_ms: pre_start_origin.started_at_epoch_ms,
+                    start_command_at_epoch_ms,
+                    wall_time_ns: pre_start_wall_time_ns,
+                    process_cpu_time_ns: pre_start_process_cpu_time_ns,
+                };
+                let verification_diagnostics_origin = app
+                    .source_verification_service
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "reviewed TIFF import has no source-verification service".to_owned()
+                    })?
+                    .diagnostics();
+                app.apply_import_command(
+                    ImportCommand::Start {
+                        review_id: review.review_id,
+                        draft,
+                    },
+                    ctx,
+                );
+                if let Some(problem) = app.import.problem.as_ref() {
+                    return Err(format!("reviewed TIFF import could not start: {problem}"));
+                }
+                if !app.import.workers.status().is_importing() {
+                    return Err("reviewed TIFF import did not create an active worker".to_owned());
+                }
+                let timing_origin = app
+                    .import
+                    .workers
+                    .active_import_timing_origin()
+                    .ok_or_else(|| {
+                        "reviewed TIFF import has no exact worker timing origin".to_owned()
+                    })?;
+                self.active_import_timing_origin = Some(timing_origin.clone());
+                self.active_import_verification_diagnostics_origin =
+                    Some(verification_diagnostics_origin);
+                self.completed_import_primary_measurement = None;
+                self.completed_publication_to_open_ready_measurement = None;
+                self.completed_import_pre_start_measurement = Some(pre_start_measurement);
+                self.active_import_pre_start_origin = None;
+                Ok(CommandProgress::Done(json!({
+                    "review_id": review.review_id.get(),
+                    "destination": review.destination,
+                    "operation_token": operation_token_json(&timing_origin.token),
+                    "reviewed_source_fingerprint_sha256": timing_origin.source_fingerprint.to_string(),
+                    "reviewed_source_bytes": timing_origin.reviewed_source_bytes,
+                    "working_memory_bytes": working_memory_bytes,
+                    "primary_clock_started_at_epoch_ms": timing_origin.started_at_epoch_ms,
+                    "primary_clock_start_boundary": "accepted_start_import_command_immediately_before_worker_spawn",
+                    "normal_review_command_path": true,
+                })))
+            }
+            ProductAutomationCommand::WaitForImportProgress {
+                stage,
+                minimum_completed_work_units,
+                timeout_ms,
+            } => {
+                let started = *self.active_wait_started.get_or_insert_with(Instant::now);
+                let diagnostics = app.import.workers.diagnostics();
+                let completed = diagnostics.maximum_completed_for_name(stage);
+                if completed >= *minimum_completed_work_units {
+                    Ok(CommandProgress::Done(json!({
+                        "stage": stage,
+                        "minimum_completed_work_units": minimum_completed_work_units,
+                        "observed_completed_work_units": completed,
+                        "waited_ms": duration_ms(started.elapsed()),
+                    })))
+                } else if started.elapsed() >= Duration::from_millis(*timeout_ms) {
+                    Err(format!(
+                        "timed out after {timeout_ms} ms waiting for import stage {stage:?} to reach {minimum_completed_work_units} work units; observed {completed}"
+                    ))
+                } else if !app.import.workers.status().is_importing() {
+                    Err(format!(
+                        "import stopped before stage {stage:?} reached {minimum_completed_work_units} work units; observed {completed}"
+                    ))
+                } else {
+                    Ok(CommandProgress::Waiting)
+                }
+            }
+            ProductAutomationCommand::CancelImport => {
+                if !app.import.workers.status().is_importing() {
+                    return Err("cancel_import requires an active import".to_owned());
+                }
+                app.apply_import_command(ImportCommand::CancelImport, ctx);
+                Ok(CommandProgress::Done(json!({
+                    "cancellation_requested": true,
+                    "normal_import_command_path": true,
+                })))
+            }
+            ProductAutomationCommand::WaitForImportedOpenReady { path, timeout_ms } => {
+                let started = *self.active_wait_started.get_or_insert_with(Instant::now);
+                let snapshot = app.application.snapshot();
+                let selected_matches =
+                    normalize_path(app.dataset.selected_path()) == normalize_path(path);
+                let verified = matches!(snapshot.source(), SourceVerificationSnapshot::Verified(_))
+                    && app
+                        .source_verification_service
+                        .as_ref()
+                        .is_some_and(|service| service.active_token().is_none());
+                let import_idle = !app.import.workers.status().is_active();
+                if selected_matches && verified && import_idle && app.import.problem.is_none() {
+                    let timing_origin =
+                        self.active_import_timing_origin.as_ref().ok_or_else(|| {
+                            "import became open-ready without an exact worker timing origin"
+                                .to_owned()
+                        })?;
+                    let open_ready_at = Instant::now();
+                    let open_ready_at_epoch_ms = epoch_ms();
+                    let open_ready_process_cpu_time_ns = process_cpu_time_ns();
+                    let wall_time_ns = u64::try_from(
+                        open_ready_at
+                            .checked_duration_since(timing_origin.started_at)
+                            .ok_or_else(|| "primary-clock instant moved backwards".to_owned())?
+                            .as_nanos(),
+                    )
+                    .map_err(|_| "primary-clock wall time overflowed u64".to_owned())?;
+                    let process_cpu_time_ns = open_ready_process_cpu_time_ns
+                        .checked_sub(timing_origin.process_cpu_time_ns)
+                        .ok_or_else(|| {
+                            "primary-clock process CPU time moved backwards".to_owned()
+                        })?;
+                    let diagnostics = app.import.workers.diagnostics();
+                    let successful =
+                        diagnostics.last_successful_import.as_ref().ok_or_else(|| {
+                            "import became open-ready without retained successful import evidence"
+                                .to_owned()
+                        })?;
+                    if successful.review_id != timing_origin.review_id
+                        || successful.token != timing_origin.token
+                        || successful.source_fingerprint != timing_origin.source_fingerprint
+                        || successful.reviewed_source_bytes != timing_origin.reviewed_source_bytes
+                        || normalize_path(&successful.destination)
+                            != normalize_path(&timing_origin.destination)
+                        || normalize_path(path) != normalize_path(&successful.destination)
+                    {
+                        return Err(
+                            "open-ready package, worker timing origin, and successful receipt do not describe the same import"
+                                .to_owned(),
+                        );
+                    }
+                    let publication_transfer = app
+                        .source_open_service
+                        .as_ref()
+                        .and_then(|service| {
+                            service.completed_imported_publication_transfer()
+                        })
+                        .ok_or_else(|| {
+                            "import became open-ready without storage execution evidence for its publication transfer"
+                                .to_owned()
+                        })?;
+                    if normalize_path(publication_transfer.destination()) != normalize_path(path) {
+                        return Err(
+                            "storage publication-transfer evidence is bound to another destination"
+                                .to_owned(),
+                        );
+                    }
+                    let publication_currentness = publication_transfer.execution();
+                    let reconciled_currentness_reads = publication_currentness
+                        .first_inventory_object_reads()
+                        .checked_add(publication_currentness.observed_snapshot_object_reads())
+                        .and_then(|value| {
+                            value.checked_add(
+                                publication_currentness.second_inventory_object_reads(),
+                            )
+                        });
+                    if publication_currentness.expected_snapshot_object_reads() == 0
+                        || publication_currentness.first_inventory_object_reads() == 0
+                        || publication_currentness.first_inventory_object_reads()
+                            != publication_currentness.second_inventory_object_reads()
+                        || publication_currentness.observed_snapshot_object_reads()
+                            != publication_currentness.expected_snapshot_object_reads()
+                        || reconciled_currentness_reads
+                            != Some(publication_currentness.observed_total_object_reads())
+                        || publication_currentness.observed_codec_decode_calls() != 0
+                    {
+                        return Err(
+                            "storage publication-transfer execution evidence violated its currentness contract"
+                                .to_owned(),
+                        );
+                    }
+                    let published = successful.published_timing.as_ref().ok_or_else(|| {
+                        "successful import has no exact Published-event timing".to_owned()
+                    })?;
+                    if published.published_at < timing_origin.started_at {
+                        return Err(
+                            "successful import Published-event timing precedes its worker origin"
+                                .to_owned(),
+                        );
+                    }
+                    let publication_to_open_ready_wall_time_ns = u64::try_from(
+                        open_ready_at
+                            .checked_duration_since(published.published_at)
+                            .ok_or_else(|| {
+                                "publication-to-open-ready instant moved backwards".to_owned()
+                            })?
+                            .as_nanos(),
+                    )
+                    .map_err(|_| "publication-to-open-ready wall time overflowed u64".to_owned())?;
+                    let publication_to_open_ready_process_cpu_time_ns =
+                        open_ready_process_cpu_time_ns
+                            .checked_sub(published.process_cpu_time_ns)
+                            .ok_or_else(|| {
+                                "publication-to-open-ready process CPU time moved backwards"
+                                    .to_owned()
+                            })?;
+                    let verification_origin = self
+                        .active_import_verification_diagnostics_origin
+                        .take()
+                        .ok_or_else(|| {
+                            "import became open-ready without source-verification diagnostics origin"
+                                .to_owned()
+                        })?;
+                    let verification_current = app
+                        .source_verification_service
+                        .as_ref()
+                        .ok_or_else(|| {
+                            "import became open-ready without source-verification diagnostics"
+                                .to_owned()
+                        })?
+                        .diagnostics();
+                    let source_verification_started_runs = verification_current
+                        .started_runs
+                        .checked_sub(verification_origin.started_runs)
+                        .ok_or_else(|| {
+                            "source-verification started-run counter regressed".to_owned()
+                        })?;
+                    let source_verification_progress_updates = verification_current
+                        .accepted_progress_updates
+                        .checked_sub(verification_origin.accepted_progress_updates)
+                        .ok_or_else(|| {
+                            "source-verification progress counter regressed".to_owned()
+                        })?;
+                    let source_verification_cancelled_runs = verification_current
+                        .cancelled_runs
+                        .checked_sub(verification_origin.cancelled_runs)
+                        .ok_or_else(|| {
+                            "source-verification cancellation counter regressed".to_owned()
+                        })?;
+                    let source_verification_failed_runs = verification_current
+                        .failed_runs
+                        .checked_sub(verification_origin.failed_runs)
+                        .ok_or_else(|| {
+                            "source-verification failed-run counter regressed".to_owned()
+                        })?;
+                    let source_verification_successes = verification_current
+                        .accepted_successes
+                        .checked_sub(verification_origin.accepted_successes)
+                        .ok_or_else(|| {
+                            "source-verification success counter regressed".to_owned()
+                        })?;
+                    if source_verification_started_runs != 0
+                        || source_verification_progress_updates != 0
+                        || source_verification_cancelled_runs != 0
+                        || source_verification_failed_runs != 0
+                        || source_verification_successes != 0
+                    {
+                        return Err(
+                            "imported capability unexpectedly entered the ordinary source-verification route"
+                                .to_owned(),
+                        );
+                    }
+                    let measurement = ImportPrimaryMeasurement {
+                        started_at_epoch_ms: timing_origin.started_at_epoch_ms,
+                        open_ready_at_epoch_ms,
+                        wall_time_ns,
+                        process_cpu_time_ns,
+                    };
+                    self.completed_publication_to_open_ready_measurement =
+                        Some(ImportPublicationToOpenReadyMeasurement {
+                            published_at_epoch_ms: published.published_at_epoch_ms,
+                            open_ready_at_epoch_ms,
+                            wall_time_ns: publication_to_open_ready_wall_time_ns,
+                            process_cpu_time_ns: publication_to_open_ready_process_cpu_time_ns,
+                            publication_currentness,
+                            source_verification_started_runs,
+                            source_verification_progress_updates,
+                            source_verification_cancelled_runs,
+                            source_verification_failed_runs,
+                            source_verification_successes,
+                        });
+                    self.completed_import_primary_measurement = Some(measurement);
+                    self.active_import_timing_origin = None;
+                    Ok(CommandProgress::Done(json!({
+                        "path": path.display().to_string(),
+                        "verified": true,
+                        "import_idle": true,
+                        "normal_product_open_path": true,
+                        "primary_clock": import_primary_measurement_json(Some(measurement)),
+                        "waited_ms": duration_ms(started.elapsed()),
+                    })))
+                } else if started.elapsed() >= Duration::from_millis(*timeout_ms) {
+                    Err(format!(
+                        "timed out after {timeout_ms} ms waiting for imported package {} to become verified and open-ready (selected_matches={selected_matches}, verified={verified}, import_idle={import_idle}, problem={:?})",
+                        path.display(),
+                        app.import.problem,
+                    ))
+                } else {
+                    Ok(CommandProgress::Waiting)
+                }
             }
             ProductAutomationCommand::WaitFor {
                 condition,
@@ -1005,6 +1446,13 @@ impl ProductAutomationController {
                         .as_ref()
                         .is_some_and(|service| service.active_token().is_none())
             }
+            ProductAutomationWaitCondition::ImportReviewReady => {
+                matches!(app.import.snapshot(), ImportWorkflowSnapshot::Review(_))
+            }
+            ProductAutomationWaitCondition::ImportIdle => {
+                !app.import.workers.status().is_active()
+                    && !matches!(app.import.snapshot(), ImportWorkflowSnapshot::Failed(_))
+            }
             ProductAutomationWaitCondition::ProjectStoreIdle => {
                 app.project_store.as_ref().is_some_and(|service| {
                     let status = service.status();
@@ -1165,6 +1613,51 @@ impl ProductAutomationController {
                     Ok(())
                 }
             }
+            ProductAutomationAssertCondition::ImportWorkflowEvidence {
+                required_stage_names,
+                min_projected_named_stages,
+                min_cancelled_runs,
+                min_successful_runs,
+                min_resumed_work_units,
+                min_elapsed_ms,
+                min_projected_elapsed_ms,
+                max_peak_working_bytes,
+            } => {
+                let diagnostics = app.import.workers.diagnostics();
+                let emitted = diagnostics.emitted_stage_names();
+                let missing = required_stage_names
+                    .iter()
+                    .filter(|required| !emitted.contains(&required.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if missing.is_empty()
+                    && self.projected_import_stages.len() >= *min_projected_named_stages
+                    && diagnostics.cancelled_runs >= *min_cancelled_runs
+                    && diagnostics.successful_runs >= *min_successful_runs
+                    && diagnostics.maximum_resumed_work_units >= *min_resumed_work_units
+                    && diagnostics.maximum_elapsed_ms >= *min_elapsed_ms
+                    && self.maximum_projected_import_elapsed_ms >= *min_projected_elapsed_ms
+                    && diagnostics.maximum_peak_working_bytes <= *max_peak_working_bytes
+                    && diagnostics.failed_runs == 0
+                    && diagnostics.published_events >= diagnostics.successful_runs
+                {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "import workflow evidence is incomplete: missing_stages={missing:?}, projected_stages={:?}, projected_elapsed_ms={}, cancelled_runs={}, successful_runs={}, failed_runs={}, published_events={}, resumed_work_units={}, maximum_elapsed_ms={}, peak_working_bytes={} (limit {})",
+                        self.projected_import_stages,
+                        self.maximum_projected_import_elapsed_ms,
+                        diagnostics.cancelled_runs,
+                        diagnostics.successful_runs,
+                        diagnostics.failed_runs,
+                        diagnostics.published_events,
+                        diagnostics.maximum_resumed_work_units,
+                        diagnostics.maximum_elapsed_ms,
+                        diagnostics.maximum_peak_working_bytes,
+                        max_peak_working_bytes,
+                    ))
+                }
+            }
             ProductAutomationAssertCondition::RenderTargetPixels { width, height } => {
                 let frame = product_presentation(app, PanelId::ThreeD).ok_or_else(|| {
                     "no GPU display frame exists for exact-size assertion".to_owned()
@@ -1214,6 +1707,59 @@ impl ProductAutomationController {
                 }
             }
         }
+    }
+
+    fn observe_import_projection(&mut self, app: &MiranteWorkbenchApp) {
+        let ImportWorkflowSnapshot::Importing(execution) = app.import.snapshot() else {
+            return;
+        };
+        self.maximum_projected_import_elapsed_ms = self
+            .maximum_projected_import_elapsed_ms
+            .max(execution.elapsed_ms);
+        let ImportProgressSnapshot::Stage { name, .. } = execution.progress else {
+            return;
+        };
+        if self.projected_import_stages.len() < 64 && !self.projected_import_stages.contains(&name)
+        {
+            self.projected_import_stages.push(name);
+        }
+    }
+
+    fn import_workflow_evidence_json(&self, app: &MiranteWorkbenchApp) -> Value {
+        let diagnostics = app.import.workers.diagnostics();
+        let maximum_completed_by_stage = diagnostics
+            .maximum_completed_by_stage
+            .iter()
+            .map(|(stage, completed)| {
+                json!({
+                    "stage": stage.name(),
+                    "completed_work_units": completed,
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "worker_emitted_stage_names": diagnostics.emitted_stage_names(),
+            "projected_named_stage_observations": self.projected_import_stages,
+            "maximum_projected_elapsed_ms": self.maximum_projected_import_elapsed_ms,
+            "maximum_completed_by_stage": maximum_completed_by_stage,
+            "progress_updates": diagnostics.progress_updates,
+            "published_events": diagnostics.published_events,
+            "cancelled_runs": diagnostics.cancelled_runs,
+            "successful_runs": diagnostics.successful_runs,
+            "failed_runs": diagnostics.failed_runs,
+            "maximum_resumed_work_units": diagnostics.maximum_resumed_work_units,
+            "maximum_peak_working_bytes": diagnostics.maximum_peak_working_bytes,
+            "maximum_elapsed_ms": diagnostics.maximum_elapsed_ms,
+            "inspection_and_review_clock": import_pre_start_measurement_json(self.completed_import_pre_start_measurement),
+            "primary_clock": import_primary_measurement_json(self.completed_import_primary_measurement),
+            "publication_to_open_ready_clock": import_publication_to_open_ready_measurement_json(self.completed_publication_to_open_ready_measurement),
+            "last_successful_receipt": diagnostics
+                .last_successful_import
+                .as_ref()
+                .map(successful_import_evidence_json)
+                .unwrap_or(Value::Null),
+            "fabricated_global_percentage_or_eta_observed": false,
+        })
     }
 
     fn diagnostics_json(&self, app: &MiranteWorkbenchApp) -> Value {
@@ -1300,6 +1846,7 @@ impl ProductAutomationController {
             },
             "project_state": project_state_json(app),
             "project_store_evidence": project_store_evidence_json(app),
+            "import_workflow_evidence": self.import_workflow_evidence_json(app),
         })
     }
 
@@ -1313,6 +1860,7 @@ impl ProductAutomationController {
         if self.report_written {
             return;
         }
+        self.observe_import_projection(app);
         self.report_written = true;
         if status != "passed"
             && let Err(err) = self.capture_failure_artifact(app)
@@ -1365,6 +1913,7 @@ impl ProductAutomationController {
             "finished_at_epoch_ms": epoch_ms(),
             "duration_ms": duration_ms(self.started_at.elapsed()),
             "binary": env::current_exe().ok().map(|path| path.display().to_string()),
+            "build_provenance": t5_build_provenance_json(),
             "script": {
                 "path": self.script_path.display().to_string(),
                 "schema": self.script.schema.clone(),
@@ -1380,6 +1929,7 @@ impl ProductAutomationController {
             },
             "project_state": project_state_json(app),
             "project_store_evidence": project_store_evidence_json(app),
+            "import_workflow_evidence": self.import_workflow_evidence_json(app),
             "events": &self.events,
             "diagnostics": &self.diagnostics,
             "artifacts": self
@@ -1435,6 +1985,214 @@ impl ProductAutomationController {
         self.artifacts.push(artifact);
         Ok(())
     }
+}
+
+fn import_primary_measurement_json(measurement: Option<ImportPrimaryMeasurement>) -> Value {
+    measurement.map_or(Value::Null, |measurement| {
+        json!({
+            "start_boundary": "accepted_start_import_command_immediately_before_worker_spawn",
+            "end_boundary": "published_destination_verified_and_open_ready_for_normal_product_use",
+            "clock": "std_instant_monotonic",
+            "started_at_epoch_ms": measurement.started_at_epoch_ms,
+            "open_ready_at_epoch_ms": measurement.open_ready_at_epoch_ms,
+            "wall_time_ns": measurement.wall_time_ns,
+            "process_cpu_time_ns": measurement.process_cpu_time_ns,
+            "inspection_and_human_review_excluded": true,
+            "published_capability_transfer_and_runtime_open_included": true,
+        })
+    })
+}
+
+fn t5_build_provenance_json() -> Value {
+    json!({
+        "repository_revision": option_env!("MIRANTE4D_T5_BUILD_REVISION"),
+        "profile": option_env!("MIRANTE4D_T5_BUILD_PROFILE"),
+        "compiler": option_env!("MIRANTE4D_T5_BUILD_COMPILER"),
+        "target_mode": option_env!("MIRANTE4D_T5_BUILD_TARGET_MODE"),
+    })
+}
+
+fn import_pre_start_measurement_json(measurement: Option<ImportPreStartMeasurement>) -> Value {
+    measurement.map_or(Value::Null, |measurement| {
+        json!({
+            "start_boundary": "normal_import_setup_command_dispatch",
+            "end_boundary": "reviewed_start_import_command_dispatch",
+            "wall_clock": "std_instant_monotonic",
+            "cpu_clock": "process_cpu_time",
+            "started_at_epoch_ms": measurement.started_at_epoch_ms,
+            "start_command_at_epoch_ms": measurement.start_command_at_epoch_ms,
+            "wall_time_ns": measurement.wall_time_ns,
+            "process_cpu_time_ns": measurement.process_cpu_time_ns,
+            "excluded_from_primary_clock": true,
+            "human_review_interval_included_when_present": true,
+        })
+    })
+}
+
+fn import_publication_to_open_ready_measurement_json(
+    measurement: Option<ImportPublicationToOpenReadyMeasurement>,
+) -> Value {
+    measurement.map_or(Value::Null, |measurement| {
+        json!({
+            "start_boundary": "import_worker_published_event",
+            "end_boundary": "published_destination_verified_and_open_ready_for_normal_product_use",
+            "wall_clock": "std_instant_monotonic",
+            "cpu_clock": "process_cpu_time",
+            "published_at_epoch_ms": measurement.published_at_epoch_ms,
+            "open_ready_at_epoch_ms": measurement.open_ready_at_epoch_ms,
+            "wall_time_ns": measurement.wall_time_ns,
+            "process_cpu_time_ns": measurement.process_cpu_time_ns,
+            "included_in_primary_clock": true,
+            "transfer_mode": "staged_verified_capability",
+            "publication_currentness_execution": {
+                "contract_id": measurement.publication_currentness.contract_id(),
+                "expected_snapshot_object_reads": measurement.publication_currentness.expected_snapshot_object_reads(),
+                "first_inventory_object_reads": measurement.publication_currentness.first_inventory_object_reads(),
+                "observed_snapshot_object_reads": measurement.publication_currentness.observed_snapshot_object_reads(),
+                "second_inventory_object_reads": measurement.publication_currentness.second_inventory_object_reads(),
+                "observed_total_object_reads": measurement.publication_currentness.observed_total_object_reads(),
+                "observed_codec_decode_calls": measurement.publication_currentness.observed_codec_decode_calls(),
+            },
+            "source_verification_started_runs": measurement.source_verification_started_runs,
+            "source_verification_progress_updates": measurement.source_verification_progress_updates,
+            "source_verification_cancelled_runs": measurement.source_verification_cancelled_runs,
+            "source_verification_failed_runs": measurement.source_verification_failed_runs,
+            "source_verification_successes": measurement.source_verification_successes,
+        })
+    })
+}
+
+fn import_receipt_json(receipt: &ImportReceipt) -> Value {
+    json!({
+        "package_id": receipt.package_id.to_string(),
+        "scientific_content_id": receipt.scientific_content_id.to_string(),
+        "statistics": import_statistics_json(&receipt.statistics),
+    })
+}
+
+fn successful_import_evidence_json(
+    evidence: &crate::import_worker_service::SuccessfulImportEvidence,
+) -> Value {
+    let receipt = import_receipt_json(&evidence.receipt);
+    let published_event = evidence
+        .published_timing
+        .as_ref()
+        .map_or(Value::Null, |timing| {
+            json!({
+                "published_at_epoch_ms": timing.published_at_epoch_ms,
+                "process_cpu_time_ns": timing.process_cpu_time_ns,
+            })
+        });
+    json!({
+        "review_id": evidence.review_id.get(),
+        "operation_token": operation_token_json(&evidence.token),
+        "destination": evidence.destination,
+        "reviewed_source_fingerprint_sha256": evidence.source_fingerprint.to_string(),
+        "reviewed_source_bytes": evidence.reviewed_source_bytes,
+        "published_event": published_event,
+        "package_id": receipt["package_id"],
+        "scientific_content_id": receipt["scientific_content_id"],
+        "statistics": receipt["statistics"],
+    })
+}
+
+fn operation_token_json(token: &mirante4d_application::OperationToken) -> Value {
+    json!({
+        "operation_id": token.operation_id().get(),
+        "task_id": token.task_id().get(),
+        "kind": format!("{:?}", token.kind()),
+        "source_session_generation": token.source_session_generation().get(),
+        "currentness_generation": token.currentness_generation().get(),
+    })
+}
+
+fn import_statistics_json(statistics: &ImportStatistics) -> Value {
+    let mut object = serde_json::Map::new();
+    macro_rules! insert_u64 {
+        ($($field:literal => $value:expr),* $(,)?) => {
+            $(object.insert($field.to_owned(), Value::from($value));)*
+        };
+    }
+    insert_u64! {
+        "source_bytes_read" => statistics.source_bytes_read,
+        "source_revalidation_bytes_read" => statistics.source_revalidation_bytes_read,
+        "native_decoded_bytes" => statistics.native_decoded_bytes,
+        "base_native_decoded_bytes" => statistics.base_native_decoded_bytes,
+        "scientific_identity_native_decoded_bytes" => statistics.scientific_identity_native_decoded_bytes,
+        "tiff_open_count" => statistics.tiff_open_count,
+        "native_chunk_decode_count" => statistics.native_chunk_decode_count,
+        "logical_output_bytes" => statistics.logical_output_bytes,
+        "checkpoint_payload_bytes" => statistics.checkpoint_payload_bytes,
+        "checkpoint_journal_bytes" => statistics.checkpoint_journal_bytes,
+        "checkpoint_watermark_bytes" => statistics.checkpoint_watermark_bytes,
+        "checkpoint_durable_work_units" => statistics.checkpoint_durable_work_units,
+        "checkpoint_pending_work_units" => statistics.checkpoint_pending_work_units,
+        "checkpoint_committed_batches" => statistics.checkpoint_committed_batches,
+        "codec_encode_calls" => statistics.codec_encode_calls,
+        "codec_encode_time_ns" => statistics.codec_encode_time_ns,
+        "codec_decode_calls" => statistics.codec_decode_calls,
+        "codec_decode_time_ns" => statistics.codec_decode_time_ns,
+        "sync_calls" => statistics.sync_calls,
+        "sync_time_ns" => statistics.sync_time_ns,
+        "scientific_brick_reads" => statistics.scientific_brick_reads,
+        "staged_structure_object_reads" => statistics.staged_structure_object_reads,
+        "staged_exact_object_reads" => statistics.staged_exact_object_reads,
+        "scientific_object_reads" => statistics.scientific_object_reads,
+        "scientific_payload_object_reads" => statistics.scientific_payload_object_reads,
+        "scientific_range_requests" => statistics.scientific_range_requests,
+        "scientific_encoded_bytes_read" => statistics.scientific_encoded_bytes_read,
+        "scientific_decoded_bytes" => statistics.scientific_decoded_bytes,
+        "object_reads" => statistics.object_reads,
+        "sampled_peak_open_file_descriptors" => statistics.sampled_peak_open_file_descriptors,
+        "open_file_descriptor_structural_bound" => statistics.open_file_descriptor_structural_bound,
+        "peak_open_file_descriptors" => statistics.peak_open_file_descriptors,
+        "preflight_temporary_bytes_bound" => statistics.preflight_temporary_bytes_bound,
+        "peak_temporary_bytes" => statistics.peak_temporary_bytes,
+        "peak_checkpoint_regular_files" => statistics.peak_checkpoint_regular_files,
+        "peak_working_bytes" => statistics.peak_working_bytes,
+        "peak_process_rss_bytes" => statistics.peak_process_rss_bytes,
+        "resumed_work_units" => statistics.resumed_work_units,
+        "produced_work_units" => statistics.produced_work_units,
+        "primary_wall_time_ns" => statistics.primary_wall_time_ns,
+        "primary_cpu_time_ns" => statistics.primary_cpu_time_ns,
+    }
+    object.insert(
+        "stages".to_owned(),
+        Value::Array(
+            statistics
+                .stages
+                .iter()
+                .map(|timing| {
+                    json!({
+                        "stage": import_stage_evidence_name(timing.stage),
+                        "wall_time_ns": timing.wall_time_ns,
+                        "cpu_time_ns": timing.cpu_time_ns,
+                    })
+                })
+                .collect(),
+        ),
+    );
+    Value::Object(object)
+}
+
+fn import_stage_evidence_name(stage: mirante4d_import_pipeline::ImportStage) -> String {
+    match stage {
+        mirante4d_import_pipeline::ImportStage::SourceRevalidation { pass } => {
+            format!("{}-{pass}", stage.name())
+        }
+        mirante4d_import_pipeline::ImportStage::PyramidProduction { scale } => {
+            format!("{}-{scale}", stage.name())
+        }
+        _ => stage.name().to_owned(),
+    }
+}
+
+fn process_cpu_time_ns() -> u64 {
+    let time = clock_gettime(ClockId::ProcessCPUTime);
+    u64::try_from(time.tv_sec)
+        .unwrap_or(0)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::try_from(time.tv_nsec).unwrap_or(0))
 }
 
 fn active_lease_cohort_status(

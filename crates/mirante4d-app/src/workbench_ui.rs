@@ -123,7 +123,7 @@ impl eframe::App for MiranteWorkbenchApp {
         );
         let dirty_project_close_ui = self.dirty_project_close_ui();
         let settings_ui_view = self.settings_ui_view();
-        let dataset_open_pending = self.pending_dataset_open_path.is_some();
+        let dataset_open_pending = self.pending_dataset_open.is_some();
         let project_status_message = self.project_status_message.clone();
         let source_verification_available = self
             .source_verification_service

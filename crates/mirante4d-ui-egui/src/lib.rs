@@ -675,7 +675,7 @@ pub(crate) fn show_import_workflow_window(
                     }
                     ImportWorkflowSnapshot::Importing(import) => {
                         ui.horizontal(|ui| {
-                            if !matches!(import.progress, ImportProgressSnapshot::Finished) {
+                            if !matches!(import.progress, ImportProgressSnapshot::Published) {
                                 ui.add(egui::Spinner::new());
                             }
                             status_badge(
@@ -690,6 +690,7 @@ pub(crate) fn show_import_workflow_window(
                         });
                         property_row(ui, "destination", &import.destination);
                         property_row(ui, "progress", import_progress_message(import.progress));
+                        property_row(ui, "elapsed", format_import_elapsed(import.elapsed_ms));
                         if let Some(progress) = import_progress_fraction(import.progress) {
                             ui.add(egui::ProgressBar::new(progress).show_percentage());
                         }
@@ -961,30 +962,42 @@ fn import_source_dtype_label(dtype: ImportSourceDtype) -> &'static str {
 fn import_progress_message(progress: ImportProgressSnapshot) -> String {
     match progress {
         ImportProgressSnapshot::Preparing => "Preparing import".to_owned(),
-        ImportProgressSnapshot::Producing {
-            completed_work_units,
-            total_work_units,
-        } => format!("Building package {completed_work_units}/{total_work_units}"),
-        ImportProgressSnapshot::HashingScience => "Checking scientific content".to_owned(),
-        ImportProgressSnapshot::Publishing => "Validating and publishing package".to_owned(),
-        ImportProgressSnapshot::Finished => "Import finished".to_owned(),
+        ImportProgressSnapshot::Stage {
+            name,
+            completed_work_units: Some(completed_work_units),
+            total_work_units: Some(total_work_units),
+        } => format!("{name} {completed_work_units}/{total_work_units}"),
+        ImportProgressSnapshot::Stage { name, .. } => name.to_owned(),
+        ImportProgressSnapshot::Published => {
+            "Verified package published; opening dataset".to_owned()
+        }
     }
 }
 
 fn import_progress_fraction(progress: ImportProgressSnapshot) -> Option<f32> {
     match progress {
-        ImportProgressSnapshot::Preparing => None,
-        ImportProgressSnapshot::Producing {
-            completed_work_units,
-            total_work_units,
-        } if total_work_units > 0 => Some(
-            (0.05 + 0.70 * (completed_work_units as f32 / total_work_units as f32))
-                .clamp(0.05, 0.75),
-        ),
-        ImportProgressSnapshot::Producing { .. } => None,
-        ImportProgressSnapshot::HashingScience => Some(0.80),
-        ImportProgressSnapshot::Publishing => Some(0.90),
-        ImportProgressSnapshot::Finished => Some(1.0),
+        ImportProgressSnapshot::Stage {
+            completed_work_units: Some(completed_work_units),
+            total_work_units: Some(total_work_units),
+            ..
+        } if total_work_units > 0 => {
+            Some((completed_work_units as f32 / total_work_units as f32).clamp(0.0, 1.0))
+        }
+        ImportProgressSnapshot::Preparing
+        | ImportProgressSnapshot::Stage { .. }
+        | ImportProgressSnapshot::Published => None,
+    }
+}
+
+fn format_import_elapsed(elapsed_ms: u64) -> String {
+    let total_seconds = elapsed_ms / 1_000;
+    let hours = total_seconds / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
     }
 }
 
@@ -1407,22 +1420,49 @@ mod tests {
     }
 
     #[test]
-    fn import_progress_is_coarse_and_monotonic() {
+    fn import_progress_is_stage_local_and_never_fabricates_a_global_fraction() {
         assert_eq!(
-            import_progress_fraction(ImportProgressSnapshot::Producing {
-                completed_work_units: 5,
-                total_work_units: 10,
+            import_progress_message(ImportProgressSnapshot::Stage {
+                name: "base-production",
+                completed_work_units: Some(5),
+                total_work_units: Some(10),
             }),
-            Some(0.4)
-        );
-        assert!(
-            import_progress_fraction(ImportProgressSnapshot::HashingScience)
-                < import_progress_fraction(ImportProgressSnapshot::Publishing)
+            "base-production 5/10"
         );
         assert_eq!(
-            import_progress_fraction(ImportProgressSnapshot::Finished),
-            Some(1.0)
+            import_progress_fraction(ImportProgressSnapshot::Stage {
+                name: "base-production",
+                completed_work_units: Some(5),
+                total_work_units: Some(10),
+            }),
+            Some(0.5)
         );
+        assert_eq!(
+            import_progress_message(ImportProgressSnapshot::Stage {
+                name: "source-scientific-identity",
+                completed_work_units: Some(0),
+                total_work_units: None,
+            }),
+            "source-scientific-identity"
+        );
+        assert_eq!(
+            import_progress_fraction(ImportProgressSnapshot::Stage {
+                name: "source-scientific-identity",
+                completed_work_units: Some(0),
+                total_work_units: None,
+            }),
+            None
+        );
+        assert_eq!(
+            import_progress_fraction(ImportProgressSnapshot::Published),
+            None
+        );
+        assert_eq!(
+            import_progress_message(ImportProgressSnapshot::Published),
+            "Verified package published; opening dataset"
+        );
+        assert_eq!(format_import_elapsed(7_000), "0:07");
+        assert_eq!(format_import_elapsed(3_661_000), "1:01:01");
     }
 
     #[test]

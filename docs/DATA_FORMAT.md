@@ -44,6 +44,30 @@ OME-TIFF sources. Import never changes source data. It writes to an owned
 stage, validates the result, and publishes only to a previously absent
 destination.
 
+Incomplete imports use one current, non-portable checkpoint schema with six
+regular files: two fixed canonical-base files and four encoded-spool files.
+The canonical file stores little-endian planes; checksummed state records name
+only a durable plane prefix. Its batch triggers are 16 completed planes,
+64 MiB of pending plane bytes, and a 15-second age check. The spool uses
+payload, journal, and chained watermark durability batches triggered at 512
+work units, 64 MiB of pending encoded payload, and the same age check. A stage
+boundary or serialized decoder interval can force either authority to
+synchronize earlier. A canonical plane above 64 MiB fails the checked capacity
+boundary instead of expanding a batch. Recovery discards only an incomplete
+bounded suffix, rejects complete corruption or a wrong source/plan binding,
+and never migrates a predecessor checkpoint. Checkpoint names are opened
+relative to a retained no-follow directory descriptor; canonical and spool
+cleanup remove a name only while it still identifies the exact retained file.
+Checkpoints are temporary implementation state, not part of the `.m4d`
+profile.
+
+Pixel and validity chunks are encoded once through the storage codec authority.
+The checkpoint-to-writer boundary validates kind, encoded/decoded length,
+checksum, single-frame extent, ordering, and profile before exact encoded bytes
+enter an outer shard. Packed-index chunks continue to be constructed at
+publication. Scientific and exact package identities retain their existing
+contracts.
+
 Scientific identity is independent of storage layout. Package identity covers
 the exact package bytes. Recipe, derivation, rights, citation, and analysis
 artifact identities remain explicit typed records rather than filenames or

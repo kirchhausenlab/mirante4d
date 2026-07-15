@@ -1,6 +1,6 @@
 # Current State
 
-Last reviewed: 2026-07-14
+Last reviewed: 2026-07-15
 
 Mirante4D is public, pre-alpha academic research software. Persisted formats
 and APIs can change through explicit hard cutovers; there is no supported
@@ -32,6 +32,43 @@ thread or channel. `mirante4d-ui-egui` owns shared egui visuals,
 application-problem presentation, and transient UI drafts and interaction
 state. `mirante4d-render-wgpu` is the sole product renderer. The unpublished
 `mirante4d-render-reference` CPU oracle is test-only.
+
+The importer now indexes the reviewed TIFF inventory once, traverses admitted
+native strips/tiles in source order, decodes each admitted native chunk once
+into a two-file canonical base cache, and derives base chunks, pyramids, and
+scientific identity without a second TIFF decode. Its sole checkpoint authority
+is that cache plus a four-file batched-durability spool. Eligible one-plane
+files, normalization, downsampling, scientific-tile preparation, and inner
+encoding use byte-ledger-admitted workers while one owner commits deterministic
+order; multipage inputs retain one exact-once streaming decoder.
+Descriptor-bound checkpoint files and shared positional readers prevent path
+reopens proportional to the worker count. Package publication passes validated
+canonical inner encodings directly to the sharded writer, and staged
+scientific validation reads each present base brick once. The writer retains
+that exact/scientific capability through create-only rename and, within the
+cooperative local destination-parent namespace assumed by the storage
+contract, proves the public destination is the same directory by filesystem
+identity and hands a linear capability to the importer. Product admission
+consumes it through a bounded inventory/snapshot/inventory currentness check
+and opens the imported package directly as verified; it does not repeat
+SHA-256 or scientific validation. That consumer issues a storage execution
+receipt whose separate strict-open phase deltas reconcile the two inventories
+and proof-derived snapshot sweep with zero codec decodes; product evidence also
+observes successfully started and failed ordinary-verifier runs instead of
+inferring their absence from accepted progress alone.
+
+Source inspection admits grayscale `uint8`, `uint16`, and finite `float32`
+TIFF/OME-TIFF pages using uncompressed, LZW, Deflate (current or old TIFF
+code), or PackBits compression. JPEG, WebP, Zstd-in-TIFF, fax, and other
+compression paths are rejected because their decoder workspaces are outside
+the audited memory authority. A cancellation-aware, fixed-read raw preflight
+bounds every primary IFD, eager decoder field, native chunk table, and the
+65,536-page retained-decoder authority before `tiff::Decoder` is constructed.
+Inspection, ingest, and the final exact SHA-256 pass compare the opened file
+descriptor's device/inode/generation facts with the guarded path generation
+before and after use; ingest and final revalidation also require the reviewed
+generation. None of these changes alters the active dataset or identity
+profiles.
 
 `mirante4d-analysis-core` owns exact `uint8`, `uint16`, and finite `float32`
 intensity statistics and artifact payloads. `mirante4d-analysis-runtime` runs
@@ -66,6 +103,22 @@ See [testing](TESTING.md) for commands and claim language.
   scientific-content verification runs in the background. Project attach,
   open, and save remain blocked until verification succeeds; observed source
   drift invalidates that result and requires verification again.
+- Imported-package capability transfer is fail-closed within its cooperative
+  local destination-parent namespace. Observed mutation, an unlisted object,
+  root substitution, ambiguous rename binding, or durability failure yields no
+  open-ready authority and never selects the ordinary full verifier as a
+  fallback. The contract does not defend against a hostile actor able to
+  concurrently rename or unlink entries in that parent: Unix cannot atomically
+  bind a source name to an already-open directory descriptor. A later explicit
+  external open remains an independent normal open and performs full
+  background verification.
+- The import performance implementation, public T2 tooling, and strict private
+  T5 normal-product qualification runner exist, but clean five-session public
+  timing and private three-session HW-2 execution remain acceptance work. The
+  public supporting target-source and generated-import scenarios have passed
+  on a mapped physical X display, but they are not the private T5/HW-2 product
+  qualification. The local host/storage and private-facts digests are not
+  owner-accepted yet, so no final product-performance claim is recorded.
 - The target dataset profile and project-store format are experimental and
   carry no compatibility promise.
 - The project store uses immutable objects and generations, bounded direct or

@@ -20,8 +20,11 @@ use crate::{
 
 const PRODUCT_VALIDATION_SCHEMA: &str = "mirante4d-product-validation-report";
 const PRODUCT_AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
-const PRODUCT_AUTOMATION_SCHEMA_VERSION: u32 = 2;
-const PRODUCT_VALIDATION_SCHEMA_VERSION: u32 = 1;
+const PRODUCT_AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
+const PRODUCT_AUTOMATION_SCHEMA_VERSION: u32 = 3;
+const PRODUCT_VALIDATION_SCHEMA_VERSION: u32 = 2;
+const PUBLICATION_CURRENTNESS_CONTRACT_ID: &str =
+    "mirante4d-publication-currentness-inventory-snapshot-inventory-1";
 const OUTPUT_DIR: &str = "target/mirante4d/product-validation";
 const TIMEOUT_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_TIMEOUT_SECS";
 const ALLOW_NO_DISPLAY_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_ALLOW_NO_DISPLAY";
@@ -33,12 +36,15 @@ const PREFLIGHT_ONLY_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_PREFLIGHT_ONLY";
 const GENERATED_FIXTURE_SCENARIO: &str = "target_fixture_camera_smoke";
 const GENERATED_RENDER_MODES_SCENARIO: &str = "target_fixture_render_modes";
 const B3_SOURCE_VERIFICATION_SCENARIO: &str = "target_source_verification";
+const IMPORT_PREPROCESSING_SCENARIO: &str = "import_preprocessing";
 const B4_PROJECT_PERSISTENCE_SCENARIO: &str = "b4_project_persistence";
 const B4_TRUSTED_REPORT_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_PROJECT_STORE_LIFECYCLE_REPORT";
 const B4_CHECKPOINT_SCHEMA: &str = "mirante4d-product-external-kill-checkpoint";
 const B4_CHECKPOINT_STAGE: &str = "after_real_autosave_before_external_kill";
 const B4_AUTOSAVE_MIN_ELAPSED_MS: u64 = 30_000;
 const B4_PHASE_TIMEOUT_SECS: u64 = 90;
+const B3_SCENARIO_TIMEOUT_SECS: u64 = 180;
+const IMPORT_SCENARIO_TIMEOUT_SECS: u64 = 600;
 const B4_PRIMARY_CLIENT_WIDTH: u32 = 1280;
 const B4_PRIMARY_CLIENT_HEIGHT: u32 = 720;
 const B4_SECONDARY_CLIENT_WIDTH: u32 = 1920;
@@ -53,6 +59,13 @@ const B3_SECOND_VIEWPORT_WIDTH: u32 = 1920;
 const B3_SECOND_VIEWPORT_HEIGHT: u32 = 1080;
 const B3_PRIMARY_E1_CAPTURE: &str = "b3-after-success-1280x720";
 const B3_SECONDARY_E1_CAPTURE: &str = "b3-after-success-1920x1080";
+const IMPORT_FIXTURE_Z: u32 = 65;
+const IMPORT_FIXTURE_Y: u32 = 1_025;
+const IMPORT_FIXTURE_X: u32 = 1_537;
+const IMPORT_DURABLE_PREFIX_WORK_UNITS: u64 = 512;
+const IMPORT_WORKING_MEMORY_BYTES: u64 = 256 * MIB;
+const IMPORT_VIEWPORT_WIDTH: u32 = 1_280;
+const IMPORT_VIEWPORT_HEIGHT: u32 = 720;
 const MIB: u64 = 1024 * 1024;
 const PREFLIGHT_ONLY_DISPLAY_SOURCE: &str = "preflight_only";
 const SOURCE_CLOSURE_EVIDENCE_ENTRY_MAX: usize = 131_072;
@@ -266,9 +279,11 @@ fn product_validate_report_inner(
     fs::create_dir_all(&output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
 
-    let (package, script) = product_validation_package_and_script(package, scenario)?;
-    let source_closure_before = matches!(scenario, ProductValidationScenario::B3SourceVerification)
-        .then(|| SourceClosureSnapshot::capture(&package))
+    let (package, script, preserved_source) =
+        product_validation_package_and_script(package, scenario)?;
+    let source_closure_before = preserved_source
+        .as_deref()
+        .map(SourceClosureSnapshot::capture)
         .transpose()?;
     let pending_source_closure_evidence = source_closure_before
         .as_ref()
@@ -404,7 +419,8 @@ fn product_validate_report_inner(
     })?;
     let source_closure_evidence = source_closure_before
         .as_ref()
-        .map(|before| before.compare_json(&package))
+        .zip(preserved_source.as_deref())
+        .map(|(before, source)| before.compare_json(source))
         .transpose()?
         .unwrap_or(Value::Null);
     let source_closure_changed = source_closure_evidence
@@ -474,10 +490,17 @@ fn product_validate_report_inner(
         validation_status = ProductValidationStatus::Failed;
         failure_reason = Some(reason);
     }
+    if validation_status == ProductValidationStatus::Passed
+        && matches!(scenario, ProductValidationScenario::ImportPreprocessing)
+        && let Err(reason) = import_preprocessing_evidence(automation_report.as_ref())
+    {
+        validation_status = ProductValidationStatus::Failed;
+        failure_reason = Some(reason);
+    }
     if source_closure_changed {
         validation_status = ProductValidationStatus::Failed;
         failure_reason = Some(
-            "source closure changed during B3 product validation; source bytes must remain identical"
+            "source closure changed during product validation; source bytes must remain identical"
                 .to_owned(),
         );
     }
@@ -516,6 +539,7 @@ enum ProductValidationScenario {
     GeneratedFixtureCameraSmoke,
     GeneratedFixtureRenderModes,
     B3SourceVerification,
+    ImportPreprocessing,
     B4ProjectPersistence,
 }
 
@@ -525,6 +549,7 @@ impl ProductValidationScenario {
             Self::GeneratedFixtureCameraSmoke => GENERATED_FIXTURE_SCENARIO,
             Self::GeneratedFixtureRenderModes => GENERATED_RENDER_MODES_SCENARIO,
             Self::B3SourceVerification => B3_SOURCE_VERIFICATION_SCENARIO,
+            Self::ImportPreprocessing => IMPORT_PREPROCESSING_SCENARIO,
             Self::B4ProjectPersistence => B4_PROJECT_PERSISTENCE_SCENARIO,
         }
     }
@@ -535,11 +560,13 @@ impl ProductValidationScenario {
             GENERATED_FIXTURE_SCENARIO => Ok(Self::GeneratedFixtureCameraSmoke),
             GENERATED_RENDER_MODES_SCENARIO => Ok(Self::GeneratedFixtureRenderModes),
             B3_SOURCE_VERIFICATION_SCENARIO => Ok(Self::B3SourceVerification),
+            IMPORT_PREPROCESSING_SCENARIO => Ok(Self::ImportPreprocessing),
             B4_PROJECT_PERSISTENCE_SCENARIO => Ok(Self::B4ProjectPersistence),
             other => bail!(
                 "unknown product validation scenario {other:?}; expected \
                  {GENERATED_FIXTURE_SCENARIO}, {GENERATED_RENDER_MODES_SCENARIO}, \
-                 {B3_SOURCE_VERIFICATION_SCENARIO}, or {B4_PROJECT_PERSISTENCE_SCENARIO}"
+                 {B3_SOURCE_VERIFICATION_SCENARIO}, {IMPORT_PREPROCESSING_SCENARIO}, or \
+                 {B4_PROJECT_PERSISTENCE_SCENARIO}"
             ),
         }
     }
@@ -550,15 +577,16 @@ impl ProductValidationScenario {
             GENERATED_FIXTURE_SCENARIO
                 | GENERATED_RENDER_MODES_SCENARIO
                 | B3_SOURCE_VERIFICATION_SCENARIO
+                | IMPORT_PREPROCESSING_SCENARIO
                 | B4_PROJECT_PERSISTENCE_SCENARIO
         )
     }
 
     fn default_timeout_secs(&self) -> u64 {
         match self {
-            Self::GeneratedFixtureCameraSmoke
-            | Self::GeneratedFixtureRenderModes
-            | Self::B3SourceVerification => 60,
+            Self::GeneratedFixtureCameraSmoke | Self::GeneratedFixtureRenderModes => 60,
+            Self::B3SourceVerification => B3_SCENARIO_TIMEOUT_SECS,
+            Self::ImportPreprocessing => IMPORT_SCENARIO_TIMEOUT_SECS,
             Self::B4ProjectPersistence => B4_PHASE_TIMEOUT_SECS * 3,
         }
     }
@@ -1237,10 +1265,201 @@ fn b3_exact_e1_capture_evidence(automation_report: Option<&Value>) -> Result<Val
     }))
 }
 
+fn import_preprocessing_evidence(automation_report: Option<&Value>) -> Result<Value, String> {
+    let report = automation_report
+        .ok_or_else(|| "import scenario is missing its automation report".to_owned())?;
+    if report.get("schema").and_then(Value::as_str) != Some(PRODUCT_AUTOMATION_REPORT_SCHEMA)
+        || report.get("schema_version").and_then(Value::as_u64)
+            != Some(u64::from(PRODUCT_AUTOMATION_SCHEMA_VERSION))
+    {
+        return Err("import scenario used an unsupported automation report schema".to_owned());
+    }
+    let evidence = report
+        .get("import_workflow_evidence")
+        .ok_or_else(|| "import scenario is missing import workflow evidence".to_owned())?;
+    let stages = evidence
+        .get("worker_emitted_stage_names")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "import scenario is missing emitted stage names".to_owned())?;
+    for required in [
+        "planning-and-preflight",
+        "source-revalidation",
+        "checkpoint-open-or-resume",
+        "base-production",
+        "pyramid-production",
+        "source-scientific-identity",
+        "shard-publication",
+        "staged-structure-validation",
+        "staged-exact-validation",
+        "staged-scientific-validation",
+        "commit",
+    ] {
+        if !stages.iter().any(|stage| stage.as_str() == Some(required)) {
+            return Err(format!(
+                "import scenario did not emit required named stage {required:?}"
+            ));
+        }
+    }
+    let projected_stage_count = evidence
+        .get("projected_named_stage_observations")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let cancelled_runs = evidence
+        .get("cancelled_runs")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let successful_runs = evidence
+        .get("successful_runs")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let failed_runs = evidence
+        .get("failed_runs")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let published_events = evidence
+        .get("published_events")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let resumed_work_units = evidence
+        .get("maximum_resumed_work_units")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let peak_working_bytes = evidence
+        .get("maximum_peak_working_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let elapsed_ms = evidence
+        .get("maximum_elapsed_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let projected_elapsed_ms = evidence
+        .get("maximum_projected_elapsed_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if projected_stage_count < 2
+        || cancelled_runs < 1
+        || successful_runs < 1
+        || failed_runs != 0
+        || published_events < successful_runs
+        || resumed_work_units < IMPORT_DURABLE_PREFIX_WORK_UNITS
+        || peak_working_bytes > IMPORT_WORKING_MEMORY_BYTES
+        || elapsed_ms == 0
+        || projected_elapsed_ms == 0
+    {
+        return Err(format!(
+            "import scenario evidence failed: projected_stages={projected_stage_count}, cancelled={cancelled_runs}, successful={successful_runs}, failed={failed_runs}, published_events={published_events}, resumed={resumed_work_units}, peak_working_bytes={peak_working_bytes}, elapsed_ms={elapsed_ms}, projected_elapsed_ms={projected_elapsed_ms}"
+        ));
+    }
+    let open_ready = report
+        .get("events")
+        .and_then(Value::as_array)
+        .is_some_and(|events| {
+            events.iter().any(|event| {
+                event.get("command").and_then(Value::as_str) == Some("wait_for_imported_open_ready")
+                    && event.get("status").and_then(Value::as_str) == Some("passed")
+                    && event.pointer("/details/verified").and_then(Value::as_bool) == Some(true)
+                    && event
+                        .pointer("/details/normal_product_open_path")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+            })
+        });
+    if !open_ready {
+        return Err(
+            "import scenario did not prove verified publication through the normal open path"
+                .to_owned(),
+        );
+    }
+    let transfer = evidence
+        .get("publication_to_open_ready_clock")
+        .ok_or_else(|| {
+            "import scenario is missing publication-to-open-ready transfer evidence".to_owned()
+        })?;
+    if transfer.get("transfer_mode").and_then(Value::as_str) != Some("staged_verified_capability")
+        || transfer
+            .get("included_in_primary_clock")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err("import scenario did not prove the verified capability transfer".to_owned());
+    }
+    validate_publication_currentness_execution(transfer)?;
+    for field in [
+        "source_verification_started_runs",
+        "source_verification_progress_updates",
+        "source_verification_cancelled_runs",
+        "source_verification_failed_runs",
+        "source_verification_successes",
+    ] {
+        if transfer.get(field).and_then(Value::as_u64) != Some(0) {
+            return Err(format!(
+                "import scenario unexpectedly reported nonzero {field}"
+            ));
+        }
+    }
+    Ok(evidence.clone())
+}
+
+fn validate_publication_currentness_execution(transfer: &Value) -> Result<(), String> {
+    let execution = transfer
+        .get("publication_currentness_execution")
+        .ok_or_else(|| {
+            "import scenario is missing storage publication-currentness execution evidence"
+                .to_owned()
+        })?;
+    if execution.get("contract_id").and_then(Value::as_str)
+        != Some(PUBLICATION_CURRENTNESS_CONTRACT_ID)
+    {
+        return Err(
+            "import scenario used an unknown publication-currentness execution contract".to_owned(),
+        );
+    }
+    let expected = execution
+        .get("expected_snapshot_object_reads")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "import scenario omitted expected snapshot object reads".to_owned())?;
+    let first_inventory = execution
+        .get("first_inventory_object_reads")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "import scenario omitted first-inventory object reads".to_owned())?;
+    let observed_snapshot = execution
+        .get("observed_snapshot_object_reads")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "import scenario omitted observed snapshot object reads".to_owned())?;
+    let second_inventory = execution
+        .get("second_inventory_object_reads")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "import scenario omitted second-inventory object reads".to_owned())?;
+    let observed_total = execution
+        .get("observed_total_object_reads")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "import scenario omitted total publication object reads".to_owned())?;
+    let codec_decodes = execution
+        .get("observed_codec_decode_calls")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "import scenario omitted observed publication codec decodes".to_owned())?;
+    let reconciled_total = first_inventory
+        .checked_add(observed_snapshot)
+        .and_then(|value| value.checked_add(second_inventory));
+    if expected == 0
+        || first_inventory == 0
+        || first_inventory != second_inventory
+        || observed_snapshot != expected
+        || reconciled_total != Some(observed_total)
+        || codec_decodes != 0
+    {
+        return Err(
+            "import scenario publication-currentness execution disagreed with the storage contract"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn product_validation_package_and_script(
     package: Option<&Path>,
     scenario: &ProductValidationScenario,
-) -> anyhow::Result<(PathBuf, Value)> {
+) -> anyhow::Result<(PathBuf, Value, Option<PathBuf>)> {
     match scenario {
         ProductValidationScenario::GeneratedFixtureCameraSmoke => {
             let package = match package {
@@ -1248,7 +1467,7 @@ fn product_validation_package_and_script(
                 None => default_target_fixture()?,
             };
             let script = target_fixture_camera_smoke_script(&package);
-            Ok((package, script))
+            Ok((package, script, None))
         }
         ProductValidationScenario::GeneratedFixtureRenderModes => {
             let package = match package {
@@ -1256,7 +1475,7 @@ fn product_validation_package_and_script(
                 None => default_target_fixture()?,
             };
             let script = target_fixture_render_modes_script(&package);
-            Ok((package, script))
+            Ok((package, script, None))
         }
         ProductValidationScenario::B3SourceVerification => {
             let package = match package {
@@ -1264,7 +1483,21 @@ fn product_validation_package_and_script(
                 None => default_target_fixture()?,
             };
             let script = target_source_verification_script(&package);
-            Ok((package, script))
+            Ok((package.clone(), script, Some(package)))
+        }
+        ProductValidationScenario::ImportPreprocessing => {
+            let package = match package {
+                Some(package) => package.to_path_buf(),
+                None => default_target_fixture()?,
+            };
+            let fixture = prepare_import_product_fixture(scenario)?;
+            let script = import_preprocessing_script(
+                &package,
+                &fixture.source,
+                &fixture.output_parent,
+                &fixture.destination,
+            );
+            Ok((package, script, Some(fixture.source)))
         }
         ProductValidationScenario::B4ProjectPersistence => {
             let package = match package {
@@ -1274,9 +1507,55 @@ fn product_validation_package_and_script(
             let placeholder = Path::new("target/b4-project-placeholder.m4dproj");
             let checkpoint = Path::new("target/b4-checkpoint-placeholder.json");
             let script = b4_launch_one_script(&package, placeholder, checkpoint);
-            Ok((package, script))
+            Ok((package, script, None))
         }
     }
+}
+
+struct ImportProductFixture {
+    source: PathBuf,
+    output_parent: PathBuf,
+    destination: PathBuf,
+}
+
+fn prepare_import_product_fixture(
+    scenario: &ProductValidationScenario,
+) -> anyhow::Result<ImportProductFixture> {
+    let root = product_validation_output_dir(scenario).join("public-import-fixture");
+    match fs::symlink_metadata(&root) {
+        Ok(metadata) => {
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                bail!(
+                    "owned public import fixture path is not a real directory: {}",
+                    root.display()
+                );
+            }
+            fs::remove_dir_all(&root)
+                .with_context(|| format!("failed to reset owned fixture {}", root.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect owned fixture {}", root.display()));
+        }
+    }
+    fs::create_dir(&root).with_context(|| format!("failed to create {}", root.display()))?;
+    let source = root.join("public-full-strip-source");
+    crate::import_performance::generate_t2_source(
+        &source,
+        IMPORT_FIXTURE_Z,
+        IMPORT_FIXTURE_Y,
+        IMPORT_FIXTURE_X,
+    )?;
+    let output_parent = root.join("output");
+    fs::create_dir(&output_parent)
+        .with_context(|| format!("failed to create {}", output_parent.display()))?;
+    let destination = output_parent.join("public-full-strip-source.m4d");
+    Ok(ImportProductFixture {
+        source,
+        output_parent,
+        destination,
+    })
 }
 
 fn dataset_runtime_limits(max_cpu_total_bytes: u64, max_resident_resources: u64) -> Value {
@@ -1449,9 +1728,9 @@ fn target_source_verification_script(package: &Path) -> Value {
                     "min_accepted_successes": 0
                 }
             } },
-            { "command": "assert", "condition": "nonblank_frame" },
-            { "command": "assert", "condition": { "render_target_pixels": { "width": B3_VIEWPORT_WIDTH, "height": B3_VIEWPORT_HEIGHT } } },
-            { "command": "capture_screenshot", "name": "b3-after-cancel-1280x720" },
+            // Source invalidation deliberately retires verified presentation
+            // leases. Do not wait for or capture a frame until verification
+            // has re-established the runtime authority below.
             { "command": "request_source_verification" },
             { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30000 },
             { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30000 },
@@ -1472,6 +1751,82 @@ fn target_source_verification_script(package: &Path) -> Value {
             { "command": "assert", "condition": "nonblank_frame" },
             { "command": "assert", "condition": { "render_target_pixels": { "width": B3_SECOND_VIEWPORT_WIDTH, "height": B3_SECOND_VIEWPORT_HEIGHT } } },
             { "command": "capture_screenshot", "name": "b3-after-success-1920x1080" },
+            { "command": "copy_diagnostics" },
+            { "command": "quit" }
+        ]
+    })
+}
+
+fn import_preprocessing_script(
+    startup_package: &Path,
+    source: &Path,
+    output_parent: &Path,
+    destination: &Path,
+) -> Value {
+    let mut limits = dataset_runtime_limits(512 * MIB, 192);
+    limits["max_cpu_import_working_set_bytes"] = json!(IMPORT_WORKING_MEMORY_BYTES);
+    json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "scenario": IMPORT_PREPROCESSING_SCENARIO,
+        "limits": limits,
+        "commands": [
+            { "command": "open_dataset", "path": startup_package },
+            { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5_000 },
+            { "command": "set_mapped_client_pixels", "width": IMPORT_VIEWPORT_WIDTH, "height": IMPORT_VIEWPORT_HEIGHT },
+            { "command": "set_render_target_size", "width": IMPORT_VIEWPORT_WIDTH, "height": IMPORT_VIEWPORT_HEIGHT },
+            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30_000 },
+            { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30_000 },
+            { "command": "begin_tiff_import_setup", "source": source, "output_parent": output_parent },
+            { "command": "wait_for", "condition": "import_review_ready", "timeout_ms": 30_000 },
+            { "command": "start_reviewed_import", "spacing_zyx_um": [0.4, 0.2, 0.1], "time_step_seconds": null, "no_data_sentinel": 255, "working_memory_bytes": IMPORT_WORKING_MEMORY_BYTES },
+            { "command": "wait_for_import_progress", "stage": "base-production", "minimum_completed_work_units": IMPORT_DURABLE_PREFIX_WORK_UNITS, "timeout_ms": 120_000 },
+            { "command": "cancel_import" },
+            { "command": "wait_for", "condition": "import_idle", "timeout_ms": 30_000 },
+            { "command": "assert", "condition": { "import_workflow_evidence": {
+                "required_stage_names": ["planning-and-preflight", "source-revalidation", "checkpoint-open-or-resume", "base-production"],
+                "min_projected_named_stages": 1,
+                "min_cancelled_runs": 1,
+                "min_successful_runs": 0,
+                "min_resumed_work_units": 0,
+                "min_elapsed_ms": 1,
+                "min_projected_elapsed_ms": 1,
+                "max_peak_working_bytes": IMPORT_WORKING_MEMORY_BYTES
+            } } },
+            { "command": "begin_tiff_import_setup", "source": source, "output_parent": output_parent },
+            { "command": "wait_for", "condition": "import_review_ready", "timeout_ms": 30_000 },
+            { "command": "start_reviewed_import", "spacing_zyx_um": [0.4, 0.2, 0.1], "time_step_seconds": null, "no_data_sentinel": 255, "working_memory_bytes": IMPORT_WORKING_MEMORY_BYTES },
+            { "command": "wait_for_imported_open_ready", "path": destination, "timeout_ms": 180_000 },
+            { "command": "assert", "condition": { "import_workflow_evidence": {
+                "required_stage_names": [
+                    "planning-and-preflight",
+                    "source-revalidation",
+                    "checkpoint-open-or-resume",
+                    "base-production",
+                    "pyramid-production",
+                    "source-scientific-identity",
+                    "shard-publication",
+                    "staged-structure-validation",
+                    "staged-exact-validation",
+                    "staged-scientific-validation",
+                    "commit"
+                ],
+                "min_projected_named_stages": 2,
+                "min_cancelled_runs": 1,
+                "min_successful_runs": 1,
+                "min_resumed_work_units": IMPORT_DURABLE_PREFIX_WORK_UNITS,
+                "min_elapsed_ms": 1,
+                "min_projected_elapsed_ms": 1,
+                "max_peak_working_bytes": IMPORT_WORKING_MEMORY_BYTES
+            } } },
+            { "command": "wait_for", "condition": "first_frame", "timeout_ms": 60_000 },
+            { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 60_000 },
+            { "command": "camera_fit_data" },
+            { "command": "camera_orbit", "yaw_points": 48.0, "pitch_points": 16.0 },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 60_000 },
+            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "name": "import-preprocessing-open-ready-navigation" },
             { "command": "copy_diagnostics" },
             { "command": "quit" }
         ]
@@ -2445,6 +2800,22 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
     } else {
         Value::Null
     };
+    let import_evidence = if scenario_name == IMPORT_PREPROCESSING_SCENARIO {
+        match import_preprocessing_evidence(report.automation_report_value) {
+            Ok(evidence) => json!({
+                "required": true,
+                "accepted": true,
+                "workflow": evidence,
+            }),
+            Err(reason) => json!({
+                "required": true,
+                "accepted": false,
+                "failure_reason": reason,
+            }),
+        }
+    } else {
+        Value::Null
+    };
     let requested_window_inner_size_points =
         script_requested_window_inner_size_points_json(report.script_value);
     let pixels_per_point = report
@@ -2535,6 +2906,7 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
             "pixels_per_point": pixels_per_point,
             "render_target_pixels": render_target_pixels,
             "b3_exact_e1_capture_evidence": b3_e1_capture_evidence,
+            "import_preprocessing_evidence": import_evidence,
             "render_modes": render_modes,
         },
         "limits": {

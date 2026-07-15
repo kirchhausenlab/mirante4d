@@ -12,8 +12,8 @@ use mirante4d_application::import_workflow::{
 };
 use mirante4d_domain::IntensityDType;
 use mirante4d_import_pipeline::{
-    ImportEvent, ImportOptions, NoDataPolicy, SourceLayout, SpatialCalibration, TiffInspection,
-    TiffSource, select_supported_profile,
+    ImportEvent, ImportOptions, ImportStage, NoDataPolicy, SourceLayout, SpatialCalibration,
+    TiffInspection, TiffSource, select_supported_profile,
 };
 use mirante4d_storage::ProfileKind;
 
@@ -21,6 +21,14 @@ use crate::import_worker_service::{ImportWorkerService, ImportWorkerStatus};
 
 const MIB: u64 = 1024 * 1024;
 const DEFAULT_IMPORT_WORKING_MEMORY_BYTES: u64 = 256 * MIB;
+const IMPORT_CHECKPOINT_FILES: [&str; 6] = [
+    "header",
+    "journal",
+    "payload",
+    "watermark",
+    "canonical-data",
+    "canonical-state",
+];
 pub(crate) const IMPORT_WORKING_MEMORY_CHOICES: [u64; 4] =
     [128 * MIB, 256 * MIB, 512 * MIB, 1024 * MIB];
 
@@ -93,7 +101,6 @@ pub(crate) fn reset_checkpoint_directory(path: &Path) -> anyhow::Result<()> {
         anyhow::bail!("the checkpoint path is not a real directory");
     }
 
-    let allowed = ["header", "journal", "payload"];
     let mut entries = Vec::new();
     for entry in fs::read_dir(path)? {
         let entry = entry?;
@@ -101,7 +108,7 @@ pub(crate) fn reset_checkpoint_directory(path: &Path) -> anyhow::Result<()> {
             .file_name()
             .into_string()
             .map_err(|_| anyhow::anyhow!("the checkpoint contains a non-UTF-8 entry"))?;
-        if !allowed.contains(&name.as_str()) {
+        if !IMPORT_CHECKPOINT_FILES.contains(&name.as_str()) {
             anyhow::bail!("the checkpoint contains an unrelated entry: {name}");
         }
         let metadata = fs::symlink_metadata(entry.path())?;
@@ -126,7 +133,7 @@ pub(crate) struct ImportWorkflow {
 }
 
 impl ImportWorkflow {
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             workers: ImportWorkerService::new(),
             pending_review: None,
@@ -151,6 +158,7 @@ impl ImportWorkflow {
                 destination,
                 latest_event,
                 cancellation_requested,
+                elapsed,
             } => ImportWorkflowSnapshot::Importing(ImportExecutionSnapshot {
                 destination: destination.display().to_string(),
                 progress: latest_event
@@ -158,6 +166,7 @@ impl ImportWorkflow {
                     .map(import_progress_snapshot)
                     .unwrap_or(ImportProgressSnapshot::Preparing),
                 cancellation_requested,
+                elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
             }),
             ImportWorkerStatus::Idle => {
                 if let Some(message) = self.problem.as_ref() {
@@ -324,16 +333,30 @@ fn review_snapshot(review: &PendingImportReview) -> ImportReviewSnapshot {
 
 fn import_progress_snapshot(event: &ImportEvent) -> ImportProgressSnapshot {
     match event {
-        ImportEvent::Producing {
+        ImportEvent::StageStarted {
+            stage,
             completed_work_units,
             total_work_units,
-        } => ImportProgressSnapshot::Producing {
-            completed_work_units: *completed_work_units,
-            total_work_units: *total_work_units,
-        },
-        ImportEvent::HashingScience => ImportProgressSnapshot::HashingScience,
-        ImportEvent::Publishing => ImportProgressSnapshot::Publishing,
-        ImportEvent::Finished => ImportProgressSnapshot::Finished,
+        } => stage_progress_snapshot(*stage, Some(*completed_work_units), *total_work_units),
+        ImportEvent::StageProgress {
+            stage,
+            completed_work_units,
+            total_work_units,
+        } => stage_progress_snapshot(*stage, Some(*completed_work_units), Some(*total_work_units)),
+        ImportEvent::StageFinished(timing) => stage_progress_snapshot(timing.stage, None, None),
+        ImportEvent::Published => ImportProgressSnapshot::Published,
+    }
+}
+
+fn stage_progress_snapshot(
+    stage: ImportStage,
+    completed_work_units: Option<u64>,
+    total_work_units: Option<u64>,
+) -> ImportProgressSnapshot {
+    ImportProgressSnapshot::Stage {
+        name: stage.name(),
+        completed_work_units,
+        total_work_units,
     }
 }
 
@@ -351,6 +374,48 @@ fn checkpoint_directory(destination: &std::path::Path) -> anyhow::Result<PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_progress_projects_named_stage_and_only_known_stage_work() {
+        assert_eq!(
+            import_progress_snapshot(&ImportEvent::StageStarted {
+                stage: ImportStage::SourceScientificIdentity,
+                completed_work_units: 0,
+                total_work_units: None,
+            }),
+            ImportProgressSnapshot::Stage {
+                name: "source-scientific-identity",
+                completed_work_units: Some(0),
+                total_work_units: None,
+            }
+        );
+        assert_eq!(
+            import_progress_snapshot(&ImportEvent::StageProgress {
+                stage: ImportStage::BaseProduction,
+                completed_work_units: 7,
+                total_work_units: 11,
+            }),
+            ImportProgressSnapshot::Stage {
+                name: "base-production",
+                completed_work_units: Some(7),
+                total_work_units: Some(11),
+            }
+        );
+        assert_eq!(
+            import_progress_snapshot(&ImportEvent::StageFinished(
+                mirante4d_import_pipeline::ImportStageTiming {
+                    stage: ImportStage::BaseProduction,
+                    wall_time_ns: 1,
+                    cpu_time_ns: 1,
+                },
+            )),
+            ImportProgressSnapshot::Stage {
+                name: "base-production",
+                completed_work_units: None,
+                total_work_units: None,
+            }
+        );
+    }
 
     #[test]
     fn destination_is_a_create_only_package_name_under_the_selected_parent() {
@@ -374,7 +439,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let checkpoint = temp.path().join(".cells.m4d.import-checkpoint");
         fs::create_dir(&checkpoint).unwrap();
-        for name in ["header", "journal", "payload"] {
+        for name in IMPORT_CHECKPOINT_FILES {
             fs::write(checkpoint.join(name), name).unwrap();
         }
 

@@ -12,7 +12,7 @@ contract = { max-threads = 2 }
 ui = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'package(mirante4d-app) & test(=tests::import_verify_analyze_save_and_reopen_atomically)'
+filter = 'package(mirante4d-app) & (test(=tests::import_verify_analyze_save_and_reopen_atomically) | test(=tests::imported_publication_waits_for_project_close_then_installs_without_normal_verifier) | test(=tests::failed_project_close_retains_imported_authority_without_verifier_fallback) | test(=tests::imported_transfer_drift_fails_closed_without_external_open_fallback))'
 slow-timeout = { period = "5s", terminate-after = 6 }
 
 [[profile.default.overrides]]

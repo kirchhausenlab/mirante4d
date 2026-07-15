@@ -40,6 +40,8 @@ pub enum ScientificHashError {
         expected: [u64; 4],
         actual: [u64; 4],
     },
+    #[error("a prepared scientific tile belongs to a different layer descriptor")]
+    PreparedTileDescriptorMismatch,
     #[error("layer already received all {expected} declared identity tiles")]
     TooManyTiles { expected: u64 },
     #[error("tile voxel count overflows u64")]
@@ -221,6 +223,22 @@ pub struct ScientificTile<'a> {
     values: &'a [u8],
 }
 
+/// One canonical scientific tile that has already passed value, validity,
+/// coordinate, and digest validation for a declared layer descriptor.
+///
+/// The fields stay opaque so storage scanners may reorder only these bounded
+/// digests, never manufacture a leaf or bypass canonical tile validation.
+#[derive(Clone, Copy, Debug)]
+pub struct PreparedScientificTile {
+    layer: LogicalLayerKey,
+    dtype: IntensityDType,
+    shape: Shape4D,
+    linear_index: u64,
+    origin_tzyx: [u64; 4],
+    extent_tzyx: [u64; 4],
+    digest: Sha256Digest,
+}
+
 impl<'a> ScientificTile<'a> {
     pub const fn new(
         origin_tzyx: [u64; 4],
@@ -299,25 +317,95 @@ impl ScientificLayerHasher {
         self.next_tile
     }
 
+    /// Validates and hashes one tile at its canonical linear position without
+    /// advancing the ordered layer accumulator.
+    ///
+    /// This permits a locality-aware reader to retain a bounded set of opaque
+    /// tile digests and submit them later in canonical order. It does not
+    /// change the tile preimage or Merkle-tree contract.
+    pub fn prepare_tile(
+        &self,
+        linear_index: u64,
+        tile: ScientificTile<'_>,
+    ) -> Result<PreparedScientificTile, ScientificHashError> {
+        if self.failed {
+            return Err(ScientificHashError::PreviouslyFailed);
+        }
+        let digest = self.validate_and_hash_tile(linear_index, tile)?;
+        Ok(PreparedScientificTile {
+            layer: self.descriptor.layer,
+            dtype: self.descriptor.dtype,
+            shape: self.descriptor.shape,
+            linear_index,
+            origin_tzyx: tile.origin_tzyx,
+            extent_tzyx: tile.extent_tzyx,
+            digest,
+        })
+    }
+
     pub fn push_tile(&mut self, tile: ScientificTile<'_>) -> Result<(), ScientificHashError> {
         if self.failed {
             return Err(ScientificHashError::PreviouslyFailed);
         }
-        let result = self.validate_and_hash_tile(tile);
-        match result {
-            Ok(digest) => {
-                if let Err(error) = self.merkle.push_leaf(digest) {
-                    self.failed = true;
-                    return Err(error);
-                }
-                self.next_tile += 1;
-                Ok(())
-            }
-            Err(error) => {
-                self.failed = true;
-                Err(error)
-            }
+        let result = self
+            .prepare_tile(self.next_tile, tile)
+            .and_then(|prepared| self.accept_prepared_tile(prepared));
+        if let Err(error) = result {
+            self.failed = true;
+            return Err(error);
         }
+        Ok(())
+    }
+
+    /// Advances the canonical layer accumulator with one previously prepared
+    /// tile. Prepared tiles must still arrive in exact canonical order.
+    pub fn push_prepared_tile(
+        &mut self,
+        prepared: PreparedScientificTile,
+    ) -> Result<(), ScientificHashError> {
+        if self.failed {
+            return Err(ScientificHashError::PreviouslyFailed);
+        }
+        let result = self.accept_prepared_tile(prepared);
+        if let Err(error) = result {
+            self.failed = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn accept_prepared_tile(
+        &mut self,
+        prepared: PreparedScientificTile,
+    ) -> Result<(), ScientificHashError> {
+        if prepared.layer != self.descriptor.layer
+            || prepared.dtype != self.descriptor.dtype
+            || prepared.shape != self.descriptor.shape
+        {
+            return Err(ScientificHashError::PreparedTileDescriptorMismatch);
+        }
+        if self.next_tile >= self.tile_count {
+            return Err(ScientificHashError::TooManyTiles {
+                expected: self.tile_count,
+            });
+        }
+        let (expected_origin, expected_extent) =
+            expected_tile(self.descriptor.shape, self.next_tile)?;
+        if prepared.linear_index != self.next_tile || prepared.origin_tzyx != expected_origin {
+            return Err(ScientificHashError::UnexpectedTileOrigin {
+                expected: expected_origin,
+                actual: prepared.origin_tzyx,
+            });
+        }
+        if prepared.extent_tzyx != expected_extent {
+            return Err(ScientificHashError::UnexpectedTileExtent {
+                expected: expected_extent,
+                actual: prepared.extent_tzyx,
+            });
+        }
+        self.merkle.push_leaf(prepared.digest)?;
+        self.next_tile += 1;
+        Ok(())
     }
 
     /// Consumes an in-progress computation without producing an identity.
@@ -355,15 +443,16 @@ impl ScientificLayerHasher {
 
     fn validate_and_hash_tile(
         &self,
+        linear_index: u64,
         tile: ScientificTile<'_>,
     ) -> Result<Sha256Digest, ScientificHashError> {
-        if self.next_tile >= self.tile_count {
+        if linear_index >= self.tile_count {
             return Err(ScientificHashError::TooManyTiles {
                 expected: self.tile_count,
             });
         }
         let (expected_origin, expected_extent) =
-            expected_tile(self.descriptor.shape, self.next_tile)?;
+            expected_tile(self.descriptor.shape, linear_index)?;
         if tile.origin_tzyx != expected_origin {
             return Err(ScientificHashError::UnexpectedTileOrigin {
                 expected: expected_origin,
@@ -754,6 +843,86 @@ mod tests {
             ))
             .unwrap();
         assert!(layer.finalize().is_ok());
+    }
+
+    #[test]
+    fn prepared_tiles_preserve_the_canonical_root_after_locality_reordering() {
+        let shape = Shape4D::new(1, 65, 1, 1).unwrap();
+        let descriptor = descriptor(0, IntensityDType::Uint8, shape);
+        let mut sequential = ScientificLayerHasher::new(descriptor.clone()).unwrap();
+        for index in 0..5_u64 {
+            let extent_z = if index == 4 { 1 } else { 16 };
+            let validity = all_valid(extent_z as usize);
+            let values = vec![index as u8; extent_z as usize];
+            sequential
+                .push_tile(ScientificTile::new(
+                    [0, index * 16, 0, 0],
+                    [1, extent_z, 1, 1],
+                    &validity,
+                    &values,
+                ))
+                .unwrap();
+        }
+        let expected = sequential.finalize().unwrap();
+
+        let mut reordered = ScientificLayerHasher::new(descriptor).unwrap();
+        let mut prepared = Vec::new();
+        for index in [3_u64, 2, 1, 0, 4] {
+            let extent_z = if index == 4 { 1 } else { 16 };
+            let validity = all_valid(extent_z as usize);
+            let values = vec![index as u8; extent_z as usize];
+            prepared.push(
+                reordered
+                    .prepare_tile(
+                        index,
+                        ScientificTile::new(
+                            [0, index * 16, 0, 0],
+                            [1, extent_z, 1, 1],
+                            &validity,
+                            &values,
+                        ),
+                    )
+                    .unwrap(),
+            );
+        }
+        prepared.sort_by_key(|tile| tile.linear_index);
+        for tile in prepared {
+            reordered.push_prepared_tile(tile).unwrap();
+        }
+        assert_eq!(reordered.finalize().unwrap(), expected);
+    }
+
+    #[test]
+    fn prepared_tiles_cannot_bypass_descriptor_or_canonical_order() {
+        let shape = Shape4D::new(1, 1, 1, 257).unwrap();
+        let mut out_of_order =
+            ScientificLayerHasher::new(descriptor(0, IntensityDType::Uint8, shape)).unwrap();
+        let second = out_of_order
+            .prepare_tile(
+                1,
+                ScientificTile::new([0, 0, 0, 256], [1, 1, 1, 1], &[1], &[0]),
+            )
+            .unwrap();
+        assert!(matches!(
+            out_of_order.push_prepared_tile(second),
+            Err(ScientificHashError::UnexpectedTileOrigin { .. })
+        ));
+        assert_eq!(
+            out_of_order.finalize(),
+            Err(ScientificHashError::PreviouslyFailed)
+        );
+
+        let one = Shape4D::new(1, 1, 1, 1).unwrap();
+        let source = ScientificLayerHasher::new(descriptor(1, IntensityDType::Uint8, one)).unwrap();
+        let foreign = source
+            .prepare_tile(0, ScientificTile::new([0; 4], [1; 4], &[1], &[0]))
+            .unwrap();
+        let mut target =
+            ScientificLayerHasher::new(descriptor(0, IntensityDType::Uint8, one)).unwrap();
+        assert_eq!(
+            target.push_prepared_tile(foreign),
+            Err(ScientificHashError::PreparedTileDescriptorMismatch)
+        );
     }
 
     #[test]

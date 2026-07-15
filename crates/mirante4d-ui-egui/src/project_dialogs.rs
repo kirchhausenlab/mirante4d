@@ -108,13 +108,18 @@ pub(crate) fn show_dirty_project_close_prompt(
     if !input.open {
         return;
     }
-    egui::Window::new("Unsaved Project")
+    let title = if input.pending_dataset_open {
+        "Close Current Project"
+    } else {
+        "Unsaved Project"
+    };
+    egui::Window::new(title)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(ctx, |ui| {
             ui.label(if input.pending_dataset_open {
-                "Project changes have not been saved. Save or discard them before opening another dataset."
+                "Mirante4D must close the current project before opening another dataset. Save any unsaved changes, choose Discard to retry without saving, or cancel the dataset open."
             } else {
                 "Project changes have not been saved."
             });

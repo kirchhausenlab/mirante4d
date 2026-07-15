@@ -11,7 +11,6 @@ use crate::{
     PackageObjectDescriptor, PackageObjectKind, PackagePath, PackedIndexCoordinates,
     PackedIndexError, PackedIndexRecord, ProfileHeader, ProfileValidityMode, RangeReadError,
     ShardCodecError, ShardProfileKind, StorageProfileError, ZarrArrayMetadata,
-    decode_inner_payload, decode_shard_index_tail,
 };
 
 const SPATIAL_INNER_CHUNKS_PER_SHARD_AXIS: u64 = 4;
@@ -356,7 +355,7 @@ impl<F: FnMut() -> bool> Reconciler<'_, '_, F> {
                 actual: actual_bytes,
             },
         )?;
-        let index = decode_shard_index_tail(
+        let index = self.reader.decode_shard_index_tail_accounted(
             kind,
             &bytes[payload_bytes..],
             to_u64(payload_bytes, "packed-index payload length")?,
@@ -431,7 +430,7 @@ impl<F: FnMut() -> bool> Reconciler<'_, '_, F> {
                     .ok_or(PackageStructureError::ArithmeticOverflow {
                         metric: "packed-index encoded range",
                     })?;
-            let decoded = decode_inner_payload(kind, encoded)?;
+            let decoded = self.reader.decode_inner_payload_accounted(kind, encoded)?;
             let inner_start = checked_add(
                 "packed-index inner record origin",
                 outer_start,
@@ -692,7 +691,11 @@ impl<F: FnMut() -> bool> Reconciler<'_, '_, F> {
                     actual: actual_bytes,
                 });
             }
-            let index = decode_shard_index_tail(expectation.kind, &tail, payload_bytes)?;
+            let index = self.reader.decode_shard_index_tail_accounted(
+                expectation.kind,
+                &tail,
+                payload_bytes,
+            )?;
             let mut actual_mask = 0_u64;
             for slot in 0..expectation.kind.chunks_per_shard() {
                 self.poll()?;

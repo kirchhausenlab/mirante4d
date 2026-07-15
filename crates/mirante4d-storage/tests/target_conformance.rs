@@ -258,6 +258,24 @@ fn assert_scientific_report(capability: &VerifiedScientificPackageCapability, fa
     assert_eq!(report.layer_count(), facts.physical_mapping.len() as u32);
     assert_eq!(report.identity_tiles(), expected_identity_tiles(facts));
     assert_eq!(report.brick_reads(), expected_scientific_brick_reads(facts));
+    assert!(report.object_reads() >= report.brick_reads());
+    // Every consumed payload object is opened once for its range read and
+    // twice for the independent snapshot checks. A present inner payload uses
+    // two ranges; an absent payload uses one.
+    assert_eq!(report.object_reads() % 3, 0);
+    let consumed_payload_objects = report.object_reads() / 3;
+    assert!(report.range_requests() >= consumed_payload_objects);
+    assert!(report.range_requests() <= consumed_payload_objects * 2);
+    assert!(report.encoded_bytes_read() > 0);
+    assert!(report.decoded_bytes() > 0);
+    assert!(report.peak_tile_buffer_bytes() > 0);
+    assert!(report.peak_tile_buffer_bytes() <= mirante4d_storage::PACKAGE_VALIDATION_WORKING_BYTES);
+    assert!(report.peak_prepared_tiles() > 0);
+    assert!(report.peak_prepared_tiles() <= report.identity_tiles());
+    assert!(report.peak_scan_working_bytes() >= report.peak_tile_buffer_bytes());
+    assert!(
+        report.peak_scan_working_bytes() <= mirante4d_storage::PACKAGE_VALIDATION_WORKING_BYTES
+    );
     assert_eq!(report.logical_voxels(), logical_voxels);
     assert_eq!(
         report.canonical_value_bytes(),
@@ -764,29 +782,8 @@ fn expected_scientific_brick_reads(facts: &CaseFacts) -> u64 {
     } else {
         [64, 64, 64]
     };
-    let [_, _, z, y, x] = facts.shape_tczyx;
-    let tile = [
-        SCIENTIFIC_TILE_SHAPE_TZYX[1],
-        SCIENTIFIC_TILE_SHAPE_TZYX[2],
-        SCIENTIFIC_TILE_SHAPE_TZYX[3],
-    ];
-    let mut reads_per_layer_timepoint = 0_u64;
-    for z_origin in (0..z).step_by(tile[0] as usize) {
-        for y_origin in (0..y).step_by(tile[1] as usize) {
-            for x_origin in (0..x).step_by(tile[2] as usize) {
-                let origin = [z_origin, y_origin, x_origin];
-                let end = [
-                    (z_origin + tile[0]).min(z),
-                    (y_origin + tile[1]).min(y),
-                    (x_origin + tile[2]).min(x),
-                ];
-                reads_per_layer_timepoint += (0..3)
-                    .map(|axis| (end[axis] - 1) / brick[axis] - origin[axis] / brick[axis] + 1)
-                    .product::<u64>();
-            }
-        }
-    }
-    reads_per_layer_timepoint * facts.shape_tczyx[0] * facts.shape_tczyx[1]
+    let [t, c, z, y, x] = facts.shape_tczyx;
+    t * c * z.div_ceil(brick[0]) * y.div_ceil(brick[1]) * x.div_ceil(brick[2])
 }
 
 fn identity_tile_extents(facts: &CaseFacts) -> Vec<[u64; 4]> {

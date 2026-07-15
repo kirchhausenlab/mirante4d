@@ -87,6 +87,22 @@ small regression check for storage-source changes:
 cargo xtask product-validate target_source_verification
 ```
 
+Import/preprocessing changes also run the native generated-source scenario:
+
+```bash
+cargo xtask product-validate import_preprocessing
+```
+
+For local public performance diagnostics or qualification, use the release
+`import-performance-t2` command documented in [Testing](TESTING.md). The same
+document owns the strict private `import-performance-t5` runner and its
+external configuration, real-display, raw-evidence, and sanitization rules.
+Qualification requires its local HW-2 host/ext4 profile to resolve outside the
+repository; an absent, mismatched, or not-yet-owner-accepted profile produces
+diagnostic-only evidence.
+Generated sources, packages, and evidence stay below ignored
+`target/mirante4d/` paths unless an explicit qualified scratch root is selected.
+
 Native project-persistence automation is retained for changes to that product
 path, not as a recurring acceptance ritual.
 

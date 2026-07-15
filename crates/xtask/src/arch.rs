@@ -610,10 +610,37 @@ fn check_current_state_ownership(
     )?;
     check_dataset_ownership(repo_root, &app_root, &app_fields)?;
     check_target_dataset_source(repo_root, &app_root)?;
+    check_imported_verified_open_authority(repo_root, &app_root)?;
     check_render_ownership(repo_root, metadata)?;
     check_analysis_ownership(repo_root)?;
     check_project_store_ownership(repo_root, metadata, &app_fields)?;
     check_application_route(&app_source)
+}
+
+fn check_imported_verified_open_authority(repo_root: &Path, app_root: &Path) -> anyhow::Result<()> {
+    let mut routes = Vec::new();
+    let mut constructors = 0_usize;
+    for source_path in collect_rust_source_files(app_root)? {
+        let relative = source_path.strip_prefix(repo_root).unwrap_or(&source_path);
+        let normalized = normalize_repo_path(relative);
+        if normalized.contains("/tests/") || normalized.ends_with("/tests.rs") {
+            continue;
+        }
+        let source = fs::read_to_string(&source_path)?;
+        let count = source
+            .matches("OperationCompletion::VerifiedDatasetOpened")
+            .count();
+        if count != 0 {
+            routes.push(normalized);
+            constructors += count;
+        }
+    }
+    if constructors != 1 || routes != ["crates/mirante4d-app/src/current_source_open_service.rs"] {
+        bail!(
+            "imported verified-dataset completion must have one trusted app adapter constructor: {routes:?}"
+        );
+    }
+    Ok(())
 }
 
 fn require_field_type(
@@ -1523,6 +1550,16 @@ fn normalize_repo_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imported_verified_dataset_completion_has_one_trusted_adapter_constructor() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        check_imported_verified_open_authority(
+            &repo_root,
+            &repo_root.join("crates/mirante4d-app/src"),
+        )
+        .unwrap();
+    }
 
     #[test]
     fn source_policy_keeps_ui_imports_in_the_ui_layer() {

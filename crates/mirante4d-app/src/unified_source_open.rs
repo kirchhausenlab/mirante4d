@@ -184,11 +184,10 @@ pub(crate) fn verify_target_package(
 }
 
 pub(crate) fn open_verified(
-    path: impl AsRef<Path>,
     resource_policy: ResourcePolicy,
     capability: VerifiedScientificPackageCapability,
 ) -> Result<UnifiedVerifiedSource, UnifiedVerifiedSourceOpenError> {
-    let selected_path = path.as_ref().to_path_buf();
+    let selected_path = capability.root_path().to_path_buf();
     let config = runtime_config(resource_policy)
         .map_err(UnifiedVerifiedSourceOpenError::RuntimeConfiguration)?;
     let source_error = Arc::new(Mutex::new(None));
@@ -229,6 +228,29 @@ pub(crate) fn open_verified(
     let resource_identity = catalog.scientific_identity().resource_identity();
     let dataset = DatasetDemandState::new(runtime, cpu_ledger, resource_identity, selected_path);
     Ok(UnifiedVerifiedSource { dataset, catalog })
+}
+
+/// Expands an already-verified runtime into the complete state required for a
+/// current-source replacement.
+///
+/// Imported packages use this after consuming their one-shot publication
+/// transfer. No path is accepted here: the selected path already came from the
+/// destination-bound verified capability.
+pub(crate) fn prepare_verified_current_source(
+    opened: UnifiedVerifiedSource,
+) -> anyhow::Result<UnifiedOpenedSource> {
+    let UnifiedVerifiedSource { dataset, catalog } = opened;
+    let workspace = workspace_from_catalog(catalog.as_ref())?;
+    let (render_coordination, analysis_runtime) =
+        initial_runtime_state(catalog.as_ref(), &workspace)?;
+    Ok(UnifiedOpenedSource {
+        dataset,
+        catalog,
+        workspace,
+        render_coordination,
+        analysis_runtime,
+        startup_diagnostics: collect_startup_diagnostics(),
+    })
 }
 
 #[derive(Debug)]

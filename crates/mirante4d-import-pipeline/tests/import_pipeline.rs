@@ -1,17 +1,14 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use mirante4d_dataset::{CpuByteLease, CpuByteLedger, CpuLedgerCategory, CpuLedgerError};
 use mirante4d_import_pipeline::{
-    ImportCancellation, ImportEvent, ImportOptions, NoDataPolicy, SpatialCalibration, TiffSource,
-    import_tiff, inspect_tiff, inspect_tiff_cancellable,
+    ImportCancellation, ImportEvent, ImportOptions, ImportStage, NoDataPolicy, SpatialCalibration,
+    TiffSource, import_tiff, inspect_tiff, inspect_tiff_cancellable,
 };
-use mirante4d_storage::{
-    LocalPackageCatalog, OmeLevelTransform, PackagePath, PackedIndexCoordinates, ProfileKind,
-};
+use mirante4d_storage::{OmeLevelTransform, PackagePath, PackedIndexCoordinates, ProfileKind};
 use tiff::encoder::{TiffEncoder, colortype};
 
 const SOURCE_ARCHIVE: &[u8] =
@@ -33,21 +30,7 @@ impl CpuByteLease for TestLease {
 }
 
 #[derive(Default)]
-struct TestLedger {
-    calls: AtomicUsize,
-    cancellation: Option<ImportCancellation>,
-    cancel_at_call: Option<usize>,
-}
-
-impl TestLedger {
-    fn cancelling(cancellation: ImportCancellation, cancel_at_call: usize) -> Self {
-        Self {
-            calls: AtomicUsize::new(0),
-            cancellation: Some(cancellation),
-            cancel_at_call: Some(cancel_at_call),
-        }
-    }
-}
+struct TestLedger;
 
 impl CpuByteLedger for TestLedger {
     fn try_acquire(
@@ -57,10 +40,6 @@ impl CpuByteLedger for TestLedger {
     ) -> Result<Box<dyn CpuByteLease>, CpuLedgerError> {
         assert_eq!(category, CpuLedgerCategory::ImportWorkingSet);
         assert!(bytes > 0);
-        let call = self.calls.fetch_add(1, Ordering::Relaxed);
-        if self.cancel_at_call == Some(call) {
-            self.cancellation.as_ref().unwrap().cancel();
-        }
         Ok(Box::new(TestLease { bytes }))
     }
 }
@@ -105,11 +84,14 @@ fn promoted_uint8_uint16_and_float32_sources_publish_valid_packages() {
         fs::write(&source, ustar_regular_file(SOURCE_ARCHIVE, archive_path)).unwrap();
         let source_before = fs::read(&source).unwrap();
         let inspection = inspect_tiff(TiffSource::auto(&source)).unwrap();
+        let canonical_pixel_bytes = inspection.shape.dimensions().into_iter().product::<u64>()
+            * u64::from(inspection.channels)
+            * u64::from(inspection.dtype.bytes_per_sample());
         let spacing = inspection.ome_spacing_zyx_um.unwrap_or([1.0; 3]);
         let destination = root.path().join(format!("case-{ordinal}.m4d"));
         let checkpoint = root.path().join(format!("case-{ordinal}.checkpoint"));
         let mut events = Vec::new();
-        let receipt = import_tiff(
+        let published = import_tiff(
             ImportOptions {
                 inspection,
                 destination: destination.clone(),
@@ -120,23 +102,87 @@ fn promoted_uint8_uint16_and_float32_sources_publish_valid_packages() {
                 no_data,
                 working_memory_bytes: WORKING_MEMORY_BYTES,
             },
-            &TestLedger::default(),
+            &TestLedger,
             &ImportCancellation::new(),
             |event| events.push(event),
         )
         .unwrap();
+        assert_eq!(published.destination(), destination);
+        let receipt = published.receipt();
 
         assert_eq!(fs::read(&source).unwrap(), source_before);
         assert!(!checkpoint.exists());
-        assert_eq!(events.last(), Some(&ImportEvent::Finished));
+        assert_eq!(events.last(), Some(&ImportEvent::Published));
         assert!(receipt.statistics.produced_work_units > 0);
         assert!(receipt.statistics.peak_working_bytes <= WORKING_MEMORY_BYTES);
-        let verified = LocalPackageCatalog::open(&destination)
-            .unwrap()
-            .validate_exact_package(ProfileKind::Ds0, || false)
-            .unwrap()
-            .validate_scientific_content(|| false)
-            .unwrap();
+        assert_eq!(
+            receipt.statistics.native_decoded_bytes,
+            receipt.statistics.base_native_decoded_bytes
+                + receipt.statistics.scientific_identity_native_decoded_bytes
+        );
+        assert_eq!(
+            receipt.statistics.source_revalidation_bytes_read,
+            u64::try_from(source_before.len()).unwrap()
+        );
+        assert_eq!(
+            receipt.statistics.base_native_decoded_bytes,
+            canonical_pixel_bytes
+        );
+        assert_eq!(
+            receipt.statistics.scientific_identity_native_decoded_bytes,
+            0
+        );
+        assert!(
+            receipt.statistics.source_bytes_read
+                >= receipt.statistics.source_revalidation_bytes_read
+        );
+        assert_eq!(receipt.statistics.tiff_open_count, 2);
+        assert!(receipt.statistics.native_chunk_decode_count > 0);
+        assert!(receipt.statistics.staged_structure_object_reads > 0);
+        assert!(receipt.statistics.staged_exact_object_reads > 0);
+        assert!(receipt.statistics.scientific_object_reads > 0);
+        assert!(
+            receipt.statistics.scientific_object_reads
+                >= receipt.statistics.scientific_payload_object_reads
+        );
+        assert_eq!(
+            receipt.statistics.object_reads,
+            receipt.statistics.staged_structure_object_reads
+                + receipt.statistics.staged_exact_object_reads
+                + receipt.statistics.scientific_object_reads
+        );
+        assert!(receipt.statistics.codec_encode_calls > 0);
+        assert!(receipt.statistics.codec_encode_time_ns > 0);
+        assert!(receipt.statistics.codec_decode_calls > receipt.statistics.scientific_brick_reads);
+        assert!(receipt.statistics.codec_decode_time_ns > 0);
+        assert_eq!(receipt.statistics.open_file_descriptor_structural_bound, 35);
+        assert_eq!(
+            receipt.statistics.peak_open_file_descriptors,
+            receipt
+                .statistics
+                .sampled_peak_open_file_descriptors
+                .max(receipt.statistics.open_file_descriptor_structural_bound)
+        );
+        assert!(receipt.statistics.peak_open_file_descriptors <= 64);
+        assert_eq!(receipt.statistics.peak_checkpoint_regular_files, 6);
+        assert!(
+            receipt.statistics.peak_temporary_bytes
+                <= receipt.statistics.preflight_temporary_bytes_bound
+        );
+        assert!(receipt.statistics.primary_wall_time_ns > 0);
+        assert!(receipt.statistics.primary_cpu_time_ns > 0);
+        assert!(receipt.statistics.stages.iter().any(|timing| {
+            timing.stage == ImportStage::BaseProduction && timing.wall_time_ns > 0
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ImportEvent::StageFinished(_)))
+                .count(),
+            receipt.statistics.stages.len()
+        );
+        let (receipt, transfer) = published.into_parts();
+        let (verified, _) = transfer.consume(|| false).unwrap();
         assert_eq!(verified.package_id(), receipt.package_id);
         assert_eq!(
             verified.scientific_content_id(),
@@ -161,7 +207,7 @@ fn identical_source_bytes_produce_the_same_exact_package_id() {
         });
         fs::write(&source, bytes).unwrap();
         let inspection = inspect_tiff(TiffSource::auto(&source)).unwrap();
-        let receipt = import_tiff(
+        let published = import_tiff(
             ImportOptions {
                 calibration: SpatialCalibration::new(inspection.ome_spacing_zyx_um.unwrap()),
                 inspection,
@@ -172,11 +218,12 @@ fn identical_source_bytes_produce_the_same_exact_package_id() {
                 no_data: None,
                 working_memory_bytes: WORKING_MEMORY_BYTES,
             },
-            &TestLedger::default(),
+            &TestLedger,
             &ImportCancellation::new(),
             |_| {},
         )
         .unwrap();
+        let receipt = published.receipt();
         package_ids.push(receipt.package_id);
         scientific_ids.push(receipt.scientific_content_id);
     }
@@ -214,11 +261,22 @@ fn cancellation_keeps_one_checkpoint_and_resume_finishes_without_partial_destina
     };
 
     let cancellation = ImportCancellation::new();
-    // Persistent spool records and checkpoint validation take the first two
-    // leases; cancel as the second production unit begins.
-    let cancelling_ledger = TestLedger::cancelling(cancellation.clone(), 3);
-    let error =
-        import_tiff(options.clone(), &cancelling_ledger, &cancellation, |_| {}).unwrap_err();
+    // Cancel after the ordered owner commits its first base work unit. This is
+    // independent of how many byte leases the admitted source workers need.
+    let cancellation_from_progress = cancellation.clone();
+    let error = import_tiff(options.clone(), &TestLedger, &cancellation, move |event| {
+        if matches!(
+            event,
+            ImportEvent::StageProgress {
+                stage: ImportStage::BaseProduction,
+                completed_work_units: 1,
+                ..
+            }
+        ) {
+            cancellation_from_progress.cancel();
+        }
+    })
+    .unwrap_err();
     assert!(matches!(
         error,
         mirante4d_import_pipeline::ImportError::Cancelled
@@ -231,17 +289,15 @@ fn cancellation_keeps_one_checkpoint_and_resume_finishes_without_partial_destina
             .map(|entry| entry.unwrap().file_name())
             .collect::<std::collections::BTreeSet<_>>()
             .len(),
-        3
+        6
     );
 
-    let receipt = import_tiff(
-        options,
-        &TestLedger::default(),
-        &ImportCancellation::new(),
-        |_| {},
-    )
-    .unwrap();
-    assert!(receipt.statistics.resumed_work_units > 0);
+    let published = import_tiff(options, &TestLedger, &ImportCancellation::new(), |_| {}).unwrap();
+    let receipt = published.receipt();
+    // The interrupted spool batch is intentionally discarded, while the
+    // separately durable canonical ingest is reused without another TIFF
+    // native decode.
+    assert_eq!(receipt.statistics.base_native_decoded_bytes, 0);
     assert!(destination.is_dir());
     assert!(!checkpoint.exists());
     assert_eq!(directory_bytes(&source), source_before);
@@ -282,7 +338,7 @@ fn source_destination_and_checkpoint_must_be_separate_unnested_paths() {
                 no_data: None,
                 working_memory_bytes: WORKING_MEMORY_BYTES,
             },
-            &TestLedger::default(),
+            &TestLedger,
             &ImportCancellation::new(),
             |_| {},
         )
@@ -315,7 +371,7 @@ fn multiscale_import_crosses_chunk_and_outer_shard_boundaries() {
 
     let inspection = inspect_tiff(TiffSource::auto(&source)).unwrap();
     let destination = root.path().join("wide.m4d");
-    let receipt = import_tiff(
+    let published = import_tiff(
         ImportOptions {
             inspection,
             destination: destination.clone(),
@@ -326,19 +382,16 @@ fn multiscale_import_crosses_chunk_and_outer_shard_boundaries() {
             no_data: None,
             working_memory_bytes: WORKING_MEMORY_BYTES,
         },
-        &TestLedger::default(),
+        &TestLedger,
         &ImportCancellation::new(),
         |_| {},
     )
     .unwrap();
+    let receipt = published.receipt();
     assert!(receipt.statistics.produced_work_units > 10);
 
-    let verified = LocalPackageCatalog::open(&destination)
-        .unwrap()
-        .validate_exact_package(ProfileKind::Ds0, || false)
-        .unwrap()
-        .validate_scientific_content(|| false)
-        .unwrap();
+    let (_receipt, transfer) = published.into_parts();
+    let (verified, _) = transfer.consume(|| false).unwrap();
     assert!(verified.catalog().profile().images()[0].levels().len() > 1);
     let ome_path = PackagePath::parse("images/i00000000/zarr.json").unwrap();
     let OmeLevelTransform::DiagonalMicrometer {
@@ -399,7 +452,7 @@ fn matched_channel_folders_publish_one_multichannel_volume() {
     assert_eq!(inspection.shape.dimensions(), [1, 3, 3, 4]);
 
     let destination = root.path().join("channels.m4d");
-    import_tiff(
+    let published = import_tiff(
         ImportOptions {
             inspection,
             destination: destination.clone(),
@@ -410,18 +463,14 @@ fn matched_channel_folders_publish_one_multichannel_volume() {
             no_data: None,
             working_memory_bytes: WORKING_MEMORY_BYTES,
         },
-        &TestLedger::default(),
+        &TestLedger,
         &ImportCancellation::new(),
         |_| {},
     )
     .unwrap();
 
-    let verified = LocalPackageCatalog::open(&destination)
-        .unwrap()
-        .validate_exact_package(ProfileKind::Ds0, || false)
-        .unwrap()
-        .validate_scientific_content(|| false)
-        .unwrap();
+    let (_receipt, transfer) = published.into_parts();
+    let (verified, _) = transfer.consume(|| false).unwrap();
     assert_eq!(verified.catalog().science().layers().len(), 2);
     assert_eq!(directory_tree_bytes(&source), source_before);
 }

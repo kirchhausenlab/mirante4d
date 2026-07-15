@@ -48,6 +48,15 @@ pub enum ImportError {
         #[source]
         source: io::Error,
     },
+    #[error(
+        "checkpoint durability became indeterminate while attempting to {operation} for {path}"
+    )]
+    CheckpointDurabilityIndeterminate {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("import byte/count arithmetic overflowed")]
     Overflow,
     #[error(transparent)]

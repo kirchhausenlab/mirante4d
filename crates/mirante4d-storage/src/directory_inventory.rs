@@ -31,12 +31,19 @@ pub(crate) struct ExpectedFile {
     pub(crate) role: ExpectedFileRole,
 }
 
+/// Directory-node witness used around enumeration and in the final sweep.
+///
+/// `ctime` is required as well as `mtime`: an owner can restore directory
+/// modification time after adding or removing an entry, but cannot restore
+/// change time through the ordinary filesystem API.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DirectoryIdentity {
     device: u64,
     inode: u64,
     modified_seconds: i64,
     modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
 }
 
 /// Exact bounded facts from one strict local package directory closure.
@@ -141,8 +148,17 @@ pub enum DirectoryInventoryError {
 
 pub(crate) fn inspect_directory_closure(
     reader: &LocalPackageReader,
+    expected_files: BTreeMap<PackagePath, ExpectedFile>,
+    is_cancelled: impl FnMut() -> bool,
+) -> Result<DirectoryInventory, DirectoryInventoryError> {
+    inspect_directory_closure_observed(reader, expected_files, is_cancelled, |_, _| {})
+}
+
+fn inspect_directory_closure_observed(
+    reader: &LocalPackageReader,
     mut expected_files: BTreeMap<PackagePath, ExpectedFile>,
     mut is_cancelled: impl FnMut() -> bool,
+    mut after_directory_enumerated: impl FnMut(&Path, &str),
 ) -> Result<DirectoryInventory, DirectoryInventoryError> {
     check_cancelled(&mut is_cancelled)?;
     let expected_file_count = checked_len(expected_files.len())?;
@@ -208,6 +224,7 @@ pub(crate) fn inspect_directory_closure(
         let fan_out = checked_len(children.len())?;
         inventory.maximum_directory_fan_out = inventory.maximum_directory_fan_out.max(fan_out);
         children.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        after_directory_enumerated(&directory, &relative);
         let after = checked_directory_identity(reader, &directory, &relative)?;
         if before != after {
             return Err(RangeReadError::ObjectChanged {
@@ -395,6 +412,8 @@ fn checked_directory_identity(
         inode: metadata.ino(),
         modified_seconds: metadata.mtime(),
         modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
     })
 }
 
@@ -444,5 +463,98 @@ fn io_error(operation: &'static str, path: &str, error: io::Error) -> DirectoryI
         operation,
         path: path.to_owned(),
         kind: error.kind(),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::{
+        fs::{self, File, FileTimes},
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            mpsc,
+        },
+        thread,
+        time::Duration,
+    };
+
+    use super::*;
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "mirante4d-directory-inventory-race-{}-{}",
+                std::process::id(),
+                TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn concurrent_unlisted_entry_with_restored_mtime_fails_closed() {
+        let root = TestDirectory::new();
+        let declared_path = PackagePath::parse("declared.bin").unwrap();
+        fs::write(root.0.join(declared_path.as_str()), b"declared").unwrap();
+        let original_modified = fs::metadata(&root.0).unwrap().modified().unwrap();
+        let reader = LocalPackageReader::open(&root.0).unwrap();
+        let expected = BTreeMap::from([(
+            declared_path,
+            ExpectedFile {
+                bytes: 8,
+                role: ExpectedFileRole::ManifestRoot,
+            },
+        )]);
+        let (mutate, mutation_requests) = mpsc::sync_channel(0);
+        let (mutated, mutation_results) = mpsc::sync_channel(0);
+        let mutation_root = root.0.clone();
+        let worker = thread::spawn(move || {
+            mutation_requests.recv().unwrap();
+            // Ensure ctime advances even on filesystems whose timestamp clock
+            // has a coarser tick than this small fixture's setup.
+            thread::sleep(Duration::from_millis(2));
+            fs::write(mutation_root.join("foreign.bin"), b"foreign").unwrap();
+            File::open(&mutation_root)
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(original_modified))
+                .unwrap();
+            mutated.send(()).unwrap();
+        });
+        let mut injected = false;
+
+        let error = inspect_directory_closure_observed(
+            &reader,
+            expected,
+            || false,
+            |_, relative| {
+                if relative.is_empty() && !injected {
+                    injected = true;
+                    mutate.send(()).unwrap();
+                    mutation_results.recv().unwrap();
+                }
+            },
+        )
+        .unwrap_err();
+        worker.join().unwrap();
+
+        assert!(matches!(
+            error,
+            DirectoryInventoryError::Range(RangeReadError::ObjectChanged { ref path })
+                if path == "<root>"
+        ));
+        assert!(root.0.join("foreign.bin").is_file());
     }
 }

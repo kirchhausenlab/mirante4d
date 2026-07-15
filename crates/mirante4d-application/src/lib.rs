@@ -495,6 +495,18 @@ pub enum OperationCompletion {
         catalog: Arc<DatasetCatalog>,
         workspace: Box<UnboundWorkspace>,
     },
+    /// A newly opened source whose exact package and scientific identity were
+    /// already proved before this completion was prepared.
+    ///
+    /// The catalog, durable dataset reference, and initial workspace are
+    /// admitted as one atomic source replacement. This is distinct from
+    /// `DatasetOpened`, which deliberately accepts only a provisional catalog.
+    VerifiedDatasetOpened {
+        source_generation: SourceSessionGeneration,
+        catalog: Arc<DatasetCatalog>,
+        workspace: Box<UnboundWorkspace>,
+        dataset: DatasetReference,
+    },
     SourceVerified {
         source_generation: SourceSessionGeneration,
         catalog: Arc<DatasetCatalog>,
@@ -979,6 +991,7 @@ pub enum OperationOutcome {
     Cancelled,
     Failed(OperationFailureCode),
     DatasetOpened,
+    VerifiedDatasetOpened,
     SourceVerified,
     AnalysisCommitted,
     ProjectOpened,
@@ -1283,6 +1296,11 @@ pub struct ApplicationState {
     latest_problem: Option<ApplicationEvent>,
 }
 
+enum OpenedSourceBinding {
+    Provisional,
+    Verified(DatasetReference),
+}
+
 impl ApplicationState {
     pub fn new_unbound(
         source_generation: SourceSessionGeneration,
@@ -1551,15 +1569,60 @@ impl ApplicationState {
         catalog: Arc<DatasetCatalog>,
         workspace: UnboundWorkspace,
     ) -> Result<CommandEffect, ApplicationFaultCode> {
+        self.install_opened_source(
+            source_generation,
+            catalog,
+            workspace,
+            OpenedSourceBinding::Provisional,
+        )
+    }
+
+    fn admit_verified_opened_source(
+        &mut self,
+        source_generation: SourceSessionGeneration,
+        catalog: Arc<DatasetCatalog>,
+        workspace: UnboundWorkspace,
+        dataset: DatasetReference,
+    ) -> Result<CommandEffect, ApplicationFaultCode> {
+        self.install_opened_source(
+            source_generation,
+            catalog,
+            workspace,
+            OpenedSourceBinding::Verified(dataset),
+        )
+    }
+
+    fn install_opened_source(
+        &mut self,
+        source_generation: SourceSessionGeneration,
+        catalog: Arc<DatasetCatalog>,
+        workspace: UnboundWorkspace,
+        binding: OpenedSourceBinding,
+    ) -> Result<CommandEffect, ApplicationFaultCode> {
         if source_generation.get() <= self.source_generation.get() {
             return Err(ApplicationFaultCode::SourceGenerationNotAdvanced);
         }
-        require_unverified_catalog(&catalog, source_generation)?;
+        let verified_identity = match &binding {
+            OpenedSourceBinding::Provisional => {
+                require_unverified_catalog(&catalog, source_generation)?;
+                None
+            }
+            OpenedSourceBinding::Verified(dataset) => {
+                let identity = *dataset.scientific_content_id();
+                if catalog.scientific_identity().verified_id() != Some(&identity) {
+                    return Err(ApplicationFaultCode::DatasetIdentityMismatch);
+                }
+                Some(identity)
+            }
+        };
         validate_view_against_catalog(&catalog, workspace.view())?;
         let provisional_project_id = workspace.provisional_project_id();
         self.source_generation = source_generation;
         self.catalog = catalog;
-        self.verified_source = None;
+        self.verified_source = match binding {
+            OpenedSourceBinding::Provisional => None,
+            OpenedSourceBinding::Verified(dataset) => Some(dataset),
+        };
         self.source_verification_progress = None;
         self.workspace = Workspace::Unbound(Arc::new(workspace));
         self.transient = TransientApplicationState::default();
@@ -1570,6 +1633,12 @@ impl ApplicationState {
             source_generation,
             provisional_project_id,
         })?;
+        if let Some(scientific_content_id) = verified_identity {
+            self.push_event(ApplicationEvent::SourceVerified {
+                source_generation,
+                scientific_content_id,
+            })?;
+        }
         Ok(CommandEffect::Changed)
     }
 
@@ -2684,6 +2753,18 @@ impl ApplicationState {
                 self.admit_opened_source(source_generation, catalog, *workspace)?;
                 OperationOutcome::DatasetOpened
             }
+            OperationCompletion::VerifiedDatasetOpened {
+                source_generation,
+                catalog,
+                workspace,
+                dataset,
+            } => {
+                if token.kind != OperationKind::DatasetOpen {
+                    return Err(ApplicationFaultCode::InvalidOperationCompletion);
+                }
+                self.admit_verified_opened_source(source_generation, catalog, *workspace, dataset)?;
+                OperationOutcome::VerifiedDatasetOpened
+            }
             OperationCompletion::SourceVerified {
                 source_generation,
                 catalog,
@@ -3669,7 +3750,9 @@ fn completion_matches_kind(kind: OperationKind, completion: &OperationCompletion
     match kind {
         OperationKind::DatasetOpen => matches!(
             completion,
-            OperationCompletion::DatasetOpened { .. } | OperationCompletion::Cancelled
+            OperationCompletion::DatasetOpened { .. }
+                | OperationCompletion::VerifiedDatasetOpened { .. }
+                | OperationCompletion::Cancelled
         ),
         OperationKind::SourceVerification => matches!(
             completion,

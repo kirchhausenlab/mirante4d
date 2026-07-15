@@ -1,10 +1,16 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
-    io::{BufReader, Read, Seek},
+    fs::{self, File, OpenOptions},
+    io::{BufReader, Read, Seek, SeekFrom},
+    mem::size_of,
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{FileExt, MetadataExt, OpenOptionsExt},
+    },
     path::{Component, Path, PathBuf},
 };
 
+use mirante4d_dataset::CpuByteLedger;
 use mirante4d_domain::{IntensityDType, Shape4D};
 use mirante4d_identity::{Sha256Digest, Sha256Hasher};
 use quick_xml::{
@@ -19,14 +25,29 @@ use tiff::{
 
 use crate::{
     ImportCancellation, ImportError, SourceLayout, TiffInspection, TiffSource,
-    model::InspectedSourceFile,
+    canonical_cache::CanonicalBaseCache,
+    model::{InspectedSourceFile, SourceFileGeneration},
+    ordered_workers::{OrderedWorkerDiagnostics, OrderedWorkerPolicy, run_ordered},
 };
 
 const HASH_READ_BYTES: usize = 64 * 1024;
 const MAX_ENCODED_CHUNK_OVERHEAD_BYTES: usize = 64 * 1024;
 // Keep source discovery within the portable provenance record's bounded file list.
 const MAX_SOURCE_FILES: usize = 4_096;
-const MAX_PAGES_PER_FILE: u64 = 1_000_000;
+// Retained source paths are exact-fit before this is calculated. Eight text
+// copies cover the reviewed index plus the largest simultaneous read_dir,
+// discovered-layout, accepted-inventory, and error-path views. The per-file
+// allowance covers Vec slots, DirEntry implementation state, sort/index
+// pointers, and the aligned generation vector; the fixed allowance covers
+// the final SHA buffer and collection/global allocator overhead. This
+// reservation is held for the complete in-clock import lifetime.
+const MAX_SOURCE_INDEX_TEXT_BYTES: u64 = 16 * 1024 * 1024;
+const SOURCE_INDEX_TEXT_COPIES_MAX: u64 = 8;
+const SOURCE_INDEX_BYTES_PER_FILE_MAX: u64 = 2 * 1024;
+const SOURCE_INDEX_FIXED_BYTES_MAX: u64 = 256 * 1024;
+const MAX_PAGES_PER_FILE: u64 = 65_536;
+const MAX_NATIVE_CHUNKS_PER_PAGE: usize = 262_144;
+const MAX_TIFF_IFD_ENTRIES: u64 = 4_096;
 const MAX_OME_XML_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OME_XML_EVENTS: usize = 65_536;
 const MAX_OME_XML_DEPTH: usize = 64;
@@ -34,14 +55,61 @@ const MAX_OME_XML_ATTRIBUTES: usize = 256;
 const MAX_OME_XML_ATTRIBUTE_BYTES: usize = 1024 * 1024;
 const MAX_OME_XML_VALUE_BYTES: usize = 256;
 
-/// Conservative non-pixel allocation ceiling while one TIFF region is read.
-pub(crate) const SOURCE_DECODE_OVERHEAD_BYTES_MAX: u64 =
-    (MAX_OME_XML_BYTES + HASH_READ_BYTES + MAX_ENCODED_CHUNK_OVERHEAD_BYTES) as u64;
+// Only streaming codecs whose library state fits this authority are admitted
+// by `inspect_supported_compression`. JPEG, WebP, Zstd-in-TIFF, and fax paths
+// are rejected because their additional allocations are not audited here.
+const TIFF_STREAM_CODEC_WORKSPACE_BYTES_MAX: u64 = 1024 * 1024;
+const TIFF_CHUNK_TABLE_BYTES_MAX: u64 = (MAX_NATIVE_CHUNKS_PER_PAGE as u64) * 16;
+// The decoder retains its visited-IFD chain. This is deliberately generous
+// for the current implementation's offsets and cycle-detection hash maps.
+const TIFF_RETAINED_BYTES_PER_PAGE_MAX: u64 = 512;
+// One live IFD is represented as a BTreeMap by the pinned decoder.
+const TIFF_IFD_MAP_BYTES_MAX: u64 = MAX_TIFF_IFD_ENTRIES * 128;
+
+/// Conservative non-pixel allocation ceiling while one TIFF chunk is read.
+pub(crate) const SOURCE_DECODE_FIXED_OVERHEAD_BYTES_MAX: u64 =
+    (MAX_OME_XML_BYTES + HASH_READ_BYTES + MAX_ENCODED_CHUNK_OVERHEAD_BYTES) as u64
+        + TIFF_STREAM_CODEC_WORKSPACE_BYTES_MAX
+        + TIFF_CHUNK_TABLE_BYTES_MAX
+        + TIFF_IFD_MAP_BYTES_MAX;
+
+pub(crate) const SOURCE_TASK_METADATA_BYTES_MAX: u64 = 1024 * 1024;
+// `Decoder::next_image` constructs the next image before replacing the
+// previous one, so one prior IFD and its two chunk vectors coexist briefly.
+pub(crate) const SOURCE_SERIAL_TRANSITION_BYTES_MAX: u64 =
+    TIFF_CHUNK_TABLE_BYTES_MAX + TIFF_IFD_MAP_BYTES_MAX;
+
+pub(crate) const fn retained_decoder_bytes(pages: u64) -> Option<u64> {
+    pages.checked_mul(TIFF_RETAINED_BYTES_PER_PAGE_MAX)
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SourceReadCounters {
     pub(crate) source_bytes_read: u64,
     pub(crate) decoded_bytes: u64,
+    pub(crate) tiff_open_count: u64,
+    pub(crate) native_chunk_decode_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SourceDecodeReport {
+    pub(crate) counters: SourceReadCounters,
+    pub(crate) peak_transient_bytes: u64,
+    pub(crate) parallel_files: u64,
+    pub(crate) serialized_files: u64,
+    pub(crate) peak_reorder_results: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SourceRevalidationCounters {
+    pub(crate) source_bytes_read: u64,
+    pub(crate) tiff_open_count: u64,
+    pub(crate) generation: SourceGeneration,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SourceGeneration {
+    files: Vec<SourceFileGeneration>,
 }
 
 #[derive(Debug)]
@@ -52,8 +120,10 @@ struct TiffFileFacts {
     dtype: IntensityDType,
     ome_spacing_zyx_um: Option<[f64; 3]>,
     maximum_decoded_chunk_bytes: u64,
+    maximum_encoded_chunk_bytes: u64,
     bytes: u64,
     sha256: Sha256Digest,
+    generation: SourceFileGeneration,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -175,6 +245,7 @@ fn inspect_single_file(
         planes: facts.pages,
         bytes: facts.bytes,
         sha256: facts.sha256,
+        generation: facts.generation,
     }];
     check_cancelled(cancellation)?;
     finish_inspection(
@@ -185,6 +256,7 @@ fn inspect_single_file(
         facts.dtype,
         facts.ome_spacing_zyx_um,
         facts.maximum_decoded_chunk_bytes,
+        facts.maximum_encoded_chunk_bytes,
         files,
     )
 }
@@ -279,6 +351,7 @@ fn inspect_direct_stacks(
     let mut common: Option<(u64, u64, u64, IntensityDType)> = None;
     let mut spacing = SpacingAccumulator::default();
     let mut maximum_decoded_chunk_bytes = 0;
+    let mut maximum_encoded_chunk_bytes = 0;
     let mut files = Vec::with_capacity(assigned.len());
     for (channel, timepoint, candidate) in assigned {
         check_cancelled(cancellation)?;
@@ -294,6 +367,8 @@ fn inspect_direct_stacks(
         spacing.push(&candidate.relative_name, facts.ome_spacing_zyx_um)?;
         maximum_decoded_chunk_bytes =
             maximum_decoded_chunk_bytes.max(facts.maximum_decoded_chunk_bytes);
+        maximum_encoded_chunk_bytes =
+            maximum_encoded_chunk_bytes.max(facts.maximum_encoded_chunk_bytes);
         files.push(InspectedSourceFile {
             path: candidate.path,
             relative_name: candidate.relative_name,
@@ -303,6 +378,7 @@ fn inspect_direct_stacks(
             planes: facts.pages,
             bytes: facts.bytes,
             sha256: facts.sha256,
+            generation: facts.generation,
         });
     }
     let (width, height, pages, dtype) = common.expect("directory discovery rejects no files");
@@ -316,6 +392,7 @@ fn inspect_direct_stacks(
         dtype,
         spacing.finish()?,
         maximum_decoded_chunk_bytes,
+        maximum_encoded_chunk_bytes,
         files,
     )
 }
@@ -397,6 +474,7 @@ fn inspect_channel_folders(
     let mut expected_planes = None;
     let mut spacing = SpacingAccumulator::default();
     let mut maximum_decoded_chunk_bytes = 0;
+    let mut maximum_encoded_chunk_bytes = 0;
     let mut files = Vec::new();
     for (folder_index, (_relative_folder, label, planes)) in folder_records.into_iter().enumerate()
     {
@@ -437,6 +515,8 @@ fn inspect_channel_folders(
             spacing.push(&relative_name, facts.ome_spacing_zyx_um)?;
             maximum_decoded_chunk_bytes =
                 maximum_decoded_chunk_bytes.max(facts.maximum_decoded_chunk_bytes);
+            maximum_encoded_chunk_bytes =
+                maximum_encoded_chunk_bytes.max(facts.maximum_encoded_chunk_bytes);
             files.push(InspectedSourceFile {
                 path,
                 relative_name,
@@ -446,6 +526,7 @@ fn inspect_channel_folders(
                 planes: 1,
                 bytes: facts.bytes,
                 sha256: facts.sha256,
+                generation: facts.generation,
             });
         }
     }
@@ -467,21 +548,30 @@ fn inspect_channel_folders(
         dtype,
         spacing.finish()?,
         maximum_decoded_chunk_bytes,
+        maximum_encoded_chunk_bytes,
         files,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn finish_inspection(
-    source: TiffSource,
+    mut source: TiffSource,
     layout: SourceLayout,
     shape: Shape4D,
     channels: u32,
     dtype: IntensityDType,
     ome_spacing_zyx_um: Option<[f64; 3]>,
     maximum_decoded_chunk_bytes: u64,
-    files: Vec<InspectedSourceFile>,
+    maximum_encoded_chunk_bytes: u64,
+    mut files: Vec<InspectedSourceFile>,
 ) -> Result<TiffInspection, ImportError> {
+    source.path.shrink_to_fit();
+    files.shrink_to_fit();
+    for file in &mut files {
+        file.path.shrink_to_fit();
+        file.relative_name.shrink_to_fit();
+    }
+    let source_index_working_bytes = source_index_working_bytes(&source, &files)?;
     let source_bytes = files.iter().try_fold(0_u64, |total, file| {
         total.checked_add(file.bytes).ok_or(ImportError::Overflow)
     })?;
@@ -497,6 +587,7 @@ fn finish_inspection(
     Ok(TiffInspection {
         source,
         files,
+        source_index_working_bytes,
         layout,
         shape,
         channels,
@@ -505,37 +596,107 @@ fn finish_inspection(
         source_bytes,
         source_fingerprint,
         maximum_decoded_chunk_bytes,
+        maximum_encoded_chunk_bytes,
     })
+}
+
+fn source_index_working_bytes(
+    source: &TiffSource,
+    files: &[InspectedSourceFile],
+) -> Result<u64, ImportError> {
+    let root_bytes = u64::try_from(source.path.as_os_str().as_bytes().len())
+        .map_err(|_| ImportError::Overflow)?;
+    let text_bytes = files.iter().try_fold(root_bytes, |total, file| {
+        let path_bytes = u64::try_from(file.path.as_os_str().as_bytes().len())
+            .map_err(|_| ImportError::Overflow)?;
+        let name_bytes =
+            u64::try_from(file.relative_name.len()).map_err(|_| ImportError::Overflow)?;
+        total
+            .checked_add(path_bytes)
+            .and_then(|value| value.checked_add(name_bytes))
+            .ok_or(ImportError::Overflow)
+    })?;
+    if text_bytes > MAX_SOURCE_INDEX_TEXT_BYTES {
+        return Err(ImportError::UnsupportedSource(format!(
+            "source path and filename metadata exceeds the fixed {MAX_SOURCE_INDEX_TEXT_BYTES}-byte aggregate bound"
+        )));
+    }
+    let file_count = u64::try_from(files.len()).map_err(|_| ImportError::Overflow)?;
+    let retained_struct_bytes = u64::try_from(size_of::<TiffInspection>())
+        .map_err(|_| ImportError::Overflow)?
+        .checked_add(
+            file_count
+                .checked_mul(
+                    u64::try_from(size_of::<InspectedSourceFile>())
+                        .map_err(|_| ImportError::Overflow)?,
+                )
+                .ok_or(ImportError::Overflow)?,
+        )
+        .ok_or(ImportError::Overflow)?;
+    text_bytes
+        .checked_mul(SOURCE_INDEX_TEXT_COPIES_MAX)
+        .and_then(|value| {
+            value.checked_add(file_count.checked_mul(SOURCE_INDEX_BYTES_PER_FILE_MAX)?)
+        })
+        .and_then(|value| value.checked_add(retained_struct_bytes))
+        .and_then(|value| value.checked_add(SOURCE_INDEX_FIXED_BYTES_MAX))
+        .ok_or(ImportError::Overflow)
 }
 
 pub(crate) fn revalidate(
     inspection: &TiffInspection,
     cancellation: &ImportCancellation,
-) -> Result<(), ImportError> {
+) -> Result<SourceRevalidationCounters, ImportError> {
     check_cancelled(cancellation)?;
     let current_files = enumerate_accepted_layout_files(inspection, cancellation)?;
-    let recorded = inspection
-        .files
-        .iter()
-        .map(|file| (file.relative_name.as_str(), file))
-        .collect::<BTreeMap<_, _>>();
+    let mut recorded = inspection.files.iter().enumerate().collect::<Vec<_>>();
+    recorded.sort_by(|left, right| left.1.relative_name.cmp(&right.1.relative_name));
 
     if current_files.len() != recorded.len() {
         return Err(ImportError::SourceChanged(inspection.source.path.clone()));
     }
 
-    let refreshed = inspection.files.clone();
-    for (relative_name, path) in current_files {
-        let Some(expected) = recorded.get(relative_name.as_str()) else {
-            return Err(ImportError::SourceChanged(path));
-        };
-        let (bytes, sha256) = hash_file_cancellable(&path, cancellation)?;
-        if bytes != expected.bytes || sha256 != expected.sha256 {
+    let mut counters = SourceRevalidationCounters {
+        generation: SourceGeneration {
+            files: inspection
+                .files
+                .iter()
+                .map(|file| file.generation)
+                .collect(),
+        },
+        ..SourceRevalidationCounters::default()
+    };
+    for ((relative_name, path), (recorded_index, expected)) in
+        current_files.into_iter().zip(recorded)
+    {
+        if relative_name != expected.relative_name || path != expected.path {
             return Err(ImportError::SourceChanged(path));
         }
+        let before = source_file_generation(&path)?;
+        if before != expected.generation {
+            return Err(ImportError::SourceChanged(path));
+        }
+        let (bytes, sha256) = hash_file_cancellable(&path, cancellation)?;
+        let after = source_file_generation(&path)?;
+        counters.source_bytes_read = counters
+            .source_bytes_read
+            .checked_add(bytes)
+            .ok_or(ImportError::Overflow)?;
+        counters.tiff_open_count = counters
+            .tiff_open_count
+            .checked_add(1)
+            .ok_or(ImportError::Overflow)?;
+        if before != after
+            || after != expected.generation
+            || bytes != expected.bytes
+            || sha256 != expected.sha256
+        {
+            return Err(ImportError::SourceChanged(path));
+        }
+        counters.generation.files[recorded_index] = after;
     }
 
-    let source_bytes = refreshed.iter().try_fold(0_u64, |total, file| {
+    let source_bytes = inspection.files.iter().try_fold(0_u64, |total, file| {
         total.checked_add(file.bytes).ok_or(ImportError::Overflow)
     })?;
     if source_bytes != inspection.source_bytes {
@@ -548,120 +709,460 @@ pub(crate) fn revalidate(
         inspection.dtype,
         inspection.ome_spacing_zyx_um,
         source_bytes,
-        &refreshed,
+        &inspection.files,
     )?;
     if fingerprint != inspection.source_fingerprint {
         return Err(ImportError::SourceChanged(inspection.source.path.clone()));
+    }
+    Ok(counters)
+}
+
+/// Captures the exact reviewed inventory and a kernel-backed file generation
+/// before ingest without consuming the one in-clock strong integrity pass.
+///
+/// The generation includes file identity and change time, so a source write,
+/// replacement, or metadata-restored transient mutation cannot be hidden by
+/// merely restoring length and modification time. The final strong
+/// [`revalidate`] pass still compares every byte with the reviewed SHA-256.
+pub(crate) fn capture_generation(
+    inspection: &TiffInspection,
+    cancellation: &ImportCancellation,
+) -> Result<SourceGeneration, ImportError> {
+    check_cancelled(cancellation)?;
+    let current_files = enumerate_accepted_layout_files(inspection, cancellation)?;
+    let mut recorded = inspection.files.iter().enumerate().collect::<Vec<_>>();
+    recorded.sort_by(|left, right| left.1.relative_name.cmp(&right.1.relative_name));
+    if current_files.len() != recorded.len() {
+        return Err(ImportError::SourceChanged(inspection.source.path.clone()));
+    }
+    let mut generation = SourceGeneration {
+        files: inspection
+            .files
+            .iter()
+            .map(|file| file.generation)
+            .collect(),
+    };
+    for ((relative_name, path), (recorded_index, expected)) in
+        current_files.into_iter().zip(recorded)
+    {
+        check_cancelled(cancellation)?;
+        if relative_name != expected.relative_name || path != expected.path {
+            return Err(ImportError::SourceChanged(path));
+        }
+        let file_generation = source_file_generation(&path)?;
+        if file_generation != expected.generation {
+            return Err(ImportError::SourceChanged(path));
+        }
+        generation.files[recorded_index] = file_generation;
+    }
+    Ok(generation)
+}
+
+/// Decodes the inspected source exactly once in native strip/tile order into
+/// the durable canonical base checkpoint.
+///
+/// A resumed import skips the already durable plane prefix. Within every
+/// remaining file, the decoder is opened once and each admitted native chunk
+/// is read once. The source files remain immutable and are strongly checked
+/// again by the pipeline before publication.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_canonical_into_cache(
+    inspection: &TiffInspection,
+    generation: &SourceGeneration,
+    cache: &mut CanonicalBaseCache,
+    maximum_decoded_chunk_bytes: u64,
+    working_memory_bytes: u64,
+    resident_working_bytes: u64,
+    ledger: &dyn CpuByteLedger,
+    cancellation: &ImportCancellation,
+    mut plane_completed: impl FnMut(u64, u64),
+) -> Result<SourceDecodeReport, ImportError> {
+    check_cancelled(cancellation)?;
+    if generation.files.len() != inspection.files.len() {
+        return Err(ImportError::SourceChanged(inspection.source.path.clone()));
+    }
+    let mut ordered = inspection.files.iter().enumerate().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        left.1
+            .channel
+            .cmp(&right.1.channel)
+            .then(left.1.timepoint.cmp(&right.1.timepoint))
+            .then(left.1.first_z.cmp(&right.1.first_z))
+            .then(left.1.relative_name.cmp(&right.1.relative_name))
+    });
+    let resume_plane = cache.durable_planes();
+    let total_planes = cache.total_planes();
+    let mut next_plane = resume_plane;
+    let mut remaining = Vec::new();
+    for (file_index, file) in ordered {
+        let expected_generation = generation
+            .files
+            .get(file_index)
+            .ok_or_else(|| ImportError::SourceChanged(file.path.clone()))?;
+        let first_plane = cache.plane_ordinal(file.channel, file.timepoint, file.first_z)?;
+        let end_plane = first_plane
+            .checked_add(file.planes)
+            .ok_or(ImportError::Overflow)?;
+        if end_plane <= resume_plane {
+            continue;
+        }
+        if first_plane > next_plane {
+            return Err(ImportError::UnsupportedSource(
+                "the inspected source has a gap in canonical plane order".to_owned(),
+            ));
+        }
+        remaining.push((file, expected_generation, first_plane));
+        next_plane = end_plane.max(next_plane);
+    }
+    if next_plane != total_planes {
+        return Err(ImportError::UnsupportedSource(
+            "the inspected source does not cover every canonical plane".to_owned(),
+        ));
+    }
+
+    let row_bytes = inspection
+        .shape
+        .x()
+        .checked_mul(u64::from(inspection.dtype.bytes_per_sample()))
+        .ok_or(ImportError::Overflow)?;
+    let plane_bytes = inspection
+        .shape
+        .y()
+        .checked_mul(row_bytes)
+        .ok_or(ImportError::Overflow)?;
+    let maximum_encoded_chunk_bytes = inspection.maximum_encoded_chunk_bytes;
+    let maximum_file_pages = inspection
+        .files
+        .iter()
+        .map(|file| file.planes)
+        .max()
+        .unwrap_or(1);
+    let serial_retained_bytes =
+        retained_decoder_bytes(maximum_file_pages).ok_or(ImportError::Overflow)?;
+    let parallel_retained_bytes = retained_decoder_bytes(1).ok_or(ImportError::Overflow)?;
+    let serial_transition_bytes = if maximum_file_pages > 1 {
+        SOURCE_SERIAL_TRANSITION_BYTES_MAX
+    } else {
+        0
+    };
+    let serial_charge = maximum_decoded_chunk_bytes
+        .checked_add(maximum_encoded_chunk_bytes)
+        .and_then(|value| value.checked_add(SOURCE_DECODE_FIXED_OVERHEAD_BYTES_MAX))
+        .and_then(|value| value.checked_add(serial_retained_bytes))
+        .and_then(|value| value.checked_add(serial_transition_bytes))
+        .and_then(|value| value.checked_add(row_bytes))
+        .and_then(|value| value.checked_add(SOURCE_TASK_METADATA_BYTES_MAX))
+        .ok_or(ImportError::Overflow)?;
+    let parallel_charge = maximum_decoded_chunk_bytes
+        .checked_add(maximum_encoded_chunk_bytes)
+        .and_then(|value| value.checked_add(SOURCE_DECODE_FIXED_OVERHEAD_BYTES_MAX))
+        .and_then(|value| value.checked_add(parallel_retained_bytes))
+        .and_then(|value| value.checked_add(plane_bytes))
+        .and_then(|value| value.checked_add(SOURCE_TASK_METADATA_BYTES_MAX))
+        .ok_or(ImportError::Overflow)?;
+    let parallel_policy = OrderedWorkerPolicy::for_system(
+        working_memory_bytes,
+        resident_working_bytes,
+        parallel_charge,
+    )
+    .ok();
+    let mut report = SourceDecodeReport::default();
+    let mut index = 0_usize;
+    while index < remaining.len() {
+        check_cancelled(cancellation)?;
+        if let Some(policy) = parallel_policy.filter(|_| remaining[index].0.planes == 1) {
+            let run_start = index;
+            while index < remaining.len() && remaining[index].0.planes == 1 {
+                index += 1;
+            }
+            let diagnostics = run_ordered(
+                policy,
+                ledger,
+                cancellation,
+                remaining[run_start..index].iter().copied(),
+                cache,
+                |_cache, (file, expected_generation, plane)| {
+                    Ok(SourcePlaneCpuTask {
+                        inspection,
+                        file,
+                        expected_generation,
+                        plane,
+                        maximum_decoded_chunk_bytes,
+                        maximum_encoded_chunk_bytes,
+                    })
+                },
+                decode_single_plane_task,
+                CanonicalBaseCache::commit_expired,
+                |cache, decoded| {
+                    check_cancelled(cancellation)?;
+                    if source_file_generation(&decoded.path)? != decoded.expected_generation {
+                        return Err(ImportError::SourceChanged(decoded.path));
+                    }
+                    write_canonical_plane(cache, decoded.plane, inspection, &decoded.pixels_le)?;
+                    cache.complete_plane(decoded.plane)?;
+                    add_source_counters(&mut report.counters, decoded.counters)?;
+                    plane_completed(decoded.plane + 1, cache.total_planes());
+                    Ok(())
+                },
+            )?;
+            record_source_worker_diagnostics(&mut report, parallel_charge, diagnostics)?;
+            continue;
+        }
+
+        let (file, expected_generation, _) = remaining[index];
+        // The exact-once multipage/oversized-file boundary can block inside a
+        // decoder without returning owner ticks. Do not carry a completed
+        // canonical prefix across that unbounded interval.
+        cache.commit_pending()?;
+        let combined = resident_working_bytes
+            .checked_add(serial_charge)
+            .ok_or(ImportError::Overflow)?;
+        if combined > working_memory_bytes {
+            return Err(ImportError::WorkingMemoryExceeded {
+                required_bytes: combined,
+                budget_bytes: working_memory_bytes,
+            });
+        }
+        let _lease = ledger.try_acquire(
+            mirante4d_dataset::CpuLedgerCategory::ImportWorkingSet,
+            serial_charge,
+        )?;
+        decode_file_into_cache(
+            inspection,
+            file,
+            expected_generation,
+            resume_plane,
+            cache,
+            maximum_decoded_chunk_bytes,
+            maximum_encoded_chunk_bytes,
+            cancellation,
+            &mut report.counters,
+            &mut plane_completed,
+        )?;
+        report.serialized_files = report
+            .serialized_files
+            .checked_add(1)
+            .ok_or(ImportError::Overflow)?;
+        report.peak_transient_bytes = report.peak_transient_bytes.max(serial_charge);
+        index += 1;
+    }
+    cache.commit_pending()?;
+    Ok(report)
+}
+
+#[derive(Clone, Copy)]
+struct SourcePlaneCpuTask<'a> {
+    inspection: &'a TiffInspection,
+    file: &'a InspectedSourceFile,
+    expected_generation: &'a SourceFileGeneration,
+    plane: u64,
+    maximum_decoded_chunk_bytes: u64,
+    maximum_encoded_chunk_bytes: u64,
+}
+
+struct DecodedCanonicalPlane {
+    path: PathBuf,
+    expected_generation: SourceFileGeneration,
+    plane: u64,
+    pixels_le: Vec<u8>,
+    counters: SourceReadCounters,
+}
+
+fn decode_single_plane_task(
+    task: SourcePlaneCpuTask<'_>,
+    cancellation: &ImportCancellation,
+) -> Result<DecodedCanonicalPlane, ImportError> {
+    check_cancelled(cancellation)?;
+    if task.file.planes != 1 {
+        return Err(ImportError::InvalidRequest(
+            "parallel source decode accepts exactly one TIFF plane per file",
+        ));
+    }
+    if source_file_generation(&task.file.path)? != *task.expected_generation {
+        return Err(ImportError::SourceChanged(task.file.path.clone()));
+    }
+    let raw = open_source_file(&task.file.path, "open source for parallel canonical decode")?;
+    if source_file_generation_from_open_file(&task.file.path, &raw)? != *task.expected_generation {
+        return Err(ImportError::SourceChanged(task.file.path.clone()));
+    }
+    let preflight_bytes = preflight_tiff_ifd_chain(&task.file.path, &raw, cancellation)?;
+    if source_file_generation_from_open_file(&task.file.path, &raw)? != *task.expected_generation {
+        return Err(ImportError::SourceChanged(task.file.path.clone()));
+    }
+    let counting = CountingReader::new(raw);
+    let reader = BufReader::with_capacity(HASH_READ_BYTES, counting);
+    let decode_limit = usize::try_from(task.maximum_decoded_chunk_bytes).unwrap_or(usize::MAX);
+    let mut limits = Limits::default();
+    limits.decoding_buffer_size = decode_limit.max(MAX_OME_XML_BYTES);
+    let encoded_limit = usize::try_from(task.maximum_encoded_chunk_bytes).unwrap_or(usize::MAX);
+    limits.intermediate_buffer_size =
+        encoded_limit.saturating_add(MAX_ENCODED_CHUNK_OVERHEAD_BYTES);
+    limits.ifd_value_size = MAX_OME_XML_BYTES;
+    let mut decoder = Decoder::new(reader)
+        .map_err(|error| tiff_error(&task.file.path, error))?
+        .with_limits(limits);
+    validate_current_page(
+        &task.file.path,
+        &mut decoder,
+        task.inspection.shape.x(),
+        task.inspection.shape.y(),
+        task.inspection.dtype,
+    )?;
+    let plane_bytes = task
+        .inspection
+        .shape
+        .y()
+        .checked_mul(task.inspection.shape.x())
+        .and_then(|value| value.checked_mul(u64::from(task.inspection.dtype.bytes_per_sample())))
+        .ok_or(ImportError::Overflow)?;
+    let mut pixels_le = vec![0; usize::try_from(plane_bytes).map_err(|_| ImportError::Overflow)?];
+    let mut counters = SourceReadCounters {
+        tiff_open_count: 1,
+        ..SourceReadCounters::default()
+    };
+    decode_page_into_plane(
+        &task.file.path,
+        &mut decoder,
+        task.inspection.dtype,
+        &mut pixels_le,
+        task.maximum_decoded_chunk_bytes,
+        cancellation,
+        &mut counters,
+    )?;
+    let bytes_read = decoder.inner().get_ref().bytes_read;
+    if source_file_generation_from_open_file(&task.file.path, decoder.inner().get_ref().inner())?
+        != *task.expected_generation
+    {
+        return Err(ImportError::SourceChanged(task.file.path.clone()));
+    }
+    if source_file_generation(&task.file.path)? != *task.expected_generation {
+        return Err(ImportError::SourceChanged(task.file.path.clone()));
+    }
+    counters.source_bytes_read = bytes_read
+        .checked_add(preflight_bytes)
+        .ok_or(ImportError::Overflow)?;
+    Ok(DecodedCanonicalPlane {
+        path: task.file.path.clone(),
+        expected_generation: *task.expected_generation,
+        plane: task.plane,
+        pixels_le,
+        counters,
+    })
+}
+
+fn record_source_worker_diagnostics(
+    report: &mut SourceDecodeReport,
+    task_charge_bytes: u64,
+    diagnostics: OrderedWorkerDiagnostics,
+) -> Result<(), ImportError> {
+    let in_flight = u64::try_from(diagnostics.peak_in_flight).map_err(|_| ImportError::Overflow)?;
+    report.peak_transient_bytes = report.peak_transient_bytes.max(
+        in_flight
+            .checked_mul(task_charge_bytes)
+            .ok_or(ImportError::Overflow)?,
+    );
+    report.parallel_files = report
+        .parallel_files
+        .checked_add(diagnostics.committed_tasks)
+        .ok_or(ImportError::Overflow)?;
+    report.peak_reorder_results = report
+        .peak_reorder_results
+        .max(diagnostics.peak_reorder_results);
+    Ok(())
+}
+
+fn add_source_counters(
+    total: &mut SourceReadCounters,
+    next: SourceReadCounters,
+) -> Result<(), ImportError> {
+    total.source_bytes_read = total
+        .source_bytes_read
+        .checked_add(next.source_bytes_read)
+        .ok_or(ImportError::Overflow)?;
+    total.decoded_bytes = total
+        .decoded_bytes
+        .checked_add(next.decoded_bytes)
+        .ok_or(ImportError::Overflow)?;
+    total.tiff_open_count = total
+        .tiff_open_count
+        .checked_add(next.tiff_open_count)
+        .ok_or(ImportError::Overflow)?;
+    total.native_chunk_decode_count = total
+        .native_chunk_decode_count
+        .checked_add(next.native_chunk_decode_count)
+        .ok_or(ImportError::Overflow)?;
+    Ok(())
+}
+
+fn write_canonical_plane(
+    cache: &mut CanonicalBaseCache,
+    plane: u64,
+    inspection: &TiffInspection,
+    pixels_le: &[u8],
+) -> Result<(), ImportError> {
+    let row_bytes = inspection
+        .shape
+        .x()
+        .checked_mul(u64::from(inspection.dtype.bytes_per_sample()))
+        .ok_or(ImportError::Overflow)?;
+    let row_bytes = usize::try_from(row_bytes).map_err(|_| ImportError::Overflow)?;
+    let expected = usize::try_from(inspection.shape.y())
+        .map_err(|_| ImportError::Overflow)?
+        .checked_mul(row_bytes)
+        .ok_or(ImportError::Overflow)?;
+    if pixels_le.len() != expected {
+        return Err(ImportError::InvalidRequest(
+            "a decoded canonical plane has the wrong byte length",
+        ));
+    }
+    for (y, row) in pixels_le.chunks_exact(row_bytes).enumerate() {
+        cache.write_row(
+            plane,
+            u64::try_from(y).map_err(|_| ImportError::Overflow)?,
+            0,
+            row,
+        )?;
     }
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn read_region_into(
-    inspection: &TiffInspection,
-    channel: u32,
-    timepoint: u64,
-    origin_zyx: [u64; 3],
-    extent_zyx: [u64; 3],
-    destination_le: &mut [u8],
-    maximum_decoded_chunk_bytes: u64,
-    cancellation: &ImportCancellation,
-) -> Result<SourceReadCounters, ImportError> {
-    check_cancelled(cancellation)?;
-    validate_region_request(
-        inspection,
-        channel,
-        timepoint,
-        origin_zyx,
-        extent_zyx,
-        destination_le.len(),
-    )?;
-
-    let end_z = origin_zyx[0]
-        .checked_add(extent_zyx[0])
-        .ok_or(ImportError::Overflow)?;
-    let mut matching = inspection
-        .files
-        .iter()
-        .filter(|file| file.channel == channel && file.timepoint == timepoint)
-        .filter(|file| {
-            let file_end = file.first_z.saturating_add(file.planes);
-            file.first_z < end_z && file_end > origin_zyx[0]
-        })
-        .collect::<Vec<_>>();
-    matching.sort_by(|left, right| {
-        left.first_z
-            .cmp(&right.first_z)
-            .then(left.relative_name.cmp(&right.relative_name))
-    });
-
-    let mut next_z = origin_zyx[0];
-    let mut counters = SourceReadCounters::default();
-    for file in matching {
-        let file_end = file
-            .first_z
-            .checked_add(file.planes)
-            .ok_or(ImportError::Overflow)?;
-        let read_start = file.first_z.max(origin_zyx[0]);
-        let read_end = file_end.min(end_z);
-        if read_start != next_z || read_end <= read_start {
-            return Err(ImportError::UnsupportedSource(
-                "the inspected source does not cover the requested z region exactly once"
-                    .to_owned(),
-            ));
-        }
-        read_file_region(
-            inspection,
-            file,
-            read_start,
-            read_end,
-            origin_zyx,
-            extent_zyx,
-            destination_le,
-            maximum_decoded_chunk_bytes,
-            cancellation,
-            &mut counters,
-        )?;
-        next_z = read_end;
-    }
-    if next_z != end_z {
-        return Err(ImportError::UnsupportedSource(
-            "the inspected source does not cover the requested z region".to_owned(),
-        ));
-    }
-    Ok(counters)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn read_file_region(
+fn decode_file_into_cache(
     inspection: &TiffInspection,
     file: &InspectedSourceFile,
-    read_start_z: u64,
-    read_end_z: u64,
-    origin_zyx: [u64; 3],
-    extent_zyx: [u64; 3],
-    destination_le: &mut [u8],
+    expected_generation: &SourceFileGeneration,
+    resume_plane: u64,
+    cache: &mut CanonicalBaseCache,
     maximum_decoded_chunk_bytes: u64,
+    maximum_encoded_chunk_bytes: u64,
     cancellation: &ImportCancellation,
     counters: &mut SourceReadCounters,
+    plane_completed: &mut impl FnMut(u64, u64),
 ) -> Result<(), ImportError> {
     check_cancelled(cancellation)?;
-    let metadata = fs::metadata(&file.path)
-        .map_err(|source| io_error("stat source before decode", &file.path, source))?;
-    if !metadata.is_file() || metadata.len() != file.bytes {
+    if source_file_generation(&file.path)? != *expected_generation {
         return Err(ImportError::SourceChanged(file.path.clone()));
     }
-    let raw = File::open(&file.path)
-        .map_err(|source| io_error("open source for decode", &file.path, source))?;
+    let raw = open_source_file(&file.path, "open source for canonical decode")?;
+    if source_file_generation_from_open_file(&file.path, &raw)? != *expected_generation {
+        return Err(ImportError::SourceChanged(file.path.clone()));
+    }
+    let preflight_bytes = preflight_tiff_ifd_chain(&file.path, &raw, cancellation)?;
+    if source_file_generation_from_open_file(&file.path, &raw)? != *expected_generation {
+        return Err(ImportError::SourceChanged(file.path.clone()));
+    }
+    counters.tiff_open_count = counters
+        .tiff_open_count
+        .checked_add(1)
+        .ok_or(ImportError::Overflow)?;
     let counting = CountingReader::new(raw);
     let reader = BufReader::with_capacity(HASH_READ_BYTES, counting);
     let decode_limit = usize::try_from(maximum_decoded_chunk_bytes).unwrap_or(usize::MAX);
     let mut limits = Limits::default();
-    // `tiff` also applies this field to bounded IFD arrays (for example a
-    // strip-offset table). The explicit layout check below remains the source
-    // chunk allocation gate, while this floor permits already-bounded metadata.
     limits.decoding_buffer_size = decode_limit.max(MAX_OME_XML_BYTES);
-    limits.intermediate_buffer_size = decode_limit.saturating_add(MAX_ENCODED_CHUNK_OVERHEAD_BYTES);
+    let encoded_limit = usize::try_from(maximum_encoded_chunk_bytes).unwrap_or(usize::MAX);
+    limits.intermediate_buffer_size =
+        encoded_limit.saturating_add(MAX_ENCODED_CHUNK_OVERHEAD_BYTES);
     limits.ifd_value_size = MAX_OME_XML_BYTES;
     let mut decoder = Decoder::new(reader)
         .map_err(|error| tiff_error(&file.path, error))?
@@ -673,7 +1174,11 @@ fn read_file_region(
             .first_z
             .checked_add(local_page)
             .ok_or(ImportError::Overflow)?;
-        if global_z >= read_start_z && global_z < read_end_z {
+        let plane = cache.plane_ordinal(file.channel, file.timepoint, global_z)?;
+        if plane >= resume_plane {
+            if source_file_generation(&file.path)? != *expected_generation {
+                return Err(ImportError::SourceChanged(file.path.clone()));
+            }
             validate_current_page(
                 &file.path,
                 &mut decoder,
@@ -681,21 +1186,26 @@ fn read_file_region(
                 inspection.shape.y(),
                 inspection.dtype,
             )?;
-            decode_page_region(
+            decode_page_into_cache(
                 &file.path,
                 &mut decoder,
                 inspection.dtype,
-                global_z,
-                origin_zyx,
-                extent_zyx,
-                destination_le,
+                plane,
+                cache,
                 maximum_decoded_chunk_bytes,
                 cancellation,
                 counters,
             )?;
-        }
-        if global_z + 1 >= read_end_z {
-            break;
+            if source_file_generation(&file.path)? != *expected_generation {
+                return Err(ImportError::SourceChanged(file.path.clone()));
+            }
+            cache.complete_plane(plane)?;
+            plane_completed(plane + 1, cache.total_planes());
+            if local_page + 1 < file.planes {
+                // The next TIFF page decode is an unbounded owner-side
+                // interval, so close the completed prefix before entering it.
+                cache.commit_pending()?;
+            }
         }
         if local_page + 1 < file.planes {
             decoder
@@ -704,21 +1214,108 @@ fn read_file_region(
         }
     }
     let bytes_read = decoder.inner().get_ref().bytes_read;
+    if source_file_generation_from_open_file(&file.path, decoder.inner().get_ref().inner())?
+        != *expected_generation
+    {
+        return Err(ImportError::SourceChanged(file.path.clone()));
+    }
+    if source_file_generation(&file.path)? != *expected_generation {
+        return Err(ImportError::SourceChanged(file.path.clone()));
+    }
     counters.source_bytes_read = counters
         .source_bytes_read
         .checked_add(bytes_read)
+        .and_then(|bytes| bytes.checked_add(preflight_bytes))
         .ok_or(ImportError::Overflow)?;
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decode_page_region<R: Read + Seek>(
+fn decode_page_into_cache<R: Read + Seek>(
     path: &Path,
     decoder: &mut Decoder<R>,
     dtype: IntensityDType,
-    global_z: u64,
-    origin_zyx: [u64; 3],
-    extent_zyx: [u64; 3],
+    plane: u64,
+    cache: &mut CanonicalBaseCache,
+    maximum_decoded_chunk_bytes: u64,
+    cancellation: &ImportCancellation,
+    counters: &mut SourceReadCounters,
+) -> Result<(), ImportError> {
+    let (image_width, image_height) = decoder
+        .dimensions()
+        .map_err(|error| tiff_error(path, error))?;
+    let (chunk_width, chunk_height) = decoder.chunk_dimensions();
+    if chunk_width == 0 || chunk_height == 0 {
+        return Err(ImportError::UnsupportedSource(
+            "TIFF strip/tile dimensions must be nonzero".to_owned(),
+        ));
+    }
+    let chunks_across = image_width.div_ceil(chunk_width);
+    let chunks_down = image_height.div_ceil(chunk_height);
+    for chunk_y in 0..chunks_down {
+        for chunk_x in 0..chunks_across {
+            check_cancelled(cancellation)?;
+            let chunk_index = chunk_y
+                .checked_mul(chunks_across)
+                .and_then(|base| base.checked_add(chunk_x))
+                .ok_or(ImportError::Overflow)?;
+            let layout = decoder
+                .image_chunk_buffer_layout(chunk_index)
+                .map_err(|error| tiff_error(path, error))?;
+            let required_bytes =
+                u64::try_from(layout.complete_len).map_err(|_| ImportError::Overflow)?;
+            if required_bytes > maximum_decoded_chunk_bytes {
+                return Err(ImportError::WorkingMemoryExceeded {
+                    required_bytes,
+                    budget_bytes: maximum_decoded_chunk_bytes,
+                });
+            }
+            let (data_width, data_height) = decoder.chunk_data_dimensions(chunk_index);
+            let decoded = decoder
+                .read_chunk(chunk_index)
+                .map_err(|error| tiff_error(path, error))?;
+            counters.native_chunk_decode_count = counters
+                .native_chunk_decode_count
+                .checked_add(1)
+                .ok_or(ImportError::Overflow)?;
+            let actual_bytes = decoded_result_bytes(&decoded)?;
+            if actual_bytes > maximum_decoded_chunk_bytes {
+                return Err(ImportError::WorkingMemoryExceeded {
+                    required_bytes: actual_bytes,
+                    budget_bytes: maximum_decoded_chunk_bytes,
+                });
+            }
+            counters.decoded_bytes = counters
+                .decoded_bytes
+                .checked_add(actual_bytes)
+                .ok_or(ImportError::Overflow)?;
+            let x = u64::from(chunk_x)
+                .checked_mul(u64::from(chunk_width))
+                .ok_or(ImportError::Overflow)?;
+            let y = u64::from(chunk_y)
+                .checked_mul(u64::from(chunk_height))
+                .ok_or(ImportError::Overflow)?;
+            write_decoded_chunk_rows(
+                path,
+                dtype,
+                decoded,
+                data_width,
+                data_height,
+                plane,
+                y,
+                x,
+                cache,
+            )?;
+            check_cancelled(cancellation)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_page_into_plane<R: Read + Seek>(
+    path: &Path,
+    decoder: &mut Decoder<R>,
+    dtype: IntensityDType,
     destination_le: &mut [u8],
     maximum_decoded_chunk_bytes: u64,
     cancellation: &ImportCancellation,
@@ -735,37 +1332,13 @@ fn decode_page_region<R: Read + Seek>(
     }
     let chunks_across = image_width.div_ceil(chunk_width);
     let chunks_down = image_height.div_ceil(chunk_height);
-    let request_y_end = origin_zyx[1]
-        .checked_add(extent_zyx[1])
-        .ok_or(ImportError::Overflow)?;
-    let request_x_end = origin_zyx[2]
-        .checked_add(extent_zyx[2])
-        .ok_or(ImportError::Overflow)?;
-
     for chunk_y in 0..chunks_down {
         for chunk_x in 0..chunks_across {
+            check_cancelled(cancellation)?;
             let chunk_index = chunk_y
                 .checked_mul(chunks_across)
                 .and_then(|base| base.checked_add(chunk_x))
                 .ok_or(ImportError::Overflow)?;
-            let (data_width, data_height) = decoder.chunk_data_dimensions(chunk_index);
-            let chunk_x_start = u64::from(chunk_x) * u64::from(chunk_width);
-            let chunk_y_start = u64::from(chunk_y) * u64::from(chunk_height);
-            let chunk_x_end = chunk_x_start
-                .checked_add(u64::from(data_width))
-                .ok_or(ImportError::Overflow)?;
-            let chunk_y_end = chunk_y_start
-                .checked_add(u64::from(data_height))
-                .ok_or(ImportError::Overflow)?;
-            let copy_x_start = chunk_x_start.max(origin_zyx[2]);
-            let copy_y_start = chunk_y_start.max(origin_zyx[1]);
-            let copy_x_end = chunk_x_end.min(request_x_end);
-            let copy_y_end = chunk_y_end.min(request_y_end);
-            if copy_x_start >= copy_x_end || copy_y_start >= copy_y_end {
-                continue;
-            }
-
-            check_cancelled(cancellation)?;
             let layout = decoder
                 .image_chunk_buffer_layout(chunk_index)
                 .map_err(|error| tiff_error(path, error))?;
@@ -777,10 +1350,14 @@ fn decode_page_region<R: Read + Seek>(
                     budget_bytes: maximum_decoded_chunk_bytes,
                 });
             }
+            let (data_width, data_height) = decoder.chunk_data_dimensions(chunk_index);
             let decoded = decoder
                 .read_chunk(chunk_index)
                 .map_err(|error| tiff_error(path, error))?;
-            check_cancelled(cancellation)?;
+            counters.native_chunk_decode_count = counters
+                .native_chunk_decode_count
+                .checked_add(1)
+                .ok_or(ImportError::Overflow)?;
             let actual_bytes = decoded_result_bytes(&decoded)?;
             if actual_bytes > maximum_decoded_chunk_bytes {
                 return Err(ImportError::WorkingMemoryExceeded {
@@ -792,7 +1369,13 @@ fn decode_page_region<R: Read + Seek>(
                 .decoded_bytes
                 .checked_add(actual_bytes)
                 .ok_or(ImportError::Overflow)?;
-            copy_decoded_intersection(
+            let chunk_x_start = u64::from(chunk_x)
+                .checked_mul(u64::from(chunk_width))
+                .ok_or(ImportError::Overflow)?;
+            let chunk_y_start = u64::from(chunk_y)
+                .checked_mul(u64::from(chunk_height))
+                .ok_or(ImportError::Overflow)?;
+            copy_decoded_chunk_into_plane(
                 path,
                 dtype,
                 decoded,
@@ -800,37 +1383,27 @@ fn decode_page_region<R: Read + Seek>(
                 data_height,
                 chunk_x_start,
                 chunk_y_start,
-                global_z,
-                copy_x_start,
-                copy_x_end,
-                copy_y_start,
-                copy_y_end,
-                origin_zyx,
-                extent_zyx,
+                u64::from(image_width),
+                u64::from(image_height),
                 destination_le,
             )?;
+            check_cancelled(cancellation)?;
         }
     }
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn copy_decoded_intersection(
+fn write_decoded_chunk_rows(
     path: &Path,
     dtype: IntensityDType,
     decoded: DecodingResult,
     data_width: u32,
     data_height: u32,
-    chunk_x_start: u64,
-    chunk_y_start: u64,
-    global_z: u64,
-    copy_x_start: u64,
-    copy_x_end: u64,
-    copy_y_start: u64,
-    copy_y_end: u64,
-    origin_zyx: [u64; 3],
-    extent_zyx: [u64; 3],
-    destination_le: &mut [u8],
+    plane: u64,
+    y_start: u64,
+    x_start: u64,
+    cache: &mut CanonicalBaseCache,
 ) -> Result<(), ImportError> {
     let expected_samples = usize::try_from(
         u64::from(data_width)
@@ -838,78 +1411,59 @@ fn copy_decoded_intersection(
             .ok_or(ImportError::Overflow)?,
     )
     .map_err(|_| ImportError::Overflow)?;
+    let row_samples = usize::try_from(data_width).map_err(|_| ImportError::Overflow)?;
     match (dtype, decoded) {
         (IntensityDType::Uint8, DecodingResult::U8(values)) => {
             if values.len() != expected_samples {
                 return Err(chunk_size_error(path, values.len(), expected_samples));
             }
-            for y in copy_y_start..copy_y_end {
-                let source = source_row_range(
-                    chunk_x_start,
-                    chunk_y_start,
-                    data_width,
-                    y,
-                    copy_x_start,
-                    copy_x_end,
+            for (row, values) in values.chunks_exact(row_samples).enumerate() {
+                cache.write_row(
+                    plane,
+                    y_start + u64::try_from(row).map_err(|_| ImportError::Overflow)?,
+                    x_start,
+                    values,
                 )?;
-                let destination = destination_row_range(
-                    global_z,
-                    y,
-                    copy_x_start,
-                    copy_x_end,
-                    origin_zyx,
-                    extent_zyx,
-                    1,
-                )?;
-                destination_le[destination].copy_from_slice(&values[source]);
             }
         }
         (IntensityDType::Uint16, DecodingResult::U16(values)) => {
             if values.len() != expected_samples {
                 return Err(chunk_size_error(path, values.len(), expected_samples));
             }
-            copy_numeric_rows(
-                &values,
-                destination_le,
-                data_width,
-                chunk_x_start,
-                chunk_y_start,
-                global_z,
-                copy_x_start,
-                copy_x_end,
-                copy_y_start,
-                copy_y_end,
-                origin_zyx,
-                extent_zyx,
-                2,
-                |value, output| output.copy_from_slice(&value.to_le_bytes()),
-            )?;
+            let mut row_le = vec![0_u8; row_samples * 2];
+            for (row, values) in values.chunks_exact(row_samples).enumerate() {
+                for (value, output) in values.iter().zip(row_le.chunks_exact_mut(2)) {
+                    output.copy_from_slice(&value.to_le_bytes());
+                }
+                cache.write_row(
+                    plane,
+                    y_start + u64::try_from(row).map_err(|_| ImportError::Overflow)?,
+                    x_start,
+                    &row_le,
+                )?;
+            }
         }
         (IntensityDType::Float32, DecodingResult::F32(values)) => {
             if values.len() != expected_samples {
                 return Err(chunk_size_error(path, values.len(), expected_samples));
             }
-            if values.iter().any(|value| !value.is_finite()) {
-                return Err(ImportError::UnsupportedSource(format!(
-                    "TIFF {path:?} contains a non-finite float32 sample"
-                )));
+            let mut row_le = vec![0_u8; row_samples * 4];
+            for (row, values) in values.chunks_exact(row_samples).enumerate() {
+                for (value, output) in values.iter().zip(row_le.chunks_exact_mut(4)) {
+                    if !value.is_finite() {
+                        return Err(ImportError::UnsupportedSource(format!(
+                            "TIFF {path:?} contains a non-finite float32 sample"
+                        )));
+                    }
+                    output.copy_from_slice(&value.to_bits().to_le_bytes());
+                }
+                cache.write_row(
+                    plane,
+                    y_start + u64::try_from(row).map_err(|_| ImportError::Overflow)?,
+                    x_start,
+                    &row_le,
+                )?;
             }
-            copy_numeric_rows(
-                &values,
-                destination_le,
-                data_width,
-                chunk_x_start,
-                chunk_y_start,
-                global_z,
-                copy_x_start,
-                copy_x_end,
-                copy_y_start,
-                copy_y_end,
-                origin_zyx,
-                extent_zyx,
-                4,
-                |value, output| output.copy_from_slice(&value.to_bits().to_le_bytes()),
-            )?;
         }
         _ => {
             return Err(ImportError::UnsupportedSource(format!(
@@ -921,107 +1475,135 @@ fn copy_decoded_intersection(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn copy_numeric_rows<T: Copy>(
-    values: &[T],
-    destination_le: &mut [u8],
+fn copy_decoded_chunk_into_plane(
+    path: &Path,
+    dtype: IntensityDType,
+    decoded: DecodingResult,
     data_width: u32,
+    data_height: u32,
     chunk_x_start: u64,
     chunk_y_start: u64,
-    global_z: u64,
-    copy_x_start: u64,
-    copy_x_end: u64,
-    copy_y_start: u64,
-    copy_y_end: u64,
-    origin_zyx: [u64; 3],
-    extent_zyx: [u64; 3],
-    bytes_per_sample: u64,
-    encode: impl Fn(T, &mut [u8]),
+    image_width: u64,
+    image_height: u64,
+    destination_le: &mut [u8],
 ) -> Result<(), ImportError> {
-    for y in copy_y_start..copy_y_end {
-        let source = source_row_range(
-            chunk_x_start,
-            chunk_y_start,
-            data_width,
-            y,
-            copy_x_start,
-            copy_x_end,
-        )?;
-        let destination = destination_row_range(
-            global_z,
-            y,
-            copy_x_start,
-            copy_x_end,
-            origin_zyx,
-            extent_zyx,
-            bytes_per_sample,
-        )?;
-        let mut output = destination.start;
-        for value in &values[source] {
-            let end = output
-                .checked_add(usize::try_from(bytes_per_sample).map_err(|_| ImportError::Overflow)?)
-                .ok_or(ImportError::Overflow)?;
-            encode(*value, &mut destination_le[output..end]);
-            output = end;
+    let expected_samples = usize::try_from(
+        u64::from(data_width)
+            .checked_mul(u64::from(data_height))
+            .ok_or(ImportError::Overflow)?,
+    )
+    .map_err(|_| ImportError::Overflow)?;
+    let bytes_per_sample = u64::from(dtype.bytes_per_sample());
+    let expected_destination = image_width
+        .checked_mul(image_height)
+        .and_then(|value| value.checked_mul(bytes_per_sample))
+        .ok_or(ImportError::Overflow)?;
+    if u64::try_from(destination_le.len()).map_err(|_| ImportError::Overflow)?
+        != expected_destination
+        || chunk_x_start
+            .checked_add(u64::from(data_width))
+            .is_none_or(|end| end > image_width)
+        || chunk_y_start
+            .checked_add(u64::from(data_height))
+            .is_none_or(|end| end > image_height)
+    {
+        return Err(ImportError::InvalidRequest(
+            "a decoded TIFF chunk does not fit its canonical plane",
+        ));
+    }
+    let row_samples = usize::try_from(data_width).map_err(|_| ImportError::Overflow)?;
+    match (dtype, decoded) {
+        (IntensityDType::Uint8, DecodingResult::U8(values)) => {
+            if values.len() != expected_samples {
+                return Err(chunk_size_error(path, values.len(), expected_samples));
+            }
+            for (row, values) in values.chunks_exact(row_samples).enumerate() {
+                let destination = plane_chunk_row_range(
+                    chunk_x_start,
+                    chunk_y_start,
+                    image_width,
+                    row,
+                    u64::from(data_width),
+                    1,
+                )?;
+                destination_le[destination].copy_from_slice(values);
+            }
         }
-        debug_assert_eq!(output, destination.end);
+        (IntensityDType::Uint16, DecodingResult::U16(values)) => {
+            if values.len() != expected_samples {
+                return Err(chunk_size_error(path, values.len(), expected_samples));
+            }
+            for (row, values) in values.chunks_exact(row_samples).enumerate() {
+                let destination = plane_chunk_row_range(
+                    chunk_x_start,
+                    chunk_y_start,
+                    image_width,
+                    row,
+                    u64::from(data_width),
+                    2,
+                )?;
+                for (value, output) in values
+                    .iter()
+                    .zip(destination_le[destination].chunks_exact_mut(2))
+                {
+                    output.copy_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        (IntensityDType::Float32, DecodingResult::F32(values)) => {
+            if values.len() != expected_samples {
+                return Err(chunk_size_error(path, values.len(), expected_samples));
+            }
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(ImportError::UnsupportedSource(format!(
+                    "TIFF {path:?} contains a non-finite float32 sample"
+                )));
+            }
+            for (row, values) in values.chunks_exact(row_samples).enumerate() {
+                let destination = plane_chunk_row_range(
+                    chunk_x_start,
+                    chunk_y_start,
+                    image_width,
+                    row,
+                    u64::from(data_width),
+                    4,
+                )?;
+                for (value, output) in values
+                    .iter()
+                    .zip(destination_le[destination].chunks_exact_mut(4))
+                {
+                    output.copy_from_slice(&value.to_bits().to_le_bytes());
+                }
+            }
+        }
+        _ => {
+            return Err(ImportError::UnsupportedSource(format!(
+                "TIFF {path:?} decoded to a different sample type than inspection"
+            )));
+        }
     }
     Ok(())
 }
 
-fn source_row_range(
+fn plane_chunk_row_range(
     chunk_x_start: u64,
     chunk_y_start: u64,
-    data_width: u32,
-    y: u64,
-    copy_x_start: u64,
-    copy_x_end: u64,
-) -> Result<std::ops::Range<usize>, ImportError> {
-    let row = y.checked_sub(chunk_y_start).ok_or(ImportError::Overflow)?;
-    let x = copy_x_start
-        .checked_sub(chunk_x_start)
-        .ok_or(ImportError::Overflow)?;
-    let start = row
-        .checked_mul(u64::from(data_width))
-        .and_then(|value| value.checked_add(x))
-        .ok_or(ImportError::Overflow)?;
-    let len = copy_x_end
-        .checked_sub(copy_x_start)
-        .ok_or(ImportError::Overflow)?;
-    let end = start.checked_add(len).ok_or(ImportError::Overflow)?;
-    Ok(usize::try_from(start).map_err(|_| ImportError::Overflow)?
-        ..usize::try_from(end).map_err(|_| ImportError::Overflow)?)
-}
-
-fn destination_row_range(
-    global_z: u64,
-    y: u64,
-    copy_x_start: u64,
-    copy_x_end: u64,
-    origin_zyx: [u64; 3],
-    extent_zyx: [u64; 3],
+    image_width: u64,
+    row: usize,
+    row_samples: u64,
     bytes_per_sample: u64,
 ) -> Result<std::ops::Range<usize>, ImportError> {
-    let z = global_z
-        .checked_sub(origin_zyx[0])
-        .ok_or(ImportError::Overflow)?;
-    let local_y = y.checked_sub(origin_zyx[1]).ok_or(ImportError::Overflow)?;
-    let local_x = copy_x_start
-        .checked_sub(origin_zyx[2])
-        .ok_or(ImportError::Overflow)?;
-    let sample_start = z
-        .checked_mul(extent_zyx[1])
-        .and_then(|value| value.checked_add(local_y))
-        .and_then(|value| value.checked_mul(extent_zyx[2]))
-        .and_then(|value| value.checked_add(local_x))
-        .ok_or(ImportError::Overflow)?;
-    let sample_len = copy_x_end
-        .checked_sub(copy_x_start)
+    let row = u64::try_from(row).map_err(|_| ImportError::Overflow)?;
+    let sample_start = chunk_y_start
+        .checked_add(row)
+        .and_then(|y| y.checked_mul(image_width))
+        .and_then(|value| value.checked_add(chunk_x_start))
         .ok_or(ImportError::Overflow)?;
     let byte_start = sample_start
         .checked_mul(bytes_per_sample)
         .ok_or(ImportError::Overflow)?;
     let byte_end = sample_start
-        .checked_add(sample_len)
+        .checked_add(row_samples)
         .and_then(|value| value.checked_mul(bytes_per_sample))
         .ok_or(ImportError::Overflow)?;
     Ok(
@@ -1030,18 +1612,474 @@ fn destination_row_range(
     )
 }
 
+#[derive(Clone, Copy)]
+enum TiffByteOrder {
+    Little,
+    Big,
+}
+
+impl TiffByteOrder {
+    fn u16(self, bytes: &[u8]) -> u16 {
+        let bytes = [bytes[0], bytes[1]];
+        match self {
+            Self::Little => u16::from_le_bytes(bytes),
+            Self::Big => u16::from_be_bytes(bytes),
+        }
+    }
+
+    fn u32(self, bytes: &[u8]) -> u32 {
+        let bytes = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        match self {
+            Self::Little => u32::from_le_bytes(bytes),
+            Self::Big => u32::from_be_bytes(bytes),
+        }
+    }
+
+    fn u64(self, bytes: &[u8]) -> u64 {
+        let bytes = [
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ];
+        match self {
+            Self::Little => u64::from_le_bytes(bytes),
+            Self::Big => u64::from_be_bytes(bytes),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TiffIfdFormat {
+    byte_order: TiffByteOrder,
+    big_tiff: bool,
+    inline_bytes: u64,
+    entry_bytes: u64,
+    count_bytes: u64,
+    next_bytes: u64,
+}
+
+struct PreflightIfd {
+    entries_offset: u64,
+    entry_count: u64,
+    next_ifd: u64,
+}
+
+/// Validate the complete primary IFD chain with fixed-size positional reads
+/// before constructing `tiff::Decoder`. The pinned decoder parses its first
+/// image under a 256 MiB default limit, retains page-history maps, and does not
+/// bound the IFD entry count. This pass establishes the tighter importer
+/// authority before any of those allocations are reachable.
+fn preflight_tiff_ifd_chain(
+    path: &Path,
+    file: &File,
+    cancellation: &ImportCancellation,
+) -> Result<u64, ImportError> {
+    check_cancelled(cancellation)?;
+    let file_bytes = file
+        .metadata()
+        .map_err(|source| io_error("inspect TIFF preflight length", path, source))?
+        .len();
+    let mut bytes_read = 0_u64;
+    let mut header = [0_u8; 8];
+    preflight_read_exact(path, file, 0, &mut header, &mut bytes_read)?;
+    let byte_order = match &header[..2] {
+        b"II" => TiffByteOrder::Little,
+        b"MM" => TiffByteOrder::Big,
+        _ => return Err(preflight_error(path, "has an invalid byte-order signature")),
+    };
+    let (format, first_ifd) = match byte_order.u16(&header[2..4]) {
+        42 => (
+            TiffIfdFormat {
+                byte_order,
+                big_tiff: false,
+                inline_bytes: 4,
+                entry_bytes: 12,
+                count_bytes: 2,
+                next_bytes: 4,
+            },
+            u64::from(byte_order.u32(&header[4..8])),
+        ),
+        43 => {
+            if byte_order.u16(&header[4..6]) != 8 || byte_order.u16(&header[6..8]) != 0 {
+                return Err(preflight_error(path, "has an invalid BigTIFF header"));
+            }
+            let mut offset = [0_u8; 8];
+            preflight_read_exact(path, file, 8, &mut offset, &mut bytes_read)?;
+            (
+                TiffIfdFormat {
+                    byte_order,
+                    big_tiff: true,
+                    inline_bytes: 8,
+                    entry_bytes: 20,
+                    count_bytes: 8,
+                    next_bytes: 8,
+                },
+                byte_order.u64(&offset),
+            )
+        }
+        _ => return Err(preflight_error(path, "has an invalid TIFF version")),
+    };
+    if first_ifd == 0 {
+        return Err(preflight_error(path, "does not contain an image directory"));
+    }
+
+    // Brent cycle detection adds no page-proportional memory to the preflight.
+    let mut cycle_anchor = first_ifd;
+    let mut cycle_power = 1_u64;
+    let mut cycle_length = 0_u64;
+    let mut current = first_ifd;
+    let mut pages = 0_u64;
+    loop {
+        check_cancelled(cancellation)?;
+        pages = pages.checked_add(1).ok_or(ImportError::Overflow)?;
+        if pages > MAX_PAGES_PER_FILE {
+            return Err(preflight_error(
+                path,
+                &format!("exceeds the {MAX_PAGES_PER_FILE} page limit"),
+            ));
+        }
+        let ifd = preflight_ifd_header(path, file, file_bytes, format, current, &mut bytes_read)?;
+        preflight_ifd_entries(
+            path,
+            file,
+            file_bytes,
+            format,
+            &ifd,
+            cancellation,
+            &mut bytes_read,
+        )?;
+        if ifd.next_ifd == 0 {
+            break;
+        }
+
+        cycle_length = cycle_length.checked_add(1).ok_or(ImportError::Overflow)?;
+        if cycle_anchor == ifd.next_ifd {
+            return Err(preflight_error(
+                path,
+                "contains a cycle in its image directories",
+            ));
+        }
+        if cycle_length == cycle_power {
+            cycle_anchor = ifd.next_ifd;
+            cycle_power = cycle_power.saturating_mul(2);
+            cycle_length = 0;
+        }
+        current = ifd.next_ifd;
+    }
+    Ok(bytes_read)
+}
+
+fn preflight_ifd_header(
+    path: &Path,
+    file: &File,
+    file_bytes: u64,
+    format: TiffIfdFormat,
+    ifd_offset: u64,
+    bytes_read: &mut u64,
+) -> Result<PreflightIfd, ImportError> {
+    let mut count = [0_u8; 8];
+    let count_len = usize::try_from(format.count_bytes).map_err(|_| ImportError::Overflow)?;
+    preflight_read_exact(path, file, ifd_offset, &mut count[..count_len], bytes_read)?;
+    let entry_count = if format.big_tiff {
+        format.byte_order.u64(&count)
+    } else {
+        u64::from(format.byte_order.u16(&count[..2]))
+    };
+    if entry_count > MAX_TIFF_IFD_ENTRIES {
+        return Err(preflight_error(
+            path,
+            &format!(
+                "has {entry_count} entries in one image directory; the limit is {MAX_TIFF_IFD_ENTRIES}"
+            ),
+        ));
+    }
+    let entries_offset = ifd_offset
+        .checked_add(format.count_bytes)
+        .ok_or(ImportError::Overflow)?;
+    let next_offset = entry_count
+        .checked_mul(format.entry_bytes)
+        .and_then(|bytes| entries_offset.checked_add(bytes))
+        .ok_or(ImportError::Overflow)?;
+    let end = next_offset
+        .checked_add(format.next_bytes)
+        .ok_or(ImportError::Overflow)?;
+    if end > file_bytes {
+        return Err(preflight_error(path, "has a truncated image directory"));
+    }
+    let mut next = [0_u8; 8];
+    let next_len = usize::try_from(format.next_bytes).map_err(|_| ImportError::Overflow)?;
+    preflight_read_exact(path, file, next_offset, &mut next[..next_len], bytes_read)?;
+    let next_ifd = if format.big_tiff {
+        format.byte_order.u64(&next)
+    } else {
+        u64::from(format.byte_order.u32(&next[..4]))
+    };
+    Ok(PreflightIfd {
+        entries_offset,
+        entry_count,
+        next_ifd,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preflight_ifd_entries(
+    path: &Path,
+    file: &File,
+    file_bytes: u64,
+    format: TiffIfdFormat,
+    ifd: &PreflightIfd,
+    cancellation: &ImportCancellation,
+    bytes_read: &mut u64,
+) -> Result<(), ImportError> {
+    let mut entry = [0_u8; 20];
+    let entry_len = usize::try_from(format.entry_bytes).map_err(|_| ImportError::Overflow)?;
+    let mut compression_seen = false;
+    let mut strip_offsets = None;
+    let mut strip_counts = None;
+    let mut tile_offsets = None;
+    let mut tile_counts = None;
+    let mut eager_tags_seen = 0_u32;
+    for index in 0..ifd.entry_count {
+        check_cancelled(cancellation)?;
+        let offset = index
+            .checked_mul(format.entry_bytes)
+            .and_then(|bytes| ifd.entries_offset.checked_add(bytes))
+            .ok_or(ImportError::Overflow)?;
+        preflight_read_exact(path, file, offset, &mut entry[..entry_len], bytes_read)?;
+        let tag = format.byte_order.u16(&entry[..2]);
+        let type_code = format.byte_order.u16(&entry[2..4]);
+        let count = if format.big_tiff {
+            format.byte_order.u64(&entry[4..12])
+        } else {
+            u64::from(format.byte_order.u32(&entry[4..8]))
+        };
+        let value_offset = if format.big_tiff { 12 } else { 8 };
+        let type_bytes = tiff_type_bytes(type_code).ok_or_else(|| {
+            preflight_error(path, &format!("uses unknown TIFF field type {type_code}"))
+        })?;
+        let value_bytes = count.checked_mul(type_bytes).ok_or(ImportError::Overflow)?;
+        if value_bytes > MAX_OME_XML_BYTES as u64 {
+            return Err(preflight_error(
+                path,
+                &format!(
+                    "has a TIFF field of {value_bytes} bytes; the per-field limit is {MAX_OME_XML_BYTES}"
+                ),
+            ));
+        }
+        if let Some(bit) = eager_tag_bit(tag) {
+            if eager_tags_seen & bit != 0 {
+                return Err(preflight_error(path, "duplicates an eager image field"));
+            }
+            eager_tags_seen |= bit;
+        }
+
+        match tag {
+            // The admitted source is single-sample grayscale. Tight bounds on
+            // eager vectors protect Decoder::new before caller limits apply.
+            258 | 339 => {
+                if type_code != 3 || count != 1 {
+                    return Err(preflight_error(
+                        path,
+                        "has an unsupported BitsPerSample or SampleFormat cardinality",
+                    ));
+                }
+            }
+            277 => {
+                if type_code != 3
+                    || count != 1
+                    || format
+                        .byte_order
+                        .u16(&entry[value_offset..value_offset + 2])
+                        != 1
+                {
+                    return Err(preflight_error(
+                        path,
+                        "must declare exactly one sample per pixel",
+                    ));
+                }
+            }
+            338 => {
+                return Err(preflight_error(
+                    path,
+                    "uses ExtraSamples outside the grayscale source contract",
+                ));
+            }
+            530 => {
+                if type_code != 3 || count != 2 {
+                    return Err(preflight_error(
+                        path,
+                        "has an unsupported ChromaSubsampling cardinality",
+                    ));
+                }
+            }
+            347 => {
+                return Err(preflight_error(
+                    path,
+                    "declares JPEG tables outside the accepted compression contract",
+                ));
+            }
+            256 | 257 | 278 | 322 | 323 => {
+                if !matches!(type_code, 3 | 4 | 16) || count != 1 {
+                    return Err(preflight_error(
+                        path,
+                        "has an unsupported image-dimension field cardinality",
+                    ));
+                }
+            }
+            262 | 284 | 317 => {
+                if type_code != 3 || count != 1 {
+                    return Err(preflight_error(
+                        path,
+                        "has an unsupported eager scalar field cardinality",
+                    ));
+                }
+            }
+            259 => {
+                if compression_seen || type_code != 3 || count != 1 {
+                    return Err(preflight_error(path, "has an invalid Compression field"));
+                }
+                compression_seen = true;
+                let compression = format
+                    .byte_order
+                    .u16(&entry[value_offset..value_offset + 2]);
+                if !supported_tiff_compression(compression) {
+                    return Err(preflight_error(
+                        path,
+                        &format!("uses unsupported compression code {compression}"),
+                    ));
+                }
+            }
+            273 | 279 | 324 | 325 => {
+                if !matches!(type_code, 3 | 4 | 16)
+                    || count == 0
+                    || count > MAX_NATIVE_CHUNKS_PER_PAGE as u64
+                {
+                    return Err(preflight_error(
+                        path,
+                        "has an unsupported strip/tile table cardinality",
+                    ));
+                }
+                match tag {
+                    273 => strip_offsets = Some(count),
+                    279 => strip_counts = Some(count),
+                    324 => tile_offsets = Some(count),
+                    325 => tile_counts = Some(count),
+                    _ => unreachable!(),
+                }
+            }
+            _ => {}
+        }
+
+        if value_bytes > format.inline_bytes {
+            let external_offset = if format.big_tiff {
+                format
+                    .byte_order
+                    .u64(&entry[value_offset..value_offset + 8])
+            } else {
+                u64::from(
+                    format
+                        .byte_order
+                        .u32(&entry[value_offset..value_offset + 4]),
+                )
+            };
+            let external_end = external_offset
+                .checked_add(value_bytes)
+                .ok_or(ImportError::Overflow)?;
+            if external_end > file_bytes {
+                return Err(preflight_error(
+                    path,
+                    "has a TIFF field outside the source file",
+                ));
+            }
+        }
+    }
+
+    let valid_chunks = match (strip_offsets, strip_counts, tile_offsets, tile_counts) {
+        (Some(offsets), Some(counts), None, None) | (None, None, Some(offsets), Some(counts)) => {
+            offsets == counts
+        }
+        _ => false,
+    };
+    if !valid_chunks {
+        return Err(preflight_error(
+            path,
+            "must declare one matching strip or tile offset/count table pair",
+        ));
+    }
+    Ok(())
+}
+
+const fn eager_tag_bit(tag: u16) -> Option<u32> {
+    match tag {
+        256 => Some(1 << 0),
+        257 => Some(1 << 1),
+        258 => Some(1 << 2),
+        259 => Some(1 << 3),
+        262 => Some(1 << 4),
+        273 => Some(1 << 5),
+        277 => Some(1 << 6),
+        278 => Some(1 << 7),
+        279 => Some(1 << 8),
+        284 => Some(1 << 9),
+        317 => Some(1 << 10),
+        322 => Some(1 << 11),
+        323 => Some(1 << 12),
+        324 => Some(1 << 13),
+        325 => Some(1 << 14),
+        338 => Some(1 << 15),
+        339 => Some(1 << 16),
+        347 => Some(1 << 17),
+        530 => Some(1 << 18),
+        _ => None,
+    }
+}
+
+const fn tiff_type_bytes(type_code: u16) -> Option<u64> {
+    match type_code {
+        1 | 2 | 6 | 7 => Some(1),
+        3 | 8 => Some(2),
+        4 | 9 | 11 | 13 => Some(4),
+        5 | 10 | 12 | 16 | 17 | 18 => Some(8),
+        _ => None,
+    }
+}
+
+fn preflight_read_exact(
+    path: &Path,
+    file: &File,
+    offset: u64,
+    destination: &mut [u8],
+    bytes_read: &mut u64,
+) -> Result<(), ImportError> {
+    file.read_exact_at(destination, offset)
+        .map_err(|source| io_error("read TIFF preflight metadata", path, source))?;
+    *bytes_read = bytes_read
+        .checked_add(u64::try_from(destination.len()).map_err(|_| ImportError::Overflow)?)
+        .ok_or(ImportError::Overflow)?;
+    Ok(())
+}
+
+fn preflight_error(path: &Path, detail: &str) -> ImportError {
+    ImportError::UnsupportedSource(format!("TIFF {path:?} {detail}"))
+}
+
 fn inspect_file(
     path: &Path,
     cancellation: &ImportCancellation,
 ) -> Result<TiffFileFacts, ImportError> {
     check_cancelled(cancellation)?;
     ensure_regular_tiff_file(path)?;
-    let before = fs::metadata(path)
-        .map_err(|source| io_error("stat source before inspection", path, source))?;
-    let raw =
-        File::open(path).map_err(|source| io_error("open source for inspection", path, source))?;
+    let before = source_file_generation(path)?;
+    let raw = open_source_file(path, "open source for inspection")?;
+    if source_file_generation_from_open_file(path, &raw)? != before {
+        return Err(ImportError::SourceChanged(path.to_path_buf()));
+    }
+    preflight_tiff_ifd_chain(path, &raw, cancellation)?;
+    if source_file_generation_from_open_file(path, &raw)? != before {
+        return Err(ImportError::SourceChanged(path.to_path_buf()));
+    }
     let reader = BufReader::with_capacity(HASH_READ_BYTES, raw);
     let mut limits = Limits::default();
+    limits.decoding_buffer_size = MAX_OME_XML_BYTES;
+    limits.intermediate_buffer_size = MAX_OME_XML_BYTES;
     limits.ifd_value_size = MAX_OME_XML_BYTES;
     let mut decoder = Decoder::new(reader)
         .map_err(|error| tiff_error(path, error))?
@@ -1050,6 +2088,7 @@ fn inspect_file(
     let mut expected = None;
     let mut pages = 0_u64;
     let mut maximum_decoded_chunk_bytes = 0_u64;
+    let mut maximum_encoded_chunk_bytes = 0_u64;
     loop {
         check_cancelled(cancellation)?;
         pages = pages.checked_add(1).ok_or(ImportError::Overflow)?;
@@ -1078,6 +2117,7 @@ fn inspect_file(
             )));
         }
         let dtype = current_page_dtype(path, &mut decoder)?;
+        inspect_supported_compression(path, &mut decoder)?;
         let page_facts = (u64::from(width), u64::from(height), dtype);
         if let Some(expected) = expected {
             if page_facts != expected {
@@ -1099,6 +2139,8 @@ fn inspect_file(
             .and_then(|value| value.checked_mul(u64::from(dtype.bytes_per_sample())))
             .ok_or(ImportError::Overflow)?;
         maximum_decoded_chunk_bytes = maximum_decoded_chunk_bytes.max(maximum_chunk);
+        let encoded_chunk_bytes = current_page_encoded_chunk_bytes(path, &mut decoder)?;
+        maximum_encoded_chunk_bytes = maximum_encoded_chunk_bytes.max(encoded_chunk_bytes);
         check_cancelled(cancellation)?;
         if decoder.more_images() {
             decoder
@@ -1108,13 +2150,15 @@ fn inspect_file(
             break;
         }
     }
-    drop(decoder);
-
-    let (bytes, sha256) = hash_file_cancellable(path, cancellation)?;
+    decoder
+        .inner()
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| io_error("rewind source for inspection hash", path, source))?;
+    let (bytes, sha256) = hash_reader_cancellable(path, decoder.inner(), cancellation)?;
     check_cancelled(cancellation)?;
-    let after = fs::metadata(path)
-        .map_err(|source| io_error("stat source after inspection", path, source))?;
-    if before.len() != bytes || after.len() != bytes {
+    let opened_after = source_file_generation_from_open_file(path, decoder.inner().get_ref())?;
+    let path_after = source_file_generation(path)?;
+    if before != opened_after || before != path_after || before.bytes != bytes {
         return Err(ImportError::SourceChanged(path.to_path_buf()));
     }
     let (width, height, dtype) = expected.expect("a TIFF decoder always exposes one image");
@@ -1132,8 +2176,10 @@ fn inspect_file(
         dtype,
         ome_spacing_zyx_um,
         maximum_decoded_chunk_bytes,
+        maximum_encoded_chunk_bytes,
         bytes,
         sha256,
+        generation: before,
     })
 }
 
@@ -1155,6 +2201,63 @@ fn current_page_dtype<R: Read + Seek>(
             "TIFF {path:?} is not grayscale uint8, uint16, or float32"
         ))),
     }
+}
+
+fn inspect_supported_compression<R: Read + Seek>(
+    path: &Path,
+    decoder: &mut Decoder<R>,
+) -> Result<(), ImportError> {
+    let compression = decoder
+        .find_tag_unsigned::<u16>(Tag::Compression)
+        .map_err(|error| tiff_error(path, error))?
+        .unwrap_or(1);
+    // None, LZW, Deflate, old Deflate, and PackBits are streaming in the
+    // pinned TIFF decoder. Other enabled decoder paths have distinct,
+    // unaudited whole-chunk workspaces and are deliberately outside the
+    // importer contract.
+    if !supported_tiff_compression(compression) {
+        return Err(ImportError::UnsupportedSource(format!(
+            "TIFF {path:?} uses unsupported compression code {compression}; accepted codes are uncompressed, LZW, Deflate, old Deflate, and PackBits"
+        )));
+    }
+    Ok(())
+}
+
+const fn supported_tiff_compression(compression: u16) -> bool {
+    matches!(compression, 1 | 5 | 8 | 0x80b2 | 0x8005)
+}
+
+fn current_page_encoded_chunk_bytes<R: Read + Seek>(
+    path: &Path,
+    decoder: &mut Decoder<R>,
+) -> Result<u64, ImportError> {
+    let strip = decoder
+        .find_tag_unsigned_vec::<u64>(Tag::StripByteCounts)
+        .map_err(|error| tiff_error(path, error))?;
+    let tile = decoder
+        .find_tag_unsigned_vec::<u64>(Tag::TileByteCounts)
+        .map_err(|error| tiff_error(path, error))?;
+    let counts = match (strip, tile) {
+        (Some(counts), None) | (None, Some(counts)) => counts,
+        _ => {
+            return Err(ImportError::UnsupportedSource(format!(
+                "TIFF {path:?} must declare exactly one strip or tile byte-count table"
+            )));
+        }
+    };
+    if counts.is_empty() || counts.len() > MAX_NATIVE_CHUNKS_PER_PAGE {
+        return Err(ImportError::UnsupportedSource(format!(
+            "TIFF {path:?} has an unsupported native chunk count"
+        )));
+    }
+    counts.into_iter().try_fold(0_u64, |maximum, bytes| {
+        if bytes == 0 || usize::try_from(bytes).is_err() {
+            return Err(ImportError::UnsupportedSource(format!(
+                "TIFF {path:?} has an invalid encoded native chunk length"
+            )));
+        }
+        Ok(maximum.max(bytes))
+    })
 }
 
 fn validate_current_page<R: Read + Seek>(
@@ -1181,9 +2284,18 @@ fn hash_file_cancellable(
     path: &Path,
     cancellation: &ImportCancellation,
 ) -> Result<(u64, Sha256Digest), ImportError> {
-    let file =
-        File::open(path).map_err(|source| io_error("open source for hashing", path, source))?;
-    hash_reader_cancellable(path, file, cancellation)
+    let before = source_file_generation(path)?;
+    let mut file = open_source_file(path, "open source for hashing")?;
+    if source_file_generation_from_open_file(path, &file)? != before {
+        return Err(ImportError::SourceChanged(path.to_path_buf()));
+    }
+    let result = hash_reader_cancellable(path, &mut file, cancellation)?;
+    if source_file_generation_from_open_file(path, &file)? != before
+        || source_file_generation(path)? != before
+    {
+        return Err(ImportError::SourceChanged(path.to_path_buf()));
+    }
+    Ok(result)
 }
 
 fn hash_reader_cancellable(
@@ -1327,7 +2439,7 @@ fn read_directory(
 fn enumerate_accepted_layout_files(
     inspection: &TiffInspection,
     cancellation: &ImportCancellation,
-) -> Result<BTreeMap<String, PathBuf>, ImportError> {
+) -> Result<Vec<(String, PathBuf)>, ImportError> {
     check_cancelled(cancellation)?;
     let root_metadata = fs::symlink_metadata(&inspection.source.path)
         .map_err(|_| ImportError::SourceChanged(inspection.source.path.clone()))?;
@@ -1340,7 +2452,7 @@ fn enumerate_accepted_layout_files(
         }
         let relative = relative_name_for_file(&inspection.source.path, &inspection.source.path)
             .map_err(|_| ImportError::SourceChanged(inspection.source.path.clone()))?;
-        return Ok(BTreeMap::from([(relative, inspection.source.path.clone())]));
+        return Ok(vec![(relative, inspection.source.path.clone())]);
     }
     if !root_metadata.is_dir() {
         return Err(ImportError::SourceChanged(inspection.source.path.clone()));
@@ -1357,14 +2469,16 @@ fn enumerate_accepted_layout_files(
         }
         _ => return Err(ImportError::SourceChanged(inspection.source.path.clone())),
     };
-    let mut files = BTreeMap::new();
+    let mut files = Vec::with_capacity(paths.len());
     for path in paths {
         check_cancelled(cancellation)?;
         let relative = relative_name_for_file(&inspection.source.path, &path)
             .map_err(|_| ImportError::SourceChanged(path.clone()))?;
-        if files.insert(relative, path.clone()).is_some() {
-            return Err(ImportError::SourceChanged(path));
-        }
+        files.push((relative, path));
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    if files.windows(2).any(|window| window[0].0 == window[1].0) {
+        return Err(ImportError::SourceChanged(inspection.source.path.clone()));
     }
     Ok(files)
 }
@@ -2055,49 +3169,6 @@ fn aggregate_fingerprint(
     Ok(hasher.finalize())
 }
 
-fn validate_region_request(
-    inspection: &TiffInspection,
-    channel: u32,
-    timepoint: u64,
-    origin_zyx: [u64; 3],
-    extent_zyx: [u64; 3],
-    destination_bytes: usize,
-) -> Result<(), ImportError> {
-    if channel >= inspection.channels || timepoint >= inspection.shape.t() {
-        return Err(ImportError::InvalidRequest(
-            "source region channel or timepoint is out of bounds",
-        ));
-    }
-    if extent_zyx.contains(&0) {
-        return Err(ImportError::InvalidRequest(
-            "source region extents must be positive",
-        ));
-    }
-    for axis in 0..3 {
-        let end = origin_zyx[axis]
-            .checked_add(extent_zyx[axis])
-            .ok_or(ImportError::Overflow)?;
-        if end > inspection.shape.spatial().dimensions()[axis] {
-            return Err(ImportError::InvalidRequest(
-                "source region extends outside the inspected shape",
-            ));
-        }
-    }
-    let expected = extent_zyx
-        .into_iter()
-        .try_fold(1_u64, |count, extent| {
-            count.checked_mul(extent).ok_or(ImportError::Overflow)
-        })?
-        .checked_mul(u64::from(inspection.dtype.bytes_per_sample()))
-        .ok_or(ImportError::Overflow)?;
-    if usize::try_from(expected).map_err(|_| ImportError::Overflow)? != destination_bytes {
-        return Err(ImportError::InvalidRequest(
-            "source region destination has the wrong byte length",
-        ));
-    }
-    Ok(())
-}
-
 fn decoded_result_bytes(decoded: &DecodingResult) -> Result<u64, ImportError> {
     let (samples, width) = match decoded {
         DecodingResult::U8(values) => (values.len(), 1_u64),
@@ -2144,6 +3215,51 @@ fn chunk_size_error(path: &Path, actual: usize, expected: usize) -> ImportError 
     }
 }
 
+fn source_file_generation(path: &Path) -> Result<SourceFileGeneration, ImportError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| io_error("inspect source generation", path, source))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ImportError::SourceChanged(path.to_path_buf()));
+    }
+    Ok(source_file_generation_from_metadata(&metadata))
+}
+
+fn open_source_file(path: &Path, operation: &'static str) -> Result<File, ImportError> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(
+            i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits())
+                .expect("O_NOFOLLOW is representable as a platform open flag"),
+        )
+        .open(path)
+        .map_err(|source| io_error(operation, path, source))
+}
+
+fn source_file_generation_from_open_file(
+    path: &Path,
+    file: &File,
+) -> Result<SourceFileGeneration, ImportError> {
+    let metadata = file
+        .metadata()
+        .map_err(|source| io_error("inspect opened source generation", path, source))?;
+    if !metadata.is_file() {
+        return Err(ImportError::SourceChanged(path.to_path_buf()));
+    }
+    Ok(source_file_generation_from_metadata(&metadata))
+}
+
+fn source_file_generation_from_metadata(metadata: &fs::Metadata) -> SourceFileGeneration {
+    SourceFileGeneration {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        bytes: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    }
+}
+
 fn io_error(operation: &'static str, path: &Path, source: std::io::Error) -> ImportError {
     ImportError::Io {
         operation,
@@ -2163,6 +3279,10 @@ impl<R> CountingReader<R> {
             inner,
             bytes_read: 0,
         }
+    }
+
+    const fn inner(&self) -> &R {
+        &self.inner
     }
 }
 
@@ -2189,15 +3309,101 @@ mod tests {
         fs::{self, File, OpenOptions},
         io::{Cursor, Write},
         path::Path,
+        sync::{Arc, Mutex},
     };
 
+    use mirante4d_dataset::{CpuByteLease, CpuLedgerCategory, CpuLedgerError};
     use tempfile::tempdir;
     use tiff::{
-        encoder::{TiffEncoder, colortype},
+        encoder::{Compression, DeflateLevel, TiffEncoder, colortype},
         tags::Tag,
     };
 
     use super::*;
+
+    struct TestLease(u64);
+
+    impl CpuByteLease for TestLease {
+        fn category(&self) -> CpuLedgerCategory {
+            CpuLedgerCategory::ImportWorkingSet
+        }
+
+        fn reserved_bytes(&self) -> u64 {
+            self.0
+        }
+    }
+
+    struct TestLedger;
+
+    impl CpuByteLedger for TestLedger {
+        fn try_acquire(
+            &self,
+            category: CpuLedgerCategory,
+            bytes: u64,
+        ) -> Result<Box<dyn CpuByteLease>, CpuLedgerError> {
+            assert_eq!(category, CpuLedgerCategory::ImportWorkingSet);
+            Ok(Box::new(TestLease(bytes)))
+        }
+    }
+
+    #[derive(Default)]
+    struct TrackingState {
+        used: u64,
+        peak: u64,
+    }
+
+    struct TrackingLedger {
+        budget: u64,
+        state: Arc<Mutex<TrackingState>>,
+    }
+
+    struct TrackingLease {
+        bytes: u64,
+        state: Arc<Mutex<TrackingState>>,
+    }
+
+    impl Drop for TrackingLease {
+        fn drop(&mut self) {
+            let mut state = self.state.lock().unwrap();
+            state.used -= self.bytes;
+        }
+    }
+
+    impl CpuByteLease for TrackingLease {
+        fn category(&self) -> CpuLedgerCategory {
+            CpuLedgerCategory::ImportWorkingSet
+        }
+
+        fn reserved_bytes(&self) -> u64 {
+            self.bytes
+        }
+    }
+
+    impl CpuByteLedger for TrackingLedger {
+        fn try_acquire(
+            &self,
+            category: CpuLedgerCategory,
+            bytes: u64,
+        ) -> Result<Box<dyn CpuByteLease>, CpuLedgerError> {
+            assert_eq!(category, CpuLedgerCategory::ImportWorkingSet);
+            let mut state = self.state.lock().unwrap();
+            let available = self.budget.saturating_sub(state.used);
+            if bytes > available {
+                return Err(CpuLedgerError::CapacityExceeded {
+                    category,
+                    requested_bytes: bytes,
+                    available_bytes: available,
+                });
+            }
+            state.used += bytes;
+            state.peak = state.peak.max(state.used);
+            drop(state);
+            Ok(Box::new(TrackingLease {
+                bytes,
+                state: Arc::clone(&self.state),
+            }))
+        }
+    }
 
     struct CancelAfterFirstRead {
         source: Cursor<Vec<u8>>,
@@ -2228,7 +3434,7 @@ mod tests {
     }
 
     #[test]
-    fn single_stack_inspection_and_strip_bounded_region_are_exact() {
+    fn single_stack_inspection_and_canonical_decode_are_exact_and_bounded() {
         let temporary = tempdir().unwrap();
         let path = temporary.path().join("stack.tif");
         write_u16_stack(&path, 4, 3, 2, true).unwrap();
@@ -2248,7 +3454,9 @@ mod tests {
                 .unwrap()
                 .1
         );
-        revalidate(&inspection, &ImportCancellation::new()).unwrap();
+        let revalidation = revalidate(&inspection, &ImportCancellation::new()).unwrap();
+        assert_eq!(revalidation.source_bytes_read, inspection.source_bytes);
+        assert_eq!(revalidation.tiff_open_count, 1);
 
         let cancellation = ImportCancellation::new();
         cancellation.cancel();
@@ -2257,35 +3465,90 @@ mod tests {
             Err(ImportError::Cancelled)
         ));
 
-        let mut destination = vec![0_u8; 2 * 2 * 2 * 2];
-        let counters = read_region_into(
-            &inspection,
-            0,
-            0,
-            [0, 1, 1],
-            [2, 2, 2],
-            &mut destination,
-            8,
-            &ImportCancellation::new(),
+        let checkpoint = temporary.path().join("canonical-checkpoint");
+        fs::create_dir(&checkpoint).unwrap();
+        let binding = crate::canonical_cache::CanonicalCacheBinding::new(
+            Sha256Digest::parse(&"7".repeat(64)).unwrap(),
+            inspection.source_fingerprint,
+        );
+        let mut cache = crate::canonical_cache::CanonicalBaseCache::open_or_create(
+            &checkpoint,
+            binding,
+            inspection.shape,
+            inspection.channels,
+            inspection.dtype,
         )
         .unwrap();
-        let values = destination
+        let report = decode_canonical_into_cache(
+            &inspection,
+            &revalidation.generation,
+            &mut cache,
+            inspection.maximum_decoded_chunk_bytes,
+            256 * 1024 * 1024,
+            1,
+            &TestLedger,
+            &ImportCancellation::new(),
+            |_, _| {},
+        )
+        .unwrap();
+        let counters = report.counters;
+        assert_eq!(counters.decoded_bytes, 48);
+        assert_eq!(counters.tiff_open_count, 1);
+        assert_eq!(counters.native_chunk_decode_count, 6);
+        assert_eq!(report.serialized_files, 1);
+        assert_eq!(report.parallel_files, 0);
+        let mut canonical = vec![0; 48];
+        cache
+            .read_region_into(0, 0, [0, 0, 0], [2, 3, 4], &mut canonical)
+            .unwrap();
+        let values = canonical
             .chunks_exact(2)
             .map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
-        assert_eq!(values, [5, 6, 9, 10, 105, 106, 109, 110]);
-        assert_eq!(counters.decoded_bytes, 32);
-        assert!(counters.source_bytes_read > 0);
-
-        let error = read_region_into(
+        assert_eq!(
+            values,
+            [
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 100, 101, 102, 103, 104, 105, 106, 107, 108,
+                109, 110, 111,
+            ]
+        );
+        let resumed = decode_canonical_into_cache(
             &inspection,
-            0,
-            0,
-            [0, 0, 0],
-            [1, 1, 1],
-            &mut [0; 2],
-            7,
+            &revalidation.generation,
+            &mut cache,
+            inspection.maximum_decoded_chunk_bytes,
+            256 * 1024 * 1024,
+            1,
+            &TestLedger,
             &ImportCancellation::new(),
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(resumed, SourceDecodeReport::default());
+
+        let limited_checkpoint = temporary.path().join("limited-checkpoint");
+        fs::create_dir(&limited_checkpoint).unwrap();
+        let mut limited = CanonicalBaseCache::open_or_create(
+            &limited_checkpoint,
+            crate::canonical_cache::CanonicalCacheBinding::new(
+                Sha256Digest::parse(&"6".repeat(64)).unwrap(),
+                inspection.source_fingerprint,
+            ),
+            inspection.shape,
+            inspection.channels,
+            inspection.dtype,
+        )
+        .unwrap();
+        let error = decode_canonical_into_cache(
+            &inspection,
+            &revalidation.generation,
+            &mut limited,
+            7,
+            256 * 1024 * 1024,
+            1,
+            &TestLedger,
+            &ImportCancellation::new(),
+            |_, _| {},
         )
         .unwrap_err();
         assert!(matches!(
@@ -2296,17 +3559,31 @@ mod tests {
             }
         ));
 
+        let cancelled_checkpoint = temporary.path().join("cancelled-checkpoint");
+        fs::create_dir(&cancelled_checkpoint).unwrap();
+        let mut cancelled_cache = CanonicalBaseCache::open_or_create(
+            &cancelled_checkpoint,
+            crate::canonical_cache::CanonicalCacheBinding::new(
+                Sha256Digest::parse(&"5".repeat(64)).unwrap(),
+                inspection.source_fingerprint,
+            ),
+            inspection.shape,
+            inspection.channels,
+            inspection.dtype,
+        )
+        .unwrap();
         let cancellation = ImportCancellation::new();
         cancellation.cancel();
-        let error = read_region_into(
+        let error = decode_canonical_into_cache(
             &inspection,
-            0,
-            0,
-            [0, 0, 0],
-            [1, 1, 1],
-            &mut [0; 2],
-            8,
+            &revalidation.generation,
+            &mut cancelled_cache,
+            inspection.maximum_decoded_chunk_bytes,
+            256 * 1024 * 1024,
+            1,
+            &TestLedger,
             &cancellation,
+            |_, _| {},
         )
         .unwrap_err();
         assert!(matches!(error, ImportError::Cancelled));
@@ -2321,6 +3598,57 @@ mod tests {
             revalidate(&inspection, &ImportCancellation::new()),
             Err(ImportError::SourceChanged(changed)) if changed == path
         ));
+        assert!(matches!(
+            capture_generation(&inspection, &ImportCancellation::new()),
+            Err(ImportError::SourceChanged(changed)) if changed == path
+        ));
+    }
+
+    #[test]
+    fn byte_identical_replacement_after_review_is_rejected_at_start_and_final_check() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("stack.tif");
+        let backup = temporary.path().join("stack-original.tif");
+        write_u16_stack(&path, 4, 3, 1, true).unwrap();
+        let inspection = inspect(TiffSource::auto(&path)).unwrap();
+        fs::rename(&path, &backup).unwrap();
+        fs::copy(&backup, &path).unwrap();
+
+        assert!(matches!(
+            capture_generation(&inspection, &ImportCancellation::new()),
+            Err(ImportError::SourceChanged(changed)) if changed == path
+        ));
+        assert!(matches!(
+            revalidate(&inspection, &ImportCancellation::new()),
+            Err(ImportError::SourceChanged(changed)) if changed == path
+        ));
+    }
+
+    #[test]
+    fn opened_descriptor_cannot_be_hidden_by_restoring_the_source_path() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("source.tif");
+        let original = temporary.path().join("original.tif");
+        let replacement = temporary.path().join("replacement.tif");
+        fs::write(&path, b"original-bytes").unwrap();
+        fs::write(&replacement, b"replaced-bytes").unwrap();
+        let expected = source_file_generation(&path).unwrap();
+
+        fs::rename(&path, &original).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let opened_replacement = open_source_file(&path, "open replacement").unwrap();
+        fs::rename(&path, &replacement).unwrap();
+        fs::rename(&original, &path).unwrap();
+
+        let restored = source_file_generation(&path).unwrap();
+        assert_eq!(
+            (restored.device, restored.inode),
+            (expected.device, expected.inode)
+        );
+        assert_ne!(
+            source_file_generation_from_open_file(&path, &opened_replacement).unwrap(),
+            restored
+        );
     }
 
     #[test]
@@ -2410,18 +3738,35 @@ mod tests {
         assert_eq!(inspection.channels, 2);
         assert!(inspection.files[0].relative_name.starts_with("channel2/"));
 
-        let mut destination = vec![0_u8; 2 * 2 * 3 * 2];
-        read_region_into(
-            &inspection,
-            0,
-            0,
-            [0, 0, 0],
-            [2, 2, 3],
-            &mut destination,
-            inspection.maximum_decoded_chunk_bytes,
-            &ImportCancellation::new(),
+        let checkpoint = tempdir().unwrap();
+        let generation = capture_generation(&inspection, &ImportCancellation::new()).unwrap();
+        let mut cache = CanonicalBaseCache::open_or_create(
+            checkpoint.path(),
+            crate::canonical_cache::CanonicalCacheBinding::new(
+                Sha256Digest::parse(&"4".repeat(64)).unwrap(),
+                inspection.source_fingerprint,
+            ),
+            inspection.shape,
+            inspection.channels,
+            inspection.dtype,
         )
         .unwrap();
+        decode_canonical_into_cache(
+            &inspection,
+            &generation,
+            &mut cache,
+            inspection.maximum_decoded_chunk_bytes,
+            256 * 1024 * 1024,
+            1,
+            &TestLedger,
+            &ImportCancellation::new(),
+            |_, _| {},
+        )
+        .unwrap();
+        let mut destination = vec![0_u8; 2 * 2 * 3 * 2];
+        cache
+            .read_region_into(0, 0, [0, 0, 0], [2, 2, 3], &mut destination)
+            .unwrap();
         let values = destination
             .chunks_exact(2)
             .map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap()))
@@ -2434,6 +3779,87 @@ mod tests {
             inspect(TiffSource::auto(temporary.path())),
             Err(ImportError::UnsupportedSource(_))
         ));
+    }
+
+    #[test]
+    fn single_plane_files_use_the_ordered_byte_bounded_decode_path() {
+        let temporary = tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let channel = source.join("channel0");
+        fs::create_dir_all(&channel).unwrap();
+        for z in 0..8_u16 {
+            write_u16_stack_with_base(
+                &channel.join(format!("z{z:02}.tif")),
+                4,
+                3,
+                1,
+                true,
+                z * 100,
+            )
+            .unwrap();
+        }
+        let inspection = inspect(TiffSource::auto(&source)).unwrap();
+        let generation = revalidate(&inspection, &ImportCancellation::new())
+            .unwrap()
+            .generation;
+        let checkpoint = temporary.path().join("checkpoint");
+        fs::create_dir(&checkpoint).unwrap();
+        let mut cache = CanonicalBaseCache::open_or_create(
+            &checkpoint,
+            crate::canonical_cache::CanonicalCacheBinding::new(
+                Sha256Digest::parse(&"8".repeat(64)).unwrap(),
+                inspection.source_fingerprint,
+            ),
+            inspection.shape,
+            inspection.channels,
+            inspection.dtype,
+        )
+        .unwrap();
+        let budget = 128 * 1024 * 1024;
+        let resident = 1024 * 1024;
+        let state = Arc::new(Mutex::new(TrackingState::default()));
+        let ledger = TrackingLedger {
+            budget: budget - resident,
+            state: Arc::clone(&state),
+        };
+        let report = decode_canonical_into_cache(
+            &inspection,
+            &generation,
+            &mut cache,
+            inspection.maximum_decoded_chunk_bytes,
+            budget,
+            resident,
+            &ledger,
+            &ImportCancellation::new(),
+            |_, _| {},
+        )
+        .unwrap();
+
+        assert_eq!(report.parallel_files, 8);
+        assert_eq!(report.serialized_files, 0);
+        assert_eq!(report.counters.tiff_open_count, 8);
+        assert_eq!(report.counters.native_chunk_decode_count, 24);
+        assert!(report.peak_reorder_results <= 8);
+        assert!(report.peak_transient_bytes <= budget - resident);
+        let state = state.lock().unwrap();
+        assert_eq!(state.used, 0);
+        assert!(state.peak <= budget - resident);
+        drop(state);
+
+        let mut canonical = vec![0; 8 * 3 * 4 * 2];
+        cache
+            .read_region_into(0, 0, [0, 0, 0], [8, 3, 4], &mut canonical)
+            .unwrap();
+        let values = canonical
+            .chunks_exact(2)
+            .map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        for z in 0..8_usize {
+            assert_eq!(
+                &values[z * 12..z * 12 + 12],
+                &(0..12).map(|i| (z * 100 + i) as u16).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
@@ -2467,15 +3893,29 @@ mod tests {
         let inspection = inspect(TiffSource::auto(&path)).unwrap();
         assert_eq!(inspection.dtype, IntensityDType::Float32);
         assert_eq!(inspection.ome_spacing_zyx_um, Some([0.7, 0.3, 0.2]));
-        let error = read_region_into(
+        let generation = capture_generation(&inspection, &ImportCancellation::new()).unwrap();
+        let checkpoint = tempdir().unwrap();
+        let mut cache = CanonicalBaseCache::open_or_create(
+            checkpoint.path(),
+            crate::canonical_cache::CanonicalCacheBinding::new(
+                Sha256Digest::parse(&"3".repeat(64)).unwrap(),
+                inspection.source_fingerprint,
+            ),
+            inspection.shape,
+            inspection.channels,
+            inspection.dtype,
+        )
+        .unwrap();
+        let error = decode_canonical_into_cache(
             &inspection,
-            0,
-            0,
-            [0, 0, 0],
-            [1, 2, 2],
-            &mut [0; 16],
+            &generation,
+            &mut cache,
             inspection.maximum_decoded_chunk_bytes,
+            256 * 1024 * 1024,
+            1,
+            &TestLedger,
             &ImportCancellation::new(),
+            |_, _| {},
         )
         .unwrap_err();
         assert!(
@@ -2583,6 +4023,553 @@ mod tests {
             inspect(TiffSource::auto(path)),
             Err(ImportError::UnsupportedSource(_))
         ));
+    }
+
+    #[test]
+    fn tiled_tiff_decodes_each_native_tile_once_and_crops_edge_padding_exactly() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("tiled.tif");
+        let values = (0..19 * 17)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect::<Vec<_>>();
+        write_tiled_u8(&path, 19, 17, 16, 16, &values).unwrap();
+
+        let inspection = inspect(TiffSource::auto(&path)).unwrap();
+        assert_eq!(inspection.shape.dimensions(), [1, 1, 17, 19]);
+        assert_eq!(inspection.dtype, IntensityDType::Uint8);
+        assert_eq!(inspection.maximum_decoded_chunk_bytes, 16 * 16);
+        assert_eq!(inspection.maximum_encoded_chunk_bytes, 16 * 16);
+
+        let (report, canonical) = decode_fixture(&inspection, 'a');
+        assert_eq!(report.counters.tiff_open_count, 1);
+        assert_eq!(report.counters.native_chunk_decode_count, 4);
+        assert_eq!(report.counters.decoded_bytes, 19 * 17);
+        assert_eq!(canonical, values);
+    }
+
+    #[test]
+    fn supported_packbits_tiff_decodes_each_native_strip_once_and_preserves_values() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("packbits.tif");
+        let values = [vec![7_u8; 16], vec![9_u8; 16]].concat();
+        let file = File::create(&path).unwrap();
+        let mut encoder = TiffEncoder::new(file)
+            .unwrap()
+            .with_compression(Compression::Packbits);
+        let mut image = encoder.new_image::<colortype::Gray8>(8, 4).unwrap();
+        image.rows_per_strip(2).unwrap();
+        image.write_data(&values).unwrap();
+
+        let inspection = inspect(TiffSource::auto(&path)).unwrap();
+        assert_eq!(inspection.shape.dimensions(), [1, 1, 4, 8]);
+        assert_eq!(inspection.dtype, IntensityDType::Uint8);
+        assert_eq!(inspection.maximum_decoded_chunk_bytes, 16);
+        assert_eq!(inspection.maximum_encoded_chunk_bytes, 2);
+
+        let (report, canonical) = decode_fixture(&inspection, 'b');
+        assert_eq!(report.counters.tiff_open_count, 1);
+        assert_eq!(report.counters.native_chunk_decode_count, 2);
+        assert_eq!(report.counters.decoded_bytes, 32);
+        assert_eq!(canonical, values);
+    }
+
+    #[test]
+    fn supported_lzw_and_deflate_tiffs_decode_exactly() {
+        let temporary = tempdir().unwrap();
+        let values = (0..32).map(|index| (index * 7) as u8).collect::<Vec<_>>();
+        for (name, compression, binding) in [
+            ("lzw", Compression::Lzw, 'd'),
+            (
+                "deflate",
+                Compression::Deflate(DeflateLevel::default()),
+                'e',
+            ),
+        ] {
+            let path = temporary.path().join(format!("{name}.tif"));
+            let file = File::create(&path).unwrap();
+            let mut encoder = TiffEncoder::new(file)
+                .unwrap()
+                .with_compression(compression);
+            let mut image = encoder.new_image::<colortype::Gray8>(8, 4).unwrap();
+            image.rows_per_strip(2).unwrap();
+            image.write_data(&values).unwrap();
+
+            let inspection = inspect(TiffSource::auto(&path)).unwrap();
+            let (report, canonical) = decode_fixture(&inspection, binding);
+            assert_eq!(report.counters.native_chunk_decode_count, 2);
+            assert_eq!(report.counters.decoded_bytes, 32);
+            assert_eq!(canonical, values, "{name}");
+        }
+    }
+
+    #[test]
+    fn supported_old_deflate_tiff_decodes_exactly() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("old-deflate.tif");
+        let values = (0..32).map(|index| (index * 11) as u8).collect::<Vec<_>>();
+        let file = File::create(&path).unwrap();
+        let mut encoder = TiffEncoder::new(file)
+            .unwrap()
+            .with_compression(Compression::Deflate(DeflateLevel::default()));
+        let mut image = encoder.new_image::<colortype::Gray8>(8, 4).unwrap();
+        image.rows_per_strip(2).unwrap();
+        image.write_data(&values).unwrap();
+        patch_classic_le_compression(&path, 0x80b2);
+
+        let inspection = inspect(TiffSource::auto(&path)).unwrap();
+        let (report, canonical) = decode_fixture(&inspection, '1');
+        assert_eq!(report.counters.native_chunk_decode_count, 2);
+        assert_eq!(canonical, values);
+    }
+
+    #[test]
+    fn otherwise_valid_tiffs_with_closed_out_codecs_are_rejected() {
+        let temporary = tempdir().unwrap();
+        let base = temporary.path().join("base.tif");
+        let file = File::create(&base).unwrap();
+        TiffEncoder::new(file)
+            .unwrap()
+            .write_image::<colortype::Gray8>(2, 2, &[1, 2, 3, 4])
+            .unwrap();
+        for (name, compression) in [
+            ("fax3", 3),
+            ("fax4", 4),
+            ("jpeg", 7),
+            ("zstd", 50_000),
+            ("webp", 50_001),
+            ("other", 65_000),
+        ] {
+            let path = temporary.path().join(format!("{name}.tif"));
+            fs::copy(&base, &path).unwrap();
+            patch_classic_le_compression(&path, compression);
+            assert!(matches!(
+                inspect(TiffSource::auto(&path)),
+                Err(ImportError::UnsupportedSource(message))
+                    if message.contains(&compression.to_string())
+            ));
+        }
+    }
+
+    #[test]
+    fn compression_allowlist_is_closed_and_explicit() {
+        for compression in [1, 5, 8, 0x80b2, 0x8005] {
+            assert!(supported_tiff_compression(compression), "{compression:#x}");
+        }
+        for compression in [0, 2, 3, 4, 6, 7, 9, 10, 32766, 50000] {
+            assert!(!supported_tiff_compression(compression), "{compression:#x}");
+        }
+    }
+
+    #[test]
+    fn raw_preflight_rejects_unbounded_first_ifd_allocations() {
+        let temporary = tempdir().unwrap();
+        let cancellation = ImportCancellation::new();
+
+        let excessive_entries = temporary.path().join("ifd-entries.tif");
+        let mut bytes = classic_tiff_header();
+        FixtureEndian::Little
+            .push_u16(&mut bytes, u16::try_from(MAX_TIFF_IFD_ENTRIES + 1).unwrap());
+        fs::write(&excessive_entries, bytes).unwrap();
+        let file = File::open(&excessive_entries).unwrap();
+        assert!(matches!(
+            preflight_tiff_ifd_chain(&excessive_entries, &file, &cancellation),
+            Err(ImportError::UnsupportedSource(message)) if message.contains("entries")
+        ));
+
+        for (name, hostile_entry, expected) in [
+            ("bits", (258, 3, 1_000_000, 0), "BitsPerSample"),
+            ("photometric", (262, 3, 1_000_000, 0), "scalar"),
+            (
+                "chunks",
+                (273, 4, MAX_NATIVE_CHUNKS_PER_PAGE as u32 + 1, 0),
+                "strip/tile",
+            ),
+        ] {
+            let path = temporary.path().join(format!("{name}.tif"));
+            let entries = if hostile_entry.0 == 273 {
+                vec![hostile_entry, (279, 4, 1, 1)]
+            } else {
+                vec![hostile_entry, (273, 4, 1, 0), (279, 4, 1, 1)]
+            };
+            write_preflight_fixture(&path, &entries, 0).unwrap();
+            let file = File::open(&path).unwrap();
+            assert!(matches!(
+                preflight_tiff_ifd_chain(&path, &file, &cancellation),
+                Err(ImportError::UnsupportedSource(message)) if message.contains(expected)
+            ));
+        }
+
+        let jpeg = temporary.path().join("jpeg-tables.tif");
+        write_preflight_fixture(
+            &jpeg,
+            &[
+                (259, 3, 1, 7),
+                (273, 4, 1, 0),
+                (279, 4, 1, 1),
+                (347, 7, 8_000_000, 0),
+            ],
+            0,
+        )
+        .unwrap();
+        let file = File::open(&jpeg).unwrap();
+        assert!(matches!(
+            preflight_tiff_ifd_chain(&jpeg, &file, &cancellation),
+            Err(ImportError::UnsupportedSource(message))
+                if message.contains("compression code 7")
+        ));
+    }
+
+    #[test]
+    fn raw_preflight_enforces_the_retained_page_authority() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("too-many-pages.tif");
+        let pages = MAX_PAGES_PER_FILE + 1;
+        let ifd_bytes = 2_u64 + 2 * 12 + 4;
+        let mut bytes = classic_tiff_header();
+        for page in 0..pages {
+            FixtureEndian::Little.push_u16(&mut bytes, 2);
+            push_long_ifd_entry(&mut bytes, FixtureEndian::Little, 273, 1, 0);
+            push_long_ifd_entry(&mut bytes, FixtureEndian::Little, 279, 1, 1);
+            let next = if page + 1 == pages {
+                0
+            } else {
+                u32::try_from(8 + (page + 1) * ifd_bytes).unwrap()
+            };
+            FixtureEndian::Little.push_u32(&mut bytes, next);
+        }
+        fs::write(&path, bytes).unwrap();
+        let file = File::open(&path).unwrap();
+        assert!(matches!(
+            preflight_tiff_ifd_chain(&path, &file, &ImportCancellation::new()),
+            Err(ImportError::UnsupportedSource(message)) if message.contains("page limit")
+        ));
+        assert_eq!(
+            retained_decoder_bytes(MAX_PAGES_PER_FILE),
+            Some(32 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn big_endian_u16_tiff_is_canonicalized_little_endian_per_native_strip() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("big-endian.tif");
+        let values = [0x0102, 0x1122, 0x3344, 0x5566, 0x7788, 0x99aa];
+        write_big_endian_striped_u16(&path, 3, 2, 1, &values).unwrap();
+
+        let inspection = inspect(TiffSource::auto(&path)).unwrap();
+        assert_eq!(inspection.shape.dimensions(), [1, 1, 2, 3]);
+        assert_eq!(inspection.dtype, IntensityDType::Uint16);
+        assert_eq!(inspection.maximum_decoded_chunk_bytes, 6);
+        assert_eq!(inspection.maximum_encoded_chunk_bytes, 6);
+
+        let (report, canonical) = decode_fixture(&inspection, 'c');
+        assert_eq!(report.counters.tiff_open_count, 1);
+        assert_eq!(report.counters.native_chunk_decode_count, 2);
+        assert_eq!(report.counters.decoded_bytes, 12);
+        let canonical_values = canonical
+            .chunks_exact(2)
+            .map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(canonical_values, values);
+        assert_eq!(&canonical[..2], &0x0102_u16.to_le_bytes());
+    }
+
+    #[test]
+    fn bigtiff_preflight_and_decode_preserve_values() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("source-bigtiff.tif");
+        let values = [3_u16, 5, 8, 13, 21, 34];
+        let file = File::create(&path).unwrap();
+        let mut encoder = TiffEncoder::new_big(file).unwrap();
+        let mut image = encoder.new_image::<colortype::Gray16>(3, 2).unwrap();
+        image.rows_per_strip(1).unwrap();
+        image.write_data(&values).unwrap();
+
+        let inspection = inspect(TiffSource::auto(&path)).unwrap();
+        let (report, canonical) = decode_fixture(&inspection, 'f');
+        assert_eq!(report.counters.native_chunk_decode_count, 2);
+        assert_eq!(
+            canonical
+                .chunks_exact(2)
+                .map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>(),
+            values
+        );
+    }
+
+    fn decode_fixture(
+        inspection: &TiffInspection,
+        binding_digit: char,
+    ) -> (SourceDecodeReport, Vec<u8>) {
+        assert_eq!(inspection.shape.t(), 1);
+        assert_eq!(inspection.channels, 1);
+        let checkpoint = tempdir().unwrap();
+        let binding = crate::canonical_cache::CanonicalCacheBinding::new(
+            Sha256Digest::parse(&binding_digit.to_string().repeat(64)).unwrap(),
+            inspection.source_fingerprint,
+        );
+        let mut cache = CanonicalBaseCache::open_or_create(
+            checkpoint.path(),
+            binding,
+            inspection.shape,
+            inspection.channels,
+            inspection.dtype,
+        )
+        .unwrap();
+        let generation = capture_generation(inspection, &ImportCancellation::new()).unwrap();
+        let report = decode_canonical_into_cache(
+            inspection,
+            &generation,
+            &mut cache,
+            inspection.maximum_decoded_chunk_bytes,
+            256 * 1024 * 1024,
+            1,
+            &TestLedger,
+            &ImportCancellation::new(),
+            |_, _| {},
+        )
+        .unwrap();
+        let canonical_bytes = inspection
+            .shape
+            .z()
+            .checked_mul(inspection.shape.y())
+            .and_then(|value| value.checked_mul(inspection.shape.x()))
+            .and_then(|value| value.checked_mul(u64::from(inspection.dtype.bytes_per_sample())))
+            .unwrap();
+        let mut canonical = vec![0; usize::try_from(canonical_bytes).unwrap()];
+        cache
+            .read_region_into(
+                0,
+                0,
+                [0, 0, 0],
+                [
+                    inspection.shape.z(),
+                    inspection.shape.y(),
+                    inspection.shape.x(),
+                ],
+                &mut canonical,
+            )
+            .unwrap();
+        (report, canonical)
+    }
+
+    #[derive(Clone, Copy)]
+    enum FixtureEndian {
+        Little,
+        Big,
+    }
+
+    impl FixtureEndian {
+        fn push_u16(self, destination: &mut Vec<u8>, value: u16) {
+            let encoded = match self {
+                Self::Little => value.to_le_bytes(),
+                Self::Big => value.to_be_bytes(),
+            };
+            destination.extend_from_slice(&encoded);
+        }
+
+        fn push_u32(self, destination: &mut Vec<u8>, value: u32) {
+            let encoded = match self {
+                Self::Little => value.to_le_bytes(),
+                Self::Big => value.to_be_bytes(),
+            };
+            destination.extend_from_slice(&encoded);
+        }
+    }
+
+    fn classic_tiff_header() -> Vec<u8> {
+        let mut bytes = b"II".to_vec();
+        FixtureEndian::Little.push_u16(&mut bytes, 42);
+        FixtureEndian::Little.push_u32(&mut bytes, 8);
+        bytes
+    }
+
+    fn write_preflight_fixture(
+        path: &Path,
+        entries: &[(u16, u16, u32, u32)],
+        next_ifd: u32,
+    ) -> std::io::Result<()> {
+        let mut bytes = classic_tiff_header();
+        FixtureEndian::Little.push_u16(&mut bytes, u16::try_from(entries.len()).unwrap());
+        for &(tag, type_code, count, value_or_offset) in entries {
+            FixtureEndian::Little.push_u16(&mut bytes, tag);
+            FixtureEndian::Little.push_u16(&mut bytes, type_code);
+            FixtureEndian::Little.push_u32(&mut bytes, count);
+            FixtureEndian::Little.push_u32(&mut bytes, value_or_offset);
+        }
+        FixtureEndian::Little.push_u32(&mut bytes, next_ifd);
+        fs::write(path, bytes)
+    }
+
+    fn patch_classic_le_compression(path: &Path, compression: u16) {
+        let mut bytes = fs::read(path).unwrap();
+        assert_eq!(&bytes[..2], b"II");
+        assert_eq!(u16::from_le_bytes(bytes[2..4].try_into().unwrap()), 42);
+        let ifd = usize::try_from(u32::from_le_bytes(bytes[4..8].try_into().unwrap())).unwrap();
+        let entries = usize::from(u16::from_le_bytes(bytes[ifd..ifd + 2].try_into().unwrap()));
+        let mut patched = false;
+        for index in 0..entries {
+            let entry = ifd + 2 + index * 12;
+            if u16::from_le_bytes(bytes[entry..entry + 2].try_into().unwrap()) == 259 {
+                assert_eq!(
+                    u16::from_le_bytes(bytes[entry + 2..entry + 4].try_into().unwrap()),
+                    3
+                );
+                assert_eq!(
+                    u32::from_le_bytes(bytes[entry + 4..entry + 8].try_into().unwrap()),
+                    1
+                );
+                bytes[entry + 8..entry + 10].copy_from_slice(&compression.to_le_bytes());
+                patched = true;
+                break;
+            }
+        }
+        assert!(patched, "fixture has a Compression field");
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn push_short_ifd_entry(
+        destination: &mut Vec<u8>,
+        endian: FixtureEndian,
+        tag: u16,
+        value: u16,
+    ) {
+        endian.push_u16(destination, tag);
+        endian.push_u16(destination, 3);
+        endian.push_u32(destination, 1);
+        endian.push_u16(destination, value);
+        endian.push_u16(destination, 0);
+    }
+
+    fn push_long_ifd_entry(
+        destination: &mut Vec<u8>,
+        endian: FixtureEndian,
+        tag: u16,
+        count: u32,
+        value_or_offset: u32,
+    ) {
+        endian.push_u16(destination, tag);
+        endian.push_u16(destination, 4);
+        endian.push_u32(destination, count);
+        endian.push_u32(destination, value_or_offset);
+    }
+
+    fn write_tiled_u8(
+        path: &Path,
+        width: u32,
+        height: u32,
+        tile_width: u32,
+        tile_height: u32,
+        values: &[u8],
+    ) -> std::io::Result<()> {
+        assert_eq!(values.len(), usize::try_from(width * height).unwrap());
+        let tiles_across = width.div_ceil(tile_width);
+        let tiles_down = height.div_ceil(tile_height);
+        let tile_count = tiles_across * tiles_down;
+        assert!(tile_count > 1);
+        let entry_count = 12_u16;
+        let ifd_end = 8_u32 + 2 + u32::from(entry_count) * 12 + 4;
+        let offsets_offset = ifd_end;
+        let counts_offset = offsets_offset + tile_count * 4;
+        let pixels_offset = counts_offset + tile_count * 4;
+        let tile_bytes = tile_width * tile_height;
+
+        let endian = FixtureEndian::Little;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        endian.push_u16(&mut bytes, 42);
+        endian.push_u32(&mut bytes, 8);
+        endian.push_u16(&mut bytes, entry_count);
+        push_long_ifd_entry(&mut bytes, endian, 256, 1, width);
+        push_long_ifd_entry(&mut bytes, endian, 257, 1, height);
+        push_short_ifd_entry(&mut bytes, endian, 258, 8);
+        push_short_ifd_entry(&mut bytes, endian, 259, 1);
+        push_short_ifd_entry(&mut bytes, endian, 262, 1);
+        push_short_ifd_entry(&mut bytes, endian, 277, 1);
+        push_short_ifd_entry(&mut bytes, endian, 284, 1);
+        push_long_ifd_entry(&mut bytes, endian, 322, 1, tile_width);
+        push_long_ifd_entry(&mut bytes, endian, 323, 1, tile_height);
+        push_long_ifd_entry(&mut bytes, endian, 324, tile_count, offsets_offset);
+        push_long_ifd_entry(&mut bytes, endian, 325, tile_count, counts_offset);
+        push_short_ifd_entry(&mut bytes, endian, 339, 1);
+        endian.push_u32(&mut bytes, 0);
+        assert_eq!(bytes.len(), usize::try_from(ifd_end).unwrap());
+
+        for tile in 0..tile_count {
+            endian.push_u32(&mut bytes, pixels_offset + tile * tile_bytes);
+        }
+        for _ in 0..tile_count {
+            endian.push_u32(&mut bytes, tile_bytes);
+        }
+        assert_eq!(bytes.len(), usize::try_from(pixels_offset).unwrap());
+
+        for tile_y in 0..tiles_down {
+            for tile_x in 0..tiles_across {
+                for local_y in 0..tile_height {
+                    for local_x in 0..tile_width {
+                        let x = tile_x * tile_width + local_x;
+                        let y = tile_y * tile_height + local_y;
+                        let value = if x < width && y < height {
+                            values[usize::try_from(y * width + x).unwrap()]
+                        } else {
+                            0xfe
+                        };
+                        bytes.push(value);
+                    }
+                }
+            }
+        }
+        File::create(path)?.write_all(&bytes)
+    }
+
+    fn write_big_endian_striped_u16(
+        path: &Path,
+        width: u32,
+        height: u32,
+        rows_per_strip: u32,
+        values: &[u16],
+    ) -> std::io::Result<()> {
+        assert_eq!(values.len(), usize::try_from(width * height).unwrap());
+        let strip_count = height.div_ceil(rows_per_strip);
+        assert!(strip_count > 1);
+        let strip_bytes = width * rows_per_strip * 2;
+        let entry_count = 11_u16;
+        let ifd_end = 8_u32 + 2 + u32::from(entry_count) * 12 + 4;
+        let offsets_offset = ifd_end;
+        let counts_offset = offsets_offset + strip_count * 4;
+        let pixels_offset = counts_offset + strip_count * 4;
+
+        let endian = FixtureEndian::Big;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"MM");
+        endian.push_u16(&mut bytes, 42);
+        endian.push_u32(&mut bytes, 8);
+        endian.push_u16(&mut bytes, entry_count);
+        push_long_ifd_entry(&mut bytes, endian, 256, 1, width);
+        push_long_ifd_entry(&mut bytes, endian, 257, 1, height);
+        push_short_ifd_entry(&mut bytes, endian, 258, 16);
+        push_short_ifd_entry(&mut bytes, endian, 259, 1);
+        push_short_ifd_entry(&mut bytes, endian, 262, 1);
+        push_long_ifd_entry(&mut bytes, endian, 273, strip_count, offsets_offset);
+        push_short_ifd_entry(&mut bytes, endian, 277, 1);
+        push_long_ifd_entry(&mut bytes, endian, 278, 1, rows_per_strip);
+        push_long_ifd_entry(&mut bytes, endian, 279, strip_count, counts_offset);
+        push_short_ifd_entry(&mut bytes, endian, 284, 1);
+        push_short_ifd_entry(&mut bytes, endian, 339, 1);
+        endian.push_u32(&mut bytes, 0);
+        assert_eq!(bytes.len(), usize::try_from(ifd_end).unwrap());
+
+        for strip in 0..strip_count {
+            endian.push_u32(&mut bytes, pixels_offset + strip * strip_bytes);
+        }
+        for _ in 0..strip_count {
+            endian.push_u32(&mut bytes, strip_bytes);
+        }
+        assert_eq!(bytes.len(), usize::try_from(pixels_offset).unwrap());
+        for value in values {
+            endian.push_u16(&mut bytes, *value);
+        }
+        File::create(path)?.write_all(&bytes)
     }
 
     fn write_u16_stack(

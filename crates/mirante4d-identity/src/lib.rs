@@ -29,8 +29,8 @@ pub use object::{
     MAX_MEDIA_TYPE_BYTES, MAX_OBJECT_ROLE_BYTES, MediaType, ObjectRole, RawObjectDescriptor,
 };
 pub use scientific::{
-    SCIENTIFIC_TILE_SHAPE_TZYX, ScientificDatasetHasher, ScientificHashError,
-    ScientificLayerDescriptor, ScientificLayerHasher, ScientificLayerRoot,
+    PreparedScientificTile, SCIENTIFIC_TILE_SHAPE_TZYX, ScientificDatasetHasher,
+    ScientificHashError, ScientificLayerDescriptor, ScientificLayerHasher, ScientificLayerRoot,
     ScientificTemporalCalibration, ScientificTile,
 };
 

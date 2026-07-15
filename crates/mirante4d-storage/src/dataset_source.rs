@@ -30,9 +30,12 @@ const SINK_WRITE_CHUNK_BYTES: usize = 8 * 1024;
 /// Conservative caller reservation for one exact-plus-scientific validation.
 ///
 /// The accepted validators retain bounded metadata, one 64 KiB hash buffer,
-/// one fixed scientific tile, and one physical brick at a time. Product
-/// verification acquires this from `InFlightDecode` before invoking them.
+/// four fixed scientific tiles, one physical brick, the shared native codec
+/// workspace, and a bounded tile-digest slab. Product verification acquires
+/// this from `InFlightDecode` before invoking them.
 pub const PACKAGE_VALIDATION_WORKING_BYTES: u64 = 64 * 1024 * 1024;
+
+const _: () = assert!(PACKAGE_VALIDATION_WORKING_BYTES >= crate::INNER_CODEC_WORKING_BYTES_MAX);
 
 /// Failure while binding an opened target package to the dataset contract.
 #[derive(Debug, Error)]
