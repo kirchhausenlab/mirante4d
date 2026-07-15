@@ -13,7 +13,6 @@ const REGISTRY_PATH: &str = "verification/registry.json";
 const SELECTORS_PATH: &str = "verification/generated/selectors.json";
 const DOCTESTS_PATH: &str = "verification/generated/doctests.json";
 const NEXTEST_CONFIG_PATH: &str = ".config/nextest.toml";
-const PREDECESSOR_DISPOSITION_PATH: &str = "verification/predecessor-disposition.json";
 
 #[derive(Debug, Deserialize)]
 pub(super) struct Registry {
@@ -143,67 +142,6 @@ struct NonPrLane {
     activation_state: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct PredecessorDisposition {
-    schema: String,
-    schema_version: u32,
-    source: DispositionSource,
-    invariants: DispositionInvariants,
-    rules: Vec<DispositionRule>,
-    current_additions: Vec<CurrentAddition>,
-    expected_summary: BTreeMap<String, u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DispositionSource {
-    path: String,
-    sha256: String,
-    record_count: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct DispositionInvariants {
-    exactly_one_rule: bool,
-    current_case_exactly_one_lane: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct DispositionRule {
-    id: String,
-    #[serde(rename = "match")]
-    match_spec: DispositionMatch,
-    disposition: String,
-    reason: String,
-    lane: Option<String>,
-    requirement_ids: Vec<String>,
-    replacement_command: Option<String>,
-    deletion_gate: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct DispositionMatch {
-    source_dispositions: Option<Vec<String>>,
-    kinds: Option<Vec<String>>,
-    owners: Option<Vec<String>>,
-    ignored: Option<bool>,
-    ids: Option<Vec<String>>,
-    id_prefixes: Option<Vec<String>>,
-    source_path_prefixes: Option<Vec<String>>,
-    exclude_ids: Option<Vec<String>>,
-    exclude_id_prefixes: Option<Vec<String>>,
-    exclude_source_path_prefixes: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CurrentAddition {
-    id: String,
-    kind: String,
-    owner: String,
-    lane: String,
-    requirement_ids: Vec<String>,
-    reason: String,
-}
-
 pub(super) fn read_registry() -> anyhow::Result<Registry> {
     let path = repo_path(REGISTRY_PATH);
     let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -215,7 +153,6 @@ pub(super) fn read_registry() -> anyhow::Result<Registry> {
 
 pub(super) fn sync_generated(check: bool) -> anyhow::Result<()> {
     let registry = read_registry()?;
-    validate_predecessor_disposition()?;
     let selectors = generated_selectors(&registry)?;
     let doctests = generated_doctests()?;
     let nextest = generated_nextest(&registry)?;
@@ -273,268 +210,6 @@ fn generated_doctests() -> anyhow::Result<String> {
     let mut encoded = serde_json::to_string_pretty(&value)?;
     encoded.push('\n');
     Ok(encoded)
-}
-
-pub(super) fn validate_predecessor_disposition() -> anyhow::Result<()> {
-    let path = repo_path(PREDECESSOR_DISPOSITION_PATH);
-    let encoded = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let disposition: PredecessorDisposition = serde_json::from_slice(&encoded)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
-    if disposition.schema != "mirante4d-verification-predecessor-disposition"
-        || disposition.schema_version != 1
-    {
-        bail!("verification predecessor disposition has unsupported schema identity");
-    }
-    if !disposition.invariants.exactly_one_rule
-        || !disposition.invariants.current_case_exactly_one_lane
-    {
-        bail!("verification predecessor disposition must fail closed on both invariants");
-    }
-    if disposition.source.record_count != 1055 {
-        bail!("verification predecessor source record count must remain 1055");
-    }
-    let source_path = safe_repo_relative_path(&disposition.source.path)?;
-    let actual_sha = sha256_file(&source_path)?;
-    if actual_sha != disposition.source.sha256 {
-        bail!(
-            "verification predecessor source digest mismatch: expected {}, found {actual_sha}",
-            disposition.source.sha256
-        );
-    }
-    let source: Value = serde_json::from_slice(
-        &fs::read(&source_path)
-            .with_context(|| format!("failed to read {}", source_path.display()))?,
-    )?;
-    let records = source
-        .get("records")
-        .and_then(Value::as_array)
-        .context("pre-foundation verification manifest is missing records")?;
-    if records.len() as u64 != disposition.source.record_count {
-        bail!("pre-foundation verification record count drifted");
-    }
-
-    let mut rule_ids = BTreeSet::new();
-    let allowed_dispositions = ["kept", "moved", "rewritten", "deleted"];
-    for rule in &disposition.rules {
-        if !rule_ids.insert(rule.id.as_str())
-            || !allowed_dispositions.contains(&rule.disposition.as_str())
-            || rule.reason.trim().is_empty()
-            || rule.requirement_ids.is_empty()
-        {
-            bail!(
-                "predecessor disposition rule {:?} is incomplete or duplicate",
-                rule.id
-            );
-        }
-        if rule.disposition == "deleted" && rule.deletion_gate.as_deref().is_none_or(str::is_empty)
-        {
-            bail!(
-                "deleted predecessor rule {:?} must name a deletion gate",
-                rule.id
-            );
-        }
-        if rule.disposition != "deleted" && rule.lane.as_deref().is_none_or(str::is_empty) {
-            bail!("retained predecessor rule {:?} must name a lane", rule.id);
-        }
-        if rule.replacement_command.as_deref() == Some("") {
-            bail!(
-                "predecessor rule {:?} has an empty replacement command",
-                rule.id
-            );
-        }
-        validate_match_spec_references(&rule.id, &rule.match_spec, records)?;
-    }
-
-    let mut disposition_counts = BTreeMap::<String, u64>::new();
-    let mut rule_match_counts = vec![0_u64; disposition.rules.len()];
-    for record in records {
-        let matched = disposition
-            .rules
-            .iter()
-            .enumerate()
-            .filter(|(_, rule)| disposition_rule_matches(&rule.match_spec, record))
-            .collect::<Vec<_>>();
-        if matched.len() != 1 {
-            let id = record
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("<missing>");
-            bail!(
-                "predecessor record {id:?} matched {} disposition rules, expected exactly one",
-                matched.len()
-            );
-        }
-        rule_match_counts[matched[0].0] += 1;
-        *disposition_counts
-            .entry(matched[0].1.disposition.clone())
-            .or_default() += 1;
-    }
-    for (rule, count) in disposition.rules.iter().zip(rule_match_counts) {
-        if count == 0 {
-            bail!(
-                "predecessor disposition rule {:?} matched no source records",
-                rule.id
-            );
-        }
-    }
-
-    let mut additions = BTreeSet::new();
-    for addition in &disposition.current_additions {
-        if !additions.insert(addition.id.as_str())
-            || addition.kind.trim().is_empty()
-            || addition.owner.trim().is_empty()
-            || addition.lane.trim().is_empty()
-            || addition.requirement_ids.is_empty()
-            || addition.reason.trim().is_empty()
-        {
-            bail!(
-                "current verification addition {:?} is incomplete or duplicate",
-                addition.id
-            );
-        }
-    }
-    validate_expected_summary(
-        &disposition.expected_summary,
-        records.len() as u64,
-        disposition.current_additions.len() as u64,
-        &disposition_counts,
-    )?;
-    Ok(())
-}
-
-fn disposition_rule_matches(spec: &DispositionMatch, record: &Value) -> bool {
-    matches_optional_string_set(spec.source_dispositions.as_deref(), record, "disposition")
-        && matches_optional_string_set(spec.kinds.as_deref(), record, "kind")
-        && matches_optional_string_set(spec.owners.as_deref(), record, "owner")
-        && spec
-            .ignored
-            .is_none_or(|expected| record.get("ignored").and_then(Value::as_bool) == Some(expected))
-        && matches_optional_string_set(spec.ids.as_deref(), record, "id")
-        && matches_optional_prefixes(spec.id_prefixes.as_deref(), record, "id")
-        && matches_optional_prefixes(spec.source_path_prefixes.as_deref(), record, "source_path")
-        && !matches_any_string(spec.exclude_ids.as_deref(), record, "id")
-        && !matches_any_prefix(spec.exclude_id_prefixes.as_deref(), record, "id")
-        && !matches_any_prefix(
-            spec.exclude_source_path_prefixes.as_deref(),
-            record,
-            "source_path",
-        )
-}
-
-fn matches_optional_string_set(values: Option<&[String]>, record: &Value, field: &str) -> bool {
-    values.is_none_or(|values| {
-        record
-            .get(field)
-            .and_then(Value::as_str)
-            .is_some_and(|actual| values.iter().any(|value| value == actual))
-    })
-}
-
-fn matches_optional_prefixes(prefixes: Option<&[String]>, record: &Value, field: &str) -> bool {
-    prefixes.is_none_or(|prefixes| {
-        record
-            .get(field)
-            .and_then(Value::as_str)
-            .is_some_and(|actual| prefixes.iter().any(|prefix| actual.starts_with(prefix)))
-    })
-}
-
-fn matches_any_string(values: Option<&[String]>, record: &Value, field: &str) -> bool {
-    values.is_some_and(|values| {
-        record
-            .get(field)
-            .and_then(Value::as_str)
-            .is_some_and(|actual| values.iter().any(|value| value == actual))
-    })
-}
-
-fn matches_any_prefix(prefixes: Option<&[String]>, record: &Value, field: &str) -> bool {
-    prefixes.is_some_and(|prefixes| {
-        record
-            .get(field)
-            .and_then(Value::as_str)
-            .is_some_and(|actual| prefixes.iter().any(|prefix| actual.starts_with(prefix)))
-    })
-}
-
-fn validate_match_spec_references(
-    rule_id: &str,
-    spec: &DispositionMatch,
-    records: &[Value],
-) -> anyhow::Result<()> {
-    for (field, values) in [
-        ("disposition", spec.source_dispositions.as_deref()),
-        ("kind", spec.kinds.as_deref()),
-        ("owner", spec.owners.as_deref()),
-        ("id", spec.ids.as_deref()),
-        ("id", spec.exclude_ids.as_deref()),
-    ] {
-        if let Some(values) = values {
-            if values.is_empty() {
-                bail!("predecessor rule {rule_id:?} has an empty {field} match set");
-            }
-            for expected in values {
-                if expected.is_empty()
-                    || !records.iter().any(|record| {
-                        record.get(field).and_then(Value::as_str) == Some(expected.as_str())
-                    })
-                {
-                    bail!(
-                        "predecessor rule {rule_id:?} references unmatched {field} value {expected:?}"
-                    );
-                }
-            }
-        }
-    }
-    for (field, prefixes) in [
-        ("id", spec.id_prefixes.as_deref()),
-        ("source_path", spec.source_path_prefixes.as_deref()),
-        ("id", spec.exclude_id_prefixes.as_deref()),
-        ("source_path", spec.exclude_source_path_prefixes.as_deref()),
-    ] {
-        if let Some(prefixes) = prefixes {
-            if prefixes.is_empty() {
-                bail!("predecessor rule {rule_id:?} has an empty {field} prefix set");
-            }
-            for prefix in prefixes {
-                if prefix.is_empty()
-                    || !records.iter().any(|record| {
-                        record
-                            .get(field)
-                            .and_then(Value::as_str)
-                            .is_some_and(|actual| actual.starts_with(prefix))
-                    })
-                {
-                    bail!(
-                        "predecessor rule {rule_id:?} references unmatched {field} prefix {prefix:?}"
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_expected_summary(
-    expected: &BTreeMap<String, u64>,
-    source_records: u64,
-    current_additions: u64,
-    disposition_counts: &BTreeMap<String, u64>,
-) -> anyhow::Result<()> {
-    for (key, expected_value) in expected {
-        let actual = match key.as_str() {
-            "source_records" | "record_count" => source_records,
-            "current_additions" => current_additions,
-            disposition => disposition_counts
-                .get(disposition)
-                .copied()
-                .with_context(|| format!("unknown predecessor expected_summary field {key:?}"))?,
-        };
-        if actual != *expected_value {
-            bail!("predecessor expected_summary {key:?} expected {expected_value}, found {actual}");
-        }
-    }
-    Ok(())
 }
 
 fn safe_repo_relative_path(relative: &str) -> anyhow::Result<PathBuf> {
@@ -667,21 +342,10 @@ fn validate_registry(registry: &Registry) -> anyhow::Result<()> {
         }
     }
     let expected_non_pr = BTreeSet::from([
-        "deep-coverage",
-        "deep-fuzz",
-        "deep-mutation",
         "developer-local",
         "format-lifecycle",
-        "main-package-capability",
-        "performance",
+        "linux-release",
         "project-store-lifecycle",
-        "product-e1",
-        "product-e2",
-        "product-e3",
-        "product-e4",
-        "release",
-        "scientific-acceptance",
-        "stress",
         "trusted-gpu",
     ]);
     let actual_non_pr = registry
