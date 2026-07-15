@@ -6,8 +6,10 @@ mod analysis_workspace;
 mod fidelity;
 mod project_dialogs;
 mod runtime_diagnostics;
+mod workbench;
 mod workbench_chrome;
 mod workbench_inspector;
+mod workbench_viewer;
 
 pub use analysis_workspace::{show_analysis_workspace, show_analysis_workspace_window};
 pub use fidelity::{
@@ -19,6 +21,7 @@ pub use project_dialogs::{
     ProjectRecoveryView, show_dirty_project_close_prompt, show_project_recovery_ui,
 };
 pub use runtime_diagnostics::{RuntimeDiagnosticsView, show_runtime_diagnostics_body};
+pub use workbench::{WorkbenchView, show_workbench};
 pub use workbench_chrome::{
     LeftWorkbenchView, ProjectControlsView, TopToolbarView, playback_status_label,
     show_left_workbench_panel, show_top_toolbar, viewport_hover_status_label,
@@ -26,6 +29,10 @@ pub use workbench_chrome::{
 pub use workbench_inspector::{
     AnalysisControlsView, CameraInspectorView, InspectorWorkbenchView, histogram_bins_label,
     histogram_status_label, show_workbench_inspector,
+};
+pub use workbench_viewer::{
+    ViewerInteractionConfig, ViewerWorkbenchView, render_viewport_for_display_size,
+    show_workbench_viewer,
 };
 
 use std::{fmt::Display, hash::Hash, time::Duration};

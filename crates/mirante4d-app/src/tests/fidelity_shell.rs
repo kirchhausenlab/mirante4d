@@ -45,21 +45,6 @@ fn frame_fidelity_label_keeps_exact_source_lod_concise() {
 }
 
 #[test]
-fn display_size_maps_to_physical_render_viewport_and_clamps_aspect() {
-    assert_eq!(
-        render_viewport_for_display_size(egui::vec2(640.2, 360.2), 2.0, 2048).unwrap(),
-        RenderExtent::new(1280, 720).unwrap()
-    );
-    assert_eq!(
-        render_viewport_for_display_size(egui::vec2(1000.0, 2000.0), 2.0, 2048).unwrap(),
-        RenderExtent::new(1024, 2048).unwrap()
-    );
-    assert!(render_viewport_for_display_size(egui::Vec2::ZERO, 2.0, 2048).is_none());
-    assert!(render_viewport_for_display_size(egui::vec2(640.0, 360.0), 0.0, 2048).is_none());
-    assert!(render_viewport_for_display_size(egui::vec2(640.0, 360.0), 2.0, 0).is_none());
-}
-
-#[test]
 fn workbench_shell_exposes_primary_regions_at_high_dpi() {
     use egui_kittest::{Harness, kittest::Queryable};
 

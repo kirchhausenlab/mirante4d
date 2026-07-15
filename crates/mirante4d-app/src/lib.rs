@@ -32,7 +32,6 @@ mod runtime_diagnostics_panel;
 mod semantic_demand;
 mod semantic_tiles;
 mod smoke;
-mod tool_interactions;
 mod transfer_presets;
 mod unified_source_open;
 mod viewer_layout;
@@ -50,7 +49,7 @@ use analysis_workspace::{
 };
 use cross_section_readout::cross_section_hover_readout_for_panel_point;
 pub use diagnostics::{StartupDiagnostics, collect_startup_diagnostics, default_log_path};
-use display_refresh::{ViewportDisplayImage, duration_ms};
+use display_refresh::duration_ms;
 use eframe::egui;
 use fidelity::composite_fidelity_label;
 use histogram::active_layer_histogram_summary;
@@ -68,7 +67,7 @@ use mirante4d_application::{
     RenderCoordinationState, ResidentRenderFailureStatus, SourceSessionGeneration,
     SourceVerificationSnapshot, SystemMonotonicClock, WorkspaceSnapshot,
     import_workflow::{ImportCommand, ImportReviewId},
-    viewer_tools::{ViewerTool, ViewerToolState},
+    viewer_tools::ViewerToolState,
     viewport_interaction::default_camera_for_shape,
 };
 pub use mirante4d_application::{
@@ -100,19 +99,13 @@ use mirante4d_ui_egui as ui_kit;
 use product_automation::{ProductAutomationAppUpdateTiming, ProductAutomationController};
 use render_state::set_render_viewport;
 pub use smoke::{AppSmokeOptions, AppSmokeReport, PlaybackSmokeFrame, run_headless_smoke};
-use tool_interactions::apply_viewport_tool_response;
 use ui_kit::{
-    CrossSectionReadoutRequest, DirtyProjectCloseView, DirtyProjectSaveAction,
-    ProjectRecoveryCandidateView, ProjectRecoveryView, RenderUiRequest, ViewportObservation,
-    WorkbenchAnalysisKind, WorkbenchLayoutSpec, WorkbenchUiAction, WorkbenchUiOutput,
-    show_analysis_workspace_window, show_dirty_project_close_prompt, show_project_recovery_ui,
+    DirtyProjectCloseView, DirtyProjectSaveAction, ProjectRecoveryCandidateView,
+    ProjectRecoveryView, RenderUiRequest, ViewportObservation, WorkbenchAnalysisKind,
+    WorkbenchUiAction, WorkbenchUiOutput,
 };
 #[cfg(test)]
-use ui_kit::{histogram_bins_label, playback_status_label};
-use viewport::{
-    fit_size, presentation_viewport_for_display_size, render_viewport_for_display_size,
-    viewport_hover_from_response, viewport_interaction_commands,
-};
+use ui_kit::{WorkbenchLayoutSpec, histogram_bins_label, playback_status_label};
 use workbench_controls::{
     dataset_path_status_label, request_background_work_repaint,
     request_background_work_repaint_after,

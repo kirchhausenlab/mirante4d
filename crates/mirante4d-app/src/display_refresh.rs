@@ -20,17 +20,6 @@ use mirante4d_render_api::{
 };
 use mirante4d_render_wgpu::WgpuRenderRuntimeError;
 
-#[derive(Clone)]
-pub(crate) enum ViewportDisplayImage {
-    UiBackground {
-        size: egui::Vec2,
-    },
-    Presentation {
-        slot: PresentationSlot,
-        size: egui::Vec2,
-    },
-}
-
 pub(crate) const fn display_refresh_path_label(path: DisplayRefreshPath) -> &'static str {
     match path {
         DisplayRefreshPath::GpuResidentDisplay => "gpu display",
@@ -45,15 +34,6 @@ pub(crate) struct DisplayRenderTiming {
     pub(crate) gpu_upload_ms: Option<f64>,
     pub(crate) gpu_compute_ms: Option<f64>,
     pub(crate) egui_texture_ms: f64,
-}
-
-impl ViewportDisplayImage {
-    pub(crate) fn size_vec2(&self) -> egui::Vec2 {
-        match self {
-            Self::UiBackground { size } => *size,
-            Self::Presentation { size, .. } => *size,
-        }
-    }
 }
 
 pub(crate) fn duration_ms(duration: Duration) -> f64 {
@@ -112,39 +92,6 @@ impl MiranteWorkbenchApp {
             })
             .flatten();
         PresentationSurface::new(viewport, frame)
-    }
-
-    pub(crate) fn viewport_display_image(
-        &self,
-        snapshot: &ApplicationSnapshot,
-    ) -> ViewportDisplayImage {
-        if let Some(extent) = self.product_display(snapshot, PresentationSlot::ThreeD) {
-            return ViewportDisplayImage::Presentation {
-                slot: PresentationSlot::ThreeD,
-                size: extent_size(extent),
-            };
-        }
-        ViewportDisplayImage::UiBackground {
-            size: extent_size(self.render_coordination.render_viewport),
-        }
-    }
-
-    pub(crate) fn cross_section_panel_display_image(
-        &self,
-        panel_id: PanelId,
-        snapshot: &ApplicationSnapshot,
-    ) -> Option<ViewportDisplayImage> {
-        let slot = match panel_id {
-            PanelId::Xy => PresentationSlot::Xy,
-            PanelId::Xz => PresentationSlot::Xz,
-            PanelId::Yz => PresentationSlot::Yz,
-            PanelId::ThreeD => return None,
-        };
-        let extent = self.product_display(snapshot, slot)?;
-        Some(ViewportDisplayImage::Presentation {
-            slot,
-            size: extent_size(extent),
-        })
     }
 
     fn product_display(
@@ -712,10 +659,6 @@ fn cross_section_scope(panel_id: PanelId) -> anyhow::Result<u64> {
         PanelId::Yz => Ok(SCOPE_CROSS_SECTION_YZ),
         PanelId::ThreeD => anyhow::bail!("the 3D panel has no cross-section demand scope"),
     }
-}
-
-fn extent_size(extent: RenderExtent) -> egui::Vec2 {
-    egui::vec2(extent.width_pixels() as f32, extent.height_pixels() as f32)
 }
 
 pub(crate) fn render_backend_for_mode(mode: RenderMode) -> RenderBackend {

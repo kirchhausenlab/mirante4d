@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::viewer_layout::PanelId;
-use crate::workbench_ui::viewer_tool_for_kind;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct WorkbenchUiApplyTiming {
@@ -293,11 +292,6 @@ impl MiranteWorkbenchApp {
             if let Err(fault) = self.apply_application_command(command, ui.ctx()) {
                 tracing::warn!(?fault, "UI application command rejected");
             }
-        }
-        let accepted_snapshot = self.application.snapshot();
-        let accepted_tool = viewer_tool_for_kind(accepted_snapshot.transient().active_tool());
-        if self.egui_ui.viewer_tools.active_tool != accepted_tool {
-            self.egui_ui.viewer_tools.set_active_tool(accepted_tool);
         }
         let command_apply_ms = duration_ms(command_apply_started.elapsed());
 
