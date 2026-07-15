@@ -52,11 +52,9 @@ The workspace has eighteen packages (seventeen `mirante4d-*` crates plus
   resolution.
 - `xtask`: developer and verification tooling, never a product mode.
 
-`mirante4d-core` and the predecessor application/session/preferences models
-do not exist. Lower crates do not depend on the app/UI layer; the renderer
-does not read files; format code does not own viewer state.
-The predecessor data, format, import, and renderer crates do not exist. The
-product uses `mirante4d-storage`, `mirante4d-import-pipeline`, and
+Lower crates do not depend on the app/UI layer; the renderer does not read
+files; format code does not own viewer state. The product uses
+`mirante4d-storage`, `mirante4d-import-pipeline`, and
 `mirante4d-render-wgpu`; the CPU reference renderer is test-only.
 
 ## Application Composition
@@ -67,18 +65,14 @@ product uses `mirante4d-storage`, `mirante4d-import-pipeline`, and
 project-store/settings/source-open handles. It is a
 composition root, not a second model.
 
-There are no remaining temporary runtime owners. The former
-`CurrentValidationRuntime` wrapper is deleted; product automation is composed
-directly and its render-size override exists only in test builds.
-
-The temporary egui bridge and render owner are deleted. The native app projects
-one immutable workbench view, calls `mirante4d-ui-egui` once, and resolves the
-returned typed commands, service requests, and opaque presentation paints.
+Product automation is composed directly and its render-size override exists
+only in test builds. The native app projects one immutable workbench view,
+calls `mirante4d-ui-egui` once, and resolves the returned typed commands,
+service requests, and opaque presentation paints.
 Widget layout and interaction state do not have a second native path.
 `ProjectStoreApplicationService` is the sole product project I/O route; its
 actor owns project roots, sessions, leases, refs, recovery, and filesystem
-mutation. The project-v15 bridge and `CurrentProjectRuntime` are deleted, with
-no compatibility reader or fallback.
+mutation. There is no compatibility reader or fallback.
 
 The native `ImportWorkflow` owns TIFF worker cancellation, bounded terminal
 results, retry options, and explicit joining. It projects immutable import

@@ -14,7 +14,7 @@ use mirante4d_render_api::{
 
 use crate::viewer_layout::PanelId;
 
-/// The product deliberately stays inside the successor's single-call lease
+/// The product deliberately stays inside the renderer's single-call lease
 /// window. Aggregate dataset demand uses the same bound.
 pub(crate) const PRODUCT_RENDER_RESOURCE_LIMIT: usize = 128;
 

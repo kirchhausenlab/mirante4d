@@ -81,7 +81,7 @@ impl PackageShardInput {
     }
 }
 
-/// Complete typed input to the off-product deterministic package writer.
+/// Complete typed input to the deterministic package writer.
 ///
 /// `shards` may be any lazy iterator. Encoded shards, descriptors, manifest
 /// pages, roots, and their paths are deliberately not accepted as input.
@@ -183,7 +183,7 @@ pub enum PackageWriteError {
     Profile(#[from] StorageProfileError),
 }
 
-/// Sole off-product writer for a new local target-profile package.
+/// Sole writer for a new local target-profile package.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalPackageWriter;
 

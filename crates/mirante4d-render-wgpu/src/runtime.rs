@@ -24,7 +24,7 @@ use super::{
 const MAX_WIDTH: u32 = 1_920;
 const MAX_HEIGHT: u32 = 1_080;
 // The inherited render API permits larger generic plans, but this deliberately
-// small successor slice admits only bounded view-local metadata. The 256-entry
+// small product renderer admits only bounded view-local metadata. The 256-entry
 // input ceiling preserves the accepted 129-resource traversal fixture. The
 // resident metadata table has the same fixed ceiling, while each traversal,
 // supplied-lease window, and submitted shader table stays at 128 resources.
@@ -208,7 +208,7 @@ fn validate_requirement_slice(
     }
 
     // The generic RenderRequirements contract permits arbitrary semantic
-    // regions. This successor must reject ambiguous overlap before the shader,
+    // regions. The renderer rejects ambiguous overlap before the shader,
     // matching the independent CPU oracle. The enclosing 256-entry cap makes
     // this pairwise validation a fixed, small metadata bound.
     for (index, first) in resources.iter().enumerate() {

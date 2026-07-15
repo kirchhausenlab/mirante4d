@@ -28,12 +28,10 @@ validation and reads, and create-only package publication.
 `mirante4d-import-pipeline` is the active bounded, cancellable, restartable
 TIFF/OME-TIFF producer. Native composition now owns its bounded worker results,
 latest-only progress, cancellation, and explicit shutdown; egui owns no import
-thread or channel. The predecessor `mirante4d-data`, `mirante4d-format`,
-and `mirante4d-import` crates are deleted. `mirante4d-ui-egui` now owns shared
-egui visuals, application-problem presentation, and transient UI drafts and
-interaction state. `mirante4d-render-wgpu` is
-the sole product renderer. The unpublished `mirante4d-render-reference` CPU
-oracle is test-only, and the predecessor `mirante4d-renderer` crate is deleted.
+thread or channel. `mirante4d-ui-egui` owns shared egui visuals,
+application-problem presentation, and transient UI drafts and interaction
+state. `mirante4d-render-wgpu` is the sole product renderer. The unpublished
+`mirante4d-render-reference` CPU oracle is test-only.
 
 `mirante4d-analysis-core` owns exact `uint8`, `uint16`, and finite `float32`
 intensity statistics and artifact payloads. `mirante4d-analysis-runtime` runs
@@ -42,21 +40,15 @@ window, lower priority than interactive work, scoped cancellation, and stale
 result suppression. The product exposes whole-layer summaries over time and a
 numeric axis-aligned box at the current timepoint. A complete table/plot pair
 becomes visible only after one atomic project-store commit, and authenticated
-pairs are restored when the project reopens. The predecessor
-`mirante4d-analysis` crate and its segmentation code are deleted.
-
-`mirante4d-core`, the application
-`AppState` god-state, `WorkbenchCommand`, project-v14 authority, and
-preferences-v1 authority have been deleted. There is one live canonical
+pairs are restored when the project reopens. There is one live canonical
 application reducer and one canonical project model.
 
 ## Foundation Status
 
 The foundation refactor through WP-15 is complete. It
 established the current bounded storage, runtime, renderer, project,
-application, analysis, UI, verification, and local packaging authorities and
-deleted their predecessor product paths. Git history and immutable tags retain
-the individual package record.
+application, analysis, UI, verification, and local packaging authorities. Git
+history and immutable tags retain the individual package record.
 
 ## Current Verification Boundary
 
