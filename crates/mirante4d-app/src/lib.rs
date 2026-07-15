@@ -114,7 +114,7 @@ use playback::playback_status_label;
 #[cfg(test)]
 use playback::stepped_timepoint;
 use product_automation::{ProductAutomationAppUpdateTiming, ProductAutomationController};
-use render_state::{set_presentation_viewport, set_render_viewport};
+use render_state::set_render_viewport;
 pub use smoke::{AppSmokeOptions, AppSmokeReport, PlaybackSmokeFrame, run_headless_smoke};
 pub use state::{HistogramStatus, LayerHistogramSummary};
 use tool_interactions::apply_viewport_tool_response;
@@ -125,7 +125,8 @@ use transfer_presets::{
 #[cfg(test)]
 use ui_kit::{AnalysisPlotViewRange, AnalysisTableSort, ViewportIntensity};
 use ui_kit::{
-    NativeWorkbenchAction, StatusTone, ViewportHover, WorkbenchLayoutSpec, WorkbenchUiOutput,
+    NativeWorkbenchAction, RenderUiRequest, StatusTone, ViewportHover, ViewportObservation,
+    WorkbenchLayoutSpec, WorkbenchUiOutput,
 };
 use viewport::{
     default_camera_for_shape, fit_camera_to_shape_preserving_view, fit_size,

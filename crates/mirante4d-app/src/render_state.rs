@@ -1,4 +1,4 @@
-use mirante4d_render_api::{PresentationViewport, RenderExtent};
+use mirante4d_render_api::RenderExtent;
 use mirante4d_render_wgpu::WgpuRenderRuntimeError;
 
 use crate::{FrameFailureKind, RenderCoordinationState, ResidentRenderFailureStatus};
@@ -8,13 +8,6 @@ pub(crate) fn set_render_viewport(
     viewport: RenderExtent,
 ) -> bool {
     render.set_render_viewport(viewport)
-}
-
-pub(crate) fn set_presentation_viewport(
-    render: &mut RenderCoordinationState,
-    viewport: PresentationViewport,
-) -> bool {
-    render.set_presentation_viewport(viewport)
 }
 
 pub(crate) fn render_failure_status(error: &anyhow::Error) -> ResidentRenderFailureStatus {

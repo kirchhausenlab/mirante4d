@@ -42,7 +42,7 @@ use mirante4d_project_model::{
     ProjectRevisionHighWater, ProjectRevisionId, ProjectState, ViewState,
 };
 use mirante4d_render_api::PresentedFrame;
-pub use mirante4d_render_api::{PresentationPaintRequest, PresentationViewport};
+pub use mirante4d_render_api::{PresentationPaintRequest, PresentationViewport, RenderExtent};
 use mirante4d_settings::{RejectedFileDisposition, ResourcePolicy};
 
 /// Maximum number of project revisions retained for undo/redo.

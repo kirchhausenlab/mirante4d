@@ -148,6 +148,7 @@ pub(super) fn accepted_successor_public_root_additions(
             "FrameFidelityStatus",
             "LodDecisionReason",
             "RenderBackend",
+            "RenderExtent",
             "SystemMonotonicClock",
             "render_coordination",
             "viewer_tools",

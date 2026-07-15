@@ -1,6 +1,7 @@
 //! Native resolution of typed workbench UI output.
 
 use super::*;
+use crate::viewer_layout::PanelId;
 use crate::workbench_ui::viewer_tool_for_kind;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -8,6 +9,24 @@ pub(crate) struct WorkbenchUiApplyTiming {
     pub(crate) command_apply_ms: f64,
     pub(crate) display_refresh_trigger_ms: f64,
     pub(crate) import_action_ms: f64,
+}
+
+fn apply_viewport_observations(
+    render_coordination: &mut RenderCoordinationState,
+    observations: impl IntoIterator<Item = ViewportObservation>,
+) -> bool {
+    let mut changed = false;
+    for observation in observations {
+        changed |= render_coordination.record_viewports(
+            observation.slot(),
+            observation.presentation(),
+            observation.render(),
+        );
+    }
+    if changed {
+        render_coordination.request_refresh();
+    }
+    changed
 }
 
 impl MiranteWorkbenchApp {
@@ -20,6 +39,8 @@ impl MiranteWorkbenchApp {
             application_commands,
             import_commands,
             native_actions,
+            viewport_observations,
+            render_requests,
             presentation_paints,
             mut rerender_requested,
             texture_refresh_requested,
@@ -73,6 +94,41 @@ impl MiranteWorkbenchApp {
             }
         }
 
+        if apply_viewport_observations(&mut self.render_coordination, viewport_observations) {
+            ui.ctx().request_repaint();
+        }
+
+        for request in render_requests {
+            if self.render_coordination.refresh_requested() {
+                continue;
+            }
+            match request {
+                RenderUiRequest::EnsureCrossSectionCurrent { panel } => {
+                    let panel_id = PanelId::from_application_panel(panel);
+                    let slot = panel_id.presentation_slot();
+                    let before = self.render_coordination.surface(slot).clone();
+                    match self.render_cross_section_panel_for_display_if_needed(panel_id) {
+                        Ok(timing) => {
+                            if timing.is_some() || self.render_coordination.surface(slot) != &before
+                            {
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                        Err(error) => {
+                            if self.render_coordination.surface(slot) != &before {
+                                ui.ctx().request_repaint();
+                            }
+                            tracing::error!(
+                                %error,
+                                panel = panel_id.label(),
+                                "cross-section panel render failed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // Resolve snapshot-built paints before a same-frame application
         // command can retire or replace their presentation token.
         for paint in presentation_paints {
@@ -119,6 +175,7 @@ impl MiranteWorkbenchApp {
 
 #[cfg(test)]
 mod tests {
+    use mirante4d_application::RenderExtent;
     use mirante4d_render_api::{PresentationPaintRequest, PresentationToken};
 
     use super::*;
@@ -144,5 +201,40 @@ mod tests {
             output.presentation_paints[0].slot(),
             PresentationSlot::ThreeD
         );
+    }
+
+    #[test]
+    fn viewport_observations_coalesce_one_refresh_request() {
+        let initial_presentation = PresentationViewport::new(320.0, 240.0).unwrap();
+        let initial_render = RenderExtent::new(320, 240).unwrap();
+        let mut coordination = RenderCoordinationState::new(
+            FrameFidelityStatus::new_with_presentation(initial_render, initial_presentation),
+        );
+        let presentation = PresentationViewport::new(640.0, 360.0).unwrap();
+        let render = RenderExtent::new(1280, 720).unwrap();
+        let observation = ViewportObservation::new(PresentationSlot::Xy, presentation, render);
+
+        assert!(apply_viewport_observations(
+            &mut coordination,
+            [observation, observation]
+        ));
+        assert_eq!(
+            coordination
+                .surface(PresentationSlot::Xy)
+                .presentation_viewport(),
+            Some(presentation)
+        );
+        assert_eq!(
+            coordination.surface(PresentationSlot::Xy).render_viewport(),
+            Some(render)
+        );
+        assert!(coordination.take_refresh_request());
+        assert!(!coordination.take_refresh_request());
+
+        assert!(!apply_viewport_observations(
+            &mut coordination,
+            [observation]
+        ));
+        assert!(!coordination.take_refresh_request());
     }
 }

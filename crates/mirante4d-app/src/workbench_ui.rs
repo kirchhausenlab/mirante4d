@@ -155,45 +155,46 @@ impl MiranteWorkbenchApp {
         }
     }
 
-    fn sync_3d_viewport_for_display_size(
-        &mut self,
+    fn observe_3d_viewport_for_display_size(
+        &self,
         ctx: &egui::Context,
         display_size_points: egui::Vec2,
+        output: &mut WorkbenchUiOutput,
     ) {
         let max_texture_side =
             self.render_viewport_max_side(ctx.input(|input| input.max_texture_side));
-        let mut viewport_changed = false;
-        if let Some(presentation_viewport) =
+        let Some(presentation_viewport) =
             presentation_viewport_for_display_size(display_size_points)
-        {
-            viewport_changed |=
-                set_presentation_viewport(&mut self.render_coordination, presentation_viewport);
-        }
+        else {
+            return;
+        };
         let automation_render_target = self
             .validation_runtime
             .product_automation
             .as_ref()
             .and_then(ProductAutomationController::render_target_override);
-        if let Some(render_viewport) = automation_render_target.or_else(|| {
+        let Some(render_viewport) = automation_render_target.or_else(|| {
             render_viewport_for_display_size(
                 display_size_points,
                 ctx.pixels_per_point(),
                 max_texture_side,
             )
-        }) {
-            viewport_changed |= set_render_viewport(&mut self.render_coordination, render_viewport);
-        }
-        if viewport_changed {
-            self.render_coordination.request_refresh();
-            ctx.request_repaint();
-        }
+        }) else {
+            return;
+        };
+        output.viewport_observations.push(ViewportObservation::new(
+            PresentationSlot::ThreeD,
+            presentation_viewport,
+            render_viewport,
+        ));
     }
 
-    fn record_four_panel_viewport(
-        &mut self,
+    fn observe_four_panel_viewport(
+        &self,
         ctx: &egui::Context,
         panel_id: PanelId,
         display_size_points: egui::Vec2,
+        output: &mut WorkbenchUiOutput,
     ) -> Option<PresentationViewport> {
         let presentation_viewport = presentation_viewport_for_display_size(display_size_points)?;
         let max_texture_side =
@@ -203,15 +204,11 @@ impl MiranteWorkbenchApp {
             ctx.pixels_per_point(),
             max_texture_side,
         )?;
-        let changed = self.render_coordination.record_viewports(
+        output.viewport_observations.push(ViewportObservation::new(
             panel_id.presentation_slot(),
             presentation_viewport,
             render_viewport,
-        );
-        if changed {
-            self.render_coordination.request_refresh();
-            ctx.request_repaint();
-        }
+        ));
         Some(presentation_viewport)
     }
 
@@ -224,7 +221,7 @@ impl MiranteWorkbenchApp {
     ) {
         let available = ui.available_size();
         let ctx = ui.ctx().clone();
-        self.sync_3d_viewport_for_display_size(&ctx, available);
+        self.observe_3d_viewport_for_display_size(&ctx, available, output);
         let display_image = self.viewport_display_image(snapshot);
         let image_size = fit_size(display_image.size_vec2(), available);
         ui.centered_and_justified(|ui| {
@@ -303,8 +300,7 @@ impl MiranteWorkbenchApp {
     ) {
         let available = ui.available_size();
         let ctx = ui.ctx().clone();
-        self.record_four_panel_viewport(&ctx, PanelId::ThreeD, available);
-        self.sync_3d_viewport_for_display_size(&ctx, available);
+        self.observe_3d_viewport_for_display_size(&ctx, available, output);
         let display_image = self.viewport_display_image(snapshot);
         let image_size = fit_size(display_image.size_vec2(), available);
         ui.centered_and_justified(|ui| {
@@ -402,16 +398,15 @@ impl MiranteWorkbenchApp {
     ) {
         let available = ui.available_size();
         let ctx = ui.ctx().clone();
-        let presentation_viewport = self.record_four_panel_viewport(&ctx, panel_id, available);
-        if !self.render_coordination.refresh_requested()
-            && let Err(err) = self.render_cross_section_panel_for_display_if_needed(panel_id)
-        {
-            tracing::error!(
-                error = %err,
-                panel = panel_id.label(),
-                "cross-section panel render failed"
-            );
-        }
+        let presentation_viewport =
+            self.observe_four_panel_viewport(&ctx, panel_id, available, output);
+        let application_panel = application_cross_section_panel_id(panel_id)
+            .expect("a cross-section widget has a cross-section panel ID");
+        output
+            .render_requests
+            .push(RenderUiRequest::EnsureCrossSectionCurrent {
+                panel: application_panel,
+            });
         let response = if let Some(display_image) =
             self.cross_section_panel_display_image(panel_id, snapshot)
         {
@@ -860,6 +855,8 @@ impl eframe::App for MiranteWorkbenchApp {
         let mut texture_refresh_requested = false;
         let mut application_commands = Vec::new();
         let mut native_actions = Vec::new();
+        let mut viewport_observations = Vec::new();
+        let mut render_requests = Vec::new();
         let mut presentation_paints = Vec::new();
         let import_snapshot = application_snapshot.import_workflow();
         let import_active = matches!(import_snapshot, ImportWorkflowSnapshot::Importing(_));
@@ -2167,6 +2164,8 @@ impl eframe::App for MiranteWorkbenchApp {
         application_commands.append(&mut viewer_output.application_commands);
         import_commands.append(&mut viewer_output.import_commands);
         native_actions.append(&mut viewer_output.native_actions);
+        viewport_observations.append(&mut viewer_output.viewport_observations);
+        render_requests.append(&mut viewer_output.render_requests);
         presentation_paints.append(&mut viewer_output.presentation_paints);
         rerender_requested |= viewer_output.rerender_requested;
         texture_refresh_requested |= viewer_output.texture_refresh_requested;
@@ -2201,6 +2200,8 @@ impl eframe::App for MiranteWorkbenchApp {
                 application_commands,
                 import_commands,
                 native_actions,
+                viewport_observations,
+                render_requests,
                 presentation_paints,
                 rerender_requested,
                 texture_refresh_requested,

@@ -10,8 +10,9 @@ use std::{fmt::Display, hash::Hash};
 
 use eframe::egui::{self, Color32, RichText};
 use mirante4d_application::{
-    ApplicationCommand, ApplicationEvent, OperationOutcome, PresentationPaintRequest,
-    PresentationSlot, PresentationSurface,
+    ApplicationCommand, ApplicationEvent, CrossSectionPanelId, OperationOutcome,
+    PresentationPaintRequest, PresentationSlot, PresentationSurface, PresentationViewport,
+    RenderExtent,
     import_workflow::{
         ImportCommand, ImportProgressSnapshot, ImportReviewDraft, ImportReviewId,
         ImportReviewSnapshot, ImportSourceDtype, ImportSourceLayout, ImportWorkflowSnapshot,
@@ -204,6 +205,54 @@ pub enum NativeWorkbenchAction {
     CopySelectedAnalysisCsv,
 }
 
+/// One validated viewport measurement observed while egui lays out a panel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewportObservation {
+    slot: PresentationSlot,
+    presentation: PresentationViewport,
+    render: RenderExtent,
+}
+
+impl ViewportObservation {
+    pub const fn new(
+        slot: PresentationSlot,
+        presentation: PresentationViewport,
+        render: RenderExtent,
+    ) -> Self {
+        Self {
+            slot,
+            presentation,
+            render,
+        }
+    }
+
+    pub const fn slot(self) -> PresentationSlot {
+        self.slot
+    }
+
+    pub const fn presentation(self) -> PresentationViewport {
+        self.presentation
+    }
+
+    pub const fn render(self) -> RenderExtent {
+        self.render
+    }
+}
+
+/// Rendering work requested after egui finishes building a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderUiRequest {
+    EnsureCrossSectionCurrent { panel: CrossSectionPanelId },
+}
+
+impl RenderUiRequest {
+    pub const fn cross_section_panel(self) -> CrossSectionPanelId {
+        match self {
+            Self::EnsureCrossSectionCurrent { panel } => panel,
+        }
+    }
+}
+
 /// Typed results emitted while egui builds one visible workbench frame.
 ///
 /// Commands retain their existing post-build batching behavior. Native shell
@@ -214,6 +263,8 @@ pub struct WorkbenchUiOutput {
     pub application_commands: Vec<ApplicationCommand>,
     pub import_commands: Vec<ImportCommand>,
     pub native_actions: Vec<NativeWorkbenchAction>,
+    pub viewport_observations: Vec<ViewportObservation>,
+    pub render_requests: Vec<RenderUiRequest>,
     pub presentation_paints: Vec<EguiPresentationPaint>,
     pub rerender_requested: bool,
     pub texture_refresh_requested: bool,
@@ -913,6 +964,21 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn workbench_runtime_requests_keep_validated_boundary_types() {
+        let presentation = PresentationViewport::new(640.0, 360.0).unwrap();
+        let render = RenderExtent::new(1280, 720).unwrap();
+        let observation = ViewportObservation::new(PresentationSlot::Xz, presentation, render);
+
+        assert_eq!(observation.slot(), PresentationSlot::Xz);
+        assert_eq!(observation.presentation(), presentation);
+        assert_eq!(observation.render(), render);
+        let request = RenderUiRequest::EnsureCrossSectionCurrent {
+            panel: CrossSectionPanelId::Yz,
+        };
+        assert_eq!(request.cross_section_panel(), CrossSectionPanelId::Yz);
+    }
+
     fn import_draft(spacing: f64) -> ImportReviewDraft {
         ImportReviewDraft {
             spacing_zyx_um: [spacing; 3],
@@ -983,6 +1049,8 @@ mod tests {
                 NativeWorkbenchAction::OpenDatasetDialog,
                 NativeWorkbenchAction::CopySelectedAnalysisCsv,
             ],
+            viewport_observations: Vec::new(),
+            render_requests: Vec::new(),
             presentation_paints: Vec::new(),
             rerender_requested: true,
             texture_refresh_requested: false,
