@@ -2,6 +2,10 @@
 
 #![forbid(unsafe_code)]
 
+mod fidelity;
+
+pub use fidelity::{frame_fidelity_label, show_frame_fidelity_property_rows};
+
 use std::{fmt::Display, hash::Hash};
 
 use eframe::egui::{self, Color32, RichText};

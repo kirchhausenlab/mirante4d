@@ -14,7 +14,7 @@ fn frame_fidelity_label_names_currently_shown_lod() {
     fidelity.display_freshness = DisplayedFrameFreshness::Current;
     fidelity.frame_time_ms = Some(12.5);
 
-    let label = frame_fidelity_label(&fidelity);
+    let label = ui_kit::frame_fidelity_label(&fidelity);
 
     assert!(label.contains("shown s2 / target s0"));
     assert!(label.contains("budget-limited"));
@@ -39,69 +39,8 @@ fn frame_fidelity_label_keeps_exact_source_lod_concise() {
     fidelity.backend = RenderBackend::GpuCameraMip;
 
     assert_eq!(
-        frame_fidelity_label(&fidelity),
+        ui_kit::frame_fidelity_label(&fidelity),
         "shown s0 exact | GPU MIP | 998x1024 px; 512x512 pt | render pending"
-    );
-}
-
-#[test]
-fn frame_fidelity_labels_cover_status_reason_and_failure_vocabularies() {
-    for (value, expected) in [
-        (FrameCompleteness::Exact, "exact"),
-        (FrameCompleteness::Complete, "complete"),
-        (FrameCompleteness::Loading, "loading"),
-        (FrameCompleteness::Incomplete, "incomplete"),
-        (FrameCompleteness::BudgetLimited, "budget-limited"),
-    ] {
-        assert_eq!(frame_completeness_label(value), expected);
-    }
-    for (value, expected) in [
-        (LodDecisionReason::ExactS0, "exact s0"),
-        (
-            LodDecisionReason::ScreenEquivalentCoarserScale,
-            "screen-equivalent LOD",
-        ),
-        (LodDecisionReason::PlaybackDownshift, "playback LOD"),
-        (LodDecisionReason::LoadingTargetScale, "loading target LOD"),
-        (LodDecisionReason::NoVisibleData, "outside selected data"),
-        (LodDecisionReason::FrameBudgetLimited, "frame budget"),
-        (LodDecisionReason::GpuBudgetLimited, "GPU budget"),
-        (LodDecisionReason::CpuBudgetLimited, "CPU budget"),
-        (LodDecisionReason::BackendLimit, "backend limit"),
-        (LodDecisionReason::AllocationFailed, "allocation failed"),
-        (
-            LodDecisionReason::IncompleteResidency,
-            "incomplete residency",
-        ),
-        (
-            LodDecisionReason::InvalidModeParameter,
-            "invalid mode parameter",
-        ),
-        (LodDecisionReason::UnsupportedDtype, "unsupported dtype"),
-        (LodDecisionReason::InvalidTransform, "invalid transform"),
-    ] {
-        assert_eq!(frame_reason_label(value), expected);
-    }
-    for (value, expected) in [
-        (FrameFailureKind::BudgetExceeded, "budget exceeded"),
-        (FrameFailureKind::BackendLimit, "backend limit"),
-        (FrameFailureKind::AllocationFailed, "allocation failed"),
-        (
-            FrameFailureKind::IncompleteResidency,
-            "incomplete residency",
-        ),
-        (
-            FrameFailureKind::InvalidModeParameter,
-            "invalid mode parameter",
-        ),
-        (FrameFailureKind::UnsupportedDtype, "unsupported dtype"),
-        (FrameFailureKind::InvalidTransform, "invalid transform"),
-    ] {
-        assert_eq!(frame_failure_kind_label(value), expected);
-    }
-    assert_eq!(
-        crate::fidelity::render_backend_label(RenderBackend::Empty),
-        "empty"
     );
 }
 

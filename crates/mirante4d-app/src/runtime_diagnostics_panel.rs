@@ -2,10 +2,7 @@ use eframe::egui;
 use mirante4d_application::RenderSurfaceState;
 use mirante4d_dataset::CpuLedgerCategory;
 
-use crate::{
-    MiranteWorkbenchApp, fidelity::show_frame_fidelity_property_rows, ui_kit,
-    viewer_layout::PanelId,
-};
+use crate::{MiranteWorkbenchApp, ui_kit, viewer_layout::PanelId};
 
 const CPU_CATEGORIES: [(CpuLedgerCategory, &str); 7] = [
     (CpuLedgerCategory::DecodedResidency, "decoded residency"),
@@ -165,7 +162,7 @@ pub(crate) fn show_runtime_diagnostics_body(app: &MiranteWorkbenchApp, ui: &mut 
             ),
         );
     }
-    show_frame_fidelity_property_rows(ui, &app.render_coordination.frame_fidelity);
+    ui_kit::show_frame_fidelity_property_rows(ui, &app.render_coordination.frame_fidelity);
 }
 
 pub(crate) fn diagnostics_summary_text(app: &MiranteWorkbenchApp) -> String {

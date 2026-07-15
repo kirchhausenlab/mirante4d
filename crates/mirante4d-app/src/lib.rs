@@ -61,14 +61,7 @@ use cross_section_readout::cross_section_hover_readout_for_response;
 pub use diagnostics::{StartupDiagnostics, collect_startup_diagnostics, default_log_path};
 use display_refresh::{ViewportDisplayImage, duration_ms};
 use eframe::egui;
-use fidelity::{
-    composite_fidelity_label, iso_shading_policy_label, render_sampling_policy_label,
-    show_frame_fidelity_property_rows,
-};
-#[cfg(test)]
-use fidelity::{
-    frame_completeness_label, frame_failure_kind_label, frame_fidelity_label, frame_reason_label,
-};
+use fidelity::{composite_fidelity_label, iso_shading_policy_label, render_sampling_policy_label};
 use histogram::{
     active_layer_histogram_summary, auto_dense_window_from_histogram,
     auto_dvr_opacity_transfer_from_histogram, auto_signal_window_from_histogram,

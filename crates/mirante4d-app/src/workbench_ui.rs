@@ -1664,7 +1664,7 @@ impl eframe::App for MiranteWorkbenchApp {
                         );
                     });
                     ui_kit::section(ui, "Frame", |ui| {
-                        show_frame_fidelity_property_rows(
+                        ui_kit::show_frame_fidelity_property_rows(
                             ui,
                             &self.render_coordination.frame_fidelity,
                         );
