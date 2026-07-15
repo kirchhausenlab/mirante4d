@@ -55,9 +55,7 @@ predecessor-field disposition before any product authority moves.
 Current dependency, side-effect, state-class, and semantic invariants live in
 the code and [current architecture](../ARCHITECTURE.md). Git history and the
 immutable exit tags preserve the exact cutover signatures and predecessor
-disposition. The current owner and deletion state is recorded without brittle
-field counts in
-[`architecture/current-state-field-ledger.json`](../../architecture/current-state-field-ledger.json).
+disposition.
 
 ## Consequences
 

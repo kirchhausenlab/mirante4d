@@ -198,5 +198,3 @@ files are neither read nor changed.
 `mirante4d-storage::PackagePath` is the sole package-path authority.
 `mirante4d-identity` owns raw typed object facts and exact hashing, but no
 parallel path type.
-The concise live ownership ledger is
-[`architecture/current-state-field-ledger.json`](../architecture/current-state-field-ledger.json).

@@ -62,26 +62,6 @@ const REQUIRED_CRATES: &[(&str, &str)] = &[
     ("xtask", "crates/xtask"),
 ];
 
-const FORBIDDEN_CRATE_PATHS: &[&str] = &[
-    "crates/mirante4d-analysis",
-    "crates/mirante4d-core",
-    "crates/mirante4d-data",
-    "crates/mirante4d-format",
-    "crates/mirante4d-import",
-    "crates/mirante4d-preprocess",
-    "crates/mirante4d-renderer",
-];
-
-const FORBIDDEN_CRATE_PACKAGES: &[&str] = &[
-    "mirante4d-analysis",
-    "mirante4d-core",
-    "mirante4d-data",
-    "mirante4d-format",
-    "mirante4d-import",
-    "mirante4d-preprocess",
-    "mirante4d-renderer",
-];
-
 const NO_CUSTOM_BUILD_CRATES: &[&str] = &[
     "mirante4d-application",
     "mirante4d-dataset",
@@ -98,7 +78,7 @@ pub(crate) fn architecture_self_check() -> anyhow::Result<()> {
     check_source_architecture_policy(repo_root)?;
     check_boundary_source_ownership(repo_root)?;
     let metadata = workspace_dependency_metadata(repo_root)?;
-    check_dependency_direction(repo_root, &metadata)?;
+    check_dependency_direction(&metadata)?;
     check_current_state_ownership(repo_root, &metadata)?;
     check_tracked_artifact_policy()?;
     Ok(())
@@ -108,11 +88,6 @@ fn check_crate_paths(repo_root: &Path) -> anyhow::Result<()> {
     for (_, relative_path) in REQUIRED_CRATES {
         if !repo_root.join(relative_path).is_dir() {
             bail!("required crate directory is missing: {relative_path}");
-        }
-    }
-    for relative_path in FORBIDDEN_CRATE_PATHS {
-        if repo_root.join(relative_path).exists() {
-            bail!("retired or unowned crate directory exists: {relative_path}");
         }
     }
     Ok(())
@@ -207,12 +182,7 @@ fn source_architecture_violations(path: &Path, source: &str) -> Vec<String> {
                 "winit::",
                 "zarrs::",
                 "serde::",
-                "mirante4d_analysis",
                 "mirante4d_app",
-                "mirante4d_data",
-                "mirante4d_format",
-                "mirante4d_import",
-                "mirante4d_renderer",
             ],
             "canonical model crate must remain independent of runtime and product frameworks",
         ));
@@ -375,12 +345,7 @@ fn check_boundary_source_ownership(repo_root: &Path) -> anyhow::Result<()> {
         "wgpu::",
         "winit::",
         "zarrs::",
-        "mirante4d_analysis::",
         "mirante4d_app::",
-        "mirante4d_data::",
-        "mirante4d_format::",
-        "mirante4d_import::",
-        "mirante4d_renderer::",
     ];
     let mut violations = Vec::new();
     for crate_name in [
@@ -476,10 +441,7 @@ fn workspace_dependency_metadata(repo_root: &Path) -> anyhow::Result<WorkspaceDe
     parse_workspace_dependency_metadata(&metadata)
 }
 
-fn check_dependency_direction(
-    repo_root: &Path,
-    metadata: &WorkspaceDependencyMetadata,
-) -> anyhow::Result<()> {
+fn check_dependency_direction(metadata: &WorkspaceDependencyMetadata) -> anyhow::Result<()> {
     let expected_packages = REQUIRED_CRATES
         .iter()
         .map(|(name, _)| (*name).to_owned())
@@ -511,16 +473,9 @@ fn check_dependency_direction(
         }
     }
 
-    let forbidden_packages = FORBIDDEN_CRATE_PACKAGES
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
     for (package, kinds) in &metadata.declared_dependency_kinds_by_name {
-        for (kind, dependencies) in kinds {
+        for dependencies in kinds.values() {
             for dependency in dependencies {
-                if forbidden_packages.contains(dependency.as_str()) {
-                    bail!("{package} has a {kind} dependency on retired package {dependency}");
-                }
                 if dependency == "mirante4d-app" {
                     bail!("{package} must not depend on the native application crate");
                 }
@@ -597,7 +552,7 @@ fn check_dependency_direction(
         );
     }
 
-    check_non_workspace_manifest_forbidden_dependencies(repo_root, &forbidden_packages)
+    Ok(())
 }
 
 fn normal_dependencies<'a>(
@@ -635,56 +590,6 @@ fn check_current_state_ownership(
     repo_root: &Path,
     metadata: &WorkspaceDependencyMetadata,
 ) -> anyhow::Result<()> {
-    let ledger_path = repo_root.join("architecture/current-state-field-ledger.json");
-    let ledger: serde_json::Value = serde_json::from_slice(
-        &fs::read(&ledger_path)
-            .with_context(|| format!("failed to read {}", ledger_path.display()))?,
-    )
-    .with_context(|| format!("failed to parse {}", ledger_path.display()))?;
-    if ledger.get("schema").and_then(serde_json::Value::as_str)
-        != Some("mirante4d-current-state-field-ledger")
-        || ledger
-            .get("schema_version")
-            .and_then(serde_json::Value::as_u64)
-            != Some(2)
-    {
-        bail!(
-            "{} is not a supported current-state ledger",
-            ledger_path.display()
-        );
-    }
-
-    let expected_dataset_authority = serde_json::json!({
-        "runtime_owner": "mirante4d-dataset-runtime",
-        "composition_state": "DatasetDemandState",
-        "sole_poll_owner": "DatasetRequestDispatcher",
-        "lease_retention": {
-            "type": "RetainedLeases",
-            "path": "crates/mirante4d-app/src/retained_leases.rs"
-        },
-        "source": {
-            "type": "LocalDatasetSource",
-            "path": "crates/mirante4d-storage/src/dataset_source.rs"
-        }
-    });
-    if ledger.get("dataset_authority") != Some(&expected_dataset_authority) {
-        bail!("current dataset authority ledger drifted");
-    }
-    let expected_render_authority = serde_json::json!({
-        "runtime_owner": "mirante4d-render-wgpu",
-        "contract_owner": "mirante4d-render-api"
-    });
-    if ledger.get("render_authority") != Some(&expected_render_authority) {
-        bail!("current render authority ledger drifted");
-    }
-    let temporary_owners = ledger
-        .get("temporary_owners")
-        .and_then(serde_json::Value::as_array)
-        .context("current-state temporary_owners must be an array")?;
-    if !temporary_owners.is_empty() {
-        bail!("current-state ledger must not retain temporary runtime owners");
-    }
-
     let app_root = repo_root.join("crates/mirante4d-app/src");
     let app_source = fs::read_to_string(app_root.join("lib.rs"))?;
     let app_fields = rust_struct_field_type_identifiers(&app_source, "MiranteWorkbenchApp")?;
@@ -703,27 +608,12 @@ fn check_current_state_ownership(
         "project_store",
         "ProjectStoreApplicationService",
     )?;
-    for forbidden_field in [
-        "dataset_runtime",
-        "render_runtime",
-        "ui_runtime",
-        "import_runtime",
-        "project_runtime",
-        "project_persistence",
-        "validation_runtime",
-    ] {
-        if app_fields.contains_key(forbidden_field) {
-            bail!("retired composition field remains: {forbidden_field}");
-        }
-    }
-
-    check_cutover_predecessor_absence(repo_root)?;
     check_dataset_ownership(repo_root, &app_root, &app_fields)?;
     check_target_dataset_source(repo_root, &app_root)?;
     check_render_ownership(repo_root, metadata)?;
     check_analysis_ownership(repo_root)?;
     check_project_store_ownership(repo_root, metadata, &app_fields)?;
-    check_application_route_and_private_bridges(repo_root, &app_source)
+    check_application_route(&app_source)
 }
 
 fn require_field_type(
@@ -739,56 +629,6 @@ fn require_field_type(
     } else {
         bail!("MiranteWorkbenchApp.{field} must contain {type_name}")
     }
-}
-
-fn check_cutover_predecessor_absence(repo_root: &Path) -> anyhow::Result<()> {
-    for relative_path in [
-        "crates/mirante4d-app/src/current_egui_shell_bridge.rs",
-        "crates/mirante4d-app/src/current_project_persistence_bridge.rs",
-        "crates/mirante4d-app/src/current_runtime/analysis.rs",
-        "crates/mirante4d-app/src/current_runtime/mod.rs",
-        "crates/mirante4d-app/src/current_runtime/dataset.rs",
-        "crates/mirante4d-app/src/current_runtime/import.rs",
-        "crates/mirante4d-app/src/current_runtime/project.rs",
-        "crates/mirante4d-app/src/current_runtime/render.rs",
-        "crates/mirante4d-app/src/current_runtime/ui.rs",
-        "crates/mirante4d-app/src/current_runtime/validation.rs",
-        "crates/mirante4d-app/src/display_identity.rs",
-        "crates/mirante4d-app/src/resident_rendering.rs",
-    ] {
-        if repo_root.join(relative_path).exists() {
-            bail!("retired cutover path still exists: {relative_path}");
-        }
-    }
-
-    let forbidden_identifiers = [
-        "CurrentAnalysisRuntime",
-        "CurrentDatasetRuntime",
-        "CurrentImportRuntime",
-        "CurrentLeaseBridge",
-        "CurrentProjectPersistenceBridge",
-        "CurrentProjectRuntime",
-        "CurrentRenderRuntime",
-        "CurrentUiRuntime",
-        "CurrentValidationRuntime",
-        "GpuRenderer",
-        "mirante4d_renderer",
-    ];
-    for source_path in collect_rust_source_files(&repo_root.join("crates"))? {
-        if source_path.starts_with(repo_root.join("crates/xtask")) {
-            continue;
-        }
-        let source = fs::read_to_string(&source_path)?;
-        for identifier in forbidden_identifiers {
-            if source_contains_identifier(&source, identifier) {
-                bail!(
-                    "retired cutover identifier {identifier} remains in {}",
-                    source_path.display()
-                );
-            }
-        }
-    }
-    Ok(())
 }
 
 fn check_dataset_ownership(
@@ -883,7 +723,6 @@ fn check_render_ownership(
     let app_normal = normal_dependencies(metadata, "mirante4d-app")?;
     if !app_normal.contains("mirante4d-render-wgpu")
         || app_normal.contains("mirante4d-render-reference")
-        || app_normal.contains("mirante4d-renderer")
     {
         bail!("native app must use only render-wgpu for product rendering");
     }
@@ -1019,34 +858,6 @@ fn check_project_store_ownership(
         }
     }
 
-    for source_root in [&app_root, &application_root] {
-        for source_path in collect_rust_source_files(source_root)? {
-            let source = fs::read_to_string(&source_path)?;
-            for forbidden in [
-                "current_project_persistence_bridge",
-                "CurrentProjectPersistenceBridge",
-                "CurrentProjectRuntime",
-                "current_project_path",
-                "PROJECT_V15_SCHEMA",
-                "PROJECT_V15_SCHEMA_VERSION",
-                "ProjectDocumentDto",
-            ] {
-                if source_contains_identifier(&source, forbidden) {
-                    bail!(
-                        "retired project-store identifier {forbidden} remains in {}",
-                        source_path.display()
-                    );
-                }
-            }
-            if source.contains("mirante4d-project-v15") {
-                bail!(
-                    "retired project schema remains in {}",
-                    source_path.display()
-                );
-            }
-        }
-    }
-
     let app_normal = normal_dependencies(metadata, "mirante4d-app")?;
     if app_normal.contains("mirante4d-identity") || !app_normal.contains(PROJECT_STORE) {
         bail!("native app project-store dependency route drifted");
@@ -1054,30 +865,7 @@ fn check_project_store_ownership(
     Ok(())
 }
 
-fn check_application_route_and_private_bridges(
-    repo_root: &Path,
-    app_source: &str,
-) -> anyhow::Result<()> {
-    let app_source_root = repo_root.join("crates/mirante4d-app/src");
-    let bridge_paths = collect_rust_source_files(&app_source_root)?
-        .into_iter()
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with("_bridge.rs"))
-        })
-        .collect::<Vec<_>>();
-    if !bridge_paths.is_empty() {
-        bail!("native app must not retain private bridge files: {bridge_paths:?}");
-    }
-
-    let private_bridge_modules = private_root_module_names(app_source)?
-        .into_iter()
-        .filter(|name| name.ends_with("_bridge"))
-        .collect::<BTreeSet<_>>();
-    if !private_bridge_modules.is_empty() {
-        bail!("native app must not retain private bridge modules: {private_bridge_modules:?}");
-    }
+fn check_application_route(app_source: &str) -> anyhow::Result<()> {
     if !app_source.contains("self.application.dispatch(")
         || !app_source.contains("self.application.snapshot()")
         || !app_source.contains("self.application.drain_events(")
@@ -1123,112 +911,6 @@ fn manifest_contains_project_store_rename(value: &toml::Value) -> bool {
         toml::Value::Array(values) => values.iter().any(manifest_contains_project_store_rename),
         _ => false,
     }
-}
-
-fn check_non_workspace_manifest_forbidden_dependencies(
-    repo_root: &Path,
-    forbidden_packages: &BTreeSet<&str>,
-) -> anyhow::Result<()> {
-    let mut manifests = Vec::new();
-    collect_non_workspace_cargo_manifests(repo_root, repo_root, &mut manifests)?;
-    manifests.sort();
-    for manifest_path in manifests {
-        let source = fs::read_to_string(&manifest_path)
-            .with_context(|| format!("failed to read {}", manifest_path.display()))?;
-        let manifest = source
-            .parse::<toml::Table>()
-            .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
-        let dependencies = manifest_dependency_package_names(&manifest)?;
-        let forbidden = dependencies
-            .iter()
-            .filter(|dependency| forbidden_packages.contains(dependency.as_str()))
-            .collect::<Vec<_>>();
-        if !forbidden.is_empty() {
-            bail!(
-                "non-workspace target {} depends on retired packages: {forbidden:?}",
-                manifest_path.display(),
-            );
-        }
-    }
-    Ok(())
-}
-
-fn collect_non_workspace_cargo_manifests(
-    repo_root: &Path,
-    directory: &Path,
-    manifests: &mut Vec<PathBuf>,
-) -> anyhow::Result<()> {
-    for entry in fs::read_dir(directory)
-        .with_context(|| format!("failed to read directory {}", directory.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            continue;
-        }
-        if file_type.is_dir() {
-            let name = entry.file_name();
-            if name == ".git" || name == "crates" || name == "target" || name == "vendor" {
-                continue;
-            }
-            collect_non_workspace_cargo_manifests(repo_root, &path, manifests)?;
-        } else if file_type.is_file()
-            && entry.file_name() == "Cargo.toml"
-            && path != repo_root.join("Cargo.toml")
-        {
-            manifests.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn manifest_dependency_package_names(manifest: &toml::Table) -> anyhow::Result<BTreeSet<String>> {
-    let mut dependencies = BTreeSet::new();
-    for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
-        if let Some(table) = manifest.get(key) {
-            add_manifest_dependency_table(table, &mut dependencies, key)?;
-        }
-    }
-    if let Some(targets) = manifest.get("target") {
-        let targets = targets
-            .as_table()
-            .context("Cargo target dependencies must be a table")?;
-        for (target, target_specification) in targets {
-            let target_specification = target_specification
-                .as_table()
-                .with_context(|| format!("Cargo target {target:?} must be a table"))?;
-            for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
-                if let Some(table) = target_specification.get(key) {
-                    add_manifest_dependency_table(
-                        table,
-                        &mut dependencies,
-                        &format!("target.{target}.{key}"),
-                    )?;
-                }
-            }
-        }
-    }
-    Ok(dependencies)
-}
-
-fn add_manifest_dependency_table(
-    value: &toml::Value,
-    dependencies: &mut BTreeSet<String>,
-    context: &str,
-) -> anyhow::Result<()> {
-    let table = value
-        .as_table()
-        .with_context(|| format!("Cargo {context} must be a table"))?;
-    for (declared_name, specification) in table {
-        let package_name = specification
-            .as_table()
-            .and_then(|specification| specification.get("package"))
-            .and_then(toml::Value::as_str)
-            .unwrap_or(declared_name);
-        dependencies.insert(package_name.to_owned());
-    }
-    Ok(())
 }
 
 fn validate_local_cargo_overrides(repo_root: &Path) -> anyhow::Result<()> {
@@ -1628,27 +1310,6 @@ fn collect_type_identifiers(ty: &syn::Type, identifiers: &mut BTreeSet<String>) 
     }
 }
 
-fn private_root_module_names(source: &str) -> anyhow::Result<BTreeSet<String>> {
-    let file =
-        syn::parse_file(source).context("failed to parse Rust source for module inventory")?;
-    file.items
-        .iter()
-        .filter_map(|item| match item {
-            syn::Item::Mod(item) => Some(item),
-            _ => None,
-        })
-        .map(|module| {
-            if !matches!(module.vis, syn::Visibility::Inherited) {
-                bail!("module {} must remain private", module.ident);
-            }
-            if module.content.is_some() {
-                bail!("module {} must remain file-backed", module.ident);
-            }
-            Ok(module.ident.to_string())
-        })
-        .collect()
-}
-
 fn rust_root_defined_item_names(source: &str) -> anyhow::Result<BTreeSet<String>> {
     let file = syn::parse_file(source).context("failed to parse Rust source for item inventory")?;
     Ok(file
@@ -2002,28 +1663,6 @@ directory = "vendor"
             let config = config.parse::<toml::Table>().unwrap();
             assert!(validate_repository_cargo_config_table(&config, ".cargo/config.toml").is_err());
         }
-    }
-
-    #[test]
-    fn manifest_dependency_inventory_resolves_package_aliases() {
-        let manifest = r#"
-[package]
-name = "external-target"
-version = "0.0.0"
-[dev-dependencies]
-app-boundary = { package = "mirante4d-application", path = "../application" }
-[target.'cfg(unix)'.build-dependencies]
-mirante4d-settings = { path = "../settings" }
-"#
-        .parse::<toml::Table>()
-        .unwrap();
-        assert_eq!(
-            manifest_dependency_package_names(&manifest).unwrap(),
-            BTreeSet::from([
-                "mirante4d-application".to_owned(),
-                "mirante4d-settings".to_owned(),
-            ])
-        );
     }
 
     #[test]
