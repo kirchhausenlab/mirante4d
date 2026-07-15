@@ -2125,6 +2125,7 @@ dependencies = [
 name = "mirante4d-application"
 version = "0.1.0"
 dependencies = [
+ "mirante4d-analysis-core",
  "mirante4d-dataset",
  "mirante4d-domain",
  "mirante4d-identity",

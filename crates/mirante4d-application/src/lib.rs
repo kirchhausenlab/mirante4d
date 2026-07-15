@@ -6,12 +6,17 @@
 
 #![forbid(unsafe_code)]
 
+mod analysis_workspace;
 pub mod import_workflow;
 mod project_store_service;
 pub mod render_coordination;
 pub mod viewer_tools;
 pub mod viewport_interaction;
 
+pub use analysis_workspace::{
+    AnalysisPlotSnapshot, AnalysisTableSnapshot, AnalysisWorkspaceSnapshot,
+};
+pub use mirante4d_analysis_core::{AnalysisPlot, AnalysisTable, IntensityStatistics};
 pub use project_store_service::{
     MonotonicClock, ProjectRecoveryStoreLocator, ProjectStoreApplicationService,
     ProjectStoreLifecycle, ProjectStoreServiceError, ProjectStoreServiceEvent,

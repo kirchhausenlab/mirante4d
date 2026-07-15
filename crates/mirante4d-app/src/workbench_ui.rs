@@ -949,9 +949,9 @@ impl eframe::App for MiranteWorkbenchApp {
         let analysis_roi_origin = self.analysis_runtime.roi_origin();
         let analysis_roi_shape = self.analysis_runtime.roi_shape();
         let transient = application_snapshot.transient();
-        let analysis_workspace_view = AnalysisWorkspaceView::new(
+        let analysis_workspace_view = analysis_workspace_snapshot(
             &self.analysis_runtime,
-            AnalysisWorkspaceViewInput {
+            AnalysisWorkspaceSnapshotInput {
                 table_descriptors: transient.analysis_tables(),
                 plot_descriptors: transient.analysis_plots(),
                 selected_table: transient.selected_analysis_table(),

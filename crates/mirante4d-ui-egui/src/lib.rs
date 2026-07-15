@@ -2,8 +2,10 @@
 
 #![forbid(unsafe_code)]
 
+mod analysis_workspace;
 mod fidelity;
 
+pub use analysis_workspace::{show_analysis_workspace, show_analysis_workspace_window};
 pub use fidelity::{frame_fidelity_label, show_frame_fidelity_property_rows};
 
 use std::{fmt::Display, hash::Hash, time::Duration};

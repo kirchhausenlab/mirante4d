@@ -80,7 +80,7 @@ pub(super) fn accepted_successor_normal_dependency_additions(
             "mirante4d-storage",
             "mirante4d-ui-egui",
         ],
-        "mirante4d-application" => &["mirante4d-project-store"],
+        "mirante4d-application" => &["mirante4d-analysis-core", "mirante4d-project-store"],
         "mirante4d-renderer" => &["mirante4d-dataset"],
         "mirante4d-identity" => &["mirante4d-domain", "sha2", "unicode-normalization"],
         "mirante4d-project-store" => &["mirante4d-domain"],
@@ -121,6 +121,11 @@ pub(super) fn accepted_successor_public_root_additions(
 ) -> &'static [&'static str] {
     match crate_name {
         "mirante4d-application" => &[
+            "AnalysisPlot",
+            "AnalysisPlotSnapshot",
+            "AnalysisTable",
+            "AnalysisTableSnapshot",
+            "AnalysisWorkspaceSnapshot",
             "CrossSectionPanelScheduleReason",
             "CrossSectionPanelScheduleState",
             "CrossSectionPanelScheduleStatus",
@@ -148,9 +153,11 @@ pub(super) fn accepted_successor_public_root_additions(
             "FrameCompleteness",
             "FrameFailureKind",
             "FrameFidelityStatus",
+            "IntensityStatistics",
             "LodDecisionReason",
             "RenderBackend",
             "RenderExtent",
+            "ResourcePolicy",
             "SystemMonotonicClock",
             "render_coordination",
             "viewer_tools",

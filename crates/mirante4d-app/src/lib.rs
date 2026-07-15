@@ -46,16 +46,9 @@ mod workbench_playback_runtime;
 mod workbench_ui;
 mod workbench_ui_output;
 
-#[cfg(test)]
 use analysis_workspace::{
-    AnalysisPlotBounds, analysis_plot_bounds, analysis_plot_visible_bounds,
-    analysis_table_preview_rows, nearest_analysis_plot_point,
-    normalize_analysis_plot_view_for_plot, pan_analysis_plot_view, plot_screen_position,
-    zoom_analysis_plot_view,
-};
-use analysis_workspace::{
-    AnalysisTableExportInput, AnalysisWorkspaceView, AnalysisWorkspaceViewInput,
-    export_selected_analysis_table, show_analysis_workspace, show_analysis_workspace_window,
+    AnalysisTableExportInput, AnalysisWorkspaceSnapshotInput, analysis_workspace_snapshot,
+    export_selected_analysis_table,
 };
 use cross_section_readout::cross_section_hover_readout_for_panel_point;
 pub use diagnostics::{StartupDiagnostics, collect_startup_diagnostics, default_log_path};
@@ -123,10 +116,11 @@ use transfer_presets::{
     channel_preset_from_current_view, next_user_channel_preset_id,
 };
 #[cfg(test)]
-use ui_kit::{AnalysisPlotViewRange, AnalysisTableSort, ViewportIntensity};
+use ui_kit::ViewportIntensity;
 use ui_kit::{
     CrossSectionReadoutRequest, RenderUiRequest, StatusTone, ViewportHover, ViewportObservation,
     WorkbenchAnalysisKind, WorkbenchLayoutSpec, WorkbenchUiAction, WorkbenchUiOutput,
+    show_analysis_workspace, show_analysis_workspace_window,
 };
 use viewport::{
     default_camera_for_shape, fit_camera_to_shape_preserving_view, fit_size,
