@@ -1,6 +1,6 @@
 //! Product-side ownership for one bounded analysis session.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use mirante4d_analysis_core::{
@@ -43,8 +43,8 @@ pub(crate) struct AnalysisProductRuntime {
     execution: AnalysisRuntime,
     active_token: Option<OperationToken>,
     pending: Option<ProductPendingCommit>,
-    tables: BTreeMap<AnalysisTableId, AnalysisTable>,
-    plots: BTreeMap<AnalysisPlotId, AnalysisPlot>,
+    tables: BTreeMap<AnalysisTableId, Arc<AnalysisTable>>,
+    plots: BTreeMap<AnalysisPlotId, Arc<AnalysisPlot>>,
     pending_load: Option<Vec<DecodedBundle>>,
     progress: Option<AnalysisProgress>,
     status_text: String,
@@ -132,12 +132,22 @@ impl AnalysisProductRuntime {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn table(&self, id: AnalysisTableId) -> Option<&AnalysisTable> {
-        self.tables.get(&id)
+        self.tables.get(&id).map(Arc::as_ref)
     }
 
+    #[cfg(test)]
     pub(crate) fn plot(&self, id: AnalysisPlotId) -> Option<&AnalysisPlot> {
-        self.plots.get(&id)
+        self.plots.get(&id).map(Arc::as_ref)
+    }
+
+    pub(crate) fn table_handle(&self, id: AnalysisTableId) -> Option<Arc<AnalysisTable>> {
+        self.tables.get(&id).cloned()
+    }
+
+    pub(crate) fn plot_handle(&self, id: AnalysisPlotId) -> Option<Arc<AnalysisPlot>> {
+        self.plots.get(&id).cloned()
     }
 
     pub(crate) fn start(
@@ -379,9 +389,9 @@ impl AnalysisProductRuntime {
             .artifacts()
             .plot()
             .map(|artifact| artifact.value().clone());
-        self.tables.insert(table_id, table);
+        self.tables.insert(table_id, Arc::new(table));
         if let Some((plot_id, plot)) = plot_id.zip(plot) {
-            self.plots.insert(plot_id, plot);
+            self.plots.insert(plot_id, Arc::new(plot));
         }
         self.active_token = None;
         self.progress = None;
@@ -476,9 +486,9 @@ impl AnalysisProductRuntime {
             .take()
             .context("persisted analysis results were not staged")?;
         for bundle in bundles {
-            self.tables.insert(bundle.table_id, bundle.table);
+            self.tables.insert(bundle.table_id, Arc::new(bundle.table));
             if let Some((plot_id, plot)) = bundle.plot {
-                self.plots.insert(plot_id, plot);
+                self.plots.insert(plot_id, Arc::new(plot));
             }
         }
         self.status_text = "Loaded saved analysis results.".to_owned();

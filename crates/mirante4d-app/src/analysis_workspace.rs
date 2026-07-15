@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
 use eframe::egui;
@@ -38,36 +38,36 @@ pub(crate) struct AnalysisWorkspaceViewInput<'a> {
 }
 
 #[derive(Debug)]
-pub(crate) struct AnalysisWorkspaceView<'a> {
-    status_text: &'a str,
+pub(crate) struct AnalysisWorkspaceView {
+    status_text: String,
     progress_blocks: Option<(u64, u64)>,
-    tables: Vec<AnalysisTableView<'a>>,
-    plots: Vec<AnalysisPlotView<'a>>,
+    tables: Vec<AnalysisTableView>,
+    plots: Vec<AnalysisPlotView>,
     selected_table: Option<AnalysisTableId>,
     selected_plot: Option<AnalysisPlotId>,
     selected_plot_point: Option<AnalysisPlotPointSelection>,
     last_export_csv_bytes: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct AnalysisTableView<'a> {
+#[derive(Debug, Clone)]
+struct AnalysisTableView {
     id: AnalysisTableId,
-    table: Option<&'a AnalysisTable>,
+    table: Option<Arc<AnalysisTable>>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct AnalysisPlotView<'a> {
+#[derive(Debug, Clone)]
+struct AnalysisPlotView {
     id: AnalysisPlotId,
-    plot: Option<&'a AnalysisPlot>,
+    plot: Option<Arc<AnalysisPlot>>,
 }
 
-impl<'a> AnalysisWorkspaceView<'a> {
+impl AnalysisWorkspaceView {
     pub(crate) fn new(
-        analysis: &'a AnalysisProductRuntime,
+        analysis: &AnalysisProductRuntime,
         input: AnalysisWorkspaceViewInput<'_>,
     ) -> Self {
         Self {
-            status_text: analysis.status_text(),
+            status_text: analysis.status_text().to_owned(),
             progress_blocks: analysis
                 .progress()
                 .map(|progress| (progress.completed_blocks(), progress.total_blocks())),
@@ -76,7 +76,7 @@ impl<'a> AnalysisWorkspaceView<'a> {
                 .iter()
                 .map(|descriptor| AnalysisTableView {
                     id: descriptor.id(),
-                    table: analysis.table(descriptor.id()),
+                    table: analysis.table_handle(descriptor.id()),
                 })
                 .collect(),
             plots: input
@@ -84,7 +84,7 @@ impl<'a> AnalysisWorkspaceView<'a> {
                 .iter()
                 .map(|descriptor| AnalysisPlotView {
                     id: descriptor.id(),
-                    plot: analysis.plot(descriptor.id()),
+                    plot: analysis.plot_handle(descriptor.id()),
                 })
                 .collect(),
             selected_table: input.selected_table,
@@ -94,18 +94,18 @@ impl<'a> AnalysisWorkspaceView<'a> {
         }
     }
 
-    fn table(&self, id: AnalysisTableId) -> Option<&'a AnalysisTable> {
+    fn table(&self, id: AnalysisTableId) -> Option<&AnalysisTable> {
         self.tables
             .iter()
             .find(|entry| entry.id == id)
-            .and_then(|entry| entry.table)
+            .and_then(|entry| entry.table.as_deref())
     }
 
-    fn plot(&self, id: AnalysisPlotId) -> Option<&'a AnalysisPlot> {
+    fn plot(&self, id: AnalysisPlotId) -> Option<&AnalysisPlot> {
         self.plots
             .iter()
             .find(|entry| entry.id == id)
-            .and_then(|entry| entry.plot)
+            .and_then(|entry| entry.plot.as_deref())
     }
 }
 
@@ -117,7 +117,7 @@ pub(crate) struct AnalysisTableExportInput<'a> {
 
 pub(crate) fn show_analysis_workspace_window(
     ctx: &egui::Context,
-    view: &AnalysisWorkspaceView<'_>,
+    view: &AnalysisWorkspaceView,
     egui_ui: &mut EguiUiState,
 ) -> Vec<ApplicationCommand> {
     if !egui_ui.analysis_workspace_open {
@@ -144,7 +144,7 @@ pub(crate) fn show_analysis_workspace_window(
 
 pub(crate) fn show_analysis_workspace(
     ui: &mut egui::Ui,
-    view: &AnalysisWorkspaceView<'_>,
+    view: &AnalysisWorkspaceView,
     egui_ui: &mut EguiUiState,
 ) -> Vec<ApplicationCommand> {
     let mut commands = Vec::new();
@@ -155,7 +155,7 @@ pub(crate) fn show_analysis_workspace(
     } else {
         StatusTone::Ready
     };
-    ui_kit::status_badge(ui, tone, view.status_text);
+    ui_kit::status_badge(ui, tone, &view.status_text);
     ui_kit::property_row(ui, "saved tables", view.tables.len().to_string());
     ui_kit::property_row(ui, "saved plots", view.plots.len().to_string());
     if let Some((completed_blocks, total_blocks)) = view.progress_blocks {
@@ -222,7 +222,7 @@ pub(crate) fn show_analysis_workspace(
 
 fn show_analysis_result_browser(
     ui: &mut egui::Ui,
-    view: &AnalysisWorkspaceView<'_>,
+    view: &AnalysisWorkspaceView,
     plot_view: &mut Option<AnalysisPlotViewRange>,
     commands: &mut Vec<ApplicationCommand>,
 ) {
@@ -239,7 +239,7 @@ fn show_analysis_result_browser(
                 .max_height(92.0)
                 .show(ui, |ui| {
                     for (index, entry) in view.tables.iter().enumerate() {
-                        let label = entry.table.map_or_else(
+                        let label = entry.table.as_deref().map_or_else(
                             || format!("{:02} saved table (loading)", index + 1),
                             |table| {
                                 format!(
@@ -266,7 +266,7 @@ fn show_analysis_result_browser(
                 .max_height(92.0)
                 .show(ui, |ui| {
                     for (index, entry) in view.plots.iter().enumerate() {
-                        let label = entry.plot.map_or_else(
+                        let label = entry.plot.as_deref().map_or_else(
                             || format!("{:02} saved plot (loading)", index + 1),
                             |plot| {
                                 format!(

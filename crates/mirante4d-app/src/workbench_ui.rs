@@ -842,6 +842,17 @@ impl eframe::App for MiranteWorkbenchApp {
         let analysis_active = self.analysis_runtime.active_token().is_some();
         let analysis_roi_origin = self.analysis_runtime.roi_origin();
         let analysis_roi_shape = self.analysis_runtime.roi_shape();
+        let transient = application_snapshot.transient();
+        let analysis_workspace_view = AnalysisWorkspaceView::new(
+            &self.analysis_runtime,
+            AnalysisWorkspaceViewInput {
+                table_descriptors: transient.analysis_tables(),
+                plot_descriptors: transient.analysis_plots(),
+                selected_table: transient.selected_analysis_table(),
+                selected_plot: transient.selected_analysis_plot(),
+                selected_plot_point: transient.selected_analysis_plot_point(),
+            },
+        );
         let dirty_project_close_ui = self.dirty_project_close_ui();
         let canonical_tool = viewer_tool_for_kind(application_snapshot.transient().active_tool());
         if self.egui_ui.viewer_tools.active_tool != canonical_tool {
@@ -1770,16 +1781,6 @@ impl eframe::App for MiranteWorkbenchApp {
                         if let Some(reason) = analysis_start_unavailable_reason.as_deref() {
                             ui_kit::status_badge(ui, StatusTone::Warning, reason);
                         }
-                        let analysis_workspace_view = AnalysisWorkspaceView::new(
-                            &self.analysis_runtime,
-                            AnalysisWorkspaceViewInput {
-                                table_descriptors: transient.analysis_tables(),
-                                plot_descriptors: transient.analysis_plots(),
-                                selected_table: transient.selected_analysis_table(),
-                                selected_plot: transient.selected_analysis_plot(),
-                                selected_plot_point: transient.selected_analysis_plot_point(),
-                            },
-                        );
                         let commands = show_analysis_workspace(
                             ui,
                             &analysis_workspace_view,
@@ -2135,17 +2136,6 @@ impl eframe::App for MiranteWorkbenchApp {
         rerender_requested |= viewer_output.rerender_requested;
         texture_refresh_requested |= viewer_output.texture_refresh_requested;
 
-        let transient = application_snapshot.transient();
-        let analysis_workspace_view = AnalysisWorkspaceView::new(
-            &self.analysis_runtime,
-            AnalysisWorkspaceViewInput {
-                table_descriptors: transient.analysis_tables(),
-                plot_descriptors: transient.analysis_plots(),
-                selected_table: transient.selected_analysis_table(),
-                selected_plot: transient.selected_analysis_plot(),
-                selected_plot_point: transient.selected_analysis_plot_point(),
-            },
-        );
         let commands =
             show_analysis_workspace_window(ui.ctx(), &analysis_workspace_view, &mut self.egui_ui);
         application_commands.extend(commands);
