@@ -196,9 +196,11 @@ and import crates are deleted.
 WP-09B is accepted on protected main at
 `b73dd86fed8cc3ac7b34f75f20dcd8bb8ac85672`, tagged
 `foundation-wp-09b-exit-1`. `mirante4d-render-wgpu` is the sole product render
-route; the predecessor renderer and CPU placeholder route are deleted. WP-09C
-is moving the visible egui shell and remaining process coordination onto the
-accepted application, dataset, render, import, and project boundaries.
+route; the predecessor renderer and CPU placeholder route are deleted. The
+WP-09C candidate gives the visible egui workbench one snapshot-in,
+typed-output-out entry. UI layout and interaction live in `mirante4d-ui-egui`;
+the native app retains process/service composition and presentation-token
+resolution without a second widget path.
 
 ## Current Verification Boundary
 

@@ -48,7 +48,8 @@ The workspace has eighteen packages (seventeen `mirante4d-*` crates plus
 - `mirante4d-ui-egui`: active egui visual components, UI-facing message
   projection, and transient egui interaction state; its only Mirante
   dependency is `mirante4d-application`.
-- `mirante4d-app`: native composition and the remaining shell during WP-09C.
+- `mirante4d-app`: native process/service composition and presentation-token
+  resolution.
 - `xtask`: developer and verification tooling, never a product mode.
 
 `mirante4d-core` and the predecessor application/session/preferences models
@@ -72,9 +73,10 @@ The temporary owners and deletion gates are:
 |---|---|---|
 | `CurrentValidationRuntime` | product-validation harness only | WP-14 |
 
-The temporary egui bridge and render owner are deleted. The remaining visible
-workbench still calls `ApplicationState` directly while WP-09C moves its
-snapshot-to-command composition into `mirante4d-ui-egui`.
+The temporary egui bridge and render owner are deleted. The native app projects
+one immutable workbench view, calls `mirante4d-ui-egui` once, and resolves the
+returned typed commands, service requests, and opaque presentation paints.
+Widget layout and interaction state do not have a second native path.
 `ProjectStoreApplicationService` is the sole product project I/O route; its
 actor owns project roots, sessions, leases, refs, recovery, and filesystem
 mutation. The project-v15 bridge and `CurrentProjectRuntime` are deleted, with

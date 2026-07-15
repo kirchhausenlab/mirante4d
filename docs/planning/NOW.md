@@ -10,19 +10,18 @@ WP-09B is accepted on protected main at
 renderer; the predecessor renderer, complete-residency gate, old display
 identity, and CPU placeholder route are deleted.
 
-## WP-09C Active
+## WP-09C Candidate
 
-WP-09C makes egui the visible shell rather than an application runtime. UI code
-will read immutable application snapshots, emit typed commands, and request
-paint through opaque presentation tokens. Import, analysis, project I/O,
-render coordination, worker lifetime, and WGPU resources will remain behind the
-application/composition boundary.
+The visible workbench now enters `mirante4d-ui-egui` once with an immutable
+application snapshot and small projected facts. The UI owns layout and
+interaction, then returns typed commands, requests, and opaque presentation
+paints. The native app pumps services and resolves that output; it no longer
+draws or merges individual workbench regions.
 
-Native presentation ownership, the UI-only crate, the command/snapshot surface,
-and import/render coordination are in place. The temporary UI/import/render
-owners and shell bridge are deleted. The remaining cutover moves the visible
-workbench to one snapshot-in, typed-output-out UI entry point and shrinks the
-native app to process composition. Acceptance is focused boundary testing plus
-one bounded native small-fixture scenario at 1280x720 with a short 1920x1080
-check. Earlier durability, science, runtime, and GPU qualification is inherited
-rather than repeated.
+Focused UI/app tests and strict linting pass. The normal release viewer also
+opened the bounded target fixture on the mapped Vulkan display, exercised the
+render modes and four-panel layout at 1280x720, and remained usable at
+1920x1080. Earlier project durability, import, analysis, runtime, and GPU
+qualification is inherited rather than repeated. The candidate still needs the
+ordinary PR checks, protected-main acceptance, and its create-once exit tag;
+WP-14 follows.

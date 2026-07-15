@@ -7,7 +7,7 @@ Public-data publication: deferred to a separate future handoff
 WP-09C predecessor: `foundation-wp-09b-exit-1`
 Completed through: WP-09B at
 `b73dd86fed8cc3ac7b34f75f20dcd8bb8ac85672`
-Current checkpoint: WP-09C UI and composition-root cutover
+Current checkpoint: WP-09C UI and composition-root candidate
 Next protected-branch checkpoint: accept the command/snapshot UI boundary
 
 ## Purpose
@@ -202,8 +202,9 @@ WP-10C accepted the target storage/import product cutover at
 are deleted. WP-09B accepted the sole progressive product renderer at
 `b73dd86fed8cc3ac7b34f75f20dcd8bb8ac85672`
 (`foundation-wp-09b-exit-1`); its predecessor and fallback routes are deleted.
-WP-09C is now moving UI and process composition onto the accepted subsystem
-boundaries.
+The WP-09C candidate now routes the complete visible workbench through one
+snapshot-in, typed-output-out `mirante4d-ui-egui` entry while the native app
+retains only process/service composition and presentation resolution.
 
 ## Dataset And Fixture Boundary
 
