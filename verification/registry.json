@@ -148,7 +148,7 @@
       "fixture_tier": "T1-target",
       "timeout_secs": 900,
       "evidence_level": "E0",
-      "trigger": "target-format change or release candidate",
+      "trigger": "manual clean revision after a target-format or storage-boundary change",
       "command": "cargo xtask verify-local format-lifecycle",
       "hosted_required": false,
       "activation_state": "active-WP-10A"
