@@ -2498,9 +2498,8 @@ impl MiranteWorkbenchApp {
         });
     }
 
-    fn active_histogram_summary(&mut self) -> LayerHistogramSummary {
-        let snapshot = self.application.snapshot();
-        let view = application_view(&snapshot);
+    fn active_histogram_summary(&self, snapshot: &ApplicationSnapshot) -> LayerHistogramSummary {
+        let view = application_view(snapshot);
         let active_key = view.active_layer();
         let layer = snapshot
             .catalog()

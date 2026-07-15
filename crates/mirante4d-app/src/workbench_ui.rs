@@ -877,8 +877,9 @@ impl eframe::App for MiranteWorkbenchApp {
         let playback_ms = duration_ms(playback_started.elapsed());
 
         let ui_build_started = Instant::now();
-        let mut histogram_ui_ms = 0.0;
-        let mut active_layer_histogram_for_ui = None;
+        let histogram_started = Instant::now();
+        let active_layer_histogram_for_ui = self.active_histogram_summary(&application_snapshot);
+        let histogram_ui_ms = duration_ms(histogram_started.elapsed());
         let project_actions_available = matches!(
             application_snapshot.source(),
             SourceVerificationSnapshot::Verified(_)
@@ -1566,31 +1567,18 @@ impl eframe::App for MiranteWorkbenchApp {
                                     }
                                 }
                             });
-                        let histogram =
-                            if let Some(histogram) = active_layer_histogram_for_ui.clone() {
-                                histogram
-                            } else {
-                                let histogram_started = Instant::now();
-                                let histogram = self.active_histogram_summary();
-                                histogram_ui_ms += duration_ms(histogram_started.elapsed());
-                                active_layer_histogram_for_ui = Some(histogram.clone());
-                                histogram
-                            };
-                        ui_kit::property_row(ui, "histogram", histogram_status_label(&histogram));
-                        ui_kit::property_row(
-                            ui,
-                            "histogram bins",
-                            histogram_bins_label(&histogram),
-                        );
+                        let histogram = &active_layer_histogram_for_ui;
+                        ui_kit::property_row(ui, "histogram", histogram_status_label(histogram));
+                        ui_kit::property_row(ui, "histogram bins", histogram_bins_label(histogram));
                         ui.horizontal_wrapped(|ui| {
                             if ui_kit::toolbar_button(
                                 ui,
                                 "Auto Dense",
-                                histogram_can_auto_window(&histogram),
+                                histogram_can_auto_window(histogram),
                             )
                             .clicked()
                             {
-                                match auto_dense_window_from_histogram(&histogram) {
+                                match auto_dense_window_from_histogram(histogram) {
                                     Ok(window) => {
                                         let current = active_layer.transfer();
                                         let transfer = LayerTransfer::new(
@@ -1615,11 +1603,11 @@ impl eframe::App for MiranteWorkbenchApp {
                             if ui_kit::toolbar_button(
                                 ui,
                                 "Auto Signal",
-                                histogram_can_auto_window(&histogram),
+                                histogram_can_auto_window(histogram),
                             )
                             .clicked()
                             {
-                                match auto_signal_window_from_histogram(&histogram) {
+                                match auto_signal_window_from_histogram(histogram) {
                                     Ok(window) => {
                                         let current = active_layer.transfer();
                                         let transfer = LayerTransfer::new(
@@ -2005,26 +1993,16 @@ impl eframe::App for MiranteWorkbenchApp {
                                         ));
                                     }
                                 });
-                                let histogram = if let Some(histogram) =
-                                    active_layer_histogram_for_ui.clone()
-                                {
-                                    histogram
-                                } else {
-                                    let histogram_started = Instant::now();
-                                    let histogram = self.active_histogram_summary();
-                                    histogram_ui_ms += duration_ms(histogram_started.elapsed());
-                                    active_layer_histogram_for_ui = Some(histogram.clone());
-                                    histogram
-                                };
+                                let histogram = &active_layer_histogram_for_ui;
                                 ui.horizontal_wrapped(|ui| {
                                     if ui_kit::toolbar_button(
                                         ui,
                                         "Auto Opacity",
-                                        histogram_can_auto_window(&histogram),
+                                        histogram_can_auto_window(histogram),
                                     )
                                     .clicked()
                                     {
-                                        match auto_dvr_opacity_transfer_from_histogram(&histogram) {
+                                        match auto_dvr_opacity_transfer_from_histogram(histogram) {
                                             Ok(transfer) => {
                                                 let opacity_transfer =
                                                     CanonicalDvrOpacityTransfer::new(
