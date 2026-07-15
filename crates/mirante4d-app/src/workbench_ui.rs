@@ -1047,8 +1047,8 @@ impl eframe::App for MiranteWorkbenchApp {
                 .is_some_and(ProjectStoreApplicationService::can_save_as);
         let project_recovery_ui = self.project_recovery_ui();
         let project_recovery_available = can_inspect_project_recovery
-            || !project_recovery_ui.candidates.is_empty()
-            || !project_recovery_ui.locators.is_empty();
+            || project_recovery_ui.has_candidates()
+            || project_recovery_ui.has_locators();
         let active_layer = view
             .layer(view.active_layer())
             .expect("application view contains its active layer");
@@ -1896,7 +1896,7 @@ impl eframe::App for MiranteWorkbenchApp {
                     egui::CollapsingHeader::new("Runtime Diagnostics")
                         .default_open(false)
                         .show(ui, |ui| {
-                            runtime_diagnostics_panel::show_runtime_diagnostics_body(
+                            show_runtime_diagnostics_body(
                                 &runtime_diagnostics_view,
                                 ui,
                                 &mut actions,
@@ -2246,8 +2246,8 @@ impl eframe::App for MiranteWorkbenchApp {
             &mut self.egui_ui,
             application_snapshot.import_workflow(),
         ));
-        Self::show_project_recovery_ui(ui.ctx(), &project_recovery_ui, &mut actions);
-        Self::show_dirty_project_close_prompt(ui.ctx(), dirty_project_close_ui, &mut actions);
+        show_project_recovery_ui(ui.ctx(), &project_recovery_ui, &mut actions);
+        show_dirty_project_close_prompt(ui.ctx(), dirty_project_close_ui, &mut actions);
         let ui_build_ms = duration_ms(ui_build_started.elapsed());
         let apply_timing = self.apply_workbench_ui_output(
             ui,
@@ -2362,19 +2362,7 @@ pub(crate) fn viewport_hover_status_label(hover: ViewportHover) -> String {
 
 #[cfg(test)]
 mod tests {
-    use egui_kittest::{Harness, kittest::Queryable};
-
     use super::*;
-
-    struct DirtyCloseHarnessState {
-        input: DirtyProjectCloseUi,
-        actions: Vec<WorkbenchUiAction>,
-    }
-
-    struct ProjectRecoveryHarnessState {
-        input: ProjectRecoveryUi,
-        actions: Vec<WorkbenchUiAction>,
-    }
 
     #[test]
     fn viewport_hover_status_label_exposes_pixel_intensity() {
@@ -2398,114 +2386,5 @@ mod tests {
         assert!(zoom_out_scroll > 0.0);
         let reconstructed = (-zoom_in_scroll * CROSS_SECTION_SCROLL_ZOOM_FACTOR_SCALE).exp();
         assert!((reconstructed - 1.25).abs() < 1e-6);
-    }
-
-    #[test]
-    fn dirty_project_prompt_returns_ordered_choices_without_app_side_effects() {
-        let mut harness = Harness::builder().build_ui_state(
-            |ui, state: &mut DirtyCloseHarnessState| {
-                state.actions.clear();
-                MiranteWorkbenchApp::show_dirty_project_close_prompt(
-                    ui.ctx(),
-                    state.input,
-                    &mut state.actions,
-                );
-            },
-            DirtyCloseHarnessState {
-                input: DirtyProjectCloseUi {
-                    open: true,
-                    pending_dataset_open: true,
-                    save_action: DirtyProjectSaveAction::SaveAs,
-                },
-                actions: Vec::new(),
-            },
-        );
-
-        harness.get_by_label("Save As").click();
-        harness.step();
-        assert_eq!(
-            harness.state().actions,
-            vec![WorkbenchUiAction::SaveDirtyProjectAs]
-        );
-
-        harness.get_by_label("Discard").click();
-        harness.step();
-        assert_eq!(
-            harness.state().actions,
-            vec![WorkbenchUiAction::DiscardDirtyProject]
-        );
-
-        harness.get_by_label("Cancel").click();
-        harness.step();
-        assert_eq!(
-            harness.state().actions,
-            vec![WorkbenchUiAction::CancelDirtyProjectClose]
-        );
-    }
-
-    #[test]
-    fn project_recovery_windows_return_exact_selected_identities() {
-        let generation_id = ProjectGenerationId::parse(&format!(
-            "{}{}",
-            ProjectGenerationId::PREFIX,
-            "11".repeat(32)
-        ))
-        .unwrap();
-        let mut review_harness = Harness::builder().build_ui_state(
-            |ui, state: &mut ProjectRecoveryHarnessState| {
-                state.actions.clear();
-                MiranteWorkbenchApp::show_project_recovery_ui(
-                    ui.ctx(),
-                    &state.input,
-                    &mut state.actions,
-                );
-            },
-            ProjectRecoveryHarnessState {
-                input: ProjectRecoveryUi {
-                    review_generation: Some(generation_id),
-                    panel_open: false,
-                    candidates: Vec::new(),
-                    locators: Vec::new(),
-                    can_open_locator: false,
-                },
-                actions: Vec::new(),
-            },
-        );
-
-        review_harness.get_by_label("Recover Autosave").click();
-        review_harness.step();
-        assert_eq!(
-            review_harness.state().actions,
-            vec![WorkbenchUiAction::RecoverReviewedAutosave(generation_id)]
-        );
-
-        let project_id = ProjectId::from_bytes([7; 16]);
-        let mut locator_harness = Harness::builder().build_ui_state(
-            |ui, state: &mut ProjectRecoveryHarnessState| {
-                state.actions.clear();
-                MiranteWorkbenchApp::show_project_recovery_ui(
-                    ui.ctx(),
-                    &state.input,
-                    &mut state.actions,
-                );
-            },
-            ProjectRecoveryHarnessState {
-                input: ProjectRecoveryUi {
-                    review_generation: None,
-                    panel_open: true,
-                    candidates: Vec::new(),
-                    locators: vec![project_id],
-                    can_open_locator: true,
-                },
-                actions: Vec::new(),
-            },
-        );
-
-        locator_harness.get_by_label("Inspect and Recover").click();
-        locator_harness.step();
-        assert_eq!(
-            locator_harness.state().actions,
-            vec![WorkbenchUiAction::OpenRecoveryLocator(project_id)]
-        );
     }
 }

@@ -104,11 +104,7 @@ fn workbench_runtime_diagnostics_exposes_unified_runtime_bounds_and_leases() {
         .build_ui(|ui| {
             ui_kit::configure_visuals(ui.ctx());
             let view = runtime_diagnostics_panel::runtime_diagnostics_view(&app);
-            runtime_diagnostics_panel::show_runtime_diagnostics_body(
-                &view,
-                ui,
-                &mut Vec::new(),
-            );
+            ui_kit::show_runtime_diagnostics_body(&view, ui, &mut Vec::new());
         });
 
     for label in [

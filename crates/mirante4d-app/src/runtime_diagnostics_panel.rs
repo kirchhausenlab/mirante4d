@@ -1,8 +1,8 @@
-use eframe::egui;
 use mirante4d_application::RenderSurfaceState;
 use mirante4d_dataset::CpuLedgerCategory;
+use mirante4d_ui_egui::RuntimeDiagnosticsView;
 
-use crate::{MiranteWorkbenchApp, ui_kit, viewer_layout::PanelId};
+use crate::{MiranteWorkbenchApp, viewer_layout::PanelId};
 
 const CPU_CATEGORIES: [(CpuLedgerCategory, &str); 7] = [
     (CpuLedgerCategory::DecodedResidency, "decoded residency"),
@@ -13,12 +13,6 @@ const CPU_CATEGORIES: [(CpuLedgerCategory, &str); 7] = [
     (CpuLedgerCategory::Prefetch, "prefetch"),
     (CpuLedgerCategory::ImportWorkingSet, "import working set"),
 ];
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct RuntimeDiagnosticsView {
-    rows: Vec<(String, String)>,
-    frame_fidelity: mirante4d_application::FrameFidelityStatus,
-}
 
 pub(crate) fn runtime_diagnostics_view(app: &MiranteWorkbenchApp) -> RuntimeDiagnosticsView {
     let snapshot = app.application.snapshot();
@@ -153,24 +147,7 @@ pub(crate) fn runtime_diagnostics_view(app: &MiranteWorkbenchApp) -> RuntimeDiag
             ),
         ));
     }
-    RuntimeDiagnosticsView {
-        rows,
-        frame_fidelity: app.render_coordination.frame_fidelity.clone(),
-    }
-}
-
-pub(crate) fn show_runtime_diagnostics_body(
-    view: &RuntimeDiagnosticsView,
-    ui: &mut egui::Ui,
-    actions: &mut Vec<ui_kit::WorkbenchUiAction>,
-) {
-    if ui_kit::toolbar_button(ui, "Copy Diagnostics", true).clicked() {
-        actions.push(ui_kit::WorkbenchUiAction::CopyDiagnostics);
-    }
-    for (label, value) in &view.rows {
-        ui_kit::property_row(ui, label, value);
-    }
-    ui_kit::show_frame_fidelity_property_rows(ui, &view.frame_fidelity);
+    RuntimeDiagnosticsView::new(rows, app.render_coordination.frame_fidelity.clone())
 }
 
 pub(crate) fn diagnostics_summary_text(app: &MiranteWorkbenchApp) -> String {

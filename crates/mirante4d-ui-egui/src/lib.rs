@@ -4,9 +4,16 @@
 
 mod analysis_workspace;
 mod fidelity;
+mod project_dialogs;
+mod runtime_diagnostics;
 
 pub use analysis_workspace::{show_analysis_workspace, show_analysis_workspace_window};
 pub use fidelity::{frame_fidelity_label, show_frame_fidelity_property_rows};
+pub use project_dialogs::{
+    DirtyProjectCloseView, DirtyProjectSaveAction, ProjectRecoveryCandidateView,
+    ProjectRecoveryView, show_dirty_project_close_prompt, show_project_recovery_ui,
+};
+pub use runtime_diagnostics::{RuntimeDiagnosticsView, show_runtime_diagnostics_body};
 
 use std::{fmt::Display, hash::Hash, time::Duration};
 

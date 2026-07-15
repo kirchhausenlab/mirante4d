@@ -118,9 +118,11 @@ use transfer_presets::{
 #[cfg(test)]
 use ui_kit::ViewportIntensity;
 use ui_kit::{
-    CrossSectionReadoutRequest, RenderUiRequest, StatusTone, ViewportHover, ViewportObservation,
-    WorkbenchAnalysisKind, WorkbenchLayoutSpec, WorkbenchUiAction, WorkbenchUiOutput,
-    show_analysis_workspace, show_analysis_workspace_window,
+    CrossSectionReadoutRequest, DirtyProjectCloseView, DirtyProjectSaveAction,
+    ProjectRecoveryCandidateView, ProjectRecoveryView, RenderUiRequest, StatusTone, ViewportHover,
+    ViewportObservation, WorkbenchAnalysisKind, WorkbenchLayoutSpec, WorkbenchUiAction,
+    WorkbenchUiOutput, show_analysis_workspace, show_analysis_workspace_window,
+    show_dirty_project_close_prompt, show_project_recovery_ui, show_runtime_diagnostics_body,
 };
 use viewport::{
     default_camera_for_shape, fit_camera_to_shape_preserving_view, fit_size,
@@ -142,29 +144,6 @@ const DEFAULT_DVR_OPACITY_GAMMA: f32 = 0.25;
 const CROSS_SECTION_FAST_SLICE_MULTIPLIER: f64 = 10.0;
 const CROSS_SECTION_ROTATE_RADIANS_PER_POINT: f64 = 0.005;
 const PROJECT_RECOVERY_ROOT_ENTRIES_MAX: usize = 64;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DirtyProjectSaveAction {
-    Unavailable,
-    Save,
-    SaveAs,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DirtyProjectCloseUi {
-    open: bool,
-    pending_dataset_open: bool,
-    save_action: DirtyProjectSaveAction,
-}
-
-#[derive(Debug, Clone)]
-struct ProjectRecoveryUi {
-    review_generation: Option<ProjectGenerationId>,
-    panel_open: bool,
-    candidates: Vec<ProjectRecoveryCandidate>,
-    locators: Vec<ProjectId>,
-    can_open_locator: bool,
-}
 
 fn application_view(snapshot: &ApplicationSnapshot) -> &ViewState {
     match snapshot.workspace() {
@@ -1622,7 +1601,7 @@ impl MiranteWorkbenchApp {
         }
     }
 
-    fn dirty_project_close_ui(&self) -> DirtyProjectCloseUi {
+    fn dirty_project_close_ui(&self) -> DirtyProjectCloseView {
         let save_action = self
             .project_store
             .as_ref()
@@ -1634,184 +1613,41 @@ impl MiranteWorkbenchApp {
                 },
             )
             .unwrap_or(DirtyProjectSaveAction::Unavailable);
-        DirtyProjectCloseUi {
-            open: self.egui_ui.close_prompt_open,
-            pending_dataset_open: self.pending_dataset_open_path.is_some(),
+        DirtyProjectCloseView::new(
+            self.egui_ui.close_prompt_open,
+            self.pending_dataset_open_path.is_some(),
             save_action,
-        }
+        )
     }
 
-    fn show_dirty_project_close_prompt(
-        ctx: &egui::Context,
-        input: DirtyProjectCloseUi,
-        actions: &mut Vec<WorkbenchUiAction>,
-    ) {
-        if !input.open {
-            return;
-        }
-        egui::Window::new("Unsaved Project")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.label(if input.pending_dataset_open {
-                    "Project changes have not been saved. Save or discard them before opening another dataset."
-                } else {
-                    "Project changes have not been saved."
-                });
-                ui.horizontal(|ui| {
-                    let save_available = input.save_action != DirtyProjectSaveAction::Unavailable;
-                    let save_label = if input.save_action == DirtyProjectSaveAction::SaveAs {
-                        "Save As"
-                    } else {
-                        "Save"
-                    };
-                    if ui_kit::toolbar_button(ui, save_label, save_available).clicked() {
-                        actions.push(if input.save_action == DirtyProjectSaveAction::SaveAs {
-                            WorkbenchUiAction::SaveDirtyProjectAs
-                        } else {
-                            WorkbenchUiAction::SaveDirtyProject
-                        });
-                    }
-                    if ui_kit::toolbar_button(ui, "Discard", true).clicked() {
-                        actions.push(WorkbenchUiAction::DiscardDirtyProject);
-                    }
-                    if ui_kit::toolbar_button(ui, "Cancel", true).clicked() {
-                        actions.push(WorkbenchUiAction::CancelDirtyProjectClose);
-                    }
-                });
-            });
-    }
-
-    fn project_recovery_ui(&self) -> ProjectRecoveryUi {
-        ProjectRecoveryUi {
-            review_generation: self
-                .project_recovery_review
+    fn project_recovery_ui(&self) -> ProjectRecoveryView {
+        ProjectRecoveryView::new(
+            self.project_recovery_review
                 .as_ref()
                 .map(|review| review.automatic_newer),
-            panel_open: self.project_recovery_panel_open,
-            candidates: self.project_recovery_candidates.clone(),
-            locators: self
-                .project_store
+            self.project_recovery_panel_open,
+            self.project_recovery_candidates
+                .iter()
+                .map(|candidate| {
+                    ProjectRecoveryCandidateView::new(
+                        candidate.generation_id(),
+                        candidate.classification().to_owned(),
+                        candidate.origin().to_owned(),
+                        candidate.revision_sequence(),
+                        candidate.generation_sequence(),
+                        candidate.artifact_count(),
+                        candidate.non_regenerable_artifact_count(),
+                    )
+                })
+                .collect(),
+            self.project_store
                 .as_ref()
                 .map(|service| service.recovery_store_project_ids().collect())
                 .unwrap_or_default(),
-            can_open_locator: self
-                .project_store
+            self.project_store
                 .as_ref()
                 .is_some_and(ProjectStoreApplicationService::can_open),
-        }
-    }
-
-    fn show_project_recovery_ui(
-        ctx: &egui::Context,
-        input: &ProjectRecoveryUi,
-        actions: &mut Vec<WorkbenchUiAction>,
-    ) {
-        if let Some(automatic_newer) = input.review_generation {
-            egui::Window::new("Recover autosaved project?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.label(
-                        "A newer autosave was found for the saved project. Recovery opens it as an unsaved branch that must be saved with Save As.",
-                    );
-                    ui.horizontal(|ui| {
-                        if ui_kit::toolbar_button(ui, "Recover Autosave", true).clicked() {
-                            actions.push(WorkbenchUiAction::RecoverReviewedAutosave(
-                                automatic_newer,
-                            ));
-                        }
-                        if ui_kit::toolbar_button(ui, "Open Saved Project", true).clicked() {
-                            actions
-                                .push(WorkbenchUiAction::AcceptSavedProjectAfterRecoveryReview);
-                        }
-                    });
-                });
-        }
-
-        if !input.panel_open {
-            return;
-        }
-        let mut panel_open = true;
-        let mut selected = None;
-        let mut selected_locator = None;
-        egui::Window::new("Project Recovery")
-            .open(&mut panel_open)
-            .resizable(true)
-            .default_width(520.0)
-            .show(ctx, |ui| {
-                if input.candidates.is_empty() && input.locators.is_empty() {
-                    ui.label("No validated recovery branches are available.");
-                    return;
-                }
-                ui.label(
-                    "Recovery never changes the stored project. A selected branch opens dirty and must be saved with Save As.",
-                );
-                ui.separator();
-                if !input.locators.is_empty() {
-                    ui.heading("Unsaved projects from earlier launches");
-                    for project_id in &input.locators {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(format!("Project {project_id}"));
-                            if ui_kit::toolbar_button(
-                                ui,
-                                "Inspect and Recover",
-                                input.can_open_locator,
-                            )
-                            .on_hover_text("Validated by the project-store actor before opening")
-                            .clicked()
-                            {
-                                selected_locator = Some(*project_id);
-                            }
-                        });
-                    }
-                    if !input.candidates.is_empty() {
-                        ui.separator();
-                    }
-                }
-                if !input.candidates.is_empty() {
-                    ui.heading("Branches in the selected project");
-                }
-                egui::ScrollArea::vertical()
-                    .max_height(320.0)
-                    .show(ui, |ui| {
-                        for candidate in &input.candidates {
-                            ui.group(|ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(format!(
-                                        "{} · {} · revision {}",
-                                        candidate.classification(),
-                                        candidate.origin(),
-                                        candidate.revision_sequence()
-                                    ));
-                                    if ui_kit::toolbar_button(ui, "Open Recovery", true).clicked()
-                                    {
-                                        selected = Some(candidate.generation_id());
-                                    }
-                                });
-                                ui_kit::muted_label(
-                                    ui,
-                                    format!(
-                                        "generation {} · artifacts {} ({} non-regenerable)",
-                                        candidate.generation_sequence(),
-                                        candidate.artifact_count(),
-                                        candidate.non_regenerable_artifact_count()
-                                    ),
-                                );
-                            });
-                        }
-                    });
-            });
-        if !panel_open {
-            actions.push(WorkbenchUiAction::CloseProjectRecoveryPanel);
-        }
-        if let Some(generation_id) = selected {
-            actions.push(WorkbenchUiAction::OpenRecoveryCandidate(generation_id));
-        } else if let Some(project_id) = selected_locator {
-            actions.push(WorkbenchUiAction::OpenRecoveryLocator(project_id));
-        }
+        )
     }
 
     fn open_project_recovery_panel(&mut self) {
