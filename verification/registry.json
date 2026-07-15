@@ -113,13 +113,13 @@
     {
       "id": "ui",
       "kind": "nextest",
-      "owner": "application-ui",
+      "owner": "egui-and-application-ui",
       "requirements": ["D-022-ui"],
       "fixture_tier": "none-or-T2",
       "capability": "hosted-headless-cpu",
       "hosted_required": true,
-      "packages": ["mirante4d-app"],
-      "selector": "package(mirante4d-app)",
+      "packages": ["mirante4d-app", "mirante4d-ui-egui"],
+      "selector": "package(mirante4d-app) | package(mirante4d-ui-egui)",
       "warn_ms": 2000,
       "terminate_ms": 10000,
       "aggregate_timeout_secs": 720
