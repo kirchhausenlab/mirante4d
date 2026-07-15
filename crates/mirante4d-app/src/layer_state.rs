@@ -3,7 +3,7 @@ use mirante4d_project_model::ViewState;
 
 use crate::{
     DisplayedFrameFreshness, FrameCompleteness, LodDecisionReason, RenderCoordinationState,
-    application_view, current_runtime::analysis::AnalysisProductRuntime,
+    analysis_session::AnalysisProductRuntime, application_view,
     dataset_requests::DatasetDemandState,
 };
 

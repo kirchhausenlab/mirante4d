@@ -279,7 +279,6 @@ impl eframe::App for MiranteWorkbenchApp {
         if workbench_playback_runtime::background_work_active(
             &snapshot,
             &self.import.workers,
-            &self.analysis_runtime,
             &self.dataset,
             &self.render_coordination,
             &self.native_presentation,

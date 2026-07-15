@@ -745,6 +745,8 @@ fn check_cutover_predecessor_absence(repo_root: &Path) -> anyhow::Result<()> {
     for relative_path in [
         "crates/mirante4d-app/src/current_egui_shell_bridge.rs",
         "crates/mirante4d-app/src/current_project_persistence_bridge.rs",
+        "crates/mirante4d-app/src/current_runtime/analysis.rs",
+        "crates/mirante4d-app/src/current_runtime/mod.rs",
         "crates/mirante4d-app/src/current_runtime/dataset.rs",
         "crates/mirante4d-app/src/current_runtime/import.rs",
         "crates/mirante4d-app/src/current_runtime/project.rs",

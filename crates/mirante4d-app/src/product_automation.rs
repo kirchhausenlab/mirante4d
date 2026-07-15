@@ -996,7 +996,6 @@ impl ProductAutomationController {
                 !crate::workbench_playback_runtime::background_work_active(
                     &snapshot,
                     &app.import.workers,
-                    &app.analysis_runtime,
                     &app.dataset,
                     &app.render_coordination,
                     &app.native_presentation,

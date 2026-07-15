@@ -4,7 +4,7 @@ use mirante4d_application::{
     AnalysisTableDescriptor, AnalysisTableId, AnalysisTableSnapshot, AnalysisWorkspaceSnapshot,
 };
 
-use crate::current_runtime::analysis::AnalysisProductRuntime;
+use crate::analysis_session::AnalysisProductRuntime;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AnalysisWorkspaceSnapshotInput<'a> {

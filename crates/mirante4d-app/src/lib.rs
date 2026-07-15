@@ -5,10 +5,10 @@ use std::{
 };
 
 mod analysis_product;
+mod analysis_session;
 mod analysis_workspace;
 mod cross_section_readout;
 mod cross_section_scheduler;
-mod current_runtime;
 mod current_settings_connection;
 mod current_source_open_service;
 mod current_source_verification_service;
@@ -442,7 +442,7 @@ pub struct MiranteWorkbenchApp {
     native_presentation: native_presentation::NativePresentationBridge,
     egui_ui: ui_kit::EguiUiState,
     import: ImportWorkflow,
-    analysis_runtime: current_runtime::analysis::AnalysisProductRuntime,
+    analysis_runtime: analysis_session::AnalysisProductRuntime,
     product_automation: Option<ProductAutomationController>,
     #[cfg(test)]
     test_render_viewport_max_side: Option<usize>,

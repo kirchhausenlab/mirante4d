@@ -6,7 +6,6 @@ use mirante4d_domain::ViewerLayout;
 
 use crate::{
     BACKGROUND_WORK_REPAINT_INTERVAL, RenderCoordinationState,
-    current_runtime::analysis::AnalysisProductRuntime,
     dataset_requests::{DatasetDemandState, SCOPE_CURRENT_3D},
     import_worker_service::ImportWorkerService,
     native_presentation::NativePresentationBridge,
@@ -16,7 +15,6 @@ use crate::{
 pub(crate) fn background_work_active(
     snapshot: &ApplicationSnapshot,
     import: &ImportWorkerService,
-    _analysis: &AnalysisProductRuntime,
     dataset: &DatasetDemandState,
     render: &RenderCoordinationState,
     presentation: &NativePresentationBridge,

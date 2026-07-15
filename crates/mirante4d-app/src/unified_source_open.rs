@@ -26,8 +26,8 @@ use mirante4d_storage::{
 
 use crate::{
     FrameCompleteness, FrameFidelityStatus, LodDecisionReason, StartupDiagnostics,
+    analysis_session::AnalysisProductRuntime,
     collect_startup_diagnostics,
-    current_runtime::analysis::AnalysisProductRuntime,
     dataset_requests::DatasetDemandState,
     default_camera_for_shape,
     transfer_presets::default_channel_presets,

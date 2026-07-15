@@ -27,7 +27,7 @@ use mirante4d_storage::{
 };
 
 use crate::{
-    current_runtime::analysis::AnalysisProductRuntime,
+    analysis_session::AnalysisProductRuntime,
     dataset_requests::DatasetDemandState,
     unified_source_open::{self, UnifiedOpenedSource},
 };
