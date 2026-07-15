@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeSet,
     env, fs,
     fs::OpenOptions,
     io::Write,
@@ -26,7 +25,6 @@ use mirante4d_render_api::{PresentationViewport, RenderExtent};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::DisplayRefreshTiming;
 use crate::cross_section_readout::{
     CrossSectionHoverGenerationStatus, CrossSectionHoverReadout, CrossSectionHoverStatus,
     CrossSectionHoverValue, CrossSectionReadoutInput, cross_section_hover_readout_for_panel_point,
@@ -39,26 +37,14 @@ use crate::{
 mod capture;
 mod diagnostics;
 mod model;
-mod timing;
 
 use capture::{
     ProductAutomationArtifact, ProductAutomationImageStats, capture_color_image,
     color_image_from_rgba, current_display_image_stats, product_target_capture,
     sanitize_artifact_label, write_color_image_ppm,
 };
-use diagnostics::{
-    dataset_runtime_diagnostics_json, gpu_adapter_diagnostics_json, gpu_timestamp_timing_json,
-};
+use diagnostics::{dataset_runtime_diagnostics_json, gpu_adapter_diagnostics_json};
 use model::*;
-use timing::{
-    ProductAutomationAppUpdatePhases, ProductAutomationAppUpdateSample,
-    ProductAutomationCrossSectionLatencySample, ProductAutomationDisplayRefreshSample,
-    ProductAutomationInputToPresentSample, app_update_timing_summary_json,
-    cross_section_latency_summary_json, details_with_display_refresh_timing,
-    display_refresh_timing_json, display_refresh_timing_summary_json,
-    input_to_present_timing_summary_json, new_display_refresh_timing_from_details,
-    presentation_timing_json,
-};
 
 const ENABLE_AUTOMATION_ENV: &str = "MIRANTE4D_ENABLE_AUTOMATION";
 const AUTOMATION_SCRIPT_ENV: &str = "MIRANTE4D_AUTOMATION_SCRIPT";
@@ -230,91 +216,10 @@ pub(crate) struct ProductAutomationController {
     events: Vec<ProductAutomationEvent>,
     diagnostics: Vec<Value>,
     artifacts: Vec<ProductAutomationArtifact>,
-    app_update_samples: Vec<ProductAutomationAppUpdateSample>,
-    display_refresh_samples: Vec<ProductAutomationDisplayRefreshSample>,
-    input_to_present_samples: Vec<ProductAutomationInputToPresentSample>,
-    cross_section_latency_samples: Vec<ProductAutomationCrossSectionLatencySample>,
-    pending_cross_section_latency_samples: Vec<PendingCrossSectionLatencySample>,
     limit_observations: ProductAutomationLimitObservations,
     render_target_override: Option<RenderExtent>,
     requested_mapped_client_pixels: Option<(u32, u32)>,
     report_written: bool,
-}
-
-#[derive(Debug)]
-struct PendingCrossSectionLatencySample {
-    command_index: usize,
-    command: &'static str,
-    operation: &'static str,
-    panel_id: PanelId,
-    started_at: Instant,
-    target_generation: u64,
-    active_timepoint: u64,
-}
-
-impl PendingCrossSectionLatencySample {
-    fn json(&self) -> Value {
-        json!({
-            "kind": "pending_cross_section_command_to_current_partial_latency",
-            "taxonomy_version": 1,
-            "command_index": self.command_index,
-            "command": self.command,
-            "operation": self.operation,
-            "panel": self.panel_id.label(),
-            "target_generation": self.target_generation,
-            "active_timepoint": self.active_timepoint,
-            "elapsed_ms": duration_ms(self.started_at.elapsed()),
-        })
-    }
-
-    fn completed_sample(
-        &self,
-        app: &MiranteWorkbenchApp,
-    ) -> Option<ProductAutomationCrossSectionLatencySample> {
-        let snapshot = app.application.snapshot();
-        if application_view(&snapshot).timepoint().get() != self.active_timepoint {
-            return None;
-        }
-        let panel = app
-            .render_coordination
-            .surface(self.panel_id.presentation_slot());
-        let displayed_generation = panel.displayed_generation()?;
-        if displayed_generation < self.target_generation {
-            return None;
-        }
-        product_presentation(app, self.panel_id)?;
-        let schedule = panel.cross_section_schedule();
-        Some(ProductAutomationCrossSectionLatencySample {
-            command_index: self.command_index,
-            command: self.command,
-            operation: self.operation,
-            panel_id: self.panel_id,
-            event_epoch_ms: epoch_ms(),
-            latency_ms: duration_ms(self.started_at.elapsed()),
-            target_generation: self.target_generation,
-            displayed_generation,
-            active_timepoint: self.active_timepoint,
-            target_scale_level: schedule.and_then(|schedule| schedule.target_scale_level),
-            render_scale_level: schedule.and_then(|schedule| schedule.render_scale_level),
-            missing_occupied_chunks: schedule
-                .map_or(0, |schedule| schedule.missing_occupied_bricks),
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ProductAutomationAppUpdateTiming {
-    pub(crate) update_started: Instant,
-    pub(crate) setup_ms: f64,
-    pub(crate) task_drain_ms: f64,
-    pub(crate) playback_ms: f64,
-    pub(crate) ui_build_ms: f64,
-    pub(crate) histogram_ui_ms: f64,
-    pub(crate) command_apply_ms: f64,
-    pub(crate) display_refresh_trigger_ms: f64,
-    pub(crate) import_action_ms: f64,
-    pub(crate) brick_result_drain_ms: f64,
-    pub(crate) background_repaint_request_ms: f64,
 }
 
 impl ProductAutomationController {
@@ -328,48 +233,23 @@ impl ProductAutomationController {
         })
     }
 
-    pub(crate) fn drive(
-        app: &mut MiranteWorkbenchApp,
-        ctx: &egui::Context,
-        update_timing: ProductAutomationAppUpdateTiming,
-    ) {
+    pub(crate) fn drive(app: &mut MiranteWorkbenchApp, ctx: &egui::Context) {
         let Some(mut automation) = app.product_automation.take() else {
             return;
         };
-        let automation_started = Instant::now();
         match automation.step(app, ctx) {
             AutomationStatus::Continue => {
-                automation.record_app_update_sample(
-                    app,
-                    update_timing,
-                    duration_ms(automation_started.elapsed()),
-                );
                 ctx.request_repaint();
             }
             AutomationStatus::Waiting { repaint_after } => {
-                automation.record_app_update_sample(
-                    app,
-                    update_timing,
-                    duration_ms(automation_started.elapsed()),
-                );
                 if let Some(delay) = repaint_after {
                     ctx.request_repaint_after(delay);
                 }
             }
             AutomationStatus::Finished => {
-                automation.record_app_update_sample(
-                    app,
-                    update_timing,
-                    duration_ms(automation_started.elapsed()),
-                );
                 automation.write_report_and_close(app, ctx, "passed", None);
             }
             AutomationStatus::Failed(reason) => {
-                automation.record_app_update_sample(
-                    app,
-                    update_timing,
-                    duration_ms(automation_started.elapsed()),
-                );
                 automation.write_report_and_close(app, ctx, "failed", Some(reason));
             }
         }
@@ -405,11 +285,6 @@ impl ProductAutomationController {
             events: Vec::new(),
             diagnostics: Vec::new(),
             artifacts: Vec::new(),
-            app_update_samples: Vec::new(),
-            display_refresh_samples: Vec::new(),
-            input_to_present_samples: Vec::new(),
-            cross_section_latency_samples: Vec::new(),
-            pending_cross_section_latency_samples: Vec::new(),
             limit_observations: ProductAutomationLimitObservations::default(),
             render_target_override: None,
             requested_mapped_client_pixels: None,
@@ -448,7 +323,6 @@ impl ProductAutomationController {
                 repaint_after: None,
             };
         }
-        self.observe_cross_section_latency_samples(app);
         if self.command_index >= self.script.commands.len() {
             if self.events.iter().any(|event| event.status == "failed") {
                 return AutomationStatus::Failed("automation initialization failed".to_owned());
@@ -459,9 +333,7 @@ impl ProductAutomationController {
         let command = self.script.commands[self.command_index].clone();
         let command_index = self.command_index;
         let command_started = Instant::now();
-        let previous_display_refresh_timing = app.render_coordination.last_display_refresh_timing;
-        let result = self.execute_command(app, ctx, &command, previous_display_refresh_timing);
-        let command_execution_elapsed = command_started.elapsed();
+        let result = self.execute_command(app, ctx, &command);
         if let Err(reason) = self.observe_and_enforce_limits(app) {
             self.events.push(ProductAutomationEvent::failed(
                 command_index,
@@ -473,35 +345,6 @@ impl ProductAutomationController {
         }
         match result {
             Ok(CommandProgress::Done(details)) => {
-                if let Some(timing) = new_display_refresh_timing_from_details(
-                    &details,
-                    app,
-                    previous_display_refresh_timing,
-                ) {
-                    let event_epoch_ms = epoch_ms();
-                    self.display_refresh_samples
-                        .push(ProductAutomationDisplayRefreshSample {
-                            command_index,
-                            command: command.name(),
-                            event_epoch_ms,
-                            timing,
-                        });
-                    self.input_to_present_samples
-                        .push(ProductAutomationInputToPresentSample {
-                            command_index,
-                            command: command.name(),
-                            event_epoch_ms,
-                            latency_ms: duration_ms(command_execution_elapsed),
-                            display_refresh_timing: timing,
-                        });
-                }
-                self.queue_cross_section_latency_samples_for_command(
-                    app,
-                    &command,
-                    command_index,
-                    command_started,
-                );
-                self.observe_cross_section_latency_samples(app);
                 self.events.push(ProductAutomationEvent::passed(
                     command_index,
                     command.name(),
@@ -539,7 +382,6 @@ impl ProductAutomationController {
         app: &mut MiranteWorkbenchApp,
         ctx: &egui::Context,
         command: &ProductAutomationCommand,
-        previous_display_refresh_timing: Option<DisplayRefreshTiming>,
     ) -> Result<CommandProgress, String> {
         match command {
             ProductAutomationCommand::OpenDataset { path } => {
@@ -840,13 +682,9 @@ impl ProductAutomationController {
                         cross_section,
                     },
                 )?;
-                Ok(CommandProgress::Done(details_with_display_refresh_timing(
-                    app,
-                    previous_display_refresh_timing,
-                    json!({
-                        "layout": layout.name(),
-                    }),
-                )))
+                Ok(CommandProgress::Done(json!({
+                    "layout": layout.name(),
+                })))
             }
             ProductAutomationCommand::SetTimepoint { timepoint } => {
                 let snapshot = app.application.snapshot();
@@ -871,14 +709,10 @@ impl ProductAutomationController {
                 let active_timepoint = application_view(&app.application.snapshot())
                     .timepoint()
                     .get();
-                Ok(CommandProgress::Done(details_with_display_refresh_timing(
-                    app,
-                    previous_display_refresh_timing,
-                    json!({
-                        "timepoint": timepoint,
-                        "active_timepoint": active_timepoint,
-                    }),
-                )))
+                Ok(CommandProgress::Done(json!({
+                    "timepoint": timepoint,
+                    "active_timepoint": active_timepoint,
+                })))
             }
             ProductAutomationCommand::StepTimepoint { delta } => {
                 let snapshot = app.application.snapshot();
@@ -895,14 +729,10 @@ impl ProductAutomationController {
                 let active_timepoint = application_view(&app.application.snapshot())
                     .timepoint()
                     .get();
-                Ok(CommandProgress::Done(details_with_display_refresh_timing(
-                    app,
-                    previous_display_refresh_timing,
-                    json!({
-                        "delta": delta,
-                        "active_timepoint": active_timepoint,
-                    }),
-                )))
+                Ok(CommandProgress::Done(json!({
+                    "delta": delta,
+                    "active_timepoint": active_timepoint,
+                })))
             }
             ProductAutomationCommand::SetPlayback { playing } => {
                 dispatch_application_command(
@@ -913,14 +743,10 @@ impl ProductAutomationController {
                 let active_timepoint = application_view(&app.application.snapshot())
                     .timepoint()
                     .get();
-                Ok(CommandProgress::Done(details_with_display_refresh_timing(
-                    app,
-                    previous_display_refresh_timing,
-                    json!({
-                        "playing": playing,
-                        "active_timepoint": active_timepoint,
-                    }),
-                )))
+                Ok(CommandProgress::Done(json!({
+                    "playing": playing,
+                    "active_timepoint": active_timepoint,
+                })))
             }
             ProductAutomationCommand::SetRenderMode { mode } => {
                 let render_mode: RenderMode = (*mode).into();
@@ -938,13 +764,9 @@ impl ProductAutomationController {
                     ))
                 })?;
                 dispatch_application_command(app, ctx, command)?;
-                Ok(CommandProgress::Done(details_with_display_refresh_timing(
-                    app,
-                    previous_display_refresh_timing,
-                    json!({
-                        "render_mode": mode.name(),
-                    }),
-                )))
+                Ok(CommandProgress::Done(json!({
+                    "render_mode": mode.name(),
+                })))
             }
             ProductAutomationCommand::SetLayerRenderMode { layer_index, mode } => {
                 let render_mode: RenderMode = (*mode).into();
@@ -961,14 +783,10 @@ impl ProductAutomationController {
                     ))
                 })?;
                 dispatch_application_command(app, ctx, command)?;
-                Ok(CommandProgress::Done(details_with_display_refresh_timing(
-                    app,
-                    previous_display_refresh_timing,
-                    json!({
-                        "layer_index": layer_index,
-                        "render_mode": mode.name(),
-                    }),
-                )))
+                Ok(CommandProgress::Done(json!({
+                    "layer_index": layer_index,
+                    "render_mode": mode.name(),
+                })))
             }
             ProductAutomationCommand::SetIsoDisplayLevel { display_level } => {
                 if !display_level.is_finite() || !(0.0..=1.0).contains(display_level) {
@@ -993,13 +811,9 @@ impl ProductAutomationController {
                     ))
                 })?;
                 dispatch_application_command(app, ctx, command)?;
-                Ok(CommandProgress::Done(details_with_display_refresh_timing(
-                    app,
-                    previous_display_refresh_timing,
-                    json!({
-                        "display_level": display_level,
-                    }),
-                )))
+                Ok(CommandProgress::Done(json!({
+                    "display_level": display_level,
+                })))
             }
             ProductAutomationCommand::SetDvrDensityScale { density_scale } => {
                 if !density_scale.is_finite()
@@ -1034,13 +848,9 @@ impl ProductAutomationController {
                     ))
                 })?;
                 dispatch_application_command(app, ctx, command)?;
-                Ok(CommandProgress::Done(details_with_display_refresh_timing(
-                    app,
-                    previous_display_refresh_timing,
-                    json!({
-                        "density_scale": density_scale,
-                    }),
-                )))
+                Ok(CommandProgress::Done(json!({
+                    "density_scale": density_scale,
+                })))
             }
             ProductAutomationCommand::SetChannelVisibility {
                 layer_index,
@@ -1055,14 +865,10 @@ impl ProductAutomationController {
                     ))
                 })?;
                 dispatch_application_command(app, ctx, command)?;
-                Ok(CommandProgress::Done(details_with_display_refresh_timing(
-                    app,
-                    previous_display_refresh_timing,
-                    json!({
-                        "layer_index": layer_index,
-                        "visible": visible,
-                    }),
-                )))
+                Ok(CommandProgress::Done(json!({
+                    "layer_index": layer_index,
+                    "visible": visible,
+                })))
             }
             ProductAutomationCommand::SetLayerOpacity {
                 layer_index,
@@ -1088,14 +894,10 @@ impl ProductAutomationController {
                     ))
                 })?;
                 dispatch_application_command(app, ctx, command)?;
-                Ok(CommandProgress::Done(details_with_display_refresh_timing(
-                    app,
-                    previous_display_refresh_timing,
-                    json!({
-                        "layer_index": layer_index,
-                        "opacity": opacity,
-                    }),
-                )))
+                Ok(CommandProgress::Done(json!({
+                    "layer_index": layer_index,
+                    "opacity": opacity,
+                })))
             }
             ProductAutomationCommand::SetLayerWindow {
                 layer_index,
@@ -1124,15 +926,11 @@ impl ProductAutomationController {
                     ))
                 })?;
                 dispatch_application_command(app, ctx, command)?;
-                Ok(CommandProgress::Done(details_with_display_refresh_timing(
-                    app,
-                    previous_display_refresh_timing,
-                    json!({
-                        "layer_index": layer_index,
-                        "low": low,
-                        "high": high,
-                    }),
-                )))
+                Ok(CommandProgress::Done(json!({
+                    "layer_index": layer_index,
+                    "low": low,
+                    "high": high,
+                })))
             }
             ProductAutomationCommand::CameraFitData => {
                 let snapshot = app.application.snapshot();
@@ -1148,11 +946,7 @@ impl ProductAutomationController {
                     app.render_coordination.presentation_viewport,
                 );
                 dispatch_application_command(app, ctx, ApplicationCommand::SetCamera(camera))?;
-                Ok(CommandProgress::Done(details_with_display_refresh_timing(
-                    app,
-                    previous_display_refresh_timing,
-                    json!({}),
-                )))
+                Ok(CommandProgress::Done(json!({})))
             }
             ProductAutomationCommand::CameraReset => {
                 let snapshot = app.application.snapshot();
@@ -1164,11 +958,7 @@ impl ProductAutomationController {
                 let camera =
                     default_camera_for_shape(layer.shape().spatial(), layer.grid_to_world());
                 dispatch_application_command(app, ctx, ApplicationCommand::SetCamera(camera))?;
-                Ok(CommandProgress::Done(details_with_display_refresh_timing(
-                    app,
-                    previous_display_refresh_timing,
-                    json!({}),
-                )))
+                Ok(CommandProgress::Done(json!({})))
             }
             ProductAutomationCommand::CameraOrbit {
                 yaw_points,
@@ -1183,14 +973,10 @@ impl ProductAutomationController {
                 let camera =
                     orbit_camera(start_camera, start, current, [viewport_side, viewport_side]);
                 dispatch_application_command(app, ctx, ApplicationCommand::SetCamera(camera))?;
-                Ok(CommandProgress::Done(details_with_display_refresh_timing(
-                    app,
-                    previous_display_refresh_timing,
-                    json!({
-                        "yaw_points": yaw_points,
-                        "pitch_points": pitch_points,
-                    }),
-                )))
+                Ok(CommandProgress::Done(json!({
+                    "yaw_points": yaw_points,
+                    "pitch_points": pitch_points,
+                })))
             }
             ProductAutomationCommand::CameraPan {
                 x_points,
@@ -1203,27 +989,19 @@ impl ProductAutomationController {
                     [*x_points, *y_points],
                 );
                 dispatch_application_command(app, ctx, ApplicationCommand::SetCamera(camera))?;
-                Ok(CommandProgress::Done(details_with_display_refresh_timing(
-                    app,
-                    previous_display_refresh_timing,
-                    json!({
-                        "x_points": x_points,
-                        "y_points": y_points,
-                        "viewport_height_points": viewport_height_points,
-                    }),
-                )))
+                Ok(CommandProgress::Done(json!({
+                    "x_points": x_points,
+                    "y_points": y_points,
+                    "viewport_height_points": viewport_height_points,
+                })))
             }
             ProductAutomationCommand::CameraZoom { scroll_y_points } => {
                 let snapshot = app.application.snapshot();
                 let camera = zoom_camera(*application_view(&snapshot).camera(), *scroll_y_points);
                 dispatch_application_command(app, ctx, ApplicationCommand::SetCamera(camera))?;
-                Ok(CommandProgress::Done(details_with_display_refresh_timing(
-                    app,
-                    previous_display_refresh_timing,
-                    json!({
-                        "scroll_y_points": scroll_y_points,
-                    }),
-                )))
+                Ok(CommandProgress::Done(json!({
+                    "scroll_y_points": scroll_y_points,
+                })))
             }
             ProductAutomationCommand::CrossSectionPan {
                 panel,
@@ -1848,25 +1626,6 @@ impl ProductAutomationController {
                     ))
                 }
             }
-            ProductAutomationAssertCondition::ObservedTimepoints { min_distinct } => {
-                let mut observed = BTreeSet::new();
-                observed.insert(view.timepoint().get());
-                observed.extend(
-                    self.app_update_samples
-                        .iter()
-                        .map(|sample| sample.active_timepoint),
-                );
-                if observed.len() >= *min_distinct {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "observed {} distinct active timepoint(s), expected at least {}; observed={:?}",
-                        observed.len(),
-                        min_distinct,
-                        observed
-                    ))
-                }
-            }
             ProductAutomationAssertCondition::Playback { playing } => {
                 let actual = snapshot.transient().playback_active();
                 if actual == *playing {
@@ -2143,13 +1902,9 @@ impl ProductAutomationController {
                     "completeness": format!("{:?}", app.render_coordination.frame_fidelity.completeness),
                     "reason": format!("{:?}", app.render_coordination.frame_fidelity.reason),
                     "display_freshness": format!("{:?}", app.render_coordination.frame_fidelity.display_freshness),
-                    "frame_time_ms": app.render_coordination.frame_fidelity.frame_time_ms,
                     "last_failure_kind": app.render_coordination.frame_fidelity.last_failure_kind.map(|kind| format!("{kind:?}")),
                     "last_capacity_error": app.render_coordination.frame_fidelity.last_capacity_error.clone(),
                 },
-                "display_refresh_timing": app
-                    .render_coordination.last_display_refresh_timing
-                    .map(display_refresh_timing_json),
                 "progressive_presentation": app.native_presentation.product_gpu.as_ref().map(|product| json!({
                     "current_partial_frames_presented": product.current_partial_frames_presented,
                     "partial_to_settled_transitions": product.partial_to_settled_transitions,
@@ -2174,8 +1929,6 @@ impl ProductAutomationController {
                 .native_presentation.product_gpu
                 .as_ref()
                 .map(|product| gpu_adapter_diagnostics_json(product.renderer.diagnostics())),
-            "gpu_timestamp_timing": gpu_timestamp_timing_json(),
-            "presentation_timing": presentation_timing_json(),
             "camera": {
                 "projection": format!("{:?}", view.camera().projection()),
                 "viewport": {
@@ -2274,45 +2027,6 @@ impl ProductAutomationController {
             "project_state": project_state_json(app),
             "project_store_evidence": project_store_evidence_json(app),
             "events": &self.events,
-            "app_update_timing_samples": self
-                .app_update_samples
-                .iter()
-                .map(ProductAutomationAppUpdateSample::json)
-                .collect::<Vec<_>>(),
-            "app_update_timing_summary": app_update_timing_summary_json(
-                &self.app_update_samples,
-            ),
-            "display_refresh_timing_samples": self
-                .display_refresh_samples
-                .iter()
-                .map(ProductAutomationDisplayRefreshSample::json)
-                .collect::<Vec<_>>(),
-            "display_refresh_timing_summary": display_refresh_timing_summary_json(
-                &self.display_refresh_samples,
-            ),
-            "input_to_present_timing_samples": self
-                .input_to_present_samples
-                .iter()
-                .map(ProductAutomationInputToPresentSample::json)
-                .collect::<Vec<_>>(),
-            "input_to_present_timing_summary": input_to_present_timing_summary_json(
-                &self.input_to_present_samples,
-            ),
-            "cross_section_latency_samples": self
-                .cross_section_latency_samples
-                .iter()
-                .map(ProductAutomationCrossSectionLatencySample::json)
-                .collect::<Vec<_>>(),
-            "cross_section_latency_pending_samples": self
-                .pending_cross_section_latency_samples
-                .iter()
-                .map(PendingCrossSectionLatencySample::json)
-                .collect::<Vec<_>>(),
-            "cross_section_latency_summary": cross_section_latency_summary_json(
-                &self.cross_section_latency_samples,
-                self.pending_cross_section_latency_samples.len(),
-            ),
-            "presentation_timing": presentation_timing_json(),
             "diagnostics": &self.diagnostics,
             "artifacts": self
                 .artifacts
@@ -2349,201 +2063,6 @@ impl ProductAutomationController {
         }
         app.egui_ui.allow_close_without_prompt = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-    }
-
-    fn record_app_update_sample(
-        &mut self,
-        app: &MiranteWorkbenchApp,
-        timing: ProductAutomationAppUpdateTiming,
-        automation_step_ms: f64,
-    ) {
-        if self.report_written {
-            return;
-        }
-        let total_update_ms = duration_ms(timing.update_started.elapsed());
-        let snapshot = app.application.snapshot();
-        let view = application_view(&snapshot);
-        let render_mode = view
-            .layer(view.active_layer())
-            .expect("application view has an active layer")
-            .render_state()
-            .mode();
-        self.app_update_samples
-            .push(ProductAutomationAppUpdateSample {
-                sample_index: self.app_update_samples.len(),
-                command_index: self.command_index,
-                event_epoch_ms: epoch_ms(),
-                timing: ProductAutomationAppUpdatePhases {
-                    setup_ms: timing.setup_ms,
-                    task_drain_ms: timing.task_drain_ms,
-                    playback_ms: timing.playback_ms,
-                    ui_build_ms: timing.ui_build_ms,
-                    histogram_ui_ms: timing.histogram_ui_ms,
-                    command_apply_ms: timing.command_apply_ms,
-                    display_refresh_trigger_ms: timing.display_refresh_trigger_ms,
-                    import_action_ms: timing.import_action_ms,
-                    brick_result_drain_ms: timing.brick_result_drain_ms,
-                    background_repaint_request_ms: timing.background_repaint_request_ms,
-                    automation_step_ms,
-                    total_update_ms,
-                },
-                background_work_active: crate::workbench_playback_runtime::background_work_active(
-                    &snapshot,
-                    &app.import.workers,
-                    &app.analysis_runtime,
-                    &app.dataset,
-                    &app.render_coordination,
-                    &app.native_presentation,
-                ),
-                active_timepoint: view.timepoint().get(),
-                render_mode,
-                display_freshness: app.render_coordination.frame_fidelity.display_freshness,
-                target_scale_level: app.render_coordination.frame_fidelity.target_scale_level,
-                displayed_scale_level: app.render_coordination.frame_fidelity.displayed_scale_level,
-                visible_bricks: app.render_coordination.frame_fidelity.visible_bricks,
-                resident_bricks: app.dataset.retained_leases().retained_len(),
-            });
-    }
-
-    fn queue_cross_section_latency_samples_for_command(
-        &mut self,
-        app: &MiranteWorkbenchApp,
-        command: &ProductAutomationCommand,
-        command_index: usize,
-        started_at: Instant,
-    ) {
-        match command {
-            ProductAutomationCommand::CrossSectionPan { panel, .. } => self
-                .queue_cross_section_latency_sample(
-                    app,
-                    command_index,
-                    command.name(),
-                    "pan",
-                    PanelId::from(*panel),
-                    started_at,
-                ),
-            ProductAutomationCommand::CrossSectionSliceStep { panel, .. } => self
-                .queue_cross_section_latency_sample(
-                    app,
-                    command_index,
-                    command.name(),
-                    "slice_shift",
-                    PanelId::from(*panel),
-                    started_at,
-                ),
-            ProductAutomationCommand::CrossSectionZoom { panel, .. } => self
-                .queue_cross_section_latency_sample(
-                    app,
-                    command_index,
-                    command.name(),
-                    "zoom",
-                    PanelId::from(*panel),
-                    started_at,
-                ),
-            ProductAutomationCommand::CrossSectionRotate { panel, .. } => self
-                .queue_cross_section_latency_sample(
-                    app,
-                    command_index,
-                    command.name(),
-                    "oblique_rotation",
-                    PanelId::from(*panel),
-                    started_at,
-                ),
-            ProductAutomationCommand::SetTimepoint { .. }
-            | ProductAutomationCommand::StepTimepoint { .. } => {
-                for panel_id in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
-                    self.queue_cross_section_latency_sample(
-                        app,
-                        command_index,
-                        command.name(),
-                        "timepoint_change",
-                        panel_id,
-                        started_at,
-                    );
-                }
-            }
-            ProductAutomationCommand::OpenDataset { .. }
-            | ProductAutomationCommand::NewProject
-            | ProductAutomationCommand::InitialSaveWithEdit { .. }
-            | ProductAutomationCommand::OpenProject { .. }
-            | ProductAutomationCommand::RecoverAutomaticAutosave
-            | ProductAutomationCommand::SaveProjectAs { .. }
-            | ProductAutomationCommand::CloseProjectStore
-            | ProductAutomationCommand::WriteExternalKillCheckpoint { .. }
-            | ProductAutomationCommand::HoldForExternalKill
-            | ProductAutomationCommand::CancelSourceVerification
-            | ProductAutomationCommand::RequestSourceVerification
-            | ProductAutomationCommand::WaitFor { .. }
-            | ProductAutomationCommand::SetViewportSize { .. }
-            | ProductAutomationCommand::SetMappedClientPixels { .. }
-            | ProductAutomationCommand::SetRenderTargetSize { .. }
-            | ProductAutomationCommand::SetViewerLayout { .. }
-            | ProductAutomationCommand::SetPlayback { .. }
-            | ProductAutomationCommand::SetRenderMode { .. }
-            | ProductAutomationCommand::SetLayerRenderMode { .. }
-            | ProductAutomationCommand::SetIsoDisplayLevel { .. }
-            | ProductAutomationCommand::SetDvrDensityScale { .. }
-            | ProductAutomationCommand::SetChannelVisibility { .. }
-            | ProductAutomationCommand::SetLayerOpacity { .. }
-            | ProductAutomationCommand::SetLayerWindow { .. }
-            | ProductAutomationCommand::CameraFitData
-            | ProductAutomationCommand::CameraReset
-            | ProductAutomationCommand::CameraOrbit { .. }
-            | ProductAutomationCommand::CameraPan { .. }
-            | ProductAutomationCommand::CameraZoom { .. }
-            | ProductAutomationCommand::ProbePanelHover { .. }
-            | ProductAutomationCommand::ProbeHover { .. }
-            | ProductAutomationCommand::CopyDiagnostics
-            | ProductAutomationCommand::CaptureScreenshot { .. }
-            | ProductAutomationCommand::Assert { .. }
-            | ProductAutomationCommand::SleepOrFrames { .. }
-            | ProductAutomationCommand::Quit => {}
-        }
-    }
-
-    fn queue_cross_section_latency_sample(
-        &mut self,
-        app: &MiranteWorkbenchApp,
-        command_index: usize,
-        command: &'static str,
-        operation: &'static str,
-        panel_id: PanelId,
-        started_at: Instant,
-    ) {
-        if panel_id.cross_section_panel().is_none() {
-            return;
-        }
-        let panel = app
-            .render_coordination
-            .surface(panel_id.presentation_slot());
-        self.pending_cross_section_latency_samples
-            .push(PendingCrossSectionLatencySample {
-                command_index,
-                command,
-                operation,
-                panel_id,
-                started_at,
-                target_generation: panel.generation(),
-                active_timepoint: application_view(&app.application.snapshot())
-                    .timepoint()
-                    .get(),
-            });
-    }
-
-    fn observe_cross_section_latency_samples(&mut self, app: &MiranteWorkbenchApp) {
-        if self.pending_cross_section_latency_samples.is_empty() {
-            return;
-        }
-        let mut still_pending = Vec::new();
-        let pending = std::mem::take(&mut self.pending_cross_section_latency_samples);
-        for sample in pending {
-            if let Some(completed) = sample.completed_sample(app) {
-                self.cross_section_latency_samples.push(completed);
-            } else {
-                still_pending.push(sample);
-            }
-        }
-        self.pending_cross_section_latency_samples = still_pending;
     }
 
     fn observe_and_enforce_limits(&mut self, app: &MiranteWorkbenchApp) -> Result<(), String> {

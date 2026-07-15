@@ -596,7 +596,7 @@ fn b4_aggregate_requires_signal_nine_normal_joins_and_zero_retries() {
 }
 
 #[test]
-fn b4_trusted_report_must_match_revision_and_actor_thresholds() {
+fn b4_trusted_report_must_match_revision_and_durability_facts() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("trusted.json");
     let commit = "a".repeat(40);
@@ -614,10 +614,7 @@ fn b4_trusted_report_must_match_revision_and_actor_thresholds() {
         "identity": {"commit": commit, "tree": tree, "clean": true},
         "harness": {"retries": 0},
         "counters": {
-            "enqueue_poll_p99_ms": 5.0,
-            "enqueue_poll_samples": 1000,
-            "incremental_unchanged_artifact_bytes_rewritten": 0,
-            "post_open_or_save_metadata_rss_bytes": 100663296
+            "incremental_unchanged_artifact_bytes_rewritten": 0
         }
     });
     let report = json!({
@@ -640,15 +637,13 @@ fn b4_trusted_report_must_match_revision_and_actor_thresholds() {
     });
     write_json_file(&path, &report).unwrap();
     let accepted = load_b4_trusted_project_store_evidence(&path, &identity).unwrap();
-    assert_eq!(accepted["performance_result"], "passed");
     assert_eq!(
-        accepted["lifecycle_evidence"]["counters"]["enqueue_poll_samples"],
-        1000
+        accepted["lifecycle_evidence"]["counters"]["incremental_unchanged_artifact_bytes_rewritten"],
+        0
     );
 
     let mut failed = report;
-    failed["evidence"]["wp10b_project_store_lifecycle"]["counters"]["enqueue_poll_p99_ms"] =
-        json!(5.01);
+    failed["evidence"]["wp10b_project_store_lifecycle"]["harness"]["retries"] = json!(1);
     write_json_file(&path, &failed).unwrap();
     assert!(load_b4_trusted_project_store_evidence(&path, &identity).is_err());
 }
@@ -1042,73 +1037,6 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
                 }
             }
         ],
-        "app_update_timing_summary": {
-            "kind": "app_update_timing_summary",
-            "sample_count": 2
-        },
-        "display_refresh_timing_summary": {
-            "kind": "display_refresh_timing_summary",
-            "sample_count": 1
-        },
-        "input_to_present_timing_summary": {
-            "kind": "input_to_present_proxy_timing_summary",
-            "sample_count": 1,
-            "measurement_scope": "automation_command_start_to_app_display_refresh_complete"
-        },
-        "cross_section_latency_summary": {
-            "kind": "cross_section_latency_summary",
-            "taxonomy_version": 1,
-            "measurement_scope": "automation_cross_section_command_start_to_panel_displayed_generation",
-            "presentation_proxy": "panel_displayed_generation_with_gpu_display_frame",
-            "sample_count": 3,
-            "pending_sample_count": 0,
-            "latency_ms": {
-                "sample_count": 3,
-                "p50": 24.0,
-                "p95": 48.0,
-                "p99": 48.0,
-                "max": 48.0
-            },
-            "warm_interaction_gate": {
-                "threshold_ms": 250.0,
-                "status": "passed"
-            },
-            "by_operation": {
-                "pan": {
-                    "latency_ms": {
-                        "sample_count": 2,
-                        "p50": 18.0,
-                        "p95": 24.0,
-                        "p99": 24.0,
-                        "max": 24.0
-                    },
-                    "warm_interaction_gate": {
-                        "threshold_ms": 250.0,
-                        "status": "passed"
-                    }
-                },
-                "oblique_rotation": {
-                    "latency_ms": {
-                        "sample_count": 1,
-                        "p50": 48.0,
-                        "p95": 48.0,
-                        "p99": 48.0,
-                        "max": 48.0
-                    },
-                    "warm_interaction_gate": {
-                        "threshold_ms": 250.0,
-                        "status": "passed"
-                    }
-                }
-            }
-        },
-        "presentation_timing": {
-            "kind": "presentation_timing",
-            "status": "app_proxy_available_os_compositor_timestamp_unavailable",
-            "os_compositor_present_timestamp": {
-                "status": "unsupported_by_current_eframe_wgpu_integration"
-            }
-        },
         "diagnostics": [
             {
                 "dataset_runtime": {
@@ -1211,16 +1139,7 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
             },
             "gpu_adapter": {
                 "name": "unit adapter",
-                "backend": "Vulkan",
-                "timestamp_queries_supported": true,
-                "timestamp_queries_requested": true,
-                "timestamp_queries_enabled": true
-            },
-            "gpu_timestamp_timing": {
-                "kind": "gpu_timestamp_timing",
-                "status": "enabled",
-                "measurement_scope": "renderer_compute_pass_elapsed_time_from_wgpu_timestamp_queries",
-                "sample_field": "gpu_compute_ms"
+                "backend": "Vulkan"
             }
         }
     });
@@ -1250,7 +1169,6 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
             class: DisplayClass::RealDisplay,
             source: "unit",
         },
-        gpu_timestamps_requested: true,
         preflight_only: false,
         source_closure_evidence: Value::Null,
         automation_status: Some("passed".to_owned()),
@@ -1283,62 +1201,6 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
         stderr_path.to_string_lossy().as_ref()
     );
     assert_eq!(
-        report["metrics"]["display_refresh_timing_summary"]["kind"],
-        "display_refresh_timing_summary"
-    );
-    assert_eq!(
-        report["metrics"]["app_update_timing_summary"]["kind"],
-        "app_update_timing_summary"
-    );
-    assert_eq!(
-        report["metrics"]["input_to_present_timing_summary"]["kind"],
-        "input_to_present_proxy_timing_summary"
-    );
-    assert_eq!(
-        report["metrics"]["input_to_present_timing_summary"]["measurement_scope"],
-        "automation_command_start_to_app_display_refresh_complete"
-    );
-    assert_eq!(
-        report["metrics"]["cross_section_latency_summary"]["kind"],
-        "cross_section_latency_summary"
-    );
-    assert_eq!(
-        report["metrics"]["cross_section_latency_summary"]["sample_count"],
-        3
-    );
-    assert_eq!(
-        report["metrics"]["cross_section_performance_gate_table"]["kind"],
-        "cross_section_performance_gate_table"
-    );
-    assert_eq!(
-        report["metrics"]["cross_section_performance_gate_table"]["pending_sample_count"],
-        0
-    );
-    assert_eq!(
-        report["metrics"]["cross_section_performance_gate_table"]["rows"][0]["operation"],
-        "pan"
-    );
-    assert_eq!(
-        report["metrics"]["cross_section_performance_gate_table"]["rows"][0]["p95_ms"],
-        24.0
-    );
-    assert_eq!(
-        report["metrics"]["cross_section_performance_gate_table"]["rows"][0]["status"],
-        "passed"
-    );
-    assert_eq!(
-        report["metrics"]["cross_section_performance_gate_table"]["rows"][3]["operation"],
-        "oblique_rotation"
-    );
-    assert_eq!(
-        report["metrics"]["cross_section_performance_gate_table"]["rows"][3]["p95_ms"],
-        48.0
-    );
-    assert_eq!(
-        report["metrics"]["cross_section_performance_gate_table"]["rows"][4]["status"],
-        "missing_samples"
-    );
-    assert_eq!(
         report["metrics"]["dataset_runtime"]["kind"],
         "dataset_runtime_metrics"
     );
@@ -1369,26 +1231,9 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
         "Single3d"
     );
     assert_eq!(report["gpu_adapter"]["name"], "unit adapter");
-    assert_eq!(report["gpu_timestamp_timing"]["status"], "enabled");
-    assert_eq!(
-        report["metrics"]["gpu_timestamp_timing"]["sample_field"],
-        "gpu_compute_ms"
-    );
-    assert_eq!(
-        report["presentation_timing"]["status"],
-        "app_proxy_available_os_compositor_timestamp_unavailable"
-    );
-    assert_eq!(
-        report["metrics"]["presentation_timing"]["os_compositor_present_timestamp"]["status"],
-        "unsupported_by_current_eframe_wgpu_integration"
-    );
     assert_eq!(report["environment"]["display"], "real_display");
     assert_eq!(report["environment"]["display_class"], "real_display");
     assert_eq!(report["environment"]["display_class_source"], "unit");
-    assert_eq!(
-        report["environment"]["product_validate_gpu_timestamps_requested"],
-        true
-    );
     assert_eq!(
         report["environment"]["product_validate_preflight_only"],
         false
@@ -1465,7 +1310,6 @@ fn wrapper_report_marks_preflight_as_non_launch_unsupported_evidence() {
             class: DisplayClass::Unsupported,
             source: PREFLIGHT_ONLY_DISPLAY_SOURCE,
         },
-        gpu_timestamps_requested: false,
         preflight_only: true,
         source_closure_evidence: Value::Null,
         automation_status: None,

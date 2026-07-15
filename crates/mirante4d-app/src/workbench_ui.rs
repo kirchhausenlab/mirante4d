@@ -97,16 +97,11 @@ fn active_layer_no_data_policy_label(snapshot: &ApplicationSnapshot) -> Option<&
 
 impl eframe::App for MiranteWorkbenchApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let update_started = Instant::now();
-        let setup_started = Instant::now();
         self.pump_application_services();
         self.handle_close_request(ui.ctx());
-        let setup_ms = duration_ms(setup_started.elapsed());
 
-        let task_drain_started = Instant::now();
         self.drain_tiff_import_setup_results(ui.ctx());
         self.drain_import_results(ui.ctx());
-        let task_drain_ms = duration_ms(task_drain_started.elapsed());
 
         let application_snapshot = self.application_snapshot_for_ui();
         let viewer_ui_snapshot = self.viewer_ui_snapshot(&application_snapshot);
@@ -136,19 +131,14 @@ impl eframe::App for MiranteWorkbenchApp {
             .is_some_and(|service| service.active_token().is_none());
         let runtime_diagnostics_view = runtime_diagnostics_panel::runtime_diagnostics_view(self);
         let mut application_commands = Vec::new();
-        let playback_started = Instant::now();
         workbench_playback_runtime::enqueue_playback_command_if_due(
             &application_snapshot,
             &self.dataset,
             &mut application_commands,
             ui.ctx(),
         );
-        let playback_ms = duration_ms(playback_started.elapsed());
 
-        let ui_build_started = Instant::now();
-        let histogram_started = Instant::now();
         let active_layer_histogram_for_ui = self.active_histogram_summary(&application_snapshot);
-        let histogram_ui_ms = duration_ms(histogram_started.elapsed());
         let project_actions_available = matches!(
             application_snapshot.source(),
             SourceVerificationSnapshot::Verified(_)
@@ -277,14 +267,10 @@ impl eframe::App for MiranteWorkbenchApp {
         );
         application_commands.append(&mut workbench_output.application_commands);
         workbench_output.application_commands = application_commands;
-        let ui_build_ms = duration_ms(ui_build_started.elapsed());
-        let apply_timing = self.apply_workbench_ui_output(ui, workbench_output);
+        self.apply_workbench_ui_output(ui, workbench_output);
 
-        let brick_result_drain_started = Instant::now();
         self.drain_brick_results(ui.ctx());
-        let brick_result_drain_ms = duration_ms(brick_result_drain_started.elapsed());
 
-        let background_repaint_started = Instant::now();
         let snapshot = self.application.snapshot();
         let project_store_pending = self
             .project_store
@@ -313,25 +299,8 @@ impl eframe::App for MiranteWorkbenchApp {
         {
             ui.ctx().request_repaint_after(delay);
         }
-        let background_repaint_request_ms = duration_ms(background_repaint_started.elapsed());
 
-        ProductAutomationController::drive(
-            self,
-            ui.ctx(),
-            ProductAutomationAppUpdateTiming {
-                update_started,
-                setup_ms,
-                task_drain_ms,
-                playback_ms,
-                ui_build_ms,
-                histogram_ui_ms,
-                command_apply_ms: apply_timing.command_apply_ms,
-                display_refresh_trigger_ms: apply_timing.display_refresh_trigger_ms,
-                import_action_ms: apply_timing.import_action_ms,
-                brick_result_drain_ms,
-                background_repaint_request_ms,
-            },
-        );
+        ProductAutomationController::drive(self, ui.ctx());
     }
 
     fn on_exit(&mut self) {

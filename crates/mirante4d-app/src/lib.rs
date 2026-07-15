@@ -49,7 +49,6 @@ use analysis_workspace::{
 };
 use cross_section_readout::cross_section_hover_readout_for_panel_point;
 pub use diagnostics::{StartupDiagnostics, collect_startup_diagnostics, default_log_path};
-use display_refresh::duration_ms;
 use eframe::egui;
 use fidelity::composite_fidelity_label;
 use histogram::active_layer_histogram_summary;
@@ -96,7 +95,7 @@ use mirante4d_render_api::PresentationViewport;
 use mirante4d_render_wgpu::{WgpuRenderRuntime, WgpuRenderRuntimeConfig};
 use mirante4d_settings::{RejectedFileDisposition, ResourcePolicy, recommended_for_current_system};
 use mirante4d_ui_egui as ui_kit;
-use product_automation::{ProductAutomationAppUpdateTiming, ProductAutomationController};
+use product_automation::ProductAutomationController;
 use render_state::set_render_viewport;
 pub use smoke::{AppSmokeOptions, AppSmokeReport, PlaybackSmokeFrame, run_headless_smoke};
 use ui_kit::{

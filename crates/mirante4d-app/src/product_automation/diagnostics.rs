@@ -72,12 +72,3 @@ pub(crate) fn gpu_adapter_diagnostics_json(adapter: &WgpuRenderRuntimeDiagnostic
         "validation_error_count": adapter.validation_error_count(),
     })
 }
-
-pub(crate) fn gpu_timestamp_timing_json() -> Value {
-    json!({
-        "kind": "gpu_timing",
-        "taxonomy_version": 1,
-        "status": "not_collected",
-        "reason": "WP-09B makes no performance claim",
-    })
-}

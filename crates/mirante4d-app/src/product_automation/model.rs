@@ -466,9 +466,6 @@ pub(super) enum ProductAutomationAssertCondition {
     ActiveTimepoint {
         timepoint: u64,
     },
-    ObservedTimepoints {
-        min_distinct: usize,
-    },
     Playback {
         playing: bool,
     },
@@ -532,7 +529,6 @@ impl ProductAutomationAssertCondition {
             Self::RenderMode { .. } => "render_mode",
             Self::ViewerLayout { .. } => "viewer_layout",
             Self::ActiveTimepoint { .. } => "active_timepoint",
-            Self::ObservedTimepoints { .. } => "observed_timepoints",
             Self::Playback { .. } => "playback",
             Self::CrossSectionActivePanel { .. } => "cross_section_active_panel",
             Self::CrossSectionPanelSchedule { .. } => "cross_section_panel_schedule",

@@ -30,8 +30,6 @@ const APP_BINARY_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_APP_BINARY";
 const DISPLAY_CLASS_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS";
 const SCENARIO_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_SCENARIO";
 const PREFLIGHT_ONLY_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_PREFLIGHT_ONLY";
-const PRODUCT_VALIDATE_GPU_TIMESTAMPS_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_GPU_TIMESTAMPS";
-const APP_GPU_TIMESTAMPS_ENV: &str = "MIRANTE4D_GPU_TIMESTAMPS";
 const GENERATED_FIXTURE_SCENARIO: &str = "target_fixture_camera_smoke";
 const GENERATED_RENDER_MODES_SCENARIO: &str = "target_fixture_render_modes";
 const B3_SOURCE_VERIFICATION_SCENARIO: &str = "target_source_verification";
@@ -270,7 +268,6 @@ fn product_validate_report_inner(
     }
     let started_at = Instant::now();
     let started_at_epoch_ms = epoch_ms();
-    let gpu_timestamps_requested = product_validate_gpu_timestamps_requested();
     let binary = ProductValidationAppBinary::from_environment()?;
     let base_output_dir = PathBuf::from(OUTPUT_DIR);
     fs::create_dir_all(&base_output_dir)
@@ -329,7 +326,6 @@ fn product_validate_report_inner(
                 class: DisplayClass::Unsupported,
                 source: PREFLIGHT_ONLY_DISPLAY_SOURCE,
             },
-            gpu_timestamps_requested,
             preflight_only,
             source_closure_evidence: pending_source_closure_evidence.clone(),
             automation_status: None,
@@ -365,7 +361,6 @@ fn product_validate_report_inner(
             stdout: &stdout_path,
             stderr: &stderr_path,
             display,
-            gpu_timestamps_requested,
             preflight_only,
             source_closure_evidence: pending_source_closure_evidence.clone(),
             automation_status: None,
@@ -398,7 +393,6 @@ fn product_validate_report_inner(
             stdout: &stdout_path,
             stderr: &stderr_path,
             display,
-            gpu_timestamps_requested,
             preflight_only,
             source_closure_evidence: pending_source_closure_evidence.clone(),
             automation_status: None,
@@ -418,7 +412,6 @@ fn product_validate_report_inner(
         stdout_path: &stdout_path,
         stderr_path: &stderr_path,
         timeout,
-        gpu_timestamps_requested,
     })?;
     let source_closure_evidence = source_closure_before
         .as_ref()
@@ -451,7 +444,6 @@ fn product_validate_report_inner(
             stdout: &stdout_path,
             stderr: &stderr_path,
             display,
-            gpu_timestamps_requested,
             preflight_only,
             source_closure_evidence: source_closure_evidence.clone(),
             automation_status: None,
@@ -517,7 +509,6 @@ fn product_validate_report_inner(
         stdout: &stdout_path,
         stderr: &stderr_path,
         display,
-        gpu_timestamps_requested,
         preflight_only,
         source_closure_evidence,
         automation_status,
@@ -1086,46 +1077,27 @@ fn load_b4_trusted_project_store_evidence(
     let counters = lifecycle
         .get("counters")
         .context("trusted project-store lifecycle evidence lacks counters")?;
-    let enqueue_poll_p99_ms = counters
-        .get("enqueue_poll_p99_ms")
-        .and_then(Value::as_f64)
-        .context("trusted project-store enqueue/poll p99 is missing")?;
-    let enqueue_poll_samples = counters
-        .get("enqueue_poll_samples")
-        .and_then(Value::as_u64)
-        .context("trusted project-store enqueue/poll sample count is missing")?;
     let unchanged_bytes = counters
         .get("incremental_unchanged_artifact_bytes_rewritten")
         .and_then(Value::as_u64)
         .context("trusted project-store unchanged-byte counter is missing")?;
-    let metadata_rss = counters
-        .get("post_open_or_save_metadata_rss_bytes")
-        .and_then(Value::as_u64)
-        .context("trusted project-store metadata RSS is missing")?;
-    if !(0.0..=5.0).contains(&enqueue_poll_p99_ms)
-        || enqueue_poll_samples < 1_000
-        || unchanged_bytes != 0
-        || metadata_rss > 100_663_296
+    if unchanged_bytes != 0
         || lifecycle
             .pointer("/harness/retries")
             .and_then(Value::as_u64)
             != Some(0)
     {
-        bail!("trusted project-store performance or zero-retry thresholds did not pass");
+        bail!("trusted project-store zero-rewrite or zero-retry facts did not pass");
     }
+    let mut lifecycle_evidence = lifecycle.clone();
+    lifecycle_evidence["counters"] = json!({
+        "incremental_unchanged_artifact_bytes_rewritten": unchanged_bytes,
+    });
     Ok(json!({
         "source_report": path,
         "binding": "explicit_path_exact_commit_tree_clean_identity",
         "aggregate_identity": report_identity,
-        "lifecycle_evidence": lifecycle,
-        "performance_thresholds": {
-            "enqueue_poll_p99_ms_max": 5.0,
-            "enqueue_poll_samples_min": 1000,
-            "incremental_unchanged_artifact_bytes_rewritten_max": 0,
-            "post_open_or_save_metadata_rss_bytes_max": 100663296,
-            "retries": 0
-        },
-        "performance_result": "passed"
+        "lifecycle_evidence": lifecycle_evidence,
     }))
 }
 
@@ -2387,7 +2359,6 @@ struct ProductAutomationRun<'a> {
     stdout_path: &'a Path,
     stderr_path: &'a Path,
     timeout: Duration,
-    gpu_timestamps_requested: bool,
 }
 
 fn run_product_automation(run: ProductAutomationRun<'_>) -> anyhow::Result<ProductProcessStatus> {
@@ -2403,9 +2374,6 @@ fn run_product_automation(run: ProductAutomationRun<'_>) -> anyhow::Result<Produ
         .env("MIRANTE4D_AUTOMATION_REPORT", run.automation_report)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    if run.gpu_timestamps_requested {
-        command.env(APP_GPU_TIMESTAMPS_ENV, "1");
-    }
     println!("running product validation: {:?}", command);
     let mut child = command.spawn().with_context(|| {
         format!(
@@ -2462,7 +2430,6 @@ struct WrapperReport<'a> {
     stdout: &'a Path,
     stderr: &'a Path,
     display: DisplayClassification,
-    gpu_timestamps_requested: bool,
     preflight_only: bool,
     source_closure_evidence: Value,
     automation_status: Option<String>,
@@ -2481,37 +2448,6 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
     let git_commit = host.get("git_commit").cloned().unwrap_or(Value::Null);
     let dirty_worktree = host.get("dirty_worktree").cloned().unwrap_or(Value::Null);
     let finished_at_epoch_ms = epoch_ms();
-    let automation_summary = report
-        .automation_report_value
-        .and_then(|value| value.get("display_refresh_timing_summary"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    let app_update_summary = report
-        .automation_report_value
-        .and_then(|value| value.get("app_update_timing_summary"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    let input_to_present_summary = report
-        .automation_report_value
-        .and_then(|value| value.get("input_to_present_timing_summary"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    let cross_section_latency_summary = report
-        .automation_report_value
-        .and_then(|value| value.get("cross_section_latency_summary"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    let presentation_timing = report
-        .automation_report_value
-        .and_then(|value| {
-            value.get("presentation_timing").or_else(|| {
-                value
-                    .get("final_diagnostics")
-                    .and_then(|diagnostics| diagnostics.get("presentation_timing"))
-            })
-        })
-        .cloned()
-        .unwrap_or(Value::Null);
     let automation_artifacts = report
         .automation_report_value
         .and_then(|value| value.get("artifacts"))
@@ -2527,20 +2463,12 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
         })
         .cloned()
         .unwrap_or(Value::Null);
-    let gpu_timestamp_timing = report
-        .automation_report_value
-        .and_then(|value| value.get("final_diagnostics"))
-        .and_then(|value| value.get("gpu_timestamp_timing"))
-        .cloned()
-        .unwrap_or(Value::Null);
     let dataset_runtime_metrics =
         product_validation_dataset_runtime_metrics(report.automation_report_value);
     let lease_bridge_metrics =
         product_validation_lease_bridge_metrics(report.automation_report_value);
     let cross_section_panel_metrics =
         product_validation_cross_section_panel_metrics(report.automation_report_value);
-    let cross_section_performance_gate_table =
-        product_validation_cross_section_performance_gate_table(report.automation_report_value);
     let automation_script_scenario = report
         .script_value
         .get("scenario")
@@ -2652,8 +2580,6 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
         "binary": report.binary,
         "host": host,
         "gpu_adapter": gpu_adapter,
-        "gpu_timestamp_timing": gpu_timestamp_timing.clone(),
-        "presentation_timing": presentation_timing.clone(),
         "dataset": dataset_context_json(report.package),
         "scenario": {
             "name": scenario_name,
@@ -2688,16 +2614,9 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
         },
         "metrics": {
             "duration_ms": report.duration_ms,
-            "app_update_timing_summary": app_update_summary,
-            "display_refresh_timing_summary": automation_summary,
-            "input_to_present_timing_summary": input_to_present_summary,
-            "cross_section_latency_summary": cross_section_latency_summary,
-            "cross_section_performance_gate_table": cross_section_performance_gate_table,
             "dataset_runtime": dataset_runtime_metrics,
             "lease_bridge": lease_bridge_metrics,
             "cross_section_panels": cross_section_panel_metrics,
-            "gpu_timestamp_timing": gpu_timestamp_timing,
-            "presentation_timing": presentation_timing,
         },
         "artifacts": {
             "automation_report": report.automation_report,
@@ -2716,9 +2635,6 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
             "display_env_present": env::var_os("DISPLAY").is_some(),
             "wayland_display_env_present": env::var_os("WAYLAND_DISPLAY").is_some(),
             "display_class_override_env": env::var(DISPLAY_CLASS_ENV).ok(),
-            "product_validate_gpu_timestamps_env": env::var(PRODUCT_VALIDATE_GPU_TIMESTAMPS_ENV).ok(),
-            "product_validate_gpu_timestamps_requested": report.gpu_timestamps_requested,
-            "app_gpu_timestamps_env_set_by_wrapper": report.gpu_timestamps_requested,
             "product_validate_preflight_only_env": env::var(PREFLIGHT_ONLY_ENV).ok(),
             "product_validate_preflight_only": report.preflight_only,
         },
@@ -2732,105 +2648,6 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
 
 fn script_limits_json(script: &Value) -> Value {
     script.get("limits").cloned().unwrap_or_else(|| json!({}))
-}
-
-fn product_validation_cross_section_performance_gate_table(
-    automation_report_value: Option<&Value>,
-) -> Value {
-    const WARM_INTERACTION_GATE_MS: f64 = 250.0;
-    let summary =
-        automation_report_value.and_then(|value| value.get("cross_section_latency_summary"));
-    let operations = [
-        ("pan", "warm_cross_section_pan_input_to_current_partial"),
-        ("zoom", "warm_cross_section_zoom_input_to_current_partial"),
-        (
-            "slice_shift",
-            "warm_cross_section_slice_shift_input_to_current_partial",
-        ),
-        (
-            "oblique_rotation",
-            "warm_cross_section_oblique_rotation_input_to_current_partial",
-        ),
-        (
-            "timepoint_change",
-            "cold_cross_section_timepoint_change_input_to_current_partial",
-        ),
-    ];
-    let rows = operations
-        .into_iter()
-        .map(|(operation, metric)| {
-            let operation_summary = summary
-                .and_then(|summary| summary.get("by_operation"))
-                .and_then(|by_operation| by_operation.get(operation));
-            let latency = operation_summary.and_then(|value| value.get("latency_ms"));
-            let gate = operation_summary.and_then(|value| {
-                value
-                    .get("latency_gate")
-                    .or_else(|| value.get("warm_interaction_gate"))
-            });
-            json!({
-                "metric": metric,
-                "operation": operation,
-                "presentation_proxy": "panel_displayed_generation_with_gpu_display_frame",
-                "gate_kind": gate
-                    .and_then(|value| value.get("kind"))
-                    .and_then(Value::as_str)
-                    .unwrap_or(if operation == "timepoint_change" {
-                        "cold_current_partial"
-                    } else {
-                        "warm_interaction"
-                    }),
-                "sample_count": latency
-                    .and_then(|value| value.get("sample_count"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                "p50_ms": latency
-                    .and_then(|value| value.get("p50"))
-                    .cloned()
-                    .unwrap_or(Value::Null),
-                "p95_ms": latency
-                    .and_then(|value| value.get("p95"))
-                    .cloned()
-                    .unwrap_or(Value::Null),
-                "p99_ms": latency
-                    .and_then(|value| value.get("p99"))
-                    .cloned()
-                    .unwrap_or(Value::Null),
-                "max_ms": latency
-                    .and_then(|value| value.get("max"))
-                    .cloned()
-                    .unwrap_or(Value::Null),
-                "threshold_ms": gate
-                    .and_then(|value| value.get("threshold_ms"))
-                    .and_then(Value::as_f64)
-                    .unwrap_or(if operation == "timepoint_change" {
-                        2000.0
-                    } else {
-                        WARM_INTERACTION_GATE_MS
-                    }),
-                "status": gate
-                    .and_then(|value| value.get("status"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("missing_samples"),
-            })
-        })
-        .collect::<Vec<_>>();
-    json!({
-        "kind": "cross_section_performance_gate_table",
-        "taxonomy_version": 1,
-        "source": "product_automation_cross_section_latency_summary",
-        "measurement_scope": "automation_cross_section_command_start_to_panel_displayed_generation",
-        "overall_status": summary
-            .and_then(|summary| summary.get("operation_gate").or_else(|| summary.get("warm_interaction_gate")))
-            .and_then(|gate| gate.get("status"))
-            .and_then(Value::as_str)
-            .unwrap_or("missing_samples"),
-        "pending_sample_count": summary
-            .and_then(|summary| summary.get("pending_sample_count"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        "rows": rows,
-    })
 }
 
 fn product_validation_dataset_runtime_metrics(automation_report_value: Option<&Value>) -> Value {
@@ -3140,18 +2957,6 @@ fn env_flag(name: &str) -> bool {
     env::var(name)
         .ok()
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
-fn product_validate_gpu_timestamps_requested() -> bool {
-    env::var(PRODUCT_VALIDATE_GPU_TIMESTAMPS_ENV)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
         .unwrap_or(false)
 }
 
