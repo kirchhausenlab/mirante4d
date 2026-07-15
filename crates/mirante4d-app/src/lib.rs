@@ -44,6 +44,7 @@ mod workbench_controls;
 mod workbench_import;
 mod workbench_playback_runtime;
 mod workbench_ui;
+mod workbench_ui_output;
 
 #[cfg(test)]
 use analysis_workspace::{
@@ -130,7 +131,9 @@ use transfer_presets::{
 };
 #[cfg(test)]
 use ui_kit::{AnalysisPlotViewRange, AnalysisTableSort, ViewportIntensity};
-use ui_kit::{StatusTone, ViewportHover, WorkbenchLayoutSpec};
+use ui_kit::{
+    NativeWorkbenchAction, StatusTone, ViewportHover, WorkbenchLayoutSpec, WorkbenchUiOutput,
+};
 use viewport::{
     default_camera_for_shape, fit_camera_to_shape_preserving_view, fit_size,
     presentation_viewport_for_display_size, render_viewport_for_display_size,

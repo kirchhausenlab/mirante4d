@@ -143,27 +143,15 @@ impl MiranteWorkbenchApp {
         ui: &mut egui::Ui,
         snapshot: &ApplicationSnapshot,
         view: &ViewState,
-        application_commands: &mut Vec<ApplicationCommand>,
-        rerender_requested: &mut bool,
-        texture_refresh_requested: &mut bool,
+        output: &mut WorkbenchUiOutput,
     ) {
         match view.layout() {
-            CanonicalViewerLayout::Single3d => self.show_single_3d_viewport(
-                ui,
-                snapshot,
-                view,
-                application_commands,
-                rerender_requested,
-                texture_refresh_requested,
-            ),
-            CanonicalViewerLayout::FourPanel => self.show_four_panel_viewport(
-                ui,
-                snapshot,
-                view,
-                application_commands,
-                rerender_requested,
-                texture_refresh_requested,
-            ),
+            CanonicalViewerLayout::Single3d => {
+                self.show_single_3d_viewport(ui, snapshot, view, output)
+            }
+            CanonicalViewerLayout::FourPanel => {
+                self.show_four_panel_viewport(ui, snapshot, view, output)
+            }
         }
     }
 
@@ -232,9 +220,7 @@ impl MiranteWorkbenchApp {
         ui: &mut egui::Ui,
         snapshot: &ApplicationSnapshot,
         view: &ViewState,
-        application_commands: &mut Vec<ApplicationCommand>,
-        rerender_requested: &mut bool,
-        texture_refresh_requested: &mut bool,
+        output: &mut WorkbenchUiOutput,
     ) {
         let available = ui.available_size();
         let ctx = ui.ctx().clone();
@@ -242,16 +228,7 @@ impl MiranteWorkbenchApp {
         let display_image = self.viewport_display_image(snapshot);
         let image_size = fit_size(display_image.size_vec2(), available);
         ui.centered_and_justified(|ui| {
-            self.show_3d_viewport_image(
-                ui,
-                display_image,
-                image_size,
-                snapshot,
-                view,
-                application_commands,
-                rerender_requested,
-                texture_refresh_requested,
-            );
+            self.show_3d_viewport_image(ui, display_image, image_size, snapshot, view, output);
         });
     }
 
@@ -260,9 +237,7 @@ impl MiranteWorkbenchApp {
         ui: &mut egui::Ui,
         snapshot: &ApplicationSnapshot,
         view: &ViewState,
-        application_commands: &mut Vec<ApplicationCommand>,
-        rerender_requested: &mut bool,
-        texture_refresh_requested: &mut bool,
+        output: &mut WorkbenchUiOutput,
     ) {
         let available = ui.available_size();
         let gap = 6.0;
@@ -280,16 +255,7 @@ impl MiranteWorkbenchApp {
             for row in panels.chunks_exact(2) {
                 ui.horizontal(|ui| {
                     for panel_id in row {
-                        self.show_four_panel_cell(
-                            ui,
-                            *panel_id,
-                            cell_size,
-                            snapshot,
-                            view,
-                            application_commands,
-                            rerender_requested,
-                            texture_refresh_requested,
-                        );
+                        self.show_four_panel_cell(ui, *panel_id, cell_size, snapshot, view, output);
                     }
                 });
             }
@@ -304,9 +270,7 @@ impl MiranteWorkbenchApp {
         cell_size: egui::Vec2,
         snapshot: &ApplicationSnapshot,
         view: &ViewState,
-        application_commands: &mut Vec<ApplicationCommand>,
-        rerender_requested: &mut bool,
-        texture_refresh_requested: &mut bool,
+        output: &mut WorkbenchUiOutput,
     ) {
         let tokens = ui_kit::UiTokens::default();
         ui.allocate_ui_with_layout(cell_size, egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -321,22 +285,9 @@ impl MiranteWorkbenchApp {
                     ui.label(egui::RichText::new(panel_id.label()).strong());
                     ui.add_space(4.0);
                     match panel_id {
-                        PanelId::ThreeD => self.show_embedded_3d_panel(
-                            ui,
-                            snapshot,
-                            view,
-                            application_commands,
-                            rerender_requested,
-                            texture_refresh_requested,
-                        ),
+                        PanelId::ThreeD => self.show_embedded_3d_panel(ui, snapshot, view, output),
                         PanelId::Xy | PanelId::Xz | PanelId::Yz => {
-                            self.show_cross_section_panel(
-                                ui,
-                                panel_id,
-                                snapshot,
-                                view,
-                                application_commands,
-                            );
+                            self.show_cross_section_panel(ui, panel_id, snapshot, view, output);
                         }
                     }
                 });
@@ -348,9 +299,7 @@ impl MiranteWorkbenchApp {
         ui: &mut egui::Ui,
         snapshot: &ApplicationSnapshot,
         view: &ViewState,
-        application_commands: &mut Vec<ApplicationCommand>,
-        rerender_requested: &mut bool,
-        texture_refresh_requested: &mut bool,
+        output: &mut WorkbenchUiOutput,
     ) {
         let available = ui.available_size();
         let ctx = ui.ctx().clone();
@@ -359,16 +308,7 @@ impl MiranteWorkbenchApp {
         let display_image = self.viewport_display_image(snapshot);
         let image_size = fit_size(display_image.size_vec2(), available);
         ui.centered_and_justified(|ui| {
-            self.show_3d_viewport_image(
-                ui,
-                display_image,
-                image_size,
-                snapshot,
-                view,
-                application_commands,
-                rerender_requested,
-                texture_refresh_requested,
-            );
+            self.show_3d_viewport_image(ui, display_image, image_size, snapshot, view, output);
         });
     }
 
@@ -380,9 +320,7 @@ impl MiranteWorkbenchApp {
         image_size: egui::Vec2,
         snapshot: &ApplicationSnapshot,
         view: &ViewState,
-        application_commands: &mut Vec<ApplicationCommand>,
-        rerender_requested: &mut bool,
-        texture_refresh_requested: &mut bool,
+        output: &mut WorkbenchUiOutput,
     ) {
         if image_size == egui::Vec2::ZERO {
             return;
@@ -414,6 +352,7 @@ impl MiranteWorkbenchApp {
                 slot,
                 image_size,
                 egui::Sense::click_and_drag(),
+                output,
             ),
         };
         let hover =
@@ -431,8 +370,8 @@ impl MiranteWorkbenchApp {
             hover,
         ) {
             Ok(outcome) => {
-                *texture_refresh_requested |= outcome.texture_refresh_requested;
-                *rerender_requested |= outcome.rerender_requested;
+                output.texture_refresh_requested |= outcome.texture_refresh_requested;
+                output.rerender_requested |= outcome.rerender_requested;
             }
             Err(err) => {
                 tracing::warn!(%err, "viewer tool interaction rejected");
@@ -442,12 +381,14 @@ impl MiranteWorkbenchApp {
             self.egui_ui.viewer_tools.active_tool,
             ViewerTool::Navigate | ViewerTool::Inspect
         ) {
-            application_commands.extend(viewport_interaction_commands(
-                &mut self.egui_ui,
-                view,
-                &response,
-                image_size,
-            ));
+            output
+                .application_commands
+                .extend(viewport_interaction_commands(
+                    &mut self.egui_ui,
+                    view,
+                    &response,
+                    image_size,
+                ));
         }
     }
 
@@ -457,7 +398,7 @@ impl MiranteWorkbenchApp {
         panel_id: PanelId,
         snapshot: &ApplicationSnapshot,
         view: &ViewState,
-        application_commands: &mut Vec<ApplicationCommand>,
+        output: &mut WorkbenchUiOutput,
     ) {
         let available = ui.available_size();
         let ctx = ui.ctx().clone();
@@ -484,6 +425,7 @@ impl MiranteWorkbenchApp {
                             image_size,
                             panel_id,
                             snapshot,
+                            output,
                         )
                     })
                     .inner,
@@ -526,7 +468,7 @@ impl MiranteWorkbenchApp {
                 &response,
             ) {
                 Ok(commands) if !commands.is_empty() => {
-                    application_commands.extend(commands);
+                    output.application_commands.extend(commands);
                     ctx.request_repaint_after(CROSS_SECTION_INTERACTION_SETTLE_DURATION);
                 }
                 Ok(_) => {}
@@ -542,6 +484,7 @@ impl MiranteWorkbenchApp {
         image_size: egui::Vec2,
         panel_id: PanelId,
         snapshot: &ApplicationSnapshot,
+        output: &mut WorkbenchUiOutput,
     ) -> egui::Response {
         let response = match display_image {
             ViewportDisplayImage::UiBackground { .. } => {
@@ -557,6 +500,7 @@ impl MiranteWorkbenchApp {
                 slot,
                 image_size,
                 egui::Sense::click_and_drag(),
+                output,
             ),
         };
         response.widget_info(|| {
@@ -576,6 +520,7 @@ impl MiranteWorkbenchApp {
         slot: PresentationSlot,
         image_size: egui::Vec2,
         sense: egui::Sense,
+        output: &mut WorkbenchUiOutput,
     ) -> egui::Response {
         let surface = snapshot
             .presentations()
@@ -584,10 +529,8 @@ impl MiranteWorkbenchApp {
         let (response, paint) = ui_kit::reserve_presentation(ui, slot, surface, image_size, sense);
         ui.painter()
             .rect_filled(response.rect, 0.0, ui.visuals().extreme_bg_color);
-        if let Some(paint) = paint
-            && let Err(error) = self.native_presentation.paint(ui, paint)
-        {
-            tracing::warn!(%error, ?slot, "native presentation request was rejected");
+        if let Some(paint) = paint {
+            output.presentation_paints.push(paint);
         }
         response
     }
@@ -838,7 +781,7 @@ fn render_state_with_sampling(
     }
 }
 
-fn viewer_tool_for_kind(tool: ToolKind) -> ViewerTool {
+pub(crate) fn viewer_tool_for_kind(tool: ToolKind) -> ViewerTool {
     match tool {
         ToolKind::Navigate => ViewerTool::Navigate,
         ToolKind::Inspect => ViewerTool::Inspect,
@@ -916,6 +859,8 @@ impl eframe::App for MiranteWorkbenchApp {
         let mut rerender_requested = false;
         let mut texture_refresh_requested = false;
         let mut application_commands = Vec::new();
+        let mut native_actions = Vec::new();
+        let mut presentation_paints = Vec::new();
         let import_snapshot = application_snapshot.import_workflow();
         let import_active = matches!(import_snapshot, ImportWorkflowSnapshot::Importing(_));
         let dataset_open_active = application_snapshot
@@ -1011,13 +956,13 @@ impl eframe::App for MiranteWorkbenchApp {
                     )
                     .clicked()
                     {
-                        self.open_native_from_dialog(ui.ctx());
+                        native_actions.push(NativeWorkbenchAction::OpenDatasetDialog);
                     }
                     if ui_kit::toolbar_button(ui, "New Project", !workflow_busy && can_new_project)
                         .on_hover_text("Start an unsaved project for the verified dataset")
                         .clicked()
                     {
-                        self.new_current_project();
+                        native_actions.push(NativeWorkbenchAction::NewProject);
                     }
                     if ui_kit::toolbar_button(
                         ui,
@@ -1027,7 +972,7 @@ impl eframe::App for MiranteWorkbenchApp {
                     .on_hover_text("Requires a verified scientific dataset identity")
                     .clicked()
                     {
-                        self.open_session_from_dialog(ui.ctx());
+                        native_actions.push(NativeWorkbenchAction::OpenProjectDialog);
                     }
                     if ui_kit::toolbar_button(
                         ui,
@@ -1037,7 +982,7 @@ impl eframe::App for MiranteWorkbenchApp {
                     .on_hover_text("Requires a verified scientific dataset identity")
                     .clicked()
                     {
-                        self.save_current_project();
+                        native_actions.push(NativeWorkbenchAction::SaveProject);
                     }
                     if ui_kit::toolbar_button(
                         ui,
@@ -1047,7 +992,7 @@ impl eframe::App for MiranteWorkbenchApp {
                     .on_hover_text("Save a new project identity with exact fork provenance")
                     .clicked()
                     {
-                        self.save_current_project_as();
+                        native_actions.push(NativeWorkbenchAction::SaveProjectAs);
                     }
                     if ui_kit::toolbar_button(
                         ui,
@@ -1062,19 +1007,19 @@ impl eframe::App for MiranteWorkbenchApp {
                     .on_hover_text("List validated autosave and manual recovery branches")
                     .clicked()
                     {
-                        self.open_project_recovery_panel();
+                        native_actions.push(NativeWorkbenchAction::OpenProjectRecovery);
                     }
                     if ui_kit::toolbar_button(ui, "Import Dir", !workflow_busy)
                         .on_hover_text("Import TIFF directory")
                         .clicked()
                     {
-                        self.import_tiff_directory_from_dialog(ui.ctx());
+                        native_actions.push(NativeWorkbenchAction::ImportTiffDirectoryDialog);
                     }
                     if ui_kit::toolbar_button(ui, "Import File", !workflow_busy)
                         .on_hover_text("Import TIFF file")
                         .clicked()
                     {
-                        self.import_tiff_file_from_dialog(ui.ctx());
+                        native_actions.push(NativeWorkbenchAction::ImportTiffFileDialog);
                     }
                     if import_active {
                         let cancellation_pending = matches!(
@@ -1795,22 +1740,7 @@ impl eframe::App for MiranteWorkbenchApp {
                             )
                             .clicked()
                             {
-                                match export_selected_analysis_table(
-                                    &mut self.analysis_runtime,
-                                    AnalysisTableExportInput {
-                                        table_descriptors: transient.analysis_tables(),
-                                        selected_table: transient.selected_analysis_table(),
-                                    },
-                                ) {
-                                    Ok(_) => {
-                                        if let Some(csv) = self.analysis_runtime.last_export_csv() {
-                                            ui.ctx().copy_text(csv.to_owned());
-                                        }
-                                    }
-                                    Err(error) => {
-                                        tracing::warn!(%error, "analysis table export rejected");
-                                    }
-                                }
+                                native_actions.push(NativeWorkbenchAction::CopySelectedAnalysisCsv);
                             }
                         });
                         let layer_shape = snapshot
@@ -2230,16 +2160,16 @@ impl eframe::App for MiranteWorkbenchApp {
                 });
             });
 
+        let mut viewer_output = WorkbenchUiOutput::default();
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            self.show_viewer_layout(
-                ui,
-                &application_snapshot,
-                view,
-                &mut application_commands,
-                &mut rerender_requested,
-                &mut texture_refresh_requested,
-            );
+            self.show_viewer_layout(ui, &application_snapshot, view, &mut viewer_output);
         });
+        application_commands.append(&mut viewer_output.application_commands);
+        import_commands.append(&mut viewer_output.import_commands);
+        native_actions.append(&mut viewer_output.native_actions);
+        presentation_paints.append(&mut viewer_output.presentation_paints);
+        rerender_requested |= viewer_output.rerender_requested;
+        texture_refresh_requested |= viewer_output.texture_refresh_requested;
 
         let snapshot = self.application.snapshot();
         let transient = snapshot.transient();
@@ -2265,34 +2195,17 @@ impl eframe::App for MiranteWorkbenchApp {
         self.show_project_recovery_ui(ui.ctx());
         self.show_dirty_project_close_prompt(ui.ctx());
         let ui_build_ms = duration_ms(ui_build_started.elapsed());
-
-        let command_apply_started = Instant::now();
-        for command in application_commands {
-            if let Err(fault) = self.apply_application_command(command, ui.ctx()) {
-                tracing::warn!(?fault, "UI application command rejected");
-            }
-        }
-        let accepted_snapshot = self.application.snapshot();
-        let accepted_tool = viewer_tool_for_kind(accepted_snapshot.transient().active_tool());
-        if self.egui_ui.viewer_tools.active_tool != accepted_tool {
-            self.egui_ui.viewer_tools.set_active_tool(accepted_tool);
-        }
-        let command_apply_ms = duration_ms(command_apply_started.elapsed());
-
-        let display_refresh_trigger_started = Instant::now();
-        rerender_requested |= self.render_coordination.take_refresh_request();
-        if rerender_requested {
-            self.refresh_frame(ui.ctx());
-        } else if texture_refresh_requested {
-            self.refresh_texture_only(ui.ctx());
-        }
-        let display_refresh_trigger_ms = duration_ms(display_refresh_trigger_started.elapsed());
-
-        let import_action_started = Instant::now();
-        for command in import_commands {
-            self.apply_import_command(command, ui.ctx());
-        }
-        let import_action_ms = duration_ms(import_action_started.elapsed());
+        let apply_timing = self.apply_workbench_ui_output(
+            ui,
+            WorkbenchUiOutput {
+                application_commands,
+                import_commands,
+                native_actions,
+                presentation_paints,
+                rerender_requested,
+                texture_refresh_requested,
+            },
+        );
 
         let brick_result_drain_started = Instant::now();
         self.drain_brick_results(ui.ctx());
@@ -2339,9 +2252,9 @@ impl eframe::App for MiranteWorkbenchApp {
                 playback_ms,
                 ui_build_ms,
                 histogram_ui_ms,
-                command_apply_ms,
-                display_refresh_trigger_ms,
-                import_action_ms,
+                command_apply_ms: apply_timing.command_apply_ms,
+                display_refresh_trigger_ms: apply_timing.display_refresh_trigger_ms,
+                import_action_ms: apply_timing.import_action_ms,
                 brick_result_drain_ms,
                 background_repaint_request_ms,
             },

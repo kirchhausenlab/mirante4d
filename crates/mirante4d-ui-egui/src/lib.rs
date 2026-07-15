@@ -6,8 +6,8 @@ use std::{fmt::Display, hash::Hash};
 
 use eframe::egui::{self, Color32, RichText};
 use mirante4d_application::{
-    ApplicationEvent, OperationOutcome, PresentationPaintRequest, PresentationSlot,
-    PresentationSurface,
+    ApplicationCommand, ApplicationEvent, OperationOutcome, PresentationPaintRequest,
+    PresentationSlot, PresentationSurface,
     import_workflow::{
         ImportCommand, ImportProgressSnapshot, ImportReviewDraft, ImportReviewId,
         ImportReviewSnapshot, ImportSourceDtype, ImportSourceLayout, ImportWorkflowSnapshot,
@@ -180,6 +180,39 @@ pub struct EguiPresentationPaint {
     slot: PresentationSlot,
     request: PresentationPaintRequest,
     rect: egui::Rect,
+}
+
+/// Native shell work requested by a workbench widget.
+///
+/// These actions contain no filesystem paths, service handles, or backend
+/// resources. The process composition root performs the native dialog or
+/// clipboard operation after egui has finished building the workbench.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeWorkbenchAction {
+    OpenDatasetDialog,
+    NewProject,
+    OpenProjectDialog,
+    SaveProject,
+    SaveProjectAs,
+    OpenProjectRecovery,
+    ImportTiffDirectoryDialog,
+    ImportTiffFileDialog,
+    CopySelectedAnalysisCsv,
+}
+
+/// Typed results emitted while egui builds one visible workbench frame.
+///
+/// Commands retain their existing post-build batching behavior. Native shell
+/// actions and backend-neutral paint requests are likewise resolved only by
+/// the process composition root.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct WorkbenchUiOutput {
+    pub application_commands: Vec<ApplicationCommand>,
+    pub import_commands: Vec<ImportCommand>,
+    pub native_actions: Vec<NativeWorkbenchAction>,
+    pub presentation_paints: Vec<EguiPresentationPaint>,
+    pub rerender_requested: bool,
+    pub texture_refresh_requested: bool,
 }
 
 impl EguiPresentationPaint {
@@ -935,6 +968,37 @@ mod tests {
         assert!(!state.analysis_workspace_open);
         assert!(state.import_review.is_none());
         assert!(!state.import_checkpoint_reset_confirmed);
+    }
+
+    #[test]
+    fn workbench_output_contains_only_typed_ui_results() {
+        let output = WorkbenchUiOutput {
+            application_commands: vec![ApplicationCommand::SetPlaybackActive(true)],
+            import_commands: vec![ImportCommand::CancelImport],
+            native_actions: vec![
+                NativeWorkbenchAction::OpenDatasetDialog,
+                NativeWorkbenchAction::CopySelectedAnalysisCsv,
+            ],
+            presentation_paints: Vec::new(),
+            rerender_requested: true,
+            texture_refresh_requested: false,
+        };
+
+        assert_eq!(
+            output.application_commands,
+            vec![ApplicationCommand::SetPlaybackActive(true)]
+        );
+        assert_eq!(output.import_commands, vec![ImportCommand::CancelImport]);
+        assert_eq!(
+            output.native_actions,
+            vec![
+                NativeWorkbenchAction::OpenDatasetDialog,
+                NativeWorkbenchAction::CopySelectedAnalysisCsv,
+            ]
+        );
+        assert!(output.presentation_paints.is_empty());
+        assert!(output.rerender_requested);
+        assert!(!output.texture_refresh_requested);
     }
     use mirante4d_application::{PresentationSurface, PresentationViewport};
 
