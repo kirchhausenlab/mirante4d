@@ -1796,7 +1796,9 @@ impl eframe::App for MiranteWorkbenchApp {
                         );
                         application_commands.extend(commands);
                     });
-                    ui_kit::section(ui, "Settings", |ui| self.show_settings_body(ui));
+                    ui_kit::section(ui, "Settings", |ui| {
+                        self.show_settings_body(ui, &mut actions);
+                    });
                     egui::CollapsingHeader::new("Runtime Diagnostics")
                         .default_open(false)
                         .show(ui, |ui| self.show_runtime_diagnostics_body(ui));

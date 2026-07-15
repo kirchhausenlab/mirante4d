@@ -213,6 +213,9 @@ pub enum WorkbenchUiAction {
     CancelAnalysis,
     SetAnalysisRoi { origin: [u64; 3], shape: [u64; 3] },
     StartAnalysis(WorkbenchAnalysisKind),
+    SaveSettings(ResourcePolicyDraft),
+    ReplaceRejectedSettings(ResourcePolicyDraft),
+    UseRecommendedSettings,
 }
 
 /// One validated viewport measurement observed while egui lays out a panel.
@@ -1064,6 +1067,15 @@ mod tests {
                     shape: [4, 5, 6],
                 },
                 WorkbenchUiAction::StartAnalysis(WorkbenchAnalysisKind::CurrentTimepointBox),
+                WorkbenchUiAction::SaveSettings(ResourcePolicyDraft {
+                    cpu_dataset_budget_bytes: 256,
+                    gpu_budget_bytes: 128,
+                }),
+                WorkbenchUiAction::ReplaceRejectedSettings(ResourcePolicyDraft {
+                    cpu_dataset_budget_bytes: 512,
+                    gpu_budget_bytes: 256,
+                }),
+                WorkbenchUiAction::UseRecommendedSettings,
             ],
             viewport_observations: Vec::new(),
             render_requests: Vec::new(),
@@ -1088,6 +1100,15 @@ mod tests {
                     shape: [4, 5, 6],
                 },
                 WorkbenchUiAction::StartAnalysis(WorkbenchAnalysisKind::CurrentTimepointBox),
+                WorkbenchUiAction::SaveSettings(ResourcePolicyDraft {
+                    cpu_dataset_budget_bytes: 256,
+                    gpu_budget_bytes: 128,
+                }),
+                WorkbenchUiAction::ReplaceRejectedSettings(ResourcePolicyDraft {
+                    cpu_dataset_budget_bytes: 512,
+                    gpu_budget_bytes: 256,
+                }),
+                WorkbenchUiAction::UseRecommendedSettings,
             ]
         );
         assert!(output.presentation_paints.is_empty());

@@ -630,7 +630,7 @@ impl MiranteWorkbenchApp {
         runtime_diagnostics_panel::diagnostics_summary_text(self)
     }
 
-    fn show_settings_body(&mut self, ui: &mut egui::Ui) {
+    fn show_settings_body(&mut self, ui: &mut egui::Ui, actions: &mut Vec<WorkbenchUiAction>) {
         let mut cpu_dataset_mib =
             bytes_to_mib_rounded(self.egui_ui.settings_runtime_draft.cpu_dataset_budget_bytes);
         if ui
@@ -664,37 +664,26 @@ impl MiranteWorkbenchApp {
         }
         ui_kit::property_row(ui, "GPU MiB", gpu_mib.to_string());
 
-        let policy = ResourcePolicy::new(
+        let draft = self.egui_ui.settings_runtime_draft;
+        let policy_valid = ResourcePolicy::new(
             self.egui_ui.settings_runtime_draft.cpu_dataset_budget_bytes,
             self.egui_ui.settings_runtime_draft.gpu_budget_bytes,
         )
-        .ok();
+        .is_ok();
         let pending = self.settings_connection.pending().is_some();
         ui.horizontal(|ui| {
-            if ui_kit::toolbar_button(ui, "Save Settings", policy.is_some() && !pending).clicked()
-                && let Some(policy) = policy
-            {
-                self.request_resource_policy_change(policy, RejectedFileDisposition::Preserve);
+            if ui_kit::toolbar_button(ui, "Save Settings", policy_valid && !pending).clicked() {
+                actions.push(WorkbenchUiAction::SaveSettings(draft));
             }
-            if ui_kit::toolbar_button(ui, "Recommended", !pending).clicked()
-                && let Ok(policy) = recommended_for_current_system(None)
-            {
-                self.egui_ui.settings_runtime_draft = ui_kit::ResourcePolicyDraft {
-                    cpu_dataset_budget_bytes: policy.cpu_dataset_budget_bytes(),
-                    gpu_budget_bytes: policy.gpu_budget_bytes(),
-                };
+            if ui_kit::toolbar_button(ui, "Recommended", !pending).clicked() {
+                actions.push(WorkbenchUiAction::UseRecommendedSettings);
             }
         });
         if self.settings_connection.rejected_file_present()
-            && ui_kit::toolbar_button(
-                ui,
-                "Replace Rejected Settings",
-                policy.is_some() && !pending,
-            )
-            .clicked()
-            && let Some(policy) = policy
+            && ui_kit::toolbar_button(ui, "Replace Rejected Settings", policy_valid && !pending)
+                .clicked()
         {
-            self.request_resource_policy_change(policy, RejectedFileDisposition::ReplaceExplicitly);
+            actions.push(WorkbenchUiAction::ReplaceRejectedSettings(draft));
         }
         ui_kit::property_row(
             ui,
@@ -705,7 +694,7 @@ impl MiranteWorkbenchApp {
                 format!("{:?}", self.settings_connection.startup_status())
             },
         );
-        if policy.is_none() {
+        if !policy_valid {
             ui_kit::status_badge(
                 ui,
                 StatusTone::Error,

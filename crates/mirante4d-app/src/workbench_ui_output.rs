@@ -116,6 +116,50 @@ impl MiranteWorkbenchApp {
                             Some(format!("Analysis could not start: {error}"));
                     }
                 }
+                WorkbenchUiAction::SaveSettings(draft) => {
+                    match ResourcePolicy::new(
+                        draft.cpu_dataset_budget_bytes,
+                        draft.gpu_budget_bytes,
+                    ) {
+                        Ok(policy) => self.request_resource_policy_change(
+                            policy,
+                            RejectedFileDisposition::Preserve,
+                        ),
+                        Err(error) => tracing::warn!(
+                            ?error,
+                            "valid settings draft was rejected after widget construction"
+                        ),
+                    }
+                }
+                WorkbenchUiAction::ReplaceRejectedSettings(draft) => {
+                    match ResourcePolicy::new(
+                        draft.cpu_dataset_budget_bytes,
+                        draft.gpu_budget_bytes,
+                    ) {
+                        Ok(policy) => self.request_resource_policy_change(
+                            policy,
+                            RejectedFileDisposition::ReplaceExplicitly,
+                        ),
+                        Err(error) => tracing::warn!(
+                            ?error,
+                            "valid settings draft was rejected after widget construction"
+                        ),
+                    }
+                }
+                WorkbenchUiAction::UseRecommendedSettings => {
+                    match recommended_for_current_system(None) {
+                        Ok(policy) => {
+                            self.egui_ui.settings_runtime_draft = ui_kit::ResourcePolicyDraft {
+                                cpu_dataset_budget_bytes: policy.cpu_dataset_budget_bytes(),
+                                gpu_budget_bytes: policy.gpu_budget_bytes(),
+                            };
+                            ui.ctx().request_repaint();
+                        }
+                        Err(error) => {
+                            tracing::warn!(?error, "recommended resource policy is unavailable")
+                        }
+                    }
+                }
             }
         }
 
