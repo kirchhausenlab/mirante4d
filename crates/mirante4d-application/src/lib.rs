@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod analysis_workspace;
+mod histogram;
 pub mod import_workflow;
 mod project_store_service;
 pub mod render_coordination;
@@ -15,6 +16,11 @@ pub mod viewport_interaction;
 
 pub use analysis_workspace::{
     AnalysisPlotSnapshot, AnalysisTableSnapshot, AnalysisWorkspaceSnapshot,
+};
+pub use histogram::{
+    DEFAULT_DVR_OPACITY_GAMMA, HistogramAutoError, HistogramStatus, LayerHistogramSummary,
+    auto_dense_window_from_histogram, auto_dvr_opacity_transfer_from_histogram,
+    auto_signal_window_from_histogram, histogram_can_auto_window,
 };
 pub use mirante4d_analysis_core::{AnalysisPlot, AnalysisTable, IntensityStatistics};
 pub use project_store_service::{

@@ -3,7 +3,7 @@
 use eframe::egui;
 use mirante4d_application::{
     DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind, FrameFidelityStatus,
-    LodDecisionReason, RenderBackend,
+    IsoShadingPolicy, LodDecisionReason, RenderBackend, SamplingPolicy,
 };
 
 use crate::property_row;
@@ -49,6 +49,20 @@ pub fn frame_fidelity_label(fidelity: &FrameFidelityStatus) -> String {
     }
     parts.push(frame_render_time_label(fidelity));
     parts.join(" | ")
+}
+
+pub fn render_sampling_policy_label(policy: SamplingPolicy) -> &'static str {
+    match policy {
+        SamplingPolicy::SmoothLinear => "Smooth linear",
+        SamplingPolicy::VoxelExact => "Voxel exact",
+    }
+}
+
+pub fn iso_shading_policy_label(policy: IsoShadingPolicy) -> &'static str {
+    match policy {
+        IsoShadingPolicy::GradientLighting => "Gradient lighting",
+        IsoShadingPolicy::Flat => "Flat threshold hit",
+    }
 }
 
 fn frame_display_freshness_label(fidelity: &FrameFidelityStatus) -> Option<&'static str> {

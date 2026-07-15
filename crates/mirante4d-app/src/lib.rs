@@ -32,7 +32,6 @@ mod runtime_diagnostics_panel;
 mod semantic_demand;
 mod semantic_tiles;
 mod smoke;
-mod state;
 mod tool_interactions;
 mod transfer_presets;
 mod unified_source_open;
@@ -53,18 +52,13 @@ use cross_section_readout::cross_section_hover_readout_for_panel_point;
 pub use diagnostics::{StartupDiagnostics, collect_startup_diagnostics, default_log_path};
 use display_refresh::{ViewportDisplayImage, duration_ms};
 use eframe::egui;
-use fidelity::{composite_fidelity_label, iso_shading_policy_label, render_sampling_policy_label};
-use histogram::{
-    active_layer_histogram_summary, auto_dense_window_from_histogram,
-    auto_dvr_opacity_transfer_from_histogram, auto_signal_window_from_histogram,
-    histogram_bins_label, histogram_can_auto_window, histogram_status_label,
-};
+use fidelity::composite_fidelity_label;
+use histogram::active_layer_histogram_summary;
 #[cfg(test)]
 use import_worker_service::ImportWorkerStatus;
 use import_worker_service::{ImportWorkerCompletion, ImportWorkerOutcome};
 use import_workflow::{ImportWorkflow, reset_checkpoint_directory, tiff_destination};
-#[cfg(test)]
-use mirante4d_application::stepped_timepoint;
+use mirante4d_application::LayerHistogramSummary;
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, ApplicationFault, ApplicationFaultCode,
     ApplicationSnapshot, ApplicationState, CommandEffect, DisplayRefreshPath, DisplayRefreshTiming,
@@ -73,7 +67,7 @@ use mirante4d_application::{
     ProjectStoreApplicationService, ProjectStoreLifecycle, ProjectStoreServiceEvent,
     RenderCoordinationState, ResidentRenderFailureStatus, SourceSessionGeneration,
     SourceVerificationSnapshot, SystemMonotonicClock, WorkspaceSnapshot,
-    import_workflow::{ImportCommand, ImportReviewId, ImportWorkflowSnapshot},
+    import_workflow::{ImportCommand, ImportReviewId},
     viewer_tools::{ViewerTool, ViewerToolState},
     viewport_interaction::default_camera_for_shape,
 };
@@ -82,19 +76,19 @@ pub use mirante4d_application::{
     CrossSectionPanelScheduleStatus, DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind,
     FrameFidelityStatus, LodDecisionReason, RenderBackend,
 };
-use mirante4d_dataset::{DatasetSourceId, ResourceValidity};
-use mirante4d_domain::{
-    DisplayWindow, DvrOpacityTransfer as CanonicalDvrOpacityTransfer, IsoLightState,
-    IsoShadingPolicy, LayerTransfer, RenderState as CanonicalRenderState, RgbColor, SamplingPolicy,
-    ScaleLevel, TRANSFER_GAMMA_MAX, TRANSFER_GAMMA_MIN, TransferCurve,
-    ViewerLayout as CanonicalViewerLayout,
+#[cfg(test)]
+use mirante4d_application::{
+    HistogramStatus, auto_dense_window_from_histogram, auto_signal_window_from_histogram,
+    histogram_can_auto_window, import_workflow::ImportWorkflowSnapshot, stepped_timepoint,
 };
+use mirante4d_dataset::{DatasetSourceId, ResourceValidity};
 #[cfg(test)]
 use mirante4d_domain::{IntensityDType, Shape3D, TimeIndex};
+use mirante4d_domain::{ScaleLevel, ViewerLayout as CanonicalViewerLayout};
 #[cfg(test)]
 use mirante4d_import_pipeline::ImportCancellation;
 use mirante4d_import_pipeline::{ImportError, ImportOptions, ImportReceipt, TiffSource};
-use mirante4d_project_model::{LayerViewState, ProjectId, ProjectRevisionId, ViewState};
+use mirante4d_project_model::{ProjectId, ProjectRevisionId, ViewState};
 use mirante4d_project_store::{
     ProjectGenerationId, ProjectOpenMode, ProjectRecoveryCandidate, ProjectStoreConfig,
     ProjectStoreFault, ProjectStorePath, ProjectStoreRequestId,
@@ -106,20 +100,15 @@ use mirante4d_ui_egui as ui_kit;
 use product_automation::{ProductAutomationAppUpdateTiming, ProductAutomationController};
 use render_state::set_render_viewport;
 pub use smoke::{AppSmokeOptions, AppSmokeReport, PlaybackSmokeFrame, run_headless_smoke};
-pub use state::{HistogramStatus, LayerHistogramSummary};
 use tool_interactions::apply_viewport_tool_response;
-use transfer_presets::{
-    built_in_transfer_preset_curve, built_in_transfer_preset_label, built_in_transfer_presets,
-};
-#[cfg(test)]
-use ui_kit::playback_status_label;
 use ui_kit::{
     CrossSectionReadoutRequest, DirtyProjectCloseView, DirtyProjectSaveAction,
-    ProjectRecoveryCandidateView, ProjectRecoveryView, RenderUiRequest, StatusTone,
-    ViewportObservation, WorkbenchAnalysisKind, WorkbenchLayoutSpec, WorkbenchUiAction,
-    WorkbenchUiOutput, show_analysis_workspace, show_analysis_workspace_window,
-    show_dirty_project_close_prompt, show_project_recovery_ui, show_runtime_diagnostics_body,
+    ProjectRecoveryCandidateView, ProjectRecoveryView, RenderUiRequest, ViewportObservation,
+    WorkbenchAnalysisKind, WorkbenchLayoutSpec, WorkbenchUiAction, WorkbenchUiOutput,
+    show_analysis_workspace_window, show_dirty_project_close_prompt, show_project_recovery_ui,
 };
+#[cfg(test)]
+use ui_kit::{histogram_bins_label, playback_status_label};
 use viewport::{
     fit_size, presentation_viewport_for_display_size, render_viewport_for_display_size,
     viewport_hover_from_response, viewport_interaction_commands,
@@ -133,7 +122,6 @@ const BACKGROUND_WORK_REPAINT_INTERVAL: Duration = Duration::from_millis(50);
 pub(crate) const CROSS_SECTION_INTERACTION_SETTLE_DURATION: Duration = Duration::from_millis(120);
 const DVR_DENSITY_SCALE_MIN: f64 = 0.1;
 const DVR_DENSITY_SCALE_MAX: f64 = 64.0;
-const DEFAULT_DVR_OPACITY_GAMMA: f32 = 0.25;
 const CROSS_SECTION_FAST_SLICE_MULTIPLIER: f64 = 10.0;
 const CROSS_SECTION_ROTATE_RADIANS_PER_POINT: f64 = 0.005;
 const PROJECT_RECOVERY_ROOT_ENTRIES_MAX: usize = 64;

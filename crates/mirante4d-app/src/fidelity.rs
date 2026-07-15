@@ -1,6 +1,5 @@
 use crate::{RenderCoordinationState, application_view, display_graph::DisplayGraph, ui_kit};
 use mirante4d_application::ApplicationSnapshot;
-use mirante4d_domain::{IsoShadingPolicy, SamplingPolicy};
 
 pub(crate) fn composite_fidelity_label(
     snapshot: &ApplicationSnapshot,
@@ -18,21 +17,7 @@ pub(crate) fn composite_fidelity_label(
             .expect("application view contains its active layer")
             .render_state()
             .sampling_policy();
-        label.push_str(render_sampling_policy_label(sampling));
+        label.push_str(ui_kit::render_sampling_policy_label(sampling));
     }
     label
-}
-
-pub(crate) fn render_sampling_policy_label(policy: SamplingPolicy) -> &'static str {
-    match policy {
-        SamplingPolicy::SmoothLinear => "Smooth linear",
-        SamplingPolicy::VoxelExact => "Voxel exact",
-    }
-}
-
-pub(crate) fn iso_shading_policy_label(policy: IsoShadingPolicy) -> &'static str {
-    match policy {
-        IsoShadingPolicy::GradientLighting => "Gradient lighting",
-        IsoShadingPolicy::Flat => "Flat threshold hit",
-    }
 }

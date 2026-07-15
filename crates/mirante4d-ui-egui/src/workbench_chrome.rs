@@ -1,9 +1,9 @@
 use eframe::egui;
 use mirante4d_application::{
-    ApplicationCommand, ApplicationSnapshot, CameraView, CrossSectionView, DvrOpacityTransfer,
-    IsoShadingPolicy, LayerViewState, PresentationViewport, Projection, RenderMode, RenderState,
-    SamplingPolicy, SourceVerificationSnapshot, TimeIndex, TransferCurve, ViewerLayout,
-    channel_preset_from_view,
+    ApplicationCommand, ApplicationSnapshot, CameraView, CrossSectionView,
+    DEFAULT_DVR_OPACITY_GAMMA, DvrOpacityTransfer, IsoShadingPolicy, LayerViewState,
+    PresentationViewport, Projection, RenderMode, RenderState, SamplingPolicy,
+    SourceVerificationSnapshot, TimeIndex, TransferCurve, ViewerLayout, channel_preset_from_view,
     import_workflow::{ImportCommand, ImportWorkflowSnapshot},
     next_user_channel_preset_id, stepped_timepoint,
     viewport_interaction::{fit_active_layer_camera, reset_active_layer_view},
@@ -17,8 +17,6 @@ use crate::{
 
 const DEFAULT_ISO_DISPLAY_LEVEL: f32 = 0.5;
 const DEFAULT_DVR_DENSITY_SCALE: f64 = 12.0;
-const DEFAULT_DVR_OPACITY_GAMMA: f32 = 0.25;
-
 #[derive(Debug, Clone, Copy)]
 pub struct ProjectControlsView<'a> {
     pub status_message: Option<&'a str>,

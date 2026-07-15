@@ -4,46 +4,6 @@ use mirante4d_project_model::{
     ChannelPreset, ChannelPresetEntry, ChannelPresetId, ProjectModelError, ViewState,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BuiltInTransferPreset {
-    Linear,
-    BrightGamma,
-    HighContrast,
-}
-
-#[cfg(test)]
-pub(crate) fn built_in_transfer_preset_id(preset: BuiltInTransferPreset) -> &'static str {
-    match preset {
-        BuiltInTransferPreset::Linear => "linear",
-        BuiltInTransferPreset::BrightGamma => "bright_gamma",
-        BuiltInTransferPreset::HighContrast => "high_contrast",
-    }
-}
-
-pub(crate) fn built_in_transfer_preset_curve(preset: BuiltInTransferPreset) -> TransferCurve {
-    match preset {
-        BuiltInTransferPreset::Linear => TransferCurve::linear(),
-        BuiltInTransferPreset::BrightGamma => TransferCurve::gamma(2.0).unwrap(),
-        BuiltInTransferPreset::HighContrast => TransferCurve::gamma(0.75).unwrap(),
-    }
-}
-
-pub(crate) fn built_in_transfer_preset_label(preset: BuiltInTransferPreset) -> &'static str {
-    match preset {
-        BuiltInTransferPreset::Linear => "Linear",
-        BuiltInTransferPreset::BrightGamma => "Bright gamma",
-        BuiltInTransferPreset::HighContrast => "High contrast",
-    }
-}
-
-pub(crate) fn built_in_transfer_presets() -> [BuiltInTransferPreset; 3] {
-    [
-        BuiltInTransferPreset::Linear,
-        BuiltInTransferPreset::BrightGamma,
-        BuiltInTransferPreset::HighContrast,
-    ]
-}
-
 pub(crate) fn fluorescence_palette_color(index: usize) -> RgbColor {
     const PALETTE: [[f32; 3]; 8] = [
         [0.00, 0.85, 0.35],
@@ -123,37 +83,4 @@ pub(crate) fn default_channel_presets(
         )?);
     }
     Ok(presets)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn built_in_transfer_presets_have_stable_ids_labels_and_curves() {
-        let presets = built_in_transfer_presets();
-
-        assert_eq!(
-            presets
-                .iter()
-                .map(|preset| built_in_transfer_preset_id(*preset).to_owned())
-                .collect::<Vec<_>>(),
-            vec!["linear", "bright_gamma", "high_contrast"]
-        );
-        assert_eq!(
-            presets
-                .iter()
-                .map(|preset| built_in_transfer_preset_label(*preset))
-                .collect::<Vec<_>>(),
-            vec!["Linear", "Bright gamma", "High contrast"]
-        );
-        assert_eq!(
-            built_in_transfer_preset_curve(BuiltInTransferPreset::Linear),
-            TransferCurve::linear()
-        );
-        assert_eq!(
-            built_in_transfer_preset_curve(BuiltInTransferPreset::BrightGamma),
-            TransferCurve::gamma(2.0).unwrap()
-        );
-    }
 }
