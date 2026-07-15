@@ -1,7 +1,7 @@
 //! Bounded TIFF/OME-TIFF import into the target Mirante4D profile.
 //!
-//! WP-11 built the replacement producer. WP-10C makes this crate the product
-//! owner for source inspection, import execution, and their worker threads.
+//! This crate owns product source inspection, import execution, and their
+//! worker threads.
 
 #![forbid(unsafe_code)]
 

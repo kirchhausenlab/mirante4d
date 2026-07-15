@@ -1,8 +1,7 @@
-//! Off-product progressive WGPU rendering runtime.
+//! Progressive WGPU product-rendering runtime.
 //!
-//! This crate owns successor GPU resources and consumes only semantic dataset
-//! leases and backend-neutral render contracts. It is deliberately unreachable
-//! from the product until the WP-09B cutover.
+//! This crate owns product GPU resources and consumes only semantic dataset
+//! leases and backend-neutral render contracts.
 
 #![forbid(unsafe_code)]
 
