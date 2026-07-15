@@ -6,7 +6,7 @@ mod fidelity;
 
 pub use fidelity::{frame_fidelity_label, show_frame_fidelity_property_rows};
 
-use std::{fmt::Display, hash::Hash};
+use std::{fmt::Display, hash::Hash, time::Duration};
 
 use eframe::egui::{self, Color32, RichText};
 use mirante4d_application::{
@@ -352,6 +352,16 @@ pub struct WorkbenchUiOutput {
     pub presentation_paints: Vec<EguiPresentationPaint>,
     pub rerender_requested: bool,
     pub texture_refresh_requested: bool,
+    pub repaint_after: Option<Duration>,
+}
+
+impl WorkbenchUiOutput {
+    pub fn request_repaint_after(&mut self, delay: Duration) {
+        self.repaint_after = Some(
+            self.repaint_after
+                .map_or(delay, |current| current.min(delay)),
+        );
+    }
 }
 
 impl EguiPresentationPaint {
@@ -1073,6 +1083,10 @@ mod tests {
             [f64::NAN, 0.5],
         )
         .is_none());
+        let mut output = WorkbenchUiOutput::default();
+        output.request_repaint_after(Duration::from_millis(120));
+        output.request_repaint_after(Duration::from_millis(50));
+        assert_eq!(output.repaint_after, Some(Duration::from_millis(50)));
         assert!(
             CrossSectionReadoutRequest::new(CrossSectionPanelId::Xy, presentation, [1.01, 0.5],)
                 .is_none()
@@ -1170,6 +1184,7 @@ mod tests {
             presentation_paints: Vec::new(),
             rerender_requested: true,
             texture_refresh_requested: false,
+            repaint_after: None,
         };
 
         assert_eq!(

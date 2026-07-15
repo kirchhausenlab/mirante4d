@@ -45,6 +45,7 @@ impl MiranteWorkbenchApp {
             presentation_paints,
             mut rerender_requested,
             texture_refresh_requested,
+            repaint_after,
         } = output;
 
         let command_apply_started = Instant::now();
@@ -239,6 +240,9 @@ impl MiranteWorkbenchApp {
                     ui.ctx().copy_text(self.diagnostics_summary_text());
                 }
             }
+        }
+        if let Some(delay) = repaint_after {
+            ui.ctx().request_repaint_after(delay);
         }
 
         if apply_viewport_observations(&mut self.render_coordination, viewport_observations) {

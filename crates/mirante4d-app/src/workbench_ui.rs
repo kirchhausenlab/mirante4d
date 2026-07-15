@@ -456,7 +456,7 @@ impl MiranteWorkbenchApp {
             ) {
                 Ok(commands) if !commands.is_empty() => {
                     output.application_commands.extend(commands);
-                    ctx.request_repaint_after(CROSS_SECTION_INTERACTION_SETTLE_DURATION);
+                    output.request_repaint_after(CROSS_SECTION_INTERACTION_SETTLE_DURATION);
                 }
                 Ok(_) => {}
                 Err(error) => tracing::warn!(%error, "cross-section interaction rejected"),
@@ -867,6 +867,7 @@ impl eframe::App for MiranteWorkbenchApp {
 
         let mut rerender_requested = false;
         let mut texture_refresh_requested = false;
+        let mut repaint_after: Option<Duration> = None;
         let mut application_commands = Vec::new();
         let mut actions = Vec::new();
         let mut viewport_observations = Vec::new();
@@ -2150,6 +2151,13 @@ impl eframe::App for MiranteWorkbenchApp {
         presentation_paints.append(&mut viewer_output.presentation_paints);
         rerender_requested |= viewer_output.rerender_requested;
         texture_refresh_requested |= viewer_output.texture_refresh_requested;
+        if let Some(delay) = viewer_output.repaint_after {
+            if let Some(current) = repaint_after {
+                repaint_after = Some(current.min(delay));
+            } else {
+                repaint_after = Some(delay);
+            }
+        }
 
         let commands =
             show_analysis_workspace_window(ui.ctx(), &analysis_workspace_view, &mut self.egui_ui);
@@ -2175,6 +2183,7 @@ impl eframe::App for MiranteWorkbenchApp {
                 presentation_paints,
                 rerender_requested,
                 texture_refresh_requested,
+                repaint_after,
             },
         );
 
