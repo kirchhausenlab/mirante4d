@@ -1,14 +1,10 @@
 {
   "schema": "mirante4d-wp10a-normative-standards",
   "schema_version": 1,
-  "status": "accepted-off-product",
-  "entry": {
-    "path": "architecture/wp10a-c-authority-entry.json",
-    "sha256": "040dc8c85524d77ee0660c4ae541df9bd5878508c3c1682d6d5158402aef046d"
-  },
+  "status": "active-experimental",
   "validator": {
     "path": "tools/target-fixtures/standards_check.py",
-    "sha256": "59e0167709346ff3be144e02ecebaefa2b1efca3408e832031dec39625f6a2d8"
+    "sha256": "8aa58fc0a53421ce2c5c66c8f73e0eed91d9917bf7694c60f5fc9e0f30cae371"
   },
   "profile_scope": {
     "storage_profile": "m4d-zarr3-local-1.0",

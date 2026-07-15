@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch once and verify the exact offline WP-10A standards artifacts."""
+"""Fetch once and verify the exact offline standards artifacts."""
 
 from __future__ import annotations
 
@@ -49,15 +49,8 @@ def load_manifest(path: Path) -> tuple[dict[str, object], list[dict[str, object]
         raise ValueError("standards manifest must be an object")
     if document.get("schema") != "mirante4d-wp10a-normative-standards":
         raise ValueError("unexpected standards manifest schema")
-    if document.get("schema_version") != 1 or document.get("status") != "accepted-off-product":
-        raise ValueError("standards manifest version or status is not accepted")
-
-    entry = document.get("entry")
-    if not isinstance(entry, dict):
-        raise ValueError("standards manifest entry binding is absent")
-    entry_path = ROOT / str(entry.get("path", ""))
-    if not entry_path.is_file() or sha256_file(entry_path) != entry.get("sha256"):
-        raise ValueError("WP-10A-C entry binding does not match")
+    if document.get("schema_version") != 1 or document.get("status") != "active-experimental":
+        raise ValueError("standards manifest version or status is not active experimental")
 
     sources = document.get("sources")
     if not isinstance(sources, list) or not sources:
@@ -153,7 +146,10 @@ def verify_artifacts(artifacts: list[dict[str, object]]) -> None:
         raise ValueError(f"standards inventory mismatch: missing={missing}, extra={extra}")
     if total_bytes > MAX_ARTIFACT_BYTES:
         raise ValueError("combined standards bytes exceed the fixed bound")
-    print(f"WP-10A standards: {len(expected_paths)} artifacts, {total_bytes} bytes, exact digests passed")
+    print(
+        f"normative standards: {len(expected_paths)} artifacts, "
+        f"{total_bytes} bytes, exact digests passed"
+    )
 
 
 def main() -> None:

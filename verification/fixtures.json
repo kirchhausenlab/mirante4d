@@ -120,7 +120,7 @@
       "publication": "public-safe-synthetic",
       "license": "MIT",
       "path": "fixtures/target/manifest.json",
-      "sha256": "0b2bad3c976b431d83cda1e24fae1ff50524a9865d7c5b260ccfc0a7d84e2321",
+      "sha256": "b413c82e865d6ff6681dcaf8b5b2f11784d961ec59b60b6485cc6f05e5a50e25",
       "validation_command": "python3 tools/target-fixtures/t1/validate.py --manifest fixtures/target/manifest.json --self-test",
       "promotion": {
         "authority": "fixtures/target/manifest.json#/approvals",
