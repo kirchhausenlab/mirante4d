@@ -2,7 +2,7 @@
 
 Status: ACCEPTED AND IMPLEMENTED BY WP-07A
 Accepted: 2026-07-11
-Last reviewed: 2026-07-11
+Last reviewed: 2026-07-15
 Owning package: WP-07A
 Product authority cutover: WP-07B
 
@@ -88,6 +88,3 @@ parsing an identity string is not a T1 conformance claim.
 ## Owning Documents
 
 - [Current Architecture](../ARCHITECTURE.md)
-- [Foundation Refactor Handoff](../plans/active/FOUNDATION_REFACTOR_HANDOFF.md)
-- [Technical Cutover Work Packages](../plans/active/foundation-refactor/TECHNICAL_CUTOVER_WORK_PACKAGES.md)
-- [Workspace Architecture Brief](../plans/active/foundation-refactor/WORKSPACE_ARCHITECTURE_BRIEF.md)

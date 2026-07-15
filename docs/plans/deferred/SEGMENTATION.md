@@ -1,15 +1,15 @@
 # Deferred Derived-Label Capability
 
 Status: DEFERRED
-Last updated: 2026-07-10
+Last updated: 2026-07-15
 
 Mirante4D has no segmentation product, persistence, renderer, or automation
-surface. A previous prototype was removed during WP-02 because its foundation
-was not safe or complete.
+surface. A previous prototype was removed during WP-02 rather than carried
+across the foundation refactor.
 
-Any return must wait until the foundation program is complete and requires a
-separately approved capability plan. That plan should reconsider the design
-from first principles while retaining these scientific lessons:
+Foundation completion does not reactivate segmentation. Any return requires a
+separately approved capability plan that reconsiders the design from first
+principles while retaining these scientific lessons:
 
 - categorical IDs require exact, non-interpolated sampling and an explicit
   background policy;

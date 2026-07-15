@@ -8,11 +8,6 @@ microscopy data.
 Follow the sole read order in the [documentation index](README.md), then read
 the domain document that owns the change.
 
-For foundation work, also read the
-[foundation handoff](plans/active/FOUNDATION_REFACTOR_HANDOFF.md), the current
-work-package contract, its accepted predecessor-bound entry brief, and only the
-technical briefs named by that package.
-
 Authority resolves as follows:
 
 - [Product](PRODUCT.md) owns product scope.
@@ -41,8 +36,8 @@ active authorities as a documentation defect; do not silently choose one.
   silently select dense, CPU, legacy, or alternate product paths.
 - Scientific conformance needs independent expected facts or an independent
   reader. Writer/reader self-agreement is insufficient.
-- Segmentation remains absent throughout the foundation program. Restoring it
-  requires a separately approved post-foundation capability plan.
+- Segmentation remains absent. Restoring it requires a separately approved
+  capability plan.
 - Do not commit secrets, private paths, or unpublished dataset metadata.
 - Hosted verification must cost `$0`: standard public runners only, no paid
   runners, and no public self-hosted workstation.
@@ -59,17 +54,13 @@ implementation.
 
 Before editing:
 
-1. Bind the work to the accepted predecessor and owning package.
-2. Write a short entry brief with outcome, invariants, allowed scope,
-   authority flip and deletions, non-goals, risks, stop conditions, exact
-   evidence, and rollback unit.
-3. Obtain user approval before changing accepted scope, order, architecture,
-   proof class, or replacing the requested outcome with a narrower patch.
-4. Define how the predecessor is deleted and the new authority is proved.
-
-Foundation packages also follow the entry, exit, evidence, commit, and attempt-
-tag contract in the foundation handoff. A cutover is incomplete while its
-predecessor or a hidden alternate path remains.
+1. Write a short, concrete plan naming the outcome, important invariants,
+   scope, authority changes, deletions, risks, and useful checks.
+2. Obtain user approval before materially changing the requested scope,
+   architecture, or evidence class.
+3. For a cutover, define how the predecessor is deleted and how the new
+   authority will be checked. A cutover is incomplete while a hidden alternate
+   path remains.
 
 ## Verification Language
 
@@ -86,5 +77,5 @@ Unit tests, smoke tests, virtual/no-display automation, benchmarks, snapshots,
 and internal readbacks are supporting evidence, not substitutes.
 
 Performance claims must name the workload, hardware, metric, sampling method,
-and threshold. Completion reports must name the revision, commands, fixtures
-or datasets, results, failures, skipped checks, waivers, and remaining risk.
+and threshold. Completion reports should state the meaningful checks and
+results, important skips or waivers, and remaining risk.

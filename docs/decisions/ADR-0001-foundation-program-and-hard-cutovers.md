@@ -1,9 +1,8 @@
 # ADR-0001 — Foundation Program And Hard Cutovers
 
-Status: ACCEPTED TARGET DECISION
+Status: ACCEPTED AND IMPLEMENTED
 Accepted: 2026-07-09
-Last reviewed: 2026-07-11
-Implementation authorization: NONE INDEPENDENT; ACTIVE HANDOFF AND PACKAGE ENTRY ONLY
+Last reviewed: 2026-07-15
 Decision source: OD-001 through OD-008 and PRG-001/002/003/008/015
 
 ## Context
@@ -28,7 +27,7 @@ debris, and requires planning before implementation.
   fallback branches, re-export facades, or dormant feature flags.
 - WP-02 removed the segmentation prototype before the general foundation
   rebuild. Segmentation remains absent and may return only through a separately
-  approved post-foundation capability plan.
+  approved capability plan.
 - Separate planning approval from implementation authorization through PH-00,
   a promoted revision-stamped handoff, entry-stamped package briefs, and
   immutable exit evidence.
@@ -51,14 +50,11 @@ debris, and requires planning before implementation.
 - Current behavior remains authoritative until its owning cutover lands; target
   documentation cannot pretend implementation already exists.
 - User data is never deleted merely because application support is removed.
-- A failed cutover reopens its owning package instead of becoming WP-15 cleanup
-  debt.
+- A failed cutover reopens its owning change instead of becoming lingering
+  cleanup debt.
 
 ## Enforcement
 
-The [foundation implementation handoff](../plans/active/FOUNDATION_REFACTOR_HANDOFF.md) owns program
-scope, sequencing, and promotion. Exact package contracts live in the
-[entry catalog](../plans/active/foundation-refactor/FOUNDATION_ENTRY_WORK_PACKAGES.md)
-and [technical catalog](../plans/active/foundation-refactor/TECHNICAL_CUTOVER_WORK_PACKAGES.md).
-`docs/CURRENT_STATE.md` remains current-state authority; later cutovers update
-it with the behavior they actually install.
+[Current State](../CURRENT_STATE.md) and
+[Current Architecture](../ARCHITECTURE.md) own the resulting product facts.
+Git history and immutable tags preserve the individual cutover record.

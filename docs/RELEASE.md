@@ -1,7 +1,7 @@
 # Release
 
-Mirante4D has no supported public release. The current packaging path builds a
-local Linux x86_64 release candidate for validation.
+Mirante4D has no supported public release. It has a durable local pre-alpha
+Linux x86_64 packaging path for maintainer and research use.
 
 ## Build
 
@@ -35,8 +35,9 @@ Application logs default to
 `$XDG_STATE_HOME/mirante4d/mirante4d.log` or
 `~/.local/state/mirante4d/mirante4d.log`.
 
-WP-14 validates this local package path. It does not create a supported public
-release or change the platform boundary above.
+The package path has passed the promoted small-fixture checks at 1280x720 and
+1920x1080. That does not create a supported public release or broaden the
+platform boundary above.
 
 After packaging, run the existing small-fixture viewer check against the
 unpacked packaged executable:

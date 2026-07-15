@@ -1,17 +1,13 @@
 # Mirante4D Open Data — Deferred Follow-On Plan
 
 Status: DEFERRED under D-021
-Program version: 0.21 (deferred scope split under D-021)
-Last updated: 2026-07-10
-Implementation authorization: NO
+Last updated: 2026-07-15
 Scope source: D-021
-Parent boundary: `docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md`
-Entry gate: accepted technical foundation plus separate explicit owner approval
-Intended successor: `docs/plans/active/OPEN_DATA_RELEASE_HANDOFF.md`
+Entry gate: separate explicit owner approval for a concrete data-release effort
 
-This plan is outside the foundation implementation handoff. It cannot block
-technical-foundation or public-source completion, and it authorizes no dataset
-selection, upload, DOI, visibility, or release action.
+This plan is separate from ordinary software development. Foundation
+completion authorizes no dataset selection, upload, DOI, visibility, or
+release action.
 
 ## Deferred Public Data Release Contract
 
@@ -19,10 +15,9 @@ Status: FOLLOW-ON ONLY under resolved D-021.
 
 Public code does not automatically authorize public data. Each dataset release
 must pass a separate data-release gate in a separately approved follow-on
-handoff. The foundation handoff must make the format, importer, provenance,
-identity, validation, and small-fixture contracts capable of supporting that
-future release, but it must not select/upload full release candidates or wait on
-hosting, DOI, or dataset-specific release approval.
+plan. The current format, importer, provenance, identity, validation, and
+small-fixture contracts are prerequisites for a future release, but they do
+not select or authorize a release candidate.
 
 SpatialDINO's already public S3 objects are the first candidate inventory for
 the follow-on. WP-13A must map exact object/release identities to ownership,
@@ -86,15 +81,14 @@ Every public dataset release must include:
 - Which approved D-008 regeneration/conversion remedy and deprecation metadata
   accompany any future incompatible stable-major cutover.
 
-These decisions do not block foundation-hand-off approval or public source
-release. No public-data upload should begin until a separate follow-on is
-approved, these decisions are resolved, and the release candidate can be
-reproduced and validated from a clean environment.
+These decisions do not block ordinary source or software development. No
+public-data upload should begin until a separate release effort is approved,
+these decisions are resolved, and the release candidate can be reproduced and
+validated from a clean environment.
 
 ### WP-13A — Public Data Registry And Staged Release Candidates
 
-Status: DEFERRED FOLLOW-ON — excluded from the foundation implementation
-handoff by resolved D-021.
+Status: DEFERRED; foundation completion does not authorize this work.
 
 Goal: prepare rights-cleared staged datasets and reproducible Mirante4D
 derivatives for a versioned scientific release without claiming candidate
@@ -131,17 +125,17 @@ Exit proof:
 
 ### WP-13V — Candidate-Specific Public-Data Acceptance
 
-Status: DEFERRED FOLLOW-ON — excluded from the foundation implementation
-handoff by resolved D-021.
+Status: DEFERRED; foundation completion does not authorize this work.
 
-Goal: bind the exact immutable WP-13A candidate to the completed technical
-foundation and release evidence before any irreversible upload/DOI action.
+Goal: bind the exact immutable WP-13A candidate to the current product and
+release evidence before any irreversible upload/DOI action.
 
 Required work and exit proof:
 
 - Re-run every follow-on-approved public-data reproducibility, integrity, format,
   import, render, analysis-if-in-scope, performance-if-claimed, package, and
-  product-open gate against the exact candidate digest after WP-15 passes.
+  product-open gate against the exact candidate digest and then-current
+  accepted Mirante4D revision.
 - Produce a signed candidate-acceptance evidence-set manifest with the named
   technical, scientific, data-custodian, and rights approvals required for
   candidate acceptance, plus any valid waivers, artifacts, and freshness
@@ -152,8 +146,7 @@ Required work and exit proof:
 
 ### WP-13B — Public Data Publication
 
-Status: DEFERRED FOLLOW-ON — excluded from the foundation implementation
-handoff by resolved D-021.
+Status: DEFERRED; foundation completion does not authorize this work.
 
 Goal: publish only the exact WP-13A candidate digest accepted by WP-13V and the
 required rights/institutional/data-owner approvers.
@@ -163,7 +156,7 @@ Required work:
 - Obtain the named release approvals and verify no embargo, agreement, privacy,
   ethics, export, ownership, or institutional blocker remains.
 - Verify the upload input byte-for-byte matches the WP-13V evidence-set digest;
-  WP-14 or WP-15 evidence alone cannot authorize publication.
+  software or package evidence alone cannot authorize publication.
 - Upload immutable versioned artifacts to the approved archival host/mirror.
 - Assign stable identifiers/DOIs, publish the already accepted candidate
   digests, licenses, citation metadata, release notes, and

@@ -274,5 +274,3 @@ authority. `mirante4d-identity` owns raw typed object facts and exact hashing,
 but no parallel path type.
 The concise live owner/deletion ledger is
 [`architecture/current-state-field-ledger.json`](../architecture/current-state-field-ledger.json).
-Later target ownership is defined by the
-[workspace architecture brief](plans/active/foundation-refactor/WORKSPACE_ARCHITECTURE_BRIEF.md).

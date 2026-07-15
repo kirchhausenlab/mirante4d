@@ -73,7 +73,7 @@ MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
 
 The accepted WP-10B project-store power-cut qualification remains available
 only for future changes to that durability boundary. Do not rerun it for
-unrelated foundation work:
+unrelated work:
 
 ```bash
 MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
@@ -96,8 +96,8 @@ project persistence, not as a recurring acceptance ritual.
 
 - Keep generated packages, private microscopy data, logs, and evidence under
   ignored local paths, never in the repository.
-- Use focused checks while iterating, then run every gate required by the
-  owning work package.
+- Use focused checks while iterating, then run the checks relevant to the
+  affected boundary.
 - Add a dependency only for a clear current need. Run
   `cargo xtask verify-deps`; exact exceptions live only in the
   [exception ledger](DEPENDENCY_EXCEPTIONS.md).

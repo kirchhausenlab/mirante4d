@@ -1,10 +1,10 @@
 # ADR-0005: Use Six Verification Leaves, Two Zero-Cost Checks, And Trusted-Local Evidence
 
-Status: ACCEPTED TARGET DECISION
+Status: ACCEPTED AND IMPLEMENTED
 Date accepted: 2026-07-10
+Last reviewed: 2026-07-15
 Decision IDs: D-022, D-023
-Implementation authorization: NONE INDEPENDENT; ACTIVE HANDOFF AND PACKAGE ENTRY ONLY
-Current-state effect: WP-06 TOPOLOGY ACTIVE; EXACT-REVISION EXIT PENDING
+Current-state effect: SIX-LEAF TOPOLOGY AND TWO ZERO-COST CHECKS ACTIVE
 
 This ADR did not independently authorize a test rewrite, fixture generation,
 hosted run, runner registration, workflow change, branch rule, cache, artifact
@@ -105,8 +105,8 @@ unstable proof green.
   not silently converted into a pass.
 - Flakes and missing assertions remain visible and can block closure; quarantine
   is a repair deadline, not a green status mechanism.
-- Accepted target policy did not validate or replace any predecessor test or
-  report before its owning work package executed.
+- The policy did not validate or replace any predecessor test or report until
+  WP-06 implemented it.
 
 ## Enforcement
 
@@ -134,5 +134,5 @@ unstable proof green.
 
 ## Owning Documents
 
-- [Foundation Refactor Implementation Handoff](../plans/active/FOUNDATION_REFACTOR_HANDOFF.md)
-- [Verification, Evidence, And Performance Brief](../plans/active/foundation-refactor/VERIFICATION_EVIDENCE_BRIEF.md)
+- [Testing](../TESTING.md)
+- [Development](../DEVELOPMENT.md)

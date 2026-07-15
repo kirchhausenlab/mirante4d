@@ -73,5 +73,4 @@ project format remains experimental.
 The active dataset profile does not promise backward compatibility, stable
 public release support, or generic OME-Zarr compatibility. Its frozen technical
 contract and independent target corpus are recorded in
-[`architecture/wp10a-storage-contract.json`](../architecture/wp10a-storage-contract.json)
-and the [foundation handoff](plans/active/FOUNDATION_REFACTOR_HANDOFF.md).
+[`architecture/wp10a-storage-contract.json`](../architecture/wp10a-storage-contract.json).

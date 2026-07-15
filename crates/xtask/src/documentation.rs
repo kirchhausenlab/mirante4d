@@ -175,7 +175,7 @@ fn validate_index(repo_root: &Path, index: &DocumentationIndex) -> anyhow::Resul
             None => bail!("required authority {authority:?} is missing"),
         }
         let expected_scope = if authority == "decisions" {
-            TruthScope::Target
+            TruthScope::Reference
         } else {
             TruthScope::Current
         };
@@ -639,7 +639,7 @@ mod tests {
                 document("docs/RELEASE.md", "current", &["release"], Some(ROOT_INDEX)),
                 document(
                     "docs/decisions/README.md",
-                    "target",
+                    "reference",
                     &["decisions"],
                     Some(ROOT_INDEX),
                 ),

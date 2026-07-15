@@ -1,9 +1,8 @@
 # ADR-0008 — Lightweight Contribution Governance
 
-Status: ACCEPTED TARGET DECISION
+Status: ACCEPTED AND IMPLEMENTED
 Accepted: 2026-07-10
-Last reviewed: 2026-07-11
-Implementation authorization: NONE INDEPENDENT; ACTIVE HANDOFF AND PACKAGE ENTRY ONLY
+Last reviewed: 2026-07-15
 Public contribution intake: OPERATIONAL
 Decision ID: D-003
 Current-state effect: PUBLIC SOURCE POLICY AND REMOTE CONTROLS OPERATIONAL
@@ -68,10 +67,9 @@ contributions.
   accepted.
 - A future CLA, DCO, approval-count, maintainer-role, or inbound-license change
   requires a new owner-approved ADR and prospective policy update.
-- Later governance changes require the normal approved work-package boundary.
+- Later governance changes require a short approved plan and prospective
+  policy update.
 
 ## Owning Documents
 
-- `docs/plans/active/FOUNDATION_REFACTOR_HANDOFF.md`
-- `docs/DEVELOPMENT.md`
-- `docs/plans/active/foundation-refactor/FOUNDATION_ENTRY_WORK_PACKAGES.md`
+- [Development](../DEVELOPMENT.md)
