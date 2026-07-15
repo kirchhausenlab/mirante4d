@@ -1,7 +1,7 @@
 {
   "schema": "mirante4d-verification-fixture-registry",
   "schema_version": 1,
-  "record_count": 11,
+  "record_count": 8,
   "rules": {
     "maximum_records": 64,
     "candidate_output_root": "target/mirante4d/fixture-candidates",
@@ -197,8 +197,8 @@
       },
       "validation_command": "python3 tools/project-store-vm/run.py --self-test",
       "promotion": null,
-      "expiry": "WP-14 review",
-      "deletion_gate": "WP-14 verification hardening",
+      "expiry": null,
+      "deletion_gate": null,
       "target_format_conformance": false
     },
     {
@@ -226,8 +226,8 @@
       },
       "validation_command": "MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 cargo xtask verify-local trusted-gpu",
       "promotion": null,
-      "expiry": "WP-14 review",
-      "deletion_gate": "WP-14 verification hardening",
+      "expiry": null,
+      "deletion_gate": null,
       "target_format_conformance": false
     },
     {
@@ -258,8 +258,8 @@
       },
       "validation_command": "MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 cargo xtask verify-local trusted-gpu",
       "promotion": null,
-      "expiry": "WP-14 review",
-      "deletion_gate": "WP-14 verification hardening",
+      "expiry": null,
+      "deletion_gate": null,
       "target_format_conformance": false
     },
     {
@@ -288,8 +288,8 @@
       },
       "validation_command": "MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 cargo xtask verify-local trusted-gpu",
       "promotion": null,
-      "expiry": "WP-14 review",
-      "deletion_gate": "WP-14 verification hardening",
+      "expiry": null,
+      "deletion_gate": null,
       "target_format_conformance": false
     },
     {
@@ -313,69 +313,9 @@
         "authority": "reviewed-source-change",
         "changed_authority_requires_new_version": true
       },
-      "expiry": "WP-09C review",
+      "expiry": null,
       "deletion_gate": null,
       "target_format_conformance": false
-    },
-    {
-      "id": "T5-QUAL-001",
-      "tier": "T5",
-      "claim_scope": "spatial-extreme-open-navigation-render-resource",
-      "authority_state": "private-resolver-only",
-      "owner": "trusted local qualification",
-      "capability": "trusted-hw2-vulkan",
-      "publication": "internal_lab_data",
-      "validation_command": "private resolver only; never runnable by public policy",
-      "lineages": [],
-      "limits": {
-        "public_paths": 0,
-        "public_digests": 0
-      },
-      "opaque_id": "T5-QUAL-001",
-      "public_identity": "opaque-id-only",
-      "public_path_or_digest": null,
-      "expiry": null,
-      "deletion_gate": null
-    },
-    {
-      "id": "T5-QUAL-002",
-      "tier": "T5",
-      "claim_scope": "temporal-extreme-playback-cancellation-resource",
-      "authority_state": "private-resolver-only",
-      "owner": "trusted local qualification",
-      "capability": "trusted-hw2-vulkan",
-      "publication": "internal_lab_data",
-      "validation_command": "private resolver only; never runnable by public policy",
-      "lineages": [],
-      "limits": {
-        "public_paths": 0,
-        "public_digests": 0
-      },
-      "opaque_id": "T5-QUAL-002",
-      "public_identity": "opaque-id-only",
-      "public_path_or_digest": null,
-      "expiry": null,
-      "deletion_gate": null
-    },
-    {
-      "id": "T5-QUAL-003",
-      "tier": "T5",
-      "claim_scope": "ordinary-multichannel-science-and-hw2-calibration",
-      "authority_state": "private-resolver-only",
-      "owner": "trusted local qualification",
-      "capability": "trusted-hw2-vulkan",
-      "publication": "internal_lab_data",
-      "validation_command": "private resolver only; never runnable by public policy",
-      "lineages": [],
-      "limits": {
-        "public_paths": 0,
-        "public_digests": 0
-      },
-      "opaque_id": "T5-QUAL-003",
-      "public_identity": "opaque-id-only",
-      "public_path_or_digest": null,
-      "expiry": null,
-      "deletion_gate": null
     }
   ]
 }
