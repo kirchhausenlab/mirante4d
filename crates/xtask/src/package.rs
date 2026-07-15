@@ -8,10 +8,9 @@ use anyhow::{Context, bail};
 use serde_json::{Value, json};
 
 use crate::{
-    deps::{CargoMetadata, cargo_metadata},
+    deps::{self, CargoMetadata, cargo_metadata},
     process::{run_cargo, run_command},
     target_fixture::extract_target_u16_fixture,
-    verify,
 };
 
 const DIST_ROOT: &str = "target/mirante4d/dist";
@@ -71,7 +70,7 @@ fn build_linux_release_package() -> anyhow::Result<LinuxReleaseArtifacts> {
     }
 
     let source_identity = require_clean_committed_worktree()?;
-    verify::verify_deps()?;
+    deps::verify_deps()?;
     run_cargo(["build", "--release", "-p", "mirante4d-app"])?;
 
     let metadata = cargo_metadata()?;

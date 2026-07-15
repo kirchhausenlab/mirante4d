@@ -2,9 +2,7 @@ use std::{env, path::Path};
 
 use anyhow::{Context, bail};
 
-use crate::bench::bench_check;
 use crate::command_audit::command_audit;
-use crate::neuroglancer_compare::neuroglancer_compare;
 use crate::product_validate::{is_product_validation_scenario_name, product_validate};
 use crate::smoke::app_smoke;
 use crate::workflow_audit::workflow_audit;
@@ -16,14 +14,12 @@ const PRODUCT_VALIDATE_USAGE: &str = "usage: cargo xtask product-validate [targe
       t5_qual_001_four_panel_continuous_cross_section|t5_qual_002_four_panel_timepoint|t5_qual_002_four_panel_autoplay|custom_script]";
 
 mod arch;
-mod bench;
 mod command_audit;
 mod deps;
 mod dev;
 mod documentation;
 mod host;
 mod ids;
-mod neuroglancer_compare;
 mod package;
 mod process;
 mod product_validate;
@@ -31,7 +27,6 @@ mod reports;
 mod smoke;
 mod target_fixture;
 mod verification;
-mod verify;
 mod workflow_audit;
 
 pub(crate) use ids::stable_id_from_name;
@@ -74,8 +69,7 @@ fn main() -> anyhow::Result<()> {
             }
             verification::verification_sync(option.as_deref() == Some("--check"))
         }
-        "verify-deps" => verify::verify_deps(),
-        "verify-coverage" => verify::verify_coverage(),
+        "verify-deps" => deps::verify_deps(),
         "package-dev" => package::package_dev().map(|path| println!("{}", path.display())),
         "package-linux-release" => {
             package::package_linux_release().map(|path| println!("{}", path.display()))
@@ -99,29 +93,6 @@ fn main() -> anyhow::Result<()> {
                     .map(|path| println!("{}", path.display()))
             }
         },
-        "bench-check" => {
-            let current = args.next().context(
-                "usage: cargo xtask bench-check <current-report.json> <baseline-report.json>",
-            )?;
-            let baseline = args.next().context(
-                "usage: cargo xtask bench-check <current-report.json> <baseline-report.json>",
-            )?;
-            if args.next().is_some() {
-                bail!(
-                    "usage: cargo xtask bench-check <current-report.json> <baseline-report.json>"
-                );
-            }
-            bench_check(Path::new(&current), Path::new(&baseline))
-        }
-        "neuroglancer-compare" => {
-            let manifest = args
-                .next()
-                .context("usage: cargo xtask neuroglancer-compare <comparison-manifest.json>")?;
-            if args.next().is_some() {
-                bail!("usage: cargo xtask neuroglancer-compare <comparison-manifest.json>");
-            }
-            neuroglancer_compare(Path::new(&manifest)).map(|path| println!("{}", path.display()))
-        }
         "workflow-audit" => workflow_audit().map(|path| println!("{}", path.display())),
         "docs-check" => documentation::docs_check(),
         "command-audit" => command_audit().map(|path| println!("{}", path.display())),
@@ -202,13 +173,10 @@ Mirante4D developer tasks
   cargo xtask verify-local <format-lifecycle|project-store-lifecycle|trusted-gpu>
   cargo xtask verification-sync [--check]
   cargo xtask verify-deps
-  cargo xtask verify-coverage
   cargo xtask package-dev
   cargo xtask package-linux-release
   cargo xtask app-smoke <target-package>
   cargo xtask product-validate [target-package] [scenario]
-  cargo xtask bench-check <current-report.json> <baseline-report.json>
-  cargo xtask neuroglancer-compare <comparison-manifest.json>
   cargo xtask workflow-audit
   cargo xtask docs-check
   cargo xtask command-audit

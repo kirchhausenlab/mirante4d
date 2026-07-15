@@ -97,9 +97,8 @@ ledgers separate, validates the exact case facts and per-frame maxima, and
 includes a render after every dataset lease is released. This is off-product
 component evidence, not viewer or performance validation.
 
-No benchmark baseline is currently authoritative. The temporary tool-owned
-[baseline directory](benchmarks/baselines/README.md) remains diagnostic until
-WP-14 owns its final disposition.
+WP-14 makes no performance claim and keeps no benchmark-baseline command or
+repository baseline.
 
 ## Product Validation
 
