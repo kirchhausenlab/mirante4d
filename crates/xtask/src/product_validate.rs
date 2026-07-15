@@ -1314,7 +1314,7 @@ fn target_fixture_camera_smoke_script(package: &Path) -> Value {
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
             { "command": "set_viewport_size", "width": GENERATED_VIEWPORT_WIDTH, "height": GENERATED_VIEWPORT_HEIGHT },
             { "command": "set_render_target_size", "width": GENERATED_VIEWPORT_WIDTH, "height": GENERATED_VIEWPORT_HEIGHT },
-            { "command": "sleep_or_frames", "frames": 3 },
+            { "command": "sleep_frames", "frames": 3 },
             { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30000 },
             { "command": "assert", "condition": "no_render_error" },
             { "command": "set_render_mode", "mode": "mip" },
@@ -1323,7 +1323,7 @@ fn target_fixture_camera_smoke_script(package: &Path) -> Value {
             { "command": "camera_orbit", "yaw_points": 120.0, "pitch_points": 32.0 },
             { "command": "camera_pan", "x_points": 40.0, "y_points": -24.0 },
             { "command": "camera_zoom", "scroll_y_points": -120.0 },
-            { "command": "sleep_or_frames", "frames": 2 },
+            { "command": "sleep_frames", "frames": 2 },
             { "command": "probe_hover", "x_fraction": 0.42, "y_fraction": 0.58 },
             { "command": "capture_screenshot", "name": "post-camera-sequence" },
             { "command": "copy_diagnostics" },
@@ -1349,7 +1349,7 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
             { "command": "set_layer_window", "layer_index": 1, "low": 20000.0, "high": 24096.0 },
             { "command": "set_layer_opacity", "layer_index": 0, "opacity": 1.0 },
             { "command": "set_layer_opacity", "layer_index": 1, "opacity": 1.0 },
-            { "command": "sleep_or_frames", "frames": 3 },
+            { "command": "sleep_frames", "frames": 3 },
             { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30000 },
             { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30000 },
             { "command": "camera_fit_data" },
@@ -1386,7 +1386,7 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
             { "command": "set_render_mode", "mode": "mip" },
             { "command": "set_layer_render_mode", "layer_index": 1, "mode": "mip" },
             { "command": "set_viewer_layout", "layout": "four_panel" },
-            { "command": "sleep_or_frames", "frames": 8 },
+            { "command": "sleep_frames", "frames": 8 },
             { "command": "assert", "condition": { "viewer_layout": { "layout": "four_panel" } } },
             { "command": "assert", "condition": { "cross_section_panel_schedule": {
                 "panel": "xz",
@@ -1400,7 +1400,7 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
             { "command": "assert", "condition": "no_render_error" },
             { "command": "capture_screenshot", "name": "generated-linked-panels" },
             { "command": "set_viewer_layout", "layout": "single3d" },
-            { "command": "sleep_or_frames", "frames": 3 },
+            { "command": "sleep_frames", "frames": 3 },
             { "command": "assert", "condition": "cross_section_retired" },
             { "command": "set_viewport_size", "width": GENERATED_RESIZED_VIEWPORT_WIDTH, "height": GENERATED_RESIZED_VIEWPORT_HEIGHT },
             { "command": "set_render_target_size", "width": GENERATED_RESIZED_VIEWPORT_WIDTH, "height": GENERATED_RESIZED_VIEWPORT_HEIGHT },
@@ -1467,7 +1467,7 @@ fn target_source_verification_script(package: &Path) -> Value {
             { "command": "capture_screenshot", "name": "b3-after-success-1280x720" },
             { "command": "set_viewport_size", "width": B3_SECOND_VIEWPORT_WIDTH, "height": B3_SECOND_VIEWPORT_HEIGHT },
             { "command": "set_render_target_size", "width": B3_SECOND_VIEWPORT_WIDTH, "height": B3_SECOND_VIEWPORT_HEIGHT },
-            { "command": "sleep_or_frames", "frames": 3 },
+            { "command": "sleep_frames", "frames": 3 },
             { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
             { "command": "assert", "condition": "nonblank_frame" },
             { "command": "assert", "condition": { "render_target_pixels": { "width": B3_SECOND_VIEWPORT_WIDTH, "height": B3_SECOND_VIEWPORT_HEIGHT } } },
@@ -2270,12 +2270,6 @@ fn validate_b4_attempt(attempt: &Value, expected_number: u64) -> anyhow::Result<
     {
         bail!("B4 launch {expected_number} app request and external client geometry disagree");
     }
-    if !automation
-        .pointer("/viewport_evidence/observed_client_area_pixels")
-        .is_some_and(Value::is_null)
-    {
-        bail!("B4 app report must not claim the xtask-owned external client observation");
-    }
     qualifying_nonblank_viewport_capture(Some(automation)).map_err(anyhow::Error::msg)?;
     if automation
         .pointer("/project_store_evidence/close_result/status")
@@ -2451,11 +2445,6 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
     } else {
         Value::Null
     };
-    let command_count = report
-        .script_value
-        .get("commands")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
     let requested_window_inner_size_points =
         script_requested_window_inner_size_points_json(report.script_value);
     let pixels_per_point = report
@@ -2474,10 +2463,6 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
         })
         .unwrap_or(Value::Null);
     let render_modes = script_render_modes_json(report.script_value);
-    let frame_wait_count = script_frame_wait_count(report.script_value);
-    let millis_wait_count = script_millis_wait_count(report.script_value);
-    let wait_timeout_ms_total = script_wait_timeout_ms_total(report.script_value);
-    let automation_limits = script_limits_json(report.script_value);
     let max_cpu_total_bytes = script_limit_u64(report.script_value, "max_cpu_total_bytes");
     let cpu_category_byte_limits = json!({
         "decoded_residency": script_limit_u64(report.script_value, "max_cpu_decoded_residency_bytes"),
@@ -2546,26 +2531,14 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
             "automation_script_scenario": automation_script_scenario,
             "automation_script": report.script,
             "automation_status": report.automation_status,
-            "command_count": command_count,
             "requested_window_inner_size_points": requested_window_inner_size_points,
             "pixels_per_point": pixels_per_point,
-            "observed_client_area_pixels": Value::Null,
             "render_target_pixels": render_target_pixels,
             "b3_exact_e1_capture_evidence": b3_e1_capture_evidence,
-            "render_modes": render_modes.clone(),
-            "frame_wait_count": frame_wait_count,
-            "millis_wait_count": millis_wait_count,
-            "wait_timeout_ms_total": wait_timeout_ms_total,
-            "automation_limits": automation_limits.clone(),
+            "render_modes": render_modes,
         },
         "limits": {
             "timeout_secs": report.timeout_secs,
-            "render_modes": render_modes,
-            "command_count": command_count,
-            "frame_wait_count": frame_wait_count,
-            "millis_wait_count": millis_wait_count,
-            "wait_timeout_ms_total": wait_timeout_ms_total,
-            "automation_limits": automation_limits,
             "cpu_total_byte_limit_bytes": max_cpu_total_bytes,
             "cpu_category_byte_limits": cpu_category_byte_limits,
             "runtime_work_limits": runtime_work_limits,
@@ -2604,10 +2577,6 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
         },
         "source_closure_evidence": report.source_closure_evidence,
     })
-}
-
-fn script_limits_json(script: &Value) -> Value {
-    script.get("limits").cloned().unwrap_or_else(|| json!({}))
 }
 
 fn product_validation_dataset_runtime_metrics(automation_report_value: Option<&Value>) -> Value {
@@ -2747,40 +2716,6 @@ fn script_render_modes_json(script: &Value) -> Value {
     } else {
         json!(modes)
     }
-}
-
-fn script_frame_wait_count(script: &Value) -> u64 {
-    script_commands(script).map_or(0, |commands| {
-        commands
-            .iter()
-            .filter(|command| {
-                command.get("command").and_then(Value::as_str) == Some("sleep_or_frames")
-                    && command.get("frames").and_then(Value::as_u64).is_some()
-            })
-            .count() as u64
-    })
-}
-
-fn script_millis_wait_count(script: &Value) -> u64 {
-    script_commands(script).map_or(0, |commands| {
-        commands
-            .iter()
-            .filter(|command| {
-                command.get("command").and_then(Value::as_str) == Some("sleep_or_frames")
-                    && command.get("millis").and_then(Value::as_u64).is_some()
-            })
-            .count() as u64
-    })
-}
-
-fn script_wait_timeout_ms_total(script: &Value) -> u64 {
-    script_commands(script).map_or(0, |commands| {
-        commands
-            .iter()
-            .filter(|command| command.get("command").and_then(Value::as_str) == Some("wait_for"))
-            .filter_map(|command| command.get("timeout_ms").and_then(Value::as_u64))
-            .sum()
-    })
 }
 
 fn script_commands(script: &Value) -> Option<&Vec<Value>> {

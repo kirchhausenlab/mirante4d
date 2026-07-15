@@ -271,7 +271,7 @@ fn automation_script_parses_retained_four_panel_assertions() {
 }
 
 #[test]
-fn automation_script_rejects_removed_model_spellings() {
+fn automation_script_rejects_removed_model_inputs() {
     for command in [
         json!({ "command": "set_viewer_layout", "layout": "single_3d" }),
         json!({
@@ -283,6 +283,20 @@ fn automation_script_rejects_removed_model_spellings() {
             } }
         }),
         json!({ "command": "set_render_mode", "mode": "isosurface" }),
+        json!({ "command": "sleep_or_frames", "frames": 1 }),
+        json!({ "command": "sleep_frames", "millis": 1 }),
+        json!({
+            "command": "camera_orbit",
+            "yaw_points": 1.0,
+            "pitch_points": 1.0,
+            "viewport_height_points": 800.0
+        }),
+        json!({
+            "command": "camera_pan",
+            "x_points": 1.0,
+            "y_points": 1.0,
+            "viewport_height_points": 800.0
+        }),
     ] {
         let script = json!({
             "schema": AUTOMATION_SCRIPT_SCHEMA,

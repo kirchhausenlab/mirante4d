@@ -465,7 +465,7 @@ fn b4_scripts_lock_the_fixed_three_launch_cutover() {
                 .unwrap()
                 .iter()
                 .all(|command| {
-                    command.get("command").and_then(Value::as_str) != Some("sleep_or_frames")
+                    command.get("command").and_then(Value::as_str) != Some("sleep_frames")
                 })
         );
     }
@@ -1247,10 +1247,21 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
         GENERATED_VIEWPORT_WIDTH
     );
     assert_eq!(report["scenario"]["pixels_per_point"], 1.5);
-    assert!(report["scenario"]["observed_client_area_pixels"].is_null());
     assert_eq!(report["scenario"]["render_target_pixels"]["width"], 16);
     assert!(report["scenario"].get("viewport").is_none());
     assert!(report["limits"].get("viewport").is_none());
+    for removed in [
+        "command_count",
+        "observed_client_area_pixels",
+        "frame_wait_count",
+        "millis_wait_count",
+        "wait_timeout_ms_total",
+        "automation_limits",
+    ] {
+        assert!(report["scenario"].get(removed).is_none());
+        assert!(report["limits"].get(removed).is_none());
+    }
+    assert!(report["limits"].get("render_modes").is_none());
     assert_eq!(report["scenario"]["name"], GENERATED_FIXTURE_SCENARIO);
     assert_eq!(
         report["scenario"]["automation_script_scenario"],

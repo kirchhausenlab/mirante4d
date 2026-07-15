@@ -148,7 +148,6 @@ pub(crate) struct ProductAutomationController {
     report_path: PathBuf,
     command_index: usize,
     active_wait_started: Option<Instant>,
-    sleep_started: Option<Instant>,
     sleep_frames_remaining: Option<u32>,
     started_at_epoch_ms: u128,
     started_at: Instant,
@@ -217,7 +216,6 @@ impl ProductAutomationController {
             report_path,
             command_index: 0,
             active_wait_started: None,
-            sleep_started: None,
             sleep_frames_remaining: None,
             started_at_epoch_ms: epoch_ms(),
             started_at: Instant::now(),
@@ -291,7 +289,6 @@ impl ProductAutomationController {
                     details,
                 ));
                 self.active_wait_started = None;
-                self.sleep_started = None;
                 self.sleep_frames_remaining = None;
                 if self.command_index == command_index {
                     self.command_index += 1;
@@ -810,9 +807,8 @@ impl ProductAutomationController {
             ProductAutomationCommand::CameraOrbit {
                 yaw_points,
                 pitch_points,
-                viewport_height_points,
             } => {
-                let viewport_side = viewport_height_points.unwrap_or(800.0);
+                let viewport_side = 800.0;
                 let start = [viewport_side * 0.5, viewport_side * 0.5];
                 let current = [start[0] + *yaw_points, start[1] + *pitch_points];
                 let snapshot = app.application.snapshot();
@@ -825,11 +821,7 @@ impl ProductAutomationController {
                     "pitch_points": pitch_points,
                 })))
             }
-            ProductAutomationCommand::CameraPan {
-                x_points,
-                y_points,
-                viewport_height_points,
-            } => {
+            ProductAutomationCommand::CameraPan { x_points, y_points } => {
                 let snapshot = app.application.snapshot();
                 let camera = pan_camera(
                     *application_view(&snapshot).camera(),
@@ -839,7 +831,6 @@ impl ProductAutomationController {
                 Ok(CommandProgress::Done(json!({
                     "x_points": x_points,
                     "y_points": y_points,
-                    "viewport_height_points": viewport_height_points,
                 })))
             }
             ProductAutomationCommand::CameraZoom { scroll_y_points } => {
@@ -889,22 +880,13 @@ impl ProductAutomationController {
                         .then(|| cross_section_diagnostics_json(app)),
                 })))
             }
-            ProductAutomationCommand::SleepOrFrames { millis, frames } => {
-                if let Some(frames) = frames {
-                    let remaining = self.sleep_frames_remaining.get_or_insert(*frames);
-                    if *remaining == 0 {
-                        return Ok(CommandProgress::Done(json!({ "frames": frames })));
-                    }
-                    *remaining -= 1;
-                    return Ok(CommandProgress::Waiting);
+            ProductAutomationCommand::SleepFrames { frames } => {
+                let remaining = self.sleep_frames_remaining.get_or_insert(*frames);
+                if *remaining == 0 {
+                    return Ok(CommandProgress::Done(json!({ "frames": frames })));
                 }
-                let millis = millis.unwrap_or(0);
-                let started = *self.sleep_started.get_or_insert_with(Instant::now);
-                if started.elapsed() >= Duration::from_millis(millis) {
-                    Ok(CommandProgress::Done(json!({ "millis": millis })))
-                } else {
-                    Ok(CommandProgress::Waiting)
-                }
+                *remaining -= 1;
+                Ok(CommandProgress::Waiting)
             }
             ProductAutomationCommand::Quit => {
                 self.command_index = self.script.commands.len();
@@ -1373,18 +1355,10 @@ impl ProductAutomationController {
             "schema_version": AUTOMATION_SCHEMA_VERSION,
             "status": status,
             "failure_reason": failure_reason,
-            "evidence_level": "E1",
-            "claim_boundary": {
-                "evidence_type": "internal_native_window_product_automation",
-                "source": "instrumented_application_commands_internal_state_and_readback",
-                "closure_authority": "integration_support_only_not_black_box_product_open",
-                "e4_product_open_satisfied": false,
-            },
             "viewport_evidence": {
                 "requested_window_inner_size_points": requested_window_inner_size_points,
                 "requested_mapped_client_pixels": requested_mapped_client_pixels,
                 "pixels_per_point": ctx.pixels_per_point(),
-                "observed_client_area_pixels": Value::Null,
                 "render_target_pixels": render_target_pixels,
             },
             "started_at_epoch_ms": self.started_at_epoch_ms,

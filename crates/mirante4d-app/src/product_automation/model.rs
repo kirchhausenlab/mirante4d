@@ -278,12 +278,10 @@ pub(super) enum ProductAutomationCommand {
     CameraOrbit {
         yaw_points: f32,
         pitch_points: f32,
-        viewport_height_points: Option<f32>,
     },
     CameraPan {
         x_points: f32,
         y_points: f32,
-        viewport_height_points: Option<f32>,
     },
     CameraZoom {
         scroll_y_points: f32,
@@ -299,9 +297,8 @@ pub(super) enum ProductAutomationCommand {
     Assert {
         condition: ProductAutomationAssertCondition,
     },
-    SleepOrFrames {
-        millis: Option<u64>,
-        frames: Option<u32>,
+    SleepFrames {
+        frames: u32,
     },
     Quit,
 }
@@ -339,7 +336,7 @@ impl ProductAutomationCommand {
             Self::CopyDiagnostics => "copy_diagnostics",
             Self::CaptureScreenshot { .. } => "capture_screenshot",
             Self::Assert { .. } => "assert",
-            Self::SleepOrFrames { .. } => "sleep_or_frames",
+            Self::SleepFrames { .. } => "sleep_frames",
             Self::Quit => "quit",
         }
     }
