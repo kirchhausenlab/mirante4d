@@ -9,7 +9,6 @@ use mirante4d_render_api::{
     CameraFrame, DEFAULT_PRESENTATION_VIEWPORT, PresentationViewport, RenderExtent,
 };
 
-use crate::RenderCoordinationState;
 use mirante4d_ui_egui::{EguiUiState, ViewportHover};
 
 const DEFAULT_INITIAL_VIEWPORT_SIDE: u32 = 512;
@@ -219,7 +218,6 @@ fn focal_limit_for_axis(fit_points: f64, max_abs_projected_at_focal_1: f64) -> f
 pub(crate) fn viewport_hover_from_response(
     _snapshot: &ApplicationSnapshot,
     _view: &ViewState,
-    _render: &RenderCoordinationState,
     _response: &egui::Response,
 ) -> Option<ViewportHover> {
     // The current product path retains only a GPU presentation texture.

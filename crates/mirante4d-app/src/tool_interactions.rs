@@ -9,7 +9,7 @@ use mirante4d_application::{
 use mirante4d_domain::RenderMode;
 use mirante4d_ui_egui::{EguiUiState, ViewportHover, ViewportIntensity};
 
-use crate::{FrameCompleteness, RenderCoordinationState, application_view};
+use crate::{FrameCompleteness, application_view};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ToolInteractionOutcome {
@@ -20,12 +20,12 @@ pub(crate) struct ToolInteractionOutcome {
 pub(crate) fn apply_viewport_tool_response(
     snapshot: &ApplicationSnapshot,
     egui_ui: &mut EguiUiState,
-    render: &RenderCoordinationState,
+    frame_completeness: FrameCompleteness,
     response: &egui::Response,
     hover: Option<ViewportHover>,
 ) -> anyhow::Result<ToolInteractionOutcome> {
     let hit = hover
-        .map(|hover| pick_hit_from_viewport_hover(snapshot, render, hover))
+        .map(|hover| pick_hit_from_viewport_hover(snapshot, frame_completeness, hover))
         .transpose()?;
     let mut commands = egui_ui
         .viewer_tools
@@ -67,7 +67,7 @@ pub(crate) fn apply_viewport_tool_response(
 /// World/grid/source fields remain absent instead of being guessed.
 pub(crate) fn pick_hit_from_viewport_hover(
     snapshot: &ApplicationSnapshot,
-    render: &RenderCoordinationState,
+    frame_completeness: FrameCompleteness,
     hover: ViewportHover,
 ) -> anyhow::Result<PickHit> {
     let view = application_view(snapshot);
@@ -93,7 +93,7 @@ pub(crate) fn pick_hit_from_viewport_hover(
             ViewportIntensity::F32(value) => PickValue::IntensityF32(value),
         }),
         policy: pick_policy_for_render_mode(active_layer.render_state().mode()),
-        completeness: pick_completeness_for_frame(render.frame_fidelity.completeness),
+        completeness: pick_completeness_for_frame(frame_completeness),
     })
 }
 

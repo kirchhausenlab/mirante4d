@@ -1,7 +1,7 @@
 use super::*;
 use mirante4d_application::CrossSectionPanelId;
 use mirante4d_domain::{Opacity, ToolKind};
-use mirante4d_render_api::CameraFrame;
+use mirante4d_render_api::{CameraFrame, RenderExtent};
 
 use crate::viewer_layout::{PanelId, cross_section_schedule_status_label};
 
@@ -130,12 +130,105 @@ fn layout_selector(
 const CROSS_SECTION_SCROLL_POINTS_PER_NOTCH: f32 = 120.0;
 const CROSS_SECTION_SCROLL_ZOOM_FACTOR_SCALE: f32 = 0.001;
 
-impl MiranteWorkbenchApp {
-    fn render_viewport_max_side(&self, context_max: usize) -> usize {
-        if let Some(test_max) = self.validation_runtime.test_render_viewport_max_side {
-            return context_max.min(test_max);
+#[derive(Clone)]
+struct ViewerUiSnapshot {
+    presentation_viewport: PresentationViewport,
+    render_viewport: RenderExtent,
+    frame_fidelity: FrameFidelityStatus,
+    composite_fidelity: String,
+    dataset_path: String,
+    messages: Vec<String>,
+    three_d_display: ViewportDisplayImage,
+    xy_display: Option<ViewportDisplayImage>,
+    xz_display: Option<ViewportDisplayImage>,
+    yz_display: Option<ViewportDisplayImage>,
+    xy_placeholder: String,
+    xz_placeholder: String,
+    yz_placeholder: String,
+    test_render_viewport_max_side: Option<usize>,
+    automation_render_target: Option<RenderExtent>,
+}
+
+impl ViewerUiSnapshot {
+    fn display_for_panel(&self, panel_id: PanelId) -> Option<ViewportDisplayImage> {
+        match panel_id {
+            PanelId::Xy => self.xy_display.clone(),
+            PanelId::Xz => self.xz_display.clone(),
+            PanelId::Yz => self.yz_display.clone(),
+            PanelId::ThreeD => Some(self.three_d_display.clone()),
         }
-        context_max
+    }
+
+    fn placeholder_for_panel(&self, panel_id: PanelId) -> &str {
+        match panel_id {
+            PanelId::Xy => &self.xy_placeholder,
+            PanelId::Xz => &self.xz_placeholder,
+            PanelId::Yz => &self.yz_placeholder,
+            PanelId::ThreeD => "3D",
+        }
+    }
+
+    fn render_viewport_max_side(&self, context_max: usize) -> usize {
+        self.test_render_viewport_max_side
+            .map_or(context_max, |test_max| context_max.min(test_max))
+    }
+}
+
+impl MiranteWorkbenchApp {
+    fn viewer_ui_snapshot(&self, snapshot: &ApplicationSnapshot) -> ViewerUiSnapshot {
+        let panel_placeholder = |panel_id: PanelId| {
+            let panel = self
+                .render_coordination
+                .surface(panel_id.presentation_slot());
+            if panel.render_failure().is_some() {
+                format!("{}\nrender failed", panel_id.label())
+            } else {
+                panel
+                    .cross_section_schedule()
+                    .map(cross_section_schedule_status_label)
+                    .map(|status| format!("{}\n{status}", panel_id.label()))
+                    .unwrap_or_else(|| panel_id.label().to_owned())
+            }
+        };
+        let dataset_plan_error = self.dataset.last_plan_error().map(str::to_owned);
+        let mut messages = dataset_plan_error.iter().cloned().collect::<Vec<_>>();
+        if let Some(error) = &self.render_coordination.frame_fidelity.last_capacity_error
+            && dataset_plan_error.as_deref() != Some(error.as_str())
+        {
+            messages.push(error.clone());
+        }
+        for (slot, panel) in self.render_coordination.iter() {
+            if let Some(failure) = panel.render_failure() {
+                let panel_id = PanelId::from_presentation_slot(slot);
+                messages.push(format!(
+                    "{} cross-section failed ({:?}): {}",
+                    panel_id.label(),
+                    failure.kind(),
+                    failure.message()
+                ));
+            }
+        }
+        ViewerUiSnapshot {
+            presentation_viewport: self.render_coordination.presentation_viewport,
+            render_viewport: self.render_coordination.render_viewport,
+            frame_fidelity: self.render_coordination.frame_fidelity.clone(),
+            composite_fidelity: composite_fidelity_label(snapshot, &self.render_coordination),
+            dataset_path: dataset_path_status_label(self.dataset.selected_path()),
+            messages,
+            three_d_display: self.viewport_display_image(snapshot),
+            xy_display: self.cross_section_panel_display_image(PanelId::Xy, snapshot),
+            xz_display: self.cross_section_panel_display_image(PanelId::Xz, snapshot),
+            yz_display: self.cross_section_panel_display_image(PanelId::Yz, snapshot),
+            xy_placeholder: panel_placeholder(PanelId::Xy),
+            xz_placeholder: panel_placeholder(PanelId::Xz),
+            yz_placeholder: panel_placeholder(PanelId::Yz),
+            test_render_viewport_max_side: self.validation_runtime.test_render_viewport_max_side,
+            automation_render_target: self
+                .validation_runtime
+                .product_automation
+                .as_ref()
+                .and_then(ProductAutomationController::render_target_override),
+        }
     }
 
     fn show_viewer_layout(
@@ -143,14 +236,15 @@ impl MiranteWorkbenchApp {
         ui: &mut egui::Ui,
         snapshot: &ApplicationSnapshot,
         view: &ViewState,
+        viewer: &ViewerUiSnapshot,
         output: &mut WorkbenchUiOutput,
     ) {
         match view.layout() {
             CanonicalViewerLayout::Single3d => {
-                self.show_single_3d_viewport(ui, snapshot, view, output)
+                self.show_single_3d_viewport(ui, snapshot, view, viewer, output)
             }
             CanonicalViewerLayout::FourPanel => {
-                self.show_four_panel_viewport(ui, snapshot, view, output)
+                self.show_four_panel_viewport(ui, snapshot, view, viewer, output)
             }
         }
     }
@@ -159,21 +253,17 @@ impl MiranteWorkbenchApp {
         &self,
         ctx: &egui::Context,
         display_size_points: egui::Vec2,
+        viewer: &ViewerUiSnapshot,
         output: &mut WorkbenchUiOutput,
     ) {
         let max_texture_side =
-            self.render_viewport_max_side(ctx.input(|input| input.max_texture_side));
+            viewer.render_viewport_max_side(ctx.input(|input| input.max_texture_side));
         let Some(presentation_viewport) =
             presentation_viewport_for_display_size(display_size_points)
         else {
             return;
         };
-        let automation_render_target = self
-            .validation_runtime
-            .product_automation
-            .as_ref()
-            .and_then(ProductAutomationController::render_target_override);
-        let Some(render_viewport) = automation_render_target.or_else(|| {
+        let Some(render_viewport) = viewer.automation_render_target.or_else(|| {
             render_viewport_for_display_size(
                 display_size_points,
                 ctx.pixels_per_point(),
@@ -194,11 +284,12 @@ impl MiranteWorkbenchApp {
         ctx: &egui::Context,
         panel_id: PanelId,
         display_size_points: egui::Vec2,
+        viewer: &ViewerUiSnapshot,
         output: &mut WorkbenchUiOutput,
     ) -> Option<PresentationViewport> {
         let presentation_viewport = presentation_viewport_for_display_size(display_size_points)?;
         let max_texture_side =
-            self.render_viewport_max_side(ctx.input(|input| input.max_texture_side));
+            viewer.render_viewport_max_side(ctx.input(|input| input.max_texture_side));
         let render_viewport = render_viewport_for_display_size(
             display_size_points,
             ctx.pixels_per_point(),
@@ -217,15 +308,24 @@ impl MiranteWorkbenchApp {
         ui: &mut egui::Ui,
         snapshot: &ApplicationSnapshot,
         view: &ViewState,
+        viewer: &ViewerUiSnapshot,
         output: &mut WorkbenchUiOutput,
     ) {
         let available = ui.available_size();
         let ctx = ui.ctx().clone();
-        self.observe_3d_viewport_for_display_size(&ctx, available, output);
-        let display_image = self.viewport_display_image(snapshot);
+        self.observe_3d_viewport_for_display_size(&ctx, available, viewer, output);
+        let display_image = viewer.three_d_display.clone();
         let image_size = fit_size(display_image.size_vec2(), available);
         ui.centered_and_justified(|ui| {
-            self.show_3d_viewport_image(ui, display_image, image_size, snapshot, view, output);
+            self.show_3d_viewport_image(
+                ui,
+                display_image,
+                image_size,
+                snapshot,
+                view,
+                viewer,
+                output,
+            );
         });
     }
 
@@ -234,6 +334,7 @@ impl MiranteWorkbenchApp {
         ui: &mut egui::Ui,
         snapshot: &ApplicationSnapshot,
         view: &ViewState,
+        viewer: &ViewerUiSnapshot,
         output: &mut WorkbenchUiOutput,
     ) {
         let available = ui.available_size();
@@ -252,7 +353,9 @@ impl MiranteWorkbenchApp {
             for row in panels.chunks_exact(2) {
                 ui.horizontal(|ui| {
                     for panel_id in row {
-                        self.show_four_panel_cell(ui, *panel_id, cell_size, snapshot, view, output);
+                        self.show_four_panel_cell(
+                            ui, *panel_id, cell_size, snapshot, view, viewer, output,
+                        );
                     }
                 });
             }
@@ -267,6 +370,7 @@ impl MiranteWorkbenchApp {
         cell_size: egui::Vec2,
         snapshot: &ApplicationSnapshot,
         view: &ViewState,
+        viewer: &ViewerUiSnapshot,
         output: &mut WorkbenchUiOutput,
     ) {
         let tokens = ui_kit::UiTokens::default();
@@ -282,9 +386,13 @@ impl MiranteWorkbenchApp {
                     ui.label(egui::RichText::new(panel_id.label()).strong());
                     ui.add_space(4.0);
                     match panel_id {
-                        PanelId::ThreeD => self.show_embedded_3d_panel(ui, snapshot, view, output),
+                        PanelId::ThreeD => {
+                            self.show_embedded_3d_panel(ui, snapshot, view, viewer, output)
+                        }
                         PanelId::Xy | PanelId::Xz | PanelId::Yz => {
-                            self.show_cross_section_panel(ui, panel_id, snapshot, view, output);
+                            self.show_cross_section_panel(
+                                ui, panel_id, snapshot, view, viewer, output,
+                            );
                         }
                     }
                 });
@@ -296,15 +404,24 @@ impl MiranteWorkbenchApp {
         ui: &mut egui::Ui,
         snapshot: &ApplicationSnapshot,
         view: &ViewState,
+        viewer: &ViewerUiSnapshot,
         output: &mut WorkbenchUiOutput,
     ) {
         let available = ui.available_size();
         let ctx = ui.ctx().clone();
-        self.observe_3d_viewport_for_display_size(&ctx, available, output);
-        let display_image = self.viewport_display_image(snapshot);
+        self.observe_3d_viewport_for_display_size(&ctx, available, viewer, output);
+        let display_image = viewer.three_d_display.clone();
         let image_size = fit_size(display_image.size_vec2(), available);
         ui.centered_and_justified(|ui| {
-            self.show_3d_viewport_image(ui, display_image, image_size, snapshot, view, output);
+            self.show_3d_viewport_image(
+                ui,
+                display_image,
+                image_size,
+                snapshot,
+                view,
+                viewer,
+                output,
+            );
         });
     }
 
@@ -316,6 +433,7 @@ impl MiranteWorkbenchApp {
         image_size: egui::Vec2,
         snapshot: &ApplicationSnapshot,
         view: &ViewState,
+        viewer: &ViewerUiSnapshot,
         output: &mut WorkbenchUiOutput,
     ) {
         if image_size == egui::Vec2::ZERO {
@@ -327,12 +445,11 @@ impl MiranteWorkbenchApp {
                     ui.allocate_exact_size(image_size, egui::Sense::click_and_drag());
                 ui.painter()
                     .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
-                let label =
-                    if self.render_coordination.frame_fidelity.backend == RenderBackend::Empty {
-                        "No visible data"
-                    } else {
-                        "Loading…"
-                    };
+                let label = if viewer.frame_fidelity.backend == RenderBackend::Empty {
+                    "No visible data"
+                } else {
+                    "Loading…"
+                };
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -351,8 +468,7 @@ impl MiranteWorkbenchApp {
                 output,
             ),
         };
-        let hover =
-            viewport_hover_from_response(snapshot, view, &self.render_coordination, &response);
+        let hover = viewport_hover_from_response(snapshot, view, &response);
         if response.hovered() || view.layout() == CanonicalViewerLayout::Single3d {
             self.egui_ui.hovered_pixel = hover;
             self.egui_ui.hovered_source_readout = None;
@@ -360,7 +476,7 @@ impl MiranteWorkbenchApp {
         match apply_viewport_tool_response(
             snapshot,
             &mut self.egui_ui,
-            &self.render_coordination,
+            viewer.frame_fidelity.completeness,
             &response,
             hover,
         ) {
@@ -393,12 +509,13 @@ impl MiranteWorkbenchApp {
         panel_id: PanelId,
         snapshot: &ApplicationSnapshot,
         view: &ViewState,
+        viewer: &ViewerUiSnapshot,
         output: &mut WorkbenchUiOutput,
     ) {
         let available = ui.available_size();
         let ctx = ui.ctx().clone();
         let presentation_viewport =
-            self.observe_four_panel_viewport(&ctx, panel_id, available, output);
+            self.observe_four_panel_viewport(&ctx, panel_id, available, viewer, output);
         let application_panel = application_cross_section_panel_id(panel_id)
             .expect("a cross-section widget has a cross-section panel ID");
         output
@@ -406,9 +523,7 @@ impl MiranteWorkbenchApp {
             .push(RenderUiRequest::EnsureCrossSectionCurrent {
                 panel: application_panel,
             });
-        let response = if let Some(display_image) =
-            self.cross_section_panel_display_image(panel_id, snapshot)
-        {
+        let response = if let Some(display_image) = viewer.display_for_panel(panel_id) {
             let image_size = fit_size(display_image.size_vec2(), available);
             if image_size != egui::Vec2::ZERO {
                 Some(
@@ -430,7 +545,9 @@ impl MiranteWorkbenchApp {
         } else {
             None
         }
-        .unwrap_or_else(|| self.show_cross_section_panel_placeholder(ui, panel_id, available));
+        .unwrap_or_else(|| {
+            self.show_cross_section_panel_placeholder(ui, panel_id, available, viewer)
+        });
 
         if let Some(presentation_viewport) = presentation_viewport
             && let Some(request) = CrossSectionReadoutRequest::from_response(
@@ -527,6 +644,7 @@ impl MiranteWorkbenchApp {
         ui: &mut egui::Ui,
         panel_id: PanelId,
         available: egui::Vec2,
+        viewer: &ViewerUiSnapshot,
     ) -> egui::Response {
         let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
         response.widget_info(|| {
@@ -536,23 +654,10 @@ impl MiranteWorkbenchApp {
                 format!("{} cross-section panel", panel_id.label()),
             )
         });
-        let panel = self
-            .render_coordination
-            .surface(panel_id.presentation_slot());
-        let status = panel
-            .cross_section_schedule()
-            .map(cross_section_schedule_status_label);
-        let text = if panel.render_failure().is_some() {
-            format!("{}\nrender failed", panel_id.label())
-        } else {
-            status
-                .map(|status| format!("{}\n{}", panel_id.label(), status))
-                .unwrap_or_else(|| panel_id.label().to_owned())
-        };
         ui.painter().text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
-            text,
+            viewer.placeholder_for_panel(panel_id),
             egui::FontId::proportional(18.0),
             ui.visuals().weak_text_color(),
         );
@@ -837,6 +942,7 @@ impl eframe::App for MiranteWorkbenchApp {
         let task_drain_ms = duration_ms(task_drain_started.elapsed());
 
         let application_snapshot = self.application_snapshot_for_ui();
+        let viewer_ui_snapshot = self.viewer_ui_snapshot(&application_snapshot);
         let view = application_view(&application_snapshot);
         let analysis_start_unavailable_reason = self.analysis_start_unavailable_reason();
         let analysis_active = self.analysis_runtime.active_token().is_some();
@@ -1083,7 +1189,7 @@ impl eframe::App for MiranteWorkbenchApp {
                                 *view.camera(),
                                 active_catalog_layer.shape().spatial(),
                                 active_catalog_layer.grid_to_world(),
-                                self.render_coordination.presentation_viewport,
+                                viewer_ui_snapshot.presentation_viewport,
                             ),
                         ));
                     }
@@ -1091,7 +1197,7 @@ impl eframe::App for MiranteWorkbenchApp {
                         match reset_view_command(
                             &application_snapshot,
                             view,
-                            self.render_coordination.presentation_viewport,
+                            viewer_ui_snapshot.presentation_viewport,
                         ) {
                             Ok(command) => application_commands.push(command),
                             Err(error) => tracing::warn!(%error, "view reset rejected"),
@@ -1203,10 +1309,7 @@ impl eframe::App for MiranteWorkbenchApp {
                         ui_kit::property_row(
                             ui,
                             "fidelity",
-                            composite_fidelity_label(
-                                &application_snapshot,
-                                &self.render_coordination,
-                            ),
+                            &viewer_ui_snapshot.composite_fidelity,
                         );
                         if let Some(hover) = self.egui_ui.hovered_pixel {
                             ui_kit::property_row(ui, "hover", viewport_hover_status_label(hover));
@@ -1226,7 +1329,7 @@ impl eframe::App for MiranteWorkbenchApp {
                         ui_kit::property_row(
                             ui,
                             "path",
-                            dataset_path_status_label(self.dataset.selected_path()),
+                            &viewer_ui_snapshot.dataset_path,
                         );
                         ui.horizontal_wrapped(|ui| {
                             show_playback_controls(
@@ -1664,17 +1767,15 @@ impl eframe::App for MiranteWorkbenchApp {
                     ui_kit::section(ui, "Frame", |ui| {
                         ui_kit::show_frame_fidelity_property_rows(
                             ui,
-                            &self.render_coordination.frame_fidelity,
+                            &viewer_ui_snapshot.frame_fidelity,
                         );
                         ui_kit::property_row(
                             ui,
                             "pixels",
-                            self.render_coordination
+                            viewer_ui_snapshot
                                 .render_viewport
                                 .width_pixels()
-                                .saturating_mul(
-                                    self.render_coordination.render_viewport.height_pixels(),
-                                )
+                                .saturating_mul(viewer_ui_snapshot.render_viewport.height_pixels())
                                 .to_string(),
                         );
                         ui_kit::property_row(ui, "nonzero", "unavailable");
@@ -2078,7 +2179,7 @@ impl eframe::App for MiranteWorkbenchApp {
                         );
                         if let Ok(camera_frame) = CameraFrame::new(
                             *view.camera(),
-                            self.render_coordination.presentation_viewport,
+                            viewer_ui_snapshot.presentation_viewport,
                         ) {
                             let camera_forward = camera_frame.axes().forward();
                             ui_kit::property_row(
@@ -2103,29 +2204,8 @@ impl eframe::App for MiranteWorkbenchApp {
                         if let ImportWorkflowSnapshot::Failed(failure) = import_snapshot {
                             ui_kit::status_badge(ui, StatusTone::Error, &failure.message);
                         }
-                        if let Some(error) = self.dataset.last_plan_error() {
-                            ui_kit::status_badge(ui, StatusTone::Error, error);
-                        }
-                        if let Some(error) =
-                            &self.render_coordination.frame_fidelity.last_capacity_error
-                            && self.dataset.last_plan_error() != Some(error.as_str())
-                        {
-                            ui_kit::status_badge(ui, StatusTone::Error, error);
-                        }
-                        for (slot, panel) in self.render_coordination.iter() {
-                            if let Some(failure) = panel.render_failure() {
-                                let panel_id = PanelId::from_presentation_slot(slot);
-                                ui_kit::status_badge(
-                                    ui,
-                                    StatusTone::Error,
-                                    format!(
-                                        "{} cross-section failed ({:?}): {}",
-                                        panel_id.label(),
-                                        failure.kind(),
-                                        failure.message()
-                                    ),
-                                );
-                            }
+                        for message in &viewer_ui_snapshot.messages {
+                            ui_kit::status_badge(ui, StatusTone::Error, message);
                         }
                         if let Some(hover) = self.egui_ui.hovered_pixel {
                             ui_kit::property_row(
@@ -2140,7 +2220,13 @@ impl eframe::App for MiranteWorkbenchApp {
 
         let mut viewer_output = WorkbenchUiOutput::default();
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            self.show_viewer_layout(ui, &application_snapshot, view, &mut viewer_output);
+            self.show_viewer_layout(
+                ui,
+                &application_snapshot,
+                view,
+                &viewer_ui_snapshot,
+                &mut viewer_output,
+            );
         });
         application_commands.append(&mut viewer_output.application_commands);
         import_commands.append(&mut viewer_output.import_commands);
