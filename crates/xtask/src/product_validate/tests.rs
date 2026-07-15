@@ -22,18 +22,6 @@ fn assert_dataset_runtime_limits(script: &Value, total_bytes: u64, resident_reso
     );
 }
 
-fn active_lease_cohort_assertions(commands: &[Value]) -> usize {
-    commands
-        .iter()
-        .filter(|command| {
-            command["condition"]["active_lease_cohort"]["min_required"] == 1
-                && command["condition"]["active_lease_cohort"]["min_retained"] == 1
-                && command["condition"]["active_lease_cohort"]["max_missing"] == 0
-                && command["condition"]["active_lease_cohort"]["complete"] == true
-        })
-        .count()
-}
-
 fn b3_exact_capture_report(second_width: u64) -> Value {
     json!({
         "status": "passed",
@@ -666,693 +654,32 @@ fn b4_trusted_report_must_match_revision_and_actor_thresholds() {
 }
 
 #[test]
-fn t5_qual_001_interaction_mip_script_records_bounded_mip_camera_sequence() {
-    let script = t5_qual_001_interaction_mip_script(Path::new("/tmp/T5-QUAL-001.m4d"));
-    let commands = script["commands"].as_array().unwrap();
-    let command_names: Vec<_> = commands
-        .iter()
-        .filter_map(|command| command["command"].as_str())
-        .collect();
-
-    assert_eq!(script["scenario"], T5_QUAL_001_INTERACTION_MIP_SCENARIO);
-    assert_dataset_runtime_limits(&script, 4 * GIB, 4_096);
-    assert_eq!(
-        script_requested_window_inner_size_points_json(&script)["width"],
-        T5_QUAL_001_VIEWPORT_WIDTH
-    );
-    assert_eq!(
-        script_requested_window_inner_size_points_json(&script)["height"],
-        T5_QUAL_001_VIEWPORT_HEIGHT
-    );
-    assert_eq!(script_render_modes_json(&script), json!(["mip"]));
-    assert_eq!(script_frame_wait_count(&script), 6);
-    assert!(
-        commands
-            .iter()
-            .any(|command| command["name"] == "t5-qual-001-first-orbit-cache-miss")
-    );
-    assert!(
-        commands
-            .iter()
-            .any(|command| command["name"] == "t5-qual-001-return-orbit-cache-reuse")
-    );
-    assert!(
-        command_names
-            .iter()
-            .filter(|&&name| name == "copy_diagnostics")
-            .count()
-            >= 4
-    );
-    assert_eq!(
-        command_names
-            .iter()
-            .filter(|&&name| name == "probe_hover")
-            .count(),
-        2
-    );
-    assert!(commands.iter().all(|command| command["mode"] != "dvr"));
-    assert!(commands.iter().all(|command| command["mode"] != "iso"));
-    assert_eq!(commands.last().unwrap()["command"], "quit");
-}
-
-#[test]
-fn t5_qual_001_interaction_render_modes_script_records_bounded_mode_sequence() {
-    let script = t5_qual_001_interaction_render_modes_script(Path::new("/tmp/T5-QUAL-001.m4d"));
-    let commands = script["commands"].as_array().unwrap();
-    let command_names: Vec<_> = commands
-        .iter()
-        .filter_map(|command| command["command"].as_str())
-        .collect();
-
-    assert_eq!(
-        script["scenario"],
-        T5_QUAL_001_INTERACTION_RENDER_MODES_SCENARIO
-    );
-    assert_dataset_runtime_limits(&script, 6 * GIB, 8_192);
-    assert_eq!(
-        script_requested_window_inner_size_points_json(&script)["width"],
-        T5_QUAL_001_VIEWPORT_WIDTH
-    );
-    assert_eq!(
-        script_requested_window_inner_size_points_json(&script)["height"],
-        T5_QUAL_001_VIEWPORT_HEIGHT
-    );
-    assert_eq!(
-        script_render_modes_json(&script),
-        json!(["mip", "dvr", "iso"])
-    );
-    let mode_sequence: Vec<_> = commands
-        .iter()
-        .filter(|command| command["command"] == "set_render_mode")
-        .filter_map(|command| command["mode"].as_str())
-        .collect();
-    assert_eq!(mode_sequence, ["mip", "dvr", "iso", "mip"]);
-    assert_eq!(
-        command_names
-            .iter()
-            .filter(|&&name| name == "set_render_mode")
-            .count(),
-        4
-    );
-    assert!(commands.iter().any(|command| {
-        command["command"] == "set_dvr_density_scale"
-            && command["density_scale"].as_f64() == Some(8.0)
-    }));
-    assert!(commands.iter().any(|command| {
-        command["command"] == "set_iso_display_level"
-            && command["display_level"].as_f64() == Some(0.02)
-    }));
-    assert_eq!(
-        command_names
-            .iter()
-            .filter(|&&name| name == "probe_hover")
-            .count(),
-        3
-    );
-    assert!(
-        commands
-            .iter()
-            .any(|command| command["name"] == "t5-qual-001-render-modes-dvr-orbit")
-    );
-    assert!(
-        commands
-            .iter()
-            .any(|command| command["name"] == "t5-qual-001-render-modes-iso-pan")
-    );
-    assert!(
-        commands
-            .iter()
-            .any(|command| { command["condition"]["render_mode"]["mode"].as_str() == Some("dvr") })
-    );
-    assert!(
-        commands
-            .iter()
-            .any(|command| { command["condition"]["render_mode"]["mode"].as_str() == Some("iso") })
-    );
-    assert_eq!(commands.last().unwrap()["command"], "quit");
-}
-
-#[test]
-fn t5_qual_001_four_panel_cross_section_script_records_layout_and_2d_interactions() {
-    let script = t5_qual_001_four_panel_cross_section_script(Path::new("/tmp/T5-QUAL-001.m4d"));
-    let commands = script["commands"].as_array().unwrap();
-    let command_names: Vec<_> = commands
-        .iter()
-        .filter_map(|command| command["command"].as_str())
-        .collect();
-
-    assert_eq!(
-        script["scenario"],
-        T5_QUAL_001_FOUR_PANEL_CROSS_SECTION_SCENARIO
-    );
-    assert_dataset_runtime_limits(&script, 6 * GIB, 8_192);
-    assert_eq!(
-        script_requested_window_inner_size_points_json(&script)["width"],
-        T5_QUAL_001_VIEWPORT_WIDTH
-    );
-    assert_eq!(
-        script_requested_window_inner_size_points_json(&script)["height"],
-        T5_QUAL_001_VIEWPORT_HEIGHT
-    );
-    assert_eq!(script_render_modes_json(&script), json!(["mip"]));
-    assert!(
-        commands
-            .iter()
-            .any(|command| command["command"] == "set_viewer_layout"
-                && command["layout"] == "four_panel")
-    );
-    assert!(commands.iter().any(
-        |command| command["command"] == "set_viewer_layout" && command["layout"] == "single3d"
-    ));
-    for expected in [
-        "cross_section_pan",
-        "cross_section_slice_step",
-        "cross_section_zoom",
-        "cross_section_rotate",
-        "probe_panel_hover",
-    ] {
-        assert!(command_names.contains(&expected), "missing {expected}");
-    }
-    for panel in ["xy", "xz", "yz"] {
-        let schedule_assert = commands
-            .iter()
-            .find(|command| {
-                command["condition"]["cross_section_panel_schedule"]["panel"] == panel
-                    && command["condition"]["cross_section_panel_schedule"]
-                        ["min_selected_resources"]
-                        == 1
-            })
-            .unwrap_or_else(|| panic!("missing {panel} panel schedule assertion"));
-        assert_eq!(
-            schedule_assert["condition"]["cross_section_panel_schedule"]["min_selected_resources"],
-            1
-        );
-    }
-    assert_eq!(active_lease_cohort_assertions(commands), 1);
-    let panel_distinct_assert_count = commands
-        .iter()
-        .filter(|command| {
-            command["condition"]["cross_section_panel_images_distinct"]["min_different_pixels"] == 1
-        })
-        .count();
-    assert_eq!(panel_distinct_assert_count, 2);
-    let four_panel_distinct_assert_count = commands
-        .iter()
-        .filter(|command| {
-            command["condition"]["four_panel_images_distinct"]["min_different_pixels"] == 1
-        })
-        .count();
-    assert_eq!(four_panel_distinct_assert_count, 2);
-    assert!(
-        commands
-            .iter()
-            .any(|command| command["condition"] == "cross_section_retired")
-    );
-    let hover_probe = commands
-        .iter()
-        .find(|command| command["command"] == "probe_panel_hover")
-        .expect("missing panel hover probe");
-    assert_eq!(hover_probe["panel"], "xz");
-    assert_eq!(hover_probe["expected_status"], "value");
-    assert_eq!(hover_probe["expect_value"], true);
-    assert!(
-        commands
-            .iter()
-            .any(|command| command["name"] == "t5-qual-001-four-panel-after-oblique-interaction")
-    );
-    assert_eq!(commands.last().unwrap()["command"], "quit");
-    validate_product_automation_script(&script).unwrap();
-}
-
-#[test]
-fn t5_qual_001_four_panel_fine_scale_script_records_zoomed_s0_gate() {
-    let script = t5_qual_001_four_panel_fine_scale_script(Path::new("/tmp/T5-QUAL-001.m4d"));
-    let commands = script["commands"].as_array().unwrap();
-    let command_names: Vec<_> = commands
-        .iter()
-        .filter_map(|command| command["command"].as_str())
-        .collect();
-
-    assert_eq!(
-        script["scenario"],
-        T5_QUAL_001_FOUR_PANEL_FINE_SCALE_SCENARIO
-    );
-    assert_dataset_runtime_limits(&script, 6 * GIB, 8_192);
-    assert_eq!(
-        script_requested_window_inner_size_points_json(&script)["width"],
-        T5_QUAL_001_VIEWPORT_WIDTH
-    );
-    assert_eq!(
-        script_requested_window_inner_size_points_json(&script)["height"],
-        T5_QUAL_001_VIEWPORT_HEIGHT
-    );
-    assert_eq!(script_render_modes_json(&script), json!(["mip"]));
-    assert_eq!(
-        command_names
-            .iter()
-            .filter(|&&name| name == "cross_section_zoom")
-            .count(),
-        3
-    );
-    assert!(commands.iter().any(|command| {
-        command["command"] == "cross_section_zoom"
-            && command["panel"] == "xz"
-            && command["scroll_y_points"]
-                .as_f64()
-                .is_some_and(|value| value > 0.0)
-    }));
-    for panel in ["xy", "xz", "yz"] {
-        let schedule_assert = commands
-            .iter()
-            .find(|command| {
-                command["condition"]["cross_section_panel_schedule"]["panel"] == panel
-                    && command["condition"]["cross_section_panel_schedule"]["target_scale_level"]
-                        == 0
-                    && command["condition"]["cross_section_panel_schedule"]["render_scale_level"]
-                        == 0
-            })
-            .unwrap_or_else(|| panic!("missing fine-scale schedule assertion for {panel}"));
-        assert_eq!(
-            schedule_assert["condition"]["cross_section_panel_schedule"]["display_current"],
-            true
-        );
-    }
-    assert_eq!(active_lease_cohort_assertions(commands), 1);
-    assert!(
-        commands
-            .iter()
-            .any(|command| command["name"] == "t5-qual-001-four-panel-fine-scale-s0")
-    );
-    assert!(
-        commands
-            .iter()
-            .any(|command| command["condition"] == "cross_section_retired")
-    );
-    assert_eq!(commands.last().unwrap()["command"], "quit");
-    validate_product_automation_script(&script).unwrap();
-}
-
-#[test]
-fn t5_qual_001_four_panel_continuous_cross_section_script_records_nonblank_stress_gate() {
-    let script =
-        t5_qual_001_four_panel_continuous_cross_section_script(Path::new("/tmp/T5-QUAL-001.m4d"));
-    let commands = script["commands"].as_array().unwrap();
-    let command_names: Vec<_> = commands
-        .iter()
-        .filter_map(|command| command["command"].as_str())
-        .collect();
-
-    assert_eq!(
-        script["scenario"],
-        T5_QUAL_001_FOUR_PANEL_CONTINUOUS_CROSS_SECTION_SCENARIO
-    );
-    assert_dataset_runtime_limits(&script, 6 * GIB, 8_192);
-    assert_eq!(
-        script_requested_window_inner_size_points_json(&script)["width"],
-        T5_QUAL_001_VIEWPORT_WIDTH
-    );
-    assert_eq!(
-        script_requested_window_inner_size_points_json(&script)["height"],
-        T5_QUAL_001_VIEWPORT_HEIGHT
-    );
-    assert_eq!(script_render_modes_json(&script), json!(["mip"]));
-    for command_name in [
-        "cross_section_rotate",
-        "cross_section_slice_step",
-        "cross_section_pan",
-        "cross_section_zoom",
-    ] {
-        assert_eq!(
-            command_names
-                .iter()
-                .filter(|&&name| name == command_name)
-                .count(),
-            6,
-            "unexpected count for {command_name}"
-        );
-    }
-    assert!(
-        commands.iter().any(|command| {
-            command["command"] == "cross_section_slice_step"
-                && command["fast"].as_bool() == Some(true)
-        }),
-        "continuous 2D stress should include fast slice stepping"
-    );
-    assert!(commands.iter().any(|command| {
-        command["command"] == "cross_section_zoom"
-            && command["scroll_y_points"]
-                .as_f64()
-                .is_some_and(|value| value > 0.0)
-    }));
-    assert!(commands.iter().any(|command| {
-        command["command"] == "cross_section_zoom"
-            && command["scroll_y_points"]
-                .as_f64()
-                .is_some_and(|value| value < 0.0)
-    }));
-    let nonblank_assert_count = commands
-        .iter()
-        .filter(|command| {
-            command["condition"]["cross_section_panel_nonblank"]["min_nonzero_rgb_pixels"].as_u64()
-                == Some(1)
-        })
-        .count();
-    assert_eq!(nonblank_assert_count, 24);
-    for panel in ["xy", "xz", "yz"] {
-        let schedule_assert = commands
-            .iter()
-            .find(|command| {
-                command["condition"]["cross_section_panel_schedule"]["panel"] == panel
-                    && command["condition"]["cross_section_panel_schedule"]
-                        ["max_missing_occupied_resources"]
-                        == 0
-                    && command["condition"]["cross_section_panel_schedule"]["display_current"]
-                        == true
-            })
-            .unwrap_or_else(|| panic!("missing settled schedule assertion for {panel}"));
-        assert!(
-            schedule_assert["condition"]["cross_section_panel_schedule"]["min_generation"]
-                .as_u64()
-                .is_some_and(|value| value >= 4)
-        );
-    }
-    assert!(active_lease_cohort_assertions(commands) >= 1);
-    assert!(
-        commands
-            .iter()
-            .any(|command| command["name"] == "t5-qual-001-four-panel-continuous-settled")
-    );
-    assert!(
-        commands
-            .iter()
-            .any(|command| command["condition"] == "cross_section_retired")
-    );
-    assert_eq!(commands.last().unwrap()["command"], "quit");
-    validate_product_automation_script(&script).unwrap();
-}
-
-#[test]
-fn t5_qual_002_four_panel_timepoint_script_records_2d_timepoint_updates() {
-    let script = t5_qual_002_four_panel_timepoint_script(Path::new("/tmp/t5_qual_002.m4d"));
-    let commands = script["commands"].as_array().unwrap();
-    let command_names: Vec<_> = commands
-        .iter()
-        .filter_map(|command| command["command"].as_str())
-        .collect();
-
-    assert_eq!(
-        script["scenario"],
-        T5_QUAL_002_FOUR_PANEL_TIMEPOINT_SCENARIO
-    );
-    assert_dataset_runtime_limits(&script, 6 * GIB, 8_192);
-    assert_eq!(
-        script_requested_window_inner_size_points_json(&script)["width"],
-        T5_QUAL_002_VIEWPORT_WIDTH
-    );
-    assert_eq!(
-        script_requested_window_inner_size_points_json(&script)["height"],
-        T5_QUAL_002_VIEWPORT_HEIGHT
-    );
-    assert_eq!(script_render_modes_json(&script), json!(["mip"]));
-    assert!(
-        commands
-            .iter()
-            .any(|command| command["command"] == "set_viewer_layout"
-                && command["layout"] == "four_panel")
-    );
-    assert!(commands.iter().any(
-        |command| command["command"] == "set_viewer_layout" && command["layout"] == "single3d"
-    ));
-    assert_eq!(
-        command_names
-            .iter()
-            .filter(|&&name| name == "set_timepoint")
-            .count(),
-        1
-    );
-    assert_eq!(
-        command_names
-            .iter()
-            .filter(|&&name| name == "step_timepoint")
-            .count(),
-        1
-    );
-    for timepoint in [0, 1, 2] {
-        assert!(
-            commands.iter().any(|command| {
-                command["condition"]["active_timepoint"]["timepoint"].as_u64() == Some(timepoint)
-            }),
-            "missing active timepoint assertion for {timepoint}"
-        );
-    }
-    assert_eq!(active_lease_cohort_assertions(commands), 3);
-    assert_eq!(
-        commands
-            .iter()
-            .filter(|command| {
-                command["condition"]["cross_section_panel_schedule"]["display_current"].as_bool()
-                    == Some(true)
-                    && command["condition"]["cross_section_panel_schedule"]
-                        ["max_missing_occupied_resources"]
-                        .as_u64()
-                        == Some(0)
-            })
-            .count(),
-        9
-    );
-    assert!(
-        commands
-            .iter()
-            .any(|command| command["name"] == "t5_qual_002-four-panel-timepoint-2")
-    );
-    assert!(
-        commands
-            .iter()
-            .any(|command| command["condition"] == "cross_section_retired")
-    );
-    assert_eq!(commands.last().unwrap()["command"], "quit");
-    validate_product_automation_script(&script).unwrap();
-}
-
-#[test]
-fn t5_qual_002_four_panel_autoplay_script_records_2d_playback_updates() {
-    let script = t5_qual_002_four_panel_autoplay_script(Path::new("/tmp/t5_qual_002.m4d"));
-    let commands = script["commands"].as_array().unwrap();
-    let command_names: Vec<_> = commands
-        .iter()
-        .filter_map(|command| command["command"].as_str())
-        .collect();
-
-    assert_eq!(script["scenario"], T5_QUAL_002_FOUR_PANEL_AUTOPLAY_SCENARIO);
-    assert_dataset_runtime_limits(&script, 6 * GIB, 8_192);
-    assert_eq!(
-        script_requested_window_inner_size_points_json(&script)["width"],
-        T5_QUAL_002_VIEWPORT_WIDTH
-    );
-    assert_eq!(
-        script_requested_window_inner_size_points_json(&script)["height"],
-        T5_QUAL_002_VIEWPORT_HEIGHT
-    );
-    assert_eq!(script_render_modes_json(&script), json!(["mip"]));
-    assert!(
-        commands
-            .iter()
-            .any(|command| command["command"] == "set_viewer_layout"
-                && command["layout"] == "four_panel")
-    );
-    assert!(commands.iter().any(
-        |command| command["command"] == "set_viewer_layout" && command["layout"] == "single3d"
-    ));
-    assert_eq!(
-        command_names
-            .iter()
-            .filter(|&&name| name == "set_timepoint")
-            .count(),
-        0
-    );
-    assert_eq!(
-        command_names
-            .iter()
-            .filter(|&&name| name == "step_timepoint")
-            .count(),
-        0
-    );
-    assert_eq!(
-        commands
-            .iter()
-            .filter(|command| command["command"] == "set_playback")
-            .count(),
-        2
-    );
-    assert!(
-        commands
-            .iter()
-            .any(|command| { command["condition"]["playback"]["playing"].as_bool() == Some(true) })
-    );
-    assert!(
-        commands.iter().any(|command| {
-            command["condition"]["playback"]["playing"].as_bool() == Some(false)
-        })
-    );
-    assert!(commands.iter().any(|command| {
-        command["condition"]["observed_timepoints"]["min_distinct"].as_u64() == Some(2)
-    }));
-    assert!(active_lease_cohort_assertions(commands) >= 2);
-    for panel in ["xy", "xz", "yz"] {
-        assert!(commands.iter().any(|command| {
-            command["condition"]["cross_section_panel_nonblank"]["panel"] == panel
-                && command["condition"]["cross_section_panel_nonblank"]["min_nonzero_rgb_pixels"]
-                    .as_u64()
-                    == Some(1)
-        }));
-    }
-    assert!(
-        commands
-            .iter()
-            .any(|command| command["name"] == "t5_qual_002-four-panel-autoplay-settled")
-    );
-    assert!(
-        commands
-            .iter()
-            .any(|command| command["condition"] == "cross_section_retired")
-    );
-    assert_eq!(commands.last().unwrap()["command"], "quit");
-    validate_product_automation_script(&script).unwrap();
-}
-
-#[test]
-fn t5_qual_001_interaction_continuous_script_records_paced_mode_sequences() {
-    let script = t5_qual_001_interaction_continuous_script(Path::new("/tmp/T5-QUAL-001.m4d"));
-    let commands = script["commands"].as_array().unwrap();
-    let command_names: Vec<_> = commands
-        .iter()
-        .filter_map(|command| command["command"].as_str())
-        .collect();
-
-    assert_eq!(
-        script["scenario"],
-        T5_QUAL_001_INTERACTION_CONTINUOUS_SCENARIO
-    );
-    assert_dataset_runtime_limits(&script, 6 * GIB, 8_192);
-    assert_eq!(
-        script_requested_window_inner_size_points_json(&script)["width"],
-        T5_QUAL_001_VIEWPORT_WIDTH
-    );
-    assert_eq!(
-        script_requested_window_inner_size_points_json(&script)["height"],
-        T5_QUAL_001_VIEWPORT_HEIGHT
-    );
-    assert_eq!(
-        script_render_modes_json(&script),
-        json!(["mip", "dvr", "iso"])
-    );
-    assert_eq!(script_frame_wait_count(&script), 4);
-    assert_eq!(
-        command_names
-            .iter()
-            .filter(|&&name| name == "camera_orbit")
-            .count(),
-        54
-    );
-    assert_eq!(
-        command_names
-            .iter()
-            .filter(|&&name| name == "camera_pan")
-            .count(),
-        18
-    );
-    assert_eq!(
-        command_names
-            .iter()
-            .filter(|&&name| name == "camera_zoom")
-            .count(),
-        9
-    );
-    assert_eq!(
-        command_names
-            .iter()
-            .filter(|&&name| name == "copy_diagnostics")
-            .count(),
-        7
-    );
-    assert_eq!(
-        command_names
-            .iter()
-            .filter(|&&name| name == "capture_screenshot")
-            .count(),
-        3
-    );
-    assert!(commands.iter().all(|command| {
-        command["command"] != "copy_diagnostics"
-            || command.as_object().is_some_and(|object| object.len() == 1)
-    }));
-    validate_product_automation_script(&script).unwrap();
-    assert_eq!(commands.last().unwrap()["command"], "quit");
-}
-
-#[test]
 fn product_validation_scenario_resolution_is_strict() {
     assert_eq!(
-        ProductValidationScenario::resolve(None, None, None).unwrap(),
+        ProductValidationScenario::resolve(None, None).unwrap(),
         ProductValidationScenario::GeneratedFixtureCameraSmoke
     );
     assert_eq!(
-        ProductValidationScenario::resolve(Some("t5-qual-001-interaction-mip"), None, None)
-            .unwrap(),
-        ProductValidationScenario::T5Qual001InteractionMip
-    );
-    assert_eq!(
-        ProductValidationScenario::resolve(Some("render-modes"), None, None).unwrap(),
+        ProductValidationScenario::resolve(Some("render-modes"), None).unwrap(),
         ProductValidationScenario::GeneratedFixtureRenderModes
     );
     assert_eq!(
-        ProductValidationScenario::resolve(Some("b4-project-persistence"), None, None).unwrap(),
+        ProductValidationScenario::resolve(Some("target-source-verification"), None).unwrap(),
+        ProductValidationScenario::B3SourceVerification
+    );
+    assert_eq!(
+        ProductValidationScenario::resolve(Some("b4-project-persistence"), None).unwrap(),
         ProductValidationScenario::B4ProjectPersistence
     );
     assert_eq!(
-        ProductValidationScenario::resolve(Some("t5-qual-001-render-modes"), None, None).unwrap(),
-        ProductValidationScenario::T5Qual001InteractionRenderModes
-    );
-    assert_eq!(
-        ProductValidationScenario::resolve(Some("t5-qual-001-continuous"), None, None).unwrap(),
-        ProductValidationScenario::T5Qual001InteractionContinuous
-    );
-    assert_eq!(
-        ProductValidationScenario::resolve(Some("t5-qual-001-four-panel"), None, None).unwrap(),
-        ProductValidationScenario::T5Qual001FourPanelCrossSection
-    );
-    assert_eq!(
-        ProductValidationScenario::resolve(Some("t5-qual-001-fine-scale"), None, None).unwrap(),
-        ProductValidationScenario::T5Qual001FourPanelFineScale
-    );
-    assert_eq!(
-        ProductValidationScenario::resolve(Some("t5-qual-001-four-panel-continuous"), None, None)
-            .unwrap(),
-        ProductValidationScenario::T5Qual001FourPanelContinuousCrossSection
-    );
-    assert_eq!(
-        ProductValidationScenario::resolve(Some("t5_qual_002-timepoint"), None, None).unwrap(),
-        ProductValidationScenario::T5Qual002FourPanelTimepoint
-    );
-    assert_eq!(
-        ProductValidationScenario::resolve(Some("t5_qual_002-autoplay"), None, None).unwrap(),
-        ProductValidationScenario::T5Qual002FourPanelAutoplay
+        ProductValidationScenario::resolve(None, Some(B3_SOURCE_VERIFICATION_SCENARIO)).unwrap(),
+        ProductValidationScenario::B3SourceVerification
     );
     assert!(
-        ProductValidationScenario::resolve(Some("unknown"), None, None)
+        ProductValidationScenario::resolve(Some("unknown"), None)
             .unwrap_err()
             .to_string()
             .contains("unknown product validation scenario")
-    );
-    assert!(
-        ProductValidationScenario::resolve(
-            Some(T5_QUAL_001_INTERACTION_MIP_SCENARIO),
-            None,
-            Some(PathBuf::from("/tmp/script.json")),
-        )
-        .unwrap_err()
-        .to_string()
-        .contains(CUSTOM_SCRIPT_ENV)
     );
 }
 
@@ -1367,48 +694,12 @@ fn product_validation_output_dirs_are_scenario_scoped() {
         Path::new(OUTPUT_DIR).join(GENERATED_RENDER_MODES_SCENARIO)
     );
     assert_eq!(
+        product_validation_output_dir(&ProductValidationScenario::B3SourceVerification),
+        Path::new(OUTPUT_DIR).join(B3_SOURCE_VERIFICATION_SCENARIO)
+    );
+    assert_eq!(
         product_validation_output_dir(&ProductValidationScenario::B4ProjectPersistence),
         Path::new(OUTPUT_DIR).join(B4_PROJECT_PERSISTENCE_SCENARIO)
-    );
-    assert_eq!(
-        product_validation_output_dir(&ProductValidationScenario::T5Qual001InteractionMip),
-        Path::new(OUTPUT_DIR).join(T5_QUAL_001_INTERACTION_MIP_SCENARIO)
-    );
-    assert_eq!(
-        product_validation_output_dir(&ProductValidationScenario::T5Qual001InteractionRenderModes),
-        Path::new(OUTPUT_DIR).join(T5_QUAL_001_INTERACTION_RENDER_MODES_SCENARIO)
-    );
-    assert_eq!(
-        product_validation_output_dir(&ProductValidationScenario::T5Qual001InteractionContinuous),
-        Path::new(OUTPUT_DIR).join(T5_QUAL_001_INTERACTION_CONTINUOUS_SCENARIO)
-    );
-    assert_eq!(
-        product_validation_output_dir(&ProductValidationScenario::T5Qual001FourPanelCrossSection),
-        Path::new(OUTPUT_DIR).join(T5_QUAL_001_FOUR_PANEL_CROSS_SECTION_SCENARIO)
-    );
-    assert_eq!(
-        product_validation_output_dir(&ProductValidationScenario::T5Qual001FourPanelFineScale),
-        Path::new(OUTPUT_DIR).join(T5_QUAL_001_FOUR_PANEL_FINE_SCALE_SCENARIO)
-    );
-    assert_eq!(
-        product_validation_output_dir(
-            &ProductValidationScenario::T5Qual001FourPanelContinuousCrossSection
-        ),
-        Path::new(OUTPUT_DIR).join(T5_QUAL_001_FOUR_PANEL_CONTINUOUS_CROSS_SECTION_SCENARIO)
-    );
-    assert_eq!(
-        product_validation_output_dir(&ProductValidationScenario::T5Qual002FourPanelTimepoint),
-        Path::new(OUTPUT_DIR).join(T5_QUAL_002_FOUR_PANEL_TIMEPOINT_SCENARIO)
-    );
-    assert_eq!(
-        product_validation_output_dir(&ProductValidationScenario::T5Qual002FourPanelAutoplay),
-        Path::new(OUTPUT_DIR).join(T5_QUAL_002_FOUR_PANEL_AUTOPLAY_SCENARIO)
-    );
-    assert_eq!(
-        product_validation_output_dir(&ProductValidationScenario::CustomScript(PathBuf::from(
-            "/tmp/script.json"
-        ))),
-        Path::new(OUTPUT_DIR).join(CUSTOM_SCRIPT_SCENARIO)
     );
 }
 
@@ -1436,29 +727,7 @@ fn product_validation_cleanup_removes_legacy_root_artifacts_only() {
 }
 
 #[test]
-fn heavy_local_sample_scenarios_require_package_before_heavy_work() {
-    for scenario in [
-        ProductValidationScenario::T5Qual001InteractionMip,
-        ProductValidationScenario::T5Qual001InteractionRenderModes,
-        ProductValidationScenario::T5Qual001InteractionContinuous,
-        ProductValidationScenario::T5Qual001FourPanelCrossSection,
-        ProductValidationScenario::T5Qual001FourPanelFineScale,
-        ProductValidationScenario::T5Qual001FourPanelContinuousCrossSection,
-        ProductValidationScenario::T5Qual002FourPanelTimepoint,
-        ProductValidationScenario::T5Qual002FourPanelAutoplay,
-    ] {
-        assert!(
-            scenario
-                .validate_package_arg(None)
-                .unwrap_err()
-                .to_string()
-                .contains("requires <native-package.m4d>")
-        );
-    }
-}
-
-#[test]
-fn custom_product_automation_script_validation_rejects_wrong_schema() {
+fn fixed_product_automation_script_validation_rejects_wrong_schema() {
     let script = json!({
         "schema": "wrong",
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
@@ -1493,7 +762,7 @@ fn custom_product_automation_script_validation_rejects_wrong_schema() {
 }
 
 #[test]
-fn custom_product_automation_script_validation_requires_open_dataset_and_quit() {
+fn fixed_product_automation_script_validation_requires_open_dataset_and_quit() {
     let missing_open = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
@@ -1526,7 +795,7 @@ fn custom_product_automation_script_validation_requires_open_dataset_and_quit() 
 }
 
 #[test]
-fn custom_product_automation_script_validation_rejects_bad_limits() {
+fn fixed_product_automation_script_validation_rejects_bad_limits() {
     let unknown = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
@@ -1571,56 +840,6 @@ fn display_status_names_are_report_stable() {
     assert_eq!(DisplayClass::RealDisplay.name(), "real_display");
     assert_eq!(DisplayClass::VirtualDisplay.name(), "virtual_display");
     assert_eq!(DisplayClass::Unsupported.name(), "unsupported");
-}
-
-#[test]
-fn linux_status_rss_parser_reports_bytes() {
-    let status = "Name:\tmirante4d-app\nVmRSS:\t  12345 kB\nThreads:\t1\n";
-
-    assert_eq!(parse_linux_status_rss_bytes(status), Some(12_641_280));
-    assert_eq!(parse_linux_status_rss_bytes("Name:\tmissing\n"), None);
-}
-
-#[test]
-fn process_rss_guard_defaults_only_for_t5_qual_001_scenarios() {
-    assert_eq!(
-        ProductValidationScenario::GeneratedFixtureCameraSmoke.default_process_rss_limit_bytes(),
-        None
-    );
-    assert_eq!(
-        ProductValidationScenario::T5Qual001InteractionMip.default_process_rss_limit_bytes(),
-        Some(8 * GIB)
-    );
-    assert_eq!(
-        ProductValidationScenario::T5Qual001InteractionRenderModes
-            .default_process_rss_limit_bytes(),
-        Some(8 * GIB)
-    );
-    assert_eq!(
-        ProductValidationScenario::T5Qual001InteractionContinuous.default_process_rss_limit_bytes(),
-        Some(8 * GIB)
-    );
-    assert_eq!(
-        ProductValidationScenario::T5Qual001FourPanelCrossSection.default_process_rss_limit_bytes(),
-        Some(8 * GIB)
-    );
-    assert_eq!(
-        ProductValidationScenario::T5Qual001FourPanelFineScale.default_process_rss_limit_bytes(),
-        Some(8 * GIB)
-    );
-    assert_eq!(
-        ProductValidationScenario::T5Qual001FourPanelContinuousCrossSection
-            .default_process_rss_limit_bytes(),
-        Some(8 * GIB)
-    );
-    assert_eq!(
-        ProductValidationScenario::T5Qual002FourPanelTimepoint.default_process_rss_limit_bytes(),
-        Some(8 * GIB)
-    );
-    assert_eq!(
-        ProductValidationScenario::T5Qual002FourPanelAutoplay.default_process_rss_limit_bytes(),
-        Some(8 * GIB)
-    );
 }
 
 #[test]
@@ -2033,9 +1252,6 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
         },
         gpu_timestamps_requested: true,
         preflight_only: false,
-        process_rss_limit_bytes: Some(8 * GIB),
-        process_peak_rss_bytes: Some(64 * MIB),
-        process_rss_limit_exceeded: false,
         source_closure_evidence: Value::Null,
         automation_status: Some("passed".to_owned()),
         exit_status: Some("0".to_owned()),
@@ -2177,10 +1393,6 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
         report["environment"]["product_validate_preflight_only"],
         false
     );
-    assert_eq!(report["limits"]["process_rss_limit_bytes"], 8 * GIB);
-    assert_eq!(report["process"]["rss_limit_bytes"], 8 * GIB);
-    assert_eq!(report["process"]["peak_rss_bytes"], 64 * MIB);
-    assert_eq!(report["process"]["rss_limit_exceeded"], false);
     assert_eq!(report["evidence_level"], "E1");
     assert_eq!(
         report["claim_boundary"]["evidence_type"],
@@ -2206,7 +1418,6 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
         GENERATED_FIXTURE_SCENARIO
     );
     assert_eq!(report["scenario"]["render_modes"], json!(["mip"]));
-    assert_eq!(report["limits"]["heavy_local_evidence"], false);
     assert_eq!(report["limits"]["cpu_byte_limit_enforced"], true);
     assert_eq!(report["limits"]["runtime_work_limit_enforced"], true);
     assert_eq!(
@@ -2221,53 +1432,13 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
         report["limits"]["runtime_work_limits"]["queued_requests"],
         script["limits"]["max_runtime_queued_requests"]
     );
-
-    let custom_script_report = wrapper_report_json(WrapperReport {
-        path: &wrapper_path,
-        scenario_name: CUSTOM_SCRIPT_SCENARIO,
-        status: ProductValidationStatus::Passed,
-        failure_reason: None,
-        started_at_epoch_ms: 0,
-        duration_ms: 1.0,
-        timeout_secs: 60,
-        package: &package,
-        binary: Path::new("/tmp/packaged-mirante4d-app"),
-        script: &script_path,
-        script_value: &script,
-        automation_report: &automation_report_path,
-        automation_report_value: Some(&automation_report),
-        stdout: &stdout_path,
-        stderr: &stderr_path,
-        display: DisplayClassification {
-            class: DisplayClass::VirtualDisplay,
-            source: DISPLAY_CLASS_ENV,
-        },
-        gpu_timestamps_requested: false,
-        preflight_only: false,
-        process_rss_limit_bytes: None,
-        process_peak_rss_bytes: None,
-        process_rss_limit_exceeded: false,
-        source_closure_evidence: Value::Null,
-        automation_status: Some("passed".to_owned()),
-        exit_status: Some("0".to_owned()),
-        exit_success: Some(true),
-    });
-
-    assert_eq!(
-        custom_script_report["scenario"]["name"],
-        CUSTOM_SCRIPT_SCENARIO
-    );
-    assert_eq!(
-        custom_script_report["scenario"]["automation_script_scenario"],
-        GENERATED_FIXTURE_SCENARIO
-    );
 }
 
 #[test]
 fn wrapper_report_marks_preflight_as_non_launch_unsupported_evidence() {
     let tempdir = tempfile::tempdir().unwrap();
     let package = extract_target_u16_fixture(tempdir.path()).unwrap();
-    let script = t5_qual_001_interaction_mip_script(&package);
+    let script = target_fixture_camera_smoke_script(&package);
     let wrapper_path = tempdir.path().join("product-validation-report.json");
     let script_path = tempdir.path().join("product-automation-script.json");
     let automation_report_path = tempdir.path().join("product-automation-report.json");
@@ -2276,12 +1447,12 @@ fn wrapper_report_marks_preflight_as_non_launch_unsupported_evidence() {
 
     let report = wrapper_report_json(WrapperReport {
         path: &wrapper_path,
-        scenario_name: T5_QUAL_001_INTERACTION_MIP_SCENARIO,
+        scenario_name: GENERATED_FIXTURE_SCENARIO,
         status: ProductValidationStatus::Unsupported,
         failure_reason: Some("product validation preflight requested".to_owned()),
         started_at_epoch_ms: 0,
         duration_ms: 1.0,
-        timeout_secs: 180,
+        timeout_secs: 60,
         package: &package,
         binary: Path::new("/tmp/packaged-mirante4d-app"),
         script: &script_path,
@@ -2296,9 +1467,6 @@ fn wrapper_report_marks_preflight_as_non_launch_unsupported_evidence() {
         },
         gpu_timestamps_requested: false,
         preflight_only: true,
-        process_rss_limit_bytes: Some(8 * GIB),
-        process_peak_rss_bytes: None,
-        process_rss_limit_exceeded: false,
         source_closure_evidence: Value::Null,
         automation_status: None,
         exit_status: None,
@@ -2311,10 +1479,7 @@ fn wrapper_report_marks_preflight_as_non_launch_unsupported_evidence() {
         "product validation preflight requested"
     );
     assert_eq!(report["dataset"]["manifest_status"], "loaded");
-    assert_eq!(
-        report["scenario"]["name"],
-        T5_QUAL_001_INTERACTION_MIP_SCENARIO
-    );
+    assert_eq!(report["scenario"]["name"], GENERATED_FIXTURE_SCENARIO);
     assert_eq!(
         report["scenario"]["automation_script"],
         script_path.to_string_lossy().as_ref()
@@ -2328,8 +1493,6 @@ fn wrapper_report_marks_preflight_as_non_launch_unsupported_evidence() {
         report["environment"]["product_validate_preflight_only"],
         true
     );
-    assert_eq!(report["limits"]["heavy_local_evidence"], true);
-    assert_eq!(report["limits"]["process_rss_limit_bytes"], 8 * GIB);
     assert!(report["process"]["exit_success"].is_null());
     assert!(report["process"]["exit_status"].is_null());
 }

@@ -8,10 +8,7 @@ use crate::smoke::app_smoke;
 use crate::workflow_audit::workflow_audit;
 
 const PRODUCT_VALIDATE_USAGE: &str = "usage: cargo xtask product-validate [target-package] \
-     [target_fixture_camera_smoke|target_fixture_render_modes|target_source_verification|b4_project_persistence|\
-      t5_qual_001_interaction_mip|t5_qual_001_interaction_render_modes|t5_qual_001_interaction_continuous|\
-      t5_qual_001_four_panel_cross_section|t5_qual_001_four_panel_fine_scale|\
-      t5_qual_001_four_panel_continuous_cross_section|t5_qual_002_four_panel_timepoint|t5_qual_002_four_panel_autoplay|custom_script]";
+     [target_fixture_camera_smoke|target_fixture_render_modes|target_source_verification|b4_project_persistence]";
 
 mod arch;
 mod command_audit;
@@ -150,9 +147,9 @@ under target/mirante4d/product-validation/. With no package argument, the
 bounded promoted target U16 fixture is extracted locally.
 
 The ordinary bounded scenarios are target_fixture_camera_smoke,
-target_fixture_render_modes, and target_source_verification. The T5 scenarios
-require an explicit local package and the heavy-work opt-in. Use custom_script
-with MIRANTE4D_PRODUCT_VALIDATE_SCRIPT=<script.json> for a reviewed script.
+target_fixture_render_modes, and target_source_verification. The retained
+b4_project_persistence scenario checks project save, recovery, and reopen
+behavior across three application launches.
 
 Useful controls:
   MIRANTE4D_PRODUCT_VALIDATE_TIMEOUT_SECS=<seconds>
@@ -218,13 +215,6 @@ mod tests {
             ProductValidateArgs::Run {
                 package: None,
                 scenario: Some("b4_project_persistence".to_owned())
-            }
-        );
-        assert_eq!(
-            product_validate_args(args(&["sample.m4d", "t5_qual_001_interaction_mip"])).unwrap(),
-            ProductValidateArgs::Run {
-                package: Some("sample.m4d".to_owned()),
-                scenario: Some("t5_qual_001_interaction_mip".to_owned())
             }
         );
     }

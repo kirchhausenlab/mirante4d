@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::{
     host::benchmark_host_context,
-    process::{run_cargo, with_heavy_benchmark_guard},
+    process::run_cargo,
     reports::{read_json_file, write_json_file},
     target_fixture::extract_target_u16_fixture,
 };
@@ -29,10 +29,8 @@ const SKIP_RELEASE_BUILD_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_SKIP_RELEASE_BU
 const APP_BINARY_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_APP_BINARY";
 const DISPLAY_CLASS_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS";
 const SCENARIO_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_SCENARIO";
-const CUSTOM_SCRIPT_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_SCRIPT";
 const PREFLIGHT_ONLY_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_PREFLIGHT_ONLY";
 const PRODUCT_VALIDATE_GPU_TIMESTAMPS_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_GPU_TIMESTAMPS";
-const PRODUCT_VALIDATE_MAX_RSS_BYTES_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_MAX_RSS_BYTES";
 const APP_GPU_TIMESTAMPS_ENV: &str = "MIRANTE4D_GPU_TIMESTAMPS";
 const GENERATED_FIXTURE_SCENARIO: &str = "target_fixture_camera_smoke";
 const GENERATED_RENDER_MODES_SCENARIO: &str = "target_fixture_render_modes";
@@ -47,16 +45,6 @@ const B4_PRIMARY_CLIENT_WIDTH: u32 = 1280;
 const B4_PRIMARY_CLIENT_HEIGHT: u32 = 720;
 const B4_SECONDARY_CLIENT_WIDTH: u32 = 1920;
 const B4_SECONDARY_CLIENT_HEIGHT: u32 = 1080;
-const T5_QUAL_001_INTERACTION_MIP_SCENARIO: &str = "t5_qual_001_interaction_mip";
-const T5_QUAL_001_INTERACTION_RENDER_MODES_SCENARIO: &str = "t5_qual_001_interaction_render_modes";
-const T5_QUAL_001_INTERACTION_CONTINUOUS_SCENARIO: &str = "t5_qual_001_interaction_continuous";
-const T5_QUAL_001_FOUR_PANEL_CROSS_SECTION_SCENARIO: &str = "t5_qual_001_four_panel_cross_section";
-const T5_QUAL_001_FOUR_PANEL_FINE_SCALE_SCENARIO: &str = "t5_qual_001_four_panel_fine_scale";
-const T5_QUAL_001_FOUR_PANEL_CONTINUOUS_CROSS_SECTION_SCENARIO: &str =
-    "t5_qual_001_four_panel_continuous_cross_section";
-const T5_QUAL_002_FOUR_PANEL_TIMEPOINT_SCENARIO: &str = "t5_qual_002_four_panel_timepoint";
-const T5_QUAL_002_FOUR_PANEL_AUTOPLAY_SCENARIO: &str = "t5_qual_002_four_panel_autoplay";
-const CUSTOM_SCRIPT_SCENARIO: &str = "custom_script";
 const GENERATED_VIEWPORT_WIDTH: u32 = 1280;
 const GENERATED_VIEWPORT_HEIGHT: u32 = 720;
 const GENERATED_RESIZED_VIEWPORT_WIDTH: u32 = 1920;
@@ -67,12 +55,7 @@ const B3_SECOND_VIEWPORT_WIDTH: u32 = 1920;
 const B3_SECOND_VIEWPORT_HEIGHT: u32 = 1080;
 const B3_PRIMARY_E1_CAPTURE: &str = "b3-after-success-1280x720";
 const B3_SECONDARY_E1_CAPTURE: &str = "b3-after-success-1920x1080";
-const T5_QUAL_001_VIEWPORT_WIDTH: u32 = 1280;
-const T5_QUAL_001_VIEWPORT_HEIGHT: u32 = 720;
-const T5_QUAL_002_VIEWPORT_WIDTH: u32 = 1280;
-const T5_QUAL_002_VIEWPORT_HEIGHT: u32 = 720;
 const MIB: u64 = 1024 * 1024;
-const GIB: u64 = 1024 * MIB;
 const PREFLIGHT_ONLY_DISPLAY_SOURCE: &str = "preflight_only";
 const LEGACY_ROOT_PRODUCT_VALIDATION_ARTIFACTS: &[&str] = &[
     "product-automation-script.json",
@@ -273,20 +256,9 @@ pub(crate) fn product_validate_report_with_scenario(
     package: Option<&Path>,
     scenario: Option<&str>,
 ) -> anyhow::Result<ProductValidationOutcome> {
-    let scenario = ProductValidationScenario::resolve(
-        scenario,
-        env::var(SCENARIO_ENV).ok().as_deref(),
-        env::var_os(CUSTOM_SCRIPT_ENV).map(PathBuf::from),
-    )?;
-    scenario.validate_package_arg(package)?;
-    if scenario.requires_heavy_opt_in() {
-        let command_name = format!("product-validate {}", scenario.name());
-        with_heavy_benchmark_guard(&command_name, || {
-            product_validate_report_inner(package, &scenario)
-        })
-    } else {
-        product_validate_report_inner(package, &scenario)
-    }
+    let scenario =
+        ProductValidationScenario::resolve(scenario, env::var(SCENARIO_ENV).ok().as_deref())?;
+    product_validate_report_inner(package, &scenario)
 }
 
 fn product_validate_report_inner(
@@ -330,7 +302,6 @@ fn product_validate_report_inner(
     }
     write_json_file(&script_path, &script)?;
     let timeout_seconds = timeout_secs(scenario);
-    let process_rss_limit_bytes = process_rss_limit_bytes(scenario);
     let preflight_only = env_flag(PREFLIGHT_ONLY_ENV);
 
     if preflight_only {
@@ -360,9 +331,6 @@ fn product_validate_report_inner(
             },
             gpu_timestamps_requested,
             preflight_only,
-            process_rss_limit_bytes,
-            process_peak_rss_bytes: None,
-            process_rss_limit_exceeded: false,
             source_closure_evidence: pending_source_closure_evidence.clone(),
             automation_status: None,
             exit_status: None,
@@ -399,9 +367,6 @@ fn product_validate_report_inner(
             display,
             gpu_timestamps_requested,
             preflight_only,
-            process_rss_limit_bytes,
-            process_peak_rss_bytes: None,
-            process_rss_limit_exceeded: false,
             source_closure_evidence: pending_source_closure_evidence.clone(),
             automation_status: None,
             exit_status: None,
@@ -435,9 +400,6 @@ fn product_validate_report_inner(
             display,
             gpu_timestamps_requested,
             preflight_only,
-            process_rss_limit_bytes,
-            process_peak_rss_bytes: None,
-            process_rss_limit_exceeded: false,
             source_closure_evidence: pending_source_closure_evidence.clone(),
             automation_status: None,
             exit_status: None,
@@ -457,7 +419,6 @@ fn product_validate_report_inner(
         stderr_path: &stderr_path,
         timeout,
         gpu_timestamps_requested,
-        max_rss_bytes: process_rss_limit_bytes,
     })?;
     let source_closure_evidence = source_closure_before
         .as_ref()
@@ -492,9 +453,6 @@ fn product_validate_report_inner(
             display,
             gpu_timestamps_requested,
             preflight_only,
-            process_rss_limit_bytes,
-            process_peak_rss_bytes: status.peak_rss_bytes,
-            process_rss_limit_exceeded: status.rss_limit_exceeded,
             source_closure_evidence: source_closure_evidence.clone(),
             automation_status: None,
             exit_status: status.exit_status,
@@ -503,47 +461,6 @@ fn product_validate_report_inner(
         return Ok(ProductValidationOutcome {
             report_path: wrapper_report_path,
             status: ProductValidationStatus::TimedOut,
-        });
-    }
-
-    if status.rss_limit_exceeded {
-        write_wrapper_report(WrapperReport {
-            path: &wrapper_report_path,
-            scenario_name: scenario.name(),
-            status: ProductValidationStatus::Failed,
-            failure_reason: Some(format!(
-                "native app exceeded product validation process RSS limit: peak={} limit={}",
-                status
-                    .peak_rss_bytes
-                    .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string()),
-                process_rss_limit_bytes
-                    .map_or_else(|| "unset".to_owned(), |bytes| bytes.to_string())
-            )),
-            started_at_epoch_ms,
-            duration_ms: duration_ms(started_at.elapsed()),
-            timeout_secs: timeout_seconds,
-            package: &package,
-            binary: binary.path(),
-            script: &script_path,
-            script_value: &script,
-            automation_report: &automation_report_path,
-            automation_report_value: None,
-            stdout: &stdout_path,
-            stderr: &stderr_path,
-            display,
-            gpu_timestamps_requested,
-            preflight_only,
-            process_rss_limit_bytes,
-            process_peak_rss_bytes: status.peak_rss_bytes,
-            process_rss_limit_exceeded: status.rss_limit_exceeded,
-            source_closure_evidence: source_closure_evidence.clone(),
-            automation_status: None,
-            exit_status: status.exit_status,
-            exit_success: status.exit_success,
-        })?;
-        return Ok(ProductValidationOutcome {
-            report_path: wrapper_report_path,
-            status: ProductValidationStatus::Failed,
         });
     }
 
@@ -602,9 +519,6 @@ fn product_validate_report_inner(
         display,
         gpu_timestamps_requested,
         preflight_only,
-        process_rss_limit_bytes,
-        process_peak_rss_bytes: status.peak_rss_bytes,
-        process_rss_limit_exceeded: status.rss_limit_exceeded,
         source_closure_evidence,
         automation_status,
         exit_status: status.exit_status,
@@ -623,15 +537,6 @@ enum ProductValidationScenario {
     GeneratedFixtureRenderModes,
     B3SourceVerification,
     B4ProjectPersistence,
-    T5Qual001InteractionMip,
-    T5Qual001InteractionRenderModes,
-    T5Qual001InteractionContinuous,
-    T5Qual001FourPanelCrossSection,
-    T5Qual001FourPanelFineScale,
-    T5Qual001FourPanelContinuousCrossSection,
-    T5Qual002FourPanelTimepoint,
-    T5Qual002FourPanelAutoplay,
-    CustomScript(PathBuf),
 }
 
 impl ProductValidationScenario {
@@ -641,35 +546,11 @@ impl ProductValidationScenario {
             Self::GeneratedFixtureRenderModes => GENERATED_RENDER_MODES_SCENARIO,
             Self::B3SourceVerification => B3_SOURCE_VERIFICATION_SCENARIO,
             Self::B4ProjectPersistence => B4_PROJECT_PERSISTENCE_SCENARIO,
-            Self::T5Qual001InteractionMip => T5_QUAL_001_INTERACTION_MIP_SCENARIO,
-            Self::T5Qual001InteractionRenderModes => T5_QUAL_001_INTERACTION_RENDER_MODES_SCENARIO,
-            Self::T5Qual001InteractionContinuous => T5_QUAL_001_INTERACTION_CONTINUOUS_SCENARIO,
-            Self::T5Qual001FourPanelCrossSection => T5_QUAL_001_FOUR_PANEL_CROSS_SECTION_SCENARIO,
-            Self::T5Qual001FourPanelFineScale => T5_QUAL_001_FOUR_PANEL_FINE_SCALE_SCENARIO,
-            Self::T5Qual001FourPanelContinuousCrossSection => {
-                T5_QUAL_001_FOUR_PANEL_CONTINUOUS_CROSS_SECTION_SCENARIO
-            }
-            Self::T5Qual002FourPanelTimepoint => T5_QUAL_002_FOUR_PANEL_TIMEPOINT_SCENARIO,
-            Self::T5Qual002FourPanelAutoplay => T5_QUAL_002_FOUR_PANEL_AUTOPLAY_SCENARIO,
-            Self::CustomScript(_) => CUSTOM_SCRIPT_SCENARIO,
         }
     }
 
-    fn resolve(
-        explicit: Option<&str>,
-        env_value: Option<&str>,
-        custom_script: Option<PathBuf>,
-    ) -> anyhow::Result<Self> {
+    fn resolve(explicit: Option<&str>, env_value: Option<&str>) -> anyhow::Result<Self> {
         let requested = explicit.or(env_value);
-        if let Some(path) = custom_script {
-            match requested {
-                Some(CUSTOM_SCRIPT_SCENARIO) | None => return Ok(Self::CustomScript(path)),
-                Some(other) => bail!(
-                    "{CUSTOM_SCRIPT_ENV} cannot be combined with generated product validation \
-                     scenario {other:?}; use {CUSTOM_SCRIPT_SCENARIO:?} or unset {CUSTOM_SCRIPT_ENV}"
-                ),
-            }
-        }
         match requested.unwrap_or(GENERATED_FIXTURE_SCENARIO) {
             GENERATED_FIXTURE_SCENARIO | "target-fixture-camera-smoke" | "target" => {
                 Ok(Self::GeneratedFixtureCameraSmoke)
@@ -683,47 +564,10 @@ impl ProductValidationScenario {
             B4_PROJECT_PERSISTENCE_SCENARIO | "b4-project-persistence" => {
                 Ok(Self::B4ProjectPersistence)
             }
-            T5_QUAL_001_INTERACTION_MIP_SCENARIO
-            | "t5-qual-001-interaction-mip"
-            | "T5-QUAL-001" => Ok(Self::T5Qual001InteractionMip),
-            T5_QUAL_001_INTERACTION_RENDER_MODES_SCENARIO
-            | "t5-qual-001-interaction-render-modes"
-            | "t5-qual-001-render-modes" => Ok(Self::T5Qual001InteractionRenderModes),
-            T5_QUAL_001_INTERACTION_CONTINUOUS_SCENARIO
-            | "t5-qual-001-interaction-continuous"
-            | "t5-qual-001-continuous" => Ok(Self::T5Qual001InteractionContinuous),
-            T5_QUAL_001_FOUR_PANEL_CROSS_SECTION_SCENARIO
-            | "t5-qual-001-four-panel-cross-section"
-            | "t5-qual-001-four-panel" => Ok(Self::T5Qual001FourPanelCrossSection),
-            T5_QUAL_001_FOUR_PANEL_FINE_SCALE_SCENARIO
-            | "t5-qual-001-four-panel-fine-scale"
-            | "t5-qual-001-fine-scale" => Ok(Self::T5Qual001FourPanelFineScale),
-            T5_QUAL_001_FOUR_PANEL_CONTINUOUS_CROSS_SECTION_SCENARIO
-            | "t5-qual-001-four-panel-continuous-cross-section"
-            | "t5-qual-001-four-panel-continuous"
-            | "t5-qual-001-cross-section-continuous" => {
-                Ok(Self::T5Qual001FourPanelContinuousCrossSection)
-            }
-            T5_QUAL_002_FOUR_PANEL_TIMEPOINT_SCENARIO
-            | "t5_qual_002-four-panel-timepoint"
-            | "t5_qual_002-timepoint" => Ok(Self::T5Qual002FourPanelTimepoint),
-            T5_QUAL_002_FOUR_PANEL_AUTOPLAY_SCENARIO
-            | "t5_qual_002-four-panel-autoplay"
-            | "t5_qual_002-autoplay" => Ok(Self::T5Qual002FourPanelAutoplay),
-            CUSTOM_SCRIPT_SCENARIO => {
-                bail!("{CUSTOM_SCRIPT_SCENARIO} requires {CUSTOM_SCRIPT_ENV}=<script.json>")
-            }
             other => bail!(
                 "unknown product validation scenario {other:?}; expected \
                  {GENERATED_FIXTURE_SCENARIO}, {GENERATED_RENDER_MODES_SCENARIO}, \
-                 {B3_SOURCE_VERIFICATION_SCENARIO}, {B4_PROJECT_PERSISTENCE_SCENARIO}, \
-                 {T5_QUAL_001_INTERACTION_MIP_SCENARIO}, {T5_QUAL_001_INTERACTION_RENDER_MODES_SCENARIO}, \
-                 {T5_QUAL_001_INTERACTION_CONTINUOUS_SCENARIO}, {T5_QUAL_001_FOUR_PANEL_CROSS_SECTION_SCENARIO}, \
-                 {T5_QUAL_001_FOUR_PANEL_FINE_SCALE_SCENARIO}, \
-                 {T5_QUAL_001_FOUR_PANEL_CONTINUOUS_CROSS_SECTION_SCENARIO}, \
-                 {T5_QUAL_002_FOUR_PANEL_TIMEPOINT_SCENARIO}, \
-                 {T5_QUAL_002_FOUR_PANEL_AUTOPLAY_SCENARIO}, \
-                 or {CUSTOM_SCRIPT_SCENARIO}"
+                 {B3_SOURCE_VERIFICATION_SCENARIO}, or {B4_PROJECT_PERSISTENCE_SCENARIO}"
             ),
         }
     }
@@ -741,93 +585,16 @@ impl ProductValidationScenario {
                 | "target-source-verification"
                 | B4_PROJECT_PERSISTENCE_SCENARIO
                 | "b4-project-persistence"
-                | T5_QUAL_001_INTERACTION_MIP_SCENARIO
-                | "t5-qual-001-interaction-mip"
-                | "T5-QUAL-001"
-                | T5_QUAL_001_INTERACTION_RENDER_MODES_SCENARIO
-                | "t5-qual-001-interaction-render-modes"
-                | "t5-qual-001-render-modes"
-                | T5_QUAL_001_INTERACTION_CONTINUOUS_SCENARIO
-                | "t5-qual-001-interaction-continuous"
-                | "t5-qual-001-continuous"
-                | T5_QUAL_001_FOUR_PANEL_CROSS_SECTION_SCENARIO
-                | "t5-qual-001-four-panel-cross-section"
-                | "t5-qual-001-four-panel"
-                | T5_QUAL_001_FOUR_PANEL_FINE_SCALE_SCENARIO
-                | "t5-qual-001-four-panel-fine-scale"
-                | "t5-qual-001-fine-scale"
-                | T5_QUAL_001_FOUR_PANEL_CONTINUOUS_CROSS_SECTION_SCENARIO
-                | "t5-qual-001-four-panel-continuous-cross-section"
-                | "t5-qual-001-four-panel-continuous"
-                | "t5-qual-001-cross-section-continuous"
-                | T5_QUAL_002_FOUR_PANEL_TIMEPOINT_SCENARIO
-                | "t5_qual_002-four-panel-timepoint"
-                | "t5_qual_002-timepoint"
-                | T5_QUAL_002_FOUR_PANEL_AUTOPLAY_SCENARIO
-                | "t5_qual_002-four-panel-autoplay"
-                | "t5_qual_002-autoplay"
-                | CUSTOM_SCRIPT_SCENARIO
         )
-    }
-
-    fn requires_heavy_opt_in(&self) -> bool {
-        self.is_heavy_local_sample_scenario()
     }
 
     fn default_timeout_secs(&self) -> u64 {
         match self {
             Self::GeneratedFixtureCameraSmoke
             | Self::GeneratedFixtureRenderModes
-            | Self::B3SourceVerification
-            | Self::CustomScript(_) => 60,
+            | Self::B3SourceVerification => 60,
             Self::B4ProjectPersistence => B4_PHASE_TIMEOUT_SECS * 3,
-            Self::T5Qual001InteractionMip => 180,
-            Self::T5Qual001InteractionRenderModes => 240,
-            Self::T5Qual001InteractionContinuous => 300,
-            Self::T5Qual001FourPanelCrossSection => 300,
-            Self::T5Qual001FourPanelFineScale => 300,
-            Self::T5Qual001FourPanelContinuousCrossSection => 300,
-            Self::T5Qual002FourPanelTimepoint => 300,
-            Self::T5Qual002FourPanelAutoplay => 300,
         }
-    }
-
-    fn default_process_rss_limit_bytes(&self) -> Option<u64> {
-        if self.is_heavy_local_sample_scenario() {
-            Some(8 * GIB)
-        } else {
-            None
-        }
-    }
-
-    fn validate_package_arg(&self, package: Option<&Path>) -> anyhow::Result<()> {
-        if self.is_heavy_local_sample_scenario() && package.is_none() {
-            bail!(
-                "{} product validation requires <native-package.m4d>",
-                self.name()
-            );
-        }
-        Ok(())
-    }
-
-    fn is_t5_qual_001_scenario(&self) -> bool {
-        matches!(
-            self,
-            Self::T5Qual001InteractionMip
-                | Self::T5Qual001InteractionRenderModes
-                | Self::T5Qual001InteractionContinuous
-                | Self::T5Qual001FourPanelCrossSection
-                | Self::T5Qual001FourPanelFineScale
-                | Self::T5Qual001FourPanelContinuousCrossSection
-        )
-    }
-
-    fn is_heavy_local_sample_scenario(&self) -> bool {
-        self.is_t5_qual_001_scenario()
-            || matches!(
-                self,
-                Self::T5Qual002FourPanelTimepoint | Self::T5Qual002FourPanelAutoplay
-            )
     }
 }
 
@@ -1577,80 +1344,6 @@ fn product_validation_package_and_script(
             let script = b4_launch_one_script(&package, placeholder, checkpoint);
             Ok((package, script))
         }
-        ProductValidationScenario::T5Qual001InteractionMip => {
-            let package = package
-                .context(
-                    "t5_qual_001_interaction_mip product validation requires <native-package.m4d>",
-                )?
-                .to_path_buf();
-            let script = t5_qual_001_interaction_mip_script(&package);
-            Ok((package, script))
-        }
-        ProductValidationScenario::T5Qual001InteractionRenderModes => {
-            let package = package
-                .context(
-                    "t5_qual_001_interaction_render_modes product validation requires <native-package.m4d>",
-                )?
-                .to_path_buf();
-            let script = t5_qual_001_interaction_render_modes_script(&package);
-            Ok((package, script))
-        }
-        ProductValidationScenario::T5Qual001InteractionContinuous => {
-            let package = package.context(
-                "t5_qual_001_interaction_continuous product validation requires <native-package.m4d>",
-            )?;
-            let script = t5_qual_001_interaction_continuous_script(package);
-            Ok((package.to_path_buf(), script))
-        }
-        ProductValidationScenario::T5Qual001FourPanelCrossSection => {
-            let package = package.context(
-                "t5_qual_001_four_panel_cross_section product validation requires <native-package.m4d>",
-            )?;
-            let script = t5_qual_001_four_panel_cross_section_script(package);
-            Ok((package.to_path_buf(), script))
-        }
-        ProductValidationScenario::T5Qual001FourPanelFineScale => {
-            let package = package.context(
-                "t5_qual_001_four_panel_fine_scale product validation requires <native-package.m4d>",
-            )?;
-            let script = t5_qual_001_four_panel_fine_scale_script(package);
-            Ok((package.to_path_buf(), script))
-        }
-        ProductValidationScenario::T5Qual001FourPanelContinuousCrossSection => {
-            let package = package.context(
-                "t5_qual_001_four_panel_continuous_cross_section product validation requires <native-package.m4d>",
-            )?;
-            let script = t5_qual_001_four_panel_continuous_cross_section_script(package);
-            Ok((package.to_path_buf(), script))
-        }
-        ProductValidationScenario::T5Qual002FourPanelTimepoint => {
-            let package = package.context(
-                "t5_qual_002_four_panel_timepoint product validation requires <native-package.m4d>",
-            )?;
-            let script = t5_qual_002_four_panel_timepoint_script(package);
-            Ok((package.to_path_buf(), script))
-        }
-        ProductValidationScenario::T5Qual002FourPanelAutoplay => {
-            let package = package.context(
-                "t5_qual_002_four_panel_autoplay product validation requires <native-package.m4d>",
-            )?;
-            let script = t5_qual_002_four_panel_autoplay_script(package);
-            Ok((package.to_path_buf(), script))
-        }
-        ProductValidationScenario::CustomScript(script_path) => {
-            let script = load_custom_product_automation_script(script_path)?;
-            let package = match package {
-                Some(package) => package.to_path_buf(),
-                None => script_open_dataset_path(&script).with_context(|| {
-                    format!(
-                        "{CUSTOM_SCRIPT_ENV}={} does not include an open_dataset command; \
-                         pass <native-package.m4d> explicitly",
-                        script_path.display()
-                    )
-                })?,
-            };
-            Ok((package, script))
-        }
     }
 }
 
@@ -1975,748 +1668,6 @@ fn b4_launch_three_script(package: &Path, save_as: &Path) -> Value {
     })
 }
 
-fn t5_qual_001_interaction_mip_script(package: &Path) -> Value {
-    json!({
-        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
-        "scenario": T5_QUAL_001_INTERACTION_MIP_SCENARIO,
-        "limits": dataset_runtime_limits(4 * GIB, 4_096),
-        "commands": [
-            { "command": "open_dataset", "path": package },
-            { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
-            { "command": "set_viewport_size", "width": T5_QUAL_001_VIEWPORT_WIDTH, "height": T5_QUAL_001_VIEWPORT_HEIGHT },
-            { "command": "sleep_or_frames", "frames": 3 },
-            { "command": "wait_for", "condition": "first_frame", "timeout_ms": 60000 },
-            { "command": "assert", "condition": "no_render_error" },
-            { "command": "set_render_mode", "mode": "mip" },
-            { "command": "assert", "condition": { "render_mode": { "mode": "mip" } } },
-            { "command": "camera_fit_data" },
-            { "command": "sleep_or_frames", "frames": 5 },
-            { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
-            { "command": "copy_diagnostics" },
-            { "command": "capture_screenshot", "name": "t5-qual-001-initial-mip" },
-            { "command": "camera_orbit", "yaw_points": 180.0, "pitch_points": 24.0, "viewport_height_points": T5_QUAL_001_VIEWPORT_HEIGHT as f32 },
-            { "command": "sleep_or_frames", "frames": 5 },
-            { "command": "probe_hover", "x_fraction": 0.45, "y_fraction": 0.55 },
-            { "command": "copy_diagnostics" },
-            { "command": "capture_screenshot", "name": "t5-qual-001-first-orbit-cache-miss" },
-            { "command": "camera_orbit", "yaw_points": -180.0, "pitch_points": -24.0, "viewport_height_points": T5_QUAL_001_VIEWPORT_HEIGHT as f32 },
-            { "command": "sleep_or_frames", "frames": 5 },
-            { "command": "copy_diagnostics" },
-            { "command": "capture_screenshot", "name": "t5-qual-001-return-orbit-cache-reuse" },
-            { "command": "camera_pan", "x_points": 96.0, "y_points": -48.0, "viewport_height_points": T5_QUAL_001_VIEWPORT_HEIGHT as f32 },
-            { "command": "sleep_or_frames", "frames": 5 },
-            { "command": "copy_diagnostics" },
-            { "command": "camera_zoom", "scroll_y_points": -160.0 },
-            { "command": "sleep_or_frames", "frames": 5 },
-            { "command": "copy_diagnostics" },
-            { "command": "assert", "condition": "nonblank_frame" },
-            { "command": "assert", "condition": "no_render_error" },
-            { "command": "quit" }
-        ]
-    })
-}
-
-fn t5_qual_001_interaction_render_modes_script(package: &Path) -> Value {
-    json!({
-        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
-        "scenario": T5_QUAL_001_INTERACTION_RENDER_MODES_SCENARIO,
-        "limits": dataset_runtime_limits(6 * GIB, 8_192),
-        "commands": [
-            { "command": "open_dataset", "path": package },
-            { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
-            { "command": "set_viewport_size", "width": T5_QUAL_001_VIEWPORT_WIDTH, "height": T5_QUAL_001_VIEWPORT_HEIGHT },
-            { "command": "sleep_or_frames", "frames": 3 },
-            { "command": "wait_for", "condition": "first_frame", "timeout_ms": 60000 },
-            { "command": "camera_fit_data" },
-            { "command": "set_render_mode", "mode": "mip" },
-            { "command": "assert", "condition": { "render_mode": { "mode": "mip" } } },
-            { "command": "assert", "condition": "nonblank_frame" },
-            { "command": "assert", "condition": "no_render_error" },
-            { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
-            { "command": "copy_diagnostics" },
-            { "command": "capture_screenshot", "name": "t5-qual-001-render-modes-mip" },
-            { "command": "set_render_mode", "mode": "dvr" },
-            { "command": "set_dvr_density_scale", "density_scale": 8.0 },
-            { "command": "sleep_or_frames", "frames": 5 },
-            { "command": "assert", "condition": { "render_mode": { "mode": "dvr" } } },
-            { "command": "assert", "condition": "nonblank_frame" },
-            { "command": "assert", "condition": "no_render_error" },
-            { "command": "probe_hover", "x_fraction": 0.47, "y_fraction": 0.53 },
-            { "command": "camera_orbit", "yaw_points": 120.0, "pitch_points": 16.0, "viewport_height_points": T5_QUAL_001_VIEWPORT_HEIGHT as f32 },
-            { "command": "sleep_or_frames", "frames": 5 },
-            { "command": "copy_diagnostics" },
-            { "command": "capture_screenshot", "name": "t5-qual-001-render-modes-dvr-orbit" },
-            { "command": "set_render_mode", "mode": "iso" },
-            { "command": "set_iso_display_level", "display_level": 0.02 },
-            { "command": "sleep_or_frames", "frames": 5 },
-            { "command": "assert", "condition": { "render_mode": { "mode": "iso" } } },
-            { "command": "assert", "condition": "nonblank_frame" },
-            { "command": "assert", "condition": "no_render_error" },
-            { "command": "probe_hover", "x_fraction": 0.52, "y_fraction": 0.48 },
-            { "command": "camera_pan", "x_points": 80.0, "y_points": -40.0, "viewport_height_points": T5_QUAL_001_VIEWPORT_HEIGHT as f32 },
-            { "command": "sleep_or_frames", "frames": 5 },
-            { "command": "copy_diagnostics" },
-            { "command": "capture_screenshot", "name": "t5-qual-001-render-modes-iso-pan" },
-            { "command": "set_render_mode", "mode": "mip" },
-            { "command": "sleep_or_frames", "frames": 5 },
-            { "command": "assert", "condition": { "render_mode": { "mode": "mip" } } },
-            { "command": "assert", "condition": "nonblank_frame" },
-            { "command": "assert", "condition": "no_render_error" },
-            { "command": "copy_diagnostics" },
-            { "command": "capture_screenshot", "name": "t5-qual-001-render-modes-return-mip" },
-            { "command": "quit" }
-        ]
-    })
-}
-
-fn t5_qual_001_interaction_continuous_script(package: &Path) -> Value {
-    let mut commands = vec![
-        json!({ "command": "open_dataset", "path": package }),
-        json!({ "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 }),
-        json!({ "command": "set_viewport_size", "width": T5_QUAL_001_VIEWPORT_WIDTH, "height": T5_QUAL_001_VIEWPORT_HEIGHT }),
-        json!({ "command": "sleep_or_frames", "frames": 3 }),
-        json!({ "command": "wait_for", "condition": "first_frame", "timeout_ms": 60000 }),
-        json!({ "command": "camera_fit_data" }),
-        json!({ "command": "set_render_mode", "mode": "mip" }),
-        json!({ "command": "assert", "condition": { "render_mode": { "mode": "mip" } } }),
-        json!({ "command": "sleep_or_frames", "frames": 5 }),
-        json!({ "command": "copy_diagnostics" }),
-    ];
-    append_continuous_camera_sequence(&mut commands, 18);
-    commands.extend([
-        json!({ "command": "assert", "condition": "nonblank_frame" }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "copy_diagnostics" }),
-        json!({ "command": "capture_screenshot", "name": "t5-qual-001-continuous-mip" }),
-        json!({ "command": "set_render_mode", "mode": "dvr" }),
-        json!({ "command": "set_dvr_density_scale", "density_scale": 8.0 }),
-        json!({ "command": "assert", "condition": { "render_mode": { "mode": "dvr" } } }),
-        json!({ "command": "sleep_or_frames", "frames": 5 }),
-    ]);
-    append_continuous_camera_sequence(&mut commands, 18);
-    commands.extend([
-        json!({ "command": "assert", "condition": "nonblank_frame" }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "copy_diagnostics" }),
-        json!({ "command": "capture_screenshot", "name": "t5-qual-001-continuous-dvr" }),
-        json!({ "command": "set_render_mode", "mode": "iso" }),
-        json!({ "command": "set_iso_display_level", "display_level": 0.02 }),
-        json!({ "command": "assert", "condition": { "render_mode": { "mode": "iso" } } }),
-        json!({ "command": "sleep_or_frames", "frames": 5 }),
-    ]);
-    append_continuous_camera_sequence(&mut commands, 18);
-    commands.extend([
-        json!({ "command": "assert", "condition": "nonblank_frame" }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "copy_diagnostics" }),
-        json!({ "command": "capture_screenshot", "name": "t5-qual-001-continuous-iso" }),
-        json!({ "command": "quit" }),
-    ]);
-
-    json!({
-        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
-        "scenario": T5_QUAL_001_INTERACTION_CONTINUOUS_SCENARIO,
-        "limits": dataset_runtime_limits(6 * GIB, 8_192),
-        "commands": commands,
-    })
-}
-
-fn t5_qual_001_four_panel_cross_section_script(package: &Path) -> Value {
-    let commands = vec![
-        json!({ "command": "open_dataset", "path": package }),
-        json!({ "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 }),
-        json!({ "command": "set_viewport_size", "width": T5_QUAL_001_VIEWPORT_WIDTH, "height": T5_QUAL_001_VIEWPORT_HEIGHT }),
-        json!({ "command": "sleep_or_frames", "frames": 3 }),
-        json!({ "command": "wait_for", "condition": "first_frame", "timeout_ms": 60000 }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "set_render_mode", "mode": "mip" }),
-        json!({ "command": "assert", "condition": { "render_mode": { "mode": "mip" } } }),
-        json!({ "command": "camera_fit_data" }),
-        json!({ "command": "sleep_or_frames", "frames": 5 }),
-        json!({ "command": "copy_diagnostics" }),
-        json!({ "command": "capture_screenshot", "name": "t5-qual-001-four-panel-single3d-baseline" }),
-        json!({ "command": "set_viewer_layout", "layout": "four_panel" }),
-        json!({ "command": "sleep_or_frames", "frames": 8 }),
-        json!({ "command": "assert", "condition": { "viewer_layout": { "layout": "four_panel" } } }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "assert", "condition": { "cross_section_panel_schedule": {
-            "panel": "xy",
-            "min_generation": 1,
-            "min_selected_resources": 1
-        } } }),
-        json!({ "command": "assert", "condition": { "cross_section_panel_schedule": {
-            "panel": "xz",
-            "min_generation": 1,
-            "min_selected_resources": 1
-        } } }),
-        json!({ "command": "assert", "condition": { "cross_section_panel_schedule": {
-            "panel": "yz",
-            "min_generation": 1,
-            "min_selected_resources": 1
-        } } }),
-        json!({ "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 60000 }),
-        json!({ "command": "assert", "condition": { "cross_section_panel_images_distinct": {
-            "min_different_pixels": 1
-        } } }),
-        json!({ "command": "assert", "condition": { "four_panel_images_distinct": {
-            "min_different_pixels": 1
-        } } }),
-        json!({ "command": "copy_diagnostics" }),
-        json!({ "command": "capture_screenshot", "name": "t5-qual-001-four-panel-initial" }),
-        json!({ "command": "cross_section_pan", "panel": "xz", "x_points": 72.0, "y_points": -24.0 }),
-        json!({ "command": "sleep_or_frames", "frames": 3 }),
-        json!({ "command": "assert", "condition": { "cross_section_active_panel": { "panel": "xz" } } }),
-        json!({ "command": "cross_section_slice_step", "panel": "xz", "notches": 2.0 }),
-        json!({ "command": "cross_section_slice_step", "panel": "xz", "notches": -1.0, "fast": true }),
-        json!({ "command": "cross_section_zoom", "panel": "xz", "x_fraction": 0.45, "y_fraction": 0.55, "scroll_y_points": -120.0 }),
-        json!({ "command": "cross_section_rotate", "panel": "xz", "x_points": 28.0, "y_points": -16.0 }),
-        json!({ "command": "sleep_or_frames", "frames": 8 }),
-        json!({ "command": "assert", "condition": { "cross_section_active_panel": { "panel": "xz" } } }),
-        json!({ "command": "assert", "condition": { "cross_section_panel_schedule": {
-            "panel": "xz",
-            "min_generation": 2,
-            "min_selected_resources": 1
-        } } }),
-        json!({ "command": "assert", "condition": { "active_lease_cohort": {
-            "min_required": 1,
-            "min_retained": 1,
-            "max_missing": 0,
-            "complete": true
-        } } }),
-        json!({ "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 60000 }),
-        json!({ "command": "assert", "condition": { "cross_section_panel_images_distinct": {
-            "min_different_pixels": 1
-        } } }),
-        json!({ "command": "assert", "condition": { "four_panel_images_distinct": {
-            "min_different_pixels": 1
-        } } }),
-        json!({ "command": "probe_panel_hover", "panel": "xz", "x_fraction": 0.5, "y_fraction": 0.5, "expected_status": "value", "expect_value": true }),
-        json!({ "command": "copy_diagnostics" }),
-        json!({ "command": "capture_screenshot", "name": "t5-qual-001-four-panel-after-oblique-interaction" }),
-        json!({ "command": "sleep_or_frames", "frames": 8 }),
-        json!({ "command": "copy_diagnostics" }),
-        json!({ "command": "set_viewer_layout", "layout": "single3d" }),
-        json!({ "command": "sleep_or_frames", "frames": 3 }),
-        json!({ "command": "assert", "condition": { "viewer_layout": { "layout": "single3d" } } }),
-        json!({ "command": "assert", "condition": "cross_section_retired" }),
-        json!({ "command": "camera_orbit", "yaw_points": 90.0, "pitch_points": 12.0, "viewport_height_points": T5_QUAL_001_VIEWPORT_HEIGHT as f32 }),
-        json!({ "command": "sleep_or_frames", "frames": 5 }),
-        json!({ "command": "assert", "condition": "nonblank_frame" }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "copy_diagnostics" }),
-        json!({ "command": "capture_screenshot", "name": "t5-qual-001-four-panel-returned-single3d" }),
-        json!({ "command": "quit" }),
-    ];
-    json!({
-        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
-        "scenario": T5_QUAL_001_FOUR_PANEL_CROSS_SECTION_SCENARIO,
-        "limits": dataset_runtime_limits(6 * GIB, 8_192),
-        "commands": commands,
-    })
-}
-
-fn t5_qual_001_four_panel_fine_scale_script(package: &Path) -> Value {
-    let mut commands = vec![
-        json!({ "command": "open_dataset", "path": package }),
-        json!({ "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 }),
-        json!({ "command": "set_viewport_size", "width": T5_QUAL_001_VIEWPORT_WIDTH, "height": T5_QUAL_001_VIEWPORT_HEIGHT }),
-        json!({ "command": "sleep_or_frames", "frames": 3 }),
-        json!({ "command": "wait_for", "condition": "first_frame", "timeout_ms": 60000 }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "set_render_mode", "mode": "mip" }),
-        json!({ "command": "assert", "condition": { "render_mode": { "mode": "mip" } } }),
-        json!({ "command": "camera_fit_data" }),
-        json!({ "command": "sleep_or_frames", "frames": 5 }),
-        json!({ "command": "set_viewer_layout", "layout": "four_panel" }),
-        json!({ "command": "sleep_or_frames", "frames": 8 }),
-        json!({ "command": "assert", "condition": { "viewer_layout": { "layout": "four_panel" } } }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 60000 }),
-        json!({ "command": "copy_diagnostics" }),
-        json!({ "command": "capture_screenshot", "name": "t5-qual-001-fine-scale-broad-before-zoom" }),
-        json!({ "command": "cross_section_zoom", "panel": "xz", "x_fraction": 0.5, "y_fraction": 0.5, "scroll_y_points": 1000.0 }),
-        json!({ "command": "cross_section_zoom", "panel": "xz", "x_fraction": 0.5, "y_fraction": 0.5, "scroll_y_points": 1000.0 }),
-        json!({ "command": "cross_section_zoom", "panel": "xz", "x_fraction": 0.5, "y_fraction": 0.5, "scroll_y_points": 1000.0 }),
-        json!({ "command": "sleep_or_frames", "millis": 250 }),
-        json!({ "command": "assert", "condition": { "cross_section_active_panel": { "panel": "xz" } } }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 120000 }),
-    ];
-    append_t5_qual_001_fine_scale_panel_assertions(&mut commands, 4);
-    commands.extend([
-        json!({ "command": "copy_diagnostics" }),
-        json!({ "command": "capture_screenshot", "name": "t5-qual-001-four-panel-fine-scale-s0" }),
-        json!({ "command": "set_viewer_layout", "layout": "single3d" }),
-        json!({ "command": "sleep_or_frames", "frames": 3 }),
-        json!({ "command": "assert", "condition": { "viewer_layout": { "layout": "single3d" } } }),
-        json!({ "command": "assert", "condition": "cross_section_retired" }),
-        json!({ "command": "camera_orbit", "yaw_points": 80.0, "pitch_points": 10.0, "viewport_height_points": T5_QUAL_001_VIEWPORT_HEIGHT as f32 }),
-        json!({ "command": "sleep_or_frames", "frames": 5 }),
-        json!({ "command": "assert", "condition": "nonblank_frame" }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "copy_diagnostics" }),
-        json!({ "command": "capture_screenshot", "name": "t5-qual-001-fine-scale-returned-single3d" }),
-        json!({ "command": "quit" }),
-    ]);
-
-    json!({
-        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
-        "scenario": T5_QUAL_001_FOUR_PANEL_FINE_SCALE_SCENARIO,
-        "limits": dataset_runtime_limits(6 * GIB, 8_192),
-        "commands": commands,
-    })
-}
-
-fn append_t5_qual_001_fine_scale_panel_assertions(commands: &mut Vec<Value>, min_generation: u64) {
-    for panel in ["xy", "xz", "yz"] {
-        commands.push(
-            json!({ "command": "assert", "condition": { "cross_section_panel_schedule": {
-            "panel": panel,
-            "min_generation": min_generation,
-            "target_scale_level": 0,
-            "render_scale_level": 0,
-            "min_selected_resources": 1,
-            "max_missing_occupied_resources": 0,
-            "display_current": true
-        } } }),
-        );
-    }
-    commands.push(
-        json!({ "command": "assert", "condition": { "active_lease_cohort": {
-        "min_required": 1,
-        "min_retained": 1,
-        "max_missing": 0,
-        "complete": true
-    } } }),
-    );
-    commands.push(
-        json!({ "command": "assert", "condition": { "cross_section_panel_images_distinct": {
-        "min_different_pixels": 1
-    } } }),
-    );
-    commands.push(
-        json!({ "command": "assert", "condition": { "four_panel_images_distinct": {
-        "min_different_pixels": 1
-    } } }),
-    );
-}
-
-fn t5_qual_001_four_panel_continuous_cross_section_script(package: &Path) -> Value {
-    let mut commands = vec![
-        json!({ "command": "open_dataset", "path": package }),
-        json!({ "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 }),
-        json!({ "command": "set_viewport_size", "width": T5_QUAL_001_VIEWPORT_WIDTH, "height": T5_QUAL_001_VIEWPORT_HEIGHT }),
-        json!({ "command": "sleep_or_frames", "frames": 3 }),
-        json!({ "command": "wait_for", "condition": "first_frame", "timeout_ms": 60000 }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "set_render_mode", "mode": "mip" }),
-        json!({ "command": "assert", "condition": { "render_mode": { "mode": "mip" } } }),
-        json!({ "command": "camera_fit_data" }),
-        json!({ "command": "sleep_or_frames", "frames": 5 }),
-        json!({ "command": "set_viewer_layout", "layout": "four_panel" }),
-        json!({ "command": "sleep_or_frames", "frames": 8 }),
-        json!({ "command": "assert", "condition": { "viewer_layout": { "layout": "four_panel" } } }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 60000 }),
-    ];
-    append_cross_section_panel_nonblank_assertions(&mut commands);
-    commands.extend([
-        json!({ "command": "copy_diagnostics" }),
-        json!({ "command": "capture_screenshot", "name": "t5-qual-001-four-panel-continuous-initial" }),
-    ]);
-    append_continuous_cross_section_sequence(&mut commands, 6);
-    commands.extend([
-        json!({ "command": "assert", "condition": { "cross_section_active_panel": { "panel": "xz" } } }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 120000 }),
-    ]);
-    append_t5_qual_001_continuous_cross_section_settled_assertions(&mut commands, 4);
-    commands.extend([
-        json!({ "command": "copy_diagnostics" }),
-        json!({ "command": "capture_screenshot", "name": "t5-qual-001-four-panel-continuous-settled" }),
-        json!({ "command": "set_viewer_layout", "layout": "single3d" }),
-        json!({ "command": "sleep_or_frames", "frames": 3 }),
-        json!({ "command": "assert", "condition": { "viewer_layout": { "layout": "single3d" } } }),
-        json!({ "command": "assert", "condition": "cross_section_retired" }),
-        json!({ "command": "camera_orbit", "yaw_points": 80.0, "pitch_points": 12.0, "viewport_height_points": T5_QUAL_001_VIEWPORT_HEIGHT as f32 }),
-        json!({ "command": "sleep_or_frames", "frames": 5 }),
-        json!({ "command": "assert", "condition": "nonblank_frame" }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "copy_diagnostics" }),
-        json!({ "command": "capture_screenshot", "name": "t5-qual-001-four-panel-continuous-returned-single3d" }),
-        json!({ "command": "quit" }),
-    ]);
-
-    json!({
-        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
-        "scenario": T5_QUAL_001_FOUR_PANEL_CONTINUOUS_CROSS_SECTION_SCENARIO,
-        "limits": dataset_runtime_limits(6 * GIB, 8_192),
-        "commands": commands,
-    })
-}
-
-fn append_continuous_cross_section_sequence(commands: &mut Vec<Value>, steps: usize) {
-    for step in 0..steps {
-        let direction = if step.is_multiple_of(2) { 1.0 } else { -1.0 };
-        commands.push(json!({
-            "command": "cross_section_rotate",
-            "panel": "xz",
-            "x_points": direction * 24.0,
-            "y_points": -direction * 14.0,
-        }));
-        commands.push(json!({
-            "command": "cross_section_slice_step",
-            "panel": "xz",
-            "notches": direction,
-            "fast": step.is_multiple_of(3),
-        }));
-        commands.push(json!({
-            "command": "cross_section_pan",
-            "panel": "xz",
-            "x_points": direction * 42.0,
-            "y_points": -direction * 18.0,
-        }));
-        commands.push(json!({
-            "command": "cross_section_zoom",
-            "panel": "xz",
-            "x_fraction": 0.5,
-            "y_fraction": 0.5,
-            "scroll_y_points": if step.is_multiple_of(2) { 140.0 } else { -105.0 },
-        }));
-        commands.push(json!({ "command": "sleep_or_frames", "frames": 1 }));
-        commands.push(json!({ "command": "assert", "condition": "no_render_error" }));
-        commands.push(
-            json!({ "command": "assert", "condition": { "cross_section_active_panel": {
-                "panel": "xz"
-            } } }),
-        );
-        append_cross_section_panel_nonblank_assertions(commands);
-        if step == steps / 2 {
-            commands.push(json!({ "command": "copy_diagnostics" }));
-        }
-    }
-}
-
-fn append_cross_section_panel_nonblank_assertions(commands: &mut Vec<Value>) {
-    for panel in ["xy", "xz", "yz"] {
-        commands.push(
-            json!({ "command": "assert", "condition": { "cross_section_panel_nonblank": {
-                "panel": panel,
-                "min_nonzero_rgb_pixels": 1
-            } } }),
-        );
-    }
-}
-
-fn append_t5_qual_001_continuous_cross_section_settled_assertions(
-    commands: &mut Vec<Value>,
-    min_generation: u64,
-) {
-    for panel in ["xy", "xz", "yz"] {
-        commands.push(
-            json!({ "command": "assert", "condition": { "cross_section_panel_schedule": {
-                "panel": panel,
-                "min_generation": min_generation,
-                "min_selected_resources": 1,
-                "max_missing_occupied_resources": 0,
-                "display_current": true
-            } } }),
-        );
-        commands.push(
-            json!({ "command": "assert", "condition": { "cross_section_panel_nonblank": {
-                "panel": panel,
-                "min_nonzero_rgb_pixels": 1
-            } } }),
-        );
-    }
-    commands.push(
-        json!({ "command": "assert", "condition": { "active_lease_cohort": {
-        "min_required": 1,
-        "min_retained": 1,
-        "max_missing": 0,
-        "complete": true
-    } } }),
-    );
-    commands.push(
-        json!({ "command": "assert", "condition": { "cross_section_panel_images_distinct": {
-            "min_different_pixels": 1
-        } } }),
-    );
-    commands.push(
-        json!({ "command": "assert", "condition": { "four_panel_images_distinct": {
-            "min_different_pixels": 1
-        } } }),
-    );
-}
-
-fn t5_qual_002_four_panel_timepoint_script(package: &Path) -> Value {
-    let mut commands = vec![
-        json!({ "command": "open_dataset", "path": package }),
-        json!({ "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 }),
-        json!({ "command": "set_viewport_size", "width": T5_QUAL_002_VIEWPORT_WIDTH, "height": T5_QUAL_002_VIEWPORT_HEIGHT }),
-        json!({ "command": "sleep_or_frames", "frames": 3 }),
-        json!({ "command": "wait_for", "condition": "first_frame", "timeout_ms": 60000 }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "set_render_mode", "mode": "mip" }),
-        json!({ "command": "assert", "condition": { "render_mode": { "mode": "mip" } } }),
-        json!({ "command": "camera_fit_data" }),
-        json!({ "command": "sleep_or_frames", "frames": 5 }),
-        json!({ "command": "set_viewer_layout", "layout": "four_panel" }),
-        json!({ "command": "sleep_or_frames", "frames": 8 }),
-        json!({ "command": "assert", "condition": { "viewer_layout": { "layout": "four_panel" } } }),
-        json!({ "command": "assert", "condition": { "active_timepoint": { "timepoint": 0 } } }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 90000 }),
-    ];
-    append_t5_qual_002_timepoint_panel_assertions(
-        &mut commands,
-        0,
-        1,
-        "t5_qual_002-four-panel-timepoint-0",
-    );
-    commands.extend([
-        json!({ "command": "set_timepoint", "timepoint": 1 }),
-        json!({ "command": "assert", "condition": { "active_timepoint": { "timepoint": 1 } } }),
-        json!({ "command": "sleep_or_frames", "frames": 8 }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 90000 }),
-    ]);
-    append_t5_qual_002_timepoint_panel_assertions(
-        &mut commands,
-        1,
-        2,
-        "t5_qual_002-four-panel-timepoint-1",
-    );
-    commands.extend([
-        json!({ "command": "step_timepoint", "delta": 1 }),
-        json!({ "command": "assert", "condition": { "active_timepoint": { "timepoint": 2 } } }),
-        json!({ "command": "sleep_or_frames", "frames": 8 }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 90000 }),
-    ]);
-    append_t5_qual_002_timepoint_panel_assertions(
-        &mut commands,
-        2,
-        3,
-        "t5_qual_002-four-panel-timepoint-2",
-    );
-    commands.extend([
-        json!({ "command": "set_viewer_layout", "layout": "single3d" }),
-        json!({ "command": "sleep_or_frames", "frames": 3 }),
-        json!({ "command": "assert", "condition": { "viewer_layout": { "layout": "single3d" } } }),
-        json!({ "command": "assert", "condition": "cross_section_retired" }),
-        json!({ "command": "assert", "condition": "nonblank_frame" }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "copy_diagnostics" }),
-        json!({ "command": "capture_screenshot", "name": "t5_qual_002-four-panel-returned-single3d" }),
-        json!({ "command": "quit" }),
-    ]);
-
-    json!({
-        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
-        "scenario": T5_QUAL_002_FOUR_PANEL_TIMEPOINT_SCENARIO,
-        "limits": dataset_runtime_limits(6 * GIB, 8_192),
-        "commands": commands,
-    })
-}
-
-fn t5_qual_002_four_panel_autoplay_script(package: &Path) -> Value {
-    let mut commands = vec![
-        json!({ "command": "open_dataset", "path": package }),
-        json!({ "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 }),
-        json!({ "command": "set_viewport_size", "width": T5_QUAL_002_VIEWPORT_WIDTH, "height": T5_QUAL_002_VIEWPORT_HEIGHT }),
-        json!({ "command": "sleep_or_frames", "frames": 3 }),
-        json!({ "command": "wait_for", "condition": "first_frame", "timeout_ms": 60000 }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "set_render_mode", "mode": "mip" }),
-        json!({ "command": "assert", "condition": { "render_mode": { "mode": "mip" } } }),
-        json!({ "command": "camera_fit_data" }),
-        json!({ "command": "sleep_or_frames", "frames": 5 }),
-        json!({ "command": "set_viewer_layout", "layout": "four_panel" }),
-        json!({ "command": "sleep_or_frames", "frames": 8 }),
-        json!({ "command": "assert", "condition": { "viewer_layout": { "layout": "four_panel" } } }),
-        json!({ "command": "assert", "condition": { "active_timepoint": { "timepoint": 0 } } }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 90000 }),
-    ];
-    append_t5_qual_002_timepoint_panel_assertions(
-        &mut commands,
-        0,
-        1,
-        "t5_qual_002-four-panel-autoplay-0",
-    );
-    commands.extend([
-        json!({ "command": "set_playback", "playing": true }),
-        json!({ "command": "assert", "condition": { "playback": { "playing": true } } }),
-        json!({ "command": "sleep_or_frames", "millis": 350 }),
-        json!({ "command": "set_playback", "playing": false }),
-        json!({ "command": "assert", "condition": { "playback": { "playing": false } } }),
-        json!({ "command": "assert", "condition": { "observed_timepoints": { "min_distinct": 2 } } }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 120000 }),
-        json!({ "command": "assert", "condition": { "active_lease_cohort": {
-            "min_required": 1,
-            "min_retained": 1,
-            "max_missing": 0,
-            "complete": true
-        } } }),
-    ]);
-    append_t5_qual_002_autoplay_panel_assertions(
-        &mut commands,
-        2,
-        "t5_qual_002-four-panel-autoplay-settled",
-    );
-    commands.extend([
-        json!({ "command": "set_viewer_layout", "layout": "single3d" }),
-        json!({ "command": "sleep_or_frames", "frames": 3 }),
-        json!({ "command": "assert", "condition": { "viewer_layout": { "layout": "single3d" } } }),
-        json!({ "command": "assert", "condition": "cross_section_retired" }),
-        json!({ "command": "assert", "condition": "nonblank_frame" }),
-        json!({ "command": "assert", "condition": "no_render_error" }),
-        json!({ "command": "copy_diagnostics" }),
-        json!({ "command": "capture_screenshot", "name": "t5_qual_002-four-panel-autoplay-returned-single3d" }),
-        json!({ "command": "quit" }),
-    ]);
-
-    json!({
-        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
-        "scenario": T5_QUAL_002_FOUR_PANEL_AUTOPLAY_SCENARIO,
-        "limits": dataset_runtime_limits(6 * GIB, 8_192),
-        "commands": commands,
-    })
-}
-
-fn append_t5_qual_002_timepoint_panel_assertions(
-    commands: &mut Vec<Value>,
-    timepoint: u64,
-    min_generation: u64,
-    screenshot_name: &str,
-) {
-    for panel in ["xy", "xz", "yz"] {
-        commands.push(
-            json!({ "command": "assert", "condition": { "cross_section_panel_schedule": {
-            "panel": panel,
-            "min_generation": min_generation,
-            "min_selected_resources": 1,
-            "max_missing_occupied_resources": 0,
-            "display_current": true
-        } } }),
-        );
-    }
-    commands.push(json!({ "command": "assert", "condition": {
-        "active_timepoint": { "timepoint": timepoint }
-    } }));
-    commands.push(
-        json!({ "command": "assert", "condition": { "active_lease_cohort": {
-        "min_required": 1,
-        "min_retained": 1,
-        "max_missing": 0,
-        "complete": true
-    } } }),
-    );
-    commands.push(
-        json!({ "command": "assert", "condition": { "cross_section_panel_images_distinct": {
-        "min_different_pixels": 1
-    } } }),
-    );
-    commands.push(
-        json!({ "command": "assert", "condition": { "four_panel_images_distinct": {
-        "min_different_pixels": 1
-    } } }),
-    );
-    commands.push(json!({ "command": "copy_diagnostics" }));
-    commands.push(json!({ "command": "capture_screenshot", "name": screenshot_name }));
-}
-
-fn append_t5_qual_002_autoplay_panel_assertions(
-    commands: &mut Vec<Value>,
-    min_generation: u64,
-    screenshot_name: &str,
-) {
-    for panel in ["xy", "xz", "yz"] {
-        commands.push(
-            json!({ "command": "assert", "condition": { "cross_section_panel_schedule": {
-                "panel": panel,
-                "min_generation": min_generation,
-                "min_selected_resources": 1,
-                "max_missing_occupied_resources": 0,
-                "display_current": true
-            } } }),
-        );
-        commands.push(
-            json!({ "command": "assert", "condition": { "cross_section_panel_nonblank": {
-                "panel": panel,
-                "min_nonzero_rgb_pixels": 1
-            } } }),
-        );
-    }
-    commands.push(
-        json!({ "command": "assert", "condition": { "cross_section_panel_images_distinct": {
-            "min_different_pixels": 1
-        } } }),
-    );
-    commands.push(
-        json!({ "command": "assert", "condition": { "four_panel_images_distinct": {
-            "min_different_pixels": 1
-        } } }),
-    );
-    commands.push(json!({ "command": "copy_diagnostics" }));
-    commands.push(json!({ "command": "capture_screenshot", "name": screenshot_name }));
-}
-
-fn append_continuous_camera_sequence(commands: &mut Vec<Value>, steps: usize) {
-    for step in 0..steps {
-        let direction = if step.is_multiple_of(2) { 1.0 } else { -1.0 };
-        commands.push(json!({
-            "command": "camera_orbit",
-            "yaw_points": direction * 16.0,
-            "pitch_points": direction * 4.0,
-            "viewport_height_points": T5_QUAL_001_VIEWPORT_HEIGHT as f32,
-        }));
-        if step.is_multiple_of(3) {
-            commands.push(json!({
-                "command": "camera_pan",
-                "x_points": direction * 12.0,
-                "y_points": -direction * 6.0,
-                "viewport_height_points": T5_QUAL_001_VIEWPORT_HEIGHT as f32,
-            }));
-        }
-        if step.is_multiple_of(6) {
-            commands.push(json!({
-                "command": "camera_zoom",
-                "scroll_y_points": -direction * 18.0,
-            }));
-        }
-        if step == steps / 2 {
-            commands.push(json!({ "command": "copy_diagnostics" }));
-        }
-    }
-}
-
-fn load_custom_product_automation_script(path: &Path) -> anyhow::Result<Value> {
-    let script = read_json_file(path).with_context(|| {
-        format!(
-            "failed to read custom product validation script {}",
-            path.display()
-        )
-    })?;
-    validate_product_automation_script(&script).with_context(|| {
-        format!(
-            "invalid custom product validation script {}",
-            path.display()
-        )
-    })?;
-    Ok(script)
-}
-
 fn validate_product_automation_script(script: &Value) -> anyhow::Result<()> {
     if script.get("schema").and_then(Value::as_str) != Some(PRODUCT_AUTOMATION_SCRIPT_SCHEMA) {
         bail!("automation script schema must be {PRODUCT_AUTOMATION_SCRIPT_SCHEMA}");
@@ -2787,39 +1738,6 @@ fn validate_product_automation_limits(script: &Value) -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-fn script_open_dataset_path(script: &Value) -> Option<PathBuf> {
-    script
-        .get("commands")
-        .and_then(Value::as_array)?
-        .iter()
-        .find(|command| command.get("command").and_then(Value::as_str) == Some("open_dataset"))?
-        .get("path")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-}
-
-fn process_rss_limit_bytes(scenario: &ProductValidationScenario) -> Option<u64> {
-    env::var(PRODUCT_VALIDATE_MAX_RSS_BYTES_ENV)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .or_else(|| scenario.default_process_rss_limit_bytes())
-}
-
-fn linux_process_rss_bytes(pid: u32) -> Option<u64> {
-    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    parse_linux_status_rss_bytes(&status)
-}
-
-fn parse_linux_status_rss_bytes(status: &str) -> Option<u64> {
-    let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
-    let kib = line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|value| value.parse::<u64>().ok())?;
-    Some(kib * 1024)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3470,7 +2388,6 @@ struct ProductAutomationRun<'a> {
     stderr_path: &'a Path,
     timeout: Duration,
     gpu_timestamps_requested: bool,
-    max_rss_bytes: Option<u64>,
 }
 
 fn run_product_automation(run: ProductAutomationRun<'_>) -> anyhow::Result<ProductProcessStatus> {
@@ -3497,7 +2414,6 @@ fn run_product_automation(run: ProductAutomationRun<'_>) -> anyhow::Result<Produ
         )
     })?;
     let deadline = Instant::now() + run.timeout;
-    let mut peak_rss_bytes = None;
     loop {
         if let Some(exit_status) = child
             .try_wait()
@@ -3505,37 +2421,15 @@ fn run_product_automation(run: ProductAutomationRun<'_>) -> anyhow::Result<Produ
         {
             return Ok(ProductProcessStatus {
                 timed_out: false,
-                rss_limit_exceeded: false,
-                peak_rss_bytes,
                 exit_status: Some(exit_status.to_string()),
                 exit_success: Some(exit_status.success()),
             });
-        }
-        if let Some(max_rss_bytes) = run.max_rss_bytes
-            && let Some(current_rss_bytes) = linux_process_rss_bytes(child.id())
-        {
-            peak_rss_bytes = Some(
-                peak_rss_bytes.map_or(current_rss_bytes, |peak: u64| peak.max(current_rss_bytes)),
-            );
-            if current_rss_bytes > max_rss_bytes {
-                let _ = child.kill();
-                let exit_status = child.wait().ok().map(|status| status.to_string());
-                return Ok(ProductProcessStatus {
-                    timed_out: false,
-                    rss_limit_exceeded: true,
-                    peak_rss_bytes,
-                    exit_status,
-                    exit_success: None,
-                });
-            }
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let exit_status = child.wait().ok().map(|status| status.to_string());
             return Ok(ProductProcessStatus {
                 timed_out: true,
-                rss_limit_exceeded: false,
-                peak_rss_bytes,
                 exit_status,
                 exit_success: None,
             });
@@ -3547,8 +2441,6 @@ fn run_product_automation(run: ProductAutomationRun<'_>) -> anyhow::Result<Produ
 #[derive(Debug)]
 struct ProductProcessStatus {
     timed_out: bool,
-    rss_limit_exceeded: bool,
-    peak_rss_bytes: Option<u64>,
     exit_status: Option<String>,
     exit_success: Option<bool>,
 }
@@ -3572,9 +2464,6 @@ struct WrapperReport<'a> {
     display: DisplayClassification,
     gpu_timestamps_requested: bool,
     preflight_only: bool,
-    process_rss_limit_bytes: Option<u64>,
-    process_peak_rss_bytes: Option<u64>,
-    process_rss_limit_exceeded: bool,
     source_closure_evidence: Value,
     automation_status: Option<String>,
     exit_status: Option<String>,
@@ -3700,14 +2589,6 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
     let frame_wait_count = script_frame_wait_count(report.script_value);
     let millis_wait_count = script_millis_wait_count(report.script_value);
     let wait_timeout_ms_total = script_wait_timeout_ms_total(report.script_value);
-    let heavy_local_evidence = scenario_name == T5_QUAL_001_INTERACTION_MIP_SCENARIO
-        || scenario_name == T5_QUAL_001_INTERACTION_RENDER_MODES_SCENARIO
-        || scenario_name == T5_QUAL_001_INTERACTION_CONTINUOUS_SCENARIO
-        || scenario_name == T5_QUAL_001_FOUR_PANEL_CROSS_SECTION_SCENARIO
-        || scenario_name == T5_QUAL_001_FOUR_PANEL_FINE_SCALE_SCENARIO
-        || scenario_name == T5_QUAL_001_FOUR_PANEL_CONTINUOUS_CROSS_SECTION_SCENARIO
-        || scenario_name == T5_QUAL_002_FOUR_PANEL_TIMEPOINT_SCENARIO
-        || scenario_name == T5_QUAL_002_FOUR_PANEL_AUTOPLAY_SCENARIO;
     let automation_limits = script_limits_json(report.script_value);
     let max_cpu_total_bytes = script_limit_u64(report.script_value, "max_cpu_total_bytes");
     let cpu_category_byte_limits = json!({
@@ -3794,7 +2675,6 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
         "limits": {
             "timeout_secs": report.timeout_secs,
             "render_modes": render_modes,
-            "heavy_local_evidence": heavy_local_evidence,
             "command_count": command_count,
             "frame_wait_count": frame_wait_count,
             "millis_wait_count": millis_wait_count,
@@ -3805,7 +2685,6 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
             "runtime_work_limits": runtime_work_limits,
             "cpu_byte_limit_enforced": cpu_byte_limit_enforced,
             "runtime_work_limit_enforced": runtime_work_limit_enforced,
-            "process_rss_limit_bytes": report.process_rss_limit_bytes,
         },
         "metrics": {
             "duration_ms": report.duration_ms,
@@ -3842,14 +2721,10 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
             "app_gpu_timestamps_env_set_by_wrapper": report.gpu_timestamps_requested,
             "product_validate_preflight_only_env": env::var(PREFLIGHT_ONLY_ENV).ok(),
             "product_validate_preflight_only": report.preflight_only,
-            "product_validate_max_rss_bytes_env": env::var(PRODUCT_VALIDATE_MAX_RSS_BYTES_ENV).ok(),
         },
         "process": {
             "exit_status": report.exit_status,
             "exit_success": report.exit_success,
-            "rss_limit_bytes": report.process_rss_limit_bytes,
-            "peak_rss_bytes": report.process_peak_rss_bytes,
-            "rss_limit_exceeded": report.process_rss_limit_exceeded,
         },
         "source_closure_evidence": report.source_closure_evidence,
     })
