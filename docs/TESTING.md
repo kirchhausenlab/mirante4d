@@ -1,6 +1,6 @@
 # Testing And Evidence
 
-Last updated: 2026-07-15
+Last updated: 2026-07-16
 
 ## Claim Language
 
@@ -398,10 +398,105 @@ it can confirm a guessed complete private configuration. The runner uses a
 fresh private Cargo target, rejects external Cargo configuration and custom
 compiler/profile/toolchain overrides, and requires the app report to carry
 embedded revision, release-profile, compiler, and fresh-target provenance.
-Both owner-accepted digest
-constants are currently unset, so only explicitly diagnostic runs can execute,
-and `--diagnostic` can never emit qualification evidence even after the
-constants are pinned.
+Both owner-accepted digest constants are pinned. Their opaque values remain in
+their source authorities and are not repeated here. Diagnostic runs can never
+emit qualification evidence.
+
+#### Accepted Import And Preprocessing Qualification
+
+The immutable qualification revision for the current import/preprocessing
+implementation is `eb5c9ffd12cbd9fce65bd03559b8e7f93170d72e`, with tree
+`fec040f4772fbfa0e59bfd18babf178030b073c3`. Its report records
+`evidence_class: qualification`. The complete required automated check set
+passed at that revision. Both sample sets ran on the owner-accepted HW-2/ext4
+tuple with a 256 MiB import budget, declared warm cache, and declared no
+competing activity. The normal native T5/DS-3 route was product-validated there
+with an externally observed mapped native X11 client and owner-attested
+physical-display attachment.
+
+| Workload | Sampling and primary-clock observations | Median gate | Result |
+| --- | --- | --- | --- |
+| Public generated full-plane-strip T2 | Five independent release process sessions: 4.581971238 s, 4.609749805 s, 4.624230190 s, 4.593098360 s, and 4.654008439 s | 4.609749805 s at most 60 s | Passed |
+| Private T5/DS-3 | Three fresh release normal-product sessions: 702.537630793 s, 678.022452456 s, and 691.093848488 s | 691.093848488 s (11 min 31.094 s) at most 15 min | Passed; non-blocking 10-minute stretch missed |
+
+All recorded per-sample runtime and resource gates passed. T5 observed a
+251.075 MiB maximum import-ledger peak within the 256 MiB budget, a 98.180 MiB
+maximum external RSS delta against the 384 MiB gate, 35 peak import-owned file
+descriptors against the 64-file bound, six checkpoint files against the
+eight-file bound, and 1,817 counted durability calls per sample against the
+5,000-call exclusive ceiling. Every exact, scientific, independent per-scale,
+source-preservation, determinism, counter-reconciliation,
+publication-capability, open-ready, and rendered-navigation check passed. The
+T5 report records no failures, skips, or waivers, and no mandatory closeout
+check was skipped or waived.
+
+The final deletion audit at that revision found the intended single importer
+and six-file checkpoint authority. It found no predecessor checkpoint reader,
+per-work-unit or per-regular-object durability predecessor, decoded
+publication route, automatic exact/scientific rescan in the imported
+publication-to-open-ready route, fixed-percentage progress route, alternate
+importer, or hidden selector. A later explicit external open remains a
+separate normal route that performs full background verification.
+
+The applicable executables remained unchanged within each sample set, and the
+`xtask` digest matched across T2 and T5.
+The standard release build used
+`rustc 1.96.1 (31fca3adb 2026-06-26)` with LLVM 22.1.2, no custom Rust flags,
+and no compiler wrapper. The release `xtask` SHA-256 was
+`3c952cb3a80313d07db2b790b556f79153d5a2632fe8bbfb4ae490a369f3e7aa`;
+the fresh-private-target application SHA-256 was
+`e7dbe36d2b0abc049510207ef9daafdb884a122cfb8dfd4f22738839a935a0bb`.
+The T2 report SHA-256 was
+`33a27f748b012d1548391f0c8320056e1ecf11932c925b8366a033278cb38fe8`.
+The sanitized T5 summary SHA-256 was
+`2d53394f67d7c4e82ec422750f576f8f860dc543c97a86e6491f9f0295eaa4c9`,
+and it binds the finalized private raw report through SHA-256
+`1bbf0f18c19fb7fe2c72cade9f0bd50e8cb774ae1ec2c24d13a16e36c1a3502e`.
+No private path, label, filename, dimensions, source identity, package
+identity, or scientific digest is published here.
+
+The final revision-bound checks were:
+
+```bash
+python3 tools/source-fixtures/validate.py \
+  --manifest fixtures/source/manifest.json --self-test
+python3 tools/target-fixtures/t1/validate.py \
+  --manifest fixtures/target/manifest.json --self-test
+cargo fmt --all
+cargo xtask verify-pr
+cargo xtask verify-local format-lifecycle
+cargo xtask product-validate target_source_verification
+cargo xtask product-validate import_preprocessing
+cargo run --release -p xtask -- import-performance-t2 \
+  --samples 5 --scratch <owner-qualified-ext4-scratch> \
+  --qualification-profile <owner-pinned-profile> \
+  --cache-condition warm --competing-activity none
+MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display \
+  cargo run --release -p xtask -- import-performance-t5 \
+  --config <owner-pinned-private-config>
+```
+
+The owner accepted these remaining risks:
+
+- no relative-speedup or timing-tail claim is made from these sample counts;
+- cache state and competing activity are declarations, not operating-system
+  controls;
+- physical-display attachment is owner-attested and is not cryptographically
+  proved by mapped X11 geometry;
+- the retained owner-approved private-configuration commitment can confirm a
+  correctly guessed complete configuration; and
+- the non-blocking 10-minute stretch target was not met.
+
+The filesystem-wide `syncfs` latency, writeback-error, and cancellation
+coupling and the cooperative destination-parent threat-model limitation in
+[Current state](CURRENT_STATE.md) also remain accepted limitations; neither was
+weakened to meet the timing gate.
+
+This record is revision-bound. This documentation-only closeout successor
+changes no product or performance implementation and was not itself
+performance-qualified. Its executable revision receives no independent
+performance claim. Later product, performance, threshold, evidence-schema, or
+evidence-policy changes affecting this boundary require fresh evidence.
 
 Rendering, linked-panel, or packaged-viewer changes use:
 

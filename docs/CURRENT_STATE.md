@@ -1,6 +1,6 @@
 # Current State
 
-Last reviewed: 2026-07-15
+Last reviewed: 2026-07-16
 
 Mirante4D is public, pre-alpha academic research software. Persisted formats
 and APIs can change through explicit hard cutovers; there is no supported
@@ -100,6 +100,28 @@ commands used only when their boundaries change.
 
 See [testing](TESTING.md) for commands and claim language.
 
+## Import And Preprocessing Performance
+
+The import/preprocessing hard cutover is implemented and automated-verified at
+immutable revision `eb5c9ffd12cbd9fce65bd03559b8e7f93170d72e`. Both
+qualification sets used the owner-accepted HW-2/ext4 tuple, a 256 MiB import
+budget, and declared warm-cache/no-competing-activity conditions. The public
+T2 workload passed five independent release sessions with a
+4.609749805-second median against the 60-second gate. The normal native private
+T5/DS-3 workflow is product-validated at that revision on the owner-attested
+physical display and externally observed mapped X11 client: three fresh
+release sessions had a 691.093848488-second (11-minute 31.094-second) median
+against the 15-minute gate.
+
+Every mandatory per-sample, invariant, correctness, source-preservation,
+determinism, resource, and publication-to-open-ready gate passed. The T5 report
+records no failures, skips, or waivers, and no mandatory closeout check was
+skipped or waived. The non-blocking 10-minute stretch target was not met.
+[Testing and evidence](TESTING.md) owns the exact protocol, revision-bound
+evidence, and accepted remaining risks. The documentation-only closeout
+successor was not itself performance-qualified; these claims attach only to
+the named qualification revision and its recorded release executables.
+
 ## Known Limitations
 
 - Target packages open provisionally while bounded exact-package and
@@ -115,15 +137,6 @@ See [testing](TESTING.md) for commands and claim language.
   bind a source name to an already-open directory descriptor. A later explicit
   external open remains an independent normal open and performs full
   background verification.
-- The import performance implementation, public T2 tooling, and strict private
-  T5 normal-product qualification runner exist, but clean five-session public
-  timing and private three-session HW-2 execution remain acceptance work. The
-  public supporting target-source and generated-import scenarios have passed
-  on a mapped physical X display, but they are not the private T5/HW-2 product
-  qualification. The reviewed local host/storage profile and stable private
-  T5-facts commitments are owner-accepted and pinned, but no final
-  product-performance claim is recorded until the complete clean sample sets
-  and deletion audit pass at their immutable qualification revision.
 - The target dataset profile and project-store format are experimental and
   carry no compatibility promise.
 - TIFF import and create-only dataset publication require Linux kernel 5.8 or

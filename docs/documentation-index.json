@@ -140,12 +140,6 @@
       "listed_in": "docs/README.md"
     },
     {
-      "path": "docs/plans/active/IMPORT_PREPROCESSING_PERFORMANCE_HANDOFF.md",
-      "truth_scope": "target",
-      "authorities": [],
-      "listed_in": "docs/README.md"
-    },
-    {
       "path": "docs/plans/deferred/OPEN_DATA_FOLLOW_ON.md",
       "truth_scope": "deferred",
       "authorities": [],
