@@ -422,11 +422,7 @@ computes and hashes fixed Z/Y slabs; its full T2 calculated working peak is
 22,578,060 bytes, and no oracle scratch remained after the diagnostic. A
 one-sample release run on a dirty worktree matched every frozen fact with a
 5.539560251-second primary time, 267,131,688-byte import-ledger peak, and
-67,313,664-byte external RSS delta. This is not qualification: the required
-clean immutable revision, five owner-qualified HW-2/ext4 sessions, private
-no-sentinel T5 regression, and affected-dataset real-display workflow remain
-outstanding in the active [restoration closeout
-plan](plans/active/UINT8_SENTINEL_NO_DATA_RESTORATION.md).
+67,313,664-byte external RSS delta.
 
 On the same dirty worktree, both public fixture validators, `cargo fmt --all --
 --check`, workspace all-target Clippy with zero warnings, the full import-
@@ -439,6 +435,27 @@ accepted cancellation, resume, and publication with a 267,074,040-byte peak
 below 256 MiB. Neither report satisfies E4 product-open or the affected-
 dataset real-display product-validation gate. Dirty-tree reports cannot become
 qualification evidence.
+
+Interim clean revision `f73cb36d050d701eba5a1c197a802759efdf5137`
+(tree `6330b074d5a34dc53177e7e23ca63a36575fdab1`) subsequently passed the
+same repository/local set with qualifying evidence. Its five owner-qualified
+HW-2/ext4 T2 sessions were 13.654825657, 14.477087517, 14.033167153,
+16.611035435, and 13.707822937 seconds, producing a 14.033167153-second median
+against the 60-second gate. Every runtime/resource gate passed, the 256 MiB
+ledger peak was 267,116,376 bytes, maximum external RSS delta was 68,206,592
+bytes, the checkpoint remained six files, source inventory was unchanged, and
+exact/scientific identities were deterministic.
+
+Owner review confirmed that the pinned T5 workload is the affected private
+sentinel-selected dataset and that the visible defect is fixed. The earlier
+no-sentinel assumption was incorrect. Its frozen scientific ID, layer root,
+and per-scale digests describe pre-restoration output, so copying a diagnostic
+package's new values would be self-blessing. Final qualification requires two
+identical bounded source-oracle runs, a hard-cut private fact/config
+commitment, oracle/config/package agreement, and T2/T5 reruns at the final
+clean revision. Private paths, geometry, identities, and raw facts remain
+external. The active [restoration closeout
+plan](plans/active/UINT8_SENTINEL_NO_DATA_RESTORATION.md) owns this work.
 
 #### Accepted Import And Preprocessing Qualification
 

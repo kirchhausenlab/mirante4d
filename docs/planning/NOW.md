@@ -48,16 +48,18 @@ used temporary-file-backed fixed slabs with a calculated 22,578,060-byte peak
 and removed both scratch levels. This is diagnostic evidence, not
 qualification.
 
-The current dirty worktree passed both fixture validators, format checking,
-workspace all-target Clippy with zero warnings, 100 import-pipeline unit tests,
-seven general integration tests, seven independent sentinel-oracle tests, and
-`verify-pr` with 904 selected Nextest cases passed, three reported skips, and
-passing doctests. The six-phase local format lifecycle had no skips. Both E1
-product-automation scenarios passed; `import_preprocessing` exercised
-cancellation, resume, and publication with a 267,074,040-byte peak below 256
-MiB. These runs are non-qualifying because the tree is dirty, and neither
-product report satisfies E4 product-open or the affected-dataset real-display
-gate. ND-04 remains active for acceptance at a clean immutable revision,
-five-session owner-qualified T2, no-sentinel private T5 regression, and
-affected-dataset real-display validation. Other unresolved work remains in
-[the backlog](../BACKLOG.md).
+Clean revision `f73cb36` passed both fixture validators, formatting, qualifying
+`verify-pr` with 904 selected Nextest cases passed and three reported skips,
+the qualifying six-phase local format lifecycle, and both E1 product-
+automation scenarios. Its five owner-qualified T2 sessions had a
+14.033167153-second median against 60 seconds; every runtime/resource gate
+passed and identities were deterministic.
+
+Owner review then confirmed that the pinned private T5 workload is the
+affected sentinel-bearing dataset and that its visible boundary defect
+is fixed in normal use. The previous no-sentinel T5 assumption was wrong: its
+frozen semantic facts describe pre-restoration output. ND-04 now remains active
+to add a bounded source-derived T5 oracle, replace only the affected private
+scientific/layer/scale facts and opaque config commitment, rerun T2 and T5 at
+the final clean revision, and record the complete real-display LOD sweep.
+Other unresolved work remains in [the backlog](../BACKLOG.md).

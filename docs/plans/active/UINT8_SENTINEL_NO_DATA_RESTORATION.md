@@ -1,6 +1,6 @@
 # Uint8 Sentinel No-Data Restoration Plan
 
-Status: ACTIVE — IMPLEMENTED; CLEAN-REVISION QUALIFICATION AND REAL-DISPLAY VALIDATION PENDING
+Status: ACTIVE — IMPLEMENTED; PRIVATE T5 FACT CUTOVER AND FINAL QUALIFICATION PENDING
 Implementation authorization: OWNER APPROVED 2026-07-16
 Last reviewed: 2026-07-16
 Planning predecessor: clean `85350219efcc0c96b492f9a5029ba80752b49306`
@@ -24,8 +24,10 @@ policy through fused, validity-only halos rather than substituting a weaker
 mask rule.
 
 ND-00 through ND-03 are implemented in the current source. ND-04 remains open:
-the revision-bound qualified performance sessions and affected-dataset
-real-display validation have not yet been accepted. [Current
+the public T2 workload qualified at interim clean revision `f73cb36`, and the
+owner reports that the visible boundary defect is fixed on the affected private
+dataset, but the private T5 expected-fact authority and final-revision
+qualification have not yet been cut over. [Current
 state](../../CURRENT_STATE.md) owns the implemented behavior, and [Testing and
 evidence](../../TESTING.md) distinguishes the new diagnostic evidence from the
 older immutable qualification.
@@ -102,6 +104,32 @@ The predecessor reference is commit `61cd392`, especially
 `:1295-1320`. Independent expected facts shall encode the contract above
 rather than invoke that deleted implementation or copy production output.
 
+## Private T5 Authority Correction
+
+Owner review on 2026-07-16 confirmed that the pinned private T5 workload is the
+affected dataset and is imported with an explicit uint8 sentinel. The earlier
+ND-04 statement that T5 was no-sentinel was wrong. Its frozen scientific ID,
+layer root, and seven per-scale digests describe the pre-restoration
+exact-only/point-LOD output and cannot serve as regression facts for this
+cutover.
+
+Before final T5 qualification, an xtask-only source oracle shall independently
+enumerate the pinned one-plane grayscale uint8 TIFF stack, decode source pixels
+without invoking importer normalization or package output, and apply the exact
+contract in this plan. It shall derive the base scientific identity and layer
+root, every recursive scale digest, and centered transform facts directly from
+source-derived value/validity records. The oracle, frozen private config, and
+candidate package must agree three ways. Candidate package readback or a first
+diagnostic run is never the source of expected facts.
+
+The oracle keeps at most two create-new row-major scratch levels, never a full
+level in RAM, and uses fixed plane/slab rings admitted below 256 MiB. It
+preflights the constant two-file scratch bound, deletes parent state as each
+child completes, and proves zero remnants after success, error, or
+cancellation. Private paths, geometry, identities, and facts remain outside
+the repository. The old private configuration commitment is rejected through
+a new fact-authority/schema binding rather than accepted by compatibility.
+
 ## Non-Negotiable Invariants
 
 1. Source microscopy data is never modified.
@@ -110,9 +138,11 @@ rather than invoke that deleted implementation or copy production output.
    queue, and reorder buffer.
 3. Work remains bounded and cancellable across base production, scientific
    identity, every pyramid level, checkpointing, publication, and validation.
-4. The checkpoint remains one fixed two-file canonical cache plus one fixed
-   four-file spool. No level-proportional scratch files or mask sidecars are
-   introduced by the selected design.
+4. The production checkpoint remains one fixed two-file canonical cache plus
+   one fixed four-file spool. No level-proportional scratch files or mask
+   sidecars are introduced by the product design. The private qualification
+   oracle's two external, create-new, self-cleaning level files are evidence
+   work outside the importer/checkpoint authority.
 5. Final package arrays remain sharded, and physical-object count remains
    independent of logical brick count.
 6. Validity remains one shared scientific authority for import, storage,
@@ -131,6 +161,8 @@ rather than invoke that deleted implementation or copy production output.
     transforms. They are not migrated or silently reinterpreted.
 12. Public fixtures and documentation disclose no private dataset path,
     label, geometry, or scientific identity.
+13. Private sentinel qualification facts come from the bounded source oracle,
+    not from copying candidate package output into the accepted configuration.
 
 ## Scope
 
@@ -427,9 +459,10 @@ Exit proof:
 
 ### ND-04 — Qualification, Product Validation, And Closeout
 
-Implementation status: in progress; the dirty-worktree automated and local
-checks passed, while clean-revision qualification and real-display product
-validation remain.
+Implementation status: in progress. Clean revision `f73cb36` passed the public
+T2 qualification and the complete repository/local automated set. The private
+T5 source-oracle fact cutover and qualification at the final oracle-bearing
+revision remain.
 
 Goal: prove scientific correctness, bounded performance, and the visible
 product outcome on public and relevant private data before closing the plan.
@@ -440,10 +473,14 @@ Required work:
   revision.
 - Run five independent release T2 sessions on the accepted HW-2/ext4 profile
   under the existing absolute gate and new independent sentinel facts.
-- Re-run the three-session T5 qualification. It remains semantically
-  no-sentinel and must retain its frozen current scientific facts, thereby
-  proving that the shared importer, resource, recipe, and evidence changes did
-  not escape the selected sentinel-only scope.
+- Replace the affected sentinel-bearing T5 workload's pre-restoration semantic
+  facts through two identical bounded source-oracle runs, hard-cut the private
+  config/fact-authority commitment, and compare oracle, config, and diagnostic
+  package readback before qualification.
+- Re-run both five-session T2 and three-session T5 qualification at the final
+  clean immutable oracle-bearing revision. Preserve all existing absolute
+  timing, memory, RSS, descriptor, checkpoint, source, publication, and normal-
+  product gates.
 - Exercise the normal native import and rendering workflow on the affected
   sentinel-bearing dataset on the relevant real display and hardware. Inspect
   LOD 0 and every coarse LOD at the data/no-data boundary and retain private
@@ -471,6 +508,7 @@ Exit proof:
 | Partition independence | One-chunk versus tiled runs | Identical canonical values, validity, transforms, statistics, and scientific identity across faces, edges, corners, and worker counts |
 | Transform correctness | Independent physical-coordinate facts | Axis-aware factors and centered translations match the mean footprint at every LOD |
 | Scientific identity | Independent scientific reader/facts | Dilated base validity and canonical values produce the expected scientific ID and layer roots |
+| Private T5 source oracle | Two fresh source-derived oracle runs plus package comparison | Exact agreement for scientific ID, layer root, every scale digest, scale shape/count, and centered transform; no candidate-output bootstrap |
 | Canonical invalid representation | Full package readback | Every invalid integer sample is zero; valid zero remains distinguishable |
 | Sentinel-disabled regression | Frozen uint8/uint16/float32 facts | Non-sentinel values, validity, transforms, scale digests, and scientific identity remain unchanged |
 | Halo pixel isolation | Structural test and counters | Halo-only parents cause zero pixel component reads/decodes; core pixel parent fan-in remains at most eight in 3D or four in 2D |
@@ -478,6 +516,7 @@ Exit proof:
 | Working memory | Pressure tests and every timed run | Import-ledger peak remains at most 256 MiB |
 | External memory | Every timed T2 and required T5 run | Peak RSS delta remains at most 384 MiB and reconciles with ledger-external overhead |
 | Files and temporary state | Pressure tests and every timed run | At most 64 import-owned file descriptors, exactly the current six checkpoint files, and no new level- or chunk-proportional physical objects |
+| Private oracle resources | Preflight, receipt, and cleanup audit | At most 256 MiB RAM, two level scratch files, bounded descriptors, admitted free space, and zero remnants before timed product samples |
 | Timing | Five T2 sessions and three T5 sessions | T2 median remains at most 60 seconds; T5 median remains at most 15 minutes |
 | Determinism and resume | Repeated fresh/resumed imports | Same-revision exact package and scientific IDs agree; resumed output equals fresh output; old checkpoints reject explicitly |
 | Source and publication safety | Fixtures, mutation tests, and product runs | Source closure is unchanged; cancellation never publishes; validated output publishes create-only and opens through the existing verified capability route |
@@ -530,14 +569,15 @@ cargo run --release -p xtask -- import-performance-t2 \
   --cache-condition warm --competing-activity none
 ```
 
-The two `product-validate` commands passed as E1 automated supporting evidence
-on the dirty worktree. `target_source_verification` accepted two internal GPU
-readback captures, and `import_preprocessing` accepted cancellation, resume,
-and publication with a 267,074,040-byte peak below 256 MiB. Neither report
-satisfies E4 product-open or the affected-dataset real-display product-
-validation gate. The fixture validators, formatting, all-target Clippy, full
-import-pipeline tests, `verify-pr`, and the six-phase local format lifecycle
-also passed, but their dirty-tree reports are not qualification evidence.
+At clean revision `f73cb36`, both fixture validators, formatting, qualifying
+`verify-pr` (904 passed, three skipped), the qualifying six-phase local format
+lifecycle, and both E1 product-automation scenarios passed. The five T2 release
+sessions were 13.654825657, 14.477087517, 14.033167153, 16.611035435, and
+13.707822937 seconds, for a 14.033167153-second median against the 60-second
+gate. Every runtime/resource gate passed, source inventory was unchanged, and
+package/scientific identities were deterministic. This interim qualification
+does not remove the requirement to rerun T2 at the final oracle-bearing
+revision.
 
 Also run the owner-pinned private T5 command from
 [Testing and evidence](../../TESTING.md). Private source, package, screenshots,
@@ -551,7 +591,9 @@ Stop implementation and return for owner review before:
 - adding threshold/range inference, base-only dilation, point-selected
   sentinel LODs, all-parent-valid reduction, or renderer-only suppression;
 - adding a second full-level pass, new scratch/checkpoint files, a validity
-  sidecar hierarchy, or a compatibility checkpoint reader;
+  sidecar hierarchy, or a compatibility checkpoint reader to the production
+  importer; the explicitly bounded two-file qualification oracle is not a
+  product/checkpoint path;
 - changing the M4D storage profile or scientific identity algorithm rather
   than changing the canonical content and recipe;
 - broadening mean reduction to non-sentinel datasets;
@@ -577,6 +619,9 @@ Known risks and controls:
   preflight and worker policy before increasing parallelism.
 - **Scientific-ID divergence:** base production and independent scientific
   tiling use the same normative policy through separately exercised paths.
+- **Private-fact self-blessing:** the predecessor T5 bootstrap copied candidate
+  package facts. Replace it with two stable source-oracle runs and require
+  oracle/config/package agreement before pinning the new opaque commitment.
 - **Spatial shift:** mean LODs require centered axis-aware transforms; do not
   retain point-sampling translation.
 - **Checkpoint ambiguity:** bind the algorithm version and reject old durable

@@ -140,14 +140,16 @@ evidence.
 ## Known Limitations
 
 - The restored sentinel policy is implemented and independently read back on
-  generated 2D/3D boundary fixtures and one diagnostic public T2 run. It has
-  also passed the dirty-worktree repository/local checks and both E1 product-
-  automation scenarios, including cancellation/resume/publication below the
-  256 MiB ledger. Those runs are supporting evidence, not product validation.
-  The cutover has not yet completed the revision-bound five-session HW-2/ext4
-  T2 qualification, no-sentinel private T5 regression, or real-display
-  exercise on the affected private dataset. The earlier performance
-  qualification predates this semantic cutover and does not qualify it. The active
+  generated 2D/3D boundary fixtures. Interim clean revision `f73cb36` passed
+  the complete repository/local set and five-session HW-2/ext4 T2
+  qualification with a 14.033167153-second median against 60 seconds. The
+  owner also exercised the affected private workload and reports that
+  the visible boundary defect is fixed. Formal closeout remains open because
+  the pinned T5 workload is sentinel-selected, contrary to the earlier plan's
+  no-sentinel assumption, and its pre-restoration scientific/scale facts must
+  be replaced by a bounded source oracle before final-revision T2/T5
+  qualification. The earlier performance qualification predates this semantic
+  cutover and does not qualify it. The active
   [restoration closeout](plans/active/UINT8_SENTINEL_NO_DATA_RESTORATION.md)
   owns those remaining evidence steps.
 - Target packages open provisionally while bounded exact-package and
