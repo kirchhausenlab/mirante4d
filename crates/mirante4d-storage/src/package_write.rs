@@ -210,8 +210,8 @@ impl PackageWriteReceipt {
         self.codec_report
     }
 
-    /// Successful object and directory durability calls made by the package
-    /// writer. Checkpoint synchronization is accounted by the importer.
+    /// Successful staged-filesystem and directory durability calls made by the
+    /// package writer. Checkpoint synchronization is accounted by the importer.
     pub const fn sync_calls(self) -> u64 {
         self.sync_calls
     }
@@ -306,29 +306,9 @@ impl PackageCodecCounters {
 }
 
 impl PackageSyncCounters {
-    fn record(&mut self, elapsed: Duration) -> Result<(), PackageWriteError> {
-        self.calls = self
-            .calls
-            .checked_add(1)
-            .ok_or(PackageWriteError::InvalidInput {
-                reason: "the package object sync-call counter overflowed",
-            })?;
-        self.time_ns = self
-            .time_ns
-            .checked_add(u64::try_from(elapsed.as_nanos()).map_err(|_| {
-                PackageWriteError::InvalidInput {
-                    reason: "the package object sync-time counter overflowed",
-                }
-            })?)
-            .ok_or(PackageWriteError::InvalidInput {
-                reason: "the package object sync-time counter overflowed",
-            })?;
-        Ok(())
-    }
-
     fn record_publication(&mut self, report: crate::local_publication::PublicationSyncReport) {
         // Publication has already performed these durability operations. Keep
-        // evidence collection infallible after the atomic rename boundary.
+        // evidence collection infallible, particularly after atomic rename.
         self.calls = self.calls.saturating_add(report.calls);
         self.time_ns = self.time_ns.saturating_add(report.time_ns);
     }
@@ -345,6 +325,8 @@ pub enum PackageWriteError {
     DestinationExists,
     #[error("atomic create-only directory publication is unsupported on this filesystem")]
     AtomicPublishUnsupported,
+    #[error("filesystem-wide package durability requires Linux kernel 5.8 or newer")]
+    FilesystemDurabilityUnsupported,
     #[error("package {package_id} became visible, but final directory durability is unknown")]
     CommitIndeterminate {
         package_id: PackageId,
@@ -529,13 +511,8 @@ impl LocalPackageWriter {
             check_cancelled(&mut is_cancelled)?;
             require_descriptor_capacity(descriptors.len(), limits.total_physical_objects)?;
             require_new_path(&mut written_paths, &object.path)?;
-            let (descriptor, snapshot) = write_object_bytes(
-                &mut publication,
-                object.path,
-                object.kind,
-                &object.bytes,
-                &mut syncs,
-            )?;
+            let (descriptor, snapshot) =
+                write_object_bytes(&mut publication, object.path, object.kind, &object.bytes)?;
             descriptors.push(descriptor);
             snapshots.push(snapshot);
         }
@@ -599,7 +576,6 @@ impl LocalPackageWriter {
                 array.metadata.kind(),
                 shard.chunks,
                 &mut is_cancelled,
-                &mut syncs,
                 &mut codecs,
             )?;
             descriptors.push(descriptor);
@@ -616,30 +592,21 @@ impl LocalPackageWriter {
                 reason: "manifest page ordinal exceeds u32",
             })?;
             let path = manifest_page_path(ordinal)?;
-            let snapshot = write_authority_bytes(
-                &mut publication,
-                path,
-                &page.canonical_bytes()?,
-                &mut syncs,
-            )?;
+            let snapshot = write_authority_bytes(&mut publication, path, &page.canonical_bytes()?)?;
             snapshots.push(snapshot);
         }
         drop(pages);
         let root_path = profile.manifest_root_path().clone();
         drop(profile);
-        let root_snapshot = write_authority_bytes(
-            &mut publication,
-            root_path,
-            &root.canonical_bytes()?,
-            &mut syncs,
-        )?;
+        let root_snapshot =
+            write_authority_bytes(&mut publication, root_path, &root.canonical_bytes()?)?;
         snapshots.push(root_snapshot);
         let package_id = root.package_id()?;
 
-        let directory_syncs = publication
-            .sync_directories(&mut is_cancelled)
+        let stage_syncs = publication
+            .sync_stage(&mut is_cancelled)
             .map_err(map_publication_error_without_commit)?;
-        syncs.record_publication(directory_syncs);
+        syncs.record_publication(stage_syncs);
         check_cancelled(&mut is_cancelled)?;
         publication_clock.finish(observer);
 
@@ -1097,9 +1064,8 @@ fn write_object_bytes(
     path: PackagePath,
     kind: PackageObjectKind,
     bytes: &[u8],
-    syncs: &mut PackageSyncCounters,
 ) -> Result<(PackageObjectDescriptor, LocalObjectSnapshot), PackageWriteError> {
-    let (facts, snapshot) = write_hashed_file(publication, path.clone(), syncs, |file, hasher| {
+    let (facts, snapshot) = write_hashed_file(publication, path.clone(), |file, hasher| {
         write_hashed(file, hasher, bytes)
     })?;
     let descriptor = PackageObjectDescriptor::new(path, kind, facts.byte_length(), facts.digest())?;
@@ -1110,9 +1076,8 @@ fn write_authority_bytes(
     publication: &mut LocalPublication,
     path: PackagePath,
     bytes: &[u8],
-    syncs: &mut PackageSyncCounters,
 ) -> Result<LocalObjectSnapshot, PackageWriteError> {
-    write_hashed_file(publication, path, syncs, |file, hasher| {
+    write_hashed_file(publication, path, |file, hasher| {
         write_hashed(file, hasher, bytes)
     })
     .map(|(_facts, snapshot)| snapshot)
@@ -1126,10 +1091,9 @@ fn write_shard(
     codec_kind: ShardProfileKind,
     chunks: Vec<Option<PackageInnerChunk>>,
     is_cancelled: &mut impl FnMut() -> bool,
-    syncs: &mut PackageSyncCounters,
     codecs: &mut PackageCodecCounters,
 ) -> Result<(PackageObjectDescriptor, LocalObjectSnapshot), PackageWriteError> {
-    let (facts, snapshot) = write_hashed_file(publication, path.clone(), syncs, |file, hasher| {
+    let (facts, snapshot) = write_hashed_file(publication, path.clone(), |file, hasher| {
         let mut lengths = Vec::with_capacity(codec_kind.chunks_per_shard());
         for chunk in chunks {
             check_cancelled(is_cancelled)?;
@@ -1168,7 +1132,6 @@ fn write_shard(
 fn write_hashed_file(
     publication: &mut LocalPublication,
     path: PackagePath,
-    syncs: &mut PackageSyncCounters,
     write_body: impl FnOnce(&mut File, &mut ExactBytesHasher) -> Result<(), PackageWriteError>,
 ) -> Result<(mirante4d_identity::ExactBytesFacts, LocalObjectSnapshot), PackageWriteError> {
     let mut file = publication
@@ -1176,16 +1139,11 @@ fn write_hashed_file(
         .map_err(map_publication_error_without_commit)?;
     let mut hasher = ExactBytesHasher::new();
     write_body(&mut file, &mut hasher)?;
-    let sync_started = Instant::now();
-    file.sync_all().map_err(|source| PackageWriteError::Io {
-        operation: "sync staged package object",
-        source,
-    })?;
-    syncs.record(sync_started.elapsed())?;
     let metadata = file.metadata().map_err(|source| PackageWriteError::Io {
         operation: "inspect staged package object",
         source,
     })?;
+    drop(file);
     let facts = hasher.finalize()?;
     if facts.byte_length() != metadata.len() {
         return invalid_input("the staged object length changed while it was written");
@@ -1244,6 +1202,9 @@ fn map_publication_error_without_commit(error: LocalPublicationError) -> Package
         LocalPublicationError::DestinationExists => PackageWriteError::DestinationExists,
         LocalPublicationError::AtomicPublishUnsupported { .. } => {
             PackageWriteError::AtomicPublishUnsupported
+        }
+        LocalPublicationError::FilesystemDurabilityUnsupported => {
+            PackageWriteError::FilesystemDurabilityUnsupported
         }
         LocalPublicationError::CommitIndeterminate { source } => PackageWriteError::Io {
             operation: "unexpected precommit durability state",
@@ -1399,6 +1360,59 @@ mod tests {
         assert_eq!(brick.logical_extent_zyx(), [1, 2, 3]);
         assert!(brick.pixel_payload().is_some());
         assert!(brick.validity_payload().is_none());
+    }
+
+    #[test]
+    fn package_write_route_has_one_prevalidation_stage_barrier_and_no_object_sync() {
+        let source = include_str!("package_write.rs");
+        let route_start = source
+            .find("    fn write_new_with_validation<I>(")
+            .expect("package-write route must exist");
+        let route_tail = &source[route_start..];
+        let route_end = route_tail
+            .find("\nstruct PackageWriteStageClock")
+            .expect("stage clock must follow the package-write route");
+        let route = &route_tail[..route_end];
+        let helper_start = source
+            .find("fn write_object_bytes(")
+            .expect("object writer helpers must exist");
+        let helper_tail = &source[helper_start..];
+        let helper_end = helper_tail
+            .find("\nfn check_cancelled(")
+            .expect("cancellation helper must follow object writer helpers");
+        let object_writers = &helper_tail[..helper_end];
+
+        assert_eq!(route.matches(".sync_stage(").count(), 1);
+        let barrier = route
+            .find(".sync_stage(")
+            .expect("the package route must synchronize its complete stage");
+        let validation = route
+            .find("PackageWriteStage::StagedStructureValidation")
+            .expect("staged structure validation must remain explicit");
+        assert!(barrier < validation);
+        for forbidden in [
+            ".sync_all(",
+            ".sync_data(",
+            "fdatasync(",
+            "fsync(",
+            "syncfs(",
+        ] {
+            assert!(
+                !route.contains(forbidden) && !object_writers.contains(forbidden),
+                "package construction contains a forbidden per-object durability route {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_filesystem_durability_remains_a_typed_writer_capability() {
+        let error = map_publication_error_without_commit(
+            LocalPublicationError::FilesystemDurabilityUnsupported,
+        );
+        assert!(matches!(
+            error,
+            PackageWriteError::FilesystemDurabilityUnsupported
+        ));
     }
 
     #[test]
@@ -1862,7 +1876,11 @@ mod tests {
         // and both present payloads.
         assert_eq!(codecs.decode_calls(), 10);
         assert!(codecs.decode_time_ns() > 0);
-        assert!(receipt.sync_calls() > receipt.admission().counts().total_physical_objects);
+        assert_eq!(
+            receipt.sync_calls(),
+            receipt.admission().counts().directories + 2,
+            "one stage-wide filesystem barrier, every package directory, and the destination parent must be counted exactly"
+        );
         assert!(receipt.sync_time_ns() > 0);
 
         let expected = [

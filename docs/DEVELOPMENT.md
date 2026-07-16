@@ -24,7 +24,10 @@ Mirante4D currently develops and packages on Linux x86_64.
    ```
 
 Running the application also requires a working Vulkan-capable graphics
-driver.
+driver. TIFF import and create-only dataset publication require Linux kernel
+5.8 or newer; older kernels are rejected before a private publication stage is
+created because their `syncfs` result does not reliably report writeback
+failures.
 
 ## Commands
 

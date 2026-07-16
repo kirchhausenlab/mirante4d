@@ -44,7 +44,10 @@ order; multipage inputs retain one exact-once streaming decoder.
 Descriptor-bound checkpoint files and shared positional readers prevent path
 reopens proportional to the worker count. Package publication passes validated
 canonical inner encodings directly to the sharded writer, and staged
-scientific validation reads each present base brick once. The writer retains
+scientific validation reads each present base brick once. After every staged
+object closes, one counted Linux filesystem barrier replaces per-object file
+syncs; deepest-first staged-directory syncs, validation, create-only rename,
+and destination-parent sync retain the publication ordering. The writer retains
 that exact/scientific capability through create-only rename and, within the
 cooperative local destination-parent namespace assumed by the storage
 contract, proves the public destination is the same directory by filesystem
@@ -121,6 +124,11 @@ See [testing](TESTING.md) for commands and claim language.
   owner-accepted yet, so no final product-performance claim is recorded.
 - The target dataset profile and project-store format are experimental and
   carry no compatibility promise.
+- TIFF import and create-only dataset publication require Linux kernel 5.8 or
+  newer. Their single stage-finalization `syncfs` barrier flushes the whole
+  containing filesystem, so unrelated dirty data can delay cancellation or
+  make publication fail closed on an unrelated writeback error; it never makes
+  an incomplete stage publishable.
 - The project store uses immutable objects and generations, bounded direct or
   paged closure, atomic refs, held leases, and generation-last publication.
   Its application service is the sole product route for Create, Open, Save,

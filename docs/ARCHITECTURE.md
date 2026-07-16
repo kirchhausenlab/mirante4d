@@ -143,8 +143,12 @@ Codec operation/time evidence distinguishes checkpoint inner encoding and
 checkpoint-dependent decoding from package-construction encoding and
 staged-validation decoding. Durability operation/time
 evidence covers canonical-cache and spool file/directory synchronization,
-every staged package object, every staged directory, and the destination
-parent synchronization after rename.
+one counted Linux `syncfs` barrier after all staged package objects close,
+every staged directory, and the destination parent synchronization after
+rename. The barrier is filesystem-wide rather than stage-scoped: unrelated
+dirty data can add latency or surface a conservative writeback failure. Package
+creation rejects Linux kernels older than 5.8, where `syncfs` did not reliably
+report those failures.
 
 The one-shot published-capability consumer returns a storage-issued execution
 receipt for its closed inventory/snapshot/inventory route. The receipt splits

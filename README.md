@@ -24,7 +24,9 @@ Current implementation facts and limitations are recorded in
 
 ## Build And Run
 
-Mirante4D currently targets Linux x86_64. Install the Rust toolchain selected by
+Mirante4D currently targets Linux x86_64. TIFF import and create-only dataset
+publication require Linux kernel 5.8 or newer so filesystem-wide durability
+failures are reported reliably. Install the Rust toolchain selected by
 `rust-toolchain.toml`, clone the repository, and run:
 
 ```bash

@@ -24,6 +24,8 @@ checker is a hard failure.
 ## Current Boundary
 
 - Linux x86_64 is the only package target.
+- TIFF import and create-only dataset publication require Linux kernel 5.8 or
+  newer; opening an existing package does not use that publication barrier.
 - There is no auto-updater, signed channel, Windows/macOS package, or release
   support window.
 - A successful build or packaging smoke is not a supported release and is not

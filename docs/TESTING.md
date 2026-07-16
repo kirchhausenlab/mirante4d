@@ -167,9 +167,13 @@ cargo run --release -p xtask -- import-performance-t2 \
 
 The successful import receipt is the counter authority consumed by both
 performance runners. `sync_calls` and `sync_time_ns` cover canonical-cache and
-spool file/directory durability plus package-object, staged-directory, and
-post-rename parent-directory durability. Codec call/time fields aggregate
-checkpoint pixel/validity encoding and checkpoint-dependent decoding,
+spool file/directory durability plus one counted staged-filesystem `syncfs`,
+every staged-directory `fsync`, and the post-rename parent-directory `fsync`.
+The `syncfs` duration can include unrelated dirty writeback on the same
+filesystem; an unrelated writeback error fails the import conservatively.
+Package creation rejects Linux kernels older than 5.8 because their `syncfs`
+result did not reliably report writeback failures. Codec call/time fields
+aggregate checkpoint pixel/validity encoding and checkpoint-dependent decoding,
 package-construction inner encoding (including packed-index inners), and
 staged-validation decoding; the encoded pixel/validity publication boundary
 must not add a second inner encode. Package-object reads are actual successful

@@ -343,7 +343,10 @@ Implementation status: implemented. The sole checkpoint is the six-file
 canonical-cache/spool schema; encoded pixel and validity inners pass through to
 the shard writer, recovery accepts only a validated durable prefix, and the
 predecessor checkpoint and decoded publication paths are absent. Final IP-04
-clean-revision deletion-audit acceptance remains pending.
+clean-revision deletion-audit acceptance remains pending. Package staging now
+uses one counted Linux filesystem barrier after all physical-object files
+close, then retains deepest-first directory syncs and the post-rename parent
+sync; Linux kernels older than 5.8 fail before staging.
 
 Goal: activate the decode-once candidate, remove logical-brick-proportional
 durability and duplicate inner-codec work, and leave one product/checkpoint
@@ -518,7 +521,7 @@ inside both the clock and the traffic counter.
 | Base decode amplification | Every timed T2 and T5 run | Native decoded pixel bytes at most 1.10 times canonical source pixel bytes |
 | Source scientific traversal | Every timed T2 and T5 run | Zero additional TIFF native decodes for scientific identity |
 | Timed import source traffic | Every timed T2 and T5 run | At most 2.50 times unique raw source bytes, including one strong integrity traversal |
-| Durability calls | Every timed T5 run | Fewer than 5,000 aggregate import-process `sync_calls` (file/directory `sync_all` and `fsync`) and no work-unit-proportional sync path |
+| Durability calls | Every timed T5 run | Fewer than 5,000 aggregate import-process `sync_calls` across all explicit file, directory, and filesystem durability operations; no work-unit-proportional checkpoint sync or per-regular-package-object file-sync path |
 | Working memory | Pressure tests and every timed run | Import-ledger peak at most 256 MiB with all import buffers and queues accounted |
 | External memory check | Every timed T2 and T5 run | Peak process RSS minus the pre-import idle baseline at most 384 MiB, with ledger-external overhead reconciled |
 | Open-file bound | Pressure tests and every timed run | At most 64 simultaneously open import-owned file descriptors |
@@ -556,8 +559,8 @@ Focused automated coverage must include:
 - source mutation before, during, and after ingest;
 - cancellation at every stage and stale-result suppression;
 - fresh, resumed, truncated, corrupt, reordered, and wrong-source checkpoints;
-- durability failpoints around payload, journal, watermark, sync, validation,
-  publication, and rename;
+- durability failpoints around payload, journal, watermark, checkpoint sync,
+  the staged-filesystem barrier, validation, publication, and rename;
 - deterministic output across repeated runs and admitted worker counts;
 - independent expected values or digests for every generated pyramid scale;
 - independent exact/scientific rejection after package mutation; and
@@ -617,6 +620,10 @@ Known implementation risks and required controls:
   objects, checksum records, and clean only importer-owned stages.
 - **Batched durability:** define the loss/recompute bound precisely and prove
   every crash boundary with fault injection.
+- **Filesystem-wide package barrier:** the stage-finalization `syncfs` can wait
+  for unrelated dirty data or surface its writeback error. Require Linux 5.8 or
+  newer, count and time the call, retain directory and parent syncs, and record
+  this fail-closed latency/cancellation coupling for owner acceptance.
 - **Encoded pass-through:** preserve one codec authority and validate kind,
   length, checksum, order, and profile before shard assembly.
 - **Parallel determinism:** keep one ordered commit owner, bounded reorder

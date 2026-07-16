@@ -205,8 +205,9 @@ pub struct ImportStatistics {
     pub codec_encode_time_ns: u64,
     pub codec_decode_calls: u64,
     pub codec_decode_time_ns: u64,
-    /// Successful durability calls across checkpoint files/directories and
-    /// package objects, staged directories, and the destination parent.
+    /// Successful durability calls across checkpoint files/directories, the
+    /// staged-package filesystem barrier, staged directories, and the
+    /// destination parent.
     pub sync_calls: u64,
     /// Monotonic wall time spent in the durability calls above.
     pub sync_time_ns: u64,
