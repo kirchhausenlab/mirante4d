@@ -59,6 +59,7 @@ const PUBLICATION_CURRENTNESS_CONTRACT_ID: &str =
     "mirante4d-publication-currentness-inventory-snapshot-inventory-1";
 const SCALE_DIGEST_SCHEME: &str = "mirante4d-t5-canonical-scale-voxels-1";
 const CONFIG_BYTES_MAX: u64 = 1024 * 1024;
+const RAW_REPORT_BYTES_MAX: u64 = 32 * 1024 * 1024;
 const WORKING_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 const RSS_DELTA_BYTES_MAX: u64 = 384 * 1024 * 1024;
 const PRIMARY_MEDIAN_NS_MAX: u64 = 15 * 60 * 1_000_000_000;
@@ -75,6 +76,33 @@ const POST_PRIMARY_TIMEOUT_SECONDS: u64 = 10 * 60;
 const MAPPED_WIDTH: u32 = 1280;
 const MAPPED_HEIGHT: u32 = 720;
 const SOURCE_ENTRY_MAX: usize = 4_096;
+const T5_SAMPLE_GATE_NAMES: [&str; 25] = [
+    "base_decode_amplification",
+    "canonical_base_pixel_bytes",
+    "complete_source_revalidation",
+    "counter_reconciliation",
+    "durability_calls",
+    "durable_checkpoint_prefix",
+    "exact_correctness",
+    "external_rss_delta",
+    "fixed_six_checkpoint_files",
+    "fresh_checkpoint_not_resumed",
+    "frozen_centered_transforms",
+    "independent_scientific_locality",
+    "normal_product_navigation",
+    "open_file_bound",
+    "per_scale_semantic_regression",
+    "progress_truthfulness",
+    "real_mapped_display",
+    "reviewed_source_workload_binding",
+    "scientific_correctness",
+    "source_scientific_traversal",
+    "staged_scientific_locality",
+    "storage_binding_stable",
+    "temporary_byte_bound",
+    "timed_source_traffic",
+    "working_memory",
+];
 
 /// Owner-accepted after two independent full source-oracle derivations
 /// produced byte-identical schema-v2 configurations.
@@ -85,6 +113,25 @@ pub(crate) const OWNER_ACCEPTED_T5_CONFIG_SHA256: Option<&str> =
 enum QualificationKind {
     Correctness,
     Performance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SummaryPublicationMode {
+    InProcess,
+    FinalizedRawReplay,
+}
+
+impl SummaryPublicationMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::InProcess => "in_process_after_finalized_raw",
+            Self::FinalizedRawReplay => "finalized_raw_replay",
+        }
+    }
+
+    const fn is_recovery(self) -> bool {
+        matches!(self, Self::FinalizedRawReplay)
+    }
 }
 
 impl QualificationKind {
@@ -107,6 +154,12 @@ struct RunArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OracleAuditArgs {
     config: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublishArgs {
+    config: PathBuf,
+    raw_report: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -193,11 +246,9 @@ struct SampleEvidence {
     primary_wall_time_ns: u64,
     package_id: String,
     scientific_content_id: String,
-    reviewed_source_fingerprint_sha256: String,
     failed_gates: Vec<String>,
     all_gates_passed: bool,
     raw: Value,
-    sanitized: Value,
 }
 
 #[derive(Debug)]
@@ -708,44 +759,511 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
     });
     let raw_report_path = session_root.join("raw-private-report.json");
     write_new_synced_json(&raw_report_path, &raw_report)?;
-    let raw_report_sha256 = sha256_file(&raw_report_path)?;
+    cancellation.check("sanitized evidence publication")?;
+    let sanitized_path = publish_finalized_raw_report(
+        repository_root,
+        &config_input,
+        &config,
+        &raw_report_path,
+        SummaryPublicationMode::InProcess,
+    )?;
+    cancellation.check("command completion")?;
+    Ok(sanitized_path)
+}
 
-    let filesystem_class = scratch_binding_start
-        .filesystem_type
-        .clone()
-        .unwrap_or_else(|| "unavailable".to_owned());
+pub(crate) fn publish(args: Vec<String>) -> anyhow::Result<PathBuf> {
+    let args = parse_publish_args(args)?;
+    let build_provenance = qualification_build_provenance();
+    require_release_xtask(&build_provenance)?;
+    require_standard_app_build_environment(&build_provenance)?;
+    let repository = repository_identity();
+    require_clean_repository(&repository)?;
+    let build_reasons = qualification_build_reason_codes(&build_provenance, &repository);
+    if !build_reasons.is_empty() {
+        bail!(
+            "T5 report publication requires an exact clean release xtask: {}",
+            build_reasons.join(", ")
+        );
+    }
+    let repository_root = repository
+        .root
+        .as_deref()
+        .context("T5 report publication could not resolve the repository root")?;
+    require_no_external_cargo_configuration(repository_root)?;
+    let config_input = read_config_input(&args.config, repository_root)?;
+    let config: T5Config = serde_json::from_slice(&config_input.bytes)
+        .context("private T5 configuration is not strict valid JSON")?;
+    validate_config(&config)?;
+    if config_binding_status(&config_input.sha256) != "matched" {
+        bail!("T5 report publication requires the owner-pinned private configuration");
+    }
+    publish_finalized_raw_report(
+        repository_root,
+        &config_input,
+        &config,
+        &args.raw_report,
+        SummaryPublicationMode::FinalizedRawReplay,
+    )
+}
+
+fn publish_finalized_raw_report(
+    repository_root: &Path,
+    config_input: &ConfigInput,
+    config: &T5Config,
+    raw_report_path: &Path,
+    publication_mode: SummaryPublicationMode,
+) -> anyhow::Result<PathBuf> {
+    let (raw_report, raw_report_sha256) =
+        read_finalized_raw_report(raw_report_path, repository_root, RAW_REPORT_BYTES_MAX)?;
+    validate_raw_config_binding(&raw_report, config_input, config)?;
+    let publisher_repository = repository_identity();
+    require_clean_repository(&publisher_repository)?;
+    let publisher_build_provenance = qualification_build_provenance();
+    require_release_xtask(&publisher_build_provenance)?;
+    let publisher_build_reasons =
+        qualification_build_reason_codes(&publisher_build_provenance, &publisher_repository);
+    if !publisher_build_reasons.is_empty() {
+        bail!(
+            "T5 summary publisher is not bound to its clean repository revision: {}",
+            publisher_build_reasons.join(", ")
+        );
+    }
+    let publisher_revision = publisher_repository
+        .commit
+        .as_deref()
+        .context("T5 summary publisher lacks a repository revision")?;
+    let publisher_executable = env::current_exe()?;
+    validate_release_executable(&publisher_executable, "T5 summary publisher")?;
+    let publisher_executable_sha256 = sha256_file(&publisher_executable)?;
+    let sanitized_report = sanitized_report_from_raw(
+        &raw_report,
+        &raw_report_sha256,
+        config_input,
+        config,
+        publisher_revision,
+        &publisher_executable_sha256,
+        publication_mode,
+    )?;
+    let private_strings = private_strings_from_raw(
+        &raw_report,
+        raw_report_path,
+        repository_root,
+        config_input,
+        config,
+    );
+    validate_sanitized_report(&sanitized_report, &private_strings)?;
+
+    let evidence_id = required_string(&raw_report, "/session_id")?;
+    if !evidence_id.starts_with("t5-")
+        || evidence_id.len() > 96
+        || !evidence_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-' || byte.is_ascii_lowercase())
+    {
+        bail!("finalized T5 raw report has an unsafe evidence identifier");
+    }
+    let sanitized_root = repository_root.join("target/mirante4d/import-performance-t5");
+    fs::create_dir_all(&sanitized_root)?;
+    let sanitized_path = sanitized_root.join(format!("{evidence_id}-summary.json"));
+    write_new_synced_json(&sanitized_path, &sanitized_report)?;
+    let reread = read_bounded_json(&sanitized_path, RAW_REPORT_BYTES_MAX)?;
+    if reread != sanitized_report {
+        bail!("published T5 summary changed while reread");
+    }
+    validate_sanitized_report(&reread, &private_strings)?;
+    if reread
+        .pointer("/bindings/private_raw_report_sha256")
+        .and_then(Value::as_str)
+        != Some(raw_report_sha256.as_str())
+    {
+        bail!("published T5 summary lost its finalized raw-report binding");
+    }
+    Ok(sanitized_path)
+}
+
+fn read_finalized_raw_report(
+    path: &Path,
+    repository_root: &Path,
+    maximum_bytes: u64,
+) -> anyhow::Result<(Value, String)> {
+    if !path.is_absolute() {
+        bail!("T5 report publication requires an absolute --raw-report path");
+    }
+    let path_metadata = fs::symlink_metadata(path)?;
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.is_file()
+        || path_metadata.len() == 0
+        || path_metadata.len() > maximum_bytes
+        || path_metadata.permissions().mode() & 0o077 != 0
+    {
+        bail!("finalized T5 raw report must be one bounded private regular file");
+    }
+    let canonical = fs::canonicalize(path)?;
+    if canonical.starts_with(fs::canonicalize(repository_root)?) {
+        bail!("finalized private T5 raw report must remain outside the repository");
+    }
+    let parent = canonical
+        .parent()
+        .context("finalized T5 raw report has no parent")?;
+    let parent_metadata = fs::metadata(parent)?;
+    if !parent_metadata.is_dir() || parent_metadata.permissions().mode() & 0o077 != 0 {
+        bail!("finalized T5 raw report parent must remain private");
+    }
+
+    let mut file = File::open(&canonical)?;
+    let before = file.metadata()?;
+    if before.dev() != path_metadata.dev()
+        || before.ino() != path_metadata.ino()
+        || before.len() != path_metadata.len()
+    {
+        bail!("finalized T5 raw report path changed while opened");
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(before.len()).unwrap_or(0));
+    Read::by_ref(&mut file)
+        .take(maximum_bytes + 1)
+        .read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    let path_after = fs::symlink_metadata(&canonical)?;
+    if u64::try_from(bytes.len()).ok() != Some(before.len())
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || after.dev() != path_after.dev()
+        || after.ino() != path_after.ino()
+        || after.len() != path_after.len()
+    {
+        bail!("finalized T5 raw report changed while read");
+    }
+    let digest = sha256_bytes(&bytes);
+    let report = serde_json::from_slice(&bytes).context("finalized T5 raw report is malformed")?;
+    Ok((report, digest))
+}
+
+fn validate_raw_config_binding(
+    raw: &Value,
+    config_input: &ConfigInput,
+    config: &T5Config,
+) -> anyhow::Result<()> {
+    require_exact_object_keys(
+        raw,
+        &[
+            "build",
+            "configuration",
+            "frozen_source_facts",
+            "protocol",
+            "qualification_profile",
+            "samples",
+            "schema",
+            "schema_version",
+            "session_id",
+            "source_preservation",
+            "summary",
+        ],
+        "finalized T5 raw report",
+    )?;
+    if required_string(raw, "/schema")? != RAW_REPORT_SCHEMA
+        || required_pointer_u64(raw, "/schema_version")? != 4
+    {
+        bail!("finalized T5 raw report schema mismatch");
+    }
+    let parsed_config = serde_json::to_value(config)?;
+    if required_string(raw, "/configuration/sha256")? != config_input.sha256
+        || required_string(raw, "/configuration/owner_accepted_sha256")?
+            != OWNER_ACCEPTED_T5_CONFIG_SHA256.context("T5 config pin is absent")?
+        || required_string(raw, "/configuration/binding_status")? != "matched"
+        || raw.pointer("/configuration/parsed") != Some(&parsed_config)
+        || raw.pointer("/configuration/path") != Some(&json!(config_input.path))
+    {
+        bail!("finalized T5 raw report does not match the pinned configuration bytes");
+    }
+    Ok(())
+}
+
+fn sanitized_report_from_raw(
+    raw: &Value,
+    raw_report_sha256: &str,
+    config_input: &ConfigInput,
+    config: &T5Config,
+    publisher_revision: &str,
+    publisher_executable_sha256: &str,
+    publication_mode: SummaryPublicationMode,
+) -> anyhow::Result<Value> {
+    let qualification_kind = required_string(raw, "/protocol/qualification_kind")?;
+    let diagnostic_requested = required_bool(raw, "/protocol/diagnostic_requested")?;
+    let sample_count = usize::try_from(required_pointer_u64(raw, "/protocol/sample_count")?)?;
+    let performance_requested = match qualification_kind {
+        "correctness" => {
+            if sample_count != CORRECTNESS_SAMPLES {
+                bail!("correctness raw report must contain exactly one sample");
+            }
+            false
+        }
+        "performance" => {
+            if sample_count != PERFORMANCE_SAMPLES {
+                bail!("performance raw report must contain exactly three samples");
+            }
+            true
+        }
+        _ => bail!("finalized T5 raw report has an unknown qualification kind"),
+    };
+    let raw_samples = raw
+        .pointer("/samples")
+        .and_then(Value::as_array)
+        .context("finalized T5 raw report lacks samples")?;
+    if raw_samples.len() != sample_count {
+        bail!("finalized T5 raw report sample count is inconsistent");
+    }
+    for pointer in [
+        "/protocol/fresh_checkpoint_and_absent_destination_per_sample",
+        "/protocol/fresh_release_process_per_sample",
+        "/protocol/normal_product_import_route",
+        "/frozen_source_facts/package_validated_against_frozen_facts",
+        "/frozen_source_facts/owner_pinned_fact_freeze_binding",
+    ] {
+        if !required_bool(raw, pointer)? {
+            bail!("finalized T5 raw report lost a mandatory fact at {pointer}");
+        }
+    }
+    if required_bool(raw, "/frozen_source_facts/source_oracle_recomputed")?
+        || required_string(raw, "/frozen_source_facts/fact_authority")? != FACT_AUTHORITY
+        || required_string(raw, "/frozen_source_facts/oracle_recomputation_policy")?
+            != "explicit_offline_audit_only"
+    {
+        bail!("finalized T5 raw report has an invalid frozen-fact authority");
+    }
+
+    let mut sanitized_samples = Vec::with_capacity(sample_count);
+    let mut primary_times = Vec::with_capacity(sample_count);
+    let mut identities = Vec::with_capacity(sample_count);
+    let mut samples_passed = true;
+    for (expected_index, sample) in raw_samples.iter().enumerate() {
+        if usize::try_from(required_pointer_u64(sample, "/sample_index")?)? != expected_index {
+            bail!("finalized T5 raw report sample indices are not contiguous");
+        }
+        let gates = sample
+            .pointer("/gates")
+            .and_then(Value::as_object)
+            .context("finalized T5 raw sample lacks gates")?;
+        let expected_gates = T5_SAMPLE_GATE_NAMES.into_iter().collect::<BTreeSet<_>>();
+        let actual_gates = gates.keys().map(String::as_str).collect::<BTreeSet<_>>();
+        if actual_gates != expected_gates || gates.values().any(|value| !value.is_boolean()) {
+            bail!("finalized T5 raw sample gate set or value type is invalid");
+        }
+        let all_gates_passed = gates.values().all(|value| value.as_bool() == Some(true));
+        if required_bool(sample, "/all_gates_passed")? != all_gates_passed {
+            bail!("finalized T5 raw sample gate aggregate is inconsistent");
+        }
+        samples_passed &= all_gates_passed;
+        let primary_wall_time_ns = required_pointer_u64(sample, "/timing/primary_wall_time_ns")?;
+        primary_times.push(primary_wall_time_ns);
+        identities.push((
+            required_string(sample, "/receipt/package_id")?.to_owned(),
+            required_string(sample, "/receipt/scientific_content_id")?.to_owned(),
+        ));
+        sanitized_samples.push(json!({
+            "sample_index": expected_index,
+            "inspection_and_review_wall_time_ns": required_value(sample, "/timing/inspection_and_review_wall_time_ns")?,
+            "inspection_and_review_process_cpu_time_ns": required_value(sample, "/timing/inspection_and_review_process_cpu_time_ns")?,
+            "primary_wall_time_ns": primary_wall_time_ns,
+            "primary_process_cpu_time_ns": required_value(sample, "/timing/primary_process_cpu_time_ns")?,
+            "publication_to_open_ready_wall_time_ns": required_value(sample, "/timing/publication_to_open_ready_wall_time_ns")?,
+            "publication_to_open_ready_process_cpu_time_ns": required_value(sample, "/timing/publication_to_open_ready_process_cpu_time_ns")?,
+            "external_rss_delta_bytes": required_value(sample, "/rss/primary_delta_bytes")?,
+            "external_rss_delta_minus_ledger_peak_bytes": required_value(sample, "/rss/external_delta_minus_ledger_peak_bytes")?,
+            "peak_working_bytes": required_value(sample, "/receipt/statistics/peak_working_bytes")?,
+            "peak_open_file_descriptors": required_value(sample, "/receipt/statistics/peak_open_file_descriptors")?,
+            "peak_temporary_bytes": required_value(sample, "/receipt/statistics/peak_temporary_bytes")?,
+            "peak_checkpoint_regular_files": required_value(sample, "/receipt/statistics/peak_checkpoint_regular_files")?,
+            "sync_calls": required_value(sample, "/receipt/statistics/sync_calls")?,
+            "gates": gates,
+            "all_gates_passed": all_gates_passed,
+        }));
+    }
+    primary_times.sort_unstable();
+    let median_primary_wall_time_ns = primary_times[primary_times.len() / 2];
+    let cross_sample_ids_consistent =
+        (sample_count > 1).then(|| identities.windows(2).all(|pair| pair[0] == pair[1]));
+    let performance_timing_gate_passed =
+        performance_requested && median_primary_wall_time_ns <= PRIMARY_MEDIAN_NS_MAX;
+
+    let profile_statuses_match = [
+        "/qualification_profile/source_start/status",
+        "/qualification_profile/scratch_start/status",
+        "/qualification_profile/session_start/status",
+        "/qualification_profile/source_end/status",
+        "/qualification_profile/scratch_end/status",
+        "/qualification_profile/session_end/status",
+    ]
+    .into_iter()
+    .all(|pointer| raw.pointer(pointer).and_then(Value::as_str) == Some("matched"));
+    let profile_unchanged = required_bool(raw, "/qualification_profile/unchanged")?
+        && raw.pointer("/qualification_profile/source_start")
+            == raw.pointer("/qualification_profile/source_end")
+        && raw.pointer("/qualification_profile/scratch_start")
+            == raw.pointer("/qualification_profile/scratch_end")
+        && raw.pointer("/qualification_profile/session_start")
+            == raw.pointer("/qualification_profile/session_end");
+    let binding_eligible = required_string(raw, "/configuration/binding_status")? == "matched"
+        && profile_statuses_match
+        && profile_unchanged;
+    let frozen_source_matched =
+        required_bool(raw, "/source_preservation/matches_frozen_configuration")?;
+    let source_preserved = required_bool(raw, "/source_preservation/unchanged")?
+        && raw.pointer("/source_preservation/before") == raw.pointer("/source_preservation/after")
+        && raw
+            .pointer("/source_preservation/before/inventory_sha256")
+            .and_then(Value::as_str)
+            == Some(config.expected.source_inventory_sha256.as_str());
+    let repository_unchanged = required_bool(raw, "/build/repository_unchanged")?;
+    let hardware_unchanged = required_bool(raw, "/build/hardware_unchanged")?;
+    let xtask_unchanged = required_bool(raw, "/build/xtask_executable_unchanged")?
+        && raw.pointer("/build/xtask_executable_sha256_start")
+            == raw.pointer("/build/xtask_executable_sha256_end");
+    let executable_unchanged = required_bool(raw, "/build/executable_unchanged")?
+        && raw.pointer("/build/executable_sha256_start")
+            == raw.pointer("/build/executable_sha256_end");
+    let config_unchanged = required_bool(raw, "/summary/config_unchanged")?;
+    let build_start_clean = raw
+        .pointer("/build/provenance_reason_codes_start")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty);
+    let build_end_clean = raw
+        .pointer("/build/provenance_reason_codes_end")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty);
+    let invariant_gates_passed = frozen_source_matched
+        && source_preserved
+        && repository_unchanged
+        && hardware_unchanged
+        && xtask_unchanged
+        && executable_unchanged
+        && config_unchanged
+        && build_start_clean
+        && build_end_clean;
+    let correctness_qualification_passed = correctness_qualification_claim_passed(
+        diagnostic_requested,
+        binding_eligible,
+        samples_passed,
+        invariant_gates_passed,
+    );
+    let performance_qualification_passed = performance_qualification_claim_passed(
+        performance_requested,
+        correctness_qualification_passed,
+        performance_timing_gate_passed,
+        cross_sample_ids_consistent,
+    );
+    let qualification_passed = if performance_requested {
+        performance_qualification_passed
+    } else {
+        correctness_qualification_passed
+    };
+
+    for (pointer, expected) in [
+        ("/summary/absolute_gate_ns", json!(PRIMARY_MEDIAN_NS_MAX)),
+        (
+            "/summary/stretch_target_ns",
+            json!(PRIMARY_MEDIAN_STRETCH_NS),
+        ),
+        ("/summary/samples_passed", json!(samples_passed)),
+        (
+            "/summary/cross_sample_ids_consistent",
+            json!(cross_sample_ids_consistent),
+        ),
+        (
+            "/summary/frozen_source_matched",
+            json!(frozen_source_matched),
+        ),
+        ("/summary/source_preserved", json!(source_preserved)),
+        ("/summary/binding_eligible", json!(binding_eligible)),
+        (
+            "/summary/performance_timing_gate_evaluated",
+            json!(performance_requested),
+        ),
+        (
+            "/summary/performance_timing_gate_passed",
+            json!(performance_timing_gate_passed),
+        ),
+        (
+            "/summary/correctness_qualification_passed",
+            json!(correctness_qualification_passed),
+        ),
+        (
+            "/summary/performance_qualification_passed",
+            json!(performance_qualification_passed),
+        ),
+        ("/summary/qualification_passed", json!(qualification_passed)),
+    ] {
+        if raw.pointer(pointer) != Some(&expected) {
+            bail!("finalized T5 raw report summary is internally inconsistent at {pointer}");
+        }
+    }
+    let expected_median = if performance_requested {
+        json!(median_primary_wall_time_ns)
+    } else {
+        Value::Null
+    };
+    if raw.pointer("/summary/performance_median_primary_wall_time_ns") != Some(&expected_median) {
+        bail!("finalized T5 raw report median is internally inconsistent");
+    }
+    if qualification_passed
+        && !raw
+            .pointer("/summary/diagnostic_reason_codes")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+    {
+        bail!("qualifying T5 raw report retained diagnostic failures");
+    }
+
+    let measurement_revision = required_string(raw, "/build/repository_start/commit")?;
+    if raw
+        .pointer("/build/repository_end/commit")
+        .and_then(Value::as_str)
+        != Some(measurement_revision)
+        || required_bool(raw, "/build/repository_start/dirty_worktree")?
+        || required_bool(raw, "/build/repository_end/dirty_worktree")?
+    {
+        bail!("finalized T5 raw report is not bound to one clean measurement revision");
+    }
+    let filesystem_class = raw
+        .pointer("/qualification_profile/source_start/observed_filesystem_type")
+        .and_then(Value::as_str)
+        .unwrap_or("unavailable");
     let mut remaining_risks = vec![
         "no_relative_speedup_or_timing_tail_claim",
         "cache_and_competing_activity_are_declared_not_os_enforced",
         "physical_display_attachment_is_owner_attested_not_cryptographically_proved",
         "retained_private_configuration_commitment_can_confirm_a_guessed_configuration",
     ];
-    if args.qualification_kind == QualificationKind::Performance
-        && median_primary_wall_time_ns > PRIMARY_MEDIAN_STRETCH_NS
-    {
+    if performance_requested && median_primary_wall_time_ns > PRIMARY_MEDIAN_STRETCH_NS {
         remaining_risks.push("nonblocking_10_minute_stretch_target_not_met");
     }
-    if args.qualification_kind == QualificationKind::Correctness {
+    if !performance_requested {
         remaining_risks.push("restored_policy_three_sample_performance_not_qualified");
     }
-    let sanitized_report = json!({
+    let diagnostic_reason_codes = required_value(raw, "/summary/diagnostic_reason_codes")?;
+    Ok(json!({
         "schema": SANITIZED_REPORT_SCHEMA,
         "schema_version": 4,
-        "evidence_id": session_id,
+        "evidence_id": required_string(raw, "/session_id")?,
         "workload_id": config.workload_id,
         "evidence_class": if qualification_passed {
-            match args.qualification_kind {
-                QualificationKind::Correctness => "correctness_qualification",
-                QualificationKind::Performance => "performance_qualification",
-            }
-        } else {
-            "diagnostic"
-        },
+            if performance_requested { "performance_qualification" } else { "correctness_qualification" }
+        } else { "diagnostic" },
         "status": if qualification_passed { "passed" } else { "not_qualified" },
+        "publication": {
+            "mode": publication_mode.label(),
+            "measurement_revision": measurement_revision,
+            "publisher_revision": publisher_revision,
+            "publisher_executable_sha256": publisher_executable_sha256,
+            "measurement_reexecuted_for_publication": false,
+            "reporting_only_recovery": publication_mode.is_recovery(),
+        },
         "protocol": {
-            "qualification_kind": args.qualification_kind.label(),
-            "sample_count": args.samples,
-            "diagnostic_requested": args.diagnostic,
+            "qualification_kind": qualification_kind,
+            "sample_count": sample_count,
+            "diagnostic_requested": diagnostic_requested,
             "fresh_release_processes": true,
             "normal_product_import_route": true,
             "source_oracle_recomputed": false,
@@ -759,46 +1277,46 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
             "cache_condition": config.cache_condition,
             "competing_activity": config.competing_activity,
             "required_hardware_class": IMPORT_QUALIFICATION_HARDWARE_CLASS,
-            "qualified_hardware_class": if profile_matched_at_start && profile_matched_at_end { Some(IMPORT_QUALIFICATION_HARDWARE_CLASS) } else { None },
+            "qualified_hardware_class": if profile_statuses_match { Some(IMPORT_QUALIFICATION_HARDWARE_CLASS) } else { None },
             "filesystem_class": filesystem_class,
         },
         "bindings": {
-            "private_configuration": config_binding_status,
+            "private_configuration": required_string(raw, "/configuration/binding_status")?,
             "private_configuration_sha256": config_input.sha256,
             "private_raw_report_sha256": raw_report_sha256,
-            "host_and_storage_profile": if profile_matched_at_start && profile_matched_at_end { "matched" } else { "not_matched" },
-            "qualification_profile_sha256": source_binding_start.profile_sha256,
-            "observed_host_fingerprint_sha256": source_binding_start.host_fingerprint_sha256,
-            "observed_storage_fingerprint_sha256": source_binding_start.storage_fingerprint_sha256,
+            "host_and_storage_profile": if profile_statuses_match { "matched" } else { "not_matched" },
+            "qualification_profile_sha256": required_value(raw, "/qualification_profile/source_start/profile_sha256")?,
+            "observed_host_fingerprint_sha256": required_value(raw, "/qualification_profile/source_start/observed_host_fingerprint_sha256")?,
+            "observed_storage_fingerprint_sha256": required_value(raw, "/qualification_profile/source_start/observed_storage_fingerprint_sha256")?,
             "configuration_unchanged": config_unchanged,
             "repository_unchanged": repository_unchanged,
             "xtask_executable_unchanged": xtask_unchanged,
             "release_executable_unchanged": executable_unchanged,
         },
         "build": {
-            "repository_revision": repository_start.commit,
-            "xtask_executable_sha256": xtask_digest_start,
-            "app_executable_sha256": executable_digest_start,
+            "repository_revision": measurement_revision,
+            "xtask_executable_sha256": required_value(raw, "/build/xtask_executable_sha256_start")?,
+            "app_executable_sha256": required_value(raw, "/build/executable_sha256_start")?,
             "app_build_target_mode": "fresh-private-target",
-            "xtask": qualification_build_provenance_evidence(&build_provenance),
-            "toolchain": build_provenance.compiler,
+            "xtask": required_value(raw, "/build/xtask_provenance")?,
+            "toolchain": required_value(raw, "/build/xtask_provenance/compiler")?,
         },
         "commands": [
-            if args.diagnostic {
+            if diagnostic_requested {
                 "cargo run --release -p xtask -- import-performance-t5 --config <private-config> --diagnostic"
-            } else if args.qualification_kind == QualificationKind::Performance {
+            } else if performance_requested {
                 "cargo run --release -p xtask -- import-performance-t5 --config <private-config> --performance"
             } else {
                 "cargo run --release -p xtask -- import-performance-t5 --config <private-config>"
             },
             "normal native app setup/review/start/open-ready/render/navigation route",
         ],
-        "samples": samples.iter().map(|sample| sample.sanitized.clone()).collect::<Vec<_>>(),
+        "samples": sanitized_samples,
         "gates": {
-            "performance_median_primary_wall_time_ns": if args.qualification_kind == QualificationKind::Performance { Some(median_primary_wall_time_ns) } else { None },
-            "performance_timing_gate_evaluated": args.qualification_kind == QualificationKind::Performance,
-            "median_at_most_15_minutes": if args.qualification_kind == QualificationKind::Performance { Some(performance_timing_gate_passed) } else { None },
-            "median_stretch_at_most_10_minutes": if args.qualification_kind == QualificationKind::Performance { Some(median_primary_wall_time_ns <= PRIMARY_MEDIAN_STRETCH_NS) } else { None },
+            "performance_median_primary_wall_time_ns": if performance_requested { Some(median_primary_wall_time_ns) } else { None },
+            "performance_timing_gate_evaluated": performance_requested,
+            "median_at_most_15_minutes": if performance_requested { Some(performance_timing_gate_passed) } else { None },
+            "median_stretch_at_most_10_minutes": if performance_requested { Some(median_primary_wall_time_ns <= PRIMARY_MEDIAN_STRETCH_NS) } else { None },
             "all_per_sample_gates": samples_passed,
             "cross_sample_ids_consistent": cross_sample_ids_consistent,
             "frozen_source_matched": frozen_source_matched,
@@ -809,11 +1327,7 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
             "qualification_passed": qualification_passed,
         },
         "failures": diagnostic_reason_codes,
-        "skips": if args.qualification_kind == QualificationKind::Correctness {
-            vec!["three_sample_performance_qualification_not_requested"]
-        } else {
-            Vec::<&str>::new()
-        },
+        "skips": if performance_requested { Vec::<&str>::new() } else { vec!["three_sample_performance_qualification_not_requested"] },
         "waivers": [],
         "remaining_risks": remaining_risks,
         "private_values_redacted": {
@@ -825,14 +1339,27 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
             "private_source_scientific_and_package_digests": true,
             "opaque_configuration_raw_report_qualification_and_executable_binding_digests_retained": true,
         },
-    });
+    }))
+}
+
+fn private_strings_from_raw(
+    raw: &Value,
+    raw_report_path: &Path,
+    repository_root: &Path,
+    config_input: &ConfigInput,
+    config: &T5Config,
+) -> Vec<String> {
     let mut private_strings = vec![
-        source.display().to_string(),
-        scratch_root.display().to_string(),
-        qualification_profile.display().to_string(),
+        raw_report_path.display().to_string(),
+        raw_report_path
+            .parent()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        config.source.display().to_string(),
+        config.scratch_root.display().to_string(),
+        config.qualification_profile.display().to_string(),
         config_input.path.display().to_string(),
         repository_root.display().to_string(),
-        source_before.sha256.clone(),
         config.expected.source_inventory_sha256.clone(),
         config.expected.reviewed_source_fingerprint_sha256.clone(),
         config.expected.scientific_content_id.clone(),
@@ -851,31 +1378,74 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
             .iter()
             .map(|scale| scale.digest_sha256.clone()),
     );
-    for sample in &samples {
-        private_strings.push(sample.package_id.clone());
-        private_strings.push(sample.scientific_content_id.clone());
-        private_strings.push(sample.reviewed_source_fingerprint_sha256.clone());
-        for pointer in [
-            "/independent_validation/layer_roots",
-            "/independent_validation/scales",
-        ] {
-            if let Some(facts) = sample.raw.pointer(pointer).and_then(Value::as_array) {
-                private_strings.extend(facts.iter().filter_map(|fact| {
-                    fact.get("digest_sha256")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                }));
+    if let Some(samples) = raw.pointer("/samples").and_then(Value::as_array) {
+        for sample in samples {
+            for pointer in [
+                "/receipt/package_id",
+                "/receipt/scientific_content_id",
+                "/receipt/reviewed_source_fingerprint_sha256",
+                "/independent_validation/package_id",
+                "/independent_validation/scientific_content_id",
+            ] {
+                if let Some(value) = sample.pointer(pointer).and_then(Value::as_str) {
+                    private_strings.push(value.to_owned());
+                }
+            }
+            for pointer in [
+                "/independent_validation/layer_roots",
+                "/independent_validation/scales",
+            ] {
+                if let Some(facts) = sample.pointer(pointer).and_then(Value::as_array) {
+                    private_strings.extend(facts.iter().filter_map(|fact| {
+                        fact.get("digest_sha256")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    }));
+                }
             }
         }
     }
-    validate_sanitized_report(&sanitized_report, &private_strings)?;
-    cancellation.check("sanitized evidence publication")?;
-    let sanitized_root = repository_root.join("target/mirante4d/import-performance-t5");
-    fs::create_dir_all(&sanitized_root)?;
-    let sanitized_path = sanitized_root.join(format!("{session_id}-summary.json"));
-    write_new_synced_json(&sanitized_path, &sanitized_report)?;
-    cancellation.check("command completion")?;
-    Ok(sanitized_path)
+    private_strings
+}
+
+fn required_value(value: &Value, pointer: &str) -> anyhow::Result<Value> {
+    value
+        .pointer(pointer)
+        .cloned()
+        .with_context(|| format!("finalized T5 raw report lacks {pointer}"))
+}
+
+fn required_string<'a>(value: &'a Value, pointer: &str) -> anyhow::Result<&'a str> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .with_context(|| format!("finalized T5 raw report lacks string {pointer}"))
+}
+
+fn required_bool(value: &Value, pointer: &str) -> anyhow::Result<bool> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_bool)
+        .with_context(|| format!("finalized T5 raw report lacks Boolean {pointer}"))
+}
+
+fn required_pointer_u64(value: &Value, pointer: &str) -> anyhow::Result<u64> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_u64)
+        .with_context(|| format!("finalized T5 raw report lacks unsigned integer {pointer}"))
+}
+
+fn require_exact_object_keys(value: &Value, expected: &[&str], label: &str) -> anyhow::Result<()> {
+    let object = value
+        .as_object()
+        .with_context(|| format!("{label} is not an object"))?;
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+    if actual != expected {
+        bail!("{label} has an unexpected key set");
+    }
+    Ok(())
 }
 
 pub(crate) fn run_oracle_audit(args: Vec<String>) -> anyhow::Result<()> {
@@ -1112,6 +1682,39 @@ fn parse_oracle_audit_args(args: Vec<String>) -> anyhow::Result<OracleAuditArgs>
     }
     Ok(OracleAuditArgs {
         config: config.context("import-performance-t5-oracle-audit requires --config PATH")?,
+    })
+}
+
+fn parse_publish_args(args: Vec<String>) -> anyhow::Result<PublishArgs> {
+    let mut config = None;
+    let mut raw_report = None;
+    let mut index = 0;
+    while index < args.len() {
+        let (slot, label) = match args[index].as_str() {
+            "--config" => (&mut config, "--config"),
+            "--raw-report" => (&mut raw_report, "--raw-report"),
+            "--help" | "-h" | "help" => bail!(
+                "usage: cargo run --release -p xtask -- import-performance-t5-publish --config /absolute/private/config.json --raw-report /absolute/private/raw-private-report.json"
+            ),
+            option => bail!("unknown import-performance-t5-publish option {option:?}"),
+        };
+        index += 1;
+        let value = PathBuf::from(
+            args.get(index)
+                .with_context(|| format!("{label} requires an absolute path"))?,
+        );
+        if !value.is_absolute() {
+            bail!("import-performance-t5-publish requires an absolute {label} path");
+        }
+        if slot.replace(value).is_some() {
+            bail!("import-performance-t5-publish accepts {label} exactly once");
+        }
+        index += 1;
+    }
+    Ok(PublishArgs {
+        config: config.context("import-performance-t5-publish requires --config PATH")?,
+        raw_report: raw_report
+            .context("import-performance-t5-publish requires --raw-report PATH")?,
     })
 }
 
@@ -2269,34 +2872,14 @@ fn run_sample(
         "gates": gates,
         "all_gates_passed": all_gates_passed,
     });
-    let sanitized = json!({
-        "sample_index": sample_index,
-        "inspection_and_review_wall_time_ns": inspection_and_review_wall_time_ns,
-        "inspection_and_review_process_cpu_time_ns": inspection_and_review_cpu_time_ns,
-        "primary_wall_time_ns": primary_wall_time_ns,
-        "primary_process_cpu_time_ns": primary_cpu_time_ns,
-        "publication_to_open_ready_wall_time_ns": publication_to_open_ready_wall_time_ns,
-        "publication_to_open_ready_process_cpu_time_ns": publication_to_open_ready_cpu_time_ns,
-        "external_rss_delta_bytes": external_rss_delta_bytes,
-        "external_rss_delta_minus_ledger_peak_bytes": rss_minus_ledger,
-        "peak_working_bytes": peak_working_bytes,
-        "peak_open_file_descriptors": peak_open_file_descriptors,
-        "peak_temporary_bytes": peak_temporary_bytes,
-        "peak_checkpoint_regular_files": peak_checkpoint_regular_files,
-        "sync_calls": sync_calls,
-        "gates": gates,
-        "all_gates_passed": all_gates_passed,
-    });
     Ok(SampleEvidence {
         sample_index,
         primary_wall_time_ns,
         package_id: receipt_package_id,
         scientific_content_id: receipt_scientific_id,
-        reviewed_source_fingerprint_sha256,
         failed_gates,
         all_gates_passed,
         raw,
-        sanitized,
     })
 }
 
@@ -4068,7 +4651,8 @@ fn validate_sanitized_report(report: &Value, private_strings: &[String]) -> anyh
                             | "source_inventory_name_bytes"
                             | "required_scratch_bytes"
                             | "scratch_free_bytes"
-                    ) {
+                    ) && !matches!(value, Value::Bool(_))
+                    {
                         bail!("sanitized T5 summary retained a private numeric oracle fact");
                     }
                     visit(value, private_strings)?;
@@ -4299,6 +4883,44 @@ mod tests {
                 "--config".into(),
                 "/private/current.json".into(),
                 "--config".into(),
+                "/private/other.json".into(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn finalized_raw_publisher_parser_requires_two_absolute_paths() {
+        assert_eq!(
+            parse_publish_args(vec![
+                "--config".into(),
+                "/private/current.json".into(),
+                "--raw-report".into(),
+                "/private/raw-private-report.json".into(),
+            ])
+            .unwrap(),
+            PublishArgs {
+                config: PathBuf::from("/private/current.json"),
+                raw_report: PathBuf::from("/private/raw-private-report.json"),
+            }
+        );
+        assert!(parse_publish_args(Vec::new()).is_err());
+        assert!(
+            parse_publish_args(vec![
+                "--config".into(),
+                "/private/current.json".into(),
+                "--raw-report".into(),
+                "relative.json".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_publish_args(vec![
+                "--config".into(),
+                "/private/current.json".into(),
+                "--raw-report".into(),
+                "/private/raw.json".into(),
+                "--raw-report".into(),
                 "/private/other.json".into(),
             ])
             .is_err()
@@ -4887,6 +5509,14 @@ mod tests {
     fn sanitized_report_validator_rejects_paths_identities_and_digests() {
         validate_sanitized_report(&json!({"status": "diagnostic"}), &[]).unwrap();
         validate_sanitized_report(&json!({"app_executable_sha256": "0".repeat(64)}), &[]).unwrap();
+        validate_sanitized_report(
+            &json!({
+                "samples": [{"gates": {"canonical_base_pixel_bytes": true}}],
+                "oracle_gates": {"canonical_base_pixel_bytes": false},
+            }),
+            &[],
+        )
+        .unwrap();
         assert!(validate_sanitized_report(&json!({"value": "/private/source"}), &[]).is_err());
         assert!(
             validate_sanitized_report(

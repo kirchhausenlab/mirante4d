@@ -83,6 +83,8 @@ fn main() -> anyhow::Result<()> {
         "import-performance-t5" => {
             import_performance_t5::run(args.collect()).map(|path| println!("{}", path.display()))
         }
+        "import-performance-t5-publish" => import_performance_t5::publish(args.collect())
+            .map(|path| println!("{}", path.display())),
         "import-performance-t5-oracle-audit" => {
             import_performance_t5::run_oracle_audit(args.collect())
         }
@@ -173,12 +175,14 @@ Mirante4D developer tasks
   cargo xtask workflow-audit
   cargo run --release -p xtask -- import-performance-t2 [--samples 5] [--qualification-profile PATH]
   cargo run --release -p xtask -- import-performance-t5 --config /absolute/private/config.json [--performance | --diagnostic]
+  cargo run --release -p xtask -- import-performance-t5-publish --config /absolute/private/config.json --raw-report /absolute/private/raw-private-report.json
   cargo run --release -p xtask -- import-performance-t5-oracle-audit --config /absolute/private/config.json
   cargo xtask docs-check
   cargo xtask run-dev
 
 T2 and T5 qualification require matching local, non-repository qualification profiles.
 T5 also requires an owner-pinned private configuration; --diagnostic never qualifies.
+The T5 publisher only replays sanitized publication from a finalized private raw report.
 The T5 oracle audit is an explicit offline check of that pinned v2 configuration.
 
 Run cargo xtask product-validate --help for scenario details."

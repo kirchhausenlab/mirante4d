@@ -473,6 +473,25 @@ Both owner-accepted digest constants are pinned. Their opaque values remain in
 their source authorities and are not repeated here. Diagnostic runs can never
 emit qualification evidence.
 
+The private raw report is finalized and synced before the sanitized summary is
+constructed. If summary construction, privacy validation, or publication
+fails after that point, do not repeat the dataset run. Repair the reporting
+code and replay only the finalized raw receipt:
+
+```bash
+cargo run --release -p xtask -- import-performance-t5-publish \
+  --config /absolute/private/t5-config.json \
+  --raw-report /absolute/private/raw-private-report.json
+```
+
+This command accepts only the pinned configuration and the exact bounded
+private raw-report schema. It rechecks sample, gate, invariant, median, and
+qualification consistency; constructs the same allowlisted summary; runs the
+private-value validator; and publishes create-new evidence with a binding to
+the exact raw bytes. It records measurement and publisher revisions
+separately. It does not open the source or package, launch the application or
+importer, recompute an oracle, or re-execute a measurement.
+
 #### Sentinel Restoration Evidence Status
 
 The current source implements the guarded `uint8` sentinel policy described in
