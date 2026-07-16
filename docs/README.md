@@ -24,13 +24,9 @@ exceptions have one separate tool-owned
 
 ## Plans
 
-One corrective closeout plan remains active. Its semantic cutover and
-one-time private fact freeze are complete; one private correctness run and
-documentation closeout remain:
-
-- [uint8 sentinel no-data restoration](plans/active/UINT8_SENTINEL_NO_DATA_RESTORATION.md).
-
-[Current work](planning/NOW.md) owns its checkpoint status.
+No implementation or corrective plan is active. [Current
+work](planning/NOW.md) owns the completed checkpoint; Git history is the
+archive of deleted plans.
 
 Two future outcomes remain deliberately separate from ordinary development:
 

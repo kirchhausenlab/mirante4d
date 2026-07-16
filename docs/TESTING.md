@@ -545,13 +545,34 @@ full bounded source-oracle derivations completed independently and produced
 byte-identical schema-v2 candidate configurations without source mutation or
 retained scratch. That one-time fact freeze is complete. The five-session T2
 evidence at `f73cb36` remains accepted because subsequent changes affect only
-the private xtask fact/evidence boundary. Final closeout now requires one clean
-normal-product T5 correctness sample comparing its package with the pinned
-oracle-derived facts. No restored-policy three-sample T5 performance
-qualification is claimed unless the optional `--performance` run is explicitly
-requested later. Private paths, geometry, identities, and raw facts remain
-external. The active [restoration closeout
-plan](plans/active/UINT8_SENTINEL_NO_DATA_RESTORATION.md) owns this work.
+the private xtask fact/evidence boundary.
+
+Clean measurement revision
+`30bb16758d22055deb1e52fe6803b95592094eee` passed all 11 `verify-pr` policy
+phases and all eight Rust phases with 924 tests discovered. Exactly one fresh
+release normal-product T5 correctness sample then passed on the accepted
+profile and owner-attested real display. All 25 per-sample gates passed,
+including package/scientific identity, layer root, all seven scale digests,
+centered transforms, canonical invalid values, source preservation, fixed
+checkpoint and resource limits, verified publication, mapped display,
+navigation, and counter reconciliation. Every cross-run invariant passed; the
+report has no failures or waivers. Its sole skip is the intentionally
+unrequested three-sample performance qualification.
+
+The primary time was 960.549555223 seconds. This single observation is not a
+median or distribution and does not qualify current T5 performance. A
+post-measurement sanitizer false positive rejected the Boolean
+`canonical_base_pixel_bytes` gate name as though it were the private numeric
+fact. The finalized mode-`0600` raw receipt remained valid and unchanged.
+Clean publisher revision `5a9077d407bf5bdc9c78caf75e558e0c63950afa`
+corrected the type-aware sanitizer and replayed only summary publication; it
+did not re-execute the measurement. The raw-report SHA-256 is
+`9d71ca22aa993c212c7f93de215b952f7b5b059faa8aae8de5181c131ca1c9e6`,
+and the sanitized-summary SHA-256 is
+`377af022d4c1205031e3eb8d5d6a874ce2339026560445887b42beff5f20b365`.
+Private paths, labels, geometry, source/package identities, and raw facts remain
+external. No restored-policy three-sample T5 performance qualification is
+claimed unless the optional `--performance` run is explicitly requested.
 
 #### Accepted Import And Preprocessing Qualification
 

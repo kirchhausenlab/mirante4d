@@ -134,31 +134,27 @@ evidence, and accepted remaining risks. Revision
 `85350219efcc0c96b492f9a5029ba80752b49306`, the clean predecessor to the
 sentinel restoration, was documentation-only and was not performance-
 qualified. These claims attach only to the named qualification revision and
-its recorded release executables; the restored sentinel cutover requires the
-new correctness evidence described below and does not inherit this historical
-T5 performance claim.
+its recorded release executables. The restored sentinel cutover now has the
+separate correctness evidence described below but does not inherit this
+historical T5 performance claim.
 
 ## Known Limitations
 
-- The restored sentinel policy is implemented and independently read back on
-  generated 2D/3D boundary fixtures. Interim clean revision `f73cb36` passed
-  the complete repository/local set and five-session HW-2/ext4 T2
-  qualification with a 14.033167153-second median against 60 seconds. The
-  owner also exercised the affected private workload and reports that
-  the visible boundary defect is fixed. At clean revision `d6478d9`, two full
-  independent bounded source-oracle derivations produced byte-identical
-  schema-v2 candidate facts for that sentinel-bearing workload. This is the
-  accepted one-time fact freeze; routine correctness runs compare one imported
-  package with those frozen facts and do not recompute the oracle. The current
-  source pins the schema-v2 commitment and removes the legacy bootstrap path. Formal
-  closeout remains open for one clean normal-product T5 correctness run. The
-  earlier T5 performance qualification predates this semantic cutover and does
-  not qualify restored-policy performance; a new three-sample performance run
-  is optional and must be explicitly requested before making that claim. The
-  accepted T2 evidence remains attached to the unchanged production-importer
-  boundary and is not repeated for xtask-only fact-authority changes. The active
-  [restoration closeout](plans/active/UINT8_SENTINEL_NO_DATA_RESTORATION.md)
-  owns those remaining evidence steps.
+- The restored sentinel policy is implemented and closed. Generated 2D/3D
+  fixtures cover boundaries and every LOD; clean revision `f73cb36` passed the
+  complete repository/local set and accepted five-session T2 qualification;
+  and two bounded source-oracle runs at `d6478d9` supplied the byte-identical
+  one-time private fact freeze. Clean revision
+  `30bb16758d22055deb1e52fe6803b95592094eee` then passed one real-display
+  normal-product private correctness sample against those frozen facts,
+  including all seven scale digests, centered transforms, canonical invalid
+  values, source preservation, resource bounds, publication, and navigation.
+  Owner observation also confirms that the affected workflow's visible fringe
+  is fixed. The sample establishes correctness only: the earlier T5
+  performance qualification predates the semantic cutover, and a current
+  three-sample performance run remains optional and explicit. Routine runs do
+  not recompute the oracle; the accepted T2 evidence remains attached to the
+  unchanged production-importer boundary.
 - Target packages open provisionally while bounded exact-package and
   scientific-content verification runs in the background. Project attach,
   open, and save remain blocked until verification succeeds; observed source
