@@ -315,8 +315,8 @@ are rejected rather than treated as a compatibility input by the formal
 qualification runner.
 The source-inventory digest uses the `mirante4d-t5-source-inventory-1` domain
 and binds the sorted relative names, lengths, and complete contents of every
-source file. Freeze it independently before owner acceptance; a diagnostic run
-can expose the candidate only in its external private raw report. The separate
+source file. It was frozen independently before owner acceptance; candidate
+facts and receipts remain only in external private material. The separate
 reviewed-source fingerprint is the importer's domain-separated commitment to
 the exact accepted layout, dimensions, dtype, relative names, lengths, and
 per-file SHA-256 values. Each sample binds that fingerprint and the reviewed
@@ -332,51 +332,53 @@ to `cache_condition: "warm"` because its inventory proof streams the source,
 and to the public `competing_activity: "none"` declaration. Both must exactly
 equal the shared profile protocol.
 
-The one-time oracle command accepts only the exactly pinned legacy private
-configuration and creates a new mode-`0600` v2 candidate without overwriting
-either input or an existing output:
+#### One-Time T5 Source-Fact Freeze
 
-```bash
-cargo run --release -p xtask -- import-performance-t5-oracle \
-  --config /absolute/private/legacy-t5-config.json \
-  --output /absolute/private/restored-t5-candidate-a.json
-cargo run --release -p xtask -- import-performance-t5-oracle \
-  --config /absolute/private/legacy-t5-config.json \
-  --output /absolute/private/restored-t5-candidate-b.json
-```
-
-Both runs independently enumerate and decode source TIFF planes, apply the
-restored sentinel contract through every LOD, and derive scientific, layer,
+At clean revision `d6478d9`, two independent full source-oracle derivations
+enumerated and decoded the accepted source TIFF planes, applied the restored
+sentinel contract through all seven LODs, and derived scientific, layer,
 scale, and centered-transform facts without importing or reading a candidate
-package. Their candidate configurations must be byte-identical. The oracle
-uses fixed plane/slab rings below 256 MiB, at most two create-new row-major
-level files, admitted external scratch space, bounded descriptors, and zero
-scratch remnants. The first `SIGINT` or `SIGTERM` requests cooperative
-cancellation, is checked throughout source decoding and recursive hashing,
-kills and reaps an active product child, and lets identity-checked scratch
-cleanup run. A repeated termination signal forces immediate exit; `SIGKILL`
-and power loss cannot run process cleanup and may retain only private external
-session material.
+package. They produced byte-identical schema-v2 candidate configurations,
+observed unchanged source, stayed within the admitted memory, descriptor, and
+two-file scratch bounds, and left no oracle scratch. Those completed runs are
+the one-time fact freeze; their private raw receipts and facts remain outside
+the repository.
 
-Only after those source-derived facts are stable may an explicit diagnostic
-run compare a normal product import against the candidate configuration:
+The oracle uses fixed plane/slab rings below 256 MiB, at most two create-new
+row-major level files, admitted external scratch space, and bounded
+descriptors. The first `SIGINT` or `SIGTERM` requests cooperative cancellation
+and permits identity-checked cleanup. A repeated termination signal forces
+immediate exit; `SIGKILL` and power loss cannot run process cleanup and may
+retain only private external session material.
+
+Routine correctness and performance runs never recompute this oracle. A new
+offline oracle audit is required only when explicit sentinel semantics, the
+fact schema or authority, or the oracle implementation changes while the
+pinned source remains unchanged. Unexpected source-byte drift is rejected by
+the audit's inventory preflight before the expensive derivation. Intentionally
+accepting a different source is a new two-run fact-freeze and owner-pinning
+work item, not an audit of this frozen workload. The audit never updates
+expected facts.
+The legacy schema-v1 bootstrap is not a compatibility path; after the accepted
+schema-v2 commitment is pinned, only schema v2 is admitted and Git history is
+the archive of the one-time bootstrap.
+
+Run the expensive audit only after one of those triggers:
 
 ```bash
-export MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display
-cargo run --release -p xtask -- import-performance-t5 \
-  --config /absolute/private/t5-config.json \
-  --diagnostic --samples 1
+cargo run --release -p xtask -- import-performance-t5-oracle-audit \
+  --config /absolute/private/t5-config.json
 ```
 
-Candidate package output is a comparator, never the expected-fact source. The
-diagnostic must show exact oracle/config/package agreement, centered-transform
-agreement, unchanged source, admitted oracle resources, and zero scratch
-remnants. Pin only the opaque digest of the byte-identical, source-oracle-
-derived candidate after this diagnostic succeeds.
+The audit accepts only the pinned v2 configuration, uses bounded temporary
+scratch, writes no configuration or report artifact, and emits only a
+private-redacted Boolean result. It is not a prerequisite for routine product
+correctness or performance runs.
 
-The reviewed HW-2 profile and stable two-pass T5 configuration commitments are
-now pinned in the following authorities. The mandatory protocol omits
-`--diagnostic` and uses its fixed three fresh process sessions:
+#### Routine T5 Correctness
+
+The reviewed HW-2 profile and source-oracle-derived T5 configuration
+commitments are pinned in the following authorities:
 
 - pin the accepted shared profile digest in
   `crates/xtask/src/host.rs`;
@@ -389,8 +391,14 @@ cargo run --release -p xtask -- import-performance-t5 \
   --config /absolute/private/t5-config.json
 ```
 
-Each session drives the normal application setup/review/start importer, starts
-the monotonic primary clock at the accepted worker spawn, includes the
+This default command runs exactly one fresh normal-product process session. It
+is the routine correctness protocol, not a performance sample set. It can
+establish package/scientific correctness and product evidence, but its elapsed
+time is only an observation and cannot establish a median or distribution.
+
+Each requested session drives the normal application setup/review/start
+importer and starts the monotonic primary clock at the accepted worker spawn.
+It includes the
 publication-capability currentness check and verified runtime construction
 through open-ready, then performs a rendered navigation assertion. Setup,
 inspection, and any review interval have separate
@@ -412,22 +420,39 @@ Physical-display attachment remains an explicit owner attestation through
 cryptographically distinguish every physical, VNC, and virtual server. The
 parent samples RSS externally, and post-open
 readback independently validates the exact closure, scientific identity and
-layer roots, and every scale digest. Source inventory is streamed before,
-between, and after sessions, and the in-clock strong source-revalidation byte
-counter must equal the exact reviewed source total. Missing counters, stale
+layer roots, all seven scale digests, and every centered transform against the
+frozen schema-v2 facts. Source inventory is streamed before and after the
+sample set, and the in-clock strong source-revalidation byte counter must equal
+the exact reviewed source total. Missing counters, stale
 output/checkpoint state, source or executable drift, dirty repository state,
 non-release binaries, missing display attestation or external mapped-client
 proof, profile/config mismatch, and every mandatory resource or timing gate
-fail closed.
+applicable to the requested correctness or performance mode fail closed.
 
-Before timed application samples, the mandatory runner recomputes the bounded
-source oracle once outside the primary clock and requires exact agreement with
-the pinned configuration. Oracle scratch is removed before the product starts,
-so its files, descriptors, bytes, and elapsed time cannot contaminate importer
-resource or timing evidence. Each produced package must then agree with both
-the configuration and source oracle, including centered transforms. Every
-timed sample must also observe exactly the fixed six checkpoint regular files;
-the former permissive eight-file ceiling is not the restored-policy gate.
+The routine runner does not invoke the source oracle. Each produced package
+must agree directly with the source-oracle-derived pinned configuration,
+including centered transforms, while the before/after inventory proves that
+the frozen source binding still holds. Every product sample must also observe
+exactly the fixed six checkpoint regular files; the former permissive
+eight-file ceiling is not the restored-policy gate.
+
+#### Optional T5 Performance Qualification
+
+A current restored-policy performance claim is explicit and optional:
+
+```bash
+export MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display
+cargo run --release -p xtask -- import-performance-t5 \
+  --config /absolute/private/t5-config.json --performance
+```
+
+`--performance` runs exactly three fresh process sessions and evaluates the
+existing 15-minute median gate plus cross-sample identity determinism. It is
+the only T5 mode that can emit restored-policy performance-qualification
+evidence. The default one-sample correctness command records
+`three_sample_performance_qualification_not_requested` as an intentional skip;
+that is not a correctness failure. Do not rerun the offline oracle before
+either mode unless one of the audit triggers above has changed.
 
 The complete raw report, app reports, logs, screenshots, paths, dimensions,
 and identities stay below a mode-`0700` external scratch session; runner-created
@@ -496,10 +521,16 @@ Owner review confirmed that the pinned T5 workload is the affected private
 sentinel-selected dataset and that the visible defect is fixed. The earlier
 no-sentinel assumption was incorrect. Its frozen scientific ID, layer root,
 and per-scale digests describe pre-restoration output, so copying a diagnostic
-package's new values would be self-blessing. Final qualification requires two
-identical bounded source-oracle runs, a hard-cut private fact/config
-commitment, oracle/config/package agreement, and T2/T5 reruns at the final
-clean revision. Private paths, geometry, identities, and raw facts remain
+package's new values would be self-blessing. At clean revision `d6478d9`, two
+full bounded source-oracle derivations completed independently and produced
+byte-identical schema-v2 candidate configurations without source mutation or
+retained scratch. That one-time fact freeze is complete. The five-session T2
+evidence at `f73cb36` remains accepted because subsequent changes affect only
+the private xtask fact/evidence boundary. Final closeout now requires one clean
+normal-product T5 correctness sample comparing its package with the pinned
+oracle-derived facts. No restored-policy three-sample T5 performance
+qualification is claimed unless the optional `--performance` run is explicitly
+requested later. Private paths, geometry, identities, and raw facts remain
 external. The active [restoration closeout
 plan](plans/active/UINT8_SENTINEL_NO_DATA_RESTORATION.md) owns this work.
 
@@ -602,7 +633,8 @@ This record is revision-bound. Revision
 `85350219efcc0c96b492f9a5029ba80752b49306`, the clean predecessor to the
 sentinel restoration, was documentation-only and was not performance-
 qualified. The current sentinel cutover does not inherit the older
-qualification and requires fresh evidence. Later product, performance,
+qualification and still requires the one-sample correctness evidence described
+above. Later product, performance,
 threshold, evidence-schema, or evidence-policy changes affecting this boundary
 also require fresh evidence.
 

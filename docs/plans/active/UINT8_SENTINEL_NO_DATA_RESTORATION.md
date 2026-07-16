@@ -1,6 +1,6 @@
 # Uint8 Sentinel No-Data Restoration Plan
 
-Status: ACTIVE — IMPLEMENTED; PRIVATE T5 FACT CUTOVER AND FINAL QUALIFICATION PENDING
+Status: ACTIVE — IMPLEMENTED; ONE PRIVATE T5 CORRECTNESS RUN AND CLOSEOUT PENDING
 Implementation authorization: OWNER APPROVED 2026-07-16
 Last reviewed: 2026-07-16
 Planning predecessor: clean `85350219efcc0c96b492f9a5029ba80752b49306`
@@ -24,13 +24,15 @@ policy through fused, validity-only halos rather than substituting a weaker
 mask rule.
 
 ND-00 through ND-03 are implemented in the current source. ND-04 remains open:
-the public T2 workload qualified at interim clean revision `f73cb36`, and the
-owner reports that the visible boundary defect is fixed on the affected private
-dataset, but the private T5 expected-fact authority and final-revision
-qualification have not yet been cut over. [Current
+the public T2 workload qualified at interim clean revision `f73cb36`, the owner
+reports that the visible boundary defect is fixed on the affected private
+dataset, and two full independent source-oracle derivations at clean revision
+`d6478d9` produced byte-identical schema-v2 candidate facts. That derivation is
+the completed one-time T5 fact freeze. One clean normal-product T5 correctness
+run and documentation closeout remain. [Current
 state](../../CURRENT_STATE.md) owns the implemented behavior, and [Testing and
-evidence](../../TESTING.md) distinguishes the new diagnostic evidence from the
-older immutable qualification.
+evidence](../../TESTING.md) distinguishes the boundary-scoped restoration
+evidence from the older immutable qualification.
 
 ## Selected Outcome
 
@@ -113,14 +115,14 @@ layer root, and seven per-scale digests describe the pre-restoration
 exact-only/point-LOD output and cannot serve as regression facts for this
 cutover.
 
-Before final T5 qualification, an xtask-only source oracle shall independently
-enumerate the pinned one-plane grayscale uint8 TIFF stack, decode source pixels
-without invoking importer normalization or package output, and apply the exact
-contract in this plan. It shall derive the base scientific identity and layer
-root, every recursive scale digest, and centered transform facts directly from
-source-derived value/validity records. The oracle, frozen private config, and
-candidate package must agree three ways. Candidate package readback or a first
-diagnostic run is never the source of expected facts.
+An xtask-only source oracle independently enumerates the pinned one-plane
+grayscale uint8 TIFF stack, decodes source pixels without invoking importer
+normalization or package output, and applies the exact contract in this plan.
+It derives the base scientific identity and layer root, every recursive scale
+digest, and centered transform facts directly from source-derived
+value/validity records. The frozen private config records those oracle facts;
+the remaining product package must agree with them. Candidate package readback
+is never the source of expected facts.
 
 The oracle keeps at most two create-new row-major scratch levels, never a full
 level in RAM, and uses fixed plane/slab rings admitted below 256 MiB. It
@@ -129,6 +131,18 @@ child completes, and proves zero remnants after success, error, or
 cancellation. Private paths, geometry, identities, and facts remain outside
 the repository. The old private configuration commitment is rejected through
 a new fact-authority/schema binding rather than accepted by compatibility.
+
+Two independent full derivations at clean revision `d6478d9` completed under
+those bounds and produced byte-identical schema-v2 candidates without source
+mutation or retained oracle scratch. They are the one-time source-fact freeze,
+not work to repeat before product samples. The routine T5 correctness runner
+checks the frozen source inventory and compares package output with the frozen
+facts; it does not invoke the source oracle. A new offline oracle audit is
+required only after a change to explicit sentinel semantics, fact schema or
+authority, or oracle implementation while the pinned source is unchanged.
+Unexpected source drift fails its inventory preflight before derivation and
+never regenerates expected facts. Intentionally accepting a different source
+requires a new two-run fact freeze and owner pin rather than this audit.
 
 ## Non-Negotiable Invariants
 
@@ -460,43 +474,58 @@ Exit proof:
 ### ND-04 — Qualification, Product Validation, And Closeout
 
 Implementation status: in progress. Clean revision `f73cb36` passed the public
-T2 qualification and the complete repository/local automated set. The private
-T5 source-oracle fact cutover and qualification at the final oracle-bearing
-revision remain.
+T2 qualification and the complete repository/local automated set. Clean
+revision `d6478d9` supplied the bounded private source oracle, and two full
+independent derivations produced byte-identical schema-v2 candidates. The
+current source pins that v2 commitment and removes the legacy bootstrap. One
+normal-product T5 correctness sample and closeout remain.
 
-Goal: prove scientific correctness, bounded performance, and the visible
-product outcome on public and relevant private data before closing the plan.
+Goal: prove scientific correctness and the visible product outcome on public
+and relevant private data, while reusing accepted evidence for unchanged
+boundaries. A fresh T5 performance distribution is a separate, explicit
+optional claim rather than a correctness prerequisite.
 
 Required work:
 
-- Run the complete functional and structural check set at one clean immutable
-  revision.
-- Run five independent release T2 sessions on the accepted HW-2/ext4 profile
-  under the existing absolute gate and new independent sentinel facts.
-- Replace the affected sentinel-bearing T5 workload's pre-restoration semantic
-  facts through two identical bounded source-oracle runs, hard-cut the private
-  config/fact-authority commitment, and compare oracle, config, and diagnostic
-  package readback before qualification.
-- Re-run both five-session T2 and three-session T5 qualification at the final
-  clean immutable oracle-bearing revision. Preserve all existing absolute
-  timing, memory, RSS, descriptor, checkpoint, source, publication, and normal-
-  product gates.
-- Exercise the normal native import and rendering workflow on the affected
-  sentinel-bearing dataset on the relevant real display and hardware. Inspect
-  LOD 0 and every coarse LOD at the data/no-data boundary and retain private
-  raw evidence outside the repository.
+- Reuse the complete functional, structural, product-automation, and
+  five-session T2 evidence from clean revision `f73cb36`; later changes affect
+  only the private xtask fact/evidence authority and do not change the
+  production importer or its performance boundary.
+- Retain the completed hard cut: the two byte-identical bounded source-oracle
+  derivations at clean revision `d6478d9` are the one-time private fact freeze,
+  the schema-v2 config/fact-authority commitment is pinned, and the legacy
+  bootstrap path is absent.
+- Run focused checks for the fact-authority and runner changes. Do not repeat
+  format lifecycle, public product scenarios, or T2 performance evidence whose
+  owning boundaries did not change.
+- Run exactly one clean release normal-product T5 correctness sample. Check the
+  frozen source binding before and after the run, then compare the resulting
+  package with the frozen scientific ID, layer root, every one of the seven
+  scale digests, centered transforms, and canonical validity/value facts.
+  Preserve the existing per-sample memory, RSS, descriptor, six-file
+  checkpoint, source, publication, open-ready, and normal-product gates.
+- Use the owner's affected-workflow observation for the visible result; the
+  one correctness sample supplies the mapped real-display evidence, and its
+  independent seven-scale package readback supplies exhaustive LOD
+  correctness. Retain private raw evidence outside the repository.
+- Run three fresh T5 samples only when the owner explicitly requests a current
+  restored-policy performance claim. A one-sample elapsed time is an
+  observation and cannot establish a median or distribution.
 - Update owning current documents only with behavior and evidence proved at
   the accepted revision, then delete this active plan; Git history is its
   archive.
 
 Exit proof:
 
-- Every mandatory gate below passes with revision, executable, workload,
-  sampling, hardware, filesystem, failures, skips, waivers, and remaining
-  risks reported.
-- The previously visible bright interrupted boundary fringe is absent at every
-  exercised LOD, and package readback independently matches expected validity
-  and values.
+- Every applicable gate below passes with the owning revision, executable,
+  workload, sampling, hardware, filesystem, failures, skips, waivers, and
+  remaining risks reported.
+- The owner-observed bright interrupted boundary fringe is absent in the
+  affected normal workflow, and the one correctness package independently
+  matches expected validity, values, identity, transforms, and digests at all
+  seven LODs.
+- The record explicitly states that no restored-policy three-sample T5
+  performance qualification was requested or claimed.
 - The owner accepts remaining risks and the final deletion audit.
 
 ## Mandatory Gates
@@ -508,23 +537,27 @@ Exit proof:
 | Partition independence | One-chunk versus tiled runs | Identical canonical values, validity, transforms, statistics, and scientific identity across faces, edges, corners, and worker counts |
 | Transform correctness | Independent physical-coordinate facts | Axis-aware factors and centered translations match the mean footprint at every LOD |
 | Scientific identity | Independent scientific reader/facts | Dilated base validity and canonical values produce the expected scientific ID and layer roots |
-| Private T5 source oracle | Two fresh source-derived oracle runs plus package comparison | Exact agreement for scientific ID, layer root, every scale digest, scale shape/count, and centered transform; no candidate-output bootstrap |
+| Private T5 source oracle | Two completed full source-derived runs at `d6478d9` | Byte-identical schema-v2 facts, unchanged source, admitted resources, zero scratch remnants, and no candidate-package input; repeat only after an oracle-audit trigger |
+| Private T5 package correctness | One clean release normal-product sample | Package scientific ID, layer root, all seven scale digests and transforms, canonical values/validity, and source binding match the frozen schema-v2 authority |
 | Canonical invalid representation | Full package readback | Every invalid integer sample is zero; valid zero remains distinguishable |
 | Sentinel-disabled regression | Frozen uint8/uint16/float32 facts | Non-sentinel values, validity, transforms, scale digests, and scientific identity remain unchanged |
 | Halo pixel isolation | Structural test and counters | Halo-only parents cause zero pixel component reads/decodes; core pixel parent fan-in remains at most eight in 3D or four in 2D |
 | Bounded halo authority | Preflight, pressure tests, and receipts | Parent descriptors are at most 64 in 3D or 16 in 2D; every dense/packed mask and sequential decode buffer is charged before admission |
-| Working memory | Pressure tests and every timed run | Import-ledger peak remains at most 256 MiB |
-| External memory | Every timed T2 and required T5 run | Peak RSS delta remains at most 384 MiB and reconciles with ledger-external overhead |
-| Files and temporary state | Pressure tests and every timed run | At most 64 import-owned file descriptors, exactly the current six checkpoint files, and no new level- or chunk-proportional physical objects |
-| Private oracle resources | Preflight, receipt, and cleanup audit | At most 256 MiB RAM, two level scratch files, bounded descriptors, admitted free space, and zero remnants before timed product samples |
-| Timing | Five T2 sessions and three T5 sessions | T2 median remains at most 60 seconds; T5 median remains at most 15 minutes |
+| Working memory | Pressure tests, accepted T2 runs, and the T5 correctness sample | Import-ledger peak remains at most 256 MiB |
+| External memory | Accepted T2 runs and the T5 correctness sample | Peak RSS delta remains at most 384 MiB and reconciles with ledger-external overhead |
+| Files and temporary state | Pressure tests and applicable product runs | At most 64 import-owned file descriptors, exactly the current six checkpoint files, and no new level- or chunk-proportional physical objects |
+| Private oracle resources | Completed one-time derivation receipts and any trigger-only audit | At most 256 MiB RAM, two level scratch files, bounded descriptors, admitted free space, and zero remnants |
+| Performance | Accepted five-session T2 evidence; optional explicit three-session T5 run | T2 median at `f73cb36` remains at most 60 seconds; no restored-policy T5 median is claimed unless the optional run is requested and passes 15 minutes |
 | Determinism and resume | Repeated fresh/resumed imports | Same-revision exact package and scientific IDs agree; resumed output equals fresh output; old checkpoints reject explicitly |
 | Source and publication safety | Fixtures, mutation tests, and product runs | Source closure is unchanged; cancellation never publishes; validated output publishes create-only and opens through the existing verified capability route |
-| Visible product result | Normal native real-display workflow | No bright no-data fringe at LOD 0 or any exercised coarse LOD; no renderer fallback or repeated product error |
+| Visible product result | Owner's normal native real-display workflow plus seven-scale package readback | No bright no-data fringe in the affected workflow; no renderer fallback or repeated product error; every LOD independently matches frozen facts |
 
-The performance gates are absolute for the existing declared workloads. This
-plan makes no relative speedup claim. A diagnostic fused-halo benchmark may
-guide optimization but cannot replace correctness or qualification evidence.
+The accepted T2 performance gate is absolute for its declared workload. The
+single T5 correctness sample may record elapsed and resource observations but
+does not establish a median, distribution, or restored-policy performance
+qualification. If explicitly requested, the optional three-sample T5 protocol
+retains the existing absolute 15-minute median gate. This plan makes no
+relative speedup claim.
 
 ## Verification
 
@@ -551,7 +584,7 @@ Focused automated coverage shall include:
 - scientific statistics and analysis excluding final invalidity; and
 - existing complete-package reads plus frozen non-sentinel import behavior.
 
-Required repository and local checks at the final affected revision include:
+The production-importer boundary checks were:
 
 ```bash
 python3 tools/source-fixtures/validate.py \
@@ -575,13 +608,17 @@ lifecycle, and both E1 product-automation scenarios passed. The five T2 release
 sessions were 13.654825657, 14.477087517, 14.033167153, 16.611035435, and
 13.707822937 seconds, for a 14.033167153-second median against the 60-second
 gate. Every runtime/resource gate passed, source inventory was unchanged, and
-package/scientific identities were deterministic. This interim qualification
-does not remove the requirement to rerun T2 at the final oracle-bearing
-revision.
+package/scientific identities were deterministic. That evidence is accepted
+for the unchanged production-importer boundary and is not repeated after the
+xtask-only source-fact and evidence-protocol work.
 
-Also run the owner-pinned private T5 command from
-[Testing and evidence](../../TESTING.md). Private source, package, screenshots,
-paths, geometry, identities, and raw reports remain outside the repository.
+For the remaining xtask boundary, run formatting/documentation checks and the
+focused T5 runner/oracle tests. Then run the one-sample owner-pinned private T5
+correctness command from [Testing and evidence](../../TESTING.md). The optional
+`--performance` command runs three fresh samples only when a current T5
+performance claim is explicitly requested. Private source, package,
+screenshots, paths, geometry, identities, and raw reports remain outside the
+repository.
 
 ## Risks And Stop Conditions
 
@@ -620,17 +657,19 @@ Known risks and controls:
 - **Scientific-ID divergence:** base production and independent scientific
   tiling use the same normative policy through separately exercised paths.
 - **Private-fact self-blessing:** the predecessor T5 bootstrap copied candidate
-  package facts. Replace it with two stable source-oracle runs and require
-  oracle/config/package agreement before pinning the new opaque commitment.
+  package facts. Two stable source-oracle runs now supply byte-identical frozen
+  facts without a candidate package; the remaining correctness sample compares
+  package output with that frozen authority.
 - **Spatial shift:** mean LODs require centered axis-aware transforms; do not
   retain point-sampling translation.
 - **Checkpoint ambiguity:** bind the algorithm version and reject old durable
   prefixes; never infer which semantics produced them.
 - **Fast-path drift:** all-valid/all-invalid and packed/separable paths must be
   bit-identical to the direct oracle.
-- **Performance miss:** preserve the policy and collect stage/component
-  evidence. A two-pass design or semantic alternative requires a revised,
-  owner-approved plan.
+- **No restored-policy T5 performance distribution:** the correctness closeout
+  intentionally uses one sample and makes no median or tail claim. If an
+  explicit optional three-sample run misses its gate, preserve the semantic
+  policy and review performance separately.
 - **Residual real-data fringe:** if oracle-conformant one-voxel dilation still
   exposes a wider upstream interpolation band, stop and review that distinct
   source/preprocessing policy. Do not introduce an unrecorded threshold or
@@ -662,9 +701,11 @@ The plan is complete only when:
 - bounded memory, descriptors, checkpoint files, temporary state,
   cancellation, deterministic resume, sharding, validation, and publication
   remain directly proved;
-- T2 and T5 gates pass at one clean immutable revision;
+- accepted production-importer/T2 evidence, the completed one-time private
+  source-fact freeze, and one clean T5 correctness run form a revision-bound
+  evidence chain without recomputing unchanged boundaries;
 - the normal product is validated on the relevant sentinel-bearing dataset and
-  real display at every LOD; and
+  real display, while independent package readback covers every LOD; and
 - current-state and owning technical documentation record only proved facts,
   reported skips/waivers/risks are accepted, and this active plan is deleted.
 

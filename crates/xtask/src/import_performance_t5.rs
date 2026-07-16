@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     fs,
     fs::{File, OpenOptions},
     io::{Read, Write},
@@ -24,13 +24,6 @@ use mirante4d_identity::{ScientificContentId, Sha256Digest, Sha256Hasher};
 use mirante4d_storage::{
     LocalPackageCatalog, OmeLevelTransform, PackedIndexCoordinates, ProfileKind,
     ProfileValidityMode, ShardProfileKind,
-};
-use rustix::{
-    fd::OwnedFd,
-    fs::{
-        AtFlags, Mode, OFlags, RenameFlags, fstat, fsync, openat, renameat_with, statat, unlinkat,
-    },
-    io::Errno,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -56,10 +49,10 @@ use crate::{
     target_fixture::extract_target_u16_fixture,
 };
 
-const LEGACY_CONFIG_SCHEMA: &str = "mirante4d-private-import-performance-t5-1";
 const CONFIG_SCHEMA: &str = "mirante4d-private-import-performance-t5-2";
-const RAW_REPORT_SCHEMA: &str = "mirante4d-private-import-performance-t5-raw-4";
-const SANITIZED_REPORT_SCHEMA: &str = "mirante4d-import-performance-t5-summary-4";
+const RAW_REPORT_SCHEMA: &str = "mirante4d-private-import-performance-t5-raw-5";
+const SANITIZED_REPORT_SCHEMA: &str = "mirante4d-import-performance-t5-summary-5";
+const ORACLE_AUDIT_REPORT_SCHEMA: &str = "mirante4d-import-performance-t5-oracle-audit-1";
 const PRODUCT_AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
 const PRODUCT_AUTOMATION_SCHEMA_VERSION: u64 = 3;
 const PUBLICATION_CURRENTNESS_CONTRACT_ID: &str =
@@ -70,7 +63,8 @@ const WORKING_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 const RSS_DELTA_BYTES_MAX: u64 = 384 * 1024 * 1024;
 const PRIMARY_MEDIAN_NS_MAX: u64 = 15 * 60 * 1_000_000_000;
 const PRIMARY_MEDIAN_STRETCH_NS: u64 = 10 * 60 * 1_000_000_000;
-const DEFAULT_SAMPLES: usize = 3;
+const CORRECTNESS_SAMPLES: usize = 1;
+const PERFORMANCE_SAMPLES: usize = 3;
 const T5_SCALE_COUNT: usize = 7;
 const RSS_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
 // Linux can tear down a process memory map before making its exit waitable.
@@ -82,23 +76,37 @@ const MAPPED_WIDTH: u32 = 1280;
 const MAPPED_HEIGHT: u32 = 720;
 const SOURCE_ENTRY_MAX: usize = 4_096;
 
-/// The restored-policy configuration remains unaccepted until two independent
-/// source-oracle runs agree and the owner pins their opaque external commitment.
-const LEGACY_OWNER_ACCEPTED_T5_CONFIG_SHA256: &str =
-    "3b27aabbe604edbc08b02c334ce193692121d1509e450cb001d66bfc3616369a";
-pub(crate) const OWNER_ACCEPTED_T5_CONFIG_SHA256: Option<&str> = None;
+/// Owner-accepted after two independent full source-oracle derivations
+/// produced byte-identical schema-v2 configurations.
+pub(crate) const OWNER_ACCEPTED_T5_CONFIG_SHA256: Option<&str> =
+    Some("dd04964ed3062e88d8e3a9325ef9241369d9ac91983cea447158a7667058b4e8");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QualificationKind {
+    Correctness,
+    Performance,
+}
+
+impl QualificationKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Correctness => "correctness",
+            Self::Performance => "performance",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunArgs {
     config: PathBuf,
     samples: usize,
     diagnostic: bool,
+    qualification_kind: QualificationKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct OracleBootstrapArgs {
+struct OracleAuditArgs {
     config: PathBuf,
-    output: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -132,37 +140,6 @@ struct ExpectedFacts {
     scale_digest_scheme: String,
     scales: Vec<ExpectedScaleFact>,
     transforms: Vec<ExpectedTransformFact>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyT5Config {
-    schema: String,
-    workload_id: String,
-    source: PathBuf,
-    scratch_root: PathBuf,
-    qualification_profile: PathBuf,
-    expected_profile: String,
-    spacing_zyx_um: [f64; 3],
-    time_step_seconds: Option<f64>,
-    no_data_sentinel: Option<u8>,
-    working_memory_bytes: u64,
-    primary_timeout_seconds: u64,
-    cache_condition: String,
-    competing_activity: String,
-    expected: LegacyExpectedFacts,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyExpectedFacts {
-    source_inventory_sha256: String,
-    reviewed_source_fingerprint_sha256: String,
-    canonical_source_pixel_bytes: u64,
-    scientific_content_id: String,
-    scientific_layer_roots: Vec<ExpectedLayerRoot>,
-    scale_digest_scheme: String,
-    scales: Vec<ExpectedScaleFact>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -233,12 +210,7 @@ struct IndependentValidation {
     scale_facts_match: bool,
     layer_roots_match: bool,
     scientific_id_matches: bool,
-    oracle_scale_facts_match: bool,
-    oracle_layer_roots_match: bool,
-    oracle_scientific_id_matches: bool,
-    oracle_transform_facts_match: bool,
     config_transform_facts_match: bool,
-    oracle_canonical_base_pixel_bytes_match: bool,
     scientific_brick_reads: u64,
     canonical_base_pixel_bytes: u64,
 }
@@ -443,7 +415,7 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
         config_binding_status == "matched" && profile_matched_at_start;
     if !qualification_eligible_at_start && !args.diagnostic {
         bail!(
-            "T5 qualification is not owner-bound; rerun with --diagnostic only to collect private candidate evidence for owner review"
+            "T5 qualification is not owner-bound; --diagnostic may inspect the private binding without making a qualification claim"
         );
     }
     if matches!(source_binding_start.status, "invalid" | "rejected")
@@ -492,45 +464,11 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
     }
 
     let cancellation = CommandCancellation::install()?;
-    cancellation.check("source-oracle setup")?;
+    cancellation.check("source inventory setup")?;
     let source_before = source_inventory(&source, cancellation.token())?;
     let frozen_source_matched = source_before.sha256 == config.expected.source_inventory_sha256;
     if !frozen_source_matched && !args.diagnostic {
         bail!("private T5 source inventory does not match the owner-frozen workload");
-    }
-    let oracle_scratch = OwnedOracleScratch::create(session_root.join("source-oracle"))?;
-    let source_oracle = t5_sentinel_oracle::derive(OracleRequest {
-        source: &source,
-        scratch: oracle_scratch.path(),
-        sentinel: config.no_data_sentinel,
-        spacing_zyx_um: config.spacing_zyx_um,
-        time_step_seconds: config.time_step_seconds,
-        working_memory_bytes: config.working_memory_bytes,
-        scale_digest_scheme: &config.expected.scale_digest_scheme,
-        cancelled: cancellation.token(),
-    })
-    .context("private T5 source oracle failed")?;
-    cancellation.check("source-oracle derivation")?;
-    let oracle_scratch_removed_empty = oracle_scratch.remove_and_report_empty()?;
-    let source_after_oracle = source_inventory(&source, cancellation.token())?;
-    let oracle_gates = source_oracle_gates(
-        &source_oracle,
-        &config.expected,
-        &source_before,
-        &source_after_oracle,
-        oracle_scratch_removed_empty,
-        config.working_memory_bytes,
-    );
-    let source_oracle_passed = oracle_gates.values().all(|passed| *passed);
-    if !source_oracle_passed && !args.diagnostic {
-        let failed = oracle_gates
-            .iter()
-            .filter_map(|(gate, passed)| (!passed).then_some(gate.as_str()))
-            .collect::<Vec<_>>();
-        bail!(
-            "private T5 source oracle disagrees with its frozen authority or resource bounds: {}",
-            failed.join(", ")
-        );
     }
     validate_release_executable(&executable, "T5 release app")?;
     let executable_digest_start = sha256_file(&executable)?;
@@ -540,7 +478,6 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
         &repository_root.join("target/mirante4d/import-performance-t5/startup"),
     )?;
     let mut samples = Vec::with_capacity(args.samples);
-    let mut latest_source_inventory = None;
     for sample_index in 0..args.samples {
         samples.push(run_sample(
             sample_index,
@@ -556,7 +493,6 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
             &qualification_protocol,
             &build_provenance.compiler,
             args.diagnostic,
-            &source_oracle,
             cancellation.token(),
         )?);
         if sha256_file(&executable)? != executable_digest_start
@@ -564,15 +500,12 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
         {
             bail!("release app executable changed during the T5 sample set");
         }
-        let current_source_inventory = source_inventory(&source, cancellation.token())?;
-        if current_source_inventory != source_before {
-            bail!("private T5 source changed between independent samples");
-        }
-        latest_source_inventory = Some(current_source_inventory);
     }
 
-    let source_after =
-        latest_source_inventory.context("T5 sample protocol captured no final source inventory")?;
+    let source_after = source_inventory(&source, cancellation.token())?;
+    if source_after != source_before {
+        bail!("private T5 source changed during the sample set");
+    }
     cancellation.check("post-sample invariant validation")?;
     let xtask_digest_end = sha256_file(&xtask_executable)?;
     let xtask_unchanged = xtask_digest_start == xtask_digest_end
@@ -605,7 +538,7 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
     let build_reason_codes_end =
         qualification_build_reason_codes(&build_provenance, &repository_end);
 
-    let source_preserved = source_before == source_after && source_before == source_after_oracle;
+    let source_preserved = source_before == source_after;
     let repository_unchanged = repository_same_clean_revision(&repository_start, &repository_end);
     let hardware_unchanged = hardware_start == hardware_end;
     let executable_unchanged = executable_digest_start == executable_digest_end
@@ -626,13 +559,16 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
         .collect::<Vec<_>>();
     primary_times.sort_unstable();
     let median_primary_wall_time_ns = primary_times[primary_times.len() / 2];
-    let deterministic_ids = samples.windows(2).all(|pair| {
-        pair[0].package_id == pair[1].package_id
-            && pair[0].scientific_content_id == pair[1].scientific_content_id
+    let cross_sample_ids_consistent = (samples.len() > 1).then(|| {
+        samples.windows(2).all(|pair| {
+            pair[0].package_id == pair[1].package_id
+                && pair[0].scientific_content_id == pair[1].scientific_content_id
+        })
     });
     let samples_passed = samples.iter().all(|sample| sample.all_gates_passed);
-    let absolute_gate_passed =
-        args.samples == DEFAULT_SAMPLES && median_primary_wall_time_ns <= PRIMARY_MEDIAN_NS_MAX;
+    let performance_timing_gate_passed = args.qualification_kind == QualificationKind::Performance
+        && args.samples == PERFORMANCE_SAMPLES
+        && median_primary_wall_time_ns <= PRIMARY_MEDIAN_NS_MAX;
     let binding_eligible = qualification_eligible_at_start
         && config_binding_status == "matched"
         && profile_matched_at_end
@@ -644,16 +580,23 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
         && xtask_unchanged
         && executable_unchanged
         && config_unchanged
-        && build_reason_codes_end.is_empty()
-        && deterministic_ids
-        && source_oracle_passed;
-    let qualification_passed = qualification_claim_passed(
+        && build_reason_codes_end.is_empty();
+    let correctness_qualification_passed = correctness_qualification_claim_passed(
         args.diagnostic,
         binding_eligible,
         samples_passed,
-        absolute_gate_passed,
         invariant_gates_passed,
     );
+    let performance_qualification_passed = performance_qualification_claim_passed(
+        args.qualification_kind == QualificationKind::Performance,
+        correctness_qualification_passed,
+        performance_timing_gate_passed,
+        cross_sample_ids_consistent,
+    );
+    let qualification_passed = match args.qualification_kind {
+        QualificationKind::Correctness => correctness_qualification_passed,
+        QualificationKind::Performance => performance_qualification_passed,
+    };
     let diagnostic_reason_codes = qualification_diagnostic_reason_codes(
         &args,
         config_binding_status,
@@ -666,7 +609,7 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
         &build_reason_codes_start,
         &build_reason_codes_end,
         &samples,
-        absolute_gate_passed,
+        performance_timing_gate_passed,
         frozen_source_matched,
         source_preserved,
         repository_unchanged,
@@ -674,13 +617,12 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
         xtask_unchanged,
         executable_unchanged,
         config_unchanged,
-        deterministic_ids,
-        &oracle_gates,
+        cross_sample_ids_consistent,
     );
 
     let raw_report = json!({
         "schema": RAW_REPORT_SCHEMA,
-        "schema_version": 3,
+        "schema_version": 4,
         "session_id": session_id,
         "configuration": {
             "path": config_input.path,
@@ -690,6 +632,7 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
             "parsed": config,
         },
         "protocol": {
+            "qualification_kind": args.qualification_kind.label(),
             "sample_count": args.samples,
             "diagnostic_requested": args.diagnostic,
             "fresh_release_process_per_sample": true,
@@ -737,29 +680,29 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
             "matches_frozen_configuration": frozen_source_matched,
             "unchanged": source_preserved,
         },
-        "source_oracle": {
+        "frozen_source_facts": {
             "fact_authority": FACT_AUTHORITY,
-            "executed_once_before_all_samples_outside_primary_clock": true,
-            "facts": source_oracle,
-            "source_after_oracle": inventory_json(&source_after_oracle),
-            "scratch_directory_removed_empty": oracle_scratch_removed_empty,
-            "gates": oracle_gates,
-            "all_gates_passed": source_oracle_passed,
+            "source_oracle_recomputed": false,
+            "oracle_recomputation_policy": "explicit_offline_audit_only",
+            "package_validated_against_frozen_facts": true,
+            "owner_pinned_fact_freeze_binding": config_binding_status == "matched",
         },
         "samples": samples.iter().map(|sample| sample.raw.clone()).collect::<Vec<_>>(),
         "summary": {
-            "median_primary_wall_time_ns": median_primary_wall_time_ns,
+            "performance_median_primary_wall_time_ns": if args.qualification_kind == QualificationKind::Performance { Some(median_primary_wall_time_ns) } else { None },
             "absolute_gate_ns": PRIMARY_MEDIAN_NS_MAX,
             "stretch_target_ns": PRIMARY_MEDIAN_STRETCH_NS,
-            "absolute_gate_passed": absolute_gate_passed,
+            "performance_timing_gate_evaluated": args.qualification_kind == QualificationKind::Performance,
+            "performance_timing_gate_passed": performance_timing_gate_passed,
             "samples_passed": samples_passed,
-            "deterministic_package_and_scientific_ids": deterministic_ids,
+            "cross_sample_ids_consistent": cross_sample_ids_consistent,
             "frozen_source_matched": frozen_source_matched,
             "source_preserved": source_preserved,
             "config_unchanged": config_unchanged,
             "binding_eligible": binding_eligible,
-            "source_oracle_passed": source_oracle_passed,
             "diagnostic_reason_codes": diagnostic_reason_codes,
+            "correctness_qualification_passed": correctness_qualification_passed,
+            "performance_qualification_passed": performance_qualification_passed,
             "qualification_passed": qualification_passed,
         },
     });
@@ -777,23 +720,38 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
         "physical_display_attachment_is_owner_attested_not_cryptographically_proved",
         "retained_private_configuration_commitment_can_confirm_a_guessed_configuration",
     ];
-    if median_primary_wall_time_ns > PRIMARY_MEDIAN_STRETCH_NS {
+    if args.qualification_kind == QualificationKind::Performance
+        && median_primary_wall_time_ns > PRIMARY_MEDIAN_STRETCH_NS
+    {
         remaining_risks.push("nonblocking_10_minute_stretch_target_not_met");
+    }
+    if args.qualification_kind == QualificationKind::Correctness {
+        remaining_risks.push("restored_policy_three_sample_performance_not_qualified");
     }
     let sanitized_report = json!({
         "schema": SANITIZED_REPORT_SCHEMA,
-        "schema_version": 3,
+        "schema_version": 4,
         "evidence_id": session_id,
         "workload_id": config.workload_id,
-        "evidence_class": if qualification_passed { "qualification" } else { "diagnostic" },
+        "evidence_class": if qualification_passed {
+            match args.qualification_kind {
+                QualificationKind::Correctness => "correctness_qualification",
+                QualificationKind::Performance => "performance_qualification",
+            }
+        } else {
+            "diagnostic"
+        },
         "status": if qualification_passed { "passed" } else { "not_qualified" },
         "protocol": {
+            "qualification_kind": args.qualification_kind.label(),
             "sample_count": args.samples,
             "diagnostic_requested": args.diagnostic,
             "fresh_release_processes": true,
             "normal_product_import_route": true,
-            "bounded_source_oracle_before_samples": true,
-            "source_oracle_fact_authority": FACT_AUTHORITY,
+            "source_oracle_recomputed": false,
+            "oracle_recomputation_policy": "explicit_offline_audit_only",
+            "frozen_fact_authority": FACT_AUTHORITY,
+            "package_validated_against_frozen_facts": true,
             "real_external_mapped_window_required": true,
             "physical_display_attachment_owner_attested": true,
             "external_display_proof_scope": "mapped_native_x11_client_geometry",
@@ -828,6 +786,8 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
         "commands": [
             if args.diagnostic {
                 "cargo run --release -p xtask -- import-performance-t5 --config <private-config> --diagnostic"
+            } else if args.qualification_kind == QualificationKind::Performance {
+                "cargo run --release -p xtask -- import-performance-t5 --config <private-config> --performance"
             } else {
                 "cargo run --release -p xtask -- import-performance-t5 --config <private-config>"
             },
@@ -835,20 +795,25 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
         ],
         "samples": samples.iter().map(|sample| sample.sanitized.clone()).collect::<Vec<_>>(),
         "gates": {
-            "median_primary_wall_time_ns": median_primary_wall_time_ns,
-            "median_at_most_15_minutes": absolute_gate_passed,
-            "median_stretch_at_most_10_minutes": median_primary_wall_time_ns <= PRIMARY_MEDIAN_STRETCH_NS,
+            "performance_median_primary_wall_time_ns": if args.qualification_kind == QualificationKind::Performance { Some(median_primary_wall_time_ns) } else { None },
+            "performance_timing_gate_evaluated": args.qualification_kind == QualificationKind::Performance,
+            "median_at_most_15_minutes": if args.qualification_kind == QualificationKind::Performance { Some(performance_timing_gate_passed) } else { None },
+            "median_stretch_at_most_10_minutes": if args.qualification_kind == QualificationKind::Performance { Some(median_primary_wall_time_ns <= PRIMARY_MEDIAN_STRETCH_NS) } else { None },
             "all_per_sample_gates": samples_passed,
-            "deterministic_output": deterministic_ids,
+            "cross_sample_ids_consistent": cross_sample_ids_consistent,
             "frozen_source_matched": frozen_source_matched,
             "source_preserved": source_preserved,
             "all_invariants": invariant_gates_passed,
-            "source_oracle": source_oracle_passed,
-            "source_oracle_gates": oracle_gates,
+            "correctness_qualification_passed": correctness_qualification_passed,
+            "performance_qualification_passed": performance_qualification_passed,
             "qualification_passed": qualification_passed,
         },
         "failures": diagnostic_reason_codes,
-        "skips": [],
+        "skips": if args.qualification_kind == QualificationKind::Correctness {
+            vec!["three_sample_performance_qualification_not_requested"]
+        } else {
+            Vec::<&str>::new()
+        },
         "waivers": [],
         "remaining_risks": remaining_risks,
         "private_values_redacted": {
@@ -886,19 +851,6 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
             .iter()
             .map(|scale| scale.digest_sha256.clone()),
     );
-    private_strings.push(source_oracle.scientific_content_id.clone());
-    private_strings.extend(
-        source_oracle
-            .layer_roots
-            .iter()
-            .map(|root| root.digest_sha256.clone()),
-    );
-    private_strings.extend(
-        source_oracle
-            .scales
-            .iter()
-            .map(|scale| scale.digest_sha256.clone()),
-    );
     for sample in &samples {
         private_strings.push(sample.package_id.clone());
         private_strings.push(sample.scientific_content_id.clone());
@@ -926,8 +878,8 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
     Ok(sanitized_path)
 }
 
-pub(crate) fn run_oracle_bootstrap(args: Vec<String>) -> anyhow::Result<PathBuf> {
-    let args = parse_oracle_bootstrap_args(args)?;
+pub(crate) fn run_oracle_audit(args: Vec<String>) -> anyhow::Result<()> {
+    let args = parse_oracle_audit_args(args)?;
     let build_provenance = qualification_build_provenance();
     require_release_xtask(&build_provenance)?;
     require_standard_app_build_environment(&build_provenance)?;
@@ -937,14 +889,14 @@ pub(crate) fn run_oracle_bootstrap(args: Vec<String>) -> anyhow::Result<PathBuf>
     let build_reasons = qualification_build_reason_codes(&build_provenance, &repository_start);
     if !build_reasons.is_empty() {
         bail!(
-            "T5 oracle bootstrap build provenance is not the exact clean release revision: {}",
+            "T5 oracle audit build provenance is not the exact clean release revision: {}",
             build_reasons.join(", ")
         );
     }
     let repository_root = repository_start
         .root
         .as_deref()
-        .context("T5 oracle bootstrap could not resolve the repository root")?;
+        .context("T5 oracle audit could not resolve the repository root")?;
     require_no_external_cargo_configuration(repository_root)?;
     let xtask_executable =
         env::current_exe().context("failed to resolve the T5 oracle xtask executable")?;
@@ -953,42 +905,27 @@ pub(crate) fn run_oracle_bootstrap(args: Vec<String>) -> anyhow::Result<PathBuf>
     let xtask_metadata_start = fs::metadata(&xtask_executable)?;
 
     let input = read_config_input(&args.config, repository_root)?;
-    if input.sha256 != LEGACY_OWNER_ACCEPTED_T5_CONFIG_SHA256 {
-        bail!("T5 oracle bootstrap accepts only the exact owner-pinned legacy configuration");
+    if config_binding_status(&input.sha256) != "matched" {
+        bail!("T5 oracle audit accepts only the exact owner-pinned v2 configuration");
     }
-    let legacy: LegacyT5Config = serde_json::from_slice(&input.bytes)
-        .context("legacy private T5 configuration is not strict valid JSON")?;
-    if legacy.schema != LEGACY_CONFIG_SCHEMA {
-        bail!("T5 oracle bootstrap requires the exact legacy configuration schema");
-    }
-    validate_legacy_config(&legacy)?;
+    let config: T5Config = serde_json::from_slice(&input.bytes)
+        .context("private T5 oracle-audit configuration is not strict valid JSON")?;
+    validate_config(&config)?;
 
-    let output = external_create_new_path(&args.output, repository_root)?;
-    let output_parent = output
-        .parent()
-        .context("T5 oracle bootstrap output has no parent")?;
-    let output_parent_identity = fs::symlink_metadata(output_parent)?;
-    if output == input.path {
-        bail!("T5 oracle bootstrap output must differ from its legacy input");
-    }
     let protocol = ImportQualificationProtocol::new(
-        legacy.cache_condition.clone(),
-        legacy.competing_activity.clone(),
+        config.cache_condition.clone(),
+        config.competing_activity.clone(),
     );
-    let source = canonical_external_source(&legacy.source, repository_root)?;
-    let scratch_root = canonical_external_directory(&legacy.scratch_root, repository_root)?;
+    let source = canonical_external_source(&config.source, repository_root)?;
+    let scratch_root = canonical_external_directory(&config.scratch_root, repository_root)?;
     let qualification_profile = canonical_external_regular_file(
-        &legacy.qualification_profile,
+        &config.qualification_profile,
         repository_root,
         IMPORT_QUALIFICATION_PROFILE_MAX_BYTES,
         "qualification profile",
     )?;
-    if source.starts_with(&scratch_root)
-        || scratch_root.starts_with(&source)
-        || output.starts_with(&source)
-        || output == source
-    {
-        bail!("T5 oracle bootstrap source, scratch, and output paths are not safely disjoint");
+    if source.starts_with(&scratch_root) || scratch_root.starts_with(&source) {
+        bail!("T5 oracle audit source and scratch paths are not safely disjoint");
     }
     let hardware = host_hardware_identity();
     let source_binding = assess_import_qualification_profile(
@@ -1006,18 +943,17 @@ pub(crate) fn run_oracle_bootstrap(args: Vec<String>) -> anyhow::Result<PathBuf>
         &protocol,
     );
     if !qualification_matched(&source_binding) || !qualification_matched(&scratch_binding) {
-        bail!("T5 oracle bootstrap requires the owner-accepted source and scratch profile");
+        bail!("T5 oracle audit requires the owner-accepted source and scratch profile");
     }
 
     let cancellation = CommandCancellation::install()?;
-    cancellation.check("source-oracle bootstrap setup")?;
+    cancellation.check("source-oracle audit setup")?;
     let source_before = source_inventory(&source, cancellation.token())?;
-    if source_before.sha256 != legacy.expected.source_inventory_sha256 {
-        bail!("T5 oracle bootstrap source inventory differs from the pinned legacy workload");
+    if source_before.sha256 != config.expected.source_inventory_sha256 {
+        bail!("T5 oracle audit source inventory differs from the pinned v2 workload");
     }
-    let oracle_scratch = OwnedOracleScratch::create(
-        scratch_root.join(format!("oracle-bootstrap-{}", session_id()?)),
-    )?;
+    let oracle_scratch =
+        OwnedOracleScratch::create(scratch_root.join(format!("oracle-audit-{}", session_id()?)))?;
     let oracle_binding = assess_import_qualification_profile(
         Some(&qualification_profile),
         &repository_start,
@@ -1026,33 +962,34 @@ pub(crate) fn run_oracle_bootstrap(args: Vec<String>) -> anyhow::Result<PathBuf>
         &protocol,
     );
     if !qualification_matched(&oracle_binding) {
-        bail!("T5 oracle bootstrap scratch is outside the owner-accepted profile");
+        bail!("T5 oracle audit scratch is outside the owner-accepted profile");
     }
     let oracle = t5_sentinel_oracle::derive(OracleRequest {
         source: &source,
         scratch: oracle_scratch.path(),
-        sentinel: legacy
-            .no_data_sentinel
-            .context("T5 oracle bootstrap requires an explicit uint8 sentinel")?,
-        spacing_zyx_um: legacy.spacing_zyx_um,
-        time_step_seconds: legacy.time_step_seconds,
-        working_memory_bytes: legacy.working_memory_bytes,
-        scale_digest_scheme: &legacy.expected.scale_digest_scheme,
+        sentinel: config.no_data_sentinel,
+        spacing_zyx_um: config.spacing_zyx_um,
+        time_step_seconds: config.time_step_seconds,
+        working_memory_bytes: config.working_memory_bytes,
+        scale_digest_scheme: &config.expected.scale_digest_scheme,
         cancelled: cancellation.token(),
     })
-    .context("private T5 source oracle bootstrap failed")?;
-    cancellation.check("source-oracle bootstrap derivation")?;
+    .context("private T5 source oracle audit failed")?;
+    cancellation.check("source-oracle audit derivation")?;
     let scratch_removed_empty = oracle_scratch.remove_and_report_empty()?;
     let source_after = source_inventory(&source, cancellation.token())?;
-    validate_bootstrap_oracle(
-        &legacy,
+    let mut gates = source_oracle_gates(
         &oracle,
+        &config.expected,
         &source_before,
         &source_after,
         scratch_removed_empty,
-    )?;
-    let upgraded = legacy_config_with_facts(&legacy, &oracle)?;
-    validate_config(&upgraded)?;
+        config.working_memory_bytes,
+    );
+    gates.insert(
+        "accepted_v2_configuration".to_owned(),
+        config_binding_status(&input.sha256) == "matched",
+    );
 
     let repository_end = repository_identity();
     let hardware_end = host_hardware_identity();
@@ -1070,34 +1007,86 @@ pub(crate) fn run_oracle_bootstrap(args: Vec<String>) -> anyhow::Result<PathBuf>
         &hardware_end,
         &protocol,
     );
-    if !repository_same_clean_revision(&repository_start, &repository_end)
-        || hardware != hardware_end
-        || source_binding != source_binding_end
-        || scratch_binding != scratch_binding_end
-        || sha256_file(&xtask_executable)? != xtask_digest_start
-        || !same_file_metadata(&xtask_metadata_start, &fs::metadata(&xtask_executable)?)
-        || read_config_input(&input.path, repository_root)? != input
-    {
-        bail!("T5 oracle bootstrap provenance or legacy input changed while deriving facts");
+    gates.insert(
+        "qualification_profile_unchanged".to_owned(),
+        source_binding == source_binding_end && scratch_binding == scratch_binding_end,
+    );
+    gates.insert(
+        "repository_and_hardware_unchanged".to_owned(),
+        repository_same_clean_revision(&repository_start, &repository_end)
+            && hardware == hardware_end
+            && qualification_build_reason_codes(&build_provenance, &repository_end).is_empty(),
+    );
+    gates.insert(
+        "xtask_executable_unchanged".to_owned(),
+        sha256_file(&xtask_executable)? == xtask_digest_start
+            && same_file_metadata(&xtask_metadata_start, &fs::metadata(&xtask_executable)?),
+    );
+    gates.insert(
+        "configuration_unchanged".to_owned(),
+        read_config_input(&input.path, repository_root)? == input,
+    );
+
+    let all_gates_passed = gates.values().all(|passed| *passed);
+    let report = json!({
+        "schema": ORACLE_AUDIT_REPORT_SCHEMA,
+        "status": if all_gates_passed { "passed" } else { "failed" },
+        "gates": gates,
+        "all_gates_passed": all_gates_passed,
+        "private_values_redacted": true,
+    });
+    let mut private_strings = vec![
+        source.display().to_string(),
+        scratch_root.display().to_string(),
+        qualification_profile.display().to_string(),
+        input.path.display().to_string(),
+        repository_root.display().to_string(),
+        source_before.sha256.clone(),
+        source_after.sha256.clone(),
+        input.sha256.clone(),
+        config.expected.source_inventory_sha256.clone(),
+        config.expected.reviewed_source_fingerprint_sha256.clone(),
+        config.expected.scientific_content_id.clone(),
+        oracle.scientific_content_id.clone(),
+    ];
+    private_strings.extend(
+        config
+            .expected
+            .scientific_layer_roots
+            .iter()
+            .map(|root| root.digest_sha256.clone()),
+    );
+    private_strings.extend(
+        config
+            .expected
+            .scales
+            .iter()
+            .map(|scale| scale.digest_sha256.clone()),
+    );
+    private_strings.extend(
+        oracle
+            .layer_roots
+            .iter()
+            .map(|root| root.digest_sha256.clone()),
+    );
+    private_strings.extend(
+        oracle
+            .scales
+            .iter()
+            .map(|scale| scale.digest_sha256.clone()),
+    );
+    validate_sanitized_report(&report, &private_strings)?;
+    cancellation.check("source-oracle audit report")?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if !all_gates_passed {
+        bail!("T5 source-oracle audit failed one or more sanitized gates");
     }
-    let output_parent_end = fs::symlink_metadata(output_parent)?;
-    if !same_directory_identity(&output_parent_identity, &output_parent_end)
-        || !matches!(
-            fs::symlink_metadata(&output),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound
-        )
-    {
-        bail!("T5 oracle bootstrap output path changed before create-new publication");
-    }
-    write_new_synced_config_with_precommit(&output, &upgraded, || {
-        cancellation.check("source-oracle config publication")
-    })?;
-    Ok(output)
+    cancellation.check("source-oracle audit completion")?;
+    Ok(())
 }
 
-fn parse_oracle_bootstrap_args(args: Vec<String>) -> anyhow::Result<OracleBootstrapArgs> {
+fn parse_oracle_audit_args(args: Vec<String>) -> anyhow::Result<OracleAuditArgs> {
     let mut config = None;
-    let mut output = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -1107,74 +1096,73 @@ fn parse_oracle_bootstrap_args(args: Vec<String>) -> anyhow::Result<OracleBootst
                     args.get(index)
                         .context("--config requires an absolute path")?,
                 );
-                if config.replace(value).is_some() {
-                    bail!("import-performance-t5-oracle accepts --config exactly once");
+                if !value.is_absolute() {
+                    bail!("import-performance-t5-oracle-audit requires an absolute --config path");
                 }
-            }
-            "--output" => {
-                index += 1;
-                let value = PathBuf::from(
-                    args.get(index)
-                        .context("--output requires an absolute path")?,
-                );
-                if output.replace(value).is_some() {
-                    bail!("import-performance-t5-oracle accepts --output exactly once");
+                if config.replace(value).is_some() {
+                    bail!("import-performance-t5-oracle-audit accepts --config exactly once");
                 }
             }
             "--help" | "-h" | "help" => bail!(
-                "usage: cargo run --release -p xtask -- import-performance-t5-oracle --config /absolute/private/legacy-config.json --output /absolute/private/config.json"
+                "usage: cargo run --release -p xtask -- import-performance-t5-oracle-audit --config /absolute/private/config.json"
             ),
-            option => bail!("unknown import-performance-t5-oracle option {option:?}"),
+            option => bail!("unknown import-performance-t5-oracle-audit option {option:?}"),
         }
         index += 1;
     }
-    Ok(OracleBootstrapArgs {
-        config: config.context("import-performance-t5-oracle requires --config PATH")?,
-        output: output.context("import-performance-t5-oracle requires --output PATH")?,
+    Ok(OracleAuditArgs {
+        config: config.context("import-performance-t5-oracle-audit requires --config PATH")?,
     })
 }
 
 fn parse_args(args: Vec<String>) -> anyhow::Result<RunArgs> {
     let mut config = None;
-    let mut samples = DEFAULT_SAMPLES;
     let mut diagnostic = false;
+    let mut performance = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--config" => {
                 index += 1;
-                config = Some(PathBuf::from(
+                let value = PathBuf::from(
                     args.get(index)
                         .context("--config requires an absolute path")?,
-                ));
-            }
-            "--samples" => {
-                index += 1;
-                samples = args
-                    .get(index)
-                    .context("--samples requires a value")?
-                    .parse::<usize>()
-                    .context("--samples must be an integer")?;
+                );
+                if !value.is_absolute() {
+                    bail!("import-performance-t5 requires an absolute --config path");
+                }
+                if config.replace(value).is_some() {
+                    bail!("import-performance-t5 accepts --config exactly once");
+                }
             }
             "--diagnostic" => diagnostic = true,
+            "--performance" => performance = true,
             "--help" | "-h" | "help" => bail!(
-                "usage: cargo run --release -p xtask -- import-performance-t5 --config /absolute/private/config.json [--diagnostic] [--samples 3]"
+                "usage: cargo run --release -p xtask -- import-performance-t5 --config /absolute/private/config.json [--performance | --diagnostic]"
             ),
             option => bail!("unknown import-performance-t5 option {option:?}"),
         }
         index += 1;
     }
     let config = config.context("import-performance-t5 requires --config PATH")?;
-    if samples == 0 || samples > 9 {
-        bail!("T5 sample count must be between one and nine");
+    if diagnostic && performance {
+        bail!("--diagnostic and --performance are mutually exclusive");
     }
-    if samples != DEFAULT_SAMPLES && !diagnostic {
-        bail!("qualification evidence requires exactly three independent process sessions");
-    }
+    let qualification_kind = if performance {
+        QualificationKind::Performance
+    } else {
+        QualificationKind::Correctness
+    };
+    let samples = if performance {
+        PERFORMANCE_SAMPLES
+    } else {
+        CORRECTNESS_SAMPLES
+    };
     Ok(RunArgs {
         config,
         samples,
         diagnostic,
+        qualification_kind,
     })
 }
 
@@ -1291,227 +1279,6 @@ fn validate_config(config: &T5Config) -> anyhow::Result<()> {
         .collect::<BTreeSet<_>>();
     if transform_ordinals != required_transform_ordinals {
         bail!("private T5 expected transforms require unique ordinals zero through six");
-    }
-    Ok(())
-}
-
-fn validate_legacy_config(legacy: &LegacyT5Config) -> anyhow::Result<()> {
-    if legacy.schema != LEGACY_CONFIG_SCHEMA
-        || !valid_workload_id(&legacy.workload_id)
-        || legacy.expected_profile != "DS-3"
-        || legacy.working_memory_bytes != WORKING_MEMORY_BYTES
-        || !(60..=7_200).contains(&legacy.primary_timeout_seconds)
-        || legacy.cache_condition != "warm"
-        || legacy.competing_activity != "none"
-        || legacy.no_data_sentinel.is_none()
-    {
-        bail!("legacy private T5 configuration violates its frozen protocol");
-    }
-    for path in [
-        &legacy.source,
-        &legacy.scratch_root,
-        &legacy.qualification_profile,
-    ] {
-        if !path.is_absolute() {
-            bail!("legacy private T5 configuration paths must be absolute");
-        }
-    }
-    if legacy
-        .spacing_zyx_um
-        .iter()
-        .any(|value| !value.is_finite() || *value <= 0.0)
-        || legacy
-            .time_step_seconds
-            .is_some_and(|value| !value.is_finite() || value <= 0.0)
-        || legacy.expected.canonical_source_pixel_bytes == 0
-        || legacy.expected.scale_digest_scheme != SCALE_DIGEST_SCHEME
-    {
-        bail!("legacy private T5 configuration contains invalid calibration or fact metadata");
-    }
-    Sha256Digest::parse(&legacy.expected.source_inventory_sha256)?;
-    Sha256Digest::parse(&legacy.expected.reviewed_source_fingerprint_sha256)?;
-    ScientificContentId::parse(&legacy.expected.scientific_content_id)?;
-    let mut layer_keys = BTreeSet::new();
-    for root in &legacy.expected.scientific_layer_roots {
-        if !layer_keys.insert(root.logical_layer) {
-            bail!("legacy private T5 configuration repeats a logical layer");
-        }
-        Sha256Digest::parse(&root.digest_sha256)?;
-    }
-    if layer_keys.is_empty() {
-        bail!("legacy private T5 configuration has no scientific layer facts");
-    }
-    let mut scale_keys = BTreeSet::new();
-    for scale in &legacy.expected.scales {
-        if !scale_keys.insert((scale.image_ordinal, scale.scale_ordinal))
-            || scale.brick_reads == 0
-            || scale.logical_voxels == 0
-        {
-            bail!("legacy private T5 configuration has invalid scale facts");
-        }
-        Sha256Digest::parse(&scale.digest_sha256)?;
-    }
-    let required_scale_keys = (0..T5_SCALE_COUNT)
-        .map(|scale| (0_u32, u32::try_from(scale).expect("seven scales fit u32")))
-        .collect::<BTreeSet<_>>();
-    if scale_keys != required_scale_keys {
-        bail!("legacy private T5 configuration requires image zero scales zero through six");
-    }
-    Ok(())
-}
-
-fn legacy_config_with_facts(
-    legacy: &LegacyT5Config,
-    oracle: &OracleFacts,
-) -> anyhow::Result<T5Config> {
-    if oracle.canonical_base_pixel_bytes != legacy.expected.canonical_source_pixel_bytes {
-        bail!("T5 oracle bootstrap changed the frozen canonical base-byte count");
-    }
-    let legacy_layer_keys = legacy
-        .expected
-        .scientific_layer_roots
-        .iter()
-        .map(|root| root.logical_layer)
-        .collect::<BTreeSet<_>>();
-    let oracle_layer_keys = oracle
-        .layer_roots
-        .iter()
-        .map(|root| root.logical_layer)
-        .collect::<BTreeSet<_>>();
-    if legacy_layer_keys != oracle_layer_keys
-        || legacy_layer_keys.len() != legacy.expected.scientific_layer_roots.len()
-        || oracle_layer_keys.len() != oracle.layer_roots.len()
-    {
-        bail!("T5 oracle bootstrap changed the frozen logical-layer keys");
-    }
-    if !oracle_scale_keys_and_counts_match(oracle, &legacy.expected.scales)
-        || !oracle_transform_coverage(oracle)
-    {
-        bail!("T5 oracle bootstrap changed scale keys/counts or omitted a transform");
-    }
-    let scientific_layer_roots = legacy
-        .expected
-        .scientific_layer_roots
-        .iter()
-        .map(|legacy_root| {
-            let oracle_root = oracle
-                .layer_roots
-                .iter()
-                .find(|root| root.logical_layer == legacy_root.logical_layer)
-                .context("T5 oracle bootstrap omitted a frozen logical layer")?;
-            Ok(ExpectedLayerRoot {
-                logical_layer: legacy_root.logical_layer,
-                digest_sha256: oracle_root.digest_sha256.clone(),
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let scales = legacy
-        .expected
-        .scales
-        .iter()
-        .map(|legacy_scale| {
-            let oracle_scale = oracle
-                .scales
-                .iter()
-                .find(|scale| {
-                    scale.image_ordinal == legacy_scale.image_ordinal
-                        && scale.scale_ordinal == legacy_scale.scale_ordinal
-                })
-                .context("T5 oracle bootstrap omitted a frozen scale")?;
-            Ok(ExpectedScaleFact {
-                image_ordinal: legacy_scale.image_ordinal,
-                scale_ordinal: legacy_scale.scale_ordinal,
-                digest_sha256: oracle_scale.digest_sha256.clone(),
-                brick_reads: legacy_scale.brick_reads,
-                logical_voxels: legacy_scale.logical_voxels,
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let transforms = legacy
-        .expected
-        .scales
-        .iter()
-        .map(|legacy_scale| {
-            let transform = oracle
-                .transforms
-                .iter()
-                .find(|transform| transform.scale_ordinal == legacy_scale.scale_ordinal)
-                .context("T5 oracle bootstrap omitted a frozen scale transform")?;
-            Ok(ExpectedTransformFact {
-                scale_ordinal: transform.scale_ordinal,
-                scale_zyx: transform.scale_zyx,
-                translation_zyx: transform.translation_zyx,
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    Ok(T5Config {
-        schema: CONFIG_SCHEMA.to_owned(),
-        workload_id: legacy.workload_id.clone(),
-        source: legacy.source.clone(),
-        scratch_root: legacy.scratch_root.clone(),
-        qualification_profile: legacy.qualification_profile.clone(),
-        expected_profile: legacy.expected_profile.clone(),
-        spacing_zyx_um: legacy.spacing_zyx_um,
-        time_step_seconds: legacy.time_step_seconds,
-        no_data_sentinel: legacy
-            .no_data_sentinel
-            .context("legacy private T5 configuration requires an explicit sentinel")?,
-        working_memory_bytes: legacy.working_memory_bytes,
-        primary_timeout_seconds: legacy.primary_timeout_seconds,
-        cache_condition: legacy.cache_condition.clone(),
-        competing_activity: legacy.competing_activity.clone(),
-        expected: ExpectedFacts {
-            expected_fact_authority: FACT_AUTHORITY.to_owned(),
-            source_inventory_sha256: legacy.expected.source_inventory_sha256.clone(),
-            reviewed_source_fingerprint_sha256: legacy
-                .expected
-                .reviewed_source_fingerprint_sha256
-                .clone(),
-            canonical_source_pixel_bytes: oracle.canonical_base_pixel_bytes,
-            scientific_content_id: oracle.scientific_content_id.clone(),
-            scientific_layer_roots,
-            scale_digest_scheme: legacy.expected.scale_digest_scheme.clone(),
-            scales,
-            transforms,
-        },
-    })
-}
-
-fn validate_bootstrap_oracle(
-    legacy: &LegacyT5Config,
-    oracle: &OracleFacts,
-    source_before: &InventoryFacts,
-    source_after: &InventoryFacts,
-    scratch_removed_empty: bool,
-) -> anyhow::Result<()> {
-    if source_before != source_after || !oracle.resources.source_unchanged {
-        bail!("T5 oracle bootstrap observed source mutation");
-    }
-    if oracle.resources.source_files != source_before.regular_files
-        || oracle.resources.source_planes == 0
-        || oracle.resources.source_inventory_name_bytes == 0
-        || !oracle.resources.deterministic_filename_order
-    {
-        bail!("T5 oracle bootstrap source enumeration is incomplete or nondeterministic");
-    }
-    if oracle.resources.calculated_peak_working_bytes > legacy.working_memory_bytes
-        || oracle.resources.required_scratch_bytes > oracle.resources.scratch_free_bytes
-        || oracle.resources.peak_scratch_regular_files > 2
-        || oracle.resources.calculated_open_files_bound > 64
-    {
-        bail!("T5 oracle bootstrap exceeds a memory, scratch, or open-file resource bound");
-    }
-    if oracle.resources.scratch_files_remaining != 0 || !scratch_removed_empty {
-        bail!("T5 oracle bootstrap left scratch remnants");
-    }
-    if oracle.canonical_base_pixel_bytes != legacy.expected.canonical_source_pixel_bytes
-        || !oracle_scale_keys_and_counts_match(oracle, &legacy.expected.scales)
-    {
-        bail!("T5 oracle bootstrap disagrees with independently frozen base bytes or scale counts");
-    }
-    if !oracle_transform_coverage(oracle) {
-        bail!("T5 oracle bootstrap produced incomplete or ambiguous transform facts");
     }
     Ok(())
 }
@@ -1771,32 +1538,6 @@ fn canonical_external_source(path: &Path, repository_root: &Path) -> anyhow::Res
     Ok(canonical)
 }
 
-fn external_create_new_path(path: &Path, repository_root: &Path) -> anyhow::Result<PathBuf> {
-    if !path.is_absolute() {
-        bail!("T5 oracle bootstrap output must be absolute");
-    }
-    match fs::symlink_metadata(path) {
-        Ok(_) => bail!("T5 oracle bootstrap output must not already exist"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    let parent = path
-        .parent()
-        .context("T5 oracle bootstrap output has no parent")?;
-    let parent_metadata = fs::symlink_metadata(parent)?;
-    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
-        bail!("T5 oracle bootstrap output parent must be a nonsymlink directory");
-    }
-    let parent = fs::canonicalize(parent)?;
-    if parent.starts_with(fs::canonicalize(repository_root)?) {
-        bail!("T5 oracle bootstrap output must remain outside the repository");
-    }
-    let name = path
-        .file_name()
-        .context("T5 oracle bootstrap output has no file name")?;
-    Ok(parent.join(name))
-}
-
 fn config_binding_status(digest: &str) -> &'static str {
     match OWNER_ACCEPTED_T5_CONFIG_SHA256 {
         Some(accepted) if accepted == digest => "matched",
@@ -1818,18 +1559,25 @@ fn qualification_tuple_matched(assessment: &ImportQualificationAssessment) -> bo
     )
 }
 
-const fn qualification_claim_passed(
+const fn correctness_qualification_claim_passed(
     diagnostic: bool,
     binding_eligible: bool,
     samples_passed: bool,
-    absolute_gate_passed: bool,
     invariant_gates_passed: bool,
 ) -> bool {
-    !diagnostic
-        && binding_eligible
-        && samples_passed
-        && absolute_gate_passed
-        && invariant_gates_passed
+    !diagnostic && binding_eligible && samples_passed && invariant_gates_passed
+}
+
+const fn performance_qualification_claim_passed(
+    performance_requested: bool,
+    correctness_passed: bool,
+    timing_gate_passed: bool,
+    cross_sample_ids_consistent: Option<bool>,
+) -> bool {
+    performance_requested
+        && correctness_passed
+        && timing_gate_passed
+        && matches!(cross_sample_ids_consistent, Some(true))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1845,7 +1593,7 @@ fn qualification_diagnostic_reason_codes(
     build_start: &[&'static str],
     build_end: &[&'static str],
     samples: &[SampleEvidence],
-    absolute_gate_passed: bool,
+    performance_timing_gate_passed: bool,
     frozen_source_matched: bool,
     source_preserved: bool,
     repository_unchanged: bool,
@@ -1853,15 +1601,11 @@ fn qualification_diagnostic_reason_codes(
     xtask_unchanged: bool,
     executable_unchanged: bool,
     config_unchanged: bool,
-    deterministic_ids: bool,
-    oracle_gates: &BTreeMap<String, bool>,
+    cross_sample_ids_consistent: Option<bool>,
 ) -> Vec<String> {
     let mut reasons = BTreeSet::new();
     if args.diagnostic {
         reasons.insert("diagnostic_mode_explicitly_requested".to_owned());
-    }
-    if args.samples != DEFAULT_SAMPLES {
-        reasons.insert("sample_count_not_three".to_owned());
     }
     match config_binding_status {
         "matched" => {}
@@ -1901,13 +1645,16 @@ fn qualification_diagnostic_reason_codes(
             reasons.insert(format!("sample_{}_{gate}_failed", sample.sample_index));
         }
     }
-    for (gate, passed) in oracle_gates {
-        if !passed {
-            reasons.insert(format!("source_oracle_{gate}_failed"));
-        }
+    if args.qualification_kind == QualificationKind::Performance && !performance_timing_gate_passed
+    {
+        reasons.insert("performance_absolute_time_gate_failed".to_owned());
+    }
+    if args.qualification_kind == QualificationKind::Performance
+        && cross_sample_ids_consistent != Some(true)
+    {
+        reasons.insert("performance_sample_identities_not_deterministic".to_owned());
     }
     for (passed, reason) in [
-        (absolute_gate_passed, "absolute_time_gate_failed"),
         (
             frozen_source_matched,
             "source_inventory_does_not_match_frozen_workload",
@@ -1918,7 +1665,6 @@ fn qualification_diagnostic_reason_codes(
         (xtask_unchanged, "xtask_executable_changed"),
         (executable_unchanged, "release_executable_changed"),
         (config_unchanged, "private_configuration_changed"),
-        (deterministic_ids, "sample_identities_not_deterministic"),
     ] {
         if !passed {
             reasons.insert(reason.to_owned());
@@ -2034,7 +1780,6 @@ fn run_sample(
     protocol: &ImportQualificationProtocol,
     compiler: &str,
     diagnostic: bool,
-    source_oracle: &OracleFacts,
     cancelled: &AtomicBool,
 ) -> anyhow::Result<SampleEvidence> {
     require_not_cancelled(cancelled, "T5 sample setup")?;
@@ -2278,8 +2023,7 @@ fn run_sample(
     validate_required_statistics(statistics)?;
 
     require_not_cancelled(cancelled, "independent package validation")?;
-    let independent =
-        independently_validate_package(&destination, &config.expected, source_oracle, cancelled)?;
+    let independent = independently_validate_package(&destination, &config.expected, cancelled)?;
     require_not_cancelled(cancelled, "independent package validation")?;
     let destination_binding = assess_import_qualification_profile(
         Some(qualification_profile),
@@ -2423,24 +2167,8 @@ fn run_sample(
         independent.scale_facts_match,
     );
     gates.insert(
-        "source_oracle_scientific_correctness".to_owned(),
-        independent.oracle_scientific_id_matches && independent.oracle_layer_roots_match,
-    );
-    gates.insert(
-        "source_oracle_per_scale_correctness".to_owned(),
-        independent.oracle_scale_facts_match,
-    );
-    gates.insert(
-        "source_oracle_centered_transforms".to_owned(),
-        independent.oracle_transform_facts_match,
-    );
-    gates.insert(
         "frozen_centered_transforms".to_owned(),
         independent.config_transform_facts_match,
-    );
-    gates.insert(
-        "source_oracle_canonical_base_bytes".to_owned(),
-        independent.oracle_canonical_base_pixel_bytes_match,
     );
     gates.insert("exact_correctness".to_owned(), true);
     gates.insert("progress_truthfulness".to_owned(), stages_truthful);
@@ -2531,12 +2259,7 @@ fn run_sample(
             "layer_roots_match": independent.layer_roots_match,
             "scale_facts_match": independent.scale_facts_match,
             "scientific_id_matches": independent.scientific_id_matches,
-            "oracle_layer_roots_match": independent.oracle_layer_roots_match,
-            "oracle_scale_facts_match": independent.oracle_scale_facts_match,
-            "oracle_scientific_id_matches": independent.oracle_scientific_id_matches,
-            "oracle_transform_facts_match": independent.oracle_transform_facts_match,
             "config_transform_facts_match": independent.config_transform_facts_match,
-            "oracle_canonical_base_pixel_bytes_match": independent.oracle_canonical_base_pixel_bytes_match,
             "scientific_brick_reads": independent.scientific_brick_reads,
             "canonical_base_pixel_bytes": independent.canonical_base_pixel_bytes,
             "canonical_base_pixel_bytes_match": independent.canonical_base_pixel_bytes
@@ -3439,6 +3162,10 @@ fn source_oracle_gates(
         expected.expected_fact_authority == FACT_AUTHORITY,
     );
     gates.insert(
+        "frozen_source_inventory".to_owned(),
+        source_before.sha256 == expected.source_inventory_sha256,
+    );
+    gates.insert(
         "frozen_scientific_facts".to_owned(),
         oracle_matches_expected(oracle, expected),
     );
@@ -3637,7 +3364,6 @@ fn oracle_scale_keys_and_counts_match(
 fn independently_validate_package(
     destination: &Path,
     expected: &ExpectedFacts,
-    source_oracle: &OracleFacts,
     cancelled: &AtomicBool,
 ) -> anyhow::Result<IndependentValidation> {
     require_not_cancelled(cancelled, "independent exact-package validation")?;
@@ -3652,7 +3378,6 @@ fn independently_validate_package(
         .context("T5 independent scientific package validation failed")?;
     let scientific_content_id = verified.scientific_content_id().to_string();
     let scientific_id_matches = scientific_content_id == expected.scientific_content_id;
-    let oracle_scientific_id_matches = scientific_content_id == source_oracle.scientific_content_id;
 
     let mut actual_roots = verified
         .layer_roots()
@@ -3666,16 +3391,6 @@ fn independently_validate_package(
     let mut expected_roots = expected.scientific_layer_roots.clone();
     expected_roots.sort();
     let layer_roots_match = actual_roots == expected_roots;
-    let mut oracle_roots = source_oracle
-        .layer_roots
-        .iter()
-        .map(|root| ExpectedLayerRoot {
-            logical_layer: root.logical_layer,
-            digest_sha256: root.digest_sha256.clone(),
-        })
-        .collect::<Vec<_>>();
-    oracle_roots.sort();
-    let oracle_layer_roots_match = actual_roots == oracle_roots;
     let layer_roots = actual_roots
         .iter()
         .map(|root| {
@@ -3708,19 +3423,6 @@ fn independently_validate_package(
     let mut expected_scales = expected.scales.clone();
     expected_scales.sort();
     let scale_facts_match = actual_scales == expected_scales;
-    let mut oracle_scales = source_oracle
-        .scales
-        .iter()
-        .map(|fact| ExpectedScaleFact {
-            image_ordinal: fact.image_ordinal,
-            scale_ordinal: fact.scale_ordinal,
-            digest_sha256: fact.digest_sha256.clone(),
-            brick_reads: fact.brick_reads,
-            logical_voxels: fact.logical_voxels,
-        })
-        .collect::<Vec<_>>();
-    oracle_scales.sort();
-    let oracle_scale_facts_match = actual_scales == oracle_scales;
     let scale_facts = actual_scales
         .iter()
         .map(|fact| {
@@ -3734,8 +3436,6 @@ fn independently_validate_package(
         })
         .collect();
     let actual_transforms = package_transform_facts(&verified)?;
-    let oracle_transform_facts_match =
-        transform_facts_match(&actual_transforms, &source_oracle.transforms);
     let config_transform_facts_match =
         expected_transform_facts_match(&actual_transforms, &expected.transforms);
     let transform_facts = actual_transforms
@@ -3757,13 +3457,7 @@ fn independently_validate_package(
         scale_facts_match,
         layer_roots_match,
         scientific_id_matches,
-        oracle_scale_facts_match,
-        oracle_layer_roots_match,
-        oracle_scientific_id_matches,
-        oracle_transform_facts_match,
         config_transform_facts_match,
-        oracle_canonical_base_pixel_bytes_match: canonical_base_pixel_bytes
-            == source_oracle.canonical_base_pixel_bytes,
         scientific_brick_reads,
         canonical_base_pixel_bytes,
     })
@@ -3805,6 +3499,7 @@ fn package_transform_facts(
         .collect()
 }
 
+#[cfg(test)]
 fn transform_facts_match(
     actual: &[ObservedTransformFact],
     expected: &[t5_sentinel_oracle::OracleTransformFact],
@@ -3986,20 +3681,13 @@ fn scale_fact(
                                     let source_index = linear_3d([z, y, x], brick_shape)?;
                                     let valid = effective_validity(&brick, source_index)?;
                                     row.push(u8::from(valid));
-                                    if valid {
-                                        if let Some(pixel) = brick.pixel_payload() {
-                                            let start = source_index
-                                                .checked_mul(sample_bytes)
-                                                .context("T5 scale pixel offset overflowed")?;
-                                            row.extend_from_slice(
-                                                &pixel[start..start + sample_bytes],
-                                            );
-                                        } else {
-                                            row.resize(row.len() + sample_bytes, 0);
-                                        }
-                                    } else {
-                                        row.resize(row.len() + sample_bytes, 0);
-                                    }
+                                    append_canonical_sample(
+                                        &mut row,
+                                        brick.pixel_payload(),
+                                        source_index,
+                                        sample_bytes,
+                                        valid,
+                                    )?;
                                 }
                                 hasher.update(&row);
                             }
@@ -4022,6 +3710,43 @@ fn scale_fact(
         },
         canonical_pixel_bytes,
     ))
+}
+
+fn append_canonical_sample(
+    row: &mut Vec<u8>,
+    pixel_payload: Option<&[u8]>,
+    source_index: usize,
+    sample_bytes: usize,
+    valid: bool,
+) -> anyhow::Result<()> {
+    let sample = if let Some(pixel) = pixel_payload {
+        let start = source_index
+            .checked_mul(sample_bytes)
+            .context("T5 scale pixel offset overflowed")?;
+        let end = start
+            .checked_add(sample_bytes)
+            .context("T5 scale pixel end overflowed")?;
+        Some(
+            pixel
+                .get(start..end)
+                .context("T5 scale pixel payload is shorter than its declared brick")?,
+        )
+    } else {
+        None
+    };
+    if !valid && sample.is_some_and(|bytes| bytes.iter().any(|byte| *byte != 0)) {
+        bail!("T5 invalid voxel is not stored with canonical-zero pixel bytes");
+    }
+    if valid {
+        if let Some(sample) = sample {
+            row.extend_from_slice(sample);
+        } else {
+            row.resize(row.len() + sample_bytes, 0);
+        }
+    } else {
+        row.resize(row.len() + sample_bytes, 0);
+    }
+    Ok(())
 }
 
 fn pixel_kind_facts(kind: ShardProfileKind) -> anyhow::Result<([u64; 3], usize, u8)> {
@@ -4185,10 +3910,6 @@ fn same_file_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
         && left.ctime_nsec() == right.ctime_nsec()
 }
 
-fn same_directory_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.is_dir() && right.is_dir() && left.dev() == right.dev() && left.ino() == right.ino()
-}
-
 fn repository_same_clean_revision(start: &RepositoryIdentity, end: &RepositoryIdentity) -> bool {
     start.root.is_some()
         && start.commit.is_some()
@@ -4246,119 +3967,6 @@ fn write_new_synced_json(path: &Path, value: &Value) -> anyhow::Result<()> {
     file.sync_all()?;
     File::open(parent)?.sync_all()?;
     Ok(())
-}
-
-struct PendingConfigPublication {
-    parent: OwnedFd,
-    stage: File,
-    stage_name: OsString,
-    owns_stage: bool,
-}
-
-impl PendingConfigPublication {
-    fn create(parent_path: &Path) -> anyhow::Result<Self> {
-        let directory_flags =
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-        let parent = openat(rustix::fs::CWD, parent_path, directory_flags, Mode::empty())
-            .context("failed to open the T5 oracle config output parent")?;
-        let file_flags =
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-        let token = session_id()?;
-
-        for attempt in 0_u8..32 {
-            let stage_name = OsString::from(format!(".mirante4d-t5-config-{token}-{attempt}.tmp"));
-            match openat(
-                &parent,
-                stage_name.as_os_str(),
-                file_flags,
-                Mode::RUSR | Mode::WUSR,
-            ) {
-                Ok(stage) => {
-                    return Ok(Self {
-                        parent,
-                        stage: File::from(stage),
-                        stage_name,
-                        owns_stage: true,
-                    });
-                }
-                Err(Errno::EXIST) => {}
-                Err(error) => {
-                    return Err(error)
-                        .context("failed to create the private T5 oracle config stage");
-                }
-            }
-        }
-        bail!("failed to reserve a unique private T5 oracle config stage")
-    }
-
-    fn stage_name_still_owned(&self) -> anyhow::Result<bool> {
-        let descriptor = fstat(&self.stage)?;
-        let named = statat(
-            &self.parent,
-            self.stage_name.as_os_str(),
-            AtFlags::SYMLINK_NOFOLLOW,
-        )?;
-        Ok(descriptor.st_dev == named.st_dev && descriptor.st_ino == named.st_ino)
-    }
-
-    fn publish(mut self, destination_name: &OsStr) -> anyhow::Result<()> {
-        if !self.stage_name_still_owned()? {
-            bail!("T5 oracle config stage identity changed before publication");
-        }
-        renameat_with(
-            &self.parent,
-            self.stage_name.as_os_str(),
-            &self.parent,
-            destination_name,
-            RenameFlags::NOREPLACE,
-        )
-        .context("failed to atomically create the T5 oracle config output")?;
-
-        // The successful no-replace rename is the publication point. From
-        // here onward the destination is a complete validated file, so Drop
-        // must never unlink it even if the parent durability barrier fails.
-        self.owns_stage = false;
-        fsync(&self.parent).context(
-            "T5 oracle config was published, but parent-directory durability is indeterminate",
-        )?;
-        Ok(())
-    }
-}
-
-impl Drop for PendingConfigPublication {
-    fn drop(&mut self) {
-        if self.owns_stage {
-            let _ = unlinkat(&self.parent, self.stage_name.as_os_str(), AtFlags::empty());
-            let _ = fsync(&self.parent);
-        }
-    }
-}
-
-fn write_new_synced_config_with_precommit(
-    path: &Path,
-    config: &T5Config,
-    precommit: impl FnOnce() -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    let value = serde_json::to_value(config)?;
-    let parsed: T5Config = serde_json::from_value(value.clone())?;
-    validate_config(&parsed)?;
-    let bytes = serde_json::to_vec_pretty(&value)?;
-    let parent = path.parent().context("T5 config output has no parent")?;
-    let destination_name = path
-        .file_name()
-        .context("T5 config output has no file name")?;
-    let mut publication = PendingConfigPublication::create(parent)?;
-    publication.stage.write_all(&bytes)?;
-    publication
-        .stage
-        .set_permissions(fs::Permissions::from_mode(0o600))?;
-    publication.stage.sync_all()?;
-    let metadata = publication.stage.metadata()?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
-        bail!("T5 oracle bootstrap stage is not a private mode-0600 regular file");
-    }
-    precommit()?;
-    publication.publish(destination_name)
 }
 
 fn create_private_directory(path: &Path) -> std::io::Result<()> {
@@ -4476,20 +4084,6 @@ fn validate_sanitized_report(report: &Value, private_strings: &[String]) -> anyh
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn valid_legacy_config(root: &Path) -> LegacyT5Config {
-        let mut value = valid_config_json(root);
-        value["schema"] = json!(LEGACY_CONFIG_SCHEMA);
-        value["expected"]
-            .as_object_mut()
-            .unwrap()
-            .remove("expected_fact_authority");
-        value["expected"]
-            .as_object_mut()
-            .unwrap()
-            .remove("transforms");
-        serde_json::from_value(value).unwrap()
-    }
 
     fn stub_oracle_facts() -> OracleFacts {
         let scales = (0..T5_SCALE_COUNT)
@@ -4616,7 +4210,7 @@ mod tests {
         assert!(serde_json::from_value::<T5Config>(extra).is_err());
 
         let mut legacy_schema = valid_config_json(root);
-        legacy_schema["schema"] = json!(LEGACY_CONFIG_SCHEMA);
+        legacy_schema["schema"] = json!("mirante4d-private-import-performance-t5-1");
         let config: T5Config = serde_json::from_value(legacy_schema).unwrap();
         assert!(validate_config(&config).is_err());
 
@@ -4643,59 +4237,69 @@ mod tests {
     }
 
     #[test]
-    fn argument_parser_keeps_three_sessions_as_the_qualification_protocol() {
+    fn argument_parser_separates_correctness_from_optional_performance() {
         let parsed = parse_args(vec!["--config".into(), "/private/config.json".into()]).unwrap();
-        assert_eq!(parsed.samples, 3);
+        assert_eq!(parsed.samples, CORRECTNESS_SAMPLES);
         assert!(!parsed.diagnostic);
+        assert_eq!(parsed.qualification_kind, QualificationKind::Correctness);
+        let performance = parse_args(vec![
+            "--config".into(),
+            "/private/config.json".into(),
+            "--performance".into(),
+        ])
+        .unwrap();
+        assert_eq!(performance.samples, PERFORMANCE_SAMPLES);
+        assert_eq!(
+            performance.qualification_kind,
+            QualificationKind::Performance
+        );
         assert!(
             parse_args(vec![
                 "--config".into(),
                 "/private/config.json".into(),
                 "--samples".into(),
-                "2".into(),
+                "3".into(),
             ])
             .is_err()
         );
-        assert_eq!(
+        assert!(
             parse_args(vec![
                 "--config".into(),
                 "/private/config.json".into(),
-                "--samples".into(),
-                "2".into(),
                 "--diagnostic".into(),
+                "--performance".into(),
             ])
-            .unwrap()
-            .samples,
-            2
+            .is_err()
         );
+        assert!(parse_args(vec!["--config".into(), "relative.json".into()]).is_err());
     }
 
     #[test]
-    fn oracle_bootstrap_parser_requires_exact_input_and_output_arguments() {
+    fn oracle_audit_parser_requires_exactly_one_absolute_v2_config() {
         assert_eq!(
-            parse_oracle_bootstrap_args(vec![
-                "--config".into(),
-                "/private/legacy.json".into(),
-                "--output".into(),
-                "/private/current.json".into(),
-            ])
-            .unwrap(),
-            OracleBootstrapArgs {
-                config: PathBuf::from("/private/legacy.json"),
-                output: PathBuf::from("/private/current.json"),
+            parse_oracle_audit_args(vec!["--config".into(), "/private/current.json".into()])
+                .unwrap(),
+            OracleAuditArgs {
+                config: PathBuf::from("/private/current.json"),
             }
         );
+        assert!(parse_oracle_audit_args(Vec::new()).is_err());
+        assert!(parse_oracle_audit_args(vec!["--config".into(), "relative.json".into()]).is_err());
         assert!(
-            parse_oracle_bootstrap_args(vec!["--config".into(), "/private/legacy.json".into(),])
-                .is_err()
+            parse_oracle_audit_args(vec![
+                "--config".into(),
+                "/private/current.json".into(),
+                "--output".into(),
+                "/private/other.json".into(),
+            ])
+            .is_err()
         );
         assert!(
-            parse_oracle_bootstrap_args(vec![
+            parse_oracle_audit_args(vec![
                 "--config".into(),
-                "/private/legacy.json".into(),
-                "--output".into(),
                 "/private/current.json".into(),
-                "--diagnostic".into(),
+                "--config".into(),
+                "/private/other.json".into(),
             ])
             .is_err()
         );
@@ -4720,6 +4324,19 @@ mod tests {
             WORKING_MEMORY_BYTES,
         );
         assert!(gates.values().all(|passed| *passed));
+
+        let mut changed_inventory = inventory.clone();
+        changed_inventory.sha256 = "5".repeat(64);
+        assert!(
+            !source_oracle_gates(
+                &oracle,
+                &config.expected,
+                &changed_inventory,
+                &changed_inventory,
+                true,
+                WORKING_MEMORY_BYTES,
+            )["frozen_source_inventory"]
+        );
 
         let mut bit_different_expected = config.expected.clone();
         bit_different_expected.transforms[0].translation_zyx[0] = -0.0;
@@ -4784,56 +4401,16 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_replaces_only_authorized_scientific_facts() {
-        let legacy = valid_legacy_config(Path::new("/private"));
-        let mut oracle = stub_oracle_facts();
-        oracle.scientific_content_id = format!("m4d-sc-v1-sha256:{}", "9".repeat(64));
-        oracle.layer_roots[0].digest_sha256 = "8".repeat(64);
-        oracle.scales[0].digest_sha256 = "7".repeat(64);
-        let upgraded = legacy_config_with_facts(&legacy, &oracle).unwrap();
+    fn package_readback_rejects_nonzero_bytes_beneath_invalidity() {
+        let mut row = Vec::new();
+        append_canonical_sample(&mut row, Some(&[7, 8, 0, 0]), 0, 2, true).unwrap();
+        append_canonical_sample(&mut row, Some(&[7, 8, 0, 0]), 1, 2, false).unwrap();
+        assert_eq!(row, vec![7, 8, 0, 0]);
 
-        assert_eq!(upgraded.schema, CONFIG_SCHEMA);
-        assert_eq!(upgraded.expected.expected_fact_authority, FACT_AUTHORITY);
-        assert_eq!(upgraded.source, legacy.source);
-        assert_eq!(upgraded.scratch_root, legacy.scratch_root);
-        assert_eq!(
-            upgraded.expected.source_inventory_sha256,
-            legacy.expected.source_inventory_sha256
-        );
-        assert_eq!(
-            upgraded.expected.reviewed_source_fingerprint_sha256,
-            legacy.expected.reviewed_source_fingerprint_sha256
-        );
-        assert_eq!(
-            upgraded.expected.canonical_source_pixel_bytes,
-            legacy.expected.canonical_source_pixel_bytes
-        );
-        assert_eq!(
-            upgraded.expected.scientific_content_id,
-            oracle.scientific_content_id
-        );
-        assert_eq!(
-            upgraded.expected.scientific_layer_roots[0].digest_sha256,
-            oracle.layer_roots[0].digest_sha256
-        );
-        assert_eq!(
-            upgraded.expected.scales[0].digest_sha256,
-            oracle.scales[0].digest_sha256
-        );
-        assert!(expected_oracle_transform_facts_match(
-            &upgraded.expected.transforms,
-            &oracle.transforms
-        ));
-        assert_eq!(
-            (
-                upgraded.expected.scales[0].image_ordinal,
-                upgraded.expected.scales[0].scale_ordinal,
-                upgraded.expected.scales[0].brick_reads,
-                upgraded.expected.scales[0].logical_voxels,
-            ),
-            (0, 0, 1, 16)
-        );
-        validate_config(&upgraded).unwrap();
+        assert!(append_canonical_sample(&mut Vec::new(), Some(&[255]), 0, 1, false).is_err());
+        let mut implicit_zero = Vec::new();
+        append_canonical_sample(&mut implicit_zero, None, 0, 1, true).unwrap();
+        assert_eq!(implicit_zero, vec![0]);
     }
 
     #[test]
@@ -4894,25 +4471,55 @@ mod tests {
             OWNER_ACCEPTED_IMPORT_QUALIFICATION_PROFILE_SHA256,
             Some("50d18c8d3f695a90ff879fc6cdea210b273cc52f97f63350931e42fdd2b38abe")
         );
-        assert_eq!(OWNER_ACCEPTED_T5_CONFIG_SHA256, None);
         assert_eq!(
-            LEGACY_OWNER_ACCEPTED_T5_CONFIG_SHA256,
-            "3b27aabbe604edbc08b02c334ce193692121d1509e450cb001d66bfc3616369a"
+            OWNER_ACCEPTED_T5_CONFIG_SHA256,
+            Some("dd04964ed3062e88d8e3a9325ef9241369d9ac91983cea447158a7667058b4e8")
         );
         assert_eq!(
-            config_binding_status(LEGACY_OWNER_ACCEPTED_T5_CONFIG_SHA256),
-            "pending_owner_acceptance"
+            config_binding_status(OWNER_ACCEPTED_T5_CONFIG_SHA256.unwrap()),
+            "matched"
         );
     }
 
     #[test]
-    fn qualification_claim_requires_every_gate_and_never_accepts_diagnostic_mode() {
-        assert!(qualification_claim_passed(false, true, true, true, true));
-        assert!(!qualification_claim_passed(true, true, true, true, true));
-        assert!(!qualification_claim_passed(false, false, true, true, true));
-        assert!(!qualification_claim_passed(false, true, false, true, true));
-        assert!(!qualification_claim_passed(false, true, true, false, true));
-        assert!(!qualification_claim_passed(false, true, true, true, false));
+    fn correctness_and_performance_claims_have_distinct_gates() {
+        assert!(correctness_qualification_claim_passed(
+            false, true, true, true
+        ));
+        assert!(!correctness_qualification_claim_passed(
+            true, true, true, true
+        ));
+        assert!(!correctness_qualification_claim_passed(
+            false, false, true, true
+        ));
+        assert!(!correctness_qualification_claim_passed(
+            false, true, false, true
+        ));
+        assert!(!correctness_qualification_claim_passed(
+            false, true, true, false
+        ));
+
+        assert!(performance_qualification_claim_passed(
+            true,
+            true,
+            true,
+            Some(true)
+        ));
+        assert!(!performance_qualification_claim_passed(
+            false,
+            true,
+            true,
+            Some(true)
+        ));
+        assert!(!performance_qualification_claim_passed(
+            true, true, true, None
+        ));
+        assert!(!performance_qualification_claim_passed(
+            true,
+            true,
+            false,
+            Some(true)
+        ));
     }
 
     #[test]
@@ -5155,61 +4762,6 @@ mod tests {
             fs::metadata(report).unwrap().permissions().mode() & 0o077,
             0
         );
-    }
-
-    #[test]
-    fn bootstrap_output_is_create_new_strict_json_with_exact_private_mode() {
-        let root = tempfile::tempdir().unwrap();
-        let output = root.path().join("current.json");
-        let second = root.path().join("second.json");
-        let config: T5Config =
-            serde_json::from_value(valid_config_json(Path::new("/private"))).unwrap();
-        write_new_synced_config_with_precommit(&output, &config, || Ok(())).unwrap();
-        write_new_synced_config_with_precommit(&second, &config, || Ok(())).unwrap();
-        assert_eq!(
-            fs::metadata(&output).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        let bytes = fs::read(&output).unwrap();
-        assert!(bytes.starts_with(b"{\n  \""));
-        assert_eq!(bytes, fs::read(&second).unwrap());
-        let parsed: T5Config = serde_json::from_slice(&bytes).unwrap();
-        validate_config(&parsed).unwrap();
-        assert!(write_new_synced_config_with_precommit(&output, &config, || Ok(())).is_err());
-    }
-
-    #[test]
-    fn bootstrap_output_failure_never_publishes_or_retains_a_stage() {
-        let root = tempfile::tempdir().unwrap();
-        let output = root.path().join("current.json");
-        let config: T5Config =
-            serde_json::from_value(valid_config_json(Path::new("/private"))).unwrap();
-
-        assert!(
-            write_new_synced_config_with_precommit(&output, &config, || {
-                bail!("injected prepublication failure")
-            })
-            .is_err()
-        );
-        assert!(!output.exists());
-        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn bootstrap_output_path_stays_external_and_absent() {
-        let root = tempfile::tempdir().unwrap();
-        let repository = root.path().join("repository");
-        let external = root.path().join("external");
-        fs::create_dir(&repository).unwrap();
-        fs::create_dir(&external).unwrap();
-        let output = external.join("current.json");
-        assert_eq!(
-            external_create_new_path(&output, &repository).unwrap(),
-            output
-        );
-        assert!(external_create_new_path(&repository.join("private.json"), &repository).is_err());
-        fs::write(&output, b"occupied").unwrap();
-        assert!(external_create_new_path(&output, &repository).is_err());
     }
 
     #[test]

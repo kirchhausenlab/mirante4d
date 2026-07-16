@@ -58,8 +58,23 @@ passed and identities were deterministic.
 Owner review then confirmed that the pinned private T5 workload is the
 affected sentinel-bearing dataset and that its visible boundary defect
 is fixed in normal use. The previous no-sentinel T5 assumption was wrong: its
-frozen semantic facts describe pre-restoration output. ND-04 now remains active
-to add a bounded source-derived T5 oracle, replace only the affected private
-scientific/layer/scale facts and opaque config commitment, rerun T2 and T5 at
-the final clean revision, and record the complete real-display LOD sweep.
+frozen semantic facts describe pre-restoration output. At clean revision
+`d6478d9`, two independent full bounded source-oracle derivations completed and
+produced byte-identical schema-v2 candidate configurations without altering the
+source or retaining oracle scratch. Those results are the one-time private fact
+freeze.
+
+The hard-cut v2 fact/config commitment is now implemented and the legacy
+bootstrap path is gone. ND-04 remains active only to run exactly one clean
+release normal-product T5 correctness sample, compare its package with the
+frozen scientific, layer, seven-scale, and centered-transform facts, and record
+the closeout. Routine correctness does not recompute the oracle. A new oracle audit is trigger-only after sentinel
+semantics, fact authority/schema, or oracle implementation changes; unexpected
+source drift fails its inventory preflight, while intentional source
+replacement requires a new fact freeze. A three-sample T5 run is optional and
+explicit when a restored-policy
+performance claim is wanted; it is not part of correctness closeout. The
+five-session T2 evidence at `f73cb36` is reused because subsequent changes are
+confined to private xtask fact and evidence authority, not the production
+importer or its performance boundary.
 Other unresolved work remains in [the backlog](../BACKLOG.md).
