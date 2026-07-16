@@ -60,6 +60,18 @@ and proof-derived snapshot sweep with zero codec decodes; product evidence also
 observes successfully started and failed ordinary-verifier runs instead of
 inferring their absence from accepted progress alone.
 
+Reviewed `uint8` sentinel imports now use one guarded policy at every product
+boundary. Base chunks and scientific-identity tiles classify exact source
+sentinel bytes through a clipped one-voxel halo, dilate invalidity in 2D or 3D,
+and store canonical zero for final invalid samples. Every coarse sentinel LOD
+uses valid-only aligned factor-two means with half-up rounding, derives support
+from final parent validity, and applies the same one-voxel invalid dilation.
+Fused workers read ordinary parent pixels separately from expanded
+validity-only halos; packed-index uniform facts avoid mask decoding, and
+halo-only parents never read pixel payloads. Sentinel mean LODs publish
+axis-aware centered transforms. Imports without a sentinel retain their
+existing point-decimation and origin-anchored transforms.
+
 Source inspection admits grayscale `uint8`, `uint16`, and finite `float32`
 TIFF/OME-TIFF pages using uncompressed, LZW, Deflate (current or old TIFF
 code), or PackBits compression. JPEG, WebP, Zstd-in-TIFF, fax, and other
@@ -118,12 +130,26 @@ determinism, resource, and publication-to-open-ready gate passed. The T5 report
 records no failures, skips, or waivers, and no mandatory closeout check was
 skipped or waived. The non-blocking 10-minute stretch target was not met.
 [Testing and evidence](TESTING.md) owns the exact protocol, revision-bound
-evidence, and accepted remaining risks. The documentation-only closeout
-successor was not itself performance-qualified; these claims attach only to
-the named qualification revision and its recorded release executables.
+evidence, and accepted remaining risks. Revision
+`85350219efcc0c96b492f9a5029ba80752b49306`, the clean predecessor to the
+sentinel restoration, was documentation-only and was not performance-
+qualified. These claims attach only to the named qualification revision and
+its recorded release executables; the current sentinel cutover requires fresh
+evidence.
 
 ## Known Limitations
 
+- The restored sentinel policy is implemented and independently read back on
+  generated 2D/3D boundary fixtures and one diagnostic public T2 run. It has
+  also passed the dirty-worktree repository/local checks and both E1 product-
+  automation scenarios, including cancellation/resume/publication below the
+  256 MiB ledger. Those runs are supporting evidence, not product validation.
+  The cutover has not yet completed the revision-bound five-session HW-2/ext4
+  T2 qualification, no-sentinel private T5 regression, or real-display
+  exercise on the affected private dataset. The earlier performance
+  qualification predates this semantic cutover and does not qualify it. The active
+  [restoration closeout](plans/active/UINT8_SENTINEL_NO_DATA_RESTORATION.md)
+  owns those remaining evidence steps.
 - Target packages open provisionally while bounded exact-package and
   scientific-content verification runs in the background. Project attach,
   open, and save remain blocked until verification succeeds; observed source

@@ -402,10 +402,49 @@ Both owner-accepted digest constants are pinned. Their opaque values remain in
 their source authorities and are not repeated here. Diagnostic runs can never
 emit qualification evidence.
 
+#### Sentinel Restoration Evidence Status
+
+The current source implements the guarded `uint8` sentinel policy described in
+[Data format and safety](DATA_FORMAT.md). Independent integration coverage
+constructs source-adjacent bright boundaries, holes, interrupted lines, odd
+tails, and 2D/3D chunk crossings, then reads every package value and validity
+bit at every generated LOD. It separately assembles scientific identity and
+checks centered axis-aware transforms and canonical-zero invalid values.
+Focused production cases cover sentinel zero, a non-255 sentinel, and a valid
+derived mean numerically equal to that sentinel. Exhaustive bounded and
+deterministic randomized masks compare the optimized base dilation with a
+direct neighborhood oracle.
+
+The public T2 authority now derives base and recursive LOD facts through an
+independent restored-policy oracle and validates all five scales through exact
+package readback. The oracle keeps at most two row-major scratch levels and
+computes and hashes fixed Z/Y slabs; its full T2 calculated working peak is
+22,578,060 bytes, and no oracle scratch remained after the diagnostic. A
+one-sample release run on a dirty worktree matched every frozen fact with a
+5.539560251-second primary time, 267,131,688-byte import-ledger peak, and
+67,313,664-byte external RSS delta. This is not qualification: the required
+clean immutable revision, five owner-qualified HW-2/ext4 sessions, private
+no-sentinel T5 regression, and affected-dataset real-display workflow remain
+outstanding in the active [restoration closeout
+plan](plans/active/UINT8_SENTINEL_NO_DATA_RESTORATION.md).
+
+On the same dirty worktree, both public fixture validators, `cargo fmt --all --
+--check`, workspace all-target Clippy with zero warnings, the full import-
+pipeline test set, `cargo xtask verify-pr`, and the six-phase local format
+lifecycle passed. `verify-pr` reported 904 selected Nextest cases passed, three
+skips, and passing doctests. The two required `product-validate` commands also
+passed as E1 automated supporting evidence: `target_source_verification`
+accepted two internal GPU readback captures, and `import_preprocessing`
+accepted cancellation, resume, and publication with a 267,074,040-byte peak
+below 256 MiB. Neither report satisfies E4 product-open or the affected-
+dataset real-display product-validation gate. Dirty-tree reports cannot become
+qualification evidence.
+
 #### Accepted Import And Preprocessing Qualification
 
-The immutable qualification revision for the current import/preprocessing
-implementation is `eb5c9ffd12cbd9fce65bd03559b8e7f93170d72e`, with tree
+The immutable qualification revision for the pre-restoration
+import/preprocessing implementation is
+`eb5c9ffd12cbd9fce65bd03559b8e7f93170d72e`, with tree
 `fec040f4772fbfa0e59bfd18babf178030b073c3`. Its report records
 `evidence_class: qualification`. The complete required automated check set
 passed at that revision. Both sample sets ran on the owner-accepted HW-2/ext4
@@ -413,6 +452,10 @@ tuple with a 256 MiB import budget, declared warm cache, and declared no
 competing activity. The normal native T5/DS-3 route was product-validated there
 with an externally observed mapped native X11 client and owner-attested
 physical-display attachment.
+
+Those performance and product claims remain valid only for that named
+revision and its recorded executables. They predate the sentinel semantic
+cutover and do not qualify the current source.
 
 | Workload | Sampling and primary-clock observations | Median gate | Result |
 | --- | --- | --- | --- |
@@ -492,11 +535,13 @@ coupling and the cooperative destination-parent threat-model limitation in
 [Current state](CURRENT_STATE.md) also remain accepted limitations; neither was
 weakened to meet the timing gate.
 
-This record is revision-bound. This documentation-only closeout successor
-changes no product or performance implementation and was not itself
-performance-qualified. Its executable revision receives no independent
-performance claim. Later product, performance, threshold, evidence-schema, or
-evidence-policy changes affecting this boundary require fresh evidence.
+This record is revision-bound. Revision
+`85350219efcc0c96b492f9a5029ba80752b49306`, the clean predecessor to the
+sentinel restoration, was documentation-only and was not performance-
+qualified. The current sentinel cutover does not inherit the older
+qualification and requires fresh evidence. Later product, performance,
+threshold, evidence-schema, or evidence-policy changes affecting this boundary
+also require fresh evidence.
 
 Rendering, linked-panel, or packaged-viewer changes use:
 

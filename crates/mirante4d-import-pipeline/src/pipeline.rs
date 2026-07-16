@@ -21,7 +21,8 @@ use crate::{
     cpu_chunk::{
         BaseChunkCpuTask, EncodedPreparedWorkUnit, PyramidChunkCpuTask, PyramidSourceChunk,
         ScientificTileCpuTask, base_task_charge_bytes, prepare_base_chunk, prepare_pyramid_chunk,
-        prepare_scientific_tile, pyramid_task_charge_bytes, scientific_task_charge_bytes,
+        prepare_scientific_tile, pyramid_pixel_source_chunks_max, pyramid_task_charge_bytes,
+        pyramid_validity_source_chunks_max, scientific_task_charge_bytes,
     },
     observability::{
         IMPORT_OPEN_FILE_DESCRIPTOR_STRUCTURAL_BOUND, ImportFileDescriptorMonitor, PrimaryClock,
@@ -31,6 +32,7 @@ use crate::{
     package::{PackageMetadataInput, build_package_metadata},
     plan::ImportPlan,
     publish::publish_package,
+    sentinel::{Region3, clipped_halo, invalid_dilation_radius},
     spool::{ImportSpool, SpoolBinding, SpoolEncodedChunkInput, SpoolWorkUnitKey},
 };
 
@@ -438,6 +440,7 @@ fn produce_base(
                     chunk[1] * inner[1],
                     chunk[2] * inner[2],
                 ],
+                source_shape_zyx: [shape.z(), shape.y(), shape.x()],
                 u8_sentinel: sentinel(options),
             })
         },
@@ -546,13 +549,18 @@ fn produce_coarse_levels(
                         chunk[1] * inner[1],
                         chunk[2] * inner[2],
                     ];
-                    let source_origin = target_origin.map(|value| value * 2);
+                    let mut source_origin = [0; 3];
                     let mut source_extent = [0; 3];
                     for axis in 0..3 {
-                        source_extent[axis] = (target_extent[axis] * 2)
+                        source_origin[axis] = target_origin[axis]
+                            .checked_mul(2)
+                            .ok_or(ImportError::Overflow)?;
+                        source_extent[axis] = target_extent[axis]
+                            .checked_mul(2)
+                            .ok_or(ImportError::Overflow)?
                             .min(previous_shape[axis] - source_origin[axis]);
                     }
-                    let source_chunks = describe_spooled_region(
+                    let pixel_source_chunks = describe_spooled_region(
                         spool,
                         plan,
                         scale - 1,
@@ -560,19 +568,61 @@ fn produce_coarse_levels(
                         u64::from(coordinates.c()),
                         source_origin,
                         source_extent,
+                        pyramid_pixel_source_chunks_max(plan.is_2d),
                     )?;
+                    let target_level_shape = [shape.z(), shape.y(), shape.x()];
+                    let (validity_origin, validity_extent, validity_source_chunks) =
+                        if plan.explicit_validity {
+                            let target_halo = clipped_halo(
+                                Region3 {
+                                    origin: target_origin,
+                                    shape: target_extent,
+                                },
+                                target_level_shape,
+                                invalid_dilation_radius(target_level_shape),
+                            )?;
+                            let mut validity_origin = [0; 3];
+                            let mut validity_extent = [0; 3];
+                            for axis in 0..3 {
+                                validity_origin[axis] = target_halo.origin[axis]
+                                    .checked_mul(2)
+                                    .ok_or(ImportError::Overflow)?;
+                                validity_extent[axis] = target_halo.shape[axis]
+                                    .checked_mul(2)
+                                    .ok_or(ImportError::Overflow)?
+                                    .min(previous_shape[axis] - validity_origin[axis]);
+                            }
+                            let chunks = describe_spooled_region(
+                                spool,
+                                plan,
+                                scale - 1,
+                                u64::from(coordinates.t()),
+                                u64::from(coordinates.c()),
+                                validity_origin,
+                                validity_extent,
+                                pyramid_validity_source_chunks_max(plan.is_2d),
+                            )?;
+                            (validity_origin, validity_extent, chunks)
+                        } else {
+                            (source_origin, source_extent, Vec::new())
+                        };
                     Ok(PyramidChunkCpuTask {
                         key,
                         dtype: options.inspection.dtype,
                         is_2d: plan.is_2d,
                         payload: Arc::clone(&payload),
-                        source_chunks,
+                        pixel_source_chunks,
+                        validity_source_chunks,
                         source_level_shape_zyx: previous_shape,
                         source_origin_zyx: source_origin,
                         source_shape_zyx: source_extent,
+                        validity_origin_zyx: validity_origin,
+                        validity_shape_zyx: validity_extent,
                         pixel_kind: plan.pixel_kind,
                         validity_kind: plan.validity_kind,
                         explicit_validity: plan.explicit_validity,
+                        target_level_shape_zyx: target_level_shape,
+                        target_origin_zyx: target_origin,
                         target_shape_zyx: target_extent,
                     })
                 },
@@ -610,6 +660,7 @@ fn describe_spooled_region(
     c: u64,
     origin: [u64; 3],
     extent: [u64; 3],
+    maximum_chunks: usize,
 ) -> Result<Vec<PyramidSourceChunk>, ImportError> {
     let inner = chunk_shape(plan.is_2d);
     let start = [
@@ -622,7 +673,17 @@ fn describe_spooled_region(
         (origin[1] + extent[1] - 1) / inner[1],
         (origin[2] + extent[2] - 1) / inner[2],
     ];
-    let mut chunks = Vec::with_capacity(if plan.is_2d { 4 } else { 8 });
+    let capacity = (0..3).try_fold(1_u64, |product, axis| {
+        product.checked_mul(end[axis] - start[axis] + 1)
+    });
+    let capacity = usize::try_from(capacity.ok_or(ImportError::Overflow)?)
+        .map_err(|_| ImportError::Overflow)?;
+    if capacity > maximum_chunks {
+        return Err(ImportError::InvalidCheckpoint(
+            "a coarse-level source region exceeds its charged parent-descriptor bound".to_owned(),
+        ));
+    }
+    let mut chunks = Vec::with_capacity(capacity);
     for z in start[0]..=end[0] {
         for y in start[1]..=end[1] {
             for x in start[2]..=end[2] {
@@ -663,7 +724,8 @@ fn hash_scientific_content(
     .map_err(|_| ImportError::InvalidRequest("spatial calibration is not a valid transform"))?;
     let mut dataset = ScientificDatasetHasher::new(options.inspection.channels)?;
     let canonical_reader = Arc::new(canonical.reader()?);
-    let task_charge = scientific_task_charge_bytes(options.inspection.dtype)?;
+    let task_charge =
+        scientific_task_charge_bytes(options.inspection.dtype, options.no_data.is_some())?;
     let policy = OrderedWorkerPolicy::for_system(
         options.working_memory_bytes,
         resident_working_bytes,
@@ -712,6 +774,7 @@ fn hash_scientific_content(
                     channel,
                     origin_tzyx: [t, z, y, x],
                     extent_tzyx: [1, extent[0], extent[1], extent[2]],
+                    source_shape_zyx: [shape.z(), shape.y(), shape.x()],
                     u8_sentinel: sentinel(options),
                 })
             },
@@ -1362,6 +1425,7 @@ mod tests {
                 inspection.clone(),
                 serial_destination.clone(),
                 temporary.path().join("serial.checkpoint"),
+                None,
             )
         });
         let parallel_destination = temporary.path().join("parallel.m4d");
@@ -1370,6 +1434,7 @@ mod tests {
                 inspection,
                 parallel_destination.clone(),
                 temporary.path().join("parallel.checkpoint"),
+                None,
             )
         });
 
@@ -1379,6 +1444,56 @@ mod tests {
         let parallel_closure = package_closure(&parallel_destination);
         assert!(!serial_closure.is_empty());
         assert_eq!(serial_closure, parallel_closure);
+    }
+
+    #[test]
+    fn guarded_sentinel_pyramid_is_deterministic_across_worker_counts() {
+        let temporary = tempdir().unwrap();
+        let source = temporary.path().join("sentinel-wide.tif");
+        let (width, height) = (257_u32, 17_u32);
+        let values = (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    if (x + 3 * y).is_multiple_of(97) {
+                        255
+                    } else {
+                        u8::try_from((11 * x + 7 * y) % 255).unwrap()
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let file = fs::File::create(&source).unwrap();
+        TiffEncoder::new(file)
+            .unwrap()
+            .write_image::<colortype::Gray8>(width, height, &values)
+            .unwrap();
+        let inspection = crate::source::inspect(TiffSource::auto(&source)).unwrap();
+
+        let serial_destination = temporary.path().join("sentinel-serial.m4d");
+        let serial = crate::ordered_workers::with_test_worker_count(1, || {
+            import_with_test_policy(
+                inspection.clone(),
+                serial_destination.clone(),
+                temporary.path().join("sentinel-serial.checkpoint"),
+                Some(NoDataPolicy::U8Sentinel(255)),
+            )
+        });
+        let parallel_destination = temporary.path().join("sentinel-parallel.m4d");
+        let parallel = crate::ordered_workers::with_test_worker_count(4, || {
+            import_with_test_policy(
+                inspection,
+                parallel_destination.clone(),
+                temporary.path().join("sentinel-parallel.checkpoint"),
+                Some(NoDataPolicy::U8Sentinel(255)),
+            )
+        });
+
+        assert_eq!(serial.scientific_content_id, parallel.scientific_content_id);
+        assert_eq!(serial.package_id, parallel.package_id);
+        assert_eq!(
+            package_closure(&serial_destination),
+            package_closure(&parallel_destination)
+        );
     }
 
     #[test]
@@ -1474,6 +1589,7 @@ mod tests {
         inspection: TiffInspection,
         destination: PathBuf,
         checkpoint_directory: PathBuf,
+        no_data: Option<NoDataPolicy>,
     ) -> ImportReceipt {
         run(
             ImportOptions {
@@ -1483,7 +1599,7 @@ mod tests {
                 profile: ProfileKind::Ds0,
                 calibration: crate::SpatialCalibration::new([1.0; 3]),
                 time_step_seconds: None,
-                no_data: None,
+                no_data,
                 working_memory_bytes: 512 * 1024 * 1024,
             },
             &TestLedger,

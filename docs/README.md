@@ -22,10 +22,14 @@ Agents must also follow the [agent guide](AGENTS.md). Dependency-policy
 exceptions have one separate tool-owned
 [ledger](DEPENDENCY_EXCEPTIONS.md).
 
-## Deferred Plans
+## Plans
 
-No implementation handoff is currently active. [Current
-work](planning/NOW.md) records a selected checkpoint when one is approved.
+One corrective closeout plan remains active. Its semantic cutover is
+implemented; qualification and real-dataset product validation remain:
+
+- [uint8 sentinel no-data restoration](plans/active/UINT8_SENTINEL_NO_DATA_RESTORATION.md).
+
+[Current work](planning/NOW.md) owns its checkpoint status.
 
 Two future outcomes remain deliberately separate from ordinary development:
 

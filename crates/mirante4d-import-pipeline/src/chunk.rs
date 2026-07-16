@@ -168,19 +168,7 @@ pub(crate) fn prepare_chunk(
     })
 }
 
-pub(crate) fn normalize_u8_sentinel(pixels: &mut [u8], sentinel: u8) -> Vec<u8> {
-    pixels
-        .iter_mut()
-        .map(|value| {
-            let valid = *value != sentinel;
-            if !valid {
-                *value = 0;
-            }
-            u8::from(valid)
-        })
-        .collect()
-}
-
+#[cfg(test)]
 pub(crate) fn unpack_validity(
     packed: &[u8],
     logical_shape_zyx: [u64; 3],
@@ -463,14 +451,6 @@ mod tests {
             prepared.record.statistics().numeric_range_bits(),
             Some((0, 0))
         );
-    }
-
-    #[test]
-    fn sentinel_normalization_uses_scientific_zero_for_invalid_samples() {
-        let mut pixels = [4, 255, 8];
-        let validity = normalize_u8_sentinel(&mut pixels, 255);
-        assert_eq!(pixels, [4, 0, 8]);
-        assert_eq!(validity, [1, 0, 1]);
     }
 
     #[test]

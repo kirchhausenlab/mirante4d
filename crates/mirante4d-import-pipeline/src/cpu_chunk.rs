@@ -1,6 +1,6 @@
 //! Bounded base/pyramid CPU tasks and canonical inner encoding.
 
-use std::{sync::Arc, time::Instant};
+use std::{mem::size_of, sync::Arc, time::Instant};
 
 use mirante4d_domain::IntensityDType;
 use mirante4d_identity::{
@@ -16,9 +16,13 @@ use crate::{
     canonical_cache::CanonicalBaseReader,
     chunk::{
         PreparedChunk, checked_voxels, chunk_extent, chunk_shape, compact_byte_len,
-        copy_padded_region, normalize_u8_sentinel, prepare_chunk, unpack_validity,
+        copy_padded_region, prepare_chunk, validity_kind,
     },
     pyramid::downsample_region,
+    sentinel::{
+        GuardedU8Region, Region3, clipped_halo, downsample_guarded_u8, guarded_u8_core,
+        invalid_dilation_radius,
+    },
     spool::{SpoolPayloadReader, SpoolWorkUnitDescriptor, SpoolWorkUnitKey},
 };
 
@@ -37,6 +41,7 @@ pub(crate) struct BaseChunkCpuTask {
     pub(crate) channel: u32,
     pub(crate) timepoint: u64,
     pub(crate) origin_zyx: [u64; 3],
+    pub(crate) source_shape_zyx: [u64; 3],
     pub(crate) u8_sentinel: Option<u8>,
 }
 
@@ -51,14 +56,27 @@ pub(crate) struct PyramidChunkCpuTask {
     pub(crate) dtype: IntensityDType,
     pub(crate) is_2d: bool,
     pub(crate) payload: Arc<SpoolPayloadReader>,
-    pub(crate) source_chunks: Vec<PyramidSourceChunk>,
+    pub(crate) pixel_source_chunks: Vec<PyramidSourceChunk>,
+    pub(crate) validity_source_chunks: Vec<PyramidSourceChunk>,
     pub(crate) source_level_shape_zyx: [u64; 3],
     pub(crate) source_origin_zyx: [u64; 3],
     pub(crate) source_shape_zyx: [u64; 3],
+    pub(crate) validity_origin_zyx: [u64; 3],
+    pub(crate) validity_shape_zyx: [u64; 3],
     pub(crate) pixel_kind: ShardProfileKind,
     pub(crate) validity_kind: ShardProfileKind,
     pub(crate) explicit_validity: bool,
+    pub(crate) target_level_shape_zyx: [u64; 3],
+    pub(crate) target_origin_zyx: [u64; 3],
     pub(crate) target_shape_zyx: [u64; 3],
+}
+
+pub(crate) const fn pyramid_pixel_source_chunks_max(is_2d: bool) -> usize {
+    if is_2d { 4 } else { 8 }
+}
+
+pub(crate) const fn pyramid_validity_source_chunks_max(is_2d: bool) -> usize {
+    if is_2d { 16 } else { 64 }
 }
 
 pub(crate) struct ScientificTileCpuTask {
@@ -68,6 +86,7 @@ pub(crate) struct ScientificTileCpuTask {
     pub(crate) channel: u32,
     pub(crate) origin_tzyx: [u64; 4],
     pub(crate) extent_tzyx: [u64; 4],
+    pub(crate) source_shape_zyx: [u64; 3],
     pub(crate) u8_sentinel: Option<u8>,
 }
 
@@ -94,18 +113,39 @@ pub(crate) fn prepare_base_chunk(
     cancellation: &ImportCancellation,
 ) -> Result<EncodedPreparedWorkUnit, ImportError> {
     check_cancelled(cancellation)?;
-    let mut pixels_le = vec![0; compact_byte_len(task.dtype, task.logical_shape_zyx)?];
-    task.canonical.read_region_into(
-        task.channel,
-        task.timepoint,
-        task.origin_zyx,
-        task.logical_shape_zyx,
-        &mut pixels_le,
-    )?;
+    let (pixels_le, validity) = match task.u8_sentinel {
+        Some(sentinel) => {
+            if task.dtype != IntensityDType::Uint8 {
+                return Err(ImportError::InvalidRequest(
+                    "the guarded sentinel policy requires uint8 pixels",
+                ));
+            }
+            let guarded = read_guarded_u8_core(
+                &task.canonical,
+                task.channel,
+                task.timepoint,
+                task.source_shape_zyx,
+                Region3 {
+                    origin: task.origin_zyx,
+                    shape: task.logical_shape_zyx,
+                },
+                sentinel,
+            )?;
+            (guarded.pixels, Some(guarded.validity))
+        }
+        None => {
+            let mut pixels = vec![0; compact_byte_len(task.dtype, task.logical_shape_zyx)?];
+            task.canonical.read_region_into(
+                task.channel,
+                task.timepoint,
+                task.origin_zyx,
+                task.logical_shape_zyx,
+                &mut pixels,
+            )?;
+            (pixels, None)
+        }
+    };
     check_cancelled(cancellation)?;
-    let validity = task
-        .u8_sentinel
-        .map(|sentinel| normalize_u8_sentinel(&mut pixels_le, sentinel));
     let prepared = prepare_chunk(
         task.key.coordinates(),
         task.dtype,
@@ -132,25 +172,53 @@ pub(crate) fn prepare_pyramid_chunk(
 ) -> Result<EncodedPreparedWorkUnit, ImportError> {
     check_cancelled(cancellation)?;
     let decoded = read_spooled_region(&task, cancellation)?;
-    let downsampled = downsample_region(
-        task.dtype,
-        task.source_shape_zyx,
-        &decoded.pixels_le,
-        decoded.validity.as_deref(),
-    )?;
-    if downsampled.shape_zyx != task.target_shape_zyx {
-        return Err(ImportError::InvalidCheckpoint(
-            "coarse chunk shape differs from its import plan".to_owned(),
-        ));
-    }
+    let (pixels_le, validity) = if task.explicit_validity {
+        if task.dtype != IntensityDType::Uint8 {
+            return Err(ImportError::InvalidRequest(
+                "the guarded pyramid policy requires uint8 pixels",
+            ));
+        }
+        let parent_validity = decoded.validity.as_deref().ok_or_else(|| {
+            ImportError::InvalidCheckpoint(
+                "a guarded pyramid task has no parent validity".to_owned(),
+            )
+        })?;
+        let guarded = downsample_guarded_u8(
+            &decoded.pixels_le,
+            Region3 {
+                origin: task.source_origin_zyx,
+                shape: task.source_shape_zyx,
+            },
+            parent_validity,
+            Region3 {
+                origin: task.validity_origin_zyx,
+                shape: task.validity_shape_zyx,
+            },
+            task.source_level_shape_zyx,
+            task.target_level_shape_zyx,
+            Region3 {
+                origin: task.target_origin_zyx,
+                shape: task.target_shape_zyx,
+            },
+        )?;
+        (guarded.pixels, Some(guarded.validity))
+    } else {
+        let downsampled = downsample_region(task.dtype, task.source_shape_zyx, &decoded.pixels_le)?;
+        if downsampled.shape_zyx != task.target_shape_zyx {
+            return Err(ImportError::InvalidCheckpoint(
+                "coarse chunk shape differs from its import plan".to_owned(),
+            ));
+        }
+        (downsampled.pixels_le, None)
+    };
     check_cancelled(cancellation)?;
     let prepared = prepare_chunk(
         task.key.coordinates(),
         task.dtype,
         task.is_2d,
         task.target_shape_zyx,
-        &downsampled.pixels_le,
-        downsampled.validity.as_deref(),
+        &pixels_le,
+        validity.as_deref(),
     )?;
     check_cancelled(cancellation)?;
     encode_prepared(
@@ -174,23 +242,45 @@ pub(crate) fn prepare_scientific_tile(
         task.extent_tzyx[2],
         task.extent_tzyx[3],
     ];
-    let mut pixels = vec![0; compact_byte_len(task.descriptor.dtype(), extent)?];
-    task.canonical.read_region_into(
-        task.channel,
-        task.origin_tzyx[0],
-        [
+    let core = Region3 {
+        origin: [
             task.origin_tzyx[1],
             task.origin_tzyx[2],
             task.origin_tzyx[3],
         ],
-        extent,
-        &mut pixels,
-    )?;
-    check_cancelled(cancellation)?;
-    let per_voxel_validity = match task.u8_sentinel {
-        Some(sentinel) => normalize_u8_sentinel(&mut pixels, sentinel),
-        None => vec![1; checked_voxels(extent)?],
+        shape: extent,
     };
+    let (pixels, per_voxel_validity) = match task.u8_sentinel {
+        Some(sentinel) => {
+            if task.descriptor.dtype() != IntensityDType::Uint8 {
+                return Err(ImportError::InvalidRequest(
+                    "the guarded scientific sentinel policy requires uint8 pixels",
+                ));
+            }
+            let guarded = read_guarded_u8_core(
+                &task.canonical,
+                task.channel,
+                task.origin_tzyx[0],
+                task.source_shape_zyx,
+                core,
+                sentinel,
+            )?;
+            (guarded.pixels, guarded.validity)
+        }
+        None => {
+            let mut pixels = vec![0; compact_byte_len(task.descriptor.dtype(), extent)?];
+            task.canonical.read_region_into(
+                task.channel,
+                task.origin_tzyx[0],
+                core.origin,
+                extent,
+                &mut pixels,
+            )?;
+            let validity = vec![1; checked_voxels(extent)?];
+            (pixels, validity)
+        }
+    };
+    check_cancelled(cancellation)?;
     let validity = pack_scientific_validity(&per_voxel_validity)?;
     let hasher = ScientificLayerHasher::new(task.descriptor)?;
     let prepared = hasher.prepare_tile(
@@ -199,6 +289,30 @@ pub(crate) fn prepare_scientific_tile(
     )?;
     check_cancelled(cancellation)?;
     Ok(prepared)
+}
+
+fn read_guarded_u8_core(
+    canonical: &CanonicalBaseReader,
+    channel: u32,
+    timepoint: u64,
+    source_shape_zyx: [u64; 3],
+    core: Region3,
+    sentinel: u8,
+) -> Result<GuardedU8Region, ImportError> {
+    let window = clipped_halo(
+        core,
+        source_shape_zyx,
+        invalid_dilation_radius(source_shape_zyx),
+    )?;
+    let mut window_pixels = vec![0; checked_voxels(window.shape)?];
+    canonical.read_region_into(
+        channel,
+        timepoint,
+        window.origin,
+        window.shape,
+        &mut window_pixels,
+    )?;
+    guarded_u8_core(&window_pixels, window, source_shape_zyx, core, sentinel)
 }
 
 fn encode_prepared(
@@ -263,58 +377,41 @@ fn read_spooled_region(
 ) -> Result<DecodedSpoolRegion, ImportError> {
     let width = usize::from(task.dtype.bytes_per_sample());
     let mut pixels = vec![0; compact_byte_len(task.dtype, task.source_shape_zyx)?];
-    let mut validity = task
-        .explicit_validity
-        .then(|| vec![0; checked_voxels(task.source_shape_zyx).expect("shape was checked")]);
     let inner = chunk_shape(task.is_2d);
     let mut codec_decode_calls = 0_u64;
     let mut codec_decode_time_ns = 0_u64;
-    for source in &task.source_chunks {
+    for source in &task.pixel_source_chunks {
         check_cancelled(cancellation)?;
-        let decoded = task.payload.read_work_unit(source.descriptor)?;
-        codec_decode_calls = codec_decode_calls
-            .checked_add(decoded.codec_decode_calls)
-            .ok_or(ImportError::Overflow)?;
-        codec_decode_time_ns = codec_decode_time_ns
-            .checked_add(decoded.codec_decode_time_ns)
-            .ok_or(ImportError::Overflow)?;
-        let unit = decoded.unit;
         let logical = chunk_extent(task.source_level_shape_zyx, source.chunk_zyx, task.is_2d)?;
         let capacity =
             u64::try_from(checked_voxels(logical)?).map_err(|_| ImportError::Overflow)?;
-        let record = PackedIndexRecord::decode(&unit.packed_index, task.dtype, capacity).map_err(
-            |error| {
-                ImportError::InvalidCheckpoint(format!("a packed-index record is invalid: {error}"))
-            },
-        )?;
+        let record = source
+            .descriptor
+            .packed_index_record(task.dtype, capacity)?;
         let chunk_origin = [
             source.chunk_zyx[0] * inner[0],
             source.chunk_zyx[1] * inner[1],
             source.chunk_zyx[2] * inner[2],
         ];
-        let mut overlap_origin = [0; 3];
-        let mut overlap_end = [0; 3];
-        for axis in 0..3 {
-            overlap_origin[axis] = task.source_origin_zyx[axis].max(chunk_origin[axis]);
-            overlap_end[axis] = (task.source_origin_zyx[axis] + task.source_shape_zyx[axis])
-                .min(chunk_origin[axis] + logical[axis]);
-        }
-        let overlap = [
-            overlap_end[0] - overlap_origin[0],
-            overlap_end[1] - overlap_origin[1],
-            overlap_end[2] - overlap_origin[2],
-        ];
-        let source_local = [
-            overlap_origin[0] - chunk_origin[0],
-            overlap_origin[1] - chunk_origin[1],
-            overlap_origin[2] - chunk_origin[2],
-        ];
-        let destination_local = [
-            overlap_origin[0] - task.source_origin_zyx[0],
-            overlap_origin[1] - task.source_origin_zyx[1],
-            overlap_origin[2] - task.source_origin_zyx[2],
-        ];
-        if let Some(pixel) = unit.pixel {
+        let overlap = region_overlap(
+            chunk_origin,
+            logical,
+            task.source_origin_zyx,
+            task.source_shape_zyx,
+        )?
+        .ok_or_else(|| {
+            ImportError::InvalidCheckpoint(
+                "a described pixel source chunk does not overlap its region".to_owned(),
+            )
+        })?;
+        let decoded = task.payload.read_pixel_component(source.descriptor)?;
+        accumulate_decode_metrics(
+            &mut codec_decode_calls,
+            &mut codec_decode_time_ns,
+            decoded.codec_decode_calls,
+            decoded.codec_decode_time_ns,
+        )?;
+        if let Some(pixel) = decoded.chunk {
             if pixel.kind != task.pixel_kind {
                 return Err(ImportError::InvalidCheckpoint(
                     "a spooled pixel chunk has the wrong storage kind".to_owned(),
@@ -323,54 +420,260 @@ fn read_spooled_region(
             copy_padded_region(
                 &pixel.decoded,
                 inner,
-                source_local,
-                overlap,
+                overlap.source_local,
+                overlap.shape,
                 width,
                 &mut pixels,
                 task.source_shape_zyx,
-                destination_local,
+                overlap.destination_local,
             )?;
         } else if record.pixel_payload_present() {
             return Err(ImportError::InvalidCheckpoint(
                 "a required spooled pixel chunk is absent".to_owned(),
             ));
         }
+    }
 
-        if let Some(destination) = validity.as_mut() {
-            let compact = match unit.validity {
-                Some(validity) => {
-                    if validity.kind != task.validity_kind {
-                        return Err(ImportError::InvalidCheckpoint(
-                            "a spooled validity chunk has the wrong storage kind".to_owned(),
-                        ));
-                    }
-                    unpack_validity(&validity.decoded, logical, task.is_2d)?
-                }
-                None if record.all_voxels_valid() => vec![1; checked_voxels(logical)?],
-                None if record.all_voxels_invalid() => vec![0; checked_voxels(logical)?],
-                None => {
-                    return Err(ImportError::InvalidCheckpoint(
-                        "an explicit-validity record has no effective mask".to_owned(),
-                    ));
-                }
-            };
-            copy_mask_region(
-                &compact,
+    let validity = if task.explicit_validity {
+        let mut destination = vec![0; checked_voxels(task.validity_shape_zyx)?];
+        for source in &task.validity_source_chunks {
+            check_cancelled(cancellation)?;
+            let logical = chunk_extent(task.source_level_shape_zyx, source.chunk_zyx, task.is_2d)?;
+            let capacity =
+                u64::try_from(checked_voxels(logical)?).map_err(|_| ImportError::Overflow)?;
+            let record = source
+                .descriptor
+                .packed_index_record(task.dtype, capacity)?;
+            if !record.explicit_validity() {
+                return Err(ImportError::InvalidCheckpoint(
+                    "a guarded pyramid source has no explicit validity".to_owned(),
+                ));
+            }
+            let chunk_origin = [
+                source.chunk_zyx[0] * inner[0],
+                source.chunk_zyx[1] * inner[1],
+                source.chunk_zyx[2] * inner[2],
+            ];
+            let overlap = region_overlap(
+                chunk_origin,
                 logical,
-                source_local,
-                overlap,
-                destination,
-                task.source_shape_zyx,
-                destination_local,
+                task.validity_origin_zyx,
+                task.validity_shape_zyx,
+            )?
+            .ok_or_else(|| {
+                ImportError::InvalidCheckpoint(
+                    "a described validity source chunk does not overlap its region".to_owned(),
+                )
+            })?;
+            if record.all_voxels_valid() {
+                fill_mask_region(
+                    &mut destination,
+                    task.validity_shape_zyx,
+                    overlap.destination_local,
+                    overlap.shape,
+                    1,
+                )?;
+                continue;
+            }
+            if record.all_voxels_invalid() {
+                continue;
+            }
+            let decoded = task.payload.read_validity_component(source.descriptor)?;
+            accumulate_decode_metrics(
+                &mut codec_decode_calls,
+                &mut codec_decode_time_ns,
+                decoded.codec_decode_calls,
+                decoded.codec_decode_time_ns,
+            )?;
+            let packed = decoded.chunk.ok_or_else(|| {
+                ImportError::InvalidCheckpoint(
+                    "a mixed-validity source has no validity component".to_owned(),
+                )
+            })?;
+            if packed.kind != task.validity_kind {
+                return Err(ImportError::InvalidCheckpoint(
+                    "a spooled validity chunk has the wrong storage kind".to_owned(),
+                ));
+            }
+            copy_packed_mask_region(
+                &packed.decoded,
+                inner,
+                logical,
+                overlap.source_local,
+                overlap.shape,
+                &mut destination,
+                task.validity_shape_zyx,
+                overlap.destination_local,
+                task.is_2d,
             )?;
         }
-    }
+        Some(destination)
+    } else {
+        None
+    };
     Ok(DecodedSpoolRegion {
         pixels_le: pixels,
         validity,
         codec_decode_calls,
         codec_decode_time_ns,
     })
+}
+
+#[derive(Clone, Copy)]
+struct RegionOverlap {
+    source_local: [u64; 3],
+    destination_local: [u64; 3],
+    shape: [u64; 3],
+}
+
+fn region_overlap(
+    source_origin: [u64; 3],
+    source_shape: [u64; 3],
+    destination_origin: [u64; 3],
+    destination_shape: [u64; 3],
+) -> Result<Option<RegionOverlap>, ImportError> {
+    let mut overlap_origin = [0; 3];
+    let mut overlap_end = [0; 3];
+    for axis in 0..3 {
+        let source_end = source_origin[axis]
+            .checked_add(source_shape[axis])
+            .ok_or(ImportError::Overflow)?;
+        let destination_end = destination_origin[axis]
+            .checked_add(destination_shape[axis])
+            .ok_or(ImportError::Overflow)?;
+        overlap_origin[axis] = source_origin[axis].max(destination_origin[axis]);
+        overlap_end[axis] = source_end.min(destination_end);
+        if overlap_origin[axis] >= overlap_end[axis] {
+            return Ok(None);
+        }
+    }
+    Ok(Some(RegionOverlap {
+        source_local: [
+            overlap_origin[0] - source_origin[0],
+            overlap_origin[1] - source_origin[1],
+            overlap_origin[2] - source_origin[2],
+        ],
+        destination_local: [
+            overlap_origin[0] - destination_origin[0],
+            overlap_origin[1] - destination_origin[1],
+            overlap_origin[2] - destination_origin[2],
+        ],
+        shape: [
+            overlap_end[0] - overlap_origin[0],
+            overlap_end[1] - overlap_origin[1],
+            overlap_end[2] - overlap_origin[2],
+        ],
+    }))
+}
+
+fn accumulate_decode_metrics(
+    total_calls: &mut u64,
+    total_time_ns: &mut u64,
+    calls: u64,
+    time_ns: u64,
+) -> Result<(), ImportError> {
+    *total_calls = total_calls
+        .checked_add(calls)
+        .ok_or(ImportError::Overflow)?;
+    *total_time_ns = total_time_ns
+        .checked_add(time_ns)
+        .ok_or(ImportError::Overflow)?;
+    Ok(())
+}
+
+fn fill_mask_region(
+    destination: &mut [u8],
+    destination_shape: [u64; 3],
+    destination_origin: [u64; 3],
+    extent: [u64; 3],
+    value: u8,
+) -> Result<(), ImportError> {
+    if !matches!(value, 0 | 1) || destination.len() != checked_voxels(destination_shape)? {
+        return Err(ImportError::InvalidCheckpoint(
+            "validity fill region is malformed".to_owned(),
+        ));
+    }
+    for z in 0..extent[0] {
+        for y in 0..extent[1] {
+            for x in 0..extent[2] {
+                let index = linear_index(
+                    destination_shape,
+                    [
+                        destination_origin[0] + z,
+                        destination_origin[1] + y,
+                        destination_origin[2] + x,
+                    ],
+                )?;
+                destination[index] = value;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_packed_mask_region(
+    packed: &[u8],
+    inner: [u64; 3],
+    logical: [u64; 3],
+    source_origin: [u64; 3],
+    extent: [u64; 3],
+    destination: &mut [u8],
+    destination_shape: [u64; 3],
+    destination_origin: [u64; 3],
+    is_2d: bool,
+) -> Result<(), ImportError> {
+    if packed.len() != validity_kind(is_2d).decoded_inner_bytes()
+        || destination.len() != checked_voxels(destination_shape)?
+    {
+        return Err(ImportError::InvalidCheckpoint(
+            "packed validity region is malformed".to_owned(),
+        ));
+    }
+    for axis in 0..3 {
+        if source_origin[axis]
+            .checked_add(extent[axis])
+            .is_none_or(|end| end > logical[axis])
+            || destination_origin[axis]
+                .checked_add(extent[axis])
+                .is_none_or(|end| end > destination_shape[axis])
+        {
+            return Err(ImportError::InvalidCheckpoint(
+                "packed validity overlap lies outside its region".to_owned(),
+            ));
+        }
+    }
+    let row_bytes = usize::try_from(inner[2].div_ceil(8)).map_err(|_| ImportError::Overflow)?;
+    for z in 0..extent[0] {
+        for y in 0..extent[1] {
+            let source_z = source_origin[0] + z;
+            let source_y = source_origin[1] + y;
+            let row = usize::try_from(
+                source_z
+                    .checked_mul(inner[1])
+                    .and_then(|value| value.checked_add(source_y))
+                    .ok_or(ImportError::Overflow)?,
+            )
+            .map_err(|_| ImportError::Overflow)?;
+            let row_offset = row.checked_mul(row_bytes).ok_or(ImportError::Overflow)?;
+            for x in 0..extent[2] {
+                let source_x = source_origin[2] + x;
+                let byte = usize::try_from(source_x / 8).map_err(|_| ImportError::Overflow)?;
+                let bit = u8::try_from(source_x % 8).expect("modulo eight fits u8");
+                let valid = u8::from(packed[row_offset + byte] & (1 << bit) != 0);
+                let destination_index = linear_index(
+                    destination_shape,
+                    [
+                        destination_origin[0] + z,
+                        destination_origin[1] + y,
+                        destination_origin[2] + x,
+                    ],
+                )?;
+                destination[destination_index] = valid;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn encode_one(
@@ -387,14 +690,28 @@ fn encode_one(
 pub(crate) fn base_task_charge_bytes(
     dtype: IntensityDType,
     pixel_kind: ShardProfileKind,
-    validity_kind: ShardProfileKind,
+    validity_profile: ShardProfileKind,
     explicit_validity: bool,
 ) -> Result<u64, ImportError> {
     let pixel_inner = as_u64(pixel_kind.decoded_inner_bytes())?;
     let pixel_encoded = as_u64(pixel_kind.encoded_inner_bytes_max())?;
-    let mut bytes = pixel_inner
-        .checked_add(pixel_inner)
-        .and_then(|value| value.checked_add(pixel_encoded))
+    let compact_source = if explicit_validity {
+        maximum_base_halo_voxels(validity_profile)?
+            .checked_mul(u64::from(dtype.bytes_per_sample()))
+            .ok_or(ImportError::Overflow)?
+    } else {
+        pixel_inner
+    };
+    let decoded_pixels = if explicit_validity {
+        compact_source
+            .checked_add(pixel_inner) // cropped compact target
+            .and_then(|value| value.checked_add(pixel_inner)) // padded target
+            .ok_or(ImportError::Overflow)?
+    } else {
+        pixel_inner.checked_mul(2).ok_or(ImportError::Overflow)?
+    };
+    let mut bytes = decoded_pixels
+        .checked_add(pixel_encoded)
         .and_then(|value| value.checked_add(INNER_CODEC_WORKING_BYTES_MAX))
         .and_then(|value| value.checked_add(TASK_AND_QUEUE_METADATA_BYTES))
         .ok_or(ImportError::Overflow)?;
@@ -402,9 +719,11 @@ pub(crate) fn base_task_charge_bytes(
         let logical_voxels = pixel_inner / u64::from(dtype.bytes_per_sample());
         bytes = bytes
             .checked_add(logical_voxels)
-            .and_then(|value| value.checked_add(as_u64(validity_kind.decoded_inner_bytes()).ok()?))
             .and_then(|value| {
-                value.checked_add(as_u64(validity_kind.encoded_inner_bytes_max()).ok()?)
+                value.checked_add(as_u64(validity_profile.decoded_inner_bytes()).ok()?)
+            })
+            .and_then(|value| {
+                value.checked_add(as_u64(validity_profile.encoded_inner_bytes_max()).ok()?)
             })
             .ok_or(ImportError::Overflow)?;
     }
@@ -414,100 +733,130 @@ pub(crate) fn base_task_charge_bytes(
 pub(crate) fn pyramid_task_charge_bytes(
     dtype: IntensityDType,
     pixel_kind: ShardProfileKind,
-    validity_kind: ShardProfileKind,
+    validity_profile: ShardProfileKind,
     is_2d: bool,
     explicit_validity: bool,
 ) -> Result<u64, ImportError> {
-    let source_multiplier = if is_2d { 4_u64 } else { 8_u64 };
+    let source_multiplier = pyramid_pixel_source_chunks_max(is_2d) as u64;
+    let descriptor_multiplier = if explicit_validity {
+        source_multiplier + pyramid_validity_source_chunks_max(is_2d) as u64
+    } else {
+        source_multiplier
+    };
     let pixel_inner = as_u64(pixel_kind.decoded_inner_bytes())?;
     let pixel_encoded = as_u64(pixel_kind.encoded_inner_bytes_max())?;
     let mut bytes = pixel_inner
         .checked_mul(source_multiplier)
         .and_then(|value| value.checked_add(pixel_inner)) // one decoded spool chunk
-        .and_then(|value| value.checked_add(pixel_encoded)) // one encoded spool chunk
+        .and_then(|value| value.checked_add(pixel_encoded)) // encoded source component
         .and_then(|value| value.checked_add(pixel_inner)) // compact target
         .and_then(|value| value.checked_add(pixel_inner)) // padded target
-        .and_then(|value| value.checked_add(pixel_encoded))
+        .and_then(|value| value.checked_add(pixel_encoded)) // encoded target component
         .and_then(|value| value.checked_add(INNER_CODEC_WORKING_BYTES_MAX))
+        .and_then(|value| {
+            value.checked_add(
+                u64::try_from(size_of::<PyramidSourceChunk>())
+                    .ok()?
+                    .checked_mul(descriptor_multiplier)?,
+            )
+        })
         .and_then(|value| value.checked_add(TASK_AND_QUEUE_METADATA_BYTES))
         .ok_or(ImportError::Overflow)?;
     if explicit_validity {
         let target_voxels = pixel_inner / u64::from(dtype.bytes_per_sample());
-        let validity_inner = as_u64(validity_kind.decoded_inner_bytes())?;
+        let validity_inner = as_u64(validity_profile.decoded_inner_bytes())?;
+        let parent_validity_voxels = maximum_parent_validity_halo_voxels(is_2d)?;
+        let target_support_voxels = maximum_target_support_halo_voxels(is_2d)?;
         bytes = bytes
-            .checked_add(
-                target_voxels
-                    .checked_mul(source_multiplier)
-                    .ok_or(ImportError::Overflow)?,
-            )
+            .checked_add(parent_validity_voxels)
             .and_then(|value| value.checked_add(validity_inner)) // decoded spool mask
             .and_then(|value| {
-                value.checked_add(as_u64(validity_kind.encoded_inner_bytes_max()).ok()?)
-            }) // encoded spool mask
+                value.checked_add(as_u64(validity_profile.encoded_inner_bytes_max()).ok()?)
+            }) // encoded source mask
+            .and_then(|value| value.checked_add(target_support_voxels))
             .and_then(|value| value.checked_add(target_voxels)) // target byte mask
             .and_then(|value| value.checked_add(validity_inner)) // packed target mask
             .and_then(|value| {
-                value.checked_add(as_u64(validity_kind.encoded_inner_bytes_max()).ok()?)
+                value.checked_add(as_u64(validity_profile.encoded_inner_bytes_max()).ok()?)
             })
             .ok_or(ImportError::Overflow)?;
     }
     Ok(bytes)
 }
 
-pub(crate) fn scientific_task_charge_bytes(dtype: IntensityDType) -> Result<u64, ImportError> {
+pub(crate) fn scientific_task_charge_bytes(
+    dtype: IntensityDType,
+    explicit_validity: bool,
+) -> Result<u64, ImportError> {
     let voxels = SCIENTIFIC_TILE_SHAPE_TZYX[1]
         .checked_mul(SCIENTIFIC_TILE_SHAPE_TZYX[2])
         .and_then(|value| value.checked_mul(SCIENTIFIC_TILE_SHAPE_TZYX[3]))
         .ok_or(ImportError::Overflow)?;
-    voxels
+    let source_voxels = if explicit_validity {
+        SCIENTIFIC_TILE_SHAPE_TZYX[1]
+            .checked_add(2)
+            .and_then(|z| {
+                SCIENTIFIC_TILE_SHAPE_TZYX[2]
+                    .checked_add(2)
+                    .and_then(|y| z.checked_mul(y))
+            })
+            .and_then(|zy| {
+                SCIENTIFIC_TILE_SHAPE_TZYX[3]
+                    .checked_add(2)
+                    .and_then(|x| zy.checked_mul(x))
+            })
+            .ok_or(ImportError::Overflow)?
+    } else {
+        voxels
+    };
+    source_voxels
         .checked_mul(u64::from(dtype.bytes_per_sample()))
+        .and_then(|value| {
+            if explicit_validity {
+                value.checked_add(voxels.checked_mul(u64::from(dtype.bytes_per_sample()))?)
+            } else {
+                Some(value)
+            }
+        })
         .and_then(|value| value.checked_add(voxels))
         .and_then(|value| value.checked_add(voxels.div_ceil(8)))
         .and_then(|value| value.checked_add(TASK_AND_QUEUE_METADATA_BYTES))
         .ok_or(ImportError::Overflow)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn copy_mask_region(
-    source: &[u8],
-    source_shape: [u64; 3],
-    source_origin: [u64; 3],
-    extent: [u64; 3],
-    destination: &mut [u8],
-    destination_shape: [u64; 3],
-    destination_origin: [u64; 3],
-) -> Result<(), ImportError> {
-    if source.len() != checked_voxels(source_shape)?
-        || destination.len() != checked_voxels(destination_shape)?
-    {
-        return Err(ImportError::InvalidCheckpoint(
-            "validity region length differs from its shape".to_owned(),
-        ));
-    }
-    for z in 0..extent[0] {
-        for y in 0..extent[1] {
-            for x in 0..extent[2] {
-                let source_index = linear_index(
-                    source_shape,
-                    [
-                        source_origin[0] + z,
-                        source_origin[1] + y,
-                        source_origin[2] + x,
-                    ],
-                )?;
-                let destination_index = linear_index(
-                    destination_shape,
-                    [
-                        destination_origin[0] + z,
-                        destination_origin[1] + y,
-                        destination_origin[2] + x,
-                    ],
-                )?;
-                destination[destination_index] = source[source_index];
-            }
-        }
-    }
-    Ok(())
+fn maximum_base_halo_voxels(validity_profile: ShardProfileKind) -> Result<u64, ImportError> {
+    let is_2d = validity_profile == ShardProfileKind::Validity2d;
+    let inner = chunk_shape(is_2d);
+    checked_product_u64([
+        if is_2d { 1 } else { inner[0] + 2 },
+        inner[1] + 2,
+        inner[2] + 2,
+    ])
+}
+
+fn maximum_parent_validity_halo_voxels(is_2d: bool) -> Result<u64, ImportError> {
+    let inner = chunk_shape(is_2d);
+    checked_product_u64([
+        if is_2d { 1 } else { inner[0] * 2 + 4 },
+        inner[1] * 2 + 4,
+        inner[2] * 2 + 4,
+    ])
+}
+
+fn maximum_target_support_halo_voxels(is_2d: bool) -> Result<u64, ImportError> {
+    let inner = chunk_shape(is_2d);
+    checked_product_u64([
+        if is_2d { 1 } else { inner[0] + 2 },
+        inner[1] + 2,
+        inner[2] + 2,
+    ])
+}
+
+fn checked_product_u64(values: [u64; 3]) -> Result<u64, ImportError> {
+    values
+        .into_iter()
+        .try_fold(1_u64, |product, value| product.checked_mul(value))
+        .ok_or(ImportError::Overflow)
 }
 
 fn linear_index(shape: [u64; 3], coordinate: [u64; 3]) -> Result<usize, ImportError> {
@@ -574,5 +923,9 @@ mod tests {
         assert!(base > 10 * 1024 * 1024);
         assert!(pyramid > 20 * 1024 * 1024);
         assert!(pyramid > base);
+        assert_eq!(pyramid_pixel_source_chunks_max(true), 4);
+        assert_eq!(pyramid_pixel_source_chunks_max(false), 8);
+        assert_eq!(pyramid_validity_source_chunks_max(true), 16);
+        assert_eq!(pyramid_validity_source_chunks_max(false), 64);
     }
 }

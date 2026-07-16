@@ -2,11 +2,14 @@ use std::{
     collections::BTreeSet,
     env, fs,
     fs::File,
-    io::Read,
+    io::{Read, Seek, SeekFrom, Write},
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -40,36 +43,42 @@ use crate::{
     reports::write_json_file,
 };
 
-const EVIDENCE_SCHEMA: &str = "mirante4d-import-performance-evidence-4";
-const WORKER_SCHEMA: &str = "mirante4d-import-performance-sample-4";
+const EVIDENCE_SCHEMA: &str = "mirante4d-import-performance-evidence-5";
+const WORKER_SCHEMA: &str = "mirante4d-import-performance-sample-5";
 const PUBLICATION_CURRENTNESS_CONTRACT_ID: &str =
     "mirante4d-publication-currentness-inventory-snapshot-inventory-1";
 const T2_Z: u32 = 65;
 const T2_Y: u32 = 1_025;
 const T2_X: u32 = 2_049;
 const T2_SENTINEL: u8 = 255;
+const T2_SCALE_FACT_SCHEME: &str = "mirante4d-t2-restored-sentinel-scale-fact-2";
+const T2_ORACLE_COMPUTE_SLAB_Z: usize = 64;
+const T2_ORACLE_COMPUTE_SLAB_Y: usize = 32;
+const T2_SCALE_FACT_SLAB_Z: usize = 64;
+const T2_SCALE_FACT_SLAB_Y: usize = 64;
+static T2_ORACLE_SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const T2_EXPECTED_SCIENTIFIC_CONTENT_ID: &str =
-    "m4d-sc-v1-sha256:757c8677c4ba2f28f6f10da63a2d03f891e8879c71b68d926439c2352c19c931";
+    "m4d-sc-v1-sha256:22d5cb0ff78710a5e6a5ebb57f84c28686773b5f8ce844c8bb3ea993d9eec779";
 const T2_EXPECTED_SCALE_FACTS: [([u64; 3], &str); 5] = [
     (
         [65, 1_025, 2_049],
-        "f8a70a9ebf4dd44fc09d8a1f9b0407129debe68f56381b7676c641b99a6eb65f",
+        "9c9add98ffb9ce4eebb9a23c73313005b6059c8f8c5df70785d19f6366f8e60b",
     ),
     (
         [33, 513, 1_025],
-        "d20d89e2ae4c1230371fcbf586e4eb74a94525e70c9964e4907f288e925f55a8",
+        "4298a1a6ac8b9c0d96d4fdbb8d4103ed5b0e9e914af32d74144f0481f936da99",
     ),
     (
         [17, 257, 513],
-        "ed7179b972f79d53e676e72e70f90db6448dda7bd3e40943fde8b1a1a46c05a0",
+        "30c5d321997f32f14d4567b5e95040299fc7cce65adad43a043ce55897b6ccd2",
     ),
     (
         [9, 129, 257],
-        "fcf4a90832f08546420475b5562d391d52650120651ceb4d7abec14368d751c2",
+        "cba86e645960df27832959b0d6cbd62adffc180d37ddb80ea885727f108ebf7d",
     ),
     (
         [5, 65, 129],
-        "0742532d6e422ab08a394d219399c33117702cb9899e0a3ac0d4084d7169e66b",
+        "ff2754c7d724d79a5085206ad1abd75b36f2d84c9f5446e82a0d359b83bcb979",
     ),
 ];
 const WORKING_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
@@ -142,7 +151,7 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
     let generation_started = Instant::now();
     generate_t2_source(&source, T2_Z, T2_Y, T2_X)?;
     let source_preservation_before = source_inventory_facts(&source)?;
-    let expected_facts = t2_expected_facts(T2_Z, T2_Y, T2_X)?;
+    let expected_facts = t2_expected_facts(T2_Z, T2_Y, T2_X, &session_root)?;
     let generation_wall_time_ns = duration_ns(generation_started.elapsed())?;
 
     let mut samples = Vec::with_capacity(args.samples);
@@ -708,18 +717,35 @@ fn validate_imported_t2_scales(
     verified: &VerifiedScientificPackageCapability,
 ) -> anyhow::Result<Value> {
     const INNER: u64 = 64;
+    if u64::try_from(T2_SCALE_FACT_SLAB_Z)? != INNER
+        || u64::try_from(T2_SCALE_FACT_SLAB_Y)? != INNER
+    {
+        bail!("T2 scale-fact slabs must align with package Z/Y bricks");
+    }
     let mut facts = Vec::with_capacity(T2_EXPECTED_SCALE_FACTS.len());
     for (scale, (shape, expected_digest)) in T2_EXPECTED_SCALE_FACTS.iter().enumerate() {
-        let voxel_count = shape
-            .iter()
-            .try_fold(1_u64, |total, value| total.checked_mul(*value))
-            .context("T2 scale voxel count overflow")?;
-        let mut values = vec![0_u8; usize::try_from(voxel_count)?];
-        let mut validity = vec![0_u8; usize::try_from(voxel_count.div_ceil(8))?];
         let grid = shape.map(|value| value.div_ceil(INNER));
         let mut brick_reads = 0_u64;
+        let mut hasher = t2_scale_fact_hasher(scale, *shape)?;
         for z_chunk in 0..grid[0] {
             for y_chunk in 0..grid[1] {
+                let slab_origin = [z_chunk * INNER, y_chunk * INNER, 0];
+                let slab_shape = [
+                    (shape[0] - slab_origin[0]).min(INNER),
+                    (shape[1] - slab_origin[1]).min(INNER),
+                    shape[2],
+                ];
+                let slab_voxels = slab_shape
+                    .into_iter()
+                    .try_fold(1_u64, |total, dimension| total.checked_mul(dimension))
+                    .context("T2 validation slab voxel count overflow")?;
+                let slab_bytes = slab_voxels
+                    .checked_mul(2)
+                    .context("T2 validation slab byte count overflow")?;
+                if slab_bytes > WORKING_MEMORY_BYTES {
+                    bail!("T2 validation slab exceeds the working-memory bound");
+                }
+                let mut records = vec![0_u8; usize::try_from(slab_bytes)?];
                 for x_chunk in 0..grid[2] {
                     let brick = verified.read_brick(
                         PackedIndexCoordinates::new(
@@ -735,18 +761,24 @@ fn validate_imported_t2_scales(
                     )?;
                     brick_reads = brick_reads.checked_add(1).context("brick read overflow")?;
                     let extent = brick.logical_extent_zyx();
+                    let expected_extent = [
+                        slab_shape[0],
+                        slab_shape[1],
+                        (shape[2] - x_chunk * INNER).min(INNER),
+                    ];
+                    if extent != expected_extent {
+                        bail!("T2 scale {scale} brick extent disagrees with its logical grid");
+                    }
                     let record = brick.record();
                     for local_z in 0..extent[0] {
                         for local_y in 0..extent[1] {
                             for local_x in 0..extent[2] {
                                 let padded_index = (local_z * INNER + local_y) * INNER + local_x;
-                                let global_z = z_chunk * INNER + local_z;
-                                let global_y = y_chunk * INNER + local_y;
-                                let global_x = x_chunk * INNER + local_x;
-                                let global_index =
-                                    (global_z * shape[1] + global_y) * shape[2] + global_x;
-                                let global_index = usize::try_from(global_index)?;
-                                values[global_index] = brick.pixel_payload().map_or(0, |pixels| {
+                                let slab_x = x_chunk * INNER + local_x;
+                                let slab_index =
+                                    (local_z * slab_shape[1] + local_y) * slab_shape[2] + slab_x;
+                                let slab_index = usize::try_from(slab_index)?;
+                                let value = brick.pixel_payload().map_or(0, |pixels| {
                                     pixels[usize::try_from(padded_index)
                                         .expect("profile-sized padded index fits usize")]
                                 });
@@ -763,17 +795,23 @@ fn validate_imported_t2_scales(
                                     let index = usize::try_from(padded_index)?;
                                     packed[index / 8] & (1 << (index % 8)) != 0
                                 };
-                                if valid {
-                                    validity[global_index / 8] |= 1 << (global_index % 8);
-                                } else if values[global_index] != 0 {
+                                if !valid && value != 0 {
                                     bail!(
                                         "T2 invalid voxel is not canonical zero at scale {scale}"
                                     );
                                 }
+                                records[slab_index * 2] = value;
+                                records[slab_index * 2 + 1] = u8::from(valid);
                             }
                         }
                     }
                 }
+                update_t2_scale_fact_slab(
+                    &mut hasher,
+                    [slab_origin[0], slab_origin[1]],
+                    slab_shape,
+                    &records,
+                )?;
             }
         }
         let expected_bricks = grid
@@ -782,16 +820,6 @@ fn validate_imported_t2_scales(
             .context("T2 brick count overflow")?;
         if brick_reads != expected_bricks {
             bail!("T2 scale {scale} was not scanned exactly once per logical brick");
-        }
-        let mut hasher = Sha256Hasher::new();
-        hasher.update(b"mirante4d-t2-scale-fact-1\0");
-        hasher.update(u32::try_from(scale)?.to_le_bytes());
-        for dimension in shape {
-            hasher.update(dimension.to_le_bytes());
-        }
-        for (index, value) in values.into_iter().enumerate() {
-            let valid = validity[index / 8] & (1 << (index % 8)) != 0;
-            hasher.update([value, u8::from(valid)]);
         }
         let actual_digest = hasher.finalize().to_string();
         if actual_digest != *expected_digest {
@@ -805,7 +833,8 @@ fn validate_imported_t2_scales(
         }));
     }
     Ok(json!({
-        "scheme": "mirante4d-t2-imported-scale-validation-1",
+        "scheme": "mirante4d-t2-restored-sentinel-imported-scale-validation-2",
+        "scale_fact_scheme": T2_SCALE_FACT_SCHEME,
         "reader": "exact-capability-brick-reader",
         "scales": facts,
     }))
@@ -1160,8 +1189,650 @@ fn t2_value(z: u32, y: u32, x: u32) -> u8 {
     }
 }
 
-fn t2_expected_facts(z: u32, y: u32, x: u32) -> anyhow::Result<Value> {
-    let shape = Shape4D::new(1, u64::from(z), u64::from(y), u64::from(x))?;
+#[cfg(test)]
+#[derive(Debug)]
+struct DenseT2OracleLevel {
+    shape_zyx: [usize; 3],
+    values: Vec<u8>,
+    validity: Vec<u8>,
+}
+
+#[cfg(test)]
+impl DenseT2OracleLevel {
+    fn voxel_count(&self) -> anyhow::Result<usize> {
+        self.shape_zyx
+            .into_iter()
+            .try_fold(1_usize, |total, dimension| total.checked_mul(dimension))
+            .context("T2 oracle voxel count overflow")
+    }
+
+    fn index(&self, z: usize, y: usize, x: usize) -> usize {
+        (z * self.shape_zyx[1] + y) * self.shape_zyx[2] + x
+    }
+
+    fn is_valid(&self, index: usize) -> bool {
+        validity_bit(&self.validity, index)
+    }
+}
+
+#[cfg(test)]
+fn validity_bit(validity: &[u8], index: usize) -> bool {
+    validity[index / 8] & (1 << (index % 8)) != 0
+}
+
+#[cfg(test)]
+fn clear_validity_bit(validity: &mut [u8], index: usize) {
+    validity[index / 8] &= !(1 << (index % 8));
+}
+
+#[cfg(test)]
+fn clear_unused_validity_bits(validity: &mut [u8], voxel_count: usize) {
+    let remainder = voxel_count % 8;
+    if remainder != 0 {
+        let last = validity
+            .last_mut()
+            .expect("a nonzero remainder implies a nonempty validity buffer");
+        *last &= (1 << remainder) - 1;
+    }
+}
+
+#[cfg(test)]
+fn t2_dense_oracle_base_from_values(
+    shape_zyx: [usize; 3],
+    values: Vec<u8>,
+    sentinel: u8,
+) -> anyhow::Result<DenseT2OracleLevel> {
+    if shape_zyx.contains(&0) {
+        bail!("T2 oracle dimensions must be positive");
+    }
+    let voxel_count = shape_zyx
+        .into_iter()
+        .try_fold(1_usize, |total, dimension| total.checked_mul(dimension))
+        .context("T2 oracle base voxel count overflow")?;
+    if values.len() != voxel_count {
+        bail!("T2 oracle base values disagree with the declared shape");
+    }
+
+    let mut validity = vec![u8::MAX; voxel_count.div_ceil(8)];
+    clear_unused_validity_bits(&mut validity, voxel_count);
+    let z_radius = usize::from(shape_zyx[0] > 1);
+    for z in 0..shape_zyx[0] {
+        for y in 0..shape_zyx[1] {
+            for x in 0..shape_zyx[2] {
+                let index = (z * shape_zyx[1] + y) * shape_zyx[2] + x;
+                if values[index] != sentinel {
+                    continue;
+                }
+                for neighbor_z in z.saturating_sub(z_radius)..=(z + z_radius).min(shape_zyx[0] - 1)
+                {
+                    for neighbor_y in y.saturating_sub(1)..=(y + 1).min(shape_zyx[1] - 1) {
+                        for neighbor_x in x.saturating_sub(1)..=(x + 1).min(shape_zyx[2] - 1) {
+                            let neighbor = (neighbor_z * shape_zyx[1] + neighbor_y) * shape_zyx[2]
+                                + neighbor_x;
+                            clear_validity_bit(&mut validity, neighbor);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut values = values;
+    for (index, value) in values.iter_mut().enumerate() {
+        if !validity_bit(&validity, index) {
+            *value = 0;
+        }
+    }
+    Ok(DenseT2OracleLevel {
+        shape_zyx,
+        values,
+        validity,
+    })
+}
+
+#[cfg(test)]
+fn t2_dense_oracle_next(parent: &DenseT2OracleLevel) -> anyhow::Result<DenseT2OracleLevel> {
+    if parent.values.len() != parent.voxel_count()?
+        || parent.validity.len() != parent.values.len().div_ceil(8)
+    {
+        bail!("T2 oracle parent buffers disagree with their shape");
+    }
+    let reduced = parent.shape_zyx.map(|dimension| dimension > 1);
+    let shape_zyx = std::array::from_fn(|axis| {
+        if reduced[axis] {
+            parent.shape_zyx[axis].div_ceil(2)
+        } else {
+            parent.shape_zyx[axis]
+        }
+    });
+    let voxel_count = shape_zyx
+        .into_iter()
+        .try_fold(1_usize, |total, dimension| total.checked_mul(dimension))
+        .context("T2 oracle child voxel count overflow")?;
+    let mut values = vec![0_u8; voxel_count];
+    let mut support = vec![0_u8; voxel_count.div_ceil(8)];
+
+    for z in 0..shape_zyx[0] {
+        for y in 0..shape_zyx[1] {
+            for x in 0..shape_zyx[2] {
+                let child = (z * shape_zyx[1] + y) * shape_zyx[2] + x;
+                let origin = [
+                    if reduced[0] { z * 2 } else { z },
+                    if reduced[1] { y * 2 } else { y },
+                    if reduced[2] { x * 2 } else { x },
+                ];
+                let end: [usize; 3] = std::array::from_fn(|axis| {
+                    (origin[axis] + usize::from(reduced[axis]) + 1).min(parent.shape_zyx[axis])
+                });
+                let mut sum = 0_u32;
+                let mut count = 0_u32;
+                for parent_z in origin[0]..end[0] {
+                    for parent_y in origin[1]..end[1] {
+                        for parent_x in origin[2]..end[2] {
+                            let index = parent.index(parent_z, parent_y, parent_x);
+                            if parent.is_valid(index) {
+                                sum += u32::from(parent.values[index]);
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+                if let Some(mean) = (sum + count / 2).checked_div(count) {
+                    support[child / 8] |= 1 << (child % 8);
+                    values[child] = u8::try_from(mean).context("T2 oracle mean exceeds uint8")?;
+                }
+            }
+        }
+    }
+
+    let mut validity = vec![u8::MAX; voxel_count.div_ceil(8)];
+    clear_unused_validity_bits(&mut validity, voxel_count);
+    let z_radius = usize::from(shape_zyx[0] > 1);
+    for z in 0..shape_zyx[0] {
+        for y in 0..shape_zyx[1] {
+            for x in 0..shape_zyx[2] {
+                let index = (z * shape_zyx[1] + y) * shape_zyx[2] + x;
+                if validity_bit(&support, index) {
+                    continue;
+                }
+                for neighbor_z in z.saturating_sub(z_radius)..=(z + z_radius).min(shape_zyx[0] - 1)
+                {
+                    for neighbor_y in y.saturating_sub(1)..=(y + 1).min(shape_zyx[1] - 1) {
+                        for neighbor_x in x.saturating_sub(1)..=(x + 1).min(shape_zyx[2] - 1) {
+                            let neighbor = (neighbor_z * shape_zyx[1] + neighbor_y) * shape_zyx[2]
+                                + neighbor_x;
+                            clear_validity_bit(&mut validity, neighbor);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (index, value) in values.iter_mut().enumerate() {
+        if !validity_bit(&validity, index) {
+            *value = 0;
+        }
+    }
+    Ok(DenseT2OracleLevel {
+        shape_zyx,
+        values,
+        validity,
+    })
+}
+
+#[derive(Debug)]
+struct T2OracleLevel {
+    shape_zyx: [usize; 3],
+    records: File,
+    scratch_path: PathBuf,
+}
+
+impl Drop for T2OracleLevel {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.scratch_path);
+    }
+}
+
+impl T2OracleLevel {
+    fn shape_u64(&self) -> anyhow::Result<[u64; 3]> {
+        Ok([
+            u64::try_from(self.shape_zyx[0])?,
+            u64::try_from(self.shape_zyx[1])?,
+            u64::try_from(self.shape_zyx[2])?,
+        ])
+    }
+
+    fn read_region(
+        &mut self,
+        origin_zyx: [usize; 3],
+        shape_zyx: [usize; 3],
+    ) -> anyhow::Result<Vec<u8>> {
+        let end = [
+            origin_zyx[0].checked_add(shape_zyx[0]),
+            origin_zyx[1].checked_add(shape_zyx[1]),
+            origin_zyx[2].checked_add(shape_zyx[2]),
+        ];
+        let [Some(end_z), Some(end_y), Some(end_x)] = end else {
+            bail!("T2 oracle read region overflows its level");
+        };
+        if shape_zyx.contains(&0)
+            || end_z > self.shape_zyx[0]
+            || end_y > self.shape_zyx[1]
+            || end_x > self.shape_zyx[2]
+        {
+            bail!("T2 oracle read region is outside its level");
+        }
+        let voxels = checked_voxels_usize(shape_zyx)?;
+        let bytes = voxels
+            .checked_mul(2)
+            .context("T2 oracle read-region byte count overflow")?;
+        if u64::try_from(bytes)? > WORKING_MEMORY_BYTES {
+            bail!("T2 oracle read region exceeds the working-memory bound");
+        }
+        let mut records = vec![0_u8; bytes];
+        let full_x = origin_zyx[2] == 0 && shape_zyx[2] == self.shape_zyx[2];
+        if full_x {
+            let plane_bytes = shape_zyx[1]
+                .checked_mul(shape_zyx[2])
+                .and_then(|value| value.checked_mul(2))
+                .context("T2 oracle plane byte count overflow")?;
+            for local_z in 0..shape_zyx[0] {
+                let source = level_record_offset(
+                    self.shape_zyx,
+                    [origin_zyx[0] + local_z, origin_zyx[1], 0],
+                )?;
+                self.records.seek(SeekFrom::Start(source))?;
+                let target = local_z * plane_bytes;
+                self.records
+                    .read_exact(&mut records[target..target + plane_bytes])?;
+            }
+        } else {
+            let row_bytes = shape_zyx[2]
+                .checked_mul(2)
+                .context("T2 oracle row byte count overflow")?;
+            for local_z in 0..shape_zyx[0] {
+                for local_y in 0..shape_zyx[1] {
+                    let source = level_record_offset(
+                        self.shape_zyx,
+                        [
+                            origin_zyx[0] + local_z,
+                            origin_zyx[1] + local_y,
+                            origin_zyx[2],
+                        ],
+                    )?;
+                    self.records.seek(SeekFrom::Start(source))?;
+                    let target = (local_z * shape_zyx[1] + local_y) * row_bytes;
+                    self.records
+                        .read_exact(&mut records[target..target + row_bytes])?;
+                }
+            }
+        }
+        Ok(records)
+    }
+}
+
+fn checked_voxels_usize(shape_zyx: [usize; 3]) -> anyhow::Result<usize> {
+    shape_zyx
+        .into_iter()
+        .try_fold(1_usize, |total, dimension| total.checked_mul(dimension))
+        .context("T2 oracle voxel count overflow")
+}
+
+fn level_record_offset(shape_zyx: [usize; 3], coordinate_zyx: [usize; 3]) -> anyhow::Result<u64> {
+    let index = coordinate_zyx[0]
+        .checked_mul(shape_zyx[1])
+        .and_then(|value| value.checked_add(coordinate_zyx[1]))
+        .and_then(|value| value.checked_mul(shape_zyx[2]))
+        .and_then(|value| value.checked_add(coordinate_zyx[2]))
+        .and_then(|value| value.checked_mul(2))
+        .context("T2 oracle file offset overflow")?;
+    Ok(u64::try_from(index)?)
+}
+
+fn create_t2_oracle_level(scratch: &Path, shape_zyx: [usize; 3]) -> anyhow::Result<T2OracleLevel> {
+    if shape_zyx.contains(&0) {
+        bail!("T2 oracle dimensions must be positive");
+    }
+    let bytes = checked_voxels_usize(shape_zyx)?
+        .checked_mul(2)
+        .context("T2 oracle level byte count overflow")?;
+    let sequence = T2_ORACLE_SCRATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let scratch_path = scratch.join(format!(
+        ".t2-oracle-{}-{sequence:016x}.scratch",
+        std::process::id()
+    ));
+    let records = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&scratch_path)
+        .with_context(|| {
+            format!(
+                "failed to create bounded T2 oracle scratch in {}",
+                scratch.display()
+            )
+        })?;
+    let level = T2OracleLevel {
+        shape_zyx,
+        records,
+        scratch_path,
+    };
+    level.records.set_len(u64::try_from(bytes)?)?;
+    Ok(level)
+}
+
+fn write_t2_oracle_region(
+    level: &mut T2OracleLevel,
+    origin_zyx: [usize; 3],
+    shape_zyx: [usize; 3],
+    records: &[u8],
+) -> anyhow::Result<()> {
+    let expected = checked_voxels_usize(shape_zyx)?
+        .checked_mul(2)
+        .context("T2 oracle write-region byte count overflow")?;
+    if records.len() != expected
+        || origin_zyx[2] != 0
+        || shape_zyx[2] != level.shape_zyx[2]
+        || (0..3).any(|axis| {
+            origin_zyx[axis]
+                .checked_add(shape_zyx[axis])
+                .is_none_or(|end| end > level.shape_zyx[axis])
+        })
+    {
+        bail!("T2 oracle write region disagrees with its level");
+    }
+    let plane_bytes = shape_zyx[1]
+        .checked_mul(shape_zyx[2])
+        .and_then(|value| value.checked_mul(2))
+        .context("T2 oracle write plane byte count overflow")?;
+    for local_z in 0..shape_zyx[0] {
+        let target =
+            level_record_offset(level.shape_zyx, [origin_zyx[0] + local_z, origin_zyx[1], 0])?;
+        level.records.seek(SeekFrom::Start(target))?;
+        let source = local_z * plane_bytes;
+        level
+            .records
+            .write_all(&records[source..source + plane_bytes])?;
+    }
+    Ok(())
+}
+
+fn require_t2_oracle_working_bytes(parts: &[usize]) -> anyhow::Result<u64> {
+    let total = parts.iter().try_fold(0_u64, |total, bytes| {
+        total.checked_add(u64::try_from(*bytes).ok()?)
+    });
+    let total = total.context("T2 oracle working byte count overflow")?;
+    if total > WORKING_MEMORY_BYTES {
+        bail!("T2 oracle slab exceeds the selected working-memory bound");
+    }
+    Ok(total)
+}
+
+fn t2_oracle_base(z: u32, y: u32, x: u32, scratch: &Path) -> anyhow::Result<T2OracleLevel> {
+    let shape_zyx = [
+        usize::try_from(z)?,
+        usize::try_from(y)?,
+        usize::try_from(x)?,
+    ];
+    let mut level = create_t2_oracle_level(scratch, shape_zyx)?;
+    let z_radius = usize::from(shape_zyx[0] > 1);
+    for core_z in (0..shape_zyx[0]).step_by(T2_ORACLE_COMPUTE_SLAB_Z) {
+        for core_y in (0..shape_zyx[1]).step_by(T2_ORACLE_COMPUTE_SLAB_Y) {
+            let core_origin = [core_z, core_y, 0];
+            let core_shape = [
+                (shape_zyx[0] - core_z).min(T2_ORACLE_COMPUTE_SLAB_Z),
+                (shape_zyx[1] - core_y).min(T2_ORACLE_COMPUTE_SLAB_Y),
+                shape_zyx[2],
+            ];
+            let core_end: [usize; 3] =
+                std::array::from_fn(|axis| core_origin[axis] + core_shape[axis]);
+            let halo_origin = [core_z.saturating_sub(z_radius), core_y.saturating_sub(1), 0];
+            let halo_end = [
+                (core_end[0] + z_radius).min(shape_zyx[0]),
+                (core_end[1] + 1).min(shape_zyx[1]),
+                shape_zyx[2],
+            ];
+            let halo_shape = std::array::from_fn(|axis| halo_end[axis] - halo_origin[axis]);
+            let halo_voxels = checked_voxels_usize(halo_shape)?;
+            let output_bytes = checked_voxels_usize(core_shape)?
+                .checked_mul(2)
+                .context("T2 oracle base output byte count overflow")?;
+            require_t2_oracle_working_bytes(&[halo_voxels, output_bytes])?;
+
+            let mut raw = Vec::with_capacity(halo_voxels);
+            for local_z in 0..halo_shape[0] {
+                for local_y in 0..halo_shape[1] {
+                    for local_x in 0..halo_shape[2] {
+                        raw.push(t2_value(
+                            u32::try_from(halo_origin[0] + local_z)?,
+                            u32::try_from(halo_origin[1] + local_y)?,
+                            u32::try_from(local_x)?,
+                        ));
+                    }
+                }
+            }
+            let mut output = vec![0_u8; output_bytes];
+            for local_z in 0..core_shape[0] {
+                for local_y in 0..core_shape[1] {
+                    for local_x in 0..core_shape[2] {
+                        let source = (((core_origin[0] + local_z - halo_origin[0])
+                            * halo_shape[1]
+                            + (core_origin[1] + local_y - halo_origin[1]))
+                            * halo_shape[2])
+                            + local_x;
+                        let target = (local_z * core_shape[1] + local_y) * core_shape[2] + local_x;
+                        output[target * 2] = raw[source];
+                        output[target * 2 + 1] = 1;
+                    }
+                }
+            }
+            for halo_z in 0..halo_shape[0] {
+                for halo_y in 0..halo_shape[1] {
+                    for halo_x in 0..halo_shape[2] {
+                        let source = (halo_z * halo_shape[1] + halo_y) * halo_shape[2] + halo_x;
+                        if raw[source] != T2_SENTINEL {
+                            continue;
+                        }
+                        let global = [halo_origin[0] + halo_z, halo_origin[1] + halo_y, halo_x];
+                        let invalid_start = [
+                            global[0].saturating_sub(z_radius).max(core_origin[0]),
+                            global[1].saturating_sub(1).max(core_origin[1]),
+                            global[2].saturating_sub(1),
+                        ];
+                        let invalid_end = [
+                            (global[0] + z_radius + 1).min(core_end[0]),
+                            (global[1] + 2).min(core_end[1]),
+                            (global[2] + 2).min(core_end[2]),
+                        ];
+                        for invalid_z in invalid_start[0]..invalid_end[0] {
+                            for invalid_y in invalid_start[1]..invalid_end[1] {
+                                for invalid_x in invalid_start[2]..invalid_end[2] {
+                                    let target = ((invalid_z - core_origin[0]) * core_shape[1]
+                                        + (invalid_y - core_origin[1]))
+                                        * core_shape[2]
+                                        + invalid_x;
+                                    output[target * 2] = 0;
+                                    output[target * 2 + 1] = 0;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            write_t2_oracle_region(&mut level, core_origin, core_shape, &output)?;
+        }
+    }
+    Ok(level)
+}
+
+fn t2_oracle_next(parent: &mut T2OracleLevel, scratch: &Path) -> anyhow::Result<T2OracleLevel> {
+    let reduced = parent.shape_zyx.map(|dimension| dimension > 1);
+    let child_shape = std::array::from_fn(|axis| {
+        if reduced[axis] {
+            parent.shape_zyx[axis].div_ceil(2)
+        } else {
+            parent.shape_zyx[axis]
+        }
+    });
+    let mut child = create_t2_oracle_level(scratch, child_shape)?;
+    let z_radius = usize::from(child_shape[0] > 1);
+    for core_z in (0..child_shape[0]).step_by(T2_ORACLE_COMPUTE_SLAB_Z) {
+        for core_y in (0..child_shape[1]).step_by(T2_ORACLE_COMPUTE_SLAB_Y) {
+            let core_origin = [core_z, core_y, 0];
+            let core_shape = [
+                (child_shape[0] - core_z).min(T2_ORACLE_COMPUTE_SLAB_Z),
+                (child_shape[1] - core_y).min(T2_ORACLE_COMPUTE_SLAB_Y),
+                child_shape[2],
+            ];
+            let core_end: [usize; 3] =
+                std::array::from_fn(|axis| core_origin[axis] + core_shape[axis]);
+            let window_origin = [core_z.saturating_sub(z_radius), core_y.saturating_sub(1), 0];
+            let window_end = [
+                (core_end[0] + z_radius).min(child_shape[0]),
+                (core_end[1] + 1).min(child_shape[1]),
+                child_shape[2],
+            ];
+            let window_shape = std::array::from_fn(|axis| window_end[axis] - window_origin[axis]);
+            let parent_origin: [usize; 3] = std::array::from_fn(|axis| {
+                if reduced[axis] {
+                    window_origin[axis] * 2
+                } else {
+                    window_origin[axis]
+                }
+            });
+            let parent_end: [usize; 3] = std::array::from_fn(|axis| {
+                if reduced[axis] {
+                    (window_end[axis] * 2).min(parent.shape_zyx[axis])
+                } else {
+                    window_end[axis]
+                }
+            });
+            let parent_shape: [usize; 3] =
+                std::array::from_fn(|axis| parent_end[axis] - parent_origin[axis]);
+            let parent_bytes = checked_voxels_usize(parent_shape)?
+                .checked_mul(2)
+                .context("T2 oracle parent slab byte count overflow")?;
+            let window_voxels = checked_voxels_usize(window_shape)?;
+            let output_bytes = checked_voxels_usize(core_shape)?
+                .checked_mul(2)
+                .context("T2 oracle child output byte count overflow")?;
+            require_t2_oracle_working_bytes(&[
+                parent_bytes,
+                window_voxels,
+                window_voxels,
+                output_bytes,
+            ])?;
+            let parent_records = parent.read_region(parent_origin, parent_shape)?;
+            let mut means = vec![0_u8; window_voxels];
+            let mut support = vec![0_u8; window_voxels];
+            for local_z in 0..window_shape[0] {
+                for local_y in 0..window_shape[1] {
+                    for local_x in 0..window_shape[2] {
+                        let global = [
+                            window_origin[0] + local_z,
+                            window_origin[1] + local_y,
+                            local_x,
+                        ];
+                        let block_origin: [usize; 3] = std::array::from_fn(|axis| {
+                            if reduced[axis] {
+                                global[axis] * 2
+                            } else {
+                                global[axis]
+                            }
+                        });
+                        let block_end: [usize; 3] = std::array::from_fn(|axis| {
+                            (block_origin[axis] + usize::from(reduced[axis]) + 1)
+                                .min(parent.shape_zyx[axis])
+                        });
+                        let mut sum = 0_u32;
+                        let mut count = 0_u32;
+                        for parent_z in block_origin[0]..block_end[0] {
+                            for parent_y in block_origin[1]..block_end[1] {
+                                for parent_x in block_origin[2]..block_end[2] {
+                                    let source = ((parent_z - parent_origin[0]) * parent_shape[1]
+                                        + (parent_y - parent_origin[1]))
+                                        * parent_shape[2]
+                                        + (parent_x - parent_origin[2]);
+                                    if parent_records[source * 2 + 1] != 0 {
+                                        sum += u32::from(parent_records[source * 2]);
+                                        count += 1;
+                                    }
+                                }
+                            }
+                        }
+                        let target =
+                            (local_z * window_shape[1] + local_y) * window_shape[2] + local_x;
+                        if let Some(mean) = (sum + count / 2).checked_div(count) {
+                            support[target] = 1;
+                            means[target] =
+                                u8::try_from(mean).context("T2 oracle mean exceeds uint8")?;
+                        }
+                    }
+                }
+            }
+
+            let mut output = vec![0_u8; output_bytes];
+            for local_z in 0..core_shape[0] {
+                for local_y in 0..core_shape[1] {
+                    for local_x in 0..core_shape[2] {
+                        let source = (((core_origin[0] + local_z - window_origin[0])
+                            * window_shape[1]
+                            + (core_origin[1] + local_y - window_origin[1]))
+                            * window_shape[2])
+                            + local_x;
+                        let target = (local_z * core_shape[1] + local_y) * core_shape[2] + local_x;
+                        output[target * 2] = means[source];
+                        output[target * 2 + 1] = 1;
+                    }
+                }
+            }
+            for window_z in 0..window_shape[0] {
+                for window_y in 0..window_shape[1] {
+                    for window_x in 0..window_shape[2] {
+                        let source =
+                            (window_z * window_shape[1] + window_y) * window_shape[2] + window_x;
+                        if support[source] != 0 {
+                            continue;
+                        }
+                        let global = [
+                            window_origin[0] + window_z,
+                            window_origin[1] + window_y,
+                            window_x,
+                        ];
+                        let invalid_start = [
+                            global[0].saturating_sub(z_radius).max(core_origin[0]),
+                            global[1].saturating_sub(1).max(core_origin[1]),
+                            global[2].saturating_sub(1),
+                        ];
+                        let invalid_end = [
+                            (global[0] + z_radius + 1).min(core_end[0]),
+                            (global[1] + 2).min(core_end[1]),
+                            (global[2] + 2).min(core_end[2]),
+                        ];
+                        for invalid_z in invalid_start[0]..invalid_end[0] {
+                            for invalid_y in invalid_start[1]..invalid_end[1] {
+                                for invalid_x in invalid_start[2]..invalid_end[2] {
+                                    let target = ((invalid_z - core_origin[0]) * core_shape[1]
+                                        + (invalid_y - core_origin[1]))
+                                        * core_shape[2]
+                                        + invalid_x;
+                                    output[target * 2] = 0;
+                                    output[target * 2 + 1] = 0;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            write_t2_oracle_region(&mut child, core_origin, core_shape, &output)?;
+        }
+    }
+    Ok(child)
+}
+
+fn t2_oracle_scientific_content_id(level: &mut T2OracleLevel) -> anyhow::Result<String> {
+    let shape_zyx = level.shape_u64()?;
+    let shape = Shape4D::new(1, shape_zyx[0], shape_zyx[1], shape_zyx[2])?;
     let transform = GridToWorld::scale(0.1, 0.2, 0.4)?;
     let descriptor = ScientificLayerDescriptor::new(
         LogicalLayerKey::new(0),
@@ -1171,33 +1842,34 @@ fn t2_expected_facts(z: u32, y: u32, x: u32) -> anyhow::Result<Value> {
         transform,
     )?;
     let mut layer = ScientificLayerHasher::new(descriptor)?;
-    for tile_z in (0..u64::from(z)).step_by(SCIENTIFIC_TILE_SHAPE_TZYX[1] as usize) {
-        for tile_y in (0..u64::from(y)).step_by(SCIENTIFIC_TILE_SHAPE_TZYX[2] as usize) {
-            for tile_x in (0..u64::from(x)).step_by(SCIENTIFIC_TILE_SHAPE_TZYX[3] as usize) {
+    for tile_z in (0..shape_zyx[0]).step_by(SCIENTIFIC_TILE_SHAPE_TZYX[1] as usize) {
+        for tile_y in (0..shape_zyx[1]).step_by(SCIENTIFIC_TILE_SHAPE_TZYX[2] as usize) {
+            for tile_x in (0..shape_zyx[2]).step_by(SCIENTIFIC_TILE_SHAPE_TZYX[3] as usize) {
                 let extent = [
-                    (u64::from(z) - tile_z).min(SCIENTIFIC_TILE_SHAPE_TZYX[1]),
-                    (u64::from(y) - tile_y).min(SCIENTIFIC_TILE_SHAPE_TZYX[2]),
-                    (u64::from(x) - tile_x).min(SCIENTIFIC_TILE_SHAPE_TZYX[3]),
+                    (shape_zyx[0] - tile_z).min(SCIENTIFIC_TILE_SHAPE_TZYX[1]),
+                    (shape_zyx[1] - tile_y).min(SCIENTIFIC_TILE_SHAPE_TZYX[2]),
+                    (shape_zyx[2] - tile_x).min(SCIENTIFIC_TILE_SHAPE_TZYX[3]),
                 ];
-                let voxels = usize::try_from(extent[0] * extent[1] * extent[2])?;
+                let extent_usize = extent
+                    .map(usize::try_from)
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?;
+                let extent_usize: [usize; 3] = extent_usize.try_into().expect("three dimensions");
+                let records = level.read_region(
+                    [
+                        usize::try_from(tile_z)?,
+                        usize::try_from(tile_y)?,
+                        usize::try_from(tile_x)?,
+                    ],
+                    extent_usize,
+                )?;
+                let voxels = checked_voxels_usize(extent_usize)?;
                 let mut values = Vec::with_capacity(voxels);
                 let mut validity = vec![0_u8; voxels.div_ceil(8)];
-                let mut index = 0_usize;
-                for local_z in 0..extent[0] {
-                    for local_y in 0..extent[1] {
-                        for local_x in 0..extent[2] {
-                            let raw = t2_value(
-                                u32::try_from(tile_z + local_z)?,
-                                u32::try_from(tile_y + local_y)?,
-                                u32::try_from(tile_x + local_x)?,
-                            );
-                            let valid = raw != T2_SENTINEL;
-                            values.push(if valid { raw } else { 0 });
-                            if valid {
-                                validity[index / 8] |= 1 << (index % 8);
-                            }
-                            index += 1;
-                        }
+                for index in 0..voxels {
+                    values.push(records[index * 2]);
+                    if records[index * 2 + 1] != 0 {
+                        validity[index / 8] |= 1 << (index % 8);
                     }
                 }
                 layer.push_tile(ScientificTile::new(
@@ -1211,62 +1883,244 @@ fn t2_expected_facts(z: u32, y: u32, x: u32) -> anyhow::Result<Value> {
     }
     let mut dataset = ScientificDatasetHasher::new(1)?;
     dataset.push_layer(layer.finalize()?)?;
-    let scientific_content_id = dataset.finalize()?;
+    Ok(dataset.finalize()?.to_string())
+}
+
+fn t2_scale_fact_hasher(scale: usize, shape_zyx: [u64; 3]) -> anyhow::Result<Sha256Hasher> {
+    let mut hasher = Sha256Hasher::new();
+    hasher.update(T2_SCALE_FACT_SCHEME.as_bytes());
+    hasher.update([0]);
+    hasher.update(u32::try_from(scale)?.to_le_bytes());
+    for dimension in shape_zyx {
+        hasher.update(dimension.to_le_bytes());
+    }
+    hasher.update(u64::try_from(T2_SCALE_FACT_SLAB_Z)?.to_le_bytes());
+    hasher.update(u64::try_from(T2_SCALE_FACT_SLAB_Y)?.to_le_bytes());
+    Ok(hasher)
+}
+
+fn update_t2_scale_fact_slab(
+    hasher: &mut Sha256Hasher,
+    slab_origin_zy: [u64; 2],
+    slab_shape_zyx: [u64; 3],
+    records: &[u8],
+) -> anyhow::Result<()> {
+    let voxels = slab_shape_zyx
+        .into_iter()
+        .try_fold(1_u64, |total, dimension| total.checked_mul(dimension))
+        .context("T2 scale-fact slab voxel count overflow")?;
+    if u64::try_from(records.len())?
+        != voxels
+            .checked_mul(2)
+            .context("T2 scale-fact slab overflow")?
+    {
+        bail!("T2 scale-fact slab records disagree with their shape");
+    }
+    for record in records.chunks_exact(2) {
+        if record[1] > 1 || (record[1] == 0 && record[0] != 0) {
+            bail!("T2 scale-fact slab violates canonical value/validity representation");
+        }
+    }
+    for coordinate in slab_origin_zy {
+        hasher.update(coordinate.to_le_bytes());
+    }
+    for dimension in slab_shape_zyx {
+        hasher.update(dimension.to_le_bytes());
+    }
+    hasher.update(records);
+    Ok(())
+}
+
+fn t2_oracle_scale_fact_digest(level: &mut T2OracleLevel, scale: usize) -> anyhow::Result<String> {
+    let shape = level.shape_u64()?;
+    let mut hasher = t2_scale_fact_hasher(scale, shape)?;
+    for slab_z in (0..level.shape_zyx[0]).step_by(T2_SCALE_FACT_SLAB_Z) {
+        for slab_y in (0..level.shape_zyx[1]).step_by(T2_SCALE_FACT_SLAB_Y) {
+            let slab_shape = [
+                (level.shape_zyx[0] - slab_z).min(T2_SCALE_FACT_SLAB_Z),
+                (level.shape_zyx[1] - slab_y).min(T2_SCALE_FACT_SLAB_Y),
+                level.shape_zyx[2],
+            ];
+            let records = level.read_region([slab_z, slab_y, 0], slab_shape)?;
+            update_t2_scale_fact_slab(
+                &mut hasher,
+                [u64::try_from(slab_z)?, u64::try_from(slab_y)?],
+                slab_shape
+                    .map(u64::try_from)
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?
+                    .try_into()
+                    .expect("three dimensions"),
+                &records,
+            )?;
+        }
+    }
+    Ok(hasher.finalize().to_string())
+}
+
+fn t2_oracle_shape_bytes(shape_zyx: [usize; 3], bytes_per_voxel: usize) -> anyhow::Result<u64> {
+    Ok(u64::try_from(
+        checked_voxels_usize(shape_zyx)?
+            .checked_mul(bytes_per_voxel)
+            .context("T2 oracle peak byte count overflow")?,
+    )?)
+}
+
+fn t2_oracle_peak_working_bytes(z: u32, y: u32, x: u32) -> anyhow::Result<u64> {
+    let mut parent = [
+        usize::try_from(z)?,
+        usize::try_from(y)?,
+        usize::try_from(x)?,
+    ];
+    let base_z_radius = usize::from(parent[0] > 1);
+    let base_halo = [
+        parent[0].min(T2_ORACLE_COMPUTE_SLAB_Z + 2 * base_z_radius),
+        parent[1].min(T2_ORACLE_COMPUTE_SLAB_Y + 2),
+        parent[2],
+    ];
+    let base_core = [
+        parent[0].min(T2_ORACLE_COMPUTE_SLAB_Z),
+        parent[1].min(T2_ORACLE_COMPUTE_SLAB_Y),
+        parent[2],
+    ];
+    let mut peak = t2_oracle_shape_bytes(base_halo, 1)?
+        .checked_add(t2_oracle_shape_bytes(base_core, 2)?)
+        .context("T2 oracle base peak overflow")?;
+    peak = peak.max(t2_oracle_shape_bytes(
+        [
+            parent[0].min(T2_SCALE_FACT_SLAB_Z),
+            parent[1].min(T2_SCALE_FACT_SLAB_Y),
+            parent[2],
+        ],
+        2,
+    )?);
+    let scientific_tile = [
+        parent[0].min(usize::try_from(SCIENTIFIC_TILE_SHAPE_TZYX[1])?),
+        parent[1].min(usize::try_from(SCIENTIFIC_TILE_SHAPE_TZYX[2])?),
+        parent[2].min(usize::try_from(SCIENTIFIC_TILE_SHAPE_TZYX[3])?),
+    ];
+    let scientific_voxels = checked_voxels_usize(scientific_tile)?;
+    let scientific_peak = scientific_voxels
+        .checked_mul(3)
+        .and_then(|value| value.checked_add(scientific_voxels.div_ceil(8)))
+        .context("T2 oracle scientific-tile peak overflow")?;
+    peak = peak.max(u64::try_from(scientific_peak)?);
+
+    for child in t2_pyramid_shapes(z, y, x).into_iter().skip(1) {
+        let child = [
+            usize::try_from(child[0])?,
+            usize::try_from(child[1])?,
+            usize::try_from(child[2])?,
+        ];
+        let reduced = parent.map(|dimension| dimension > 1);
+        let child_z_radius = usize::from(child[0] > 1);
+        let window = [
+            child[0].min(T2_ORACLE_COMPUTE_SLAB_Z + 2 * child_z_radius),
+            child[1].min(T2_ORACLE_COMPUTE_SLAB_Y + 2),
+            child[2],
+        ];
+        let parent_region: [usize; 3] = std::array::from_fn(|axis| {
+            if reduced[axis] {
+                parent[axis].min(window[axis] * 2)
+            } else {
+                window[axis]
+            }
+        });
+        let core = [
+            child[0].min(T2_ORACLE_COMPUTE_SLAB_Z),
+            child[1].min(T2_ORACLE_COMPUTE_SLAB_Y),
+            child[2],
+        ];
+        let core_bytes = t2_oracle_shape_bytes(core, 2)?;
+        let transition_peak = t2_oracle_shape_bytes(parent_region, 2)?
+            .checked_add(t2_oracle_shape_bytes(window, 2)?)
+            .and_then(|value| value.checked_add(core_bytes))
+            .context("T2 oracle transition peak overflow")?;
+        let digest_peak = t2_oracle_shape_bytes(
+            [
+                child[0].min(T2_SCALE_FACT_SLAB_Z),
+                child[1].min(T2_SCALE_FACT_SLAB_Y),
+                child[2],
+            ],
+            2,
+        )?;
+        peak = peak.max(transition_peak).max(digest_peak);
+        parent = child;
+    }
+    if peak > WORKING_MEMORY_BYTES {
+        bail!("T2 oracle peak exceeds the selected working-memory bound");
+    }
+    Ok(peak)
+}
+
+fn t2_expected_facts(z: u32, y: u32, x: u32, scratch: &Path) -> anyhow::Result<Value> {
+    let oracle_peak_working_bytes = t2_oracle_peak_working_bytes(z, y, x)?;
+    let mut level = t2_oracle_base(z, y, x, scratch)?;
+    let scientific_content_id = t2_oracle_scientific_content_id(&mut level)?;
     let is_full_t2 = (z, y, x) == (T2_Z, T2_Y, T2_X);
-    if is_full_t2 && scientific_content_id.to_string() != T2_EXPECTED_SCIENTIFIC_CONTENT_ID {
-        bail!("analytic T2 scientific identity differs from its frozen expected fact");
+    if is_full_t2 && scientific_content_id != T2_EXPECTED_SCIENTIFIC_CONTENT_ID {
+        bail!(
+            "restored-policy T2 scientific identity {scientific_content_id} differs from its frozen expected fact"
+        );
     }
 
-    let scales = t2_pyramid_shapes(z, y, x)
-        .into_iter()
-        .enumerate()
-        .map(|(scale, shape)| {
-            let mut hasher = Sha256Hasher::new();
-            hasher.update(b"mirante4d-t2-scale-fact-1\0");
-            hasher.update(u32::try_from(scale)?.to_le_bytes());
-            for dimension in shape {
-                hasher.update(dimension.to_le_bytes());
+    let expected_shapes = t2_pyramid_shapes(z, y, x);
+    let scale_count = expected_shapes.len();
+    let mut scales = Vec::with_capacity(scale_count);
+    for (scale, expected_shape) in expected_shapes.into_iter().enumerate() {
+        let shape = level.shape_u64()?;
+        if shape != expected_shape {
+            bail!("T2 recursive oracle scale {scale} has an unexpected shape");
+        }
+        let digest = t2_oracle_scale_fact_digest(&mut level, scale)?;
+        if is_full_t2 {
+            let Some((frozen_shape, frozen_digest)) = T2_EXPECTED_SCALE_FACTS.get(scale) else {
+                bail!("T2 recursive oracle produced more pyramid scales than its frozen facts");
+            };
+            if shape != *frozen_shape || digest != *frozen_digest {
+                bail!(
+                    "T2 recursive oracle scale {scale} digest {digest} differs from its frozen expected fact"
+                );
             }
-            let source_step = 1_u64
-                .checked_shl(u32::try_from(scale)?)
-                .context("T2 pyramid scale exceeds the expected shift")?;
-            for scale_z in 0..shape[0] {
-                for scale_y in 0..shape[1] {
-                    for scale_x in 0..shape[2] {
-                        let raw = t2_value(
-                            u32::try_from(scale_z * source_step)?,
-                            u32::try_from(scale_y * source_step)?,
-                            u32::try_from(scale_x * source_step)?,
-                        );
-                        let valid = raw != T2_SENTINEL;
-                        hasher.update([if valid { raw } else { 0 }, u8::from(valid)]);
-                    }
-                }
-            }
-            let digest = hasher.finalize().to_string();
-            if is_full_t2 {
-                let Some((expected_shape, expected_digest)) = T2_EXPECTED_SCALE_FACTS.get(scale)
-                else {
-                    bail!("analytic T2 produced more pyramid scales than its frozen facts");
-                };
-                if shape != *expected_shape || digest != *expected_digest {
-                    bail!("analytic T2 scale {scale} differs from its frozen expected fact");
-                }
-            }
-            Ok(json!({
-                "scale": scale,
-                "shape_zyx": shape,
-                "value_validity_digest": digest,
-            }))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        }
+        scales.push(json!({
+            "scale": scale,
+            "shape_zyx": shape,
+            "value_validity_digest": digest,
+        }));
+        if scale + 1 < scale_count {
+            level = t2_oracle_next(&mut level, scratch)?;
+        }
+    }
     if is_full_t2 && scales.len() != T2_EXPECTED_SCALE_FACTS.len() {
-        bail!("analytic T2 produced fewer pyramid scales than its frozen facts");
+        bail!("T2 recursive oracle produced fewer pyramid scales than its frozen facts");
     }
     Ok(json!({
-        "scheme": "mirante4d-t2-expected-facts-1",
-        "producer": "analytic-generator-independent-of-import-output",
-        "scientific_content_id": scientific_content_id.to_string(),
+        "scheme": "mirante4d-t2-restored-sentinel-expected-facts-2",
+        "scale_fact_scheme": T2_SCALE_FACT_SCHEME,
+        "producer": "temporary-file-backed-fixed-slab-recursive-oracle-independent-of-import-output",
+        "oracle_resources": {
+            "compute_slab_zy": [T2_ORACLE_COMPUTE_SLAB_Z, T2_ORACLE_COMPUTE_SLAB_Y],
+            "scale_fact_slab_zy": [T2_SCALE_FACT_SLAB_Z, T2_SCALE_FACT_SLAB_Y],
+            "temporary_level_files_retained": 2,
+            "working_memory_bound_bytes": WORKING_MEMORY_BYTES,
+            "calculated_peak_working_bytes": oracle_peak_working_bytes,
+        },
+        "policy": {
+            "source_classification": "exact-sentinel-equality",
+            "invalid_dilation": {
+                "metric": "chebyshev",
+                "radius_voxels": 1,
+                "stages": "base-and-every-lod",
+                "out_of_bounds": "ignored",
+                "z_radius": "zero-when-level-z-is-one",
+            },
+            "reduction": "aligned-factor-two-valid-only-half-up-mean",
+            "unsupported": "zero-valid-contributors",
+            "invalid_canonical_value": 0,
+            "derived_values_reclassified_by_sentinel": false,
+        },
+        "scientific_content_id": scientific_content_id,
         "pyramid_scales": scales,
     }))
 }
@@ -1586,6 +2440,66 @@ mod tests {
         for x in 1..1_021 {
             assert_ne!(t2_value(0, 0, x), T2_SENTINEL);
         }
+    }
+
+    #[test]
+    fn t2_recursive_oracle_freezes_dilation_rounding_and_derived_sentinel_semantics() {
+        let raw_3d = (0..27)
+            .map(|index| if index == 0 { 255 } else { index as u8 })
+            .collect::<Vec<_>>();
+        let corner_3d = t2_dense_oracle_base_from_values([3, 3, 3], raw_3d, 255).unwrap();
+        assert_eq!(
+            (0..corner_3d.values.len())
+                .filter(|index| corner_3d.is_valid(*index))
+                .count(),
+            19
+        );
+        for z in 0..2 {
+            for y in 0..2 {
+                for x in 0..2 {
+                    let index = corner_3d.index(z, y, x);
+                    assert_eq!(
+                        (corner_3d.values[index], corner_3d.is_valid(index)),
+                        (0, false)
+                    );
+                }
+            }
+        }
+
+        let corner_2d =
+            t2_dense_oracle_base_from_values([1, 3, 3], vec![255, 1, 2, 3, 4, 5, 6, 7, 8], 255)
+                .unwrap();
+        assert_eq!(
+            (0..corner_2d.values.len())
+                .filter(|index| corner_2d.is_valid(*index))
+                .count(),
+            5
+        );
+
+        let odd = t2_dense_oracle_base_from_values([1, 3, 5], (1..=15).collect(), 255).unwrap();
+        let odd_reduced = t2_dense_oracle_next(&odd).unwrap();
+        assert_eq!(odd_reduced.shape_zyx, [1, 2, 3]);
+        assert_eq!(odd_reduced.values, [4, 6, 8, 12, 14, 15]);
+        assert!((0..odd_reduced.values.len()).all(|index| odd_reduced.is_valid(index)));
+
+        let derived = t2_dense_oracle_next(
+            &t2_dense_oracle_base_from_values([1, 1, 2], vec![6, 8], 7).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(derived.values, [7]);
+        assert!(derived.is_valid(0));
+
+        let temporary = tempfile::tempdir().unwrap();
+        let facts = t2_expected_facts(1, 3, 5, temporary.path()).unwrap();
+        assert_eq!(facts["scale_fact_scheme"], json!(T2_SCALE_FACT_SCHEME));
+        assert_eq!(
+            facts["policy"]["reduction"],
+            "aligned-factor-two-valid-only-half-up-mean"
+        );
+        assert_eq!(
+            t2_oracle_peak_working_bytes(T2_Z, T2_Y, T2_X).unwrap(),
+            22_578_060
+        );
     }
 
     #[test]

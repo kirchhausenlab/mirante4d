@@ -16,6 +16,7 @@ use crate::{
 };
 
 const SPACE_OVERHEAD_BYTES: u64 = 4 * 1024 * 1024;
+const U8_SENTINEL_ALGORITHM_ID: &[u8] = b"mirante4d-u8-sentinel-chebyshev1-valid-mean-v1";
 const SUPPORTED_PROFILE_ORDER: [ProfileKind; 5] = [
     ProfileKind::Ds0,
     ProfileKind::Ds1,
@@ -402,30 +403,13 @@ fn working_memory_required(
     is_2d: bool,
     resident_working_bytes: u64,
 ) -> Result<u64, ImportError> {
-    let pixel_inner =
-        u64::try_from(pixel.decoded_inner_bytes()).map_err(|_| ImportError::Overflow)?;
-    let validity_inner =
-        u64::try_from(validity.decoded_inner_bytes()).map_err(|_| ImportError::Overflow)?;
-    let pixel_encoded =
-        u64::try_from(pixel.encoded_inner_bytes_max()).map_err(|_| ImportError::Overflow)?;
-    let validity_encoded =
-        u64::try_from(validity.encoded_inner_bytes_max()).map_err(|_| ImportError::Overflow)?;
-    let source_multiplier = if is_2d { 4 } else { 8 };
-    let pyramid_phase = pixel_inner
-        .checked_mul(source_multiplier)
-        .and_then(|value| value.checked_add(pixel_inner))
-        .and_then(|value| value.checked_add(pixel_encoded))
-        .and_then(|value| {
-            if options.no_data.is_some() {
-                value
-                    .checked_add(pixel_inner.checked_mul(source_multiplier)?)
-                    .and_then(|value| value.checked_add(validity_inner))
-                    .and_then(|value| value.checked_add(validity_encoded))
-            } else {
-                Some(value)
-            }
-        })
-        .ok_or(ImportError::Overflow)?;
+    let pyramid_phase = pyramid_task_charge_bytes(
+        options.inspection.dtype,
+        pixel,
+        validity,
+        is_2d,
+        options.no_data.is_some(),
+    )?;
     let row_bytes = options
         .inspection
         .shape
@@ -463,7 +447,8 @@ fn working_memory_required(
     // back to this mandatory row-streaming phase when the parallel task does
     // not fit, so admission must not make the optimization compulsory.
     let source_phase = serial_source_phase;
-    let identity_phase = scientific_task_charge_bytes(options.inspection.dtype)?;
+    let identity_phase =
+        scientific_task_charge_bytes(options.inspection.dtype, options.no_data.is_some())?;
     let publication_phase = publication_shard_bytes(pixel)?
         .max(if options.no_data.is_some() {
             publication_shard_bytes(validity)?
@@ -560,7 +545,16 @@ fn plan_digest(options: &ImportOptions, shapes: &[Shape4D]) -> Sha256Digest {
         None => hasher.update([0]),
     }
     match options.no_data {
-        Some(NoDataPolicy::U8Sentinel(value)) => hasher.update([1, value]),
+        Some(NoDataPolicy::U8Sentinel(value)) => {
+            hasher.update([1, value]);
+            // A durable checkpoint created by the exact-only/point-selected
+            // predecessor must not resume into restored sentinel semantics.
+            // The unchanged no-sentinel route deliberately retains its prior
+            // plan digest and resumability.
+            hasher.update(b"algorithm\0");
+            hasher.update(U8_SENTINEL_ALGORITHM_ID);
+            hasher.update(b"\0");
+        }
         None => hasher.update([0, 0]),
     }
     hasher.finalize()
@@ -670,6 +664,33 @@ mod tests {
             ImportPlan::new(&options),
             Err(ImportError::InvalidRequest(_))
         ));
+    }
+
+    #[test]
+    fn sentinel_plan_digest_binds_the_restored_algorithm() {
+        let mut options = options(Shape4D::new(1, 1, 2, 2).unwrap());
+        options.inspection.dtype = IntensityDType::Uint8;
+        options.no_data = Some(NoDataPolicy::U8Sentinel(255));
+
+        let plan = ImportPlan::new(&options).unwrap();
+        assert_eq!(
+            plan.plan_digest.to_string(),
+            "221f328a56c803ad490fe8d75a118e2f4da59e513c29e41996d7337d5ef7c50a"
+        );
+        assert_ne!(
+            plan.plan_digest.to_string(),
+            // Frozen from the same request under the pre-restoration V2
+            // exact-sentinel/point-decimation plan binding.
+            "ddd8fcb0e234c6ba4d27fc2745ec8d0a7dc0bafe0ebf6b0ea47b6cf2dcd14a83"
+        );
+
+        options.no_data = None;
+        assert_eq!(
+            ImportPlan::new(&options).unwrap().plan_digest.to_string(),
+            // The no-sentinel algorithm did not change, so its prior plan
+            // binding and resumability remain intact.
+            "1be11e61bd817ef17d1a2a6510f16f232e0f1a7e8449c33ae1e5f924d10d9593"
+        );
     }
 
     #[test]

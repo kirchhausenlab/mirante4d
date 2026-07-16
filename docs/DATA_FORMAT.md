@@ -44,6 +44,24 @@ OME-TIFF sources. Import never changes source data. It writes to an owned
 stage, validates the result, and publishes only to a previously absent
 destination.
 
+For a reviewed `uint8` sentinel, source equality is evaluated only at LOD 0.
+Final base validity is the in-bounds Chebyshev-radius-one erosion of source
+validity (zero Z radius for 2D). Each later LOD stores the half-up mean of valid
+samples in its aligned, odd-tail-clipped factor-two parent block, marks a child
+supported when any parent is valid, and applies the same in-bounds one-voxel
+invalid dilation. A derived mean numerically equal to the source sentinel
+remains valid. Every final invalid integer sample is canonical zero. The
+sentinel recipe records these classification, dimensionality, reduction,
+rounding, support, dilation, and canonicalization facts under
+`tiff-import-u8-sentinel-guarded-pyramid` version `2.0.0`; no-sentinel recipes
+retain the existing canonical-base operation.
+
+Sentinel mean levels use an axis-aware centered OME transform. An axis reduced
+by cumulative factor `F` has scale `base_spacing * F` and translation
+`base_spacing * (F - 1) / 2`; an axis already of length one keeps factor one
+and zero translation. Existing complete packages retain their recorded arrays
+and transforms and are not reinterpreted.
+
 Incomplete imports use one current, non-portable checkpoint schema with six
 regular files: two fixed canonical-base files and four encoded-spool files.
 The canonical file stores little-endian planes; checksummed state records name
@@ -55,11 +73,13 @@ boundary or serialized decoder interval can force either authority to
 synchronize earlier. A canonical plane above 64 MiB fails the checked capacity
 boundary instead of expanding a batch. Recovery discards only an incomplete
 bounded suffix, rejects complete corruption or a wrong source/plan binding,
-and never migrates a predecessor checkpoint. Checkpoint names are opened
-relative to a retained no-follow directory descriptor; canonical and spool
-cleanup remove a name only while it still identifies the exact retained file.
-Checkpoints are temporary implementation state, not part of the `.m4d`
-profile.
+and never migrates a predecessor checkpoint. Sentinel checkpoints bind the
+guarded-mean algorithm identifier, so an incomplete exact-only/point-sampled
+checkpoint is rejected and must be explicitly reset before restart. Checkpoint
+names are opened relative to a retained no-follow directory descriptor;
+canonical and spool cleanup remove a name only while it still identifies the
+exact retained file. Checkpoints are temporary implementation state, not part
+of the `.m4d` profile.
 
 Pixel and validity chunks are encoded once through the storage codec authority.
 The checkpoint-to-writer boundary validates kind, encoded/decoded length,

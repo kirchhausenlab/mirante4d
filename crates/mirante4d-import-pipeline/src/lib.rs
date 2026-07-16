@@ -18,6 +18,7 @@ mod pipeline;
 mod plan;
 mod publish;
 mod pyramid;
+mod sentinel;
 mod source;
 mod spool;
 mod worker;

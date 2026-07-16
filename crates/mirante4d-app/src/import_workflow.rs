@@ -289,7 +289,9 @@ fn validate_review(review: &PendingImportReview, draft: ImportReviewDraft) -> an
         anyhow::bail!("the time step must be positive and finite");
     }
     if draft.no_data_sentinel.is_some() && review.inspection.dtype != IntensityDType::Uint8 {
-        anyhow::bail!("a no-data sentinel is supported only for uint8 TIFF input");
+        anyhow::bail!(
+            "the exact-sentinel plus one-voxel invalid-dilation policy is supported only for uint8 TIFF input"
+        );
     }
     if !IMPORT_WORKING_MEMORY_CHOICES.contains(&draft.working_memory_bytes) {
         anyhow::bail!("select one of the offered import memory limits");

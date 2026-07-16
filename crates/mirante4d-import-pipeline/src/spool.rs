@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use mirante4d_domain::IntensityDType;
 use mirante4d_identity::{Sha256Digest, Sha256Hasher};
 #[cfg(test)]
 use mirante4d_storage::encode_inner_payload;
@@ -180,6 +181,7 @@ pub(crate) struct SpoolChunk {
 }
 
 /// One complete recovered work unit.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SpoolWorkUnit {
     pub(crate) key: SpoolWorkUnitKey,
@@ -215,9 +217,11 @@ pub(crate) struct SpoolPayloadReader {
     snapshot_bytes: u64,
 }
 
+/// One selectively decoded spool component and the codec work attributable to
+/// that read. An absent component performs no payload I/O or codec operation.
 #[derive(Debug)]
-pub(crate) struct SpoolDecodedWorkUnit {
-    pub(crate) unit: SpoolWorkUnit,
+pub(crate) struct SpoolDecodedComponent {
+    pub(crate) chunk: Option<SpoolChunk>,
     pub(crate) codec_decode_calls: u64,
     pub(crate) codec_decode_time_ns: u64,
 }
@@ -1008,43 +1012,68 @@ impl From<ChunkRecord> for SpoolChunkDescriptor {
     }
 }
 
+impl SpoolWorkUnitDescriptor {
+    /// Strictly decodes the immutable packed-index facts associated with this
+    /// descriptor. Workers can inspect the all-valid/all-invalid flags before
+    /// deciding whether a validity payload decode is necessary.
+    pub(crate) fn packed_index_record(
+        self,
+        dtype: IntensityDType,
+        logical_brick_capacity: u64,
+    ) -> Result<PackedIndexRecord, ImportError> {
+        let record = PackedIndexRecord::decode(&self.packed_index, dtype, logical_brick_capacity)
+            .map_err(|error| {
+            ImportError::InvalidCheckpoint(format!("a packed-index record is invalid: {error}"))
+        })?;
+        if record.coordinates() != self.key.coordinates() {
+            return Err(ImportError::InvalidCheckpoint(
+                "a packed-index record does not match its spool work-unit key".to_owned(),
+            ));
+        }
+        if record.pixel_payload_present() != self.pixel.is_some() {
+            return Err(ImportError::InvalidCheckpoint(
+                "a packed-index pixel-presence fact disagrees with its spool descriptor".to_owned(),
+            ));
+        }
+        let validity_payload_required = record.explicit_validity() && !record.all_voxels_invalid();
+        if validity_payload_required != self.validity.is_some() {
+            return Err(ImportError::InvalidCheckpoint(
+                "packed-index validity facts disagree with the spool descriptor".to_owned(),
+            ));
+        }
+        Ok(record)
+    }
+}
+
 impl SpoolPayloadReader {
-    pub(crate) fn read_work_unit(
+    /// Reads and checksum-validates only the pixel component named by one
+    /// immutable descriptor. The paired validity component is never touched.
+    pub(crate) fn read_pixel_component(
         &self,
         descriptor: SpoolWorkUnitDescriptor,
-    ) -> Result<SpoolDecodedWorkUnit, ImportError> {
-        let mut codec_decode_calls = 0_u64;
-        let mut codec_decode_time_ns = 0_u64;
-        let pixel = self.read_chunk(
-            descriptor.pixel,
-            &mut codec_decode_calls,
-            &mut codec_decode_time_ns,
-        )?;
-        let validity = self.read_chunk(
-            descriptor.validity,
-            &mut codec_decode_calls,
-            &mut codec_decode_time_ns,
-        )?;
-        Ok(SpoolDecodedWorkUnit {
-            unit: SpoolWorkUnit {
-                key: descriptor.key,
-                pixel,
-                validity,
-                packed_index: descriptor.packed_index,
-            },
-            codec_decode_calls,
-            codec_decode_time_ns,
-        })
+    ) -> Result<SpoolDecodedComponent, ImportError> {
+        self.read_component(descriptor.pixel)
     }
 
-    fn read_chunk(
+    /// Reads and checksum-validates only the validity component named by one
+    /// immutable descriptor. The paired pixel component is never touched.
+    pub(crate) fn read_validity_component(
+        &self,
+        descriptor: SpoolWorkUnitDescriptor,
+    ) -> Result<SpoolDecodedComponent, ImportError> {
+        self.read_component(descriptor.validity)
+    }
+
+    fn read_component(
         &self,
         descriptor: Option<SpoolChunkDescriptor>,
-        codec_decode_calls: &mut u64,
-        codec_decode_time_ns: &mut u64,
-    ) -> Result<Option<SpoolChunk>, ImportError> {
+    ) -> Result<SpoolDecodedComponent, ImportError> {
         let Some(descriptor) = descriptor else {
-            return Ok(None);
+            return Ok(SpoolDecodedComponent {
+                chunk: None,
+                codec_decode_calls: 0,
+                codec_decode_time_ns: 0,
+            });
         };
         let end = descriptor
             .offset
@@ -1069,16 +1098,14 @@ impl SpoolPayloadReader {
         let decoded = decode_inner_payload(descriptor.kind, &encoded).map_err(|error| {
             ImportError::InvalidCheckpoint(format!("an encoded chunk is invalid: {error}"))
         })?;
-        *codec_decode_calls = codec_decode_calls
-            .checked_add(1)
-            .ok_or(ImportError::Overflow)?;
-        *codec_decode_time_ns = codec_decode_time_ns
-            .checked_add(elapsed_ns(started.elapsed()))
-            .ok_or(ImportError::Overflow)?;
-        Ok(Some(SpoolChunk {
-            kind: descriptor.kind,
-            decoded,
-        }))
+        Ok(SpoolDecodedComponent {
+            chunk: Some(SpoolChunk {
+                kind: descriptor.kind,
+                decoded,
+            }),
+            codec_decode_calls: 1,
+            codec_decode_time_ns: elapsed_ns(started.elapsed()),
+        })
     }
 }
 
@@ -2070,8 +2097,8 @@ fn invalid_checkpoint<T>(message: impl Into<String>) -> Result<T, ImportError> {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
-        io::{Seek, SeekFrom, Write},
+        fs::{self, OpenOptions},
+        io::{Read, Seek, SeekFrom, Write},
     };
 
     use mirante4d_domain::IntensityDType;
@@ -2205,6 +2232,144 @@ mod tests {
                 .decoded,
             decoded
         );
+    }
+
+    #[test]
+    fn selective_component_reads_do_not_touch_the_paired_payload() {
+        let (_temporary, checkpoint) = checkpoint();
+        let mut spool = open(&checkpoint, binding(4)).unwrap();
+        let key = key(0);
+        let pixel_kind = ShardProfileKind::Pixel2dUint8;
+        let validity_kind = ShardProfileKind::Validity2d;
+        let pixels = decoded(pixel_kind, 23);
+        let validity = decoded(validity_kind, 0x55);
+        spool
+            .append_if_absent(
+                key,
+                Some(SpoolChunkInput::new(pixel_kind, &pixels)),
+                Some(SpoolChunkInput::new(validity_kind, &validity)),
+                packed(key, 3, 1, true, true),
+            )
+            .unwrap();
+
+        let descriptor = spool.work_unit_descriptor(key).unwrap();
+        assert_eq!(descriptor.key, key);
+        assert!(descriptor.pixel.is_some());
+        assert!(descriptor.validity.is_some());
+        let record = descriptor
+            .packed_index_record(IntensityDType::Uint8, 6)
+            .unwrap();
+        assert!(!record.all_voxels_valid());
+        assert!(!record.all_voxels_invalid());
+        let reader = spool.payload_reader().unwrap();
+        let decoded_validity = reader.read_validity_component(descriptor).unwrap();
+        assert_eq!(decoded_validity.codec_decode_calls, 1);
+        assert!(decoded_validity.codec_decode_time_ns > 0);
+        assert_eq!(decoded_validity.chunk.unwrap().decoded, validity);
+
+        // Corrupt only the pixel frame. A validity-only read must remain
+        // successful, which is the direction used by halo-only parents.
+        let pixel_offset = descriptor.pixel.unwrap().offset;
+        let mut payload = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(checkpoint.join(PAYLOAD_FILE))
+            .unwrap();
+        payload.seek(SeekFrom::Start(pixel_offset)).unwrap();
+        let mut original_pixel_byte = [0_u8; 1];
+        payload.read_exact(&mut original_pixel_byte).unwrap();
+        payload.seek(SeekFrom::Start(pixel_offset)).unwrap();
+        payload.write_all(&[original_pixel_byte[0] ^ 0xff]).unwrap();
+        assert_eq!(
+            reader
+                .read_validity_component(descriptor)
+                .unwrap()
+                .chunk
+                .unwrap()
+                .decoded,
+            validity
+        );
+        assert!(matches!(
+            reader.read_pixel_component(descriptor),
+            Err(ImportError::InvalidCheckpoint(_))
+        ));
+        payload.seek(SeekFrom::Start(pixel_offset)).unwrap();
+        payload.write_all(&original_pixel_byte).unwrap();
+
+        // Corrupt only the validity frame after the immutable descriptor and
+        // snapshot have been captured. A selective pixel read must still
+        // succeed, proving that it neither reads nor decodes the paired mask.
+        let validity_offset = descriptor.validity.unwrap().offset;
+        payload.seek(SeekFrom::Start(validity_offset)).unwrap();
+        let mut byte = [0_u8; 1];
+        payload.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0xff;
+        payload.seek(SeekFrom::Start(validity_offset)).unwrap();
+        payload.write_all(&byte).unwrap();
+
+        let pixel = reader.read_pixel_component(descriptor).unwrap();
+        assert_eq!(pixel.codec_decode_calls, 1);
+        assert!(pixel.codec_decode_time_ns > 0);
+        assert_eq!(pixel.chunk.unwrap().decoded, pixels);
+        assert!(matches!(
+            reader.read_validity_component(descriptor),
+            Err(ImportError::InvalidCheckpoint(_))
+        ));
+    }
+
+    #[test]
+    fn packed_index_uniform_facts_allow_payload_free_validity_reads() {
+        let (_temporary, checkpoint) = checkpoint();
+        let mut spool = open(&checkpoint, binding(5)).unwrap();
+        let all_valid_key = key(0);
+        let all_invalid_key = key(1);
+        let pixel_kind = ShardProfileKind::Pixel2dUint8;
+        let validity_kind = ShardProfileKind::Validity2d;
+        let pixels = decoded(pixel_kind, 7);
+        let validity = decoded(validity_kind, 0xff);
+        spool
+            .append_if_absent(
+                all_valid_key,
+                Some(SpoolChunkInput::new(pixel_kind, &pixels)),
+                Some(SpoolChunkInput::new(validity_kind, &validity)),
+                packed(all_valid_key, 6, 1, true, true),
+            )
+            .unwrap();
+        spool
+            .append_if_absent(
+                all_invalid_key,
+                None,
+                None,
+                packed(all_invalid_key, 0, 0, false, true),
+            )
+            .unwrap();
+
+        let all_valid = spool.work_unit_descriptor(all_valid_key).unwrap();
+        let valid_record = all_valid
+            .packed_index_record(IntensityDType::Uint8, 6)
+            .unwrap();
+        assert!(valid_record.all_voxels_valid());
+        assert!(!valid_record.all_voxels_invalid());
+        // The canonical spool retains an all-valid mask component, but the
+        // record proves a worker can synthesize it without reading that frame.
+        assert!(all_valid.validity.is_some());
+
+        let all_invalid = spool.work_unit_descriptor(all_invalid_key).unwrap();
+        let invalid_record = all_invalid
+            .packed_index_record(IntensityDType::Uint8, 6)
+            .unwrap();
+        assert!(!invalid_record.all_voxels_valid());
+        assert!(invalid_record.all_voxels_invalid());
+        assert!(all_invalid.pixel.is_none());
+        assert!(all_invalid.validity.is_none());
+        let absent = spool
+            .payload_reader()
+            .unwrap()
+            .read_validity_component(all_invalid)
+            .unwrap();
+        assert!(absent.chunk.is_none());
+        assert_eq!(absent.codec_decode_calls, 0);
+        assert_eq!(absent.codec_decode_time_ns, 0);
     }
 
     #[test]

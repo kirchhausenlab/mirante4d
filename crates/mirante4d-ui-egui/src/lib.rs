@@ -52,6 +52,9 @@ use mirante4d_application::{
     viewport_interaction::ViewportOrbitDrag,
 };
 
+const U8_SENTINEL_POLICY_DESCRIPTION: &str =
+    "exact sentinel match + one-voxel invalid dilation at base and every LOD";
+
 /// Egui-local draft values and interaction state.
 #[derive(Debug)]
 pub struct EguiUiState {
@@ -887,6 +890,11 @@ fn show_import_review(
                 *sentinel = value as u8;
             }
         });
+        property_row(
+            ui,
+            "selected no-data policy",
+            U8_SENTINEL_POLICY_DESCRIPTION,
+        );
     } else if !sentinel_supported {
         property_row(ui, "no-data sentinel", "available only for uint8 sources");
     }
@@ -1381,6 +1389,27 @@ mod tests {
                 draft,
             }]
         );
+    }
+
+    #[test]
+    fn sentinel_import_review_states_the_guarded_policy() {
+        let mut draft = import_draft(0.5);
+        draft.no_data_sentinel = Some(255);
+        let harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 700.0))
+            .build_ui_state(
+                |ui, state: &mut ImportWindowHarnessState| {
+                    state.commands =
+                        show_import_workflow_window(ui.ctx(), &mut state.ui, &state.snapshot);
+                },
+                ImportWindowHarnessState {
+                    ui: EguiUiState::new(256, 128),
+                    snapshot: import_review(12, draft),
+                    commands: Vec::new(),
+                },
+            );
+
+        harness.get_by_label(U8_SENTINEL_POLICY_DESCRIPTION);
     }
 
     #[test]

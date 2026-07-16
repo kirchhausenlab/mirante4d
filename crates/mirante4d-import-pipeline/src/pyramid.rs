@@ -13,13 +13,10 @@ const STOP_VOXELS_PER_TIMEPOINT: u64 = 262_144;
 /// Result of reducing one caller-owned dense source region.
 ///
 /// Pixels use the target profile's canonical little-endian representation.
-/// Validity remains one byte per voxel here; the package producer packs those
-/// bytes only when it writes the target validity array.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DownsampledRegion {
     pub shape_zyx: [u64; 3],
     pub pixels_le: Vec<u8>,
-    pub validity: Option<Vec<u8>>,
 }
 
 /// Builds the deterministic spatial pyramid used by the import producer.
@@ -60,18 +57,16 @@ pub(crate) const fn pixel_chunk_shape(shape: Shape4D) -> [u64; 3] {
 
 /// Decimates one bounded dense Z/Y/X source region by a factor of two.
 ///
-/// `pixels_le` contains tightly packed canonical samples. When `validity` is
-/// present it must contain one canonical byte (`0` or `1`) per source sample.
-/// Each output copies the source sample at its even factor-two origin. An
-/// invalid selected sample becomes zero-valued and invalid. Ceil division
-/// retains the final source coordinate when a dimension is odd, matching a
-/// factor-two scale with constant translation. The returned region is tightly
-/// packed and has `ceil(source / 2)` dimensions.
+/// `pixels_le` contains tightly packed canonical samples. Each output copies
+/// the source sample at its even factor-two origin. Ceil division retains the
+/// final source coordinate when a dimension is odd, matching a factor-two
+/// scale with constant translation. Explicit-validity uint8 imports use the
+/// guarded predecessor reducer in `sentinel`; this helper is intentionally
+/// incapable of selecting the obsolete exact-only validity policy.
 pub(crate) fn downsample_region(
     dtype: IntensityDType,
     source_shape_zyx: [u64; 3],
     pixels_le: &[u8],
-    validity: Option<&[u8]>,
 ) -> Result<DownsampledRegion, ImportError> {
     let source_voxels = checked_voxels(source_shape_zyx)?;
     let bytes_per_sample = usize::from(dtype.bytes_per_sample());
@@ -81,16 +76,6 @@ pub(crate) fn downsample_region(
     if pixels_le.len() != expected_pixel_bytes {
         return Err(ImportError::InvalidRequest(
             "downsample source pixel length does not match its shape",
-        ));
-    }
-    if validity.is_some_and(|mask| mask.len() != source_voxels) {
-        return Err(ImportError::InvalidRequest(
-            "downsample source validity length does not match its shape",
-        ));
-    }
-    if validity.is_some_and(|mask| mask.iter().any(|value| !matches!(value, 0 | 1))) {
-        return Err(ImportError::InvalidRequest(
-            "downsample validity bytes must be canonical 0 or 1",
         ));
     }
     if dtype == IntensityDType::Float32
@@ -109,39 +94,24 @@ pub(crate) fn downsample_region(
         .checked_mul(bytes_per_sample)
         .ok_or(ImportError::Overflow)?;
     let mut output = Vec::with_capacity(output_bytes);
-    let mut output_validity = validity.map(|_| Vec::with_capacity(output_voxels));
 
     for output_z in 0..output_shape_zyx[0] {
         for output_y in 0..output_shape_zyx[1] {
             for output_x in 0..output_shape_zyx[2] {
                 let origin = [output_z * 2, output_y * 2, output_x * 2];
                 let index = source_index(source_shape_zyx, origin[0], origin[1], origin[2])?;
-                let valid = validity.is_none_or(|mask| mask[index] == 1);
                 let byte_start = index
                     .checked_mul(bytes_per_sample)
                     .ok_or(ImportError::Overflow)?;
-                if valid {
-                    output.extend_from_slice(&pixels_le[byte_start..byte_start + bytes_per_sample]);
-                } else {
-                    output.resize(output.len() + bytes_per_sample, 0);
-                }
-                if let Some(mask) = output_validity.as_mut() {
-                    mask.push(u8::from(valid));
-                }
+                output.extend_from_slice(&pixels_le[byte_start..byte_start + bytes_per_sample]);
             }
         }
     }
 
     debug_assert_eq!(output.len(), output_bytes);
-    debug_assert!(
-        output_validity
-            .as_ref()
-            .is_none_or(|mask| mask.len() == output_voxels)
-    );
     Ok(DownsampledRegion {
         shape_zyx: output_shape_zyx,
         pixels_le: output,
-        validity: output_validity,
     })
 }
 
@@ -266,13 +236,11 @@ mod tests {
             IntensityDType::Uint8,
             [1, 3, 3],
             &[0, 1, 2, 3, 4, 5, 6, 7, 9],
-            None,
         )
         .unwrap();
 
         assert_eq!(reduced.shape_zyx, [1, 2, 2]);
         assert_eq!(reduced.pixels_le, vec![0, 2, 6, 9]);
-        assert_eq!(reduced.validity, None);
     }
 
     #[test]
@@ -281,34 +249,10 @@ mod tests {
             IntensityDType::Uint16,
             [3, 2, 2],
             &u16_bytes(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
-            None,
         )
         .unwrap();
 
         assert_eq!(decode_u16(&reduced.pixels_le), vec![0, 8]);
-    }
-
-    #[test]
-    fn validity_follows_only_the_selected_sample() {
-        let reduced = downsample_region(
-            IntensityDType::Uint8,
-            [1, 2, 4],
-            &[10, 200, 30, 40, 50, 60, 70, 80],
-            Some(&[0, 1, 1, 1, 1, 1, 1, 1]),
-        )
-        .unwrap();
-        assert_eq!(reduced.pixels_le, vec![0, 30]);
-        assert_eq!(reduced.validity, Some(vec![0, 1]));
-
-        let empty = downsample_region(
-            IntensityDType::Uint16,
-            [1, 1, 1],
-            &u16_bytes(&[u16::MAX]),
-            Some(&[0]),
-        )
-        .unwrap();
-        assert_eq!(decode_u16(&empty.pixels_le), vec![0]);
-        assert_eq!(empty.validity, Some(vec![0]));
     }
 
     #[test]
@@ -317,28 +261,18 @@ mod tests {
             IntensityDType::Float32,
             [1, 1, 3],
             &f32_bytes(&[f32::MAX, -f32::MAX, 3.0]),
-            None,
         )
         .unwrap();
         assert_eq!(decode_f32(&reduced.pixels_le), vec![f32::MAX, 3.0]);
 
-        let error = downsample_region(
-            IntensityDType::Float32,
-            [1, 1, 1],
-            &f32_bytes(&[f32::NAN]),
-            None,
-        )
-        .unwrap_err();
+        let error = downsample_region(IntensityDType::Float32, [1, 1, 1], &f32_bytes(&[f32::NAN]))
+            .unwrap_err();
         assert!(matches!(error, ImportError::InvalidRequest(_)));
     }
 
     #[test]
     fn malformed_dense_regions_are_rejected() {
-        assert!(downsample_region(IntensityDType::Uint16, [1, 1, 2], &[0; 2], None).is_err());
-        assert!(downsample_region(IntensityDType::Uint8, [1, 1, 1], &[0], Some(&[2])).is_err());
-        assert!(
-            downsample_region(IntensityDType::Uint8, [1, 1, 3], &[0; 3], Some(&[1, 2, 1])).is_err()
-        );
-        assert!(downsample_region(IntensityDType::Uint8, [0, 1, 1], &[], None).is_err());
+        assert!(downsample_region(IntensityDType::Uint16, [1, 1, 2], &[0; 2]).is_err());
+        assert!(downsample_region(IntensityDType::Uint8, [0, 1, 1], &[]).is_err());
     }
 }

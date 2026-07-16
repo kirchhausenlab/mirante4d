@@ -1,6 +1,6 @@
 # Architecture
 
-Last updated: 2026-07-15
+Last updated: 2026-07-16
 
 Mirante4D is a native Rust desktop viewer and analysis workbench. It opens
 strict `.m4d` packages; source microscopy data enters through explicit
@@ -115,6 +115,19 @@ run concurrently; multipage or over-task-ceiling TIFFs use one streaming
 decoder. The calling owner alone advances checkpoint state and commits
 canonical order. Canonical and spool positional readers are shared, so worker
 tasks add no per-task checkpoint descriptors.
+
+The reviewed `U8Sentinel` selector has one hard-cut production route. Base and
+scientific-identity tasks read a clipped Chebyshev-radius-one source halo,
+classify exact sentinel equality, scatter invalid dilation into the logical
+core, and canonicalize final invalid values to zero. A coarse task reads pixel
+components only for its aligned factor-two core (at most four 2D or eight 3D
+parents), while a separately charged parent-validity window supplies the
+target-plus-one support halo (at most sixteen or sixty-four parents). Uniform
+packed-index facts synthesize validity without codec work; mixed parents decode
+only their validity component. The task forms valid-only half-up means,
+dilates unsupported child samples, crops once, and encodes one final work unit.
+There is no full-level support pass or sentinel fallback to point decimation.
+No-sentinel imports retain the prior point-sampled route.
 
 Publication streams those validated inner encodings into indexed outer shards
 without decoding and re-encoding pixel or validity chunks. The storage writer
