@@ -10,7 +10,7 @@ use std::{
         fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -53,6 +53,9 @@ const PRIMARY_MEDIAN_NS_MAX: u64 = 15 * 60 * 1_000_000_000;
 const PRIMARY_MEDIAN_STRETCH_NS: u64 = 10 * 60 * 1_000_000_000;
 const DEFAULT_SAMPLES: usize = 3;
 const RSS_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
+// Linux can tear down a process memory map before making its exit waitable.
+// Only a real exit observed within this small terminal window is accepted.
+const RSS_TERMINAL_EXIT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(1);
 const INSPECTION_TIMEOUT_SECONDS: u64 = 30 * 60;
 const POST_PRIMARY_TIMEOUT_SECONDS: u64 = 10 * 60;
 const MAPPED_WIDTH: u32 = 1280;
@@ -1835,6 +1838,14 @@ struct ProcessObservation {
 enum ProcessRssPoll<T> {
     Exited(T),
     Sample(u64),
+    ExitPending,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TerminalRssExitConfirmation<T> {
+    Exited(T),
+    RssGraceExpired,
+    ProcessDeadlineReached,
 }
 
 fn run_app_process(run: AppRun<'_>) -> anyhow::Result<ProcessObservation> {
@@ -1871,7 +1882,7 @@ fn run_app_process(run: AppRun<'_>) -> anyhow::Result<ProcessObservation> {
     let mut mapped_window = None;
     let mut next_geometry_probe = Instant::now();
     loop {
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = try_wait_t5_child(&mut child)? {
             return Ok(ProcessObservation {
                 exit_success: status.success(),
                 rss_samples,
@@ -1879,7 +1890,15 @@ fn run_app_process(run: AppRun<'_>) -> anyhow::Result<ProcessObservation> {
             });
         }
         let rss_result = read_process_rss_bytes(pid);
-        match reconcile_process_rss_poll(rss_result, child.try_wait()?)? {
+        let exit_status = try_wait_t5_child(&mut child)?;
+        let rss_poll = match reconcile_process_rss_poll(rss_result, exit_status) {
+            Ok(rss_poll) => rss_poll,
+            Err(error) => {
+                terminate_t5_child(&mut child);
+                return Err(error);
+            }
+        };
+        match rss_poll {
             ProcessRssPoll::Exited(status) => {
                 return Ok(ProcessObservation {
                     exit_success: status.success(),
@@ -1891,12 +1910,49 @@ fn run_app_process(run: AppRun<'_>) -> anyhow::Result<ProcessObservation> {
                 epoch_ms: epoch_ms(),
                 rss_bytes,
             }),
+            ProcessRssPoll::ExitPending => {
+                let confirmation = confirm_process_exit_after_rss_disappeared(
+                    || child.try_wait().map_err(Into::into),
+                    || thread::sleep(RSS_SAMPLE_INTERVAL),
+                    Instant::now,
+                    deadline,
+                    RSS_TERMINAL_EXIT_CONFIRM_TIMEOUT,
+                );
+                let status = match confirmation {
+                    Ok(TerminalRssExitConfirmation::Exited(status)) => status,
+                    Ok(TerminalRssExitConfirmation::RssGraceExpired) => {
+                        terminate_t5_child(&mut child);
+                        bail!(
+                            "Linux process RSS status disappeared without a bounded T5 child exit confirmation"
+                        );
+                    }
+                    Ok(TerminalRssExitConfirmation::ProcessDeadlineReached) => {
+                        terminate_t5_child(&mut child);
+                        bail!("T5 app process exceeded its declared timeout");
+                    }
+                    Err(error) => {
+                        terminate_t5_child(&mut child);
+                        return Err(error);
+                    }
+                };
+                return Ok(ProcessObservation {
+                    exit_success: status.success(),
+                    rss_samples,
+                    mapped_window,
+                });
+            }
         }
         if mapped_window.is_none() && Instant::now() >= next_geometry_probe {
-            mapped_window = probe_x11_client_geometry(pid, MAPPED_WIDTH, MAPPED_HEIGHT)?;
+            mapped_window = match probe_x11_client_geometry(pid, MAPPED_WIDTH, MAPPED_HEIGHT) {
+                Ok(mapped_window) => mapped_window,
+                Err(error) => {
+                    terminate_t5_child(&mut child);
+                    return Err(error);
+                }
+            };
             next_geometry_probe = Instant::now() + Duration::from_millis(100);
         }
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = try_wait_t5_child(&mut child)? {
             return Ok(ProcessObservation {
                 exit_success: status.success(),
                 rss_samples,
@@ -1904,8 +1960,7 @@ fn run_app_process(run: AppRun<'_>) -> anyhow::Result<ProcessObservation> {
             });
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_t5_child(&mut child);
             bail!("T5 app process exceeded its declared timeout");
         }
         thread::sleep(RSS_SAMPLE_INTERVAL);
@@ -1916,12 +1971,71 @@ fn reconcile_process_rss_poll<T>(
     rss_result: anyhow::Result<Option<u64>>,
     exit_status: Option<T>,
 ) -> anyhow::Result<ProcessRssPoll<T>> {
+    let rss_result = rss_result?;
     if let Some(status) = exit_status {
         return Ok(ProcessRssPoll::Exited(status));
     }
-    rss_result?
-        .map(ProcessRssPoll::Sample)
-        .context("Linux process RSS status disappeared while the T5 child remained live")
+    Ok(match rss_result {
+        Some(rss_bytes) => ProcessRssPoll::Sample(rss_bytes),
+        None => ProcessRssPoll::ExitPending,
+    })
+}
+
+fn try_wait_t5_child(child: &mut Child) -> anyhow::Result<Option<ExitStatus>> {
+    match child.try_wait() {
+        Ok(status) => Ok(status),
+        Err(error) => {
+            terminate_t5_child(child);
+            Err(error.into())
+        }
+    }
+}
+
+fn terminate_t5_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn confirm_process_exit_after_rss_disappeared<T>(
+    mut try_wait: impl FnMut() -> anyhow::Result<Option<T>>,
+    mut pause: impl FnMut(),
+    mut now: impl FnMut() -> Instant,
+    process_deadline: Instant,
+    confirmation_timeout: Duration,
+) -> anyhow::Result<TerminalRssExitConfirmation<T>> {
+    let confirmation_started = now();
+    let confirmation_deadline = confirmation_started
+        .checked_add(confirmation_timeout)
+        .unwrap_or(process_deadline);
+    let (terminal_deadline, timeout_outcome) = if process_deadline <= confirmation_deadline {
+        (
+            process_deadline,
+            TerminalRssExitConfirmation::ProcessDeadlineReached,
+        )
+    } else {
+        (
+            confirmation_deadline,
+            TerminalRssExitConfirmation::RssGraceExpired,
+        )
+    };
+    if confirmation_started >= terminal_deadline {
+        return Ok(timeout_outcome);
+    }
+    if let Some(status) = try_wait()? {
+        return Ok(TerminalRssExitConfirmation::Exited(status));
+    }
+    loop {
+        if now() >= terminal_deadline {
+            return Ok(timeout_outcome);
+        }
+        pause();
+        if now() >= terminal_deadline {
+            return Ok(timeout_outcome);
+        }
+        if let Some(status) = try_wait()? {
+            return Ok(TerminalRssExitConfirmation::Exited(status));
+        }
+    }
 }
 
 fn read_process_rss_bytes(pid: u32) -> anyhow::Result<Option<u64>> {
@@ -1938,7 +2052,14 @@ fn parse_process_rss_bytes(status: &str) -> anyhow::Result<Option<u64>> {
     let Some(value) = status.lines().find_map(|line| line.strip_prefix("VmRSS:")) else {
         // Linux zombie status documents and a process that exits while its
         // procfs file is read legitimately omit VmRSS. The caller accepts
-        // this only when a second wait confirms that the child exited.
+        // this only after bounded exit confirmation. Other surviving memory
+        // fields instead indicate a malformed or truncated live status.
+        if status.lines().any(|line| {
+            line.split_once(':')
+                .is_some_and(|(name, _)| name.starts_with("Vm") || name.starts_with("Rss"))
+        }) {
+            bail!("Linux process status omitted VmRSS while other memory fields remained");
+        }
         return Ok(None);
     };
     let mut fields = value.split_ascii_whitespace();
@@ -3238,7 +3359,13 @@ mod tests {
             parse_process_rss_bytes("Name:\tapp\nState:\tZ (zombie)\n").unwrap(),
             None
         );
+        assert_eq!(
+            parse_process_rss_bytes("Name:\tapp\nState:\tR (running)\n").unwrap(),
+            None
+        );
         for malformed in [
+            "Name:\tapp\nVmSize:\t123 kB\n",
+            "Name:\tapp\nRssAnon:\t123 kB\n",
             "VmRSS:\n",
             "VmRSS:\tnot-a-number kB\n",
             "VmRSS:\t123 bytes\n",
@@ -3260,16 +3387,117 @@ mod tests {
             reconcile_process_rss_poll(Ok(Some(42)), None::<&str>).unwrap(),
             ProcessRssPoll::Sample(42)
         );
-        assert!(reconcile_process_rss_poll(Ok(None), None::<&str>).is_err());
         assert_eq!(
-            reconcile_process_rss_poll(Err(anyhow::anyhow!("terminal race")), Some("exited"))
-                .unwrap(),
-            ProcessRssPoll::Exited("exited")
+            reconcile_process_rss_poll(Ok(None), None::<&str>).unwrap(),
+            ProcessRssPoll::ExitPending
         );
+        let terminal_error =
+            reconcile_process_rss_poll(Err(anyhow::anyhow!("terminal race")), Some("exited"))
+                .unwrap_err();
+        assert_eq!(terminal_error.to_string(), "terminal race");
         let live_error =
             reconcile_process_rss_poll::<&str>(Err(anyhow::anyhow!("malformed live status")), None)
                 .unwrap_err();
         assert_eq!(live_error.to_string(), "malformed live status");
+    }
+
+    #[test]
+    fn missing_terminal_rss_requires_bounded_confirmed_exit() {
+        let start = Instant::now();
+        let mut statuses = std::collections::VecDeque::from([None, None, Some("exited")]);
+        let now = std::cell::Cell::new(start);
+        let pauses = std::cell::Cell::new(0_u64);
+        assert_eq!(
+            confirm_process_exit_after_rss_disappeared(
+                || Ok(statuses.pop_front().flatten()),
+                || {
+                    pauses.set(pauses.get() + 1);
+                    now.set(now.get() + Duration::from_millis(100));
+                },
+                || now.get(),
+                start + Duration::from_secs(10),
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+            TerminalRssExitConfirmation::Exited("exited")
+        );
+        assert_eq!(pauses.get(), 2);
+
+        let polls = std::cell::Cell::new(0_u64);
+        let pauses = std::cell::Cell::new(0_u64);
+        let now = std::cell::Cell::new(start);
+        let live_outcome = confirm_process_exit_after_rss_disappeared::<&str>(
+            || {
+                polls.set(polls.get() + 1);
+                Ok(None)
+            },
+            || {
+                pauses.set(pauses.get() + 1);
+                now.set(now.get() + Duration::from_millis(500));
+            },
+            || now.get(),
+            start + Duration::from_secs(10),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(live_outcome, TerminalRssExitConfirmation::RssGraceExpired);
+        assert_eq!(polls.get(), 2);
+        assert_eq!(pauses.get(), 2);
+
+        let mut statuses = std::collections::VecDeque::from([None, Some("too late")]);
+        let now = std::cell::Cell::new(start);
+        assert_eq!(
+            confirm_process_exit_after_rss_disappeared(
+                || Ok(statuses.pop_front().flatten()),
+                || now.set(now.get() + Duration::from_secs(1)),
+                || now.get(),
+                start + Duration::from_secs(10),
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+            TerminalRssExitConfirmation::RssGraceExpired
+        );
+        assert_eq!(statuses.len(), 1);
+
+        let polls = std::cell::Cell::new(0_u64);
+        assert_eq!(
+            confirm_process_exit_after_rss_disappeared(
+                || {
+                    polls.set(polls.get() + 1);
+                    Ok(Some("too late"))
+                },
+                || {},
+                || start,
+                start,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+            TerminalRssExitConfirmation::ProcessDeadlineReached
+        );
+        assert_eq!(polls.get(), 0);
+
+        let now = std::cell::Cell::new(start);
+        assert_eq!(
+            confirm_process_exit_after_rss_disappeared::<&str>(
+                || Ok(None),
+                || now.set(now.get() + Duration::from_millis(250)),
+                || now.get(),
+                start + Duration::from_millis(250),
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+            TerminalRssExitConfirmation::ProcessDeadlineReached
+        );
+
+        let poll_error = confirm_process_exit_after_rss_disappeared::<&str>(
+            || Err(anyhow::anyhow!("wait failed")),
+            || unreachable!("a failed exit poll must not pause"),
+            || start,
+            start + Duration::from_secs(10),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(poll_error.to_string(), "wait failed");
     }
 
     #[test]
