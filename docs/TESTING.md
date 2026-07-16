@@ -243,11 +243,13 @@ and absence of custom Rust flags or compiler wrappers. Qualification accepts
 only a standard `release` build whose embedded revision matches the clean
 runtime checkout.
 
-A matching freshly authored profile is still self-attestation. It reports
-`binding_matched_pending_owner_acceptance` and remains diagnostic until the
-owner reviews the local tuple and accepts that profile's opaque SHA-256 in the
-repository qualification authority. No profile digest is accepted at present,
-so the tooling deliberately cannot emit final qualification evidence yet.
+A matching freshly authored profile is still self-attestation. Unless its
+opaque SHA-256 is the exact owner-accepted commitment in the repository
+qualification authority, it reports either pending acceptance or an owner
+digest mismatch and remains diagnostic. One reviewed local HW-2 profile
+commitment is now pinned; its raw host, storage, and path tuple remains local.
+Qualification still requires every observed boundary to match that exact
+commitment and its declared protocol.
 
 The private T5 product protocol has a separate strict release-only runner. Its
 configuration must be a nonsymlink regular JSON file outside the repository;
@@ -335,7 +337,8 @@ confirm that all workload/science gates pass and the facts remain stable. Pin
 only the final configuration digest from this second stable run; the first
 digest commits placeholders and is never eligible for owner acceptance.
 
-After owner review pins both opaque digests, the mandatory protocol omits
+The reviewed HW-2 profile and stable two-pass T5 configuration commitments are
+now pinned in the following authorities. The mandatory protocol omits
 `--diagnostic` and uses its fixed three fresh process sessions:
 
 - pin the accepted shared profile digest in

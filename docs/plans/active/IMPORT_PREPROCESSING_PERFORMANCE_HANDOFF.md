@@ -61,14 +61,15 @@ Implemented behavior includes:
   product scenario, qualification-profile binding, build/executable
   provenance, and sanitized/private evidence separation.
 
-Focused automated tests, one dirty-worktree release diagnostic, and the two
-public supporting product scenarios on a mapped physical X display are
-implementation evidence only. The owner-accepted HW-2 profile and T5
-configuration digests are unset, so the tools deliberately cannot make a
-qualification claim. No public or private absolute timing gate is recorded as
-passed here. [Testing and evidence](../../TESTING.md) owns the implemented
-sync, inner-codec, staged-object-read, descriptor, RSS, and byte-bound counter
-semantics used by both runners.
+Focused automated tests, diagnostic runs, and the two public supporting product
+scenarios on a mapped physical X display are implementation evidence only. The
+owner has accepted the reviewed HW-2 profile and stable two-pass T5
+configuration commitments, and both opaque digests are pinned in their
+repository authorities. The clean five-session T2 and three-session T5
+qualification sets have not yet been recorded, so no public or private
+absolute timing gate is accepted here. [Testing and evidence](../../TESTING.md)
+owns the implemented sync, inner-codec, staged-object-read, descriptor, RSS,
+and byte-bound counter semantics used by both runners.
 
 ## Observed Problem
 

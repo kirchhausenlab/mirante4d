@@ -26,14 +26,14 @@ LZW, current/old Deflate, and PackBits decoder set, binds opened source file
 descriptors to reviewed generation facts, and retains descriptor-bound
 checkpoint files and shared worker readers.
 
-Automated correctness, a one-session dirty-worktree release diagnostic, and
-the two public supporting product scenarios on a mapped physical X display are
-evidence for the implementation, not closeout. The active checkpoint is IP-04
-qualification: run the complete checks from one clean immutable revision, the
-five-session T2 protocol, the three-session private timing protocol, and the
-private normal mapped product workflow on owner-accepted HW-2; record accepted
-skips/risks and accept the final deletion audit. Neither the local HW-2 profile
-nor private T5-facts digest is owner-accepted, so current timing evidence is
-diagnostic only. This handoff remains active until those product and
-performance gates are accepted. Other unresolved work remains in [the
-backlog](../BACKLOG.md).
+Automated correctness, diagnostics, and the two public supporting product
+scenarios on a mapped physical X display are evidence for the implementation,
+not closeout. The owner has accepted the reviewed local HW-2 profile, the
+stable two-pass private T5 configuration, the physical-display declaration,
+and the recorded remaining risks; both opaque commitments are pinned. The
+active checkpoint is IP-04 qualification: run the complete checks from this
+clean immutable revision, the five-session T2 protocol, the three-session
+private timing protocol, and the private normal mapped product workflow on
+owner-accepted HW-2; record the accepted results and final deletion audit.
+This handoff remains active until those product and performance gates are
+accepted. Other unresolved work remains in [the backlog](../BACKLOG.md).

@@ -120,8 +120,10 @@ See [testing](TESTING.md) for commands and claim language.
   timing and private three-session HW-2 execution remain acceptance work. The
   public supporting target-source and generated-import scenarios have passed
   on a mapped physical X display, but they are not the private T5/HW-2 product
-  qualification. The local host/storage and private-facts digests are not
-  owner-accepted yet, so no final product-performance claim is recorded.
+  qualification. The reviewed local host/storage profile and stable private
+  T5-facts commitments are owner-accepted and pinned, but no final
+  product-performance claim is recorded until the complete clean sample sets
+  and deletion audit pass at their immutable qualification revision.
 - The target dataset profile and project-store format are experimental and
   carry no compatibility promise.
 - TIFF import and create-only dataset publication require Linux kernel 5.8 or

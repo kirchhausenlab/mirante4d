@@ -62,9 +62,10 @@ const MAPPED_WIDTH: u32 = 1280;
 const MAPPED_HEIGHT: u32 = 720;
 const SOURCE_ENTRY_MAX: usize = 4_096;
 
-/// Private facts cannot bless themselves. The owner must review one exact
-/// external configuration and pin its opaque digest in a repository change.
-pub(crate) const OWNER_ACCEPTED_T5_CONFIG_SHA256: Option<&str> = None;
+/// The owner accepted this exact opaque external-configuration commitment.
+/// Private facts remain outside the repository and any other digest fails closed.
+pub(crate) const OWNER_ACCEPTED_T5_CONFIG_SHA256: Option<&str> =
+    Some("3b27aabbe604edbc08b02c334ce193692121d1509e450cb001d66bfc3616369a");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunArgs {
@@ -3311,6 +3312,26 @@ mod tests {
                 "{variable} is not a release compiler/profile override"
             );
         }
+    }
+
+    #[test]
+    fn owner_bindings_pin_exact_reviewed_commitments() {
+        assert_eq!(
+            OWNER_ACCEPTED_IMPORT_QUALIFICATION_PROFILE_SHA256,
+            Some("50d18c8d3f695a90ff879fc6cdea210b273cc52f97f63350931e42fdd2b38abe")
+        );
+        assert_eq!(
+            OWNER_ACCEPTED_T5_CONFIG_SHA256,
+            Some("3b27aabbe604edbc08b02c334ce193692121d1509e450cb001d66bfc3616369a")
+        );
+        assert_eq!(
+            config_binding_status(OWNER_ACCEPTED_T5_CONFIG_SHA256.unwrap()),
+            "matched"
+        );
+        assert_eq!(
+            config_binding_status(&"0".repeat(64)),
+            "owner_digest_mismatch"
+        );
     }
 
     #[test]

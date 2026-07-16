@@ -100,9 +100,9 @@ For local public performance diagnostics or qualification, use the release
 `import-performance-t2` command documented in [Testing](TESTING.md). The same
 document owns the strict private `import-performance-t5` runner and its
 external configuration, real-display, raw-evidence, and sanitization rules.
-Qualification requires its local HW-2 host/ext4 profile to resolve outside the
-repository; an absent, mismatched, or not-yet-owner-accepted profile produces
-diagnostic-only evidence.
+Qualification requires the exact owner-pinned local HW-2 host/ext4 profile to
+resolve outside the repository; an absent, mismatched, or differently
+committed profile produces diagnostic-only evidence.
 Generated sources, packages, and evidence stay below ignored
 `target/mirante4d/` paths unless an explicit qualified scratch root is selected.
 

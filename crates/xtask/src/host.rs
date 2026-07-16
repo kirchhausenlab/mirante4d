@@ -14,9 +14,10 @@ pub(crate) const IMPORT_QUALIFICATION_PROFILE_SCHEMA: &str =
     "mirante4d-import-performance-qualification-profile-2";
 pub(crate) const IMPORT_QUALIFICATION_PROFILE_MAX_BYTES: u64 = 64 * 1024;
 pub(crate) const IMPORT_QUALIFICATION_HARDWARE_CLASS: &str = "HW-2";
-// Qualification remains fail-closed until the owner reviews a local profile and
-// accepts its opaque digest in a repository change. Raw profile fields stay local.
-pub(crate) const OWNER_ACCEPTED_IMPORT_QUALIFICATION_PROFILE_SHA256: Option<&str> = None;
+// The owner accepted this exact opaque local-profile commitment. Raw profile
+// fields stay local, and any other profile remains fail-closed.
+pub(crate) const OWNER_ACCEPTED_IMPORT_QUALIFICATION_PROFILE_SHA256: Option<&str> =
+    Some("50d18c8d3f695a90ff879fc6cdea210b273cc52f97f63350931e42fdd2b38abe");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImportQualificationProtocol {
@@ -771,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_external_profile_binding_is_redacted_and_pending_owner_acceptance() {
+    fn exact_external_profile_binding_is_redacted_and_rejects_unaccepted_digest() {
         let temporary = tempfile::tempdir().unwrap();
         let repository = temporary.path().join("repository");
         let qualified_root = temporary.path().join("qualified-private-scratch");
@@ -795,11 +796,11 @@ mod tests {
 
         assert_eq!(
             assessment.status,
-            "binding_matched_pending_owner_acceptance"
+            "binding_matched_but_owner_digest_mismatch"
         );
         assert_eq!(
             assessment.reason_codes,
-            vec!["qualification_profile_pending_owner_acceptance"]
+            vec!["qualification_profile_owner_digest_mismatch"]
         );
         assert!(assessment.profile_sha256.is_some());
         assert!(assessment.host_fingerprint_sha256.is_some());
