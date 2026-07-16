@@ -259,7 +259,7 @@ shape-free example shows the fields, not accepted private facts:
 
 ```json
 {
-  "schema": "mirante4d-private-import-performance-t5-1",
+  "schema": "mirante4d-private-import-performance-t5-2",
   "workload_id": "t5-0123456789abcdef0123456789abcdef",
   "source": "/absolute/qualified/ext4/scratch/private-source",
   "scratch_root": "/absolute/qualified/ext4/scratch/t5",
@@ -267,12 +267,13 @@ shape-free example shows the fields, not accepted private facts:
   "expected_profile": "DS-3",
   "spacing_zyx_um": [1.0, 1.0, 1.0],
   "time_step_seconds": null,
-  "no_data_sentinel": null,
+  "no_data_sentinel": 255,
   "working_memory_bytes": 268435456,
   "primary_timeout_seconds": 1200,
   "cache_condition": "warm",
   "competing_activity": "none",
   "expected": {
+    "expected_fact_authority": "mirante4d-t5-source-derived-guarded-sentinel-oracle-1",
     "source_inventory_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
     "reviewed_source_fingerprint_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
     "canonical_source_pixel_bytes": 1,
@@ -292,13 +293,26 @@ shape-free example shows the fields, not accepted private facts:
         "brick_reads": 1,
         "logical_voxels": 1
       }
+    ],
+    "transforms": [
+      {
+        "scale_ordinal": 0,
+        "scale_zyx": [1.0, 1.0, 1.0],
+        "translation_zyx": [0.0, 0.0, 0.0]
+      }
     ]
   }
 }
 ```
 
 Replace every placeholder with independently frozen private facts and include
-exactly one entry for every physical image/scale and logical scientific layer.
+exactly one scale and centered-transform entry for every physical image/scale,
+plus one root for every logical scientific layer. DS-3 requires scale ordinals
+zero through six; the single entries above show field shape only.
+Schema v2 requires an explicit uint8 sentinel and the exact source-derived
+guarded-sentinel fact authority. The v1 configuration and opaque commitment
+are rejected rather than treated as a compatibility input by the formal
+qualification runner.
 The source-inventory digest uses the `mirante4d-t5-source-inventory-1` domain
 and binds the sorted relative names, lengths, and complete contents of every
 source file. Freeze it independently before owner acceptance; a diagnostic run
@@ -318,8 +332,34 @@ to `cache_condition: "warm"` because its inventory proof streams the source,
 and to the public `competing_activity: "none"` declaration. Both must exactly
 equal the shared profile protocol.
 
-An explicit diagnostic run can collect the candidate opaque configuration and
-profile digests without creating a qualification claim:
+The one-time oracle command accepts only the exactly pinned legacy private
+configuration and creates a new mode-`0600` v2 candidate without overwriting
+either input or an existing output:
+
+```bash
+cargo run --release -p xtask -- import-performance-t5-oracle \
+  --config /absolute/private/legacy-t5-config.json \
+  --output /absolute/private/restored-t5-candidate-a.json
+cargo run --release -p xtask -- import-performance-t5-oracle \
+  --config /absolute/private/legacy-t5-config.json \
+  --output /absolute/private/restored-t5-candidate-b.json
+```
+
+Both runs independently enumerate and decode source TIFF planes, apply the
+restored sentinel contract through every LOD, and derive scientific, layer,
+scale, and centered-transform facts without importing or reading a candidate
+package. Their candidate configurations must be byte-identical. The oracle
+uses fixed plane/slab rings below 256 MiB, at most two create-new row-major
+level files, admitted external scratch space, bounded descriptors, and zero
+scratch remnants. The first `SIGINT` or `SIGTERM` requests cooperative
+cancellation, is checked throughout source decoding and recursive hashing,
+kills and reaps an active product child, and lets identity-checked scratch
+cleanup run. A repeated termination signal forces immediate exit; `SIGKILL`
+and power loss cannot run process cleanup and may retain only private external
+session material.
+
+Only after those source-derived facts are stable may an explicit diagnostic
+run compare a normal product import against the candidate configuration:
 
 ```bash
 export MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display
@@ -328,14 +368,11 @@ cargo run --release -p xtask -- import-performance-t5 \
   --diagnostic --samples 1
 ```
 
-Bootstrap is deliberately at least two-pass. The first diagnostic uses
-syntactically valid placeholders and reveals the actual inventory, reviewed
-source fingerprint, canonical base-byte total, scientific/layer facts, and
-per-scale facts only in its private raw report. Replace every expected fact,
-then run the diagnostic again with that complete candidate configuration and
-confirm that all workload/science gates pass and the facts remain stable. Pin
-only the final configuration digest from this second stable run; the first
-digest commits placeholders and is never eligible for owner acceptance.
+Candidate package output is a comparator, never the expected-fact source. The
+diagnostic must show exact oracle/config/package agreement, centered-transform
+agreement, unchanged source, admitted oracle resources, and zero scratch
+remnants. Pin only the opaque digest of the byte-identical, source-oracle-
+derived candidate after this diagnostic succeeds.
 
 The reviewed HW-2 profile and stable two-pass T5 configuration commitments are
 now pinned in the following authorities. The mandatory protocol omits
@@ -382,6 +419,15 @@ output/checkpoint state, source or executable drift, dirty repository state,
 non-release binaries, missing display attestation or external mapped-client
 proof, profile/config mismatch, and every mandatory resource or timing gate
 fail closed.
+
+Before timed application samples, the mandatory runner recomputes the bounded
+source oracle once outside the primary clock and requires exact agreement with
+the pinned configuration. Oracle scratch is removed before the product starts,
+so its files, descriptors, bytes, and elapsed time cannot contaminate importer
+resource or timing evidence. Each produced package must then agree with both
+the configuration and source oracle, including centered transforms. Every
+timed sample must also observe exactly the fixed six checkpoint regular files;
+the former permissive eight-file ceiling is not the restored-policy gate.
 
 The complete raw report, app reports, logs, screenshots, paths, dimensions,
 and identities stay below a mode-`0700` external scratch session; runner-created

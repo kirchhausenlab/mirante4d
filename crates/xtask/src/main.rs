@@ -19,6 +19,7 @@ mod package;
 mod process;
 mod product_validate;
 mod reports;
+mod t5_sentinel_oracle;
 mod target_fixture;
 mod verification;
 mod workflow_audit;
@@ -81,6 +82,10 @@ fn main() -> anyhow::Result<()> {
         }
         "import-performance-t5" => {
             import_performance_t5::run(args.collect()).map(|path| println!("{}", path.display()))
+        }
+        "import-performance-t5-oracle" => {
+            import_performance_t5::run_oracle_bootstrap(args.collect())
+                .map(|path| println!("{}", path.display()))
         }
         "__import-performance-t2-worker" => import_performance::run_worker(args.collect()),
         "docs-check" => documentation::docs_check(),
@@ -169,11 +174,13 @@ Mirante4D developer tasks
   cargo xtask workflow-audit
   cargo run --release -p xtask -- import-performance-t2 [--samples 5] [--qualification-profile PATH]
   cargo run --release -p xtask -- import-performance-t5 --config /absolute/private/config.json [--diagnostic]
+  cargo run --release -p xtask -- import-performance-t5-oracle --config /absolute/private/legacy-config.json --output /absolute/private/config.json
   cargo xtask docs-check
   cargo xtask run-dev
 
 T2 and T5 qualification require matching local, non-repository qualification profiles.
 T5 also requires an owner-pinned private configuration; --diagnostic never qualifies.
+The T5 oracle command upgrades only the exactly pinned legacy private configuration.
 
 Run cargo xtask product-validate --help for scenario details."
     );

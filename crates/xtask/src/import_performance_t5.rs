@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs,
     fs::{File, OpenOptions},
     io::{Read, Write},
@@ -11,6 +11,10 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -18,10 +22,23 @@ use std::{
 use anyhow::{Context, bail};
 use mirante4d_identity::{ScientificContentId, Sha256Digest, Sha256Hasher};
 use mirante4d_storage::{
-    LocalPackageCatalog, PackedIndexCoordinates, ProfileKind, ProfileValidityMode, ShardProfileKind,
+    LocalPackageCatalog, OmeLevelTransform, PackedIndexCoordinates, ProfileKind,
+    ProfileValidityMode, ShardProfileKind,
+};
+use rustix::{
+    fd::OwnedFd,
+    fs::{
+        AtFlags, Mode, OFlags, RenameFlags, fstat, fsync, openat, renameat_with, statat, unlinkat,
+    },
+    io::Errno,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use signal_hook::{
+    SigId,
+    consts::signal::{SIGINT, SIGTERM},
+    flag,
+};
 
 use crate::{
     host::{
@@ -35,12 +52,14 @@ use crate::{
         repository_identity,
     },
     process::cargo_command,
+    t5_sentinel_oracle::{self, FACT_AUTHORITY, OracleFacts, OracleRequest},
     target_fixture::extract_target_u16_fixture,
 };
 
-const CONFIG_SCHEMA: &str = "mirante4d-private-import-performance-t5-1";
-const RAW_REPORT_SCHEMA: &str = "mirante4d-private-import-performance-t5-raw-3";
-const SANITIZED_REPORT_SCHEMA: &str = "mirante4d-import-performance-t5-summary-3";
+const LEGACY_CONFIG_SCHEMA: &str = "mirante4d-private-import-performance-t5-1";
+const CONFIG_SCHEMA: &str = "mirante4d-private-import-performance-t5-2";
+const RAW_REPORT_SCHEMA: &str = "mirante4d-private-import-performance-t5-raw-4";
+const SANITIZED_REPORT_SCHEMA: &str = "mirante4d-import-performance-t5-summary-4";
 const PRODUCT_AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
 const PRODUCT_AUTOMATION_SCHEMA_VERSION: u64 = 3;
 const PUBLICATION_CURRENTNESS_CONTRACT_ID: &str =
@@ -52,6 +71,7 @@ const RSS_DELTA_BYTES_MAX: u64 = 384 * 1024 * 1024;
 const PRIMARY_MEDIAN_NS_MAX: u64 = 15 * 60 * 1_000_000_000;
 const PRIMARY_MEDIAN_STRETCH_NS: u64 = 10 * 60 * 1_000_000_000;
 const DEFAULT_SAMPLES: usize = 3;
+const T5_SCALE_COUNT: usize = 7;
 const RSS_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
 // Linux can tear down a process memory map before making its exit waitable.
 // Only a real exit observed within this small terminal window is accepted.
@@ -62,16 +82,23 @@ const MAPPED_WIDTH: u32 = 1280;
 const MAPPED_HEIGHT: u32 = 720;
 const SOURCE_ENTRY_MAX: usize = 4_096;
 
-/// The owner accepted this exact opaque external-configuration commitment.
-/// Private facts remain outside the repository and any other digest fails closed.
-pub(crate) const OWNER_ACCEPTED_T5_CONFIG_SHA256: Option<&str> =
-    Some("3b27aabbe604edbc08b02c334ce193692121d1509e450cb001d66bfc3616369a");
+/// The restored-policy configuration remains unaccepted until two independent
+/// source-oracle runs agree and the owner pins their opaque external commitment.
+const LEGACY_OWNER_ACCEPTED_T5_CONFIG_SHA256: &str =
+    "3b27aabbe604edbc08b02c334ce193692121d1509e450cb001d66bfc3616369a";
+pub(crate) const OWNER_ACCEPTED_T5_CONFIG_SHA256: Option<&str> = None;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunArgs {
     config: PathBuf,
     samples: usize,
     diagnostic: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OracleBootstrapArgs {
+    config: PathBuf,
+    output: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -85,7 +112,7 @@ struct T5Config {
     expected_profile: String,
     spacing_zyx_um: [f64; 3],
     time_step_seconds: Option<f64>,
-    no_data_sentinel: Option<u8>,
+    no_data_sentinel: u8,
     working_memory_bytes: u64,
     primary_timeout_seconds: u64,
     cache_condition: String,
@@ -96,6 +123,39 @@ struct T5Config {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ExpectedFacts {
+    expected_fact_authority: String,
+    source_inventory_sha256: String,
+    reviewed_source_fingerprint_sha256: String,
+    canonical_source_pixel_bytes: u64,
+    scientific_content_id: String,
+    scientific_layer_roots: Vec<ExpectedLayerRoot>,
+    scale_digest_scheme: String,
+    scales: Vec<ExpectedScaleFact>,
+    transforms: Vec<ExpectedTransformFact>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyT5Config {
+    schema: String,
+    workload_id: String,
+    source: PathBuf,
+    scratch_root: PathBuf,
+    qualification_profile: PathBuf,
+    expected_profile: String,
+    spacing_zyx_um: [f64; 3],
+    time_step_seconds: Option<f64>,
+    no_data_sentinel: Option<u8>,
+    working_memory_bytes: u64,
+    primary_timeout_seconds: u64,
+    cache_condition: String,
+    competing_activity: String,
+    expected: LegacyExpectedFacts,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyExpectedFacts {
     source_inventory_sha256: String,
     reviewed_source_fingerprint_sha256: String,
     canonical_source_pixel_bytes: u64,
@@ -120,6 +180,14 @@ struct ExpectedScaleFact {
     digest_sha256: String,
     brick_reads: u64,
     logical_voxels: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ExpectedTransformFact {
+    scale_ordinal: u32,
+    scale_zyx: [f64; 3],
+    translation_zyx: [f64; 3],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,11 +229,148 @@ struct IndependentValidation {
     scientific_content_id: String,
     layer_roots: Vec<Value>,
     scale_facts: Vec<Value>,
+    transform_facts: Vec<Value>,
     scale_facts_match: bool,
     layer_roots_match: bool,
     scientific_id_matches: bool,
+    oracle_scale_facts_match: bool,
+    oracle_layer_roots_match: bool,
+    oracle_scientific_id_matches: bool,
+    oracle_transform_facts_match: bool,
+    config_transform_facts_match: bool,
+    oracle_canonical_base_pixel_bytes_match: bool,
     scientific_brick_reads: u64,
     canonical_base_pixel_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct ObservedTransformFact {
+    scale_ordinal: u32,
+    scale_zyx: [f64; 3],
+    translation_zyx: [f64; 3],
+}
+
+struct OwnedOracleScratch {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    armed: bool,
+}
+
+struct CommandCancellation {
+    flag: Arc<AtomicBool>,
+    // signal-hook cannot safely restore the prior/default disposition when an
+    // action is unregistered. Keep these registrations live until this
+    // one-command process exits; every remaining long path observes `flag`.
+    _registrations: Vec<SigId>,
+}
+
+impl CommandCancellation {
+    fn install() -> anyhow::Result<Self> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut registrations = Vec::with_capacity(4);
+        for (signal, exit_status) in [(SIGINT, 130), (SIGTERM, 143)] {
+            // Registration order is normative: the first signal sees false in
+            // the conditional shutdown action, then the flag action requests
+            // cooperative cleanup. A repeated signal terminates immediately.
+            registrations.push(flag::register_conditional_shutdown(
+                signal,
+                exit_status,
+                Arc::clone(&cancelled),
+            )?);
+            registrations.push(flag::register(signal, Arc::clone(&cancelled))?);
+        }
+        Ok(Self {
+            flag: cancelled,
+            _registrations: registrations,
+        })
+    }
+
+    fn token(&self) -> &AtomicBool {
+        &self.flag
+    }
+
+    fn check(&self, phase: &str) -> anyhow::Result<()> {
+        if self.flag.load(Ordering::Acquire) {
+            bail!("T5 command cancelled by SIGINT or SIGTERM during {phase}");
+        }
+        Ok(())
+    }
+}
+
+impl OwnedOracleScratch {
+    fn create(path: PathBuf) -> anyhow::Result<Self> {
+        create_private_directory(&path).with_context(|| {
+            format!(
+                "failed to create private T5 oracle scratch {}",
+                path.display()
+            )
+        })?;
+        let created = fs::symlink_metadata(&path)?;
+        let scratch = Self {
+            path,
+            device: created.dev(),
+            inode: created.ino(),
+            armed: true,
+        };
+        fs::set_permissions(&scratch.path, fs::Permissions::from_mode(0o700))?;
+        let metadata = fs::symlink_metadata(&scratch.path)?;
+        if !scratch.path_still_names_created_directory(&metadata)
+            || metadata.permissions().mode() & 0o777 != 0o700
+        {
+            bail!("private T5 oracle scratch is not a mode-0700 real directory");
+        }
+        Ok(scratch)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn remove_and_report_empty(mut self) -> anyhow::Result<bool> {
+        let metadata = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.armed = false;
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !self.path_still_names_created_directory(&metadata)
+            || fs::read_dir(&self.path)?.next().is_some()
+        {
+            self.armed = false;
+            return Ok(false);
+        }
+        fs::remove_dir(&self.path)?;
+        let absent_after_removal = fs::symlink_metadata(&self.path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        self.armed = false;
+        Ok(absent_after_removal)
+    }
+
+    fn path_still_names_created_directory(&self, metadata: &fs::Metadata) -> bool {
+        !metadata.file_type().is_symlink()
+            && metadata.is_dir()
+            && metadata.dev() == self.device
+            && metadata.ino() == self.inode
+    }
+}
+
+impl Drop for OwnedOracleScratch {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&self.path) else {
+            return;
+        };
+        if self.path_still_names_created_directory(&metadata)
+            && fs::read_dir(&self.path).is_ok_and(|mut entries| entries.next().is_none())
+        {
+            let _ = fs::remove_dir(&self.path);
+        }
+    }
 }
 
 pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
@@ -286,10 +491,46 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
         bail!("repository identity changed while building the T5 release app");
     }
 
-    let source_before = source_inventory(&source)?;
+    let cancellation = CommandCancellation::install()?;
+    cancellation.check("source-oracle setup")?;
+    let source_before = source_inventory(&source, cancellation.token())?;
     let frozen_source_matched = source_before.sha256 == config.expected.source_inventory_sha256;
     if !frozen_source_matched && !args.diagnostic {
         bail!("private T5 source inventory does not match the owner-frozen workload");
+    }
+    let oracle_scratch = OwnedOracleScratch::create(session_root.join("source-oracle"))?;
+    let source_oracle = t5_sentinel_oracle::derive(OracleRequest {
+        source: &source,
+        scratch: oracle_scratch.path(),
+        sentinel: config.no_data_sentinel,
+        spacing_zyx_um: config.spacing_zyx_um,
+        time_step_seconds: config.time_step_seconds,
+        working_memory_bytes: config.working_memory_bytes,
+        scale_digest_scheme: &config.expected.scale_digest_scheme,
+        cancelled: cancellation.token(),
+    })
+    .context("private T5 source oracle failed")?;
+    cancellation.check("source-oracle derivation")?;
+    let oracle_scratch_removed_empty = oracle_scratch.remove_and_report_empty()?;
+    let source_after_oracle = source_inventory(&source, cancellation.token())?;
+    let oracle_gates = source_oracle_gates(
+        &source_oracle,
+        &config.expected,
+        &source_before,
+        &source_after_oracle,
+        oracle_scratch_removed_empty,
+        config.working_memory_bytes,
+    );
+    let source_oracle_passed = oracle_gates.values().all(|passed| *passed);
+    if !source_oracle_passed && !args.diagnostic {
+        let failed = oracle_gates
+            .iter()
+            .filter_map(|(gate, passed)| (!passed).then_some(gate.as_str()))
+            .collect::<Vec<_>>();
+        bail!(
+            "private T5 source oracle disagrees with its frozen authority or resource bounds: {}",
+            failed.join(", ")
+        );
     }
     validate_release_executable(&executable, "T5 release app")?;
     let executable_digest_start = sha256_file(&executable)?;
@@ -315,13 +556,15 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
             &qualification_protocol,
             &build_provenance.compiler,
             args.diagnostic,
+            &source_oracle,
+            cancellation.token(),
         )?);
         if sha256_file(&executable)? != executable_digest_start
             || !same_file_metadata(&executable_metadata_start, &fs::metadata(&executable)?)
         {
             bail!("release app executable changed during the T5 sample set");
         }
-        let current_source_inventory = source_inventory(&source)?;
+        let current_source_inventory = source_inventory(&source, cancellation.token())?;
         if current_source_inventory != source_before {
             bail!("private T5 source changed between independent samples");
         }
@@ -330,6 +573,7 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
 
     let source_after =
         latest_source_inventory.context("T5 sample protocol captured no final source inventory")?;
+    cancellation.check("post-sample invariant validation")?;
     let xtask_digest_end = sha256_file(&xtask_executable)?;
     let xtask_unchanged = xtask_digest_start == xtask_digest_end
         && same_file_metadata(&xtask_metadata_start, &fs::metadata(&xtask_executable)?);
@@ -361,7 +605,7 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
     let build_reason_codes_end =
         qualification_build_reason_codes(&build_provenance, &repository_end);
 
-    let source_preserved = source_before == source_after;
+    let source_preserved = source_before == source_after && source_before == source_after_oracle;
     let repository_unchanged = repository_same_clean_revision(&repository_start, &repository_end);
     let hardware_unchanged = hardware_start == hardware_end;
     let executable_unchanged = executable_digest_start == executable_digest_end
@@ -401,7 +645,8 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
         && executable_unchanged
         && config_unchanged
         && build_reason_codes_end.is_empty()
-        && deterministic_ids;
+        && deterministic_ids
+        && source_oracle_passed;
     let qualification_passed = qualification_claim_passed(
         args.diagnostic,
         binding_eligible,
@@ -430,11 +675,12 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
         executable_unchanged,
         config_unchanged,
         deterministic_ids,
+        &oracle_gates,
     );
 
     let raw_report = json!({
         "schema": RAW_REPORT_SCHEMA,
-        "schema_version": 2,
+        "schema_version": 3,
         "session_id": session_id,
         "configuration": {
             "path": config_input.path,
@@ -491,6 +737,15 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
             "matches_frozen_configuration": frozen_source_matched,
             "unchanged": source_preserved,
         },
+        "source_oracle": {
+            "fact_authority": FACT_AUTHORITY,
+            "executed_once_before_all_samples_outside_primary_clock": true,
+            "facts": source_oracle,
+            "source_after_oracle": inventory_json(&source_after_oracle),
+            "scratch_directory_removed_empty": oracle_scratch_removed_empty,
+            "gates": oracle_gates,
+            "all_gates_passed": source_oracle_passed,
+        },
         "samples": samples.iter().map(|sample| sample.raw.clone()).collect::<Vec<_>>(),
         "summary": {
             "median_primary_wall_time_ns": median_primary_wall_time_ns,
@@ -503,6 +758,7 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
             "source_preserved": source_preserved,
             "config_unchanged": config_unchanged,
             "binding_eligible": binding_eligible,
+            "source_oracle_passed": source_oracle_passed,
             "diagnostic_reason_codes": diagnostic_reason_codes,
             "qualification_passed": qualification_passed,
         },
@@ -526,7 +782,7 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
     }
     let sanitized_report = json!({
         "schema": SANITIZED_REPORT_SCHEMA,
-        "schema_version": 2,
+        "schema_version": 3,
         "evidence_id": session_id,
         "workload_id": config.workload_id,
         "evidence_class": if qualification_passed { "qualification" } else { "diagnostic" },
@@ -536,6 +792,8 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
             "diagnostic_requested": args.diagnostic,
             "fresh_release_processes": true,
             "normal_product_import_route": true,
+            "bounded_source_oracle_before_samples": true,
+            "source_oracle_fact_authority": FACT_AUTHORITY,
             "real_external_mapped_window_required": true,
             "physical_display_attachment_owner_attested": true,
             "external_display_proof_scope": "mapped_native_x11_client_geometry",
@@ -585,6 +843,8 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
             "frozen_source_matched": frozen_source_matched,
             "source_preserved": source_preserved,
             "all_invariants": invariant_gates_passed,
+            "source_oracle": source_oracle_passed,
+            "source_oracle_gates": oracle_gates,
             "qualification_passed": qualification_passed,
         },
         "failures": diagnostic_reason_codes,
@@ -626,6 +886,19 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
             .iter()
             .map(|scale| scale.digest_sha256.clone()),
     );
+    private_strings.push(source_oracle.scientific_content_id.clone());
+    private_strings.extend(
+        source_oracle
+            .layer_roots
+            .iter()
+            .map(|root| root.digest_sha256.clone()),
+    );
+    private_strings.extend(
+        source_oracle
+            .scales
+            .iter()
+            .map(|scale| scale.digest_sha256.clone()),
+    );
     for sample in &samples {
         private_strings.push(sample.package_id.clone());
         private_strings.push(sample.scientific_content_id.clone());
@@ -644,11 +917,221 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
         }
     }
     validate_sanitized_report(&sanitized_report, &private_strings)?;
+    cancellation.check("sanitized evidence publication")?;
     let sanitized_root = repository_root.join("target/mirante4d/import-performance-t5");
     fs::create_dir_all(&sanitized_root)?;
     let sanitized_path = sanitized_root.join(format!("{session_id}-summary.json"));
     write_new_synced_json(&sanitized_path, &sanitized_report)?;
+    cancellation.check("command completion")?;
     Ok(sanitized_path)
+}
+
+pub(crate) fn run_oracle_bootstrap(args: Vec<String>) -> anyhow::Result<PathBuf> {
+    let args = parse_oracle_bootstrap_args(args)?;
+    let build_provenance = qualification_build_provenance();
+    require_release_xtask(&build_provenance)?;
+    require_standard_app_build_environment(&build_provenance)?;
+
+    let repository_start = repository_identity();
+    require_clean_repository(&repository_start)?;
+    let build_reasons = qualification_build_reason_codes(&build_provenance, &repository_start);
+    if !build_reasons.is_empty() {
+        bail!(
+            "T5 oracle bootstrap build provenance is not the exact clean release revision: {}",
+            build_reasons.join(", ")
+        );
+    }
+    let repository_root = repository_start
+        .root
+        .as_deref()
+        .context("T5 oracle bootstrap could not resolve the repository root")?;
+    require_no_external_cargo_configuration(repository_root)?;
+    let xtask_executable =
+        env::current_exe().context("failed to resolve the T5 oracle xtask executable")?;
+    validate_release_executable(&xtask_executable, "T5 oracle xtask")?;
+    let xtask_digest_start = sha256_file(&xtask_executable)?;
+    let xtask_metadata_start = fs::metadata(&xtask_executable)?;
+
+    let input = read_config_input(&args.config, repository_root)?;
+    if input.sha256 != LEGACY_OWNER_ACCEPTED_T5_CONFIG_SHA256 {
+        bail!("T5 oracle bootstrap accepts only the exact owner-pinned legacy configuration");
+    }
+    let legacy: LegacyT5Config = serde_json::from_slice(&input.bytes)
+        .context("legacy private T5 configuration is not strict valid JSON")?;
+    if legacy.schema != LEGACY_CONFIG_SCHEMA {
+        bail!("T5 oracle bootstrap requires the exact legacy configuration schema");
+    }
+    validate_legacy_config(&legacy)?;
+
+    let output = external_create_new_path(&args.output, repository_root)?;
+    let output_parent = output
+        .parent()
+        .context("T5 oracle bootstrap output has no parent")?;
+    let output_parent_identity = fs::symlink_metadata(output_parent)?;
+    if output == input.path {
+        bail!("T5 oracle bootstrap output must differ from its legacy input");
+    }
+    let protocol = ImportQualificationProtocol::new(
+        legacy.cache_condition.clone(),
+        legacy.competing_activity.clone(),
+    );
+    let source = canonical_external_source(&legacy.source, repository_root)?;
+    let scratch_root = canonical_external_directory(&legacy.scratch_root, repository_root)?;
+    let qualification_profile = canonical_external_regular_file(
+        &legacy.qualification_profile,
+        repository_root,
+        IMPORT_QUALIFICATION_PROFILE_MAX_BYTES,
+        "qualification profile",
+    )?;
+    if source.starts_with(&scratch_root)
+        || scratch_root.starts_with(&source)
+        || output.starts_with(&source)
+        || output == source
+    {
+        bail!("T5 oracle bootstrap source, scratch, and output paths are not safely disjoint");
+    }
+    let hardware = host_hardware_identity();
+    let source_binding = assess_import_qualification_profile(
+        Some(&qualification_profile),
+        &repository_start,
+        &source,
+        &hardware,
+        &protocol,
+    );
+    let scratch_binding = assess_import_qualification_profile(
+        Some(&qualification_profile),
+        &repository_start,
+        &scratch_root,
+        &hardware,
+        &protocol,
+    );
+    if !qualification_matched(&source_binding) || !qualification_matched(&scratch_binding) {
+        bail!("T5 oracle bootstrap requires the owner-accepted source and scratch profile");
+    }
+
+    let cancellation = CommandCancellation::install()?;
+    cancellation.check("source-oracle bootstrap setup")?;
+    let source_before = source_inventory(&source, cancellation.token())?;
+    if source_before.sha256 != legacy.expected.source_inventory_sha256 {
+        bail!("T5 oracle bootstrap source inventory differs from the pinned legacy workload");
+    }
+    let oracle_scratch = OwnedOracleScratch::create(
+        scratch_root.join(format!("oracle-bootstrap-{}", session_id()?)),
+    )?;
+    let oracle_binding = assess_import_qualification_profile(
+        Some(&qualification_profile),
+        &repository_start,
+        oracle_scratch.path(),
+        &hardware,
+        &protocol,
+    );
+    if !qualification_matched(&oracle_binding) {
+        bail!("T5 oracle bootstrap scratch is outside the owner-accepted profile");
+    }
+    let oracle = t5_sentinel_oracle::derive(OracleRequest {
+        source: &source,
+        scratch: oracle_scratch.path(),
+        sentinel: legacy
+            .no_data_sentinel
+            .context("T5 oracle bootstrap requires an explicit uint8 sentinel")?,
+        spacing_zyx_um: legacy.spacing_zyx_um,
+        time_step_seconds: legacy.time_step_seconds,
+        working_memory_bytes: legacy.working_memory_bytes,
+        scale_digest_scheme: &legacy.expected.scale_digest_scheme,
+        cancelled: cancellation.token(),
+    })
+    .context("private T5 source oracle bootstrap failed")?;
+    cancellation.check("source-oracle bootstrap derivation")?;
+    let scratch_removed_empty = oracle_scratch.remove_and_report_empty()?;
+    let source_after = source_inventory(&source, cancellation.token())?;
+    validate_bootstrap_oracle(
+        &legacy,
+        &oracle,
+        &source_before,
+        &source_after,
+        scratch_removed_empty,
+    )?;
+    let upgraded = legacy_config_with_facts(&legacy, &oracle)?;
+    validate_config(&upgraded)?;
+
+    let repository_end = repository_identity();
+    let hardware_end = host_hardware_identity();
+    let source_binding_end = assess_import_qualification_profile(
+        Some(&qualification_profile),
+        &repository_end,
+        &source,
+        &hardware_end,
+        &protocol,
+    );
+    let scratch_binding_end = assess_import_qualification_profile(
+        Some(&qualification_profile),
+        &repository_end,
+        &scratch_root,
+        &hardware_end,
+        &protocol,
+    );
+    if !repository_same_clean_revision(&repository_start, &repository_end)
+        || hardware != hardware_end
+        || source_binding != source_binding_end
+        || scratch_binding != scratch_binding_end
+        || sha256_file(&xtask_executable)? != xtask_digest_start
+        || !same_file_metadata(&xtask_metadata_start, &fs::metadata(&xtask_executable)?)
+        || read_config_input(&input.path, repository_root)? != input
+    {
+        bail!("T5 oracle bootstrap provenance or legacy input changed while deriving facts");
+    }
+    let output_parent_end = fs::symlink_metadata(output_parent)?;
+    if !same_directory_identity(&output_parent_identity, &output_parent_end)
+        || !matches!(
+            fs::symlink_metadata(&output),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+    {
+        bail!("T5 oracle bootstrap output path changed before create-new publication");
+    }
+    write_new_synced_config_with_precommit(&output, &upgraded, || {
+        cancellation.check("source-oracle config publication")
+    })?;
+    Ok(output)
+}
+
+fn parse_oracle_bootstrap_args(args: Vec<String>) -> anyhow::Result<OracleBootstrapArgs> {
+    let mut config = None;
+    let mut output = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" => {
+                index += 1;
+                let value = PathBuf::from(
+                    args.get(index)
+                        .context("--config requires an absolute path")?,
+                );
+                if config.replace(value).is_some() {
+                    bail!("import-performance-t5-oracle accepts --config exactly once");
+                }
+            }
+            "--output" => {
+                index += 1;
+                let value = PathBuf::from(
+                    args.get(index)
+                        .context("--output requires an absolute path")?,
+                );
+                if output.replace(value).is_some() {
+                    bail!("import-performance-t5-oracle accepts --output exactly once");
+                }
+            }
+            "--help" | "-h" | "help" => bail!(
+                "usage: cargo run --release -p xtask -- import-performance-t5-oracle --config /absolute/private/legacy-config.json --output /absolute/private/config.json"
+            ),
+            option => bail!("unknown import-performance-t5-oracle option {option:?}"),
+        }
+        index += 1;
+    }
+    Ok(OracleBootstrapArgs {
+        config: config.context("import-performance-t5-oracle requires --config PATH")?,
+        output: output.context("import-performance-t5-oracle requires --output PATH")?,
+    })
 }
 
 fn parse_args(args: Vec<String>) -> anyhow::Result<RunArgs> {
@@ -741,6 +1224,9 @@ fn validate_config(config: &T5Config) -> anyhow::Result<()> {
     if config.competing_activity != "none" {
         bail!("private T5 competing_activity must be the public declaration `none`");
     }
+    if config.expected.expected_fact_authority != FACT_AUTHORITY {
+        bail!("private T5 expected-fact authority is not the source sentinel oracle");
+    }
     if config.expected.canonical_source_pixel_bytes == 0 {
         bail!("private T5 expected canonical source pixel bytes must be nonzero");
     }
@@ -774,6 +1260,258 @@ fn validate_config(config: &T5Config) -> anyhow::Result<()> {
         }
         Sha256Digest::parse(&scale.digest_sha256)
             .context("private T5 expected scale digest is invalid")?;
+    }
+    let required_scale_keys = (0..T5_SCALE_COUNT)
+        .map(|scale| (0_u32, u32::try_from(scale).expect("seven scales fit u32")))
+        .collect::<BTreeSet<_>>();
+    if scale_keys != required_scale_keys {
+        bail!("private T5 expected facts require exactly image zero scales zero through six");
+    }
+    if config.expected.transforms.len() != T5_SCALE_COUNT {
+        bail!("private T5 expected facts require exactly seven centered transforms");
+    }
+    let mut transform_ordinals = BTreeSet::new();
+    for transform in &config.expected.transforms {
+        if !transform_ordinals.insert(transform.scale_ordinal) {
+            bail!("private T5 expected transforms contain a duplicate scale ordinal");
+        }
+        if transform
+            .scale_zyx
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+            || transform.translation_zyx.iter().any(|value| {
+                !value.is_finite() || *value < 0.0 || value.to_bits() == (-0.0_f64).to_bits()
+            })
+        {
+            bail!("private T5 expected transforms contain invalid finite coordinates");
+        }
+    }
+    let required_transform_ordinals = (0..T5_SCALE_COUNT)
+        .map(|scale| u32::try_from(scale).expect("seven scales fit u32"))
+        .collect::<BTreeSet<_>>();
+    if transform_ordinals != required_transform_ordinals {
+        bail!("private T5 expected transforms require unique ordinals zero through six");
+    }
+    Ok(())
+}
+
+fn validate_legacy_config(legacy: &LegacyT5Config) -> anyhow::Result<()> {
+    if legacy.schema != LEGACY_CONFIG_SCHEMA
+        || !valid_workload_id(&legacy.workload_id)
+        || legacy.expected_profile != "DS-3"
+        || legacy.working_memory_bytes != WORKING_MEMORY_BYTES
+        || !(60..=7_200).contains(&legacy.primary_timeout_seconds)
+        || legacy.cache_condition != "warm"
+        || legacy.competing_activity != "none"
+        || legacy.no_data_sentinel.is_none()
+    {
+        bail!("legacy private T5 configuration violates its frozen protocol");
+    }
+    for path in [
+        &legacy.source,
+        &legacy.scratch_root,
+        &legacy.qualification_profile,
+    ] {
+        if !path.is_absolute() {
+            bail!("legacy private T5 configuration paths must be absolute");
+        }
+    }
+    if legacy
+        .spacing_zyx_um
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+        || legacy
+            .time_step_seconds
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        || legacy.expected.canonical_source_pixel_bytes == 0
+        || legacy.expected.scale_digest_scheme != SCALE_DIGEST_SCHEME
+    {
+        bail!("legacy private T5 configuration contains invalid calibration or fact metadata");
+    }
+    Sha256Digest::parse(&legacy.expected.source_inventory_sha256)?;
+    Sha256Digest::parse(&legacy.expected.reviewed_source_fingerprint_sha256)?;
+    ScientificContentId::parse(&legacy.expected.scientific_content_id)?;
+    let mut layer_keys = BTreeSet::new();
+    for root in &legacy.expected.scientific_layer_roots {
+        if !layer_keys.insert(root.logical_layer) {
+            bail!("legacy private T5 configuration repeats a logical layer");
+        }
+        Sha256Digest::parse(&root.digest_sha256)?;
+    }
+    if layer_keys.is_empty() {
+        bail!("legacy private T5 configuration has no scientific layer facts");
+    }
+    let mut scale_keys = BTreeSet::new();
+    for scale in &legacy.expected.scales {
+        if !scale_keys.insert((scale.image_ordinal, scale.scale_ordinal))
+            || scale.brick_reads == 0
+            || scale.logical_voxels == 0
+        {
+            bail!("legacy private T5 configuration has invalid scale facts");
+        }
+        Sha256Digest::parse(&scale.digest_sha256)?;
+    }
+    let required_scale_keys = (0..T5_SCALE_COUNT)
+        .map(|scale| (0_u32, u32::try_from(scale).expect("seven scales fit u32")))
+        .collect::<BTreeSet<_>>();
+    if scale_keys != required_scale_keys {
+        bail!("legacy private T5 configuration requires image zero scales zero through six");
+    }
+    Ok(())
+}
+
+fn legacy_config_with_facts(
+    legacy: &LegacyT5Config,
+    oracle: &OracleFacts,
+) -> anyhow::Result<T5Config> {
+    if oracle.canonical_base_pixel_bytes != legacy.expected.canonical_source_pixel_bytes {
+        bail!("T5 oracle bootstrap changed the frozen canonical base-byte count");
+    }
+    let legacy_layer_keys = legacy
+        .expected
+        .scientific_layer_roots
+        .iter()
+        .map(|root| root.logical_layer)
+        .collect::<BTreeSet<_>>();
+    let oracle_layer_keys = oracle
+        .layer_roots
+        .iter()
+        .map(|root| root.logical_layer)
+        .collect::<BTreeSet<_>>();
+    if legacy_layer_keys != oracle_layer_keys
+        || legacy_layer_keys.len() != legacy.expected.scientific_layer_roots.len()
+        || oracle_layer_keys.len() != oracle.layer_roots.len()
+    {
+        bail!("T5 oracle bootstrap changed the frozen logical-layer keys");
+    }
+    if !oracle_scale_keys_and_counts_match(oracle, &legacy.expected.scales)
+        || !oracle_transform_coverage(oracle)
+    {
+        bail!("T5 oracle bootstrap changed scale keys/counts or omitted a transform");
+    }
+    let scientific_layer_roots = legacy
+        .expected
+        .scientific_layer_roots
+        .iter()
+        .map(|legacy_root| {
+            let oracle_root = oracle
+                .layer_roots
+                .iter()
+                .find(|root| root.logical_layer == legacy_root.logical_layer)
+                .context("T5 oracle bootstrap omitted a frozen logical layer")?;
+            Ok(ExpectedLayerRoot {
+                logical_layer: legacy_root.logical_layer,
+                digest_sha256: oracle_root.digest_sha256.clone(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let scales = legacy
+        .expected
+        .scales
+        .iter()
+        .map(|legacy_scale| {
+            let oracle_scale = oracle
+                .scales
+                .iter()
+                .find(|scale| {
+                    scale.image_ordinal == legacy_scale.image_ordinal
+                        && scale.scale_ordinal == legacy_scale.scale_ordinal
+                })
+                .context("T5 oracle bootstrap omitted a frozen scale")?;
+            Ok(ExpectedScaleFact {
+                image_ordinal: legacy_scale.image_ordinal,
+                scale_ordinal: legacy_scale.scale_ordinal,
+                digest_sha256: oracle_scale.digest_sha256.clone(),
+                brick_reads: legacy_scale.brick_reads,
+                logical_voxels: legacy_scale.logical_voxels,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let transforms = legacy
+        .expected
+        .scales
+        .iter()
+        .map(|legacy_scale| {
+            let transform = oracle
+                .transforms
+                .iter()
+                .find(|transform| transform.scale_ordinal == legacy_scale.scale_ordinal)
+                .context("T5 oracle bootstrap omitted a frozen scale transform")?;
+            Ok(ExpectedTransformFact {
+                scale_ordinal: transform.scale_ordinal,
+                scale_zyx: transform.scale_zyx,
+                translation_zyx: transform.translation_zyx,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    Ok(T5Config {
+        schema: CONFIG_SCHEMA.to_owned(),
+        workload_id: legacy.workload_id.clone(),
+        source: legacy.source.clone(),
+        scratch_root: legacy.scratch_root.clone(),
+        qualification_profile: legacy.qualification_profile.clone(),
+        expected_profile: legacy.expected_profile.clone(),
+        spacing_zyx_um: legacy.spacing_zyx_um,
+        time_step_seconds: legacy.time_step_seconds,
+        no_data_sentinel: legacy
+            .no_data_sentinel
+            .context("legacy private T5 configuration requires an explicit sentinel")?,
+        working_memory_bytes: legacy.working_memory_bytes,
+        primary_timeout_seconds: legacy.primary_timeout_seconds,
+        cache_condition: legacy.cache_condition.clone(),
+        competing_activity: legacy.competing_activity.clone(),
+        expected: ExpectedFacts {
+            expected_fact_authority: FACT_AUTHORITY.to_owned(),
+            source_inventory_sha256: legacy.expected.source_inventory_sha256.clone(),
+            reviewed_source_fingerprint_sha256: legacy
+                .expected
+                .reviewed_source_fingerprint_sha256
+                .clone(),
+            canonical_source_pixel_bytes: oracle.canonical_base_pixel_bytes,
+            scientific_content_id: oracle.scientific_content_id.clone(),
+            scientific_layer_roots,
+            scale_digest_scheme: legacy.expected.scale_digest_scheme.clone(),
+            scales,
+            transforms,
+        },
+    })
+}
+
+fn validate_bootstrap_oracle(
+    legacy: &LegacyT5Config,
+    oracle: &OracleFacts,
+    source_before: &InventoryFacts,
+    source_after: &InventoryFacts,
+    scratch_removed_empty: bool,
+) -> anyhow::Result<()> {
+    if source_before != source_after || !oracle.resources.source_unchanged {
+        bail!("T5 oracle bootstrap observed source mutation");
+    }
+    if oracle.resources.source_files != source_before.regular_files
+        || oracle.resources.source_planes == 0
+        || oracle.resources.source_inventory_name_bytes == 0
+        || !oracle.resources.deterministic_filename_order
+    {
+        bail!("T5 oracle bootstrap source enumeration is incomplete or nondeterministic");
+    }
+    if oracle.resources.calculated_peak_working_bytes > legacy.working_memory_bytes
+        || oracle.resources.required_scratch_bytes > oracle.resources.scratch_free_bytes
+        || oracle.resources.peak_scratch_regular_files > 2
+        || oracle.resources.calculated_open_files_bound > 64
+    {
+        bail!("T5 oracle bootstrap exceeds a memory, scratch, or open-file resource bound");
+    }
+    if oracle.resources.scratch_files_remaining != 0 || !scratch_removed_empty {
+        bail!("T5 oracle bootstrap left scratch remnants");
+    }
+    if oracle.canonical_base_pixel_bytes != legacy.expected.canonical_source_pixel_bytes
+        || !oracle_scale_keys_and_counts_match(oracle, &legacy.expected.scales)
+    {
+        bail!("T5 oracle bootstrap disagrees with independently frozen base bytes or scale counts");
+    }
+    if !oracle_transform_coverage(oracle) {
+        bail!("T5 oracle bootstrap produced incomplete or ambiguous transform facts");
     }
     Ok(())
 }
@@ -1033,6 +1771,32 @@ fn canonical_external_source(path: &Path, repository_root: &Path) -> anyhow::Res
     Ok(canonical)
 }
 
+fn external_create_new_path(path: &Path, repository_root: &Path) -> anyhow::Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("T5 oracle bootstrap output must be absolute");
+    }
+    match fs::symlink_metadata(path) {
+        Ok(_) => bail!("T5 oracle bootstrap output must not already exist"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let parent = path
+        .parent()
+        .context("T5 oracle bootstrap output has no parent")?;
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        bail!("T5 oracle bootstrap output parent must be a nonsymlink directory");
+    }
+    let parent = fs::canonicalize(parent)?;
+    if parent.starts_with(fs::canonicalize(repository_root)?) {
+        bail!("T5 oracle bootstrap output must remain outside the repository");
+    }
+    let name = path
+        .file_name()
+        .context("T5 oracle bootstrap output has no file name")?;
+    Ok(parent.join(name))
+}
+
 fn config_binding_status(digest: &str) -> &'static str {
     match OWNER_ACCEPTED_T5_CONFIG_SHA256 {
         Some(accepted) if accepted == digest => "matched",
@@ -1090,6 +1854,7 @@ fn qualification_diagnostic_reason_codes(
     executable_unchanged: bool,
     config_unchanged: bool,
     deterministic_ids: bool,
+    oracle_gates: &BTreeMap<String, bool>,
 ) -> Vec<String> {
     let mut reasons = BTreeSet::new();
     if args.diagnostic {
@@ -1136,6 +1901,11 @@ fn qualification_diagnostic_reason_codes(
             reasons.insert(format!("sample_{}_{gate}_failed", sample.sample_index));
         }
     }
+    for (gate, passed) in oracle_gates {
+        if !passed {
+            reasons.insert(format!("source_oracle_{gate}_failed"));
+        }
+    }
     for (passed, reason) in [
         (absolute_gate_passed, "absolute_time_gate_failed"),
         (
@@ -1157,7 +1927,15 @@ fn qualification_diagnostic_reason_codes(
     reasons.into_iter().collect()
 }
 
-fn source_inventory(root: &Path) -> anyhow::Result<InventoryFacts> {
+fn require_not_cancelled(cancelled: &AtomicBool, phase: &str) -> anyhow::Result<()> {
+    if cancelled.load(Ordering::Acquire) {
+        bail!("T5 command cancelled by SIGINT or SIGTERM during {phase}");
+    }
+    Ok(())
+}
+
+fn source_inventory(root: &Path, cancelled: &AtomicBool) -> anyhow::Result<InventoryFacts> {
+    require_not_cancelled(cancelled, "source inventory")?;
     let root_metadata = fs::symlink_metadata(root)?;
     let mut pending = Vec::new();
     let mut files = Vec::<(Vec<u8>, PathBuf)>::new();
@@ -1174,7 +1952,9 @@ fn source_inventory(root: &Path) -> anyhow::Result<InventoryFacts> {
         bail!("private T5 source inventory root changed type");
     }
     while let Some(directory) = pending.pop() {
+        require_not_cancelled(cancelled, "source inventory")?;
         for entry in fs::read_dir(&directory)? {
+            require_not_cancelled(cancelled, "source inventory")?;
             let entry = entry?;
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path)?;
@@ -1203,6 +1983,7 @@ fn source_inventory(root: &Path) -> anyhow::Result<InventoryFacts> {
     let mut source_bytes = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     for (relative, path) in &files {
+        require_not_cancelled(cancelled, "source inventory")?;
         let metadata = fs::symlink_metadata(path)?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             bail!("private T5 source changed type during inventory");
@@ -1217,6 +1998,7 @@ fn source_inventory(root: &Path) -> anyhow::Result<InventoryFacts> {
         let mut file = File::open(path)?;
         let mut consumed = 0_u64;
         loop {
+            require_not_cancelled(cancelled, "source inventory")?;
             let count = file.read(&mut buffer)?;
             if count == 0 {
                 break;
@@ -1252,7 +2034,10 @@ fn run_sample(
     protocol: &ImportQualificationProtocol,
     compiler: &str,
     diagnostic: bool,
+    source_oracle: &OracleFacts,
+    cancelled: &AtomicBool,
 ) -> anyhow::Result<SampleEvidence> {
+    require_not_cancelled(cancelled, "T5 sample setup")?;
     let sample_root = session_root.join(format!("sample-{sample_index:02}"));
     create_private_directory(&sample_root)?;
     let output_parent = sample_root.join("output");
@@ -1317,27 +2102,31 @@ fn run_sample(
     )?;
     write_new_synced_json(&script_path, &script)?;
 
-    let observation = run_app_process(AppRun {
-        executable,
-        startup_package,
-        script: &script_path,
-        automation_report: &automation_report_path,
-        stdout: &stdout_path,
-        stderr: &stderr_path,
-        app_log: &app_log_path,
-        config_home: &config_home,
-        cache_home: &cache_home,
-        data_home: &data_home,
-        state_home: &state_home,
-        temp_home: &temp_home,
-        timeout: Duration::from_secs(
-            config
-                .primary_timeout_seconds
-                .checked_add(INSPECTION_TIMEOUT_SECONDS)
-                .and_then(|seconds| seconds.checked_add(POST_PRIMARY_TIMEOUT_SECONDS))
-                .context("T5 process timeout overflowed")?,
-        ),
-    })?;
+    let observation = run_app_process(
+        AppRun {
+            executable,
+            startup_package,
+            script: &script_path,
+            automation_report: &automation_report_path,
+            stdout: &stdout_path,
+            stderr: &stderr_path,
+            app_log: &app_log_path,
+            config_home: &config_home,
+            cache_home: &cache_home,
+            data_home: &data_home,
+            state_home: &state_home,
+            temp_home: &temp_home,
+            timeout: Duration::from_secs(
+                config
+                    .primary_timeout_seconds
+                    .checked_add(INSPECTION_TIMEOUT_SECONDS)
+                    .and_then(|seconds| seconds.checked_add(POST_PRIMARY_TIMEOUT_SECONDS))
+                    .context("T5 process timeout overflowed")?,
+            ),
+        },
+        cancelled,
+    )?;
+    require_not_cancelled(cancelled, "T5 application process")?;
     if !observation.exit_success {
         bail!("T5 app process did not exit successfully");
     }
@@ -1488,7 +2277,10 @@ fn run_sample(
         .context("T5 receipt lacks import statistics")?;
     validate_required_statistics(statistics)?;
 
-    let independent = independently_validate_package(&destination, &config.expected)?;
+    require_not_cancelled(cancelled, "independent package validation")?;
+    let independent =
+        independently_validate_package(&destination, &config.expected, source_oracle, cancelled)?;
+    require_not_cancelled(cancelled, "independent package validation")?;
     let destination_binding = assess_import_qualification_profile(
         Some(qualification_profile),
         repository,
@@ -1611,8 +2403,8 @@ fn run_sample(
             && peak_temporary_bytes <= preflight_temporary_bytes_bound,
     );
     gates.insert(
-        "temporary_object_bound".to_owned(),
-        peak_checkpoint_regular_files <= 8,
+        "fixed_six_checkpoint_files".to_owned(),
+        peak_checkpoint_regular_files == 6,
     );
     gates.insert(
         "staged_scientific_locality".to_owned(),
@@ -1629,6 +2421,26 @@ fn run_sample(
     gates.insert(
         "per_scale_semantic_regression".to_owned(),
         independent.scale_facts_match,
+    );
+    gates.insert(
+        "source_oracle_scientific_correctness".to_owned(),
+        independent.oracle_scientific_id_matches && independent.oracle_layer_roots_match,
+    );
+    gates.insert(
+        "source_oracle_per_scale_correctness".to_owned(),
+        independent.oracle_scale_facts_match,
+    );
+    gates.insert(
+        "source_oracle_centered_transforms".to_owned(),
+        independent.oracle_transform_facts_match,
+    );
+    gates.insert(
+        "frozen_centered_transforms".to_owned(),
+        independent.config_transform_facts_match,
+    );
+    gates.insert(
+        "source_oracle_canonical_base_bytes".to_owned(),
+        independent.oracle_canonical_base_pixel_bytes_match,
     );
     gates.insert("exact_correctness".to_owned(), true);
     gates.insert("progress_truthfulness".to_owned(), stages_truthful);
@@ -1715,9 +2527,16 @@ fn run_sample(
             "scientific_content_id": independent.scientific_content_id,
             "layer_roots": independent.layer_roots,
             "scales": independent.scale_facts,
+            "transforms": independent.transform_facts,
             "layer_roots_match": independent.layer_roots_match,
             "scale_facts_match": independent.scale_facts_match,
             "scientific_id_matches": independent.scientific_id_matches,
+            "oracle_layer_roots_match": independent.oracle_layer_roots_match,
+            "oracle_scale_facts_match": independent.oracle_scale_facts_match,
+            "oracle_scientific_id_matches": independent.oracle_scientific_id_matches,
+            "oracle_transform_facts_match": independent.oracle_transform_facts_match,
+            "config_transform_facts_match": independent.config_transform_facts_match,
+            "oracle_canonical_base_pixel_bytes_match": independent.oracle_canonical_base_pixel_bytes_match,
             "scientific_brick_reads": independent.scientific_brick_reads,
             "canonical_base_pixel_bytes": independent.canonical_base_pixel_bytes,
             "canonical_base_pixel_bytes_match": independent.canonical_base_pixel_bytes
@@ -1849,7 +2668,8 @@ enum TerminalRssExitConfirmation<T> {
     ProcessDeadlineReached,
 }
 
-fn run_app_process(run: AppRun<'_>) -> anyhow::Result<ProcessObservation> {
+fn run_app_process(run: AppRun<'_>, cancelled: &AtomicBool) -> anyhow::Result<ProcessObservation> {
+    require_not_cancelled(cancelled, "T5 application launch")?;
     let stdout = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1883,6 +2703,10 @@ fn run_app_process(run: AppRun<'_>) -> anyhow::Result<ProcessObservation> {
     let mut mapped_window = None;
     let mut next_geometry_probe = Instant::now();
     loop {
+        if cancelled.load(Ordering::Acquire) {
+            terminate_t5_child(&mut child);
+            bail!("T5 command cancelled by SIGINT or SIGTERM while the app child was active");
+        }
         if let Some(status) = try_wait_t5_child(&mut child)? {
             return Ok(ProcessObservation {
                 exit_success: status.success(),
@@ -1913,7 +2737,10 @@ fn run_app_process(run: AppRun<'_>) -> anyhow::Result<ProcessObservation> {
             }),
             ProcessRssPoll::ExitPending => {
                 let confirmation = confirm_process_exit_after_rss_disappeared(
-                    || child.try_wait().map_err(Into::into),
+                    || {
+                        require_not_cancelled(cancelled, "T5 child exit confirmation")?;
+                        child.try_wait().map_err(Into::into)
+                    },
                     || thread::sleep(RSS_SAMPLE_INTERVAL),
                     Instant::now,
                     deadline,
@@ -2598,21 +3425,234 @@ fn ratio_at_most(numerator: u64, denominator: u64, max_numerator: u128, scale: u
             <= u128::from(denominator).saturating_mul(max_numerator)
 }
 
+fn source_oracle_gates(
+    oracle: &OracleFacts,
+    expected: &ExpectedFacts,
+    source_before: &InventoryFacts,
+    source_after: &InventoryFacts,
+    scratch_removed_empty: bool,
+    working_memory_bytes: u64,
+) -> BTreeMap<String, bool> {
+    let mut gates = BTreeMap::new();
+    gates.insert(
+        "fact_authority".to_owned(),
+        expected.expected_fact_authority == FACT_AUTHORITY,
+    );
+    gates.insert(
+        "frozen_scientific_facts".to_owned(),
+        oracle_matches_expected(oracle, expected),
+    );
+    gates.insert(
+        "frozen_scale_keys_and_counts".to_owned(),
+        oracle_scale_keys_and_counts_match(oracle, &expected.scales),
+    );
+    gates.insert(
+        "frozen_centered_transforms".to_owned(),
+        expected_oracle_transform_facts_match(&expected.transforms, &oracle.transforms),
+    );
+    gates.insert(
+        "canonical_base_pixel_bytes".to_owned(),
+        oracle.canonical_base_pixel_bytes == expected.canonical_source_pixel_bytes,
+    );
+    gates.insert(
+        "working_memory_bound".to_owned(),
+        oracle.resources.calculated_peak_working_bytes <= working_memory_bytes,
+    );
+    gates.insert(
+        "scratch_capacity".to_owned(),
+        oracle.resources.required_scratch_bytes <= oracle.resources.scratch_free_bytes,
+    );
+    gates.insert(
+        "scratch_file_bound".to_owned(),
+        oracle.resources.peak_scratch_regular_files <= 2,
+    );
+    gates.insert(
+        "open_file_bound".to_owned(),
+        oracle.resources.calculated_open_files_bound <= 64,
+    );
+    gates.insert(
+        "zero_scratch_remnants".to_owned(),
+        oracle.resources.scratch_files_remaining == 0 && scratch_removed_empty,
+    );
+    gates.insert(
+        "deterministic_filename_order".to_owned(),
+        oracle.resources.deterministic_filename_order,
+    );
+    gates.insert(
+        "nonempty_source_planes".to_owned(),
+        oracle.resources.source_planes > 0,
+    );
+    gates.insert(
+        "source_file_count".to_owned(),
+        oracle.resources.source_files == source_before.regular_files,
+    );
+    gates.insert(
+        "source_inventory_names".to_owned(),
+        oracle.resources.source_inventory_name_bytes > 0,
+    );
+    gates.insert(
+        "transform_coverage".to_owned(),
+        oracle_transform_coverage(oracle),
+    );
+    gates.insert(
+        "source_preservation".to_owned(),
+        oracle.resources.source_unchanged && source_before == source_after,
+    );
+    gates
+}
+
+fn oracle_transform_coverage(oracle: &OracleFacts) -> bool {
+    let scale_ordinals = oracle
+        .scales
+        .iter()
+        .map(|scale| (scale.image_ordinal, scale.scale_ordinal))
+        .collect::<BTreeSet<_>>();
+    let transform_ordinals = oracle
+        .transforms
+        .iter()
+        .map(|transform| transform.scale_ordinal)
+        .collect::<BTreeSet<_>>();
+    scale_ordinals.len() == oracle.scales.len()
+        && scale_ordinals.iter().all(|(image, _)| *image == 0)
+        && transform_ordinals.len() == oracle.transforms.len()
+        && transform_ordinals
+            == scale_ordinals
+                .iter()
+                .map(|(_, scale)| *scale)
+                .collect::<BTreeSet<_>>()
+}
+
+fn oracle_matches_expected(oracle: &OracleFacts, expected: &ExpectedFacts) -> bool {
+    if oracle.scientific_content_id != expected.scientific_content_id
+        || oracle.canonical_base_pixel_bytes != expected.canonical_source_pixel_bytes
+        || !expected_oracle_transform_facts_match(&expected.transforms, &oracle.transforms)
+    {
+        return false;
+    }
+    let mut oracle_roots = oracle
+        .layer_roots
+        .iter()
+        .map(|root| (root.logical_layer, root.digest_sha256.as_str()))
+        .collect::<Vec<_>>();
+    oracle_roots.sort_unstable();
+    let mut expected_roots = expected
+        .scientific_layer_roots
+        .iter()
+        .map(|root| (root.logical_layer, root.digest_sha256.as_str()))
+        .collect::<Vec<_>>();
+    expected_roots.sort_unstable();
+
+    let mut oracle_scales = oracle
+        .scales
+        .iter()
+        .map(|scale| {
+            (
+                scale.image_ordinal,
+                scale.scale_ordinal,
+                scale.digest_sha256.as_str(),
+                scale.brick_reads,
+                scale.logical_voxels,
+            )
+        })
+        .collect::<Vec<_>>();
+    oracle_scales.sort_unstable();
+    let mut expected_scales = expected
+        .scales
+        .iter()
+        .map(|scale| {
+            (
+                scale.image_ordinal,
+                scale.scale_ordinal,
+                scale.digest_sha256.as_str(),
+                scale.brick_reads,
+                scale.logical_voxels,
+            )
+        })
+        .collect::<Vec<_>>();
+    expected_scales.sort_unstable();
+    oracle_roots == expected_roots && oracle_scales == expected_scales
+}
+
+fn expected_oracle_transform_facts_match(
+    expected: &[ExpectedTransformFact],
+    oracle: &[t5_sentinel_oracle::OracleTransformFact],
+) -> bool {
+    let mut expected = expected
+        .iter()
+        .map(|fact| {
+            (
+                fact.scale_ordinal,
+                fact.scale_zyx.map(f64::to_bits),
+                fact.translation_zyx.map(f64::to_bits),
+            )
+        })
+        .collect::<Vec<_>>();
+    expected.sort_unstable_by_key(|fact| fact.0);
+    let mut oracle = oracle
+        .iter()
+        .map(|fact| {
+            (
+                fact.scale_ordinal,
+                fact.scale_zyx.map(f64::to_bits),
+                fact.translation_zyx.map(f64::to_bits),
+            )
+        })
+        .collect::<Vec<_>>();
+    oracle.sort_unstable_by_key(|fact| fact.0);
+    expected == oracle
+}
+
+fn oracle_scale_keys_and_counts_match(
+    oracle: &OracleFacts,
+    expected: &[ExpectedScaleFact],
+) -> bool {
+    let mut oracle_counts = oracle
+        .scales
+        .iter()
+        .map(|scale| {
+            (
+                scale.image_ordinal,
+                scale.scale_ordinal,
+                scale.brick_reads,
+                scale.logical_voxels,
+            )
+        })
+        .collect::<Vec<_>>();
+    oracle_counts.sort_unstable();
+    let mut expected_counts = expected
+        .iter()
+        .map(|scale| {
+            (
+                scale.image_ordinal,
+                scale.scale_ordinal,
+                scale.brick_reads,
+                scale.logical_voxels,
+            )
+        })
+        .collect::<Vec<_>>();
+    expected_counts.sort_unstable();
+    oracle_counts == expected_counts
+}
+
 fn independently_validate_package(
     destination: &Path,
     expected: &ExpectedFacts,
+    source_oracle: &OracleFacts,
+    cancelled: &AtomicBool,
 ) -> anyhow::Result<IndependentValidation> {
+    require_not_cancelled(cancelled, "independent exact-package validation")?;
     let catalog = LocalPackageCatalog::open(destination)
         .context("T5 independent post-open package catalog rejected the destination")?;
     let exact = catalog
-        .validate_exact_package(ProfileKind::Ds3, || false)
+        .validate_exact_package(ProfileKind::Ds3, || cancelled.load(Ordering::Acquire))
         .context("T5 independent exact package validation failed")?;
     let package_id = exact.package_id().to_string();
     let verified = exact
-        .validate_scientific_content(|| false)
+        .validate_scientific_content(|| cancelled.load(Ordering::Acquire))
         .context("T5 independent scientific package validation failed")?;
     let scientific_content_id = verified.scientific_content_id().to_string();
     let scientific_id_matches = scientific_content_id == expected.scientific_content_id;
+    let oracle_scientific_id_matches = scientific_content_id == source_oracle.scientific_content_id;
 
     let mut actual_roots = verified
         .layer_roots()
@@ -2626,6 +3666,16 @@ fn independently_validate_package(
     let mut expected_roots = expected.scientific_layer_roots.clone();
     expected_roots.sort();
     let layer_roots_match = actual_roots == expected_roots;
+    let mut oracle_roots = source_oracle
+        .layer_roots
+        .iter()
+        .map(|root| ExpectedLayerRoot {
+            logical_layer: root.logical_layer,
+            digest_sha256: root.digest_sha256.clone(),
+        })
+        .collect::<Vec<_>>();
+    oracle_roots.sort();
+    let oracle_layer_roots_match = actual_roots == oracle_roots;
     let layer_roots = actual_roots
         .iter()
         .map(|root| {
@@ -2640,8 +3690,9 @@ fn independently_validate_package(
     let mut canonical_base_pixel_bytes = 0_u64;
     for image in verified.catalog().profile().images() {
         for level in image.levels() {
+            require_not_cancelled(cancelled, "independent per-scale validation")?;
             let (fact, canonical_pixel_bytes) =
-                scale_fact(&verified, image.image_ordinal(), level)?;
+                scale_fact(&verified, image.image_ordinal(), level, cancelled)?;
             if level.scale_ordinal() == 0 {
                 canonical_base_pixel_bytes = canonical_base_pixel_bytes
                     .checked_add(canonical_pixel_bytes)
@@ -2657,6 +3708,19 @@ fn independently_validate_package(
     let mut expected_scales = expected.scales.clone();
     expected_scales.sort();
     let scale_facts_match = actual_scales == expected_scales;
+    let mut oracle_scales = source_oracle
+        .scales
+        .iter()
+        .map(|fact| ExpectedScaleFact {
+            image_ordinal: fact.image_ordinal,
+            scale_ordinal: fact.scale_ordinal,
+            digest_sha256: fact.digest_sha256.clone(),
+            brick_reads: fact.brick_reads,
+            logical_voxels: fact.logical_voxels,
+        })
+        .collect::<Vec<_>>();
+    oracle_scales.sort();
+    let oracle_scale_facts_match = actual_scales == oracle_scales;
     let scale_facts = actual_scales
         .iter()
         .map(|fact| {
@@ -2669,28 +3733,132 @@ fn independently_validate_package(
             })
         })
         .collect();
+    let actual_transforms = package_transform_facts(&verified)?;
+    let oracle_transform_facts_match =
+        transform_facts_match(&actual_transforms, &source_oracle.transforms);
+    let config_transform_facts_match =
+        expected_transform_facts_match(&actual_transforms, &expected.transforms);
+    let transform_facts = actual_transforms
+        .iter()
+        .map(|fact| serde_json::to_value(fact).expect("transform fact is JSON-safe"))
+        .collect();
     let scientific_brick_reads = verified.validation_report().brick_reads();
     verified
-        .revalidate_complete(|| false)
+        .revalidate_complete(|| cancelled.load(Ordering::Acquire))
         .context("T5 package changed during independent per-scale readback")?;
+    require_not_cancelled(cancelled, "independent package validation")?;
 
     Ok(IndependentValidation {
         package_id,
         scientific_content_id,
         layer_roots,
         scale_facts,
+        transform_facts,
         scale_facts_match,
         layer_roots_match,
         scientific_id_matches,
+        oracle_scale_facts_match,
+        oracle_layer_roots_match,
+        oracle_scientific_id_matches,
+        oracle_transform_facts_match,
+        config_transform_facts_match,
+        oracle_canonical_base_pixel_bytes_match: canonical_base_pixel_bytes
+            == source_oracle.canonical_base_pixel_bytes,
         scientific_brick_reads,
         canonical_base_pixel_bytes,
     })
+}
+
+fn package_transform_facts(
+    verified: &mirante4d_storage::VerifiedScientificPackageCapability,
+) -> anyhow::Result<Vec<ObservedTransformFact>> {
+    let images = verified.catalog().profile().images();
+    if images.len() != 1 || images[0].image_ordinal() != 0 {
+        bail!("T5 source-oracle transform authority requires exactly physical image zero");
+    }
+    let image = &images[0];
+    let metadata_path =
+        mirante4d_storage::PackagePath::parse(&format!("{}/zarr.json", image.image_group_path()))?;
+    let ome = verified
+        .catalog()
+        .ome_image(&metadata_path)
+        .context("T5 package lacks its OME image-group transform metadata")?;
+    if ome.level_transforms().len() != image.levels().len() {
+        bail!("T5 package OME transform count differs from its scale count");
+    }
+    ome.level_transforms()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, transform)| match transform {
+            OmeLevelTransform::DiagonalMicrometer {
+                scale_zyx,
+                translation_zyx,
+            } => Ok(ObservedTransformFact {
+                scale_ordinal: u32::try_from(ordinal)?,
+                scale_zyx: scale_zyx.map(|value| value.value()),
+                translation_zyx: translation_zyx.map(|value| value.value()),
+            }),
+            OmeLevelTransform::UnitlessIdentity => {
+                bail!("T5 source-oracle transform authority requires micrometer calibration")
+            }
+        })
+        .collect()
+}
+
+fn transform_facts_match(
+    actual: &[ObservedTransformFact],
+    expected: &[t5_sentinel_oracle::OracleTransformFact],
+) -> bool {
+    actual.len() == expected.len()
+        && actual.iter().zip(expected).all(|(actual, expected)| {
+            actual.scale_ordinal == expected.scale_ordinal
+                && actual
+                    .scale_zyx
+                    .iter()
+                    .zip(expected.scale_zyx)
+                    .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
+                && actual
+                    .translation_zyx
+                    .iter()
+                    .zip(expected.translation_zyx)
+                    .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
+        })
+}
+
+fn expected_transform_facts_match(
+    actual: &[ObservedTransformFact],
+    expected: &[ExpectedTransformFact],
+) -> bool {
+    let mut actual = actual
+        .iter()
+        .map(|fact| {
+            (
+                fact.scale_ordinal,
+                fact.scale_zyx.map(f64::to_bits),
+                fact.translation_zyx.map(f64::to_bits),
+            )
+        })
+        .collect::<Vec<_>>();
+    actual.sort_unstable_by_key(|fact| fact.0);
+    let mut expected = expected
+        .iter()
+        .map(|fact| {
+            (
+                fact.scale_ordinal,
+                fact.scale_zyx.map(f64::to_bits),
+                fact.translation_zyx.map(f64::to_bits),
+            )
+        })
+        .collect::<Vec<_>>();
+    expected.sort_unstable_by_key(|fact| fact.0);
+    actual == expected
 }
 
 fn scale_fact(
     verified: &mirante4d_storage::VerifiedScientificPackageCapability,
     image_ordinal: u32,
     level: &mirante4d_storage::ProfileLevel,
+    cancelled: &AtomicBool,
 ) -> anyhow::Result<(ExpectedScaleFact, u64)> {
     let metadata_path =
         mirante4d_storage::PackagePath::parse(&format!("{}/zarr.json", level.pixel_path()))?;
@@ -2756,6 +3924,7 @@ fn scale_fact(
             for z_chunk in 0..chunk_counts[0] {
                 for y_chunk in 0..chunk_counts[1] {
                     for x_chunk in 0..chunk_counts[2] {
+                        require_not_cancelled(cancelled, "independent scale-brick traversal")?;
                         let coordinates = PackedIndexCoordinates::new(
                             image_ordinal,
                             level.scale_ordinal(),
@@ -2766,7 +3935,7 @@ fn scale_fact(
                             u32::try_from(x_chunk)?,
                         );
                         let brick = verified
-                            .read_brick(coordinates, || false)
+                            .read_brick(coordinates, || cancelled.load(Ordering::Acquire))
                             .context("T5 independent per-scale brick read failed")?;
                         observed_bricks = observed_bricks
                             .checked_add(1)
@@ -2807,6 +3976,10 @@ fn scale_fact(
                         row.clear();
                         row.reserve(row_capacity.saturating_sub(row.capacity()));
                         for z in 0..extent[0] {
+                            require_not_cancelled(
+                                cancelled,
+                                "independent scale-brick row traversal",
+                            )?;
                             for y in 0..extent[1] {
                                 row.clear();
                                 for x in 0..extent[2] {
@@ -3012,6 +4185,10 @@ fn same_file_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
         && left.ctime_nsec() == right.ctime_nsec()
 }
 
+fn same_directory_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.is_dir() && right.is_dir() && left.dev() == right.dev() && left.ino() == right.ino()
+}
+
 fn repository_same_clean_revision(start: &RepositoryIdentity, end: &RepositoryIdentity) -> bool {
     start.root.is_some()
         && start.commit.is_some()
@@ -3069,6 +4246,119 @@ fn write_new_synced_json(path: &Path, value: &Value) -> anyhow::Result<()> {
     file.sync_all()?;
     File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+struct PendingConfigPublication {
+    parent: OwnedFd,
+    stage: File,
+    stage_name: OsString,
+    owns_stage: bool,
+}
+
+impl PendingConfigPublication {
+    fn create(parent_path: &Path) -> anyhow::Result<Self> {
+        let directory_flags =
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+        let parent = openat(rustix::fs::CWD, parent_path, directory_flags, Mode::empty())
+            .context("failed to open the T5 oracle config output parent")?;
+        let file_flags =
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+        let token = session_id()?;
+
+        for attempt in 0_u8..32 {
+            let stage_name = OsString::from(format!(".mirante4d-t5-config-{token}-{attempt}.tmp"));
+            match openat(
+                &parent,
+                stage_name.as_os_str(),
+                file_flags,
+                Mode::RUSR | Mode::WUSR,
+            ) {
+                Ok(stage) => {
+                    return Ok(Self {
+                        parent,
+                        stage: File::from(stage),
+                        stage_name,
+                        owns_stage: true,
+                    });
+                }
+                Err(Errno::EXIST) => {}
+                Err(error) => {
+                    return Err(error)
+                        .context("failed to create the private T5 oracle config stage");
+                }
+            }
+        }
+        bail!("failed to reserve a unique private T5 oracle config stage")
+    }
+
+    fn stage_name_still_owned(&self) -> anyhow::Result<bool> {
+        let descriptor = fstat(&self.stage)?;
+        let named = statat(
+            &self.parent,
+            self.stage_name.as_os_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )?;
+        Ok(descriptor.st_dev == named.st_dev && descriptor.st_ino == named.st_ino)
+    }
+
+    fn publish(mut self, destination_name: &OsStr) -> anyhow::Result<()> {
+        if !self.stage_name_still_owned()? {
+            bail!("T5 oracle config stage identity changed before publication");
+        }
+        renameat_with(
+            &self.parent,
+            self.stage_name.as_os_str(),
+            &self.parent,
+            destination_name,
+            RenameFlags::NOREPLACE,
+        )
+        .context("failed to atomically create the T5 oracle config output")?;
+
+        // The successful no-replace rename is the publication point. From
+        // here onward the destination is a complete validated file, so Drop
+        // must never unlink it even if the parent durability barrier fails.
+        self.owns_stage = false;
+        fsync(&self.parent).context(
+            "T5 oracle config was published, but parent-directory durability is indeterminate",
+        )?;
+        Ok(())
+    }
+}
+
+impl Drop for PendingConfigPublication {
+    fn drop(&mut self) {
+        if self.owns_stage {
+            let _ = unlinkat(&self.parent, self.stage_name.as_os_str(), AtFlags::empty());
+            let _ = fsync(&self.parent);
+        }
+    }
+}
+
+fn write_new_synced_config_with_precommit(
+    path: &Path,
+    config: &T5Config,
+    precommit: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let value = serde_json::to_value(config)?;
+    let parsed: T5Config = serde_json::from_value(value.clone())?;
+    validate_config(&parsed)?;
+    let bytes = serde_json::to_vec_pretty(&value)?;
+    let parent = path.parent().context("T5 config output has no parent")?;
+    let destination_name = path
+        .file_name()
+        .context("T5 config output has no file name")?;
+    let mut publication = PendingConfigPublication::create(parent)?;
+    publication.stage.write_all(&bytes)?;
+    publication
+        .stage
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    publication.stage.sync_all()?;
+    let metadata = publication.stage.metadata()?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
+        bail!("T5 oracle bootstrap stage is not a private mode-0600 regular file");
+    }
+    precommit()?;
+    publication.publish(destination_name)
 }
 
 fn create_private_directory(path: &Path) -> std::io::Result<()> {
@@ -3157,7 +4447,22 @@ fn validate_sanitized_report(report: &Value, private_strings: &[String]) -> anyh
                 }
             }
             Value::Object(values) => {
-                for value in values.values() {
+                for (key, value) in values {
+                    if matches!(
+                        key.as_str(),
+                        "scale_zyx"
+                            | "translation_zyx"
+                            | "logical_voxels"
+                            | "brick_reads"
+                            | "canonical_base_pixel_bytes"
+                            | "source_planes"
+                            | "source_files"
+                            | "source_inventory_name_bytes"
+                            | "required_scratch_bytes"
+                            | "scratch_free_bytes"
+                    ) {
+                        bail!("sanitized T5 summary retained a private numeric oracle fact");
+                    }
                     visit(value, private_strings)?;
                 }
             }
@@ -3172,7 +4477,88 @@ fn validate_sanitized_report(report: &Value, private_strings: &[String]) -> anyh
 mod tests {
     use super::*;
 
+    fn valid_legacy_config(root: &Path) -> LegacyT5Config {
+        let mut value = valid_config_json(root);
+        value["schema"] = json!(LEGACY_CONFIG_SCHEMA);
+        value["expected"]
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_fact_authority");
+        value["expected"]
+            .as_object_mut()
+            .unwrap()
+            .remove("transforms");
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn stub_oracle_facts() -> OracleFacts {
+        let scales = (0..T5_SCALE_COUNT)
+            .map(|scale| t5_sentinel_oracle::OracleScaleFact {
+                image_ordinal: 0,
+                scale_ordinal: u32::try_from(scale).unwrap(),
+                digest_sha256: "2".repeat(64),
+                brick_reads: 1,
+                logical_voxels: if scale == 0 { 16 } else { 1 },
+            })
+            .collect();
+        let transforms = (0..T5_SCALE_COUNT)
+            .map(|scale| {
+                let factor = f64::from(1_u32 << scale);
+                t5_sentinel_oracle::OracleTransformFact {
+                    scale_ordinal: u32::try_from(scale).unwrap(),
+                    scale_zyx: [factor; 3],
+                    translation_zyx: [(factor - 1.0) / 2.0; 3],
+                }
+            })
+            .collect();
+        OracleFacts {
+            scientific_content_id: format!("m4d-sc-v1-sha256:{}", "0".repeat(64)),
+            layer_roots: vec![t5_sentinel_oracle::OracleLayerRoot {
+                logical_layer: 0,
+                digest_sha256: "1".repeat(64),
+            }],
+            scales,
+            transforms,
+            canonical_base_pixel_bytes: 16,
+            resources: t5_sentinel_oracle::OracleResources {
+                calculated_peak_working_bytes: 1024,
+                required_scratch_bytes: 2048,
+                scratch_free_bytes: 4096,
+                peak_scratch_regular_files: 2,
+                scratch_files_remaining: 0,
+                calculated_open_files_bound: 4,
+                source_planes: 1,
+                source_files: 1,
+                source_inventory_name_bytes: 8,
+                deterministic_filename_order: true,
+                source_unchanged: true,
+            },
+        }
+    }
+
     fn valid_config_json(root: &Path) -> Value {
+        let scales = (0..T5_SCALE_COUNT)
+            .map(|scale| {
+                json!({
+                    "image_ordinal": 0,
+                    "scale_ordinal": scale,
+                    "digest_sha256": "2".repeat(64),
+                    "brick_reads": 1,
+                    "logical_voxels": if scale == 0 { 16 } else { 1 },
+                })
+            })
+            .collect::<Vec<_>>();
+        let transforms = (0..T5_SCALE_COUNT)
+            .map(|scale| {
+                let factor = f64::from(1_u32 << scale);
+                let translation = (factor - 1.0) / 2.0;
+                json!({
+                    "scale_ordinal": scale,
+                    "scale_zyx": [factor, factor, factor],
+                    "translation_zyx": [translation, translation, translation],
+                })
+            })
+            .collect::<Vec<_>>();
         json!({
             "schema": CONFIG_SCHEMA,
             "workload_id": "t5-0123456789abcdef0123456789abcdef",
@@ -3182,12 +4568,13 @@ mod tests {
             "expected_profile": "DS-3",
             "spacing_zyx_um": [1.0, 1.0, 1.0],
             "time_step_seconds": null,
-            "no_data_sentinel": null,
+            "no_data_sentinel": 255,
             "working_memory_bytes": WORKING_MEMORY_BYTES,
             "primary_timeout_seconds": 1200,
             "cache_condition": "warm",
             "competing_activity": "none",
             "expected": {
+                "expected_fact_authority": FACT_AUTHORITY,
                 "source_inventory_sha256": "3".repeat(64),
                 "reviewed_source_fingerprint_sha256": "4".repeat(64),
                 "canonical_source_pixel_bytes": 16,
@@ -3197,13 +4584,8 @@ mod tests {
                     "digest_sha256": "1".repeat(64),
                 }],
                 "scale_digest_scheme": SCALE_DIGEST_SCHEME,
-                "scales": [{
-                    "image_ordinal": 0,
-                    "scale_ordinal": 0,
-                    "digest_sha256": "2".repeat(64),
-                    "brick_reads": 1,
-                    "logical_voxels": 16,
-                }],
+                "scales": scales,
+                "transforms": transforms,
             },
         })
     }
@@ -3225,13 +4607,39 @@ mod tests {
         assert!(validate_config(&config).is_err());
 
         let mut private_protocol_label = valid_config_json(root);
-        private_protocol_label["competing_activity"] = json!("private-cell-dataset");
+        private_protocol_label["competing_activity"] = json!("private-dataset-label");
         let config: T5Config = serde_json::from_value(private_protocol_label).unwrap();
         assert!(validate_config(&config).is_err());
 
         let mut extra = valid_config_json(root);
         extra["unexpected"] = json!(true);
         assert!(serde_json::from_value::<T5Config>(extra).is_err());
+
+        let mut legacy_schema = valid_config_json(root);
+        legacy_schema["schema"] = json!(LEGACY_CONFIG_SCHEMA);
+        let config: T5Config = serde_json::from_value(legacy_schema).unwrap();
+        assert!(validate_config(&config).is_err());
+
+        let mut missing_authority = valid_config_json(root);
+        missing_authority["expected"]
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_fact_authority");
+        assert!(serde_json::from_value::<T5Config>(missing_authority).is_err());
+
+        let mut missing_sentinel = valid_config_json(root);
+        missing_sentinel["no_data_sentinel"] = Value::Null;
+        assert!(serde_json::from_value::<T5Config>(missing_sentinel).is_err());
+
+        let mut duplicate_transform: T5Config =
+            serde_json::from_value(valid_config_json(root)).unwrap();
+        duplicate_transform.expected.transforms[1].scale_ordinal = 0;
+        assert!(validate_config(&duplicate_transform).is_err());
+
+        let mut nonfinite_transform: T5Config =
+            serde_json::from_value(valid_config_json(root)).unwrap();
+        nonfinite_transform.expected.transforms[1].scale_zyx[0] = f64::INFINITY;
+        assert!(validate_config(&nonfinite_transform).is_err());
     }
 
     #[test]
@@ -3260,6 +4668,172 @@ mod tests {
             .samples,
             2
         );
+    }
+
+    #[test]
+    fn oracle_bootstrap_parser_requires_exact_input_and_output_arguments() {
+        assert_eq!(
+            parse_oracle_bootstrap_args(vec![
+                "--config".into(),
+                "/private/legacy.json".into(),
+                "--output".into(),
+                "/private/current.json".into(),
+            ])
+            .unwrap(),
+            OracleBootstrapArgs {
+                config: PathBuf::from("/private/legacy.json"),
+                output: PathBuf::from("/private/current.json"),
+            }
+        );
+        assert!(
+            parse_oracle_bootstrap_args(vec!["--config".into(), "/private/legacy.json".into(),])
+                .is_err()
+        );
+        assert!(
+            parse_oracle_bootstrap_args(vec![
+                "--config".into(),
+                "/private/legacy.json".into(),
+                "--output".into(),
+                "/private/current.json".into(),
+                "--diagnostic".into(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn source_oracle_gate_binds_facts_resources_and_source_preservation() {
+        let config: T5Config =
+            serde_json::from_value(valid_config_json(Path::new("/private"))).unwrap();
+        let inventory = InventoryFacts {
+            regular_files: 1,
+            source_bytes: 123,
+            sha256: "3".repeat(64),
+        };
+        let oracle = stub_oracle_facts();
+        let gates = source_oracle_gates(
+            &oracle,
+            &config.expected,
+            &inventory,
+            &inventory,
+            true,
+            WORKING_MEMORY_BYTES,
+        );
+        assert!(gates.values().all(|passed| *passed));
+
+        let mut bit_different_expected = config.expected.clone();
+        bit_different_expected.transforms[0].translation_zyx[0] = -0.0;
+        assert!(
+            !source_oracle_gates(
+                &oracle,
+                &bit_different_expected,
+                &inventory,
+                &inventory,
+                true,
+                WORKING_MEMORY_BYTES,
+            )["frozen_centered_transforms"]
+        );
+
+        let mut oversized = oracle.clone();
+        oversized.resources.calculated_peak_working_bytes = WORKING_MEMORY_BYTES + 1;
+        assert!(
+            !source_oracle_gates(
+                &oversized,
+                &config.expected,
+                &inventory,
+                &inventory,
+                true,
+                WORKING_MEMORY_BYTES,
+            )["working_memory_bound"]
+        );
+        assert!(
+            !source_oracle_gates(
+                &oracle,
+                &config.expected,
+                &inventory,
+                &inventory,
+                false,
+                WORKING_MEMORY_BYTES,
+            )["zero_scratch_remnants"]
+        );
+    }
+
+    #[test]
+    fn package_transform_gate_is_bit_exact_for_config_and_oracle() {
+        let oracle = stub_oracle_facts();
+        let config: T5Config =
+            serde_json::from_value(valid_config_json(Path::new("/private"))).unwrap();
+        let observed = oracle
+            .transforms
+            .iter()
+            .map(|fact| ObservedTransformFact {
+                scale_ordinal: fact.scale_ordinal,
+                scale_zyx: fact.scale_zyx,
+                translation_zyx: fact.translation_zyx,
+            })
+            .collect::<Vec<_>>();
+        assert!(transform_facts_match(&observed, &oracle.transforms));
+        assert!(expected_transform_facts_match(
+            &observed,
+            &config.expected.transforms
+        ));
+
+        let mut drifted = config.expected.transforms.clone();
+        drifted[0].translation_zyx[0] = -0.0;
+        assert!(!expected_transform_facts_match(&observed, &drifted));
+    }
+
+    #[test]
+    fn bootstrap_replaces_only_authorized_scientific_facts() {
+        let legacy = valid_legacy_config(Path::new("/private"));
+        let mut oracle = stub_oracle_facts();
+        oracle.scientific_content_id = format!("m4d-sc-v1-sha256:{}", "9".repeat(64));
+        oracle.layer_roots[0].digest_sha256 = "8".repeat(64);
+        oracle.scales[0].digest_sha256 = "7".repeat(64);
+        let upgraded = legacy_config_with_facts(&legacy, &oracle).unwrap();
+
+        assert_eq!(upgraded.schema, CONFIG_SCHEMA);
+        assert_eq!(upgraded.expected.expected_fact_authority, FACT_AUTHORITY);
+        assert_eq!(upgraded.source, legacy.source);
+        assert_eq!(upgraded.scratch_root, legacy.scratch_root);
+        assert_eq!(
+            upgraded.expected.source_inventory_sha256,
+            legacy.expected.source_inventory_sha256
+        );
+        assert_eq!(
+            upgraded.expected.reviewed_source_fingerprint_sha256,
+            legacy.expected.reviewed_source_fingerprint_sha256
+        );
+        assert_eq!(
+            upgraded.expected.canonical_source_pixel_bytes,
+            legacy.expected.canonical_source_pixel_bytes
+        );
+        assert_eq!(
+            upgraded.expected.scientific_content_id,
+            oracle.scientific_content_id
+        );
+        assert_eq!(
+            upgraded.expected.scientific_layer_roots[0].digest_sha256,
+            oracle.layer_roots[0].digest_sha256
+        );
+        assert_eq!(
+            upgraded.expected.scales[0].digest_sha256,
+            oracle.scales[0].digest_sha256
+        );
+        assert!(expected_oracle_transform_facts_match(
+            &upgraded.expected.transforms,
+            &oracle.transforms
+        ));
+        assert_eq!(
+            (
+                upgraded.expected.scales[0].image_ordinal,
+                upgraded.expected.scales[0].scale_ordinal,
+                upgraded.expected.scales[0].brick_reads,
+                upgraded.expected.scales[0].logical_voxels,
+            ),
+            (0, 0, 1, 16)
+        );
+        validate_config(&upgraded).unwrap();
     }
 
     #[test]
@@ -3320,17 +4894,14 @@ mod tests {
             OWNER_ACCEPTED_IMPORT_QUALIFICATION_PROFILE_SHA256,
             Some("50d18c8d3f695a90ff879fc6cdea210b273cc52f97f63350931e42fdd2b38abe")
         );
+        assert_eq!(OWNER_ACCEPTED_T5_CONFIG_SHA256, None);
         assert_eq!(
-            OWNER_ACCEPTED_T5_CONFIG_SHA256,
-            Some("3b27aabbe604edbc08b02c334ce193692121d1509e450cb001d66bfc3616369a")
+            LEGACY_OWNER_ACCEPTED_T5_CONFIG_SHA256,
+            "3b27aabbe604edbc08b02c334ce193692121d1509e450cb001d66bfc3616369a"
         );
         assert_eq!(
-            config_binding_status(OWNER_ACCEPTED_T5_CONFIG_SHA256.unwrap()),
-            "matched"
-        );
-        assert_eq!(
-            config_binding_status(&"0".repeat(64)),
-            "owner_digest_mismatch"
+            config_binding_status(LEGACY_OWNER_ACCEPTED_T5_CONFIG_SHA256),
+            "pending_owner_acceptance"
         );
     }
 
@@ -3555,16 +5126,17 @@ mod tests {
     #[test]
     fn source_inventory_streams_sorted_bytes_and_rejects_symlinks() {
         let root = tempfile::tempdir().unwrap();
+        let cancelled = AtomicBool::new(false);
         fs::write(root.path().join("b.tif"), b"b").unwrap();
         fs::write(root.path().join("a.tif"), b"a").unwrap();
-        let before = source_inventory(root.path()).unwrap();
+        let before = source_inventory(root.path(), &cancelled).unwrap();
         assert_eq!(before.regular_files, 2);
         assert_eq!(before.source_bytes, 2);
-        assert_eq!(source_inventory(root.path()).unwrap(), before);
+        assert_eq!(source_inventory(root.path(), &cancelled).unwrap(), before);
 
         std::os::unix::fs::symlink(root.path().join("a.tif"), root.path().join("link.tif"))
             .unwrap();
-        assert!(source_inventory(root.path()).is_err());
+        assert!(source_inventory(root.path(), &cancelled).is_err());
     }
 
     #[test]
@@ -3583,6 +5155,101 @@ mod tests {
             fs::metadata(report).unwrap().permissions().mode() & 0o077,
             0
         );
+    }
+
+    #[test]
+    fn bootstrap_output_is_create_new_strict_json_with_exact_private_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("current.json");
+        let second = root.path().join("second.json");
+        let config: T5Config =
+            serde_json::from_value(valid_config_json(Path::new("/private"))).unwrap();
+        write_new_synced_config_with_precommit(&output, &config, || Ok(())).unwrap();
+        write_new_synced_config_with_precommit(&second, &config, || Ok(())).unwrap();
+        assert_eq!(
+            fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let bytes = fs::read(&output).unwrap();
+        assert!(bytes.starts_with(b"{\n  \""));
+        assert_eq!(bytes, fs::read(&second).unwrap());
+        let parsed: T5Config = serde_json::from_slice(&bytes).unwrap();
+        validate_config(&parsed).unwrap();
+        assert!(write_new_synced_config_with_precommit(&output, &config, || Ok(())).is_err());
+    }
+
+    #[test]
+    fn bootstrap_output_failure_never_publishes_or_retains_a_stage() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("current.json");
+        let config: T5Config =
+            serde_json::from_value(valid_config_json(Path::new("/private"))).unwrap();
+
+        assert!(
+            write_new_synced_config_with_precommit(&output, &config, || {
+                bail!("injected prepublication failure")
+            })
+            .is_err()
+        );
+        assert!(!output.exists());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn bootstrap_output_path_stays_external_and_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        let external = root.path().join("external");
+        fs::create_dir(&repository).unwrap();
+        fs::create_dir(&external).unwrap();
+        let output = external.join("current.json");
+        assert_eq!(
+            external_create_new_path(&output, &repository).unwrap(),
+            output
+        );
+        assert!(external_create_new_path(&repository.join("private.json"), &repository).is_err());
+        fs::write(&output, b"occupied").unwrap();
+        assert!(external_create_new_path(&output, &repository).is_err());
+    }
+
+    #[test]
+    fn oracle_scratch_removes_only_its_unchanged_empty_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let empty = root.path().join("empty");
+        let guard = OwnedOracleScratch::create(empty.clone()).unwrap();
+        assert!(guard.remove_and_report_empty().unwrap());
+        assert!(!empty.exists());
+
+        let remnants = root.path().join("remnants");
+        let guard = OwnedOracleScratch::create(remnants.clone()).unwrap();
+        fs::write(remnants.join("unexpected"), b"retain for inspection").unwrap();
+        assert!(!guard.remove_and_report_empty().unwrap());
+        assert!(remnants.join("unexpected").is_file());
+
+        let replaced = root.path().join("replaced");
+        let original = root.path().join("original-moved");
+        let guard = OwnedOracleScratch::create(replaced.clone()).unwrap();
+        fs::rename(&replaced, &original).unwrap();
+        fs::create_dir(&replaced).unwrap();
+        assert!(!guard.remove_and_report_empty().unwrap());
+        assert!(replaced.is_dir());
+        assert!(original.is_dir());
+    }
+
+    #[test]
+    fn cooperative_cancellation_preserves_source_and_removes_empty_oracle_scratch() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.tif");
+        let source_bytes = b"immutable-source";
+        fs::write(&source, source_bytes).unwrap();
+        let scratch_path = root.path().join("oracle-scratch");
+        let scratch = OwnedOracleScratch::create(scratch_path.clone()).unwrap();
+        let cancelled = AtomicBool::new(true);
+
+        assert!(source_inventory(&source, &cancelled).is_err());
+        assert!(scratch.remove_and_report_empty().unwrap());
+        assert_eq!(fs::read(source).unwrap(), source_bytes);
+        assert!(!scratch_path.exists());
     }
 
     #[test]
@@ -3687,5 +5354,24 @@ mod tests {
             validate_sanitized_report(&json!({"value": "0".repeat(64)}), &["0".repeat(64)],)
                 .is_err()
         );
+        for private_numeric_key in [
+            "scale_zyx",
+            "translation_zyx",
+            "logical_voxels",
+            "brick_reads",
+            "canonical_base_pixel_bytes",
+            "source_planes",
+            "source_files",
+            "source_inventory_name_bytes",
+            "required_scratch_bytes",
+            "scratch_free_bytes",
+        ] {
+            let mut report = serde_json::Map::new();
+            report.insert(private_numeric_key.to_owned(), json!(1));
+            assert!(
+                validate_sanitized_report(&Value::Object(report), &[]).is_err(),
+                "{private_numeric_key} must remain private",
+            );
+        }
     }
 }
