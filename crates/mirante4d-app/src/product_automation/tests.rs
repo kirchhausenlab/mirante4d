@@ -2016,6 +2016,8 @@ fn automation_script_parses_source_verification_evidence_workflow() {
           "scenario": "b3_source_verification",
           "commands": [
             { "command": "set_render_target_size", "width": 1280, "height": 720 },
+            { "command": "cancel_active_source_verification" },
+            { "command": "wait_for", "condition": "source_verification_inactive", "timeout_ms": 1000 },
             { "command": "cancel_source_verification" },
             { "command": "wait_for", "condition": "source_verification_required", "timeout_ms": 1000 },
             { "command": "request_source_verification" },
@@ -2037,13 +2039,24 @@ fn automation_script_parses_source_verification_evidence_workflow() {
 
     script.validate().unwrap();
     assert_eq!(script.commands[0].name(), "set_render_target_size");
-    assert_eq!(script.commands[1].name(), "cancel_source_verification");
-    assert_eq!(script.commands[3].name(), "request_source_verification");
-    let ProductAutomationCommand::Assert { condition } = &script.commands[5] else {
+    assert_eq!(
+        script.commands[1].name(),
+        "cancel_active_source_verification"
+    );
+    assert!(matches!(
+        script.commands[2],
+        ProductAutomationCommand::WaitFor {
+            condition: ProductAutomationWaitCondition::SourceVerificationInactive,
+            ..
+        }
+    ));
+    assert_eq!(script.commands[3].name(), "cancel_source_verification");
+    assert_eq!(script.commands[5].name(), "request_source_verification");
+    let ProductAutomationCommand::Assert { condition } = &script.commands[7] else {
         panic!("expected source-verification evidence assertion");
     };
     assert_eq!(condition.name(), "source_verification_evidence");
-    let ProductAutomationCommand::Assert { condition } = &script.commands[6] else {
+    let ProductAutomationCommand::Assert { condition } = &script.commands[8] else {
         panic!("expected render-target assertion");
     };
     assert_eq!(condition.name(), "render_target_pixels");

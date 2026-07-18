@@ -991,10 +991,23 @@ product-gate misses continue through the complete population for attribution,
 but the first fatal setup, process, hard-safety, or evidence-integrity failure
 stops immediately and preserves the exact partial lineage. The role-process
 timeout is derived from the validated action, prerequisite, and concurrent-
-batch schedule plus bounded launch and closeout grace, with the IP import wall
-counted once; there is no caller-authored timeout. This three-sample population
-is development evidence under the existing progression rule and cannot
-establish a performance claim.
+batch schedule plus a fixed 30-second startup-admission grace and 10-second
+closeout grace, with the IP import wall counted once; there is no caller-
+authored timeout. This three-sample population is development evidence under
+the existing progression rule and cannot establish a performance claim.
+
+Automatic full-package source verification is not a generic viewer-startup
+prerequisite. RZ, ZB, RO, ST, NO, VM, and IP cancel the normal automatic
+verifier through its real reducer operation and require an inactive,
+nonquarantined verifier within five seconds before their first measurement
+boundary. PT applies the same bounded quiescence before its package switch and
+again before measuring the successor package. FC retains its application-cold
+milestones before quiescence and requires its resident runtime-idle observation
+afterward. VV also quiesces the unmeasured automatic run, then retains one
+controlled cancelled setup run and one full measured verification request with
+the existing active-throughout and typed completion evidence. This preserves
+provisional-viewing semantics and scientific fail-closed behavior without
+serializing every fresh process, or VV twice, through a package-scale scan.
 
 Preflight and execution also share one exact clean-release executable gate.
 The invoking `xtask` must embed the profile-bound revision, compiler, release

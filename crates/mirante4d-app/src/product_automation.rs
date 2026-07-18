@@ -552,6 +552,54 @@ const fn automation_runtime_is_idle(
     !background_work_active && !camera_demand_planning_active && !prepared_demand_install_pending
 }
 
+pub(super) fn cancel_active_source_verification(
+    app: &mut MiranteWorkbenchApp,
+) -> Result<Value, String> {
+    let automatic_request_pending = app.pending_automatic_source_verification.is_some();
+    // Observe a verifier that reached its commit point before attempting
+    // cancellation; committed promotion must win over cancellation.
+    app.pump_application_services();
+    if app.pending_automatic_source_verification.is_some() {
+        app.try_start_pending_automatic_source_verification();
+        if app.pending_automatic_source_verification.is_some() {
+            return Err(
+                "automatic source verification could not enter a cancellable state".to_owned(),
+            );
+        }
+    }
+    let snapshot = app.application.snapshot();
+    let operation_id = match snapshot.source() {
+        SourceVerificationSnapshot::Verifying { operation_id, .. } => Some(*operation_id),
+        SourceVerificationSnapshot::Required | SourceVerificationSnapshot::Verified(_) => None,
+    };
+    if let Some(operation_id) = operation_id {
+        app.application
+            .dispatch(ApplicationCommand::CancelOperation(operation_id))
+            .map_err(|fault| {
+                format!("active source-verification cancellation was rejected: {fault:?}")
+            })?;
+        app.pump_application_services();
+    }
+    Ok(json!({
+        "active_operation_observed": operation_id.is_some(),
+        "cancellation_requested": operation_id.is_some(),
+        "automatic_request_dispatched": automatic_request_pending,
+    }))
+}
+
+pub(super) fn source_verification_inactive(app: &MiranteWorkbenchApp) -> bool {
+    let snapshot = app.application.snapshot();
+    matches!(
+        snapshot.source(),
+        SourceVerificationSnapshot::Required | SourceVerificationSnapshot::Verified(_)
+    ) && app
+        .source_verification_service
+        .as_ref()
+        .is_some_and(|service| service.active_token().is_none())
+        && app.pending_automatic_source_verification.is_none()
+        && !app.dataset.source_quarantined()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ProductGateObservationOutcome {
@@ -2561,6 +2609,9 @@ impl ProductAutomationController {
                     "cancellation_requested_before_worker_poll": true,
                 })))
             }
+            ProductAutomationCommand::CancelActiveSourceVerification => {
+                cancel_active_source_verification(app).map(CommandProgress::Done)
+            }
             ProductAutomationCommand::RequestSourceVerification => {
                 dispatch_application_command(
                     app,
@@ -3976,6 +4027,9 @@ impl ProductAutomationController {
             }
             ProductAutomationWaitCondition::CoordinatedPresentationSettled => {
                 coordinated_visible_layout_current_complete_with_snapshot(app, snapshot)
+            }
+            ProductAutomationWaitCondition::SourceVerificationInactive => {
+                source_verification_inactive(app)
             }
             ProductAutomationWaitCondition::SourceVerificationRequired => {
                 matches!(snapshot.source(), SourceVerificationSnapshot::Required)

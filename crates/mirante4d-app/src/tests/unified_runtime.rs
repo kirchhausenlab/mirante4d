@@ -1680,6 +1680,37 @@ fn terminal_idle_source_fault_quarantines_immediately_and_wakes_the_service_pump
 }
 
 #[test]
+fn automation_quiescence_dispatches_and_retires_the_pending_normal_verifier() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    app.source_verification_service =
+        Some(current_source_verification_service::CurrentSourceVerificationService::new());
+    app.pending_automatic_source_verification = Some(app.application.snapshot().source_generation());
+
+    assert!(!product_automation::source_verification_inactive(&app));
+    let details = product_automation::cancel_active_source_verification(&mut app).unwrap();
+    assert_eq!(details["automatic_request_dispatched"], true);
+    assert!(app.pending_automatic_source_verification.is_none());
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !product_automation::source_verification_inactive(&app) {
+        assert!(std::time::Instant::now() < deadline);
+        app.pump_application_services();
+        std::thread::yield_now();
+    }
+    assert!(!app.dataset.source_quarantined());
+
+    app.dataset.request_shutdown().unwrap();
+    app.source_verification_service
+        .take()
+        .unwrap()
+        .shutdown()
+        .unwrap();
+}
+
+#[test]
 fn automatic_source_verification_waits_for_the_previous_worker_to_retire() {
     let temp = tempfile::tempdir().unwrap();
     let package = write_target_fixture(temp.path()).unwrap();

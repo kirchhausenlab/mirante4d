@@ -46,7 +46,9 @@ const PRODUCT_GATE_CONDITION_MAX_BYTES: usize = 128;
 const PRODUCT_GATE_BATCH_MAX_OBSERVATIONS: usize = 64;
 const PRODUCT_GATE_DEADLINE_MAX_NS: u64 = 7_200_000_000_000;
 const MAX_NONIMPORT_STATIC_WAIT_NS: u64 = 35_000_000_000;
-const PROCESS_LAUNCH_CLOSEOUT_GRACE_NS: u64 = 10_000_000_000;
+const PROCESS_STARTUP_ADMISSION_GRACE_NS: u64 = 30_000_000_000;
+const PROCESS_CLOSEOUT_GRACE_NS: u64 = 10_000_000_000;
+const SOURCE_VERIFICATION_QUIESCENCE_TIMEOUT_MS: u64 = 5_000;
 const CONFORMANCE_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTEMPT_ROOT_PLACEHOLDER: &str = "${ATTEMPT_ROOT}";
 const WORKLOAD_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -2261,6 +2263,86 @@ fn source_verification_wait_indices(commands: &[Value]) -> impl Iterator<Item = 
     })
 }
 
+fn source_verification_inactive_wait_indices(
+    commands: &[Value],
+) -> impl Iterator<Item = usize> + '_ {
+    commands.iter().enumerate().filter_map(|(index, command)| {
+        (command.get("command").and_then(Value::as_str) == Some("wait_for")
+            && command.get("condition").and_then(Value::as_str)
+                == Some("source_verification_inactive"))
+        .then_some(index)
+    })
+}
+
+fn validate_source_verification_isolation_contract(
+    id: &str,
+    commands: &[Value],
+) -> anyhow::Result<()> {
+    let inactive_waits = source_verification_inactive_wait_indices(commands).collect::<Vec<_>>();
+    let cancel_indices = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| {
+            (command.get("command").and_then(Value::as_str)
+                == Some("cancel_active_source_verification"))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let expected_count = usize::from(id == "PT") + 1;
+    if inactive_waits.len() != expected_count || cancel_indices.len() != expected_count {
+        bail!(
+            "viewer scenario {id} must quiesce automatic source verification exactly {expected_count} time(s)"
+        )
+    }
+    for (&cancel, &wait) in cancel_indices.iter().zip(&inactive_waits) {
+        if cancel.checked_add(1) != Some(wait) {
+            bail!(
+                "viewer scenario {id} must wait for verifier inactivity immediately after requesting active-verifier cancellation"
+            )
+        }
+    }
+    if id != "FC" {
+        let first_measurement_boundary = commands
+            .iter()
+            .position(|command| {
+                matches!(
+                    command.get("command").and_then(Value::as_str),
+                    Some("observe_gate_batch" | "sample_diagnostics")
+                )
+            })
+            .context("viewer scenario must contain a measurement boundary")?;
+        if inactive_waits
+            .last()
+            .is_none_or(|wait| *wait >= first_measurement_boundary)
+        {
+            bail!(
+                "viewer scenario {id} must quiesce automatic source verification before its first measurement boundary"
+            )
+        }
+    }
+    if id == "VV" {
+        if source_verification_wait_indices(commands).next().is_some() {
+            bail!("VV must not perform an unmeasured full source verification during setup")
+        }
+        return Ok(());
+    }
+    if commands.iter().any(|command| {
+        matches!(
+            (
+                command.get("command").and_then(Value::as_str),
+                command.get("condition").and_then(Value::as_str)
+            ),
+            (Some("wait_for"), Some("source_verification_verified"))
+                | (Some("wait_for"), Some("source_verification_required"))
+                | (Some("request_source_verification"), _)
+                | (Some("cancel_source_verification"), _)
+        )
+    }) {
+        bail!("only VV may serialize a scenario through a full source-verification lifecycle")
+    }
+    Ok(())
+}
+
 fn sole_command_index(
     commands: &[Value],
     command_name: &str,
@@ -2440,8 +2522,8 @@ fn validate_dataset_action_contract(
     if target_path == representative_package_root {
         bail!("PT switch_dataset target must differ from the representative package")
     }
-    if !source_verification_wait_indices(commands).any(|index| index < *switch_index) {
-        bail!("PT must verify the representative source before switch_dataset")
+    if !source_verification_inactive_wait_indices(commands).any(|index| index < *switch_index) {
+        bail!("PT must quiesce the representative source verifier before switch_dataset")
     }
     let first_checkpoint = scenario
         .phases
@@ -2449,11 +2531,11 @@ fn validate_dataset_action_contract(
         .and_then(|phase| phase.start_diagnostic_label.as_deref())
         .and_then(|label| diagnostic_command_index(commands, label))
         .context("PT first phase start checkpoint is missing from the command stream")?;
-    if !source_verification_wait_indices(commands)
+    if !source_verification_inactive_wait_indices(commands)
         .any(|index| *switch_index < index && index < first_checkpoint)
     {
         bail!(
-            "PT must wait for source_verification_verified after switch_dataset and before its first diagnostic checkpoint"
+            "PT must quiesce the successor source verifier after switch_dataset and before its first diagnostic checkpoint"
         )
     }
     Ok(Some(target_path.to_path_buf()))
@@ -2503,6 +2585,7 @@ fn validate_required_action_surface(
 ) -> anyhow::Result<()> {
     let commands = &scenario.instrumented_script.commands;
     validate_dataset_action_contract(id, scenario, representative_package_root)?;
+    validate_source_verification_isolation_contract(id, commands)?;
     let names = commands
         .iter()
         .filter_map(|command| command.get("command").and_then(Value::as_str))
@@ -2631,6 +2714,9 @@ fn validate_required_action_surface(
                         == Some("cancel_source_verification")
                 })
                 .expect("required VV cancellation command exists");
+            let startup_quiescence = source_verification_inactive_wait_indices(commands)
+                .next()
+                .context("VV startup verifier quiescence is unavailable")?;
             let request = commands
                 .iter()
                 .position(|command| {
@@ -2646,9 +2732,13 @@ fn validate_required_action_surface(
                 .and_then(|phase| phase.start_diagnostic_label.as_deref())
                 .and_then(|label| diagnostic_command_index(commands, label))
                 .context("VV first phase start checkpoint is missing from the command stream")?;
-            if cancel >= request || request >= first_start || first_start >= completion_wait {
+            if startup_quiescence >= cancel
+                || cancel >= request
+                || request >= first_start
+                || first_start >= completion_wait
+            {
                 bail!(
-                    "VV must reset/cancel its setup verifier, request the measured verifier, then sample the first active phase"
+                    "VV must quiesce automatic verification, reset/cancel its setup verifier, request the measured verifier, then sample the first active phase"
                 )
             }
         }
@@ -3722,17 +3812,17 @@ fn expected_acceptance_condition_multiset(id: &str) -> BTreeMap<&'static str, us
 fn expected_fatal_wait_condition_multiset(id: &str) -> BTreeMap<&'static str, usize> {
     let entries: &[(&str, usize)] = match id {
         "RZ" | "ZB" | "RO" | "ST" | "NO" | "FC" | "VM" => {
-            &[("window_ready", 1), ("source_verification_verified", 1)]
+            &[("window_ready", 1), ("source_verification_inactive", 1)]
         }
-        "PT" => &[("window_ready", 1), ("source_verification_verified", 2)],
+        "PT" => &[("window_ready", 1), ("source_verification_inactive", 2)],
         "VV" => &[
             ("window_ready", 1),
-            ("source_verification_verified", 1),
+            ("source_verification_inactive", 1),
             ("source_verification_required", 1),
         ],
         "IP" => &[
             ("window_ready", 1),
-            ("source_verification_verified", 1),
+            ("source_verification_inactive", 1),
             ("runtime_idle", 1),
             ("import_review_ready", 1),
         ],
@@ -3841,7 +3931,7 @@ fn validate_product_gate_schedule(
         command.get("command").and_then(Value::as_str) == Some("request_source_verification")
     });
     if id == "FC" {
-        validate_fc_source_verification_order(&script.commands, &batches)?;
+        validate_fc_source_verification_isolation_order(&script.commands, &batches)?;
     }
     for (batch_ordinal, batch) in batches.iter().enumerate() {
         let expected_batch_id = format!("{id}.batch.{batch_ordinal:03}");
@@ -3993,13 +4083,13 @@ fn validate_product_gate_schedule(
     role_schedule_bound(id, script, profile, oracle)
 }
 
-fn validate_fc_source_verification_order(
+fn validate_fc_source_verification_isolation_order(
     commands: &[Value],
     batches: &[ExpectedProductGateBatch<'_>],
 ) -> anyhow::Result<()> {
-    let waits = source_verification_wait_indices(commands).collect::<Vec<_>>();
+    let waits = source_verification_inactive_wait_indices(commands).collect::<Vec<_>>();
     let [wait] = waits.as_slice() else {
-        bail!("FC must contain exactly one source-verification prerequisite wait")
+        bail!("FC must contain exactly one source-verification quiescence wait")
     };
     let cold = batches
         .iter()
@@ -4010,10 +4100,10 @@ fn validate_fc_source_verification_order(
         .find(|batch| batch.phase_id == "blocking_target_settled.checkpoint.001")
         .context("FC post-verification runtime-idle batch is unavailable")?;
     if cold.command_index >= *wait {
-        bail!("FC cold milestone batch must precede source verification")
+        bail!("FC cold milestone batch must precede verifier quiescence")
     }
     if runtime_idle.command_index <= *wait {
-        bail!("FC resident runtime-idle batch must follow source verification")
+        bail!("FC resident runtime-idle batch must follow verifier quiescence")
     }
     Ok(())
 }
@@ -4138,6 +4228,7 @@ fn validate_fatal_wait_deadlines(
             .context("fatal wait_for condition is unavailable")?;
         let expected_ms = match condition {
             "window_ready" => 5_000,
+            "source_verification_inactive" => SOURCE_VERIFICATION_QUIESCENCE_TIMEOUT_MS,
             "source_verification_verified" | "source_verification_required" => {
                 ceil_ns_to_ms(profile.absolute_gates.source_verification_completion_ns)?
             }
@@ -4220,7 +4311,8 @@ fn role_schedule_bound(
     }
     let derived_process_timeout_ns = static_wait_bound_ns
         .checked_add(action_duration_bound_ns)
-        .and_then(|value| value.checked_add(PROCESS_LAUNCH_CLOSEOUT_GRACE_NS))
+        .and_then(|value| value.checked_add(PROCESS_STARTUP_ADMISSION_GRACE_NS))
+        .and_then(|value| value.checked_add(PROCESS_CLOSEOUT_GRACE_NS))
         .context("derived viewer role process timeout overflows")?;
     if id == "IP" && import_primary_wall_deadline(oracle)? > grouped_gate_wait_bound_ns {
         bail!("IP derived schedule does not count its import-primary wall authority")
@@ -10597,7 +10689,8 @@ fn raw_report(
             "fresh_process_per_role_per_scenario_sample": true,
             "automatic_retries": 0,
             "process_timeouts_are_script_derived": true,
-            "launch_closeout_grace_ns": PROCESS_LAUNCH_CLOSEOUT_GRACE_NS,
+            "startup_admission_grace_ns": PROCESS_STARTUP_ADMISSION_GRACE_NS,
+            "closeout_grace_ns": PROCESS_CLOSEOUT_GRACE_NS,
             "cache_condition_attestation": args.attestation.cache_condition,
             "competing_activity_attestation": args.attestation.competing_activity,
             "power_state_attestation": args.attestation.power_state,
@@ -11618,16 +11711,18 @@ mod tests {
             true,
             vec![
                 json!({ "command": "open_dataset", "path": "/private/representative.m4d" }),
+                json!({ "command": "cancel_active_source_verification" }),
                 json!({
                     "command": "wait_for",
-                    "condition": "source_verification_verified",
-                    "timeout_ms": 900_000,
+                    "condition": "source_verification_inactive",
+                    "timeout_ms": SOURCE_VERIFICATION_QUIESCENCE_TIMEOUT_MS,
                 }),
                 json!({ "command": "switch_dataset", "path": "/private/temporal.m4d" }),
+                json!({ "command": "cancel_active_source_verification" }),
                 json!({
                     "command": "wait_for",
-                    "condition": "source_verification_verified",
-                    "timeout_ms": 900_000,
+                    "condition": "source_verification_inactive",
+                    "timeout_ms": SOURCE_VERIFICATION_QUIESCENCE_TIMEOUT_MS,
                 }),
                 json!({ "command": "sample_diagnostics", "label": "pt-advance-start" }),
                 json!({ "command": "quit" }),
@@ -12189,14 +12284,14 @@ mod tests {
     }
 
     #[test]
-    fn fc_cold_and_runtime_batches_bracket_source_verification() {
+    fn fc_cold_and_runtime_batches_bracket_verifier_quiescence() {
         let commands = vec![
             json!({ "command": "sleep_frames", "frames": 1 }),
             json!({ "command": "observe_gate_batch" }),
             json!({
                 "command": "wait_for",
-                "condition": "source_verification_verified",
-                "timeout_ms": 30_000,
+                "condition": "source_verification_inactive",
+                "timeout_ms": SOURCE_VERIFICATION_QUIESCENCE_TIMEOUT_MS,
             }),
             json!({ "command": "sleep_frames", "frames": 1 }),
             json!({ "command": "observe_gate_batch" }),
@@ -12212,19 +12307,113 @@ mod tests {
             batch(1, "blocking_target_settled.checkpoint.000"),
             batch(4, "blocking_target_settled.checkpoint.001"),
         ];
-        validate_fc_source_verification_order(&commands, &valid).unwrap();
+        validate_fc_source_verification_isolation_order(&commands, &valid).unwrap();
 
         let late_cold = vec![
             batch(2, "blocking_target_settled.checkpoint.000"),
             batch(4, "blocking_target_settled.checkpoint.001"),
         ];
-        assert!(validate_fc_source_verification_order(&commands, &late_cold).is_err());
+        assert!(validate_fc_source_verification_isolation_order(&commands, &late_cold).is_err());
 
         let early_idle = vec![
             batch(1, "blocking_target_settled.checkpoint.000"),
             batch(2, "blocking_target_settled.checkpoint.001"),
         ];
-        assert!(validate_fc_source_verification_order(&commands, &early_idle).is_err());
+        assert!(validate_fc_source_verification_isolation_order(&commands, &early_idle).is_err());
+    }
+
+    #[test]
+    fn role_watchdog_accounts_startup_admission_separately_from_declared_waits() {
+        let script = template(
+            false,
+            vec![
+                json!({
+                    "command": "wait_for",
+                    "condition": "window_ready",
+                    "timeout_ms": 5_000,
+                }),
+                json!({
+                    "command": "camera_zoom_sequence",
+                    "duration_ms": 2_000,
+                    "samples": 120,
+                    "scroll_y_points": -120.0,
+                }),
+            ],
+        );
+        let schedule = role_schedule_bound("RZ", &script, &profile(), &ip_oracle_scenario())
+            .expect("the bounded schedule must be derivable");
+        assert_eq!(schedule.prerequisite_wait_bound_ns, 5_000_000_000);
+        assert_eq!(schedule.action_duration_bound_ns, 2_000_000_000);
+        assert_eq!(schedule.static_wait_bound_ns, 5_000_000_000);
+        assert_eq!(
+            schedule.derived_process_timeout_ns,
+            5_000_000_000
+                + 2_000_000_000
+                + PROCESS_STARTUP_ADMISSION_GRACE_NS
+                + PROCESS_CLOSEOUT_GRACE_NS
+        );
+    }
+
+    #[test]
+    fn non_vv_scenarios_require_bounded_verifier_quiescence_before_measurement() {
+        let pair = || {
+            vec![
+                json!({ "command": "cancel_active_source_verification" }),
+                json!({
+                    "command": "wait_for",
+                    "condition": "source_verification_inactive",
+                    "timeout_ms": SOURCE_VERIFICATION_QUIESCENCE_TIMEOUT_MS,
+                }),
+            ]
+        };
+        for id in ["RZ", "ZB", "RO", "ST", "NO", "VM", "IP"] {
+            let mut commands = pair();
+            commands.push(json!({ "command": "sample_diagnostics", "label": "start" }));
+            commands.push(json!({ "command": "observe_gate_batch" }));
+            validate_source_verification_isolation_contract(id, &commands).unwrap();
+
+            let mut serialized = commands.clone();
+            serialized[1]["condition"] = json!("source_verification_verified");
+            assert!(validate_source_verification_isolation_contract(id, &serialized).is_err());
+
+            let mut nonadjacent = commands.clone();
+            nonadjacent.insert(1, json!({ "command": "sleep_frames", "frames": 1 }));
+            assert!(validate_source_verification_isolation_contract(id, &nonadjacent).is_err());
+
+            let mut after_measurement = commands;
+            after_measurement.rotate_left(2);
+            assert!(
+                validate_source_verification_isolation_contract(id, &after_measurement).is_err()
+            );
+        }
+
+        let mut pt = pair();
+        pt.push(json!({ "command": "switch_dataset" }));
+        pt.extend(pair());
+        pt.push(json!({ "command": "sample_diagnostics", "label": "start" }));
+        pt.push(json!({ "command": "observe_gate_batch" }));
+        validate_source_verification_isolation_contract("PT", &pt).unwrap();
+
+        let mut fc = vec![json!({ "command": "observe_gate_batch" })];
+        fc.extend(pair());
+        fc.push(json!({ "command": "observe_gate_batch" }));
+        validate_source_verification_isolation_contract("FC", &fc).unwrap();
+
+        let mut vv = pair();
+        vv.push(json!({ "command": "observe_gate_batch" }));
+        validate_source_verification_isolation_contract("VV", &vv).unwrap();
+        let unquiesced_vv = vec![json!({ "command": "observe_gate_batch" })];
+        assert!(validate_source_verification_isolation_contract("VV", &unquiesced_vv).is_err());
+        let mut serialized_vv = vv;
+        serialized_vv.insert(
+            2,
+            json!({
+                "command": "wait_for",
+                "condition": "source_verification_verified",
+                "timeout_ms": 30_000,
+            }),
+        );
+        assert!(validate_source_verification_isolation_contract("VV", &serialized_vv).is_err());
     }
 
     fn profile() -> ViewerQualificationProfile {
@@ -13909,31 +14098,31 @@ mod tests {
         assert!(validate_dataset_action_contract("PT", &duplicate_open, representative).is_err());
 
         let mut switch_with_timeout = dataset_contract_scenario("PT");
-        switch_with_timeout.instrumented_script.commands[2]["timeout_ms"] = json!(120_000);
+        switch_with_timeout.instrumented_script.commands[3]["timeout_ms"] = json!(120_000);
         assert!(
             validate_dataset_action_contract("PT", &switch_with_timeout, representative).is_err()
         );
 
         let mut duplicate_switch = dataset_contract_scenario("PT");
         duplicate_switch.instrumented_script.commands.insert(
-            3,
+            4,
             json!({ "command": "switch_dataset", "path": "/private/other.m4d" }),
         );
         assert!(validate_dataset_action_contract("PT", &duplicate_switch, representative).is_err());
 
         let mut same_target = dataset_contract_scenario("PT");
-        same_target.instrumented_script.commands[2]["path"] = json!("/private/representative.m4d");
+        same_target.instrumented_script.commands[3]["path"] = json!("/private/representative.m4d");
         assert!(validate_dataset_action_contract("PT", &same_target, representative).is_err());
 
         let mut relative_target = dataset_contract_scenario("PT");
-        relative_target.instrumented_script.commands[2]["path"] = json!("temporal.m4d");
+        relative_target.instrumented_script.commands[3]["path"] = json!("temporal.m4d");
         assert!(validate_dataset_action_contract("PT", &relative_target, representative).is_err());
 
         let mut missing_post_switch_verification = dataset_contract_scenario("PT");
         missing_post_switch_verification
             .instrumented_script
             .commands
-            .remove(3);
+            .remove(5);
         assert!(
             validate_dataset_action_contract(
                 "PT",
@@ -13948,7 +14137,7 @@ mod tests {
         let mut non_pt = dataset_contract_scenario("RZ");
         non_pt.phases[0].start_diagnostic_label = None;
         assert!(validate_dataset_action_contract("RZ", &non_pt, representative).is_err());
-        non_pt.instrumented_script.commands.remove(2);
+        non_pt.instrumented_script.commands.remove(3);
         assert_eq!(
             validate_dataset_action_contract("RZ", &non_pt, representative).unwrap(),
             None
@@ -15102,6 +15291,7 @@ mod tests {
             for _ in 0..count {
                 let timeout_ms = match condition {
                     "window_ready" => 5_000,
+                    "source_verification_inactive" => SOURCE_VERIFICATION_QUIESCENCE_TIMEOUT_MS,
                     "source_verification_verified" | "source_verification_required" => 30_000,
                     "runtime_idle" => 30_000,
                     "import_review_ready" => 60_000,
