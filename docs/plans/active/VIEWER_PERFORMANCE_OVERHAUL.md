@@ -999,8 +999,12 @@ establish a performance claim.
 Preflight and execution also share one exact clean-release executable gate.
 The invoking `xtask` must embed the profile-bound revision, compiler, release
 profile, and standard build settings; a stale cached preflight binary cannot
-bless bundles for a newer runner. Private attempt-local output, open-ready,
-and cleanup paths are cross-bound before any product process may launch.
+bless bundles for a newer runner. One canonical builder fixes every release
+profile dimension and the host target. Execution builds the app and runs
+conformance from a detached clean worktree of the profile revision, then
+rechecks the live repository, detached source, and app digest before every
+role launch. Private attempt-local output, open-ready, and cleanup paths are
+cross-bound before any product process may launch.
 
 ### Claim boundary
 

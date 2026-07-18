@@ -22,12 +22,12 @@ use super::{
     ViewerQualificationProfile, binding_reasons, commitment_fingerprint,
     conformance_receipt::{self, ConformanceEvidence},
     load_external_profile, observe, profile_contract_sha256, read_bounded_regular_file,
-    require_exact_release_build_binding, require_nonsymlink_components, require_sha256,
-    require_text, sanitized_report as preflight_report, validate_owner_accepted_profile,
+    require_exact_release_admission, require_nonsymlink_components, require_sha256, require_text,
+    sanitized_report as preflight_report, validate_owner_accepted_profile,
 };
 use crate::host::{
     QualificationBuildProvenance, RepositoryIdentity, qualification_build_provenance,
-    qualification_build_provenance_evidence, repository_identity,
+    qualification_build_provenance_evidence, repository_identity, repository_identity_at,
 };
 use crate::process::cargo_command;
 
@@ -1143,6 +1143,20 @@ struct RoleEvidence {
     reasons: BTreeSet<String>,
 }
 
+#[derive(Debug)]
+struct ImmutableSourceBuild {
+    source_root: PathBuf,
+    app_binary: PathBuf,
+}
+
+#[derive(Debug)]
+struct RunImmutabilityBinding {
+    live_repository: RepositoryIdentity,
+    source_repository: RepositoryIdentity,
+    source_root: PathBuf,
+    app_binary_sha256: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProductGateOutcome {
     command_index: usize,
@@ -1229,7 +1243,12 @@ pub(crate) fn run_measurement(arguments: Vec<String>) -> anyhow::Result<()> {
     let profile = load_external_profile(&args.profile, &repository_root)?;
     validate_owner_accepted_profile(&profile.profile)?;
     let xtask_build = qualification_build_provenance();
-    require_exact_release_build_binding(&profile.profile, &repository, &xtask_build)?;
+    require_exact_release_admission(
+        &profile.profile,
+        &repository,
+        &xtask_build,
+        &repository_root,
+    )?;
     let workload = load_external_json::<WorkloadBundle>(
         &args.workload_bundle,
         &repository_root,
@@ -1256,16 +1275,21 @@ pub(crate) fn run_measurement(arguments: Vec<String>) -> anyhow::Result<()> {
         &repository_root,
     )?;
     validate_oracle_source_commitments(&oracle.value, &repository_root)?;
-    crate::import_performance_t5::require_standard_app_build_environment(&xtask_build)?;
-    crate::import_performance_t5::require_no_external_cargo_configuration(&repository_root)?;
     let result_root = create_result_directory(&args.result_directory, &repository_root)?;
-    let app_binary = build_fresh_release_app(
+    let immutable_build = build_fresh_release_app(
         &repository_root,
         &result_root,
         &profile.profile.build.repository_revision,
         &profile.profile.build.compiler,
     )?;
+    let app_binary = immutable_build.app_binary;
     let app_binary_sha256 = digest_regular_file(&app_binary, "viewer app binary")?;
+    let immutability = RunImmutabilityBinding {
+        live_repository: repository.clone(),
+        source_repository: repository_identity_at(&immutable_build.source_root),
+        source_root: immutable_build.source_root,
+        app_binary_sha256: app_binary_sha256.clone(),
+    };
 
     let observations = observe(&profile.profile, &repository_root);
     let binding_reason_codes = binding_reasons(&profile.profile, &args.attestation, &observations)
@@ -1290,7 +1314,7 @@ pub(crate) fn run_measurement(arguments: Vec<String>) -> anyhow::Result<()> {
             let numerical_contract = serde_json::to_value(oracle.value.numerical_contract)
                 .context("failed to encode the numerical contract for executable binding")?;
             conformance_receipt::execute(
-                &repository_root,
+                &immutability.source_root,
                 fresh_target,
                 &result_root,
                 CONFORMANCE_TIMEOUT,
@@ -1317,6 +1341,7 @@ pub(crate) fn run_measurement(arguments: Vec<String>) -> anyhow::Result<()> {
             &oracle.value,
             &app_binary,
             &result_root,
+            &immutability,
         );
         for sample in &samples {
             all_reasons.extend(sample.reasons.iter().cloned());
@@ -1341,6 +1366,13 @@ pub(crate) fn run_measurement(arguments: Vec<String>) -> anyhow::Result<()> {
     {
         all_reasons.insert("repository_changed_or_dirty_during_run".to_owned());
     }
+    let source_repository_end = repository_identity_at(&immutability.source_root);
+    if !repository_identity_unchanged_and_clean(
+        &immutability.source_repository,
+        &source_repository_end,
+    ) {
+        all_reasons.insert("immutable_source_changed_during_run".to_owned());
+    }
     let app_binary_sha256_end = digest_regular_file(&app_binary, "viewer app binary after run")?;
     if app_binary_sha256_end != app_binary_sha256 {
         all_reasons.insert("app_binary_changed_during_run".to_owned());
@@ -1364,6 +1396,8 @@ pub(crate) fn run_measurement(arguments: Vec<String>) -> anyhow::Result<()> {
         &all_reasons,
         &repository,
         &repository_end,
+        &immutability.source_repository,
+        &source_repository_end,
         &xtask_build,
     );
     let raw_path = result_root.join("raw-private-report.json");
@@ -1435,6 +1469,47 @@ fn repository_identity_unchanged_and_clean(
         && start.commit == end.commit
         && start.dirty_worktree == Some(false)
         && end.dirty_worktree == Some(false)
+}
+
+fn prelaunch_immutability_reason_codes_from(
+    binding: &RunImmutabilityBinding,
+    live_repository: &RepositoryIdentity,
+    source_repository: &RepositoryIdentity,
+    app_binary_sha256: Option<&str>,
+) -> BTreeSet<String> {
+    let mut reasons = BTreeSet::new();
+    if !repository_identity_unchanged_and_clean(&binding.live_repository, live_repository) {
+        reasons.insert("repository_changed_or_dirty_before_role_launch".to_owned());
+    }
+    if !repository_identity_unchanged_and_clean(&binding.source_repository, source_repository) {
+        reasons.insert("immutable_source_changed_before_role_launch".to_owned());
+    }
+    match app_binary_sha256 {
+        Some(observed) if observed == binding.app_binary_sha256 => {}
+        Some(_) => {
+            reasons.insert("app_binary_changed_before_role_launch".to_owned());
+        }
+        None => {
+            reasons.insert("app_binary_unavailable_before_role_launch".to_owned());
+        }
+    }
+    reasons
+}
+
+fn prelaunch_immutability_reason_codes(
+    binding: &RunImmutabilityBinding,
+    app_binary: &Path,
+) -> BTreeSet<String> {
+    let live_repository = repository_identity();
+    let source_repository = repository_identity_at(&binding.source_root);
+    let app_binary_sha256 =
+        digest_regular_file(app_binary, "viewer app binary before role launch").ok();
+    prelaunch_immutability_reason_codes_from(
+        binding,
+        &live_repository,
+        &source_repository,
+        app_binary_sha256.as_deref(),
+    )
 }
 
 fn parse_args(arguments: Vec<String>) -> anyhow::Result<RunArgs> {
@@ -4395,11 +4470,13 @@ fn build_fresh_release_app(
     result_root: &Path,
     revision: &str,
     compiler: &str,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<ImmutableSourceBuild> {
+    let source_root = create_immutable_source_worktree(repository_root, result_root, revision)?;
+    crate::import_performance_t5::require_no_external_cargo_configuration(&source_root)?;
     let target_directory = result_root.join("fresh-private-target");
     let mut command = cargo_command();
     command
-        .current_dir(repository_root)
+        .current_dir(&source_root)
         .env("RUSTC", "rustc")
         .env("RUSTFLAGS", "")
         .env("CARGO_ENCODED_RUSTFLAGS", "")
@@ -4432,11 +4509,53 @@ fn build_fresh_release_app(
     if !status.success() {
         bail!("fresh viewer release app build failed with status {status}")
     }
-    validate_app_binary(
+    let app_binary = validate_app_binary(
         &target_directory
             .join("release")
             .join(format!("mirante4d-app{}", std::env::consts::EXE_SUFFIX)),
-    )
+    )?;
+    let source_after = repository_identity_at(&source_root);
+    if source_after.commit.as_deref() != Some(revision)
+        || source_after.dirty_worktree != Some(false)
+    {
+        bail!("immutable viewer source changed during the fresh app build")
+    }
+    Ok(ImmutableSourceBuild {
+        source_root,
+        app_binary,
+    })
+}
+
+fn create_immutable_source_worktree(
+    repository_root: &Path,
+    result_root: &Path,
+    revision: &str,
+) -> anyhow::Result<PathBuf> {
+    let source_root = result_root.join("immutable-source");
+    if source_root.exists() {
+        bail!("immutable viewer source root already exists")
+    }
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repository_root)
+        .args(["worktree", "add", "--detach"])
+        .arg(&source_root)
+        .arg(revision)
+        .status()
+        .context("failed to create the immutable viewer source worktree")?;
+    if !status.success() {
+        bail!("immutable viewer source worktree creation failed with {status}")
+    }
+    let source_root = fs::canonicalize(&source_root)
+        .context("immutable viewer source worktree is unavailable")?;
+    let identity = repository_identity_at(&source_root);
+    if identity.root.as_deref() != Some(source_root.as_path())
+        || identity.commit.as_deref() != Some(revision)
+        || identity.dirty_worktree != Some(false)
+    {
+        bail!("immutable viewer source worktree does not match the bound clean revision")
+    }
+    Ok(source_root)
 }
 
 fn validate_app_binary(path: &Path) -> anyhow::Result<PathBuf> {
@@ -4601,6 +4720,7 @@ fn execute_samples(
     oracle: &OracleBundle,
     app_binary: &Path,
     result_root: &Path,
+    immutability: &RunImmutabilityBinding,
 ) -> Vec<SampleEvidence> {
     let script_map = scripts
         .scenarios
@@ -4630,6 +4750,7 @@ fn execute_samples(
                 oracle_scenario,
                 app_binary,
                 result_root,
+                immutability,
             );
             let integrity_failed = has_integrity_reasons(&sample.reasons)
                 || has_integrity_reasons(&sample.instrumented.reasons)
@@ -4889,6 +5010,7 @@ fn execute_sample(
     oracle: &OracleScenario,
     app_binary: &Path,
     result_root: &Path,
+    immutability: &RunImmutabilityBinding,
 ) -> SampleEvidence {
     let mut instrumented = None;
     let mut control = None;
@@ -4927,6 +5049,7 @@ fn execute_sample(
                     role,
                     app_binary,
                     result_root,
+                    immutability,
                 )
             },
         );
@@ -5234,6 +5357,34 @@ fn execute_role(
     role: AttemptRole,
     app_binary: &Path,
     result_root: &Path,
+    immutability: &RunImmutabilityBinding,
+) -> RoleEvidence {
+    execute_role_with_prelaunch_check(
+        profile,
+        import_source,
+        sample_index,
+        scenario,
+        oracle,
+        template,
+        role,
+        app_binary,
+        result_root,
+        || prelaunch_immutability_reason_codes(immutability, app_binary),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_role_with_prelaunch_check(
+    profile: &ViewerQualificationProfile,
+    import_source: Option<&ImportSourceBinding>,
+    sample_index: u32,
+    scenario: &ScriptScenario,
+    oracle: &OracleScenario,
+    template: &AutomationScriptTemplate,
+    role: AttemptRole,
+    app_binary: &Path,
+    result_root: &Path,
+    prelaunch_check: impl FnOnce() -> BTreeSet<String>,
 ) -> RoleEvidence {
     let schedule = role_schedule_bound(&scenario.id, template, profile, oracle)
         .expect("validated viewer script has a derived process schedule");
@@ -5242,6 +5393,10 @@ fn execute_role(
         scenario.id,
         role_name = role.directory_name(),
     ));
+    let prelaunch_reasons = prelaunch_check();
+    if !prelaunch_reasons.is_empty() {
+        return rejected_prelaunch_role_evidence(role, intended_root, schedule, prelaunch_reasons);
+    }
     let setup = (|| -> anyhow::Result<(PathBuf, String, String)> {
         let role_root = create_attempt_tree(result_root, sample_index, &scenario.id, role)?;
         write_resource_settings(&role_root, profile)?;
@@ -5445,6 +5600,41 @@ fn execute_role(
         cleanup_manifest_sha256,
         cleanup_completed,
         product_gate_outcomes,
+        reasons,
+    }
+}
+
+fn rejected_prelaunch_role_evidence(
+    role: AttemptRole,
+    root: PathBuf,
+    schedule: RoleScheduleBound,
+    reasons: BTreeSet<String>,
+) -> RoleEvidence {
+    RoleEvidence {
+        role,
+        root,
+        expanded_script_sha256: String::new(),
+        template_script_sha256: String::new(),
+        process: ProcessObservation {
+            launch_attempted: false,
+            status: None,
+            external_wall_time_ns: 0,
+            timed_out: false,
+            spawn_error: Some("prelaunch immutability binding rejected".to_owned()),
+        },
+        automation_report: None,
+        automation_report_sha256: None,
+        app_wall_time_ns: None,
+        process_cpu_time_ns: None,
+        derived_process_timeout_ns: schedule.derived_process_timeout_ns,
+        static_wait_bound_ns: schedule.static_wait_bound_ns,
+        gate_batch_count: schedule.gate_batch_count,
+        gate_observation_count: schedule.gate_observation_count,
+        source_inventory_before: None,
+        source_inventory_after: None,
+        cleanup_manifest_sha256: None,
+        cleanup_completed: false,
+        product_gate_outcomes: Vec::new(),
         reasons,
     }
 }
@@ -10337,6 +10527,8 @@ fn raw_report(
     all_reasons: &BTreeSet<String>,
     repository_start: &RepositoryIdentity,
     repository_end: &RepositoryIdentity,
+    source_repository_start: &RepositoryIdentity,
+    source_repository_end: &RepositoryIdentity,
     xtask_build: &QualificationBuildProvenance,
 ) -> Value {
     let binding_reason_refs = binding_reasons
@@ -10378,6 +10570,20 @@ fn raw_report(
                 repository_start,
                 repository_end,
             ),
+            "immutable_source_start": {
+                "revision": source_repository_start.commit,
+                "dirty_worktree": source_repository_start.dirty_worktree,
+                "root_resolved": source_repository_start.root.is_some(),
+            },
+            "immutable_source_end": {
+                "revision": source_repository_end.commit,
+                "dirty_worktree": source_repository_end.dirty_worktree,
+                "root_resolved": source_repository_end.root.is_some(),
+            },
+            "immutable_source_unchanged_and_clean": repository_identity_unchanged_and_clean(
+                source_repository_start,
+                source_repository_end,
+            ),
         },
         "protocol": {
             "development_samples": profile.profile.protocol.development_samples,
@@ -10398,6 +10604,7 @@ fn raw_report(
             "independent_oracle": oracle.path,
             "app_binary": app_binary,
             "result_root": result_root,
+            "immutable_source_root": source_repository_start.root,
             "representative_package": profile.profile.workload.representative_package.root,
         },
         "commitments": {
@@ -11653,7 +11860,7 @@ mod tests {
         fs::write(&source, b"mutated-pixels").unwrap();
 
         let result_root = tempfile::tempdir().unwrap();
-        let evidence = execute_role(
+        let evidence = execute_role_with_prelaunch_check(
             &profile(),
             Some(&binding),
             1,
@@ -11663,6 +11870,7 @@ mod tests {
             AttemptRole::Instrumented,
             &result_root.path().join("must-not-run"),
             result_root.path(),
+            BTreeSet::new,
         );
 
         assert_eq!(
@@ -11685,7 +11893,7 @@ mod tests {
         let result_root = tempfile::tempdir().unwrap();
         fs::create_dir_all(result_root.path().join("sample-01/IP/instrumented")).unwrap();
 
-        let evidence = execute_role(
+        let evidence = execute_role_with_prelaunch_check(
             &profile(),
             None,
             1,
@@ -11695,6 +11903,7 @@ mod tests {
             AttemptRole::Instrumented,
             &result_root.path().join("must-not-run"),
             result_root.path(),
+            BTreeSet::new,
         );
 
         assert_eq!(
@@ -11703,6 +11912,75 @@ mod tests {
         );
         assert!(!evidence.process.launch_attempted);
         assert!(!evidence.root.join("stdout.log").exists());
+    }
+
+    #[test]
+    fn prelaunch_immutability_rejection_creates_no_attempt_or_process() {
+        let live_repository = RepositoryIdentity {
+            root: Some(PathBuf::from("/live")),
+            commit: Some("a".repeat(40)),
+            dirty_worktree: Some(false),
+        };
+        let source_repository = RepositoryIdentity {
+            root: Some(PathBuf::from("/immutable")),
+            commit: Some("a".repeat(40)),
+            dirty_worktree: Some(false),
+        };
+        let binding = RunImmutabilityBinding {
+            live_repository: live_repository.clone(),
+            source_repository: source_repository.clone(),
+            source_root: PathBuf::from("/immutable"),
+            app_binary_sha256: "b".repeat(64),
+        };
+        assert!(
+            prelaunch_immutability_reason_codes_from(
+                &binding,
+                &live_repository,
+                &source_repository,
+                Some(&"b".repeat(64)),
+            )
+            .is_empty()
+        );
+
+        let mut changed_live = live_repository;
+        changed_live.dirty_worktree = Some(true);
+        let mut changed_source = source_repository;
+        changed_source.commit = Some("c".repeat(40));
+        let reasons = prelaunch_immutability_reason_codes_from(
+            &binding,
+            &changed_live,
+            &changed_source,
+            Some(&"d".repeat(64)),
+        );
+        assert_eq!(
+            reasons,
+            BTreeSet::from([
+                "app_binary_changed_before_role_launch".to_owned(),
+                "immutable_source_changed_before_role_launch".to_owned(),
+                "repository_changed_or_dirty_before_role_launch".to_owned(),
+            ])
+        );
+
+        let scenario = ip_action_scenario();
+        let result_root = tempfile::tempdir().unwrap();
+        let evidence = execute_role_with_prelaunch_check(
+            &profile(),
+            None,
+            1,
+            &scenario,
+            &ip_oracle_scenario(),
+            &scenario.instrumented_script,
+            AttemptRole::Instrumented,
+            &result_root.path().join("must-not-run"),
+            result_root.path(),
+            || reasons,
+        );
+        assert!(!evidence.process.launch_attempted);
+        assert!(!evidence.root.exists());
+        assert_eq!(
+            evidence.process.spawn_error.as_deref(),
+            Some("prelaunch immutability binding rejected")
+        );
     }
 
     #[test]
@@ -11743,7 +12021,7 @@ mod tests {
         set_ip_source(&mut scenario, &source);
         let binding = import_source_binding(&scenario.instrumented_script);
         let result_root = tempfile::tempdir().unwrap();
-        let evidence = execute_role(
+        let evidence = execute_role_with_prelaunch_check(
             &profile(),
             Some(&binding),
             1,
@@ -11753,6 +12031,7 @@ mod tests {
             AttemptRole::Instrumented,
             &app,
             result_root.path(),
+            BTreeSet::new,
         );
 
         assert!(evidence.reasons.contains("import_source_inventory_changed"));

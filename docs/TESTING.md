@@ -111,11 +111,13 @@ observations.
 
 The EP-00 predecessor-development protocol is frozen through one external,
 owner-bound v5 profile plus strict workload, v5 script, and independent-oracle
-bundles. Preflight and execution use the release-only commands shown by:
+bundles. Build the release runner through its canonical builder, then invoke
+that exact executable for preflight and execution:
 
 ```bash
-cargo run --release -p xtask -- viewer-performance-preflight --help
-cargo run --release -p xtask -- viewer-performance-run --help
+cargo xtask viewer-performance-build-runner
+target/release/xtask viewer-performance-preflight --help
+target/release/xtask viewer-performance-run --help
 ```
 
 Those inputs remain outside the repository because they bind private package
@@ -127,7 +129,12 @@ reporting may name only path-free counters, gates, and reason codes.
 Both preflight and execution require the invoking release `xtask` to carry the
 exact clean profile-bound repository revision, compiler, and standard build
 provenance. A stale cached preflight executable fails before its result can be
-used to authorize a measurement.
+used to authorize a measurement. The canonical builder explicitly binds every
+release profile dimension, including assertions, overflow, incremental, LTO,
+panic, codegen units, rpath, stripping, and the compiler host target.
+Execution builds and runs conformance from a detached clean worktree of the
+profile revision. The live repository, detached source, and app digest are
+rechecked before every role; drift stops before the next process launch.
 
 The predecessor run is exactly three ordered samples of all ten frozen
 scenarios. Every scenario has one fresh instrumented process and one fresh

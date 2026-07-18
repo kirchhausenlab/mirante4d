@@ -1,8 +1,13 @@
 use std::{
+    collections::BTreeMap,
     env,
+    ffi::OsString,
     path::{Path, PathBuf},
     process::Command,
 };
+
+#[path = "src/build_contract.rs"]
+mod build_contract;
 
 fn main() {
     for variable in [
@@ -12,6 +17,15 @@ fn main() {
         "RUSTC_WRAPPER",
         "RUSTC_WORKSPACE_WRAPPER",
     ] {
+        println!("cargo:rerun-if-env-changed={variable}");
+    }
+    for (variable, _) in build_contract::CANONICAL_RELEASE_ENVIRONMENT
+        .iter()
+        .chain(std::iter::once(&build_contract::CANONICAL_RELEASE_STRIP))
+    {
+        println!("cargo:rerun-if-env-changed={variable}");
+    }
+    for variable in ["CARGO_BUILD_TARGET", "CARGO_INCREMENTAL", "RUSTC_BOOTSTRAP"] {
         println!("cargo:rerun-if-env-changed={variable}");
     }
 
@@ -35,6 +49,12 @@ fn main() {
     )
     .is_none_or(|output| !output.is_empty());
     let compiler = compiler_description();
+    let environment = env::vars_os().collect::<BTreeMap<OsString, OsString>>();
+    let canonical_release_contract = build_contract::canonical_release_environment_matches(
+        &environment,
+        &env::var("TARGET").unwrap_or_else(|_| "unavailable".to_owned()),
+        &compiler,
+    );
     let custom_rustflags = environment_value_is_nonempty("CARGO_ENCODED_RUSTFLAGS")
         || environment_value_is_nonempty("RUSTFLAGS");
     let rustc_wrapper = environment_value_is_nonempty("RUSTC_WRAPPER")
@@ -65,6 +85,14 @@ fn main() {
     emit(
         "MIRANTE4D_XTASK_BUILD_RUSTC_WRAPPER",
         if rustc_wrapper { "true" } else { "false" },
+    );
+    emit(
+        "MIRANTE4D_XTASK_BUILD_CANONICAL_RELEASE_CONTRACT",
+        if canonical_release_contract {
+            "true"
+        } else {
+            "false"
+        },
     );
 }
 

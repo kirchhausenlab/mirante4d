@@ -1,6 +1,8 @@
 use std::{
-    collections::BTreeSet,
-    env, fs,
+    collections::{BTreeMap, BTreeSet},
+    env,
+    ffi::OsString,
+    fs,
     fs::File,
     io::Read,
     path::{Component, Path, PathBuf},
@@ -13,9 +15,16 @@ use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::host::{
-    QualificationBuildProvenance, RepositoryIdentity, host_hardware_identity,
-    qualification_build_provenance, qualification_build_reason_codes, repository_identity,
+use crate::{
+    build_contract::{
+        CANONICAL_RELEASE_ENVIRONMENT, CANONICAL_RELEASE_STRIP,
+        canonical_release_environment_matches,
+    },
+    host::{
+        QualificationBuildProvenance, RepositoryIdentity, host_hardware_identity,
+        qualification_build_provenance, qualification_build_reason_codes, repository_identity,
+    },
+    process::cargo_command,
 };
 
 const PROFILE_SCHEMA: &str = "mirante4d-viewer-performance-qualification-profile-5";
@@ -46,6 +55,83 @@ pub(crate) const USAGE: &str = "usage: cargo xtask viewer-performance-preflight 
     --power-state DESCRIPTION --compositor-scale-milli INTEGER";
 
 pub(crate) use runner::run_measurement;
+
+pub(crate) fn build_qualification_runner(arguments: Vec<String>) -> anyhow::Result<()> {
+    if !arguments.is_empty() {
+        bail!("viewer-performance-build-runner accepts no arguments")
+    }
+    let repository = repository_identity();
+    if repository.dirty_worktree != Some(false) || repository.commit.is_none() {
+        bail!("viewer qualification runner build requires one clean repository revision")
+    }
+    let repository_root = repository
+        .root
+        .as_deref()
+        .context("viewer runner build could not identify the repository root")?;
+    crate::import_performance_t5::require_no_external_cargo_configuration(repository_root)?;
+
+    let compiler_output = Command::new("rustc")
+        .args(["--version", "--verbose"])
+        .output()
+        .context("viewer runner build could not identify rustc")?;
+    let compiler = compiler_output
+        .status
+        .success()
+        .then(|| String::from_utf8(compiler_output.stdout).ok())
+        .flatten()
+        .context("viewer runner build could not decode rustc identity")?;
+    let target = compiler
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .context("viewer runner compiler identity omitted its host target")?;
+    let canonical_environment = CANONICAL_RELEASE_ENVIRONMENT
+        .iter()
+        .chain(std::iter::once(&CANONICAL_RELEASE_STRIP))
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        .collect::<BTreeMap<_, _>>();
+    if !canonical_release_environment_matches(&canonical_environment, target, &compiler) {
+        bail!("internal canonical viewer release build contract is inconsistent")
+    }
+
+    let clean_status = cargo_command()
+        .current_dir(repository_root)
+        .args(["clean", "--release", "-p", "xtask"])
+        .status()
+        .context("failed to start the viewer qualification runner clean build")?;
+    if !clean_status.success() {
+        bail!("viewer qualification runner release clean failed with {clean_status}")
+    }
+
+    let mut build = cargo_command();
+    build
+        .current_dir(repository_root)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("RUSTC_BOOTSTRAP")
+        .env_remove("CARGO_BUILD_TARGET")
+        .env_remove("CARGO_INCREMENTAL");
+    for (name, _) in std::env::vars_os()
+        .filter(|(name, _)| name.to_string_lossy().starts_with("CARGO_PROFILE_RELEASE_"))
+    {
+        build.env_remove(name);
+    }
+    for (name, value) in CANONICAL_RELEASE_ENVIRONMENT
+        .iter()
+        .chain(std::iter::once(&CANONICAL_RELEASE_STRIP))
+    {
+        build.env(name, value);
+    }
+    let build_status = build
+        .args(["build", "--locked", "--release", "-p", "xtask"])
+        .status()
+        .context("failed to start the canonical viewer qualification runner build")?;
+    if !build_status.success() {
+        bail!("canonical viewer qualification runner build failed with {build_status}")
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PreflightArgs {
@@ -309,7 +395,12 @@ pub(crate) fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     let loaded = load_external_profile(&arguments.profile, &repository_root)?;
     validate_owner_accepted_profile(&loaded.profile)?;
     let build_provenance = qualification_build_provenance();
-    require_exact_release_build_binding(&loaded.profile, &repository, &build_provenance)?;
+    require_exact_release_admission(
+        &loaded.profile,
+        &repository,
+        &build_provenance,
+        &repository_root,
+    )?;
     let bundle_commitments = runner::load_and_validate_preflight_bundles(
         &loaded.profile,
         &arguments.workload_bundle,
@@ -542,6 +633,9 @@ fn exact_release_build_binding_reason_codes(
     if provenance.compiler != profile.build.compiler {
         reasons.push("xtask_compiler_mismatch");
     }
+    if !provenance.canonical_release_contract {
+        reasons.push("canonical_release_build_contract_missing");
+    }
     reasons.sort_unstable();
     reasons.dedup();
     reasons
@@ -565,6 +659,17 @@ fn require_exact_release_build_binding(
         )
     }
     Ok(())
+}
+
+fn require_exact_release_admission(
+    profile: &ViewerQualificationProfile,
+    repository: &RepositoryIdentity,
+    provenance: &QualificationBuildProvenance,
+    repository_root: &Path,
+) -> anyhow::Result<()> {
+    require_exact_release_build_binding(profile, repository, provenance)?;
+    crate::import_performance_t5::require_standard_app_build_environment(provenance)?;
+    crate::import_performance_t5::require_no_external_cargo_configuration(repository_root)
 }
 
 fn validate_profile_contract(
@@ -1816,6 +1921,7 @@ mod tests {
                 compiler: profile.build.compiler.clone(),
                 custom_rustflags: false,
                 rustc_wrapper: false,
+                canonical_release_contract: true,
             },
         )
     }
@@ -1839,6 +1945,12 @@ mod tests {
         assert!(
             exact_release_build_binding_reason_codes(&profile, &repository, &provenance, true)
                 .contains(&"runner_build_not_release")
+        );
+        let mut noncanonical = provenance;
+        noncanonical.canonical_release_contract = false;
+        assert!(
+            exact_release_build_binding_reason_codes(&profile, &repository, &noncanonical, false)
+                .contains(&"canonical_release_build_contract_missing")
         );
     }
 

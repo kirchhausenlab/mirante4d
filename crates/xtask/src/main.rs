@@ -9,6 +9,7 @@ const PRODUCT_VALIDATE_USAGE: &str = "usage: cargo xtask product-validate [targe
      [target_fixture_camera_smoke|target_fixture_render_modes|target_fixture_resident_navigation_no_readback|target_source_verification|import_preprocessing|b4_project_persistence]";
 
 mod arch;
+mod build_contract;
 mod deps;
 mod dev;
 mod documentation;
@@ -91,6 +92,9 @@ fn main() -> anyhow::Result<()> {
         }
         "viewer-performance-preflight" => viewer_performance::run(args.collect()),
         "viewer-performance-run" => viewer_performance::run_measurement(args.collect()),
+        "viewer-performance-build-runner" => {
+            viewer_performance::build_qualification_runner(args.collect())
+        }
         "__import-performance-t2-worker" => import_performance::run_worker(args.collect()),
         "docs-check" => documentation::docs_check(),
         "run-dev" => dev::run_dev(),
@@ -183,6 +187,7 @@ Mirante4D developer tasks
   cargo run --release -p xtask -- import-performance-t5-oracle-audit --config /absolute/private/config.json
   cargo run --release -p xtask -- viewer-performance-preflight --qualification-profile /absolute/private/viewer-profile.json --workload-bundle /absolute/private/workload.json --interaction-script-bundle /absolute/private/scripts.json --independent-oracle /absolute/private/oracle.json --cache-condition warm --competing-activity none --power-state balanced --compositor-scale-milli 1000
   cargo run --release -p xtask -- viewer-performance-run --help
+  cargo xtask viewer-performance-build-runner
   cargo xtask docs-check
   cargo xtask run-dev
 

@@ -55,6 +55,7 @@ pub(crate) struct QualificationBuildProvenance {
     pub(crate) compiler: String,
     pub(crate) custom_rustflags: bool,
     pub(crate) rustc_wrapper: bool,
+    pub(crate) canonical_release_contract: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,6 +158,8 @@ pub(crate) fn qualification_build_provenance() -> QualificationBuildProvenance {
         compiler: env!("MIRANTE4D_XTASK_BUILD_COMPILER").replace("\\n", "\n"),
         custom_rustflags: env!("MIRANTE4D_XTASK_BUILD_CUSTOM_RUSTFLAGS") == "true",
         rustc_wrapper: env!("MIRANTE4D_XTASK_BUILD_RUSTC_WRAPPER") == "true",
+        canonical_release_contract: env!("MIRANTE4D_XTASK_BUILD_CANONICAL_RELEASE_CONTRACT")
+            == "true",
     }
 }
 
@@ -172,6 +175,7 @@ pub(crate) fn qualification_build_provenance_evidence(
         "compiler": provenance.compiler,
         "custom_rustflags": provenance.custom_rustflags,
         "rustc_wrapper": provenance.rustc_wrapper,
+        "canonical_release_contract": provenance.canonical_release_contract,
     })
 }
 
@@ -218,6 +222,10 @@ pub(crate) fn repository_identity() -> RepositoryIdentity {
             dirty_worktree: None,
         };
     };
+    repository_identity_at(root_path)
+}
+
+pub(crate) fn repository_identity_at(root_path: &Path) -> RepositoryIdentity {
     let root_argument = root_path.as_os_str();
     let commit = Command::new("git")
         .arg("-C")
@@ -241,7 +249,7 @@ pub(crate) fn repository_identity() -> RepositoryIdentity {
         .filter(|output| output.status.success())
         .map(|output| !output.stdout.is_empty());
     RepositoryIdentity {
-        root,
+        root: Some(root_path.to_path_buf()),
         commit,
         dirty_worktree,
     }
@@ -914,6 +922,7 @@ mod tests {
             compiler: "rustc example".to_owned(),
             custom_rustflags: false,
             rustc_wrapper: false,
+            canonical_release_contract: true,
         };
         assert!(qualification_build_reason_codes(&accepted, &repository).is_empty());
 
