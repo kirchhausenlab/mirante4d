@@ -1178,7 +1178,16 @@ revision for provisional viewing.
 
 Per-ray/sample diagnostics are temporary unless they can remain without
 material synchronization or perturbation. Instrumentation overhead is
-measured.
+measured with one fresh instrumented/control process pair for each of three
+balanced samples per scenario. Raw pair observations remain visible, but the
+accepted bound is evaluated only from the summed clocks of the complete exact
+three-pair scenario population; no noisy pair is retried, filtered, or used as
+a fail-fast threshold. The wall operand excludes only the checked integer
+lifetime of successful qualification-only GPU-timing awaits whose event and
+frozen identity match the immediately adjacent diagnostic checkpoint. Raw
+wall minus that exact wait sum must equal adjusted wall. CPU clocks are not
+adjusted. Missing, inconsistent, overflowed, incomplete, or reordered facts
+fail evidence integrity.
 
 During EP-00, EP-01, and EP-04 development, temporary work-normalized kernel
 evidence includes GPU time per output pixel and executed sample, descriptor

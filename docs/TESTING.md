@@ -180,6 +180,22 @@ unbound provisional-viewing roles instead require those project-only fields to
 remain explicit nulls while retaining the same exact finalized-view-commit
 gate.
 
+Instrumentation overhead is evaluated once per scenario over its complete,
+balanced three-pair development population. Each pair retains the raw
+instrumented app wall clock, matched control wall clock, raw process CPU
+clocks, and an observation-only basis-point result. The runner subtracts from
+the instrumented wall clock only the checked sum of integer `waited_ns` values
+from successful qualification-only `await_active_view_gpu_timing` commands.
+Every subtracted event must have the exact v5 shape, agree with its `waited_ms`
+value and fixed five-second bound, and match the frozen execution identity in
+the immediately adjacent phase diagnostic. The adjusted wall sum must also
+reconcile exactly as raw wall minus that wait sum. Process CPU time is never
+adjusted. The 200-basis-point gate is applied to the summed adjusted-wall and
+raw-CPU operands for each exact three-pair scenario population, not to an
+individual pair. There are no retries, dropped pairs, outlier filters, or
+negative-overhead credits. Missing, inconsistent, overflowed, incomplete, or
+reordered operands make the evidence invalid rather than making the gate pass.
+
 Claim-bearing timing histories retain 4,096 allocation-free samples. This is
 large enough for the frozen maximum 480-sample interaction plus the
 30-second verification gate and bounded polling headroom; a phase that still

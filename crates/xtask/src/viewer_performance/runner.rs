@@ -34,8 +34,8 @@ use crate::process::cargo_command;
 const WORKLOAD_SCHEMA: &str = "mirante4d-viewer-performance-workload-bundle-4";
 const SCRIPT_BUNDLE_SCHEMA: &str = "mirante4d-viewer-performance-script-bundle-5";
 const ORACLE_SCHEMA: &str = "mirante4d-viewer-performance-oracle-bundle-3";
-const RAW_REPORT_SCHEMA: &str = "mirante4d-viewer-performance-raw-private-report-3";
-const RECEIPT_SCHEMA: &str = "mirante4d-viewer-performance-development-receipt-3";
+const RAW_REPORT_SCHEMA: &str = "mirante4d-viewer-performance-raw-private-report-4";
+const RECEIPT_SCHEMA: &str = "mirante4d-viewer-performance-development-receipt-4";
 const AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 const AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
 const AUTOMATION_SCHEMA_VERSION: u64 = 5;
@@ -1224,9 +1224,30 @@ struct SampleEvidence {
     instrumented: RoleEvidence,
     control: Option<RoleEvidence>,
     phases: Vec<PhaseEvaluation>,
+    instrumented_qualification_wait_wall_ns: Option<u64>,
+    instrumented_adjusted_wall_time_ns: Option<u64>,
     wall_overhead_basis_points: Option<u64>,
     process_cpu_overhead_basis_points: Option<u64>,
     reasons: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InstrumentationOverheadPopulationEvidence {
+    scenario: String,
+    expected_sample_pairs: usize,
+    observed_sample_pairs: usize,
+    instrumented_raw_app_wall_time_ns: Option<u64>,
+    instrumented_qualification_wait_wall_ns: Option<u64>,
+    instrumented_adjusted_app_wall_time_ns: Option<u64>,
+    control_app_wall_time_ns: Option<u64>,
+    wall_overhead_basis_points: Option<u64>,
+    instrumented_process_cpu_time_ns: Option<u64>,
+    control_process_cpu_time_ns: Option<u64>,
+    process_cpu_overhead_basis_points: Option<u64>,
+    maximum_overhead_basis_points: u64,
+    population_complete: bool,
+    gate_evaluable: bool,
+    gate_passed: Option<bool>,
 }
 
 pub(crate) fn run_measurement(arguments: Vec<String>) -> anyhow::Result<()> {
@@ -1361,6 +1382,12 @@ pub(crate) fn run_measurement(arguments: Vec<String>) -> anyhow::Result<()> {
     }
     let population =
         validate_attempt_population(&profile.profile, &scripts.value, &samples, &mut all_reasons);
+    let instrumentation_overhead_populations = validate_population_instrumentation_overhead(
+        &profile.profile,
+        &samples,
+        population,
+        &mut all_reasons,
+    );
 
     let repository_end = repository_identity();
     if !repository_identity_unchanged_and_clean(&repository, &repository_end)
@@ -1396,6 +1423,7 @@ pub(crate) fn run_measurement(arguments: Vec<String>) -> anyhow::Result<()> {
         conformance.as_ref(),
         &samples,
         population,
+        &instrumentation_overhead_populations,
         &all_reasons,
         &repository,
         &repository_end,
@@ -1416,6 +1444,7 @@ pub(crate) fn run_measurement(arguments: Vec<String>) -> anyhow::Result<()> {
         conformance.as_ref(),
         &samples,
         population,
+        &instrumentation_overhead_populations,
         &all_reasons,
     );
     println!(
@@ -5167,6 +5196,135 @@ fn product_gate_outcomes_match_template(
         })
 }
 
+fn validate_population_instrumentation_overhead(
+    profile: &ViewerQualificationProfile,
+    samples: &[SampleEvidence],
+    population: PopulationEvidence,
+    reasons: &mut BTreeSet<String>,
+) -> Vec<InstrumentationOverheadPopulationEvidence> {
+    let population_exact = population_evidence_is_exact(population);
+    let expected_sample_pairs =
+        usize::try_from(profile.protocol.development_samples).unwrap_or(usize::MAX);
+    let maximum = u64::from(
+        profile
+            .absolute_gates
+            .maximum_instrumentation_overhead_basis_points,
+    );
+    let mut rows = Vec::with_capacity(REQUIRED_SCENARIOS.len());
+    for scenario in REQUIRED_SCENARIOS {
+        let scenario_samples = samples
+            .iter()
+            .filter(|sample| sample.scenario == scenario)
+            .collect::<Vec<_>>();
+        let observed_sample_pairs = scenario_samples.len();
+        let population_complete =
+            population_exact && observed_sample_pairs == expected_sample_pairs;
+        if observed_sample_pairs != expected_sample_pairs {
+            reasons.insert("instrumentation_overhead_population_missing".to_owned());
+        }
+        let instrumented_raw_wall = population_complete
+            .then(|| {
+                scenario_samples.iter().try_fold(0_u64, |total, sample| {
+                    total.checked_add(sample.instrumented.app_wall_time_ns?)
+                })
+            })
+            .flatten();
+        let qualification_wait_wall = population_complete
+            .then(|| {
+                scenario_samples.iter().try_fold(0_u64, |total, sample| {
+                    total.checked_add(sample.instrumented_qualification_wait_wall_ns?)
+                })
+            })
+            .flatten();
+        let instrumented_adjusted_wall = population_complete
+            .then(|| {
+                scenario_samples.iter().try_fold(0_u64, |total, sample| {
+                    total.checked_add(sample.instrumented_adjusted_wall_time_ns?)
+                })
+            })
+            .flatten();
+        let control_wall = population_complete
+            .then(|| {
+                scenario_samples.iter().try_fold(0_u64, |total, sample| {
+                    total.checked_add(sample.control.as_ref()?.app_wall_time_ns?)
+                })
+            })
+            .flatten();
+        let instrumented_cpu = population_complete
+            .then(|| {
+                scenario_samples.iter().try_fold(0_u64, |total, sample| {
+                    total.checked_add(sample.instrumented.process_cpu_time_ns?)
+                })
+            })
+            .flatten();
+        let control_cpu = population_complete
+            .then(|| {
+                scenario_samples.iter().try_fold(0_u64, |total, sample| {
+                    total.checked_add(sample.control.as_ref()?.process_cpu_time_ns?)
+                })
+            })
+            .flatten();
+        let adjusted_wall_reconciles = match (
+            instrumented_raw_wall,
+            qualification_wait_wall,
+            instrumented_adjusted_wall,
+        ) {
+            (Some(raw), Some(wait), Some(adjusted)) => raw.checked_sub(wait) == Some(adjusted),
+            _ => false,
+        };
+        if population_complete && !adjusted_wall_reconciles {
+            reasons.insert(
+                "instrumentation_adjusted_wall_time_population_reconciliation_failed".to_owned(),
+            );
+        }
+        let wall = population_complete
+            .then(|| {
+                paired_overhead_basis_points(
+                    instrumented_adjusted_wall.filter(|_| adjusted_wall_reconciles),
+                    control_wall,
+                    "instrumentation_wall_overhead_population_fact_missing",
+                    reasons,
+                )
+            })
+            .flatten();
+        let cpu = population_complete
+            .then(|| {
+                paired_overhead_basis_points(
+                    instrumented_cpu,
+                    control_cpu,
+                    "instrumentation_cpu_overhead_population_fact_missing",
+                    reasons,
+                )
+            })
+            .flatten();
+        let gate_evaluable = wall.is_some() && cpu.is_some();
+        let gate_passed = wall
+            .zip(cpu)
+            .map(|(wall, cpu)| wall <= maximum && cpu <= maximum);
+        if gate_passed == Some(false) {
+            reasons.insert("instrumentation_overhead_gate_exceeded".to_owned());
+        }
+        rows.push(InstrumentationOverheadPopulationEvidence {
+            scenario: scenario.to_owned(),
+            expected_sample_pairs,
+            observed_sample_pairs,
+            instrumented_raw_app_wall_time_ns: instrumented_raw_wall,
+            instrumented_qualification_wait_wall_ns: qualification_wait_wall,
+            instrumented_adjusted_app_wall_time_ns: instrumented_adjusted_wall,
+            control_app_wall_time_ns: control_wall,
+            wall_overhead_basis_points: wall,
+            instrumented_process_cpu_time_ns: instrumented_cpu,
+            control_process_cpu_time_ns: control_cpu,
+            process_cpu_overhead_basis_points: cpu,
+            maximum_overhead_basis_points: maximum,
+            population_complete,
+            gate_evaluable,
+            gate_passed,
+        });
+    }
+    rows
+}
+
 fn product_gate_outcome_is_coherent(outcome: &ProductGateOutcome) -> bool {
     match outcome.outcome {
         ProductGateStatus::Passed => {
@@ -5291,10 +5449,25 @@ fn execute_sample(
     }
     let phases = evaluate_phases(profile, numerical_contract, scenario, oracle, &instrumented);
     let mut reasons = BTreeSet::new();
+    let instrumented_qualification_wait_wall_ns = qualification_gpu_timing_await_wall_ns(
+        instrumented.automation_report.as_ref(),
+        &scenario.instrumented_script,
+        &mut reasons,
+    );
+    let instrumented_adjusted_wall_time_ns = match (
+        instrumented.app_wall_time_ns,
+        instrumented_qualification_wait_wall_ns,
+    ) {
+        (Some(wall), Some(wait)) if wait <= wall => Some(wall - wait),
+        _ => {
+            reasons.insert("instrumentation_adjusted_wall_time_unavailable".to_owned());
+            None
+        }
+    };
     let (wall_overhead_basis_points, process_cpu_overhead_basis_points) = match &control {
         Some(control) => {
             let wall = paired_overhead_basis_points(
-                instrumented.app_wall_time_ns,
+                instrumented_adjusted_wall_time_ns,
                 control.app_wall_time_ns,
                 "instrumentation_wall_overhead_fact_missing",
                 &mut reasons,
@@ -5305,17 +5478,6 @@ fn execute_sample(
                 "instrumentation_cpu_overhead_fact_missing",
                 &mut reasons,
             );
-            for overhead in [wall, cpu].into_iter().flatten() {
-                if overhead
-                    > u64::from(
-                        profile
-                            .absolute_gates
-                            .maximum_instrumentation_overhead_basis_points,
-                    )
-                {
-                    reasons.insert("instrumentation_overhead_gate_exceeded".to_owned());
-                }
-            }
             (wall, cpu)
         }
         None => {
@@ -5333,6 +5495,8 @@ fn execute_sample(
         instrumented,
         control,
         phases,
+        instrumented_qualification_wait_wall_ns,
+        instrumented_adjusted_wall_time_ns,
         wall_overhead_basis_points,
         process_cpu_overhead_basis_points,
         reasons,
@@ -7046,6 +7210,241 @@ fn paired_overhead_basis_points(
         .saturating_mul(10_000)
         .div_ceil(u128::from(control));
     Some(u64::try_from(basis_points).unwrap_or(u64::MAX))
+}
+
+fn qualification_gpu_timing_await_wall_ns(
+    report: Option<&Value>,
+    template: &AutomationScriptTemplate,
+    reasons: &mut BTreeSet<String>,
+) -> Option<u64> {
+    let expected = template
+        .commands
+        .iter()
+        .enumerate()
+        .filter(|(_, command)| {
+            command.get("command").and_then(Value::as_str) == Some("await_active_view_gpu_timing")
+        })
+        .collect::<Vec<_>>();
+    let Some(events) = report
+        .and_then(|report| report.get("events"))
+        .and_then(Value::as_array)
+    else {
+        reasons.insert("qualification_gpu_timing_await_evidence_missing_or_invalid".to_owned());
+        return None;
+    };
+    if events
+        .iter()
+        .filter(|event| {
+            event.get("command").and_then(Value::as_str) == Some("await_active_view_gpu_timing")
+        })
+        .count()
+        != expected.len()
+    {
+        reasons.insert("qualification_gpu_timing_await_evidence_missing_or_invalid".to_owned());
+        return None;
+    }
+    let mut total = 0_u64;
+    for (command_index, command) in expected {
+        let mut matching_events = events.iter().filter(|event| {
+            event.get("command_index").and_then(Value::as_u64) == u64::try_from(command_index).ok()
+        });
+        let Some(event) = matching_events
+            .next()
+            .filter(|_| matching_events.next().is_none())
+        else {
+            reasons.insert("qualification_gpu_timing_await_evidence_missing_or_invalid".to_owned());
+            return None;
+        };
+        let event_keys = event
+            .as_object()
+            .map(|object| object.keys().map(String::as_str).collect::<BTreeSet<_>>());
+        let details = event.get("details");
+        let detail_keys = details
+            .and_then(Value::as_object)
+            .map(|object| object.keys().map(String::as_str).collect::<BTreeSet<_>>());
+        let waited_ns = details
+            .and_then(|details| details.get("waited_ns"))
+            .and_then(Value::as_u64);
+        let waited_ms = details.and_then(|details| details.get("waited_ms"));
+        let timeout_ns = command
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .filter(|timeout_ms| *timeout_ms == GPU_TIMING_AWAIT_TIMEOUT_MS)
+            .and_then(|timeout_ms| timeout_ms.checked_mul(1_000_000));
+        let target = command.get("target").and_then(Value::as_str);
+        let pass_kind = command.get("pass_kind").and_then(Value::as_str);
+        let expected_panel = match target {
+            Some("three_d") => Some("3D"),
+            Some("xy") => Some("XY"),
+            Some("xz") => Some("XZ"),
+            Some("yz") => Some("YZ"),
+            _ => None,
+        };
+        let expected_checkpoint_pass = match pass_kind {
+            Some("plane") => Some("Plane"),
+            Some("volume") => Some("Volume"),
+            _ => None,
+        };
+        let adjacent_index = command_index.checked_add(1);
+        let adjacent_command = adjacent_index.and_then(|index| template.commands.get(index));
+        let adjacent_label = adjacent_command
+            .filter(|command| {
+                command.get("command").and_then(Value::as_str) == Some("sample_diagnostics")
+            })
+            .and_then(|command| command.get("label"))
+            .and_then(Value::as_str);
+        let adjacent_event = adjacent_index.and_then(|index| {
+            let mut matches = events.iter().filter(|event| {
+                event.get("command_index").and_then(Value::as_u64) == u64::try_from(index).ok()
+                    && event.get("command").and_then(Value::as_str) == Some("sample_diagnostics")
+            });
+            matches.next().filter(|_| matches.next().is_none())
+        });
+        let adjacent_details = adjacent_event.and_then(|event| event.get("details"));
+        let matching_diagnostic = adjacent_label.and_then(|label| {
+            let mut matches = report
+                .and_then(|report| report.get("diagnostics"))
+                .and_then(Value::as_array)?
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.get("label").and_then(Value::as_str) == Some(label)
+                });
+            matches.next().filter(|_| matches.next().is_none())
+        });
+        let checkpoint = adjacent_details.and_then(|details| {
+            details.pointer("/diagnostics/render/qualification_gpu_timing_checkpoint")
+        });
+        let valid = event_keys
+            == Some(BTreeSet::from([
+                "command_index",
+                "command",
+                "status",
+                "event_epoch_ms",
+                "duration_ms",
+                "details",
+            ]))
+            && detail_keys
+                == Some(BTreeSet::from([
+                    "target",
+                    "pass_kind",
+                    "execution_id",
+                    "renderer_target",
+                    "display_generation",
+                    "renderer_frame",
+                    "identity_frozen_before_completion",
+                    "exact_presented_interval_timing_complete",
+                    "waited_ns",
+                    "waited_ms",
+                ]))
+            && event.get("command").and_then(Value::as_str) == Some("await_active_view_gpu_timing")
+            && event.get("status").and_then(Value::as_str) == Some("passed")
+            && event
+                .get("event_epoch_ms")
+                .and_then(Value::as_u64)
+                .is_some()
+            && event
+                .get("duration_ms")
+                .and_then(Value::as_f64)
+                .is_some_and(|duration| duration.is_finite() && duration >= 0.0)
+            && details
+                .and_then(|details| details.get("target"))
+                .and_then(Value::as_str)
+                == target
+            && details
+                .and_then(|details| details.get("pass_kind"))
+                .and_then(Value::as_str)
+                == pass_kind
+            && details
+                .and_then(|details| details.get("identity_frozen_before_completion"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            && details
+                .and_then(|details| details.get("exact_presented_interval_timing_complete"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            && details
+                .and_then(|details| details.get("execution_id"))
+                .and_then(Value::as_u64)
+                .is_some_and(|value| value != 0)
+            && details
+                .and_then(|details| details.get("renderer_target"))
+                .and_then(Value::as_u64)
+                .is_some_and(|value| value != 0)
+            && details
+                .and_then(|details| details.get("display_generation"))
+                .and_then(Value::as_u64)
+                .is_some()
+            && details
+                .and_then(|details| details.get("renderer_frame"))
+                .and_then(Value::as_u64)
+                .is_some_and(|value| value != 0)
+            && waited_ns.is_some_and(|waited_ns| {
+                waited_ns != 0
+                    && timeout_ns.is_some_and(|timeout_ns| waited_ns <= timeout_ns)
+                    && duration_ms_to_ns(waited_ms) == Some(waited_ns)
+            })
+            && adjacent_event
+                .and_then(|event| event.get("status"))
+                .and_then(Value::as_str)
+                == Some("passed")
+            && adjacent_details.is_some_and(|details| Some(details) == matching_diagnostic)
+            && checkpoint
+                .and_then(|checkpoint| checkpoint.get("available"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            && checkpoint
+                .and_then(|checkpoint| checkpoint.get("derivation"))
+                .and_then(Value::as_str)
+                == Some(
+                    "identity_frozen_from_current_execution_then_completed_by_exact_presented_interval_ticket",
+                )
+            && checkpoint
+                .and_then(|checkpoint| checkpoint.get("exact_presented_interval_timing_complete"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            && checkpoint
+                .and_then(|checkpoint| checkpoint.get("panel"))
+                .and_then(Value::as_str)
+                == expected_panel
+            && checkpoint
+                .and_then(|checkpoint| checkpoint.get("pass_kind"))
+                .and_then(Value::as_str)
+                == expected_checkpoint_pass
+            && checkpoint
+                .and_then(|checkpoint| checkpoint.get("execution_id"))
+                .and_then(Value::as_u64)
+                == details
+                    .and_then(|details| details.get("execution_id"))
+                    .and_then(Value::as_u64)
+            && checkpoint
+                .and_then(|checkpoint| checkpoint.get("target"))
+                .and_then(Value::as_u64)
+                == details
+                    .and_then(|details| details.get("renderer_target"))
+                    .and_then(Value::as_u64)
+            && checkpoint
+                .and_then(|checkpoint| checkpoint.get("display_generation"))
+                .and_then(Value::as_u64)
+                == details
+                    .and_then(|details| details.get("display_generation"))
+                    .and_then(Value::as_u64)
+            && checkpoint
+                .and_then(|checkpoint| checkpoint.get("renderer_frame"))
+                .and_then(Value::as_u64)
+                == details
+                    .and_then(|details| details.get("renderer_frame"))
+                    .and_then(Value::as_u64);
+        let Some(waited_ns) = waited_ns.filter(|_| valid) else {
+            reasons.insert("qualification_gpu_timing_await_evidence_missing_or_invalid".to_owned());
+            return None;
+        };
+        let Some(next) = total.checked_add(waited_ns) else {
+            reasons.insert("qualification_gpu_timing_await_evidence_missing_or_invalid".to_owned());
+            return None;
+        };
+        total = next;
+    }
+    Some(total)
 }
 
 fn cleanup_attempt_package(
@@ -10850,6 +11249,7 @@ fn raw_report(
     conformance: Option<&ConformanceEvidence>,
     samples: &[SampleEvidence],
     population: PopulationEvidence,
+    instrumentation_overhead_populations: &[InstrumentationOverheadPopulationEvidence],
     all_reasons: &BTreeSet<String>,
     repository_start: &RepositoryIdentity,
     repository_end: &RepositoryIdentity,
@@ -10977,6 +11377,9 @@ fn raw_report(
         },
         "executable_conformance": conformance.map(ConformanceEvidence::raw_json),
         "population": population_json(population),
+        "instrumentation_overhead_populations": instrumentation_overhead_population_rows(
+            instrumentation_overhead_populations,
+        ),
         "product_gate_outcomes": product_gate_outcomes,
         "product_gate_failures": product_gate_failures,
         "attempts": samples.iter().map(sample_json).collect::<Vec<_>>(),
@@ -11031,6 +11434,11 @@ fn sample_json(sample: &SampleEvidence) -> Value {
         "instrumented": role_json(&sample.instrumented),
         "instrumentation_control": sample.control.as_ref().map(role_json),
         "paired_overhead": {
+            "evaluation_scope": "per_pair_observation_only_gate_applies_to_complete_balanced_scenario_population",
+            "instrumented_raw_app_wall_time_ns": sample.instrumented.app_wall_time_ns,
+            "instrumented_qualification_gpu_timing_await_wall_time_ns": sample.instrumented_qualification_wait_wall_ns,
+            "instrumented_adjusted_app_wall_time_ns": sample.instrumented_adjusted_wall_time_ns,
+            "control_app_wall_time_ns": sample.control.as_ref().and_then(|control| control.app_wall_time_ns),
             "wall_basis_points": sample.wall_overhead_basis_points,
             "process_cpu_basis_points": sample.process_cpu_overhead_basis_points,
         },
@@ -11598,6 +12006,51 @@ fn bounded_product_gate_id(reason: &str) -> String {
     }
 }
 
+fn population_evidence_is_exact(population: PopulationEvidence) -> bool {
+    population.expected_sample_records == population.observed_sample_records
+        && population.expected_role_attempts == population.observed_role_attempts
+        && population.expected_role_attempts == population.completed_role_reports
+        && population.expected_phase_evaluations == population.observed_phase_evaluations
+        && population.expected_product_gate_observations
+            == population.observed_product_gate_observations
+        && population.sample_identities_exact
+        && population.sample_order_exact
+        && population.role_identities_exact
+        && population.phase_identities_exact
+        && population.product_gate_bijections_exact
+}
+
+fn instrumentation_overhead_population_rows(
+    populations: &[InstrumentationOverheadPopulationEvidence],
+) -> Vec<Value> {
+    populations
+        .iter()
+        .map(|population| {
+            json!({
+                "scenario": population.scenario,
+                "evaluation_scope": "complete_balanced_development_sample_population",
+                "automatic_retries": 0,
+                "sample_filtering": "none",
+                "expected_sample_pairs": population.expected_sample_pairs,
+                "observed_sample_pairs": population.observed_sample_pairs,
+                "wall_adjustment_authority": "exact_sum_of_successful_qualification_only_await_active_view_gpu_timing_waited_ns",
+                "instrumented_raw_app_wall_time_ns": population.instrumented_raw_app_wall_time_ns,
+                "instrumented_qualification_gpu_timing_await_wall_time_ns": population.instrumented_qualification_wait_wall_ns,
+                "instrumented_adjusted_app_wall_time_ns": population.instrumented_adjusted_app_wall_time_ns,
+                "control_app_wall_time_ns": population.control_app_wall_time_ns,
+                "wall_overhead_basis_points": population.wall_overhead_basis_points,
+                "instrumented_process_cpu_time_ns": population.instrumented_process_cpu_time_ns,
+                "control_process_cpu_time_ns": population.control_process_cpu_time_ns,
+                "process_cpu_overhead_basis_points": population.process_cpu_overhead_basis_points,
+                "maximum_overhead_basis_points": population.maximum_overhead_basis_points,
+                "population_complete": population.population_complete,
+                "gate_evaluable": population.gate_evaluable,
+                "gate_passed": population.gate_passed,
+            })
+        })
+        .collect()
+}
+
 fn population_json(population: PopulationEvidence) -> Value {
     json!({
         "expected_sample_records": population.expected_sample_records,
@@ -11614,17 +12067,7 @@ fn population_json(population: PopulationEvidence) -> Value {
         "role_identities_exact": population.role_identities_exact,
         "phase_identities_exact": population.phase_identities_exact,
         "product_gate_bijections_exact": population.product_gate_bijections_exact,
-        "exact": population.expected_sample_records == population.observed_sample_records
-            && population.expected_role_attempts == population.observed_role_attempts
-            && population.expected_role_attempts == population.completed_role_reports
-            && population.expected_phase_evaluations == population.observed_phase_evaluations
-            && population.expected_product_gate_observations
-                == population.observed_product_gate_observations
-            && population.sample_identities_exact
-            && population.sample_order_exact
-            && population.role_identities_exact
-            && population.phase_identities_exact
-            && population.product_gate_bijections_exact,
+        "exact": population_evidence_is_exact(population),
     })
 }
 
@@ -11647,6 +12090,7 @@ fn sanitized_receipt(
     conformance: Option<&ConformanceEvidence>,
     samples: &[SampleEvidence],
     population: PopulationEvidence,
+    instrumentation_overhead_populations: &[InstrumentationOverheadPopulationEvidence],
     reasons: &BTreeSet<String>,
 ) -> Value {
     let product_gate_outcomes = sanitized_product_gate_outcome_rows(samples);
@@ -11685,6 +12129,9 @@ fn sanitized_receipt(
         },
         "executable_conformance": conformance.map(ConformanceEvidence::sanitized_json),
         "population": population_json(population),
+        "instrumentation_overhead_populations": instrumentation_overhead_population_rows(
+            instrumentation_overhead_populations,
+        ),
         "product_gate_outcomes": product_gate_outcomes,
         "role_schedule_bounds": sanitized_role_schedule_rows(samples),
         "product_gate_failures": product_gate_failures,
@@ -12178,6 +12625,8 @@ mod tests {
                             name: format!("{id}-phase"),
                             reasons: BTreeSet::new(),
                         }],
+                        instrumented_qualification_wait_wall_ns: Some(0),
+                        instrumented_adjusted_wall_time_ns: Some(1),
                         wall_overhead_basis_points: Some(0),
                         process_cpu_overhead_basis_points: Some(0),
                         reasons: BTreeSet::new(),
@@ -14471,6 +14920,266 @@ mod tests {
     }
 
     #[test]
+    fn qualification_gpu_timing_await_wall_uses_only_exact_successful_events() {
+        let script = template(
+            true,
+            vec![
+                json!({
+                    "command": "await_active_view_gpu_timing",
+                    "target": "three_d",
+                    "pass_kind": "volume",
+                    "timeout_ms": GPU_TIMING_AWAIT_TIMEOUT_MS,
+                }),
+                json!({ "command": "sample_diagnostics", "label": "three-d-end" }),
+                json!({ "command": "sleep_frames", "frames": 1 }),
+                json!({
+                    "command": "await_active_view_gpu_timing",
+                    "target": "xy",
+                    "pass_kind": "plane",
+                    "timeout_ms": GPU_TIMING_AWAIT_TIMEOUT_MS,
+                }),
+                json!({ "command": "sample_diagnostics", "label": "xy-end" }),
+            ],
+        );
+        let diagnostic = |label, panel, pass_kind, execution_id, renderer_target, frame| {
+            json!({
+                "label": label,
+                "diagnostics": {
+                    "render": {
+                        "qualification_gpu_timing_checkpoint": {
+                            "available": true,
+                            "derivation": "identity_frozen_from_current_execution_then_completed_by_exact_presented_interval_ticket",
+                            "panel": panel,
+                            "execution_id": execution_id,
+                            "target": renderer_target,
+                            "display_generation": 3,
+                            "renderer_frame": frame,
+                            "pass_kind": pass_kind,
+                            "exact_presented_interval_timing_complete": true,
+                        },
+                    },
+                },
+            })
+        };
+        let three_d_diagnostic = diagnostic("three-d-end", "3D", "Volume", 1, 2, 4);
+        let xy_diagnostic = diagnostic("xy-end", "XY", "Plane", 5, 6, 7);
+        let await_event = |command_index,
+                           target,
+                           pass_kind,
+                           execution_id,
+                           renderer_target,
+                           frame,
+                           waited_ns,
+                           waited_ms| {
+            json!({
+                "command_index": command_index,
+                "command": "await_active_view_gpu_timing",
+                "status": "passed",
+                "event_epoch_ms": 1,
+                "duration_ms": 0.01,
+                "details": {
+                    "target": target,
+                    "pass_kind": pass_kind,
+                    "execution_id": execution_id,
+                    "renderer_target": renderer_target,
+                    "display_generation": 3,
+                    "renderer_frame": frame,
+                    "identity_frozen_before_completion": true,
+                    "exact_presented_interval_timing_complete": true,
+                    "waited_ns": waited_ns,
+                    "waited_ms": waited_ms,
+                },
+            })
+        };
+        let diagnostic_event = |command_index, details: Value| {
+            json!({
+                "command_index": command_index,
+                "command": "sample_diagnostics",
+                "status": "passed",
+                "event_epoch_ms": 1,
+                "duration_ms": 0.01,
+                "details": details,
+            })
+        };
+        let report = json!({
+            "events": [
+                await_event(0, "three_d", "volume", 1, 2, 4, 3_500_000_000_u64, 3_500.0),
+                diagnostic_event(1, three_d_diagnostic.clone()),
+                {
+                    "command_index": 2,
+                    "command": "sleep_frames",
+                    "status": "passed",
+                    "event_epoch_ms": 1,
+                    "duration_ms": 0.01,
+                    "details": {},
+                },
+                await_event(3, "xy", "plane", 5, 6, 7, 7_u64, 0.000_007),
+                diagnostic_event(4, xy_diagnostic.clone()),
+            ],
+            "diagnostics": [three_d_diagnostic, xy_diagnostic],
+        });
+        let mut reasons = BTreeSet::new();
+        assert_eq!(
+            qualification_gpu_timing_await_wall_ns(Some(&report), &script, &mut reasons),
+            Some(3_500_000_007)
+        );
+        assert!(reasons.is_empty());
+
+        let mut malformed = report;
+        malformed["events"][3]["details"]["waited_ns"] = Value::Null;
+        assert_eq!(
+            qualification_gpu_timing_await_wall_ns(Some(&malformed), &script, &mut reasons),
+            None
+        );
+        assert!(reasons.contains("qualification_gpu_timing_await_evidence_missing_or_invalid"));
+    }
+
+    #[test]
+    fn instrumentation_overhead_gate_uses_complete_balanced_scenario_populations() {
+        let profile = profile();
+        let scripts = population_scripts();
+        let mut samples = complete_population_samples();
+        for sample in samples.iter_mut().filter(|sample| sample.scenario == "RZ") {
+            let adjusted: u64 = if sample.sample_index == 1 { 120 } else { 90 };
+            let wait = u64::from(sample.sample_index) * 10;
+            sample.instrumented.app_wall_time_ns = adjusted.checked_add(wait);
+            sample.instrumented_adjusted_wall_time_ns = Some(adjusted);
+            sample.instrumented_qualification_wait_wall_ns = Some(wait);
+            sample.instrumented.process_cpu_time_ns = Some(100);
+            let control = sample.control.as_mut().unwrap();
+            control.app_wall_time_ns = Some(100);
+            control.process_cpu_time_ns = Some(100);
+        }
+        let mut reasons = BTreeSet::new();
+        let population = validate_attempt_population(&profile, &scripts, &samples, &mut reasons);
+        assert!(population_evidence_is_exact(population));
+        let rows = validate_population_instrumentation_overhead(
+            &profile,
+            &samples,
+            population,
+            &mut reasons,
+        );
+        let rz = rows.iter().find(|row| row.scenario == "RZ").unwrap();
+        assert_eq!(rz.instrumented_raw_app_wall_time_ns, Some(360));
+        assert_eq!(rz.instrumented_qualification_wait_wall_ns, Some(60));
+        assert_eq!(rz.instrumented_adjusted_app_wall_time_ns, Some(300));
+        assert_eq!(rz.wall_overhead_basis_points, Some(0));
+        assert!(rz.population_complete);
+        assert!(rz.gate_evaluable);
+        assert_eq!(rz.gate_passed, Some(true));
+        assert!(!reasons.contains("instrumentation_overhead_gate_exceeded"));
+
+        let third = samples
+            .iter_mut()
+            .find(|sample| sample.scenario == "RZ" && sample.sample_index == 3)
+            .unwrap();
+        third.instrumented.app_wall_time_ns = Some(150);
+        third.instrumented_adjusted_wall_time_ns = Some(120);
+        reasons.clear();
+        let population = validate_attempt_population(&profile, &scripts, &samples, &mut reasons);
+        let rows = validate_population_instrumentation_overhead(
+            &profile,
+            &samples,
+            population,
+            &mut reasons,
+        );
+        let rz = rows.iter().find(|row| row.scenario == "RZ").unwrap();
+        assert_eq!(rz.wall_overhead_basis_points, Some(1_000));
+        assert!(rz.gate_evaluable);
+        assert_eq!(rz.gate_passed, Some(false));
+        assert!(reasons.contains("instrumentation_overhead_gate_exceeded"));
+    }
+
+    #[test]
+    fn instrumentation_overhead_population_fails_closed_on_missing_wait_evidence() {
+        let profile = profile();
+        let scripts = population_scripts();
+        let mut samples = complete_population_samples();
+        samples
+            .iter_mut()
+            .find(|sample| sample.scenario == "RZ" && sample.sample_index == 2)
+            .unwrap()
+            .instrumented_qualification_wait_wall_ns = None;
+        let mut reasons = BTreeSet::new();
+        let population = validate_attempt_population(&profile, &scripts, &samples, &mut reasons);
+        let rows = validate_population_instrumentation_overhead(
+            &profile,
+            &samples,
+            population,
+            &mut reasons,
+        );
+        let rz = rows.iter().find(|row| row.scenario == "RZ").unwrap();
+        assert!(rz.population_complete);
+        assert!(!rz.gate_evaluable);
+        assert_eq!(rz.gate_passed, None);
+        assert!(
+            reasons.contains("instrumentation_adjusted_wall_time_population_reconciliation_failed")
+        );
+        assert!(reasons.contains("instrumentation_wall_overhead_population_fact_missing"));
+    }
+
+    #[test]
+    fn instrumentation_overhead_population_rejects_overflow_and_inexact_population() {
+        let profile = profile();
+        let scripts = population_scripts();
+        let mut samples = complete_population_samples();
+        let first = samples
+            .iter_mut()
+            .find(|sample| sample.scenario == "RZ" && sample.sample_index == 1)
+            .unwrap();
+        first.instrumented.app_wall_time_ns = Some(u64::MAX);
+        first.instrumented_adjusted_wall_time_ns = Some(u64::MAX);
+        let mut reasons = BTreeSet::new();
+        let population = validate_attempt_population(&profile, &scripts, &samples, &mut reasons);
+        let rows = validate_population_instrumentation_overhead(
+            &profile,
+            &samples,
+            population,
+            &mut reasons,
+        );
+        let rz = rows.iter().find(|row| row.scenario == "RZ").unwrap();
+        assert!(rz.population_complete);
+        assert!(!rz.gate_evaluable);
+        assert_eq!(rz.gate_passed, None);
+        assert!(
+            reasons.contains("instrumentation_adjusted_wall_time_population_reconciliation_failed")
+        );
+        assert!(reasons.contains("instrumentation_wall_overhead_population_fact_missing"));
+
+        let mut reordered = complete_population_samples();
+        reordered.swap(0, 1);
+        reasons.clear();
+        let population = validate_attempt_population(&profile, &scripts, &reordered, &mut reasons);
+        let rows = validate_population_instrumentation_overhead(
+            &profile,
+            &reordered,
+            population,
+            &mut reasons,
+        );
+        assert!(rows.iter().all(|row| !row.population_complete));
+        assert!(rows.iter().all(|row| !row.gate_evaluable));
+        assert!(rows.iter().all(|row| row.gate_passed.is_none()));
+        assert!(reasons.contains("sample_population_order_mismatch"));
+        assert!(!reasons.contains("instrumentation_overhead_gate_exceeded"));
+
+        let incomplete = complete_population_samples()
+            .into_iter()
+            .skip(1)
+            .collect::<Vec<_>>();
+        reasons.clear();
+        let population = validate_attempt_population(&profile, &scripts, &incomplete, &mut reasons);
+        let rows = validate_population_instrumentation_overhead(
+            &profile,
+            &incomplete,
+            population,
+            &mut reasons,
+        );
+        assert!(rows.iter().all(|row| !row.population_complete));
+        assert!(rows.iter().all(|row| !row.gate_evaluable));
+        assert!(reasons.contains("instrumentation_overhead_population_missing"));
+    }
+
+    #[test]
     fn zero_work_requires_present_monotonic_equal_counters() {
         let start = json!({
             "dataset_source_io": { "reader": { "physical_range_read_operations": 7 } },
@@ -16259,10 +16968,7 @@ mod tests {
             path: PathBuf::from("/private/secret/workload.json"),
         };
         let scripts = LoadedBundle {
-            value: ScriptBundle {
-                schema: SCRIPT_BUNDLE_SCHEMA.to_owned(),
-                scenarios: vec![dataset_contract_scenario("PT")],
-            },
+            value: population_scripts(),
             sha256: "33".repeat(32),
             path: PathBuf::from("/private/secret/scripts.json"),
         };
@@ -16280,28 +16986,25 @@ mod tests {
             sha256: "44".repeat(32),
             path: PathBuf::from("/private/secret/oracle.json"),
         };
-        let mut sample = complete_population_samples().remove(0);
-        sample.instrumented.product_gate_outcomes[0] =
-            product_gate_outcome("RZ.cross_section.settled", ProductGateStatus::Failed);
-        sample.phases[0]
+        let mut samples = complete_population_samples();
+        let failed_outcome = &mut samples[0].instrumented.product_gate_outcomes[0];
+        failed_outcome.outcome = ProductGateStatus::Failed;
+        failed_outcome.condition_met = false;
+        failed_outcome.timed_out = true;
+        failed_outcome.observed_after_origin_ns = failed_outcome.deadline_after_origin_ns;
+        samples[0].phases[0]
             .reasons
             .insert("product_gate_visible_panel_milestone_set_mismatch".to_owned());
-        let population = PopulationEvidence {
-            expected_sample_records: 1,
-            observed_sample_records: 1,
-            expected_role_attempts: 2,
-            observed_role_attempts: 2,
-            completed_role_reports: 2,
-            expected_phase_evaluations: 1,
-            observed_phase_evaluations: 1,
-            expected_product_gate_observations: 2,
-            observed_product_gate_observations: 2,
-            sample_identities_exact: true,
-            sample_order_exact: true,
-            role_identities_exact: true,
-            phase_identities_exact: true,
-            product_gate_bijections_exact: true,
-        };
+        let mut reasons = BTreeSet::new();
+        let population =
+            validate_attempt_population(&profile.profile, &scripts.value, &samples, &mut reasons);
+        let instrumentation_overhead = validate_population_instrumentation_overhead(
+            &profile.profile,
+            &samples,
+            population,
+            &mut reasons,
+        );
+        assert!(reasons.is_empty());
         let receipt = sanitized_receipt(
             &profile,
             &workload,
@@ -16310,8 +17013,9 @@ mod tests {
             &"66".repeat(32),
             &"77".repeat(32),
             None,
-            &[sample],
+            &samples,
             population,
+            &instrumentation_overhead,
             &BTreeSet::new(),
         );
         let encoded = serde_json::to_string(&receipt).unwrap();
@@ -16334,8 +17038,24 @@ mod tests {
         assert_eq!(receipt["population"]["exact"], true);
         assert_eq!(
             receipt["product_gate_outcomes"].as_array().unwrap().len(),
-            2
+            60
         );
+        let overhead_rows = receipt["instrumentation_overhead_populations"]
+            .as_array()
+            .unwrap();
+        assert_eq!(overhead_rows.len(), REQUIRED_SCENARIOS.len());
+        assert!(overhead_rows.iter().all(|row| {
+            row["expected_sample_pairs"] == json!(3)
+                && row["observed_sample_pairs"] == json!(3)
+                && row["instrumented_raw_app_wall_time_ns"] == json!(3)
+                && row["instrumented_qualification_gpu_timing_await_wall_time_ns"] == json!(0)
+                && row["instrumented_adjusted_app_wall_time_ns"] == json!(3)
+                && row["control_app_wall_time_ns"] == json!(3)
+                && row["maximum_overhead_basis_points"] == json!(200)
+                && row["population_complete"] == json!(true)
+                && row["gate_evaluable"] == json!(true)
+                && row["gate_passed"] == json!(true)
+        }));
         let public_gate_fields = BTreeSet::from([
             "sample_index",
             "scenario",
@@ -16375,7 +17095,10 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(receipt["role_schedule_bounds"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            receipt["role_schedule_bounds"].as_array().unwrap().len(),
+            60
+        );
         assert!(receipt.get("status").is_none());
         assert!(receipt.get("reason_codes").is_none());
         assert!(encoded.contains("non_OS_input_non_E4"));

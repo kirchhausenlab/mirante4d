@@ -3032,6 +3032,7 @@ impl ProductAutomationController {
                         match active_view_captured_gpu_timing_complete(app, *target, identity) {
                             Some(true) => {
                                 self.completed_gpu_timing_checkpoint = Some(identity);
+                                let waited = started.elapsed();
                                 Ok(CommandProgress::Done(json!({
                                     "target": target.name(),
                                     "pass_kind": pass_kind.name(),
@@ -3041,7 +3042,8 @@ impl ProductAutomationController {
                                     "renderer_frame": identity.renderer_frame.get(),
                                     "identity_frozen_before_completion": true,
                                     "exact_presented_interval_timing_complete": true,
-                                    "waited_ms": duration_ms(started.elapsed()),
+                                    "waited_ns": u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX),
+                                    "waited_ms": duration_ms(waited),
                                 })))
                             }
                             Some(false)
