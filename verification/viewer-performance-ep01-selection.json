@@ -1,0 +1,142 @@
+{
+  "schema": "mirante4d-viewer-performance-ep01-selection-authority",
+  "schema_version": 1,
+  "trace_derivation": {
+    "scheme": "mirante4d-ep01-brickkey-trace-projection-1",
+    "geometry_authorities": [
+      "mirante4d-viewer-performance-workload-bundle-4",
+      "mirante4d-viewer-performance-script-bundle-3",
+      "mirante4d-viewer-performance-oracle-bundle-3"
+    ],
+    "candidate_key_fields": [
+      "candidate_content_generation",
+      "logical_layer",
+      "time_index",
+      "scale_level",
+      "brick_z",
+      "brick_y",
+      "brick_x"
+    ],
+    "canonical_order": "unsigned_lexicographic_candidate_content_generation_layer_time_scale_z_y_x",
+    "deduplication": "exact_candidate_BrickKey",
+    "trace_digest_scheme": "sha256_domain_mirante4d_ep01_candidate_brickkey_trace_v1_sorted_binary_le",
+    "trace_digest_fields": [
+      "qualification_profile_contract_sha256",
+      "ep01_selection_authority_sha256",
+      "candidate_cubic_brick_edge",
+      "trace_family",
+      "candidate_content_generation",
+      "canonical_candidate_BrickKey_entries",
+      "unique_key_count",
+      "unique_payload_bytes"
+    ],
+    "one_digest_per_candidate_and_trace_family": true,
+    "public_receipt_serializes_raw_keys": false,
+    "serialized_predecessor_keys": false
+  },
+  "candidate_cubic_brick_edges": [32, 64],
+  "selection_rule": {
+    "candidate_order": [32, 64],
+    "rule": "select_32_if_every_gate_passes_else_64_if_every_gate_passes_else_stop",
+    "scoring_allowed": false,
+    "runtime_selector_allowed": false,
+    "headroom_arithmetic": "checked_u128_observed_times_10000_lte_limit_times_8000",
+    "engineering_ratio_denominator": "logical_candidate_pyramid_scalar_plus_validity_bytes_every_level",
+    "engineering_ratios_receive_additional_headroom": false
+  },
+  "fixed_comparison_defaults": {
+    "pyramid": "calibrated_valid_aware",
+    "maximum_pyramid_levels": 64,
+    "outer_shard_edge": 256,
+    "inner_order": "row_major",
+    "codec": "zstd",
+    "codec_level": 3,
+    "payload_integrity": "crc32c",
+    "gpu_payload": "native_little_endian_buffer",
+    "brick_summaries": [
+      "any_valid",
+      "min",
+      "max",
+      "valid_count"
+    ]
+  },
+  "required_trace_families": [
+    "arbitrary_plane",
+    "four_panel",
+    "time_navigation",
+    "mip",
+    "dvr",
+    "iso",
+    "analysis",
+    "verification"
+  ],
+  "gates": {
+    "headroom": {
+      "minimum_latency_basis_points": 2000,
+      "minimum_resource_basis_points": 2000
+    },
+    "format_and_index": {
+      "compact_inner_record_bytes": 32,
+      "maximum_compact_inner_record_bytes": 32,
+      "shard_index_header_bytes": 64,
+      "maximum_per_shard_index_bytes": 16448,
+      "maximum_total_index_bytes": 536870912,
+      "maximum_index_to_logical_pyramid_basis_points": 1000,
+      "maximum_package_to_logical_pyramid_basis_points": 11000,
+      "maximum_package_bytes_per_s0_byte": 2,
+      "maximum_temporary_to_package_basis_points": 30000,
+      "maximum_physical_objects": 11264,
+      "maximum_decoded_shard_bytes": 69206016,
+      "maximum_encoded_shard_bytes": 83890176
+    },
+    "checkpoint": {
+      "record_bytes": 64,
+      "maximum_record_bytes": 64,
+      "header_bytes": 4096,
+      "read_window_bytes": 1048576,
+      "resident_read_windows": 2,
+      "maximum_resident_bytes": 2101248,
+      "batch_records": 512,
+      "maximum_record_window": 4096,
+      "maximum_batch_payload_bytes": 67108864,
+      "maximum_batch_age_seconds": 15,
+      "maximum_regular_files": 8
+    },
+    "plane_amplification": {
+      "maximum_encoded_bytes_per_useful_byte": 96,
+      "maximum_fetched_to_useful_basis_points": 960000,
+      "maximum_decoded_to_useful_basis_points": 960000,
+      "maximum_uploaded_to_useful_basis_points": 960000,
+      "maximum_range_requests_per_new_brick": 2
+    },
+    "preprocessing": {
+      "maximum_wall_time_ns": 900000000000,
+      "maximum_process_cpu_time_ns": 1200000000000
+    },
+    "runtime": {
+      "maximum_cache_entry_metadata_bytes": 256,
+      "maximum_live_reads_per_new_brick": 1,
+      "maximum_codec_decodes_per_new_brick": 1,
+      "maximum_decoded_allocations_per_new_brick": 1,
+      "maximum_cache_authorities_per_brick": 1,
+      "maximum_resident_hash_load_basis_points": 5000,
+      "maximum_resident_hash_probes": 32,
+      "maximum_residency_entries_per_brick": 1
+    },
+    "gpu": {
+      "maximum_page_record_bytes": 64,
+      "maximum_directory_slot_bytes": 32,
+      "maximum_upload_batch_bytes": 8388608,
+      "maximum_staging_batches": 2,
+      "maximum_uploads_per_residency_epoch": 1,
+      "maximum_renderer_pipelines": 5,
+      "maximum_pick_pipelines": 1,
+      "maximum_pipeline_compiles_during_interaction": 0,
+      "maximum_common_path_fixed_private_array_entries": 8,
+      "maximum_descriptor_resolutions_per_crossed_brick": 1,
+      "maximum_command_encoders_per_coordinated_frame": 1,
+      "maximum_queue_submissions_per_coordinated_frame": 1,
+      "maximum_unaccounted_payload_allocations": 0
+    }
+  }
+}

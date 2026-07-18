@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use crate::host::{host_hardware_identity, repository_identity};
 
-const PROFILE_SCHEMA: &str = "mirante4d-viewer-performance-qualification-profile-2";
+const PROFILE_SCHEMA: &str = "mirante4d-viewer-performance-qualification-profile-3";
 const PROFILE_AUTHORITY_SCHEMA: &str = "mirante4d-viewer-performance-profile-authority";
 const PROFILE_AUTHORITY_SCHEMA_VERSION: u64 = 1;
 const PROFILE_AUTHORITY_BYTES: &[u8] =
@@ -30,6 +30,7 @@ const EXERCISE_WIDTH: u32 = 1920;
 const EXERCISE_HEIGHT: u32 = 1080;
 
 mod conformance_receipt;
+mod ep01_selection;
 mod runner;
 mod source_inventory;
 
@@ -65,6 +66,7 @@ struct ProtocolAttestation {
 struct ViewerQualificationProfile {
     schema: String,
     hardware_class: String,
+    ep01_selection_authority_sha256: String,
     build: BuildBinding,
     workload: WorkloadBinding,
     host: HostBinding,
@@ -482,10 +484,18 @@ fn read_bounded_regular_file(path: &Path, max_bytes: u64, label: &str) -> anyhow
 }
 
 fn validate_profile(profile: &ViewerQualificationProfile) -> anyhow::Result<()> {
+    ep01_selection::validate_committed_authority()?;
     if profile.schema != PROFILE_SCHEMA {
         bail!("viewer qualification profile schema must be {PROFILE_SCHEMA:?}")
     }
     require_text(&profile.hardware_class, 64, "hardware_class")?;
+    require_sha256(
+        &profile.ep01_selection_authority_sha256,
+        "ep01_selection_authority_sha256",
+    )?;
+    if profile.ep01_selection_authority_sha256 != ep01_selection::authority_fingerprint_sha256() {
+        bail!("viewer qualification profile does not bind the committed EP-01 selection authority")
+    }
     validate_build(&profile.build)?;
     validate_workload(&profile.workload)?;
     validate_host(&profile.host)?;
@@ -548,6 +558,7 @@ fn profile_contract_sha256(profile: &ViewerQualificationProfile) -> String {
     let mut fields = vec![
         profile.schema.clone(),
         profile.hardware_class.clone(),
+        profile.ep01_selection_authority_sha256.clone(),
         profile.build.profile.clone(),
         profile.build.compiler.clone(),
         profile.build.target_mode.clone(),
@@ -1415,6 +1426,7 @@ fn sanitized_report(
             "schema": PROFILE_SCHEMA,
             "sha256": loaded.sha256,
             "owner_accepted_contract_sha256": profile_contract_sha256(profile),
+            "ep01_selection_authority_sha256": profile.ep01_selection_authority_sha256,
             "maximum_bytes": PROFILE_MAX_BYTES,
             "external_nonsymlink_required": true,
         },
@@ -1443,6 +1455,7 @@ fn sanitized_report(
             "independent_oracle_fingerprint_sha256": commitment_fingerprint("independent-oracle", &profile.workload.independent_oracle_sha256),
             "resource_budget_fingerprint_sha256": resource_fingerprint(&profile.resources),
             "absolute_gate_fingerprint_sha256": gate_fingerprint(&profile.absolute_gates),
+            "ep01_selection_authority_fingerprint_sha256": ep01_selection::authority_fingerprint_sha256(),
         },
         "redaction": {
             "local_paths_omitted": true,
@@ -1820,6 +1833,18 @@ mod tests {
                 .to_string()
                 .contains("strict valid JSON")
         );
+
+        let mut predecessor = test_profile_value(temporary.path());
+        predecessor["schema"] = json!("mirante4d-viewer-performance-qualification-profile-2");
+        let predecessor: ViewerQualificationProfile = serde_json::from_value(predecessor).unwrap();
+        assert!(validate_profile(&predecessor).is_err());
+
+        let mut missing_authority = test_profile_value(temporary.path());
+        missing_authority
+            .as_object_mut()
+            .unwrap()
+            .remove("ep01_selection_authority_sha256");
+        assert!(serde_json::from_value::<ViewerQualificationProfile>(missing_authority).is_err());
     }
 
     #[test]
@@ -1845,6 +1870,16 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("Git object ID")
+        );
+
+        value = test_profile_value(Path::new("/private"));
+        value["ep01_selection_authority_sha256"] = json!("f".repeat(64));
+        let profile: ViewerQualificationProfile = serde_json::from_value(value.clone()).unwrap();
+        assert!(
+            validate_profile(&profile)
+                .unwrap_err()
+                .to_string()
+                .contains("committed EP-01 selection authority")
         );
 
         value = test_profile_value(Path::new("/private"));
@@ -1895,6 +1930,7 @@ mod tests {
         let mutations = [
             ("/schema", json!("changed-schema")),
             ("/hardware_class", json!("changed-hardware")),
+            ("/ep01_selection_authority_sha256", json!("e".repeat(64))),
             ("/build/profile", json!("changed-profile")),
             ("/build/compiler", json!("changed-compiler")),
             ("/build/target_mode", json!("changed-target")),
@@ -2074,6 +2110,7 @@ mod tests {
                 workload_bundle_sha256: "2".repeat(64),
                 interaction_script_bundle_sha256: "3".repeat(64),
                 independent_oracle_sha256: "4".repeat(64),
+                ep01_trace_geometry_sha256: "5".repeat(64),
             },
             &observations,
             &[],
@@ -2098,6 +2135,14 @@ mod tests {
             matched_report["bindings"]["profile_build_fingerprint_sha256"],
             matched_report["bindings"]["observed_build_fingerprint_sha256"]
         );
+        assert_eq!(
+            matched_report["bindings"]["ep01_selection_authority_fingerprint_sha256"],
+            ep01_selection::authority_fingerprint_sha256()
+        );
+        assert_eq!(
+            matched_report["validated_bundle_commitments"]["ep01_trace_geometry_sha256"],
+            "5".repeat(64)
+        );
 
         let mut mismatch = observations.clone();
         mismatch.cpu_model = Some("Other private CPU".to_owned());
@@ -2119,6 +2164,7 @@ mod tests {
                 workload_bundle_sha256: "2".repeat(64),
                 interaction_script_bundle_sha256: "3".repeat(64),
                 independent_oracle_sha256: "4".repeat(64),
+                ep01_trace_geometry_sha256: "5".repeat(64),
             },
             &mismatch,
             &reasons,
@@ -2192,6 +2238,7 @@ GPU1:
         json!({
             "schema": PROFILE_SCHEMA,
             "hardware_class": "HW-2-VIEWER",
+            "ep01_selection_authority_sha256": ep01_selection::authority_fingerprint_sha256(),
             "build": {
                 "repository_revision": "0".repeat(40),
                 "profile": "release",

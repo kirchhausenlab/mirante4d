@@ -31,7 +31,7 @@ use crate::host::{
 };
 use crate::process::cargo_command;
 
-const WORKLOAD_SCHEMA: &str = "mirante4d-viewer-performance-workload-bundle-3";
+const WORKLOAD_SCHEMA: &str = "mirante4d-viewer-performance-workload-bundle-4";
 const SCRIPT_BUNDLE_SCHEMA: &str = "mirante4d-viewer-performance-script-bundle-3";
 const ORACLE_SCHEMA: &str = "mirante4d-viewer-performance-oracle-bundle-3";
 const RAW_REPORT_SCHEMA: &str = "mirante4d-viewer-performance-raw-private-report-1";
@@ -48,6 +48,14 @@ const AUTOMATION_REPORT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const RAW_REPORT_MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TIMEOUT_SECONDS: u64 = 3 * 60 * 60;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const EP01_TRACE_DERIVATION_CONTRACT: &str = "mirante4d-ep01-brickkey-trace-projection-1";
+const EP01_TRACE_PACKAGE_ROLE: &str = "representative_package";
+const EP01_TRACE_GEOMETRY_SHA256_DOMAIN: &[u8] = b"mirante4d-ep01-trace-geometry-v1\0";
+const EP01_TRACE_ENTRIES_MAX: usize = 256;
+const EP01_TRACE_LAYER_ORDINAL_MAX: u32 = 63;
+const EP01_TRACE_TIME_INDEX_MAX: u64 = 1_048_575;
+const EP01_TRACE_SCALE_LEVEL_MAX: u32 = 63;
+const EP01_TRACE_SPATIAL_COORDINATE_MAX: u64 = 1_048_576;
 
 pub(crate) const RUN_USAGE: &str = "usage: cargo run --release -p xtask -- \
 viewer-performance-run --qualification-profile ABSOLUTE_EXTERNAL_PROFILE.json \
@@ -77,7 +85,79 @@ struct WorkloadBundle {
     representative_package_root_manifest_sha256: String,
     supporting_temporal_package_root_manifest_sha256: String,
     import_source: ImportSourceBinding,
+    ep01_trace_geometry: Ep01TraceGeometry,
     scenarios: Vec<WorkloadScenario>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Ep01TraceGeometry {
+    pub(super) derivation_contract: String,
+    pub(super) package_role: String,
+    pub(super) whole_layer: Vec<Ep01WholeLayerTrace>,
+    pub(super) numeric_boxes: Vec<Ep01NumericBoxTrace>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Ep01WholeLayerTrace {
+    pub(super) logical_layer_ordinal: u32,
+    pub(super) time_index: u64,
+    pub(super) scale_level: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Ep01NumericBoxTrace {
+    pub(super) logical_layer_ordinal: u32,
+    pub(super) time_index: u64,
+    pub(super) scale_level: u32,
+    pub(super) start_zyx: [u64; 3],
+    pub(super) end_zyx_exclusive: [u64; 3],
+}
+
+pub(super) fn ep01_trace_geometry_sha256(geometry: &Ep01TraceGeometry) -> String {
+    let mut hasher = Sha256Hasher::new();
+    hasher.update(EP01_TRACE_GEOMETRY_SHA256_DOMAIN);
+    hasher.update(
+        u64::try_from(geometry.derivation_contract.len())
+            .expect("EP-01 trace derivation contract length fits u64")
+            .to_le_bytes(),
+    );
+    hasher.update(geometry.derivation_contract.as_bytes());
+    hasher.update(
+        u64::try_from(geometry.package_role.len())
+            .expect("EP-01 trace package-role length fits u64")
+            .to_le_bytes(),
+    );
+    hasher.update(geometry.package_role.as_bytes());
+    hasher.update(
+        u64::try_from(geometry.whole_layer.len())
+            .expect("EP-01 whole-layer trace count fits u64")
+            .to_le_bytes(),
+    );
+    for trace in &geometry.whole_layer {
+        hasher.update(trace.logical_layer_ordinal.to_le_bytes());
+        hasher.update(trace.time_index.to_le_bytes());
+        hasher.update(trace.scale_level.to_le_bytes());
+    }
+    hasher.update(
+        u64::try_from(geometry.numeric_boxes.len())
+            .expect("EP-01 numeric-box trace count fits u64")
+            .to_le_bytes(),
+    );
+    for trace in &geometry.numeric_boxes {
+        hasher.update(trace.logical_layer_ordinal.to_le_bytes());
+        hasher.update(trace.time_index.to_le_bytes());
+        hasher.update(trace.scale_level.to_le_bytes());
+        for coordinate in trace.start_zyx {
+            hasher.update(coordinate.to_le_bytes());
+        }
+        for coordinate in trace.end_zyx_exclusive {
+            hasher.update(coordinate.to_le_bytes());
+        }
+    }
+    hasher.finalize().to_string()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -973,6 +1053,7 @@ pub(super) struct BundleCommitments {
     pub(super) workload_bundle_sha256: String,
     pub(super) interaction_script_bundle_sha256: String,
     pub(super) independent_oracle_sha256: String,
+    pub(super) ep01_trace_geometry_sha256: String,
 }
 
 pub(super) fn load_and_validate_preflight_bundles(
@@ -1005,6 +1086,7 @@ pub(super) fn load_and_validate_preflight_bundles(
         workload_bundle_sha256: workload.sha256,
         interaction_script_bundle_sha256: scripts.sha256,
         independent_oracle_sha256: oracle.sha256,
+        ep01_trace_geometry_sha256: ep01_trace_geometry_sha256(&workload.value.ep01_trace_geometry),
     })
 }
 
@@ -1415,9 +1497,7 @@ fn validate_bundles(
     if oracle.sha256 != profile.workload.independent_oracle_sha256 {
         bail!("viewer oracle bundle does not match its qualification-profile commitment")
     }
-    if workload.value.schema != WORKLOAD_SCHEMA {
-        bail!("viewer workload bundle schema must be {WORKLOAD_SCHEMA:?}")
-    }
+    validate_workload_schema(&workload.value.schema)?;
     if scripts.value.schema != SCRIPT_BUNDLE_SCHEMA {
         bail!("viewer script bundle schema must be {SCRIPT_BUNDLE_SCHEMA:?}")
     }
@@ -1436,6 +1516,7 @@ fn validate_bundles(
         "workload supporting temporal-package manifest commitment",
     )?;
     validate_import_source_binding(&workload.value.import_source)?;
+    validate_ep01_trace_geometry(&workload.value.ep01_trace_geometry)?;
     if workload.value.representative_package_root_manifest_sha256
         != profile.workload.representative_package.root_manifest_sha256
     {
@@ -1558,6 +1639,101 @@ fn validate_bundles(
         )
     }) {
         bail!("viewer scripts must exercise the profile-bound 1920x1080 extent")
+    }
+    Ok(())
+}
+
+fn validate_workload_schema(schema: &str) -> anyhow::Result<()> {
+    if schema != WORKLOAD_SCHEMA {
+        bail!("viewer workload bundle schema must be {WORKLOAD_SCHEMA:?}")
+    }
+    Ok(())
+}
+
+fn validate_ep01_trace_geometry(geometry: &Ep01TraceGeometry) -> anyhow::Result<()> {
+    if geometry.derivation_contract != EP01_TRACE_DERIVATION_CONTRACT {
+        bail!("EP-01 trace derivation contract must be {EP01_TRACE_DERIVATION_CONTRACT:?}")
+    }
+    if geometry.package_role != EP01_TRACE_PACKAGE_ROLE {
+        bail!("EP-01 analysis traces must target the {EP01_TRACE_PACKAGE_ROLE:?} authority")
+    }
+    if !(1..=EP01_TRACE_ENTRIES_MAX).contains(&geometry.whole_layer.len()) {
+        bail!(
+            "EP-01 whole-layer trace list must contain between 1 and {EP01_TRACE_ENTRIES_MAX} entries"
+        )
+    }
+    if !(1..=EP01_TRACE_ENTRIES_MAX).contains(&geometry.numeric_boxes.len()) {
+        bail!(
+            "EP-01 numeric-box trace list must contain between 1 and {EP01_TRACE_ENTRIES_MAX} entries"
+        )
+    }
+
+    for (index, trace) in geometry.whole_layer.iter().enumerate() {
+        validate_ep01_trace_location(
+            &format!("EP-01 whole-layer trace entry {index}"),
+            trace.logical_layer_ordinal,
+            trace.time_index,
+            trace.scale_level,
+        )?;
+    }
+    for (index, trace) in geometry.numeric_boxes.iter().enumerate() {
+        let label = format!("EP-01 numeric-box trace entry {index}");
+        validate_ep01_trace_location(
+            &label,
+            trace.logical_layer_ordinal,
+            trace.time_index,
+            trace.scale_level,
+        )?;
+        for coordinate in trace.start_zyx.iter().chain(trace.end_zyx_exclusive.iter()) {
+            if *coordinate > EP01_TRACE_SPATIAL_COORDINATE_MAX {
+                bail!(
+                    "{label} spatial coordinates must be at most {EP01_TRACE_SPATIAL_COORDINATE_MAX}"
+                )
+            }
+        }
+    }
+
+    if !geometry
+        .whole_layer
+        .windows(2)
+        .all(|pair| pair[0] < pair[1])
+    {
+        bail!("EP-01 whole-layer trace list must be strictly lexicographically increasing")
+    }
+    if !geometry
+        .numeric_boxes
+        .windows(2)
+        .all(|pair| pair[0] < pair[1])
+    {
+        bail!("EP-01 numeric-box trace list must be strictly lexicographically increasing")
+    }
+
+    for (index, trace) in geometry.numeric_boxes.iter().enumerate() {
+        for axis in 0..3 {
+            if trace.start_zyx[axis] >= trace.end_zyx_exclusive[axis] {
+                bail!(
+                    "EP-01 numeric-box trace entry {index} axis {axis} must be a positive half-open interval"
+                )
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_ep01_trace_location(
+    label: &str,
+    logical_layer_ordinal: u32,
+    time_index: u64,
+    scale_level: u32,
+) -> anyhow::Result<()> {
+    if logical_layer_ordinal > EP01_TRACE_LAYER_ORDINAL_MAX {
+        bail!("{label} logical layer ordinal must be at most {EP01_TRACE_LAYER_ORDINAL_MAX}")
+    }
+    if time_index > EP01_TRACE_TIME_INDEX_MAX {
+        bail!("{label} time index must be at most {EP01_TRACE_TIME_INDEX_MAX}")
+    }
+    if scale_level > EP01_TRACE_SCALE_LEVEL_MAX {
+        bail!("{label} scale level must be at most {EP01_TRACE_SCALE_LEVEL_MAX}")
     }
     Ok(())
 }
@@ -7759,6 +7935,7 @@ fn raw_report(
         workload_bundle_sha256: workload.sha256.clone(),
         interaction_script_bundle_sha256: scripts.sha256.clone(),
         independent_oracle_sha256: oracle.sha256.clone(),
+        ep01_trace_geometry_sha256: ep01_trace_geometry_sha256(&workload.value.ep01_trace_geometry),
     };
     json!({
         "schema": RAW_REPORT_SCHEMA,
@@ -7805,7 +7982,9 @@ fn raw_report(
         "commitments": {
             "qualification_profile_sha256": profile.sha256,
             "owner_accepted_profile_contract_sha256": profile_contract_sha256(&profile.profile),
+            "ep01_selection_authority_sha256": profile.profile.ep01_selection_authority_sha256,
             "workload_bundle_sha256": workload.sha256,
+            "ep01_trace_geometry_sha256": bundle_commitments.ep01_trace_geometry_sha256,
             "interaction_script_bundle_sha256": scripts.sha256,
             "independent_oracle_sha256": oracle.sha256,
             "app_binary_sha256_before_run": app_binary_sha256,
@@ -7954,7 +8133,9 @@ fn sanitized_receipt(
         "commitments": {
             "qualification_profile_sha256": profile.sha256,
             "owner_accepted_profile_contract_sha256": profile_contract_sha256(&profile.profile),
+            "ep01_selection_authority_sha256": profile.profile.ep01_selection_authority_sha256,
             "workload_bundle_sha256": workload.sha256,
+            "ep01_trace_geometry_sha256": ep01_trace_geometry_sha256(&workload.value.ep01_trace_geometry),
             "interaction_script_bundle_sha256": scripts.sha256,
             "independent_oracle_sha256": oracle.sha256,
             "app_binary_sha256": app_binary_sha256,
@@ -7979,6 +8160,41 @@ fn sanitized_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ep01_trace_geometry() -> Ep01TraceGeometry {
+        Ep01TraceGeometry {
+            derivation_contract: EP01_TRACE_DERIVATION_CONTRACT.to_owned(),
+            package_role: EP01_TRACE_PACKAGE_ROLE.to_owned(),
+            whole_layer: vec![
+                Ep01WholeLayerTrace {
+                    logical_layer_ordinal: 0,
+                    time_index: 0,
+                    scale_level: 0,
+                },
+                Ep01WholeLayerTrace {
+                    logical_layer_ordinal: 1,
+                    time_index: 3,
+                    scale_level: 2,
+                },
+            ],
+            numeric_boxes: vec![
+                Ep01NumericBoxTrace {
+                    logical_layer_ordinal: 0,
+                    time_index: 0,
+                    scale_level: 0,
+                    start_zyx: [0, 1, 2],
+                    end_zyx_exclusive: [1, 5, 8],
+                },
+                Ep01NumericBoxTrace {
+                    logical_layer_ordinal: 1,
+                    time_index: 3,
+                    scale_level: 2,
+                    start_zyx: [4, 5, 6],
+                    end_zyx_exclusive: [9, 10, 11],
+                },
+            ],
+        }
+    }
 
     fn timing_ring(total_count: u64, retained: &[u64]) -> Value {
         json!({
@@ -8460,6 +8676,7 @@ mod tests {
         serde_json::from_value(json!({
             "schema": super::super::PROFILE_SCHEMA,
             "hardware_class": "test-hardware",
+            "ep01_selection_authority_sha256": super::super::ep01_selection::authority_fingerprint_sha256(),
             "build": {
                 "repository_revision": "0".repeat(40),
                 "profile": "release",
@@ -8629,10 +8846,37 @@ mod tests {
                 "regular_files": 1,
                 "source_bytes": 1,
             },
+            "ep01_trace_geometry": ep01_trace_geometry(),
             "scenarios": [],
             "legacy": true,
         });
         assert!(serde_json::from_value::<WorkloadBundle>(workload).is_err());
+
+        let mut missing_geometry = json!({
+            "schema": WORKLOAD_SCHEMA,
+            "representative_package_root_manifest_sha256": "11".repeat(32),
+            "supporting_temporal_package_root_manifest_sha256": "22".repeat(32),
+            "import_source": {
+                "inventory_sha256": "33".repeat(32),
+                "reviewed_source_fingerprint_sha256": "44".repeat(32),
+                "regular_files": 1,
+                "source_bytes": 1,
+            },
+            "ep01_trace_geometry": ep01_trace_geometry(),
+            "scenarios": [],
+        });
+        missing_geometry
+            .as_object_mut()
+            .unwrap()
+            .remove("ep01_trace_geometry");
+        assert!(serde_json::from_value::<WorkloadBundle>(missing_geometry).is_err());
+        assert!(
+            validate_workload_schema("mirante4d-viewer-performance-workload-bundle-3").is_err()
+        );
+
+        let mut geometry = serde_json::to_value(ep01_trace_geometry()).unwrap();
+        geometry["unknown"] = json!(true);
+        assert!(serde_json::from_value::<Ep01TraceGeometry>(geometry).is_err());
 
         let mut oracle_phase = serde_json::to_value(resident_oracle_phase()).unwrap();
         oracle_phase["unknown"] = json!(1);
@@ -8641,6 +8885,211 @@ mod tests {
         let mut import_gate = serde_json::to_value(test_import_gate()).unwrap();
         import_gate["limits"]["standalone_import_open_file_limit"] = json!(64);
         assert!(serde_json::from_value::<ImportGate>(import_gate).is_err());
+    }
+
+    #[test]
+    fn ep01_trace_geometry_digest_is_frozen_and_json_format_independent() {
+        let geometry = ep01_trace_geometry();
+        assert_eq!(
+            ep01_trace_geometry_sha256(&geometry),
+            "2ca301dc3334df8ec6b5082efa9bca08b7083e657d2c646d5c68808f768099ad"
+        );
+
+        let compact = serde_json::to_string(&geometry).unwrap();
+        let pretty = serde_json::to_string_pretty(&geometry).unwrap();
+        let reordered: Ep01TraceGeometry = serde_json::from_str(
+            r#"{
+                "numeric_boxes": [
+                    {
+                        "end_zyx_exclusive": [1, 5, 8],
+                        "start_zyx": [0, 1, 2],
+                        "scale_level": 0,
+                        "time_index": 0,
+                        "logical_layer_ordinal": 0
+                    },
+                    {
+                        "end_zyx_exclusive": [9, 10, 11],
+                        "start_zyx": [4, 5, 6],
+                        "scale_level": 2,
+                        "time_index": 3,
+                        "logical_layer_ordinal": 1
+                    }
+                ],
+                "package_role": "representative_package",
+                "whole_layer": [
+                    {"scale_level": 0, "time_index": 0, "logical_layer_ordinal": 0},
+                    {"scale_level": 2, "time_index": 3, "logical_layer_ordinal": 1}
+                ],
+                "derivation_contract": "mirante4d-ep01-brickkey-trace-projection-1"
+            }"#,
+        )
+        .unwrap();
+        assert_ne!(compact, pretty);
+        let compact: Ep01TraceGeometry = serde_json::from_str(&compact).unwrap();
+        let pretty: Ep01TraceGeometry = serde_json::from_str(&pretty).unwrap();
+        assert_eq!(reordered, geometry);
+        assert_eq!(
+            ep01_trace_geometry_sha256(&compact),
+            ep01_trace_geometry_sha256(&pretty)
+        );
+        assert_eq!(
+            ep01_trace_geometry_sha256(&reordered),
+            ep01_trace_geometry_sha256(&pretty)
+        );
+    }
+
+    #[test]
+    fn ep01_trace_geometry_digest_changes_for_every_semantic_field() {
+        let geometry = ep01_trace_geometry();
+        let expected = ep01_trace_geometry_sha256(&geometry);
+        let mut mutations = Vec::new();
+
+        let mut mutation = geometry.clone();
+        mutation.derivation_contract.push_str("-changed");
+        mutations.push(mutation);
+        let mut mutation = geometry.clone();
+        mutation.package_role.push_str("-changed");
+        mutations.push(mutation);
+        for mutate in [
+            |trace: &mut Ep01WholeLayerTrace| trace.logical_layer_ordinal += 1,
+            |trace: &mut Ep01WholeLayerTrace| trace.time_index += 1,
+            |trace: &mut Ep01WholeLayerTrace| trace.scale_level += 1,
+        ] {
+            let mut mutation = geometry.clone();
+            mutate(&mut mutation.whole_layer[0]);
+            mutations.push(mutation);
+        }
+        for mutate in [
+            |trace: &mut Ep01NumericBoxTrace| trace.logical_layer_ordinal += 1,
+            |trace: &mut Ep01NumericBoxTrace| trace.time_index += 1,
+            |trace: &mut Ep01NumericBoxTrace| trace.scale_level += 1,
+        ] {
+            let mut mutation = geometry.clone();
+            mutate(&mut mutation.numeric_boxes[0]);
+            mutations.push(mutation);
+        }
+        for axis in 0..3 {
+            let mut mutation = geometry.clone();
+            mutation.numeric_boxes[0].start_zyx[axis] += 1;
+            mutations.push(mutation);
+
+            let mut mutation = geometry.clone();
+            mutation.numeric_boxes[0].end_zyx_exclusive[axis] += 1;
+            mutations.push(mutation);
+        }
+        let mut mutation = geometry.clone();
+        mutation.whole_layer.pop();
+        mutations.push(mutation);
+        let mut mutation = geometry;
+        mutation.numeric_boxes.pop();
+        mutations.push(mutation);
+
+        for mutation in mutations {
+            assert_ne!(ep01_trace_geometry_sha256(&mutation), expected);
+        }
+    }
+
+    #[test]
+    fn ep01_trace_geometry_validation_is_strict_and_bounded() {
+        let geometry = ep01_trace_geometry();
+        validate_ep01_trace_geometry(&geometry).unwrap();
+
+        let mut invalid = geometry.clone();
+        invalid.derivation_contract = "predecessor".to_owned();
+        assert!(validate_ep01_trace_geometry(&invalid).is_err());
+        let mut invalid = geometry.clone();
+        invalid.package_role = "supporting_temporal_package".to_owned();
+        assert!(validate_ep01_trace_geometry(&invalid).is_err());
+
+        let mut invalid = geometry.clone();
+        invalid.whole_layer.clear();
+        assert!(validate_ep01_trace_geometry(&invalid).is_err());
+        let mut invalid = geometry.clone();
+        invalid.numeric_boxes.clear();
+        assert!(validate_ep01_trace_geometry(&invalid).is_err());
+
+        let mut invalid = geometry.clone();
+        invalid.whole_layer = (0..=EP01_TRACE_ENTRIES_MAX)
+            .map(|time_index| Ep01WholeLayerTrace {
+                logical_layer_ordinal: 0,
+                time_index: u64::try_from(time_index).unwrap(),
+                scale_level: 0,
+            })
+            .collect();
+        assert!(validate_ep01_trace_geometry(&invalid).is_err());
+        let mut invalid = geometry.clone();
+        invalid.numeric_boxes = (0..=EP01_TRACE_ENTRIES_MAX)
+            .map(|time_index| Ep01NumericBoxTrace {
+                logical_layer_ordinal: 0,
+                time_index: u64::try_from(time_index).unwrap(),
+                scale_level: 0,
+                start_zyx: [0; 3],
+                end_zyx_exclusive: [1; 3],
+            })
+            .collect();
+        assert!(validate_ep01_trace_geometry(&invalid).is_err());
+
+        let mut invalid = geometry.clone();
+        invalid.whole_layer.swap(0, 1);
+        assert!(validate_ep01_trace_geometry(&invalid).is_err());
+        let mut invalid = geometry.clone();
+        invalid.whole_layer[1] = invalid.whole_layer[0].clone();
+        assert!(validate_ep01_trace_geometry(&invalid).is_err());
+        let mut invalid = geometry.clone();
+        invalid.numeric_boxes.swap(0, 1);
+        assert!(validate_ep01_trace_geometry(&invalid).is_err());
+        let mut invalid = geometry.clone();
+        invalid.numeric_boxes[1] = invalid.numeric_boxes[0].clone();
+        assert!(validate_ep01_trace_geometry(&invalid).is_err());
+
+        for mutate in [
+            |trace: &mut Ep01WholeLayerTrace| {
+                trace.logical_layer_ordinal = EP01_TRACE_LAYER_ORDINAL_MAX + 1;
+            },
+            |trace: &mut Ep01WholeLayerTrace| {
+                trace.time_index = EP01_TRACE_TIME_INDEX_MAX + 1;
+            },
+            |trace: &mut Ep01WholeLayerTrace| {
+                trace.scale_level = EP01_TRACE_SCALE_LEVEL_MAX + 1;
+            },
+        ] {
+            let mut invalid = geometry.clone();
+            mutate(&mut invalid.whole_layer[0]);
+            assert!(validate_ep01_trace_geometry(&invalid).is_err());
+        }
+        for mutate in [
+            |trace: &mut Ep01NumericBoxTrace| {
+                trace.logical_layer_ordinal = EP01_TRACE_LAYER_ORDINAL_MAX + 1;
+            },
+            |trace: &mut Ep01NumericBoxTrace| {
+                trace.time_index = EP01_TRACE_TIME_INDEX_MAX + 1;
+            },
+            |trace: &mut Ep01NumericBoxTrace| {
+                trace.scale_level = EP01_TRACE_SCALE_LEVEL_MAX + 1;
+            },
+        ] {
+            let mut invalid = geometry.clone();
+            mutate(&mut invalid.numeric_boxes[0]);
+            assert!(validate_ep01_trace_geometry(&invalid).is_err());
+        }
+        let mut invalid = geometry.clone();
+        invalid.numeric_boxes[0].start_zyx[0] = EP01_TRACE_SPATIAL_COORDINATE_MAX + 1;
+        assert!(validate_ep01_trace_geometry(&invalid).is_err());
+        let mut invalid = geometry.clone();
+        invalid.numeric_boxes[0].end_zyx_exclusive[0] = EP01_TRACE_SPATIAL_COORDINATE_MAX + 1;
+        assert!(validate_ep01_trace_geometry(&invalid).is_err());
+
+        for axis in 0..3 {
+            let mut invalid = geometry.clone();
+            invalid.numeric_boxes[0].end_zyx_exclusive[axis] =
+                invalid.numeric_boxes[0].start_zyx[axis];
+            assert!(validate_ep01_trace_geometry(&invalid).is_err());
+
+            let mut invalid = geometry.clone();
+            invalid.numeric_boxes[0].start_zyx[axis] =
+                invalid.numeric_boxes[0].end_zyx_exclusive[axis] + 1;
+            assert!(validate_ep01_trace_geometry(&invalid).is_err());
+        }
     }
 
     #[test]
@@ -10559,6 +11008,7 @@ mod tests {
                     regular_files: 1,
                     source_bytes: 1,
                 },
+                ep01_trace_geometry: ep01_trace_geometry(),
                 scenarios: Vec::new(),
             },
             sha256: "22".repeat(32),
@@ -10598,6 +11048,14 @@ mod tests {
         );
         let encoded = serde_json::to_string(&receipt).unwrap();
         assert!(encoded.contains(&"55".repeat(32)));
+        assert_eq!(
+            receipt["commitments"]["ep01_selection_authority_sha256"],
+            super::super::ep01_selection::authority_fingerprint_sha256()
+        );
+        assert_eq!(
+            receipt["commitments"]["ep01_trace_geometry_sha256"],
+            ep01_trace_geometry_sha256(&workload.value.ep01_trace_geometry)
+        );
         assert!(!encoded.contains("/private"));
         assert!(!encoded.contains("secret"));
         assert!(!encoded.contains("temporal.m4d"));
