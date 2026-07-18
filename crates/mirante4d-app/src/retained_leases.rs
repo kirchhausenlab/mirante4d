@@ -1,14 +1,15 @@
 //! Bounded, zero-copy ownership of dataset leases retained by the product.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, HashMap},
     fmt,
     sync::Arc,
 };
 
 use crate::product_render_intent::PRODUCT_RENDER_RESOURCE_LIMIT;
+use crate::semantic_tiles::SEMANTIC_TILE_SIDE;
 use mirante4d_dataset::{
-    DatasetResourceIdentity, DatasetResourceKey, ResourceLease, ResourcePayloadView,
+    CpuByteLease, DatasetResourceIdentity, DatasetResourceKey, ResourceLease, ResourcePayloadView,
 };
 use mirante4d_domain::{IntensityDType, LogicalLayerKey, ScaleLevel, TimeIndex};
 
@@ -19,6 +20,7 @@ pub(crate) enum RetainedLeaseError {
     TooManyRequirements { actual: usize, maximum: usize },
     ResourceNotRequired { key: DatasetResourceKey },
     ConflictingLeaseAllocation { key: DatasetResourceKey },
+    PreparedRequirementsChanged,
 }
 
 impl fmt::Display for RetainedLeaseError {
@@ -34,6 +36,9 @@ impl fmt::Display for RetainedLeaseError {
             Self::ConflictingLeaseAllocation { .. } => formatter.write_str(
                 "one semantic resource was delivered by two different lease allocations",
             ),
+            Self::PreparedRequirementsChanged => formatter.write_str(
+                "the retained requirement union changed after its worker delta was prepared",
+            ),
         }
     }
 }
@@ -46,21 +51,77 @@ impl std::error::Error for RetainedLeaseError {}
 /// and validity masks stay owned by their leases and are only borrowed here.
 #[derive(Default)]
 pub(crate) struct RetainedLeases {
-    requirements: BTreeSet<DatasetResourceKey>,
+    requirements: Arc<[DatasetResourceKey]>,
+    requirement_charge: Option<Arc<dyn CpuByteLease>>,
     leases: BTreeMap<DatasetResourceKey, Arc<dyn ResourceLease>>,
+    generation: u64,
+    spatial_index: HashMap<RetainedSpatialKey, Vec<DatasetResourceKey>>,
+    #[cfg(test)]
+    spatial_lookup_visits: std::cell::Cell<u64>,
+    #[cfg(test)]
+    prepared_requirement_swaps: u64,
+    #[cfg(test)]
+    prepared_requirement_key_visits: u64,
+    #[cfg(test)]
+    prepared_removal_delta_visits: u64,
+}
+
+/// Indivisible immutable retained-union identity and its ledger lifetime.
+/// Legacy/test unions may be uncharged; worker-installed unions always carry
+/// `Some`, and cloning this handle keeps bytes charged while a latest-only
+/// request or prepared result still references the old key body.
+#[derive(Clone)]
+pub(crate) struct RetainedRequirementHandle {
+    pub(crate) requirements: Arc<[DatasetResourceKey]>,
+    pub(crate) charge: Option<Arc<dyn CpuByteLease>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RetainedSpatialKey {
+    identity: DatasetResourceIdentity,
+    layer: LogicalLayerKey,
+    timepoint: TimeIndex,
+    scale: ScaleLevel,
+    tile: [u64; 3],
+}
+
+impl RetainedSpatialKey {
+    fn for_resource(key: DatasetResourceKey) -> Self {
+        Self {
+            identity: key.identity(),
+            layer: key.layer(),
+            timepoint: key.timepoint(),
+            scale: key.scale(),
+            tile: key
+                .region()
+                .origin()
+                .map(|value| value / SEMANTIC_TILE_SIDE),
+        }
+    }
+
+    fn for_sample(
+        identity: DatasetResourceIdentity,
+        layer: LogicalLayerKey,
+        timepoint: TimeIndex,
+        scale: ScaleLevel,
+        index: [u64; 3],
+    ) -> Self {
+        Self {
+            identity,
+            layer,
+            timepoint,
+            scale,
+            tile: index.map(|value| value / SEMANTIC_TILE_SIDE),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RetainedLeaseResource<'a> {
-    key: DatasetResourceKey,
     payload: ResourcePayloadView<'a>,
 }
 
 impl<'a> RetainedLeaseResource<'a> {
-    pub(crate) const fn key(self) -> DatasetResourceKey {
-        self.key
-    }
-
     pub(crate) const fn payload(self) -> ResourcePayloadView<'a> {
         self.payload
     }
@@ -106,6 +167,7 @@ impl fmt::Debug for RetainedLeases {
             .field("required_resources", &self.requirements.len())
             .field("retained_leases", &self.leases.len())
             .field("missing_resources", &self.missing_len())
+            .field("generation", &self.generation)
             .finish()
     }
 }
@@ -115,7 +177,17 @@ impl RetainedLeases {
         Self::default()
     }
 
+    /// Monotonic identity for the exact CPU lease cohort visible to the
+    /// renderer. Deterministic render failures may be suppressed only while
+    /// this input generation remains unchanged.
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Atomically replaces the union of current semantic requirements.
+    /// Atomically replaces the requirement set and returns the number of
+    /// previously retained lease handles retired by that replacement.
+    #[cfg(test)]
     pub(crate) fn replace_requirements(
         &mut self,
         requirements: impl IntoIterator<Item = DatasetResourceKey>,
@@ -123,27 +195,136 @@ impl RetainedLeases {
         self.replace_requirements_with_limit(requirements, MAX_RETAINED_LEASE_REQUIREMENTS)
     }
 
+    #[cfg(test)]
     fn replace_requirements_with_limit(
         &mut self,
         requirements: impl IntoIterator<Item = DatasetResourceKey>,
         maximum: usize,
     ) -> Result<usize, RetainedLeaseError> {
-        let mut next = BTreeSet::new();
-        for key in requirements {
-            next.insert(key);
-            if next.len() > maximum {
-                return Err(RetainedLeaseError::TooManyRequirements {
-                    actual: next.len(),
-                    maximum,
-                });
-            }
-        }
+        let mut next = requirements.into_iter().collect::<Vec<_>>();
+        next.sort_unstable();
+        next.dedup();
+        self.replace_prepared_requirements_with_limit(next.into(), maximum)
+    }
 
+    /// Installs an immutable canonical union prepared off the UI thread.
+    /// Swapping the large requirement body is O(1); only the much smaller set
+    /// of currently CPU-retained handles is checked for retirement.
+    #[cfg(test)]
+    pub(crate) fn replace_prepared_requirements(
+        &mut self,
+        requirements: Arc<[DatasetResourceKey]>,
+    ) -> Result<usize, RetainedLeaseError> {
+        self.replace_prepared_requirements_with_limit(requirements, MAX_RETAINED_LEASE_REQUIREMENTS)
+    }
+
+    #[cfg(test)]
+    fn replace_prepared_requirements_with_limit(
+        &mut self,
+        next: Arc<[DatasetResourceKey]>,
+        maximum: usize,
+    ) -> Result<usize, RetainedLeaseError> {
+        debug_assert!(next.is_sorted());
+        debug_assert!(next.windows(2).all(|pair| pair[0] != pair[1]));
+        Self::preflight_prepared_requirements_with_limit(&next, maximum)?;
+
+        let changed = !Arc::ptr_eq(&self.requirements, &next);
         let retained_before = self.leases.len();
-        self.leases.retain(|key, _| next.contains(key));
+        self.leases.retain(|key, _| next.binary_search(key).is_ok());
+        let leases = &self.leases;
+        self.spatial_index.retain(|_, keys| {
+            keys.retain(|key| leases.contains_key(key));
+            !keys.is_empty()
+        });
         let retired = retained_before.saturating_sub(self.leases.len());
         self.requirements = next;
+        self.requirement_charge = None;
+        #[cfg(test)]
+        {
+            self.prepared_requirement_swaps = self.prepared_requirement_swaps.saturating_add(1);
+            self.prepared_requirement_key_visits =
+                self.prepared_requirement_key_visits.saturating_add(0);
+        }
+        if changed {
+            self.generation = self.generation.saturating_add(1);
+        }
         Ok(retired)
+    }
+
+    /// Validates a worker-prepared replacement without visiting either large
+    /// key body. Arc identity binds the removal delta to the exact old union.
+    pub(crate) fn preflight_prepared_requirement_update(
+        &self,
+        previous: &Arc<[DatasetResourceKey]>,
+        next: &Arc<[DatasetResourceKey]>,
+    ) -> Result<(), RetainedLeaseError> {
+        Self::preflight_prepared_requirements(next)?;
+        if !Arc::ptr_eq(&self.requirements, previous) {
+            return Err(RetainedLeaseError::PreparedRequirementsChanged);
+        }
+        Ok(())
+    }
+
+    /// Infallible commit after `preflight_prepared_requirement_update`.
+    /// Requirement ownership swaps by Arc and only worker-proven removals
+    /// touch the retained map and their directly addressed spatial buckets.
+    pub(crate) fn commit_prepared_requirement_update(
+        &mut self,
+        previous: Arc<[DatasetResourceKey]>,
+        next: Arc<[DatasetResourceKey]>,
+        removals: &[DatasetResourceKey],
+        charge: Arc<dyn CpuByteLease>,
+    ) -> usize {
+        debug_assert!(Arc::ptr_eq(&self.requirements, &previous));
+        debug_assert!(next.is_sorted());
+        debug_assert!(removals.is_sorted());
+        debug_assert!(removals.windows(2).all(|pair| pair[0] != pair[1]));
+        debug_assert!(removals.iter().all(|key| {
+            previous.binary_search(key).is_ok() && next.binary_search(key).is_err()
+        }));
+        let changed = !Arc::ptr_eq(&previous, &next);
+        let mut retired = 0_usize;
+        for key in removals {
+            if self.leases.remove(key).is_some() {
+                retired += 1;
+                self.remove_spatial_key(*key);
+            }
+        }
+        self.requirements = next;
+        self.requirement_charge = Some(charge);
+        #[cfg(test)]
+        {
+            self.prepared_requirement_swaps = self.prepared_requirement_swaps.saturating_add(1);
+            self.prepared_removal_delta_visits = self
+                .prepared_removal_delta_visits
+                .saturating_add(removals.len() as u64);
+        }
+        if changed {
+            self.generation = self.generation.saturating_add(1);
+        }
+        retired
+    }
+
+    pub(crate) fn preflight_prepared_requirements(
+        requirements: &Arc<[DatasetResourceKey]>,
+    ) -> Result<(), RetainedLeaseError> {
+        Self::preflight_prepared_requirements_with_limit(
+            requirements,
+            MAX_RETAINED_LEASE_REQUIREMENTS,
+        )
+    }
+
+    fn preflight_prepared_requirements_with_limit(
+        requirements: &Arc<[DatasetResourceKey]>,
+        maximum: usize,
+    ) -> Result<(), RetainedLeaseError> {
+        if requirements.len() > maximum {
+            return Err(RetainedLeaseError::TooManyRequirements {
+                actual: requirements.len(),
+                maximum,
+            });
+        }
+        Ok(())
     }
 
     /// Retains a runtime lease without copying its payload.
@@ -155,7 +336,7 @@ impl RetainedLeases {
         lease: Arc<dyn ResourceLease>,
     ) -> Result<bool, RetainedLeaseError> {
         let key = lease.key();
-        if !self.requirements.contains(&key) {
+        if self.requirements.binary_search(&key).is_err() {
             return Err(RetainedLeaseError::ResourceNotRequired { key });
         }
         if let Some(current) = self.leases.get(&key) {
@@ -166,6 +347,12 @@ impl RetainedLeases {
             };
         }
         self.leases.insert(key, lease);
+        let spatial = RetainedSpatialKey::for_resource(key);
+        let bucket = self.spatial_index.entry(spatial).or_default();
+        if !bucket.contains(&key) {
+            bucket.push(key);
+        }
+        self.generation = self.generation.saturating_add(1);
         Ok(true)
     }
 
@@ -178,6 +365,31 @@ impl RetainedLeases {
         self.requirements.iter().copied()
     }
 
+    #[cfg(test)]
+    pub(crate) fn requirement_handle(&self) -> Arc<[DatasetResourceKey]> {
+        Arc::clone(&self.requirements)
+    }
+
+    pub(crate) fn accounted_requirement_handle(&self) -> RetainedRequirementHandle {
+        RetainedRequirementHandle {
+            requirements: Arc::clone(&self.requirements),
+            charge: self.requirement_charge.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn prepared_requirement_swap_work(&self) -> (u64, u64) {
+        (
+            self.prepared_requirement_swaps,
+            self.prepared_requirement_key_visits,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn prepared_removal_delta_visits(&self) -> u64 {
+        self.prepared_removal_delta_visits
+    }
+
     pub(crate) fn retained_len(&self) -> usize {
         self.leases.len()
     }
@@ -186,12 +398,13 @@ impl RetainedLeases {
         self.requirements.len().saturating_sub(self.leases.len())
     }
 
+    #[cfg(test)]
     pub(crate) fn is_complete(&self) -> bool {
         !self.requirements.is_empty() && self.missing_len() == 0
     }
 
     pub(crate) fn requires(&self, key: DatasetResourceKey) -> bool {
-        self.requirements.contains(&key)
+        self.requirements.binary_search(&key).is_ok()
     }
 
     #[cfg(test)]
@@ -203,14 +416,39 @@ impl RetainedLeases {
         self.leases.get(&key).map(|lease| lease.payload())
     }
 
-    pub(crate) fn lease_handles(
+    pub(crate) fn lease_handle(
         &self,
-        requirements: &[DatasetResourceKey],
-    ) -> Vec<Arc<dyn ResourceLease>> {
-        requirements
-            .iter()
-            .filter_map(|key| self.leases.get(key).cloned())
-            .collect()
+        requirement: DatasetResourceKey,
+    ) -> Option<Arc<dyn ResourceLease>> {
+        self.leases.get(&requirement).cloned()
+    }
+
+    /// Drops one CPU payload handle after the renderer has committed the
+    /// exact immutable resource to GPU residency. The semantic requirement
+    /// remains installed so an eviction can re-admit the same key without
+    /// replanning or changing renderer slot identity.
+    pub(crate) fn retire_payload_handle(&mut self, key: DatasetResourceKey) -> bool {
+        if self.leases.remove(&key).is_none() {
+            return false;
+        }
+        self.remove_spatial_key(key);
+        self.generation = self.generation.saturating_add(1);
+        true
+    }
+
+    fn remove_spatial_key(&mut self, key: DatasetResourceKey) {
+        let spatial = RetainedSpatialKey::for_resource(key);
+        if let Some(bucket) = self.spatial_index.get_mut(&spatial) {
+            bucket.retain(|candidate| *candidate != key);
+            if bucket.is_empty() {
+                self.spatial_index.remove(&spatial);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spatial_lookup_visits(&self) -> u64 {
+        self.spatial_lookup_visits.get()
     }
 
     pub(crate) fn retained_payloads(
@@ -294,33 +532,27 @@ impl<'a> RetainedLeaseCohort<'a> {
                 && key.scale() == scale
         };
 
-        let mut selected = requirements.map(|requirements| {
-            requirements
-                .iter()
-                .copied()
-                .filter(|key| matches_cohort(*key) && leases.leases.contains_key(key))
-                .collect::<BTreeSet<_>>()
-        });
+        let mut selected = requirements.map(|requirements| requirements.iter().copied());
         let mut retained = leases.leases.iter();
 
         std::iter::from_fn(move || {
             if let Some(selected) = selected.as_mut() {
-                let key = selected.pop_first()?;
-                let lease = leases
-                    .leases
-                    .get(&key)
-                    .expect("selected lease keys remain retained for the borrowed view");
-                return Some(RetainedLeaseResource {
-                    key,
-                    payload: lease.payload(),
-                });
+                loop {
+                    let key = selected.next()?;
+                    if matches_cohort(key)
+                        && let Some(lease) = leases.leases.get(&key)
+                    {
+                        return Some(RetainedLeaseResource {
+                            payload: lease.payload(),
+                        });
+                    }
+                }
             }
 
             loop {
                 let (key, lease) = retained.next()?;
                 if matches_cohort(*key) {
                     return Some(RetainedLeaseResource {
-                        key: *key,
                         payload: lease.payload(),
                     });
                 }
@@ -359,13 +591,31 @@ impl<'a> RetainedLeaseCohort<'a> {
     }
 
     pub(crate) fn sample(&self, index: [u64; 3]) -> RetainedLeaseSample {
-        let Some(resource) = self
-            .resources()
-            .find(|resource| region_contains(resource.key().region(), index))
-        else {
+        #[cfg(test)]
+        self.leases
+            .spatial_lookup_visits
+            .set(self.leases.spatial_lookup_visits.get().saturating_add(1));
+        let spatial = RetainedSpatialKey::for_sample(
+            self.identity,
+            self.layer,
+            self.timepoint,
+            self.scale,
+            index,
+        );
+        let Some(key) = self.leases.spatial_index.get(&spatial).and_then(|keys| {
+            keys.iter().copied().find(|key| {
+                region_contains(key.region(), index)
+                    && self
+                        .requirements
+                        .is_none_or(|requirements| requirements.binary_search(key).is_ok())
+            })
+        }) else {
             return RetainedLeaseSample::Missing;
         };
-        let region = resource.key().region();
+        let Some(lease) = self.leases.leases.get(&key) else {
+            return RetainedLeaseSample::Missing;
+        };
+        let region = key.region();
         let origin = region.origin();
         let shape = region.shape();
         let local: [u64; 3] = std::array::from_fn(|axis| index[axis] - origin[axis]);
@@ -375,7 +625,7 @@ impl<'a> RetainedLeaseCohort<'a> {
             .and_then(|value| value.checked_mul(shape.x()))
             .and_then(|value| value.checked_add(local[2]))
             .expect("validated resource shapes and regions preserve sample indexing");
-        let payload = resource.payload();
+        let payload = lease.payload();
         if !payload
             .sample_is_valid(sample_index)
             .expect("the resource region indexes its validated payload")
@@ -490,10 +740,28 @@ mod tests {
                 .view(&self.values, self.validity.as_deref())
                 .expect("fixture lease preserves its validated payload")
         }
+
+        fn payload_facts(&self) -> mirante4d_dataset::ResourcePayloadFacts {
+            mirante4d_dataset::ResourcePayloadFacts::from_payload(self.payload())
+                .expect("fixture facts are valid")
+        }
     }
 
     #[derive(Debug)]
     struct OuterLease(Arc<FixtureLease>);
+
+    #[derive(Debug)]
+    struct FixtureCpuCharge(u64);
+
+    impl CpuByteLease for FixtureCpuCharge {
+        fn category(&self) -> mirante4d_dataset::CpuLedgerCategory {
+            mirante4d_dataset::CpuLedgerCategory::QueuesAndResults
+        }
+
+        fn reserved_bytes(&self) -> u64 {
+            self.0
+        }
+    }
 
     impl ResourceLease for OuterLease {
         fn key(&self) -> DatasetResourceKey {
@@ -502,6 +770,10 @@ mod tests {
 
         fn payload(&self) -> ResourcePayloadView<'_> {
             self.0.payload()
+        }
+
+        fn payload_facts(&self) -> mirante4d_dataset::ResourcePayloadFacts {
+            self.0.payload_facts()
         }
     }
 
@@ -523,6 +795,20 @@ mod tests {
         Arc::new(FixtureLease::u16(key, values, validity).unwrap())
     }
 
+    fn semantic_key(layer: u32, tile_x: u64) -> DatasetResourceKey {
+        DatasetResourceKey::new(
+            DatasetResourceIdentity::Unverified(DatasetSourceId::new(17)),
+            LogicalLayerKey::new(layer),
+            TimeIndex::new(0),
+            ScaleLevel::BASE,
+            ResourceRegion::new(
+                [0, 0, tile_x * SEMANTIC_TILE_SIDE],
+                Shape3D::new(1, 1, 1).unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+
     #[test]
     fn retains_lease_payload_without_copying() {
         let key = key(0);
@@ -542,6 +828,35 @@ mod tests {
         assert!(payload.sample_is_valid(0).unwrap());
         assert!(!payload.sample_is_valid(1).unwrap());
         assert_eq!(retained.install(Arc::clone(&lease)), Ok(false));
+    }
+
+    #[test]
+    fn spatial_sample_lookup_is_constant_with_full_unrelated_envelope() {
+        const UNRELATED: u64 = 65_000;
+        let target = semantic_key(1, 0);
+        let mut requirements = (0..UNRELATED)
+            .map(|x| semantic_key(0, x))
+            .collect::<Vec<_>>();
+        requirements.push(target);
+        let mut retained = RetainedLeases::new();
+        retained
+            .replace_requirements(requirements.iter().copied())
+            .unwrap();
+        for key in requirements {
+            retained.install(lease(key, &[1], None)).unwrap();
+        }
+        let before = retained.spatial_lookup_visits();
+        let sample = retained
+            .resident_set(
+                target.identity(),
+                target.layer(),
+                target.timepoint(),
+                target.scale(),
+            )
+            .sample([0, 0, 0]);
+
+        assert_eq!(sample, RetainedLeaseSample::Uint16(1));
+        assert_eq!(retained.spatial_lookup_visits() - before, 1);
     }
 
     #[test]
@@ -573,6 +888,55 @@ mod tests {
         );
         assert_eq!(retained.retained_len(), 1);
         assert_eq!(retained.missing_len(), 1);
+    }
+
+    #[test]
+    fn full_envelope_prepared_swap_retires_only_the_two_key_worker_delta() {
+        const REQUIREMENTS: u64 = 65_536;
+        let previous = (0..REQUIREMENTS)
+            .map(|index| semantic_key(0, index))
+            .collect::<Arc<[_]>>();
+        let removed = [previous[17], previous[65_000]];
+        let next = previous
+            .iter()
+            .copied()
+            .filter(|key| removed.binary_search(key).is_err())
+            .collect::<Arc<[_]>>();
+        let kept = previous[31];
+        let mut retained = RetainedLeases::new();
+        retained
+            .replace_prepared_requirements(Arc::clone(&previous))
+            .unwrap();
+        for key in [removed[0], kept, removed[1]] {
+            retained.install(lease(key, &[1], None)).unwrap();
+        }
+
+        retained
+            .preflight_prepared_requirement_update(&previous, &next)
+            .unwrap();
+        let visits_before = retained.prepared_removal_delta_visits();
+        let charge: Arc<dyn CpuByteLease> = Arc::new(FixtureCpuCharge(
+            u64::try_from(next.len() * std::mem::size_of::<DatasetResourceKey>()).unwrap(),
+        ));
+        assert_eq!(
+            retained.commit_prepared_requirement_update(
+                Arc::clone(&previous),
+                Arc::clone(&next),
+                &removed,
+                charge,
+            ),
+            2
+        );
+
+        assert_eq!(
+            retained.prepared_removal_delta_visits() - visits_before,
+            2,
+            "the UI commit must not scan the 65,534-key retained target"
+        );
+        assert!(Arc::ptr_eq(&retained.requirement_handle(), &next));
+        assert!(retained.payload(removed[0]).is_none());
+        assert!(retained.payload(removed[1]).is_none());
+        assert!(retained.payload(kept).is_some());
     }
 
     #[test]
@@ -634,6 +998,22 @@ mod tests {
     }
 
     #[test]
+    fn atlas_scale_requirement_set_is_retained_without_the_old_128_cap() {
+        let mut retained = RetainedLeases::new();
+        let resources = (0..32_768).map(key).collect::<Vec<_>>();
+
+        // The return value is the number of obsolete retained lease handles
+        // retired, not the number of newly required resources.
+        assert_eq!(retained.replace_requirements(resources.clone()), Ok(0));
+        assert_eq!(retained.required_len(), 32_768);
+        assert!(
+            resources
+                .into_iter()
+                .all(|resource| retained.requires(resource))
+        );
+    }
+
+    #[test]
     fn cohort_filters_requirements_and_samples_validity() {
         let first = key(0);
         let second = key(2);
@@ -686,13 +1066,7 @@ mod tests {
             first.timepoint(),
             first.scale(),
         );
-        assert_eq!(
-            subset
-                .resources()
-                .map(RetainedLeaseResource::key)
-                .collect::<Vec<_>>(),
-            vec![second]
-        );
+        assert_eq!(subset.resources().count(), 1);
         assert_eq!(
             subset.status(),
             RetainedLeaseStatus {

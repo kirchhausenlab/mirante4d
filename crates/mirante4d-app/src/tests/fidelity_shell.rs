@@ -86,13 +86,12 @@ fn workbench_runtime_diagnostics_exposes_unified_runtime_bounds_and_leases() {
         .with_pixels_per_point(1.0)
         .build_eframe(|cc| test_workbench_app_for_ui_harness(cc, opened));
 
-    harness
-        .get_by_label("Runtime Diagnostics")
-        .scroll_to_me();
+    harness.get_by_label("Runtime Diagnostics").scroll_to_me();
     harness.step();
     harness
         .get_by_label("Runtime Diagnostics")
         .click_accesskit();
+    harness.step();
     harness.step();
 
     for label in [
@@ -110,6 +109,24 @@ fn workbench_runtime_diagnostics_exposes_unified_runtime_bounds_and_leases() {
     ] {
         harness.get_by_label(label);
     }
+}
+
+#[test]
+fn collapsed_runtime_diagnostics_collect_nothing_across_ui_frames() {
+    use egui_kittest::Harness;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let root = write_target_fixture(tempdir.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(root).unwrap();
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1440.0, 900.0))
+        .build_eframe(|cc| test_workbench_app_for_ui_harness(cc, opened));
+
+    assert_eq!(harness.state().runtime_diagnostics_collections.get(), 0);
+    for _ in 0..8 {
+        harness.step();
+    }
+    assert_eq!(harness.state().runtime_diagnostics_collections.get(), 0);
 }
 
 #[test]
@@ -150,11 +167,8 @@ fn tiff_import_setup_state_is_visible_immediately_after_output_selection() {
     let tiff_source = TiffSource::auto(source.clone());
     let destination = tiff_destination(&tiff_source, &output_parent);
 
-    app.enter_tiff_import_setup_waiting_state(
-        tiff_source,
-        destination.clone(),
-    )
-    .unwrap();
+    app.enter_tiff_import_setup_waiting_state(tiff_source, destination.clone())
+        .unwrap();
 
     assert!(matches!(
         app.import.workers.status(),

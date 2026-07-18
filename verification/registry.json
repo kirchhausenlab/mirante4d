@@ -208,6 +208,59 @@
   ],
   "selector_adapters": [
     {
+      "id": "VP02-ADAPTER-STORAGE-SCALE-DIAGNOSTICS",
+      "lane": "developer-local",
+      "owner": "mirante4d-storage",
+      "requirements": ["VP-02-local-io-and-decode"],
+      "fixture_tier": "T2",
+      "capability": "local-cpu",
+      "matches": [
+        {
+          "package": "mirante4d-storage",
+          "test_prefix": "dataset_source::tests::aligned_verified_1024_brick_eight_consumer_storage_scale_diagnostic"
+        },
+        {
+          "package": "mirante4d-storage",
+          "test_prefix": "dataset_source::tests::aligned_verified_1024_brick_storage_scale_diagnostic"
+        },
+        {
+          "package": "mirante4d-storage",
+          "test_prefix": "range_io::tests::three_dimensional_1024_unique_chunk_io_scale_diagnostic"
+        }
+      ],
+      "expected_ignored_cases": 3
+    },
+    {
+      "id": "VP03-ADAPTER-CAMERA-PLANNING-DIAGNOSTIC",
+      "lane": "developer-local",
+      "owner": "mirante4d-app",
+      "requirements": ["VP-03-camera-demand-planning"],
+      "fixture_tier": "none",
+      "capability": "local-cpu",
+      "matches": [
+        {
+          "package": "mirante4d-app",
+          "test_prefix": "camera_demand_cache::tests::large_oblique_grid_moves_full_planning_off_the_caller"
+        }
+      ],
+      "expected_ignored_cases": 1
+    },
+    {
+      "id": "EP00-ADAPTER-PRODUCTION-SHADER-STRUCTURAL-AUDIT",
+      "lane": "developer-local",
+      "owner": "mirante4d-render-wgpu",
+      "requirements": ["EP-00-workload-fidelity-and-cost-truth"],
+      "fixture_tier": "none",
+      "capability": "local-cpu",
+      "matches": [
+        {
+          "package": "mirante4d-render-wgpu",
+          "test_prefix": "shader_audit::emit_production_shader_structural_audit_json"
+        }
+      ],
+      "expected_ignored_cases": 1
+    },
+    {
       "id": "WP09A-ADAPTER-TRUSTED-GPU",
       "lane": "trusted-gpu",
       "owner": "mirante4d-render-wgpu",
@@ -223,7 +276,7 @@
           "test_prefix": "gpu_tests::"
         }
       ],
-      "expected_ignored_cases": 1
+      "expected_ignored_cases": 9
     },
     {
       "id": "WP10A-ADAPTER-FORMAT-LIFECYCLE-SCALABILITY",

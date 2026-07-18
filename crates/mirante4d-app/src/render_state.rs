@@ -27,6 +27,7 @@ pub(crate) fn frame_failure_kind_for_successor_error(
         Error::RequirementCapacityExceeded { .. }
         | Error::LeaseCapacityExceeded { .. }
         | Error::ControlCapacityExceeded
+        | Error::ResidentMetadataCapacityExceeded { .. }
         | Error::CapacityExceeded { .. } => FrameFailureKind::BudgetExceeded,
         Error::DeviceUnavailable
         | Error::SoftwareAdapter
@@ -38,13 +39,20 @@ pub(crate) fn frame_failure_kind_for_successor_error(
         | Error::PresentationCapacityExceeded { .. }
         | Error::PresentationNotRegistered { .. }
         | Error::PresentationTokenExhausted
-        | Error::CoordinateLimitExceeded
-        | Error::RaySampleLimitExceeded => FrameFailureKind::BackendLimit,
+        | Error::CoordinateLimitExceeded => FrameFailureKind::BackendLimit,
         Error::UnsupportedView => FrameFailureKind::InvalidTransform,
         Error::BackendValidation
         | Error::UnknownValidationCapture
         | Error::StaleValidationCapture
-        | Error::ValidationCaptureFailed => FrameFailureKind::AllocationFailed,
+        | Error::ValidationCaptureFailed
+        | Error::UnknownGpuTiming
+        | Error::GpuTimingFailed
+        | Error::PickCapacityExceeded
+        | Error::PickTicketExhausted
+        | Error::PickBackpressure
+        | Error::UnknownVolumePick
+        | Error::VolumePickFailed => FrameFailureKind::AllocationFailed,
+        Error::PickFrameUnavailable => FrameFailureKind::IncompleteResidency,
         Error::InvalidConfiguration
         | Error::FrameContractMismatch
         | Error::StaleFrame { .. }
@@ -54,9 +62,9 @@ pub(crate) fn frame_failure_kind_for_successor_error(
         | Error::DuplicateLease
         | Error::UnexpectedLease
         | Error::PayloadContractMismatch
-        | Error::UnsupportedSampling
-        | Error::UnsupportedIsoShading
-        | Error::FrameProgressContract => FrameFailureKind::InvalidModeParameter,
+        | Error::PickQueryMismatch
+        | Error::FrameProgressContract
+        | Error::PreparedStaticLayoutMismatch => FrameFailureKind::InvalidModeParameter,
     }
 }
 
@@ -80,6 +88,18 @@ mod successor_error_tests {
         assert_eq!(
             frame_failure_kind_for_successor_error(&WgpuRenderRuntimeError::UnsupportedBackend),
             FrameFailureKind::BackendLimit
+        );
+        assert_eq!(
+            frame_failure_kind_for_successor_error(&WgpuRenderRuntimeError::PickFrameUnavailable,),
+            FrameFailureKind::IncompleteResidency
+        );
+        assert_eq!(
+            frame_failure_kind_for_successor_error(&WgpuRenderRuntimeError::PickBackpressure),
+            FrameFailureKind::AllocationFailed
+        );
+        assert_eq!(
+            frame_failure_kind_for_successor_error(&WgpuRenderRuntimeError::PickQueryMismatch),
+            FrameFailureKind::InvalidModeParameter
         );
     }
 }

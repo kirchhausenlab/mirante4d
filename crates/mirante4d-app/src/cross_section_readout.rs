@@ -343,7 +343,7 @@ fn sample_resident_value(
     index: CrossSectionGridIndex,
 ) -> ResidentSample {
     let resident = leases.resident_set(
-        catalog.scientific_identity().resource_identity(),
+        catalog.resource_identity(),
         layer,
         timepoint,
         ScaleLevel::new(scale_level),
@@ -587,8 +587,8 @@ mod tests {
 
     use mirante4d_dataset::{
         DatasetLayer, DatasetResourceKey, DatasetSourceId, ResourceLease,
-        ResourcePayloadDescriptor, ResourcePayloadView, ResourceRegion, ResourceValidity,
-        ScientificIdentityStatus,
+        ResourcePayloadDescriptor, ResourcePayloadFacts, ResourcePayloadView, ResourceRegion,
+        ResourceValidity, ScientificIdentityStatus,
     };
     use mirante4d_domain::{IntensityDType, Shape4D, TimeIndex};
 
@@ -612,6 +612,10 @@ mod tests {
                 .view(&self.values, Some(&self.validity))
                 .expect("fixture payload remains valid")
         }
+
+        fn payload_facts(&self) -> ResourcePayloadFacts {
+            ResourcePayloadFacts::from_payload(self.payload()).expect("fixture facts are valid")
+        }
     }
 
     fn fixture() -> (DatasetCatalog, RetainedLeases) {
@@ -633,7 +637,7 @@ mod tests {
         )
         .unwrap();
         let key = DatasetResourceKey::new(
-            catalog.scientific_identity().resource_identity(),
+            catalog.resource_identity(),
             layer_key,
             TimeIndex::new(0),
             ScaleLevel::BASE,

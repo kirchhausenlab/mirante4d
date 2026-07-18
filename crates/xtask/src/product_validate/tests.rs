@@ -236,6 +236,40 @@ fn target_fixture_product_automation_script_uses_semantic_commands() {
 }
 
 #[test]
+fn resident_navigation_script_enables_timing_without_validation_readback() {
+    let script = target_fixture_resident_navigation_script(Path::new("/tmp/demo.m4d"));
+    let commands = script["commands"].as_array().unwrap();
+
+    // The ordinary viewer runs mandatory scientific verification in the
+    // background. Its bounded 64 MiB scan reservation must fit alongside the
+    // resident fixture and decode queues while this product scenario runs.
+    assert_dataset_runtime_limits(&script, 128 * MIB, 64);
+    assert_eq!(script["gpu_timing"], true);
+    assert!(commands.iter().any(|command| {
+        command["command"] == "set_viewer_layout" && command["layout"] == "single3d"
+    }));
+    assert!(commands.iter().any(|command| {
+        command["command"] == "set_mapped_client_pixels"
+            && command["width"] == GENERATED_VIEWPORT_WIDTH
+            && command["height"] == GENERATED_VIEWPORT_HEIGHT
+    }));
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command["command"] == "copy_diagnostics")
+            .count(),
+        3
+    );
+    assert!(commands.iter().all(|command| {
+        command["command"] != "capture_screenshot"
+            && command["condition"] != "nonblank_frame"
+            && command["condition"]
+                .get("four_panel_images_distinct")
+                .is_none()
+    }));
+}
+
+#[test]
 fn target_fixture_render_modes_script_switches_supported_modes() {
     let script = target_fixture_render_modes_script(Path::new("/tmp/demo.m4d"));
     let commands = script["commands"].as_array().unwrap();
@@ -284,6 +318,19 @@ fn target_fixture_render_modes_script_switches_supported_modes() {
             && command["opacity"].as_f64() == Some(1.0)
     }));
     assert!(commands.iter().any(|command| {
+        command["command"] == "set_projection" && command["projection"] == "perspective"
+    }));
+    assert!(commands.iter().any(|command| {
+        command["command"] == "set_layer_sampling"
+            && command["layer_index"].as_u64() == Some(0)
+            && command["sampling"] == "smooth_linear"
+    }));
+    assert!(commands.iter().any(|command| {
+        command["command"] == "set_layer_iso_shading"
+            && command["layer_index"].as_u64() == Some(0)
+            && command["shading"] == "gradient_lighting"
+    }));
+    assert!(commands.iter().any(|command| {
         command["command"] == "set_layer_opacity"
             && command["layer_index"].as_u64() == Some(1)
             && command["opacity"].as_f64() == Some(1.0)
@@ -320,7 +367,21 @@ fn target_fixture_render_modes_script_switches_supported_modes() {
             .iter()
             .filter(|&&name| name == "probe_hover")
             .count(),
-        3
+        4
+    );
+    assert_eq!(
+        command_names
+            .iter()
+            .filter(|&&name| name == "set_iso_light")
+            .count(),
+        2
+    );
+    assert_eq!(
+        command_names
+            .iter()
+            .filter(|&&name| name == "primary_click")
+            .count(),
+        5
     );
     assert!(
         commands
@@ -335,8 +396,15 @@ fn target_fixture_render_modes_script_switches_supported_modes() {
     assert!(
         commands
             .iter()
-            .any(|command| command["name"] == "generated-iso")
+            .any(|command| command["name"] == "generated-iso-detached-light")
     );
+    for condition in ["crosshair_linked", "roi_committed", "distance_committed"] {
+        assert!(
+            commands
+                .iter()
+                .any(|command| command["condition"] == condition)
+        );
+    }
     assert!(commands.iter().any(|command| {
         command["condition"]["viewer_layout"]["layout"].as_str() == Some("four_panel")
     }));
@@ -446,6 +514,7 @@ fn import_preprocessing_script_uses_normal_cancel_resume_open_ready_path() {
     );
     let commands = script["commands"].as_array().unwrap();
     assert_eq!(script["scenario"], IMPORT_PREPROCESSING_SCENARIO);
+    assert_dataset_runtime_limits(&script, 512 * MIB, IMPORT_RESIDENT_RESOURCE_LIMIT);
     validate_product_automation_script(&script).unwrap();
 
     let starts = commands
@@ -1040,8 +1109,13 @@ fn completed_product_validation_fails_without_viewport_capture() {
         "artifacts": []
     });
 
-    let (status, failure_reason) =
-        completed_product_validation_outcome(true, Some("passed"), None, Some(&automation_report));
+    let (status, failure_reason) = completed_product_validation_outcome(
+        true,
+        Some("passed"),
+        None,
+        Some(&automation_report),
+        true,
+    );
 
     assert_eq!(status, ProductValidationStatus::Failed);
     assert!(
@@ -1070,8 +1144,13 @@ fn completed_product_validation_fails_with_blank_viewport_capture() {
         }]
     });
 
-    let (status, failure_reason) =
-        completed_product_validation_outcome(true, Some("passed"), None, Some(&automation_report));
+    let (status, failure_reason) = completed_product_validation_outcome(
+        true,
+        Some("passed"),
+        None,
+        Some(&automation_report),
+        true,
+    );
 
     assert_eq!(status, ProductValidationStatus::Failed);
     assert!(failure_reason.is_some());
@@ -1095,8 +1174,13 @@ fn completed_product_validation_passes_with_nonblank_viewport_capture() {
         }]
     });
 
-    let (status, failure_reason) =
-        completed_product_validation_outcome(true, Some("passed"), None, Some(&automation_report));
+    let (status, failure_reason) = completed_product_validation_outcome(
+        true,
+        Some("passed"),
+        None,
+        Some(&automation_report),
+        true,
+    );
 
     assert_eq!(status, ProductValidationStatus::Passed);
     assert_eq!(failure_reason, None);
@@ -1120,11 +1204,167 @@ fn completed_product_validation_rejects_nonblank_loading_reference_capture() {
         }]
     });
 
-    let (status, failure_reason) =
-        completed_product_validation_outcome(true, Some("passed"), None, Some(&automation_report));
+    let (status, failure_reason) = completed_product_validation_outcome(
+        true,
+        Some("passed"),
+        None,
+        Some(&automation_report),
+        true,
+    );
 
     assert_eq!(status, ProductValidationStatus::Failed);
     assert!(failure_reason.unwrap().contains("GPU viewport_capture"));
+}
+
+fn resident_navigation_report() -> Value {
+    let snapshot = |reads: u64,
+                    submissions: u64,
+                    retained: u64,
+                    gpu_timings: u64,
+                    cpu_timings: u64,
+                    publications: u64| {
+        let samples = (1..=publications)
+            .map(|sequence| {
+                json!({
+                    "sequence": sequence,
+                    "frame": sequence + 1,
+                    "interval_ns": (sequence > 1).then_some(16_000_000_u64),
+                    "cpu_planning_ns": 10_000,
+                    "cpu_queue_submit_ns": 1_000,
+                    "gpu_execution_id": 100 + sequence,
+                    "gpu_presentation": 7,
+                    "gpu_frame": sequence + 1,
+                    "gpu_timing_complete": true,
+                    "gpu_upload_ns": Value::Null,
+                    "gpu_volume_pass_ns": 1_000_000,
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "dataset_source_io": {
+                "reader": {
+                    "physical_range_read_operations": reads,
+                    "codec_decode_operations": reads,
+                },
+                "physical_bricks": {"unique_decodes": reads},
+            },
+            "dataset_runtime": {"counters": {"submitted_requests": reads}},
+            "gpu_adapter": {
+                "uploads": {"resources": reads, "payload_bytes": reads},
+                "queue_submissions": submissions,
+                "retained_navigation_frames": retained,
+                "timing": {
+                    "enabled": true,
+                    "completed": gpu_timings,
+                    "cpu": {"completed": cpu_timings},
+                },
+            },
+            "render": {
+                "progressive_presentation": {
+                    "last_3d_cpu_timing": {
+                        "frame": publications + 1,
+                        "planning_ns": 10_000,
+                        "queue_submit_ns": 1_000,
+                    },
+                    "presented_frame_intervals": {
+                        "enabled": true,
+                        "total_publications": publications,
+                        "samples": samples,
+                    },
+                },
+            },
+        })
+    };
+    json!({
+        "status": "passed",
+        "viewport_evidence": {
+            "requested_mapped_client_pixels": {"width": 960, "height": 540},
+        },
+        "artifacts": [],
+        "diagnostics": [
+            snapshot(7, 10, 2, 1, 1, 1),
+            snapshot(7, 12, 4, 3, 3, 3),
+            snapshot(7, 12, 4, 3, 3, 3),
+        ],
+        "final_diagnostics": {
+            "render": {
+                "gpu_display_frame_present": true,
+                "frame_fidelity": {
+                    "target_scale_level": 0,
+                    "displayed_scale_level": 0,
+                    "completeness": "Complete",
+                    "display_freshness": "Current",
+                },
+            },
+        },
+    })
+}
+
+#[test]
+fn resident_navigation_completion_accepts_current_exact_no_capture_evidence() {
+    let report = resident_navigation_report();
+
+    let (status, reason) =
+        completed_product_validation_outcome(true, Some("passed"), None, Some(&report), false);
+
+    assert_eq!(status, ProductValidationStatus::Passed);
+    assert_eq!(reason, None);
+    assert!(resident_navigation_evidence(Some(&report)).is_ok());
+}
+
+#[test]
+fn resident_navigation_evidence_rejects_a_missing_structural_snapshot() {
+    let mut report = resident_navigation_report();
+    report["diagnostics"].as_array_mut().unwrap().pop();
+
+    let error = resident_navigation_evidence(Some(&report)).unwrap_err();
+
+    assert!(error.contains("requires baseline, post-navigation, and post-idle"));
+}
+
+#[test]
+fn resident_navigation_evidence_rejects_baseline_only_timing() {
+    let mut report = resident_navigation_report();
+    report["diagnostics"][0]["gpu_adapter"]["timing"]["cpu"]["completed"] = json!(3);
+
+    let error = resident_navigation_evidence(Some(&report)).unwrap_err();
+
+    assert!(error.contains("no new CPU renderer timing"));
+}
+
+#[test]
+fn resident_navigation_evidence_rejects_post_settle_publication() {
+    let mut report = resident_navigation_report();
+    report["diagnostics"][2]["render"]["progressive_presentation"]["presented_frame_intervals"]["total_publications"] =
+        json!(4);
+
+    let error = resident_navigation_evidence(Some(&report)).unwrap_err();
+
+    assert!(error.contains("settled frames added 1 current 3D publications"));
+}
+
+#[test]
+fn resident_navigation_evidence_rejects_missing_exact_gpu_publication_binding() {
+    let mut report = resident_navigation_report();
+    report["diagnostics"][1]["render"]["progressive_presentation"]["presented_frame_intervals"]["samples"]
+        [1]["gpu_timing_complete"] = json!(false);
+    report["diagnostics"][1]["render"]["progressive_presentation"]["presented_frame_intervals"]["samples"]
+        [1]["gpu_volume_pass_ns"] = Value::Null;
+
+    let error = resident_navigation_evidence(Some(&report)).unwrap_err();
+
+    assert!(error.contains("unique exact-execution CPU/GPU timing"));
+}
+
+#[test]
+fn resident_navigation_evidence_rejects_fewer_gpu_timings_than_publications() {
+    let mut report = resident_navigation_report();
+    report["diagnostics"][1]["gpu_adapter"]["timing"]["completed"] = json!(2);
+    report["diagnostics"][2]["gpu_adapter"]["timing"]["completed"] = json!(2);
+
+    let error = resident_navigation_evidence(Some(&report)).unwrap_err();
+
+    assert!(error.contains("execution/publication counts disagree"));
 }
 
 #[test]

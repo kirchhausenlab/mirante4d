@@ -1,8 +1,10 @@
 use crate::retained_leases::RetainedLeases;
 use crate::viewer_layout::PanelId;
+use crate::histogram::active_layer_histogram_summary;
 use mirante4d_dataset::{
     DatasetResourceIdentity, DatasetResourceKey, DatasetSourceId, ResourceLease,
-    ResourcePayloadDescriptor, ResourcePayloadView, ResourceRegion, ResourceValidity,
+    ResourcePayloadDescriptor, ResourcePayloadFacts, ResourcePayloadView, ResourceRegion,
+    ResourceValidity,
 };
 use mirante4d_domain::{LogicalLayerKey, ScaleLevel};
 
@@ -26,6 +28,10 @@ impl ResourceLease for HistogramTestLease {
                 (self.descriptor.validity_byte_len() != 0).then_some(validity),
             )
             .unwrap()
+    }
+
+    fn payload_facts(&self) -> ResourcePayloadFacts {
+        ResourcePayloadFacts::from_payload(self.payload()).unwrap()
     }
 }
 
@@ -137,6 +143,45 @@ fn active_layer_histogram_reads_only_valid_lease_samples_and_keeps_valid_zero() 
     assert_eq!(histogram.bins.iter().sum::<u64>(), 3);
     assert!(window.low() >= 0.0);
     assert!(window.high() <= 20.0);
+}
+
+#[test]
+fn settled_histogram_cache_avoids_repaint_scans_and_unrelated_invalidations() {
+    let active = histogram_key(0, 0, 0, 0, 4);
+    let unrelated = histogram_key(1, 0, 0, 0, 4);
+    let mut bridge = RetainedLeases::new();
+    bridge.replace_requirements([active, unrelated]).unwrap();
+    bridge
+        .install(u16_histogram_lease(active, &[1, 2, 3, 4], None))
+        .unwrap();
+    let requirements = [active];
+    let input = || histogram::ActiveLayerHistogramInput {
+        requirements: &requirements,
+        identity: active.identity(),
+        layer: active.layer(),
+        layer_name: "intensity",
+        dtype: IntensityDType::Uint16,
+        timepoint: active.timepoint(),
+        scale: active.scale(),
+    };
+    let mut cache = histogram::ActiveLayerHistogramCache::default();
+
+    cache.summary(&bridge, input(), 11);
+    let settled_work = cache.work();
+    for _ in 0..100 {
+        cache.summary(&bridge, input(), 11);
+    }
+    assert_eq!(cache.work(), settled_work);
+
+    bridge
+        .install(u16_histogram_lease(unrelated, &[5, 6, 7, 8], None))
+        .unwrap();
+    cache.summary(&bridge, input(), 11);
+    assert_eq!(cache.work(), settled_work);
+
+    cache.summary(&bridge, input(), 12);
+    assert_eq!(cache.work().computations, settled_work.computations + 1);
+    assert!(cache.work().sample_visits > settled_work.sample_visits);
 }
 
 #[test]
@@ -286,6 +331,7 @@ fn application_playback_commands_reconcile_transient_state_and_timepoint() {
         app.apply_application_command(ApplicationCommand::SetPlaybackActive(true), &ctx),
         Ok(CommandEffect::Changed)
     );
+    await_visible_demand_plan(&mut app);
     let snapshot = app.application.snapshot();
     assert!(snapshot.transient().playback_active());
     assert_eq!(snapshot.transient().last_playback_tick(), None);
@@ -329,6 +375,7 @@ fn application_playback_commands_reconcile_transient_state_and_timepoint() {
 
     app.apply_application_command(ApplicationCommand::SetPlaybackActive(false), &ctx)
         .unwrap();
+    await_visible_demand_plan(&mut app);
     let snapshot = app.application.snapshot();
     assert!(!snapshot.transient().playback_active());
     assert_eq!(snapshot.transient().last_playback_tick(), None);

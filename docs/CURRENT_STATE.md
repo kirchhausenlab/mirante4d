@@ -1,6 +1,6 @@
 # Current State
 
-Last reviewed: 2026-07-16
+Last reviewed: 2026-07-18
 
 Mirante4D is public, pre-alpha academic research software. Persisted formats
 and APIs can change through explicit hard cutovers; there is no supported
@@ -14,7 +14,9 @@ public release or public full microscopy dataset yet.
   `m4d-zarr3-local-1.0` OME-NGFF 0.5.2/Zarr v3 sharded storage profile.
 - Canonical framework-neutral domain, identity, project-model, application,
   dataset-catalog, render-API, and settings boundaries.
-- MIP, DVR, and ISO intensity rendering with per-channel controls.
+- MIP, DVR, and ISO intensity rendering with per-channel controls,
+  orthographic and perspective projection, voxel-exact and smooth-linear
+  sampling, flat and gradient-lit ISO, and attached or detached ISO light.
 - One bounded, byte-accounted semantic-resource runtime for 3D, linked 2D,
   playback prefetch, histogram, interactive readout, and analysis demand.
 - TIFF/OME-TIFF import plus exact whole-layer time traces and numeric box
@@ -95,6 +97,86 @@ becomes visible only after one atomic project-store commit, and authenticated
 pairs are restored when the project reopens. There is one live canonical
 application reducer and one canonical project model.
 
+The viewer hot path now uses one persistent, byte-accounted logical WGPU
+storage-buffer arena, segmented across at most four maximal bindings to honor
+adapter binding limits, with direct `uint8`, `uint16`, and `float32` loads. A
+single allocator, residency epoch, eviction policy, and byte ledger govern the
+segments; they are not alternate representations. Each active
+layer has one compact sparse hash page table, so shader lookup no longer scans
+the resident-resource list for every sample. The renderer traverses volume
+bricks, skips missing, all-invalid, and mode-noncontributing bricks, applies
+DVR early termination, and jointly integrates multichannel DVR even for
+smooth sampling or mixed affine grids. All-invalid bricks are metadata-only
+residents. Uploads use one bounded persistent mapped staging pool, and exact
+residency addition/removal deltas coordinate CPU-lease retirement and
+recovery. Reused mapped slots clear only alignment gaps and tails, not payload
+spans that the upload immediately overwrites. GPU timestamp results and volume
+picks are asynchronous; neither requires the UI thread to wait for a GPU
+mapping operation.
+Full static render-control publication uses three queue writes regardless of
+the 65,536-entry availability pattern. Compatible exact successor bodies with
+at most 32 total added-and-removed keys preserve stable record/hash slots,
+publish copy-on-write cell deltas, and reconcile pins/LRU proportional to that
+delta;
+larger or incompatible changes use the sole dense builder. Individual
+residency changes patch only their stable records, including record-only
+dormant-prefetch uploads. Incremental runtime publication is
+capped at 64 writes before issuing any GPU operation and replaces a more
+fragmented delta with one bounded dense record-slab write. Diagnostics expose
+the total, per-frame peak, and fallback count.
+
+Application demand is signature-diffed and split by 3D, linked-panel,
+playback, and analysis scope. One bounded latest-only worker performs exact
+camera candidate testing, contribution ranking, canonicalization, scope
+deltas, render-requirement preparation, and static sparse-page preparation;
+the UI swaps completed immutable artifacts instead of rebuilding a large
+camera cohort. Sustained orbit replaces one pending request and cancels the
+older traversal while retaining the last exact presentation. A full-volume
+resident cohort bypasses camera planning entirely. A bounded 17/16 camera
+guard appends at most one quarter of the primary resources plus two as a
+dormant prefetch suffix. It may decode and publish GPU control records after
+visible work, but does not affect readiness, coverage, fidelity, rendering, or
+picks until an O(1) scalar promotion. Contained camera and full-volume reuse
+promote the installed dataset/render wrappers without a membership walk or
+static rebuild. A queued guard is reprioritized in place without a duplicate
+waiter, decode, or queue slot, and exact admission-cursor rewinds preserve
+canceled staged guard work across atomic promotion.
+
+Candidate bricks come from the selected-scale view volume rather than
+per-pixel ray discovery. Bounded admission cursors, exact eviction-recovery
+sets, and retained leases preserve overlapping work. Worker-prepared retained-
+union removal deltas and one atomically prevalidated batch cancellation make
+accepted plan publication proportional to changed waiters; rejected plans
+leave installed scopes and useful pending work intact. The shared runtime uses
+a lazy versioned priority heap, generation-predicated ledger/scheduler wakeups,
+bounded decode cohorts, and coalesced progress; capacity release cannot be
+lost in a check-to-wait window and does not rely on timeout polling. Cohort
+formation virtually
+reserves every selected member's still-uncharged working bound, so an
+individually admissible set cannot form an aggregate batch that repeatedly
+fails before publishing any bytes. The runtime
+reports cohort membership plus cancelled decode execution count, time, and
+bytes as explicit waste. A short fixed post-interaction grace keeps background
+verification below warm resident navigation. Verification blocks on a
+condition variable instead of periodically polling, then resumes after
+interaction settles.
+
+Normal local reads retain one accounted package-root descriptor, resolve
+named objects beneath it with Linux `openat2` no-symlink/no-magic-link
+constraints, and reuse at most 64 authenticated object handles with their
+decoded shard indexes. One byte-accounted eight-entry physical-brick cache
+coalesces sequential and concurrent semantic consumers, including the sixteen
+2D semantic regions that may share one physical chunk. Aligned full 3D bricks
+stream through bounded writable spans directly into the runtime-owned sink
+without a payload-sized copy. Current-view cohort members share one fail-closed
+pre-use/post-use currentness transaction while preserving member-local faults
+and cancellation. Verified delivery trusts packed payload facts only after the
+scientific verifier has decoded and checked every pyramid scale. Reuse and
+batching do not weaken mutation detection or scientific identity. Native
+codec/range workspace is released immediately after physical decode; only the
+exact decoded-brick retention charge may survive a residency-capacity bypass
+while joined semantic consumers finish.
+
 ## Foundation Status
 
 The foundation refactor through WP-15 is complete. It
@@ -111,6 +193,60 @@ format, project-store, packaging, and product checks remain explicit local
 commands used only when their boundaries change.
 
 See [testing](TESTING.md) for commands and claim language.
+
+## Viewer Performance Overhaul Status
+
+The renderer, demand, scheduling, storage-read, capability-restoration, and
+small-tool implementation described above remains the current product
+baseline in the worktree. The complete PR profile passes all 11 policy phases,
+all 8 Rust phases, and 1,230 selected tests on the current dirty worktree. The
+current ignored trusted-Vulkan inventory contains nine renderer cases; its
+exact result will be recorded again on the clean EP-00 baseline revision. Both
+native-window viewer scenarios previously passed.
+The render-modes scenario exercised the restored mode/tool surface without a
+validation error. The no-readback resident-navigation scenario observed zero
+physical reads, decodes, dataset requests, payload uploads, or post-idle
+submissions during its warm camera move.
+
+Those runs are supporting E1/internal component evidence, not a qualified
+performance result or E4 product validation. Subsequent owner product testing
+found the baseline materially better but rejected it as the performance
+outcome: wheel zoom can lag or freeze, the four-panel workflow can use an
+unjustifiably coarse LOD, and compound-angle movement can visibly expose
+arriving bricks. No absolute performance or comparison-viewer claim follows
+from the existing evidence.
+
+The active
+[viewer performance plan](plans/active/VIEWER_PERFORMANCE_OVERHAUL.md) now
+records an authorized replacement end-to-end design spanning preprocessing,
+the experimental storage profile, streaming, caching, shared GPU residency,
+arbitrary planes, MIP/DVR/ISO, LOD, interaction, and complete presentation.
+It mandates one cubic-brick spatial representation shared by 2D and 3D and
+excludes anisotropic or orientation-specific payloads.
+
+EP-00 measurement authority is implemented in the current worktree. One
+strict external v3 profile binds the private representative and temporal
+packages, import source inventory, accepted hardware/display/storage tuple,
+ten exact scenarios, interaction scripts, independent LOD and numerical
+oracles, fidelity states, resource ledgers, and absolute thresholds without
+placing private paths or unpublished identities in the repository. Product
+diagnostics now expose exact generation/target timing identity, per-view
+scale and coverage, coordinated-frame and structural work, canonical resource
+unions, bounded timing histories, source/import receipts, and correctly named
+copy/control/render intervals. Synthetic copy and empty-pass controls plus a
+Naga structural audit guard timestamp placement and production shader shape.
+
+A fresh normal-product IP exercise has passed its exact source-preservation,
+deterministic publication, open-ready, currentness, receipt-reconciliation,
+memory, descriptor, temporary-storage, and time gates. The strict complete
+predecessor baseline still awaits one clean immutable revision. Focused
+predecessor evidence already reproduces the off-axis perspective DVR distance
+error, unjustifiably coarse four-panel LOD, temporal refinement handoff, and
+prepared-layout lineage defects; these are baseline findings, not accepted
+successor behavior. EP-01 representation selection and the atomic EP-02
+through EP-06 successor remain unimplemented. Final sampling and externally
+inspected EP-07 normal-product validation also remain required before
+performance completion language is appropriate.
 
 ## Import And Preprocessing Performance
 
@@ -193,16 +329,20 @@ historical T5 performance claim.
 - Packaged runtime does not expose unsaved-autosave recovery.
 - Direct X11 close of a clean project can hit an inherited Winit shutdown
   panic; the dirty-project save/discard/cancel route exits cleanly.
-- Exact linked-panel cursor readout is available from retained leases; 3D GPU
-  intensity hover remains unavailable rather than sampling a placeholder.
+- Exact linked-panel cursor readout remains lease-backed. The 3D viewer now
+  submits latest-only asynchronous picks against the exact presented GPU
+  residency for MIP, DVR, and ISO; stale or retired frames fail visibly rather
+  than reading a placeholder.
 - Rendered-viewport-derived statistics remain unavailable. Product analysis
   instead computes exact source-voxel statistics for a whole layer over time or
   a numeric box at the current timepoint; loading placeholders are never
   reported as scientific zeros.
-- Product rendering currently supports voxel-exact sampling, flat ISO shading,
-  one semantic scale per layer, 256 requirement records, and 128 supplied
-  leases per call. Unsupported cases fail explicitly instead of silently
-  changing the scientific display request.
+- Product rendering remains bounded to 1920x1080, at most 64 active layers,
+  65,536 requirement records per presentation, and the configured/device GPU
+  byte limits. The former 256-requirement, 128-lease, voxel-exact-only,
+  flat-ISO-only, orthographic-only, and 16,384-voxel global-dimension ceilings
+  are absent. Capacity and unsupported-adapter cases remain typed instead of
+  silently changing scale or display semantics.
 - Windows and macOS are not qualified targets. 4K is intentionally out of
   scope.
 - Current persisted formats have no compatibility promise.

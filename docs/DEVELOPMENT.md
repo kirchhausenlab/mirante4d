@@ -73,6 +73,27 @@ MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
   cargo xtask verify-local trusted-gpu
 ```
 
+For viewer/rendering work, the focused release diagnostics and normal-product
+scenarios are:
+
+```bash
+cargo test --release -p mirante4d-render-wgpu \
+  resident_volume_gpu_timing -- --ignored --nocapture
+cargo test --release -p mirante4d-render-wgpu \
+  payload_buffer_vs_texture_gpu_timing -- --ignored --nocapture
+MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display \
+  cargo xtask product-validate target_fixture_render_modes
+MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display \
+  cargo xtask product-validate \
+    target_fixture_resident_navigation_no_readback
+```
+
+The two ignored tests are component diagnostics. The product commands use the
+normal release application; the resident-navigation scenario avoids
+validation capture/readback. None is a final performance qualification without
+the owner-bound workload, fidelity floor, metrics, samples, and absolute
+thresholds required by [Testing](TESTING.md).
+
 The project-store power-cut check is reserved for changes to its qualified
 durability boundary. Do not rerun it for unrelated work:
 

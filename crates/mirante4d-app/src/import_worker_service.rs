@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        mpsc::{self, Receiver, TryRecvError},
+        mpsc::{self, Receiver, SyncSender, TryRecvError},
     },
     thread::JoinHandle,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -261,11 +261,13 @@ impl ImportWorkerDiagnosticsHandle {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct ImportWorkerService {
     active: Option<ActiveWorker>,
     diagnostics: ImportWorkerDiagnosticsHandle,
+    completion_wake: Option<CompletionWake>,
 }
+
+type CompletionWake = Arc<dyn Fn() + Send + Sync>;
 
 enum ActiveWorker {
     Inspection(InspectionWorker),
@@ -331,7 +333,16 @@ impl ImportWorkerService {
                     last_successful_import: None,
                 },
             ))),
+            completion_wake: None,
         }
+    }
+
+    /// Installs the native event-loop wake used after a subsequently started
+    /// worker publishes its one terminal result. The worker never calls this
+    /// before the bounded result channel accepts that result, so a wake always
+    /// makes pollable progress available to composition.
+    pub(crate) fn set_completion_wake(&mut self, wake: impl Fn() + Send + Sync + 'static) {
+        self.completion_wake = Some(Arc::new(wake));
     }
 
     pub(crate) fn diagnostics(&self) -> ImportWorkerDiagnostics {
@@ -372,9 +383,10 @@ impl ImportWorkerService {
         }
         let cancellation = ImportCancellation::new();
         let (sender, result) = mpsc::sync_channel(1);
+        let completion_wake = self.completion_wake.clone();
         let worker =
             spawn_tiff_inspection_worker(source.clone(), cancellation.clone(), move |outcome| {
-                let _ = sender.send(outcome);
+                publish_inspection_completion(sender, outcome, completion_wake)
             });
         self.active = Some(ActiveWorker::Inspection(InspectionWorker {
             source,
@@ -419,6 +431,7 @@ impl ImportWorkerService {
             source_fingerprint,
             reviewed_source_bytes,
         };
+        let completion_wake = self.completion_wake.clone();
         let worker = spawn_tiff_import_worker(
             options.clone(),
             ledger,
@@ -428,7 +441,7 @@ impl ImportWorkerService {
                 worker_events.record(event);
             },
             move |outcome| {
-                let _ = sender.send(outcome);
+                publish_import_completion(sender, outcome, completion_wake);
             },
         );
         self.active = Some(ActiveWorker::Import(Box::new(ImportWorker {
@@ -493,6 +506,40 @@ impl ImportWorkerService {
         if join_worker(active.take_worker()).is_err() {
             tracing::error!("import worker panicked during shutdown");
         }
+    }
+}
+
+impl Default for ImportWorkerService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn publish_inspection_completion(
+    sender: SyncSender<Result<TiffInspection, ImportError>>,
+    outcome: Result<TiffInspection, ImportError>,
+    completion_wake: Option<CompletionWake>,
+) {
+    publish_terminal_completion(sender, outcome, completion_wake);
+}
+
+fn publish_import_completion(
+    sender: SyncSender<Result<PublishedImport, ImportError>>,
+    outcome: Result<PublishedImport, ImportError>,
+    completion_wake: Option<CompletionWake>,
+) {
+    publish_terminal_completion(sender, outcome, completion_wake);
+}
+
+fn publish_terminal_completion<T>(
+    sender: SyncSender<T>,
+    outcome: T,
+    completion_wake: Option<CompletionWake>,
+) {
+    if sender.send(outcome).is_ok()
+        && let Some(wake) = completion_wake
+    {
+        wake();
     }
 }
 
@@ -587,7 +634,7 @@ fn epoch_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
 
@@ -642,6 +689,52 @@ mod tests {
     }
 
     #[test]
+    fn inspection_terminal_delivery_wakes_only_after_result_is_pollable() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let woke = Arc::new(AtomicBool::new(false));
+        let wake_receiver = Arc::clone(&receiver);
+        let wake_observed = Arc::clone(&woke);
+        let wake: CompletionWake = Arc::new(move || {
+            assert!(matches!(
+                wake_receiver
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .try_recv(),
+                Ok(Err(ImportError::Cancelled))
+            ));
+            wake_observed.store(true, Ordering::SeqCst);
+        });
+
+        publish_inspection_completion(sender, Err(ImportError::Cancelled), Some(wake));
+
+        assert!(woke.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn import_terminal_delivery_wakes_only_after_result_is_pollable() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let woke = Arc::new(AtomicBool::new(false));
+        let wake_receiver = Arc::clone(&receiver);
+        let wake_observed = Arc::clone(&woke);
+        let wake: CompletionWake = Arc::new(move || {
+            assert!(matches!(
+                wake_receiver
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .try_recv(),
+                Ok(Err(ImportError::Cancelled))
+            ));
+            wake_observed.store(true, Ordering::SeqCst);
+        });
+
+        publish_import_completion(sender, Err(ImportError::Cancelled), Some(wake));
+
+        assert!(woke.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn cancellation_keeps_the_worker_active_until_its_terminal_result() {
         let cancellation = ImportCancellation::new();
         let worker_cancellation = cancellation.clone();
@@ -661,6 +754,7 @@ mod tests {
                 worker: Some(worker),
             })),
             diagnostics: ImportWorkerDiagnosticsHandle::default(),
+            completion_wake: None,
         };
 
         assert!(service.cancel_inspection());
@@ -699,6 +793,7 @@ mod tests {
                 worker: Some(worker),
             })),
             diagnostics: ImportWorkerDiagnosticsHandle::default(),
+            completion_wake: None,
         };
 
         let ImportWorkerCompletion::Inspection(completion) = wait_for_completion(&mut service)
@@ -736,6 +831,7 @@ mod tests {
                 worker: Some(worker),
             })),
             diagnostics: ImportWorkerDiagnosticsHandle::default(),
+            completion_wake: None,
         };
 
         service.shutdown();
@@ -766,6 +862,7 @@ mod tests {
                 worker: Some(worker),
             })),
             diagnostics: ImportWorkerDiagnosticsHandle::default(),
+            completion_wake: None,
         };
 
         drop(service);

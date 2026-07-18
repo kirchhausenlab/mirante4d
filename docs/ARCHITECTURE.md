@@ -1,6 +1,6 @@
 # Architecture
 
-Last updated: 2026-07-16
+Last updated: 2026-07-17
 
 Mirante4D is a native Rust desktop viewer and analysis workbench. It opens
 strict `.m4d` packages; source microscopy data enters through explicit
@@ -28,17 +28,21 @@ The workspace has eighteen packages (seventeen `mirante4d-*` crates plus
 - `mirante4d-dataset-runtime`: unified request, cancellation,
   deduplication, bounded configuration/diagnostics/progress, CPU-ledger,
   completion, fault, and accounted-lease contract plus the sole production
-  scheduler and worker owner.
+  scheduler and worker owner. Its production queue is a lazy versioned
+  priority heap with byte-size admission, per-ticket cancellation, ledger
+  wakeups, and low-cost decode/cancellation-waste accounting.
 - `mirante4d-analysis-core`: pure exact intensity operations, deterministic
   statistics, and canonical table/plot artifact payloads.
 - `mirante4d-analysis-runtime`: bounded, cancellable analysis execution over
   shared dataset-runtime requests, producing pending atomic artifact bundles.
 - `mirante4d-render-api`: backend-neutral intent, requirements, progressive
-  frame status, opaque presentation lifecycle, and camera math.
+  frame status, opaque presentation lifecycle, camera math, and bounded
+  asynchronous volume-pick contracts.
 - `mirante4d-render-reference`: unpublished, bounded CPU oracle for renderer
   correctness; it owns no product route or GPU authority.
 - `mirante4d-render-wgpu`: sole product renderer, with bounded progressive GPU
-  residency and presentation built only against dataset leases and render
+  residency, direct page lookup, brick traversal, asynchronous timing and
+  picking, and presentation built only against dataset leases and render
   contracts.
 - `mirante4d-storage`: active target-profile catalog, checked ceilings,
   portable package paths, bounded local validation/reads, exact and scientific
@@ -213,6 +217,32 @@ remain owned and byte-accounted by `mirante4d-dataset-runtime`.
 payloads and passes borrowed semantic views to `mirante4d-render-wgpu`. There is
 no alternate reader, scheduler, CPU display fallback, or app-owned payload map.
 
+`LocalPackageReader` retains one byte-accounted package-root descriptor and
+uses Linux `openat2` with beneath/no-symlink/no-magic-link resolution for every
+normal named-object acquisition. One deterministic LRU retains at most 64
+authenticated object handles together with decoded shard indexes and one
+decoded packed-index inner per retained object. `LocalDatasetSource` adds one
+byte-accounted, eight-entry physical-brick cache. It coalesces an in-flight
+physical decode, retains a decoded physical brick only while the shared CPU
+ledger admits it, and fans one result out to semantic regions. This makes the
+current sixteen-quadrant 2D mapping one physical decode within the bounded
+reuse epoch. An epoch lasts only while the in-flight generation or decoded
+physical entry remains in that cache; LRU eviction starts a new epoch, and a
+semantic lease does not pin a duplicate full physical brick.
+Aligned full 3D resources instead stream codec output into the runtime-owned
+sink in bounded writable spans and avoid a payload-sized intermediate copy.
+Current-view workers may submit a bounded source cohort, so one guarded
+pre-use/post-use transaction covers its deduplicated object set while every
+member retains an independent cancellation and typed outcome. A verified
+source may use packed min/max/validity facts without rescanning a delivered
+payload only because scientific verification decoded and compared those facts
+at every runtime-addressable pyramid scale before issuing the capability.
+Every cached hit still revalidates its guarded object snapshots; source
+promotion refreshes matching authority in place and invalidates incompatible
+generations. Handle, index, physical-brick, codec, range, cohort/currentness,
+direct-span, post-decode-copy, and contention counters describe actual work
+without adding a second reader path.
+
 `AnalysisProductRuntime` is the narrow product bridge to the analysis
 runtime. It uses the shared dispatcher below interactive priority and keeps at
 most two analysis blocks in flight. Exact whole-layer time traces and numeric
@@ -231,11 +261,12 @@ use an opaque per-open source ID, never a fabricated scientific-content ID.
 ```text
 native package
   -> LocalPackageCatalog, LocalDatasetSource, and immutable logical catalog
-  -> canonical application snapshot
-  -> semantic 3D / linked-panel / playback demand
-  -> one bounded scheduler and CPU byte ledger
+  -> canonical application snapshot and selected-scale view volume
+  -> signature-diffed 3D / linked-panel / playback / analysis demand
+  -> one bounded priority scheduler and CPU byte ledger
   -> immutable accounted leases
-  -> bounded render-wgpu residency and progressive frame execution
+  -> persistent logical GPU payload arena and sparse per-layer page tables
+  -> brick traversal and progressive frame execution
   -> renderer-owned GPU target
   -> egui-wgpu presentation and diagnostics
 ```
@@ -246,14 +277,125 @@ architecture. Missing occupied data is loading/incomplete, never empty.
 An explicit zero-resource plan means the view is outside selected data (or no
 layer is visible); it is terminal and distinct from missing occupied data.
 
-The product renderer owns one bounded WGPU arena, progressive residency,
-current-frame suppression, and automation-only asynchronous validation
-capture; the independent CPU oracle owns expected RGBA, coverage, and validity
-facts. Qualification covers voxel-exact sampling, flat ISO shading, and one
-semantic scale per layer; other intent variants are rejected explicitly rather
-than silently approximated. Fixed input ceilings are 256 requirement records
-and 128 supplied leases per call. Resident-resource metadata is capped at 256;
-GPU control and reported coverage include at most 128 resources.
+The product renderer owns one persistent exact-byte logical WGPU storage-
+buffer arena. It is segmented across at most four maximal storage bindings to
+honor per-binding adapter limits, but has one allocator, residency epoch,
+eviction policy, address space, and byte ledger. Its capacity is the minimum
+of the configured payload-ledger category and the adapter's aggregate usable
+storage-binding/device limits; `uint8`, `uint16`, and `float32` samples are
+loaded directly from native payload words. An exact-byte allocator and bounded
+undo log make frame admission transactional without cloning the whole arena
+map. Uploads use at most three persistent mapped staging slots whose combined
+size cannot exceed the transfer-ledger category.
+
+Each active layer receives one compact sparse hash page table containing only
+the presentation body's required brick coordinates plus any bounded dormant
+guard suffix, together with resident page metadata.
+The stable demand layout does not change merely because another payload
+becomes resident. A compatible exact successor with at most 32 total added-
+and-removed keys retains record and hash slots; worker-prepared copy-on-write
+deltas patch only those cells and use tombstones without reconstructing the
+table. The
+exact predecessor identity guards that incremental route, while a larger or
+incompatible geometry change uses the sole compact full builder. Residency
+changes patch only the affected stable records, and pin/LRU reconciliation is
+proportional to the semantic delta.
+Shader lookup probes that page directly instead of iterating the global
+resident set. Rays advance brick segment by brick segment, skip missing and
+all-invalid pages, apply transfer-aware min/max rejection, and stop DVR after
+effective opacity saturation. All-invalid pages occupy metadata but no payload
+arena bytes. Compatible voxel-exact DVR layers share the fast brick-segment
+loop; smooth or mixed-affine DVR layers use one common-world integration loop
+so channel ordering cannot change the optical result. ISO hits are depth
+ordered, and gradients are transformed to world space by the inverse-
+transpose affine.
+
+A full static control publication is prefix, one dense record slab, and page
+table: three queue writes even for an adversarial 65,536-entry residency
+pattern. A compatible body delta writes only changed stable record/page-table
+spans. A newly resident dormant guard can therefore publish one record-only
+control update without rendering. Runtime residency publication coalesces
+sparse spans but has a pre-write ceiling of 64 operations; a more fragmented
+delta falls back to one bounded dense record-slab write. This is a bounded
+control-publication choice inside the single renderer, not an alternate
+rendering path.
+
+The same renderer path supports MIP, DVR, ISO, orthographic and perspective
+projection, full finite affine transforms, voxel-exact and SmoothLinear
+sampling, flat and gradient-lit ISO, and attached or detached light. It also
+owns latest-only asynchronous compute picks against an exact presented
+page/arena snapshot. MIP argmax, first ISO threshold, and maximum DVR opacity
+contribution are distinct pick policies; smooth results are explicitly marked
+as interpolated samples. Crosshair, numeric ROI, and distance tools consume
+current exact world hits and draw through one small UI overlay model, not a
+scene graph.
+
+The UI evaluates bounded demand signatures; one latest-only camera-demand
+worker builds candidate bricks from the selected-scale view-volume AABB plus
+exact brick intersection, then freezes canonical sorted requirements,
+contribution-prioritized admission, scope deltas, render requirements, and the
+renderer-specific static sparse-page layout. Worker results share immutable
+arrays and their CPU-ledger lifetime, so the UI commits at scope/layer scale
+without cloning, sorting, indexing, or traversing the complete cohort.
+Sustained camera input replaces one pending job, cancels an older traversal at
+bounded checkpoints, and leaves the last exact image visible until the newest
+generation is ready. Each accepted camera body may append a fixed 17/16
+visibility guard after the exact primary prefix. Guard-only resources are
+bounded to at most one quarter of the primary count plus two, enter admission
+last at prefetch priority, and are resident-but-dormant: they do not affect
+coverage, readiness, fidelity, rendering, or picking until promoted. A camera
+contained by that envelope promotes the already-installed dataset and render
+wrappers through one scalar change, with no membership walk or static-layout
+rebuild. Complete full-volume reuse is the same O(1) case and skips worker
+submission. A live queued guard is reprioritized in place rather than creating
+a second waiter or decode; its admission cursor is rewound to the old primary
+boundary so the promoted tail is revisited even when the queue is full.
+
+Demand signatures and prepared retained unions preserve overlapping scope
+interest. The worker also computes the exact old-to-new retained-key removal
+delta. Publication first validates every scope, immutable-body identity,
+charge, and renderer union; it then retires obsolete runtime waiters with one
+atomically prevalidated batch and performs an infallible scope/union commit.
+Cancelled staged waiters carry their minimum exact retry cursor into the
+promoted scope, so atomic current/refinement replacement cannot strand an
+already-advanced guard position. A rejected result therefore neither cancels
+useful overlap nor exposes a mixed generation. A complete prior/coarse
+presentation remains eligible while the current target refines. The inactive
+hidden refinement target uses exact-frame-only presentation and swaps only
+when the required prefix is exact; target, scope, retained ownership, and
+ticket reconciliation then publish as one staged transaction.
+Exact renderer residency additions allow CPU display leases to retire after
+GPU commit; exact removals enter bounded per-scope recovery sets without
+restarting unrelated admission. Generation/dirty tracking suppresses a volume
+submission for an unchanged settled view. Background verification has lower
+priority than interaction and a fixed post-input/render grace. Its worker
+blocks on an explicit condition-variable wakeup while interaction is active,
+rather than polling, and resumes after that grace rather than starving on a
+warm resident camera path.
+
+Dataset scheduler and ledger wakeups carry predicate generations. A queue or
+capacity change that lands between a worker's check and wait is therefore
+observed without timeout recovery polling. While forming a decode cohort, the
+worker also subtracts the summed not-yet-charged source working bounds from
+available capacity; final sink buffers remain normally charged. This prevents
+self-overcommitted all-or-none cohorts while retaining optimistic competition
+between independent workers. Priority promotion validates the exact live
+ticket, updates its shared job and lazy-versioned heap entry under the same
+lock, and consumes neither another queue slot nor another source waiter.
+
+Renderer diagnostics include planning/submission work, payload/control upload,
+control-publication write count/peak/fallbacks, residency/reupload/eviction,
+staging and GPU-byte peaks, and optionally
+asynchronous GPU upload and volume-pass timestamps. Timing queries are opt-in
+for diagnostics/qualification rather than unconditional product readback.
+Automation-only validation capture remains asynchronous. The independent CPU
+oracle owns expected RGBA, coverage, and validity facts; it is not a product
+renderer. Checked API ceilings are 64 active layers, 65,536 requirements per
+presentation, five registered presentation targets with at most four active
+at once, and 1920x1080. The fifth registered target permits an inactive hidden
+target to stage an atomic refinement replacement without expanding the four-
+panel active union. The old 256-record,
+128-lease, and 16,384-global-dimension ceilings are deleted.
 
 ## Persistence And Settings
 

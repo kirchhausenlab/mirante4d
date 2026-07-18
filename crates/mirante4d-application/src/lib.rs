@@ -30,10 +30,11 @@ pub use project_store_service::{
 };
 pub use render_coordination::{
     CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
-    CrossSectionPanelScheduleStatus, DisplayRefreshPath, DisplayRefreshTiming,
+    CrossSectionPanelScheduleStatus, DISPLAY_TIMING_SAMPLE_CAPACITY, DisplayDiagnosticCounters,
+    DisplayGenerationStatus, DisplayRefreshPath, DisplayRefreshTiming, DisplayTimingSamples,
     DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind, FrameFidelityStatus,
-    LodDecisionReason, RenderBackend, RenderCoordinationState, RenderSurfaceState,
-    ResidentRenderFailureStatus,
+    LayerPresentationOverflow, LayerPresentationStatus, LodDecisionReason, RenderBackend,
+    RenderCoordinationState, RenderSurfaceState, ResidentRenderFailureStatus,
 };
 
 use std::{
@@ -47,7 +48,7 @@ pub use mirante4d_domain::{
     CameraView, CrossSectionView, DisplayWindow, DvrOpacityTransfer, IsoLightState,
     IsoShadingPolicy, LayerTransfer, Opacity, Projection, RenderMode, RenderState, RgbColor,
     SamplingPolicy, TRANSFER_GAMMA_MAX, TRANSFER_GAMMA_MIN, TimeIndex, ToolKind, TransferCurve,
-    ViewerLayout,
+    ViewerLayout, WorldPoint3,
 };
 use mirante4d_identity::ScientificContentId;
 use mirante4d_project_model::{
@@ -61,7 +62,11 @@ pub use mirante4d_project_model::{
 };
 pub use mirante4d_project_store::ProjectGenerationId;
 use mirante4d_render_api::PresentedFrame;
-pub use mirante4d_render_api::{PresentationPaintRequest, PresentationViewport, RenderExtent};
+pub use mirante4d_render_api::{
+    CameraFrame, PresentationPaintRequest, PresentationViewport, ProjectedWorldPoint, RenderExtent,
+    RenderExtentEnvelope, VolumePickCompleteness, VolumePickHitKind, VolumePickPolicy,
+    VolumePickQuery, VolumePickResult, VolumePickTicket, VolumePickValue,
+};
 use mirante4d_settings::RejectedFileDisposition;
 pub use mirante4d_settings::ResourcePolicy;
 
@@ -2100,6 +2105,13 @@ impl ApplicationState {
         &mut self,
         panel: Option<CrossSectionPanelId>,
     ) -> Result<CommandEffect, ApplicationFaultCode> {
+        let four_panel = match &self.workspace {
+            Workspace::Unbound(workspace) => workspace.view.layout() == ViewerLayout::FourPanel,
+            Workspace::Bound(workspace) => {
+                workspace.current_state().view().layout() == ViewerLayout::FourPanel
+            }
+        };
+        let panel = panel.filter(|_| four_panel);
         if self.transient.active_cross_section_panel == panel {
             return Ok(CommandEffect::NoChange);
         }
@@ -2181,6 +2193,16 @@ impl ApplicationState {
     }
 
     fn normalize_transient_selections(&mut self) {
+        let four_panel = match &self.workspace {
+            Workspace::Unbound(workspace) => workspace.view.layout() == ViewerLayout::FourPanel,
+            Workspace::Bound(workspace) => {
+                workspace.current_state().view().layout() == ViewerLayout::FourPanel
+            }
+        };
+        if !four_panel {
+            self.transient.active_cross_section_panel = None;
+        }
+
         let (analysis_tables, analysis_plots) = match &self.workspace {
             Workspace::Unbound(_) => (Vec::new(), Vec::new()),
             Workspace::Bound(workspace) => {
@@ -2909,9 +2931,17 @@ impl ApplicationState {
         if catalog.scientific_identity().verified_id() != Some(&identity) {
             return Err(ApplicationFaultCode::DatasetIdentityMismatch);
         }
-        let expected =
+        let expected_runtime_catalog =
             catalog_with_identity(&self.catalog, ScientificIdentityStatus::Verified(identity))?;
-        if catalog.as_ref() != &expected {
+        let expected_scientific_catalog = DatasetCatalog::new(
+            self.catalog.label(),
+            ScientificIdentityStatus::Verified(identity),
+            self.catalog.layers().cloned().collect(),
+        )
+        .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)?;
+        if catalog.as_ref() != &expected_runtime_catalog
+            && catalog.as_ref() != &expected_scientific_catalog
+        {
             return Err(ApplicationFaultCode::DatasetIdentityMismatch);
         }
         if let Workspace::Bound(bound) = &self.workspace
@@ -2923,7 +2953,7 @@ impl ApplicationState {
             return Err(ApplicationFaultCode::DatasetIdentityMismatch);
         }
 
-        self.catalog = catalog;
+        self.catalog = Arc::new(expected_runtime_catalog);
         self.verified_source = Some(dataset);
         self.source_verification_progress = None;
         self.advance_currentness()?;
@@ -3280,11 +3310,32 @@ impl PresentationSlot {
 pub struct PresentationSurface {
     viewport: PresentationViewport,
     frame: Option<PresentedFrame>,
+    frame_current: bool,
 }
 
 impl PresentationSurface {
     pub const fn new(viewport: PresentationViewport, frame: Option<PresentedFrame>) -> Self {
-        Self { viewport, frame }
+        Self {
+            viewport,
+            frame_current: frame.is_some(),
+            frame,
+        }
+    }
+
+    /// Projects a retained display frame separately from whether it is
+    /// scientifically current for interaction. A stale frame may remain
+    /// paintable while its replacement is pending, but cannot be picked.
+    pub const fn with_frame_currentness(
+        viewport: PresentationViewport,
+        frame: Option<PresentedFrame>,
+        frame_current: bool,
+    ) -> Self {
+        let frame_current = frame.is_some() && frame_current;
+        Self {
+            viewport,
+            frame,
+            frame_current,
+        }
     }
 
     pub const fn viewport(&self) -> PresentationViewport {
@@ -3293,6 +3344,14 @@ impl PresentationSurface {
 
     pub const fn frame(&self) -> Option<&PresentedFrame> {
         self.frame.as_ref()
+    }
+
+    pub fn current_frame(&self) -> Option<&PresentedFrame> {
+        self.frame_current.then_some(self.frame.as_ref()).flatten()
+    }
+
+    pub const fn frame_is_current(&self) -> bool {
+        self.frame_current
     }
 
     pub fn paint_request(&self) -> Option<PresentationPaintRequest> {
@@ -3576,12 +3635,9 @@ fn catalog_with_identity(
     catalog: &DatasetCatalog,
     scientific_identity: ScientificIdentityStatus,
 ) -> Result<DatasetCatalog, ApplicationFaultCode> {
-    DatasetCatalog::new(
-        catalog.label(),
-        scientific_identity,
-        catalog.layers().cloned().collect(),
-    )
-    .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)
+    catalog
+        .with_scientific_identity(scientific_identity)
+        .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)
 }
 
 fn catalog_timepoint_count(catalog: &DatasetCatalog) -> u64 {

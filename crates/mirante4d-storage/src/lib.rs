@@ -48,7 +48,9 @@ pub use control::{
     TypedId, U64Decimal, manifest_page_path, pack_manifest_pages, profile_compatibility_bytes,
 };
 pub use dataset_source::{
-    LocalDatasetSource, LocalDatasetSourceOpenError, PACKAGE_VALIDATION_WORKING_BYTES,
+    LocalDatasetSource, LocalDatasetSourceDiagnostics, LocalDatasetSourceOpenError,
+    LocalDatasetSourcePromotionError, LocalDatasetSourcePromotionFailure,
+    PACKAGE_VALIDATION_WORKING_BYTES,
 };
 pub use directory_inventory::{DirectoryInventory, DirectoryInventoryError};
 pub use error::StorageProfileError;
@@ -90,7 +92,9 @@ pub use profile::{
     INNER_CODECS, OUTER_CODEC, PROFILE, ProfileKind, ScaleCountRule, StorageShape, profile_limits,
 };
 pub use range_io::{
-    LocalObjectInfo, LocalPackageReader, RangeReadError, SHARD_INDEX_RANGE_READ_BYTES_MAX,
+    LOCAL_OBJECT_CACHE_ACCOUNTED_BYTES_MAX, LOCAL_OBJECT_CACHE_ENTRY_BYTES_MAX,
+    LOCAL_OBJECT_HANDLE_CACHE_MAX, LocalObjectInfo, LocalPackageReadDiagnostics,
+    LocalPackageReader, RangeReadError, SHARD_INDEX_RANGE_READ_BYTES_MAX,
 };
 pub use shard::{
     CanonicalEncodedInner, INNER_CODEC_WORKING_BYTES_MAX, ShardCodecError, ShardIndex,

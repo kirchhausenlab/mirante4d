@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -7,6 +8,7 @@ use std::{
 mod analysis_product;
 mod analysis_session;
 mod analysis_workspace;
+mod camera_demand_cache;
 mod cross_section_readout;
 mod cross_section_scheduler;
 mod current_settings_connection;
@@ -35,6 +37,7 @@ mod smoke;
 mod transfer_presets;
 mod unified_source_open;
 mod viewer_layout;
+mod viewer_pick_runtime;
 mod viewport;
 mod workbench_brick_runtime;
 mod workbench_controls;
@@ -51,20 +54,19 @@ use cross_section_readout::cross_section_hover_readout_for_panel_point;
 pub use diagnostics::{StartupDiagnostics, collect_startup_diagnostics, default_log_path};
 use eframe::egui;
 use fidelity::composite_fidelity_label;
-use histogram::active_layer_histogram_summary;
 #[cfg(test)]
 use import_worker_service::ImportWorkerStatus;
 use import_worker_service::{ImportWorkerCompletion, ImportWorkerOutcome};
 use import_workflow::{ImportWorkflow, reset_checkpoint_directory, tiff_destination};
 use mirante4d_application::LayerHistogramSummary;
 use mirante4d_application::{
-    ApplicationCommand, ApplicationEvent, ApplicationFault, ApplicationFaultCode,
-    ApplicationSnapshot, ApplicationState, CommandEffect, DisplayRefreshPath, DisplayRefreshTiming,
-    OperationCompletion, OperationFailureCode, OperationKind, OperationToken, PresentationSlot,
-    PresentationSnapshot, PresentationSurface, ProjectRecoveryStoreLocator,
+    ApplicationCommand, ApplicationCommandKind, ApplicationEvent, ApplicationFault,
+    ApplicationFaultCode, ApplicationSnapshot, ApplicationState, CommandEffect, DisplayRefreshPath,
+    DisplayRefreshTiming, OperationCompletion, OperationFailureCode, OperationKind, OperationToken,
+    PresentationSlot, PresentationSnapshot, PresentationSurface, ProjectRecoveryStoreLocator,
     ProjectStoreApplicationService, ProjectStoreLifecycle, ProjectStoreServiceEvent,
     RenderCoordinationState, ResidentRenderFailureStatus, SourceSessionGeneration,
-    SourceVerificationSnapshot, SystemMonotonicClock, WorkspaceSnapshot,
+    SourceVerificationSnapshot, SystemMonotonicClock, VolumePickTicket, WorkspaceSnapshot,
     import_workflow::{ImportCommand, ImportReviewId},
     viewer_tools::ViewerToolState,
     viewport_interaction::default_camera_for_shape,
@@ -79,7 +81,7 @@ use mirante4d_application::{
     HistogramStatus, auto_dense_window_from_histogram, auto_signal_window_from_histogram,
     histogram_can_auto_window, import_workflow::ImportWorkflowSnapshot, stepped_timepoint,
 };
-use mirante4d_dataset::{DatasetSourceId, ResourceValidity};
+use mirante4d_dataset::{DatasetSourceId, ResourceValidity, ScientificIdentityStatus};
 #[cfg(test)]
 use mirante4d_domain::{IntensityDType, Shape3D, TimeIndex};
 use mirante4d_domain::{ScaleLevel, ViewerLayout as CanonicalViewerLayout};
@@ -91,7 +93,7 @@ use mirante4d_project_store::{
     ProjectGenerationId, ProjectOpenMode, ProjectRecoveryCandidate, ProjectStoreConfig,
     ProjectStoreFault, ProjectStorePath, ProjectStoreRequestId,
 };
-use mirante4d_render_api::PresentationViewport;
+use mirante4d_render_api::{PresentationToken, PresentationViewport};
 use mirante4d_render_wgpu::{WgpuRenderRuntime, WgpuRenderRuntimeConfig};
 use mirante4d_settings::{RejectedFileDisposition, ResourcePolicy, recommended_for_current_system};
 use mirante4d_ui_egui as ui_kit;
@@ -110,13 +112,36 @@ use workbench_controls::{
     request_background_work_repaint_after,
 };
 
+#[derive(Debug, Clone)]
+struct DeterministicFailureLatch<S> {
+    signature: S,
+}
+
+impl<S> DeterministicFailureLatch<S> {
+    const fn new(signature: S) -> Self {
+        Self { signature }
+    }
+
+    fn blocks(&self, matches: impl FnOnce(&S) -> bool) -> bool {
+        matches(&self.signature)
+    }
+}
+
 const BACKGROUND_WORK_REPAINT_INTERVAL: Duration = Duration::from_millis(50);
 pub(crate) const CROSS_SECTION_INTERACTION_SETTLE_DURATION: Duration = Duration::from_millis(120);
+/// Verification is intentionally held off for a short, fixed interval after
+/// real viewer input or a render submission. Warm-resident navigation has no
+/// dataset tickets, so pending-I/O alone cannot represent interaction load.
+const VIEWER_VERIFICATION_GRACE: Duration = Duration::from_millis(150);
 const DVR_DENSITY_SCALE_MIN: f64 = 0.1;
 const DVR_DENSITY_SCALE_MAX: f64 = 64.0;
 const CROSS_SECTION_FAST_SLICE_MULTIPLIER: f64 = 10.0;
 const CROSS_SECTION_ROTATE_RADIANS_PER_POINT: f64 = 0.005;
 const PROJECT_RECOVERY_ROOT_ENTRIES_MAX: usize = 64;
+
+fn viewer_verification_grace_active(deadline: Option<Instant>, now: Instant) -> bool {
+    deadline.is_some_and(|deadline| now < deadline)
+}
 
 fn application_view(snapshot: &ApplicationSnapshot) -> &ViewState {
     snapshot.view()
@@ -450,12 +475,43 @@ pub struct MiranteWorkbenchApp {
     dataset: dataset_requests::DatasetDemandState,
     render_coordination: RenderCoordinationState,
     native_presentation: native_presentation::NativePresentationBridge,
+    viewer_pick_queue: viewer_pick_runtime::ViewerPickQueue<VolumePickTicket>,
+    progressive_display_pacer: workbench_brick_runtime::ProgressiveDisplayRefreshPacer,
+    display_performance_milestones: display_refresh::DisplayPerformanceMilestones,
+    display_instrumentation_epoch: Instant,
+    camera_demand_planner: camera_demand_cache::CameraDemandPlanner,
+    pending_visible_demand_plan: Option<workbench_brick_runtime::PendingVisibleDemandPlan>,
+    visible_demand_failure_latch:
+        Option<DeterministicFailureLatch<workbench_brick_runtime::VisibleDemandFailureSignature>>,
+    viewer_render_failure_latches: BTreeMap<
+        PresentationToken,
+        DeterministicFailureLatch<display_refresh::ProductRenderFailureSignature>,
+    >,
+    viewer_runtime_recovery_epoch: u64,
+    prepared_scope_render_plans: BTreeMap<u64, workbench_brick_runtime::PreparedScopeRenderPlan>,
+    last_visible_demand_candidates_visited: Option<usize>,
+    staged_post_promotion_renderer_update:
+        Option<camera_demand_cache::PreparedRendererRequirementUpdate>,
+    last_camera_demand_planning_duration: Option<Duration>,
+    current_camera_reuse_envelope: Option<semantic_demand::SemanticCameraReuseEnvelope>,
+    visible_demand_planning_signature:
+        Option<workbench_brick_runtime::VisibleDemandPlanningSignature>,
+    viewer_verification_busy_until: Option<Instant>,
+    active_histogram_cache: histogram::ActiveLayerHistogramCache,
     egui_ui: ui_kit::EguiUiState,
     import: ImportWorkflow,
     analysis_runtime: analysis_session::AnalysisProductRuntime,
     product_automation: Option<ProductAutomationController>,
     #[cfg(test)]
     test_render_viewport_max_side: Option<usize>,
+    #[cfg(test)]
+    runtime_diagnostics_collections: std::cell::Cell<u64>,
+    #[cfg(test)]
+    visible_demand_plan_calls: u64,
+    #[cfg(test)]
+    cross_section_demand_plan_calls: u64,
+    #[cfg(test)]
+    product_render_attempts: u64,
     project_store: Option<ProjectStoreApplicationService<SystemMonotonicClock>>,
     project_recovery_root: Option<PathBuf>,
     project_recovery_candidates: Vec<ProjectRecoveryCandidate>,
@@ -520,13 +576,22 @@ impl MiranteWorkbenchApp {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("the interactive viewer requires the WGPU renderer"))?;
         let product_automation = ProductAutomationController::from_env();
-        let validation_capture = product_automation.is_some();
+        let validation_capture = product_automation
+            .as_ref()
+            .is_some_and(ProductAutomationController::requires_validation_capture);
+        let gpu_timing = product_automation
+            .as_ref()
+            .is_some_and(ProductAutomationController::requires_gpu_timing);
+        let diagnostic_counters = product_automation
+            .as_ref()
+            .is_some_and(ProductAutomationController::requires_diagnostic_counters);
         let product_renderer = WgpuRenderRuntime::from_existing_device(
             &render_state.adapter,
             render_state.device.clone(),
             render_state.queue.clone(),
             WgpuRenderRuntimeConfig::new(resource_policy.gpu_budget_bytes())?
-                .with_validation_capture(validation_capture),
+                .with_validation_capture(validation_capture)
+                .with_gpu_timing(gpu_timing),
         )
         .map_err(|error| anyhow::anyhow!("the progressive GPU renderer is required: {error}"))?;
         let renderer_diagnostics = product_renderer.diagnostics();
@@ -557,12 +622,39 @@ impl MiranteWorkbenchApp {
             dataset,
             render_coordination,
             native_presentation,
+            viewer_pick_queue: viewer_pick_runtime::ViewerPickQueue::default(),
+            progressive_display_pacer:
+                workbench_brick_runtime::ProgressiveDisplayRefreshPacer::default(),
+            display_performance_milestones: display_refresh::DisplayPerformanceMilestones::default(
+            ),
+            display_instrumentation_epoch: Instant::now(),
+            camera_demand_planner: camera_demand_cache::CameraDemandPlanner::new()?,
+            pending_visible_demand_plan: None,
+            visible_demand_failure_latch: None,
+            viewer_render_failure_latches: BTreeMap::new(),
+            viewer_runtime_recovery_epoch: 0,
+            prepared_scope_render_plans: BTreeMap::new(),
+            last_visible_demand_candidates_visited: None,
+            staged_post_promotion_renderer_update: None,
+            last_camera_demand_planning_duration: None,
+            current_camera_reuse_envelope: None,
+            visible_demand_planning_signature: None,
+            viewer_verification_busy_until: None,
+            active_histogram_cache: histogram::ActiveLayerHistogramCache::default(),
             egui_ui,
             import: ImportWorkflow::new(),
             analysis_runtime,
             product_automation,
             #[cfg(test)]
             test_render_viewport_max_side: None,
+            #[cfg(test)]
+            runtime_diagnostics_collections: std::cell::Cell::new(0),
+            #[cfg(test)]
+            visible_demand_plan_calls: 0,
+            #[cfg(test)]
+            cross_section_demand_plan_calls: 0,
+            #[cfg(test)]
+            product_render_attempts: 0,
             project_store,
             project_recovery_root,
             project_recovery_candidates: Vec::new(),
@@ -588,9 +680,23 @@ impl MiranteWorkbenchApp {
             ),
             pending_automatic_source_verification: None,
         };
+        app.render_coordination
+            .set_display_diagnostic_counters_enabled(diagnostic_counters);
+        let mut product_automation = app.product_automation.take();
+        let startup_bootstrap = product_automation
+            .as_mut()
+            .map(|automation| automation.apply_startup_bootstrap(&mut app, &cc.egui_ctx))
+            .transpose();
+        app.product_automation = product_automation;
+        startup_bootstrap
+            .map_err(|error| anyhow::anyhow!("automation startup bootstrap failed: {error}"))?;
+        // Establish visible interactive demand before the verifier can reserve
+        // its scan workspace. The verifier observes the busy predicate when
+        // its worker starts and therefore cannot overlap the initial decode
+        // cohort merely because thread scheduling happened to favor it.
+        app.request_opened_state_visible_work(Some(&cc.egui_ctx));
         app.request_current_source_verification();
         app.pump_application_services();
-        app.request_opened_state_visible_work(Some(&cc.egui_ctx));
         Ok(app)
     }
 
@@ -989,21 +1095,25 @@ impl MiranteWorkbenchApp {
         match event {
             ApplicationEvent::SourceVerificationRequested { token } => {
                 let path = self.dataset.selected_path().to_path_buf();
-                let resource_policy = self.application.snapshot().resource_policy();
                 let scan_ledger = self.dataset.cpu_ledger_arc();
-                let request = self
-                    .source_verification_service
-                    .as_mut()
+                let local_source = self.dataset.local_source().cloned();
+                let interactive_busy = self.source_verification_interactive_busy();
+                let request = local_source
                     .ok_or(
-                        current_source_verification_service::CurrentSourceVerificationServiceError::NoActiveOperation,
+                        current_source_verification_service::CurrentSourceVerificationServiceError::LocalSourceUnavailable,
                     )
-                    .and_then(|service| {
+                    .and_then(|local_source| {
+                        self.source_verification_service.as_mut().ok_or(
+                        current_source_verification_service::CurrentSourceVerificationServiceError::NoActiveOperation,
+                        ).and_then(|service| {
+                        service.set_interactive_busy(interactive_busy);
                         service.request_verification(
                             token.clone(),
                             path,
-                            resource_policy,
                             scan_ledger,
+                            local_source,
                         )
+                        })
                     });
                 if let Err(error) = request {
                     tracing::warn!(%error, "source-verification request failed");
@@ -1018,8 +1128,7 @@ impl MiranteWorkbenchApp {
             ApplicationEvent::SourceVerificationInvalidated { source_generation } => {
                 let snapshot = self.application.snapshot();
                 if *source_generation == snapshot.source_generation()
-                    && self.dataset.resource_identity()
-                        != snapshot.catalog().scientific_identity().resource_identity()
+                    && !self.dataset.source_quarantined()
                 {
                     self.retire_invalidated_source_runtime();
                 }
@@ -2194,6 +2303,16 @@ impl MiranteWorkbenchApp {
     }
 
     fn retire_invalidated_source_runtime(&mut self) {
+        if let Err(error) = self.camera_demand_planner.invalidate() {
+            tracing::warn!(%error, "camera-demand planner invalidation failed during source quarantine");
+        }
+        self.pending_visible_demand_plan = None;
+        self.visible_demand_planning_signature = None;
+        self.current_camera_reuse_envelope = None;
+        self.visible_demand_failure_latch = None;
+        self.prepared_scope_render_plans.clear();
+        self.staged_post_promotion_renderer_update = None;
+        self.last_camera_demand_planning_duration = None;
         if let Err(error) = self.dataset.cancel_and_clear_interactive_demand() {
             tracing::warn!(%error, "invalidated dataset demand cancellation failed");
         }
@@ -2207,6 +2326,27 @@ impl MiranteWorkbenchApp {
 
     fn request_opened_state_visible_work(&mut self, _ctx: Option<&egui::Context>) {
         self.request_visible_bricks();
+        self.update_source_verification_interactive_busy();
+    }
+
+    fn source_verification_interactive_busy(&self) -> bool {
+        self.camera_demand_planner.has_outstanding_request()
+            || self.pending_visible_demand_plan.is_some()
+            || self.dataset.dispatcher().has_pending_work()
+            || self.application.snapshot().transient().playback_active()
+            || self.analysis_runtime.active_token().is_some()
+            || viewer_verification_grace_active(self.viewer_verification_busy_until, Instant::now())
+    }
+
+    fn note_viewer_render_submission(&mut self) {
+        self.viewer_verification_busy_until = Some(Instant::now() + VIEWER_VERIFICATION_GRACE);
+    }
+
+    fn update_source_verification_interactive_busy(&self) {
+        let busy = self.source_verification_interactive_busy();
+        if let Some(service) = self.source_verification_service.as_ref() {
+            service.set_interactive_busy(busy);
+        }
     }
 
     fn poll_source_open_service(&mut self) {
@@ -2434,18 +2574,49 @@ impl MiranteWorkbenchApp {
             current_source_verification_service::CurrentSourceVerificationOutcome::Prepared(
                 prepared,
             ) => {
-                let (runtime, completion) = prepared.into_runtime_and_completion();
+                let promotion = prepared.into_promotion();
+                let identity = *promotion.dataset_reference.scientific_content_id();
+                let snapshot = self.application.snapshot();
+                if promotion.source_generation != snapshot.source_generation() {
+                    tracing::warn!(
+                        "stale source-verification promotion was suppressed with its retired source"
+                    );
+                    return;
+                }
+                let catalog = match snapshot
+                    .catalog()
+                    .with_scientific_identity(ScientificIdentityStatus::Verified(identity))
+                {
+                    Ok(catalog) => std::sync::Arc::new(catalog),
+                    Err(error) => {
+                        tracing::error!(%error, "verified source catalog promotion failed");
+                        self.complete_source_operation(
+                            token,
+                            OperationCompletion::Failed(
+                                OperationFailureCode::SourceVerificationInvalid,
+                            ),
+                        );
+                        self.retire_invalidated_source_runtime();
+                        return;
+                    }
+                };
+                let completion = OperationCompletion::SourceVerified {
+                    source_generation: promotion.source_generation,
+                    catalog,
+                    dataset: promotion.dataset_reference,
+                };
                 if self.complete_source_operation(token, completion) {
                     if let Some(service) = self.source_verification_service.as_mut() {
                         service.note_accepted_success();
                     }
-                    self.install_verified_source_runtime(runtime);
-                } else {
-                    tracing::warn!("stale source-verification result was suppressed");
-                    if let Err(error) = runtime.dataset.request_shutdown() {
-                        tracing::warn!(%error, "stale verified runtime shutdown request failed");
+                    if self.dataset.restore_verified_source() {
+                        self.request_opened_state_visible_work(None);
                     }
-                    std::thread::spawn(move || drop(runtime));
+                } else {
+                    tracing::error!(
+                        "committed source promotion could not be admitted by the application"
+                    );
+                    self.retire_invalidated_source_runtime();
                 }
             }
             current_source_verification_service::CurrentSourceVerificationOutcome::Cancelled => {
@@ -2460,18 +2631,6 @@ impl MiranteWorkbenchApp {
         }
     }
 
-    fn install_verified_source_runtime(
-        &mut self,
-        transfer: current_source_verification_service::CurrentSourceVerificationRuntimeTransfer,
-    ) {
-        let old_dataset = std::mem::replace(&mut self.dataset, transfer.dataset);
-        if let Err(error) = old_dataset.request_shutdown() {
-            tracing::warn!(%error, "unverified dataset runtime shutdown request failed");
-        }
-        self.request_opened_state_visible_work(None);
-        std::thread::spawn(move || drop(old_dataset));
-    }
-
     fn install_current_source_runtime(
         &mut self,
         transfer: current_source_open_service::CurrentSourceRuntimeTransfer,
@@ -2481,8 +2640,21 @@ impl MiranteWorkbenchApp {
             render_coordination,
             analysis_runtime,
         } = transfer;
-        self.clear_product_presentations();
+        self.retire_product_dataset_generation();
+        if let Err(error) = self.camera_demand_planner.invalidate() {
+            tracing::warn!(%error, "camera-demand planner invalidation failed during source replacement");
+        }
+        self.pending_visible_demand_plan = None;
+        self.visible_demand_failure_latch = None;
+        self.viewer_render_failure_latches.clear();
+        self.viewer_runtime_recovery_epoch = self.viewer_runtime_recovery_epoch.saturating_add(1);
+        self.prepared_scope_render_plans.clear();
+        self.staged_post_promotion_renderer_update = None;
+        self.last_camera_demand_planning_duration = None;
+        self.current_camera_reuse_envelope = None;
         let old_dataset = std::mem::replace(&mut self.dataset, dataset);
+        self.visible_demand_planning_signature = None;
+        self.active_histogram_cache = histogram::ActiveLayerHistogramCache::default();
         let old_render_coordination =
             std::mem::replace(&mut self.render_coordination, render_coordination);
         let old_analysis_runtime = std::mem::replace(&mut self.analysis_runtime, analysis_runtime);
@@ -2501,17 +2673,22 @@ impl MiranteWorkbenchApp {
         self.pending_automatic_source_verification =
             matches!(snapshot.source(), SourceVerificationSnapshot::Required)
                 .then(|| snapshot.source_generation());
+        // Publish visible demand and its verifier throttle before dispatching
+        // automatic verification for the replacement source.
+        self.request_opened_state_visible_work(None);
         if self.pending_automatic_source_verification.is_some() {
             self.try_start_pending_automatic_source_verification();
         }
-        self.request_opened_state_visible_work(None);
 
         std::thread::spawn(move || {
             drop((old_dataset, old_render_coordination, old_analysis_runtime));
         });
     }
 
-    fn active_histogram_summary(&self, snapshot: &ApplicationSnapshot) -> LayerHistogramSummary {
+    fn active_histogram_summary(
+        &mut self,
+        snapshot: &ApplicationSnapshot,
+    ) -> LayerHistogramSummary {
         let view = application_view(snapshot);
         let active_key = view.active_layer();
         let layer = snapshot
@@ -2524,19 +2701,19 @@ impl MiranteWorkbenchApp {
                 .displayed_scale_level
                 .unwrap_or(self.dataset.current_scale().get()),
         );
-        active_layer_histogram_summary(
+        let generation = self.dataset.histogram_generation(active_key);
+        self.active_histogram_cache.summary(
             self.dataset.retained_leases(),
             histogram::ActiveLayerHistogramInput {
-                requirements: self
-                    .dataset
-                    .scope_requirements(dataset_requests::SCOPE_CURRENT_3D),
-                identity: snapshot.catalog().scientific_identity().resource_identity(),
+                requirements: self.dataset.histogram_requirements(active_key),
+                identity: snapshot.catalog().resource_identity(),
                 layer: active_key,
                 layer_name: layer.label(),
                 dtype: layer.dtype(),
                 timepoint: view.timepoint(),
                 scale,
             },
+            generation,
         )
     }
 
@@ -2545,11 +2722,23 @@ impl MiranteWorkbenchApp {
         command: ApplicationCommand,
         ctx: &egui::Context,
     ) -> Result<CommandEffect, ApplicationFault> {
+        let command_kind = command.kind();
+        let interaction_started = matches!(
+            command_kind,
+            ApplicationCommandKind::SetCamera | ApplicationCommandKind::SetLayout
+        )
+        .then(Instant::now);
         let before = self.application.snapshot();
         let previous_view = application_view(&before).clone();
         let previous_playback_active = before.transient().playback_active();
         let effect = self.application.dispatch(command)?;
         if effect == CommandEffect::Changed {
+            if matches!(
+                command_kind,
+                ApplicationCommandKind::SetCamera | ApplicationCommandKind::SetLayout
+            ) {
+                self.render_coordination.record_durable_gesture_commit();
+            }
             let after = self.application.snapshot();
             self.reconcile_application_change(
                 &previous_view,
@@ -2560,8 +2749,18 @@ impl MiranteWorkbenchApp {
             if let Err(error) = self.reconcile_analysis_currentness() {
                 tracing::warn!(%error, "stale analysis could not be retired");
             }
+        } else if matches!(
+            command_kind,
+            ApplicationCommandKind::SetCamera | ApplicationCommandKind::SetLayout
+        ) {
+            self.render_coordination.record_coalesced_input_samples(1);
         }
         self.pump_application_services();
+        if let Some(started) = interaction_started {
+            let duration_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            self.render_coordination
+                .record_interaction_task_duration(duration_ns);
+        }
         Ok(effect)
     }
 
@@ -2578,12 +2777,20 @@ impl MiranteWorkbenchApp {
         if previous_view == next_view && !playback_lod_changed {
             return;
         }
-
-        if playback_lod_changed {
-            self.request_visible_bricks();
+        let volume_render_changed = layer_state::volume_render_changed(previous_view, next_view);
+        let linked_runtime_changed =
+            layer_state::cross_section_render_changed(previous_view, next_view)
+                && (previous_view.layout() == CanonicalViewerLayout::FourPanel
+                    || next_view.layout() == CanonicalViewerLayout::FourPanel);
+        if volume_render_changed || linked_runtime_changed || playback_lod_changed {
+            self.begin_display_input_generation();
+        }
+        if volume_render_changed || playback_lod_changed {
+            self.note_viewer_render_submission();
         }
 
         if previous_view == next_view {
+            self.request_visible_bricks();
             ctx.request_repaint();
             return;
         }
@@ -2610,27 +2817,255 @@ impl MiranteWorkbenchApp {
             self.egui_ui.viewport_orbit_drag = None;
             if next_view.layout() == CanonicalViewerLayout::Single3d {
                 self.clear_cross_section_product_presentations();
-                self.render_coordination.invalidate_cross_sections();
             }
         }
         if source_selection_changed {
             self.clear_3d_product_presentation();
             self.request_visible_bricks();
         } else {
-            self.invalidate_cross_section_panel_display_frames();
-            self.clear_3d_product_presentation();
-            if let Err(error) = self.rerender_display_state() {
-                tracing::error!(%error, "failed to render the accepted canonical view");
-                self.dataset.record_plan_error(error.to_string());
-                self.render_coordination.frame_fidelity.completeness =
-                    FrameCompleteness::Incomplete;
-                self.request_visible_bricks();
-            } else {
+            if linked_runtime_changed {
+                self.invalidate_cross_section_panel_display_frames();
+            }
+            if volume_render_changed {
+                if let Err(error) = self.rerender_display_state() {
+                    tracing::error!(%error, "failed to render the accepted canonical view");
+                    self.dataset.record_plan_error(error.to_string());
+                    self.render_coordination.frame_fidelity.completeness =
+                        FrameCompleteness::Incomplete;
+                }
+            } else if linked_runtime_changed {
+                // Replan only linked scopes. The demand planner's independent
+                // signatures reuse the unchanged 3D plan in O(1), and linked
+                // panels render through their own dirty callbacks.
                 self.request_visible_bricks();
             }
         }
         ctx.request_repaint();
         ctx.request_repaint_after(CROSS_SECTION_INTERACTION_SETTLE_DURATION);
+    }
+
+    pub(crate) fn begin_display_input_generation(&mut self) {
+        let now_ns = self.display_instrumentation_now_ns();
+        let generation = self
+            .render_coordination
+            .begin_display_input_generation(now_ns);
+        self.display_performance_milestones
+            .begin_generation(generation);
+    }
+
+    pub(crate) fn record_current_layout_presentation_if_complete(&mut self) {
+        let snapshot = self.application.snapshot();
+        let view = application_view(&snapshot);
+        let three_d_current = self.render_coordination.frame_fidelity.display_freshness
+            == DisplayedFrameFreshness::Current
+            && matches!(
+                self.render_coordination.frame_fidelity.completeness,
+                FrameCompleteness::Exact | FrameCompleteness::Complete
+            )
+            && self
+                .render_coordination
+                .surface(PresentationSlot::ThreeD)
+                .layer_presentations()
+                .iter()
+                .all(|layer| {
+                    layer.current && layer.available_requirements == layer.total_requirements
+                });
+        let current = match view.layout() {
+            CanonicalViewerLayout::Single3d => three_d_current,
+            CanonicalViewerLayout::FourPanel => {
+                three_d_current
+                    && [
+                        PresentationSlot::Xy,
+                        PresentationSlot::Xz,
+                        PresentationSlot::Yz,
+                    ]
+                    .into_iter()
+                    .all(|slot| {
+                        let surface = self.render_coordination.surface(slot);
+                        surface.display_current()
+                            && surface.cross_section_schedule().is_some_and(|schedule| {
+                                schedule.status == CrossSectionPanelScheduleStatus::Current
+                            })
+                            && surface.layer_presentations().iter().all(|layer| {
+                                layer.current
+                                    && layer.available_requirements == layer.total_requirements
+                            })
+                    })
+            }
+        };
+        if current {
+            let now_ns = self.display_instrumentation_now_ns();
+            self.render_coordination.record_current_presentation(now_ns);
+        }
+    }
+
+    pub(crate) fn observe_coordinated_display_milestones(&mut self, foreground_idle: bool) {
+        let snapshot = self.application.snapshot();
+        let view = application_view(&snapshot);
+        let visible_slots: &[PresentationSlot] = match view.layout() {
+            CanonicalViewerLayout::Single3d => &[PresentationSlot::ThreeD],
+            CanonicalViewerLayout::FourPanel => &PresentationSlot::ALL,
+        };
+        let mut all_useful = true;
+        let mut all_complete_at_admissible_scale = true;
+        let mut any_coarser_than_expected = false;
+        let mut all_target_current = true;
+        for slot in visible_slots.iter().copied() {
+            let surface = self.render_coordination.surface(slot);
+            let display_current = if slot == PresentationSlot::ThreeD {
+                self.render_coordination.frame_fidelity.display_freshness
+                    == DisplayedFrameFreshness::Current
+            } else {
+                surface.display_current()
+            };
+            let layers = surface.layer_presentations();
+            if layers.is_empty() {
+                let (useful, complete, coarse, target_current) = if slot == PresentationSlot::ThreeD
+                {
+                    let fidelity = &self.render_coordination.frame_fidelity;
+                    let displayed = fidelity.displayed_scale_level;
+                    (
+                        fidelity.resident_bricks > 0 || fidelity.backend == RenderBackend::Empty,
+                        display_current
+                            && matches!(
+                                fidelity.completeness,
+                                FrameCompleteness::Exact | FrameCompleteness::Complete
+                            ),
+                        displayed.is_some_and(|scale| scale > fidelity.target_scale_level),
+                        display_current
+                            && displayed == Some(fidelity.target_scale_level)
+                            && matches!(
+                                fidelity.completeness,
+                                FrameCompleteness::Exact | FrameCompleteness::Complete
+                            ),
+                    )
+                } else {
+                    let schedule = surface.cross_section_schedule();
+                    (
+                        schedule.is_some_and(|schedule| schedule.occupied_selected_bricks > 0),
+                        display_current
+                            && schedule.is_some_and(|schedule| {
+                                matches!(
+                                    schedule.status,
+                                    CrossSectionPanelScheduleStatus::Current
+                                        | CrossSectionPanelScheduleStatus::Coarse
+                                )
+                            }),
+                        schedule.is_some_and(|schedule| {
+                            matches!(
+                                (schedule.render_scale_level, schedule.target_scale_level),
+                                (Some(displayed), Some(expected)) if displayed > expected
+                            )
+                        }),
+                        display_current
+                            && schedule.is_some_and(|schedule| {
+                                schedule.status == CrossSectionPanelScheduleStatus::Current
+                            }),
+                    )
+                };
+                self.display_performance_milestones.observe_panel(
+                    slot,
+                    display_refresh::PerformanceMilestoneObservation {
+                        first_useful: useful,
+                        complete_replacement: complete,
+                        complete_coarse: complete && coarse,
+                        target_current,
+                        foreground_idle,
+                    },
+                );
+                all_useful &= useful;
+                all_complete_at_admissible_scale &= complete;
+                any_coarser_than_expected |= coarse;
+                all_target_current &= target_current;
+                continue;
+            }
+            let panel_useful = display_current
+                && layers.iter().any(|layer| {
+                    layer.expected_scale_level.is_some() && layer.available_requirements > 0
+                });
+            let panel_complete = display_current
+                && layers
+                    .iter()
+                    .filter(|layer| layer.expected_scale_level.is_some())
+                    .all(|layer| {
+                        layer.available_requirements == layer.total_requirements
+                            && matches!(
+                                (layer.displayed_scale_level, layer.expected_scale_level),
+                                (Some(displayed), Some(expected)) if displayed >= expected
+                            )
+                    });
+            let panel_coarse = panel_complete
+                && layers.iter().any(|layer| {
+                    matches!(
+                        (layer.displayed_scale_level, layer.expected_scale_level),
+                        (Some(displayed), Some(expected)) if displayed > expected
+                    )
+                });
+            let panel_target_current = display_current
+                && layers
+                    .iter()
+                    .filter(|layer| layer.expected_scale_level.is_some())
+                    .all(|layer| {
+                        layer.current && layer.available_requirements == layer.total_requirements
+                    });
+            for layer in layers
+                .iter()
+                .filter(|layer| layer.expected_scale_level.is_some())
+            {
+                let layer_useful = display_current && layer.available_requirements > 0;
+                let layer_complete = display_current
+                    && layer.available_requirements == layer.total_requirements
+                    && matches!(
+                        (layer.displayed_scale_level, layer.expected_scale_level),
+                        (Some(displayed), Some(expected)) if displayed >= expected
+                    );
+                let layer_coarse = layer_complete
+                    && matches!(
+                        (layer.displayed_scale_level, layer.expected_scale_level),
+                        (Some(displayed), Some(expected)) if displayed > expected
+                    );
+                let layer_target_current = display_current
+                    && layer.current
+                    && layer.available_requirements == layer.total_requirements;
+                self.display_performance_milestones.observe_visible_layer(
+                    slot,
+                    layer.layer_ordinal,
+                    display_refresh::PerformanceMilestoneObservation {
+                        first_useful: layer_useful,
+                        complete_replacement: layer_complete,
+                        complete_coarse: layer_coarse,
+                        target_current: layer_target_current,
+                        foreground_idle,
+                    },
+                );
+            }
+            self.display_performance_milestones.observe_panel(
+                slot,
+                display_refresh::PerformanceMilestoneObservation {
+                    first_useful: panel_useful,
+                    complete_replacement: panel_complete,
+                    complete_coarse: panel_coarse,
+                    target_current: panel_target_current,
+                    foreground_idle,
+                },
+            );
+            all_useful &= panel_useful;
+            all_complete_at_admissible_scale &= panel_complete;
+            any_coarser_than_expected |= panel_coarse;
+            all_target_current &= panel_target_current;
+        }
+        self.display_performance_milestones
+            .observe_coordinated_layout(
+                all_useful,
+                all_complete_at_admissible_scale,
+                all_complete_at_admissible_scale && any_coarser_than_expected,
+                all_target_current,
+                foreground_idle,
+            );
+    }
+
+    pub(crate) fn display_instrumentation_now_ns(&self) -> u64 {
+        u64::try_from(self.display_instrumentation_epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 }
 #[cfg(test)]

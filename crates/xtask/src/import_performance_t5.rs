@@ -1907,7 +1907,7 @@ fn require_release_xtask(provenance: &QualificationBuildProvenance) -> anyhow::R
     Ok(())
 }
 
-fn require_standard_app_build_environment(
+pub(crate) fn require_standard_app_build_environment(
     provenance: &QualificationBuildProvenance,
 ) -> anyhow::Result<()> {
     for variable in [
@@ -1980,7 +1980,9 @@ fn is_compiler_or_profile_override(
             || name.starts_with("CARGO_PROFILE_RELEASE_"))
 }
 
-fn require_no_external_cargo_configuration(repository_root: &Path) -> anyhow::Result<()> {
+pub(crate) fn require_no_external_cargo_configuration(
+    repository_root: &Path,
+) -> anyhow::Result<()> {
     let repository_root = fs::canonicalize(repository_root)?;
     if let Some(parent) = repository_root.parent() {
         for ancestor in parent.ancestors() {

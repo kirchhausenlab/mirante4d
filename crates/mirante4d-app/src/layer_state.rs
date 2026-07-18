@@ -1,9 +1,9 @@
 use mirante4d_application::ApplicationSnapshot;
+use mirante4d_domain::ViewerLayout;
 use mirante4d_project_model::ViewState;
 
 use crate::{
-    DisplayedFrameFreshness, FrameCompleteness, LodDecisionReason, RenderCoordinationState,
-    analysis_session::AnalysisProductRuntime, application_view,
+    RenderCoordinationState, analysis_session::AnalysisProductRuntime, application_view,
     dataset_requests::DatasetDemandState,
 };
 
@@ -38,20 +38,39 @@ pub(crate) fn reconcile_view_runtime(
             );
         }
         drop(dataset.take_retained_leases());
-        render.invalidate_cross_sections();
+        if previous_view.layout() == ViewerLayout::FourPanel
+            || view.layout() == ViewerLayout::FourPanel
+        {
+            render.invalidate_cross_sections();
+        }
         analysis.set_roi([0; 3], layer.shape().spatial().dimensions())?;
     }
 
-    mark_preserved_frame_stale(render);
+    if volume_render_changed(previous_view, view) {
+        render.mark_3d_display_stale();
+    }
     Ok(source_selection_changed)
 }
 
-fn mark_preserved_frame_stale(render: &mut RenderCoordinationState) {
-    render.frame_fidelity.display_freshness = DisplayedFrameFreshness::Stale;
-    render.frame_fidelity.completeness = FrameCompleteness::Loading;
-    render.frame_fidelity.reason = LodDecisionReason::LoadingTargetScale;
-    render.frame_fidelity.frame_time_ms = None;
-    render.frame_fidelity.last_failure_kind = None;
-    render.frame_fidelity.last_capacity_error = None;
-    render.request_refresh();
+/// Canonical fields consumed by the 3D render and demand pipeline.
+/// Cross-section authority is deliberately excluded: linked-slice motion must
+/// not invalidate an otherwise reusable volume frame.
+pub(crate) fn volume_render_changed(previous: &ViewState, next: &ViewState) -> bool {
+    previous.layers() != next.layers()
+        || previous.active_layer() != next.active_layer()
+        || previous.timepoint() != next.timepoint()
+        || previous.camera() != next.camera()
+        || previous.layout() != next.layout()
+        || previous.iso_light() != next.iso_light()
+}
+
+/// Canonical fields consumed by the linked-panel render and demand pipeline.
+/// Camera and isosurface-light motion are 3D-only and must leave linked panels
+/// reusable.
+pub(crate) fn cross_section_render_changed(previous: &ViewState, next: &ViewState) -> bool {
+    previous.layers() != next.layers()
+        || previous.active_layer() != next.active_layer()
+        || previous.timepoint() != next.timepoint()
+        || previous.layout() != next.layout()
+        || previous.cross_section() != next.cross_section()
 }

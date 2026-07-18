@@ -6,7 +6,7 @@ use mirante4d_application::{
     RenderState, RgbColor, SamplingPolicy, TRANSFER_GAMMA_MAX, TRANSFER_GAMMA_MIN, ToolKind,
     TransferCurve, auto_dense_window_from_histogram, auto_dvr_opacity_transfer_from_histogram,
     auto_signal_window_from_histogram, histogram_can_auto_window,
-    import_workflow::ImportWorkflowSnapshot,
+    import_workflow::ImportWorkflowSnapshot, viewer_tools::ViewerToolOverlay,
 };
 
 use crate::{
@@ -42,7 +42,7 @@ pub struct InspectorWorkbenchView<'a> {
     pub no_data_policy_label: Option<&'a str>,
     pub analysis: AnalysisControlsView<'a>,
     pub settings: &'a SettingsUiView,
-    pub runtime_diagnostics: &'a RuntimeDiagnosticsView,
+    pub runtime_diagnostics: Option<&'a RuntimeDiagnosticsView>,
     pub camera: CameraInspectorView,
     pub messages: &'a [String],
 }
@@ -86,15 +86,19 @@ pub(crate) fn show_workbench_inspector(
                         &mut output.actions,
                     );
                 });
-                egui::CollapsingHeader::new("Runtime Diagnostics")
+                let diagnostics_response = egui::CollapsingHeader::new("Runtime Diagnostics")
                     .default_open(false)
                     .show(ui, |ui| {
-                        show_runtime_diagnostics_body(
-                            view.runtime_diagnostics,
-                            ui,
-                            &mut output.actions,
-                        );
+                        if let Some(diagnostics) = view.runtime_diagnostics {
+                            show_runtime_diagnostics_body(diagnostics, ui, &mut output.actions);
+                        } else {
+                            ui.label("Collecting diagnostics…");
+                        }
                     });
+                state.runtime_diagnostics_open = diagnostics_response.body_response.is_some();
+                if state.runtime_diagnostics_open && view.runtime_diagnostics.is_none() {
+                    ui.ctx().request_repaint();
+                }
                 section(ui, "Render Settings", |ui| {
                     show_render_settings(
                         ui,
@@ -439,6 +443,12 @@ fn show_viewer_tools(
         ui.selectable_value(&mut active_tool, ToolKind::Navigate, "Navigate");
         ui.selectable_value(&mut active_tool, ToolKind::Inspect, "Inspect");
         ui.selectable_value(&mut active_tool, ToolKind::Crosshair, "Crosshair");
+        ui.selectable_value(&mut active_tool, ToolKind::RoiBox, "ROI box");
+        ui.selectable_value(
+            &mut active_tool,
+            ToolKind::MeasureDistance,
+            "Measure distance",
+        );
     });
     if active_tool != snapshot.transient().active_tool() {
         output
@@ -453,6 +463,23 @@ fn show_viewer_tools(
             "crosshair",
             format!("x{:.0} y{:.0} {:?}", screen.x, screen.y, crosshair.kind),
         );
+    }
+    match state.viewer_tools.overlay() {
+        Some(ViewerToolOverlay::RoiBox(overlay)) => property_row(
+            ui,
+            "ROI box",
+            format!(
+                "origin {:?}, shape {:?}",
+                overlay.roi().origin_zyx(),
+                overlay.roi().shape_zyx()
+            ),
+        ),
+        Some(ViewerToolOverlay::Distance(measurement)) => property_row(
+            ui,
+            "distance",
+            format!("{:.3} µm", measurement.distance_micrometers()),
+        ),
+        None => {}
     }
 }
 
@@ -562,6 +589,11 @@ fn show_render_settings(
         .show_ui(ui, |ui| {
             ui.selectable_value(
                 &mut sampling_policy,
+                SamplingPolicy::SmoothLinear,
+                render_sampling_policy_label(SamplingPolicy::SmoothLinear),
+            );
+            ui.selectable_value(
+                &mut sampling_policy,
                 SamplingPolicy::VoxelExact,
                 render_sampling_policy_label(SamplingPolicy::VoxelExact),
             );
@@ -648,8 +680,13 @@ fn show_iso_render_settings(
         .show_ui(ui, |ui| {
             ui.selectable_value(
                 &mut iso_shading_policy,
+                IsoShadingPolicy::GradientLighting,
+                iso_shading_policy_label(IsoShadingPolicy::GradientLighting),
+            );
+            ui.selectable_value(
+                &mut iso_shading_policy,
                 IsoShadingPolicy::Flat,
-                "Flat threshold hit",
+                iso_shading_policy_label(IsoShadingPolicy::Flat),
             );
         });
     if iso_shading_policy != parameters.shading_policy()
@@ -961,11 +998,7 @@ fn show_messages(
         status_badge(ui, StatusTone::Error, message);
     }
     if let Some(hover) = state.hovered_pixel {
-        property_row(
-            ui,
-            "hover",
-            format!("x{} y{} intensity {}", hover.x, hover.y, hover.intensity),
-        );
+        property_row(ui, "hover", crate::viewport_hover_status_label(hover));
     }
 }
 
@@ -1090,5 +1123,23 @@ mod tests {
             built_in_transfer_preset_curve(BuiltInTransferPreset::BrightGamma),
             TransferCurve::gamma(2.0).unwrap()
         );
+    }
+
+    #[test]
+    fn sampling_change_preserves_gradient_iso_parameters() {
+        let current = RenderState::iso(
+            SamplingPolicy::VoxelExact,
+            IsoShadingPolicy::GradientLighting,
+            0.375,
+        )
+        .unwrap();
+        let updated = render_state_with_sampling(current, SamplingPolicy::SmoothLinear).unwrap();
+
+        assert_eq!(updated.sampling_policy(), SamplingPolicy::SmoothLinear);
+        assert_eq!(
+            updated.iso_parameters().unwrap().shading_policy(),
+            IsoShadingPolicy::GradientLighting
+        );
+        assert_eq!(updated.iso_parameters().unwrap().display_level(), 0.375);
     }
 }

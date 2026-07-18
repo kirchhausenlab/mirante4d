@@ -1864,10 +1864,10 @@ mod tests {
         );
         let scientific = receipt.scientific_validation_report().unwrap();
         assert_eq!(scientific.brick_reads(), 1);
-        // The one present brick consumes packed-index and pixel objects. Each
-        // is opened for the range read and for both independent snapshot
-        // revalidations performed by the exact scientific scan.
-        assert_eq!(scientific.object_reads(), 6);
+        // The one present brick consumes packed-index and pixel objects. The
+        // exact scan reuses their generation-bound handles/indexes and proves
+        // the complete object set again at the scan boundary.
+        assert_eq!(scientific.object_reads(), 2);
         let codecs = receipt.codec_report();
         assert!(codecs.encode_calls() > 0);
         assert!(codecs.encode_time_ns() > 0);

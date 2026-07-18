@@ -1,6 +1,6 @@
 # Testing And Evidence
 
-Last updated: 2026-07-16
+Last updated: 2026-07-18
 
 ## Claim Language
 
@@ -82,6 +82,56 @@ MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
 This is component evidence. It does not replace opening the viewer when the
 visible product path changed.
 
+The viewer-overhaul GPU diagnostics are intentionally focused and ignored by
+ordinary public test selection:
+
+```bash
+cargo test --release -p mirante4d-render-wgpu \
+  resident_volume_gpu_timing -- --ignored --nocapture
+cargo test --release -p mirante4d-render-wgpu \
+  payload_buffer_vs_texture_gpu_timing -- --ignored --nocapture
+cargo test --release -p mirante4d-render-wgpu --lib \
+  -- --ignored --nocapture
+```
+
+`resident_volume_gpu_timing` uses timestamp queries after an excluded warmup
+and reports upload and volume-pass distributions separately. It is a direct-
+renderer diagnostic, not an end-to-end viewer result. The representation test
+alternates a storage buffer and filterable `R32Float` texture across two
+warmups and seven trials for one `float32`, all-valid, voxel-exact fetch-only
+case. It exists only to justify the selected storage-buffer representation;
+it makes no dtype, validity, interpolation, streaming, presentation, or
+product-performance claim.
+
+The full ignored renderer command additionally exercises multichannel order,
+MIP/DVR/ISO validity and picks, affine/perspective and SmoothLinear behavior,
+long rays, and multi-presentation residency on the trusted Vulkan adapter. It
+is correctness/component evidence; only the two named diagnostics emit timing
+observations.
+
+The EP-00 predecessor-development protocol is now frozen through one external,
+owner-bound v3 profile plus strict workload, script, and independent-oracle
+bundles. Preflight and execution use the release-only commands shown by:
+
+```bash
+cargo run --release -p xtask -- viewer-performance-preflight --help
+cargo run --release -p xtask -- viewer-performance-run --help
+```
+
+Those inputs remain outside the repository because they bind private package
+and source locations. The committed profile-contract digest, strict schemas,
+clean-revision check, hardware/display/storage observations, source inventory,
+bundle commitments, and sanitized receipt prevent a different workload or
+local edit from inheriting the result. Raw evidence stays private; public
+reporting may name only path-free counters, gates, and reason codes.
+
+This protocol establishes EP-00 baseline and later work-package evidence; it
+is not yet the final EP-07 qualification protocol. Before a performance pass
+can be claimed, the final exact sampling rule must move into this document and
+the clean atomic successor must pass the owner-bound workload, fidelity floor,
+all absolute gates, and externally inspected real-display exercise.
+Development observations and the small fixture remain diagnostic only.
+
 ### Format And Storage
 
 Validate the small independent target fixtures with:
@@ -100,6 +150,31 @@ cargo xtask verify-local format-lifecycle
 
 These checks use bounded repository fixtures. They make no stable-format,
 generic OME-Zarr, huge-dataset, or product-performance claim.
+
+Storage-reader changes can also use the release-only scale diagnostics:
+
+```bash
+cargo test --release -p mirante4d-storage \
+  aligned_verified_1024_brick_storage_scale_diagnostic \
+  -- --ignored --nocapture
+cargo test --release -p mirante4d-storage \
+  aligned_verified_1024_brick_eight_consumer_storage_scale_diagnostic \
+  -- --ignored --nocapture
+cargo test --release -p mirante4d-storage \
+  three_dimensional_1024_unique_chunk_io_scale_diagnostic \
+  -- --ignored --nocapture
+```
+
+The first two deliberately repeat the normal u16 64-cubed fixture resource
+1,024 times, sequentially or across eight consumers. They exercise the normal
+secure cohort/currentness/range/codec/direct-sink path but are structural
+surrogates, not a large unique-dataset workload. Their output separates direct
+writable-span bytes from post-decode copies and reports cohort membership, so
+an apparent syscall gain cannot hide serialized codec work or another full
+payload copy. The third creates 1,024 unique inner chunks in 16 indexed shards
+and isolates the normal handle/index/range/decode path.
+Always report filesystem, cache condition, build, hardware, run count, and the
+exact metric when citing their output.
 
 ### Project Persistence
 
@@ -682,13 +757,34 @@ Rendering, linked-panel, or packaged-viewer changes use:
 
 ```bash
 cargo xtask product-validate target_fixture_render_modes
+cargo xtask product-validate \
+  target_fixture_resident_navigation_no_readback
 ```
 
-Both use promoted small fixtures and preserve their source packages. The
-render scenario covers MIP, DVR, ISO, linked panels, 1280x720, and a short
-1920x1080 exercise. There is no 4K or simulated TiB requirement. Packaging
-changes run the scenario against the packaged executable as described in
-[Release](RELEASE.md).
+Both use a promoted small fixture and preserve its source package. The render-
+modes scenario covers MIP; perspective SmoothLinear; DVR; flat and gradient-
+lit ISO; attached and detached ISO light; orthographic linked panels;
+crosshair, ROI, and distance tools; 1280x720; and a short 1920x1080 exercise.
+The resident-navigation scenario requests a complete scale-0 frame, waits for
+runtime idle, records diagnostics, performs a small orbit/pan, waits for the
+new complete scale-0 frame, then observes 120 settled frames. It intentionally
+does not enable validation capture or synchronous readback, so its navigation
+path is representative of ordinary presentation. Its internal automation and
+diagnostic snapshots remain supporting evidence, not a timing qualification.
+There is no 4K or simulated TiB requirement. Packaging changes run the
+scenario against the packaged executable as described in [Release](RELEASE.md).
+
+For the required real-display exercise, attest the display class explicitly
+and inspect the native mapped client and logs rather than treating automation
+as product validation by itself:
+
+```bash
+MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display \
+  cargo xtask product-validate target_fixture_render_modes
+MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display \
+  cargo xtask product-validate \
+    target_fixture_resident_navigation_no_readback
+```
 
 ## Product Validation
 

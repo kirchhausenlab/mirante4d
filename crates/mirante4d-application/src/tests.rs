@@ -113,6 +113,14 @@ fn snapshot_carries_four_fixed_backend_neutral_presentation_slots() {
             Some(PresentationPaintRequest::new(token, viewport))
         );
     }
+
+    let retained = surface(5);
+    let stale =
+        PresentationSurface::with_frame_currentness(viewport, retained.frame().cloned(), false);
+    assert!(stale.frame().is_some());
+    assert!(stale.paint_request().is_some());
+    assert_eq!(stale.current_frame(), None);
+    assert!(!stale.frame_is_current());
 }
 
 #[test]
@@ -150,6 +158,8 @@ fn presentation_surface_without_a_frame_has_no_paint_request() {
 
     assert_eq!(surface.viewport(), viewport);
     assert_eq!(surface.frame(), None);
+    assert_eq!(surface.current_frame(), None);
+    assert!(!surface.frame_is_current());
     assert_eq!(surface.paint_request(), None);
 }
 
@@ -2431,6 +2441,60 @@ fn transient_commands_never_dirty_or_advance_the_project_revision() {
         ApplicationFaultCode::ArtifactNotFound
     );
     assert_eq!(application, before_invalid);
+}
+
+#[test]
+fn cross_section_panel_activity_exists_only_while_four_panel_is_visible() {
+    let mut application = bound_application();
+
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::SetActiveCrossSectionPanel(Some(
+                CrossSectionPanelId::Xy,
+            )))
+            .unwrap(),
+        CommandEffect::NoChange
+    );
+    assert_eq!(
+        application
+            .snapshot()
+            .transient()
+            .active_cross_section_panel(),
+        None
+    );
+
+    application
+        .dispatch(ApplicationCommand::SetLayout {
+            layout: ViewerLayout::FourPanel,
+            cross_section: cross_section(),
+        })
+        .unwrap();
+    application
+        .dispatch(ApplicationCommand::SetActiveCrossSectionPanel(Some(
+            CrossSectionPanelId::Xz,
+        )))
+        .unwrap();
+    assert_eq!(
+        application
+            .snapshot()
+            .transient()
+            .active_cross_section_panel(),
+        Some(CrossSectionPanelId::Xz)
+    );
+
+    application
+        .dispatch(ApplicationCommand::SetLayout {
+            layout: ViewerLayout::Single3d,
+            cross_section: cross_section(),
+        })
+        .unwrap();
+    assert_eq!(
+        application
+            .snapshot()
+            .transient()
+            .active_cross_section_panel(),
+        None
+    );
 }
 
 #[test]

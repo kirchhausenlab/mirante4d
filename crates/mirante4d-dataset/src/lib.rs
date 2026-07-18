@@ -12,7 +12,7 @@ use mirante4d_domain::{
     GridToWorld, IntensityDType, LogicalLayerKey, ScaleLevel, Shape3D, Shape4D, ShapeError,
     TimeIndex,
 };
-use mirante4d_identity::ScientificContentId;
+use mirante4d_identity::{ScientificContentId, Sha256Digest, Sha256Hasher};
 use thiserror::Error;
 
 pub const MAX_DATASET_LABEL_BYTES: usize = 256;
@@ -41,8 +41,10 @@ impl DatasetSourceId {
 /// Identity carried by a semantic resource request.
 ///
 /// Unverified sources are addressable only within their exact open session.
-/// Verification hard-cuts that provisional identity to the stable scientific
-/// content identity; the two variants never compare equal.
+/// A source opened from an existing verification capability may use the
+/// stable scientific content identity. An already-open source instead keeps
+/// its opaque session identity through proof-backed in-place verification so
+/// issued leases remain reusable; the two variants never compare equal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DatasetResourceIdentity {
     Unverified(DatasetSourceId),
@@ -166,6 +168,69 @@ impl DatasetResourceKey {
     }
 }
 
+const CANONICAL_DATASET_RESOURCE_UNION_HASH_DOMAIN: &[u8] = b"mirante4d-ep00-resource-union-v1\0";
+
+/// Incremental canonical commitment over sorted semantic resource keys and
+/// their exact payload byte lengths.
+///
+/// The caller supplies unique entries in `DatasetResourceKey` order. The
+/// builder deliberately retains no entries so diagnostic partitions can be
+/// committed without another resource-sized allocation.
+pub struct CanonicalDatasetResourceUnionHasher {
+    hasher: Sha256Hasher,
+}
+
+impl CanonicalDatasetResourceUnionHasher {
+    pub fn new() -> Self {
+        let mut hasher = Sha256Hasher::new();
+        hasher.update(CANONICAL_DATASET_RESOURCE_UNION_HASH_DOMAIN);
+        Self { hasher }
+    }
+
+    pub fn push(&mut self, key: DatasetResourceKey, payload_bytes: u64) {
+        match key.identity() {
+            DatasetResourceIdentity::Unverified(source) => {
+                self.hasher.update([0]);
+                self.hasher.update(source.get().to_le_bytes());
+            }
+            DatasetResourceIdentity::Verified(scientific) => {
+                self.hasher.update([1]);
+                self.hasher.update(scientific.digest().as_bytes());
+            }
+        }
+        self.hasher.update(key.layer().ordinal().to_le_bytes());
+        self.hasher.update(key.timepoint().get().to_le_bytes());
+        self.hasher.update(key.scale().get().to_le_bytes());
+        for coordinate in key.region().origin() {
+            self.hasher.update(coordinate.to_le_bytes());
+        }
+        for dimension in key.region().shape().dimensions() {
+            self.hasher.update(dimension.to_le_bytes());
+        }
+        self.hasher.update(payload_bytes.to_le_bytes());
+    }
+
+    pub fn finalize(self) -> Sha256Digest {
+        self.hasher.finalize()
+    }
+}
+
+impl Default for CanonicalDatasetResourceUnionHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn canonical_dataset_resource_union_sha256(
+    entries: &[(DatasetResourceKey, u64)],
+) -> Sha256Digest {
+    let mut hasher = CanonicalDatasetResourceUnionHasher::new();
+    for (key, payload_bytes) in entries {
+        hasher.push(*key, *payload_bytes);
+    }
+    hasher.finalize()
+}
+
 /// Effective validity representation for one semantic resource.
 ///
 /// `AllValid` has no validity allocation. `BitMask` carries exactly one bit
@@ -268,6 +333,101 @@ pub struct ResourcePayloadView<'a> {
     descriptor: ResourcePayloadDescriptor,
     value_bytes: &'a [u8],
     validity_bits: Option<&'a [u8]>,
+}
+
+/// Immutable value-range and validity facts computed once with decoded data.
+///
+/// These facts travel with every runtime-issued lease so render/upload
+/// planning never rescans payload samples on the UI thread. Invalid samples do
+/// not contribute to the range; an all-invalid payload uses zero bounds and
+/// reports `any_valid == false`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResourcePayloadFacts {
+    minimum: f32,
+    maximum: f32,
+    any_valid: bool,
+    all_valid: bool,
+}
+
+impl ResourcePayloadFacts {
+    /// Constructs facts already proved by a source while decoding/copying.
+    /// This is the zero-rescan path for sources whose physical metadata or
+    /// fused copy loop establishes the exact range and validity counts.
+    pub fn from_validated_range(
+        minimum: f32,
+        maximum: f32,
+        any_valid: bool,
+        all_valid: bool,
+    ) -> Result<Self, ResourceContractError> {
+        if all_valid && !any_valid
+            || any_valid && (!minimum.is_finite() || !maximum.is_finite() || minimum > maximum)
+        {
+            return Err(ResourceContractError::InvalidPayloadFacts);
+        }
+        Ok(Self {
+            minimum: if any_valid { minimum } else { 0.0 },
+            maximum: if any_valid { maximum } else { 0.0 },
+            any_valid,
+            all_valid,
+        })
+    }
+
+    /// Computes authoritative facts while the decoded bytes are still owned by
+    /// the dataset worker. Float samples, including invalid samples, must be
+    /// finite.
+    pub fn from_payload(payload: ResourcePayloadView<'_>) -> Result<Self, ResourceContractError> {
+        let dtype_bytes = usize::from(payload.dtype().bytes_per_sample());
+        let validity = payload.validity_bits();
+        let mut minimum = f32::INFINITY;
+        let mut maximum = f32::NEG_INFINITY;
+        let mut valid_count = 0_u64;
+        for (sample_index, bytes) in payload.value_bytes().chunks_exact(dtype_bytes).enumerate() {
+            let valid = validity
+                .is_none_or(|bits| bits[sample_index / 8] & (1_u8 << (sample_index & 7)) != 0);
+            let value = match dtype_bytes {
+                1 => f32::from(bytes[0]),
+                2 => f32::from(u16::from_le_bytes([bytes[0], bytes[1]])),
+                4 => {
+                    let value = f32::from_le_bytes(bytes.try_into().expect("four-byte sample"));
+                    if !value.is_finite() {
+                        return Err(ResourceContractError::NonFiniteFloatSample {
+                            index: sample_index as u64,
+                        });
+                    }
+                    value
+                }
+                _ => unreachable!("the domain exposes only u8, u16, and f32"),
+            };
+            if valid {
+                minimum = minimum.min(value);
+                maximum = maximum.max(value);
+                valid_count += 1;
+            }
+        }
+        let any_valid = valid_count != 0;
+        Ok(Self {
+            minimum: if any_valid { minimum } else { 0.0 },
+            maximum: if any_valid { maximum } else { 0.0 },
+            any_valid,
+            all_valid: valid_count == payload.sample_count(),
+        })
+    }
+
+    pub const fn minimum(self) -> f32 {
+        self.minimum
+    }
+
+    pub const fn maximum(self) -> f32 {
+        self.maximum
+    }
+
+    pub const fn any_valid(self) -> bool {
+        self.any_valid
+    }
+
+    pub const fn all_valid(self) -> bool {
+        self.all_valid
+    }
 }
 
 impl<'a> ResourcePayloadView<'a> {
@@ -463,6 +623,13 @@ pub trait CpuByteLedger: Send + Sync {
         category: CpuLedgerCategory,
         bytes: u64,
     ) -> Result<Box<dyn CpuByteLease>, CpuLedgerError>;
+
+    /// Monotonic identity for capacity-state changes that can make a
+    /// previously rejected reservation worth retrying. Test and external
+    /// ledgers that have no observable capacity changes may retain zero.
+    fn capacity_epoch(&self) -> u64 {
+        0
+    }
 }
 
 /// Inspection-only contract for a runtime-issued, byte-accounted lease.
@@ -473,6 +640,7 @@ pub trait CpuByteLedger: Send + Sync {
 pub trait ResourceLease: Send + Sync {
     fn key(&self) -> DatasetResourceKey;
     fn payload(&self) -> ResourcePayloadView<'_>;
+    fn payload_facts(&self) -> ResourcePayloadFacts;
 }
 
 /// A decoded-buffer reservation owned by the dataset runtime.
@@ -498,8 +666,33 @@ pub trait ReservedDecodeSink {
     /// every long read/decode stage; relying only on a rejected write is not a
     /// cancellation checkpoint.
     fn is_cancelled(&self) -> bool;
+    /// Borrows the next sequential portion of the already-reserved output.
+    ///
+    /// Implementations that support direct codec delivery return exactly
+    /// `min(maximum_bytes, reserved_bytes - written_bytes)` bytes and retain
+    /// them as one outstanding span until `commit_written` is called. The
+    /// caller may mutate the span but those bytes are not progress and cannot
+    /// be completed until explicitly committed. A decode failure may leave an
+    /// uncommitted span; the sink must remain unfinished.
+    fn writable_span(&mut self, _maximum_bytes: usize) -> Result<&mut [u8], DecodeSinkError> {
+        Err(DecodeSinkError::DirectWriteUnsupported)
+    }
+    /// Commits a prefix of the one outstanding writable span as sequential
+    /// decoded output. Implementations reject commits without a span or beyond
+    /// the offered length.
+    fn commit_written(&mut self, _bytes: usize) -> Result<(), DecodeSinkError> {
+        Err(DecodeSinkError::DirectWriteUnsupported)
+    }
     fn write(&mut self, bytes: &[u8]) -> Result<(), DecodeSinkError>;
     fn finish(&mut self) -> Result<(), DecodeSinkError>;
+    /// Completes a reservation with authoritative facts established as part
+    /// of the source decode/copy itself. Implementations may retain these
+    /// facts without rescanning the completed byte buffer. The source must
+    /// provide exactly the same result as `ResourcePayloadFacts::from_payload`.
+    fn finish_with_facts(&mut self, facts: ResourcePayloadFacts) -> Result<(), DecodeSinkError> {
+        let _ = facts;
+        self.finish()
+    }
     fn is_finished(&self) -> bool;
 }
 
@@ -508,12 +701,34 @@ pub trait ReservedDecodeSink {
 ///
 /// Calls are synchronous by design: WP-08B owns the worker/scheduler context
 /// in which they run. Implementations own storage discovery and codecs, but
-/// may not expose their physical layout through this interface. A successful
-/// decode must fill the exact descriptor and call `ReservedDecodeSink::finish`;
-/// `Float32` samples must already be validated as finite.
+/// may not expose their physical layout through this interface. The scheduler
+/// supplies one non-empty, explicitly bounded cohort of already-reserved
+/// sinks; a source returns exactly one result in the same order. This is the
+/// sole decode authority, including for a one-member cohort, so a source can
+/// fuse shared currentness and I/O work without retaining a parallel scalar
+/// path. A successful decode must fill the exact descriptor and call
+/// `ReservedDecodeSink::finish`; `Float32` samples must already be validated
+/// as finite. Failure of one member need not fail unrelated members unless a
+/// shared fail-closed source check cannot attribute success to the cohort.
 pub trait DatasetSource: Send + Sync {
     fn catalog(&self) -> Result<Arc<DatasetCatalog>, DatasetSourceFault>;
-    fn decode_into(&self, sink: &mut dyn ReservedDecodeSink) -> Result<(), DatasetSourceFault>;
+    /// Minimum additional `InFlightDecode` bytes required to decode one
+    /// reservation, excluding the caller-owned final payload buffer itself.
+    ///
+    /// This is a pure admission estimate: implementations must perform no I/O
+    /// and must return a bound sufficient for the resource to make progress
+    /// when it runs alone. Cohort sharing may reduce the actual live total.
+    fn minimum_decode_working_bytes(
+        &self,
+        _key: DatasetResourceKey,
+        _descriptor: ResourcePayloadDescriptor,
+    ) -> Result<u64, DatasetSourceFault> {
+        Ok(0)
+    }
+    fn decode_cohort_into(
+        &self,
+        sinks: &mut [&mut dyn ReservedDecodeSink],
+    ) -> Vec<Result<(), DatasetSourceFault>>;
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -536,6 +751,10 @@ pub enum ResourceContractError {
     ValidityPaddingBitsNonZero { used_bits: u8, final_byte: u8 },
     #[error("sample index {index} is outside the payload's {sample_count} samples")]
     SampleIndexOutOfBounds { index: u64, sample_count: u64 },
+    #[error("decoded float sample {index} is not finite")]
+    NonFiniteFloatSample { index: u64 },
+    #[error("decoded payload facts are internally inconsistent")]
+    InvalidPayloadFacts,
     #[error("decode reservation descriptor does not match the catalog resource")]
     PayloadDescriptorMismatch,
     #[error("the resource key belongs to a different source identity")]
@@ -560,8 +779,20 @@ pub enum DecodeSinkError {
     ReservationExceeded { reserved: u64, attempted: u64 },
     #[error("decode sink has already been completed")]
     AlreadyFinished,
+    #[error("this decode sink does not support direct writable spans")]
+    DirectWriteUnsupported,
+    #[error("a decode sink already has an uncommitted writable span")]
+    WritableSpanOutstanding,
+    #[error("a writable-span request must be nonzero and have reserved bytes remaining")]
+    InvalidWritableSpanRequest,
+    #[error("a direct decoded commit has {attempted} bytes but the offered span has {offered}")]
+    WritableCommitExceeded { offered: usize, attempted: usize },
+    #[error("a direct decoded commit has no outstanding writable span")]
+    WritableCommitWithoutSpan,
     #[error("decode completed with {written} of {reserved} reserved bytes written")]
     Incomplete { reserved: u64, written: u64 },
+    #[error("decoded payload values violate the canonical sample contract")]
+    InvalidPayloadValues,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -818,6 +1049,7 @@ impl DatasetLayer {
 pub struct DatasetCatalog {
     label: String,
     scientific_identity: ScientificIdentityStatus,
+    resource_identity: DatasetResourceIdentity,
     layers: BTreeMap<LogicalLayerKey, DatasetLayer>,
 }
 
@@ -825,6 +1057,16 @@ impl DatasetCatalog {
     pub fn new(
         label: impl AsRef<str>,
         scientific_identity: ScientificIdentityStatus,
+        layers: Vec<DatasetLayer>,
+    ) -> Result<Self, DatasetCatalogError> {
+        let resource_identity = scientific_identity.resource_identity();
+        Self::new_with_resource_identity(label, scientific_identity, resource_identity, layers)
+    }
+
+    fn new_with_resource_identity(
+        label: impl AsRef<str>,
+        scientific_identity: ScientificIdentityStatus,
+        resource_identity: DatasetResourceIdentity,
         layers: Vec<DatasetLayer>,
     ) -> Result<Self, DatasetCatalogError> {
         let label = validate_label("dataset label", label.as_ref(), MAX_DATASET_LABEL_BYTES)?;
@@ -851,8 +1093,29 @@ impl DatasetCatalog {
         Ok(Self {
             label,
             scientific_identity,
+            resource_identity,
             layers: by_key,
         })
+    }
+
+    /// Reclassifies the scientific identity without invalidating semantic
+    /// resource keys already issued for this exact open session.
+    ///
+    /// This is a classification operation, not proof of verification. The
+    /// verifier/application boundary remains responsible for admitting the
+    /// supplied status. Keeping the opaque runtime identity stable allows a
+    /// successfully verified local source to retain decoded and GPU-resident
+    /// data after an equivalent, fail-closed source-generation proof.
+    pub fn with_scientific_identity(
+        &self,
+        scientific_identity: ScientificIdentityStatus,
+    ) -> Result<Self, DatasetCatalogError> {
+        Self::new_with_resource_identity(
+            &self.label,
+            scientific_identity,
+            self.resource_identity,
+            self.layers.values().cloned().collect(),
+        )
     }
 
     pub fn label(&self) -> &str {
@@ -861,6 +1124,13 @@ impl DatasetCatalog {
 
     pub const fn scientific_identity(&self) -> &ScientificIdentityStatus {
         &self.scientific_identity
+    }
+
+    /// Identity used only to correlate semantic resources inside this exact
+    /// runtime. It may remain provisional after scientific verification so
+    /// already-issued leases and GPU residency do not need to be re-keyed.
+    pub const fn resource_identity(&self) -> DatasetResourceIdentity {
+        self.resource_identity
     }
 
     pub fn len(&self) -> usize {
@@ -881,7 +1151,7 @@ impl DatasetCatalog {
         &self,
         key: DatasetResourceKey,
     ) -> Result<IntensityDType, ResourceContractError> {
-        if self.scientific_identity.resource_identity() != key.identity() {
+        if self.resource_identity != key.identity() {
             return Err(ResourceContractError::ResourceIdentityMismatch);
         }
 
@@ -1073,6 +1343,10 @@ mod tests {
         .unwrap();
         assert!(!unverified.scientific_identity().is_verified());
         assert_eq!(unverified.scientific_identity().verified_id(), None);
+        assert_eq!(
+            unverified.resource_identity(),
+            DatasetResourceIdentity::Unverified(source_id())
+        );
 
         let identity = ScientificContentId::parse(ZERO_SCIENTIFIC_ID).unwrap();
         let verified = DatasetCatalog::new(
@@ -1084,6 +1358,22 @@ mod tests {
         assert_eq!(
             verified.scientific_identity().verified_id(),
             Some(&identity)
+        );
+        assert_eq!(
+            verified.resource_identity(),
+            DatasetResourceIdentity::Verified(identity)
+        );
+
+        let promoted = unverified
+            .with_scientific_identity(ScientificIdentityStatus::Verified(identity))
+            .unwrap();
+        assert_eq!(
+            promoted.scientific_identity().verified_id(),
+            Some(&identity)
+        );
+        assert_eq!(
+            promoted.resource_identity(),
+            DatasetResourceIdentity::Unverified(source_id())
         );
     }
 
@@ -1211,6 +1501,25 @@ mod tests {
             ScaleLevel::new(1),
             ResourceRegion::new([0, 1, 1], Shape3D::new(1, 1, 2).unwrap()).unwrap(),
         )
+    }
+
+    #[test]
+    fn canonical_resource_union_commitment_is_stable_and_incremental() {
+        let key = resource_key(scientific_id('1'));
+        let entries = [(key, 5)];
+        let expected = "266b0b4cb1e30b657d93644a97d310d6e1ccfe86142885f882367bc6bb4f664e";
+        assert_eq!(
+            canonical_dataset_resource_union_sha256(&entries).to_string(),
+            expected
+        );
+
+        let mut incremental = CanonicalDatasetResourceUnionHasher::new();
+        incremental.push(key, 5);
+        assert_eq!(incremental.finalize().to_string(), expected);
+        assert_ne!(
+            canonical_dataset_resource_union_sha256(&[(key, 6)]).to_string(),
+            expected
+        );
     }
 
     #[test]
@@ -1370,6 +1679,41 @@ mod tests {
         )
         .unwrap();
         assert!((0..9).all(|index| all_invalid.sample_is_valid(index) == Ok(false)));
+    }
+
+    #[test]
+    fn payload_facts_are_computed_once_from_valid_samples() {
+        let values = [10_u16, 65_535, 0, 20]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let payload = ResourcePayloadView::new(
+            IntensityDType::Uint16,
+            Shape3D::new(1, 1, 4).unwrap(),
+            ResourceValidity::BitMask,
+            &values,
+            Some(&[0b0000_1101]),
+        )
+        .unwrap();
+        let facts = ResourcePayloadFacts::from_payload(payload).unwrap();
+        assert_eq!(facts.minimum(), 0.0);
+        assert_eq!(facts.maximum(), 20.0);
+        assert!(facts.any_valid());
+        assert!(!facts.all_valid());
+
+        let non_finite = f32::NAN.to_le_bytes();
+        let payload = ResourcePayloadView::new(
+            IntensityDType::Float32,
+            Shape3D::new(1, 1, 1).unwrap(),
+            ResourceValidity::AllValid,
+            &non_finite,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            ResourcePayloadFacts::from_payload(payload),
+            Err(ResourceContractError::NonFiniteFloatSample { index: 0 })
+        );
     }
 
     #[test]
@@ -1753,31 +2097,40 @@ mod tests {
             Ok(Arc::clone(&self.catalog))
         }
 
-        fn decode_into(&self, sink: &mut dyn ReservedDecodeSink) -> Result<(), DatasetSourceFault> {
-            let key = sink.resource_key();
-            if sink.is_cancelled() {
-                return Err(DatasetSourceFault::Cancelled { key });
-            }
-            self.catalog
-                .validate_decode_reservation(sink)
-                .map_err(|reason| DatasetSourceFault::InvalidResource {
-                    key,
-                    reason: Box::new(reason),
-                })?;
-            let bytes = self
-                .resources
-                .get(&key)
-                .ok_or(DatasetSourceFault::ResourceUnavailable { key })?;
-            for part in bytes.chunks(3) {
-                if sink.is_cancelled() {
-                    return Err(DatasetSourceFault::Cancelled { key });
-                }
-                sink.write(part).map_err(|reason| sink_fault(key, reason))?;
-            }
-            if sink.is_cancelled() {
-                return Err(DatasetSourceFault::Cancelled { key });
-            }
-            sink.finish().map_err(|reason| sink_fault(key, reason))
+        fn decode_cohort_into(
+            &self,
+            sinks: &mut [&mut dyn ReservedDecodeSink],
+        ) -> Vec<Result<(), DatasetSourceFault>> {
+            sinks
+                .iter_mut()
+                .map(|sink| {
+                    let sink = &mut **sink;
+                    let key = sink.resource_key();
+                    if sink.is_cancelled() {
+                        return Err(DatasetSourceFault::Cancelled { key });
+                    }
+                    self.catalog
+                        .validate_decode_reservation(sink)
+                        .map_err(|reason| DatasetSourceFault::InvalidResource {
+                            key,
+                            reason: Box::new(reason),
+                        })?;
+                    let bytes = self
+                        .resources
+                        .get(&key)
+                        .ok_or(DatasetSourceFault::ResourceUnavailable { key })?;
+                    for part in bytes.chunks(3) {
+                        if sink.is_cancelled() {
+                            return Err(DatasetSourceFault::Cancelled { key });
+                        }
+                        sink.write(part).map_err(|reason| sink_fault(key, reason))?;
+                    }
+                    if sink.is_cancelled() {
+                        return Err(DatasetSourceFault::Cancelled { key });
+                    }
+                    sink.finish().map_err(|reason| sink_fault(key, reason))
+                })
+                .collect()
         }
     }
 
@@ -1791,60 +2144,79 @@ mod tests {
             Ok(Arc::clone(&self.catalog))
         }
 
-        fn decode_into(&self, sink: &mut dyn ReservedDecodeSink) -> Result<(), DatasetSourceFault> {
-            let key = sink.resource_key();
-            if sink.is_cancelled() {
-                return Err(DatasetSourceFault::Cancelled { key });
-            }
-            let descriptor = self
-                .catalog
-                .validate_decode_reservation(sink)
-                .map_err(|reason| DatasetSourceFault::InvalidResource {
-                    key,
-                    reason: Box::new(reason),
-                })?;
-            let mut remaining = descriptor.value_byte_len();
-            let block = [self.fill; 64];
-            while remaining > 0 {
-                if sink.is_cancelled() {
-                    return Err(DatasetSourceFault::Cancelled { key });
-                }
-                let count = usize::try_from(remaining.min(block.len() as u64))
-                    .map_err(|_| DatasetSourceFault::DecodeFailed { key })?;
-                sink.write(&block[..count])
-                    .map_err(|reason| sink_fault(key, reason))?;
-                remaining -=
-                    u64::try_from(count).map_err(|_| DatasetSourceFault::DecodeFailed { key })?;
-            }
+        fn decode_cohort_into(
+            &self,
+            sinks: &mut [&mut dyn ReservedDecodeSink],
+        ) -> Vec<Result<(), DatasetSourceFault>> {
+            sinks
+                .iter_mut()
+                .map(|sink| {
+                    let sink = &mut **sink;
+                    let key = sink.resource_key();
+                    if sink.is_cancelled() {
+                        return Err(DatasetSourceFault::Cancelled { key });
+                    }
+                    let descriptor =
+                        self.catalog
+                            .validate_decode_reservation(sink)
+                            .map_err(|reason| DatasetSourceFault::InvalidResource {
+                                key,
+                                reason: Box::new(reason),
+                            })?;
+                    let mut remaining = descriptor.value_byte_len();
+                    let block = [self.fill; 64];
+                    while remaining > 0 {
+                        if sink.is_cancelled() {
+                            return Err(DatasetSourceFault::Cancelled { key });
+                        }
+                        let count = usize::try_from(remaining.min(block.len() as u64))
+                            .map_err(|_| DatasetSourceFault::DecodeFailed { key })?;
+                        sink.write(&block[..count])
+                            .map_err(|reason| sink_fault(key, reason))?;
+                        remaining -= u64::try_from(count)
+                            .map_err(|_| DatasetSourceFault::DecodeFailed { key })?;
+                    }
 
-            let mut remaining = descriptor.validity_byte_len();
-            let full_block = [u8::MAX; 64];
-            while remaining > 0 {
-                if sink.is_cancelled() {
-                    return Err(DatasetSourceFault::Cancelled { key });
-                }
-                let count = usize::try_from(remaining.min(full_block.len() as u64))
-                    .map_err(|_| DatasetSourceFault::DecodeFailed { key })?;
-                let is_final_write = remaining == u64::try_from(count).unwrap();
-                if is_final_write && descriptor.sample_count() % 8 != 0 {
-                    let mut final_block = [u8::MAX; 64];
-                    let used_bits = u8::try_from(descriptor.sample_count() % 8)
-                        .expect("a remainder modulo eight fits in u8");
-                    final_block[count - 1] = (1_u8 << used_bits) - 1;
-                    sink.write(&final_block[..count])
-                        .map_err(|reason| sink_fault(key, reason))?;
-                } else {
-                    sink.write(&full_block[..count])
-                        .map_err(|reason| sink_fault(key, reason))?;
-                }
-                remaining -=
-                    u64::try_from(count).map_err(|_| DatasetSourceFault::DecodeFailed { key })?;
-            }
-            if sink.is_cancelled() {
-                return Err(DatasetSourceFault::Cancelled { key });
-            }
-            sink.finish().map_err(|reason| sink_fault(key, reason))
+                    let mut remaining = descriptor.validity_byte_len();
+                    let full_block = [u8::MAX; 64];
+                    while remaining > 0 {
+                        if sink.is_cancelled() {
+                            return Err(DatasetSourceFault::Cancelled { key });
+                        }
+                        let count = usize::try_from(remaining.min(full_block.len() as u64))
+                            .map_err(|_| DatasetSourceFault::DecodeFailed { key })?;
+                        let is_final_write = remaining == u64::try_from(count).unwrap();
+                        if is_final_write && descriptor.sample_count() % 8 != 0 {
+                            let mut final_block = [u8::MAX; 64];
+                            let used_bits = u8::try_from(descriptor.sample_count() % 8)
+                                .expect("a remainder modulo eight fits in u8");
+                            final_block[count - 1] = (1_u8 << used_bits) - 1;
+                            sink.write(&final_block[..count])
+                                .map_err(|reason| sink_fault(key, reason))?;
+                        } else {
+                            sink.write(&full_block[..count])
+                                .map_err(|reason| sink_fault(key, reason))?;
+                        }
+                        remaining -= u64::try_from(count)
+                            .map_err(|_| DatasetSourceFault::DecodeFailed { key })?;
+                    }
+                    if sink.is_cancelled() {
+                        return Err(DatasetSourceFault::Cancelled { key });
+                    }
+                    sink.finish().map_err(|reason| sink_fault(key, reason))
+                })
+                .collect()
         }
+    }
+
+    fn decode_one(
+        source: &dyn DatasetSource,
+        sink: &mut dyn ReservedDecodeSink,
+    ) -> Result<(), DatasetSourceFault> {
+        let mut cohort = [sink];
+        let mut outcomes = source.decode_cohort_into(&mut cohort);
+        assert_eq!(outcomes.len(), 1);
+        outcomes.remove(0)
     }
 
     fn decode_from(
@@ -1854,7 +2226,12 @@ mod tests {
         let catalog = source.catalog().unwrap();
         let descriptor = catalog.resource_payload_descriptor(key).unwrap();
         let mut sink = TestSink::new(key, descriptor);
-        source.decode_into(&mut sink).unwrap();
+        let mut cohort: [&mut dyn ReservedDecodeSink; 1] = [&mut sink];
+        source
+            .decode_cohort_into(&mut cohort)
+            .pop()
+            .unwrap()
+            .unwrap();
         assert!(sink.is_finished());
         assert_eq!(sink.written_bytes(), sink.reserved_bytes());
         let view = sink.payload_view().unwrap();
@@ -1925,7 +2302,7 @@ mod tests {
         .unwrap();
         let mut mismatched = TestSink::new(key, wrong_descriptor);
         assert_eq!(
-            source.decode_into(&mut mismatched),
+            decode_one(&source, &mut mismatched),
             Err(DatasetSourceFault::InvalidResource {
                 key,
                 reason: Box::new(ResourceContractError::PayloadDescriptorMismatch),
@@ -1935,7 +2312,7 @@ mod tests {
         let descriptor = catalog.resource_payload_descriptor(key).unwrap();
         let mut sink = TestSink::new(key, descriptor);
         assert_eq!(
-            source.decode_into(&mut sink),
+            decode_one(&source, &mut sink),
             Err(DatasetSourceFault::ResourceUnavailable { key })
         );
         let safe_message = DatasetSourceFault::ResourceUnavailable { key }.to_string();
@@ -1998,7 +2375,7 @@ mod tests {
         sink.cancelled = true;
 
         assert_eq!(
-            source.decode_into(&mut sink),
+            decode_one(&source, &mut sink),
             Err(DatasetSourceFault::Cancelled { key })
         );
         assert_eq!(sink.write_calls, 0);

@@ -33,12 +33,21 @@ impl MiranteWorkbenchApp {
             actions,
             viewport_observations,
             cross_section_readout_requests,
+            viewer_pick_request,
             render_requests,
             presentation_paints,
             mut rerender_requested,
             texture_refresh_requested,
             repaint_after,
         } = output;
+
+        if self
+            .viewer_pick_queue
+            .observe_ui_request(viewer_pick_request)
+        {
+            self.egui_ui.hovered_pixel = None;
+            self.egui_ui.viewer_tools.clear_hover();
+        }
 
         if !cross_section_readout_requests.is_empty() {
             let snapshot = self.application.snapshot();
@@ -239,6 +248,7 @@ impl MiranteWorkbenchApp {
         }
 
         if apply_viewport_observations(&mut self.render_coordination, viewport_observations) {
+            self.begin_display_input_generation();
             ui.ctx().request_repaint();
         }
 
@@ -290,9 +300,9 @@ impl MiranteWorkbenchApp {
         }
         rerender_requested |= self.render_coordination.take_refresh_request();
         if rerender_requested {
-            self.refresh_frame(ui.ctx());
+            self.refresh_frame();
         } else if texture_refresh_requested {
-            self.refresh_texture_only(ui.ctx());
+            self.refresh_texture_only();
         }
         for command in import_commands {
             self.apply_import_command(command, ui.ctx());

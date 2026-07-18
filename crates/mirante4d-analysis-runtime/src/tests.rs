@@ -29,22 +29,36 @@ impl DatasetSource for FixtureSource {
         Ok(Arc::clone(&self.catalog))
     }
 
-    fn decode_into(&self, sink: &mut dyn ReservedDecodeSink) -> Result<(), DatasetSourceFault> {
-        let key = sink.resource_key();
-        self.catalog
-            .validate_decode_reservation(sink)
-            .map_err(|reason| DatasetSourceFault::InvalidResource {
-                key,
-                reason: Box::new(reason),
-            })?;
-        let value_len = usize::try_from(sink.payload_descriptor().value_byte_len()).unwrap();
-        let first_value = u8::try_from(key.region().origin()[2]).unwrap();
-        let values = (0..value_len)
-            .map(|offset| first_value + u8::try_from(offset).unwrap())
-            .collect::<Vec<_>>();
-        sink.write(&values)
-            .map_err(|reason| sink_fault(key, reason))?;
-        sink.finish().map_err(|reason| sink_fault(key, reason))
+    #[allow(
+        clippy::result_large_err,
+        reason = "the frozen DatasetSource contract requires this exact typed fault"
+    )]
+    fn decode_cohort_into(
+        &self,
+        sinks: &mut [&mut dyn ReservedDecodeSink],
+    ) -> Vec<Result<(), DatasetSourceFault>> {
+        sinks
+            .iter_mut()
+            .map(|sink| {
+                let sink = &mut **sink;
+                let key = sink.resource_key();
+                self.catalog
+                    .validate_decode_reservation(sink)
+                    .map_err(|reason| DatasetSourceFault::InvalidResource {
+                        key,
+                        reason: Box::new(reason),
+                    })?;
+                let value_len =
+                    usize::try_from(sink.payload_descriptor().value_byte_len()).unwrap();
+                let first_value = u8::try_from(key.region().origin()[2]).unwrap();
+                let values = (0..value_len)
+                    .map(|offset| first_value + u8::try_from(offset).unwrap())
+                    .collect::<Vec<_>>();
+                sink.write(&values)
+                    .map_err(|reason| sink_fault(key, reason))?;
+                sink.finish().map_err(|reason| sink_fault(key, reason))
+            })
+            .collect()
     }
 }
 

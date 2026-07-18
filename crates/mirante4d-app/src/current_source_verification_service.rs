@@ -1,14 +1,15 @@
 //! Bounded asynchronous current-source scientific verification.
 //!
-//! One worker scans the already-open source against D-009, prepares a verified
-//! unified runtime, and transfers it only after the canonical reducer accepts
-//! the exact source-generation completion.
+//! One worker scans the already-open source against D-009 and transfers the
+//! proof capability only after the exact source-generation completion can be
+//! accepted. The composition root then promotes the existing local source in
+//! place, retaining its decoded leases and GPU resource keys.
 
 use std::{
     fmt, io,
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, TryRecvError},
     },
@@ -16,31 +17,27 @@ use std::{
 };
 
 use mirante4d_application::{
-    OperationCompletion, OperationFailureCode, OperationKind, OperationToken,
-    SourceSessionGeneration,
+    OperationFailureCode, OperationKind, OperationToken, SourceSessionGeneration,
 };
-use mirante4d_dataset::{CpuByteLedger, DatasetCatalog};
-use mirante4d_dataset_runtime::RuntimeFaultCode;
+use mirante4d_dataset::CpuByteLedger;
 use mirante4d_project_model::{DatasetLocatorHint, DatasetReference};
-use mirante4d_settings::ResourcePolicy;
 use mirante4d_storage::{
-    DirectoryInventoryError, LocalDatasetSourceOpenError, PackageAdmissionError, PackageReadError,
-    PackageValidationError, RangeReadError, ScientificPackageValidationError, StorageProfileError,
+    DirectoryInventoryError, LocalDatasetSource, LocalDatasetSourcePromotionError,
+    LocalPackageReadDiagnostics, PackageAdmissionError, PackageReadError, PackageValidationError,
+    RangeReadError, ScientificPackageValidationError, StorageProfileError,
 };
 
-use crate::{
-    dataset_requests::DatasetDemandState,
-    unified_source_open::{self, UnifiedVerifiedSourceOpenError},
-};
+use crate::unified_source_open;
 
 const RESULT_CHANNEL_CAPACITY: usize = 1;
 const WORKER_NAME: &str = "mirante4d-current-source-verification";
 const PHASE_WORK_UNITS: u64 = 1_000_000;
-const TOTAL_WORK_UNITS: u64 = 4 * PHASE_WORK_UNITS;
+const TOTAL_WORK_UNITS: u64 = 3 * PHASE_WORK_UNITS;
 
 pub(crate) struct CurrentSourceVerificationService {
     active: Option<ActiveVerification>,
     diagnostics: CurrentSourceVerificationDiagnostics,
+    throttle: Arc<VerificationThrottle>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -52,14 +49,78 @@ pub(crate) struct CurrentSourceVerificationDiagnostics {
     /// Started workers that returned a failure or lost their result/join path.
     pub(crate) failed_runs: u64,
     pub(crate) accepted_successes: u64,
+    /// Completed separate-reader verification runs, irrespective of whether
+    /// the later application completion was accepted.
+    pub(crate) completed_reader_runs: u64,
+    /// Cumulative exact operation/byte/time facts from the separate strict
+    /// readers used by completed verification runs. Current gauges are zero;
+    /// peak gauges are maxima across those completed runs.
+    pub(crate) reader: LocalPackageReadDiagnostics,
 }
 
 struct ActiveVerification {
     token: OperationToken,
     cancellation: Arc<AtomicBool>,
+    throttle: Arc<VerificationThrottle>,
     progress: Arc<Mutex<Option<CoalescedProgress>>>,
     results: Receiver<CurrentSourceVerificationResult>,
     worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct VerificationThrottle {
+    interactive_busy: AtomicBool,
+    wait_lock: Mutex<()>,
+    changed: Condvar,
+}
+
+impl VerificationThrottle {
+    fn set_interactive_busy(&self, busy: bool) {
+        if self.interactive_busy.swap(busy, Ordering::AcqRel) == busy {
+            return;
+        }
+        if !busy {
+            // Synchronize with the waiter mutex after publishing the atomic
+            // predicate. The waiter therefore either observes `false` before
+            // sleeping or is already asleep when this notification occurs.
+            let _guard = self
+                .wait_lock
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            self.changed.notify_all();
+        }
+    }
+
+    fn request_cancel(&self, cancellation: &AtomicBool) {
+        // Hold the waiter lock while publishing cancellation so a worker
+        // cannot observe `busy`, miss this notification, and then sleep.
+        let _guard = self
+            .wait_lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        cancellation.store(true, Ordering::Release);
+        self.changed.notify_all();
+    }
+
+    fn checkpoint(&self, cancellation: &AtomicBool) -> bool {
+        if is_cancelled(cancellation) {
+            return true;
+        }
+        if !self.interactive_busy.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut guard = self
+            .wait_lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while self.interactive_busy.load(Ordering::Acquire) && !is_cancelled(cancellation) {
+            guard = self
+                .changed
+                .wait(guard)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+        is_cancelled(cancellation)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,14 +147,14 @@ pub(crate) enum CurrentSourceVerificationOutcome {
 }
 
 pub(crate) struct PreparedCurrentSourceVerification {
-    dataset: DatasetDemandState,
-    catalog: Arc<DatasetCatalog>,
     dataset_reference: DatasetReference,
     source_generation: SourceSessionGeneration,
+    reader_diagnostics: LocalPackageReadDiagnostics,
 }
 
-pub(crate) struct CurrentSourceVerificationRuntimeTransfer {
-    pub(crate) dataset: DatasetDemandState,
+pub(crate) struct CurrentSourceVerificationPromotion {
+    pub(crate) dataset_reference: DatasetReference,
+    pub(crate) source_generation: SourceSessionGeneration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +163,7 @@ pub(crate) enum CurrentSourceVerificationServiceError {
     NoActiveOperation,
     OperationTokenMismatch,
     InvalidOperationKind,
+    LocalSourceUnavailable,
     WorkerSpawnFailed(io::ErrorKind),
     WorkerPanicked,
     ResultChannelDisconnected,
@@ -120,6 +182,9 @@ impl fmt::Display for CurrentSourceVerificationServiceError {
             Self::InvalidOperationKind => {
                 formatter.write_str("current-source verification requires a verification token")
             }
+            Self::LocalSourceUnavailable => {
+                formatter.write_str("current-source verification requires a retained local source")
+            }
             Self::WorkerSpawnFailed(kind) => {
                 write!(
                     formatter,
@@ -137,7 +202,7 @@ impl fmt::Display for CurrentSourceVerificationServiceError {
 impl std::error::Error for CurrentSourceVerificationServiceError {}
 
 impl CurrentSourceVerificationService {
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             active: None,
             diagnostics: CurrentSourceVerificationDiagnostics {
@@ -146,7 +211,10 @@ impl CurrentSourceVerificationService {
                 cancelled_runs: 0,
                 failed_runs: 0,
                 accepted_successes: 0,
+                completed_reader_runs: 0,
+                reader: LocalPackageReadDiagnostics::default(),
             },
+            throttle: Arc::new(VerificationThrottle::default()),
         }
     }
 
@@ -156,6 +224,12 @@ impl CurrentSourceVerificationService {
 
     pub(crate) const fn diagnostics(&self) -> CurrentSourceVerificationDiagnostics {
         self.diagnostics
+    }
+
+    /// Verification remains mandatory, but cooperatively yields between its
+    /// bounded scan units while interactive delivery or rendering is active.
+    pub(crate) fn set_interactive_busy(&self, busy: bool) {
+        self.throttle.set_interactive_busy(busy);
     }
 
     pub(crate) fn reset_diagnostics(
@@ -189,8 +263,8 @@ impl CurrentSourceVerificationService {
         &mut self,
         token: OperationToken,
         path: PathBuf,
-        resource_policy: ResourcePolicy,
         scan_ledger: Arc<dyn CpuByteLedger>,
+        source: Arc<LocalDatasetSource>,
     ) -> Result<(), CurrentSourceVerificationServiceError> {
         if self.active.is_some() {
             return Err(CurrentSourceVerificationServiceError::Busy);
@@ -203,6 +277,7 @@ impl CurrentSourceVerificationService {
         let worker_cancellation = Arc::clone(&cancellation);
         let progress = Arc::new(Mutex::new(None));
         let worker_progress = Arc::clone(&progress);
+        let worker_throttle = Arc::clone(&self.throttle);
         let worker_token = token.clone();
         let (result_sender, results) = mpsc::sync_channel(RESULT_CHANNEL_CAPACITY);
         let worker = thread::Builder::new()
@@ -212,16 +287,24 @@ impl CurrentSourceVerificationService {
                     run_verification(
                         &worker_token,
                         path,
-                        resource_policy,
                         scan_ledger,
+                        source,
                         worker_cancellation.as_ref(),
+                        worker_throttle.as_ref(),
                         worker_progress,
                     )
                 }))
                 .unwrap_or(CurrentSourceVerificationOutcome::Failed(
                     OperationFailureCode::SourceVerificationReadFailed,
                 ));
-                let outcome = if worker_cancellation.load(Ordering::Acquire) {
+                // Promotion is the operation's commit point. Cancellation
+                // wins before that point; once the source authority has been
+                // swapped, the prepared completion must be delivered so the
+                // application cannot remain provisionally classified over a
+                // verified source.
+                let outcome = if worker_cancellation.load(Ordering::Acquire)
+                    && !matches!(outcome, CurrentSourceVerificationOutcome::Prepared(_))
+                {
                     dispose_outcome(outcome);
                     CurrentSourceVerificationOutcome::Cancelled
                 } else {
@@ -242,6 +325,7 @@ impl CurrentSourceVerificationService {
         self.active = Some(ActiveVerification {
             token,
             cancellation,
+            throttle: Arc::clone(&self.throttle),
             progress,
             results,
             worker: Some(worker),
@@ -261,7 +345,7 @@ impl CurrentSourceVerificationService {
         if &active.token != token {
             return Err(CurrentSourceVerificationServiceError::OperationTokenMismatch);
         }
-        active.cancellation.store(true, Ordering::Release);
+        active.throttle.request_cancel(active.cancellation.as_ref());
         Ok(())
     }
 
@@ -306,7 +390,12 @@ impl CurrentSourceVerificationService {
                     self.note_failed_run();
                     return Err(error);
                 }
-                if cancelled {
+                if cancelled
+                    && !matches!(
+                        result.outcome,
+                        CurrentSourceVerificationOutcome::Prepared(_)
+                    )
+                {
                     let outcome = std::mem::replace(
                         &mut result.outcome,
                         CurrentSourceVerificationOutcome::Cancelled,
@@ -315,6 +404,14 @@ impl CurrentSourceVerificationService {
                 }
                 if matches!(&result.outcome, CurrentSourceVerificationOutcome::Failed(_)) {
                     self.note_failed_run();
+                }
+                if let CurrentSourceVerificationOutcome::Prepared(prepared) = &result.outcome {
+                    self.diagnostics.completed_reader_runs =
+                        self.diagnostics.completed_reader_runs.saturating_add(1);
+                    self.diagnostics.reader = add_completed_reader_diagnostics(
+                        self.diagnostics.reader,
+                        prepared.reader_diagnostics,
+                    );
                 }
                 Ok(Some(result))
             }
@@ -330,7 +427,7 @@ impl CurrentSourceVerificationService {
 
     pub(crate) fn shutdown(mut self) -> Result<(), CurrentSourceVerificationServiceError> {
         if let Some(active) = self.active.as_ref() {
-            active.cancellation.store(true, Ordering::Release);
+            active.throttle.request_cancel(active.cancellation.as_ref());
         }
         join_active(self.active.take())
     }
@@ -345,47 +442,38 @@ impl Default for CurrentSourceVerificationService {
 impl Drop for CurrentSourceVerificationService {
     fn drop(&mut self) {
         if let Some(mut active) = self.active.take() {
-            active.cancellation.store(true, Ordering::Release);
+            active.throttle.request_cancel(active.cancellation.as_ref());
             let _ = active.worker.take();
         }
     }
 }
 
 impl PreparedCurrentSourceVerification {
-    pub(crate) fn into_runtime_and_completion(
-        self,
-    ) -> (
-        CurrentSourceVerificationRuntimeTransfer,
-        OperationCompletion,
-    ) {
-        let runtime = CurrentSourceVerificationRuntimeTransfer {
-            dataset: self.dataset,
-        };
-        let completion = OperationCompletion::SourceVerified {
+    pub(crate) fn into_promotion(self) -> CurrentSourceVerificationPromotion {
+        CurrentSourceVerificationPromotion {
+            dataset_reference: self.dataset_reference,
             source_generation: self.source_generation,
-            catalog: self.catalog,
-            dataset: self.dataset_reference,
-        };
-        (runtime, completion)
+        }
     }
 }
 
 fn run_verification(
     token: &OperationToken,
     path: PathBuf,
-    resource_policy: ResourcePolicy,
     scan_ledger: Arc<dyn CpuByteLedger>,
+    source: Arc<LocalDatasetSource>,
     cancellation: &AtomicBool,
+    throttle: &VerificationThrottle,
     progress: Arc<Mutex<Option<CoalescedProgress>>>,
 ) -> CurrentSourceVerificationOutcome {
-    if is_cancelled(cancellation) {
+    if verification_checkpoint(cancellation, throttle) {
         return CurrentSourceVerificationOutcome::Cancelled;
     }
     let source_generation = token.source_session_generation();
     let capability = match unified_source_open::verify_target_package(
         &path,
         scan_ledger,
-        || is_cancelled(cancellation),
+        || verification_checkpoint(cancellation, throttle),
         |stage| store_progress(progress.as_ref(), stage_progress(stage)),
     ) {
         Ok(capability) => capability,
@@ -396,22 +484,22 @@ fn run_verification(
             return CurrentSourceVerificationOutcome::Failed(map_target_verification_error(&error));
         }
     };
-    if is_cancelled(cancellation) {
+    if verification_checkpoint(cancellation, throttle) {
         return CurrentSourceVerificationOutcome::Cancelled;
     }
     let scientific_content_id = capability.scientific_content_id();
     let package_id = capability.package_id();
-    let opened = match unified_source_open::open_verified(resource_policy, capability) {
-        Ok(opened) => opened,
-        Err(error) => {
-            return CurrentSourceVerificationOutcome::Failed(map_verified_open_error(&error));
-        }
-    };
-    if is_cancelled(cancellation) {
-        let _ = opened.dataset.request_shutdown();
-        drop(opened);
+    if verification_checkpoint(cancellation, throttle) {
         return CurrentSourceVerificationOutcome::Cancelled;
     }
+    let reader_diagnostics = match source.promote_verified(capability, || {
+        verification_checkpoint(cancellation, throttle)
+    }) {
+        Ok(diagnostics) => diagnostics,
+        Err(failure) => {
+            return CurrentSourceVerificationOutcome::Failed(map_promotion_error(failure.error()));
+        }
+    };
     store_progress(
         progress.as_ref(),
         CoalescedProgress {
@@ -425,11 +513,104 @@ fn run_verification(
     let dataset_reference =
         DatasetReference::new(scientific_content_id, Some(package_id), None, locator_hint);
     CurrentSourceVerificationOutcome::Prepared(Box::new(PreparedCurrentSourceVerification {
-        dataset: opened.dataset,
-        catalog: opened.catalog,
         dataset_reference,
         source_generation,
+        reader_diagnostics,
     }))
+}
+
+fn add_completed_reader_diagnostics(
+    total: LocalPackageReadDiagnostics,
+    run: LocalPackageReadDiagnostics,
+) -> LocalPackageReadDiagnostics {
+    LocalPackageReadDiagnostics {
+        object_open_operations: total
+            .object_open_operations
+            .saturating_add(run.object_open_operations),
+        object_open_time_ns: total
+            .object_open_time_ns
+            .saturating_add(run.object_open_time_ns),
+        open_object_handles_current: 0,
+        open_object_handles_peak: total
+            .open_object_handles_peak
+            .max(run.open_object_handles_peak),
+        object_handle_cache_entries: 0,
+        object_handle_cache_peak_entries: total
+            .object_handle_cache_peak_entries
+            .max(run.object_handle_cache_peak_entries),
+        object_handle_cache_hits: total
+            .object_handle_cache_hits
+            .saturating_add(run.object_handle_cache_hits),
+        object_handle_cache_misses: total
+            .object_handle_cache_misses
+            .saturating_add(run.object_handle_cache_misses),
+        object_handle_cache_evictions: total
+            .object_handle_cache_evictions
+            .saturating_add(run.object_handle_cache_evictions),
+        object_handle_cache_lock_acquisitions: total
+            .object_handle_cache_lock_acquisitions
+            .saturating_add(run.object_handle_cache_lock_acquisitions),
+        object_handle_cache_lock_contentions: total
+            .object_handle_cache_lock_contentions
+            .saturating_add(run.object_handle_cache_lock_contentions),
+        object_handle_cache_lock_wait_time_ns: total
+            .object_handle_cache_lock_wait_time_ns
+            .saturating_add(run.object_handle_cache_lock_wait_time_ns),
+        shard_index_cache_hits: total
+            .shard_index_cache_hits
+            .saturating_add(run.shard_index_cache_hits),
+        shard_index_cache_misses: total
+            .shard_index_cache_misses
+            .saturating_add(run.shard_index_cache_misses),
+        shard_index_decode_operations: total
+            .shard_index_decode_operations
+            .saturating_add(run.shard_index_decode_operations),
+        packed_inner_cache_hits: total
+            .packed_inner_cache_hits
+            .saturating_add(run.packed_inner_cache_hits),
+        packed_inner_cache_misses: total
+            .packed_inner_cache_misses
+            .saturating_add(run.packed_inner_cache_misses),
+        currentness_pre_use_batches: total
+            .currentness_pre_use_batches
+            .saturating_add(run.currentness_pre_use_batches),
+        currentness_post_use_batches: total
+            .currentness_post_use_batches
+            .saturating_add(run.currentness_post_use_batches),
+        currentness_snapshot_batches: total
+            .currentness_snapshot_batches
+            .saturating_add(run.currentness_snapshot_batches),
+        currentness_root_metadata_checks: total
+            .currentness_root_metadata_checks
+            .saturating_add(run.currentness_root_metadata_checks),
+        currentness_named_object_resolutions: total
+            .currentness_named_object_resolutions
+            .saturating_add(run.currentness_named_object_resolutions),
+        currentness_object_fd_metadata_checks: total
+            .currentness_object_fd_metadata_checks
+            .saturating_add(run.currentness_object_fd_metadata_checks),
+        currentness_time_ns: total
+            .currentness_time_ns
+            .saturating_add(run.currentness_time_ns),
+        physical_range_read_operations: total
+            .physical_range_read_operations
+            .saturating_add(run.physical_range_read_operations),
+        physical_encoded_bytes_read: total
+            .physical_encoded_bytes_read
+            .saturating_add(run.physical_encoded_bytes_read),
+        physical_range_read_time_ns: total
+            .physical_range_read_time_ns
+            .saturating_add(run.physical_range_read_time_ns),
+        codec_decode_operations: total
+            .codec_decode_operations
+            .saturating_add(run.codec_decode_operations),
+        codec_decoded_bytes: total
+            .codec_decoded_bytes
+            .saturating_add(run.codec_decoded_bytes),
+        codec_decode_time_ns: total
+            .codec_decode_time_ns
+            .saturating_add(run.codec_decode_time_ns),
+    }
 }
 
 fn stage_progress(stage: unified_source_open::TargetPackageVerificationStage) -> CoalescedProgress {
@@ -457,6 +638,10 @@ fn store_progress(progress: &Mutex<Option<CoalescedProgress>>, candidate: Coales
 
 fn is_cancelled(cancellation: &AtomicBool) -> bool {
     cancellation.load(Ordering::Acquire)
+}
+
+fn verification_checkpoint(cancellation: &AtomicBool, throttle: &VerificationThrottle) -> bool {
+    throttle.checkpoint(cancellation)
 }
 
 fn target_verification_cancelled(
@@ -523,6 +708,27 @@ fn map_exact_failure(error: &PackageValidationError) -> OperationFailureCode {
             OperationFailureCode::SourceChanged
         }
         _ => map_storage_failure(error, OperationFailureCode::SourceVerificationInvalid),
+    }
+}
+
+fn map_promotion_error(error: &LocalDatasetSourcePromotionError) -> OperationFailureCode {
+    match error {
+        LocalDatasetSourcePromotionError::StorageContractMismatch => {
+            OperationFailureCode::SourceVerificationInvalid
+        }
+        LocalDatasetSourcePromotionError::ProvisionalGenerationDrift => {
+            OperationFailureCode::SourceChanged
+        }
+        LocalDatasetSourcePromotionError::AuthorityEpochOverflow => {
+            OperationFailureCode::SourceVerificationCapacityExceeded
+        }
+        LocalDatasetSourcePromotionError::MetadataAdmission(_)
+        | LocalDatasetSourcePromotionError::InvalidMetadataLease => {
+            OperationFailureCode::SourceVerificationCapacityExceeded
+        }
+        LocalDatasetSourcePromotionError::Currentness(error) => {
+            map_storage_failure(error, OperationFailureCode::SourceChanged)
+        }
     }
 }
 
@@ -602,57 +808,8 @@ fn map_verification_range_failure(
     }
 }
 
-fn map_verified_open_error(error: &UnifiedVerifiedSourceOpenError) -> OperationFailureCode {
-    match error {
-        UnifiedVerifiedSourceOpenError::Adapter(error) => match error {
-            LocalDatasetSourceOpenError::MetadataAccountingOverflow
-            | LocalDatasetSourceOpenError::MetadataAdmission(_)
-            | LocalDatasetSourceOpenError::InvalidMetadataLease => {
-                OperationFailureCode::SourceVerificationCapacityExceeded
-            }
-            LocalDatasetSourceOpenError::Admission(error) => {
-                map_storage_failure(error, OperationFailureCode::SourceVerificationInvalid)
-            }
-            LocalDatasetSourceOpenError::Catalog(_)
-            | LocalDatasetSourceOpenError::MetadataInvariant { .. } => {
-                OperationFailureCode::SourceVerificationInvalid
-            }
-        },
-        UnifiedVerifiedSourceOpenError::RuntimeConfiguration(code) => match code {
-            RuntimeFaultCode::InvalidConfiguration
-            | RuntimeFaultCode::MinimumWorkUnitExceedsBudget
-            | RuntimeFaultCode::CapacityExceeded { .. } => {
-                OperationFailureCode::SourceVerificationCapacityExceeded
-            }
-            _ => OperationFailureCode::SourceVerificationReadFailed,
-        },
-        UnifiedVerifiedSourceOpenError::MissingCpuLedger => {
-            OperationFailureCode::SourceVerificationCapacityExceeded
-        }
-        UnifiedVerifiedSourceOpenError::Runtime(error) => match error.code() {
-            RuntimeFaultCode::InvalidConfiguration
-            | RuntimeFaultCode::MinimumWorkUnitExceedsBudget
-            | RuntimeFaultCode::CapacityExceeded { .. } => {
-                OperationFailureCode::SourceVerificationCapacityExceeded
-            }
-            RuntimeFaultCode::Cancelled | RuntimeFaultCode::StaleGeneration => {
-                OperationFailureCode::SourceVerificationReadFailed
-            }
-            RuntimeFaultCode::SourceRejected
-            | RuntimeFaultCode::CorruptResource
-            | RuntimeFaultCode::UnsupportedResource => {
-                OperationFailureCode::SourceVerificationInvalid
-            }
-            _ => OperationFailureCode::SourceVerificationReadFailed,
-        },
-    }
-}
-
 fn dispose_outcome(outcome: CurrentSourceVerificationOutcome) {
-    if let CurrentSourceVerificationOutcome::Prepared(prepared) = outcome {
-        let _ = prepared.dataset.request_shutdown();
-        drop(prepared);
-    }
+    drop(outcome);
 }
 
 fn join_active(
@@ -661,7 +818,7 @@ fn join_active(
     let Some(mut active) = active else {
         return Ok(());
     };
-    active.cancellation.store(true, Ordering::Release);
+    active.throttle.request_cancel(active.cancellation.as_ref());
     drop(active.results);
     match active.worker.take() {
         Some(worker) => worker
@@ -732,6 +889,64 @@ mod tests {
     }
 
     #[test]
+    fn interactive_work_pauses_verification_checkpoints_but_not_cancellation() {
+        let throttle = Arc::new(VerificationThrottle::default());
+        throttle.set_interactive_busy(true);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_throttle = Arc::clone(&throttle);
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(verification_checkpoint(
+                    worker_cancelled.as_ref(),
+                    worker_throttle.as_ref(),
+                ))
+                .unwrap();
+        });
+
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(10))
+                .is_err()
+        );
+        throttle.set_interactive_busy(false);
+        assert!(
+            !receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+        );
+        worker.join().unwrap();
+
+        let throttle = Arc::new(VerificationThrottle::default());
+        throttle.set_interactive_busy(true);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_throttle = Arc::clone(&throttle);
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(verification_checkpoint(
+                    worker_cancelled.as_ref(),
+                    worker_throttle.as_ref(),
+                ))
+                .unwrap();
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(10))
+                .is_err()
+        );
+        throttle.request_cancel(cancelled.as_ref());
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn evidence_diagnostics_reset_only_while_idle() {
         let mut service = CurrentSourceVerificationService::new();
         service.note_accepted_progress();
@@ -746,6 +961,7 @@ mod tests {
                 cancelled_runs: 1,
                 failed_runs: 1,
                 accepted_successes: 1,
+                ..CurrentSourceVerificationDiagnostics::default()
             }
         );
         service.reset_diagnostics().unwrap();
@@ -753,6 +969,46 @@ mod tests {
             service.diagnostics(),
             CurrentSourceVerificationDiagnostics::default()
         );
+    }
+
+    #[test]
+    fn completed_reader_diagnostics_sum_counters_and_preserve_only_peak_gauges() {
+        let first = LocalPackageReadDiagnostics {
+            object_open_operations: 3,
+            open_object_handles_current: 2,
+            open_object_handles_peak: 4,
+            object_handle_cache_entries: 1,
+            object_handle_cache_peak_entries: 3,
+            physical_range_read_operations: 5,
+            physical_encoded_bytes_read: 7,
+            codec_decode_operations: 11,
+            codec_decoded_bytes: 13,
+            ..LocalPackageReadDiagnostics::default()
+        };
+        let second = LocalPackageReadDiagnostics {
+            object_open_operations: 17,
+            open_object_handles_current: 6,
+            open_object_handles_peak: 8,
+            object_handle_cache_entries: 5,
+            object_handle_cache_peak_entries: 7,
+            physical_range_read_operations: 19,
+            physical_encoded_bytes_read: 23,
+            codec_decode_operations: 29,
+            codec_decoded_bytes: 31,
+            ..LocalPackageReadDiagnostics::default()
+        };
+
+        let total = add_completed_reader_diagnostics(first, second);
+
+        assert_eq!(total.object_open_operations, 20);
+        assert_eq!(total.physical_range_read_operations, 24);
+        assert_eq!(total.physical_encoded_bytes_read, 30);
+        assert_eq!(total.codec_decode_operations, 40);
+        assert_eq!(total.codec_decoded_bytes, 44);
+        assert_eq!(total.open_object_handles_current, 0);
+        assert_eq!(total.object_handle_cache_entries, 0);
+        assert_eq!(total.open_object_handles_peak, 8);
+        assert_eq!(total.object_handle_cache_peak_entries, 7);
     }
 
     #[test]
@@ -791,8 +1047,8 @@ mod tests {
             .request_verification(
                 token,
                 temp.path().join("missing-target.m4d"),
-                mirante4d_settings::ResourcePolicy::default(),
                 opened.dataset.cpu_ledger_arc(),
+                Arc::clone(opened.dataset.local_source().unwrap()),
             )
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -813,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_before_receive_wins_over_an_already_published_success() {
+    fn committed_source_promotion_wins_over_late_cancellation() {
         let temp = tempfile::tempdir().unwrap();
         let path = crate::tests::write_target_fixture(temp.path()).unwrap();
         let opened = crate::unified_source_open::open(
@@ -848,8 +1104,8 @@ mod tests {
             .request_verification(
                 token.clone(),
                 path,
-                mirante4d_settings::ResourcePolicy::default(),
                 opened.dataset.cpu_ledger_arc(),
+                Arc::clone(opened.dataset.local_source().unwrap()),
             )
             .unwrap();
         assert_eq!(service.diagnostics().started_runs, 1);
@@ -868,7 +1124,7 @@ mod tests {
         let result = service.try_recv().unwrap().unwrap();
         assert!(matches!(
             result.outcome,
-            CurrentSourceVerificationOutcome::Cancelled
+            CurrentSourceVerificationOutcome::Prepared(_)
         ));
         assert!(service.active_token().is_none());
         opened.dataset.request_shutdown().unwrap();

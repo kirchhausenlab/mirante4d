@@ -2263,6 +2263,7 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "mirante4d-dataset",
+ "mirante4d-dataset-runtime",
  "mirante4d-domain",
  "mirante4d-identity",
  "rustix 1.1.4",

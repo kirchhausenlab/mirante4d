@@ -1,6 +1,13 @@
 use super::*;
 
 impl MiranteWorkbenchApp {
+    fn bind_import_worker_completion_repaint(&mut self, ctx: &egui::Context) {
+        let completion_ctx = ctx.clone();
+        self.import
+            .workers
+            .set_completion_wake(move || completion_ctx.request_repaint());
+    }
+
     pub(super) fn import_tiff_directory_from_dialog(&mut self, ctx: &egui::Context) {
         if self.import.workers.status().is_active() {
             tracing::info!("TIFF import workflow is already running");
@@ -48,6 +55,7 @@ impl MiranteWorkbenchApp {
         output_parent: PathBuf,
         ctx: &egui::Context,
     ) {
+        self.bind_import_worker_completion_repaint(ctx);
         let destination = tiff_destination(&source, &output_parent);
         if let Err(error) = self.enter_tiff_import_setup_waiting_state(source, destination) {
             self.import.problem = Some(error.to_string());
@@ -125,6 +133,7 @@ impl MiranteWorkbenchApp {
                 self.import.workers.cancel_inspection();
             }
             ImportCommand::Start { review_id, draft } => {
+                self.bind_import_worker_completion_repaint(ctx);
                 match self.import.start_options(review_id, draft) {
                     Ok(Some(options)) => {
                         self.start_import_task(review_id, options);
@@ -151,6 +160,7 @@ impl MiranteWorkbenchApp {
                 self.import.checkpoint_retry = None;
             }
             ImportCommand::ResetCheckpointAndRestart { retry_id } => {
+                self.bind_import_worker_completion_repaint(ctx);
                 self.reset_invalid_checkpoint_and_restart(retry_id);
             }
         }

@@ -24,8 +24,10 @@ exceptions have one separate tool-owned
 
 ## Plans
 
-No implementation or corrective plan is active. [Current
-work](planning/NOW.md) owns the completed checkpoint; Git history is the
+One high-risk corrective plan is active: the [viewer performance
+overhaul](plans/active/VIEWER_PERFORMANCE_OVERHAUL.md). Its owner-authorized
+replacement is at the EP-00 workload, fidelity, and cost-truth checkpoint.
+[Current work](planning/NOW.md) owns the exact checkpoint; Git history is the
 archive of deleted plans.
 
 Two future outcomes remain deliberately separate from ordinary development:

@@ -43,12 +43,12 @@ use eframe::egui::{self, Color32, RichText};
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, CrossSectionPanelId, OperationOutcome,
     PresentationPaintRequest, PresentationSlot, PresentationSurface, PresentationViewport,
-    ProjectGenerationId, ProjectId, RenderExtent, ResourcePolicy,
+    ProjectGenerationId, ProjectId, RenderExtent, ResourcePolicy, VolumePickQuery,
     import_workflow::{
         ImportCommand, ImportProgressSnapshot, ImportReviewDraft, ImportReviewId,
         ImportReviewSnapshot, ImportSourceDtype, ImportSourceLayout, ImportWorkflowSnapshot,
     },
-    viewer_tools::ViewerToolState,
+    viewer_tools::{ScreenPosition, ViewerTool, ViewerToolContext, ViewerToolState},
     viewport_interaction::ViewportOrbitDrag,
 };
 
@@ -65,6 +65,7 @@ pub struct EguiUiState {
     pub viewer_tools: ViewerToolState,
     pub hovered_pixel: Option<ViewportHover>,
     pub hovered_source_readout: Option<String>,
+    pub runtime_diagnostics_open: bool,
     pub close_prompt_open: bool,
     pub allow_close_without_prompt: bool,
     pub settings_runtime_draft: ResourcePolicyDraft,
@@ -84,6 +85,7 @@ impl EguiUiState {
             viewer_tools: ViewerToolState::default(),
             hovered_pixel: None,
             hovered_source_readout: None,
+            runtime_diagnostics_open: false,
             close_prompt_open: false,
             allow_close_without_prompt: false,
             settings_runtime_draft: ResourcePolicyDraft {
@@ -137,6 +139,13 @@ pub struct ViewportHover {
     pub x: u64,
     pub y: u64,
     pub intensity: ViewportIntensity,
+    pub sample_kind: ViewportSampleKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewportSampleKind {
+    Voxel,
+    Interpolated,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -346,6 +355,68 @@ pub struct ViewportObservation {
     render: RenderExtent,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewerPickPurpose {
+    Hover,
+    PrimaryClick,
+}
+
+/// One latest-only scientific 3D pick requested while laying out the viewer.
+/// The query is already bound to the displayed token/frame/extent; the native
+/// composition root remains responsible for revalidating those facts when the
+/// asynchronous result completes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewerPickRequest {
+    query: VolumePickQuery,
+    context: ViewerToolContext,
+    tool: ViewerTool,
+    purpose: ViewerPickPurpose,
+    screen_position: ScreenPosition,
+}
+
+impl ViewerPickRequest {
+    pub fn new(
+        query: VolumePickQuery,
+        context: ViewerToolContext,
+        tool: ViewerTool,
+        purpose: ViewerPickPurpose,
+        screen_position: ScreenPosition,
+    ) -> Option<Self> {
+        (tool != ViewerTool::Navigate
+            && context.timepoint == query.timepoint()
+            && context.layer == query.layer()
+            && screen_position.x.is_finite()
+            && screen_position.y.is_finite())
+        .then_some(Self {
+            query,
+            context,
+            tool,
+            purpose,
+            screen_position,
+        })
+    }
+
+    pub const fn query(self) -> VolumePickQuery {
+        self.query
+    }
+
+    pub const fn context(self) -> ViewerToolContext {
+        self.context
+    }
+
+    pub const fn tool(self) -> ViewerTool {
+        self.tool
+    }
+
+    pub const fn purpose(self) -> ViewerPickPurpose {
+        self.purpose
+    }
+
+    pub const fn screen_position(self) -> ScreenPosition {
+        self.screen_position
+    }
+}
+
 impl ViewportObservation {
     pub const fn new(
         slot: PresentationSlot,
@@ -458,6 +529,7 @@ pub struct WorkbenchUiOutput {
     pub actions: Vec<WorkbenchUiAction>,
     pub viewport_observations: Vec<ViewportObservation>,
     pub cross_section_readout_requests: Vec<CrossSectionReadoutRequest>,
+    pub viewer_pick_request: Option<ViewerPickRequest>,
     pub render_requests: Vec<RenderUiRequest>,
     pub presentation_paints: Vec<EguiPresentationPaint>,
     pub rerender_requested: bool,
@@ -1276,6 +1348,7 @@ mod tests {
         );
         assert!(state.viewport_orbit_drag.is_none());
         assert!(state.analysis_filter.is_empty());
+        assert!(!state.runtime_diagnostics_open);
         assert!(!state.close_prompt_open);
         assert!(!state.analysis_workspace_open);
         assert!(state.import_review.is_none());
@@ -1308,6 +1381,7 @@ mod tests {
             ],
             viewport_observations: Vec::new(),
             cross_section_readout_requests: Vec::new(),
+            viewer_pick_request: None,
             render_requests: Vec::new(),
             presentation_paints: Vec::new(),
             rerender_requested: true,

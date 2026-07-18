@@ -28,6 +28,20 @@ const TEST_INITIAL_RENDER_VIEWPORT_SIDE: u64 = 32;
 
 use super::*;
 
+#[test]
+fn fixed_viewer_activity_grace_yields_verification_after_settle() {
+    let now = Instant::now();
+    assert!(viewer_verification_grace_active(
+        Some(now + VIEWER_VERIFICATION_GRACE),
+        now,
+    ));
+    assert!(!viewer_verification_grace_active(
+        Some(now),
+        now + Duration::from_millis(1),
+    ));
+    assert!(!viewer_verification_grace_active(None, now));
+}
+
 pub(crate) fn write_target_fixture(output_root: &Path) -> anyhow::Result<PathBuf> {
     if TARGET_FIXTURE_ARCHIVE.is_empty()
         || TARGET_FIXTURE_ARCHIVE.len() > TARGET_FIXTURE_ARCHIVE_BYTES_MAX
@@ -391,11 +405,34 @@ fn test_workbench_app_without_background_runtime(
         dataset,
         render_coordination,
         native_presentation: native_presentation::NativePresentationBridge::unavailable(),
+        viewer_pick_queue: viewer_pick_runtime::ViewerPickQueue::default(),
+        progressive_display_pacer: workbench_brick_runtime::ProgressiveDisplayRefreshPacer::default(
+        ),
+        display_performance_milestones: display_refresh::DisplayPerformanceMilestones::default(),
+        display_instrumentation_epoch: std::time::Instant::now(),
+        camera_demand_planner: camera_demand_cache::CameraDemandPlanner::new()
+            .expect("the test camera-demand worker must start"),
+        pending_visible_demand_plan: None,
+        visible_demand_failure_latch: None,
+        viewer_render_failure_latches: std::collections::BTreeMap::new(),
+        viewer_runtime_recovery_epoch: 0,
+        prepared_scope_render_plans: std::collections::BTreeMap::new(),
+        last_visible_demand_candidates_visited: None,
+        staged_post_promotion_renderer_update: None,
+        last_camera_demand_planning_duration: None,
+        current_camera_reuse_envelope: None,
+        visible_demand_planning_signature: None,
+        viewer_verification_busy_until: None,
+        active_histogram_cache: histogram::ActiveLayerHistogramCache::default(),
         egui_ui,
         import: ImportWorkflow::new(),
         analysis_runtime,
         product_automation: None,
         test_render_viewport_max_side: None,
+        runtime_diagnostics_collections: std::cell::Cell::new(0),
+        visible_demand_plan_calls: 0,
+        cross_section_demand_plan_calls: 0,
+        product_render_attempts: 0,
         project_store: None,
         project_recovery_root: None,
         project_recovery_candidates: Vec::new(),
@@ -429,6 +466,28 @@ fn test_workbench_app_for_ui_harness(
     let mut app = test_workbench_app_without_background_runtime(opened);
     app.test_render_viewport_max_side = Some(TEST_INITIAL_RENDER_VIEWPORT_SIDE as usize);
     app
+}
+
+fn await_visible_demand_plan(
+    app: &mut MiranteWorkbenchApp,
+) -> workbench_brick_runtime::VisibleBrickRequestOutcome {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut aggregate = workbench_brick_runtime::VisibleBrickRequestOutcome::default();
+    loop {
+        let outcome = app.request_visible_bricks();
+        aggregate.current_plan_installed |= outcome.current_plan_installed;
+        aggregate.current_changed |= outcome.current_changed;
+        aggregate.resident_changed |= outcome.resident_changed;
+        aggregate.current_frame_ready |= outcome.current_frame_ready;
+        if app.pending_visible_demand_plan.is_none() {
+            return aggregate;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "camera-demand worker did not publish its latest plan"
+        );
+        std::thread::yield_now();
+    }
 }
 
 include!("tests/fidelity_shell.rs");

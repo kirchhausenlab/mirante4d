@@ -503,6 +503,9 @@ fn map_verified_open_failure(error: &UnifiedVerifiedSourceOpenError) -> Operatio
         | UnifiedVerifiedSourceOpenError::MissingCpuLedger => {
             OperationFailureCode::DatasetCapacityExceeded
         }
+        UnifiedVerifiedSourceOpenError::MissingLocalSource => {
+            OperationFailureCode::DatasetReadFailed
+        }
         UnifiedVerifiedSourceOpenError::Adapter(
             LocalDatasetSourceOpenError::MetadataAccountingOverflow
             | LocalDatasetSourceOpenError::MetadataAdmission(_)

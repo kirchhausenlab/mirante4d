@@ -89,6 +89,26 @@ impl CrossSectionPanel {
 }
 
 impl CrossSectionPanelView {
+    pub fn center_world(self) -> [f64; 3] {
+        self.center_world.to_array()
+    }
+
+    pub fn right_world(self) -> [f64; 3] {
+        self.basis.right_world.to_array()
+    }
+
+    pub fn down_world(self) -> [f64; 3] {
+        self.basis.down_world.to_array()
+    }
+
+    pub fn normal_away_world(self) -> [f64; 3] {
+        self.basis.normal_away_world.to_array()
+    }
+
+    pub const fn scale_world_per_screen_point(self) -> f64 {
+        self.scale_world_per_screen_point
+    }
+
     pub fn world_point_for_panel_point(
         self,
         x_points: f64,

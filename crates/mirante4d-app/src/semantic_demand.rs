@@ -1,9 +1,12 @@
 //! Storage-independent resource-region planning for product views.
 
-use std::{collections::HashSet, fmt};
+use std::fmt;
 
 use glam::{DMat4, DQuat, DVec3};
-use mirante4d_dataset::{ResourceContractError, ResourceRegion};
+use mirante4d_dataset::{
+    CpuByteLease, CpuByteLedger, CpuLedgerCategory, CpuLedgerError, ResourceContractError,
+    ResourceRegion,
+};
 use mirante4d_domain::{CrossSectionView, GridToWorld, Projection, Shape3D};
 use mirante4d_render_api::{CameraFrame, PresentationViewport, RenderApiError, RenderExtent};
 
@@ -27,11 +30,6 @@ pub(crate) struct SemanticRegionGridSpec {
     pub(crate) volume_shape: Shape3D,
     pub(crate) resource_shape: Shape3D,
     pub(crate) grid_to_world: GridToWorld,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct VolumePlanOptions {
-    pub(crate) pixel_stride: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,11 +66,12 @@ impl CrossSectionPlane {
 
 #[derive(Debug)]
 pub(crate) enum SemanticPlanError {
-    InvalidPixelStride,
     Capacity { kind: &'static str, maximum: usize },
+    Cancelled,
     NonInvertibleTransform,
     Resource(ResourceContractError),
     Camera(RenderApiError),
+    ScratchCapacity(CpuLedgerError),
 }
 
 impl SemanticPlanError {
@@ -88,20 +87,19 @@ impl SemanticPlanError {
 impl fmt::Display for SemanticPlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidPixelStride => {
-                formatter.write_str("semantic planner pixel stride must be positive")
-            }
             Self::Capacity { kind, maximum } => {
                 write!(
                     formatter,
                     "semantic planning exceeded the {kind} limit of {maximum}"
                 )
             }
+            Self::Cancelled => formatter.write_str("semantic planning was cancelled"),
             Self::NonInvertibleTransform => {
                 formatter.write_str("grid-to-world matrix must be invertible")
             }
             Self::Resource(error) => error.fmt(formatter),
             Self::Camera(error) => error.fmt(formatter),
+            Self::ScratchCapacity(error) => write!(formatter, "semantic planning scratch: {error}"),
         }
     }
 }
@@ -111,8 +109,143 @@ impl std::error::Error for SemanticPlanError {
         match self {
             Self::Resource(error) => Some(error),
             Self::Camera(error) => Some(error),
-            Self::InvalidPixelStride | Self::Capacity { .. } | Self::NonInvertibleTransform => None,
+            Self::ScratchCapacity(error) => Some(error),
+            Self::Capacity { .. } | Self::Cancelled | Self::NonInvertibleTransform => None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SemanticPlanWork {
+    pub(crate) candidates_visited: usize,
+}
+
+pub(crate) struct VisibleResourceRegionPlan {
+    pub(crate) regions: Vec<ResourceRegion>,
+    /// Prefix visible to the unexpanded camera. Any following regions belong
+    /// only to a bounded navigation guard and are always lower priority.
+    pub(crate) primary_regions: usize,
+    pub(crate) work: SemanticPlanWork,
+    /// Keeps the candidate/output allocation charged until its caller has
+    /// converted the region vector into the final prepared result body.
+    pub(crate) scratch_charge: Option<Box<dyn CpuByteLease>>,
+}
+
+impl fmt::Debug for VisibleResourceRegionPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VisibleResourceRegionPlan")
+            .field("regions", &self.regions)
+            .field("primary_regions", &self.primary_regions)
+            .field("work", &self.work)
+            .field(
+                "scratch_charge_bytes",
+                &self
+                    .scratch_charge
+                    .as_ref()
+                    .map(|charge| charge.reserved_bytes()),
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VisibilityHalfSpace {
+    normal: DVec3,
+    offset: f64,
+}
+
+impl VisibilityHalfSpace {
+    fn through_eye(normal: DVec3, eye: DVec3) -> Self {
+        Self {
+            normal,
+            offset: -normal.dot(eye),
+        }
+    }
+
+    fn signed_distance(self, point: DVec3) -> f64 {
+        self.normal.dot(point) + self.offset
+    }
+}
+
+/// Constant-size proof that a later camera cannot expose a brick omitted by
+/// one expanded semantic plan. It stores only five guard half-spaces and the
+/// affine volume corners for each visible layer/scale; it is deliberately not
+/// a scene graph or per-brick spatial index.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SemanticCameraReuseEnvelope {
+    projection: Projection,
+    guard_planes: [VisibilityHalfSpace; 5],
+    volume_corners: Box<[[DVec3; 8]]>,
+    reusable_candidates: usize,
+}
+
+// Construction rejects every non-finite plane/corner below, so the derived
+// floating-point equality is reflexive for all values of this private type.
+impl Eq for SemanticCameraReuseEnvelope {}
+
+impl SemanticCameraReuseEnvelope {
+    pub(crate) fn new(
+        guard_camera: CameraFrame,
+        extent: RenderExtent,
+        specs: impl IntoIterator<Item = SemanticRegionGridSpec>,
+        reusable_candidates: usize,
+    ) -> Result<Self, SemanticPlanError> {
+        let guard_planes = camera_visibility_planes(guard_camera, extent)?;
+        let volume_corners = specs
+            .into_iter()
+            .map(|spec| {
+                volume_grid_corners(spec.volume_shape)
+                    .map(|corner| transform_grid_point(spec.grid_to_world, corner))
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        if !guard_planes
+            .iter()
+            .all(|plane| plane.normal.is_finite() && plane.offset.is_finite())
+            || !volume_corners
+                .iter()
+                .flatten()
+                .all(|corner| corner.is_finite())
+        {
+            return Err(SemanticPlanError::Camera(
+                RenderApiError::CameraMathNotFinite,
+            ));
+        }
+        Ok(Self {
+            projection: guard_camera.view().projection(),
+            guard_planes,
+            volume_corners,
+            reusable_candidates,
+        })
+    }
+
+    /// Proves containment using the same corresponding plane tests as the
+    /// semantic brick classifier. For each new plane, clipping an affine box
+    /// produces vertices only at retained box corners and crossed box edges;
+    /// checking those constant 20 points therefore bounds every possible
+    /// brick corner without visiting a candidate.
+    pub(crate) fn contains(
+        &self,
+        camera: CameraFrame,
+        extent: RenderExtent,
+    ) -> Result<bool, SemanticPlanError> {
+        if camera.view().projection() != self.projection {
+            return Ok(false);
+        }
+        let next_planes = camera_visibility_planes(camera, extent)?;
+        Ok(self.volume_corners.iter().all(|corners| {
+            next_planes
+                .iter()
+                .zip(self.guard_planes.iter())
+                .all(|(next, guard)| {
+                    clipped_volume_half_space_is_contained(*corners, *next, *guard)
+                })
+        }))
+    }
+
+    pub(crate) const fn reusable_candidates(&self) -> usize {
+        self.reusable_candidates
     }
 }
 
@@ -129,27 +262,6 @@ impl From<RenderApiError> for SemanticPlanError {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct GridRay {
-    origin: DVec3,
-    direction: DVec3,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RayBoxHit {
-    enter: f64,
-    exit: f64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AxisTraversal {
-    index: i64,
-    step: i64,
-    next_t: f64,
-    delta_t: f64,
-    limit: i64,
-}
-
-#[derive(Debug, Clone, Copy)]
 struct OrthographicView {
     eye: DVec3,
     forward: DVec3,
@@ -157,6 +269,16 @@ struct OrthographicView {
     up: DVec3,
     half_width: f64,
     half_height: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PerspectiveFrustum {
+    eye: DVec3,
+    forward: DVec3,
+    right: DVec3,
+    up: DVec3,
+    tan_half_width: f64,
+    tan_half_height: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,35 +319,155 @@ struct CrossSectionSlab {
     half_depth_world: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScreenContribution {
+    overlap_area: f64,
+    center_distance_squared: f64,
+    near_depth: f64,
+}
+
+#[cfg(test)]
 pub(crate) fn plan_visible_resource_regions(
     camera: CameraFrame,
     extent: RenderExtent,
     spec: SemanticRegionGridSpec,
-    options: VolumePlanOptions,
+    sampling_footprint_halo_voxels: u64,
     limits: SemanticPlanLimits,
 ) -> Result<Vec<ResourceRegion>, SemanticPlanError> {
-    if options.pixel_stride == 0 {
-        return Err(SemanticPlanError::InvalidPixelStride);
-    }
-
-    let indices = if camera.view().projection() == Projection::Orthographic {
-        plan_orthographic_regions(camera, extent, spec, limits)?
-    } else {
-        plan_perspective_regions(camera, extent, spec, options, limits)?
-    };
-    indices
-        .into_iter()
-        .map(|index| semantic_region(spec, index))
-        .collect()
+    Ok(plan_visible_resource_regions_cancellable(
+        camera,
+        extent,
+        spec,
+        sampling_footprint_halo_voxels,
+        limits,
+        None,
+        || false,
+    )?
+    .regions)
 }
 
+/// Plans exact 3D visibility while allowing a superseded camera generation to
+/// abandon its bounded candidate traversal. Cancellation is sampled every 256
+/// candidates: frequent enough to make replacement prompt without adding an
+/// atomic load to every brick test.
+#[cfg(test)]
+pub(crate) fn plan_visible_resource_regions_cancellable(
+    camera: CameraFrame,
+    extent: RenderExtent,
+    spec: SemanticRegionGridSpec,
+    sampling_footprint_halo_voxels: u64,
+    limits: SemanticPlanLimits,
+    scratch_ledger: Option<&dyn CpuByteLedger>,
+    cancelled: impl FnMut() -> bool,
+) -> Result<VisibleResourceRegionPlan, SemanticPlanError> {
+    plan_prioritized_visible_resource_regions_cancellable(
+        camera,
+        None,
+        extent,
+        spec,
+        sampling_footprint_halo_voxels,
+        limits,
+        scratch_ledger,
+        cancelled,
+    )
+}
+
+/// Plans one expanded visibility envelope while retaining the exact current
+/// camera as the first ranking tier. The optional priority camera changes no
+/// visibility result: it only partitions the expanded result into current
+/// resources followed by guard-only resources.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_prioritized_visible_resource_regions_cancellable(
+    camera: CameraFrame,
+    priority_camera: Option<CameraFrame>,
+    extent: RenderExtent,
+    spec: SemanticRegionGridSpec,
+    sampling_footprint_halo_voxels: u64,
+    limits: SemanticPlanLimits,
+    scratch_ledger: Option<&dyn CpuByteLedger>,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<VisibleResourceRegionPlan, SemanticPlanError> {
+    if cancelled() {
+        return Err(SemanticPlanError::Cancelled);
+    }
+    let planned = if camera.view().projection() == Projection::Orthographic {
+        plan_orthographic_regions(
+            camera,
+            priority_camera,
+            extent,
+            spec,
+            sampling_footprint_halo_voxels,
+            limits,
+            scratch_ledger,
+            &mut cancelled,
+        )?
+    } else {
+        plan_perspective_regions(
+            camera,
+            priority_camera,
+            spec,
+            sampling_footprint_halo_voxels,
+            limits,
+            scratch_ledger,
+            &mut cancelled,
+        )?
+    };
+    if cancelled() {
+        return Err(SemanticPlanError::Cancelled);
+    }
+    let mut regions = Vec::with_capacity(planned.indices.len());
+    for (offset, index) in planned.indices.into_iter().enumerate() {
+        if offset.is_multiple_of(256) && cancelled() {
+            return Err(SemanticPlanError::Cancelled);
+        }
+        regions.push(semantic_region(spec, index)?);
+    }
+    Ok(VisibleResourceRegionPlan {
+        regions,
+        primary_regions: planned.primary_regions,
+        work: planned.work,
+        scratch_charge: planned.scratch_charge,
+    })
+}
+
+#[cfg(test)]
 pub(crate) fn plan_cross_section_resource_regions(
     view: CrossSectionView,
     panel: CrossSectionPlane,
     presentation: PresentationViewport,
     spec: SemanticRegionGridSpec,
+    sampling_footprint_halo_voxels: u64,
     limits: SemanticPlanLimits,
 ) -> Result<Vec<ResourceRegion>, SemanticPlanError> {
+    Ok(plan_cross_section_resource_regions_cancellable(
+        view,
+        panel,
+        presentation,
+        spec,
+        sampling_footprint_halo_voxels,
+        limits,
+        None,
+        || false,
+    )?
+    .regions)
+}
+
+// The planner takes the complete immutable geometry/budget contract plus its
+// ledger and cancellation authorities; a wrapper would be used only here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_cross_section_resource_regions_cancellable(
+    view: CrossSectionView,
+    panel: CrossSectionPlane,
+    presentation: PresentationViewport,
+    spec: SemanticRegionGridSpec,
+    sampling_footprint_halo_voxels: u64,
+    limits: SemanticPlanLimits,
+    scratch_ledger: Option<&dyn CpuByteLedger>,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<VisibleResourceRegionPlan, SemanticPlanError> {
+    if cancelled() {
+        return Err(SemanticPlanError::Cancelled);
+    }
     let orientation = DQuat::from_array(view.orientation().xyzw()) * panel.relative_orientation();
     let basis = CrossSectionBasis {
         right_world: (orientation * DVec3::X).normalize(),
@@ -240,8 +482,14 @@ pub(crate) fn plan_cross_section_resource_regions(
         half_depth_world: view.depth_world() * 0.5,
     };
     let grid_shape = region_grid_shape(spec.volume_shape, spec.resource_shape);
+    let grid_to_world = grid_to_world_matrix(spec.grid_to_world);
     let Some(bounds) = cross_section_candidate_bounds(slab, spec, grid_shape) else {
-        return Ok(Vec::new());
+        return Ok(VisibleResourceRegionPlan {
+            regions: Vec::new(),
+            primary_regions: 0,
+            work: SemanticPlanWork::default(),
+            scratch_charge: None,
+        });
     };
     let candidate_count = bounds.count();
     if candidate_count > limits.max_candidates {
@@ -250,84 +498,90 @@ pub(crate) fn plan_cross_section_resource_regions(
             limits.max_candidates,
         ));
     }
+    let scratch_charge = reserve_semantic_scratch(
+        scratch_ledger,
+        cross_section_scratch_bytes(candidate_count.min(limits.max_resources))?,
+    )?;
 
     let mut regions = Vec::with_capacity(candidate_count.min(limits.max_resources));
+    let mut candidates_visited = 0_usize;
     for z in bounds.z_min..=bounds.z_max {
         for y in bounds.y_min..=bounds.y_max {
             for x in bounds.x_min..=bounds.x_max {
+                if candidates_visited.is_multiple_of(256) && cancelled() {
+                    return Err(SemanticPlanError::Cancelled);
+                }
+                candidates_visited = candidates_visited.saturating_add(1);
                 let index = RegionIndex::new(z, y, x);
-                if cross_section_intersects_region(slab, spec, index) {
+                if cross_section_intersects_region(
+                    slab,
+                    spec,
+                    index,
+                    sampling_footprint_halo_voxels,
+                    grid_to_world,
+                ) {
                     if regions.len() == limits.max_resources {
                         return Err(SemanticPlanError::capacity(
                             "resource",
                             limits.max_resources,
                         ));
                     }
-                    regions.push(semantic_region(spec, index)?);
+                    let contribution =
+                        cross_section_screen_contribution(slab, spec, index, grid_to_world)
+                            .expect("an intersecting region has finite screen bounds");
+                    regions.push((semantic_region(spec, index)?, contribution));
                 }
             }
         }
     }
-    Ok(regions)
+    if cancelled() {
+        return Err(SemanticPlanError::Cancelled);
+    }
+    regions.sort_unstable_by(|left, right| {
+        compare_screen_contribution(left.1, right.1)
+            .then_with(|| left.0.origin().cmp(&right.0.origin()))
+    });
+    if cancelled() {
+        return Err(SemanticPlanError::Cancelled);
+    }
+    Ok(VisibleResourceRegionPlan {
+        primary_regions: regions.len(),
+        regions: regions.into_iter().map(|(region, _)| region).collect(),
+        work: SemanticPlanWork { candidates_visited },
+        scratch_charge,
+    })
+}
+
+struct PlannedRegionIndices {
+    indices: Vec<RegionIndex>,
+    primary_regions: usize,
+    work: SemanticPlanWork,
+    scratch_charge: Option<Box<dyn CpuByteLease>>,
 }
 
 fn plan_perspective_regions(
     camera: CameraFrame,
-    extent: RenderExtent,
+    priority_camera: Option<CameraFrame>,
     spec: SemanticRegionGridSpec,
-    options: VolumePlanOptions,
+    sampling_footprint_halo_voxels: u64,
     limits: SemanticPlanLimits,
-) -> Result<Vec<RegionIndex>, SemanticPlanError> {
-    let world_to_grid = inverse_grid_to_world(spec.grid_to_world)?;
-    let mut regions = HashSet::new();
-    let mut candidates = 0_usize;
-    let width = extent.width_pixels();
-    let height = extent.height_pixels();
-
-    for row in stepped_pixel_indices(height, options.pixel_stride) {
-        for column in stepped_pixel_indices(width, options.pixel_stride) {
-            let ray =
-                camera.ray_for_render_pixel(f64::from(column), f64::from(row), width, height)?;
-            let ray = GridRay {
-                origin: world_to_grid
-                    .transform_point3(DVec3::from_array(ray.origin().components())),
-                direction: world_to_grid.transform_vector3(DVec3::from_array(ray.direction())),
-            };
-            collect_ray_regions(ray, spec, &mut regions, &mut candidates, limits)?;
-        }
-    }
-
-    let mut regions = regions.into_iter().collect::<Vec<_>>();
-    regions.sort_by_key(|index| (index.z, index.y, index.x));
-    Ok(regions)
-}
-
-fn plan_orthographic_regions(
-    camera: CameraFrame,
-    extent: RenderExtent,
-    spec: SemanticRegionGridSpec,
-    limits: SemanticPlanLimits,
-) -> Result<Vec<RegionIndex>, SemanticPlanError> {
-    let Some((forward, right, up)) = camera_basis(camera) else {
-        return Ok(Vec::new());
-    };
-    let view = OrthographicView {
-        eye: camera_eye(camera),
-        forward,
-        right,
-        up,
-        half_width: sampled_center_half_extent(
-            camera.orthographic_world_span_width()? * 0.5,
-            u64::from(extent.width_pixels()),
-        ),
-        half_height: sampled_center_half_extent(
-            camera.orthographic_world_span_height()? * 0.5,
-            u64::from(extent.height_pixels()),
-        ),
-    };
+    scratch_ledger: Option<&dyn CpuByteLedger>,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<PlannedRegionIndices, SemanticPlanError> {
+    let frustum = perspective_frustum(camera)?;
+    let priority_frustum = priority_camera
+        .filter(|camera| camera.view().projection() == Projection::Perspective)
+        .map(perspective_frustum)
+        .transpose()?;
+    let grid_to_world = grid_to_world_matrix(spec.grid_to_world);
     let grid_shape = region_grid_shape(spec.volume_shape, spec.resource_shape);
-    let Some(bounds) = orthographic_candidate_bounds(view, spec, grid_shape)? else {
-        return Ok(Vec::new());
+    let Some(bounds) = perspective_candidate_bounds(frustum, spec, grid_shape)? else {
+        return Ok(PlannedRegionIndices {
+            indices: Vec::new(),
+            primary_regions: 0,
+            work: SemanticPlanWork::default(),
+            scratch_charge: None,
+        });
     };
     let candidate_count = bounds.count();
     if candidate_count > limits.max_candidates {
@@ -336,25 +590,235 @@ fn plan_orthographic_regions(
             limits.max_candidates,
         ));
     }
+    let scratch_charge = reserve_semantic_scratch(
+        scratch_ledger,
+        volume_scratch_bytes(candidate_count.min(limits.max_resources))?,
+    )?;
 
     let mut regions = Vec::with_capacity(candidate_count.min(limits.max_resources));
+    let mut candidates_visited = 0_usize;
     for z in bounds.z_min..=bounds.z_max {
         for y in bounds.y_min..=bounds.y_max {
             for x in bounds.x_min..=bounds.x_max {
+                if candidates_visited.is_multiple_of(256) && cancelled() {
+                    return Err(SemanticPlanError::Cancelled);
+                }
+                candidates_visited = candidates_visited.saturating_add(1);
                 let index = RegionIndex::new(z, y, x);
-                if orthographic_region_overlaps_view(view, spec, index) {
+                if perspective_region_overlaps_frustum(
+                    frustum,
+                    spec,
+                    index,
+                    sampling_footprint_halo_voxels,
+                    grid_to_world,
+                ) {
                     if regions.len() == limits.max_resources {
                         return Err(SemanticPlanError::capacity(
                             "resource",
                             limits.max_resources,
                         ));
                     }
-                    regions.push(index);
+                    let primary = priority_frustum.is_none_or(|priority| {
+                        perspective_region_overlaps_frustum(
+                            priority,
+                            spec,
+                            index,
+                            sampling_footprint_halo_voxels,
+                            grid_to_world,
+                        )
+                    });
+                    let contribution_camera =
+                        priority_frustum.filter(|_| primary).unwrap_or(frustum);
+                    let contribution = perspective_screen_contribution(
+                        contribution_camera,
+                        spec,
+                        index,
+                        grid_to_world,
+                    )
+                    .expect("a finite intersecting region has finite screen bounds");
+                    regions.push((index, primary, contribution));
                 }
             }
         }
     }
-    Ok(regions)
+    if cancelled() {
+        return Err(SemanticPlanError::Cancelled);
+    }
+    regions.sort_unstable_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| compare_screen_contribution(left.2, right.2))
+            .then_with(|| (left.0.z, left.0.y, left.0.x).cmp(&(right.0.z, right.0.y, right.0.x)))
+    });
+    if cancelled() {
+        return Err(SemanticPlanError::Cancelled);
+    }
+    let primary_regions = regions.partition_point(|(_, primary, _)| *primary);
+    Ok(PlannedRegionIndices {
+        indices: regions.into_iter().map(|(index, _, _)| index).collect(),
+        primary_regions,
+        work: SemanticPlanWork { candidates_visited },
+        scratch_charge,
+    })
+}
+
+// The hot planner receives borrowed/scalar camera, grid, bound, accounting,
+// and cancellation authorities; aggregating them would add a one-use model.
+#[allow(clippy::too_many_arguments)]
+fn plan_orthographic_regions(
+    camera: CameraFrame,
+    priority_camera: Option<CameraFrame>,
+    extent: RenderExtent,
+    spec: SemanticRegionGridSpec,
+    sampling_footprint_halo_voxels: u64,
+    limits: SemanticPlanLimits,
+    scratch_ledger: Option<&dyn CpuByteLedger>,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<PlannedRegionIndices, SemanticPlanError> {
+    let Some(view) = orthographic_view(camera, extent)? else {
+        return Ok(PlannedRegionIndices {
+            indices: Vec::new(),
+            primary_regions: 0,
+            work: SemanticPlanWork::default(),
+            scratch_charge: None,
+        });
+    };
+    let priority_view = priority_camera
+        .filter(|camera| camera.view().projection() == Projection::Orthographic)
+        .map(|camera| orthographic_view(camera, extent))
+        .transpose()?
+        .flatten();
+    let grid_to_world = grid_to_world_matrix(spec.grid_to_world);
+    let grid_shape = region_grid_shape(spec.volume_shape, spec.resource_shape);
+    let Some(bounds) = orthographic_candidate_bounds(view, spec, grid_shape)? else {
+        return Ok(PlannedRegionIndices {
+            indices: Vec::new(),
+            primary_regions: 0,
+            work: SemanticPlanWork::default(),
+            scratch_charge: None,
+        });
+    };
+    let candidate_count = bounds.count();
+    if candidate_count > limits.max_candidates {
+        return Err(SemanticPlanError::capacity(
+            "candidate",
+            limits.max_candidates,
+        ));
+    }
+    let scratch_charge = reserve_semantic_scratch(
+        scratch_ledger,
+        volume_scratch_bytes(candidate_count.min(limits.max_resources))?,
+    )?;
+
+    let mut regions = Vec::with_capacity(candidate_count.min(limits.max_resources));
+    let mut candidates_visited = 0_usize;
+    for z in bounds.z_min..=bounds.z_max {
+        for y in bounds.y_min..=bounds.y_max {
+            for x in bounds.x_min..=bounds.x_max {
+                if candidates_visited.is_multiple_of(256) && cancelled() {
+                    return Err(SemanticPlanError::Cancelled);
+                }
+                candidates_visited = candidates_visited.saturating_add(1);
+                let index = RegionIndex::new(z, y, x);
+                if orthographic_region_overlaps_view(
+                    view,
+                    spec,
+                    index,
+                    sampling_footprint_halo_voxels,
+                    grid_to_world,
+                ) {
+                    if regions.len() == limits.max_resources {
+                        return Err(SemanticPlanError::capacity(
+                            "resource",
+                            limits.max_resources,
+                        ));
+                    }
+                    let primary = priority_view.is_none_or(|priority| {
+                        orthographic_region_overlaps_view(
+                            priority,
+                            spec,
+                            index,
+                            sampling_footprint_halo_voxels,
+                            grid_to_world,
+                        )
+                    });
+                    let contribution_view = priority_view.filter(|_| primary).unwrap_or(view);
+                    let contribution = orthographic_screen_contribution(
+                        contribution_view,
+                        spec,
+                        index,
+                        grid_to_world,
+                    )
+                    .expect("an overlapping region has finite screen bounds");
+                    regions.push((index, primary, contribution));
+                }
+            }
+        }
+    }
+    if cancelled() {
+        return Err(SemanticPlanError::Cancelled);
+    }
+    regions.sort_unstable_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| compare_screen_contribution(left.2, right.2))
+            .then_with(|| (left.0.z, left.0.y, left.0.x).cmp(&(right.0.z, right.0.y, right.0.x)))
+    });
+    if cancelled() {
+        return Err(SemanticPlanError::Cancelled);
+    }
+    let primary_regions = regions.partition_point(|(_, primary, _)| *primary);
+    Ok(PlannedRegionIndices {
+        indices: regions.into_iter().map(|(index, _, _)| index).collect(),
+        primary_regions,
+        work: SemanticPlanWork { candidates_visited },
+        scratch_charge,
+    })
+}
+
+fn reserve_semantic_scratch(
+    ledger: Option<&dyn CpuByteLedger>,
+    bytes: u64,
+) -> Result<Option<Box<dyn CpuByteLease>>, SemanticPlanError> {
+    let Some(ledger) = ledger.filter(|_| bytes != 0) else {
+        return Ok(None);
+    };
+    ledger
+        .try_acquire(CpuLedgerCategory::MetadataAndIndexes, bytes)
+        .map(Some)
+        .map_err(SemanticPlanError::ScratchCapacity)
+}
+
+fn volume_scratch_bytes(capacity: usize) -> Result<u64, SemanticPlanError> {
+    scratch_bytes(
+        capacity,
+        std::mem::size_of::<(RegionIndex, bool, ScreenContribution)>(),
+        std::mem::size_of::<RegionIndex>().max(std::mem::size_of::<ResourceRegion>()),
+    )
+}
+
+fn cross_section_scratch_bytes(capacity: usize) -> Result<u64, SemanticPlanError> {
+    scratch_bytes(
+        capacity,
+        std::mem::size_of::<(ResourceRegion, ScreenContribution)>(),
+        std::mem::size_of::<ResourceRegion>(),
+    )
+}
+
+fn scratch_bytes(
+    capacity: usize,
+    primary_record_bytes: usize,
+    conversion_record_bytes: usize,
+) -> Result<u64, SemanticPlanError> {
+    let record_bytes = primary_record_bytes
+        .checked_add(conversion_record_bytes)
+        .ok_or_else(|| SemanticPlanError::capacity("scratch byte", usize::MAX))?;
+    let bytes = capacity
+        .checked_mul(record_bytes)
+        .ok_or_else(|| SemanticPlanError::capacity("scratch byte", usize::MAX))?;
+    u64::try_from(bytes).map_err(|_| SemanticPlanError::capacity("scratch byte", usize::MAX))
 }
 
 fn semantic_region(
@@ -377,6 +841,275 @@ fn semantic_region(
     )
     .expect("a planned in-bounds resource has a nonzero clipped shape");
     Ok(ResourceRegion::new(origin, shape)?)
+}
+
+fn perspective_frustum(camera: CameraFrame) -> Result<PerspectiveFrustum, SemanticPlanError> {
+    let axes = camera.axes();
+    let focal = camera.view().perspective_focal_length_screen_points();
+    let presentation = camera.presentation();
+    let tan_half_width = presentation.width_points() * 0.5 / focal;
+    let tan_half_height = presentation.height_points() * 0.5 / focal;
+    if !tan_half_width.is_finite()
+        || !tan_half_height.is_finite()
+        || tan_half_width <= 0.0
+        || tan_half_height <= 0.0
+    {
+        return Err(SemanticPlanError::Camera(
+            RenderApiError::CameraMathNotFinite,
+        ));
+    }
+    Ok(PerspectiveFrustum {
+        eye: DVec3::from_array(camera.eye().components()),
+        forward: DVec3::from_array(axes.forward()),
+        right: DVec3::from_array(axes.right()),
+        up: DVec3::from_array(axes.up()),
+        tan_half_width,
+        tan_half_height,
+    })
+}
+
+fn orthographic_view(
+    camera: CameraFrame,
+    extent: RenderExtent,
+) -> Result<Option<OrthographicView>, SemanticPlanError> {
+    let Some((forward, right, up)) = camera_basis(camera) else {
+        return Ok(None);
+    };
+    Ok(Some(OrthographicView {
+        eye: camera_eye(camera),
+        forward,
+        right,
+        up,
+        half_width: sampled_center_half_extent(
+            camera.orthographic_world_span_width()? * 0.5,
+            u64::from(extent.width_pixels()),
+        ),
+        half_height: sampled_center_half_extent(
+            camera.orthographic_world_span_height()? * 0.5,
+            u64::from(extent.height_pixels()),
+        ),
+    }))
+}
+
+fn camera_visibility_planes(
+    camera: CameraFrame,
+    extent: RenderExtent,
+) -> Result<[VisibilityHalfSpace; 5], SemanticPlanError> {
+    match camera.view().projection() {
+        Projection::Perspective => {
+            let frustum = perspective_frustum(camera)?;
+            Ok([
+                VisibilityHalfSpace::through_eye(frustum.forward, frustum.eye),
+                VisibilityHalfSpace::through_eye(
+                    frustum.forward * frustum.tan_half_width + frustum.right,
+                    frustum.eye,
+                ),
+                VisibilityHalfSpace::through_eye(
+                    frustum.forward * frustum.tan_half_width - frustum.right,
+                    frustum.eye,
+                ),
+                VisibilityHalfSpace::through_eye(
+                    frustum.forward * frustum.tan_half_height + frustum.up,
+                    frustum.eye,
+                ),
+                VisibilityHalfSpace::through_eye(
+                    frustum.forward * frustum.tan_half_height - frustum.up,
+                    frustum.eye,
+                ),
+            ])
+        }
+        Projection::Orthographic => {
+            let Some(view) = orthographic_view(camera, extent)? else {
+                return Err(SemanticPlanError::Camera(
+                    RenderApiError::CameraMathNotFinite,
+                ));
+            };
+            Ok([
+                VisibilityHalfSpace::through_eye(view.forward, view.eye),
+                VisibilityHalfSpace {
+                    normal: view.right,
+                    offset: view.half_width - view.right.dot(view.eye),
+                },
+                VisibilityHalfSpace {
+                    normal: -view.right,
+                    offset: view.half_width + view.right.dot(view.eye),
+                },
+                VisibilityHalfSpace {
+                    normal: view.up,
+                    offset: view.half_height - view.up.dot(view.eye),
+                },
+                VisibilityHalfSpace {
+                    normal: -view.up,
+                    offset: view.half_height + view.up.dot(view.eye),
+                },
+            ])
+        }
+    }
+}
+
+const PARALLELEPIPED_EDGES: [(usize, usize); 12] = [
+    (0, 1),
+    (0, 2),
+    (0, 4),
+    (1, 3),
+    (1, 5),
+    (2, 3),
+    (2, 6),
+    (3, 7),
+    (4, 5),
+    (4, 6),
+    (5, 7),
+    (6, 7),
+];
+
+fn clipped_volume_half_space_is_contained(
+    corners: [DVec3; 8],
+    next: VisibilityHalfSpace,
+    guard: VisibilityHalfSpace,
+) -> bool {
+    let safely_inside_guard = |point: DVec3| {
+        let numerical_margin =
+            EPSILON * 32.0 * (1.0 + guard.normal.length() * point.length() + guard.offset.abs());
+        guard.signed_distance(point) >= numerical_margin
+    };
+    let next_distances = corners.map(|corner| next.signed_distance(corner) + EPSILON);
+    for (corner, next_distance) in corners.into_iter().zip(next_distances) {
+        if next_distance >= 0.0 && !safely_inside_guard(corner) {
+            return false;
+        }
+    }
+    for (left, right) in PARALLELEPIPED_EDGES {
+        let left_distance = next_distances[left];
+        let right_distance = next_distances[right];
+        if (left_distance < 0.0) == (right_distance < 0.0) {
+            continue;
+        }
+        let denominator = left_distance - right_distance;
+        if denominator.abs() <= f64::EPSILON {
+            return false;
+        }
+        let interpolation = left_distance / denominator;
+        let point = corners[left].lerp(corners[right], interpolation);
+        if !safely_inside_guard(point) {
+            return false;
+        }
+    }
+    true
+}
+
+fn perspective_candidate_bounds(
+    frustum: PerspectiveFrustum,
+    spec: SemanticRegionGridSpec,
+    grid_shape: Shape3D,
+) -> Result<Option<CandidateBounds>, SemanticPlanError> {
+    let mut min_depth = f64::INFINITY;
+    let mut max_depth = f64::NEG_INFINITY;
+    for corner in volume_grid_corners(spec.volume_shape) {
+        let world = transform_grid_point(spec.grid_to_world, corner);
+        let depth = (world - frustum.eye).dot(frustum.forward);
+        min_depth = min_depth.min(depth);
+        max_depth = max_depth.max(depth);
+    }
+    if max_depth < -EPSILON {
+        return Ok(None);
+    }
+
+    let world_to_grid = inverse_grid_to_world(spec.grid_to_world)?;
+    let near_depth = min_depth.max(0.0);
+    let far_depth = max_depth.max(0.0);
+    let mut grid_min = DVec3::splat(f64::INFINITY);
+    let mut grid_max = DVec3::splat(f64::NEG_INFINITY);
+    for depth in [near_depth, far_depth] {
+        let right = frustum.right * (depth * frustum.tan_half_width);
+        let up = frustum.up * (depth * frustum.tan_half_height);
+        for right_sign in [-1.0, 1.0] {
+            for up_sign in [-1.0, 1.0] {
+                let world =
+                    frustum.eye + frustum.forward * depth + right * right_sign + up * up_sign;
+                let grid = world_to_grid.transform_point3(world);
+                grid_min = grid_min.min(grid);
+                grid_max = grid_max.max(grid);
+            }
+        }
+    }
+    Ok(candidate_bounds_from_grid_box(
+        grid_min, grid_max, spec, grid_shape,
+    ))
+}
+
+/// Plane rejection is conservative for the affine brick parallelepiped: if
+/// every corner lies outside one frustum half-space the brick cannot be
+/// visible. Passing all planes may retain a few edge/corner false positives,
+/// which is preferable to a missing fine brick in a supposedly complete
+/// presentation cohort.
+fn perspective_region_overlaps_frustum(
+    frustum: PerspectiveFrustum,
+    spec: SemanticRegionGridSpec,
+    index: RegionIndex,
+    sampling_footprint_halo_voxels: u64,
+    grid_to_world: DMat4,
+) -> bool {
+    let Some(corners) = region_world_corners_with_halo_matrix(
+        spec,
+        index,
+        sampling_footprint_halo_voxels,
+        grid_to_world,
+    ) else {
+        return false;
+    };
+    let planes = [
+        frustum.forward,
+        frustum.forward * frustum.tan_half_width + frustum.right,
+        frustum.forward * frustum.tan_half_width - frustum.right,
+        frustum.forward * frustum.tan_half_height + frustum.up,
+        frustum.forward * frustum.tan_half_height - frustum.up,
+    ];
+    !planes.into_iter().any(|normal| {
+        corners
+            .iter()
+            .all(|corner| (*corner - frustum.eye).dot(normal) < -EPSILON)
+    })
+}
+
+fn perspective_screen_contribution(
+    frustum: PerspectiveFrustum,
+    spec: SemanticRegionGridSpec,
+    index: RegionIndex,
+    grid_to_world: DMat4,
+) -> Option<ScreenContribution> {
+    let corners = region_world_corners_with_halo_matrix(spec, index, 0, grid_to_world)?;
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut near_depth = f64::INFINITY;
+    for corner in corners {
+        let relative = corner - frustum.eye;
+        let depth = relative.dot(frustum.forward);
+        near_depth = near_depth.min(depth);
+        if depth <= EPSILON {
+            return Some(ScreenContribution {
+                overlap_area: 4.0 * frustum.tan_half_width * frustum.tan_half_height,
+                center_distance_squared: 0.0,
+                near_depth: 0.0,
+            });
+        }
+        let x = relative.dot(frustum.right) / depth;
+        let y = relative.dot(frustum.up) / depth;
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    screen_contribution(
+        min_x,
+        max_x,
+        min_y,
+        max_y,
+        frustum.tan_half_width,
+        frustum.tan_half_height,
+        near_depth,
+    )
 }
 
 fn orthographic_candidate_bounds(
@@ -498,8 +1231,15 @@ fn orthographic_region_overlaps_view(
     view: OrthographicView,
     spec: SemanticRegionGridSpec,
     index: RegionIndex,
+    sampling_footprint_halo_voxels: u64,
+    grid_to_world: DMat4,
 ) -> bool {
-    let Some(corners) = region_world_corners(spec, index) else {
+    let Some(corners) = region_world_corners_with_halo_matrix(
+        spec,
+        index,
+        sampling_footprint_halo_voxels,
+        grid_to_world,
+    ) else {
         return false;
     };
     let mut min_view_x = f64::INFINITY;
@@ -529,8 +1269,15 @@ fn cross_section_intersects_region(
     slab: CrossSectionSlab,
     spec: SemanticRegionGridSpec,
     index: RegionIndex,
+    sampling_footprint_halo_voxels: u64,
+    grid_to_world: DMat4,
 ) -> bool {
-    let Some(corners) = region_world_corners(spec, index) else {
+    let Some(corners) = region_world_corners_with_halo_matrix(
+        spec,
+        index,
+        sampling_footprint_halo_voxels,
+        grid_to_world,
+    ) else {
         return false;
     };
     let mut min_right = f64::INFINITY;
@@ -569,201 +1316,118 @@ fn cross_section_intersects_region(
     )
 }
 
-fn collect_ray_regions(
-    ray: GridRay,
+fn orthographic_screen_contribution(
+    view: OrthographicView,
     spec: SemanticRegionGridSpec,
-    regions: &mut HashSet<RegionIndex>,
-    candidates: &mut usize,
-    limits: SemanticPlanLimits,
-) -> Result<(), SemanticPlanError> {
-    if ray.direction.length_squared() <= EPSILON {
-        return Ok(());
+    index: RegionIndex,
+    grid_to_world: DMat4,
+) -> Option<ScreenContribution> {
+    let corners = region_world_corners_with_halo_matrix(spec, index, 0, grid_to_world)?;
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut near_depth = f64::INFINITY;
+    for corner in corners {
+        let relative = corner - view.eye;
+        let x = relative.dot(view.right);
+        let y = relative.dot(view.up);
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+        near_depth = near_depth.min(relative.dot(view.forward));
     }
-    let Some(hit) = intersect_grid_box(ray, spec.volume_shape) else {
-        return Ok(());
-    };
-
-    let entry = ray.origin + ray.direction * hit.enter;
-    let grid_shape = region_grid_shape(spec.volume_shape, spec.resource_shape);
-    let region_entry = DVec3::new(
-        region_axis_coordinate(entry.x, spec.resource_shape.x()),
-        region_axis_coordinate(entry.y, spec.resource_shape.y()),
-        region_axis_coordinate(entry.z, spec.resource_shape.z()),
-    );
-    let region_direction = DVec3::new(
-        ray.direction.x / spec.resource_shape.x() as f64,
-        ray.direction.y / spec.resource_shape.y() as f64,
-        ray.direction.z / spec.resource_shape.z() as f64,
-    );
-    let mut x = AxisTraversal::new(
-        region_entry.x,
-        region_direction.x,
-        hit.enter,
-        grid_shape.x(),
-    );
-    let mut y = AxisTraversal::new(
-        region_entry.y,
-        region_direction.y,
-        hit.enter,
-        grid_shape.y(),
-    );
-    let mut z = AxisTraversal::new(
-        region_entry.z,
-        region_direction.z,
-        hit.enter,
-        grid_shape.z(),
-    );
-
-    loop {
-        if !x.is_inside() || !y.is_inside() || !z.is_inside() {
-            break;
-        }
-        if *candidates == limits.max_candidates {
-            return Err(SemanticPlanError::capacity(
-                "candidate",
-                limits.max_candidates,
-            ));
-        }
-        *candidates += 1;
-
-        let index = RegionIndex::new(z.index as u64, y.index as u64, x.index as u64);
-        if !regions.contains(&index) {
-            if regions.len() == limits.max_resources {
-                return Err(SemanticPlanError::capacity(
-                    "resource",
-                    limits.max_resources,
-                ));
-            }
-            regions.insert(index);
-        }
-
-        let next_t = x.next_t.min(y.next_t.min(z.next_t));
-        if !next_t.is_finite() || next_t > hit.exit + EPSILON {
-            break;
-        }
-        if x.next_t <= next_t + EPSILON {
-            x.advance();
-        }
-        if y.next_t <= next_t + EPSILON {
-            y.advance();
-        }
-        if z.next_t <= next_t + EPSILON {
-            z.advance();
-        }
-    }
-    Ok(())
+    screen_contribution(
+        min_x,
+        max_x,
+        min_y,
+        max_y,
+        view.half_width,
+        view.half_height,
+        near_depth,
+    )
 }
 
-impl AxisTraversal {
-    fn new(entry_coordinate: f64, direction: f64, entry_t: f64, limit: u64) -> Self {
-        let limit = limit as i64;
-        let index = initial_region_index(entry_coordinate, direction, limit);
-        if direction > EPSILON {
-            let next_boundary = index as f64 + 0.5;
-            Self {
-                index,
-                step: 1,
-                next_t: entry_t + ((next_boundary - entry_coordinate) / direction).max(0.0),
-                delta_t: 1.0 / direction,
-                limit,
-            }
-        } else if direction < -EPSILON {
-            let next_boundary = index as f64 - 0.5;
-            Self {
-                index,
-                step: -1,
-                next_t: entry_t + ((next_boundary - entry_coordinate) / direction).max(0.0),
-                delta_t: -1.0 / direction,
-                limit,
-            }
-        } else {
-            Self {
-                index,
-                step: 0,
-                next_t: f64::INFINITY,
-                delta_t: f64::INFINITY,
-                limit,
-            }
-        }
+fn cross_section_screen_contribution(
+    slab: CrossSectionSlab,
+    spec: SemanticRegionGridSpec,
+    index: RegionIndex,
+    grid_to_world: DMat4,
+) -> Option<ScreenContribution> {
+    let corners = region_world_corners_with_halo_matrix(spec, index, 0, grid_to_world)?;
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut near_depth = f64::INFINITY;
+    for corner in corners {
+        let relative = corner - slab.center_world;
+        let x = relative.dot(slab.basis.right_world);
+        let y = relative.dot(slab.basis.down_world);
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+        near_depth = near_depth.min(relative.dot(slab.basis.normal_away_world).abs());
     }
-
-    fn is_inside(self) -> bool {
-        self.index >= 0 && self.index < self.limit
-    }
-
-    fn advance(&mut self) {
-        if self.step != 0 {
-            self.index += self.step;
-            self.next_t += self.delta_t;
-        }
-    }
+    screen_contribution(
+        min_x,
+        max_x,
+        min_y,
+        max_y,
+        slab.half_width_world,
+        slab.half_height_world,
+        near_depth,
+    )
 }
 
-fn region_axis_coordinate(grid_coordinate: f64, resource_axis: u64) -> f64 {
-    (grid_coordinate + 0.5) / resource_axis as f64 - 0.5
-}
-
-fn initial_region_index(coordinate: f64, direction: f64, limit: i64) -> i64 {
-    let adjusted = if direction < -EPSILON {
-        coordinate + 0.5 - EPSILON
-    } else {
-        coordinate + 0.5
-    };
-    (adjusted.floor() as i64).clamp(0, limit - 1)
-}
-
-fn intersect_grid_box(ray: GridRay, shape: Shape3D) -> Option<RayBoxHit> {
-    let mut enter = f64::NEG_INFINITY;
-    let mut exit = f64::INFINITY;
-    ray_box_axis(
-        ray.origin.x,
-        ray.direction.x,
-        -0.5,
-        shape.x() as f64 - 0.5,
-        &mut enter,
-        &mut exit,
-    )?;
-    ray_box_axis(
-        ray.origin.y,
-        ray.direction.y,
-        -0.5,
-        shape.y() as f64 - 0.5,
-        &mut enter,
-        &mut exit,
-    )?;
-    ray_box_axis(
-        ray.origin.z,
-        ray.direction.z,
-        -0.5,
-        shape.z() as f64 - 0.5,
-        &mut enter,
-        &mut exit,
-    )?;
-    if exit < enter || exit < 0.0 {
+fn screen_contribution(
+    min_x: f64,
+    max_x: f64,
+    min_y: f64,
+    max_y: f64,
+    half_width: f64,
+    half_height: f64,
+    near_depth: f64,
+) -> Option<ScreenContribution> {
+    if ![
+        min_x,
+        max_x,
+        min_y,
+        max_y,
+        half_width,
+        half_height,
+        near_depth,
+    ]
+    .into_iter()
+    .all(f64::is_finite)
+    {
         return None;
     }
-    Some(RayBoxHit {
-        enter: enter.max(0.0),
-        exit,
+    let overlap_width = max_x.min(half_width) - min_x.max(-half_width);
+    let overlap_height = max_y.min(half_height) - min_y.max(-half_height);
+    let center_x = (min_x + max_x) * 0.5;
+    let center_y = (min_y + max_y) * 0.5;
+    Some(ScreenContribution {
+        overlap_area: overlap_width.max(0.0) * overlap_height.max(0.0),
+        center_distance_squared: center_x.mul_add(center_x, center_y * center_y),
+        near_depth,
     })
 }
 
-fn ray_box_axis(
-    origin: f64,
-    direction: f64,
-    minimum: f64,
-    maximum: f64,
-    enter: &mut f64,
-    exit: &mut f64,
-) -> Option<()> {
-    if direction.abs() <= EPSILON {
-        return (minimum..=maximum).contains(&origin).then_some(());
-    }
-    let near = (minimum - origin) / direction;
-    let far = (maximum - origin) / direction;
-    *enter = enter.max(near.min(far));
-    *exit = exit.min(near.max(far));
-    Some(())
+fn compare_screen_contribution(
+    left: ScreenContribution,
+    right: ScreenContribution,
+) -> std::cmp::Ordering {
+    right
+        .overlap_area
+        .total_cmp(&left.overlap_area)
+        .then_with(|| {
+            left.center_distance_squared
+                .total_cmp(&right.center_distance_squared)
+        })
+        .then_with(|| left.near_depth.total_cmp(&right.near_depth))
 }
 
 fn region_grid_shape(volume_shape: Shape3D, resource_shape: Shape3D) -> Shape3D {
@@ -775,7 +1439,12 @@ fn region_grid_shape(volume_shape: Shape3D, resource_shape: Shape3D) -> Shape3D 
     .expect("nonzero shapes produce a nonzero resource grid")
 }
 
-fn region_world_corners(spec: SemanticRegionGridSpec, index: RegionIndex) -> Option<[DVec3; 8]> {
+fn region_world_corners_with_halo_matrix(
+    spec: SemanticRegionGridSpec,
+    index: RegionIndex,
+    halo_voxels: u64,
+    grid_to_world: DMat4,
+) -> Option<[DVec3; 8]> {
     let min_x = index.x.checked_mul(spec.resource_shape.x())?;
     let min_y = index.y.checked_mul(spec.resource_shape.y())?;
     let min_z = index.z.checked_mul(spec.resource_shape.z())?;
@@ -794,18 +1463,24 @@ fn region_world_corners(spec: SemanticRegionGridSpec, index: RegionIndex) -> Opt
     let max_z = min_z
         .saturating_add(spec.resource_shape.z())
         .min(spec.volume_shape.z());
+    let min_x = min_x.saturating_sub(halo_voxels);
+    let min_y = min_y.saturating_sub(halo_voxels);
+    let min_z = min_z.saturating_sub(halo_voxels);
+    let max_x = max_x.saturating_add(halo_voxels).min(spec.volume_shape.x());
+    let max_y = max_y.saturating_add(halo_voxels).min(spec.volume_shape.y());
+    let max_z = max_z.saturating_add(halo_voxels).min(spec.volume_shape.z());
     let xs = [min_x as f64 - 0.5, max_x as f64 - 0.5];
     let ys = [min_y as f64 - 0.5, max_y as f64 - 0.5];
     let zs = [min_z as f64 - 0.5, max_z as f64 - 0.5];
     Some([
-        transform_grid_point(spec.grid_to_world, DVec3::new(xs[0], ys[0], zs[0])),
-        transform_grid_point(spec.grid_to_world, DVec3::new(xs[1], ys[0], zs[0])),
-        transform_grid_point(spec.grid_to_world, DVec3::new(xs[0], ys[1], zs[0])),
-        transform_grid_point(spec.grid_to_world, DVec3::new(xs[1], ys[1], zs[0])),
-        transform_grid_point(spec.grid_to_world, DVec3::new(xs[0], ys[0], zs[1])),
-        transform_grid_point(spec.grid_to_world, DVec3::new(xs[1], ys[0], zs[1])),
-        transform_grid_point(spec.grid_to_world, DVec3::new(xs[0], ys[1], zs[1])),
-        transform_grid_point(spec.grid_to_world, DVec3::new(xs[1], ys[1], zs[1])),
+        grid_to_world.transform_point3(DVec3::new(xs[0], ys[0], zs[0])),
+        grid_to_world.transform_point3(DVec3::new(xs[1], ys[0], zs[0])),
+        grid_to_world.transform_point3(DVec3::new(xs[0], ys[1], zs[0])),
+        grid_to_world.transform_point3(DVec3::new(xs[1], ys[1], zs[0])),
+        grid_to_world.transform_point3(DVec3::new(xs[0], ys[0], zs[1])),
+        grid_to_world.transform_point3(DVec3::new(xs[1], ys[0], zs[1])),
+        grid_to_world.transform_point3(DVec3::new(xs[0], ys[1], zs[1])),
+        grid_to_world.transform_point3(DVec3::new(xs[1], ys[1], zs[1])),
     ])
 }
 
@@ -864,10 +1539,6 @@ fn sampled_center_half_extent(half_extent: f64, pixels: u64) -> f64 {
     half_extent * (1.0 - 1.0 / pixels as f64).max(0.0)
 }
 
-fn stepped_pixel_indices(extent: u32, stride: u64) -> impl Iterator<Item = u32> {
-    (0..extent).step_by(stride as usize)
-}
-
 fn ranges_overlap(min_a: f64, max_a: f64, min_b: f64, max_b: f64) -> bool {
     max_a >= min_b - EPSILON && min_a <= max_b + EPSILON
 }
@@ -895,4 +1566,358 @@ fn grid_to_world_matrix(transform: GridToWorld) -> DMat4 {
         }
     }
     DMat4::from_cols_array(&column_major)
+}
+
+#[cfg(test)]
+mod tests {
+    use mirante4d_domain::{CameraView, UnitQuaternion, WorldPoint3};
+
+    use super::*;
+
+    #[test]
+    fn orthographic_demand_starts_with_the_highest_contribution_center_region() {
+        let presentation = PresentationViewport::new(192.0, 192.0).unwrap();
+        let camera = CameraFrame::new(
+            CameraView::new(
+                Projection::Orthographic,
+                WorldPoint3::new(96.0, 96.0, 32.0).unwrap(),
+                UnitQuaternion::identity(),
+                1.0,
+                192.0,
+                256.0,
+            )
+            .unwrap(),
+            presentation,
+        )
+        .unwrap();
+        let regions = plan_visible_resource_regions(
+            camera,
+            RenderExtent::new(192, 192).unwrap(),
+            SemanticRegionGridSpec {
+                volume_shape: Shape3D::new(64, 192, 192).unwrap(),
+                resource_shape: Shape3D::new(64, 64, 64).unwrap(),
+                grid_to_world: GridToWorld::scale(1.0, 1.0, 1.0).unwrap(),
+            },
+            0,
+            SemanticPlanLimits::new(64, 64),
+        )
+        .unwrap();
+
+        assert_eq!(regions.len(), 9);
+        assert_eq!(regions[0].origin(), [0, 64, 64]);
+    }
+
+    #[test]
+    fn perspective_candidate_bound_counts_unique_regions_not_duplicate_ray_visits() {
+        let presentation = PresentationViewport::new(1280.0, 720.0).unwrap();
+        let camera = CameraFrame::new(
+            CameraView::new(
+                Projection::Perspective,
+                WorldPoint3::new(32.0, 32.0, 32.0).unwrap(),
+                UnitQuaternion::identity(),
+                1.0,
+                720.0,
+                128.0,
+            )
+            .unwrap(),
+            presentation,
+        )
+        .unwrap();
+        let regions = plan_visible_resource_regions(
+            camera,
+            RenderExtent::new(1280, 720).unwrap(),
+            SemanticRegionGridSpec {
+                volume_shape: Shape3D::new(64, 64, 64).unwrap(),
+                resource_shape: Shape3D::new(64, 64, 64).unwrap(),
+                grid_to_world: GridToWorld::identity(),
+            },
+            0,
+            SemanticPlanLimits::new(1, 1),
+        )
+        .unwrap();
+
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].origin(), [0, 0, 0]);
+    }
+
+    #[test]
+    fn superseded_volume_plan_stops_at_a_bounded_candidate_checkpoint() {
+        let presentation = PresentationViewport::new(256.0, 256.0).unwrap();
+        let camera = CameraFrame::new(
+            CameraView::new(
+                Projection::Orthographic,
+                WorldPoint3::new(8.0, 8.0, 8.0).unwrap(),
+                UnitQuaternion::identity(),
+                1.0,
+                256.0,
+                64.0,
+            )
+            .unwrap(),
+            presentation,
+        )
+        .unwrap();
+        let probes = std::cell::Cell::new(0_u32);
+        let error = plan_visible_resource_regions_cancellable(
+            camera,
+            RenderExtent::new(256, 256).unwrap(),
+            SemanticRegionGridSpec {
+                volume_shape: Shape3D::new(16, 16, 16).unwrap(),
+                resource_shape: Shape3D::new(1, 1, 1).unwrap(),
+                grid_to_world: GridToWorld::identity(),
+            },
+            0,
+            SemanticPlanLimits::new(4_096, 4_096),
+            None,
+            || {
+                let next = probes.get() + 1;
+                probes.set(next);
+                next >= 4
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, SemanticPlanError::Cancelled));
+        // Initial, traversal-start, and 256-candidate checkpoints bound how
+        // much stale work can pass before the fourth probe observes change.
+        assert_eq!(probes.get(), 4);
+    }
+
+    #[test]
+    fn perspective_coverage_includes_every_subpixel_brick_without_ray_sampling_holes() {
+        let presentation = PresentationViewport::new(1280.0, 720.0).unwrap();
+        let camera = CameraFrame::new(
+            CameraView::new(
+                Projection::Perspective,
+                WorldPoint3::new(8.0, 8.0, 0.0).unwrap(),
+                UnitQuaternion::identity(),
+                1.0,
+                720.0,
+                1_000.0,
+            )
+            .unwrap(),
+            presentation,
+        )
+        .unwrap();
+        let regions = plan_visible_resource_regions(
+            camera,
+            RenderExtent::new(1280, 720).unwrap(),
+            SemanticRegionGridSpec {
+                volume_shape: Shape3D::new(1, 16, 16).unwrap(),
+                resource_shape: Shape3D::new(1, 1, 1).unwrap(),
+                grid_to_world: GridToWorld::identity(),
+            },
+            0,
+            SemanticPlanLimits::new(256, 256),
+        )
+        .unwrap();
+
+        // The complete volume projects to only about twelve pixels in each
+        // dimension, so a former ~10-pixel ray grid could not discover all
+        // 256 one-voxel resources. Frustum coverage is resolution-independent.
+        assert_eq!(regions.len(), 256);
+        let origins = regions
+            .iter()
+            .map(|region| region.origin())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(origins.contains(&[0, 0, 0]));
+        assert!(origins.contains(&[0, 15, 15]));
+    }
+
+    #[test]
+    fn perspective_coverage_keeps_a_rotated_affine_brick_at_the_frustum_edge() {
+        let presentation = PresentationViewport::new(1280.0, 720.0).unwrap();
+        let camera = CameraFrame::new(
+            CameraView::new(
+                Projection::Perspective,
+                WorldPoint3::new(0.0, 0.0, 0.0).unwrap(),
+                UnitQuaternion::identity(),
+                1.0,
+                720.0,
+                32.0,
+            )
+            .unwrap(),
+            presentation,
+        )
+        .unwrap();
+        let c = std::f64::consts::FRAC_1_SQRT_2;
+        let transform = GridToWorld::from_row_major([
+            c,
+            -c,
+            0.0,
+            28.5,
+            c,
+            c,
+            0.0,
+            -3.0 * c,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ])
+        .unwrap();
+        let regions = plan_visible_resource_regions(
+            camera,
+            RenderExtent::new(1280, 720).unwrap(),
+            SemanticRegionGridSpec {
+                volume_shape: Shape3D::new(1, 4, 4).unwrap(),
+                resource_shape: Shape3D::new(1, 1, 1).unwrap(),
+                grid_to_world: transform,
+            },
+            0,
+            SemanticPlanLimits::new(16, 16),
+        )
+        .unwrap();
+
+        assert!(regions.iter().any(|region| region.origin() == [0, 3, 0]));
+    }
+
+    #[test]
+    fn oblique_candidate_scan_can_exceed_renderer_output_without_false_capacity() {
+        let diagonal = DVec3::ONE.normalize();
+        let rotation = DQuat::from_rotation_arc(diagonal, DVec3::Z);
+        let matrix = DMat4::from_quat(rotation);
+        let columns = matrix.to_cols_array();
+        let mut row_major = [0.0; 16];
+        for row in 0..4 {
+            for column in 0..4 {
+                row_major[row * 4 + column] = columns[column * 4 + row];
+            }
+        }
+        let transform = GridToWorld::from_row_major(row_major).unwrap();
+        let center = matrix.transform_point3(DVec3::splat(23.5));
+        let presentation = PresentationViewport::new(2.0, 2.0).unwrap();
+        let camera = CameraFrame::new(
+            CameraView::new(
+                Projection::Orthographic,
+                WorldPoint3::new(center.x, center.y, center.z).unwrap(),
+                UnitQuaternion::identity(),
+                1.0,
+                2.0,
+                200.0,
+            )
+            .unwrap(),
+            presentation,
+        )
+        .unwrap();
+        let spec = SemanticRegionGridSpec {
+            volume_shape: Shape3D::new(48, 48, 48).unwrap(),
+            resource_shape: Shape3D::new(1, 1, 1).unwrap(),
+            grid_to_world: transform,
+        };
+
+        let conservative_error = plan_visible_resource_regions(
+            camera,
+            RenderExtent::new(2, 2).unwrap(),
+            spec,
+            0,
+            SemanticPlanLimits::new(65_536, 65_536),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            conservative_error,
+            SemanticPlanError::Capacity {
+                kind: "candidate",
+                ..
+            }
+        ));
+
+        let visible = plan_visible_resource_regions(
+            camera,
+            RenderExtent::new(2, 2).unwrap(),
+            spec,
+            0,
+            SemanticPlanLimits::new(131_072, 65_536),
+        )
+        .unwrap();
+        assert!(!visible.is_empty());
+        assert!(visible.len() <= 65_536);
+    }
+
+    #[test]
+    fn volume_demand_includes_adjacent_brick_for_one_voxel_sampling_footprint() {
+        let presentation = PresentationViewport::new(1.0, 1.0).unwrap();
+        let camera = CameraFrame::new(
+            CameraView::new(
+                Projection::Orthographic,
+                WorldPoint3::new(63.1, 0.0, 0.0).unwrap(),
+                UnitQuaternion::identity(),
+                0.1,
+                1.0,
+                10.0,
+            )
+            .unwrap(),
+            presentation,
+        )
+        .unwrap();
+        let regions = plan_visible_resource_regions(
+            camera,
+            RenderExtent::new(1, 1).unwrap(),
+            SemanticRegionGridSpec {
+                volume_shape: Shape3D::new(1, 1, 128).unwrap(),
+                resource_shape: Shape3D::new(1, 1, 64).unwrap(),
+                grid_to_world: GridToWorld::identity(),
+            },
+            1,
+            SemanticPlanLimits::new(8, 8),
+        )
+        .unwrap();
+
+        let origins = regions
+            .iter()
+            .map(|region| region.origin())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            origins,
+            std::collections::BTreeSet::from([[0, 0, 0], [0, 0, 64]])
+        );
+    }
+
+    #[test]
+    fn cross_section_demand_uses_only_the_exact_composed_sampling_footprint() {
+        let origins = |center_x, halo_voxels| {
+            plan_cross_section_resource_regions(
+                CrossSectionView::new(
+                    WorldPoint3::new(center_x, 0.0, 0.0).unwrap(),
+                    UnitQuaternion::identity(),
+                    0.1,
+                    0.1,
+                )
+                .unwrap(),
+                CrossSectionPlane::Xy,
+                PresentationViewport::new(1.0, 1.0).unwrap(),
+                SemanticRegionGridSpec {
+                    volume_shape: Shape3D::new(1, 1, 192).unwrap(),
+                    resource_shape: Shape3D::new(1, 1, 64).unwrap(),
+                    grid_to_world: GridToWorld::identity(),
+                },
+                halo_voxels,
+                SemanticPlanLimits::new(8, 8),
+            )
+            .unwrap()
+            .iter()
+            .map(|region| region.origin())
+            .collect::<std::collections::BTreeSet<_>>()
+        };
+
+        assert_eq!(
+            origins(63.1, 0),
+            std::collections::BTreeSet::from([[0, 0, 0]])
+        );
+        assert_eq!(
+            origins(63.1, 1),
+            std::collections::BTreeSet::from([[0, 0, 0], [0, 0, 64]])
+        );
+        assert_eq!(
+            origins(126.1, 1),
+            std::collections::BTreeSet::from([[0, 0, 64]])
+        );
+        assert_eq!(
+            origins(126.1, 2),
+            std::collections::BTreeSet::from([[0, 0, 64], [0, 0, 128]])
+        );
+    }
 }

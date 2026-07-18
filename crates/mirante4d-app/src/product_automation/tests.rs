@@ -2,11 +2,550 @@ use super::capture::{
     ProductAutomationArtifact, ProductAutomationImageStats, color_image_from_rgba,
     sanitize_artifact_label, write_color_image_ppm,
 };
-use super::diagnostics::dataset_runtime_diagnostics_json;
+use super::diagnostics::{dataset_runtime_diagnostics_json, local_dataset_source_diagnostics_json};
 use super::*;
 use std::{fs, path::PathBuf};
 
 use mirante4d_dataset_runtime::{DatasetRuntimeConfig, DatasetRuntimeDiagnostics};
+
+#[test]
+fn freshness_wait_never_certifies_a_stale_exact_frame() {
+    let mut fidelity = crate::FrameFidelityStatus::new_with_presentation(
+        mirante4d_render_api::RenderExtent::new(1920, 1080).unwrap(),
+        mirante4d_render_api::PresentationViewport::new(1920.0, 1080.0).unwrap(),
+    );
+    fidelity.completeness = crate::FrameCompleteness::Exact;
+    fidelity.display_freshness = crate::DisplayedFrameFreshness::Stale;
+    assert!(!frame_freshness_is_current(&fidelity));
+
+    fidelity.display_freshness = crate::DisplayedFrameFreshness::Current;
+    assert!(frame_freshness_is_current(&fidelity));
+}
+
+#[test]
+fn runtime_idle_wait_includes_async_camera_demand_planning_and_install() {
+    assert!(automation_runtime_is_idle(false, false, false));
+    assert!(!automation_runtime_is_idle(true, false, false));
+    assert!(!automation_runtime_is_idle(false, true, false));
+    assert!(!automation_runtime_is_idle(false, false, true));
+}
+
+#[test]
+fn refinement_handoff_diagnostics_name_an_uninitialized_hidden_target() {
+    assert_eq!(
+        refinement_handoff_phase(false, false, false, false),
+        RefinementHandoffPhase::Inactive
+    );
+    assert_eq!(
+        refinement_handoff_phase(true, false, false, false),
+        RefinementHandoffPhase::AwaitingHiddenTargetRegistration
+    );
+    assert_eq!(
+        refinement_handoff_phase(true, true, false, false),
+        RefinementHandoffPhase::AwaitingHiddenTargetRequest
+    );
+    assert_eq!(
+        refinement_handoff_phase(true, true, true, false),
+        RefinementHandoffPhase::HiddenTargetStreaming
+    );
+    assert_eq!(
+        refinement_handoff_phase(true, true, true, true),
+        RefinementHandoffPhase::HiddenTargetPresented
+    );
+}
+
+#[test]
+fn target_renderer_facts_expose_request_and_progress_authority() {
+    let mut target = crate::native_presentation::ProductPresentationTarget::new(
+        mirante4d_render_api::PresentationToken::new(17).unwrap(),
+        mirante4d_render_api::RenderExtent::new(64, 64).unwrap(),
+    );
+    target.last_renderer_available_resources = 3;
+    target.set_progressive_lease_probe_state(
+        crate::native_presentation::ProgressiveLeaseProbeState {
+            next_requirement: 2,
+            requirements_remaining: 5,
+            render_requested: false,
+        },
+    );
+
+    let facts = product_target_renderer_facts_json("3D", &target);
+
+    assert_eq!(facts["request_bound"], false);
+    assert_eq!(facts["presentation_present"], false);
+    assert_eq!(facts["presentation_matches_request"], false);
+    assert_eq!(facts["last_renderer_available_resources"], 3);
+    assert_eq!(facts["progressive_probe"]["next_requirement"], 2);
+    assert_eq!(facts["progressive_probe"]["requirements_remaining"], 5);
+    assert_eq!(facts["progressive_probe"]["render_requested"], false);
+}
+
+#[test]
+fn dataset_switch_protocol_starts_once_waits_and_fails_closed() {
+    let before_timeout = AUTOMATION_DATASET_SWITCH_TIMEOUT - Duration::from_millis(1);
+    assert_eq!(
+        dataset_switch_protocol_decision(
+            true,
+            false,
+            false,
+            Duration::ZERO,
+            AUTOMATION_DATASET_SWITCH_TIMEOUT,
+        ),
+        DatasetSwitchProtocolDecision::TargetAlreadySelected
+    );
+    assert_eq!(
+        dataset_switch_protocol_decision(
+            false,
+            false,
+            false,
+            Duration::ZERO,
+            AUTOMATION_DATASET_SWITCH_TIMEOUT,
+        ),
+        DatasetSwitchProtocolDecision::Start
+    );
+    assert_eq!(
+        dataset_switch_protocol_decision(
+            false,
+            true,
+            true,
+            before_timeout,
+            AUTOMATION_DATASET_SWITCH_TIMEOUT,
+        ),
+        DatasetSwitchProtocolDecision::Waiting
+    );
+    assert_eq!(
+        dataset_switch_protocol_decision(
+            true,
+            true,
+            false,
+            before_timeout,
+            AUTOMATION_DATASET_SWITCH_TIMEOUT,
+        ),
+        DatasetSwitchProtocolDecision::Installed
+    );
+    assert_eq!(
+        dataset_switch_protocol_decision(
+            false,
+            true,
+            false,
+            before_timeout,
+            AUTOMATION_DATASET_SWITCH_TIMEOUT,
+        ),
+        DatasetSwitchProtocolDecision::Failed
+    );
+    assert_eq!(
+        dataset_switch_protocol_decision(
+            false,
+            true,
+            true,
+            AUTOMATION_DATASET_SWITCH_TIMEOUT,
+            AUTOMATION_DATASET_SWITCH_TIMEOUT,
+        ),
+        DatasetSwitchProtocolDecision::TimedOut
+    );
+    assert_eq!(AUTOMATION_DATASET_SWITCH_TIMEOUT.as_millis(), 120_000);
+}
+
+#[test]
+fn switch_dataset_command_is_distinct_from_the_startup_assertion() {
+    let script: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "scenario": "temporal_switch",
+        "commands": [
+            { "command": "open_dataset", "path": "/tmp/representative.m4d" },
+            { "command": "switch_dataset", "path": "/tmp/temporal.m4d" },
+            { "command": "quit" }
+        ]
+    }))
+    .unwrap();
+    script.validate().unwrap();
+    assert!(matches!(
+        &script.commands[0],
+        ProductAutomationCommand::OpenDataset { path }
+            if path == &PathBuf::from("/tmp/representative.m4d")
+    ));
+    assert!(matches!(
+        &script.commands[1],
+        ProductAutomationCommand::SwitchDataset { path }
+            if path == &PathBuf::from("/tmp/temporal.m4d")
+    ));
+    assert_eq!(script.commands[0].name(), "open_dataset");
+    assert_eq!(script.commands[1].name(), "switch_dataset");
+
+    let empty_target: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "scenario": "invalid_temporal_switch",
+        "commands": [{ "command": "switch_dataset", "path": "" }]
+    }))
+    .unwrap();
+    assert!(empty_target.validate().is_err());
+}
+
+#[test]
+fn ep00_script_parses_time_distributed_camera_cross_section_and_pt_commands() {
+    let script: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "scenario": "ep00_workloads",
+        "diagnostic_counters": true,
+        "commands": [
+            { "command": "camera_zoom_sequence", "samples": 24, "duration_ms": 240, "scroll_y_points_per_sample": 1.0 },
+            { "command": "camera_orbit_sequence", "samples": 12, "duration_ms": 120, "yaw_points_per_sample": 2.0, "pitch_points_per_sample": -1.0 },
+            { "command": "set_active_cross_section_panel", "panel": "xy" },
+            { "command": "cross_section_rotate_sequence", "panel": "xy", "samples": 12, "duration_ms": 120, "x_points_per_sample": 1.0, "y_points_per_sample": 0.5, "radians_per_point": 0.01 },
+            { "command": "cross_section_pan_sequence", "panel": "xz", "samples": 12, "duration_ms": 120, "x_points_per_sample": 1.0, "y_points_per_sample": -1.0 },
+            { "command": "cross_section_zoom_sequence", "panel": "yz", "samples": 12, "duration_ms": 120, "x_fraction": 0.5, "y_fraction": 0.5, "factor_per_sample": 0.98 },
+            { "command": "cross_section_slice_sequence", "panel": "yz", "samples": 12, "duration_ms": 120, "distance_world_per_sample": 0.25 },
+            { "command": "set_time_index", "time_index": 1 },
+            { "command": "set_layer_visibility", "layer_index": 1, "visible": true },
+            { "command": "set_layer_order", "layer_indices": [1, 0] },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 30000 },
+            { "command": "sample_diagnostics", "label": "after-no" },
+            { "command": "assert", "condition": { "cross_section_panel_schedule": { "panel": "yz" } } },
+            { "command": "quit" }
+        ]
+    }))
+    .unwrap();
+
+    script.validate().unwrap();
+    assert!(script.requires_diagnostic_counters());
+    assert!(matches!(
+        script.commands[0],
+        ProductAutomationCommand::CameraZoomSequence { samples: 24, .. }
+    ));
+    assert_eq!(PanelId::from(ProductAutomationPanelId::Xy), PanelId::Xy);
+    assert_eq!(PanelId::from(ProductAutomationPanelId::Yz), PanelId::Yz);
+}
+
+#[test]
+fn ep00_detailed_counters_require_the_explicit_script_flag() {
+    let script: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "scenario": "instrumentation_control",
+        "diagnostic_counters": false,
+        "gpu_timing": false,
+        "commands": [
+            { "command": "camera_pan_sequence", "samples": 2, "duration_ms": 10, "x_points_per_sample": 1.0, "y_points_per_sample": 0.0 },
+            { "command": "sample_diagnostics", "label": "disabled-control" }
+        ]
+    }))
+    .unwrap();
+
+    script.validate().unwrap();
+    assert!(!script.requires_diagnostic_counters());
+    assert!(!script.requires_gpu_timing());
+}
+
+#[test]
+fn ep00_startup_bootstrap_accepts_only_bounded_pre_demand_state() {
+    let script: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "scenario": "cold_four_panel",
+        "startup_bootstrap": {
+            "capture_start_checkpoint": true,
+            "start_diagnostic_label": "fc-cold-zero-demand",
+            "commands": [
+                { "command": "set_mapped_client_pixels", "width": 1280, "height": 720 },
+                { "command": "set_four_panel_viewports", "presentation_width_points": 317.0, "presentation_height_points": 287.5, "three_d_render_width": 1280, "three_d_render_height": 720, "linked_render_width": 317, "linked_render_height": 288 },
+                { "command": "set_viewer_layout", "layout": "four_panel" },
+                { "command": "set_time_index", "time_index": 0 },
+                { "command": "set_active_cross_section_panel", "panel": "xy" },
+                { "command": "set_layer_render_mode", "layer_index": 0, "mode": "mip" },
+                { "command": "set_layer_sampling", "layer_index": 0, "sampling": "voxel_exact" },
+                { "command": "set_layer_window", "layer_index": 0, "low": 0.0, "high": 255.0 },
+                { "command": "set_layer_opacity", "layer_index": 0, "opacity": 1.0 },
+                { "command": "set_projection", "projection": "orthographic" },
+                { "command": "camera_fit_data" },
+                { "command": "cross_section_zoom_sequence", "panel": "xy", "samples": 1, "duration_ms": 1, "x_fraction": 0.5, "y_fraction": 0.5, "factor_per_sample": 0.0625 }
+            ]
+        },
+        "commands": [{ "command": "quit" }]
+    }))
+    .unwrap();
+
+    script.validate().unwrap();
+    assert_eq!(
+        script
+            .startup_bootstrap
+            .as_ref()
+            .unwrap()
+            .start_diagnostic_label
+            .as_deref(),
+        Some("fc-cold-zero-demand")
+    );
+
+    for rejected in [
+        json!({ "command": "open_dataset", "path": "/tmp/not-bootstrap-state" }),
+        json!({ "command": "cross_section_zoom_sequence", "panel": "xy", "samples": 2, "duration_ms": 1, "x_fraction": 0.5, "y_fraction": 0.5, "factor_per_sample": 0.5 }),
+    ] {
+        let candidate: ProductAutomationScript = serde_json::from_value(json!({
+            "schema": AUTOMATION_SCRIPT_SCHEMA,
+            "schema_version": AUTOMATION_SCHEMA_VERSION,
+            "scenario": "rejected_bootstrap",
+            "startup_bootstrap": {
+                "capture_start_checkpoint": true,
+                "start_diagnostic_label": "start",
+                "commands": [rejected]
+            },
+            "commands": [{ "command": "quit" }]
+        }))
+        .unwrap();
+        assert!(candidate.validate().is_err());
+    }
+}
+
+#[test]
+fn ep00_setup_only_bootstrap_accepts_exact_camera_and_plane_without_checkpoint() {
+    let script: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "scenario": "nonresident_setup",
+        "startup_bootstrap": {
+            "capture_start_checkpoint": false,
+            "commands": [
+                { "command": "set_viewer_layout", "layout": "four_panel" },
+                { "command": "set_time_index", "time_index": 0 },
+                {
+                    "command": "set_camera_view",
+                    "projection": "orthographic",
+                    "target_world": [1.0, 2.0, 3.0],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    "orthographic_world_per_screen_point": 54.0,
+                    "perspective_focal_length_screen_points": 500.0,
+                    "perspective_view_distance_world": 1000.0
+                },
+                {
+                    "command": "set_cross_section_view",
+                    "center_world": [1.0, 2.0, 3.0],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    "scale_world_per_screen_point": 8.0,
+                    "depth_world": 64.0
+                }
+            ]
+        },
+        "commands": [{ "command": "quit" }]
+    }))
+    .unwrap();
+    script.validate().unwrap();
+    let bootstrap = script.startup_bootstrap.as_ref().unwrap();
+    assert!(!bootstrap.capture_start_checkpoint);
+    assert!(bootstrap.start_diagnostic_label.is_none());
+
+    let mismatched: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "scenario": "invalid_setup",
+        "startup_bootstrap": {
+            "capture_start_checkpoint": false,
+            "start_diagnostic_label": "must-not-exist",
+            "commands": [{ "command": "set_time_index", "time_index": 0 }]
+        },
+        "commands": [{ "command": "quit" }]
+    }))
+    .unwrap();
+    assert!(mismatched.validate().is_err());
+}
+
+#[test]
+fn ep00_exact_cross_section_view_command_is_strictly_validated() {
+    let script = serde_json::json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "scenario": "exact_cross_section_reset",
+        "commands": [
+            {
+                "command": "set_cross_section_view",
+                "center_world": [1.0, 2.0, 3.0],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                "scale_world_per_screen_point": 2.0,
+                "depth_world": 4.0
+            },
+            { "command": "quit" }
+        ]
+    });
+    let parsed: ProductAutomationScript = serde_json::from_value(script).unwrap();
+    parsed.validate().unwrap();
+
+    let invalid = serde_json::json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "scenario": "invalid_cross_section_reset",
+        "commands": [
+            {
+                "command": "set_cross_section_view",
+                "center_world": [1.0, 2.0, 3.0],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                "scale_world_per_screen_point": 0.0,
+                "depth_world": 4.0
+            }
+        ]
+    });
+    let parsed: ProductAutomationScript = serde_json::from_value(invalid).unwrap();
+    assert!(parsed.validate().is_err());
+}
+
+#[test]
+fn ep00_sequence_bounds_and_diagnostic_labels_are_validated() {
+    for command in [
+        json!({ "command": "camera_zoom_sequence", "samples": 0, "duration_ms": 1, "scroll_y_points_per_sample": 1.0 }),
+        json!({ "command": "camera_zoom_sequence", "samples": MAX_INPUT_SEQUENCE_SAMPLES + 1, "duration_ms": 1, "scroll_y_points_per_sample": 1.0 }),
+        json!({ "command": "camera_zoom_sequence", "samples": 1, "duration_ms": 0, "scroll_y_points_per_sample": 1.0 }),
+        json!({ "command": "camera_zoom_sequence", "samples": 1, "duration_ms": MAX_INPUT_SEQUENCE_DURATION_MS + 1, "scroll_y_points_per_sample": 1.0 }),
+        json!({ "command": "camera_pan_sequence", "samples": 1, "duration_ms": 1, "x_points_per_sample": 0.0, "y_points_per_sample": -0.0 }),
+        json!({ "command": "cross_section_zoom_sequence", "panel": "xy", "samples": 1, "duration_ms": 1, "x_fraction": 0.5, "y_fraction": 0.5, "factor_per_sample": 1.0 }),
+        json!({ "command": "sample_diagnostics", "label": "" }),
+        json!({ "command": "set_layer_order", "layer_indices": (0..=mirante4d_render_api::MAX_RENDER_LAYERS).collect::<Vec<_>>() }),
+    ] {
+        let script: ProductAutomationScript = serde_json::from_value(json!({
+            "schema": AUTOMATION_SCRIPT_SCHEMA,
+            "schema_version": AUTOMATION_SCHEMA_VERSION,
+            "scenario": "invalid_ep00_bound",
+            "commands": [command]
+        }))
+        .unwrap();
+        assert!(script.validate().is_err());
+    }
+}
+
+#[test]
+fn ep00_sequence_schedule_spans_the_requested_monotonic_duration() {
+    assert_eq!(sequence_sample_target_ns(0, 5, 100), 0);
+    assert_eq!(sequence_sample_target_ns(1, 5, 100), 25_000_000);
+    assert_eq!(sequence_sample_target_ns(4, 5, 100), 100_000_000);
+    assert_eq!(sequence_sample_target_ns(0, 1, 100), 0);
+}
+
+#[test]
+fn ep00_labeled_union_delta_reconciles_retained_added_and_removed_bytes() {
+    use mirante4d_dataset::{
+        DatasetResourceIdentity, DatasetResourceKey, DatasetSourceId, ResourceRegion,
+    };
+    use mirante4d_domain::{LogicalLayerKey, ScaleLevel, Shape3D, TimeIndex};
+
+    let key = |origin_x| {
+        DatasetResourceKey::new(
+            DatasetResourceIdentity::Unverified(DatasetSourceId::new(9)),
+            LogicalLayerKey::new(0),
+            TimeIndex::new(0),
+            ScaleLevel::BASE,
+            ResourceRegion::new([0, 0, origin_x], Shape3D::new(1, 1, 1).unwrap()).unwrap(),
+        )
+    };
+    let previous = vec![(key(0), 10), (key(1), 20)];
+    let current = vec![(key(1), 20), (key(2), 30)];
+
+    let delta =
+        diagnostic_resource_union_delta("before-motion", &previous, "after-motion", &current);
+
+    assert_eq!(delta["previous_label"], "before-motion");
+    assert_eq!(delta["current_label"], "after-motion");
+    assert_eq!(
+        delta["previous_union_sha256"],
+        canonical_resource_union_sha256(&previous).to_string()
+    );
+    assert_eq!(
+        delta["current_union_sha256"],
+        canonical_resource_union_sha256(&current).to_string()
+    );
+    assert_eq!(delta["retained_unique_keys"], 1);
+    assert_eq!(delta["retained_unique_payload_bytes"], 20);
+    assert_eq!(delta["added_unique_keys"], 1);
+    assert_eq!(delta["added_unique_payload_bytes"], 30);
+    assert_eq!(delta["removed_unique_keys"], 1);
+    assert_eq!(delta["removed_unique_payload_bytes"], 10);
+    assert_eq!(delta["retained_payload_bytes_match"], true);
+    assert_eq!(delta["partitions_pairwise_disjoint"], true);
+
+    let phase_start_resident = vec![(key(1), 20), (key(7), 70)];
+    let partition = target_residency_partition_json("phase-start", &phase_start_resident, &current);
+    assert_eq!(partition["available"], true);
+    assert_eq!(partition["phase_start_label"], "phase-start");
+    assert_eq!(
+        partition["phase_start_resident_union_sha256"],
+        canonical_resource_union_sha256(&phase_start_resident).to_string()
+    );
+    assert_eq!(
+        partition["resident_target_intersection"]["canonical_entries_sha256"],
+        canonical_resource_union_sha256(&[(key(1), 20)]).to_string()
+    );
+    assert_eq!(partition["resident_target_intersection"]["unique_keys"], 1);
+    assert_eq!(
+        partition["nonresident_target_difference"]["canonical_entries_sha256"],
+        canonical_resource_union_sha256(&[(key(2), 30)]).to_string()
+    );
+    assert_eq!(partition["nonresident_target_difference"]["unique_keys"], 1);
+    assert_eq!(partition["target_union_reconciles"], true);
+}
+
+#[test]
+fn ep00_display_batch_aggregates_include_hidden_staging_target_work() {
+    use crate::native_presentation::ProductTargetDiagnosticCounters;
+
+    let first = ProductTargetDiagnosticCounters {
+        color_passes: 2,
+        completion_notifications: 3,
+        encoded_display_batches: 3,
+        control_static_rebuilds: 1,
+        ..ProductTargetDiagnosticCounters::default()
+    };
+    let hidden_staging = ProductTargetDiagnosticCounters {
+        color_passes: 5,
+        completion_notifications: 7,
+        encoded_display_batches: 7,
+        control_static_rebuilds: 11,
+        ..ProductTargetDiagnosticCounters::default()
+    };
+
+    let total = aggregate_product_target_diagnostic_counters([first, hidden_staging]);
+
+    assert_eq!(total.color_passes, 7);
+    assert_eq!(total.completion_notifications, 10);
+    assert_eq!(total.encoded_display_batches, 10);
+    assert_eq!(total.control_static_rebuilds, 12);
+}
+
+#[test]
+fn automation_alone_does_not_enable_validation_capture() {
+    let navigation: ProductAutomationScript = serde_json::from_str(
+        r#"{
+          "schema": "mirante4d-product-automation-script",
+          "schema_version": 3,
+          "scenario": "performance_navigation",
+          "commands": [
+            { "command": "camera_orbit", "yaw_points": 10.0, "pitch_points": 5.0 },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "quit" }
+          ]
+        }"#,
+    )
+    .unwrap();
+    navigation.validate().unwrap();
+    assert!(!navigation.requires_validation_capture());
+
+    for pixel_command in [
+        r#"{ "command": "capture_screenshot", "name": "mode-proof" }"#,
+        r#"{ "command": "assert", "condition": "nonblank_frame" }"#,
+        r#"{ "command": "assert", "condition": {
+          "four_panel_images_distinct": { "min_different_pixels": 1 }
+        } }"#,
+    ] {
+        let raw = format!(
+            r#"{{
+              "schema": "mirante4d-product-automation-script",
+              "schema_version": 3,
+              "scenario": "render_correctness",
+              "commands": [{pixel_command}]
+            }}"#
+        );
+        let script: ProductAutomationScript = serde_json::from_str(&raw).unwrap();
+        script.validate().unwrap();
+        assert!(script.requires_validation_capture());
+    }
+}
 
 #[test]
 fn import_raw_evidence_serializes_the_complete_statistics_surface() {
@@ -236,13 +775,28 @@ fn automation_script_parses_semantic_camera_commands() {
             { "command": "set_iso_display_level", "display_level": 0.05 },
             { "command": "set_dvr_density_scale", "density_scale": 12.0 },
             { "command": "set_layer_render_mode", "layer_index": 1, "mode": "dvr" },
+            { "command": "set_projection", "projection": "perspective" },
+            { "command": "set_layer_sampling", "layer_index": 1, "sampling": "smooth_linear" },
+            { "command": "set_layer_render_mode", "layer_index": 1, "mode": "iso" },
+            { "command": "set_layer_iso_shading", "layer_index": 1, "shading": "gradient_lighting" },
+            { "command": "set_iso_light", "light": { "kind": "detached_screen", "x": 0.25, "y": -0.5 } },
             { "command": "set_layer_window", "layer_index": 0, "low": 0.0, "high": 4096.0 },
             { "command": "set_layer_opacity", "layer_index": 0, "opacity": 1.0 },
             { "command": "camera_orbit", "yaw_points": 100.0, "pitch_points": 25.0 },
             { "command": "camera_pan", "x_points": 10.0, "y_points": -5.0 },
             { "command": "camera_zoom", "scroll_y_points": -120.0 },
+            { "command": "set_active_tool", "tool": "inspect" },
             { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
+            { "command": "primary_click", "x_fraction": 0.5, "y_fraction": 0.5 },
             { "command": "capture_screenshot", "name": "unit screenshot" },
+            { "command": "assert", "condition": { "projection": { "projection": "perspective" } } },
+            { "command": "assert", "condition": { "layer_sampling": { "layer_index": 1, "sampling": "smooth_linear" } } },
+            { "command": "assert", "condition": { "layer_iso_shading": { "layer_index": 1, "shading": "gradient_lighting" } } },
+            { "command": "assert", "condition": { "iso_light": { "light": { "kind": "detached_screen", "x": 0.25, "y": -0.5 } } } },
+            { "command": "assert", "condition": { "active_tool": { "tool": "inspect" } } },
+            { "command": "assert", "condition": "crosshair_linked" },
+            { "command": "assert", "condition": "roi_committed" },
+            { "command": "assert", "condition": "distance_committed" },
             { "command": "assert", "condition": "no_render_error" },
             { "command": "quit" }
           ]
@@ -251,17 +805,26 @@ fn automation_script_parses_semantic_camera_commands() {
     let script: ProductAutomationScript = serde_json::from_str(raw).unwrap();
 
     script.validate().unwrap();
-    assert_eq!(script.commands.len(), 14);
+    assert_eq!(script.commands.len(), 29);
     assert_eq!(script.limits.max_cpu_total_bytes, Some(1024));
     assert_eq!(script.limits.max_runtime_queued_requests, Some(128));
     assert_eq!(script.commands[2].name(), "set_iso_display_level");
     assert_eq!(script.commands[3].name(), "set_dvr_density_scale");
     assert_eq!(script.commands[4].name(), "set_layer_render_mode");
-    assert_eq!(script.commands[5].name(), "set_layer_window");
-    assert_eq!(script.commands[6].name(), "set_layer_opacity");
-    assert_eq!(script.commands[7].name(), "camera_orbit");
-    assert_eq!(script.commands[10].name(), "probe_hover");
-    assert_eq!(script.commands[11].name(), "capture_screenshot");
+    assert_eq!(script.commands[5].name(), "set_projection");
+    assert_eq!(script.commands[6].name(), "set_layer_sampling");
+    assert_eq!(script.commands[8].name(), "set_layer_iso_shading");
+    assert_eq!(script.commands[9].name(), "set_iso_light");
+    assert_eq!(script.commands[10].name(), "set_layer_window");
+    assert_eq!(script.commands[11].name(), "set_layer_opacity");
+    assert_eq!(script.commands[12].name(), "camera_orbit");
+    assert_eq!(script.commands[15].name(), "set_active_tool");
+    assert_eq!(script.commands[16].name(), "probe_hover");
+    assert_eq!(script.commands[17].name(), "primary_click");
+    assert_eq!(script.commands[18].name(), "capture_screenshot");
+    for index in 19..=27 {
+        assert_eq!(script.commands[index].name(), "assert");
+    }
 }
 
 #[test]
@@ -436,6 +999,9 @@ fn automation_script_rejects_wrong_schema_version() {
         schema: AUTOMATION_SCRIPT_SCHEMA.to_owned(),
         schema_version: 1,
         scenario: "unit".to_owned(),
+        gpu_timing: false,
+        diagnostic_counters: false,
+        startup_bootstrap: None,
         limits: ProductAutomationLimits::default(),
         commands: vec![ProductAutomationCommand::Quit],
     };
@@ -505,6 +1071,38 @@ fn dataset_runtime_diagnostics_json_names_capacity_usage_and_bounds() {
     assert_eq!(value["work"]["in_flight_decodes"], 1);
     assert_eq!(value["work"]["pending_completions"], 2);
     assert_eq!(value["work"]["resident_resources"], 4);
+    assert_eq!(value["performance"]["cache_hits"], 0);
+    assert_eq!(value["counters"]["decode_cohorts"], 0);
+    assert_eq!(value["counters"]["decode_cohort_members"], 0);
+    assert_eq!(value["counters"]["peak_decode_cohort_members"], 0);
+    assert_eq!(value["performance"]["decode_time_ns"], 0);
+    assert_eq!(value["performance"]["cancelled_decode_executions"], 0);
+    assert_eq!(value["performance"]["cancelled_decode_time_ns"], 0);
+    assert_eq!(value["performance"]["cancelled_decode_bytes"], 0);
+}
+
+#[test]
+fn local_source_diagnostics_json_names_physical_reuse_and_io_costs() {
+    let value = local_dataset_source_diagnostics_json(
+        mirante4d_storage::LocalDatasetSourceDiagnostics::default(),
+    );
+
+    assert_eq!(value["physical_bricks"]["cache_hits"], 0);
+    assert_eq!(value["physical_bricks"]["unique_decoded_bytes"], 0);
+    assert_eq!(value["aligned_direct"]["deliveries"], 0);
+    assert_eq!(value["aligned_direct"]["sink_span_bytes"], 0);
+    assert_eq!(value["aligned_direct"]["post_decode_copy_bytes"], 0);
+    assert_eq!(value["reader"]["physical_range_read_operations"], 0);
+    assert_eq!(value["reader"]["currentness"]["pre_use_batches"], 0);
+    assert_eq!(value["reader"]["currentness"]["time_ns"], 0);
+    assert_eq!(value["reader"]["codec_decode_time_ns"], 0);
+    assert_eq!(
+        value["reader"]["cancelled_encoded_bytes"],
+        json!({
+            "available": false,
+            "reason": "physical_range_cohort_has_no_per_sink_cancellation_ownership",
+        })
+    );
 }
 
 fn runtime_diagnostics(

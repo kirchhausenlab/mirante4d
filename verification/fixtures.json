@@ -211,11 +211,11 @@
       "publication": "public-safe-generated",
       "license": "MIT",
       "path": "crates/mirante4d-render-wgpu/src/gpu_tests.rs",
-      "sha256": "611ed6f6ee7ca6374150a17b313980ba3f9747947db4b711cca0dd55477f0695",
+      "sha256": "f367240c2cc040e65791eb837e2801adcf2de7b14132e11019f25e42a7826a35",
       "generator": {
         "command": "MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 cargo xtask verify-local trusted-gpu",
         "source": "crates/mirante4d-render-wgpu/src/gpu_tests.rs",
-        "sha256": "611ed6f6ee7ca6374150a17b313980ba3f9747947db4b711cca0dd55477f0695",
+        "sha256": "f367240c2cc040e65791eb837e2801adcf2de7b14132e11019f25e42a7826a35",
         "production_writer_used": false
       },
       "lineages": [],
@@ -240,11 +240,11 @@
       "publication": "public-safe-generated",
       "license": "MIT",
       "path": "crates/mirante4d-render-wgpu/src/gpu_tests.rs",
-      "sha256": "611ed6f6ee7ca6374150a17b313980ba3f9747947db4b711cca0dd55477f0695",
+      "sha256": "f367240c2cc040e65791eb837e2801adcf2de7b14132e11019f25e42a7826a35",
       "generator": {
         "command": "MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 cargo xtask verify-local trusted-gpu",
         "source": "crates/mirante4d-render-wgpu/src/gpu_tests.rs",
-        "sha256": "611ed6f6ee7ca6374150a17b313980ba3f9747947db4b711cca0dd55477f0695",
+        "sha256": "f367240c2cc040e65791eb837e2801adcf2de7b14132e11019f25e42a7826a35",
         "production_writer_used": false
       },
       "lineages": [],
@@ -272,18 +272,18 @@
       "publication": "public-safe-generated",
       "license": "MIT",
       "path": "crates/mirante4d-render-wgpu/src/gpu_tests.rs",
-      "sha256": "611ed6f6ee7ca6374150a17b313980ba3f9747947db4b711cca0dd55477f0695",
+      "sha256": "f367240c2cc040e65791eb837e2801adcf2de7b14132e11019f25e42a7826a35",
       "generator": {
         "command": "MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 cargo xtask verify-local trusted-gpu",
         "source": "crates/mirante4d-render-wgpu/src/gpu_tests.rs",
-        "sha256": "611ed6f6ee7ca6374150a17b313980ba3f9747947db4b711cca0dd55477f0695",
+        "sha256": "f367240c2cc040e65791eb837e2801adcf2de7b14132e11019f25e42a7826a35",
         "production_writer_used": false
       },
       "lineages": [],
       "limits": {
-        "resources": 129,
-        "payload_bytes": 129,
-        "first_frame_resources": 128,
+        "resources": 32768,
+        "payload_bytes": 32768,
+        "first_frame_resources": 512,
         "second_frame_resources": 1
       },
       "validation_command": "MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 cargo xtask verify-local trusted-gpu",

@@ -97,6 +97,24 @@ fn active_layer_no_data_policy_label(snapshot: &ApplicationSnapshot) -> Option<&
 
 impl eframe::App for MiranteWorkbenchApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let update_started = Instant::now();
+        let generation_at_start = self.render_coordination.display_generation();
+        let active_input_at_start = generation_at_start.input_generation > 0
+            && generation_at_start.current_presentation_generation
+                != Some(generation_at_start.input_generation);
+        let snapshot_at_start = self.application.snapshot();
+        let loading_work_at_start = workbench_playback_runtime::background_work_active(
+            &snapshot_at_start,
+            &self.import.workers,
+            &self.dataset,
+            &self.render_coordination,
+            &self.native_presentation,
+            false,
+        ) || self.camera_demand_planner.has_outstanding_request()
+            || self.pending_visible_demand_plan.is_some();
+        let heartbeat_at_ns = self.display_instrumentation_now_ns();
+        self.render_coordination
+            .record_main_loop_heartbeat(heartbeat_at_ns);
         self.pump_application_services();
         self.handle_close_request(ui.ctx());
 
@@ -129,7 +147,11 @@ impl eframe::App for MiranteWorkbenchApp {
             .source_verification_service
             .as_ref()
             .is_some_and(|service| service.active_token().is_none());
-        let runtime_diagnostics_view = runtime_diagnostics_panel::runtime_diagnostics_view(self);
+        let runtime_diagnostics_view =
+            runtime_diagnostics_panel::runtime_diagnostics_view_if_requested(
+                self,
+                self.egui_ui.runtime_diagnostics_open,
+            );
         let mut application_commands = Vec::new();
         workbench_playback_runtime::enqueue_playback_command_if_due(
             &application_snapshot,
@@ -239,7 +261,7 @@ impl eframe::App for MiranteWorkbenchApp {
                         workspace: &analysis_workspace_view,
                     },
                     settings: &settings_ui_view,
-                    runtime_diagnostics: &runtime_diagnostics_view,
+                    runtime_diagnostics: runtime_diagnostics_view.as_ref(),
                     camera: camera_inspector_view,
                     messages: &viewer_ui_snapshot.messages,
                 },
@@ -247,6 +269,7 @@ impl eframe::App for MiranteWorkbenchApp {
                     application: &application_snapshot,
                     frame_fidelity: &viewer_ui_snapshot.frame_fidelity,
                     fallback_render_extent: viewer_ui_snapshot.render_viewport,
+                    render_extent_envelope: WgpuRenderRuntime::extent_envelope(),
                     xy_placeholder: &viewer_ui_snapshot.xy_placeholder,
                     xz_placeholder: &viewer_ui_snapshot.xz_placeholder,
                     yz_placeholder: &viewer_ui_snapshot.yz_placeholder,
@@ -270,26 +293,49 @@ impl eframe::App for MiranteWorkbenchApp {
         self.apply_workbench_ui_output(ui, workbench_output);
 
         self.drain_brick_results(ui.ctx());
+        self.pump_viewer_pick(ui.ctx());
+        if let Err(error) = self.poll_product_gpu_timings() {
+            tracing::warn!(%error, "GPU timing readback failed");
+        }
+        self.update_source_verification_interactive_busy();
 
         let snapshot = self.application.snapshot();
         let project_store_pending = self
             .project_store
             .as_ref()
             .is_some_and(ProjectStoreApplicationService::has_pending_work);
-        if workbench_playback_runtime::background_work_active(
+        let progressive_render_work =
+            workbench_playback_runtime::progressive_render_submission_work(
+                &self.dataset,
+                &self.native_presentation,
+            );
+        let background_work_active = workbench_playback_runtime::background_work_active(
             &snapshot,
             &self.import.workers,
             &self.dataset,
             &self.render_coordination,
             &self.native_presentation,
-        ) || workbench_playback_runtime::source_verification_polling_required(
-            self.pending_automatic_source_verification.is_some(),
-            self.source_verification_service
-                .as_ref()
-                .is_some_and(|service| service.active_token().is_some()),
-        ) || project_store_pending
+            progressive_render_work.any_required,
+        );
+        if workbench_playback_runtime::three_d_progress_refresh_required(
+            progressive_render_work,
+            self.dataset.dispatcher().has_pending_work(),
+        ) {
+            self.render_coordination.request_refresh();
+        }
+        if background_work_active
+            || workbench_playback_runtime::source_verification_polling_required(
+                self.pending_automatic_source_verification.is_some(),
+                self.source_verification_service
+                    .as_ref()
+                    .is_some_and(|service| service.active_token().is_some()),
+            )
+            || project_store_pending
         {
             request_background_work_repaint_after(ui.ctx());
+        }
+        if self.camera_demand_planner.has_outstanding_request() {
+            ui.ctx().request_repaint_after(Duration::from_millis(6));
         }
         if let Some(delay) = self
             .project_store
@@ -299,7 +345,28 @@ impl eframe::App for MiranteWorkbenchApp {
             ui.ctx().request_repaint_after(delay);
         }
 
-        ProductAutomationController::drive(self, ui.ctx());
+        let foreground_idle = !background_work_active
+            && !self.camera_demand_planner.has_outstanding_request()
+            && self.pending_visible_demand_plan.is_none();
+        self.observe_coordinated_display_milestones(foreground_idle);
+
+        let qualification_only_ui_overhead_ns = ProductAutomationController::drive(self, ui.ctx());
+        let generation_at_end = self.render_coordination.display_generation();
+        let active_input_at_end = generation_at_end.input_generation > 0
+            && generation_at_end.current_presentation_generation
+                != Some(generation_at_end.input_generation);
+        let loading_work_at_end = !foreground_idle;
+        if active_input_at_start
+            || active_input_at_end
+            || loading_work_at_start
+            || loading_work_at_end
+        {
+            let duration_ns = u64::try_from(update_started.elapsed().as_nanos())
+                .unwrap_or(u64::MAX)
+                .saturating_sub(qualification_only_ui_overhead_ns);
+            self.render_coordination
+                .record_active_ui_update_duration(duration_ns);
+        }
     }
 
     fn on_exit(&mut self) {

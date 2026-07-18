@@ -258,14 +258,12 @@ fn assert_scientific_report(capability: &VerifiedScientificPackageCapability, fa
     assert_eq!(report.layer_count(), facts.physical_mapping.len() as u32);
     assert_eq!(report.identity_tiles(), expected_identity_tiles(facts));
     assert_eq!(report.brick_reads(), expected_scientific_brick_reads(facts));
-    assert!(report.object_reads() >= report.brick_reads());
-    // Every consumed payload object is opened once for its range read and
-    // twice for the independent snapshot checks. A present inner payload uses
-    // two ranges; an absent payload uses one.
-    assert_eq!(report.object_reads() % 3, 0);
-    let consumed_payload_objects = report.object_reads() / 3;
-    assert!(report.range_requests() >= consumed_payload_objects);
-    assert!(report.range_requests() <= consumed_payload_objects * 2);
+    // A scientific scan reuses generation-bound handles, shard indexes, and
+    // packed inners across adjacent bricks. Object opens may therefore be far
+    // fewer than brick reads; actual physical ranges must still cover every
+    // object generation opened by the scan.
+    assert!(report.object_reads() > 0);
+    assert!(report.range_requests() >= report.object_reads());
     assert!(report.encoded_bytes_read() > 0);
     assert!(report.decoded_bytes() > 0);
     assert!(report.peak_tile_buffer_bytes() > 0);

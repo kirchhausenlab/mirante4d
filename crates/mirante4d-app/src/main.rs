@@ -128,8 +128,12 @@ fn main() -> anyhow::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Mirante4D")
-            .with_inner_size([1280.0, 800.0])
+            .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([900.0, 600.0]),
+        // The blocking viewer qualification contract is defined at one
+        // physical 60 Hz display cadence. Keep the product default explicit
+        // so a framework-default change cannot silently alter that contract.
+        vsync: true,
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: wgpu_options(),
         ..Default::default()
@@ -214,7 +218,11 @@ fn adapter_preference_score(info: &eframe::wgpu::AdapterInfo) -> u8 {
 }
 
 fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
-    let mut options = eframe::egui_wgpu::WgpuConfiguration::default();
+    let mut options = eframe::egui_wgpu::WgpuConfiguration {
+        present_mode: eframe::wgpu::PresentMode::Fifo,
+        desired_maximum_frame_latency: Some(1),
+        ..Default::default()
+    };
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut options.wgpu_setup {
         create_new.power_preference = eframe::wgpu::PowerPreference::HighPerformance;
         create_new.native_adapter_selector = Some(Arc::new(|adapters, surface| {
@@ -285,6 +293,13 @@ fn select_window_adapter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn product_surface_contract_uses_fifo_with_low_latency_queueing() {
+        let options = wgpu_options();
+        assert_eq!(options.present_mode, eframe::wgpu::PresentMode::Fifo);
+        assert_eq!(options.desired_maximum_frame_latency, Some(1));
+    }
 
     #[test]
     fn adapter_override_matches_case_insensitive_visible_facts() {

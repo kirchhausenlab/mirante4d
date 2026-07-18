@@ -1,5 +1,8 @@
 use eframe::egui;
-use mirante4d_application::{AnalysisWorkspaceSnapshot, viewer_tools::ViewerTool};
+use mirante4d_application::{
+    AnalysisWorkspaceSnapshot,
+    viewer_tools::{ViewerTool, ViewerToolContext},
+};
 
 use crate::{
     DirtyProjectCloseView, EguiUiState, InspectorWorkbenchView, LeftWorkbenchView,
@@ -54,12 +57,15 @@ fn synchronize_viewer_tool(
     application: &mirante4d_application::ApplicationSnapshot,
     state: &mut EguiUiState,
 ) {
-    let canonical = match application.transient().active_tool() {
-        mirante4d_application::ToolKind::Navigate => ViewerTool::Navigate,
-        mirante4d_application::ToolKind::Inspect => ViewerTool::Inspect,
-        mirante4d_application::ToolKind::Crosshair => ViewerTool::Crosshair,
-    };
+    let canonical = ViewerTool::from(application.transient().active_tool());
     if state.viewer_tools.active_tool != canonical {
         state.viewer_tools.set_active_tool(canonical);
     }
+    state
+        .viewer_tools
+        .synchronize_context(ViewerToolContext::new(
+            application.source_generation(),
+            application.view().timepoint(),
+            application.view().active_layer(),
+        ));
 }

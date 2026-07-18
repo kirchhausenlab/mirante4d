@@ -9,11 +9,14 @@ use mirante4d_identity::{
 };
 use thiserror::Error;
 
+use crate::brick_address::{brick_grid, pixel_brick};
+use crate::package_read::{LocalDirectBrickRead, LocalDirectBrickReadError};
+use crate::range_io::{LocalObjectGeneration, LocalObjectSnapshot};
 use crate::range_io::{LocalPackageRootSeal, PublishedPackageRootBinding};
 use crate::{
     DatasetProfileAdmission, DirectoryInventoryError, ExactPackageCapability,
     INNER_CODEC_WORKING_BYTES_MAX, LocalBrickRead, LocalPackageCatalog,
-    PACKAGE_VALIDATION_WORKING_BYTES, PackageReadError, PackageValidationError,
+    PACKAGE_VALIDATION_WORKING_BYTES, PackagePath, PackageReadError, PackageValidationError,
     PackedIndexCoordinates, RangeReadError, ScienceTemporalKind, amplification_2d,
     amplification_3d,
 };
@@ -82,6 +85,11 @@ pub struct ScientificValidationReport {
     layer_count: u32,
     identity_tiles: u64,
     brick_reads: u64,
+    pyramid_fact_brick_reads: u64,
+    pyramid_fact_object_reads: u64,
+    pyramid_fact_range_requests: u64,
+    pyramid_fact_encoded_bytes_read: u64,
+    pyramid_fact_decoded_bytes: u64,
     object_reads: u64,
     range_requests: u64,
     encoded_bytes_read: u64,
@@ -105,6 +113,29 @@ impl ScientificValidationReport {
 
     pub const fn brick_reads(self) -> u64 {
         self.brick_reads
+    }
+
+    /// Non-base bricks decoded solely to prove every packed-index fact used by
+    /// the scan-free verified runtime path. Base-brick facts are proved while
+    /// computing the scientific identity and remain included in `brick_reads`.
+    pub const fn pyramid_fact_brick_reads(self) -> u64 {
+        self.pyramid_fact_brick_reads
+    }
+
+    pub const fn pyramid_fact_object_reads(self) -> u64 {
+        self.pyramid_fact_object_reads
+    }
+
+    pub const fn pyramid_fact_range_requests(self) -> u64 {
+        self.pyramid_fact_range_requests
+    }
+
+    pub const fn pyramid_fact_encoded_bytes_read(self) -> u64 {
+        self.pyramid_fact_encoded_bytes_read
+    }
+
+    pub const fn pyramid_fact_decoded_bytes(self) -> u64 {
+        self.pyramid_fact_decoded_bytes
     }
 
     pub const fn object_reads(self) -> u64 {
@@ -156,7 +187,14 @@ pub struct VerifiedScientificPackageCapability {
     scientific_content_id: ScientificContentId,
     layer_roots: Vec<ScientificLayerRoot>,
     report: ScientificValidationReport,
+    all_scale_packed_record_facts: VerifiedAllScalePackedRecordFactsCapability,
 }
+
+/// Private proof marker issued only after the scientific pass has compared
+/// every packed statistic at every runtime-addressable scale with its decoded
+/// canonical samples.
+#[derive(Debug)]
+struct VerifiedAllScalePackedRecordFactsCapability;
 
 impl VerifiedScientificPackageCapability {
     pub const fn package_id(&self) -> PackageId {
@@ -204,6 +242,80 @@ impl VerifiedScientificPackageCapability {
         is_cancelled: impl FnMut() -> bool,
     ) -> Result<LocalBrickRead, PackageReadError> {
         self.exact.read_brick(coordinates, is_cancelled)
+    }
+
+    pub(crate) fn begin_runtime_read_cohort(
+        &self,
+        is_cancelled: impl FnMut() -> bool,
+    ) -> Result<crate::range_io::LocalCurrentnessBatch<'_>, PackageReadError> {
+        let _proof = &self.all_scale_packed_record_facts;
+        self.exact.begin_runtime_read_cohort(is_cancelled)
+    }
+
+    pub(crate) fn runtime_read_object_capacity(&self) -> usize {
+        self.exact.runtime_read_object_capacity()
+    }
+
+    pub(crate) fn read_brick_into_sink_in_cohort(
+        &self,
+        coordinates: PackedIndexCoordinates,
+        sink: &mut dyn mirante4d_dataset::ReservedDecodeSink,
+        transaction: &mut crate::range_io::LocalCurrentnessBatch<'_>,
+    ) -> Result<LocalDirectBrickRead, LocalDirectBrickReadError> {
+        let _proof = &self.all_scale_packed_record_facts;
+        self.exact.read_brick_into_sink_in_cohort(
+            coordinates,
+            sink,
+            transaction,
+            crate::package_read::DirectPayloadFactsAuthority::VerifiedPackedRecord,
+        )
+    }
+
+    pub(crate) fn read_brick_in_cohort(
+        &self,
+        coordinates: PackedIndexCoordinates,
+        transaction: &mut crate::range_io::LocalCurrentnessBatch<'_>,
+        is_cancelled: impl FnMut() -> bool,
+    ) -> Result<LocalBrickRead, PackageReadError> {
+        let _proof = &self.all_scale_packed_record_facts;
+        self.exact
+            .read_brick_in_cohort(coordinates, transaction, is_cancelled)
+    }
+
+    pub(crate) fn validate_cached_brick_in_cohort(
+        &self,
+        brick: &LocalBrickRead,
+        transaction: &mut crate::range_io::LocalCurrentnessBatch<'_>,
+        is_cancelled: impl FnMut() -> bool,
+    ) -> Result<(), PackageReadError> {
+        self.exact
+            .validate_cached_brick_in_cohort(brick, transaction, is_cancelled)
+    }
+
+    pub(crate) fn revalidate_cached_brick(
+        &self,
+        brick: &LocalBrickRead,
+        is_cancelled: impl FnMut() -> bool,
+    ) -> Result<(), PackageReadError> {
+        self.exact.revalidate_cached_brick(brick, is_cancelled)
+    }
+
+    pub(crate) fn revalidate_cached_snapshots(
+        &self,
+        snapshots: &[LocalObjectSnapshot],
+        is_cancelled: impl FnMut() -> bool,
+    ) -> Result<(), PackageReadError> {
+        self.exact
+            .revalidate_cached_snapshots(snapshots, is_cancelled)
+    }
+
+    pub(crate) fn validate_promotion_observations(
+        &self,
+        observations: &[Option<LocalObjectGeneration>],
+        is_cancelled: impl FnMut() -> bool,
+    ) -> Result<(), PackageReadError> {
+        self.exact
+            .validate_promotion_observations(observations, is_cancelled)
     }
 
     pub(crate) fn prepare_atomic_publication(
@@ -474,13 +586,15 @@ impl ExactPackageCapability {
         check_cancelled(&mut is_cancelled)?;
         self.begin_scientific_scan(&mut is_cancelled)
             .map_err(map_exact_error)?;
-        let (computed, layer_roots, report) = compute_scientific_content(&self, &mut is_cancelled)?;
+        let (computed, layer_roots, mut report) =
+            compute_scientific_content(&self, &mut is_cancelled)?;
         let declared = self.catalog().science().scientific_content_id();
         if computed != declared || self.catalog().profile().scientific_content_id() != declared {
             return Err(
                 ScientificPackageValidationError::ScientificContentMismatch { declared, computed },
             );
         }
+        validate_pyramid_packed_record_facts(&self, &mut report, &mut is_cancelled)?;
         self.finish_scientific_scan(&mut is_cancelled)
             .map_err(map_exact_error)?;
         Ok(VerifiedScientificPackageCapability {
@@ -488,8 +602,91 @@ impl ExactPackageCapability {
             scientific_content_id: computed,
             layer_roots,
             report,
+            all_scale_packed_record_facts: VerifiedAllScalePackedRecordFactsCapability,
         })
     }
+}
+
+/// Proves the packed statistics for every non-base brick before the runtime
+/// can receive a verified capability. Base bricks were already decoded and
+/// checked by `compute_scientific_content`; this pass deliberately visits only
+/// the remaining levels so verification adds the pyramid volume once.
+fn validate_pyramid_packed_record_facts(
+    exact: &ExactPackageCapability,
+    report: &mut ScientificValidationReport,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<(), ScientificPackageValidationError> {
+    for image in exact.catalog().profile().images() {
+        for level in image.levels().iter().skip(1) {
+            check_cancelled(is_cancelled)?;
+            let metadata_path = PackagePath::parse(&format!("{}/zarr.json", level.pixel_path()))
+                .map_err(|_| ScientificPackageValidationError::MetadataInvariant {
+                    reason: "a validated pyramid pixel path stopped being canonical",
+                })?;
+            let metadata = exact.catalog().zarr_array(&metadata_path).ok_or(
+                ScientificPackageValidationError::MetadataInvariant {
+                    reason: "a validated pyramid level lost its pixel metadata",
+                },
+            )?;
+            let shape: [u64; 5] = metadata.shape().try_into().map_err(|_| {
+                ScientificPackageValidationError::MetadataInvariant {
+                    reason: "a validated pyramid pixel array stopped being five-dimensional",
+                }
+            })?;
+            let (brick_shape, _) = pixel_brick(metadata.kind()).ok_or(
+                ScientificPackageValidationError::MetadataInvariant {
+                    reason: "a validated pyramid pixel array stopped using a pixel profile",
+                },
+            )?;
+            let grid = brick_grid(shape, brick_shape).map_err(|error| {
+                ScientificPackageValidationError::Read(PackageReadError::Address(error))
+            })?;
+            for t in 0..grid[0] {
+                for channel in 0..grid[1] {
+                    for z in 0..grid[2] {
+                        for y in 0..grid[3] {
+                            for x in 0..grid[4] {
+                                check_cancelled(is_cancelled)?;
+                                let coordinates = PackedIndexCoordinates::new(
+                                    image.image_ordinal(),
+                                    level.scale_ordinal(),
+                                    to_u32(t, "pyramid time coordinate")?,
+                                    to_u32(channel, "pyramid channel coordinate")?,
+                                    to_u32(z, "pyramid z coordinate")?,
+                                    to_u32(y, "pyramid y coordinate")?,
+                                    to_u32(x, "pyramid x coordinate")?,
+                                );
+                                let object_reads_started =
+                                    exact.catalog().reader().object_open_operations();
+                                let brick = exact
+                                    .read_brick_for_scientific_scan(coordinates)
+                                    .map_err(map_read_error)?;
+                                if brick.payload_facts().is_none() {
+                                    return Err(
+                                        ScientificPackageValidationError::MetadataInvariant {
+                                            reason: "pyramid fact verification returned no facts",
+                                        },
+                                    );
+                                }
+                                let object_reads = exact
+                                    .catalog()
+                                    .reader()
+                                    .object_open_operations()
+                                    .checked_sub(object_reads_started)
+                                    .ok_or(
+                                        ScientificPackageValidationError::ArithmeticOverflow {
+                                            metric: "pyramid fact object-read counter delta",
+                                        },
+                                    )?;
+                                record_pyramid_fact_read(&brick, object_reads, report)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn compute_scientific_content(
@@ -905,6 +1102,11 @@ fn record_brick_read(
     object_reads: u64,
     report: &mut ScientificValidationReport,
 ) -> Result<(), ScientificPackageValidationError> {
+    if brick.payload_facts().is_none() {
+        return Err(ScientificPackageValidationError::MetadataInvariant {
+            reason: "base-brick fact verification returned no facts",
+        });
+    }
     report.brick_reads = checked_add(report.brick_reads, 1, "brick read count")?;
     report.object_reads = checked_add(report.object_reads, object_reads, "object read count")?;
     report.range_requests = checked_add(
@@ -919,6 +1121,39 @@ fn record_brick_read(
     )?;
     report.decoded_bytes =
         checked_add(report.decoded_bytes, brick.decoded_bytes(), "decoded bytes")?;
+    Ok(())
+}
+
+fn record_pyramid_fact_read(
+    brick: &LocalBrickRead,
+    object_reads: u64,
+    report: &mut ScientificValidationReport,
+) -> Result<(), ScientificPackageValidationError> {
+    report.pyramid_fact_brick_reads = checked_add(
+        report.pyramid_fact_brick_reads,
+        1,
+        "pyramid fact brick-read count",
+    )?;
+    report.pyramid_fact_object_reads = checked_add(
+        report.pyramid_fact_object_reads,
+        object_reads,
+        "pyramid fact object-read count",
+    )?;
+    report.pyramid_fact_range_requests = checked_add(
+        report.pyramid_fact_range_requests,
+        u64::from(brick.range_requests()),
+        "pyramid fact range-request count",
+    )?;
+    report.pyramid_fact_encoded_bytes_read = checked_add(
+        report.pyramid_fact_encoded_bytes_read,
+        brick.encoded_bytes_read(),
+        "pyramid fact encoded-byte count",
+    )?;
+    report.pyramid_fact_decoded_bytes = checked_add(
+        report.pyramid_fact_decoded_bytes,
+        brick.decoded_bytes(),
+        "pyramid fact decoded-byte count",
+    )?;
     Ok(())
 }
 
@@ -1143,10 +1378,21 @@ fn check_cancelled(
 }
 
 fn map_read_error(error: PackageReadError) -> ScientificPackageValidationError {
-    if matches!(error, PackageReadError::Cancelled) {
-        ScientificPackageValidationError::Cancelled
-    } else {
-        ScientificPackageValidationError::Read(error)
+    match error {
+        PackageReadError::Cancelled => ScientificPackageValidationError::Cancelled,
+        PackageReadError::NonFinitePixelPayload {
+            sample_index,
+            sample_valid: true,
+        } => {
+            // Scientific verification owns the canonical finite-float
+            // contract. The packed-fact pass may detect the same non-finite
+            // sample before the tile hasher, but it must preserve the
+            // established scientific-readback rejection class.
+            ScientificPackageValidationError::Identity(ScientificHashError::NonFiniteFloatSample {
+                index: sample_index,
+            })
+        }
+        error => ScientificPackageValidationError::Read(error),
     }
 }
 
@@ -1276,5 +1522,28 @@ mod tests {
             ))
             .unwrap();
         assert!(invalid.finalize().is_ok());
+    }
+
+    #[test]
+    fn read_error_mapping_promotes_only_valid_nonfinite_samples() {
+        assert!(matches!(
+            map_read_error(PackageReadError::NonFinitePixelPayload {
+                sample_index: 7,
+                sample_valid: true,
+            }),
+            ScientificPackageValidationError::Identity(ScientificHashError::NonFiniteFloatSample {
+                index: 7
+            })
+        ));
+        assert!(matches!(
+            map_read_error(PackageReadError::NonFinitePixelPayload {
+                sample_index: 7,
+                sample_valid: false,
+            }),
+            ScientificPackageValidationError::Read(PackageReadError::NonFinitePixelPayload {
+                sample_index: 7,
+                sample_valid: false,
+            })
+        ));
     }
 }

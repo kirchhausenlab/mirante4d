@@ -275,12 +275,15 @@ fn assert_typed_rejection(root: &Path, recipe: &Value) {
             let error = exact
                 .validate_scientific_content(|| false)
                 .unwrap_err_or_else(|| panic!("mutation {id} passed scientific validation"));
-            assert!(matches!(
-                error,
-                ScientificPackageValidationError::Identity(
-                    ScientificHashError::NonFiniteFloatSample { .. }
-                )
-            ));
+            assert!(
+                matches!(
+                    error,
+                    ScientificPackageValidationError::Identity(
+                        ScientificHashError::NonFiniteFloatSample { .. }
+                    )
+                ),
+                "mutation {id} rejected at scientific readback with {error:?}"
+            );
         }
         stage => panic!("mutation {id} has unexpected stage {stage}"),
     }

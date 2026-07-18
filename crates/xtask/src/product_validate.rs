@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     env, fs,
     os::unix::{ffi::OsStrExt, fs::MetadataExt, process::ExitStatusExt},
     path::{Path, PathBuf},
@@ -35,6 +36,8 @@ const SCENARIO_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_SCENARIO";
 const PREFLIGHT_ONLY_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_PREFLIGHT_ONLY";
 const GENERATED_FIXTURE_SCENARIO: &str = "target_fixture_camera_smoke";
 const GENERATED_RENDER_MODES_SCENARIO: &str = "target_fixture_render_modes";
+const GENERATED_RESIDENT_NAVIGATION_SCENARIO: &str =
+    "target_fixture_resident_navigation_no_readback";
 const B3_SOURCE_VERIFICATION_SCENARIO: &str = "target_source_verification";
 const IMPORT_PREPROCESSING_SCENARIO: &str = "import_preprocessing";
 const B4_PROJECT_PERSISTENCE_SCENARIO: &str = "b4_project_persistence";
@@ -64,6 +67,7 @@ const IMPORT_FIXTURE_Y: u32 = 1_025;
 const IMPORT_FIXTURE_X: u32 = 1_537;
 const IMPORT_DURABLE_PREFIX_WORK_UNITS: u64 = 512;
 const IMPORT_WORKING_MEMORY_BYTES: u64 = 256 * MIB;
+const IMPORT_RESIDENT_RESOURCE_LIMIT: u64 = 1_024;
 const IMPORT_VIEWPORT_WIDTH: u32 = 1_280;
 const IMPORT_VIEWPORT_HEIGHT: u32 = 720;
 const MIB: u64 = 1024 * 1024;
@@ -482,6 +486,10 @@ fn product_validate_report_inner(
         automation_status.as_deref(),
         automation_failure.as_deref(),
         automation_report.as_ref(),
+        !matches!(
+            scenario,
+            ProductValidationScenario::GeneratedFixtureResidentNavigation
+        ),
     );
     if validation_status == ProductValidationStatus::Passed
         && matches!(scenario, ProductValidationScenario::B3SourceVerification)
@@ -493,6 +501,16 @@ fn product_validate_report_inner(
     if validation_status == ProductValidationStatus::Passed
         && matches!(scenario, ProductValidationScenario::ImportPreprocessing)
         && let Err(reason) = import_preprocessing_evidence(automation_report.as_ref())
+    {
+        validation_status = ProductValidationStatus::Failed;
+        failure_reason = Some(reason);
+    }
+    if validation_status == ProductValidationStatus::Passed
+        && matches!(
+            scenario,
+            ProductValidationScenario::GeneratedFixtureResidentNavigation
+        )
+        && let Err(reason) = resident_navigation_evidence(automation_report.as_ref())
     {
         validation_status = ProductValidationStatus::Failed;
         failure_reason = Some(reason);
@@ -538,6 +556,7 @@ fn product_validate_report_inner(
 enum ProductValidationScenario {
     GeneratedFixtureCameraSmoke,
     GeneratedFixtureRenderModes,
+    GeneratedFixtureResidentNavigation,
     B3SourceVerification,
     ImportPreprocessing,
     B4ProjectPersistence,
@@ -548,6 +567,7 @@ impl ProductValidationScenario {
         match self {
             Self::GeneratedFixtureCameraSmoke => GENERATED_FIXTURE_SCENARIO,
             Self::GeneratedFixtureRenderModes => GENERATED_RENDER_MODES_SCENARIO,
+            Self::GeneratedFixtureResidentNavigation => GENERATED_RESIDENT_NAVIGATION_SCENARIO,
             Self::B3SourceVerification => B3_SOURCE_VERIFICATION_SCENARIO,
             Self::ImportPreprocessing => IMPORT_PREPROCESSING_SCENARIO,
             Self::B4ProjectPersistence => B4_PROJECT_PERSISTENCE_SCENARIO,
@@ -559,13 +579,15 @@ impl ProductValidationScenario {
         match requested.unwrap_or(GENERATED_FIXTURE_SCENARIO) {
             GENERATED_FIXTURE_SCENARIO => Ok(Self::GeneratedFixtureCameraSmoke),
             GENERATED_RENDER_MODES_SCENARIO => Ok(Self::GeneratedFixtureRenderModes),
+            GENERATED_RESIDENT_NAVIGATION_SCENARIO => Ok(Self::GeneratedFixtureResidentNavigation),
             B3_SOURCE_VERIFICATION_SCENARIO => Ok(Self::B3SourceVerification),
             IMPORT_PREPROCESSING_SCENARIO => Ok(Self::ImportPreprocessing),
             B4_PROJECT_PERSISTENCE_SCENARIO => Ok(Self::B4ProjectPersistence),
             other => bail!(
                 "unknown product validation scenario {other:?}; expected \
                  {GENERATED_FIXTURE_SCENARIO}, {GENERATED_RENDER_MODES_SCENARIO}, \
-                 {B3_SOURCE_VERIFICATION_SCENARIO}, {IMPORT_PREPROCESSING_SCENARIO}, or \
+                 {GENERATED_RESIDENT_NAVIGATION_SCENARIO}, {B3_SOURCE_VERIFICATION_SCENARIO}, \
+                 {IMPORT_PREPROCESSING_SCENARIO}, or \
                  {B4_PROJECT_PERSISTENCE_SCENARIO}"
             ),
         }
@@ -576,6 +598,7 @@ impl ProductValidationScenario {
             name,
             GENERATED_FIXTURE_SCENARIO
                 | GENERATED_RENDER_MODES_SCENARIO
+                | GENERATED_RESIDENT_NAVIGATION_SCENARIO
                 | B3_SOURCE_VERIFICATION_SCENARIO
                 | IMPORT_PREPROCESSING_SCENARIO
                 | B4_PROJECT_PERSISTENCE_SCENARIO
@@ -584,7 +607,9 @@ impl ProductValidationScenario {
 
     fn default_timeout_secs(&self) -> u64 {
         match self {
-            Self::GeneratedFixtureCameraSmoke | Self::GeneratedFixtureRenderModes => 60,
+            Self::GeneratedFixtureCameraSmoke
+            | Self::GeneratedFixtureRenderModes
+            | Self::GeneratedFixtureResidentNavigation => 60,
             Self::B3SourceVerification => B3_SCENARIO_TIMEOUT_SECS,
             Self::ImportPreprocessing => IMPORT_SCENARIO_TIMEOUT_SECS,
             Self::B4ProjectPersistence => B4_PHASE_TIMEOUT_SECS * 3,
@@ -1108,6 +1133,7 @@ fn completed_product_validation_outcome(
     automation_status: Option<&str>,
     automation_failure: Option<&str>,
     automation_report: Option<&Value>,
+    require_nonblank_capture: bool,
 ) -> (ProductValidationStatus, Option<String>) {
     if !app_exited_successfully || automation_status != Some("passed") {
         return (
@@ -1123,10 +1149,53 @@ fn completed_product_validation_outcome(
         );
     }
 
-    match qualifying_nonblank_viewport_capture(automation_report) {
+    let evidence = if require_nonblank_capture {
+        qualifying_nonblank_viewport_capture(automation_report).map(|_| ())
+    } else {
+        qualifying_resident_navigation_presentation(automation_report)
+    };
+    match evidence {
         Ok(_) => (ProductValidationStatus::Passed, None),
         Err(reason) => (ProductValidationStatus::Failed, Some(reason)),
     }
+}
+
+fn qualifying_resident_navigation_presentation(
+    automation_report: Option<&Value>,
+) -> Result<(), String> {
+    let report = automation_report
+        .ok_or_else(|| "resident-navigation automation report is missing".to_owned())?;
+    let mapped = report
+        .pointer("/viewport_evidence/requested_mapped_client_pixels")
+        .ok_or_else(|| "resident-navigation report lacks mapped client pixels".to_owned())?;
+    let mapped_width = mapped.get("width").and_then(Value::as_u64).unwrap_or(0);
+    let mapped_height = mapped.get("height").and_then(Value::as_u64).unwrap_or(0);
+    let final_diagnostics = report
+        .get("final_diagnostics")
+        .ok_or_else(|| "resident-navigation report lacks final diagnostics".to_owned())?;
+    let fidelity = final_diagnostics
+        .pointer("/render/frame_fidelity")
+        .ok_or_else(|| "resident-navigation report lacks final frame fidelity".to_owned())?;
+    if mapped_width == 0
+        || mapped_height == 0
+        || final_diagnostics
+            .pointer("/render/gpu_display_frame_present")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || fidelity.get("target_scale_level").and_then(Value::as_u64) != Some(0)
+        || fidelity
+            .get("displayed_scale_level")
+            .and_then(Value::as_u64)
+            != Some(0)
+        || fidelity.get("completeness").and_then(Value::as_str) != Some("Complete")
+        || fidelity.get("display_freshness").and_then(Value::as_str) != Some("Current")
+    {
+        return Err(
+            "resident-navigation report did not prove a mapped current exact s0 GPU presentation"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn qualifying_nonblank_viewport_capture(
@@ -1456,6 +1525,269 @@ fn validate_publication_currentness_execution(transfer: &Value) -> Result<(), St
     Ok(())
 }
 
+fn resident_navigation_counter(
+    snapshot: &Value,
+    pointer: &str,
+    label: &str,
+) -> Result<u64, String> {
+    snapshot
+        .pointer(pointer)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("resident-navigation diagnostics omitted {label} at {pointer}"))
+}
+
+fn resident_navigation_delta(
+    before: &Value,
+    after: &Value,
+    pointer: &str,
+    label: &str,
+) -> Result<u64, String> {
+    let before = resident_navigation_counter(before, pointer, label)?;
+    let after = resident_navigation_counter(after, pointer, label)?;
+    after.checked_sub(before).ok_or_else(|| {
+        format!("resident-navigation counter {label} regressed from {before} to {after}")
+    })
+}
+
+/// Structural, same-process proof for the warm resident path. This does not
+/// claim a latency threshold: it proves that navigation reuses the installed
+/// cohort and that settled repaints do not keep submitting GPU work.
+fn resident_navigation_evidence(report: Option<&Value>) -> Result<Value, String> {
+    let snapshots = report
+        .and_then(|report| report.get("diagnostics"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "resident-navigation report has no diagnostics snapshots".to_owned())?;
+    if snapshots.len() < 3 {
+        return Err(format!(
+            "resident-navigation requires baseline, post-navigation, and post-idle diagnostics; observed {}",
+            snapshots.len()
+        ));
+    }
+    let baseline = &snapshots[0];
+    let navigated = &snapshots[1];
+    let idle = &snapshots[2];
+    let warm_zero_paths = [
+        (
+            "/dataset_source_io/reader/physical_range_read_operations",
+            "physical range reads",
+        ),
+        (
+            "/dataset_source_io/reader/codec_decode_operations",
+            "codec decodes",
+        ),
+        (
+            "/dataset_source_io/physical_bricks/unique_decodes",
+            "unique brick decodes",
+        ),
+        (
+            "/dataset_runtime/counters/submitted_requests",
+            "dataset requests",
+        ),
+        ("/gpu_adapter/uploads/resources", "GPU uploaded resources"),
+        (
+            "/gpu_adapter/uploads/payload_bytes",
+            "GPU uploaded payload bytes",
+        ),
+    ];
+    let mut warm_deltas = serde_json::Map::new();
+    for (pointer, label) in warm_zero_paths {
+        let delta = resident_navigation_delta(baseline, navigated, pointer, label)?;
+        if delta != 0 {
+            return Err(format!(
+                "warm resident navigation added {delta} {label}; expected structurally zero"
+            ));
+        }
+        warm_deltas.insert(label.replace(' ', "_"), Value::from(delta));
+    }
+    let retained_navigation_frames = resident_navigation_delta(
+        baseline,
+        navigated,
+        "/gpu_adapter/retained_navigation_frames",
+        "retained navigation frames",
+    )?;
+    if retained_navigation_frames == 0 {
+        return Err(
+            "warm resident navigation never exercised the retained-navigation GPU path".to_owned(),
+        );
+    }
+    let navigation_queue_submissions = resident_navigation_delta(
+        baseline,
+        navigated,
+        "/gpu_adapter/queue_submissions",
+        "navigation GPU queue submissions",
+    )?;
+    let idle_queue_submissions = resident_navigation_delta(
+        navigated,
+        idle,
+        "/gpu_adapter/queue_submissions",
+        "post-settle GPU queue submissions",
+    )?;
+    if idle_queue_submissions != 0 {
+        return Err(format!(
+            "120 settled frames added {idle_queue_submissions} GPU queue submissions"
+        ));
+    }
+    if idle
+        .pointer("/gpu_adapter/timing/enabled")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Err("resident-navigation GPU timing was requested but is not enabled".to_owned());
+    }
+    let completed_gpu_timings = resident_navigation_delta(
+        baseline,
+        navigated,
+        "/gpu_adapter/timing/completed",
+        "completed GPU timings",
+    )?;
+    if completed_gpu_timings == 0 {
+        return Err("resident-navigation completed no new asynchronous GPU timing".to_owned());
+    }
+    let idle_gpu_timings = resident_navigation_delta(
+        navigated,
+        idle,
+        "/gpu_adapter/timing/completed",
+        "post-settle completed GPU timings",
+    )?;
+    if idle_gpu_timings != 0 {
+        return Err(format!(
+            "120 settled frames completed {idle_gpu_timings} late GPU timings after runtime idle"
+        ));
+    }
+    let completed_cpu_timings = resident_navigation_delta(
+        baseline,
+        navigated,
+        "/gpu_adapter/timing/cpu/completed",
+        "completed CPU renderer timings",
+    )?;
+    if completed_cpu_timings == 0 {
+        return Err("resident-navigation collected no new CPU renderer timing".to_owned());
+    }
+    let idle_cpu_timings = resident_navigation_delta(
+        navigated,
+        idle,
+        "/gpu_adapter/timing/cpu/completed",
+        "post-settle CPU renderer timings",
+    )?;
+    if idle_cpu_timings != 0 {
+        return Err(format!(
+            "120 settled frames added {idle_cpu_timings} CPU renderer timings"
+        ));
+    }
+    let publication_pointer =
+        "/render/progressive_presentation/presented_frame_intervals/total_publications";
+    let baseline_publications =
+        resident_navigation_counter(baseline, publication_pointer, "baseline publications")?;
+    let navigated_publications =
+        resident_navigation_counter(navigated, publication_pointer, "navigated publications")?;
+    let idle_publications =
+        resident_navigation_counter(idle, publication_pointer, "post-settle publications")?;
+    let navigation_publications = navigated_publications
+        .checked_sub(baseline_publications)
+        .ok_or_else(|| "resident-navigation publication counter regressed".to_owned())?;
+    if navigation_publications == 0 {
+        return Err("resident-navigation published no current 3D frame".to_owned());
+    }
+    if retained_navigation_frames != navigation_publications
+        || navigation_queue_submissions != navigation_publications
+        || completed_gpu_timings != navigation_publications
+        || completed_cpu_timings != navigation_publications
+    {
+        return Err(format!(
+            "resident-navigation execution/publication counts disagree: publications={navigation_publications}, retained_frames={retained_navigation_frames}, queue_submissions={navigation_queue_submissions}, GPU_timings={completed_gpu_timings}, CPU_timings={completed_cpu_timings}"
+        ));
+    }
+    if idle_publications != navigated_publications {
+        return Err(format!(
+            "120 settled frames added {} current 3D publications",
+            idle_publications.saturating_sub(navigated_publications)
+        ));
+    }
+    if navigated
+        .pointer("/render/progressive_presentation/presented_frame_intervals/enabled")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Err("resident-navigation presented-frame timing is disabled".to_owned());
+    }
+    let frame_timing_samples = navigated
+        .pointer("/render/progressive_presentation/presented_frame_intervals/samples")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "resident-navigation diagnostics omitted presented-frame timing samples".to_owned()
+        })?;
+    let navigated_samples = frame_timing_samples
+        .iter()
+        .filter(|sample| {
+            sample
+                .get("sequence")
+                .and_then(Value::as_u64)
+                .is_some_and(|sequence| sequence > baseline_publications)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let expected_sample_count = usize::try_from(navigation_publications).map_err(|_| {
+        "resident-navigation publication count does not fit the evidence host".to_owned()
+    })?;
+    if navigated_samples.len() != expected_sample_count {
+        return Err(
+            "resident-navigation did not retain one timing sample per new publication".to_owned(),
+        );
+    }
+    let mut gpu_execution_ids = BTreeSet::new();
+    for (index, sample) in navigated_samples.iter().enumerate() {
+        let sequence = sample.get("sequence").and_then(Value::as_u64);
+        let frame = sample.get("frame").and_then(Value::as_u64);
+        let gpu_execution_id = sample.get("gpu_execution_id").and_then(Value::as_u64);
+        let gpu_presentation = sample.get("gpu_presentation").and_then(Value::as_u64);
+        let gpu_frame = sample.get("gpu_frame").and_then(Value::as_u64);
+        let expected_sequence = baseline_publications
+            .checked_add(index as u64 + 1)
+            .ok_or_else(|| "resident-navigation sample sequence overflowed".to_owned())?;
+        if sequence != Some(expected_sequence)
+            || sample
+                .get("interval_ns")
+                .and_then(Value::as_u64)
+                .is_none_or(|value| value == 0)
+            || frame.is_none()
+            || sample
+                .get("cpu_planning_ns")
+                .and_then(Value::as_u64)
+                .is_none()
+            || sample
+                .get("cpu_queue_submit_ns")
+                .and_then(Value::as_u64)
+                .is_none()
+            || gpu_execution_id.is_none_or(|identity| identity == 0)
+            || gpu_presentation.is_none_or(|presentation| presentation == 0)
+            || gpu_frame != frame
+            || sample.get("gpu_timing_complete").and_then(Value::as_bool) != Some(true)
+            || sample
+                .get("gpu_volume_pass_ns")
+                .and_then(Value::as_u64)
+                .is_none()
+            || !gpu_execution_ids.insert(gpu_execution_id.expect("checked above"))
+        {
+            return Err(
+                "resident-navigation did not bind every new publication to one unique exact-execution CPU/GPU timing"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(json!({
+        "warm_navigation": warm_deltas,
+        "retained_navigation_frames": retained_navigation_frames,
+        "navigation_queue_submissions": navigation_queue_submissions,
+        "post_settle_idle_queue_submissions": idle_queue_submissions,
+        "completed_gpu_timings": completed_gpu_timings,
+        "post_settle_completed_gpu_timings": idle_gpu_timings,
+        "cpu_renderer_timing": {
+            "completed": completed_cpu_timings,
+        },
+        "presented_frame_timing_samples": navigated_samples,
+    }))
+}
+
 fn product_validation_package_and_script(
     package: Option<&Path>,
     scenario: &ProductValidationScenario,
@@ -1475,6 +1807,14 @@ fn product_validation_package_and_script(
                 None => default_target_fixture()?,
             };
             let script = target_fixture_render_modes_script(&package);
+            Ok((package, script, None))
+        }
+        ProductValidationScenario::GeneratedFixtureResidentNavigation => {
+            let package = match package {
+                Some(package) => package.to_path_buf(),
+                None => default_target_fixture()?,
+            };
+            let script = target_fixture_resident_navigation_script(&package);
             Ok((package, script, None))
         }
         ProductValidationScenario::B3SourceVerification => {
@@ -1598,6 +1938,7 @@ fn target_fixture_camera_smoke_script(package: &Path) -> Value {
             { "command": "assert", "condition": "no_render_error" },
             { "command": "set_render_mode", "mode": "mip" },
             { "command": "camera_fit_data" },
+            { "command": "set_active_tool", "tool": "inspect" },
             { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
             { "command": "camera_orbit", "yaw_points": 120.0, "pitch_points": 32.0 },
             { "command": "camera_pan", "x_points": 40.0, "y_points": -24.0 },
@@ -1608,6 +1949,41 @@ fn target_fixture_camera_smoke_script(package: &Path) -> Value {
             { "command": "copy_diagnostics" },
             { "command": "assert", "condition": "nonblank_frame" },
             { "command": "assert", "condition": "no_render_error" },
+            { "command": "quit" }
+        ]
+    })
+}
+
+fn target_fixture_resident_navigation_script(package: &Path) -> Value {
+    json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "scenario": GENERATED_RESIDENT_NAVIGATION_SCENARIO,
+        "gpu_timing": true,
+        "limits": dataset_runtime_limits(128 * MIB, 64),
+        "commands": [
+            { "command": "open_dataset", "path": package },
+            { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
+            { "command": "set_viewer_layout", "layout": "single3d" },
+            { "command": "set_mapped_client_pixels", "width": GENERATED_VIEWPORT_WIDTH, "height": GENERATED_VIEWPORT_HEIGHT },
+            { "command": "set_render_target_size", "width": GENERATED_VIEWPORT_WIDTH, "height": GENERATED_VIEWPORT_HEIGHT },
+            { "command": "camera_fit_data" },
+            { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "frame_fidelity": { "scale_level": 0, "complete": true } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "copy_diagnostics" },
+            { "command": "camera_orbit", "yaw_points": 12.0, "pitch_points": 6.0 },
+            { "command": "camera_pan", "x_points": 4.0, "y_points": -3.0 },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "frame_fidelity": { "scale_level": 0, "complete": true } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "copy_diagnostics" },
+            { "command": "sleep_frames", "frames": 120 },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "copy_diagnostics" },
             { "command": "quit" }
         ]
     })
@@ -1634,16 +2010,31 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
             { "command": "camera_fit_data" },
             { "command": "set_render_mode", "mode": "mip" },
             { "command": "set_layer_render_mode", "layer_index": 1, "mode": "mip" },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
             { "command": "assert", "condition": { "render_mode": { "mode": "mip" } } },
             { "command": "assert", "condition": "nonblank_frame" },
             { "command": "assert", "condition": "no_render_error" },
             { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30000 },
+            { "command": "set_active_tool", "tool": "inspect" },
             { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
             { "command": "copy_diagnostics" },
-            { "command": "capture_screenshot", "name": "generated-mip" },
+            { "command": "capture_screenshot", "name": "generated-mip" }
+        ]
+    });
+    let Value::Array(middle) = json!([
+            { "command": "set_projection", "projection": "perspective" },
+            { "command": "set_layer_sampling", "layer_index": 0, "sampling": "smooth_linear" },
+            { "command": "set_layer_sampling", "layer_index": 1, "sampling": "smooth_linear" },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "projection": { "projection": "perspective" } } },
+            { "command": "assert", "condition": { "layer_sampling": { "layer_index": 0, "sampling": "smooth_linear" } } },
+            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "name": "generated-perspective-smooth" },
             { "command": "set_render_mode", "mode": "dvr" },
             { "command": "set_layer_render_mode", "layer_index": 1, "mode": "dvr" },
             { "command": "set_dvr_density_scale", "density_scale": 12.0 },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
             { "command": "assert", "condition": { "render_mode": { "mode": "dvr" } } },
             { "command": "assert", "condition": "nonblank_frame" },
             { "command": "assert", "condition": "no_render_error" },
@@ -1652,18 +2043,53 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
             { "command": "capture_screenshot", "name": "generated-dvr" },
             { "command": "set_render_mode", "mode": "iso" },
             { "command": "set_layer_render_mode", "layer_index": 1, "mode": "iso" },
+            { "command": "set_layer_iso_shading", "layer_index": 0, "shading": "gradient_lighting" },
+            { "command": "set_layer_iso_shading", "layer_index": 1, "shading": "gradient_lighting" },
             { "command": "set_iso_display_level", "display_level": 0.05 },
+            { "command": "set_iso_light", "light": { "kind": "detached_screen", "x": 0.25, "y": -0.35 } },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
             { "command": "assert", "condition": { "render_mode": { "mode": "iso" } } },
+            { "command": "assert", "condition": { "layer_iso_shading": { "layer_index": 0, "shading": "gradient_lighting" } } },
+            { "command": "assert", "condition": { "iso_light": { "light": { "kind": "detached_screen", "x": 0.25, "y": -0.35 } } } },
             { "command": "assert", "condition": "nonblank_frame" },
             { "command": "assert", "condition": "no_render_error" },
             { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
             { "command": "copy_diagnostics" },
-            { "command": "capture_screenshot", "name": "generated-iso" }
-        ]
-    });
+            { "command": "capture_screenshot", "name": "generated-iso-detached-light" },
+            { "command": "set_iso_light", "light": { "kind": "attached_camera" } },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "iso_light": { "light": { "kind": "attached_camera" } } } },
+            { "command": "capture_screenshot", "name": "generated-iso-attached-light" }
+    ]) else {
+        unreachable!("the product validation command middle is an array")
+    };
+    script["commands"]
+        .as_array_mut()
+        .expect("the generated product validation script has commands")
+        .extend(middle);
     let Value::Array(tail) = json!([
+            { "command": "set_projection", "projection": "orthographic" },
+            { "command": "set_layer_sampling", "layer_index": 0, "sampling": "voxel_exact" },
+            { "command": "set_layer_sampling", "layer_index": 1, "sampling": "voxel_exact" },
             { "command": "set_render_mode", "mode": "mip" },
             { "command": "set_layer_render_mode", "layer_index": 1, "mode": "mip" },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30000 },
+            { "command": "set_active_tool", "tool": "inspect" },
+            { "command": "assert", "condition": { "active_tool": { "tool": "inspect" } } },
+            { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
+            { "command": "set_active_tool", "tool": "crosshair" },
+            { "command": "primary_click", "x_fraction": 0.5, "y_fraction": 0.5 },
+            { "command": "assert", "condition": "crosshair_linked" },
+            { "command": "set_active_tool", "tool": "roi_box" },
+            { "command": "primary_click", "x_fraction": 0.44, "y_fraction": 0.44 },
+            { "command": "primary_click", "x_fraction": 0.56, "y_fraction": 0.56 },
+            { "command": "assert", "condition": "roi_committed" },
+            { "command": "set_active_tool", "tool": "measure_distance" },
+            { "command": "primary_click", "x_fraction": 0.46, "y_fraction": 0.5 },
+            { "command": "primary_click", "x_fraction": 0.54, "y_fraction": 0.5 },
+            { "command": "assert", "condition": "distance_committed" },
+            { "command": "set_active_tool", "tool": "navigate" },
             { "command": "set_viewer_layout", "layout": "four_panel" },
             { "command": "sleep_frames", "frames": 8 },
             { "command": "assert", "condition": { "viewer_layout": { "layout": "four_panel" } } },
@@ -1763,7 +2189,10 @@ fn import_preprocessing_script(
     output_parent: &Path,
     destination: &Path,
 ) -> Value {
-    let mut limits = dataset_runtime_limits(512 * MIB, 192);
+    // The promoted fixture has 850 base-production work units. Keep the
+    // resident-record ceiling structural and finite while allowing its exact
+    // s0 cohort to settle; byte residency remains independently capped below.
+    let mut limits = dataset_runtime_limits(512 * MIB, IMPORT_RESIDENT_RESOURCE_LIMIT);
     limits["max_cpu_import_working_set_bytes"] = json!(IMPORT_WORKING_MEMORY_BYTES);
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
@@ -2816,6 +3245,22 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
     } else {
         Value::Null
     };
+    let resident_navigation_evidence = if scenario_name == GENERATED_RESIDENT_NAVIGATION_SCENARIO {
+        match resident_navigation_evidence(report.automation_report_value) {
+            Ok(evidence) => json!({
+                "required": true,
+                "accepted": true,
+                "structural_deltas": evidence,
+            }),
+            Err(reason) => json!({
+                "required": true,
+                "accepted": false,
+                "failure_reason": reason,
+            }),
+        }
+    } else {
+        Value::Null
+    };
     let requested_window_inner_size_points =
         script_requested_window_inner_size_points_json(report.script_value);
     let pixels_per_point = report
@@ -2907,6 +3352,7 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
             "render_target_pixels": render_target_pixels,
             "b3_exact_e1_capture_evidence": b3_e1_capture_evidence,
             "import_preprocessing_evidence": import_evidence,
+            "resident_navigation_evidence": resident_navigation_evidence,
             "render_modes": render_modes,
         },
         "limits": {

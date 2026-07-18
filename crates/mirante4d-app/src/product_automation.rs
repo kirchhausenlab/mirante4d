@@ -8,23 +8,34 @@ use std::{
 
 use eframe::egui;
 use mirante4d_application::{
-    ApplicationCommand, ApplicationEvent, CommandEffect, ProjectStoreLifecycle,
-    SourceVerificationSnapshot, WorkspaceSnapshot,
+    ApplicationCommand, ApplicationEvent, CommandEffect, CrossSectionPanelId, OperationToken,
+    PresentationSlot, ProjectStoreLifecycle, SourceVerificationSnapshot, WorkspaceSnapshot,
     import_workflow::{
         ImportCommand, ImportProgressSnapshot, ImportReviewDraft, ImportWorkflowSnapshot,
     },
+    viewer_tools::{
+        PickCompleteness, PickHit, PickHitKind, PickPolicy, PickValue, ScreenPosition,
+        ViewerOverlayPhase, ViewerTool, ViewerToolContext, ViewerToolOverlay,
+    },
     viewport_interaction::{
-        fit_camera_to_shape_preserving_view, orbit_camera, pan_camera, zoom_camera,
+        CrossSectionPanel, CrossSectionViewState, fit_camera_to_shape_preserving_view,
+        orbit_camera, pan_camera, zoom_camera,
     },
 };
+use mirante4d_dataset::{
+    CanonicalDatasetResourceUnionHasher, DatasetResourceKey,
+    canonical_dataset_resource_union_sha256 as canonical_resource_union_sha256,
+};
 use mirante4d_domain::{
-    DisplayWindow, DvrOpacityTransfer, IsoShadingPolicy, LayerTransfer, Opacity, RenderMode,
-    RenderState, SamplingPolicy, ViewerLayout,
+    CameraView, CrossSectionView, DisplayWindow, DvrOpacityTransfer, IsoShadingPolicy,
+    LayerTransfer, Opacity, Projection, RenderMode, RenderState, SamplingPolicy, TimeIndex,
+    UnitQuaternion, ViewerLayout, WorldPoint3,
 };
 use mirante4d_import_pipeline::{ImportReceipt, ImportStatistics, TiffSource};
 use mirante4d_project_model::{LayerViewState, ProjectRevisionId};
-use mirante4d_render_api::RenderExtent;
+use mirante4d_render_api::{PresentationViewport, RenderExtent, VolumePickQuery};
 use mirante4d_storage::ScientificPublicationTransferEvidence;
+use mirante4d_ui_egui::{ViewerPickPurpose, ViewerPickRequest};
 use rustix::time::{ClockId, clock_gettime};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -44,12 +55,44 @@ use capture::{
     current_display_image_stats, product_target_capture, sanitize_artifact_label,
     write_color_image_ppm,
 };
-use diagnostics::{dataset_runtime_diagnostics_json, gpu_adapter_diagnostics_json};
+use diagnostics::{
+    dataset_runtime_diagnostics_json, gpu_adapter_diagnostics_json,
+    local_dataset_source_diagnostics_json, local_package_read_diagnostics_json,
+};
 use model::*;
 
 const ENABLE_AUTOMATION_ENV: &str = "MIRANTE4D_ENABLE_AUTOMATION";
 const AUTOMATION_SCRIPT_ENV: &str = "MIRANTE4D_AUTOMATION_SCRIPT";
 const AUTOMATION_REPORT_ENV: &str = "MIRANTE4D_AUTOMATION_REPORT";
+const AUTOMATION_PICK_TIMEOUT: Duration = Duration::from_secs(30);
+const AUTOMATION_CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
+const AUTOMATION_DATASET_SWITCH_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn sequence_sample_target_ns(sample: u32, samples: u32, duration_ms: u64) -> u64 {
+    if samples <= 1 {
+        return 0;
+    }
+    let numerator = u128::from(duration_ms)
+        .saturating_mul(1_000_000)
+        .saturating_mul(u128::from(sample));
+    u64::try_from(numerator / u128::from(samples - 1)).unwrap_or(u64::MAX)
+}
+
+fn application_cross_section_panel(panel: ProductAutomationPanelId) -> CrossSectionPanelId {
+    match panel {
+        ProductAutomationPanelId::Xy => CrossSectionPanelId::Xy,
+        ProductAutomationPanelId::Xz => CrossSectionPanelId::Xz,
+        ProductAutomationPanelId::Yz => CrossSectionPanelId::Yz,
+    }
+}
+
+fn interaction_cross_section_panel(panel: ProductAutomationPanelId) -> CrossSectionPanel {
+    match panel {
+        ProductAutomationPanelId::Xy => CrossSectionPanel::Xy,
+        ProductAutomationPanelId::Xz => CrossSectionPanel::Xz,
+        ProductAutomationPanelId::Yz => CrossSectionPanel::Yz,
+    }
+}
 
 fn product_presentation(
     app: &MiranteWorkbenchApp,
@@ -75,6 +118,35 @@ fn product_presentations_ready(
         .all(|panel| product_target_capture(app, *panel).is_some()))
 }
 
+fn product_capture_state(app: &MiranteWorkbenchApp, panels: &[PanelId]) -> String {
+    panels
+        .iter()
+        .map(|panel| {
+            let target = app
+                .native_presentation
+                .product_gpu
+                .as_ref()
+                .and_then(|product| product.targets.get(panel));
+            match target {
+                None => format!("{panel:?}:missing-target"),
+                Some(target) => format!(
+                    "{panel:?}:presented={:?},pending={:?},completed={:?}",
+                    target.presented.as_ref().map(|frame| frame.frame()),
+                    target
+                        .pending_capture
+                        .as_ref()
+                        .map(|(frame, _)| frame.frame()),
+                    target
+                        .completed_capture
+                        .as_ref()
+                        .map(|(frame, _)| frame.frame()),
+                ),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn assertion_capture_panels(condition: &ProductAutomationAssertCondition) -> Vec<PanelId> {
     match condition {
         ProductAutomationAssertCondition::NonblankFrame => vec![PanelId::ThreeD],
@@ -92,10 +164,94 @@ fn dispatch_application_command(
     app: &mut MiranteWorkbenchApp,
     ctx: &egui::Context,
     command: ApplicationCommand,
-) -> Result<(), String> {
+) -> Result<CommandEffect, String> {
     app.apply_application_command(command, ctx)
-        .map(|_| ())
         .map_err(|fault| format!("application command was rejected: {fault:?}"))
+}
+
+fn startup_dispatch(
+    app: &mut MiranteWorkbenchApp,
+    command: ApplicationCommand,
+) -> Result<CommandEffect, String> {
+    app.application
+        .dispatch(command)
+        .map_err(|fault| format!("startup application command was rejected: {fault:?}"))
+}
+
+fn startup_bootstrap_work_snapshot(app: &MiranteWorkbenchApp) -> Result<Value, String> {
+    let runtime = app
+        .dataset
+        .dispatcher()
+        .diagnostics()
+        .map_err(|error| format!("startup runtime diagnostics are unavailable: {error}"))?;
+    let source = app
+        .dataset
+        .local_source_diagnostics()
+        .ok_or_else(|| "startup local-source diagnostics are unavailable".to_owned())?;
+    let gpu = app
+        .native_presentation
+        .product_gpu
+        .as_ref()
+        .ok_or_else(|| "startup product GPU diagnostics are unavailable".to_owned())?
+        .renderer
+        .diagnostics();
+    let planner = app.camera_demand_planner.diagnostics();
+    Ok(json!({
+        "runtime_submitted_requests": runtime.submitted_requests(),
+        "runtime_started_decodes": runtime.started_decodes(),
+        "source_physical_range_reads": source.reader.physical_range_read_operations,
+        "source_codec_decodes": source.reader.codec_decode_operations,
+        "gpu_uploaded_resources": gpu.uploaded_resources(),
+        "gpu_uploaded_payload_bytes": gpu.uploaded_payload_bytes(),
+        "gpu_queue_submissions": gpu.queue_submissions(),
+        "gpu_frames_executed": gpu.frames_executed(),
+        "demand_jobs_submitted": planner.submitted,
+        "demand_jobs_completed": planner.completed,
+    }))
+}
+
+fn startup_bootstrap_work_delta(before: &Value, after: &Value) -> Result<Value, String> {
+    let mut delta = serde_json::Map::new();
+    for field in [
+        "runtime_submitted_requests",
+        "runtime_started_decodes",
+        "source_physical_range_reads",
+        "source_codec_decodes",
+        "gpu_uploaded_resources",
+        "gpu_uploaded_payload_bytes",
+        "gpu_queue_submissions",
+        "gpu_frames_executed",
+        "demand_jobs_submitted",
+        "demand_jobs_completed",
+    ] {
+        let before = before
+            .get(field)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("startup before-counter {field} is unavailable"))?;
+        let after = after
+            .get(field)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("startup after-counter {field} is unavailable"))?;
+        let value = after
+            .checked_sub(before)
+            .ok_or_else(|| format!("startup counter {field} regressed from {before} to {after}"))?;
+        delta.insert(field.to_owned(), Value::from(value));
+    }
+    Ok(Value::Object(delta))
+}
+
+fn dispatch_effective_interaction_sample(
+    app: &mut MiranteWorkbenchApp,
+    ctx: &egui::Context,
+    command: ApplicationCommand,
+) -> Result<(), String> {
+    match dispatch_application_command(app, ctx, command)? {
+        CommandEffect::Changed => Ok(()),
+        CommandEffect::NoChange => Err(
+            "automation interaction sample produced no semantic change; refusing coalesced evidence"
+                .to_owned(),
+        ),
+    }
 }
 
 fn layer_command(
@@ -125,7 +281,7 @@ fn render_state_for_mode(
     transfer: &LayerTransfer,
     mode: RenderMode,
 ) -> Result<RenderState, String> {
-    let sampling = SamplingPolicy::VoxelExact;
+    let sampling = current.sampling_policy();
     match mode {
         RenderMode::Mip => Ok(RenderState::mip(sampling)),
         RenderMode::Isosurface => {
@@ -133,8 +289,12 @@ fn render_state_for_mode(
                 .iso_parameters()
                 .map(|parameters| parameters.display_level())
                 .unwrap_or(0.5);
-            RenderState::iso(sampling, IsoShadingPolicy::Flat, level)
-                .map_err(|error| error.to_string())
+            let shading = current
+                .iso_parameters()
+                .map_or(IsoShadingPolicy::GradientLighting, |parameters| {
+                    parameters.shading_policy()
+                });
+            RenderState::iso(sampling, shading, level).map_err(|error| error.to_string())
         }
         RenderMode::Dvr => {
             let (opacity_transfer, density) = current
@@ -149,15 +309,300 @@ fn render_state_for_mode(
     }
 }
 
+fn render_state_with_sampling(
+    current: RenderState,
+    sampling: SamplingPolicy,
+) -> Result<RenderState, String> {
+    if current.mip_parameters().is_some() {
+        Ok(RenderState::mip(sampling))
+    } else if let Some(parameters) = current.dvr_parameters() {
+        RenderState::dvr(
+            sampling,
+            parameters.opacity_transfer(),
+            parameters.density_scale(),
+        )
+        .map_err(|error| error.to_string())
+    } else if let Some(parameters) = current.iso_parameters() {
+        RenderState::iso(
+            sampling,
+            parameters.shading_policy(),
+            parameters.display_level(),
+        )
+        .map_err(|error| error.to_string())
+    } else {
+        Err("the layer has no supported render mode".to_owned())
+    }
+}
+
+fn camera_with_projection(
+    camera: CameraView,
+    projection: Projection,
+) -> Result<CameraView, String> {
+    CameraView::new(
+        projection,
+        camera.target(),
+        camera.orientation(),
+        camera.orthographic_world_per_screen_point(),
+        camera.perspective_focal_length_screen_points(),
+        camera.perspective_view_distance_world(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exact_camera_view(
+    projection: ProductAutomationProjection,
+    target_world: [f64; 3],
+    orientation_xyzw: [f64; 4],
+    orthographic_world_per_screen_point: f64,
+    perspective_focal_length_screen_points: f64,
+    perspective_view_distance_world: f64,
+) -> Result<CameraView, String> {
+    let target = WorldPoint3::new(target_world[0], target_world[1], target_world[2])
+        .map_err(|error| format!("camera target was rejected: {error}"))?;
+    let orientation = UnitQuaternion::new_xyzw(
+        orientation_xyzw[0],
+        orientation_xyzw[1],
+        orientation_xyzw[2],
+        orientation_xyzw[3],
+    )
+    .map_err(|error| format!("camera orientation was rejected: {error}"))?;
+    CameraView::new(
+        projection.into(),
+        target,
+        orientation,
+        orthographic_world_per_screen_point,
+        perspective_focal_length_screen_points,
+        perspective_view_distance_world,
+    )
+    .map_err(|error| format!("camera view was rejected: {error}"))
+}
+
+fn exact_cross_section_view(
+    center_world: [f64; 3],
+    orientation_xyzw: [f64; 4],
+    scale_world_per_screen_point: f64,
+    depth_world: f64,
+) -> Result<CrossSectionView, String> {
+    let center = WorldPoint3::new(center_world[0], center_world[1], center_world[2])
+        .map_err(|error| format!("cross-section center was rejected: {error}"))?;
+    let orientation = UnitQuaternion::new_xyzw(
+        orientation_xyzw[0],
+        orientation_xyzw[1],
+        orientation_xyzw[2],
+        orientation_xyzw[3],
+    )
+    .map_err(|error| format!("cross-section orientation was rejected: {error}"))?;
+    CrossSectionView::new(
+        center,
+        orientation,
+        scale_world_per_screen_point,
+        depth_world,
+    )
+    .map_err(|error| format!("cross-section view was rejected: {error}"))
+}
+
+fn automation_pick_request(
+    app: &MiranteWorkbenchApp,
+    x_fraction: f32,
+    y_fraction: f32,
+    purpose: ViewerPickPurpose,
+) -> Result<Option<ViewerPickRequest>, String> {
+    if !x_fraction.is_finite()
+        || !y_fraction.is_finite()
+        || !(0.0..=1.0).contains(&x_fraction)
+        || !(0.0..=1.0).contains(&y_fraction)
+    {
+        return Err(format!(
+            "{} fractions must be finite and between 0.0 and 1.0",
+            automation_pick_purpose_name(purpose)
+        ));
+    }
+    if app.native_presentation.product_gpu.is_none() {
+        return Err("native GPU presentation is unavailable for product picking".to_owned());
+    }
+
+    // Product presentation frames are native-renderer state projected into the
+    // UI snapshot; the reducer snapshot alone intentionally carries no live
+    // presentation. Use the same current-frame authority as the pick pump so
+    // automation cannot wait forever without ever enqueueing a GPU request.
+    let snapshot = app.application_snapshot_for_ui();
+    let view = application_view(&snapshot);
+    let tool = ViewerTool::from(snapshot.transient().active_tool());
+    if tool == ViewerTool::Navigate {
+        return Err(format!(
+            "{} requires a non-navigation viewer tool",
+            automation_pick_purpose_name(purpose)
+        ));
+    }
+    let active_layer = view
+        .layer(view.active_layer())
+        .expect("application view has an active layer");
+    if !active_layer.visible() {
+        return Err("the active layer is hidden and cannot be picked".to_owned());
+    }
+    let Some(presented) = snapshot
+        .presentations()
+        .get(PresentationSlot::ThreeD)
+        .and_then(|surface| surface.current_frame())
+    else {
+        return Ok(None);
+    };
+
+    let extent = presented.extent();
+    let width = f64::from(extent.width_pixels());
+    let height = f64::from(extent.height_pixels());
+    let render_pixel = [
+        (f64::from(x_fraction) * width - 0.5).clamp(0.0, width - 1.0),
+        (f64::from(y_fraction) * height - 0.5).clamp(0.0, height - 1.0),
+    ];
+    let policy = match active_layer.render_state().mode() {
+        RenderMode::Mip => PickPolicy::MipArgmax,
+        RenderMode::Isosurface => PickPolicy::FirstThresholdHit,
+        RenderMode::Dvr => PickPolicy::MaximumOpacityContribution,
+    };
+    let query = VolumePickQuery::new(
+        presented,
+        view.timepoint(),
+        view.active_layer(),
+        render_pixel,
+        policy,
+    )
+    .map_err(|error| format!("automation pick query was rejected: {error}"))?;
+    let context = ViewerToolContext::new(
+        snapshot.source_generation(),
+        view.timepoint(),
+        view.active_layer(),
+    );
+    let presentation = app
+        .render_coordination
+        .surface(PresentationSlot::ThreeD)
+        .presentation_viewport()
+        .unwrap_or(app.render_coordination.presentation_viewport);
+    let screen_position = ScreenPosition::new(
+        x_fraction * presentation.width_points() as f32,
+        y_fraction * presentation.height_points() as f32,
+    );
+    ViewerPickRequest::new(query, context, tool, purpose, screen_position)
+        .map(Some)
+        .ok_or_else(|| {
+            "automation pick request was rejected by the viewer-tool contract".to_owned()
+        })
+}
+
+fn automation_pick_purpose_name(purpose: ViewerPickPurpose) -> &'static str {
+    match purpose {
+        ViewerPickPurpose::Hover => "probe_hover",
+        ViewerPickPurpose::PrimaryClick => "primary_click",
+    }
+}
+
+fn frame_freshness_is_current(fidelity: &crate::FrameFidelityStatus) -> bool {
+    fidelity.display_freshness == DisplayedFrameFreshness::Current
+}
+
+fn coordinated_visible_layout_current_complete(app: &MiranteWorkbenchApp) -> bool {
+    let generation = app.render_coordination.display_generation();
+    if generation.current_presentation_generation != Some(generation.input_generation)
+        || app.dataset.staging_current_refinement()
+        || app.dataset.current_scale().get()
+            != app.render_coordination.frame_fidelity.target_scale_level
+        || app
+            .display_performance_milestones
+            .target_settled_ms()
+            .is_none()
+    {
+        return false;
+    }
+    let snapshot = app.application.snapshot();
+    match application_view(&snapshot).layout() {
+        ViewerLayout::Single3d => true,
+        ViewerLayout::FourPanel => [
+            PresentationSlot::Xy,
+            PresentationSlot::Xz,
+            PresentationSlot::Yz,
+        ]
+        .into_iter()
+        .all(|slot| {
+            let surface = app.render_coordination.surface(slot);
+            surface.display_current()
+                && surface.cross_section_schedule().is_some_and(|schedule| {
+                    schedule.status == crate::CrossSectionPanelScheduleStatus::Current
+                })
+                && surface.layer_presentations().iter().all(|layer| {
+                    layer.current && layer.available_requirements == layer.total_requirements
+                })
+        }),
+    }
+}
+
+const fn automation_runtime_is_idle(
+    background_work_active: bool,
+    camera_demand_planning_active: bool,
+    prepared_demand_install_pending: bool,
+) -> bool {
+    !background_work_active && !camera_demand_planning_active && !prepared_demand_install_pending
+}
+
+fn automation_pick_json(
+    request: ViewerPickRequest,
+    hit: &PickHit,
+    x_fraction: f32,
+    y_fraction: f32,
+) -> Value {
+    let kind = match hit.kind {
+        PickHitKind::Empty => "empty",
+        PickHitKind::Voxel => "voxel",
+        PickHitKind::InterpolatedSample => "interpolated_sample",
+    };
+    let completeness = match hit.completeness {
+        PickCompleteness::Exact => "exact",
+        PickCompleteness::Approximate => "approximate",
+        PickCompleteness::Incomplete => "incomplete",
+        PickCompleteness::Loading => "loading",
+    };
+    let policy = match hit.policy {
+        PickPolicy::FirstThresholdHit => "first_threshold_hit",
+        PickPolicy::MipArgmax => "mip_argmax",
+        PickPolicy::MaximumOpacityContribution => "maximum_opacity_contribution",
+    };
+    let value = match hit.value {
+        Some(PickValue::IntensityU8(value)) => json!({ "dtype": "uint8", "value": value }),
+        Some(PickValue::IntensityU16(value)) => json!({ "dtype": "uint16", "value": value }),
+        Some(PickValue::IntensityF32(value)) => json!({ "dtype": "float32", "value": value }),
+        None => Value::Null,
+    };
+    json!({
+        "x_fraction": x_fraction,
+        "y_fraction": y_fraction,
+        "purpose": automation_pick_purpose_name(request.purpose()),
+        "status": if hit.kind == PickHitKind::Empty { "empty" } else { "sampled" },
+        "kind": kind,
+        "completeness": completeness,
+        "policy": policy,
+        "value": value,
+        "world_position": hit.world_position.map(|position| position.components()),
+        "render_pixel": request.query().render_pixel(),
+        "placeholder_sampled": false,
+        "native_gpu_pick": true,
+    })
+}
+
 pub(crate) struct ProductAutomationController {
     script: ProductAutomationScript,
     script_path: PathBuf,
     report_path: PathBuf,
     command_index: usize,
+    active_dataset_switch: Option<ActiveDatasetSwitch>,
     active_wait_started: Option<Instant>,
     sleep_frames_remaining: Option<u32>,
+    active_input_sequence: Option<ActiveInputSequence>,
+    previous_labeled_resource_union: Option<LabeledDiagnosticResourceUnion>,
+    diagnostic_union_peak_keys: usize,
+    diagnostic_union_peak_heap_bytes: u64,
     started_at_epoch_ms: u128,
     started_at: Instant,
+    started_process_cpu_time_ns: Option<u64>,
     events: Vec<ProductAutomationEvent>,
     diagnostics: Vec<Value>,
     artifacts: Vec<ProductAutomationArtifact>,
@@ -174,7 +619,156 @@ pub(crate) struct ProductAutomationController {
     completed_import_primary_measurement: Option<ImportPrimaryMeasurement>,
     completed_publication_to_open_ready_measurement:
         Option<ImportPublicationToOpenReadyMeasurement>,
+    startup_bootstrap_evidence: Option<Value>,
+    qualification_only_ui_overhead_ns: u64,
     report_written: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveDatasetSwitch {
+    command_index: usize,
+    started_at: Instant,
+    token: OperationToken,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DatasetSwitchProtocolDecision {
+    TargetAlreadySelected,
+    Start,
+    Waiting,
+    Installed,
+    Failed,
+    TimedOut,
+}
+
+fn dataset_switch_protocol_decision(
+    selected_matches: bool,
+    request_started: bool,
+    exact_request_pending: bool,
+    elapsed: Duration,
+    timeout: Duration,
+) -> DatasetSwitchProtocolDecision {
+    if !request_started {
+        return if selected_matches {
+            DatasetSwitchProtocolDecision::TargetAlreadySelected
+        } else {
+            DatasetSwitchProtocolDecision::Start
+        };
+    }
+    if selected_matches {
+        return DatasetSwitchProtocolDecision::Installed;
+    }
+    if !exact_request_pending {
+        return DatasetSwitchProtocolDecision::Failed;
+    }
+    if elapsed >= timeout {
+        return DatasetSwitchProtocolDecision::TimedOut;
+    }
+    DatasetSwitchProtocolDecision::Waiting
+}
+
+fn exact_dataset_switch_pending(app: &MiranteWorkbenchApp, token: &OperationToken) -> bool {
+    app.source_open_service
+        .as_ref()
+        .and_then(|service| service.active_token())
+        == Some(token)
+        || app
+            .pending_source_install
+            .as_ref()
+            .is_some_and(|pending| &pending.token == token)
+        || app
+            .application
+            .snapshot()
+            .active_operations()
+            .iter()
+            .any(|active| active == token)
+}
+
+fn cancel_exact_dataset_switch(app: &mut MiranteWorkbenchApp, token: &OperationToken) -> String {
+    let mut outcomes = Vec::new();
+    let mut reducer_cancel_requested = false;
+    let reducer_active = app
+        .application
+        .snapshot()
+        .active_operations()
+        .iter()
+        .any(|active| active == token);
+    if reducer_active {
+        match app
+            .application
+            .dispatch(ApplicationCommand::CancelOperation(token.operation_id()))
+        {
+            Ok(_) => {
+                reducer_cancel_requested = true;
+                outcomes.push("reducer_operation_cancel_requested".to_owned());
+                app.pump_application_services();
+            }
+            Err(fault) => {
+                outcomes.push(format!("reducer_operation_cancel_rejected:{fault:?}"));
+                if app.complete_source_operation(
+                    token.clone(),
+                    mirante4d_application::OperationCompletion::Failed(
+                        mirante4d_application::OperationFailureCode::DatasetReadFailed,
+                    ),
+                ) {
+                    outcomes.push("reducer_operation_failed_closed".to_owned());
+                }
+            }
+        }
+    }
+
+    let service_active = app
+        .source_open_service
+        .as_ref()
+        .and_then(|service| service.active_token())
+        == Some(token);
+    if service_active && !reducer_cancel_requested {
+        let outcome = match app
+            .source_open_service
+            .as_ref()
+            .expect("the exact active source-open service was just observed")
+            .cancel(token)
+        {
+            Ok(()) => "source_open_service_cancel_requested".to_owned(),
+            Err(error) => format!("source_open_service_cancel_rejected:{error}"),
+        };
+        outcomes.push(outcome);
+    }
+
+    if app
+        .pending_source_install
+        .as_ref()
+        .is_some_and(|pending| &pending.token == token)
+    {
+        app.abort_pending_source_install(
+            "The timed-out automated dataset switch was cancelled before installation.",
+        );
+        outcomes.push("prepared_install_suppressed".to_owned());
+    }
+
+    if outcomes.is_empty() {
+        "exact_operation_already_terminal".to_owned()
+    } else {
+        outcomes.join("+")
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActiveInputSequence {
+    command_index: usize,
+    started_at: Instant,
+    next_sample: u32,
+    samples: u32,
+    duration_ms: u64,
+    origin_generation: u64,
+    origin_durable_commits: u64,
+    origin_diagnostics: mirante4d_application::DisplayDiagnosticCounters,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputSequenceStep {
+    Wait(Duration),
+    Dispatch(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -226,11 +820,27 @@ impl ProductAutomationController {
         })
     }
 
-    pub(crate) fn drive(app: &mut MiranteWorkbenchApp, ctx: &egui::Context) {
+    /// Drives one automation step and returns the exactly measured interval
+    /// spent producing qualification-only diagnostic evidence in this UI
+    /// callback. The caller subtracts this sequential interval from the
+    /// claim-bearing active UI-update sample; semantic automation commands and
+    /// ordinary product work remain inside that sample.
+    pub(crate) fn drive(app: &mut MiranteWorkbenchApp, ctx: &egui::Context) -> u64 {
         let Some(mut automation) = app.product_automation.take() else {
-            return;
+            return 0;
         };
-        match automation.step(app, ctx) {
+        automation.qualification_only_ui_overhead_ns = 0;
+        app.render_coordination
+            .set_display_diagnostic_counters_enabled(
+                automation.script.requires_diagnostic_counters(),
+            );
+        let status = automation.step(app, ctx);
+        // Automation submits through the same one-pending/one-latest native
+        // pick queue as interactive UI input. The normal pump ran before the
+        // automation command in this frame, so pump once more to submit a new
+        // request without waiting an extra frame or introducing another path.
+        app.pump_viewer_pick(ctx);
+        match status {
             AutomationStatus::Continue => {
                 ctx.request_repaint();
             }
@@ -246,7 +856,9 @@ impl ProductAutomationController {
                 automation.write_report_and_close(app, ctx, "failed", Some(reason));
             }
         }
+        let qualification_only_ui_overhead_ns = automation.qualification_only_ui_overhead_ns;
         app.product_automation = Some(automation);
+        qualification_only_ui_overhead_ns
     }
 
     fn load_from_env() -> anyhow::Result<Self> {
@@ -270,10 +882,16 @@ impl ProductAutomationController {
             script_path,
             report_path,
             command_index: 0,
+            active_dataset_switch: None,
             active_wait_started: None,
             sleep_frames_remaining: None,
+            active_input_sequence: None,
+            previous_labeled_resource_union: None,
+            diagnostic_union_peak_keys: 0,
+            diagnostic_union_peak_heap_bytes: 0,
             started_at_epoch_ms: epoch_ms(),
             started_at: Instant::now(),
+            started_process_cpu_time_ns: checked_process_cpu_time_ns(),
             events: Vec::new(),
             diagnostics: Vec::new(),
             artifacts: Vec::new(),
@@ -288,12 +906,608 @@ impl ProductAutomationController {
             active_import_verification_diagnostics_origin: None,
             completed_import_primary_measurement: None,
             completed_publication_to_open_ready_measurement: None,
+            startup_bootstrap_evidence: None,
+            qualification_only_ui_overhead_ns: 0,
             report_written: false,
+        }
+    }
+
+    /// Installs a qualification script's declared initial view before the
+    /// ordinary product submits its first visible demand. Commands are reduced
+    /// through the canonical application state, but payload reconciliation is
+    /// deliberately deferred until the whole bootstrap is committed so no
+    /// intermediate/default cohort can enter the runtime.
+    pub(crate) fn apply_startup_bootstrap(
+        &mut self,
+        app: &mut MiranteWorkbenchApp,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        let Some(bootstrap) = self.script.startup_bootstrap.clone() else {
+            return Ok(());
+        };
+        let started = Instant::now();
+        let work_before = startup_bootstrap_work_snapshot(app)?;
+        let before = app.application.snapshot();
+        let previous_view = application_view(&before).clone();
+        let intermediate_view_reconciliations = 0_u64;
+        let mut canonical_commit_reconciliations = 0_u64;
+        let mut command_evidence = Vec::with_capacity(bootstrap.commands.len());
+        for command in &bootstrap.commands {
+            let details = self.execute_startup_bootstrap_command(app, ctx, command)?;
+            command_evidence.push(json!({
+                "command": command.name(),
+                "details": details,
+            }));
+        }
+
+        let after = app.application.snapshot();
+        let next_view = application_view(&after);
+        let volume_changed = crate::layer_state::volume_render_changed(&previous_view, next_view);
+        let linked_changed =
+            crate::layer_state::cross_section_render_changed(&previous_view, next_view)
+                && (previous_view.layout() == ViewerLayout::FourPanel
+                    || next_view.layout() == ViewerLayout::FourPanel);
+        crate::layer_state::reconcile_view_runtime(
+            &previous_view,
+            &after,
+            &mut app.dataset,
+            &mut app.render_coordination,
+            &mut app.analysis_runtime,
+        )
+        .map_err(|error| format!("startup bootstrap runtime reconciliation failed: {error}"))?;
+        canonical_commit_reconciliations = canonical_commit_reconciliations.saturating_add(1);
+        if previous_view.layout() != next_view.layout()
+            && next_view.layout() == ViewerLayout::Single3d
+        {
+            app.clear_cross_section_product_presentations();
+        } else if linked_changed {
+            app.invalidate_cross_section_panel_display_frames();
+        }
+        if volume_changed || linked_changed {
+            app.render_coordination.request_refresh();
+        }
+        let work_after = startup_bootstrap_work_snapshot(app)?;
+        let work_delta = startup_bootstrap_work_delta(&work_before, &work_after)?;
+        let zero_payload_work_observed = work_delta
+            .as_object()
+            .is_some_and(|counters| counters.values().all(|value| value.as_u64() == Some(0)));
+
+        if let Some(label) = &bootstrap.start_diagnostic_label {
+            let sample_command = ProductAutomationCommand::SampleDiagnostics {
+                label: label.clone(),
+            };
+            match self.execute_command(app, ctx, &sample_command)? {
+                CommandProgress::Done(_) => {}
+                CommandProgress::Waiting | CommandProgress::PassiveWaiting(_) => {
+                    return Err("startup diagnostic checkpoint unexpectedly waited".to_owned());
+                }
+            }
+        }
+        if bootstrap.capture_start_checkpoint {
+            let current_generation = app
+                .render_coordination
+                .display_generation()
+                .input_generation;
+            // The cold-display clock begins after the exact zero-demand
+            // checkpoint and immediately before normal visible planning.
+            app.display_performance_milestones
+                .begin_generation(current_generation);
+        }
+        self.startup_bootstrap_evidence = Some(json!({
+            "qualification_only": true,
+            "payload_requests_submitted": !zero_payload_work_observed,
+            "intermediate_view_reconciliations": intermediate_view_reconciliations,
+            "canonical_commit_reconciliations": canonical_commit_reconciliations,
+            "observed_work": {
+                "before": work_before,
+                "after": work_after,
+                "delta": work_delta,
+                "zero_payload_or_demand_work": zero_payload_work_observed,
+                "counter_scope": "runtime_source_renderer_and_demand_planner_monotonic_counters",
+            },
+            "duration_ns": u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            "commands": command_evidence,
+            "capture_start_checkpoint": bootstrap.capture_start_checkpoint,
+            "start_diagnostic_label": bootstrap.start_diagnostic_label,
+            "start_checkpoint_captured_in_diagnostics": bootstrap.capture_start_checkpoint,
+        }));
+        Ok(())
+    }
+
+    fn execute_startup_bootstrap_command(
+        &mut self,
+        app: &mut MiranteWorkbenchApp,
+        ctx: &egui::Context,
+        command: &ProductAutomationCommand,
+    ) -> Result<Value, String> {
+        match command {
+            ProductAutomationCommand::SetMappedClientPixels { width, height } => {
+                if *width == 0 || *height == 0 {
+                    return Err("requested mapped client pixels must be nonzero".to_owned());
+                }
+                let pixels_per_point = ctx
+                    .input(|input| input.viewport().native_pixels_per_point)
+                    .unwrap_or_else(|| ctx.pixels_per_point());
+                if !pixels_per_point.is_finite() || pixels_per_point <= 0.0 {
+                    return Err("native pixels-per-point is unavailable".to_owned());
+                }
+                let fullscreen = *width == 1920 && *height == 1080;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                    *width as f32 / pixels_per_point,
+                    *height as f32 / pixels_per_point,
+                )));
+                self.requested_mapped_client_pixels = Some((*width, *height));
+                Ok(json!({
+                    "requested_mapped_client_pixels": { "width": width, "height": height },
+                    "pixels_per_point": pixels_per_point,
+                    "fullscreen_requested": fullscreen,
+                }))
+            }
+            ProductAutomationCommand::SetRenderTargetSize { width, height } => {
+                let viewport = RenderExtent::new(*width, *height)
+                    .map_err(|error| format!("invalid automation render target: {error}"))?;
+                let context_max = ctx.input(|input| input.max_texture_side);
+                #[cfg(test)]
+                let maximum = app
+                    .test_render_viewport_max_side
+                    .map_or(context_max, |test_max| context_max.min(test_max));
+                #[cfg(not(test))]
+                let maximum = context_max;
+                if usize::try_from(viewport.width_pixels())
+                    .ok()
+                    .is_none_or(|width| width > maximum)
+                    || usize::try_from(viewport.height_pixels())
+                        .ok()
+                        .is_none_or(|height| height > maximum)
+                {
+                    return Err(format!(
+                        "automation render target {}x{} exceeds maximum texture side {maximum}",
+                        viewport.width_pixels(),
+                        viewport.height_pixels()
+                    ));
+                }
+                self.render_target_override = Some(viewport);
+                set_render_viewport(&mut app.render_coordination, viewport);
+                Ok(json!({
+                    "requested_render_target_pixels": {
+                        "width": viewport.width_pixels(),
+                        "height": viewport.height_pixels(),
+                    },
+                }))
+            }
+            ProductAutomationCommand::SetFourPanelViewports {
+                presentation_width_points,
+                presentation_height_points,
+                three_d_render_width,
+                three_d_render_height,
+                linked_render_width,
+                linked_render_height,
+            } => {
+                let presentation = PresentationViewport::new(
+                    *presentation_width_points,
+                    *presentation_height_points,
+                )
+                .map_err(|error| format!("invalid four-panel presentation viewport: {error}"))?;
+                let three_d_render =
+                    RenderExtent::new(*three_d_render_width, *three_d_render_height).map_err(
+                        |error| format!("invalid four-panel 3D render viewport: {error}"),
+                    )?;
+                let linked_render = RenderExtent::new(*linked_render_width, *linked_render_height)
+                    .map_err(|error| {
+                        format!("invalid four-panel linked render viewport: {error}")
+                    })?;
+                let context_max = ctx.input(|input| input.max_texture_side);
+                #[cfg(test)]
+                let maximum = app
+                    .test_render_viewport_max_side
+                    .map_or(context_max, |test_max| context_max.min(test_max));
+                #[cfg(not(test))]
+                let maximum = context_max;
+                for (name, extent) in [("3D", three_d_render), ("linked", linked_render)] {
+                    if usize::try_from(extent.width_pixels())
+                        .ok()
+                        .is_none_or(|width| width > maximum)
+                        || usize::try_from(extent.height_pixels())
+                            .ok()
+                            .is_none_or(|height| height > maximum)
+                    {
+                        return Err(format!(
+                            "four-panel {name} render viewport {}x{} exceeds maximum texture side {maximum}",
+                            extent.width_pixels(),
+                            extent.height_pixels()
+                        ));
+                    }
+                }
+                self.render_target_override = Some(three_d_render);
+                for slot in PresentationSlot::ALL {
+                    app.render_coordination.record_viewports(
+                        slot,
+                        presentation,
+                        if slot == PresentationSlot::ThreeD {
+                            three_d_render
+                        } else {
+                            linked_render
+                        },
+                    );
+                }
+                Ok(json!({
+                    "presentation_points": {
+                        "width": presentation.width_points(),
+                        "height": presentation.height_points(),
+                    },
+                    "three_d_render_pixels": {
+                        "width": three_d_render.width_pixels(),
+                        "height": three_d_render.height_pixels(),
+                    },
+                    "linked_render_pixels": {
+                        "width": linked_render.width_pixels(),
+                        "height": linked_render.height_pixels(),
+                    },
+                    "external_geometry_observation_required": true,
+                }))
+            }
+            ProductAutomationCommand::SetViewerLayout { layout } => {
+                let snapshot = app.application.snapshot();
+                let cross_section = *application_view(&snapshot).cross_section();
+                startup_dispatch(
+                    app,
+                    ApplicationCommand::SetLayout {
+                        layout: (*layout).into(),
+                        cross_section,
+                    },
+                )?;
+                Ok(json!({ "layout": layout.name() }))
+            }
+            ProductAutomationCommand::SetTimeIndex { time_index } => {
+                let snapshot = app.application.snapshot();
+                let view = application_view(&snapshot);
+                let timepoint_count = snapshot
+                    .catalog()
+                    .layer(view.active_layer())
+                    .expect("application view closes over the dataset catalog")
+                    .shape()
+                    .t();
+                if *time_index >= timepoint_count {
+                    return Err(format!(
+                        "time index {time_index} is out of bounds for {timepoint_count} timepoints"
+                    ));
+                }
+                startup_dispatch(
+                    app,
+                    ApplicationCommand::SetTimepoint(TimeIndex::new(*time_index)),
+                )?;
+                Ok(json!({
+                    "time_index": time_index,
+                    "timepoint_count": timepoint_count,
+                }))
+            }
+            ProductAutomationCommand::SetLayerRenderMode { layer_index, mode } => {
+                let render_mode: RenderMode = (*mode).into();
+                let command = layer_command(app, *layer_index, |layer| {
+                    Ok(LayerViewState::new(
+                        layer.layer_key(),
+                        layer.visible(),
+                        layer.transfer().clone(),
+                        render_state_for_mode(
+                            *layer.render_state(),
+                            layer.transfer(),
+                            render_mode,
+                        )?,
+                    ))
+                })?;
+                startup_dispatch(app, command)?;
+                Ok(json!({ "layer_index": layer_index, "render_mode": mode.name() }))
+            }
+            ProductAutomationCommand::SetProjection { projection } => {
+                let snapshot = app.application.snapshot();
+                let camera = camera_with_projection(
+                    *application_view(&snapshot).camera(),
+                    (*projection).into(),
+                )?;
+                startup_dispatch(app, ApplicationCommand::SetCamera(camera))?;
+                Ok(json!({ "projection": projection.name() }))
+            }
+            ProductAutomationCommand::SetLayerSampling {
+                layer_index,
+                sampling,
+            } => {
+                let command = layer_command(app, *layer_index, |layer| {
+                    Ok(LayerViewState::new(
+                        layer.layer_key(),
+                        layer.visible(),
+                        layer.transfer().clone(),
+                        render_state_with_sampling(*layer.render_state(), (*sampling).into())?,
+                    ))
+                })?;
+                startup_dispatch(app, command)?;
+                Ok(json!({ "layer_index": layer_index, "sampling": sampling.name() }))
+            }
+            ProductAutomationCommand::SetLayerOpacity {
+                layer_index,
+                opacity,
+            } => {
+                if !opacity.is_finite() || !(0.0..=1.0).contains(opacity) {
+                    return Err("layer opacity must be finite and between 0.0 and 1.0".to_owned());
+                }
+                let command = layer_command(app, *layer_index, |layer| {
+                    let current = layer.transfer();
+                    let transfer = LayerTransfer::new(
+                        current.window(),
+                        current.color(),
+                        Opacity::new(*opacity).map_err(|error| error.to_string())?,
+                        current.curve(),
+                        current.invert(),
+                    );
+                    Ok(LayerViewState::new(
+                        layer.layer_key(),
+                        layer.visible(),
+                        transfer,
+                        *layer.render_state(),
+                    ))
+                })?;
+                startup_dispatch(app, command)?;
+                Ok(json!({ "layer_index": layer_index, "opacity": opacity }))
+            }
+            ProductAutomationCommand::SetLayerWindow {
+                layer_index,
+                low,
+                high,
+            } => {
+                if !low.is_finite() || !high.is_finite() || low >= high {
+                    return Err(
+                        "layer window bounds must be finite with low less than high".to_owned()
+                    );
+                }
+                let command = layer_command(app, *layer_index, |layer| {
+                    let current = layer.transfer();
+                    let transfer = LayerTransfer::new(
+                        DisplayWindow::new(*low, *high).map_err(|error| error.to_string())?,
+                        current.color(),
+                        current.opacity(),
+                        current.curve(),
+                        current.invert(),
+                    );
+                    Ok(LayerViewState::new(
+                        layer.layer_key(),
+                        layer.visible(),
+                        transfer,
+                        *layer.render_state(),
+                    ))
+                })?;
+                startup_dispatch(app, command)?;
+                Ok(json!({ "layer_index": layer_index, "low": low, "high": high }))
+            }
+            ProductAutomationCommand::SetCameraView {
+                projection,
+                target_world,
+                orientation_xyzw,
+                orthographic_world_per_screen_point,
+                perspective_focal_length_screen_points,
+                perspective_view_distance_world,
+            } => {
+                let camera = exact_camera_view(
+                    *projection,
+                    *target_world,
+                    *orientation_xyzw,
+                    *orthographic_world_per_screen_point,
+                    *perspective_focal_length_screen_points,
+                    *perspective_view_distance_world,
+                )?;
+                startup_dispatch(app, ApplicationCommand::SetCamera(camera))?;
+                Ok(json!({
+                    "projection": projection.name(),
+                    "target_world": camera.target().components(),
+                    "orientation_xyzw": camera.orientation().xyzw(),
+                    "orthographic_world_per_screen_point": camera.orthographic_world_per_screen_point(),
+                    "perspective_focal_length_screen_points": camera.perspective_focal_length_screen_points(),
+                    "perspective_view_distance_world": camera.perspective_view_distance_world(),
+                }))
+            }
+            ProductAutomationCommand::CameraFitData => {
+                let snapshot = app.application.snapshot();
+                let view = application_view(&snapshot);
+                let layer = snapshot
+                    .catalog()
+                    .layer(view.active_layer())
+                    .expect("application view closes over the dataset catalog");
+                let camera = fit_camera_to_shape_preserving_view(
+                    *view.camera(),
+                    layer.shape().spatial(),
+                    layer.grid_to_world(),
+                    app.render_coordination.presentation_viewport,
+                );
+                startup_dispatch(app, ApplicationCommand::SetCamera(camera))?;
+                Ok(json!({}))
+            }
+            ProductAutomationCommand::SetActiveCrossSectionPanel { panel } => {
+                startup_dispatch(
+                    app,
+                    ApplicationCommand::SetActiveCrossSectionPanel(Some(
+                        application_cross_section_panel(*panel),
+                    )),
+                )?;
+                Ok(json!({ "panel": PanelId::from(*panel).label() }))
+            }
+            ProductAutomationCommand::SetCrossSectionView {
+                center_world,
+                orientation_xyzw,
+                scale_world_per_screen_point,
+                depth_world,
+            } => {
+                let snapshot = app.application.snapshot();
+                if application_view(&snapshot).layout() != ViewerLayout::FourPanel {
+                    return Err(
+                        "setting the cross-section view requires four-panel layout".to_owned()
+                    );
+                }
+                let cross_section = exact_cross_section_view(
+                    *center_world,
+                    *orientation_xyzw,
+                    *scale_world_per_screen_point,
+                    *depth_world,
+                )?;
+                startup_dispatch(
+                    app,
+                    ApplicationCommand::SetLayout {
+                        layout: ViewerLayout::FourPanel,
+                        cross_section,
+                    },
+                )?;
+                Ok(json!({
+                    "center_world": cross_section.center_world().components(),
+                    "orientation_xyzw": cross_section.orientation().xyzw(),
+                    "scale_world_per_screen_point": cross_section.scale_world_per_screen_point(),
+                    "depth_world": cross_section.depth_world(),
+                }))
+            }
+            ProductAutomationCommand::CrossSectionZoomSequence {
+                panel,
+                samples,
+                duration_ms,
+                x_fraction,
+                y_fraction,
+                factor_per_sample,
+            } if *samples == 1 && *duration_ms == 1 && *x_fraction == 0.5 && *y_fraction == 0.5 => {
+                let snapshot = app.application.snapshot();
+                let view = application_view(&snapshot);
+                if view.layout() != ViewerLayout::FourPanel {
+                    return Err(
+                        "cross-section bootstrap zoom requires four-panel layout".to_owned()
+                    );
+                }
+                let current = *view.cross_section();
+                let cross_section = CrossSectionView::new(
+                    current.center_world(),
+                    current.orientation(),
+                    current.scale_world_per_screen_point() * *factor_per_sample,
+                    current.depth_world(),
+                )
+                .map_err(|error| format!("cross-section bootstrap zoom was rejected: {error}"))?;
+                startup_dispatch(
+                    app,
+                    ApplicationCommand::SetActiveCrossSectionPanel(Some(
+                        application_cross_section_panel(*panel),
+                    )),
+                )?;
+                startup_dispatch(
+                    app,
+                    ApplicationCommand::SetLayout {
+                        layout: ViewerLayout::FourPanel,
+                        cross_section,
+                    },
+                )?;
+                Ok(json!({
+                    "panel": PanelId::from(*panel).label(),
+                    "centered_anchor": true,
+                    "factor": factor_per_sample,
+                }))
+            }
+            _ => Err(format!(
+                "command {} is not permitted in the pre-demand startup bootstrap",
+                command.name()
+            )),
         }
     }
 
     pub(crate) const fn render_target_override(&self) -> Option<RenderExtent> {
         self.render_target_override
+    }
+
+    pub(crate) fn requires_validation_capture(&self) -> bool {
+        self.script.requires_validation_capture()
+    }
+
+    pub(crate) const fn requires_gpu_timing(&self) -> bool {
+        self.script.requires_gpu_timing()
+    }
+
+    pub(crate) fn requires_diagnostic_counters(&self) -> bool {
+        self.script.requires_diagnostic_counters()
+    }
+
+    fn input_sequence_step(
+        &mut self,
+        app: &MiranteWorkbenchApp,
+        samples: u32,
+        duration_ms: u64,
+    ) -> InputSequenceStep {
+        let sequence = self.active_input_sequence.get_or_insert_with(|| {
+            let generation = app.render_coordination.display_generation();
+            ActiveInputSequence {
+                command_index: self.command_index,
+                started_at: Instant::now(),
+                next_sample: 0,
+                samples,
+                duration_ms,
+                origin_generation: generation.input_generation,
+                origin_durable_commits: generation.durable_gesture_commits,
+                origin_diagnostics: app.render_coordination.display_diagnostic_counters(),
+            }
+        });
+        debug_assert_eq!(sequence.command_index, self.command_index);
+        debug_assert_eq!(sequence.samples, samples);
+        debug_assert_eq!(sequence.duration_ms, duration_ms);
+        let target_ns =
+            sequence_sample_target_ns(sequence.next_sample, sequence.samples, sequence.duration_ms);
+        let elapsed_ns =
+            u64::try_from(sequence.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if elapsed_ns < target_ns {
+            InputSequenceStep::Wait(Duration::from_nanos(target_ns - elapsed_ns))
+        } else {
+            InputSequenceStep::Dispatch(sequence.next_sample)
+        }
+    }
+
+    fn complete_input_sequence_sample(
+        &mut self,
+        app: &MiranteWorkbenchApp,
+        workload: Value,
+    ) -> CommandProgress {
+        let sequence = self
+            .active_input_sequence
+            .as_mut()
+            .expect("a dispatched automation sequence sample has active state");
+        sequence.next_sample = sequence.next_sample.saturating_add(1);
+        if sequence.next_sample < sequence.samples {
+            let target_ns = sequence_sample_target_ns(
+                sequence.next_sample,
+                sequence.samples,
+                sequence.duration_ms,
+            );
+            let elapsed_ns =
+                u64::try_from(sequence.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            return CommandProgress::PassiveWaiting(Some(Duration::from_nanos(
+                target_ns.saturating_sub(elapsed_ns),
+            )));
+        }
+        let sequence = self
+            .active_input_sequence
+            .take()
+            .expect("the completed automation sequence retains its state");
+        let generation = app.render_coordination.display_generation();
+        let counters = app.render_coordination.display_diagnostic_counters();
+        CommandProgress::Done(json!({
+            "workload": workload,
+            "samples": sequence.samples,
+            "requested_duration_ms": sequence.duration_ms,
+            "actual_duration_ns": u64::try_from(sequence.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            "input_evidence": {
+                "automation_level": "E1_semantic_application_commands",
+                "os_input_injected": false,
+                "os_input_claimed": false,
+                "time_distributed_across_app_updates": true,
+            },
+            "observed_counter_delta": {
+                "detailed_counters_enabled": counters.enabled,
+                "input_generations": generation.input_generation.saturating_sub(sequence.origin_generation),
+                "durable_gesture_commits": generation.durable_gesture_commits.saturating_sub(sequence.origin_durable_commits),
+                "raw_input_samples": counters.raw_input_samples.saturating_sub(sequence.origin_diagnostics.raw_input_samples),
+                "admitted_input_generations": counters.admitted_input_generations.saturating_sub(sequence.origin_diagnostics.admitted_input_generations),
+                "coalesced_input_samples": counters.coalesced_input_samples.saturating_sub(sequence.origin_diagnostics.coalesced_input_samples),
+                "superseded_input_generations": counters.superseded_input_generations.saturating_sub(sequence.origin_diagnostics.superseded_input_generations),
+            },
+        }))
     }
 
     fn failed_to_initialize(reason: String) -> Self {
@@ -332,10 +1546,37 @@ impl ProductAutomationController {
 
         let command = self.script.commands[self.command_index].clone();
         let command_index = self.command_index;
+        if self
+            .active_input_sequence
+            .is_some_and(|sequence| sequence.command_index != command_index)
+        {
+            self.active_input_sequence = None;
+        }
         let command_started = Instant::now();
+        // Validation readback is asynchronous renderer work. Drive it before
+        // evaluating waits so `runtime_idle` can settle even when the next
+        // script command, rather than another render, is the first consumer.
+        if let Err(error) = app.poll_product_validation_captures() {
+            let mut reason = format!("failed to poll GPU validation capture: {error}");
+            if let Some(cancellation) = self.cancel_active_dataset_switch(app) {
+                reason.push_str(&format!("; dataset_switch_cancellation={cancellation}"));
+            }
+            self.events.push(ProductAutomationEvent::failed(
+                command_index,
+                command.name(),
+                command_started.elapsed(),
+                reason.clone(),
+            ));
+            return AutomationStatus::Failed(reason);
+        }
         self.observe_import_projection(app);
         let result = self.execute_command(app, ctx, &command);
         if let Err(reason) = self.observe_and_enforce_limits(app) {
+            let reason = if let Some(cancellation) = self.cancel_active_dataset_switch(app) {
+                format!("{reason}; dataset_switch_cancellation={cancellation}")
+            } else {
+                reason
+            };
             self.events.push(ProductAutomationEvent::failed(
                 command_index,
                 command.name(),
@@ -366,6 +1607,11 @@ impl ProductAutomationController {
                 AutomationStatus::Waiting { repaint_after }
             }
             Err(reason) => {
+                let reason = if let Some(cancellation) = self.cancel_active_dataset_switch(app) {
+                    format!("{reason}; dataset_switch_cancellation={cancellation}")
+                } else {
+                    reason
+                };
                 self.events.push(ProductAutomationEvent::failed(
                     command_index,
                     command.name(),
@@ -373,6 +1619,134 @@ impl ProductAutomationController {
                     reason.clone(),
                 ));
                 AutomationStatus::Failed(reason)
+            }
+        }
+    }
+
+    fn cancel_active_dataset_switch(&mut self, app: &mut MiranteWorkbenchApp) -> Option<String> {
+        self.active_dataset_switch
+            .take()
+            .map(|active| cancel_exact_dataset_switch(app, &active.token))
+    }
+
+    fn execute_dataset_switch(
+        &mut self,
+        app: &mut MiranteWorkbenchApp,
+        ctx: &egui::Context,
+        path: &Path,
+    ) -> Result<CommandProgress, String> {
+        let expected = normalize_path(path);
+        let selected_matches = normalize_path(app.dataset.selected_path()) == expected;
+        let active = self.active_dataset_switch.as_ref();
+        if let Some(active) = active
+            && active.command_index != self.command_index
+        {
+            return Err(
+                "dataset-switch state belongs to a different automation command".to_owned(),
+            );
+        }
+        let exact_request_pending =
+            active.is_some_and(|active| exact_dataset_switch_pending(app, &active.token));
+        let elapsed = active.map_or(Duration::ZERO, |active| active.started_at.elapsed());
+        match dataset_switch_protocol_decision(
+            selected_matches,
+            active.is_some(),
+            exact_request_pending,
+            elapsed,
+            AUTOMATION_DATASET_SWITCH_TIMEOUT,
+        ) {
+            DatasetSwitchProtocolDecision::TargetAlreadySelected => Err(format!(
+                "switch_dataset requires a distinct target, but {} is already selected; use open_dataset for the startup assertion",
+                path.display()
+            )),
+            DatasetSwitchProtocolDecision::Start => {
+                let started_at = Instant::now();
+                let dispatched = app
+                    .open_or_queue_dataset_path(path.to_path_buf(), Some(ctx))
+                    .map_err(|error| {
+                        format!(
+                            "normal product dataset switch to {} was rejected: {error}",
+                            path.display()
+                        )
+                    })?;
+                if !dispatched {
+                    return Err(
+                        "switch_dataset requires a clean current project; the product retained the request for an interactive dirty-project decision"
+                            .to_owned(),
+                    );
+                }
+                let token = app
+                    .source_open_service
+                    .as_ref()
+                    .and_then(|service| service.active_token())
+                    .cloned()
+                    .ok_or_else(|| {
+                        "switch_dataset dispatched no bounded current-source open operation"
+                            .to_owned()
+                    })?;
+                if !app
+                    .application
+                    .snapshot()
+                    .active_operations()
+                    .iter()
+                    .any(|active| active == &token)
+                {
+                    let cancellation = cancel_exact_dataset_switch(app, &token);
+                    return Err(format!(
+                        "switch_dataset source service has no matching reducer operation; cancellation={cancellation}"
+                    ));
+                }
+                self.active_dataset_switch = Some(ActiveDatasetSwitch {
+                    command_index: self.command_index,
+                    started_at,
+                    token,
+                });
+                Ok(CommandProgress::Waiting)
+            }
+            DatasetSwitchProtocolDecision::Waiting => Ok(CommandProgress::Waiting),
+            DatasetSwitchProtocolDecision::Installed => {
+                let active = self
+                    .active_dataset_switch
+                    .take()
+                    .expect("an installed dataset switch retains its exact operation state");
+                let previous_union_was_present =
+                    self.previous_labeled_resource_union.take().is_some();
+                Ok(CommandProgress::Done(json!({
+                    "mode": "normal_product_external_dataset_switch",
+                    "path": app.dataset.selected_path().display().to_string(),
+                    "operation_id": active.token.operation_id().get(),
+                    "normal_current_source_open_service": true,
+                    "external_open_requests": 1,
+                    "timeout_ms": AUTOMATION_DATASET_SWITCH_TIMEOUT.as_millis(),
+                    "waited_ms": duration_ms(active.started_at.elapsed()),
+                    "diagnostic_union_authority_reset": true,
+                    "previous_labeled_union_was_present": previous_union_was_present,
+                })))
+            }
+            DatasetSwitchProtocolDecision::Failed => {
+                let active = self
+                    .active_dataset_switch
+                    .take()
+                    .expect("a failed dataset switch retains its exact operation state");
+                Err(format!(
+                    "normal product dataset switch operation {} finished without installing {} after {:.3} ms",
+                    active.token.operation_id().get(),
+                    path.display(),
+                    duration_ms(active.started_at.elapsed()),
+                ))
+            }
+            DatasetSwitchProtocolDecision::TimedOut => {
+                let active = self
+                    .active_dataset_switch
+                    .take()
+                    .expect("a timed-out dataset switch retains its exact operation state");
+                let cancellation = cancel_exact_dataset_switch(app, &active.token);
+                Err(format!(
+                    "timed out after {} ms waiting for normal product dataset switch operation {} to install {}; cancellation={cancellation}",
+                    AUTOMATION_DATASET_SWITCH_TIMEOUT.as_millis(),
+                    active.token.operation_id().get(),
+                    path.display(),
+                ))
             }
         }
     }
@@ -398,6 +1772,9 @@ impl ProductAutomationController {
                     "mode": "opened_by_product_startup",
                     "path": app.dataset.selected_path().display().to_string(),
                 })))
+            }
+            ProductAutomationCommand::SwitchDataset { path } => {
+                self.execute_dataset_switch(app, ctx, path)
             }
             ProductAutomationCommand::NewProject => {
                 dispatch_application_command(app, ctx, ApplicationCommand::AttachVerifiedDataset)?;
@@ -1047,6 +2424,9 @@ impl ProductAutomationController {
                     "evidence_scope": "automation_only_internal_gpu_render_target",
                 })))
             }
+            ProductAutomationCommand::SetFourPanelViewports { .. } => {
+                Err("set_four_panel_viewports is permitted only in startup_bootstrap".to_owned())
+            }
             ProductAutomationCommand::SetViewerLayout { layout } => {
                 let viewer_layout: ViewerLayout = (*layout).into();
                 let snapshot = app.application.snapshot();
@@ -1061,6 +2441,78 @@ impl ProductAutomationController {
                 )?;
                 Ok(CommandProgress::Done(json!({
                     "layout": layout.name(),
+                })))
+            }
+            ProductAutomationCommand::SetTimeIndex { time_index } => {
+                let snapshot = app.application.snapshot();
+                let view = application_view(&snapshot);
+                let timepoint_count = snapshot
+                    .catalog()
+                    .layer(view.active_layer())
+                    .expect("application view closes over the dataset catalog")
+                    .shape()
+                    .t();
+                if *time_index >= timepoint_count {
+                    return Err(format!(
+                        "time index {time_index} is out of bounds for {timepoint_count} timepoints"
+                    ));
+                }
+                dispatch_application_command(
+                    app,
+                    ctx,
+                    ApplicationCommand::SetTimepoint(TimeIndex::new(*time_index)),
+                )?;
+                Ok(CommandProgress::Done(json!({
+                    "time_index": time_index,
+                    "timepoint_count": timepoint_count,
+                    "semantic_application_command": true,
+                })))
+            }
+            ProductAutomationCommand::SetLayerVisibility {
+                layer_index,
+                visible,
+            } => {
+                let command = layer_command(app, *layer_index, |layer| {
+                    Ok(LayerViewState::new(
+                        layer.layer_key(),
+                        *visible,
+                        layer.transfer().clone(),
+                        *layer.render_state(),
+                    ))
+                })?;
+                dispatch_application_command(app, ctx, command)?;
+                Ok(CommandProgress::Done(json!({
+                    "layer_index": layer_index,
+                    "visible": visible,
+                    "semantic_application_command": true,
+                })))
+            }
+            ProductAutomationCommand::SetLayerOrder { layer_indices } => {
+                let snapshot = app.application.snapshot();
+                let view = application_view(&snapshot);
+                if layer_indices.len() != view.layers().len() {
+                    return Err(format!(
+                        "layer order contains {} indices, expected {}",
+                        layer_indices.len(),
+                        view.layers().len()
+                    ));
+                }
+                let mut seen = std::collections::BTreeSet::new();
+                let mut order = Vec::with_capacity(layer_indices.len());
+                for index in layer_indices.iter().copied() {
+                    let layer = view
+                        .layers()
+                        .get(index)
+                        .ok_or_else(|| format!("layer order index {index} is out of bounds"))?;
+                    if !seen.insert(index) {
+                        return Err(format!("layer order index {index} is duplicated"));
+                    }
+                    order.push(layer.layer_key());
+                }
+                dispatch_application_command(app, ctx, ApplicationCommand::SetLayerOrder(order))?;
+                Ok(CommandProgress::Done(json!({
+                    "layer_indices": layer_indices,
+                    "semantic_application_command": true,
                 })))
             }
             ProductAutomationCommand::SetRenderMode { mode } => {
@@ -1101,6 +2553,75 @@ impl ProductAutomationController {
                 Ok(CommandProgress::Done(json!({
                     "layer_index": layer_index,
                     "render_mode": mode.name(),
+                })))
+            }
+            ProductAutomationCommand::SetProjection { projection } => {
+                let snapshot = app.application.snapshot();
+                let camera = camera_with_projection(
+                    *application_view(&snapshot).camera(),
+                    (*projection).into(),
+                )?;
+                dispatch_application_command(app, ctx, ApplicationCommand::SetCamera(camera))?;
+                Ok(CommandProgress::Done(json!({
+                    "projection": projection.name(),
+                })))
+            }
+            ProductAutomationCommand::SetLayerSampling {
+                layer_index,
+                sampling,
+            } => {
+                let command = layer_command(app, *layer_index, |layer| {
+                    Ok(LayerViewState::new(
+                        layer.layer_key(),
+                        layer.visible(),
+                        layer.transfer().clone(),
+                        render_state_with_sampling(*layer.render_state(), (*sampling).into())?,
+                    ))
+                })?;
+                dispatch_application_command(app, ctx, command)?;
+                Ok(CommandProgress::Done(json!({
+                    "layer_index": layer_index,
+                    "sampling": sampling.name(),
+                })))
+            }
+            ProductAutomationCommand::SetLayerIsoShading {
+                layer_index,
+                shading,
+            } => {
+                let command = layer_command(app, *layer_index, |layer| {
+                    let current = *layer.render_state();
+                    let parameters = current
+                        .iso_parameters()
+                        .ok_or_else(|| "ISO shading requires ISO render mode".to_owned())?;
+                    let render_state = RenderState::iso(
+                        current.sampling_policy(),
+                        (*shading).into(),
+                        parameters.display_level(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    Ok(LayerViewState::new(
+                        layer.layer_key(),
+                        layer.visible(),
+                        layer.transfer().clone(),
+                        render_state,
+                    ))
+                })?;
+                dispatch_application_command(app, ctx, command)?;
+                Ok(CommandProgress::Done(json!({
+                    "layer_index": layer_index,
+                    "iso_shading": shading.name(),
+                })))
+            }
+            ProductAutomationCommand::SetIsoLight { light } => {
+                let light_state = light.into_domain()?;
+                dispatch_application_command(
+                    app,
+                    ctx,
+                    ApplicationCommand::SetIsoLight(light_state),
+                )?;
+                Ok(CommandProgress::Done(json!({
+                    "iso_light": light.name(),
+                    "detached_screen_position": light_state.detached_screen_position(),
                 })))
             }
             ProductAutomationCommand::SetIsoDisplayLevel { display_level } => {
@@ -1229,6 +2750,9 @@ impl ProductAutomationController {
                     "high": high,
                 })))
             }
+            ProductAutomationCommand::SetCameraView { .. } => {
+                Err("set_camera_view is permitted only in startup_bootstrap".to_owned())
+            }
             ProductAutomationCommand::CameraFitData => {
                 let snapshot = app.application.snapshot();
                 let view = application_view(&snapshot);
@@ -1282,17 +2806,553 @@ impl ProductAutomationController {
                     "scroll_y_points": scroll_y_points,
                 })))
             }
+            ProductAutomationCommand::CameraOrbitSequence {
+                samples,
+                duration_ms,
+                yaw_points_per_sample,
+                pitch_points_per_sample,
+            } => match self.input_sequence_step(app, *samples, *duration_ms) {
+                InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
+                InputSequenceStep::Dispatch(sample_index) => {
+                    let viewport_side = 800.0;
+                    let start = [viewport_side * 0.5, viewport_side * 0.5];
+                    let current = [
+                        start[0] + *yaw_points_per_sample,
+                        start[1] + *pitch_points_per_sample,
+                    ];
+                    let snapshot = app.application.snapshot();
+                    let camera = orbit_camera(
+                        *application_view(&snapshot).camera(),
+                        start,
+                        current,
+                        [viewport_side, viewport_side],
+                    );
+                    dispatch_effective_interaction_sample(
+                        app,
+                        ctx,
+                        ApplicationCommand::SetCamera(camera),
+                    )?;
+                    Ok(self.complete_input_sequence_sample(
+                        app,
+                        json!({
+                            "kind": "camera_orbit",
+                            "last_sample_index": sample_index,
+                            "yaw_points_per_sample": yaw_points_per_sample,
+                            "pitch_points_per_sample": pitch_points_per_sample,
+                        }),
+                    ))
+                }
+            },
+            ProductAutomationCommand::CameraPanSequence {
+                samples,
+                duration_ms,
+                x_points_per_sample,
+                y_points_per_sample,
+            } => match self.input_sequence_step(app, *samples, *duration_ms) {
+                InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
+                InputSequenceStep::Dispatch(sample_index) => {
+                    let snapshot = app.application.snapshot();
+                    let camera = pan_camera(
+                        *application_view(&snapshot).camera(),
+                        [*x_points_per_sample, *y_points_per_sample],
+                    );
+                    dispatch_effective_interaction_sample(
+                        app,
+                        ctx,
+                        ApplicationCommand::SetCamera(camera),
+                    )?;
+                    Ok(self.complete_input_sequence_sample(
+                        app,
+                        json!({
+                            "kind": "camera_pan",
+                            "last_sample_index": sample_index,
+                            "x_points_per_sample": x_points_per_sample,
+                            "y_points_per_sample": y_points_per_sample,
+                        }),
+                    ))
+                }
+            },
+            ProductAutomationCommand::CameraZoomSequence {
+                samples,
+                duration_ms,
+                scroll_y_points_per_sample,
+            } => match self.input_sequence_step(app, *samples, *duration_ms) {
+                InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
+                InputSequenceStep::Dispatch(sample_index) => {
+                    let snapshot = app.application.snapshot();
+                    let camera = zoom_camera(
+                        *application_view(&snapshot).camera(),
+                        *scroll_y_points_per_sample,
+                    );
+                    dispatch_effective_interaction_sample(
+                        app,
+                        ctx,
+                        ApplicationCommand::SetCamera(camera),
+                    )?;
+                    Ok(self.complete_input_sequence_sample(
+                        app,
+                        json!({
+                            "kind": "camera_zoom",
+                            "last_sample_index": sample_index,
+                            "scroll_y_points_per_sample": scroll_y_points_per_sample,
+                        }),
+                    ))
+                }
+            },
+            ProductAutomationCommand::SetActiveCrossSectionPanel { panel } => {
+                dispatch_application_command(
+                    app,
+                    ctx,
+                    ApplicationCommand::SetActiveCrossSectionPanel(Some(
+                        application_cross_section_panel(*panel),
+                    )),
+                )?;
+                Ok(CommandProgress::Done(json!({
+                    "panel": PanelId::from(*panel).label(),
+                })))
+            }
+            ProductAutomationCommand::SetCrossSectionView {
+                center_world,
+                orientation_xyzw,
+                scale_world_per_screen_point,
+                depth_world,
+            } => {
+                let snapshot = app.application.snapshot();
+                let view = application_view(&snapshot);
+                if view.layout() != ViewerLayout::FourPanel {
+                    return Err(
+                        "setting the cross-section view requires four-panel layout".to_owned()
+                    );
+                }
+                let cross_section = exact_cross_section_view(
+                    *center_world,
+                    *orientation_xyzw,
+                    *scale_world_per_screen_point,
+                    *depth_world,
+                )?;
+                dispatch_application_command(
+                    app,
+                    ctx,
+                    ApplicationCommand::SetLayout {
+                        layout: ViewerLayout::FourPanel,
+                        cross_section,
+                    },
+                )?;
+                Ok(CommandProgress::Done(json!({
+                    "center_world": cross_section.center_world().components(),
+                    "orientation_xyzw": cross_section.orientation().xyzw(),
+                    "scale_world_per_screen_point": cross_section.scale_world_per_screen_point(),
+                    "depth_world": cross_section.depth_world(),
+                })))
+            }
+            ProductAutomationCommand::CrossSectionRotateSequence {
+                panel,
+                samples,
+                duration_ms,
+                x_points_per_sample,
+                y_points_per_sample,
+                radians_per_point,
+            } => match self.input_sequence_step(app, *samples, *duration_ms) {
+                InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
+                InputSequenceStep::Dispatch(sample_index) => {
+                    let snapshot = app.application.snapshot();
+                    let view = application_view(&snapshot);
+                    if view.layout() != ViewerLayout::FourPanel {
+                        return Err("cross-section sequence requires four-panel layout".to_owned());
+                    }
+                    let mut state = CrossSectionViewState::from_canonical(*view.cross_section());
+                    state.rotate_oblique_by_panel_drag(
+                        interaction_cross_section_panel(*panel),
+                        *x_points_per_sample,
+                        *y_points_per_sample,
+                        *radians_per_point,
+                    );
+                    let cross_section = state
+                        .into_canonical()
+                        .map_err(|error| format!("cross-section rotation was rejected: {error}"))?;
+                    dispatch_application_command(
+                        app,
+                        ctx,
+                        ApplicationCommand::SetActiveCrossSectionPanel(Some(
+                            application_cross_section_panel(*panel),
+                        )),
+                    )?;
+                    dispatch_effective_interaction_sample(
+                        app,
+                        ctx,
+                        ApplicationCommand::SetLayout {
+                            layout: ViewerLayout::FourPanel,
+                            cross_section,
+                        },
+                    )?;
+                    Ok(self.complete_input_sequence_sample(
+                        app,
+                        json!({
+                            "kind": "cross_section_rotate",
+                            "panel": PanelId::from(*panel).label(),
+                            "last_sample_index": sample_index,
+                        }),
+                    ))
+                }
+            },
+            ProductAutomationCommand::CrossSectionPanSequence {
+                panel,
+                samples,
+                duration_ms,
+                x_points_per_sample,
+                y_points_per_sample,
+            } => match self.input_sequence_step(app, *samples, *duration_ms) {
+                InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
+                InputSequenceStep::Dispatch(sample_index) => {
+                    let snapshot = app.application.snapshot();
+                    let view = application_view(&snapshot);
+                    if view.layout() != ViewerLayout::FourPanel {
+                        return Err("cross-section sequence requires four-panel layout".to_owned());
+                    }
+                    let mut state = CrossSectionViewState::from_canonical(*view.cross_section());
+                    state.pan_by_panel_points(
+                        interaction_cross_section_panel(*panel),
+                        *x_points_per_sample,
+                        *y_points_per_sample,
+                    );
+                    let cross_section = state
+                        .into_canonical()
+                        .map_err(|error| format!("cross-section pan was rejected: {error}"))?;
+                    dispatch_application_command(
+                        app,
+                        ctx,
+                        ApplicationCommand::SetActiveCrossSectionPanel(Some(
+                            application_cross_section_panel(*panel),
+                        )),
+                    )?;
+                    dispatch_effective_interaction_sample(
+                        app,
+                        ctx,
+                        ApplicationCommand::SetLayout {
+                            layout: ViewerLayout::FourPanel,
+                            cross_section,
+                        },
+                    )?;
+                    Ok(self.complete_input_sequence_sample(
+                        app,
+                        json!({
+                            "kind": "cross_section_pan",
+                            "panel": PanelId::from(*panel).label(),
+                            "last_sample_index": sample_index,
+                        }),
+                    ))
+                }
+            },
+            ProductAutomationCommand::CrossSectionZoomSequence {
+                panel,
+                samples,
+                duration_ms,
+                x_fraction,
+                y_fraction,
+                factor_per_sample,
+            } => match self.input_sequence_step(app, *samples, *duration_ms) {
+                InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
+                InputSequenceStep::Dispatch(sample_index) => {
+                    let snapshot = app.application.snapshot();
+                    let view = application_view(&snapshot);
+                    if view.layout() != ViewerLayout::FourPanel {
+                        return Err("cross-section sequence requires four-panel layout".to_owned());
+                    }
+                    let panel_id = PanelId::from(*panel);
+                    let viewport = app
+                        .render_coordination
+                        .surface(panel_id.presentation_slot())
+                        .presentation_viewport()
+                        .ok_or_else(|| {
+                            format!("{} presentation viewport is unavailable", panel_id.label())
+                        })?;
+                    let mut state = CrossSectionViewState::from_canonical(*view.cross_section());
+                    state.zoom_around_panel_point(
+                        interaction_cross_section_panel(*panel),
+                        viewport,
+                        *x_fraction * viewport.width_points(),
+                        *y_fraction * viewport.height_points(),
+                        *factor_per_sample,
+                    );
+                    let cross_section = state
+                        .into_canonical()
+                        .map_err(|error| format!("cross-section zoom was rejected: {error}"))?;
+                    dispatch_application_command(
+                        app,
+                        ctx,
+                        ApplicationCommand::SetActiveCrossSectionPanel(Some(
+                            application_cross_section_panel(*panel),
+                        )),
+                    )?;
+                    dispatch_effective_interaction_sample(
+                        app,
+                        ctx,
+                        ApplicationCommand::SetLayout {
+                            layout: ViewerLayout::FourPanel,
+                            cross_section,
+                        },
+                    )?;
+                    Ok(self.complete_input_sequence_sample(
+                        app,
+                        json!({
+                            "kind": "cross_section_zoom",
+                            "panel": panel_id.label(),
+                            "last_sample_index": sample_index,
+                        }),
+                    ))
+                }
+            },
+            ProductAutomationCommand::CrossSectionSliceSequence {
+                panel,
+                samples,
+                duration_ms,
+                distance_world_per_sample,
+            } => match self.input_sequence_step(app, *samples, *duration_ms) {
+                InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
+                InputSequenceStep::Dispatch(sample_index) => {
+                    let snapshot = app.application.snapshot();
+                    let view = application_view(&snapshot);
+                    if view.layout() != ViewerLayout::FourPanel {
+                        return Err("cross-section sequence requires four-panel layout".to_owned());
+                    }
+                    let mut state = CrossSectionViewState::from_canonical(*view.cross_section());
+                    state.slice_by_world_distance(
+                        interaction_cross_section_panel(*panel),
+                        *distance_world_per_sample,
+                    );
+                    let cross_section = state
+                        .into_canonical()
+                        .map_err(|error| format!("cross-section slice was rejected: {error}"))?;
+                    dispatch_application_command(
+                        app,
+                        ctx,
+                        ApplicationCommand::SetActiveCrossSectionPanel(Some(
+                            application_cross_section_panel(*panel),
+                        )),
+                    )?;
+                    dispatch_effective_interaction_sample(
+                        app,
+                        ctx,
+                        ApplicationCommand::SetLayout {
+                            layout: ViewerLayout::FourPanel,
+                            cross_section,
+                        },
+                    )?;
+                    Ok(self.complete_input_sequence_sample(
+                        app,
+                        json!({
+                            "kind": "cross_section_slice",
+                            "panel": PanelId::from(*panel).label(),
+                            "last_sample_index": sample_index,
+                        }),
+                    ))
+                }
+            },
+            ProductAutomationCommand::SetActiveTool { tool } => {
+                dispatch_application_command(
+                    app,
+                    ctx,
+                    ApplicationCommand::SetActiveTool((*tool).into()),
+                )?;
+                Ok(CommandProgress::Done(json!({
+                    "active_tool": tool.name(),
+                })))
+            }
             ProductAutomationCommand::ProbeHover {
                 x_fraction,
                 y_fraction,
-            } => self.probe_hover(app, *x_fraction, *y_fraction),
+            } => {
+                self.await_automation_pick(app, *x_fraction, *y_fraction, ViewerPickPurpose::Hover)
+            }
+            ProductAutomationCommand::PrimaryClick {
+                x_fraction,
+                y_fraction,
+            } => self.await_automation_pick(
+                app,
+                *x_fraction,
+                *y_fraction,
+                ViewerPickPurpose::PrimaryClick,
+            ),
             ProductAutomationCommand::CopyDiagnostics => {
+                let qualification_started = Instant::now();
                 let diagnostics = self.diagnostics_json(app);
                 self.diagnostics.push(diagnostics.clone());
+                self.qualification_only_ui_overhead_ns =
+                    u64::try_from(qualification_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 Ok(CommandProgress::Done(diagnostics))
+            }
+            ProductAutomationCommand::SampleDiagnostics { label } => {
+                let qualification_started = Instant::now();
+                let (
+                    union_accounting,
+                    gpu_resident_union_accounting,
+                    target_residency_at_phase_start,
+                ) = match (
+                    build_diagnostic_resource_union(app),
+                    build_diagnostic_gpu_resident_union(app),
+                ) {
+                    (Ok(union), Ok(gpu_resident_union)) => {
+                        let delta = self
+                            .previous_labeled_resource_union
+                            .as_ref()
+                            .map(|previous| {
+                                diagnostic_resource_union_delta(
+                                    &previous.label,
+                                    &previous.entries,
+                                    label,
+                                    &union.entries,
+                                )
+                            })
+                            .unwrap_or(Value::Null);
+                        let target_residency_at_phase_start = self
+                            .previous_labeled_resource_union
+                            .as_ref()
+                            .map(|previous| {
+                                target_residency_partition_json(
+                                    &previous.label,
+                                    &previous.gpu_resident_entries,
+                                    &union.entries,
+                                )
+                            })
+                            .unwrap_or(Value::Null);
+                        let previous_heap_bytes = self
+                            .previous_labeled_resource_union
+                            .as_ref()
+                            .and_then(|previous| {
+                                let demand =
+                                    diagnostic_vec_heap_bytes::<(DatasetResourceKey, u64)>(
+                                        previous.entries.capacity(),
+                                    )
+                                    .ok()?;
+                                let resident =
+                                    diagnostic_vec_heap_bytes::<(DatasetResourceKey, u64)>(
+                                        previous.gpu_resident_entries.capacity(),
+                                    )
+                                    .ok()?;
+                                Some(demand.saturating_add(resident))
+                            })
+                            .unwrap_or(0);
+                        let peak_heap_bytes = previous_heap_bytes
+                            .saturating_add(union.working_peak_heap_bytes)
+                            .saturating_add(gpu_resident_union.working_peak_heap_bytes);
+                        let peak_key_records = self
+                            .previous_labeled_resource_union
+                            .as_ref()
+                            .map(|previous| {
+                                previous
+                                    .entries
+                                    .capacity()
+                                    .saturating_add(previous.gpu_resident_entries.capacity())
+                            })
+                            .unwrap_or_default()
+                            .saturating_add(union.working_peak_key_records)
+                            .saturating_add(gpu_resident_union.working_peak_key_records);
+                        self.diagnostic_union_peak_heap_bytes =
+                            self.diagnostic_union_peak_heap_bytes.max(peak_heap_bytes);
+                        self.diagnostic_union_peak_keys =
+                            self.diagnostic_union_peak_keys.max(peak_key_records);
+                        let amplification = (union.unique_payload_bytes != 0).then(|| {
+                            union.summed_scope_payload_bytes as f64
+                                / union.unique_payload_bytes as f64
+                        });
+                        let canonical_entries_sha256 =
+                            canonical_resource_union_sha256(&union.entries);
+                        let exact_union = json!({
+                            "available": true,
+                            "label": label,
+                            "canonical_entries_sha256": canonical_entries_sha256.to_string(),
+                            "canonical_entries_sha256_derivation": "sha256_domain_mirante4d_ep00_resource_union_v1_sorted_binary_le",
+                            "unique_keys": union.entries.len(),
+                            "unique_payload_bytes": union.unique_payload_bytes,
+                            "summed_scope_payload_bytes": union.summed_scope_payload_bytes,
+                            "scope_overlap_amplification": amplification,
+                            "delta_from_previous_label": delta,
+                            "raw_keys_serialized": false,
+                            "derivation": "DatasetCatalog_resource_payload_descriptor_for_sorted_deduplicated_visible_prepared_scope_keys",
+                            "qualification_only_not_product_cache": true,
+                        });
+                        let exact_gpu_resident_union = json!({
+                            "available": true,
+                            "label": label,
+                            "canonical_entries_sha256": canonical_resource_union_sha256(&gpu_resident_union.entries).to_string(),
+                            "canonical_entries_sha256_derivation": "sha256_domain_mirante4d_ep00_resource_union_v1_sorted_binary_le",
+                            "unique_keys": gpu_resident_union.entries.len(),
+                            "unique_payload_bytes": gpu_resident_union.unique_payload_bytes,
+                            "raw_keys_serialized": false,
+                            "derivation": "WgpuRenderRuntime_sorted_resident_keys_joined_with_DatasetCatalog_resource_payload_descriptor",
+                            "qualification_only_not_product_cache": true,
+                        });
+                        self.previous_labeled_resource_union =
+                            Some(LabeledDiagnosticResourceUnion {
+                                label: label.as_str().to_owned(),
+                                entries: union.entries,
+                                gpu_resident_entries: gpu_resident_union.entries,
+                            });
+                        (
+                            exact_union,
+                            exact_gpu_resident_union,
+                            target_residency_at_phase_start,
+                        )
+                    }
+                    (union, resident) => {
+                        let union_error = union.err();
+                        let resident_error = resident.err();
+                        (
+                            json!({
+                                "available": false,
+                                "error_kind": "exact_resource_union_derivation_failed",
+                                "error": union_error,
+                                "raw_keys_serialized": false,
+                            }),
+                            json!({
+                                "available": false,
+                                "error_kind": "exact_gpu_resident_union_derivation_failed",
+                                "error": resident_error,
+                                "raw_keys_serialized": false,
+                            }),
+                            Value::Null,
+                        )
+                    }
+                };
+                let diagnostics = self.diagnostics_json(app);
+                let planned_scope_accounting = planned_scope_accounting_json(app);
+                let sample = json!({
+                    "label": label,
+                    "sampled_at_instrumentation_epoch_ns": app.display_instrumentation_now_ns(),
+                    "input_evidence": {
+                        "automation_level": "E1_semantic_application_commands",
+                        "os_input_injected": false,
+                        "os_input_claimed": false,
+                    },
+                    "resource_accounting": {
+                        "dataset_runtime_counters": diagnostics.get("dataset_runtime").cloned().unwrap_or(Value::Null),
+                        "dataset_source_io_counters": diagnostics.get("dataset_source_io").cloned().unwrap_or(Value::Null),
+                        "planned_semantic_payload_by_scope": planned_scope_accounting,
+                        "exact_cross_scope_union": union_accounting,
+                        "exact_gpu_resident_union": gpu_resident_union_accounting,
+                        "target_residency_at_phase_start": target_residency_at_phase_start,
+                        "qualification_snapshot_duration_ns": u64::try_from(qualification_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                        "qualification_overhead_excluded_from_interaction_task_ring": true,
+                        "union_instrumentation_peak_key_records": self.diagnostic_union_peak_keys,
+                        "union_instrumentation_peak_heap_payload_bytes": self.diagnostic_union_peak_heap_bytes,
+                        "union_instrumentation_heap_accounting": "exact_Vec_capacity_times_element_size_excludes_allocator_metadata_and_stack_fields",
+                    },
+                    "diagnostics": diagnostics,
+                });
+                self.diagnostics.push(sample.clone());
+                self.qualification_only_ui_overhead_ns =
+                    u64::try_from(qualification_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                Ok(CommandProgress::Done(sample))
             }
             ProductAutomationCommand::CaptureScreenshot { name } => {
                 if !product_presentations_ready(app, &[PanelId::ThreeD])? {
+                    let started = *self.active_wait_started.get_or_insert_with(Instant::now);
+                    if started.elapsed() >= AUTOMATION_CAPTURE_TIMEOUT {
+                        return Err(format!(
+                            "timed out waiting for current GPU validation capture: {}",
+                            product_capture_state(app, &[PanelId::ThreeD])
+                        ));
+                    }
                     return Ok(CommandProgress::Waiting);
                 }
                 let artifact = self.capture_viewport_artifact(app, name.as_deref())?;
@@ -1311,6 +3371,13 @@ impl ProductAutomationController {
                 let capture_panels = assertion_capture_panels(condition);
                 if !capture_panels.is_empty() && !product_presentations_ready(app, &capture_panels)?
                 {
+                    let started = *self.active_wait_started.get_or_insert_with(Instant::now);
+                    if started.elapsed() >= AUTOMATION_CAPTURE_TIMEOUT {
+                        return Err(format!(
+                            "timed out waiting for current GPU validation capture: {}",
+                            product_capture_state(app, &capture_panels)
+                        ));
+                    }
                     return Ok(CommandProgress::Waiting);
                 }
                 self.assert_condition(app, condition)?;
@@ -1376,28 +3443,39 @@ impl ProductAutomationController {
             .unwrap_or_else(|| PathBuf::from("target/mirante4d/product-automation-artifacts"))
     }
 
-    fn probe_hover(
-        &self,
+    fn await_automation_pick(
+        &mut self,
         app: &mut MiranteWorkbenchApp,
         x_fraction: f32,
         y_fraction: f32,
+        purpose: ViewerPickPurpose,
     ) -> Result<CommandProgress, String> {
-        if !x_fraction.is_finite()
-            || !y_fraction.is_finite()
-            || !(0.0..=1.0).contains(&x_fraction)
-            || !(0.0..=1.0).contains(&y_fraction)
+        // Consume the accepted request identity before rebuilding a request
+        // from current presentation state. A primary-click effect can
+        // synchronously publish a new frame; that expected mutation must not
+        // make automation forget the just-completed transaction and resubmit
+        // the click forever.
+        if let Some((request, hit)) = app
+            .viewer_pick_queue
+            .take_automation_completion_for(purpose)
         {
-            return Err("probe_hover fractions must be finite and between 0.0 and 1.0".to_owned());
+            return Ok(CommandProgress::Done(automation_pick_json(
+                request, &hit, x_fraction, y_fraction,
+            )));
         }
-        app.egui_ui.hovered_pixel = None;
-        app.egui_ui.hovered_source_readout = None;
-        Ok(CommandProgress::Done(json!({
-            "x_fraction": x_fraction,
-            "y_fraction": y_fraction,
-            "status": "unavailable",
-            "reason": "3D scientific intensity probing is unavailable on the current GPU presentation path",
-            "placeholder_sampled": false,
-        })))
+        let started = *self.active_wait_started.get_or_insert_with(Instant::now);
+        if started.elapsed() > AUTOMATION_PICK_TIMEOUT {
+            return Err(format!(
+                "{} did not complete through the native GPU pick queue within {} ms",
+                automation_pick_purpose_name(purpose),
+                AUTOMATION_PICK_TIMEOUT.as_millis()
+            ));
+        }
+        let Some(request) = automation_pick_request(app, x_fraction, y_fraction, purpose)? else {
+            return Ok(CommandProgress::Waiting);
+        };
+        app.viewer_pick_queue.enqueue_automation(request);
+        Ok(CommandProgress::Waiting)
     }
 
     fn wait_condition_met(
@@ -1416,21 +3494,29 @@ impl ProductAutomationController {
                     || product_presentation(app, PanelId::ThreeD).is_some()
             }
             ProductAutomationWaitCondition::RuntimeIdle => {
-                !crate::workbench_playback_runtime::background_work_active(
-                    &snapshot,
-                    &app.import.workers,
-                    &app.dataset,
-                    &app.render_coordination,
-                    &app.native_presentation,
+                let progressive_render_work =
+                    crate::workbench_playback_runtime::progressive_render_submission_work(
+                        &app.dataset,
+                        &app.native_presentation,
+                    );
+                automation_runtime_is_idle(
+                    crate::workbench_playback_runtime::background_work_active(
+                        &snapshot,
+                        &app.import.workers,
+                        &app.dataset,
+                        &app.render_coordination,
+                        &app.native_presentation,
+                        progressive_render_work.any_required,
+                    ),
+                    app.camera_demand_planner.has_outstanding_request(),
+                    app.pending_visible_demand_plan.is_some(),
                 )
             }
             ProductAutomationWaitCondition::FrameFreshnessCurrent => {
-                app.render_coordination.frame_fidelity.display_freshness
-                    == DisplayedFrameFreshness::Current
-                    || matches!(
-                        app.render_coordination.frame_fidelity.completeness,
-                        FrameCompleteness::Exact | FrameCompleteness::Complete
-                    )
+                frame_freshness_is_current(&app.render_coordination.frame_fidelity)
+            }
+            ProductAutomationWaitCondition::CoordinatedPresentationSettled => {
+                coordinated_visible_layout_current_complete(app)
             }
             ProductAutomationWaitCondition::SourceVerificationRequired => {
                 matches!(snapshot.source(), SourceVerificationSnapshot::Required)
@@ -1518,6 +3604,29 @@ impl ProductAutomationController {
                     Ok(())
                 }
             }
+            ProductAutomationAssertCondition::FrameFidelity {
+                scale_level,
+                complete,
+            } => {
+                let fidelity = &app.render_coordination.frame_fidelity;
+                let scale_matches = fidelity.displayed_scale_level == Some(*scale_level)
+                    && fidelity.target_scale_level == *scale_level;
+                let completeness_matches = !*complete
+                    || matches!(
+                        fidelity.completeness,
+                        FrameCompleteness::Exact | FrameCompleteness::Complete
+                    );
+                if scale_matches && completeness_matches {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "frame fidelity mismatch: displayed={:?}, target=s{}, completeness={:?}",
+                        fidelity.displayed_scale_level,
+                        fidelity.target_scale_level,
+                        fidelity.completeness,
+                    ))
+                }
+            }
             ProductAutomationAssertCondition::RenderMode { mode } => {
                 let expected: RenderMode = (*mode).into();
                 let actual = view
@@ -1533,6 +3642,152 @@ impl ProductAutomationController {
                         actual, expected
                     ))
                 }
+            }
+            ProductAutomationAssertCondition::Projection { projection } => {
+                let expected: Projection = (*projection).into();
+                let actual = view.camera().projection();
+                if actual == expected {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "camera projection is {:?}, expected {:?}",
+                        actual, expected
+                    ))
+                }
+            }
+            ProductAutomationAssertCondition::LayerSampling {
+                layer_index,
+                sampling,
+            } => {
+                let expected: SamplingPolicy = (*sampling).into();
+                let actual = view
+                    .layers()
+                    .get(*layer_index)
+                    .ok_or_else(|| format!("layer index {layer_index} is out of range"))?
+                    .render_state()
+                    .sampling_policy();
+                if actual == expected {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "layer {layer_index} sampling is {:?}, expected {:?}",
+                        actual, expected
+                    ))
+                }
+            }
+            ProductAutomationAssertCondition::LayerIsoShading {
+                layer_index,
+                shading,
+            } => {
+                let expected: IsoShadingPolicy = (*shading).into();
+                let actual = view
+                    .layers()
+                    .get(*layer_index)
+                    .ok_or_else(|| format!("layer index {layer_index} is out of range"))?
+                    .render_state()
+                    .iso_parameters()
+                    .ok_or_else(|| format!("layer {layer_index} is not in ISO mode"))?
+                    .shading_policy();
+                if actual == expected {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "layer {layer_index} ISO shading is {:?}, expected {:?}",
+                        actual, expected
+                    ))
+                }
+            }
+            ProductAutomationAssertCondition::IsoLight { light } => {
+                let actual = *view.iso_light();
+                if light.matches(actual) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "ISO light is {:?}, expected {}",
+                        actual,
+                        light.name()
+                    ))
+                }
+            }
+            ProductAutomationAssertCondition::ActiveTool { tool } => {
+                let expected = (*tool).into();
+                let actual = snapshot.transient().active_tool();
+                if actual == expected {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "active viewer tool is {:?}, expected {}",
+                        actual,
+                        tool.name()
+                    ))
+                }
+            }
+            ProductAutomationAssertCondition::CrosshairLinked => {
+                let hit = app
+                    .egui_ui
+                    .viewer_tools
+                    .crosshair
+                    .as_ref()
+                    .ok_or_else(|| "the viewer has no committed crosshair pick".to_owned())?;
+                let world = hit.world_position.ok_or_else(|| {
+                    "the committed crosshair has no world-space position".to_owned()
+                })?;
+                if hit.completeness != PickCompleteness::Exact {
+                    return Err(format!(
+                        "the committed crosshair is {:?}, expected exact",
+                        hit.completeness
+                    ));
+                }
+                if view.cross_section().center_world() != world {
+                    return Err(format!(
+                        "linked cross-section center {:?} does not match crosshair {:?}",
+                        view.cross_section().center_world(),
+                        world
+                    ));
+                }
+                Ok(())
+            }
+            ProductAutomationAssertCondition::RoiCommitted => {
+                let Some(ViewerToolOverlay::RoiBox(overlay)) =
+                    app.egui_ui.viewer_tools.overlay().copied()
+                else {
+                    return Err("the viewer has no ROI overlay".to_owned());
+                };
+                if overlay.phase() != ViewerOverlayPhase::Committed {
+                    return Err("the viewer ROI overlay is still a preview".to_owned());
+                }
+                let roi = overlay.roi();
+                if app.analysis_runtime.roi_origin() != roi.origin_zyx()
+                    || app.analysis_runtime.roi_shape() != roi.shape_zyx()
+                {
+                    return Err(format!(
+                        "analysis ROI {:?}/{:?} does not match viewer ROI {:?}/{:?}",
+                        app.analysis_runtime.roi_origin(),
+                        app.analysis_runtime.roi_shape(),
+                        roi.origin_zyx(),
+                        roi.shape_zyx()
+                    ));
+                }
+                Ok(())
+            }
+            ProductAutomationAssertCondition::DistanceCommitted => {
+                let Some(ViewerToolOverlay::Distance(measurement)) =
+                    app.egui_ui.viewer_tools.overlay().copied()
+                else {
+                    return Err("the viewer has no distance-measurement overlay".to_owned());
+                };
+                if measurement.phase() != ViewerOverlayPhase::Committed {
+                    return Err("the distance-measurement overlay is still a preview".to_owned());
+                }
+                if !measurement.distance_micrometers().is_finite()
+                    || measurement.distance_micrometers() <= 0.0
+                {
+                    return Err(format!(
+                        "the committed distance is not positive and finite: {}",
+                        measurement.distance_micrometers()
+                    ));
+                }
+                Ok(())
             }
             ProductAutomationAssertCondition::ViewerLayout { layout } => {
                 let expected: ViewerLayout = (*layout).into();
@@ -1802,6 +4057,11 @@ impl ProductAutomationController {
                 "projection": format!("{:?}", view.camera().projection()),
                 "backend": format!("{:?}", app.render_coordination.frame_fidelity.backend),
                 "adapter": app.startup_diagnostics.gpu_adapter.clone(),
+                "native_surface_configuration_contract": {
+                    "present_mode": "Fifo",
+                    "desired_maximum_frame_latency": 1,
+                    "evidence_scope": "configured_product_contract_not_queried_compositor_observation",
+                },
                 "last_error": typed_render_error,
                 "gpu_display_frame_present": product_presentation(app, PanelId::ThreeD).is_some(),
                 "frame_fidelity": {
@@ -1817,13 +4077,51 @@ impl ProductAutomationController {
                     "current_partial_frames_presented": product.current_partial_frames_presented,
                     "partial_to_settled_transitions": product.partial_to_settled_transitions,
                     "stale_frames_rejected": product.stale_frames_rejected,
+                    "last_3d_cpu_timing": product.targets.get(&PanelId::ThreeD).and_then(|target| {
+                        target.last_execution_timing.and_then(|execution| execution.cpu.map(|timing| json!({
+                            "frame": execution.frame.get(),
+                            "planning_ns": timing.planning_ns(),
+                            "queue_submit_ns": timing.queue_submit_ns(),
+                        })))
+                    }),
+                    "presented_frame_intervals": {
+                        "enabled": product.presented_frame_interval_timing_enabled(),
+                        "measurement_scope": "per_visible_panel_app_frame_publication_interval_not_os_compositor_present",
+                        "capacity": 256,
+                        "total_publications": product.total_presented_frame_publications(),
+                        "dropped_samples": product.dropped_presented_frame_interval_samples(),
+                        "samples": product.presented_frame_interval_samples().iter().map(|sample| json!({
+                            "sequence": sample.sequence,
+                            "panel": sample.panel.label(),
+                            "frame": sample.frame.get(),
+                            "interval_ns": sample.interval_ns,
+                            "cpu_planning_ns": sample.cpu_planning_ns,
+                            "cpu_queue_submit_ns": sample.cpu_queue_submit_ns,
+                            "gpu_execution_id": sample.gpu_execution.map(|execution| execution.execution_id),
+                            "gpu_target": sample.gpu_execution.map(|execution| execution.target.get()),
+                            "gpu_generation": sample.gpu_execution.map(|execution| execution.display_generation),
+                            "gpu_renderer_frame": sample.gpu_execution.map(|execution| execution.renderer_frame.get()),
+                            "gpu_pass_kind": sample.gpu_execution.map(|execution| format!("{:?}", execution.pass_kind)),
+                            "gpu_timing_complete": sample.gpu_timing.is_some(),
+                            "gpu_batch_envelope_ns": sample.gpu_timing.and_then(|timing| timing.batch_gpu_envelope_ns),
+                            "gpu_payload_copy_ns": sample.gpu_timing.and_then(|timing| timing.payload_copy_ns),
+                            "gpu_render_pass_ns": sample.gpu_timing.and_then(|timing| timing.render_pass_ns),
+                        })).collect::<Vec<_>>(),
+                    },
                 })),
+                "performance_milestones": display_performance_milestones_json(app),
+                "display_coordination": display_coordination_diagnostics_json(
+                    app,
+                    self.script.requires_diagnostic_counters(),
+                ),
             },
             "dataset_demand": {
                 "current_scale_level": app.dataset.current_scale().get(),
                 "last_plan_error": app.dataset.last_plan_error(),
                 "dispatcher_pending": app.dataset.dispatcher().has_pending_work(),
                 "last_fault": app.dataset.dispatcher().last_fault().map(|fault| fault.to_string()),
+                "planned_scope_accounting": planned_scope_accounting_json(app),
+                "refinement_handoff": refinement_handoff_diagnostics_json(app),
             },
             "dataset_runtime": app
                 .dataset
@@ -1831,6 +4129,11 @@ impl ProductAutomationController {
                 .diagnostics()
                 .ok()
                 .map(dataset_runtime_diagnostics_json),
+            "dataset_source_io": app
+                .dataset
+                .local_source_diagnostics()
+                .map(local_dataset_source_diagnostics_json),
+            "source_verification": source_verification_diagnostics_json(app),
             "retained_leases": retained_leases_diagnostics_json(app),
             "cross_section": cross_section_diagnostics_json(app),
             "gpu_adapter": app
@@ -1839,6 +4142,12 @@ impl ProductAutomationController {
                 .map(|product| gpu_adapter_diagnostics_json(product.renderer.diagnostics())),
             "camera": {
                 "projection": format!("{:?}", view.camera().projection()),
+                "canonical_source": "ApplicationSnapshot_ViewState_camera",
+                "target_world": view.camera().target().components(),
+                "orientation_xyzw": view.camera().orientation().xyzw(),
+                "orthographic_world_per_screen_point": view.camera().orthographic_world_per_screen_point(),
+                "perspective_focal_length_screen_points": view.camera().perspective_focal_length_screen_points(),
+                "perspective_view_distance_world": view.camera().perspective_view_distance_world(),
                 "viewport": {
                     "width": app.render_coordination.render_viewport.width_pixels(),
                     "height": app.render_coordination.render_viewport.height_pixels(),
@@ -1898,6 +4207,24 @@ impl ProductAutomationController {
             .requested_mapped_client_pixels
             .map(|(width, height)| json!({ "width": width, "height": height }))
             .unwrap_or(Value::Null);
+        let finished_process_cpu_time_ns = checked_process_cpu_time_ns();
+        let process_cpu_time = match (
+            self.started_process_cpu_time_ns,
+            finished_process_cpu_time_ns,
+        ) {
+            (Some(started_ns), Some(finished_ns)) => json!({
+                "available": true,
+                "clock": "CLOCK_PROCESS_CPUTIME_ID",
+                "started_ns": started_ns,
+                "finished_ns": finished_ns,
+                "elapsed_ns": finished_ns.saturating_sub(started_ns),
+            }),
+            _ => json!({
+                "available": false,
+                "clock": "CLOCK_PROCESS_CPUTIME_ID",
+                "error": "clock_value_was_negative_or_not_representable_as_u64_nanoseconds",
+            }),
+        };
         let report = json!({
             "schema": AUTOMATION_REPORT_SCHEMA,
             "schema_version": AUTOMATION_SCHEMA_VERSION,
@@ -1912,6 +4239,7 @@ impl ProductAutomationController {
             "started_at_epoch_ms": self.started_at_epoch_ms,
             "finished_at_epoch_ms": epoch_ms(),
             "duration_ms": duration_ms(self.started_at.elapsed()),
+            "process_cpu_time": process_cpu_time,
             "binary": env::current_exe().ok().map(|path| path.display().to_string()),
             "build_provenance": t5_build_provenance_json(),
             "script": {
@@ -1921,6 +4249,7 @@ impl ProductAutomationController {
                 "scenario": self.script.scenario.clone(),
                 "command_count": self.script.commands.len(),
             },
+            "startup_bootstrap": &self.startup_bootstrap_evidence,
             "limits": self.script.limits,
             "limit_observations": self.limit_observations.json(),
             "dataset": {
@@ -2009,6 +4338,10 @@ fn t5_build_provenance_json() -> Value {
         "profile": option_env!("MIRANTE4D_T5_BUILD_PROFILE"),
         "compiler": option_env!("MIRANTE4D_T5_BUILD_COMPILER"),
         "target_mode": option_env!("MIRANTE4D_T5_BUILD_TARGET_MODE"),
+        "opt_level": option_env!("MIRANTE4D_VIEWER_BUILD_OPT_LEVEL"),
+        "debug": option_env!("MIRANTE4D_VIEWER_BUILD_DEBUG"),
+        "custom_rustflags": option_env!("MIRANTE4D_VIEWER_BUILD_CUSTOM_RUSTFLAGS"),
+        "rustc_wrapper": option_env!("MIRANTE4D_VIEWER_BUILD_RUSTC_WRAPPER"),
     })
 }
 
@@ -2187,12 +4520,16 @@ fn import_stage_evidence_name(stage: mirante4d_import_pipeline::ImportStage) -> 
     }
 }
 
-fn process_cpu_time_ns() -> u64 {
+fn checked_process_cpu_time_ns() -> Option<u64> {
     let time = clock_gettime(ClockId::ProcessCPUTime);
     u64::try_from(time.tv_sec)
-        .unwrap_or(0)
-        .saturating_mul(1_000_000_000)
-        .saturating_add(u64::try_from(time.tv_nsec).unwrap_or(0))
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(time.tv_nsec).ok()?)
+}
+
+fn process_cpu_time_ns() -> u64 {
+    checked_process_cpu_time_ns().unwrap_or(u64::MAX)
 }
 
 fn active_lease_cohort_status(
@@ -2224,11 +4561,15 @@ fn lease_cohort_status_json(status: crate::retained_leases::RetainedLeaseStatus)
 
 fn retained_leases_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
     let bridge = app.dataset.retained_leases();
+    let gpu_only = app.dataset.gpu_only_display_payloads();
+    let unavailable = bridge.missing_len().saturating_sub(gpu_only);
     json!({
         "required": bridge.required_len(),
         "retained": bridge.retained_len(),
-        "missing": bridge.missing_len(),
-        "complete": bridge.is_complete(),
+        "cpu_absent": bridge.missing_len(),
+        "gpu_only_display": gpu_only,
+        "unavailable": unavailable,
+        "complete_cpu_or_gpu": bridge.required_len() != 0 && unavailable == 0,
         "active_cohort": active_lease_cohort_status(app).map(lease_cohort_status_json),
     })
 }
@@ -2340,16 +4681,752 @@ fn assert_cross_section_retired(app: &MiranteWorkbenchApp) -> Result<(), String>
     Ok(())
 }
 
+fn timing_samples_json(samples: &mirante4d_application::DisplayTimingSamples) -> Value {
+    let mut retained = (0..samples.retained_count())
+        .filter_map(|index| samples.sample(index))
+        .collect::<Vec<_>>();
+    retained.sort_unstable();
+    let p95_ns = (!retained.is_empty()).then(|| {
+        let rank = retained.len().saturating_mul(95).div_ceil(100);
+        retained[rank.saturating_sub(1)]
+    });
+    json!({
+        "capacity": mirante4d_application::DISPLAY_TIMING_SAMPLE_CAPACITY,
+        "total_count": samples.total_count(),
+        "retained_count": samples.retained_count(),
+        "overwritten_count": samples.overwritten_count(),
+        "maximum_ns": samples.maximum_ns(),
+        "p95_ns": p95_ns,
+        "retained_samples_ns_oldest_first": (0..samples.retained_count())
+            .filter_map(|index| samples.sample(index))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn display_performance_milestones_json(app: &MiranteWorkbenchApp) -> Value {
+    let milestones = &app.display_performance_milestones;
+    let snapshot = app.application.snapshot();
+    let visible_slots: &[PresentationSlot] = match application_view(&snapshot).layout() {
+        ViewerLayout::Single3d => &[PresentationSlot::ThreeD],
+        ViewerLayout::FourPanel => &PresentationSlot::ALL,
+    };
+    let visible_panels = visible_slots
+        .iter()
+        .copied()
+        .map(|slot| {
+            let panel = milestones.panel(slot);
+            json!({
+                "panel": PanelId::from_presentation_slot(slot).label(),
+                "first_current_presented_ms": panel.first_current_presented_ms(),
+                "first_useful_frame_ms": panel.first_useful_frame_ms(),
+                "complete_coarse_ms": panel.complete_coarse_ms(),
+                "complete_replacement_ms": panel.complete_replacement_ms(),
+                "target_settled_ms": panel.target_settled_ms(),
+                "visible_layer_overflow": panel.visible_layer_overflow(),
+                "visible_layers": panel
+                    .visible_layers()
+                    .iter()
+                    .filter_map(|layer| {
+                        layer.layer_ordinal().map(|layer_ordinal| json!({
+                            "layer_ordinal": layer_ordinal,
+                            "first_current_presented_ms": layer.first_current_presented_ms(),
+                            "first_useful_frame_ms": layer.first_useful_frame_ms(),
+                            "complete_coarse_ms": layer.complete_coarse_ms(),
+                            "complete_replacement_ms": layer.complete_replacement_ms(),
+                            "target_settled_ms": layer.target_settled_ms(),
+                        }))
+                    })
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "scope": "coordinated_visible_layout",
+        "input_generation": milestones.generation(),
+        "first_current_presented_ms": milestones.first_current_presented_ms(),
+        "first_useful_frame_ms": milestones.first_useful_frame_ms(),
+        "complete_coarse_ms": milestones.complete_coarse_ms(),
+        "complete_replacement_ms": milestones.complete_replacement_ms(),
+        "target_settled_ms": milestones.target_settled_ms(),
+        "visible_panels": visible_panels,
+        "three_d_panel_only": {
+            "first_useful_frame_ms": milestones.three_d_first_useful_frame_ms(),
+            "complete_coarse_ms": milestones.three_d_complete_coarse_ms(),
+            "complete_replacement_ms": milestones.three_d_complete_replacement_ms(),
+            "target_settled_ms": milestones.three_d_target_settled_ms(),
+        },
+    })
+}
+
+fn planned_scope_accounting_json(app: &MiranteWorkbenchApp) -> Value {
+    let planner = app.camera_demand_planner.diagnostics();
+    let scopes = app
+        .prepared_scope_render_plans
+        .iter()
+        .map(|(scope, plan)| {
+            let label = match *scope {
+                crate::dataset_requests::SCOPE_CURRENT_3D => "current_3d",
+                crate::dataset_requests::SCOPE_CURRENT_3D_REFINEMENT => "current_3d_refinement",
+                crate::dataset_requests::SCOPE_CROSS_SECTION_XY => "cross_section_xy",
+                crate::dataset_requests::SCOPE_CROSS_SECTION_XZ => "cross_section_xz",
+                crate::dataset_requests::SCOPE_CROSS_SECTION_YZ => "cross_section_yz",
+                _ => "other",
+            };
+            json!({
+                "scope": scope,
+                "label": label,
+                "planned_payload_bytes": plan.planned_payload_bytes,
+                "primary_resource_count": plan.primary_resource_count,
+                "total_requirements": plan.requirements.body().canonical().len(),
+                "payload_fact": "exact_semantic_planned_payload_for_this_requirement_body",
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "last_planner_candidates_visited": app.last_visible_demand_candidates_visited,
+        "full_demand_traversals": planner.completed,
+        "planner_candidate_visits": planner.completed_candidates_visited,
+        "ui_thread_candidate_visits": planner.ui_thread_candidates_visited,
+        // Camera-demand submission and result polling are bounded slot/atomic
+        // operations. The UI path has no blocking wait primitive; keep this
+        // explicit zero fact beside the traversals it qualifies.
+        "ui_wait_for_demand_preparation_count": 0_u64,
+        "demand_work": planner.submitted,
+        "scopes": scopes,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefinementHandoffPhase {
+    Inactive,
+    AwaitingHiddenTargetRegistration,
+    AwaitingHiddenTargetRequest,
+    HiddenTargetStreaming,
+    HiddenTargetPresented,
+}
+
+impl RefinementHandoffPhase {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Inactive => "inactive",
+            Self::AwaitingHiddenTargetRegistration => "awaiting_hidden_target_registration",
+            Self::AwaitingHiddenTargetRequest => "awaiting_hidden_target_request",
+            Self::HiddenTargetStreaming => "hidden_target_streaming",
+            Self::HiddenTargetPresented => "hidden_target_presented",
+        }
+    }
+}
+
+const fn refinement_handoff_phase(
+    staged_plan_installed: bool,
+    hidden_target_registered: bool,
+    hidden_target_request_bound: bool,
+    hidden_presentation_matches_request: bool,
+) -> RefinementHandoffPhase {
+    if !staged_plan_installed {
+        RefinementHandoffPhase::Inactive
+    } else if !hidden_target_registered {
+        RefinementHandoffPhase::AwaitingHiddenTargetRegistration
+    } else if !hidden_target_request_bound {
+        RefinementHandoffPhase::AwaitingHiddenTargetRequest
+    } else if !hidden_presentation_matches_request {
+        RefinementHandoffPhase::HiddenTargetStreaming
+    } else {
+        RefinementHandoffPhase::HiddenTargetPresented
+    }
+}
+
+fn refinement_handoff_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
+    let staged_plan_installed = app.dataset.staging_current_refinement();
+    let hidden_target = app
+        .native_presentation
+        .product_gpu
+        .as_ref()
+        .and_then(|product| product.staging_3d.as_ref());
+    let hidden_request = hidden_target.and_then(|target| target.request.as_ref());
+    let hidden_presentation_matches_request =
+        hidden_target
+            .zip(hidden_request)
+            .is_some_and(|(target, request)| {
+                target.presented.as_ref().is_some_and(|frame| {
+                    frame.frame() == request.intent.frame()
+                        && frame.extent() == request.intent.extent()
+                })
+            });
+    let phase = refinement_handoff_phase(
+        staged_plan_installed,
+        hidden_target.is_some(),
+        hidden_request.is_some(),
+        hidden_presentation_matches_request,
+    );
+    let visible = app
+        .native_presentation
+        .product_gpu
+        .as_ref()
+        .and_then(|product| product.targets.get(&PanelId::ThreeD));
+    json!({
+        "phase": phase.name(),
+        "staged_plan_installed": staged_plan_installed,
+        "holding_previous_presentation": app.dataset.holding_previous_presentation(),
+        "refinement_scope_requirement_count": app
+            .dataset
+            .scope_requirements(crate::dataset_requests::SCOPE_CURRENT_3D_REFINEMENT)
+            .len(),
+        "refinement_scope_required_prefix_len": app
+            .dataset
+            .scope_required_prefix_len(crate::dataset_requests::SCOPE_CURRENT_3D_REFINEMENT),
+        "prepared_refinement_render_plan_installed": app
+            .prepared_scope_render_plans
+            .contains_key(&crate::dataset_requests::SCOPE_CURRENT_3D_REFINEMENT),
+        "pending_visible_demand_install": app.pending_visible_demand_plan.is_some(),
+        "camera_demand_planner_active": app.camera_demand_planner.has_outstanding_request(),
+        "hidden_target_registered": hidden_target.is_some(),
+        "hidden_target_request_bound": hidden_request.is_some(),
+        "hidden_target_request_requirement_count": hidden_request
+            .map(|request| request.requirements.resource_keys().len()),
+        "hidden_target_satisfied_requirement_count": hidden_target
+            .map(|target| target.satisfied_requirement_keys.len()),
+        "hidden_target_last_renderer_available_resources": hidden_target
+            .map(|target| target.last_renderer_available_resources),
+        "hidden_target_presentation_matches_request": hidden_presentation_matches_request,
+        "hidden_target_last_execution_present": hidden_target
+            .is_some_and(|target| target.last_execution_timing.is_some()),
+        "progressive_probe_can_evaluate_hidden_target": hidden_request.is_some(),
+        "visible_3d_presentation_completeness": visible
+            .and_then(|target| target.presented.as_ref())
+            .map(|frame| format!("{:?}", frame.progress().completeness())),
+    })
+}
+
+fn source_verification_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
+    let snapshot = app.application.snapshot();
+    let state = match snapshot.source() {
+        SourceVerificationSnapshot::Required => "Required",
+        SourceVerificationSnapshot::Verifying { .. } => "Verifying",
+        SourceVerificationSnapshot::Verified(_) => "Verified",
+    };
+    let Some(service) = app.source_verification_service.as_ref() else {
+        return json!({
+            "state": state,
+            "active_operation": false,
+            "service": Value::Null,
+        });
+    };
+    let diagnostics = service.diagnostics();
+    json!({
+        "state": state,
+        "active_operation": service.active_token().is_some(),
+        "service": {
+            "started_runs": diagnostics.started_runs,
+            "accepted_progress_updates": diagnostics.accepted_progress_updates,
+            "cancelled_runs": diagnostics.cancelled_runs,
+            "failed_runs": diagnostics.failed_runs,
+            "accepted_successes": diagnostics.accepted_successes,
+            "completed_reader_runs": diagnostics.completed_reader_runs,
+            "completed_reader_scope": "completed_separate_strict_verification_readers",
+            "completed_reader_counters_include_only_completed_runs": true,
+            "completed_reader_operations": diagnostics.reader.physical_range_read_operations,
+            "completed_reader_bytes": diagnostics.reader.physical_encoded_bytes_read,
+            "completed_codec_decodes": diagnostics.reader.codec_decode_operations,
+            "completed_reader": local_package_read_diagnostics_json(diagnostics.reader),
+        },
+    })
+}
+
+struct DiagnosticResourceUnion {
+    entries: Vec<(DatasetResourceKey, u64)>,
+    unique_payload_bytes: u64,
+    summed_scope_payload_bytes: u64,
+    working_peak_heap_bytes: u64,
+    working_peak_key_records: usize,
+}
+
+struct LabeledDiagnosticResourceUnion {
+    label: String,
+    entries: Vec<(DatasetResourceKey, u64)>,
+    gpu_resident_entries: Vec<(DatasetResourceKey, u64)>,
+}
+
+fn diagnostic_vec_heap_bytes<T>(capacity: usize) -> Result<u64, String> {
+    let bytes = capacity
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| "diagnostic union allocation size overflowed usize".to_owned())?;
+    u64::try_from(bytes).map_err(|_| "diagnostic union allocation size does not fit u64".to_owned())
+}
+
+fn is_viewer_display_scope(scope: u64) -> bool {
+    matches!(
+        scope,
+        crate::dataset_requests::SCOPE_CURRENT_3D
+            | crate::dataset_requests::SCOPE_CURRENT_3D_REFINEMENT
+            | crate::dataset_requests::SCOPE_CROSS_SECTION_XY
+            | crate::dataset_requests::SCOPE_CROSS_SECTION_XZ
+            | crate::dataset_requests::SCOPE_CROSS_SECTION_YZ
+    )
+}
+
+fn build_diagnostic_resource_union(
+    app: &MiranteWorkbenchApp,
+) -> Result<DiagnosticResourceUnion, String> {
+    let total_scope_keys = app
+        .prepared_scope_render_plans
+        .iter()
+        .filter(|(scope, _)| is_viewer_display_scope(**scope))
+        .try_fold(0_usize, |total, (_, plan)| {
+            total
+                .checked_add(plan.requirements.body().canonical().len())
+                .ok_or_else(|| "diagnostic scope-key count overflowed usize".to_owned())
+        })?;
+    let mut keys = Vec::new();
+    keys.try_reserve_exact(total_scope_keys)
+        .map_err(|error| format!("diagnostic scope-key allocation failed: {error}"))?;
+    for (_, plan) in app
+        .prepared_scope_render_plans
+        .iter()
+        .filter(|(scope, _)| is_viewer_display_scope(**scope))
+    {
+        keys.extend(plan.requirements.body().canonical().iter().copied());
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    let unique_key_count = keys.len();
+    let key_working_bytes = diagnostic_vec_heap_bytes::<DatasetResourceKey>(keys.capacity())?;
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(unique_key_count)
+        .map_err(|error| format!("diagnostic key-byte allocation failed: {error}"))?;
+    let snapshot = app.application.snapshot();
+    let mut unique_payload_bytes = 0_u64;
+    for key in keys.iter().copied() {
+        let byte_len = snapshot
+            .catalog()
+            .resource_payload_descriptor(key)
+            .map_err(|error| {
+                format!("diagnostic payload derivation failed for a prepared resource: {error}")
+            })?
+            .byte_len();
+        unique_payload_bytes = unique_payload_bytes
+            .checked_add(byte_len)
+            .ok_or_else(|| "diagnostic unique payload-byte sum overflowed u64".to_owned())?;
+        entries.push((key, byte_len));
+    }
+    let entry_bytes = diagnostic_vec_heap_bytes::<(DatasetResourceKey, u64)>(entries.capacity())?;
+    let summed_scope_payload_bytes = app
+        .prepared_scope_render_plans
+        .iter()
+        .filter(|(scope, _)| is_viewer_display_scope(**scope))
+        .try_fold(0_u64, |total, (_, plan)| {
+            total
+                .checked_add(plan.planned_payload_bytes)
+                .ok_or_else(|| "diagnostic scope payload-byte sum overflowed u64".to_owned())
+        })?;
+    let working_peak_key_records = keys.capacity().saturating_add(entries.capacity());
+    Ok(DiagnosticResourceUnion {
+        entries,
+        unique_payload_bytes,
+        summed_scope_payload_bytes,
+        working_peak_heap_bytes: key_working_bytes.saturating_add(entry_bytes),
+        working_peak_key_records,
+    })
+}
+
+fn build_diagnostic_gpu_resident_union(
+    app: &MiranteWorkbenchApp,
+) -> Result<DiagnosticResourceUnion, String> {
+    let renderer = app
+        .native_presentation
+        .product_gpu
+        .as_ref()
+        .ok_or_else(|| "product GPU runtime is unavailable".to_owned())?;
+    let resident_keys = renderer.renderer.resident_keys();
+    let resident_count = resident_keys.len();
+    let mut keys = Vec::new();
+    keys.try_reserve_exact(resident_count)
+        .map_err(|error| format!("diagnostic GPU-resident key allocation failed: {error}"))?;
+    keys.extend(resident_keys);
+    debug_assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+    let key_working_bytes = diagnostic_vec_heap_bytes::<DatasetResourceKey>(keys.capacity())?;
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(keys.len())
+        .map_err(|error| format!("diagnostic GPU-resident entry allocation failed: {error}"))?;
+    let snapshot = app.application.snapshot();
+    let mut unique_payload_bytes = 0_u64;
+    for key in keys.iter().copied() {
+        let byte_len = snapshot
+            .catalog()
+            .resource_payload_descriptor(key)
+            .map_err(|error| {
+                format!("GPU residency contains a key outside the current dataset catalog: {error}")
+            })?
+            .byte_len();
+        unique_payload_bytes = unique_payload_bytes
+            .checked_add(byte_len)
+            .ok_or_else(|| "diagnostic GPU-resident payload sum overflowed u64".to_owned())?;
+        entries.push((key, byte_len));
+    }
+    let entry_bytes = diagnostic_vec_heap_bytes::<(DatasetResourceKey, u64)>(entries.capacity())?;
+    let working_peak_key_records = keys.capacity().saturating_add(entries.capacity());
+    Ok(DiagnosticResourceUnion {
+        entries,
+        unique_payload_bytes,
+        summed_scope_payload_bytes: unique_payload_bytes,
+        working_peak_heap_bytes: key_working_bytes.saturating_add(entry_bytes),
+        working_peak_key_records,
+    })
+}
+
+fn target_residency_partition_json(
+    phase_start_label: &str,
+    phase_start_resident: &[(DatasetResourceKey, u64)],
+    target: &[(DatasetResourceKey, u64)],
+) -> Value {
+    let mut resident_index = 0_usize;
+    let mut intersection_hasher = CanonicalDatasetResourceUnionHasher::new();
+    let mut difference_hasher = CanonicalDatasetResourceUnionHasher::new();
+    let (mut intersection_keys, mut intersection_bytes) = (0_u64, 0_u64);
+    let (mut difference_keys, mut difference_bytes) = (0_u64, 0_u64);
+    for (target_key, target_bytes) in target.iter().copied() {
+        while phase_start_resident
+            .get(resident_index)
+            .is_some_and(|(resident_key, _)| resident_key < &target_key)
+        {
+            resident_index += 1;
+        }
+        if let Some((resident_key, resident_bytes)) = phase_start_resident.get(resident_index)
+            && *resident_key == target_key
+        {
+            debug_assert_eq!(*resident_bytes, target_bytes);
+            intersection_keys = intersection_keys.saturating_add(1);
+            intersection_bytes = intersection_bytes.saturating_add(target_bytes);
+            intersection_hasher.push(target_key, target_bytes);
+        } else {
+            difference_keys = difference_keys.saturating_add(1);
+            difference_bytes = difference_bytes.saturating_add(target_bytes);
+            difference_hasher.push(target_key, target_bytes);
+        }
+    }
+    json!({
+        "available": true,
+        "phase_start_label": phase_start_label,
+        "phase_start_resident_union_sha256": canonical_resource_union_sha256(phase_start_resident).to_string(),
+        "target_union_sha256": canonical_resource_union_sha256(target).to_string(),
+        "resident_target_intersection": {
+            "canonical_entries_sha256": intersection_hasher.finalize().to_string(),
+            "unique_keys": intersection_keys,
+            "unique_payload_bytes": intersection_bytes,
+        },
+        "nonresident_target_difference": {
+            "canonical_entries_sha256": difference_hasher.finalize().to_string(),
+            "unique_keys": difference_keys,
+            "unique_payload_bytes": difference_bytes,
+        },
+        "partitions_pairwise_disjoint": true,
+        "target_union_reconciles": intersection_keys.saturating_add(difference_keys)
+            == u64::try_from(target.len()).unwrap_or(u64::MAX),
+        "derivation": "sorted_target_union_partition_by_phase_start_gpu_residency",
+    })
+}
+
+fn diagnostic_resource_union_delta(
+    previous_label: &str,
+    previous: &[(DatasetResourceKey, u64)],
+    current_label: &str,
+    current: &[(DatasetResourceKey, u64)],
+) -> Value {
+    let (mut previous_index, mut current_index) = (0_usize, 0_usize);
+    let (mut retained_count, mut retained_bytes) = (0_u64, 0_u64);
+    let (mut added_count, mut added_bytes) = (0_u64, 0_u64);
+    let (mut removed_count, mut removed_bytes) = (0_u64, 0_u64);
+    let mut retained_hasher = CanonicalDatasetResourceUnionHasher::new();
+    let mut added_hasher = CanonicalDatasetResourceUnionHasher::new();
+    let mut removed_hasher = CanonicalDatasetResourceUnionHasher::new();
+    let mut retained_payload_bytes_match = true;
+    while previous_index < previous.len() || current_index < current.len() {
+        match (previous.get(previous_index), current.get(current_index)) {
+            (Some((previous_key, previous_bytes)), Some((current_key, current_bytes))) => {
+                match previous_key.cmp(current_key) {
+                    std::cmp::Ordering::Equal => {
+                        retained_payload_bytes_match &= previous_bytes == current_bytes;
+                        retained_count = retained_count.saturating_add(1);
+                        retained_bytes = retained_bytes.saturating_add(*current_bytes);
+                        retained_hasher.push(*current_key, *current_bytes);
+                        previous_index += 1;
+                        current_index += 1;
+                    }
+                    std::cmp::Ordering::Less => {
+                        removed_count = removed_count.saturating_add(1);
+                        removed_bytes = removed_bytes.saturating_add(*previous_bytes);
+                        removed_hasher.push(*previous_key, *previous_bytes);
+                        previous_index += 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        added_count = added_count.saturating_add(1);
+                        added_bytes = added_bytes.saturating_add(*current_bytes);
+                        added_hasher.push(*current_key, *current_bytes);
+                        current_index += 1;
+                    }
+                }
+            }
+            (Some((previous_key, previous_bytes)), None) => {
+                removed_count = removed_count.saturating_add(1);
+                removed_bytes = removed_bytes.saturating_add(*previous_bytes);
+                removed_hasher.push(*previous_key, *previous_bytes);
+                previous_index += 1;
+            }
+            (None, Some((current_key, current_bytes))) => {
+                added_count = added_count.saturating_add(1);
+                added_bytes = added_bytes.saturating_add(*current_bytes);
+                added_hasher.push(*current_key, *current_bytes);
+                current_index += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    json!({
+        "previous_label": previous_label,
+        "previous_union_sha256": canonical_resource_union_sha256(previous).to_string(),
+        "current_label": current_label,
+        "current_union_sha256": canonical_resource_union_sha256(current).to_string(),
+        "retained_unique_keys": retained_count,
+        "retained_unique_payload_bytes": retained_bytes,
+        "retained_entries_sha256": retained_hasher.finalize().to_string(),
+        "added_unique_keys": added_count,
+        "added_unique_payload_bytes": added_bytes,
+        "added_entries_sha256": added_hasher.finalize().to_string(),
+        "removed_unique_keys": removed_count,
+        "removed_unique_payload_bytes": removed_bytes,
+        "removed_entries_sha256": removed_hasher.finalize().to_string(),
+        "retained_payload_bytes_match": retained_payload_bytes_match,
+        "partitions_pairwise_disjoint": true,
+        "partition_derivation": "sorted_DatasetResourceKey_payload_descriptor_three_way_merge",
+    })
+}
+
+fn display_coordination_diagnostics_json(
+    app: &MiranteWorkbenchApp,
+    detailed_counters_enabled: bool,
+) -> Value {
+    let generation = app.render_coordination.display_generation();
+    let detailed = app.render_coordination.display_diagnostic_counters();
+    let targets = app
+        .native_presentation
+        .product_gpu
+        .as_ref()
+        .map(|product| {
+            product
+                .targets
+                .iter()
+                .map(|(panel, target)| product_target_renderer_facts_json(panel.label(), target))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let staging_3d_renderer_facts = app
+        .native_presentation
+        .product_gpu
+        .as_ref()
+        .and_then(|product| product.staging_3d.as_ref())
+        .map(|target| {
+            let mut facts = product_target_renderer_facts_json("3D", target);
+            facts["purpose"] = Value::String("hidden_staging_3d_fallback_target".to_owned());
+            facts
+        });
+    let aggregate_target_counters = app
+        .native_presentation
+        .product_gpu
+        .as_ref()
+        .map(|product| {
+            aggregate_product_target_diagnostic_counters(
+                product
+                    .targets
+                    .values()
+                    .chain(product.staging_3d.iter())
+                    .map(|target| target.diagnostic_counters),
+            )
+        })
+        .unwrap_or_default();
+    let planner = app.camera_demand_planner.diagnostics();
+    json!({
+        "instrumentation_epoch": "app_private_monotonic_epoch",
+        "input_generation": generation.input_generation,
+        "current_presentation_generation": generation.current_presentation_generation,
+        "presentation_generation_gap": generation.presentation_generation_gap(),
+        "main_loop_heartbeat": generation.main_loop_heartbeat,
+        "heartbeat_at_input_generation": generation.heartbeat_at_input_generation,
+        "heartbeat_at_current_presentation": generation.heartbeat_at_current_presentation,
+        "current_presentation_gap_heartbeats": generation.current_presentation_gap_heartbeats,
+        "maximum_presentation_gap_heartbeats": generation.maximum_presentation_gap_heartbeats,
+        "input_generation_at_ns": generation.input_generation_at_ns,
+        "current_presentation_at_ns": generation.current_presentation_at_ns,
+        "current_presentation_gap_ns": generation.current_presentation_gap_ns,
+        "maximum_presentation_gap_ns": generation.maximum_presentation_gap_ns,
+        "active_input_main_loop_gap_ns": {
+            "current": generation.current_main_loop_heartbeat_gap_ns,
+            "maximum": generation.maximum_main_loop_heartbeat_gap_ns,
+            "samples": timing_samples_json(
+                app.render_coordination.active_main_loop_gap_samples(),
+            ),
+            "qualification_scope": "only_while_newest_input_not_current",
+        },
+        "active_input_presentation_gap_ns": {
+            "current": generation.current_presentation_gap_ns,
+            "maximum": generation.maximum_presentation_gap_ns,
+            "samples": timing_samples_json(
+                app.render_coordination.active_presentation_gap_samples(),
+            ),
+            "qualification_scope": "only_while_newest_input_not_current",
+        },
+        "raw_main_loop_gap_ns": {
+            "current": generation.raw_current_main_loop_heartbeat_gap_ns,
+            "maximum": generation.raw_maximum_main_loop_heartbeat_gap_ns,
+            "qualification_scope": "includes_settled_event_driven_idle",
+        },
+        "durable_gesture_commits": generation.durable_gesture_commits,
+        "admitted_generation_latency": timing_samples_json(
+            app.render_coordination.presentation_latency_samples(),
+        ),
+        "semantic_interaction_task_duration": {
+            "ownership": "SetCamera_or_SetLayout_application_dispatch_reconciliation_and_service_pump_attribution_only",
+            "claim_bearing_2ms_gate": false,
+            "whole_idle_frame_included": false,
+            "samples": timing_samples_json(
+                app.render_coordination.interaction_task_duration_samples(),
+            ),
+        },
+        "active_ui_update_duration": {
+            "ownership": "eframe_App_ui_callback_when_input_or_loading_work_is_active_minus_exact_sequential_qualification_diagnostic_interval",
+            "excludes": "compositor_present_and_vsync_outside_callback_and_sample_diagnostics_or_copy_diagnostics_evidence_production",
+            "claim_bearing_2ms_gate": true,
+            "settled_event_driven_idle_updates_included": false,
+            "qualification_only_automation_overhead_excluded": true,
+            "qualification_only_automation_commands_excluded": ["sample_diagnostics", "copy_diagnostics"],
+            "subtraction_method": "saturating_subtract_exact_monotonic_elapsed_interval_from_enclosing_ui_callback",
+            "samples": timing_samples_json(
+                app.render_coordination.active_ui_update_duration_samples(),
+            ),
+        },
+        "coordinated_visible_layout_current_complete": coordinated_visible_layout_current_complete(app),
+        "detailed_counters": detailed_counters_enabled.then(|| json!({
+            "enabled": detailed.enabled,
+            "raw_input_samples": detailed.raw_input_samples,
+            "admitted_input_generations": detailed.admitted_input_generations,
+            "coalesced_input_samples": detailed.coalesced_input_samples,
+            "superseded_input_generations": detailed.superseded_input_generations,
+            "current_presentations": detailed.current_presentations,
+            "pending_display_batches_peak": {
+                "available": false,
+                "reason": "no_display_batch_coordinator",
+            },
+            "display_batch_ownership": "synchronous_ui_thread_encode_submit_no_replaceable_queue",
+            "color_passes": aggregate_target_counters.color_passes,
+            "completion_notifications": aggregate_target_counters.completion_notifications,
+            "encoded_display_batches": aggregate_target_counters.encoded_display_batches,
+            "encoded_but_dropped_batches": 0_u64,
+            "sealed_obsolete_submitted_batches": 0_u64,
+            "renderer_static_preparations": planner.renderer_static_preparations,
+            "per_target_renderer_facts": targets,
+            "staging_3d_renderer_facts": staging_3d_renderer_facts,
+        })),
+        "os_input_injected": false,
+        "os_input_claimed": false,
+    })
+}
+
+fn product_target_renderer_facts_json(
+    panel: &str,
+    target: &crate::native_presentation::ProductPresentationTarget,
+) -> Value {
+    let request = target.request.as_ref();
+    let progressive_probe = target.progressive_lease_probe_state();
+    let presentation_matches_request = request.is_some_and(|request| {
+        target.presented.as_ref().is_some_and(|frame| {
+            frame.frame() == request.intent.frame() && frame.extent() == request.intent.extent()
+        })
+    });
+    json!({
+        "panel": panel,
+        "request_bound": request.is_some(),
+        "request_frame": request.map(|request| request.intent.frame().get()),
+        "request_timepoint": request.map(|request| request.intent.timepoint().get()),
+        "request_requirement_count": request.map(|request| request.requirements.resource_keys().len()),
+        "target_requirement_count": target.requirement_keys.len(),
+        "target_satisfied_requirement_count": target.satisfied_requirement_keys.len(),
+        "last_renderer_available_resources": target.last_renderer_available_resources,
+        "presentation_present": target.presented.is_some(),
+        "presentation_matches_request": presentation_matches_request,
+        "progressive_probe": {
+            "next_requirement": progressive_probe.next_requirement,
+            "requirements_remaining": progressive_probe.requirements_remaining,
+            "render_requested": progressive_probe.render_requested,
+        },
+        "renderer_calls": target.diagnostic_counters.renderer_calls,
+        "command_buffers": target.diagnostic_counters.command_buffers,
+        "queue_submissions": target.diagnostic_counters.queue_submissions,
+        "backpressure_deferrals": target.diagnostic_counters.backpressure_deferrals,
+        "control_static_rebuilds": target.diagnostic_counters.control_static_rebuilds,
+        "last_execution": target.last_execution_timing.map(|execution| json!({
+            "execution_id": execution.gpu_ticket.map(|ticket| ticket.execution_id()),
+            "target": execution.target.get(),
+            "generation": execution.gpu_ticket.map_or(execution.display_generation, |ticket| ticket.display_generation()),
+            "renderer_frame": execution.frame.get(),
+            "pass_kind": format!("{:?}", execution.pass_kind),
+            "cpu_planning_ns": execution.cpu.map(|timing| timing.planning_ns()),
+            "cpu_control_publication_ns": execution.cpu.and_then(|timing| timing.control_publication_ns()),
+            "cpu_payload_staging_ns": execution.cpu.and_then(|timing| timing.payload_staging_ns()),
+            "cpu_queue_submit_ns": execution.cpu.map(|timing| timing.queue_submit_ns()),
+            "gpu_batch_envelope_ns": execution.gpu.and_then(|timing| timing.batch_gpu_envelope_ns()),
+            "gpu_payload_copy_ns": execution.gpu.and_then(|timing| timing.payload_copy_ns()),
+            "gpu_render_pass_ns": execution.gpu.and_then(|timing| timing.render_pass_ns()),
+            "gpu_timing_available": execution.gpu.is_some(),
+        })),
+    })
+}
+
+fn aggregate_product_target_diagnostic_counters(
+    counters: impl IntoIterator<Item = crate::native_presentation::ProductTargetDiagnosticCounters>,
+) -> crate::native_presentation::ProductTargetDiagnosticCounters {
+    counters.into_iter().fold(
+        crate::native_presentation::ProductTargetDiagnosticCounters::default(),
+        |mut total, counter| {
+            total.color_passes = total.color_passes.saturating_add(counter.color_passes);
+            total.completion_notifications = total
+                .completion_notifications
+                .saturating_add(counter.completion_notifications);
+            total.encoded_display_batches = total
+                .encoded_display_batches
+                .saturating_add(counter.encoded_display_batches);
+            total.control_static_rebuilds = total
+                .control_static_rebuilds
+                .saturating_add(counter.control_static_rebuilds);
+            total
+        },
+    )
+}
+
 fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
     let snapshot = app.application.snapshot();
     let view = application_view(&snapshot);
+    let canonical_cross_section = *view.cross_section();
+    let cross_section_state = CrossSectionViewState::from_canonical(canonical_cross_section);
     let panels = app
         .render_coordination
         .iter()
         .map(|(slot, panel)| {
             let panel_id = PanelId::from_presentation_slot(slot);
+            let canonical_plane = panel_id.cross_section_panel().map(|panel| {
+                let panel_view = cross_section_state.view(panel);
+                json!({
+                    "source": "canonical_linked_cross_section_view",
+                    "plane_origin_world": panel_view.center_world(),
+                    "u_axis_world": panel_view.right_world(),
+                    "v_axis_world": panel_view.down_world(),
+                    "normal_away_world": panel_view.normal_away_world(),
+                    "world_per_screen_point": panel_view.scale_world_per_screen_point(),
+                })
+            });
             json!({
                 "panel_id": panel_id.label(),
+                "canonical_plane_geometry": canonical_plane,
                 "generation": panel.generation(),
                 "displayed_generation": panel.displayed_generation(),
                 "display_current": panel.display_current(),
@@ -2366,6 +5443,18 @@ fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
                     })
                 }),
                 "schedule": panel.cross_section_schedule().map(panel_schedule_json),
+                "layer_presentation_overflow": panel.layer_presentation_overflow().map(|overflow| json!({
+                    "actual": overflow.actual,
+                    "maximum": overflow.maximum,
+                })),
+                "layers": panel.layer_presentations().iter().map(|layer| json!({
+                    "layer_ordinal": layer.layer_ordinal,
+                    "expected_scale_level": layer.expected_scale_level,
+                    "displayed_scale_level": layer.displayed_scale_level,
+                    "available_requirements": layer.available_requirements,
+                    "total_requirements": layer.total_requirements,
+                    "current": layer.current,
+                })).collect::<Vec<_>>(),
                 "display_frame": app
                     .native_presentation
                     .product_gpu
@@ -2396,6 +5485,13 @@ fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
         "schema": "mirante4d-cross-section-panel-diagnostics",
         "schema_version": 1,
         "layout": format!("{:?}", view.layout()),
+        "canonical_linked_view": {
+            "source": "ApplicationSnapshot_ViewState_cross_section",
+            "center_world": canonical_cross_section.center_world().components(),
+            "orientation_xyzw": canonical_cross_section.orientation().xyzw(),
+            "world_per_screen_point": canonical_cross_section.scale_world_per_screen_point(),
+            "depth_world": canonical_cross_section.depth_world(),
+        },
         "active_panel": snapshot
             .transient()
             .active_cross_section_panel()
@@ -2628,14 +5724,22 @@ fn project_state_facts(app: &MiranteWorkbenchApp) -> ProductAutomationProjectSta
 
 fn project_state_json(app: &MiranteWorkbenchApp) -> Value {
     let snapshot = app.application.snapshot();
-    let (current_revision, saved_revision) = match snapshot.workspace() {
-        WorkspaceSnapshot::Bound {
-            revision,
-            saved_revision,
-            ..
-        } => (Some(*revision), *saved_revision),
-        WorkspaceSnapshot::Unbound { .. } => (None, None),
-    };
+    let (current_revision, saved_revision, revision_high_water_sequence, retained_history_entries) =
+        match snapshot.workspace() {
+            WorkspaceSnapshot::Bound {
+                revision,
+                revision_high_water,
+                saved_revision,
+                retained_history_entries,
+                ..
+            } => (
+                Some(*revision),
+                *saved_revision,
+                Some(revision_high_water.sequence()),
+                Some(*retained_history_entries),
+            ),
+            WorkspaceSnapshot::Unbound { .. } => (None, None, None, None),
+        };
     let status = app.project_store.as_ref().map(|service| service.status());
     let facts = project_state_facts(app);
     json!({
@@ -2643,6 +5747,10 @@ fn project_state_json(app: &MiranteWorkbenchApp) -> Value {
         "dirty": facts.dirty,
         "current_revision": project_revision_json(current_revision),
         "saved_revision": project_revision_json(saved_revision),
+        "revision_high_water_sequence": revision_high_water_sequence,
+        "retained_history_entries": retained_history_entries,
+        "history_entry_high_water_sequence": revision_high_water_sequence,
+        "history_entry_high_water_derivation": "one_BoundWorkspace_history_push_per_allocated_durable_revision",
         "lifecycle": facts.lifecycle.map(project_store_lifecycle_name),
         "can_save": facts.can_save,
         "can_save_as": facts.can_save_as,

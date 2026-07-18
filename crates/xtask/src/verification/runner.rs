@@ -1347,6 +1347,7 @@ fn validate_wp09a_evidence(evidence: &Value) -> anyhow::Result<()> {
             "capacity_ledger",
             "cases",
             "counters",
+            "envelope",
             "ledger",
             "readback",
             "result",
@@ -1360,7 +1361,7 @@ fn validate_wp09a_evidence(evidence: &Value) -> anyhow::Result<()> {
         .eq("mirante4d-wp09a-trusted-gpu-evidence")
         .then_some(())
         .context("WP-09A evidence schema drifted")?;
-    if require_u64(root, "schema_version", "WP-09A evidence")? != 1
+    if require_u64(root, "schema_version", "WP-09A evidence")? != 2
         || require_string(root, "result", "WP-09A evidence")? != "passed"
     {
         bail!("WP-09A evidence version or result drifted");
@@ -1398,6 +1399,11 @@ fn validate_wp09a_evidence(evidence: &Value) -> anyhow::Result<()> {
         bail!("WP-09A evidence did not use a qualifying Vulkan adapter");
     }
 
+    let envelope = validate_wp09a_envelope(
+        root.get("envelope")
+            .context("WP-09A evidence lacks envelope")?,
+    )?;
+
     let configured = validate_wp09a_ledger(
         root.get("ledger").context("WP-09A evidence lacks ledger")?,
         "WP-09A ledger",
@@ -1420,13 +1426,20 @@ fn validate_wp09a_evidence(evidence: &Value) -> anyhow::Result<()> {
     let capacity_counters_value = root
         .get("capacity_counters")
         .context("WP-09A evidence lacks capacity_counters")?;
-    let frames = validate_wp09a_counters(counters_value, "WP-09A counters")?;
-    validate_wp09a_counters(capacity_counters_value, "WP-09A capacity counters")?;
+    let frames = validate_wp09a_counters(counters_value, envelope, "WP-09A counters")?;
+    validate_wp09a_counters(
+        capacity_counters_value,
+        envelope,
+        "WP-09A capacity counters",
+    )?;
     if counters_value == capacity_counters_value {
         bail!("WP-09A main and capacity counters must be reported independently");
     }
-    validate_wp09a_counter_case_facts(counters_value, capacity_counters_value)?;
-    validate_wp09a_cases(root.get("cases").context("WP-09A evidence lacks cases")?)?;
+    validate_wp09a_counter_case_facts(counters_value, capacity_counters_value, envelope)?;
+    validate_wp09a_cases(
+        root.get("cases").context("WP-09A evidence lacks cases")?,
+        envelope,
+    )?;
 
     let readback = exact_object(
         root.get("readback")
@@ -1457,6 +1470,42 @@ fn validate_wp09a_evidence(evidence: &Value) -> anyhow::Result<()> {
         bail!("WP-09A evidence contains GPU validation errors");
     }
     Ok(())
+}
+
+fn validate_wp09a_envelope(value: &Value) -> anyhow::Result<&serde_json::Map<String, Value>> {
+    let envelope = exact_object(
+        value,
+        &[
+            "command_buffers",
+            "control_upload_bytes",
+            "maximum_extent_pixels",
+            "new_resources_uploaded",
+            "payload_upload_bytes",
+            "queue_submissions",
+            "resident_resources_visited",
+        ],
+        "WP-09A renderer envelope",
+    )?;
+    for (field, expected) in [
+        ("resident_resources_visited", 65_536_u64),
+        ("new_resources_uploaded", 512),
+        ("payload_upload_bytes", 8 * 1024 * 1024),
+        ("control_upload_bytes", 8 * 1024 * 1024),
+        ("command_buffers", 1),
+        ("queue_submissions", 1),
+    ] {
+        if require_u64(envelope, field, "WP-09A renderer envelope")? != expected {
+            bail!("WP-09A renderer envelope.{field} drifted");
+        }
+    }
+    let extent = envelope
+        .get("maximum_extent_pixels")
+        .and_then(Value::as_array)
+        .context("WP-09A renderer envelope.maximum_extent_pixels must be an array")?;
+    if extent.len() != 2 || extent[0].as_u64() != Some(1920) || extent[1].as_u64() != Some(1080) {
+        bail!("WP-09A renderer extent envelope drifted");
+    }
+    Ok(envelope)
 }
 
 fn validate_wp09a_ledger(value: &Value, context: &str) -> anyhow::Result<u64> {
@@ -1507,7 +1556,11 @@ fn validate_wp09a_ledger(value: &Value, context: &str) -> anyhow::Result<u64> {
     Ok(configured)
 }
 
-fn validate_wp09a_counters(value: &Value, context: &str) -> anyhow::Result<u64> {
+fn validate_wp09a_counters(
+    value: &Value,
+    envelope: &serde_json::Map<String, Value>,
+    context: &str,
+) -> anyhow::Result<u64> {
     let counters = exact_object(
         value,
         &[
@@ -1532,20 +1585,44 @@ fn validate_wp09a_counters(value: &Value, context: &str) -> anyhow::Result<u64> 
         bail!("{context} must record at least one successful frame");
     }
     for (total_field, max_field, accepted_maximum) in [
-        ("resources_visited", "max_resources_visited", 128_u64),
-        ("resources_uploaded", "max_resources_uploaded", 8),
+        (
+            "resources_visited",
+            "max_resources_visited",
+            require_u64(
+                envelope,
+                "resident_resources_visited",
+                "WP-09A renderer envelope",
+            )?,
+        ),
+        (
+            "resources_uploaded",
+            "max_resources_uploaded",
+            require_u64(
+                envelope,
+                "new_resources_uploaded",
+                "WP-09A renderer envelope",
+            )?,
+        ),
         (
             "payload_upload_bytes",
             "max_payload_upload_bytes",
-            8 * 1024 * 1024,
+            require_u64(envelope, "payload_upload_bytes", "WP-09A renderer envelope")?,
         ),
         (
             "control_upload_bytes",
             "max_control_upload_bytes",
-            64 * 1024,
+            require_u64(envelope, "control_upload_bytes", "WP-09A renderer envelope")?,
         ),
-        ("command_buffers", "max_command_buffers", 1),
-        ("queue_submissions", "max_queue_submissions", 1),
+        (
+            "command_buffers",
+            "max_command_buffers",
+            require_u64(envelope, "command_buffers", "WP-09A renderer envelope")?,
+        ),
+        (
+            "queue_submissions",
+            "max_queue_submissions",
+            require_u64(envelope, "queue_submissions", "WP-09A renderer envelope")?,
+        ),
     ] {
         let total = require_u64(counters, total_field, context)?;
         let observed_maximum = require_u64(counters, max_field, context)?;
@@ -1567,7 +1644,11 @@ fn validate_wp09a_counters(value: &Value, context: &str) -> anyhow::Result<u64> 
     Ok(frames)
 }
 
-fn validate_wp09a_counter_case_facts(main: &Value, capacity: &Value) -> anyhow::Result<()> {
+fn validate_wp09a_counter_case_facts(
+    main: &Value,
+    capacity: &Value,
+    envelope: &serde_json::Map<String, Value>,
+) -> anyhow::Result<()> {
     let main = main
         .as_object()
         .context("WP-09A counters must be an object")?;
@@ -1575,9 +1656,19 @@ fn validate_wp09a_counter_case_facts(main: &Value, capacity: &Value) -> anyhow::
         .as_object()
         .context("WP-09A capacity counters must be an object")?;
     for (field, expected) in [
-        ("max_resources_visited", 128_u64),
-        ("max_resources_uploaded", 8),
-        ("max_payload_upload_bytes", 8 * 1024 * 1024),
+        ("max_resources_visited", 512_u64),
+        (
+            "max_resources_uploaded",
+            require_u64(
+                envelope,
+                "new_resources_uploaded",
+                "WP-09A renderer envelope",
+            )?,
+        ),
+        (
+            "max_payload_upload_bytes",
+            require_u64(envelope, "payload_upload_bytes", "WP-09A renderer envelope")?,
+        ),
     ] {
         if require_u64(main, field, "WP-09A counters")? != expected {
             bail!("WP-09A counters.{field} does not prove the accepted boundary case");
@@ -1593,7 +1684,7 @@ fn validate_wp09a_counter_case_facts(main: &Value, capacity: &Value) -> anyhow::
         }
     }
     for (field, minimum) in [
-        ("resources_visited", 129_u64),
+        ("resources_visited", 513_u64),
         ("resources_uploaded", 9),
         ("payload_upload_bytes", 9 * 1024 * 1024),
     ] {
@@ -1614,10 +1705,14 @@ fn validate_wp09a_counter_case_facts(main: &Value, capacity: &Value) -> anyhow::
     Ok(())
 }
 
-fn validate_wp09a_cases(value: &Value) -> anyhow::Result<()> {
+fn validate_wp09a_cases(
+    value: &Value,
+    envelope: &serde_json::Map<String, Value>,
+) -> anyhow::Result<()> {
     let cases = exact_object(
         value,
         &[
+            "all_invalid_zero_byte_resident_proved",
             "cancellation_proved",
             "capacity_rejected_without_submit",
             "eviction_reupload_proved",
@@ -1638,6 +1733,7 @@ fn validate_wp09a_cases(value: &Value) -> anyhow::Result<()> {
         "WP-09A cases",
     )?;
     for field in [
+        "all_invalid_zero_byte_resident_proved",
         "cancellation_proved",
         "stale_capture_rejected",
         "stale_frame_rejected_without_submit",
@@ -1649,14 +1745,16 @@ fn validate_wp09a_cases(value: &Value) -> anyhow::Result<()> {
             bail!("WP-09A cases.{field} must be true");
         }
     }
+    let maximum_upload_bytes =
+        require_u64(envelope, "payload_upload_bytes", "WP-09A renderer envelope")?;
     for (field, expected) in [
         ("semantic_fixture_resources", 24_u64),
         ("semantic_fixture_decoded_bytes_with_validity", 241_664),
         ("upload_first_resources", 8),
-        ("upload_first_bytes", 8 * 1024 * 1024),
+        ("upload_first_bytes", maximum_upload_bytes),
         ("upload_second_resources", 1),
         ("upload_second_bytes", 1024 * 1024),
-        ("work_first_visits", 128),
+        ("work_first_visits", 512),
         ("work_second_visits", 1),
     ] {
         if require_u64(cases, field, "WP-09A cases")? != expected {
@@ -2913,7 +3011,7 @@ mod tests {
     fn valid_wp09a_evidence() -> Value {
         json!({
             "schema": "mirante4d-wp09a-trusted-gpu-evidence",
-            "schema_version": 1,
+            "schema_version": 2,
             "adapter": {
                 "name": "NVIDIA GeForce RTX 3070 Ti Laptop GPU",
                 "backend": "Vulkan",
@@ -2921,6 +3019,15 @@ mod tests {
                 "max_buffer_size_bytes": 268435456,
                 "max_storage_buffer_binding_size_bytes": 268435456,
                 "max_storage_buffers_per_shader_stage": 8
+            },
+            "envelope": {
+                "resident_resources_visited": 65536,
+                "new_resources_uploaded": 512,
+                "payload_upload_bytes": 8388608,
+                "control_upload_bytes": 8388608,
+                "command_buffers": 1,
+                "queue_submissions": 1,
+                "maximum_extent_pixels": [1920, 1080]
             },
             "ledger": {
                 "configured_bytes": 4294967296_u64,
@@ -2946,14 +3053,14 @@ mod tests {
             },
             "counters": {
                 "frames": 12,
-                "resources_visited": 196,
-                "resources_uploaded": 41,
+                "resources_visited": 605,
+                "resources_uploaded": 545,
                 "payload_upload_bytes": 9699456,
                 "control_upload_bytes": 3072,
                 "command_buffers": 12,
                 "queue_submissions": 12,
-                "max_resources_visited": 128,
-                "max_resources_uploaded": 8,
+                "max_resources_visited": 512,
+                "max_resources_uploaded": 512,
                 "max_payload_upload_bytes": 8388608,
                 "max_control_upload_bytes": 256,
                 "max_command_buffers": 1,
@@ -2987,8 +3094,9 @@ mod tests {
                 "upload_first_bytes": 8388608,
                 "upload_second_resources": 1,
                 "upload_second_bytes": 1048576,
-                "work_first_visits": 128,
+                "work_first_visits": 512,
                 "work_second_visits": 1,
+                "all_invalid_zero_byte_resident_proved": true,
                 "cancellation_proved": true,
                 "stale_capture_rejected": true,
                 "stale_frame_rejected_without_submit": true,
@@ -3032,7 +3140,7 @@ mod tests {
     #[test]
     fn wp09a_evidence_rejects_budget_and_case_incoherence() {
         let mut excessive_maximum = valid_wp09a_evidence();
-        excessive_maximum["counters"]["max_resources_visited"] = json!(129);
+        excessive_maximum["counters"]["max_resources_visited"] = json!(65537);
         assert!(validate_wp09a_evidence(&excessive_maximum).is_err());
 
         let mut impossible_total = valid_wp09a_evidence();
@@ -3048,7 +3156,7 @@ mod tests {
         assert!(validate_wp09a_evidence(&duplicate_ledgers).is_err());
 
         let mut case_drift = valid_wp09a_evidence();
-        case_drift["cases"]["work_first_visits"] = json!(127);
+        case_drift["cases"]["work_first_visits"] = json!(511);
         assert!(validate_wp09a_evidence(&case_drift).is_err());
 
         let mut capture_drift = valid_wp09a_evidence();

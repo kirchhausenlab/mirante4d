@@ -1,6 +1,7 @@
 use std::io::{Cursor, Read, Write};
 use std::ops::Range;
 
+use mirante4d_dataset::{DecodeSinkError, ReservedDecodeSink};
 use thiserror::Error;
 
 const ZSTD_LEVEL: i32 = 3;
@@ -15,6 +16,14 @@ pub const INNER_CODEC_WORKING_BYTES_MAX: u64 = 8 * 1024 * 1024;
 const CRC32C_BYTES: usize = 4;
 const INDEX_ENTRY_BYTES: usize = 16;
 const MISSING: u64 = u64::MAX;
+pub(crate) const DIRECT_DECODE_SPAN_BYTES: usize = 64 * 1024;
+
+#[derive(Debug)]
+pub(crate) enum DirectInnerDecodeError<E> {
+    Shard(ShardCodecError),
+    Sink(DecodeSinkError),
+    Observer(E),
+}
 
 /// One closed storage-profile row for indexed shard payloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -288,6 +297,64 @@ pub fn decode_inner_payload(
         });
     }
     Ok(decoded)
+}
+
+/// Decodes one validated inner frame directly into the caller-owned reserved
+/// sink in bounded spans. `observe` sees each span after decode and before its
+/// explicit commit; verified delivery uses a no-op observer while provisional
+/// delivery derives facts from the bytes in their final allocation. No
+/// decoded payload-sized staging allocation or post-decode copy is involved.
+pub(crate) fn decode_inner_payload_direct<E>(
+    kind: ShardProfileKind,
+    encoded: &[u8],
+    sink: &mut dyn ReservedDecodeSink,
+    mut observe: impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<(), DirectInnerDecodeError<E>> {
+    let compressed =
+        validate_encoded_inner_envelope(kind, encoded).map_err(DirectInnerDecodeError::Shard)?;
+    let expected = kind.decoded_inner_bytes();
+    let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(compressed))
+        .map_err(|error| DirectInnerDecodeError::Shard(zstd_error("decode", error)))?;
+    decoder
+        .window_log_max(window_log_max(expected))
+        .map_err(|error| DirectInnerDecodeError::Shard(zstd_error("decode", error)))?;
+    let mut decoded = 0_usize;
+    while decoded != expected {
+        let requested = (expected - decoded).min(DIRECT_DECODE_SPAN_BYTES);
+        {
+            let output = sink
+                .writable_span(requested)
+                .map_err(DirectInnerDecodeError::Sink)?;
+            if output.len() != requested {
+                return Err(DirectInnerDecodeError::Sink(
+                    DecodeSinkError::WritableCommitExceeded {
+                        offered: output.len(),
+                        attempted: requested,
+                    },
+                ));
+            }
+            decoder
+                .read_exact(output)
+                .map_err(|error| DirectInnerDecodeError::Shard(zstd_error("decode", error)))?;
+            observe(output).map_err(DirectInnerDecodeError::Observer)?;
+        }
+        sink.commit_written(requested)
+            .map_err(DirectInnerDecodeError::Sink)?;
+        decoded += requested;
+    }
+    let mut extra = [0_u8; 1];
+    let extra_bytes = decoder
+        .read(&mut extra)
+        .map_err(|error| DirectInnerDecodeError::Shard(zstd_error("decode", error)))?;
+    if extra_bytes != 0 {
+        return Err(DirectInnerDecodeError::Shard(
+            ShardCodecError::DecodedInnerLength {
+                expected,
+                actual: expected.saturating_add(extra_bytes),
+            },
+        ));
+    }
+    Ok(())
 }
 
 fn validate_encoded_inner_envelope(
@@ -751,11 +818,10 @@ mod tests {
 
     #[test]
     fn inner_payload_round_trips_and_corruption_is_rejected() {
-        let kind = ShardProfileKind::Validity2d;
+        let kind = ShardProfileKind::Pixel2dUint16;
         let decoded = vec![0x5a; kind.decoded_inner_bytes()];
         let encoded = encode_inner_payload(kind, &decoded).unwrap();
         assert_eq!(decode_inner_payload(kind, &encoded).unwrap(), decoded);
-
         let mut corrupt = encoded;
         corrupt[0] ^= 1;
         assert_eq!(

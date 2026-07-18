@@ -10,7 +10,7 @@ use std::{cmp::Ordering, fmt, num::NonZeroU64, sync::Arc};
 
 use mirante4d_dataset::{
     CpuByteLease, CpuByteLedger, CpuLedgerCategory, DatasetResourceKey, ResourceLease,
-    ResourcePayloadDescriptor, ResourcePayloadView,
+    ResourcePayloadDescriptor, ResourcePayloadFacts, ResourcePayloadView,
 };
 use thiserror::Error;
 
@@ -104,6 +104,7 @@ impl CancellationGeneration {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RequestPriority {
     CurrentView,
+    VisibleRefinement,
     LinkedView,
     Playback,
     Analysis,
@@ -114,10 +115,11 @@ impl RequestPriority {
     pub const fn rank(self) -> u8 {
         match self {
             Self::CurrentView => 0,
-            Self::LinkedView => 1,
-            Self::Playback => 2,
-            Self::Analysis => 3,
-            Self::Prefetch => 4,
+            Self::VisibleRefinement => 1,
+            Self::LinkedView => 2,
+            Self::Playback => 3,
+            Self::Analysis => 4,
+            Self::Prefetch => 5,
         }
     }
 
@@ -178,6 +180,10 @@ impl ResourceRequest {
 
     pub const fn priority(self) -> RequestPriority {
         self.priority
+    }
+
+    pub const fn with_priority(self, priority: RequestPriority) -> Self {
+        Self { priority, ..self }
     }
 
     pub const fn generation(self) -> CancellationGeneration {
@@ -341,6 +347,125 @@ impl DatasetRuntimeConfig {
 }
 
 /// Immutable, internally consistent observation of runtime capacity and work.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DatasetRuntimePerformanceCounters {
+    cache_hits: u64,
+    cache_misses: u64,
+    cache_evictions: u64,
+    progress_updates: u64,
+    queue_wait_ns: u64,
+    decode_time_ns: u64,
+    decoded_output_bytes: u64,
+    cancelled_decode_executions: u64,
+    cancelled_decode_time_ns: u64,
+    cancelled_decode_bytes: u64,
+    decode_cohorts: u64,
+    decode_cohort_members: u64,
+    peak_decode_cohort_members: u64,
+}
+
+impl DatasetRuntimePerformanceCounters {
+    // This is one immutable counter snapshot, assembled atomically by the
+    // runtime diagnostics boundary. A builder would add state and call-site
+    // churn without reducing hot-path work or clarifying ownership.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        cache_hits: u64,
+        cache_misses: u64,
+        cache_evictions: u64,
+        progress_updates: u64,
+        queue_wait_ns: u64,
+        decode_time_ns: u64,
+        decoded_output_bytes: u64,
+        cancelled_decode_executions: u64,
+        cancelled_decode_time_ns: u64,
+        cancelled_decode_bytes: u64,
+        decode_cohorts: u64,
+        decode_cohort_members: u64,
+        peak_decode_cohort_members: u64,
+    ) -> Self {
+        Self {
+            cache_hits,
+            cache_misses,
+            cache_evictions,
+            progress_updates,
+            queue_wait_ns,
+            decode_time_ns,
+            decoded_output_bytes,
+            cancelled_decode_executions,
+            cancelled_decode_time_ns,
+            cancelled_decode_bytes,
+            decode_cohorts,
+            decode_cohort_members,
+            peak_decode_cohort_members,
+        }
+    }
+
+    pub const fn cache_hits(self) -> u64 {
+        self.cache_hits
+    }
+
+    pub const fn cache_misses(self) -> u64 {
+        self.cache_misses
+    }
+
+    pub const fn cache_evictions(self) -> u64 {
+        self.cache_evictions
+    }
+
+    pub const fn progress_updates(self) -> u64 {
+        self.progress_updates
+    }
+
+    pub const fn queue_wait_ns(self) -> u64 {
+        self.queue_wait_ns
+    }
+
+    pub const fn decode_time_ns(self) -> u64 {
+        self.decode_time_ns
+    }
+
+    pub const fn decoded_output_bytes(self) -> u64 {
+        self.decoded_output_bytes
+    }
+
+    /// Started resource decodes whose result was discarded because their
+    /// final interested waiter was cancelled. Queued work that never began is
+    /// deliberately excluded.
+    pub const fn cancelled_decode_executions(self) -> u64 {
+        self.cancelled_decode_executions
+    }
+
+    /// Wall-clock worker time spent in source decodes that were discarded
+    /// because their final interested waiter was cancelled.
+    pub const fn cancelled_decode_time_ns(self) -> u64 {
+        self.cancelled_decode_time_ns
+    }
+
+    /// Bytes already delivered into a runtime reservation before cancellation
+    /// made that decode result unusable. This is the low-cost cancellation
+    /// waste metric; it does not count queued work that never started.
+    pub const fn cancelled_decode_bytes(self) -> u64 {
+        self.cancelled_decode_bytes
+    }
+
+    /// Source calls issued by production workers. Each call is one bounded
+    /// decode cohort, including a one-member cohort.
+    pub const fn decode_cohorts(self) -> u64 {
+        self.decode_cohorts
+    }
+
+    /// Total member reservations submitted across source cohorts.
+    pub const fn decode_cohort_members(self) -> u64 {
+        self.decode_cohort_members
+    }
+
+    /// Largest source cohort observed in this runtime.
+    pub const fn peak_decode_cohort_members(self) -> u64 {
+        self.peak_decode_cohort_members
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DatasetRuntimeDiagnostics {
     config: DatasetRuntimeConfig,
@@ -355,6 +480,7 @@ pub struct DatasetRuntimeDiagnostics {
     ready_requests: u64,
     cancelled_requests: u64,
     failed_requests: u64,
+    performance: DatasetRuntimePerformanceCounters,
 }
 
 impl DatasetRuntimeDiagnostics {
@@ -372,6 +498,39 @@ impl DatasetRuntimeDiagnostics {
         ready_requests: u64,
         cancelled_requests: u64,
         failed_requests: u64,
+    ) -> Result<Self, RuntimeFaultCode> {
+        Self::new_with_performance(
+            config,
+            category_used,
+            queued_requests,
+            in_flight_decodes,
+            pending_completions,
+            resident_resources,
+            submitted_requests,
+            started_decodes,
+            completed_decodes,
+            ready_requests,
+            cancelled_requests,
+            failed_requests,
+            DatasetRuntimePerformanceCounters::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_performance(
+        config: DatasetRuntimeConfig,
+        category_used: [u64; CPU_LEDGER_CATEGORIES.len()],
+        queued_requests: usize,
+        in_flight_decodes: usize,
+        pending_completions: usize,
+        resident_resources: usize,
+        submitted_requests: u64,
+        started_decodes: u64,
+        completed_decodes: u64,
+        ready_requests: u64,
+        cancelled_requests: u64,
+        failed_requests: u64,
+        performance: DatasetRuntimePerformanceCounters,
     ) -> Result<Self, RuntimeFaultCode> {
         let mut total_used = 0_u64;
         for category in CPU_LEDGER_CATEGORIES {
@@ -426,6 +585,7 @@ impl DatasetRuntimeDiagnostics {
             ready_requests,
             cancelled_requests,
             failed_requests,
+            performance,
         })
     }
 
@@ -453,6 +613,8 @@ impl DatasetRuntimeDiagnostics {
         self.config.request_queue_limit()
     }
 
+    /// Active production-worker source executions. One execution may carry a
+    /// bounded cohort; member totals are reported by the performance counters.
     pub const fn in_flight_decodes(self) -> usize {
         self.in_flight_decodes
     }
@@ -495,6 +657,10 @@ impl DatasetRuntimeDiagnostics {
 
     pub const fn failed_requests(self) -> u64 {
         self.failed_requests
+    }
+
+    pub const fn performance(self) -> DatasetRuntimePerformanceCounters {
+        self.performance
     }
 }
 
@@ -628,6 +794,7 @@ impl AccountedCpuLease {
 struct AccountedPayload {
     key: DatasetResourceKey,
     descriptor: ResourcePayloadDescriptor,
+    facts: ResourcePayloadFacts,
     bytes: Box<[u8]>,
     charge: RuntimeCharge,
 }
@@ -640,6 +807,12 @@ impl AccountedResourceLease {
     /// dependency merely to inspect a runtime-issued lease.
     pub fn payload(&self) -> ResourcePayloadView<'_> {
         <Self as ResourceLease>::payload(self)
+    }
+
+    /// Returns the value-range and validity facts computed once by the decode
+    /// worker, without rescanning the immutable payload allocation.
+    pub fn payload_facts(&self) -> ResourcePayloadFacts {
+        self.inner.facts
     }
 
     pub fn accounted_bytes(&self) -> u64 {
@@ -672,6 +845,10 @@ impl ResourceLease for AccountedResourceLease {
             .descriptor
             .view(value_bytes, validity_bits)
             .expect("runtime-issued lease preserves its validated descriptor")
+    }
+
+    fn payload_facts(&self) -> ResourcePayloadFacts {
+        self.payload_facts()
     }
 }
 
@@ -876,7 +1053,28 @@ pub enum ShutdownState {
 /// cancel, or drain a bounded number of completions; implementations perform
 /// I/O, decode, eviction, and worker joins outside those calls.
 pub trait DatasetRuntime: CpuByteLedger + Send + Sync {
+    /// Returns immutable admission and byte-ledger limits without collecting
+    /// O(live work) diagnostics. Hot-path demand planning must use this rather
+    /// than scanning every queued job and resident cache entry.
+    fn config(&self) -> DatasetRuntimeConfig;
     fn submit(&self, request: ResourceRequest) -> Result<RequestTicket, RuntimeFault>;
+    /// Raises one live waiter's urgency without allocating a duplicate waiter
+    /// or restarting shared decode work. Returns false when the ticket is no
+    /// longer live or already has at least the requested urgency.
+    fn promote_priority(
+        &self,
+        ticket: RequestTicket,
+        priority: RequestPriority,
+    ) -> Result<bool, RuntimeFault>;
+    /// Atomically retires a bounded set of waiters without advancing or
+    /// invalidating the rest of their demand scopes. Implementations validate
+    /// every ticket before retiring any of them. Shared decode work remains
+    /// live while another waiter is interested in the same semantic resource.
+    fn cancel_many(&self, tickets: &[RequestTicket]) -> Result<(), RuntimeFault>;
+    /// Convenience wrapper for non-transactional singleton retirement.
+    fn cancel(&self, ticket: RequestTicket) -> Result<(), RuntimeFault> {
+        self.cancel_many(std::slice::from_ref(&ticket))
+    }
     fn cancel_before(&self, current: CancellationGeneration) -> Result<(), RuntimeFault>;
     fn poll(&self, max_completions: usize) -> Result<Vec<RuntimeCompletion>, RuntimeFault>;
     fn diagnostics(&self) -> Result<DatasetRuntimeDiagnostics, RuntimeFault>;
@@ -892,7 +1090,7 @@ pub trait DatasetRuntime: CpuByteLedger + Send + Sync {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeMap, VecDeque},
+        collections::{BTreeMap, BTreeSet, VecDeque},
         sync::{Arc, Mutex},
     };
 
@@ -939,6 +1137,10 @@ mod tests {
             inner: Arc::new(AccountedPayload {
                 key: resource,
                 descriptor,
+                facts: ResourcePayloadFacts::from_payload(
+                    descriptor.view(&[1, 0, 2, 0], None).unwrap(),
+                )
+                .unwrap(),
                 bytes: vec![1, 0, 2, 0].into_boxed_slice(),
                 charge: RuntimeCharge::Test {
                     bytes: descriptor.byte_len(),
@@ -1172,6 +1374,10 @@ mod tests {
     }
 
     impl DatasetRuntime for TestRuntime {
+        fn config(&self) -> DatasetRuntimeConfig {
+            self.config
+        }
+
         fn submit(&self, request: ResourceRequest) -> Result<RequestTicket, RuntimeFault> {
             let mut state = self.state.lock().unwrap();
             let id = state
@@ -1243,6 +1449,84 @@ mod tests {
             state.progress.insert(ticket.id(), progress);
             state.submitted_requests += 1;
             Ok(ticket)
+        }
+
+        fn promote_priority(
+            &self,
+            ticket: RequestTicket,
+            priority: RequestPriority,
+        ) -> Result<bool, RuntimeFault> {
+            let mut state = self.state.lock().unwrap();
+            if state.shutdown != ShutdownState::Running {
+                return Err(RuntimeFault::for_ticket(
+                    RuntimeFaultCode::ShuttingDown,
+                    ticket,
+                ));
+            }
+            for job in state.pending.values_mut() {
+                let Some(waiter) = job
+                    .waiters
+                    .iter_mut()
+                    .find(|waiter| waiter.ticket == ticket)
+                else {
+                    continue;
+                };
+                if !priority.outranks(waiter.request.priority()) {
+                    return Ok(false);
+                }
+                waiter.request = waiter.request.with_priority(priority);
+                return Ok(true);
+            }
+            Ok(false)
+        }
+
+        fn cancel_many(&self, tickets: &[RequestTicket]) -> Result<(), RuntimeFault> {
+            if tickets.is_empty() {
+                return Ok(());
+            }
+            let mut state = self.state.lock().unwrap();
+            if state.shutdown != ShutdownState::Running {
+                return Err(tickets.first().map_or_else(
+                    || RuntimeFault::new(RuntimeFaultCode::ShuttingDown),
+                    |ticket| RuntimeFault::for_ticket(RuntimeFaultCode::ShuttingDown, *ticket),
+                ));
+            }
+            let mut live = BTreeSet::new();
+            for ticket in tickets {
+                let pending = state
+                    .pending
+                    .values()
+                    .any(|job| job.waiters.iter().any(|waiter| waiter.ticket == *ticket));
+                let terminal = state
+                    .completions
+                    .iter()
+                    .any(|completion| completion.ticket() == *ticket);
+                if !pending && !terminal {
+                    return Err(RuntimeFault::for_ticket(
+                        RuntimeFaultCode::InvariantViolation,
+                        *ticket,
+                    ));
+                }
+                if pending {
+                    live.insert(ticket.id());
+                }
+            }
+            for ticket in tickets {
+                if !live.remove(&ticket.id()) {
+                    continue;
+                }
+                state.pending.retain(|_, job| {
+                    job.waiters.retain(|waiter| waiter.ticket != *ticket);
+                    job.started || !job.waiters.is_empty()
+                });
+                state.progress.remove(&ticket.id());
+                state
+                    .completions
+                    .push_back(RuntimeCompletion::new(*ticket, RuntimeOutcome::Cancelled));
+                state.cancelled_requests = state.cancelled_requests.saturating_add(1);
+            }
+            assert!(state.completions.len() <= self.config.completion_queue_limit());
+            Ok(())
         }
 
         fn cancel_before(&self, current: CancellationGeneration) -> Result<(), RuntimeFault> {
@@ -1396,6 +1680,7 @@ mod tests {
     fn priorities_are_explicit_and_total() {
         let priorities = [
             RequestPriority::CurrentView,
+            RequestPriority::VisibleRefinement,
             RequestPriority::LinkedView,
             RequestPriority::Playback,
             RequestPriority::Analysis,
@@ -1694,6 +1979,10 @@ mod tests {
         assert_eq!(lease.ledger_category(), CpuLedgerCategory::DecodedResidency);
         assert_eq!(lease.payload().value_bytes(), &[1, 0, 2, 0]);
         assert_eq!(lease.payload().validity_bits(), None);
+        assert_eq!(lease.payload_facts().minimum(), 1.0);
+        assert_eq!(lease.payload_facts().maximum(), 2.0);
+        assert!(lease.payload_facts().any_valid());
+        assert!(lease.payload_facts().all_valid());
         assert_eq!(lease.key(), clone.key());
         assert_eq!(CpuByteLease::reserved_bytes(&lease), 4);
 
@@ -1707,6 +1996,12 @@ mod tests {
             inner: Arc::new(AccountedPayload {
                 key: key(1),
                 descriptor: masked_descriptor,
+                facts: ResourcePayloadFacts::from_payload(
+                    masked_descriptor
+                        .view(&[0, 17], Some(&[0b0000_0001]))
+                        .unwrap(),
+                )
+                .unwrap(),
                 bytes: vec![0, 17, 0b0000_0001].into_boxed_slice(),
                 charge: RuntimeCharge::Test {
                     bytes: masked_descriptor.byte_len(),
@@ -1720,6 +2015,10 @@ mod tests {
         assert_eq!(masked.payload().validity_bits(), Some(&[0b0000_0001][..]));
         assert_eq!(masked.payload().sample_is_valid(0), Ok(true));
         assert_eq!(masked.payload().sample_is_valid(1), Ok(false));
+        assert_eq!(masked.payload_facts().minimum(), 0.0);
+        assert_eq!(masked.payload_facts().maximum(), 0.0);
+        assert!(masked.payload_facts().any_valid());
+        assert!(!masked.payload_facts().all_valid());
 
         let runtime = TestRuntime::new(CancellationGeneration::new(7), 8, 8);
         let analysis = runtime.try_acquire_analysis_bytes(16).unwrap();

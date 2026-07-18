@@ -6,7 +6,7 @@ use crate::product_validate::{is_product_validation_scenario_name, product_valid
 use crate::workflow_audit::workflow_audit;
 
 const PRODUCT_VALIDATE_USAGE: &str = "usage: cargo xtask product-validate [target-package] \
-     [target_fixture_camera_smoke|target_fixture_render_modes|target_source_verification|import_preprocessing|b4_project_persistence]";
+     [target_fixture_camera_smoke|target_fixture_render_modes|target_fixture_resident_navigation_no_readback|target_source_verification|import_preprocessing|b4_project_persistence]";
 
 mod arch;
 mod deps;
@@ -22,6 +22,7 @@ mod reports;
 mod t5_sentinel_oracle;
 mod target_fixture;
 mod verification;
+mod viewer_performance;
 mod workflow_audit;
 
 fn main() -> anyhow::Result<()> {
@@ -88,6 +89,8 @@ fn main() -> anyhow::Result<()> {
         "import-performance-t5-oracle-audit" => {
             import_performance_t5::run_oracle_audit(args.collect())
         }
+        "viewer-performance-preflight" => viewer_performance::run(args.collect()),
+        "viewer-performance-run" => viewer_performance::run_measurement(args.collect()),
         "__import-performance-t2-worker" => import_performance::run_worker(args.collect()),
         "docs-check" => documentation::docs_check(),
         "run-dev" => dev::run_dev(),
@@ -144,8 +147,9 @@ under target/mirante4d/product-validation/. With no package argument, the
 bounded promoted target U16 fixture is extracted locally.
 
 The ordinary bounded scenarios are target_fixture_camera_smoke,
-target_fixture_render_modes, target_source_verification, and
-import_preprocessing. The import scenario generates a bounded public TIFF
+target_fixture_render_modes, target_fixture_resident_navigation_no_readback,
+target_source_verification, and import_preprocessing. The resident-navigation
+scenario proves warm camera reuse without framebuffer readback. The import scenario generates a bounded public TIFF
 fixture, cancels and resumes preprocessing, waits for verified publication,
 then renders the imported package. The retained b4_project_persistence
 scenario checks project save, recovery, and reopen behavior across three
@@ -177,6 +181,8 @@ Mirante4D developer tasks
   cargo run --release -p xtask -- import-performance-t5 --config /absolute/private/config.json [--performance | --diagnostic]
   cargo run --release -p xtask -- import-performance-t5-publish --config /absolute/private/config.json --raw-report /absolute/private/raw-private-report.json
   cargo run --release -p xtask -- import-performance-t5-oracle-audit --config /absolute/private/config.json
+  cargo run --release -p xtask -- viewer-performance-preflight --qualification-profile /absolute/private/viewer-profile.json --workload-bundle /absolute/private/workload.json --interaction-script-bundle /absolute/private/scripts.json --independent-oracle /absolute/private/oracle.json --cache-condition warm --competing-activity none --power-state balanced --compositor-scale-milli 1000
+  cargo run --release -p xtask -- viewer-performance-run --help
   cargo xtask docs-check
   cargo xtask run-dev
 
@@ -214,6 +220,14 @@ mod tests {
             ProductValidateArgs::Run {
                 package: None,
                 scenario: Some("target_fixture_render_modes".to_owned())
+            }
+        );
+        assert_eq!(
+            product_validate_args(args(&["target_fixture_resident_navigation_no_readback",]))
+                .unwrap(),
+            ProductValidateArgs::Run {
+                package: None,
+                scenario: Some("target_fixture_resident_navigation_no_readback".to_owned())
             }
         );
         assert_eq!(

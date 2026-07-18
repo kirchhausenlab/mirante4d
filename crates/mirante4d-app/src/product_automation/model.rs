@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use mirante4d_dataset::CpuLedgerCategory;
 use mirante4d_dataset_runtime::DatasetRuntimeDiagnostics;
-use mirante4d_domain::{RenderMode, ViewerLayout};
+use mirante4d_domain::{
+    IsoLightState, IsoShadingPolicy, Projection, RenderMode, SamplingPolicy, ToolKind, ViewerLayout,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -10,11 +12,28 @@ use crate::viewer_layout::PanelId;
 
 use super::{AUTOMATION_SCHEMA_VERSION, AUTOMATION_SCRIPT_SCHEMA};
 
+pub(super) const MAX_INPUT_SEQUENCE_SAMPLES: u32 = 4_096;
+pub(super) const MAX_INPUT_SEQUENCE_DURATION_MS: u64 = 120_000;
+const MAX_DIAGNOSTIC_SAMPLE_LABEL_BYTES: usize = 128;
+
 #[derive(Debug, Deserialize)]
 pub(super) struct ProductAutomationScript {
     pub(super) schema: String,
     pub(super) schema_version: u32,
     pub(super) scenario: String,
+    /// Qualification-only timestamp queries. Normal interactive startup has
+    /// no automation script and keeps this renderer instrumentation off.
+    #[serde(default)]
+    pub(super) gpu_timing: bool,
+    /// Qualification-only detailed counters. Minimal display generation,
+    /// heartbeat, scale, and coverage facts remain always on.
+    #[serde(default)]
+    pub(super) diagnostic_counters: bool,
+    /// Qualification-only state installed before the product issues its first
+    /// visible demand. This exists so a cold-start checkpoint can describe the
+    /// exact requested view without admitting an unrelated default cohort.
+    #[serde(default)]
+    pub(super) startup_bootstrap: Option<ProductAutomationStartupBootstrap>,
     #[serde(default)]
     pub(super) limits: ProductAutomationLimits,
     pub(super) commands: Vec<ProductAutomationCommand>,
@@ -38,6 +57,12 @@ impl ProductAutomationScript {
         if self.commands.is_empty() {
             anyhow::bail!("automation script must contain at least one command");
         }
+        if let Some(bootstrap) = &self.startup_bootstrap {
+            bootstrap.validate()?;
+        }
+        for command in &self.commands {
+            command.validate()?;
+        }
         Ok(())
     }
 
@@ -46,9 +71,106 @@ impl ProductAutomationScript {
             schema: AUTOMATION_SCRIPT_SCHEMA.to_owned(),
             schema_version: AUTOMATION_SCHEMA_VERSION,
             scenario: "failed_to_initialize".to_owned(),
+            gpu_timing: false,
+            diagnostic_counters: false,
+            startup_bootstrap: None,
             limits: ProductAutomationLimits::default(),
             commands: Vec::new(),
         }
+    }
+
+    pub(super) fn requires_validation_capture(&self) -> bool {
+        self.commands.iter().any(|command| match command {
+            ProductAutomationCommand::CaptureScreenshot { .. } => true,
+            ProductAutomationCommand::Assert { condition } => {
+                condition.requires_validation_capture()
+            }
+            _ => false,
+        })
+    }
+
+    pub(super) const fn requires_gpu_timing(&self) -> bool {
+        self.gpu_timing
+    }
+
+    pub(super) fn requires_diagnostic_counters(&self) -> bool {
+        self.diagnostic_counters
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProductAutomationStartupBootstrap {
+    /// Cold-start bootstraps capture the exact zero-demand checkpoint and
+    /// restart the cold milestone clock. Setup-only bootstraps deliberately
+    /// do neither; their scenario phase captures its start after settling.
+    pub(super) capture_start_checkpoint: bool,
+    pub(super) start_diagnostic_label: Option<String>,
+    pub(super) commands: Vec<ProductAutomationCommand>,
+}
+
+impl ProductAutomationStartupBootstrap {
+    fn validate(&self) -> anyhow::Result<()> {
+        match (self.capture_start_checkpoint, &self.start_diagnostic_label) {
+            (true, Some(label)) => validate_diagnostic_sample_label(label)?,
+            (false, None) => {}
+            (true, None) => anyhow::bail!(
+                "a checkpoint-capturing startup bootstrap requires start_diagnostic_label"
+            ),
+            (false, Some(_)) => anyhow::bail!(
+                "a setup-only startup bootstrap must not declare start_diagnostic_label"
+            ),
+        }
+        if self.commands.is_empty() {
+            anyhow::bail!("automation startup bootstrap must contain at least one command");
+        }
+        let mut mapped_client_sizes = 0_u8;
+        let mut render_target_sizes = 0_u8;
+        for command in &self.commands {
+            command.validate()?;
+            match command {
+                ProductAutomationCommand::SetMappedClientPixels { .. } => {
+                    mapped_client_sizes = mapped_client_sizes.saturating_add(1);
+                }
+                ProductAutomationCommand::SetRenderTargetSize { .. } => {
+                    render_target_sizes = render_target_sizes.saturating_add(1);
+                }
+                ProductAutomationCommand::SetFourPanelViewports { .. } => {
+                    render_target_sizes = render_target_sizes.saturating_add(1);
+                }
+                ProductAutomationCommand::SetViewerLayout { .. }
+                | ProductAutomationCommand::SetTimeIndex { .. }
+                | ProductAutomationCommand::SetLayerRenderMode { .. }
+                | ProductAutomationCommand::SetProjection { .. }
+                | ProductAutomationCommand::SetLayerSampling { .. }
+                | ProductAutomationCommand::SetLayerOpacity { .. }
+                | ProductAutomationCommand::SetLayerWindow { .. }
+                | ProductAutomationCommand::SetCameraView { .. }
+                | ProductAutomationCommand::CameraFitData
+                | ProductAutomationCommand::SetActiveCrossSectionPanel { .. }
+                | ProductAutomationCommand::SetCrossSectionView { .. } => {}
+                ProductAutomationCommand::CrossSectionZoomSequence {
+                    samples,
+                    duration_ms,
+                    x_fraction,
+                    y_fraction,
+                    ..
+                } if *samples == 1
+                    && *duration_ms == 1
+                    && *x_fraction == 0.5
+                    && *y_fraction == 0.5 => {}
+                _ => anyhow::bail!(
+                    "command {} is not permitted in the pre-demand startup bootstrap",
+                    command.name()
+                ),
+            }
+        }
+        if mapped_client_sizes > 1 || render_target_sizes > 1 {
+            anyhow::bail!(
+                "startup bootstrap accepts at most one mapped-client size and one render-target size"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -214,6 +336,9 @@ pub(super) enum ProductAutomationCommand {
     OpenDataset {
         path: PathBuf,
     },
+    SwitchDataset {
+        path: PathBuf,
+    },
     NewProject,
     InitialSaveWithEdit {
         path: PathBuf,
@@ -269,8 +394,28 @@ pub(super) enum ProductAutomationCommand {
         width: u32,
         height: u32,
     },
+    /// Qualification-only exact panel geometry installed before first demand.
+    /// Normal product geometry continues to come from the UI observation path.
+    SetFourPanelViewports {
+        presentation_width_points: f64,
+        presentation_height_points: f64,
+        three_d_render_width: u32,
+        three_d_render_height: u32,
+        linked_render_width: u32,
+        linked_render_height: u32,
+    },
     SetViewerLayout {
         layout: ProductAutomationViewerLayout,
+    },
+    SetTimeIndex {
+        time_index: u64,
+    },
+    SetLayerVisibility {
+        layer_index: usize,
+        visible: bool,
+    },
+    SetLayerOrder {
+        layer_indices: Vec<usize>,
     },
     SetRenderMode {
         mode: ProductAutomationRenderMode,
@@ -278,6 +423,20 @@ pub(super) enum ProductAutomationCommand {
     SetLayerRenderMode {
         layer_index: usize,
         mode: ProductAutomationRenderMode,
+    },
+    SetProjection {
+        projection: ProductAutomationProjection,
+    },
+    SetLayerSampling {
+        layer_index: usize,
+        sampling: ProductAutomationSamplingPolicy,
+    },
+    SetLayerIsoShading {
+        layer_index: usize,
+        shading: ProductAutomationIsoShading,
+    },
+    SetIsoLight {
+        light: ProductAutomationIsoLight,
     },
     SetIsoDisplayLevel {
         display_level: f32,
@@ -294,6 +453,15 @@ pub(super) enum ProductAutomationCommand {
         low: f32,
         high: f32,
     },
+    /// Qualification-only exact camera state for pre-demand bootstrap.
+    SetCameraView {
+        projection: ProductAutomationProjection,
+        target_world: [f64; 3],
+        orientation_xyzw: [f64; 4],
+        orthographic_world_per_screen_point: f64,
+        perspective_focal_length_screen_points: f64,
+        perspective_view_distance_world: f64,
+    },
     CameraFitData,
     CameraOrbit {
         yaw_points: f32,
@@ -306,11 +474,76 @@ pub(super) enum ProductAutomationCommand {
     CameraZoom {
         scroll_y_points: f32,
     },
+    CameraOrbitSequence {
+        samples: u32,
+        duration_ms: u64,
+        yaw_points_per_sample: f32,
+        pitch_points_per_sample: f32,
+    },
+    CameraPanSequence {
+        samples: u32,
+        duration_ms: u64,
+        x_points_per_sample: f32,
+        y_points_per_sample: f32,
+    },
+    CameraZoomSequence {
+        samples: u32,
+        duration_ms: u64,
+        scroll_y_points_per_sample: f32,
+    },
+    SetActiveCrossSectionPanel {
+        panel: ProductAutomationPanelId,
+    },
+    SetCrossSectionView {
+        center_world: [f64; 3],
+        orientation_xyzw: [f64; 4],
+        scale_world_per_screen_point: f64,
+        depth_world: f64,
+    },
+    CrossSectionRotateSequence {
+        panel: ProductAutomationPanelId,
+        samples: u32,
+        duration_ms: u64,
+        x_points_per_sample: f64,
+        y_points_per_sample: f64,
+        radians_per_point: f64,
+    },
+    CrossSectionPanSequence {
+        panel: ProductAutomationPanelId,
+        samples: u32,
+        duration_ms: u64,
+        x_points_per_sample: f64,
+        y_points_per_sample: f64,
+    },
+    CrossSectionZoomSequence {
+        panel: ProductAutomationPanelId,
+        samples: u32,
+        duration_ms: u64,
+        x_fraction: f64,
+        y_fraction: f64,
+        factor_per_sample: f64,
+    },
+    CrossSectionSliceSequence {
+        panel: ProductAutomationPanelId,
+        samples: u32,
+        duration_ms: u64,
+        distance_world_per_sample: f64,
+    },
+    SetActiveTool {
+        tool: ProductAutomationViewerTool,
+    },
     ProbeHover {
         x_fraction: f32,
         y_fraction: f32,
     },
+    PrimaryClick {
+        x_fraction: f32,
+        y_fraction: f32,
+    },
     CopyDiagnostics,
+    SampleDiagnostics {
+        label: String,
+    },
     CaptureScreenshot {
         name: Option<String>,
     },
@@ -327,6 +560,7 @@ impl ProductAutomationCommand {
     pub(super) fn name(&self) -> &'static str {
         match self {
             Self::OpenDataset { .. } => "open_dataset",
+            Self::SwitchDataset { .. } => "switch_dataset",
             Self::NewProject => "new_project",
             Self::InitialSaveWithEdit { .. } => "initial_save_with_edit",
             Self::OpenProject { .. } => "open_project",
@@ -346,25 +580,245 @@ impl ProductAutomationCommand {
             Self::SetViewportSize { .. } => "set_viewport_size",
             Self::SetMappedClientPixels { .. } => "set_mapped_client_pixels",
             Self::SetRenderTargetSize { .. } => "set_render_target_size",
+            Self::SetFourPanelViewports { .. } => "set_four_panel_viewports",
             Self::SetViewerLayout { .. } => "set_viewer_layout",
+            Self::SetTimeIndex { .. } => "set_time_index",
+            Self::SetLayerVisibility { .. } => "set_layer_visibility",
+            Self::SetLayerOrder { .. } => "set_layer_order",
             Self::SetRenderMode { .. } => "set_render_mode",
             Self::SetLayerRenderMode { .. } => "set_layer_render_mode",
+            Self::SetProjection { .. } => "set_projection",
+            Self::SetLayerSampling { .. } => "set_layer_sampling",
+            Self::SetLayerIsoShading { .. } => "set_layer_iso_shading",
+            Self::SetIsoLight { .. } => "set_iso_light",
             Self::SetIsoDisplayLevel { .. } => "set_iso_display_level",
             Self::SetDvrDensityScale { .. } => "set_dvr_density_scale",
             Self::SetLayerOpacity { .. } => "set_layer_opacity",
             Self::SetLayerWindow { .. } => "set_layer_window",
+            Self::SetCameraView { .. } => "set_camera_view",
             Self::CameraFitData => "camera_fit_data",
             Self::CameraOrbit { .. } => "camera_orbit",
             Self::CameraPan { .. } => "camera_pan",
             Self::CameraZoom { .. } => "camera_zoom",
+            Self::CameraOrbitSequence { .. } => "camera_orbit_sequence",
+            Self::CameraPanSequence { .. } => "camera_pan_sequence",
+            Self::CameraZoomSequence { .. } => "camera_zoom_sequence",
+            Self::SetActiveCrossSectionPanel { .. } => "set_active_cross_section_panel",
+            Self::SetCrossSectionView { .. } => "set_cross_section_view",
+            Self::CrossSectionRotateSequence { .. } => "cross_section_rotate_sequence",
+            Self::CrossSectionPanSequence { .. } => "cross_section_pan_sequence",
+            Self::CrossSectionZoomSequence { .. } => "cross_section_zoom_sequence",
+            Self::CrossSectionSliceSequence { .. } => "cross_section_slice_sequence",
+            Self::SetActiveTool { .. } => "set_active_tool",
             Self::ProbeHover { .. } => "probe_hover",
+            Self::PrimaryClick { .. } => "primary_click",
             Self::CopyDiagnostics => "copy_diagnostics",
+            Self::SampleDiagnostics { .. } => "sample_diagnostics",
             Self::CaptureScreenshot { .. } => "capture_screenshot",
             Self::Assert { .. } => "assert",
             Self::SleepFrames { .. } => "sleep_frames",
             Self::Quit => "quit",
         }
     }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        if let Self::SwitchDataset { path } = self
+            && path.as_os_str().is_empty()
+        {
+            anyhow::bail!("switch_dataset requires a nonempty package path");
+        }
+        if let Self::SetCameraView {
+            target_world,
+            orientation_xyzw,
+            orthographic_world_per_screen_point,
+            perspective_focal_length_screen_points,
+            perspective_view_distance_world,
+            ..
+        } = self
+            && (!target_world.iter().all(|value| value.is_finite())
+                || !orientation_xyzw.iter().all(|value| value.is_finite())
+                || orientation_xyzw.iter().all(|value| *value == 0.0)
+                || !orthographic_world_per_screen_point.is_finite()
+                || *orthographic_world_per_screen_point <= 0.0
+                || !perspective_focal_length_screen_points.is_finite()
+                || *perspective_focal_length_screen_points <= 0.0
+                || !perspective_view_distance_world.is_finite()
+                || *perspective_view_distance_world <= 0.0)
+        {
+            anyhow::bail!(
+                "camera view must contain finite coordinates and positive projection scales"
+            );
+        }
+        if let Self::SetCrossSectionView {
+            center_world,
+            orientation_xyzw,
+            scale_world_per_screen_point,
+            depth_world,
+        } = self
+            && (!center_world.iter().all(|value| value.is_finite())
+                || !orientation_xyzw.iter().all(|value| value.is_finite())
+                || orientation_xyzw.iter().all(|value| *value == 0.0)
+                || !scale_world_per_screen_point.is_finite()
+                || *scale_world_per_screen_point <= 0.0
+                || !depth_world.is_finite()
+                || *depth_world <= 0.0)
+        {
+            anyhow::bail!(
+                "cross-section view must contain finite coordinates and positive scale and depth"
+            );
+        }
+        let sequence = match self {
+            Self::CameraOrbitSequence {
+                samples,
+                duration_ms,
+                yaw_points_per_sample,
+                pitch_points_per_sample,
+            } => Some((
+                *samples,
+                *duration_ms,
+                yaw_points_per_sample.is_finite()
+                    && pitch_points_per_sample.is_finite()
+                    && (*yaw_points_per_sample != 0.0 || *pitch_points_per_sample != 0.0),
+            )),
+            Self::CameraPanSequence {
+                samples,
+                duration_ms,
+                x_points_per_sample,
+                y_points_per_sample,
+            } => Some((
+                *samples,
+                *duration_ms,
+                x_points_per_sample.is_finite()
+                    && y_points_per_sample.is_finite()
+                    && (*x_points_per_sample != 0.0 || *y_points_per_sample != 0.0),
+            )),
+            Self::CameraZoomSequence {
+                samples,
+                duration_ms,
+                scroll_y_points_per_sample,
+            } => Some((
+                *samples,
+                *duration_ms,
+                scroll_y_points_per_sample.is_finite() && *scroll_y_points_per_sample != 0.0,
+            )),
+            Self::CrossSectionRotateSequence {
+                samples,
+                duration_ms,
+                x_points_per_sample,
+                y_points_per_sample,
+                radians_per_point,
+                ..
+            } => Some((
+                *samples,
+                *duration_ms,
+                x_points_per_sample.is_finite()
+                    && y_points_per_sample.is_finite()
+                    && radians_per_point.is_finite()
+                    && (*x_points_per_sample != 0.0 || *y_points_per_sample != 0.0)
+                    && *radians_per_point != 0.0,
+            )),
+            Self::CrossSectionPanSequence {
+                samples,
+                duration_ms,
+                x_points_per_sample,
+                y_points_per_sample,
+                ..
+            } => Some((
+                *samples,
+                *duration_ms,
+                x_points_per_sample.is_finite()
+                    && y_points_per_sample.is_finite()
+                    && (*x_points_per_sample != 0.0 || *y_points_per_sample != 0.0),
+            )),
+            Self::CrossSectionZoomSequence {
+                samples,
+                duration_ms,
+                x_fraction,
+                y_fraction,
+                factor_per_sample,
+                ..
+            } => {
+                if !(0.0..=1.0).contains(x_fraction)
+                    || !(0.0..=1.0).contains(y_fraction)
+                    || !factor_per_sample.is_finite()
+                    || *factor_per_sample <= 0.0
+                    || *factor_per_sample == 1.0
+                {
+                    anyhow::bail!("cross-section zoom sequence has invalid anchor or factor");
+                }
+                Some((*samples, *duration_ms, true))
+            }
+            Self::CrossSectionSliceSequence {
+                samples,
+                duration_ms,
+                distance_world_per_sample,
+                ..
+            } => Some((
+                *samples,
+                *duration_ms,
+                distance_world_per_sample.is_finite() && *distance_world_per_sample != 0.0,
+            )),
+            _ => None,
+        };
+        if let Some((samples, duration_ms, values_are_finite)) = sequence {
+            if samples == 0 || samples > MAX_INPUT_SEQUENCE_SAMPLES {
+                anyhow::bail!(
+                    "automation input sequence samples must be in 1..={MAX_INPUT_SEQUENCE_SAMPLES}"
+                );
+            }
+            if duration_ms == 0 || duration_ms > MAX_INPUT_SEQUENCE_DURATION_MS {
+                anyhow::bail!(
+                    "automation input sequence duration_ms must be in 1..={MAX_INPUT_SEQUENCE_DURATION_MS}"
+                );
+            }
+            if !values_are_finite {
+                anyhow::bail!("automation input sequence deltas must be finite and nonzero");
+            }
+        }
+        if let Self::SampleDiagnostics { label } = self
+            && let Err(error) = validate_diagnostic_sample_label(label)
+        {
+            return Err(error);
+        }
+        if let Self::SetLayerOrder { layer_indices } = self
+            && (layer_indices.is_empty()
+                || layer_indices.len() > mirante4d_render_api::MAX_RENDER_LAYERS)
+        {
+            anyhow::bail!(
+                "layer order must contain 1..={} indices",
+                mirante4d_render_api::MAX_RENDER_LAYERS
+            );
+        }
+        if let Self::SetFourPanelViewports {
+            presentation_width_points,
+            presentation_height_points,
+            three_d_render_width,
+            three_d_render_height,
+            linked_render_width,
+            linked_render_height,
+        } = self
+            && (!presentation_width_points.is_finite()
+                || *presentation_width_points <= 0.0
+                || !presentation_height_points.is_finite()
+                || *presentation_height_points <= 0.0
+                || *three_d_render_width == 0
+                || *three_d_render_height == 0
+                || *linked_render_width == 0
+                || *linked_render_height == 0)
+        {
+            anyhow::bail!("four-panel bootstrap viewports must be finite and positive");
+        }
+        Ok(())
+    }
+}
+
+fn validate_diagnostic_sample_label(label: &str) -> anyhow::Result<()> {
+    if label.is_empty() || label.len() > MAX_DIAGNOSTIC_SAMPLE_LABEL_BYTES {
+        anyhow::bail!(
+            "diagnostic sample label must contain 1..={MAX_DIAGNOSTIC_SAMPLE_LABEL_BYTES} bytes"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -374,6 +828,7 @@ pub(super) enum ProductAutomationWaitCondition {
     FirstFrame,
     RuntimeIdle,
     FrameFreshnessCurrent,
+    CoordinatedPresentationSettled,
     SourceVerificationRequired,
     SourceVerificationVerified,
     ImportReviewReady,
@@ -391,6 +846,7 @@ impl ProductAutomationWaitCondition {
             Self::FirstFrame => "first_frame",
             Self::RuntimeIdle => "runtime_idle",
             Self::FrameFreshnessCurrent => "frame_freshness_current",
+            Self::CoordinatedPresentationSettled => "coordinated_presentation_settled",
             Self::SourceVerificationRequired => "source_verification_required",
             Self::SourceVerificationVerified => "source_verification_verified",
             Self::ImportReviewReady => "import_review_ready",
@@ -418,9 +874,33 @@ impl ProductAutomationWaitCondition {
 pub(super) enum ProductAutomationAssertCondition {
     NonblankFrame,
     NoRenderError,
+    FrameFidelity {
+        scale_level: u32,
+        complete: bool,
+    },
     RenderMode {
         mode: ProductAutomationRenderMode,
     },
+    Projection {
+        projection: ProductAutomationProjection,
+    },
+    LayerSampling {
+        layer_index: usize,
+        sampling: ProductAutomationSamplingPolicy,
+    },
+    LayerIsoShading {
+        layer_index: usize,
+        shading: ProductAutomationIsoShading,
+    },
+    IsoLight {
+        light: ProductAutomationIsoLight,
+    },
+    ActiveTool {
+        tool: ProductAutomationViewerTool,
+    },
+    CrosshairLinked,
+    RoiCommitted,
+    DistanceCommitted,
     ViewerLayout {
         layout: ProductAutomationViewerLayout,
     },
@@ -464,11 +944,27 @@ pub(super) enum ProductAutomationAssertCondition {
 }
 
 impl ProductAutomationAssertCondition {
+    fn requires_validation_capture(&self) -> bool {
+        matches!(
+            self,
+            Self::NonblankFrame | Self::FourPanelImagesDistinct { .. }
+        )
+    }
+
     pub(super) fn name(&self) -> &'static str {
         match self {
             Self::NonblankFrame => "nonblank_frame",
             Self::NoRenderError => "no_render_error",
+            Self::FrameFidelity { .. } => "frame_fidelity",
             Self::RenderMode { .. } => "render_mode",
+            Self::Projection { .. } => "projection",
+            Self::LayerSampling { .. } => "layer_sampling",
+            Self::LayerIsoShading { .. } => "layer_iso_shading",
+            Self::IsoLight { .. } => "iso_light",
+            Self::ActiveTool { .. } => "active_tool",
+            Self::CrosshairLinked => "crosshair_linked",
+            Self::RoiCommitted => "roi_committed",
+            Self::DistanceCommitted => "distance_committed",
             Self::ViewerLayout { .. } => "viewer_layout",
             Self::CrossSectionPanelSchedule { .. } => "cross_section_panel_schedule",
             Self::FourPanelImagesDistinct { .. } => "four_panel_images_distinct",
@@ -486,6 +982,7 @@ impl ProductAutomationAssertCondition {
             Self::CrossSectionPanelSchedule { .. }
                 | Self::FourPanelImagesDistinct { .. }
                 | Self::CrossSectionRetired
+                | Self::CrosshairLinked
         )
     }
 }
@@ -534,13 +1031,17 @@ impl From<ProductAutomationViewerLayout> for ViewerLayout {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ProductAutomationPanelId {
+    Xy,
     Xz,
+    Yz,
 }
 
 impl From<ProductAutomationPanelId> for PanelId {
     fn from(value: ProductAutomationPanelId) -> Self {
         match value {
+            ProductAutomationPanelId::Xy => Self::Xy,
             ProductAutomationPanelId::Xz => Self::Xz,
+            ProductAutomationPanelId::Yz => Self::Yz,
         }
     }
 }
@@ -569,6 +1070,147 @@ impl From<ProductAutomationRenderMode> for RenderMode {
             ProductAutomationRenderMode::Mip => Self::Mip,
             ProductAutomationRenderMode::Dvr => Self::Dvr,
             ProductAutomationRenderMode::Iso => Self::Isosurface,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProductAutomationProjection {
+    Orthographic,
+    Perspective,
+}
+
+impl ProductAutomationProjection {
+    pub(super) const fn name(self) -> &'static str {
+        match self {
+            Self::Orthographic => "orthographic",
+            Self::Perspective => "perspective",
+        }
+    }
+}
+
+impl From<ProductAutomationProjection> for Projection {
+    fn from(value: ProductAutomationProjection) -> Self {
+        match value {
+            ProductAutomationProjection::Orthographic => Self::Orthographic,
+            ProductAutomationProjection::Perspective => Self::Perspective,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProductAutomationSamplingPolicy {
+    VoxelExact,
+    SmoothLinear,
+}
+
+impl ProductAutomationSamplingPolicy {
+    pub(super) const fn name(self) -> &'static str {
+        match self {
+            Self::VoxelExact => "voxel_exact",
+            Self::SmoothLinear => "smooth_linear",
+        }
+    }
+}
+
+impl From<ProductAutomationSamplingPolicy> for SamplingPolicy {
+    fn from(value: ProductAutomationSamplingPolicy) -> Self {
+        match value {
+            ProductAutomationSamplingPolicy::VoxelExact => Self::VoxelExact,
+            ProductAutomationSamplingPolicy::SmoothLinear => Self::SmoothLinear,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProductAutomationIsoShading {
+    Flat,
+    GradientLighting,
+}
+
+impl ProductAutomationIsoShading {
+    pub(super) const fn name(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::GradientLighting => "gradient_lighting",
+        }
+    }
+}
+
+impl From<ProductAutomationIsoShading> for IsoShadingPolicy {
+    fn from(value: ProductAutomationIsoShading) -> Self {
+        match value {
+            ProductAutomationIsoShading::Flat => Self::Flat,
+            ProductAutomationIsoShading::GradientLighting => Self::GradientLighting,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum ProductAutomationIsoLight {
+    AttachedCamera,
+    DetachedScreen { x: f32, y: f32 },
+}
+
+impl ProductAutomationIsoLight {
+    pub(super) const fn name(self) -> &'static str {
+        match self {
+            Self::AttachedCamera => "attached_camera",
+            Self::DetachedScreen { .. } => "detached_screen",
+        }
+    }
+
+    pub(super) fn into_domain(self) -> Result<IsoLightState, String> {
+        match self {
+            Self::AttachedCamera => Ok(IsoLightState::attached_camera()),
+            Self::DetachedScreen { x, y } => {
+                IsoLightState::detached_screen(x, y).map_err(|error| error.to_string())
+            }
+        }
+    }
+
+    pub(super) fn matches(self, actual: IsoLightState) -> bool {
+        match self {
+            Self::AttachedCamera => actual.is_attached_camera(),
+            Self::DetachedScreen { x, y } => actual.detached_screen_position() == Some([x, y]),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProductAutomationViewerTool {
+    Navigate,
+    Inspect,
+    Crosshair,
+    RoiBox,
+    MeasureDistance,
+}
+
+impl ProductAutomationViewerTool {
+    pub(super) const fn name(self) -> &'static str {
+        match self {
+            Self::Navigate => "navigate",
+            Self::Inspect => "inspect",
+            Self::Crosshair => "crosshair",
+            Self::RoiBox => "roi_box",
+            Self::MeasureDistance => "measure_distance",
+        }
+    }
+}
+
+impl From<ProductAutomationViewerTool> for ToolKind {
+    fn from(value: ProductAutomationViewerTool) -> Self {
+        match value {
+            ProductAutomationViewerTool::Navigate => Self::Navigate,
+            ProductAutomationViewerTool::Inspect => Self::Inspect,
+            ProductAutomationViewerTool::Crosshair => Self::Crosshair,
+            ProductAutomationViewerTool::RoiBox => Self::RoiBox,
+            ProductAutomationViewerTool::MeasureDistance => Self::MeasureDistance,
         }
     }
 }

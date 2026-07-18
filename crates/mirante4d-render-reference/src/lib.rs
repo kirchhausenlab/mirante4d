@@ -5,14 +5,30 @@
 
 #![forbid(unsafe_code)]
 
+mod lod_oracle;
+mod numerical_oracle;
+
+pub use lod_oracle::{
+    LodOracleError, ProjectedAffineLodDecision, ProjectedAffineLodOracle, ProjectedScaleFacts,
+};
+pub use numerical_oracle::{
+    NumericalColorFacts, NumericalCompositeFacts, NumericalConformanceContract,
+    NumericalConformanceOracle, NumericalCrossSectionFacts, NumericalCrossSectionPlane,
+    NumericalDvrParameters, NumericalIsoParameters, NumericalIsoShading, NumericalOracleError,
+    NumericalPickCompleteness, NumericalPickFacts, NumericalPickKind, NumericalSampleFacts,
+    NumericalSampleState, NumericalSampling, NumericalTapFacts, NumericalTransfer, NumericalVolume,
+    NumericalVolumeFacts, NumericalVolumeMode, NumericalVolumeModeKind, NumericalVolumeQuery,
+    NumericalVoxel, NumericalWorldRay,
+};
+
 use std::collections::{BTreeMap, HashSet};
 
 use mirante4d_dataset::{
     DatasetCatalog, DatasetResourceKey, ResourceContractError, ResourceLease, ResourcePayloadView,
 };
 use mirante4d_domain::{
-    GridToWorld, IntensityDType, IsoShadingPolicy, LayerTransfer, LogicalLayerKey, RenderMode,
-    SamplingPolicy, ScaleLevel, TransferCurve,
+    GridToWorld, IntensityDType, IsoLightState, IsoShadingPolicy, LayerTransfer, LogicalLayerKey,
+    RenderMode, SamplingPolicy, ScaleLevel, TransferCurve,
 };
 use mirante4d_render_api::{CameraFrame, RenderExtent, RenderIntent, RenderViewIntent, ViewRay};
 use thiserror::Error;
@@ -20,6 +36,7 @@ use thiserror::Error;
 const MAX_REFERENCE_PIXELS: u64 = 1_920 * 1_080;
 const MAX_REFERENCE_RESOURCES: usize = 128;
 const MAX_REFERENCE_RAY_SAMPLES: u64 = 16_384;
+const GRADIENT_LENGTH_SQUARED_EPSILON: f64 = 1.0e-6;
 
 /// One bounded RGBA8 CPU rendering plus exact per-pixel semantic masks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,8 +113,6 @@ pub enum ReferenceRenderError {
     SingularGridTransform { layer: LogicalLayerKey },
     #[error("reference camera or projection math failed")]
     CameraMath,
-    #[error("gradient-lit ISO rendering is not supported by the WP-09A reference oracle")]
-    UnsupportedIsoShading,
     #[error("one reference ray requires {actual} samples, exceeding its limit of {maximum}")]
     RaySampleLimitExceeded { actual: u64, maximum: u64 },
 }
@@ -117,16 +132,6 @@ impl ReferenceRenderer {
         intent: &RenderIntent,
         leases: &[&dyn ResourceLease],
     ) -> Result<ReferenceFrame, ReferenceRenderError> {
-        if intent.layers().iter().any(|layer| {
-            layer
-                .render_state()
-                .iso_parameters()
-                .is_some_and(|parameters| {
-                    parameters.shading_policy() == IsoShadingPolicy::GradientLighting
-                })
-        }) {
-            return Err(ReferenceRenderError::UnsupportedIsoShading);
-        }
         let extent = intent.extent();
         let pixel_count = u64::from(extent.width_pixels()) * u64::from(extent.height_pixels());
         if pixel_count > MAX_REFERENCE_PIXELS {
@@ -153,11 +158,12 @@ impl ReferenceRenderer {
         let mut coverage = vec![1_u8; pixel_count];
         let mut validity = vec![0_u8; pixel_count];
 
-        let camera = match intent.view() {
-            RenderViewIntent::Volume { camera, .. } => Some(
-                CameraFrame::new(camera, intent.presentation())
-                    .map_err(|_| ReferenceRenderError::CameraMath)?,
-            ),
+        let volume_view = match intent.view() {
+            RenderViewIntent::Volume { camera, iso_light } => {
+                let camera = CameraFrame::new(camera, intent.presentation())
+                    .map_err(|_| ReferenceRenderError::CameraMath)?;
+                Some(PreparedVolumeView::new(camera, iso_light)?)
+            }
             RenderViewIntent::CrossSection(_) => None,
         };
 
@@ -166,32 +172,29 @@ impl ReferenceRenderer {
                 let index =
                     usize::try_from(u64::from(y) * u64::from(extent.width_pixels()) + u64::from(x))
                         .map_err(|_| ReferenceRenderError::OutputByteLengthOverflow)?;
-                let mut pixel = PixelResult::transparent();
-                for layer in &layers {
-                    let result = match intent.view() {
-                        RenderViewIntent::Volume { .. } => {
-                            let ray = camera
-                                .expect("volume view prepared a camera")
-                                .ray_for_render_pixel(
-                                    f64::from(x),
-                                    f64::from(y),
-                                    extent.width_pixels(),
-                                    extent.height_pixels(),
-                                )
-                                .map_err(|_| ReferenceRenderError::CameraMath)?;
-                            render_volume_layer(layer, ray)?
-                        }
-                        RenderViewIntent::CrossSection(view) => render_cross_section_layer(
-                            layer,
-                            view,
-                            intent.presentation(),
-                            extent,
-                            x,
-                            y,
-                        )?,
-                    };
-                    pixel.composite(result);
-                }
+                let pixel = match intent.view() {
+                    RenderViewIntent::Volume { .. } => {
+                        let volume_view = volume_view.expect("volume view prepared a camera");
+                        let ray = volume_view
+                            .camera
+                            .ray_for_render_pixel(
+                                f64::from(x),
+                                f64::from(y),
+                                extent.width_pixels(),
+                                extent.height_pixels(),
+                            )
+                            .map_err(|_| ReferenceRenderError::CameraMath)?;
+                        render_volume_stack(&layers, ray, volume_view.detached_iso_light)?
+                    }
+                    RenderViewIntent::CrossSection(view) => render_cross_section_stack(
+                        &layers,
+                        view,
+                        intent.presentation(),
+                        extent,
+                        x,
+                        y,
+                    )?,
+                };
                 let start = index * 4;
                 rgba8[start..start + 4].copy_from_slice(&pixel.rgba8());
                 coverage[index] = u8::from(pixel.covered);
@@ -220,6 +223,39 @@ struct PreparedLayer<'a> {
     transfer: &'a LayerTransfer,
     render_state: mirante4d_domain::RenderState,
     resources: Vec<LeaseView<'a>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreparedVolumeView {
+    camera: CameraFrame,
+    /// A detached light is fixed in world space. `None` means the light stays
+    /// attached to the camera and is derived from each pixel's ray direction.
+    detached_iso_light: Option<[f64; 3]>,
+}
+
+impl PreparedVolumeView {
+    fn new(camera: CameraFrame, iso_light: IsoLightState) -> Result<Self, ReferenceRenderError> {
+        let detached_iso_light = iso_light
+            .detached_screen_position()
+            .map(|[screen_x, screen_y]| {
+                let axes = camera.axes();
+                let screen_x = f64::from(screen_x);
+                let screen_y = f64::from(screen_y);
+                let disc_z = (1.0 - screen_x * screen_x - screen_y * screen_y)
+                    .max(0.0)
+                    .sqrt();
+                normalized(std::array::from_fn(|axis| {
+                    axes.right()[axis] * screen_x + axes.up()[axis] * screen_y
+                        - axes.forward()[axis] * disc_z
+                }))
+                .ok_or(ReferenceRenderError::CameraMath)
+            })
+            .transpose()?;
+        Ok(Self {
+            camera,
+            detached_iso_light,
+        })
+    }
 }
 
 fn validate_leases<'a>(
@@ -409,6 +445,16 @@ impl InverseAffine {
                 + self.inverse[row][2] * value[2]
         })
     }
+
+    /// Transforms a grid-space covector into world space with the inverse
+    /// transpose of the grid-to-world linear part.
+    fn normal(self, value: [f64; 3]) -> [f64; 3] {
+        std::array::from_fn(|column| {
+            self.inverse[0][column] * value[0]
+                + self.inverse[1][column] * value[1]
+                + self.inverse[2][column] * value[2]
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -553,11 +599,105 @@ fn sample(layer: &PreparedLayer<'_>, grid_xyz: [f64; 3]) -> Result<Sample, Refer
 }
 
 #[derive(Debug, Clone, Copy)]
+enum IsoGradient {
+    Missing,
+    Invalid,
+    Valid([f64; 3]),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IsoLightingContext {
+    world_direction: [f64; 3],
+    detached_iso_light: Option<[f64; 3]>,
+}
+
+fn iso_gradient(
+    layer: &PreparedLayer<'_>,
+    point: [f64; 3],
+) -> Result<IsoGradient, ReferenceRenderError> {
+    let mut taps = [Sample::Outside; 6];
+    for axis in 0..3 {
+        let mut negative = point;
+        negative[axis] -= 1.0;
+        taps[axis * 2] = sample(layer, negative)?;
+        let mut positive = point;
+        positive[axis] += 1.0;
+        taps[axis * 2 + 1] = sample(layer, positive)?;
+    }
+    if taps.iter().any(|tap| matches!(tap, Sample::Missing)) {
+        return Ok(IsoGradient::Missing);
+    }
+    if taps.iter().any(|tap| !matches!(tap, Sample::Valid(_))) {
+        return Ok(IsoGradient::Invalid);
+    }
+    let grid_gradient = std::array::from_fn(|axis| {
+        let Sample::Valid(negative) = taps[axis * 2] else {
+            unreachable!("gradient taps were proved valid")
+        };
+        let Sample::Valid(positive) = taps[axis * 2 + 1] else {
+            unreachable!("gradient taps were proved valid")
+        };
+        f64::from(positive) - f64::from(negative)
+    });
+    let world_gradient = layer.transform.normal(grid_gradient);
+    Ok(IsoGradient::Valid(
+        normalized(world_gradient).unwrap_or([0.0; 3]),
+    ))
+}
+
+fn normalized(value: [f64; 3]) -> Option<[f64; 3]> {
+    let length_squared = value
+        .iter()
+        .map(|component| component * component)
+        .sum::<f64>();
+    if !length_squared.is_finite() || length_squared <= GRADIENT_LENGTH_SQUARED_EPSILON {
+        return None;
+    }
+    let inverse_length = length_squared.sqrt().recip();
+    Some(value.map(|component| component * inverse_length))
+}
+
+fn iso_lighting(
+    layer: &PreparedLayer<'_>,
+    point: [f64; 3],
+    context: IsoLightingContext,
+) -> Result<(f32, bool), ReferenceRenderError> {
+    let parameters = layer
+        .render_state
+        .iso_parameters()
+        .expect("ISO mode exposes ISO parameters");
+    if parameters.shading_policy() == IsoShadingPolicy::Flat {
+        return Ok((1.0, false));
+    }
+    let gradient = iso_gradient(layer, point)?;
+    let missing = matches!(gradient, IsoGradient::Missing);
+    let IsoGradient::Valid(gradient) = gradient else {
+        return Ok((0.2, missing));
+    };
+    let Some(gradient) = normalized(gradient) else {
+        return Ok((0.2, false));
+    };
+    let light = match context.detached_iso_light {
+        Some(light) => light,
+        None => normalized(context.world_direction.map(|component| -component))
+            .ok_or(ReferenceRenderError::CameraMath)?,
+    };
+    let cosine = gradient
+        .iter()
+        .zip(light)
+        .map(|(gradient, light)| gradient * light)
+        .sum::<f64>()
+        .abs();
+    Ok(((0.2 + 0.8 * cosine) as f32, false))
+}
+
+#[derive(Debug, Clone, Copy)]
 struct PixelResult {
     premultiplied_rgb: [f32; 3],
     alpha: f32,
     covered: bool,
     valid: bool,
+    depth: f64,
 }
 
 impl PixelResult {
@@ -567,6 +707,7 @@ impl PixelResult {
             alpha: 0.0,
             covered: true,
             valid: false,
+            depth: f64::INFINITY,
         }
     }
 
@@ -578,6 +719,7 @@ impl PixelResult {
             alpha,
             covered: true,
             valid: true,
+            depth: f64::INFINITY,
         }
     }
 
@@ -589,6 +731,19 @@ impl PixelResult {
         self.alpha += over.alpha * remaining;
         self.covered &= over.covered;
         self.valid |= over.valid;
+        self.depth = self.depth.min(over.depth);
+    }
+
+    fn add(&mut self, other: Self) {
+        for channel in 0..3 {
+            self.premultiplied_rgb[channel] = (self.premultiplied_rgb[channel]
+                + other.premultiplied_rgb[channel])
+                .clamp(0.0, 1.0);
+        }
+        self.alpha = 1.0 - (1.0 - self.alpha) * (1.0 - other.alpha);
+        self.covered &= other.covered;
+        self.valid |= other.valid;
+        self.depth = self.depth.min(other.depth);
     }
 
     fn rgba8(self) -> [u8; 4] {
@@ -605,18 +760,70 @@ fn quantize(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-fn render_volume_layer(
+fn render_volume_stack(
+    layers: &[PreparedLayer<'_>],
+    ray: ViewRay,
+    detached_iso_light: Option<[f64; 3]>,
+) -> Result<PixelResult, ReferenceRenderError> {
+    if layers.len() == 1 {
+        return render_volume_layer(&layers[0], ray, detached_iso_light);
+    }
+
+    if layers
+        .iter()
+        .all(|layer| layer.render_state.mode() == RenderMode::Dvr)
+    {
+        return render_joint_dvr(layers, ray);
+    }
+
+    if layers
+        .iter()
+        .all(|layer| layer.render_state.mode() == RenderMode::Mip)
+    {
+        let mut result = PixelResult::transparent();
+        for layer in layers {
+            result.add(render_volume_layer(layer, ray, detached_iso_light)?);
+        }
+        return Ok(result);
+    }
+
+    if layers
+        .iter()
+        .all(|layer| layer.render_state.mode() == RenderMode::Isosurface)
+    {
+        return render_iso_stack(layers, ray, detached_iso_light);
+    }
+
+    // A heterogeneous stack is an authored 2D over-composition. Grouping a
+    // subset of equal modes would move that subset across its neighbors.
+    let mut result = PixelResult::transparent();
+    for layer in layers {
+        result.composite(render_volume_layer(layer, ray, detached_iso_light)?);
+    }
+    Ok(result)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreparedLayerRay {
+    origin: [f64; 3],
+    direction: [f64; 3],
+    entry: f64,
+    exit: f64,
+    step: f64,
+}
+
+fn prepare_layer_ray(
     layer: &PreparedLayer<'_>,
     ray: ViewRay,
-) -> Result<PixelResult, ReferenceRenderError> {
+) -> Result<Option<PreparedLayerRay>, ReferenceRenderError> {
     let origin = layer.transform.point(ray.origin().components());
     let direction = layer.transform.vector(ray.direction());
     let Some((entry, exit)) = intersect_grid(origin, direction, layer.shape_xyz) else {
-        return Ok(PixelResult::transparent());
+        return Ok(None);
     };
     let entry = entry.max(0.0);
     if exit <= entry {
-        return Ok(PixelResult::transparent());
+        return Ok(None);
     }
     let grid_speed = direction
         .iter()
@@ -625,7 +832,16 @@ fn render_volume_layer(
     if !grid_speed.is_finite() || grid_speed == 0.0 {
         return Err(ReferenceRenderError::CameraMath);
     }
-    let step = grid_speed.recip();
+    Ok(Some(PreparedLayerRay {
+        origin,
+        direction,
+        entry,
+        exit,
+        step: grid_speed.recip(),
+    }))
+}
+
+fn checked_sample_count(entry: f64, exit: f64, step: f64) -> Result<u64, ReferenceRenderError> {
     let sample_count = ((exit - entry) / step).ceil().max(1.0) as u64;
     if sample_count > MAX_REFERENCE_RAY_SAMPLES {
         return Err(ReferenceRenderError::RaySampleLimitExceeded {
@@ -633,11 +849,166 @@ fn render_volume_layer(
             maximum: MAX_REFERENCE_RAY_SAMPLES,
         });
     }
+    Ok(sample_count)
+}
+
+/// Integrates an all-DVR stack as one participating medium. The common world
+/// step is the finest step requested by any intersected layer. At each world
+/// sample, channel extinction is summed and emitted color is extinction-
+/// weighted, which makes the result independent of layer enumeration.
+fn render_joint_dvr(
+    layers: &[PreparedLayer<'_>],
+    ray: ViewRay,
+) -> Result<PixelResult, ReferenceRenderError> {
+    let mut prepared = Vec::with_capacity(layers.len());
+    for layer in layers {
+        if let Some(layer_ray) = prepare_layer_ray(layer, ray)? {
+            prepared.push((layer, layer_ray));
+        }
+    }
+    if prepared.is_empty() {
+        return Ok(PixelResult::transparent());
+    }
+
+    let entry = prepared
+        .iter()
+        .map(|(_, ray)| ray.entry)
+        .fold(f64::INFINITY, f64::min);
+    let exit = prepared
+        .iter()
+        .map(|(_, ray)| ray.exit)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let step = prepared
+        .iter()
+        .map(|(_, ray)| ray.step)
+        .fold(f64::INFINITY, f64::min);
+    let count = checked_sample_count(entry, exit, step)?;
+
+    let mut result = PixelResult::transparent();
+    let mut any_valid = false;
+    for index in 0..count {
+        let distance = entry + (index as f64 + 0.5) * step;
+        let mut total_optical_depth = 0.0_f64;
+        let mut optical_depth_weighted_rgb = [0.0_f64; 3];
+        for (layer, layer_ray) in &prepared {
+            let grid = sample_position(layer_ray.origin, layer_ray.direction, distance);
+            match sample(layer, grid)? {
+                Sample::Valid(value) => {
+                    any_valid = true;
+                    let parameters = layer
+                        .render_state
+                        .dvr_parameters()
+                        .expect("DVR mode exposes DVR parameters");
+                    let opacity_display = curve_value(
+                        value,
+                        parameters.opacity_transfer().window(),
+                        parameters.opacity_transfer().curve(),
+                        false,
+                    );
+                    let base_optical_depth =
+                        f64::from(opacity_display) * parameters.density_scale() * step;
+                    let base_alpha = 1.0 - (-base_optical_depth.max(0.0)).exp();
+                    let effective_alpha = f64::from(layer.transfer.opacity().get()) * base_alpha;
+                    let optical_depth = -(1.0 - effective_alpha).max(1.0e-6).ln();
+                    if optical_depth <= 0.0 {
+                        continue;
+                    }
+                    let display = f64::from(transfer_value(value, layer.transfer));
+                    let color = layer.transfer.color().rgb();
+                    total_optical_depth += optical_depth;
+                    for (weighted, color) in optical_depth_weighted_rgb.iter_mut().zip(color) {
+                        *weighted += f64::from(color) * display * optical_depth;
+                    }
+                }
+                Sample::Missing => result.covered = false,
+                Sample::Invalid | Sample::Outside => {}
+            }
+        }
+        if total_optical_depth > 0.0 {
+            let sample_alpha = (1.0 - (-total_optical_depth).exp()) as f32;
+            let remaining = 1.0 - result.alpha;
+            for (output, weighted) in result
+                .premultiplied_rgb
+                .iter_mut()
+                .zip(optical_depth_weighted_rgb)
+            {
+                let emitted = (weighted / total_optical_depth) as f32;
+                *output += remaining * emitted * sample_alpha;
+            }
+            result.alpha += remaining * sample_alpha;
+        }
+    }
+    result.valid = any_valid;
+    Ok(result)
+}
+
+fn render_iso_stack(
+    layers: &[PreparedLayer<'_>],
+    ray: ViewRay,
+    detached_iso_light: Option<[f64; 3]>,
+) -> Result<PixelResult, ReferenceRenderError> {
+    let mut facts = PixelResult::transparent();
+    let mut hits = Vec::with_capacity(layers.len());
+    for layer in layers {
+        let hit = render_volume_layer(layer, ray, detached_iso_light)?;
+        facts.covered &= hit.covered;
+        facts.valid |= hit.valid;
+        if hit.alpha > 0.0 {
+            hits.push(hit);
+        }
+    }
+    hits.sort_by(|first, second| first.depth.total_cmp(&second.depth));
+
+    let mut result = PixelResult::transparent();
+    for hit in hits.into_iter().rev() {
+        let mut near = hit;
+        near.composite(result);
+        result = near;
+    }
+    result.covered = facts.covered;
+    result.valid = facts.valid;
+    Ok(result)
+}
+
+fn render_volume_layer(
+    layer: &PreparedLayer<'_>,
+    ray: ViewRay,
+    detached_iso_light: Option<[f64; 3]>,
+) -> Result<PixelResult, ReferenceRenderError> {
+    let Some(prepared) = prepare_layer_ray(layer, ray)? else {
+        return Ok(PixelResult::transparent());
+    };
+    let sample_count = checked_sample_count(prepared.entry, prepared.exit, prepared.step)?;
 
     match layer.render_state.mode() {
-        RenderMode::Mip => render_mip(layer, origin, direction, entry, step, sample_count),
-        RenderMode::Dvr => render_dvr(layer, origin, direction, entry, step, sample_count),
-        RenderMode::Isosurface => render_iso(layer, origin, direction, entry, step, sample_count),
+        RenderMode::Mip => render_mip(
+            layer,
+            prepared.origin,
+            prepared.direction,
+            prepared.entry,
+            prepared.step,
+            sample_count,
+        ),
+        RenderMode::Dvr => render_dvr(
+            layer,
+            prepared.origin,
+            prepared.direction,
+            prepared.entry,
+            prepared.step,
+            sample_count,
+        ),
+        RenderMode::Isosurface => render_iso(
+            layer,
+            prepared.origin,
+            prepared.direction,
+            IsoLightingContext {
+                world_direction: ray.direction(),
+                detached_iso_light,
+            },
+            prepared.entry,
+            prepared.step,
+            sample_count,
+        ),
     }
 }
 
@@ -728,6 +1099,7 @@ fn render_iso(
     layer: &PreparedLayer<'_>,
     origin: [f64; 3],
     direction: [f64; 3],
+    lighting_context: IsoLightingContext,
     entry: f64,
     step: f64,
     count: u64,
@@ -745,12 +1117,18 @@ fn render_iso(
                 any_valid = true;
                 let display = transfer_value(value, layer.transfer);
                 if display >= parameters.display_level() {
+                    let (lighting, lighting_missing) = iso_lighting(
+                        layer,
+                        sample_position(origin, direction, distance),
+                        lighting_context,
+                    )?;
                     let mut result = PixelResult::from_display(
                         layer.transfer,
-                        display,
+                        display * lighting,
                         layer.transfer.opacity().get(),
                     );
-                    result.covered = covered;
+                    result.covered = covered && !lighting_missing;
+                    result.depth = distance;
                     return Ok(result);
                 }
             }
@@ -826,6 +1204,28 @@ fn render_cross_section_layer(
     }
 }
 
+fn render_cross_section_stack(
+    layers: &[PreparedLayer<'_>],
+    view: mirante4d_domain::CrossSectionView,
+    presentation: mirante4d_render_api::PresentationViewport,
+    extent: RenderExtent,
+    x: u32,
+    y: u32,
+) -> Result<PixelResult, ReferenceRenderError> {
+    let mut result = PixelResult::transparent();
+    for layer in layers {
+        result.add(render_cross_section_layer(
+            layer,
+            view,
+            presentation,
+            extent,
+            x,
+            y,
+        )?);
+    }
+    Ok(result)
+}
+
 fn cross_section_axes(orientation: mirante4d_domain::UnitQuaternion) -> [[f64; 3]; 2] {
     let [x, y, z, w] = orientation.xyzw();
     let rotate = |vector: [f64; 3]| {
@@ -880,12 +1280,15 @@ mod tests {
         DatasetResourceIdentity, DatasetSourceId, ResourceRegion, ResourceValidity,
     };
     use mirante4d_domain::{
-        CrossSectionView, DisplayWindow, DvrOpacityTransfer, IsoShadingPolicy, Opacity, RgbColor,
-        Shape3D, UnitQuaternion, WorldPoint3,
+        CameraView, CrossSectionView, DisplayWindow, DvrOpacityTransfer, IsoShadingPolicy, Opacity,
+        Projection, RgbColor, Shape3D, UnitQuaternion, WorldPoint3,
     };
     use mirante4d_render_api::PresentationViewport;
 
     use super::*;
+
+    const RED_CHANNEL_VALUES: [u8; 3] = [64; 3];
+    const GREEN_CHANNEL_VALUES: [u8; 3] = [192; 3];
 
     fn transfer() -> LayerTransfer {
         LayerTransfer::new(
@@ -932,6 +1335,76 @@ mod tests {
                 )
                 .unwrap(),
             }],
+        }
+    }
+
+    fn colored_transfer(color: [f32; 3], opacity: f32) -> LayerTransfer {
+        LayerTransfer::new(
+            DisplayWindow::new(0.0, 255.0).unwrap(),
+            RgbColor::new(color).unwrap(),
+            Opacity::new(opacity).unwrap(),
+            TransferCurve::linear(),
+            false,
+        )
+    }
+
+    fn center_test_ray() -> ViewRay {
+        CameraFrame::new(
+            CameraView::new(
+                Projection::Orthographic,
+                WorldPoint3::new(0.0, 0.0, 1.0).unwrap(),
+                UnitQuaternion::identity(),
+                1.0,
+                320.0,
+                10.0,
+            )
+            .unwrap(),
+            PresentationViewport::new(1.0, 1.0).unwrap(),
+        )
+        .unwrap()
+        .ray_for_render_pixel(0.0, 0.0, 1, 1)
+        .unwrap()
+    }
+
+    fn two_channel_layers<'a>(
+        red_transfer: &'a LayerTransfer,
+        green_transfer: &'a LayerTransfer,
+        state: mirante4d_domain::RenderState,
+        translate_green_z: bool,
+        reverse: bool,
+    ) -> Vec<PreparedLayer<'a>> {
+        let shape = Shape3D::new(3, 1, 1).unwrap();
+        let red = layer(
+            red_transfer,
+            state,
+            shape,
+            &RED_CHANNEL_VALUES,
+            ResourceValidity::AllValid,
+            None,
+            [1, 1, 3],
+        );
+        let mut green = layer(
+            green_transfer,
+            state,
+            shape,
+            &GREEN_CHANNEL_VALUES,
+            ResourceValidity::AllValid,
+            None,
+            [1, 1, 3],
+        );
+        if translate_green_z {
+            green.transform = InverseAffine::new(
+                GridToWorld::from_row_major([
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0,
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        if reverse {
+            vec![green, red]
+        } else {
+            vec![red, green]
         }
     }
 
@@ -993,9 +1466,95 @@ mod tests {
             None,
             [1, 1, 3],
         );
-        let iso_pixel = render_iso(&iso, [0.0, 0.0, 2.5], [0.0, 0.0, -1.0], 0.0, 1.0, 3).unwrap();
+        let iso_pixel = render_iso(
+            &iso,
+            [0.0, 0.0, 2.5],
+            [0.0, 0.0, -1.0],
+            IsoLightingContext {
+                world_direction: [0.0, 0.0, -1.0],
+                detached_iso_light: None,
+            },
+            0.0,
+            1.0,
+            3,
+        )
+        .unwrap();
         assert_eq!(iso_pixel.rgba8(), [255, 0, 0, 255]);
         assert!(iso_pixel.valid && iso_pixel.covered);
+    }
+
+    #[test]
+    fn gradient_iso_has_independent_attached_and_detached_light_hand_facts() {
+        let transfer = transfer();
+        let shape = Shape3D::new(3, 3, 3).unwrap();
+        let mut values = Vec::with_capacity(27);
+        for z in 0..3 {
+            for _y in 0..3 {
+                for x in 0..3 {
+                    values.push(if z == 1 { [0_u8, 128, 255][x] } else { 0 });
+                }
+            }
+        }
+        let iso = layer(
+            &transfer,
+            mirante4d_domain::RenderState::iso(
+                SamplingPolicy::VoxelExact,
+                IsoShadingPolicy::GradientLighting,
+                0.4,
+            )
+            .unwrap(),
+            shape,
+            &values,
+            ResourceValidity::AllValid,
+            None,
+            [3, 3, 3],
+        );
+        let render = |detached_iso_light| {
+            render_iso(
+                &iso,
+                [1.0, 1.0, 2.5],
+                [0.0, 0.0, -1.0],
+                IsoLightingContext {
+                    world_direction: [0.0, 0.0, -1.0],
+                    detached_iso_light,
+                },
+                0.0,
+                1.0,
+                3,
+            )
+            .unwrap()
+        };
+
+        let attached = render(None);
+        let detached = render(Some([1.0, 0.0, 0.0]));
+        assert_eq!(attached.rgba8(), [26, 0, 0, 255]);
+        assert_eq!(detached.rgba8(), [128, 0, 0, 255]);
+        assert!(attached.valid && attached.covered);
+        assert!(detached.valid && detached.covered);
+    }
+
+    #[test]
+    fn full_affine_inverse_and_normal_have_independent_hand_facts() {
+        let transform = GridToWorld::from_row_major([
+            0.0, -1.0, 0.25, 10.0, 1.0, 0.0, 0.0, 2.0, 0.2, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0,
+        ])
+        .unwrap();
+        let inverse = InverseAffine::new(transform).unwrap();
+
+        for (actual, expected) in inverse
+            .point([8.0, 4.0, 5.4])
+            .into_iter()
+            .zip([2.0, 3.0, 4.0])
+        {
+            assert!((actual - expected).abs() <= 1.0e-12);
+        }
+        for (actual, expected) in inverse
+            .normal([0.0, 1.0, 0.0])
+            .into_iter()
+            .zip([-1.0, -0.05, 0.25])
+        {
+            assert!((actual - expected).abs() <= 1.0e-12);
+        }
     }
 
     #[test]
@@ -1024,6 +1583,81 @@ mod tests {
         .unwrap();
         assert_eq!(pixel.rgba8(), [128, 0, 0, 255]);
         assert!(pixel.valid && pixel.covered);
+    }
+
+    #[test]
+    fn nonopaque_multichannel_modes_have_order_reversal_hand_facts() {
+        let red = colored_transfer([1.0, 0.0, 0.0], 0.4);
+        let green = colored_transfer([0.0, 1.0, 0.0], 0.6);
+        let ray = center_test_ray();
+
+        let mip_state = mirante4d_domain::RenderState::mip(SamplingPolicy::VoxelExact);
+        for reverse in [false, true] {
+            let layers = two_channel_layers(&red, &green, mip_state, false, reverse);
+            let pixel = render_volume_stack(&layers, ray, None).unwrap();
+            assert_eq!(pixel.rgba8(), [26, 115, 0, 194]);
+            assert!(pixel.valid && pixel.covered);
+
+            let section = render_cross_section_stack(
+                &layers,
+                CrossSectionView::new(
+                    WorldPoint3::new(0.0, 0.0, 1.0).unwrap(),
+                    UnitQuaternion::identity(),
+                    1.0,
+                    1.0,
+                )
+                .unwrap(),
+                PresentationViewport::new(1.0, 1.0).unwrap(),
+                RenderExtent::new(1, 1).unwrap(),
+                0,
+                0,
+            )
+            .unwrap();
+            assert_eq!(section.rgba8(), [26, 115, 0, 194]);
+            assert!(section.valid && section.covered);
+        }
+
+        let dvr_state = mirante4d_domain::RenderState::dvr(
+            SamplingPolicy::VoxelExact,
+            DvrOpacityTransfer::new(
+                DisplayWindow::new(0.0, 255.0).unwrap(),
+                TransferCurve::linear(),
+            ),
+            0.2,
+        )
+        .unwrap();
+        for reverse in [false, true] {
+            let layers = two_channel_layers(&red, &green, dvr_state, false, reverse);
+            let pixel = render_volume_stack(&layers, ray, None).unwrap();
+            assert_eq!(pixel.rgba8(), [3, 43, 0, 70]);
+            assert!(pixel.valid && pixel.covered);
+        }
+
+        let iso_state = mirante4d_domain::RenderState::iso(
+            SamplingPolicy::VoxelExact,
+            IsoShadingPolicy::Flat,
+            0.1,
+        )
+        .unwrap();
+        for reverse in [false, true] {
+            let layers = two_channel_layers(&red, &green, iso_state, true, reverse);
+            let pixel = render_volume_stack(&layers, ray, None).unwrap();
+            assert_eq!(pixel.rgba8(), [10, 115, 0, 194]);
+            assert!(pixel.valid && pixel.covered);
+        }
+
+        let mut authored = two_channel_layers(&red, &green, mip_state, false, false);
+        authored[1].render_state = iso_state;
+        assert_eq!(
+            render_volume_stack(&authored, ray, None).unwrap().rgba8(),
+            [26, 69, 0, 194]
+        );
+        let mut reversed = two_channel_layers(&red, &green, mip_state, false, true);
+        reversed[0].render_state = iso_state;
+        assert_eq!(
+            render_volume_stack(&reversed, ray, None).unwrap().rgba8(),
+            [10, 115, 0, 194]
+        );
     }
 
     #[test]
