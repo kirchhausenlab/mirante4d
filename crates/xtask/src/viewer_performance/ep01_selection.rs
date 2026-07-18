@@ -379,7 +379,7 @@ fn validate_gate_coherence(authority: &SelectionAuthority) -> anyhow::Result<()>
 
     let mut maximum_inner_records = 0_u64;
     for edge in &authority.candidate_cubic_brick_edges {
-        if *edge == 0 || defaults.outer_shard_edge % edge != 0 {
+        if *edge == 0 || !defaults.outer_shard_edge.is_multiple_of(*edge) {
             bail!("every EP-01 brick candidate must divide the fixed outer shard edge")
         }
         let per_axis = u64::from(defaults.outer_shard_edge / edge);
@@ -522,7 +522,7 @@ mod tests {
     fn every_selection_authority_leaf_is_validated_and_commitment_sensitive() {
         let authority = authority_value();
         let canonical_authority_sha256 =
-            Sha256Hasher::digest(&serde_json::to_vec(&authority).unwrap()).to_string();
+            Sha256Hasher::digest(serde_json::to_vec(&authority).unwrap()).to_string();
         let mut pointers = Vec::new();
         collect_leaf_pointers(&authority, "", &mut pointers);
         assert!(!pointers.is_empty());
