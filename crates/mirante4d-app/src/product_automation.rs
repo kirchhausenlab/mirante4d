@@ -118,10 +118,9 @@ struct ActiveViewGpuExecutionFacts {
     renderer_frame: mirante4d_render_api::FrameIdentity,
     display_generation: u64,
     pass_kind: RenderPassKind,
-    timing_complete: bool,
 }
 
-fn exact_completed_gpu_timing_identity(
+fn exact_current_gpu_timing_identity(
     current_generation: u64,
     expected_panel: PanelId,
     expected_pass_kind: RenderPassKind,
@@ -138,22 +137,29 @@ fn exact_completed_gpu_timing_identity(
         || identity.pass_kind != execution.pass_kind
         || execution.display_generation != current_generation
         || execution.pass_kind != expected_pass_kind
-        || !execution.timing_complete
     {
         return None;
     }
     intervals
         .iter()
         .rev()
-        .any(|sample| {
-            sample.panel == expected_panel
-                && sample.gpu_execution == Some(identity)
-                && sample.gpu_timing.is_some()
-        })
+        .any(|sample| sample.panel == expected_panel && sample.gpu_execution == Some(identity))
         .then_some(identity)
 }
 
-fn active_view_gpu_timing_identity(
+fn captured_gpu_timing_complete(
+    expected_panel: PanelId,
+    identity: ProductGpuExecutionIdentity,
+    intervals: &std::collections::VecDeque<PresentedFrameIntervalSample>,
+) -> Option<bool> {
+    intervals
+        .iter()
+        .rev()
+        .find(|sample| sample.panel == expected_panel && sample.gpu_execution == Some(identity))
+        .map(|sample| sample.gpu_timing.is_some())
+}
+
+fn active_view_gpu_timing_candidate(
     app: &MiranteWorkbenchApp,
     target: ProductAutomationGpuTarget,
     pass_kind: ProductAutomationGpuPassKind,
@@ -178,16 +184,28 @@ fn active_view_gpu_timing_identity(
                     renderer_frame: execution.frame,
                     display_generation: execution.display_generation,
                     pass_kind: execution.pass_kind,
-                    timing_complete: execution.gpu.is_some(),
                 })
         });
-    exact_completed_gpu_timing_identity(
+    exact_current_gpu_timing_identity(
         app.render_coordination
             .display_generation()
             .input_generation,
         expected_panel,
         expected_pass_kind,
         execution,
+        product.presented_frame_interval_samples(),
+    )
+}
+
+fn active_view_captured_gpu_timing_complete(
+    app: &MiranteWorkbenchApp,
+    target: ProductAutomationGpuTarget,
+    identity: ProductGpuExecutionIdentity,
+) -> Option<bool> {
+    let product = app.native_presentation.product_gpu.as_ref()?;
+    captured_gpu_timing_complete(
+        PanelId::from(target),
+        identity,
         product.presented_frame_interval_samples(),
     )
 }
@@ -888,6 +906,8 @@ pub(crate) struct ProductAutomationController {
     active_dataset_switch: Option<ActiveDatasetSwitch>,
     active_gate_batch: Option<ActiveProductGateBatch>,
     active_wait_started: Option<Instant>,
+    active_gpu_timing_await_identity: Option<ProductGpuExecutionIdentity>,
+    completed_gpu_timing_checkpoint: Option<ProductGpuExecutionIdentity>,
     sleep_frames_remaining: Option<u32>,
     active_input_sequence: Option<ActiveInputSequence>,
     previous_labeled_resource_union: Option<LabeledDiagnosticResourceUnion>,
@@ -1279,6 +1299,8 @@ impl ProductAutomationController {
             active_dataset_switch: None,
             active_gate_batch: None,
             active_wait_started: None,
+            active_gpu_timing_await_identity: None,
+            completed_gpu_timing_checkpoint: None,
             sleep_frames_remaining: None,
             active_input_sequence: None,
             previous_labeled_resource_union: None,
@@ -2114,6 +2136,10 @@ impl ProductAutomationController {
         }
         self.active_gate_batch = None;
         self.active_wait_started = None;
+        self.active_gpu_timing_await_identity = None;
+        if command != "await_active_view_gpu_timing" {
+            self.completed_gpu_timing_checkpoint = None;
+        }
         self.sleep_frames_remaining = None;
         if self.command_index == command_index {
             self.command_index += 1;
@@ -2996,27 +3022,53 @@ impl ProductAutomationController {
             } => {
                 let qualification_started = Instant::now();
                 let started = *self.active_wait_started.get_or_insert_with(Instant::now);
-                let result = if let Some(identity) =
-                    active_view_gpu_timing_identity(app, *target, *pass_kind)
-                {
-                    Ok(CommandProgress::Done(json!({
-                        "target": target.name(),
-                        "pass_kind": pass_kind.name(),
-                        "execution_id": identity.execution_id,
-                        "renderer_target": identity.target.get(),
-                        "display_generation": identity.display_generation,
-                        "renderer_frame": identity.renderer_frame.get(),
-                        "exact_presented_interval_timing_complete": true,
-                        "waited_ms": duration_ms(started.elapsed()),
-                    })))
-                } else if started.elapsed() >= Duration::from_millis(*timeout_ms) {
-                    Err(format!(
-                        "timed out after {timeout_ms} ms waiting for exact {} {} GPU timing",
-                        target.name(),
-                        pass_kind.name(),
-                    ))
-                } else {
-                    Ok(CommandProgress::Waiting)
+                let identity = self.active_gpu_timing_await_identity.or_else(|| {
+                    let identity = active_view_gpu_timing_candidate(app, *target, *pass_kind)?;
+                    self.active_gpu_timing_await_identity = Some(identity);
+                    Some(identity)
+                });
+                let result = match identity {
+                    Some(identity) => {
+                        match active_view_captured_gpu_timing_complete(app, *target, identity) {
+                            Some(true) => {
+                                self.completed_gpu_timing_checkpoint = Some(identity);
+                                Ok(CommandProgress::Done(json!({
+                                    "target": target.name(),
+                                    "pass_kind": pass_kind.name(),
+                                    "execution_id": identity.execution_id,
+                                    "renderer_target": identity.target.get(),
+                                    "display_generation": identity.display_generation,
+                                    "renderer_frame": identity.renderer_frame.get(),
+                                    "identity_frozen_before_completion": true,
+                                    "exact_presented_interval_timing_complete": true,
+                                    "waited_ms": duration_ms(started.elapsed()),
+                                })))
+                            }
+                            Some(false)
+                                if started.elapsed() < Duration::from_millis(*timeout_ms) =>
+                            {
+                                Ok(CommandProgress::Waiting)
+                            }
+                            Some(false) => Err(format!(
+                                "timed out after {timeout_ms} ms waiting for captured exact {} {} GPU timing",
+                                target.name(),
+                                pass_kind.name(),
+                            )),
+                            None => Err(format!(
+                                "captured exact {} {} GPU timing interval was no longer retained",
+                                target.name(),
+                                pass_kind.name(),
+                            )),
+                        }
+                    }
+                    None if started.elapsed() >= Duration::from_millis(*timeout_ms) => {
+                        Err(format!(
+                            "timed out after {timeout_ms} ms waiting to capture exact {} {} GPU timing",
+                            target.name(),
+                            pass_kind.name(),
+                        ))
+                    }
+                    None => Ok(CommandProgress::Waiting),
                 };
                 self.qualification_only_ui_overhead_ns =
                     self.qualification_only_ui_overhead_ns.saturating_add(
@@ -4820,6 +4872,10 @@ impl ProductAutomationController {
                         })).collect::<Vec<_>>(),
                     },
                 })),
+                "qualification_gpu_timing_checkpoint": qualification_gpu_timing_checkpoint_json(
+                    app,
+                    self.completed_gpu_timing_checkpoint,
+                ),
                 "performance_milestones": display_performance_milestones_json(app),
                 "display_coordination": display_coordination_diagnostics_json(
                     app,
@@ -5442,6 +5498,53 @@ fn timing_samples_json(samples: &mirante4d_application::DisplayTimingSamples) ->
         "retained_samples_ns_oldest_first": (0..samples.retained_count())
             .filter_map(|index| samples.sample(index))
             .collect::<Vec<_>>(),
+    })
+}
+
+fn qualification_gpu_timing_checkpoint_json(
+    app: &MiranteWorkbenchApp,
+    identity: Option<ProductGpuExecutionIdentity>,
+) -> Value {
+    let Some(identity) = identity else {
+        return Value::Null;
+    };
+    let sample = app
+        .native_presentation
+        .product_gpu
+        .as_ref()
+        .and_then(|product| {
+            product
+                .presented_frame_interval_samples()
+                .iter()
+                .rev()
+                .find(|sample| sample.gpu_execution == Some(identity))
+        });
+    let Some(sample) = sample else {
+        return json!({
+            "available": false,
+            "reason": "captured_presented_interval_not_retained",
+        });
+    };
+    let Some(timing) = sample.gpu_timing else {
+        return json!({
+            "available": false,
+            "reason": "captured_presented_interval_timing_incomplete",
+        });
+    };
+    json!({
+        "available": true,
+        "derivation": "identity_frozen_from_current_execution_then_completed_by_exact_presented_interval_ticket",
+        "presented_interval_sequence": sample.sequence,
+        "panel": sample.panel.label(),
+        "execution_id": identity.execution_id,
+        "target": identity.target.get(),
+        "display_generation": identity.display_generation,
+        "renderer_frame": identity.renderer_frame.get(),
+        "pass_kind": format!("{:?}", identity.pass_kind),
+        "gpu_batch_envelope_ns": timing.batch_gpu_envelope_ns,
+        "gpu_payload_copy_ns": timing.payload_copy_ns,
+        "gpu_render_pass_ns": timing.render_pass_ns,
+        "exact_presented_interval_timing_complete": true,
     })
 }
 

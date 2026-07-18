@@ -164,13 +164,14 @@ after the evidence envelope has become unusable.
 Every checkpoint acceptance batch resolves before its phase-end diagnostic.
 It is followed by one bounded, nonblocking
 `await_active_view_gpu_timing` command for the oracle-bound active target and
-pass immediately before every GPU-gated end diagnostic. Readiness requires
-both the current execution timing and the matching completed presented-
-interval ticket; a stale, execution-only, interval-only, adapter-global, or
-synchronous readback cannot satisfy it. This ordering lets asynchronous GPU
-timestamp tickets bind before the diagnostic freezes the measurement; the
-successful await publishes its adjacent diagnostic in the same UI callback so
-normal rendering cannot replace the completed ticket with a newer pending one.
+pass immediately before every GPU-gated end diagnostic. The command freezes
+the exact current execution identity only after its presented-interval record
+exists, then waits for completion of that same record even if normal rendering
+installs a newer current execution. A stale, execution-only, interval-only,
+adapter-global, or synchronous readback cannot satisfy it. The completed
+identity and timing are published as a distinct qualification checkpoint in
+the adjacent diagnostic during the same UI callback; the normal current-
+execution facts remain unmodified.
 The removed diagnostic-before-gate ordering and a callback boundary between
 readiness and capture are rejected. Phase diagnostics also bind the canonical
 current time index and application snapshot currentness.
@@ -178,6 +179,11 @@ Project revision and undo/history deltas are required only for bound projects;
 unbound provisional-viewing roles instead require those project-only fields to
 remain explicit nulls while retaining the same exact finalized-view-commit
 gate.
+
+Claim-bearing timing histories retain 4,096 allocation-free samples. This is
+large enough for the frozen maximum 480-sample interaction plus the
+30-second verification gate and bounded polling headroom; a phase that still
+overwrites that ring remains an evidence-integrity failure.
 
 Deadline values are exact validated profile, oracle, or protocol operands
 rather than private script policy. Resident gates use the frozen current-presentation bound plus

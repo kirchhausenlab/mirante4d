@@ -999,13 +999,19 @@ the existing progression rule and cannot establish a performance claim.
 Every GPU-gated phase resolves its concurrent acceptance checkpoint before
 the end diagnostic, then uses one five-second-bounded nonblocking
 active-target timing await. That await accepts only the exact current
-execution ticket after both its renderer timing and matching presented-
-interval timing are complete. It drives normal asynchronous polling and never
+execution ticket after its matching presented-interval record exists, freezes
+that identity once, and completes that same record even if normal rendering
+installs a newer execution. It drives normal asynchronous polling and never
 uses a fixed sleep or synchronous device wait. Its declared ceiling is counted
 in the role watchdog; normal completion is ordinarily the next UI tick. On
-success, readiness and publication of the adjacent end diagnostic are atomic
-within that UI callback, before normal rendering can install a newer pending
-execution ticket.
+success, the exact completed ticket is published as a distinct qualification
+checkpoint with the adjacent end diagnostic atomically within that UI
+callback; normal current-execution facts are not rewritten.
+
+The allocation-free claim-bearing timing histories retain 4,096 samples. That
+bound covers the frozen 480-sample maximum interaction, the 30-second
+verification gate, and polling headroom. Overwrite still fails evidence
+integrity; a retained suffix is never substituted for a complete phase.
 
 Automatic full-package source verification is not a generic viewer-startup
 prerequisite. RZ, ZB, RO, ST, NO, VM, and IP cancel the normal automatic

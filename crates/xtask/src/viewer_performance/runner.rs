@@ -9398,27 +9398,74 @@ fn validate_gpu_gate(
     if target_fact.get("panel").and_then(Value::as_str) != Some(expected_panel.report_label()) {
         reasons.insert("per_target_gpu_panel_identity_missing".to_owned());
     }
-    let timing = target_fact
+    let current_execution = target_fact
         .get("last_execution")
         .expect("target selection required a last execution");
-    if timing.get("gpu_upload_ns").is_some() || timing.get("gpu_volume_pass_ns").is_some() {
+    if current_execution.get("gpu_upload_ns").is_some()
+        || current_execution.get("gpu_volume_pass_ns").is_some()
+    {
         reasons.insert("removed_gpu_timing_alias_present".to_owned());
     }
-    let target = timing.get("target").and_then(Value::as_u64);
-    let execution_id = timing.get("execution_id").and_then(Value::as_u64);
-    let generation = timing.get("generation").and_then(Value::as_u64);
-    let renderer_frame = timing.get("renderer_frame").and_then(Value::as_u64);
+    if current_execution
+        .get("target")
+        .and_then(Value::as_u64)
+        .is_none_or(|target| target == 0)
+        || current_execution.get("generation").and_then(Value::as_u64) != expected_generation
+        || current_execution
+            .get("renderer_frame")
+            .and_then(Value::as_u64)
+            .is_none_or(|frame| frame == 0)
+        || current_execution.get("pass_kind").and_then(Value::as_str) != Some(expected_pass_kind)
+    {
+        reasons.insert("per_target_current_execution_identity_missing_or_mismatched".to_owned());
+    }
+
+    // The current execution may advance while its asynchronous timestamp is
+    // resolving. Qualification freezes the exact current ticket once, then
+    // completes that same presented-interval record without requiring a later
+    // stable frame. This checkpoint is published atomically with the phase
+    // diagnostic and is the GPU gate's timing authority.
+    let checkpoint = diagnostics.pointer("/render/qualification_gpu_timing_checkpoint");
+    let checkpoint_authoritative = checkpoint.is_some_and(|checkpoint| {
+        checkpoint.get("available").and_then(Value::as_bool) == Some(true)
+            && checkpoint.get("derivation").and_then(Value::as_str)
+                == Some(
+                    "identity_frozen_from_current_execution_then_completed_by_exact_presented_interval_ticket",
+                )
+            && checkpoint
+                .get("exact_presented_interval_timing_complete")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && checkpoint.get("panel").and_then(Value::as_str)
+                == Some(expected_panel.report_label())
+            && checkpoint.get("pass_kind").and_then(Value::as_str)
+                == Some(expected_pass_kind)
+            && checkpoint
+                .get("display_generation")
+                .and_then(Value::as_u64)
+                == expected_generation
+    });
+    if !checkpoint_authoritative {
+        reasons.insert("qualification_gpu_timing_checkpoint_missing_or_invalid".to_owned());
+    }
+    let execution_id = checkpoint
+        .and_then(|checkpoint| checkpoint.get("execution_id"))
+        .and_then(Value::as_u64);
+    let target = checkpoint
+        .and_then(|checkpoint| checkpoint.get("target"))
+        .and_then(Value::as_u64);
+    let generation = checkpoint
+        .and_then(|checkpoint| checkpoint.get("display_generation"))
+        .and_then(Value::as_u64);
+    let renderer_frame = checkpoint
+        .and_then(|checkpoint| checkpoint.get("renderer_frame"))
+        .and_then(Value::as_u64);
     if execution_id.is_none_or(|execution_id| execution_id == 0)
         || target.is_none_or(|target| target == 0)
-        || generation.is_none()
         || generation != expected_generation
         || renderer_frame.is_none_or(|frame| frame == 0)
-        || timing.get("pass_kind").and_then(Value::as_str) != Some(expected_pass_kind)
     {
         reasons.insert("gpu_timing_ticket_identity_missing_or_mismatched".to_owned());
-    }
-    if timing.get("gpu_timing_available").and_then(Value::as_bool) != Some(true) {
-        reasons.insert("per_target_gpu_timing_unavailable".to_owned());
     }
     let interval = diagnostics
         .pointer("/render/progressive_presentation/presented_frame_intervals/samples")
@@ -9430,19 +9477,23 @@ fn validate_gpu_gate(
                         == Some(expected_panel.report_label())
                     && sample.get("gpu_pass_kind").and_then(Value::as_str)
                         == Some(expected_pass_kind)
-                    && sample.get("gpu_generation").and_then(Value::as_u64) == expected_generation
+                    && sample.get("gpu_execution_id").and_then(Value::as_u64) == execution_id
+                    && sample.get("gpu_target").and_then(Value::as_u64) == target
+                    && sample.get("gpu_generation").and_then(Value::as_u64) == generation
+                    && sample.get("gpu_renderer_frame").and_then(Value::as_u64) == renderer_frame
             })
         });
     match interval {
         Some(interval)
-            if interval.get("gpu_execution_id").and_then(Value::as_u64) == execution_id
-                && interval.get("gpu_target").and_then(Value::as_u64) == target
-                && interval.get("gpu_generation").and_then(Value::as_u64) == generation
-                && interval.get("gpu_renderer_frame").and_then(Value::as_u64) == renderer_frame
-                && interval.get("panel").and_then(Value::as_str)
-                    == Some(expected_panel.report_label())
-                && interval.get("gpu_pass_kind").and_then(Value::as_str)
-                    == Some(expected_pass_kind) => {}
+            if checkpoint.is_some_and(|checkpoint| {
+                [
+                    "gpu_batch_envelope_ns",
+                    "gpu_payload_copy_ns",
+                    "gpu_render_pass_ns",
+                ]
+                .into_iter()
+                .all(|field| checkpoint.get(field) == interval.get(field))
+            }) => {}
         Some(_) => {
             reasons.insert("presented_interval_gpu_ticket_identity_mismatch".to_owned());
         }
@@ -9450,9 +9501,13 @@ fn validate_gpu_gate(
             reasons.insert("presented_interval_gpu_ticket_missing".to_owned());
         }
     }
-    let render_pass = timing.get("gpu_render_pass_ns").and_then(Value::as_u64);
-    let envelope = timing.get("gpu_batch_envelope_ns").and_then(Value::as_u64);
-    let payload_copy = timing.get("gpu_payload_copy_ns");
+    let render_pass = checkpoint
+        .and_then(|checkpoint| checkpoint.get("gpu_render_pass_ns"))
+        .and_then(Value::as_u64);
+    let envelope = checkpoint
+        .and_then(|checkpoint| checkpoint.get("gpu_batch_envelope_ns"))
+        .and_then(Value::as_u64);
+    let payload_copy = checkpoint.and_then(|checkpoint| checkpoint.get("gpu_payload_copy_ns"));
     if payload_copy.is_none() {
         reasons.insert("gpu_payload_copy_availability_fact_missing".to_owned());
     } else if !payload_copy.is_some_and(|value| value.is_null() || value.as_u64().is_some()) {
@@ -14520,7 +14575,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_gate_requires_current_per_target_ticket_identity_and_exact_pass_kind() {
+    fn gpu_gate_accepts_only_the_frozen_exact_presented_ticket_and_current_pass() {
         let profile = profile();
         let mut diagnostics = json!({
             "render": {
@@ -14531,18 +14586,30 @@ mod tests {
                         "per_target_renderer_facts": [{
                             "panel": "3D",
                             "last_execution": {
-                                "execution_id": 5,
-                                "target": 9,
+                                "execution_id": null,
+                                "target": 10,
                                 "generation": 7,
-                                "renderer_frame": 11,
+                                "renderer_frame": 12,
                                 "pass_kind": "Volume",
-                                "gpu_timing_available": true,
-                                "gpu_batch_envelope_ns": 100,
-                                "gpu_payload_copy_ns": null,
-                                "gpu_render_pass_ns": 80,
+                                "gpu_timing_available": false,
                             },
                         }],
                     },
+                },
+                "qualification_gpu_timing_checkpoint": {
+                    "available": true,
+                    "derivation": "identity_frozen_from_current_execution_then_completed_by_exact_presented_interval_ticket",
+                    "presented_interval_sequence": 3,
+                    "panel": "3D",
+                    "execution_id": 5,
+                    "target": 9,
+                    "display_generation": 7,
+                    "renderer_frame": 11,
+                    "pass_kind": "Volume",
+                    "gpu_batch_envelope_ns": 100,
+                    "gpu_payload_copy_ns": null,
+                    "gpu_render_pass_ns": 80,
+                    "exact_presented_interval_timing_complete": true,
                 },
                 "progressive_presentation": {
                     "presented_frame_intervals": { "samples": [{
@@ -14553,6 +14620,9 @@ mod tests {
                         "gpu_generation": 7,
                         "gpu_renderer_frame": 11,
                         "gpu_pass_kind": "Volume",
+                        "gpu_batch_envelope_ns": 100,
+                        "gpu_payload_copy_ns": null,
+                        "gpu_render_pass_ns": 80,
                     }] },
                 },
             },
@@ -14576,7 +14646,7 @@ mod tests {
             &profile,
             &mut reasons,
         );
-        assert!(reasons.contains("presented_interval_gpu_ticket_identity_mismatch"));
+        assert!(reasons.contains("presented_interval_gpu_ticket_missing"));
 
         reasons.clear();
         diagnostics["render"]["display_coordination"]["detailed_counters"]["per_target_renderer_facts"]

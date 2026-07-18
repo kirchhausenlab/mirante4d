@@ -47,7 +47,6 @@ fn active_view_gpu_timing_wait_requires_exact_execution_and_interval_completion(
         renderer_frame: identity.renderer_frame,
         display_generation: identity.display_generation,
         pass_kind: identity.pass_kind,
-        timing_complete: true,
     };
     let sample = PresentedFrameIntervalSample {
         sequence: 1,
@@ -66,7 +65,7 @@ fn active_view_gpu_timing_wait_requires_exact_execution_and_interval_completion(
     let exact = VecDeque::from([sample]);
 
     assert_eq!(
-        exact_completed_gpu_timing_identity(
+        exact_current_gpu_timing_identity(
             7,
             PanelId::ThreeD,
             RenderPassKind::Volume,
@@ -75,21 +74,8 @@ fn active_view_gpu_timing_wait_requires_exact_execution_and_interval_completion(
         ),
         Some(identity)
     );
-
-    let mut pending_execution = facts;
-    pending_execution.timing_complete = false;
     assert!(
-        exact_completed_gpu_timing_identity(
-            7,
-            PanelId::ThreeD,
-            RenderPassKind::Volume,
-            Some(pending_execution),
-            &exact,
-        )
-        .is_none()
-    );
-    assert!(
-        exact_completed_gpu_timing_identity(
+        exact_current_gpu_timing_identity(
             7,
             PanelId::ThreeD,
             RenderPassKind::Volume,
@@ -101,18 +87,41 @@ fn active_view_gpu_timing_wait_requires_exact_execution_and_interval_completion(
 
     let mut interval_only = exact;
     interval_only[0].gpu_timing = None;
-    assert!(
-        exact_completed_gpu_timing_identity(
+    assert_eq!(
+        exact_current_gpu_timing_identity(
             7,
             PanelId::ThreeD,
             RenderPassKind::Volume,
             Some(facts),
             &interval_only,
+        ),
+        Some(identity)
+    );
+    assert_eq!(
+        captured_gpu_timing_complete(PanelId::ThreeD, identity, &interval_only),
+        Some(false)
+    );
+    interval_only[0].gpu_timing = sample.gpu_timing;
+    assert_eq!(
+        captured_gpu_timing_complete(PanelId::ThreeD, identity, &interval_only),
+        Some(true)
+    );
+    assert_eq!(
+        captured_gpu_timing_complete(PanelId::Xy, identity, &interval_only),
+        None
+    );
+    assert!(
+        exact_current_gpu_timing_identity(
+            7,
+            PanelId::ThreeD,
+            RenderPassKind::Volume,
+            Some(facts),
+            &VecDeque::new(),
         )
         .is_none()
     );
     assert!(
-        exact_completed_gpu_timing_identity(
+        exact_current_gpu_timing_identity(
             8,
             PanelId::ThreeD,
             RenderPassKind::Volume,

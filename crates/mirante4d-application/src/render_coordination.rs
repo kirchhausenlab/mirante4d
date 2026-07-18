@@ -4,7 +4,12 @@ use mirante4d_render_api::{MAX_RENDER_LAYERS, PresentationViewport, RenderExtent
 
 use crate::PresentationSlot;
 
-pub const DISPLAY_TIMING_SAMPLE_CAPACITY: usize = 256;
+/// Bounded claim-bearing timing history. The frozen viewer qualification
+/// schedule can keep an input/loading phase active for thirty seconds while
+/// collecting up to 480 distributed input samples, so the former 256-entry
+/// ring could not retain one complete declared phase. 4096 covers that exact
+/// schedule with polling headroom while keeping recording allocation-free.
+pub const DISPLAY_TIMING_SAMPLE_CAPACITY: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderBackend {
@@ -275,7 +280,7 @@ impl DisplayGenerationStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisplayTimingSamples {
-    samples: [u64; DISPLAY_TIMING_SAMPLE_CAPACITY],
+    samples: Box<[u64]>,
     retained_count: usize,
     next: usize,
     total_count: u64,
@@ -286,7 +291,7 @@ pub struct DisplayTimingSamples {
 impl Default for DisplayTimingSamples {
     fn default() -> Self {
         Self {
-            samples: [0; DISPLAY_TIMING_SAMPLE_CAPACITY],
+            samples: vec![0; DISPLAY_TIMING_SAMPLE_CAPACITY].into_boxed_slice(),
             retained_count: 0,
             next: 0,
             total_count: 0,
