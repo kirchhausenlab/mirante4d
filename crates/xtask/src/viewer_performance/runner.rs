@@ -1505,6 +1505,7 @@ fn validate_bundles(
         bail!("viewer oracle bundle schema must be {ORACLE_SCHEMA:?}")
     }
     validate_oracle_contract(&oracle.value)?;
+    validate_oracle_source_commitments(&oracle.value, repository_root)?;
     require_sha256(
         &workload.value.representative_package_root_manifest_sha256,
         "workload representative-package manifest commitment",
@@ -9090,6 +9091,41 @@ mod tests {
                 invalid.numeric_boxes[0].end_zyx_exclusive[axis] + 1;
             assert!(validate_ep01_trace_geometry(&invalid).is_err());
         }
+    }
+
+    #[test]
+    fn preflight_oracle_source_commitments_match_the_exact_repository_files() {
+        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let mut oracle = OracleBundle {
+            schema: ORACLE_SCHEMA.to_owned(),
+            independent_sources: IndependentOracleSources {
+                lod_oracle_source_sha256: digest_regular_file(
+                    &repository_root.join("crates/mirante4d-render-reference/src/lod_oracle.rs"),
+                    "test LOD oracle source",
+                )
+                .unwrap(),
+                numerical_oracle_source_sha256: digest_regular_file(
+                    &repository_root
+                        .join("crates/mirante4d-render-reference/src/numerical_oracle.rs"),
+                    "test numerical oracle source",
+                )
+                .unwrap(),
+            },
+            numerical_contract: numerical_contract(),
+            conformance_cases: Vec::new(),
+            scenarios: Vec::new(),
+        };
+        validate_oracle_source_commitments(&oracle, &repository_root).unwrap();
+
+        let lod = oracle.independent_sources.lod_oracle_source_sha256.clone();
+        oracle.independent_sources.lod_oracle_source_sha256 = "00".repeat(32);
+        assert!(validate_oracle_source_commitments(&oracle, &repository_root).is_err());
+        oracle.independent_sources.lod_oracle_source_sha256 = lod;
+        oracle.independent_sources.numerical_oracle_source_sha256 = "00".repeat(32);
+        assert!(validate_oracle_source_commitments(&oracle, &repository_root).is_err());
     }
 
     #[test]
